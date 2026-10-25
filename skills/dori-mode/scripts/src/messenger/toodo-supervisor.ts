@@ -62,6 +62,8 @@ export type ToodoInboundDeps = {
   readonly listen?: (wake: () => void, signal: AbortSignal, onOpen: () => void) => Promise<void>;
   /** Waits before reconnecting the stream; tests resolve at once. */
   readonly backoff?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** The Discord mirror of the chat (toodo-mirror.ts), run at the end of every pass. */
+  readonly mirror?: { pass(toodo: ToodoApi): Promise<void> };
 };
 
 const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
@@ -153,6 +155,7 @@ export const supervisorToodo = (deps: ToodoInboundDeps) => {
         const toodo = deps.toodo();
         await inbox(toodo);
         await finishes(toodo);
+        await deps.mirror?.pass(toodo);
       }
     })().finally(() => { running = undefined; });
     return running;
@@ -189,6 +192,8 @@ export const supervisorToodo = (deps: ToodoInboundDeps) => {
     },
     /** Runs a pass now (tests, and a wake from the stream). */
     pass,
+    /** Asks for a pass without waiting for it; an error is logged. */
+    wake,
     async close(): Promise<void> {
       controller.abort();
       await listening;

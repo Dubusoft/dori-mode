@@ -89,6 +89,23 @@ export class Discord {
     return first ?? "";
   }
 
+  /**
+   * Posts through a channel webhook under another name and avatar (Discord lets no bot post as a person). The text goes
+   * through guardText like every bot post; the webhook URL holds its token, so it never appears in an error.
+   */
+  async executeWebhook(webhookUrl: string, content: string, identity: { readonly username: string; readonly avatarUrl?: string }): Promise<string> {
+    if (!/^https:\/\/(?:[a-z]+\.)?discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(webhookUrl)) throw new MessengerError("discord webhook: not a Discord webhook URL", 0);
+    const body = JSON.stringify({
+      content: guardText(content), username: identity.username.slice(0, 80), allowed_mentions: { parse: [] },
+      ...(identity.avatarUrl ? { avatar_url: identity.avatarUrl } : {}),
+    });
+    const res = await withBackoff(this.http, this.clock, { method: "POST", url: `${webhookUrl}?wait=true`, headers: { "Content-Type": "application/json" }, body }, undefined, retryAfter);
+    if (res.status >= 300) throw new MessengerError(`discord webhook POST: ${res.status} ${res.body.slice(0, 160)}`, res.status);
+    const id = (JSON.parse(res.body) as { id?: unknown }).id;
+    if (typeof id !== "string") throw new MessengerError("discord webhook POST: no message id", res.status);
+    return id;
+  }
+
   async edit(channelId: string, messageId: string, content: string): Promise<void> {
     await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(content) });
   }

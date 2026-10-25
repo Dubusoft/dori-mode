@@ -22,6 +22,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { fetchHttp } from "./messenger/http.ts";
 import { listenToodoEvents, TOODO_CHANNEL, TOODO_POLL_SECONDS, toodoClient, toodoConfigError } from "./messenger/toodo.ts";
 import { supervisorToodo, writeToodoStatus } from "./messenger/toodo-supervisor.ts";
+import { mirrorDiscord, toodoMirror } from "./messenger/toodo-mirror.ts";
 import { postOwnerLine } from "./lane-finish.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
@@ -355,8 +356,17 @@ export const supervise = async (
     let sequence = 0;
     let deliveryError: unknown;
     const emit = async (id: string, line: string): Promise<void> => { enqueueDiscord(id, line); };
+    // The Toodo chat mirrored to one Discord channel: Discord messages recorded by the inbound side, both directions run
+    // in the Toodo pass, which a recorded message wakes.
+    const mirrorConfig = toodoConfig?.discordMirror;
+    const mirror = mirrorConfig ? probe.step("toodo-mirror", () => toodoMirror({
+      channel: mirrorConfig.channel, stateDir: deps.config.stateDir, now: deps.clock.now, log: (line) => { console.error(line); },
+      discord: mirrorDiscord(discord, mirrorConfig, deps.config.discord?.ownerId),
+      wake: () => { toodoInbound?.wake(); },
+    })) : undefined;
     const discordInbound = probe.step("inbound", () => supervisorDiscord(deps, {
       ...discordOptions, token, emit,
+      ...(mirror ? { mirror: { channel: mirror.channel, record: mirror.record } } : {}),
       http: discordOptions.http ?? ((request) => fetchHttp({
         ...request, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
       })),
@@ -371,6 +381,7 @@ export const supervise = async (
         toodo: () => toodo, enqueue: enqueueToodo, stateDir: deps.config.stateDir, now: deps.clock.now,
         pollMs: (toodoConfig.pollSeconds ?? TOODO_POLL_SECONDS) * 1_000, log: (line) => { console.error(line); },
         listen: (wake, abort, onOpen) => listenToodoEvents(toodoConfig, wake, abort, onOpen),
+        ...(mirror ? { mirror } : {}),
       }));
     }
     const heartbeat = (): void => {

@@ -5,7 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ToodoApi, ToodoMessage, ToodoPending, ToodoPendingItem } from "../../src/messenger/toodo.ts";
 
 export type FakeToodoState = {
-  messages: (ToodoMessage & { taken?: boolean; acked?: boolean; handledBy?: string })[];
+  messages: (ToodoMessage & { taken?: boolean; acked?: boolean; handledBy?: string; originId?: string })[];
   events: { id: number; taskId: number; title: string; status: string; taken?: boolean }[];
   typing: boolean;
   calls: string[];
@@ -56,6 +56,13 @@ export const fileToodo = (path: string, hooks: { beforeTake?: () => void } = {})
       if (m) m.handledBy = "replyId" in link ? `reply ${link.replyId}` : `task ${link.taskId}`;
     }),
     typing: async (on) => change(`typing ${on}`, (s) => { s.typing = on; }),
+    importMessage: async (author, text, origin, originId) => change(`import ${origin}:${originId}`, (s) => {
+      const stored = s.messages.find((m) => m.origin === origin && m.originId === originId);
+      if (stored) return stored;
+      const message = { id: (s.messages.at(-1)?.id ?? 0) + 1, author, body: text, at: 0, origin, originId, taken: true };
+      s.messages.push(message);
+      return message;
+    }),
     listChat: async (after, limit = 100) => change("list", (s) => {
       const rest = s.messages.filter((m) => m.id > after);
       return { messages: rest.slice(0, limit), more: rest.length > limit };
