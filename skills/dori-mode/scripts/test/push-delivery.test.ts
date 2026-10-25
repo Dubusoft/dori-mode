@@ -19,7 +19,7 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 type Delivery = Partial<Omit<DeliveryConfig, "push">> & { readonly push?: Partial<DeliveryConfig["push"]> };
 const delivery = (patch: Delivery = {}): DeliveryConfig => {
   const base = defaultConfig().delivery;
-  return { ...base, mode: "push", ...patch, push: { ...base.push, ...patch.push } };
+  return { ...base, ...patch, push: { ...base.push, ...patch.push } };
 };
 
 /** A screen as omo draws it (phase 0 capture): the input box between the running header and the full-width separator. */
@@ -122,17 +122,6 @@ test("an urgent event for an idle lead gets exactly one [dori] pointer and one E
   expect(f.enters()).toBe(1);
   expect(journaled).toBe(1);
   expect(lines.some((line) => /^LEAD_PUSH \w+ 1 WAIT_DONE delivered attempt=1$/.test(line))).toBe(true);
-});
-
-test("tail mode, the default, never types into the lead and keeps the startup prompt's tail monitor", async () => {
-  const f = fixture();
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
-  await flush(supervisor);
-  f.clock.at += 10 * 60_000;
-  await flush(supervisor);
-  expect(f.texts()).toEqual([]);
-  expect(readJournal(f.state.dir).inbox?.takenOffset).toBe(0);
 });
 
 test("an untaken event is pushed again after ackSec though nothing is pending, and a take receipt past it stops the pushes", async () => {
@@ -529,21 +518,6 @@ test("nothing untaken and due makes no herdr call at all", async () => {
   expect(f.calls.slice(before)).toEqual([]);
 });
 
-test("shadow mode logs would-push and would-escalate and types nothing", async () => {
-  const f = fixture({ delivery: delivery({ mode: "shadow", tailMonitor: false }) });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
-  const lines: string[] = [];
-  for (let i = 0; i < 8; i++) {
-    lines.push(...await flush(supervisor));
-    f.clock.at += 60_000;
-  }
-  expect(f.texts()).toEqual([]);
-  expect(f.launches()).toEqual([]);
-  expect(lines.some((line) => /^LEAD_PUSH_SHADOW would-push \w+ 1 WAIT_DONE attempt=1$/.test(line))).toBe(true);
-  expect(lines.filter((line) => line.startsWith("LEAD_PUSH_SHADOW would-escalate"))).toHaveLength(1);
-});
-
 test("a crash between the journaled push and the send pushes once more after ackSec", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }) });
   let crash = true;
@@ -560,16 +534,17 @@ test("a crash between the journaled push and the send pushes once more after ack
   expect(f.texts()).toHaveLength(2);
 });
 
-test("entering push from tail moves the take cursor to the log's end; staying in tail keeps it (N6)", async () => {
+test("a journal written under the old tail mode moves the take cursor to the log's end on the first push start; a restart keeps it (N6)", async () => {
   const f = fixture();
-  const tail = new Supervisor(f.deps);
-  tail.enqueue("wait:1", "WAIT_DONE ci green");
-  await flush(tail);
-  tail.close();
-  const again = new Supervisor(f.deps);
-  again.close();
-  expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now(), peek: true }))).toEqual(["wait:1\tWAIT_DONE ci green"]);
-  const lines = await logged(async () => { new Supervisor({ ...f.deps, config: { ...f.deps.config, delivery: delivery() } }).close(); });
+  const first = new Supervisor(f.deps);
+  first.enqueue("wait:1", "WAIT_DONE ci green");
+  await flush(first);
+  first.close();
+  const journal = readJournal(f.state.dir);
+  writeJournal(f.state.dir, { ...journal, inbox: { ...journal.inbox, mode: "tail+tail", takenOffset: 0, push: undefined } });
+  const lines = await logged(async () => { new Supervisor(f.deps).close(); });
   expect(lines.some((line) => line.startsWith("INBOX_CURSOR_ADVANCED 0 -> "))).toBe(true);
-  expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }))).toEqual(["INBOX_EMPTY"]);
+  expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now(), peek: true }))).toEqual(["INBOX_EMPTY"]);
+  const again = await logged(async () => { new Supervisor(f.deps).close(); });
+  expect(again.some((line) => line.startsWith("INBOX_CURSOR_ADVANCED"))).toBe(false);
 });

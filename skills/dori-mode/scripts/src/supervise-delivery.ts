@@ -84,7 +84,7 @@ export class Delivery {
           }
           if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) this.owners.markReadable();
         }
-        // Everything due is in the log now: push and shadow modes make sure the lead takes it.
+        // Everything due is in the log now: the push step makes sure the lead takes it.
         if (await this.push.tick(pending)) continue;
         return;
       }

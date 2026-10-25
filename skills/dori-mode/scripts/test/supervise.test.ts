@@ -16,6 +16,8 @@ import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
+import { take, takeOutput } from "../src/inbox.ts";
+import { POINTER_PREFIX } from "../src/supervise-push.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -92,6 +94,11 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   };
 };
 
+/** The startup prompt's first instruction: every event past the take cursor is read with `dori inbox take`. */
+const TAKE_FIRST = "Run dori inbox take now";
+/** What `dori inbox take` prints the lead now, as `id\tline`. */
+const taken = (f: ReturnType<typeof fixture>): string[] => takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }));
+
 test("spinner frames of any common style do not count as screen progress; text does", () => {
   const frames = ["⠙ Thinking 12s", "✻ Thinking 13s", "◐ Thinking 14s", "| Thinking 15s", "/ Thinking 16s", "- Thinking 17s", "\\ Thinking 18s", "· Thinking 19s"];
   expect(new Set(frames.map((frame) => screenStill(`out\n${frame}\n❯ `))).size).toBe(1);
@@ -110,8 +117,16 @@ test("warm idle delivery appends once without restarting the lead", async () => 
   expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
 });
 
-test("a lane's dori report question reaches the lead as an urgent LANE_REPORT within 10 s, with no pane typing", async () => {
+test("a lane's dori report question reaches the lead as an urgent LANE_REPORT within 10 s, with only a [dori] pointer typed", async () => {
   const f = fixture();
+  // The lead is reached when the supervisor types its pointer.
+  let pointedAt: number | undefined;
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "herdr" && argv[2] === "send-text") pointedAt ??= f.clock.now();
+    return base(argv, options);
+  };
+  f.deps = { ...f.deps, run };
   await f.deps.registry.write({ key: "local-lane", title: "t", thread: "none", pane: "w:p7", brief: "b", done: "d", openedAt: new Date(f.clock.now()).toISOString() });
   const supervisor = new Supervisor(f.deps);
   const reports = openLaneReports(f.deps.config);
@@ -127,13 +142,18 @@ test("a lane's dori report question reaches the lead as an urgent LANE_REPORT wi
   ]);
   f.clock.at += 5_000;
   await supervisor.flush();
-  expect(f.clock.now() - written).toBeLessThanOrEqual(10_000);
+  expect((pointedAt ?? Number.POSITIVE_INFINITY) - written).toBeLessThanOrEqual(10_000);
   // The question wakes the lead; the milestone is digest by the policy table and waits for the next urgent delivery.
   const delivered = f.log();
   expect(delivered.some((event: { line: string }) => event.line === "LANE_REPORT local-lane question which base branch?")).toBe(true);
   expect(eventClass("LANE_REPORT local-lane question which base branch?", f.deps.config.eventPolicy)).toBe("lead-urgent");
   expect(eventClass("LANE_REPORT local-lane milestone tests green", f.deps.config.eventPolicy)).toBe("lead-digest");
-  expect(f.calls.some((call) => call[0] === "herdr" && (call[2] === "send-text" || call[2] === "send-keys"))).toBe(false);
+  // Only the pointer is typed, never the report's text: the lead reads it with dori inbox take.
+  const typedTexts = f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text").map((call) => call[4] ?? "");
+  expect(typedTexts).toHaveLength(1);
+  expect(typedTexts[0]).toStartWith(POINTER_PREFIX);
+  expect(typedTexts[0]).not.toContain("base branch");
+  expect(taken(f)).toContain("lane-report:local-lane:0:2\tLANE_REPORT local-lane question which base branch?");
   // Consumed: the next pass routes nothing.
   expect(reports.pending()).toEqual([]);
   expect(await routeReports(f.deps, reports, (id, line) => supervisor.enqueue(id, line))).toEqual([]);
@@ -213,12 +233,13 @@ test("at the TTL boundary cold delivery starts a fresh session in the same pane 
   supervisor.enqueue("cold", "INBOUND cold");
   await supervisor.flush();
   expect(f.log()).toEqual([{ id: "cold", line: "INBOUND cold" }]);
-  expect(f.prompt()).toContain('"id":"cold"');
+  expect(f.prompt()).toContain(TAKE_FIRST);
   const launched = f.calls.filter((call) => call[2] === "run");
   expect(launched).toHaveLength(1);
   expect(launched[0]?.[3]).toBe("lead:p1");
   expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toEqual(["103", "102", "101"]);
   expect(f.prompt()).toContain(`tail -c +${Buffer.byteLength(`${JSON.stringify(f.log()[0])}\n`) + 1}`);
+  expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
 });
 
 test("a stale lead with a pending durable wait delivers warm", async () => {
@@ -375,9 +396,13 @@ test("events arriving during restart stay queued and follow the prompt handoff e
   });
   await Promise.all([supervisor.flush(), supervisor.flush()]);
   expect(f.log().map((event) => event.id)).toEqual(["first", "second"]);
-  expect(f.prompt()).toContain('"id":"first"');
+  // Neither is inline (not owner messages): the new lead's first take prints each exactly once.
+  expect(f.prompt()).toContain(TAKE_FIRST);
+  expect(f.prompt()).not.toContain('"id":"first"');
   expect(f.prompt()).not.toContain('"id":"second"');
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(taken(f)).toEqual(["first\tINBOUND first", "second\tINBOUND second"]);
+  expect(taken(f)).toEqual(["INBOX_EMPTY"]);
 });
 
 const restartSession = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir).restart;
@@ -409,9 +434,10 @@ test("a hung cold start is killed by exact session and relaunched once with the 
   expect(f.calls.filter((call) => call[0] === "kill" && call[2] === "201")).toHaveLength(1);
   expect(f.clock.now() - before).toBeGreaterThanOrEqual(20_000);
   expect(f.log()).toEqual([{ id: "hung", line: "INBOUND hung" }]);
-  expect(f.prompt()).toContain('"id":"hung"');
+  expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.prompt()).toContain(`tail -c +${statSync(join(f.state.dir, "lead-events.log")).size + 1} -F`);
   expect(restartSession(f)).toBeUndefined();
+  expect(taken(f)).toEqual(["hung\tINBOUND hung"]);
 });
 
 test("two hung launches journal LEAD_STARTUP_HUNG, retain the events, and do not relaunch in a tight loop", async () => {
@@ -491,8 +517,9 @@ test("a shell with no live agent starts the lead instead of appending into an un
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("missing", "INBOUND missing-agent");
   await supervisor.flush();
-  expect(f.prompt()).toContain('"id":"missing"');
+  expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(taken(f)).toEqual(["missing\tINBOUND missing-agent"]);
 });
 
 test("stale ready state from the old occupant cannot confirm a new generation", async () => {
@@ -551,7 +578,8 @@ test("a large multibyte event reaches the prompt without exceeding the pane comm
   f.cold();
   const text = "한".repeat(2000);
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("large", `INBOUND 123 1 Owner ${text}`);
+  // An owner message: those are the events the push prompt still carries inline.
+  supervisor.enqueue("discord:123:1", `INBOUND 123 1 Owner ${text}`);
   await supervisor.flush();
   expect(f.prompt()).toContain(text);
   expect(Buffer.byteLength(f.command() ?? "")).toBeLessThan(4096);
@@ -642,8 +670,10 @@ test("a warm wake records its trigger kinds and is closed with the lead's model 
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("nudged", "NUDGED lane silent");
   supervisor.enqueue("owner", "INBOUND 1 1 hello");
-  await supervisor.flush();
   const woke = f.clock.now();
+  await supervisor.flush();
+  // Typing the pointer moves the fake clock; the wake itself is stamped when the batch was handed over.
+  const typed = f.clock.now();
   const record = (role: string, ms: number) => JSON.stringify({ type: "message", timestamp: new Date(ms).toISOString(), message: { role } });
   appendFileSync(f.file, `${[record("assistant", woke - 1_000), record("user", woke + 500), record("assistant", woke + 1_000), record("assistant", woke + 2_000)].join("\n")}\n`);
   f.clock.at += 3_000;
@@ -653,7 +683,7 @@ test("a warm wake records its trigger kinds and is closed with the lead's model 
   supervisor.close();
   expect(readWakes(f.state.dir, 0)).toEqual([
     { at: woke, session: f.file, trigger: ["INBOUND"], kinds: { NUDGED: 1, INBOUND: 1 }, calls: 2, closed: true },
-    { at: woke + 3_000, session: f.file, trigger: ["GH_PR * closed"], kinds: { "GH_PR * closed": 1 } },
+    { at: typed + 3_000, session: f.file, trigger: ["GH_PR * closed"], kinds: { "GH_PR * closed": 1 } },
   ]);
   expect(readWakes(f.state.dir, woke + 1)).toHaveLength(1);
 });
@@ -664,11 +694,12 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("nudged", "NUDGED lane silent");
   f.clock.at += 61 * 60_000;
+  const start = f.clock.now();
   await supervisor.flush();
   supervisor.close();
   const session = /--session-id ([\w-]+)/.exec(f.command() ?? "")?.[1] ?? "";
   expect(session).not.toBe("");
-  expect(readWakes(f.state.dir, 0)).toEqual([{ at: f.clock.now(), session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
+  expect(readWakes(f.state.dir, 0)).toEqual([{ at: start, session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
 });
 
 test("digest waits for an urgent event, but no longer than digestMaxDelayMin", async () => {
@@ -753,10 +784,10 @@ test("the next cold urgent delivery includes held digest in the new session prom
   await supervisor.flush();
   supervisor.enqueue("urgent", "LANE_NOT_DONE lane reason");
   await supervisor.flush();
-  expect(f.prompt()).toContain('"id":"digest"');
-  expect(f.prompt()).toContain('"id":"urgent"');
+  expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.log().map((event) => event.id)).toEqual(["digest", "urgent"]);
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(taken(f)).toEqual(["digest\tNUDGED lane silent", "urgent\tLANE_NOT_DONE lane reason"]);
 });
 
 /** A config that makes done claims wake the lead again: only then does the claim's window wait for its delivery. */
@@ -978,10 +1009,11 @@ test("a lead pane closed by hand together with its Dori workspace is recreated i
   const [launched] = launchedSessions(f);
   expect(launchedSessions(f)).toHaveLength(1);
   expect(f.calls.find((call) => call[2] === "run")?.[3]).toBe("w8:p1");
-  expect(f.prompt()).toContain("INBOUND hello");
+  expect(f.prompt()).toContain(TAKE_FIRST);
   expect(lines).toContain(`LEAD_RESTARTED w8:p1 ${launched}`);
   expect(restartSession(f)).toBeUndefined();
   expect(delivery.due).toBe(true);
+  expect(taken(f)).toEqual(["inbound:1\tINBOUND hello"]);
 });
 
 test("a starting restart is never typed into a pane whose foreground is an agent, and launches once a plain shell is back", async () => {
@@ -1141,12 +1173,13 @@ test("a fresh launch stalled on quota is stopped and relaunched on the next mode
   expect(first).toContain("--model a/primary");
   expect(second).toContain("--model b/fallback");
   expect(/--session-id (\S+)/.exec(first ?? "")?.[1]).not.toBe(/--session-id (\S+)/.exec(second ?? "")?.[1]);
-  expect(f.prompt()).toContain('"id":"cold"');
+  expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.log().map((event) => event.id)).toEqual(["cold"]);
   expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("201");
   expect(announced).toHaveLength(1);
   expect(journal(f)).toMatchObject({ leadModel: 1 });
   expect(journal(f).restart).toBeUndefined();
+  expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
 });
 
 test("on a fallback the first model is retried every leadPrimaryRetryMin and the lead moves back once it has quota on 2 checks", async () => {
@@ -1408,26 +1441,30 @@ test("LANE_QUOTA_STALL is urgent", () => {
 const inbox = (f: ReturnType<typeof fixture>): string[] =>
   readJournal(f.state.dir).events.map((e: { line: string }) => e.line);
 const ackMissing = (f: ReturnType<typeof fixture>): string[] => inbox(f).filter((line) => line.startsWith("ACK_MISSING "));
+/** Owner messages past their ack window: marked reminded (push delivery re-pushes them; no ACK_MISSING is enqueued). */
+const reminded = (f: ReturnType<typeof fixture>): string[] =>
+  ((readJournal(f.state.dir).awaitingAck ?? []) as { id: string; reminded?: true }[]).filter((entry) => entry.reminded).map((entry) => entry.id);
+/** When the message's ack window opened (the lead could read it); a push pass moves the clock past it while typing. */
+const readableSince = (f: ReturnType<typeof fixture>, id: string): number =>
+  ((readJournal(f.state.dir).awaitingAck ?? []) as { id: string; since?: number }[]).find((entry) => entry.id === id)?.since ?? Number.NaN;
 
-test("an owner message handed to the lead and not acked gets one urgent ACK_MISSING after the window", async () => {
+test("an owner message handed to the lead and not acked is reminded once after the window, with no ACK_MISSING", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner hello");
   supervisor.enqueue("discord:11:23", "VISITOR 11 23 Guest (not the owner) hi");
   await supervisor.flush();
-  f.clock.at += 59_999;
+  f.clock.at = readableSince(f, "discord:11:22") + 59_999;
   expect(supervisor.ackTick(60_000)).toEqual([]);
-  expect(ackMissing(f)).toEqual([]);
+  expect(reminded(f)).toEqual([]);
   f.clock.at += 1;
   expect(supervisor.ackTick(60_000)).toEqual([]);
-  expect(ackMissing(f)).toHaveLength(1);
-  expect(ackMissing(f)[0]?.split(" ").slice(0, 3)).toEqual(["ACK_MISSING", "11", "22"]);
-  expect(ackMissing(f)[0]).toContain("INBOUND 11 22 owner hello");
-  expect(eventPriority(ackMissing(f)[0] ?? "")).toBe("urgent");
+  expect(reminded(f)).toEqual(["discord:11:22"]);
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toHaveLength(1);
+  expect(reminded(f)).toEqual(["discord:11:22"]);
   await supervisor.flush();
-  expect(f.log().map((e) => e.line).filter((line) => line.startsWith("ACK_MISSING"))).toHaveLength(1);
+  expect(ackMissing(f)).toEqual([]);
+  expect(f.log().map((e) => e.line).filter((line) => line.startsWith("ACK_MISSING"))).toEqual([]);
 });
 
 test("still unacked after a second window: one notice per message, kept across a supervisor restart", async () => {
@@ -1435,7 +1472,7 @@ test("still unacked after a second window: one notice per message, kept across a
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner hello");
   await supervisor.flush();
-  f.clock.at += 60_000;
+  f.clock.at = readableSince(f, "discord:11:22") + 60_000;
   expect(supervisor.ackTick(60_000)).toEqual([]);
   f.clock.at += 59_999;
   expect(supervisor.ackTick(60_000)).toEqual([]);
@@ -1445,17 +1482,19 @@ test("still unacked after a second window: one notice per message, kept across a
   expect(supervisor.ackTick(60_000)).toEqual([]);
   f.clock.at += 600_000;
   expect(new Supervisor(f.deps).ackTick(60_000)).toEqual([]);
-  expect(ackMissing(f)).toHaveLength(1);
+  expect(reminded(f)).toEqual(["discord:11:22"]);
+  expect(ackMissing(f)).toEqual([]);
 });
 
-test("a Toodo chat message gets ACK_MISSING, the owner notice and UNHANDLED like a Discord one, and its receipts clear them", async () => {
+test("a Toodo chat message is reminded, gets the owner notice and UNHANDLED like a Discord one, and its receipts clear them", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("toodo:chat:12", "INBOUND toodo 12 user plan it");
   await supervisor.flush();
-  f.clock.at += 60_000;
+  f.clock.at = readableSince(f, "toodo:chat:12") + 60_000;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toEqual(["ACK_MISSING toodo 12 INBOUND toodo 12 user plan it"]);
+  expect(reminded(f)).toEqual(["toodo:chat:12"]);
+  expect(ackMissing(f)).toEqual([]);
   f.clock.at += 60_000;
   expect(supervisor.ackTick(60_000)).toEqual([{ channel: "toodo", message: "12" }]);
   supervisor.noticeSent("ack", "toodo", "12");
@@ -1509,24 +1548,29 @@ test("a cold-start batch starts its ack window when the lead is ready, not while
     f.clock.at += 600_000;
     during.push(...supervisor.ackTick(60_000));
   });
+  const booted = f.clock.now();
   await supervisor.flush();
   expect(restartSession(f)).toBeUndefined();
   expect(during).toEqual([]);
-  expect(ackMissing(f)).toEqual([]);
-  f.clock.at += 59_999;
+  expect(reminded(f)).toEqual([]);
+  // The window opened once the slow boot was over.
+  const since = readableSince(f, "discord:11:22");
+  expect(since).toBeGreaterThanOrEqual(booted);
+  f.clock.at = since + 59_999;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toEqual([]);
+  expect(reminded(f)).toEqual([]);
   f.clock.at += 1;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toHaveLength(1);
+  expect(reminded(f)).toEqual(["discord:11:22"]);
+  expect(ackMissing(f)).toEqual([]);
 });
 
-test("a cold restart gives a message the old lead never acked a fresh window but no second ACK_MISSING, and a posted notice is not repeated", async () => {
+test("a cold restart gives a message the old lead never acked a fresh window but no second reminder, and a posted notice is not repeated", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner hello");
   await supervisor.flush();
-  f.clock.at += 60_000;
+  f.clock.at = readableSince(f, "discord:11:22") + 60_000;
   supervisor.ackTick(60_000);
   f.clock.at += 60_000;
   expect(supervisor.ackTick(60_000)).toEqual([{ channel: "11", message: "22" }]);
@@ -1536,21 +1580,26 @@ test("a cold restart gives a message the old lead never acked a fresh window but
   supervisor.enqueue("discord:11:30", "INBOUND 11 30 owner again");
   await supervisor.flush();
   expect(restartSession(f)).toBeUndefined();
-  expect(ackMissing(f)).toHaveLength(1);
-  f.clock.at += 60_000;
+  expect(reminded(f)).toEqual(["discord:11:22"]);
+  f.clock.at = readableSince(f, "discord:11:30") + 60_000;
   expect(supervisor.ackTick(60_000)).toEqual([]);
   // The new lead got the old message in its handoff and was reminded of it once already: only the new one is reminded.
-  expect(ackMissing(f)).toHaveLength(2);
-  expect(ackMissing(f)[1]).toBe("ACK_MISSING 11 30 INBOUND 11 30 owner again");
+  expect(reminded(f)).toEqual(["discord:11:22", "discord:11:30"]);
   f.clock.at += 60_000;
   expect(supervisor.ackTick(60_000)).toEqual([{ channel: "11", message: "30" }]);
-  // A later cold restart reminds only the message that arrived with it, never one reminded before.
+  supervisor.noticeSent("ack", "11", "30");
+  // The new lead writes its session file, then goes cold too.
+  liveSession(f);
+  // A later cold restart reminds only the message that arrived with it, and notices only that one.
   f.cold();
   supervisor.enqueue("discord:11:40", "INBOUND 11 40 owner third");
   await supervisor.flush();
+  f.clock.at = readableSince(f, "discord:11:40") + 60_000;
+  expect(supervisor.ackTick(60_000)).toEqual([]);
+  expect(reminded(f)).toEqual(["discord:11:22", "discord:11:30", "discord:11:40"]);
   f.clock.at += 60_000;
-  supervisor.ackTick(60_000);
-  expect(ackMissing(f).slice(2)).toEqual(["ACK_MISSING 11 40 INBOUND 11 40 owner third"]);
+  expect(supervisor.ackTick(60_000)).toEqual([{ channel: "11", message: "40" }]);
+  expect(ackMissing(f)).toEqual([]);
 });
 
 test.each([false, true])("a restart replays delivered owner work with acked=%s until handled", async (acked) => {
@@ -1673,17 +1722,21 @@ test("busy lead time does not count against acknowledgment and begins when idle"
   await supervisor.flush();
   f.clock.at += 10 * 60_000;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toEqual([]);
+  expect(reminded(f)).toEqual([]);
   // When the lead becomes idle, even without any new events.
   f.pane.agent_status = "idle";
+  const idleAt = f.clock.now();
   await supervisor.flush();
   // Then the read deadline starts now, rather than at journal append.
-  f.clock.at += 59_999;
+  const since = readableSince(f, "discord:11:22");
+  expect(since).toBeGreaterThanOrEqual(idleAt);
+  f.clock.at = since + 59_999;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toEqual([]);
+  expect(reminded(f)).toEqual([]);
   f.clock.at++;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toHaveLength(1);
+  expect(reminded(f)).toEqual(["discord:11:22"]);
+  expect(ackMissing(f)).toEqual([]);
 });
 
 test("a busy lead dying before its read window starts replays the message without new traffic", async () => {
@@ -1699,12 +1752,12 @@ test("a busy lead dying before its read window starts replays the message withou
   // Then a new lead receives the request and its acknowledgment deadline starts.
   const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
   expect(events?.some((event) => event.id === "discord:11:22")).toBe(true);
-  f.clock.at += 60_000;
+  f.clock.at = readableSince(f, "discord:11:22") + 60_000;
   supervisor.ackTick(60_000);
-  expect(ackMissing(f)).toHaveLength(1);
+  expect(reminded(f)).toEqual(["discord:11:22"]);
 });
 
-test("missing-ack bodies and owner reports are redacted before durable journal and log writes", async () => {
+test("owner message bodies and lane reports are redacted before durable journal and log writes", async () => {
   // Given secrets in inbound and lane-report event payloads.
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
@@ -1721,7 +1774,9 @@ test("missing-ack bodies and owner reports are redacted before durable journal a
     expect(text).not.toContain("hunter2");
     expect(text).toContain("[REDACTED]");
   }
-  expect(ackMissing(f)[0]?.length).toBeLessThanOrEqual(2_020);
+  // The ack timer reminds without writing the body anywhere again.
+  expect(reminded(f)).toEqual(["discord:11:22"]);
+  expect(ackMissing(f)).toEqual([]);
 });
 
 
@@ -1946,8 +2001,8 @@ test("a working lead between tool calls, or one whose call started after it acke
   expect(launches(acked)).toEqual([]);
 });
 
-test("an idle lead paused by Esc gets /resume typed once after the ack window; still unacked after leadUnreadRestartMin it is restarted", async () => {
-  const f = fixture({ leadUnreadRestartMin: 5, ackTimeoutSec: 60 });
+test("an idle lead paused by Esc gets /resume typed before its pointer; still unacked after push.escalateMin it is restarted", async () => {
+  const f = fixture({ ackTimeoutSec: 60 });
   f.world.screen = PAUSED_SCREEN;
   // herdr reports an Esc-paused omo as done.
   f.pane.agent_status = "done";
@@ -1955,30 +2010,35 @@ test("an idle lead paused by Esc gets /resume typed once after the ack window; s
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
   await muted(() => supervisor.flush());
   expect(f.log().map((event) => event.id)).toEqual(["discord:1:1"]);
-  expect(typed(f)).toEqual([]);
+  const [resume, pointer, ...rest] = typed(f);
+  expect(resume).toBe("/resume");
+  expect(pointer).toStartWith(POINTER_PREFIX);
+  expect(rest).toEqual([]);
+  expect(launches(f)).toEqual([]);
   f.clock.at += 60_000;
   await muted(() => supervisor.flush());
-  expect(typed(f)).toEqual(["/resume"]);
-  await muted(() => supervisor.flush());
-  expect(typed(f)).toEqual(["/resume"]);
   expect(launches(f)).toEqual([]);
-  f.clock.at += 4 * 60_000;
+  f.clock.at += (f.deps.config.delivery.push.escalateMin - 1) * 60_000;
   await muted(() => supervisor.flush());
   expect(launches(f)).toHaveLength(1);
-  expect(f.prompt()).toContain("it was stuck idle for 5 min with 1 owner message(s) unread");
+  expect(f.prompt()).toContain("it did not take pushed events");
   expect(f.prompt()).toContain('"id":"discord:1:1"');
 });
 
 test("a paused lead with the owner's text in its input is not typed into, and a lead that is not paused is not resumed", async () => {
   for (const screen of [PAUSED_SCREEN.replace("❯ ", "❯ half a sentence"), "❯ \n(😺 OmO Native by Q Kim) ◉ watching lead events (5m)"]) {
-    const f = fixture({ leadUnreadRestartMin: 5, ackTimeoutSec: 60 });
+    const f = fixture({ ackTimeoutSec: 60 });
     f.world.screen = screen;
     const supervisor = new Supervisor(f.deps);
     supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
     await muted(() => supervisor.flush());
     f.clock.at += 2 * 60_000;
     await muted(() => supervisor.flush());
-    expect(typed(f)).toEqual([]);
+    // Never /resume; the owner's text gets nothing typed at all, an empty input only the [dori] pointer.
+    const texts = typed(f);
+    expect(texts).not.toContain("/resume");
+    if (screen.includes("half a sentence")) expect(texts).toEqual([]);
+    else expect(texts.length > 0 && texts.every((text) => text.startsWith(POINTER_PREFIX))).toBe(true);
     expect(launches(f)).toEqual([]);
   }
 });
@@ -2043,8 +2103,9 @@ test("an edited owner message is reminded and handed to a new lead in its latest
   await supervisor.flush();
   f.clock.at += 60_000;
   supervisor.ackTick(60_000);
-  const missing = inbox(f).filter((line) => line.startsWith("ACK_MISSING "));
-  expect(missing).toEqual([expect.stringContaining("revised task")]);
+  expect(reminded(f)).toEqual(["discord:1:1"]);
+  expect(ackMissing(f)).toEqual([]);
+  expect(tracked(f, "discord:1:1")).toMatchObject({ revision: "discord:1:1:edit:2027-01-15T08:01:00.000Z" });
   expect(tracked(f, "discord:1:2")).toMatchObject({ deleted: true });
   // Replaying the inbox at startup changes nothing.
   const before = journal(f).awaitingAck;
@@ -2243,7 +2304,8 @@ test.each(["json", "sqlite"] as const)("an ack-flood journal on the %s store: no
   restarted.ackTick(60_000);
   restarted.close();
   // Then the flood produced no ACK_MISSING and one digest listing the 298 untracked messages; only the new request is reminded.
-  expect(lines(f.state.dir, store, "ACK_MISSING ")).toEqual([expect.stringMatching(/^ACK_MISSING 11 5000 INBOUND 11 5000 synthetic new request$/)]);
+  expect(lines(f.state.dir, store, "ACK_MISSING ")).toEqual([]);
+  expect((stored(f.state.dir, store).awaitingAck ?? []).filter((entry) => entry.reminded).map((entry) => entry.id)).toEqual(["discord:11:5000"]);
   const digest = lines(f.state.dir, store, "OWNER_QUARANTINED ");
   expect(digest).toHaveLength(1);
   expect(digest[0]).toStartWith("OWNER_QUARANTINED 298 11:1000,1001,1004,");
@@ -2280,7 +2342,7 @@ test.each(["json", "sqlite"] as const)("a 3-day-old unresolved request survives 
   supervisor.handledTick(30 * 60_000);
   supervisor.close();
   // Then the old request is reminded in its latest text, the coverage gap is reported, and the handled one is untouched.
-  expect(lines(f.state.dir, store, "ACK_MISSING ")).toEqual([expect.stringMatching(/^ACK_MISSING 11 1 INBOUND_EDIT 11 1 synthetic old request \(edited\)$/)]);
+  expect(lines(f.state.dir, store, "ACK_MISSING ")).toEqual([]);
   expect(lines(f.state.dir, store, "UNHANDLED ")).toEqual([expect.stringMatching(/^UNHANDLED 11 3 coverage=1\/2 /)]);
   expect(lines(f.state.dir, store, "OWNER_QUARANTINED ")).toEqual([]);
   const rows = stored(f.state.dir, store).awaitingAck ?? [];
@@ -2305,5 +2367,6 @@ test("a quarantined message the lead acks, or the owner edits, is tracked like a
   // Then neither is quarantined any more: the acked one is waiting to be handled, the edited one is reminded.
   expect(tracked(f, "discord:11:1")).toMatchObject({ id: "discord:11:1" });
   expect((journal(f).awaitingAck as { quarantined?: true }[]).filter((entry) => entry.quarantined)).toEqual([]);
-  expect(ackMissing(f)).toEqual([expect.stringMatching(/^ACK_MISSING 11 2 INBOUND_EDIT 11 2 synthetic b \(edited\)$/)]);
+  expect(reminded(f)).toEqual(["discord:11:2"]);
+  expect(ackMissing(f)).toEqual([]);
 });
