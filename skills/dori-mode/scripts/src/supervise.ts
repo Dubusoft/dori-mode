@@ -10,6 +10,7 @@ import { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
 import { Delivery, OWNER_WARN_EVENTS } from "./supervise-delivery.ts";
 import { eventClass } from "./event-policy.ts";
 import { OutcomeTracking } from "./lane-outcomes.ts";
+import { LANE_FINISH_HOLD_MS, LANE_FINISH_PREFIX, laneFinish, laneFinishText, mergeFinish, parseFinish } from "./lane-finish.ts";
 
 /*
  * The supervisor in four parts: the journal (supervise-journal.ts), owner tracking (supervise-owner-tracking.ts), the
@@ -80,12 +81,39 @@ export class Supervisor {
     this.core.eventIds.add(id);
     this.owners.trackOwners([event]);
     this.outcomes.track(event);
+    this.noticeLaneFinish(event.line);
     // An owner message is synced at once (its Discord cursor moves on right after); the rest within one loop pass (ackTick).
     this.core.persist(OWNER_INBOUND.test(id) || OWNER_REVISION.test(id) ? "full" : "normal");
     if (OWNER_WARN_EVENTS.some((prefix) => line.startsWith(`${prefix} `))) this.owners.announce(`warn:${id}`, scrubForThread(`Dori warning: ${event.line}`, homedir()));
     // owner-only goes to the owner's main channel instead of the lead (delivery skips it); engine-only goes nowhere.
     if (eventClass(event.line, this.core.deps.config.eventPolicy) === "owner-only") this.owners.announce(`owner-only:${id}`, scrubForThread(event.line, homedir()));
     return true;
+  }
+
+  /**
+   * laneFinishNotice: a line that finishes a lane queues its one finish line (lane-finish.ts). The outbox row and the
+   * LANE_FINISH_NOTICE dedupe event reach the store in the same write (the nested enqueue persists both), so a crash
+   * leaves both or neither. A later finish event of the same lane only adds facts while the line is still queued; once
+   * posted (or ever queued before, even in a previous run) the lane gets nothing more.
+   */
+  private noticeLaneFinish(line: string): void {
+    if (!this.core.deps.config.laneFinishNotice || !this.owners.announces) return;
+    const finish = laneFinish(line);
+    if (!finish) return;
+    const id = `${LANE_FINISH_PREFIX}${finish.lane}`;
+    const outbox = this.core.journal.outbox ?? [];
+    const queued = outbox.find((item) => item.id === id);
+    if (queued) {
+      const known = parseFinish(queued.text);
+      const text = JSON.stringify(known ? mergeFinish(known, finish) : finish);
+      if (text === queued.text) return;
+      this.core.journal = { ...this.core.journal, outbox: outbox.map((item) => (item.id === id ? { ...item, text } : item)) };
+      return;
+    }
+    if (this.core.known(id)) return;
+    const retryAt = this.core.deps.clock.now() + LANE_FINISH_HOLD_MS;
+    this.core.journal = { ...this.core.journal, outbox: [...outbox, { id, text: JSON.stringify(finish), retryAt }] };
+    this.enqueue(id, `LANE_FINISH_NOTICE ${finish.lane} queued: ${laneFinishText(finish)}`);
   }
 
   /** Event `id` is journaled, or was and left a dedupe tombstone: a scheduled run's read-back. */
@@ -105,7 +133,11 @@ export class Supervisor {
   handledTick(timeoutMs?: number): OwnerMessage[] { return this.owners.handledTick(timeoutMs); }
 
   /** Consumes `dori reported` receipts and enqueues UNREPORTED for finished lanes the owner was not told about in time. */
-  reportTick(): Promise<void> { return this.outcomes.tick(this.core.deps.registry); }
+  reportTick(): Promise<void> {
+    // Due outbox lines (a held lane-finish line) go out on this pass too, even while lead delivery is backing off.
+    this.owners.drainOutbox();
+    return this.outcomes.tick(this.core.deps.registry);
+  }
 
   /** Called only after the messenger confirms a successful post. Failures remain eligible on the next tick. */
   noticeSent(kind: OwnerNoticeKind, channel: string, message: string): void { this.owners.noticeSent(kind, channel, message); }

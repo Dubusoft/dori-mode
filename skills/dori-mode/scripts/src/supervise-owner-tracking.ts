@@ -1,5 +1,9 @@
+import { homedir } from "node:os";
+
 import { dropAck, pendingAcks } from "./ack.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { scrubForThread } from "./freshness.ts";
+import { LANE_FINISH_PREFIX, laneFinishText, parseFinish } from "./lane-finish.ts";
 import { redactSecrets } from "./redact.ts";
 import type { Durability } from "./store.ts";
 import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "./supervise-journal.ts";
@@ -16,8 +20,11 @@ export const HUNG_EMOJI = "\u26A0\uFE0F";
 export type SupervisorHooks = {
   readonly react?: (op: "add" | "remove", channel: string, message: string, emoji: string) => Promise<void>;
   readonly persistLeadPane?: (pane: string) => void;
-  /** One plain line for the owner's main channel (lead model switches); `id` is stable across retries of the same line. */
-  readonly announce?: (text: string, id: string) => Promise<void>;
+  /**
+   * One plain line for the owner's main channel (lead model switches); `id` is stable across retries of the same line.
+   * `thread` is a lane's thread ref (lane-finish lines): post there, falling back to the main channel.
+   */
+  readonly announce?: (text: string, id: string, thread?: string) => Promise<void>;
 };
 
 export const OWNER_INBOUND = /^discord:(\d+):(\d+)$/;
@@ -303,6 +310,9 @@ export class OwnerTracking {
   /** Resolves when queued reactions and announcements have finished (tests and shutdown). */
   reactionsSettled(): Promise<void> { return this.reactions; }
 
+  /** Whether owner announcements are posted at all (an announce hook is set). */
+  get announces(): boolean { return this.hooks.announce !== undefined; }
+
   /**
    * One line for the owner's main channel, through a durable outbox: it is journaled first (with a stable id, so a
    * repeat is a no-op) and removed only once the post succeeded; failures retry every OUTBOX_RETRY_MS.
@@ -332,12 +342,20 @@ export class OwnerTracking {
         }
         if ((item.retryAt ?? 0) > this.deps.clock.now()) continue;
         let posted = false;
-        try { await announce(item.text, item.id); posted = true; } catch (e) {
+        const finish = item.id.startsWith(LANE_FINISH_PREFIX) ? parseFinish(item.text) : undefined;
+        try {
+          if (finish) {
+            // Title and thread are read at post time: the lane may be archived by now, which read() still finds.
+            const lane = await this.deps.registry.read(finish.lane);
+            await announce(scrubForThread(laneFinishText(finish, lane?.title), homedir()), item.id, lane?.thread);
+          } else await announce(item.text, item.id);
+          posted = true;
+        } catch (e) {
           console.error(`OWNER_ANNOUNCE_FAILED ${item.id} ${e instanceof Error ? e.message : String(e)}`);
         }
         const attempts = (item.attempts ?? 0) + 1;
-        // The approval request of the open episode is never given up: without it the owner cannot know to approve.
-        const drop = !posted && attempts >= OUTBOX_ATTEMPTS && !current;
+        // The approval request of the open episode and a lane-finish line are never given up: the owner would not know.
+        const drop = !posted && attempts >= OUTBOX_ATTEMPTS && !current && !finish;
         if (drop) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id} after ${attempts} attempts`);
         const outbox = (this.journal.outbox ?? []).flatMap((entry) => entry.id !== item.id ? [entry]
           : posted || drop ? [] : [{ ...entry, attempts, retryAt: this.deps.clock.now() + OUTBOX_RETRY_MS }]);
