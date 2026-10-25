@@ -8,6 +8,7 @@ import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./e
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { githubSummary } from "./github-events.ts";
 import { gatewayView, readGatewayStatus, type GatewayView } from "./gateway-status.ts";
+import { readToodoStatus, toodoView, type ToodoView } from "./messenger/toodo-supervisor.ts";
 import { type LaneReport, latestLaneReports } from "./lane-reports.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { listPanes } from "./panes.ts";
@@ -61,6 +62,8 @@ export type Status = {
     readonly issueRepos: readonly string[];
   };
   readonly gateway: GatewayView;
+  /** The Toodo Lead chat channel, when config.toodo is set: its URL and whether the supervisor holds its event stream. */
+  readonly toodo?: ToodoView & { readonly url: string };
   /** Owner messages the lead was handed and reminded about (ACK_MISSING) without acking them yet. */
   readonly unacked: number;
   /** Finished lanes (LANE_CLOSED, CI_MERGED) the lead has not reported to the owner with dori reported, oldest first. */
@@ -258,6 +261,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
       issueRepos: gh.issueRepos,
     },
     gateway: gatewayView(readGatewayStatus(d.config.stateDir), now),
+    ...(d.config.toodo ? { toodo: { ...toodoView(readToodoStatus(d.config.stateDir), now), url: d.config.toodo.url } } : {}),
     unacked: readUnacked(d.config.stateDir),
     unreported: readUnreported(d.config.stateDir),
     ...(claude ? { claude, claudeHeadroom: headroomNote(gateVerdict(claude.usage, d.config.quotaGate)) } : {}),
@@ -312,6 +316,7 @@ const problems = (s: Status, now: number): Problem[] => {
     out.push({ label: `${name} ${u.active}`, line: `services: ${name}${u.name === LEGACY_PRESENCE ? " (legacy, should be off)" : ""} ${u.active}/${u.enabled}` });
   }
   if (s.gateway.state !== "live") out.push({ label: `gateway ${s.gateway.state}`, line: `gateway: ${s.gateway.text}` });
+  if (s.toodo && s.toodo.state !== "live") out.push({ label: `toodo ${s.toodo.state}`, line: `toodo: ${s.toodo.text}` });
   const g = s.github;
   if (g.failures.length) out.push({ label: "github poll failing", line: `github: failures: ${g.failures.slice(0, 4).map((f) => `${f.repo} ${ago(f.at, now)}`).join(", ")}` });
   if (!g.issueAuthors.length) out.push({ label: "no trusted issue authors", line: "issues: no trusted authors (githubIssueAuthors), new issues never wake the lead" });
@@ -410,6 +415,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const healthy = [
     ...(probs.some((p) => p.line.startsWith("services:")) ? [] : ["services"]),
     ...(s.gateway.state === "live" ? ["gateway"] : []),
+    ...(s.toodo?.state === "live" ? ["toodo chat"] : []),
     ...(g.failures.length ? [] : [`github ${g.repos.length} repos, poll ${ago(g.lastPollAt, now)}`]),
     ...(g.issueAuthors.length ? [`issues ${g.issueRepos.length} repos`] : []),
     ...(s.claude?.mode === "ok" ? [`claude ${s.claudeHeadroom ?? "ok"}`] : []),

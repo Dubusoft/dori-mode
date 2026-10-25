@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, resolveEventPolicy } from "./event-policy.ts";
+import type { ToodoConfig } from "./messenger/toodo.ts";
 import type { StoreKind } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -46,12 +47,9 @@ export type MemoryCheckConfig = {
 };
 
 /**
- * How events reach the lead (supervise-push.ts). `tail`: the lead's own tail monitor on lead-events.log (the default).
- * `shadow`: tail delivery, while the push step logs what it would do. `push`: the supervisor types a short `[dori]`
- * pointer into the lead pane and counts events as delivered only once the lead takes them (`dori inbox take`).
+ * How events reach the lead (supervise-push.ts): the supervisor types a short `[dori]` pointer into the lead pane and
+ * counts events as delivered only once the lead takes them (`dori inbox take`). There is no mode switch.
  */
-export type DeliveryMode = "tail" | "shadow" | "push";
-export const DELIVERY_MODES: readonly DeliveryMode[] = ["tail", "shadow", "push"];
 
 export type PushConfig = {
   /** Untaken this long after a push: push again. */
@@ -71,13 +69,15 @@ export type PushConfig = {
 };
 
 export type DeliveryConfig = {
-  readonly mode: DeliveryMode;
   /** The startup prompt also arms the tail monitor; while on, only an unacked owner message escalates an idle lead. */
   readonly tailMonitor: boolean;
-  /** Forced restarts and quota switches per rolling hour; past it, push mode refuses unread-driven restarts. */
+  /** Forced restarts and quota switches per rolling hour; past it, the push ladder refuses unread-driven restarts. */
   readonly restartMaxPerHour: number;
   readonly push: PushConfig;
 };
+
+/** delivery keys that were removed; a config that still has them loads, with one warning. */
+export const REMOVED_DELIVERY_KEYS = ["mode"] as const;
 
 /** delivery.push keys that were removed; a config that still has them loads, with one warning. */
 export const REMOVED_PUSH_KEYS = ["debounceMs"] as const;
@@ -89,7 +89,6 @@ export const DELIVERY_TICK_SEC = 5;
 export const deliveryConfigError = (delivery: DeliveryConfig): string | undefined => {
   const { push } = delivery;
   const positive = (value: number) => Number.isFinite(value) && value > 0;
-  if (!DELIVERY_MODES.includes(delivery.mode)) return `delivery.mode must be one of ${DELIVERY_MODES.join(", ")}`;
   if (typeof delivery.tailMonitor !== "boolean") return "delivery.tailMonitor must be true or false";
   if (!Number.isInteger(delivery.restartMaxPerHour) || delivery.restartMaxPerHour < 1) return "delivery.restartMaxPerHour must be an integer of at least 1";
   if (!Number.isFinite(push.ackSec) || push.ackSec < 2 * DELIVERY_TICK_SEC) return `delivery.push.ackSec must be at least ${2 * DELIVERY_TICK_SEC} (twice the delivery tick)`;
@@ -119,6 +118,8 @@ export type DiscordConfig = {
 
 export type DoriConfig = {
   readonly discord?: DiscordConfig;
+  /** The Toodo Lead chat as a channel (Toodo started with TOODO_LEAD=external); absent turns the channel off. */
+  readonly toodo?: ToodoConfig;
   readonly stateDir: string;
   readonly laneWorkspace: string;
   readonly workspaces: readonly string[];
@@ -179,6 +180,8 @@ export type DoriConfig = {
   readonly unhandledNotice: string;
   /** Minutes after a lane finished (LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
   readonly reportTimeoutMin: number;
+  /** The supervisor posts one plain line itself for each finished lane (lane-finish.ts), in its thread or the main channel. */
+  readonly laneFinishNotice: boolean;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
   readonly deadPanePatterns: readonly string[];
@@ -212,7 +215,7 @@ export type DoriConfig = {
   readonly ciConfirmMin: number;
   /** The only base branch the supervisor merges lane PRs into; `main` is refused whatever this says. */
   readonly ciMergeBase: string;
-  /** How events reach the lead: tail monitor (default), shadow, or pushed pointers with take receipts. */
+  /** How events reach the lead: pushed pointers with take receipts. */
   readonly delivery: DeliveryConfig;
 };
 
@@ -258,6 +261,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   handledTimeoutMin: 30,
   unhandledNotice: "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
   reportTimeoutMin: 5,
+  laneFinishNotice: true,
   heavySlots: 1,
   heavyMaxLoad: 80,
   deadPanePatterns: ["has stopped", "no suitable jobs"],
@@ -277,7 +281,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   ciConfirmMin: 20,
   ciMergeBase: "dev",
   delivery: {
-    mode: "tail", tailMonitor: true, restartMaxPerHour: 3,
+    tailMonitor: true, restartMaxPerHour: 3,
     push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: false, takeMaxBytes: 16_384 },
   },
 });
@@ -294,6 +298,7 @@ export const REMOVED_FLAGS = [
 let warnedRemovedFlags = false;
 let warnedRemovedQuotaKeys = false;
 let warnedRemovedPushKeys = false;
+let warnedRemovedDeliveryKeys = false;
 
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
@@ -317,6 +322,11 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   }
   const quotaGate = Object.fromEntries(Object.entries(rawGate).filter(([key]) => !(REMOVED_QUOTA_KEYS as readonly string[]).includes(key))) as Partial<QuotaGate>;
   const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
+  const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);
+  if (oldDelivery.length && !warnedRemovedDeliveryKeys) {
+    warnedRemovedDeliveryKeys = true;
+    console.error(`CONFIG_DELIVERY_KEYS_REMOVED delivery.${oldDelivery.join(", delivery.")} in ${path}: push delivery is the only mode; the keys are ignored and can be deleted`);
+  }
   const rawPush = (rawDelivery.push ?? {}) as Record<string, unknown>;
   const oldPush = REMOVED_PUSH_KEYS.filter((key) => key in rawPush);
   if (oldPush.length && !warnedRemovedPushKeys) {
@@ -324,7 +334,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     console.error(`CONFIG_PUSH_KEYS_REMOVED delivery.push.${oldPush.join(", delivery.push.")} in ${path}: a burst becomes one push through the single outstanding push; the keys are ignored and can be deleted`);
   }
   const push = Object.fromEntries(Object.entries(rawPush).filter(([key]) => !(REMOVED_PUSH_KEYS as readonly string[]).includes(key))) as Partial<PushConfig>;
-  const delivery: DeliveryConfig = { ...base.delivery, ...rawDelivery, push: { ...base.delivery.push, ...push } };
+  const delivery: DeliveryConfig = { ...base.delivery, ...Object.fromEntries(Object.entries(rawDelivery).filter(([key]) => !(REMOVED_DELIVERY_KEYS as readonly string[]).includes(key))), push: { ...base.delivery.push, ...push } };
   const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, quotaGate: { ...base.quotaGate, ...quotaGate }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...raw.hooks }, delivery };
   return {
     ...merged,

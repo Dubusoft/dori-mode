@@ -84,7 +84,6 @@
   "ciConfirmMin": 20,
   "ciMergeBase": "dev",
   "delivery": {
-    "mode": "tail",
     "tailMonitor": true,
     "restartMaxPerHour": 3,
     "push": {

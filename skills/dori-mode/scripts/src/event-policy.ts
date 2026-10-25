@@ -44,12 +44,20 @@ const URGENT_KINDS = [
 const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_DONE_CLAIMED", "LANE_CLOSED", "MERGE_VERIFIED",
+  // The Toodo chat's finish reports and followed task events (messenger/toodo-supervisor.ts): informational, never acked.
+  "TOODO_FINISH", "TOODO_TASK",
 ] as const;
+
+/** The supervisor's own records: LANE_FINISH_NOTICE only dedupes its lane-finish line (lane-finish.ts). */
+const ENGINE_KINDS = ["LANE_FINISH_NOTICE"] as const;
 
 /** The actionable kinds wake the lead, every other line is digest. */
 export const DEFAULT_EVENT_POLICY: EventPolicy = {
   default: "lead-digest",
-  kinds: Object.fromEntries([...URGENT_KINDS.map((kind) => [kind, "lead-urgent"]), ...DIGEST_KINDS.map((kind) => [kind, "lead-digest"])]),
+  kinds: Object.fromEntries([
+    ...URGENT_KINDS.map((kind) => [kind, "lead-urgent"]), ...DIGEST_KINDS.map((kind) => [kind, "lead-digest"]),
+    ...ENGINE_KINDS.map((kind) => [kind, "engine-only"]),
+  ]),
 };
 
 /** Owner tracking reads these from the lead's journal: they may only be lead classes. */

@@ -9,12 +9,11 @@ import { type LeadLifecycle, PAUSED } from "./supervise-lead-lifecycle.ts";
 import { latest } from "./supervise-owner-tracking.ts";
 
 /**
- * Push delivery (delivery.mode push or shadow). Every delivery pass ends here: events appended to lead-events.log but
+ * Push delivery. Every delivery pass ends here: events appended to lead-events.log but
  * not yet taken by the lead (`dori inbox take` receipts, or an ack/handled receipt for an owner message) get one short
  * `[dori]` pointer typed into the lead pane. Untaken past push.ackSec it is pushed again, later with backoff; an idle lead
  * that keeps ignoring it is cold-restarted after push.escalateMin, within the restart cap. A finished lane not reported
- * to the owner (`dori reported`) past reportTimeoutMin counts like an untaken urgent event, taken or not. Shadow mode
- * decides the same and only logs. Event bodies are never typed: the lead reads them with `dori inbox take`.
+ * to the owner (`dori reported`) past reportTimeoutMin counts like an untaken urgent event, taken or not. Event bodies are never typed: the lead reads them with `dori inbox take`.
  */
 
 export const POINTER_PREFIX = "[dori] supervisor:";
@@ -138,12 +137,11 @@ export class PushDelivery {
   async tick(pending: readonly Event[]): Promise<boolean> {
     const { config, clock, run } = this.core.deps;
     const { delivery } = config;
-    if (delivery.mode === "tail" || this.journal.restart) return false;
+    if (this.journal.restart) return false;
     // A take receipt written since the last pass moves the cursor before anything is decided.
     this.core.consumeTakes();
     const inbox = this.journal.inbox;
     if (!inbox || this.journal.quotaExhausted) return false;
-    const shadow = delivery.mode === "shadow";
     const now = clock.now();
     const covered = this.covered();
     const past = this.logPastCursor(inbox.takenOffset);
@@ -172,9 +170,7 @@ export class PushDelivery {
     if (idle && push) {
       const reason = this.escalation(urgent, push.first, now, ageOf, due);
       if (reason) {
-        const capped = shadow ? this.core.forcedRestartsSince(now) >= delivery.restartMaxPerHour : this.lead.capRefuses("push ladder");
-        if (shadow) this.once(`shadow-escalate`, `LEAD_PUSH_SHADOW ${capped ? "would-cap" : "would-escalate"} ${batch} ${reason}`);
-        else if (!capped) {
+        if (!this.lead.capRefuses("push ladder")) {
           console.log(`LEAD_PUSH_ESCALATE ${config.leadPane} ${reason}`);
           this.lead.setRestart({
             session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: this.core.logSize(),
@@ -209,11 +205,6 @@ export class PushDelivery {
     }
     const pointer = pointerText(total, urgent.length > 0 || owed.length > 0, kinds, delivery.push.maxChars);
     const next: InboxPush = { at: now, upto, attempts: attempts + 1, batch, first, ...(this.journal.inbox?.push?.untakenLogged ? { untakenLogged: true as const } : {}) };
-    if (shadow) {
-      console.log(`LEAD_PUSH_SHADOW would-push ${batch} ${total} ${kinds.join(",")} attempt=${next.attempts}`);
-      this.savePush(next);
-      return false;
-    }
     if (input === "ours") {
       // Our own pointer still sits unsubmitted: one Enter submits it, nothing is typed again.
       this.savePush(next);
@@ -226,7 +217,6 @@ export class PushDelivery {
     this.savePush(next);
     const sent = await sendVerified(run, clock, config.leadPane, pointer);
     console.log(`LEAD_PUSH ${batch} ${total} ${kinds.join(",")} ${sent} attempt=${next.attempts}`);
-    if (!push && this.lead.warmSession) this.core.wakes.record(this.lead.warmSession, untaken, urgent.length ? urgent : overdue);
     if (sent === "delivered") return false;
     await clock.sleep(delivery.push.pasteCheckMs);
     const after = inputState(await readScreen(run, config.leadPane));

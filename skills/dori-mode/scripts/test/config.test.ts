@@ -47,6 +47,21 @@ test("an old config's removed feature flags load fine: the keys are dropped and 
   expect(warnings).toEqual([`CONFIG_FLAGS_REMOVED superviseTasks, operations, laneReports in ${path}: these flags were removed and their behavior is always on; the keys are ignored and can be deleted`]);
 });
 
+test("an old config's delivery.mode loads fine: the key is dropped and named in one warning per process", async () => {
+  const path = join(state.dir, "old-delivery-mode.json");
+  await Bun.write(path, JSON.stringify({ delivery: { mode: "push", tailMonitor: false } }));
+  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
+    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
+    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
+    console.log(JSON.stringify({ tailMonitor: a.delivery.tailMonitor, mode: ["mode" in a.delivery, "mode" in b.delivery] }));`;
+  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
+  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  expect(code).toBe(0);
+  expect(JSON.parse(out)).toEqual({ tailMonitor: false, mode: [false, false] });
+  const warnings = err.split("\n").filter((line) => line.startsWith("CONFIG_DELIVERY_KEYS_REMOVED "));
+  expect(warnings).toEqual([`CONFIG_DELIVERY_KEYS_REMOVED delivery.mode in ${path}: push delivery is the only mode; the keys are ignored and can be deleted`]);
+});
+
 test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ciToodoWorkspaces) load without error", async () => {
   const path = join(state.dir, "old-tracker.json");
   await Bun.write(path, JSON.stringify({
