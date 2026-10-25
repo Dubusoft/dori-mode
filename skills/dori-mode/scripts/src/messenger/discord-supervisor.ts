@@ -22,6 +22,8 @@ export type SupervisorDiscordOptions = {
   readonly open?: (url?: string) => GatewaySocket;
   readonly timers?: Timers;
   readonly log?: (line: string) => void;
+  /** The Toodo mirror (toodo-mirror.ts): its channel is watched like a configured one, its messages recorded for import. */
+  readonly mirror?: { readonly channel: string; readonly record: NonNullable<DiscordInboundOptions["onMirror"]> };
 };
 
 /**
@@ -46,7 +48,8 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   let stopped = false;
   let watched: readonly string[] = [];
   const statePath = join(deps.config.stateDir, "discord-inbound.json");
-  const configured = () => discordChannels(deps.config.discordChannels, []);
+  const configuredChannels = [...deps.config.discordChannels, ...(options.mirror ? [options.mirror.channel] : [])];
+  const configured = () => discordChannels(configuredChannels, []);
   if (!discordOwnerConfigured(config.ownerId)) {
     log("DISCORD_INBOUND_WARNING discord.ownerId is not configured; every Discord author is treated as a VISITOR, never the owner (run dori setup)");
   }
@@ -57,6 +60,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   const inboundOptions: DiscordInboundOptions = {
     get botId() { return botId; },
     log,
+    ...(options.mirror ? { onMirror: options.mirror.record } : {}),
     onMissingContent: () => {
       if (contentWarned) return;
       contentWarned = true;
@@ -69,7 +73,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     },
   };
   const watches = async (channel: string): Promise<boolean> =>
-    discordChannels(deps.config.discordChannels, await deps.registry.open()).includes(channel) || configured().includes((await parentOf(channel)) ?? "");
+    discordChannels(configuredChannels, await deps.registry.open()).includes(channel) || configured().includes((await parentOf(channel)) ?? "");
   // Thread id -> parent channel; null marks a channel that is not a thread. Fed by gateway thread events and REST.
   const parents = new Map<string, string | null>();
   const lookups = new Map<string, Promise<string | null>>();
@@ -102,7 +106,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
         catchupRequested = false;
         lastPoll = deps.clock.now();
         try {
-          watched = discordChannels(deps.config.discordChannels, await deps.registry.open());
+          watched = discordChannels(configuredChannels, await deps.registry.open());
           let threads: string[] = [];
           let floor: string | undefined;
           try {
@@ -168,7 +172,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     /** Gateway state for the heartbeat file. */
     state: () => ({ connected: gateway.connected, messageContent: gateway.messageContent }),
     async tick(): Promise<void> {
-      const channels = discordChannels(deps.config.discordChannels, await deps.registry.open());
+      const channels = discordChannels(configuredChannels, await deps.registry.open());
       if (polling) { await polling; return; }
       const newChannel = channels.some((channel) => !watched.includes(channel));
       const interval = gateway.healthy ? deps.config.discordSafetyPollSeconds * 1_000 : 5_000;

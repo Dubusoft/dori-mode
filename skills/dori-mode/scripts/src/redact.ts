@@ -13,6 +13,8 @@ const RULES: readonly (readonly [RegExp, string | ((...m: string[]) => string)])
   [/\b\d{6,12}:[A-Za-z0-9_-]{30,}/g, MASK],
   // Discord bot token: three base64url segments, first starts with a snowflake encoding (M/N/O).
   [/\b[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}/g, MASK],
+  // Discord webhook URL: its last segment is the token that lets anyone post.
+  [/(\bdiscord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/)[\w-]{20,}/g, (_m, p) => `${p}${MASK}`],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, (_m, p) => `${p}${MASK}`],
   [/\b((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"',;&]+)/gi, (match, prefix, raw) => {
     const value = /^["']/.test(raw) ? raw.slice(1, -1) : raw;

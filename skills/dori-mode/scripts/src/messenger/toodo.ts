@@ -20,6 +20,19 @@ export type ToodoConfig = {
   readonly leadTokenFile: string;
   /** Seconds between safety reads of the inbox when no event arrives; default 60. */
   readonly pollSeconds?: number;
+  /** One Discord channel that shows the same conversation as the Toodo chat (toodo-mirror.ts); absent mirrors nothing. */
+  readonly discordMirror?: ToodoDiscordMirrorConfig;
+};
+
+export type ToodoDiscordMirrorConfig = {
+  /** The Discord channel id (a top-level text channel the bot can read and post in). */
+  readonly channel: string;
+  /** The file holding the channel's webhook URL; the owner's Toodo messages are posted through it under their name. */
+  readonly webhookUrlFile: string;
+  /** The owner's name on mirrored posts; default their Discord name (discord.ownerId), fetched once. */
+  readonly ownerName?: string;
+  /** The owner's avatar image URL on mirrored posts; default their Discord avatar, fetched once. */
+  readonly ownerAvatarUrl?: string;
 };
 
 export const TOODO_POLL_SECONDS = 60;
@@ -34,6 +47,14 @@ export const toodoConfigError = (toodo: unknown): string | undefined => {
   if (typeof t.url !== "string" || !/^https?:\/\/[^/\s]+/.test(t.url)) return "toodo.url must be the server's http(s) URL";
   if (typeof t.leadTokenFile !== "string" || !t.leadTokenFile.trim()) return "toodo.leadTokenFile must name the server's lead-token file";
   if (t.pollSeconds !== undefined && (typeof t.pollSeconds !== "number" || !Number.isFinite(t.pollSeconds) || t.pollSeconds < 5)) return "toodo.pollSeconds must be at least 5";
+  if (t.discordMirror === undefined) return undefined;
+  const m = t.discordMirror;
+  if (typeof m !== "object" || m === null || Array.isArray(m)) return "toodo.discordMirror must be an object";
+  const mirror = m as Record<string, unknown>;
+  if (typeof mirror.channel !== "string" || !/^\d+$/.test(mirror.channel)) return "toodo.discordMirror.channel must be a Discord channel id";
+  if (typeof mirror.webhookUrlFile !== "string" || !mirror.webhookUrlFile.trim()) return "toodo.discordMirror.webhookUrlFile must name the file holding the channel's webhook URL";
+  if (mirror.ownerName !== undefined && (typeof mirror.ownerName !== "string" || !mirror.ownerName.trim() || mirror.ownerName.length > 80)) return "toodo.discordMirror.ownerName must be a name of 1 to 80 characters";
+  if (mirror.ownerAvatarUrl !== undefined && (typeof mirror.ownerAvatarUrl !== "string" || !/^https:\/\/\S+$/.test(mirror.ownerAvatarUrl))) return "toodo.discordMirror.ownerAvatarUrl must be an https URL";
   return undefined;
 };
 
@@ -73,6 +94,11 @@ export type ToodoApi = {
   markHandled(id: string, link: { readonly replyId: number } | { readonly taskId: number }): Promise<void>;
   typing(on: boolean): Promise<void>;
   listChat(after: number, limit?: number): Promise<ToodoFeed>;
+  /**
+   * Stores a message written in another chat (import_chat_message): a person's is stored as taken, so it never enters
+   * the inbox. The same origin and id again stores nothing and returns the stored message.
+   */
+  importMessage(author: "user" | "lead", text: string, origin: string, originId: string): Promise<ToodoMessage>;
 };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -143,6 +169,13 @@ export class Toodo implements ToodoApi {
     const value = await this.call("list_chat", { after, limit });
     if (!record(value) || !Array.isArray(value.messages)) throw new ToodoError("Toodo list_chat: no messages");
     return { messages: value.messages as ToodoMessage[], more: value.more === true };
+  }
+
+  async importMessage(author: "user" | "lead", text: string, origin: string, originId: string): Promise<ToodoMessage> {
+    const value = await this.call("import_chat_message", { author, text, origin, origin_id: originId });
+    const message = record(value) && record(value.message) ? value.message : value;
+    if (!record(message) || typeof message.id !== "number") throw new ToodoError("Toodo import_chat_message: no message id");
+    return message as ToodoMessage;
   }
 }
 
