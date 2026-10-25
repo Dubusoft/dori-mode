@@ -622,6 +622,7 @@ export class LeadLifecycle {
       "Supervised mode: do not start inbound pollers or sweeps.",
       "Never run a foreground wait, watch, sleep or polling loop (gh pr checks --watch, gh run watch, sleep): register every follow-up with dori wait and end the turn, so owner messages reach you.",
     ];
+    const replyFirst = "For each owner message: dori ack, then your very next call is one short reply, and only then investigate or work and send the result as a follow-up.";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     const owed = handoffLines(this.core.journal);
     const owner = restart.events.filter((event) => OWNER_INBOUND.test(event.id) || OWNER_REVISION.test(event.id));
@@ -634,6 +635,7 @@ export class LeadLifecycle {
       ...held,
       ...owed,
       transport,
+      replyFirst,
       ...(tailMonitor ? tail : []),
     ].join("\n");
   }
