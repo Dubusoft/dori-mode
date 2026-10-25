@@ -20,6 +20,7 @@ import { Discord } from "./messenger/discord.ts";
 import { acquireDiscordGateway } from "./messenger/discord-lock.ts";
 import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/discord-supervisor.ts";
 import { fetchHttp } from "./messenger/http.ts";
+import { postOwnerLine } from "./lane-finish.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
 import { OWNER_NOTICE_AFTER_MS, RetryingDelivery, SuperviseError, Supervisor } from "./supervise.ts";
@@ -250,6 +251,7 @@ export const supervise = async (
   if (!Number.isFinite(deps.config.runTimeoutMs) || deps.config.runTimeoutMs < 0) throw new SuperviseError("runTimeoutMs must be zero or positive");
   if (!Number.isFinite(deps.config.handledTimeoutMin) || deps.config.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
   if (!Number.isFinite(deps.config.reportTimeoutMin) || deps.config.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
+  if (typeof deps.config.laneFinishNotice !== "boolean") throw new SuperviseError("laneFinishNotice must be true or false");
   if (!Number.isFinite(deps.config.leadQuotaBusySwitchMin) || deps.config.leadQuotaBusySwitchMin <= 0) throw new SuperviseError("leadQuotaBusySwitchMin must be positive");
   if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
   if (!Number.isFinite(deps.config.leadUnreadRestartMin) || deps.config.leadUnreadRestartMin <= 0) throw new SuperviseError("leadUnreadRestartMin must be positive");
@@ -281,11 +283,7 @@ export const supervise = async (
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(loadedConfig, pane); },
-      announce: async (text, id) => {
-        const channel = deps.config.discordChannels[0];
-        if (!channel) throw new Error("no discordChannels configured");
-        await discord.send(channel, text, id);
-      },
+      announce: async (text, id, thread) => { await postOwnerLine(discord, deps.config.discordChannels[0], thread, text, id); },
     }));
     // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
     // run too, each run an operation row; a heavy job takes a heavy slot like `dori heavy`, without waiting for one.

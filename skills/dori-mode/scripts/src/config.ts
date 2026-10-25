@@ -179,6 +179,8 @@ export type DoriConfig = {
   readonly unhandledNotice: string;
   /** Minutes after a lane finished (LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
   readonly reportTimeoutMin: number;
+  /** The supervisor posts one plain line itself for each finished lane (lane-finish.ts), in its thread or the main channel. */
+  readonly laneFinishNotice: boolean;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
   readonly deadPanePatterns: readonly string[];
@@ -258,6 +260,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   handledTimeoutMin: 30,
   unhandledNotice: "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
   reportTimeoutMin: 5,
+  laneFinishNotice: true,
   heavySlots: 1,
   heavyMaxLoad: 80,
   deadPanePatterns: ["has stopped", "no suitable jobs"],
