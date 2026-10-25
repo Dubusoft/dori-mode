@@ -261,18 +261,18 @@ export class JournalCore {
 
   /**
    * At start: consume waiting take receipts, then place the take cursor. A first start puts it at the log's end (no
-   * replay flood). Entering push or shadow from tail, or turning the tail monitor off, advances it to the end too: the
+   * replay flood). Entering push from a journal written under the old tail mode, or turning the tail monitor off, advances it to the end too: the
    * tail monitor delivered everything before (N6). A cursor past the log's end is reset to it. The cursor file is
-   * published every time, so `dori inbox take` works in every mode.
+   * published every time, so `dori inbox take` works at any time.
    */
   initInbox(): void {
     this.consumeTakes();
-    const { mode, tailMonitor } = this.deps.config.delivery;
-    const key = `${mode}${tailMonitor ? "+tail" : ""}`;
+    const { tailMonitor } = this.deps.config.delivery;
+    const key = `push${tailMonitor ? "+tail" : ""}`;
     const size = this.logSize();
     const inbox = this.journal.inbox;
     const [was = "", wasTail = true] = inbox?.mode ? [inbox.mode.split("+")[0], inbox.mode.endsWith("+tail")] : [];
-    const advance = inbox !== undefined && mode !== "tail" && (was === "" || was === "tail" || (wasTail && !tailMonitor));
+    const advance = inbox !== undefined && (was === "" || was === "tail" || (wasTail && !tailMonitor));
     let takenOffset = inbox?.takenOffset ?? size;
     if (advance && takenOffset !== size) console.log(`INBOX_CURSOR_ADVANCED ${takenOffset} -> ${size} (${inbox?.mode ?? "none"} -> ${key})`);
     if (advance) takenOffset = size;

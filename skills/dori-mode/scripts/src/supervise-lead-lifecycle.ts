@@ -325,13 +325,12 @@ export class LeadLifecycle {
   }
 
   /**
-   * Push mode: true when the restart cap refuses an unread-driven restart (stuckRestart, the push ladder). Forced
+   * True when the restart cap refuses an unread-driven restart (stuckRestart, the push ladder). Forced
    * restarts and quota switches of the last hour count (they still run past the cap). The first refusal of each hour is
-   * logged and told to the owner once; the push step keeps re-pushing meanwhile. Tail and shadow modes never refuse.
+   * logged and told to the owner once; the push step keeps re-pushing meanwhile.
    */
   capRefuses(what: string): boolean {
     const { delivery } = this.deps.config;
-    if (delivery.mode !== "push") return false;
     const now = this.deps.clock.now();
     const count = this.core.forcedRestartsSince(now);
     if (count < delivery.restartMaxPerHour) return false;
@@ -349,7 +348,7 @@ export class LeadLifecycle {
   /**
    * An idle lead paused by Esc (omo holds every monitor event, so the delivery log never wakes it) with an owner message
    * unacked past the ack window is resumed: `/resume` is typed once per ack window, only into an empty input line.
-   * One that stays silent is restarted by stuckRestart after leadUnreadRestartMin.
+   * One that stays silent is restarted by the push ladder after push.escalateMin.
    */
   async resumePaused(): Promise<void> {
     const { config, clock, run } = this.deps;
@@ -363,7 +362,7 @@ export class LeadLifecycle {
     if (!PAUSED.test(screen)) return;
     this.resumedAt = now;
     if (!emptyInput(screen)) {
-      console.log(`LEAD_PAUSED_INPUT ${config.leadPane}: paused with text in its input; not typing, restart follows after ${config.leadUnreadRestartMin} min`);
+      console.log(`LEAD_PAUSED_INPUT ${config.leadPane}: paused with text in its input; not typing, restart follows after ${config.delivery.push.escalateMin} min`);
       return;
     }
     console.log(`LEAD_RESUMED ${config.leadPane} ${await sendVerified(run, clock, config.leadPane, "/resume")}`);
@@ -375,18 +374,16 @@ export class LeadLifecycle {
    * build or review, so it counts only while its screen has also not changed for that long (a hung turn). Measured from
    * the latest of the oldest unread message, the first time the lead was seen busy with it, and the last screen change;
    * those clocks are journaled, so a supervisor restart does not reset them.
-   * Two faster rules use leadUnreadRestartMin: a working lead held inside one tool call (a foreground wait or watch cannot
-   * take a monitor event until it returns), counted from the later of the call's start and the oldest unacked message;
-   * and an idle lead that leaves a readable owner message unacked (an Esc-paused session holds every event). Neither
-   * applies while every lead model is out of quota.
+   * A faster rule uses push.escalateMin: a working lead held inside one tool call (a foreground wait or watch cannot
+   * take a pushed pointer until it returns), counted from the later of the call's start and the oldest unacked message.
+   * An idle lead is left to the push ladder. Neither applies while every lead model is out of quota.
    */
   async stuckRestart(pending: readonly Event[]): Promise<boolean> {
     const { config, clock, run } = this.deps;
     const limit = config.leadStuckRestartMin * 60_000;
     if (!(limit > 0)) return false;
-    // Push mode: the push ladder owns idle leads, and one tool call is clocked by push.escalateMin (supervise-push.ts).
-    const push = config.delivery.mode === "push";
-    const unreadLimit = (push ? config.delivery.push.escalateMin : config.leadUnreadRestartMin) * 60_000;
+    // The push ladder owns idle leads, and one tool call is clocked by push.escalateMin (supervise-push.ts).
+    const unreadLimit = config.delivery.push.escalateMin * 60_000;
     const waiting = this.unacked();
     if (!waiting.length) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const now = clock.now();
@@ -411,12 +408,7 @@ export class LeadLifecycle {
     const exhausted = this.journal.quotaExhausted !== undefined;
     if (pane.agent_status === "idle" || pane.agent_status === "done") {
       this.patchJournal({ leadBusySince: undefined, leadScreen: undefined });
-      if (exhausted || push) return false;
-      // An idle lead reads its monitor at once. One that leaves a readable owner message unacked this long is not
-      // reading it (an Esc-paused session holds the events, or its monitor is gone): a new lead gets them in its prompt.
-      const readable = this.unacked(true);
-      const since = Math.min(...readable.map((entry) => entry.since ?? now));
-      return readable.length > 0 && now - since >= unreadLimit && restart("idle", Math.round((now - since) / 60_000), readable.length);
+      return false;
     }
     if (pane.agent_status === "working" && !exhausted) {
       // A lead inside one tool call cannot take a monitor event until the call returns: a foreground wait, watch or
@@ -612,13 +604,12 @@ export class LeadLifecycle {
   }
 
   /**
-   * The new lead's prompt. Tail mode: today's prompt (events inline, then the tail monitor from `offset`). Shadow adds
-   * the take instruction. Push: `dori inbox take` is the first action and the read path for every event past the take
+   * The new lead's prompt. `dori inbox take` is the first action and the read path for every event past the take
    * cursor (the cursor never moves on a restart), so only owner messages still unfinished and held launches are inline;
    * `[dori]` lines are transport, and the tail monitor is armed only with delivery.tailMonitor.
    */
   private startupPrompt(restart: Restart, held: readonly string[]): string {
-    const { mode, tailMonitor } = this.deps.config.delivery;
+    const { tailMonitor } = this.deps.config.delivery;
     const log = this.core.eventLog;
     const tail = [
       "Start exactly one persistent monitor with this command (the byte offset covers events arriving during startup):",
@@ -633,18 +624,6 @@ export class LeadLifecycle {
     ];
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     const owed = handoffLines(this.core.journal);
-    if (mode !== "push") {
-      return [
-        ...head,
-        ...(mode === "shadow" ? [take] : []),
-        ...(restart.reason ? [`The previous lead stopped: ${restart.reason}. Events delivered to it just before may be unhandled; check the end of ${log} and the registry before acting on them.`] : []),
-        `Handle the following pending events. ${persist}`,
-        ...restart.events.map((event) => JSON.stringify(event)),
-        ...held,
-        ...owed,
-        ...tail,
-      ].join("\n");
-    }
     const owner = restart.events.filter((event) => OWNER_INBOUND.test(event.id) || OWNER_REVISION.test(event.id));
     return [
       ...head,

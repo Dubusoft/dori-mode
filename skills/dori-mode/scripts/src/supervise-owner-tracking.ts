@@ -119,14 +119,7 @@ export class OwnerTracking {
     this.journal = { ...this.journal, awaitingAck: awaiting };
     // One ACK_MISSING per tick lists every overdue message, so an incident costs the lead one wake, not one per message.
     // It is enqueued after the reminded marks, so both reach the store in the same write.
-    // Push mode re-pushes untaken events itself, so ACK_MISSING (which would travel the same way) is not enqueued.
-    if (overdue.length && this.deps.config.delivery.mode !== "push") {
-      const items = overdue.map((entry) => {
-        const { channel, message } = ownerRef(entry.id) ?? {};
-        return `${channel} ${message} ${this.messageBody(entry.id)}`;
-      });
-      this.enqueue(`ack-missing:${now}:${Bun.hash(overdue.map((entry) => entry.id).join(" ")).toString(16)}`, `ACK_MISSING ${items.join(" | ")}`);
-    }
+    // Push delivery re-pushes untaken events itself, so ACK_MISSING (which would travel the same way) is never enqueued.
     this.compactOwners(now);
     this.core.retain(now);
     this.persist("normal");
