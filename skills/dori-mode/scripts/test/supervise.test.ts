@@ -1448,6 +1448,29 @@ test("still unacked after a second window: one notice per message, kept across a
   expect(ackMissing(f)).toHaveLength(1);
 });
 
+test("a Toodo chat message gets ACK_MISSING, the owner notice and UNHANDLED like a Discord one, and its receipts clear them", async () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("toodo:chat:12", "INBOUND toodo 12 user plan it");
+  await supervisor.flush();
+  f.clock.at += 60_000;
+  supervisor.ackTick(60_000);
+  expect(ackMissing(f)).toEqual(["ACK_MISSING toodo 12 INBOUND toodo 12 user plan it"]);
+  f.clock.at += 60_000;
+  expect(supervisor.ackTick(60_000)).toEqual([{ channel: "toodo", message: "12" }]);
+  supervisor.noticeSent("ack", "toodo", "12");
+  expect(supervisor.ackTick(60_000)).toEqual([]);
+  recordAck(f.state.dir, "toodo", "12", f.clock.now());
+  supervisor.ackTick(60_000);
+  expect(pendingAcks(f.state.dir)).toEqual([]);
+  f.clock.at += f.deps.config.handledTimeoutMin * 60_000;
+  supervisor.handledTick();
+  expect(inbox(f).filter((line) => line.startsWith("UNHANDLED "))).toEqual(["UNHANDLED toodo 12 coverage=0/1 INBOUND toodo 12 user plan it"]);
+  recordHandled(f.state.dir, "toodo", "12", f.clock.now(), { reply: true });
+  supervisor.handledTick();
+  expect(readJournal(f.state.dir).awaitingAck[0].handledAt).toBe(f.clock.now());
+});
+
 test("dori ack clears the message: no reminder, no notice, and the ack file is consumed", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);

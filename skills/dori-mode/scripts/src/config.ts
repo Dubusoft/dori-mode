@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, resolveEventPolicy } from "./event-policy.ts";
+import type { ToodoConfig } from "./messenger/toodo.ts";
 import type { StoreKind } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -119,6 +120,8 @@ export type DiscordConfig = {
 
 export type DoriConfig = {
   readonly discord?: DiscordConfig;
+  /** The Toodo Lead chat as a channel (Toodo started with TOODO_LEAD=external); absent turns the channel off. */
+  readonly toodo?: ToodoConfig;
   readonly stateDir: string;
   readonly laneWorkspace: string;
   readonly workspaces: readonly string[];

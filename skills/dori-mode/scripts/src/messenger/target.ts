@@ -1,4 +1,4 @@
-export type Platform = "slack" | "telegram" | "discord";
+export type Platform = "slack" | "telegram" | "discord" | "toodo";
 export type Target = { readonly to: string; readonly thread?: string };
 
 /**
@@ -8,6 +8,12 @@ export type Target = { readonly to: string; readonly thread?: string };
  */
 export const resolveTarget = (platform: Platform, to: string, thread?: string): Target => {
   const prefix = `${platform}:`;
+  // Toodo has one chat: `--to toodo` posts in it, `--to <n>` (or chat-<n>, toodo:<n>) answers chat message <n>.
+  if (platform === "toodo") {
+    const message = thread ?? to.replace(/^toodo:?/, "").replace(/^chat-/, "");
+    if (message && !/^\d+$/.test(message)) throw new Error(`bad Toodo target "${to}": toodo, or a chat message number`);
+    return { to: "toodo", ...(message ? { thread: message } : {}) };
+  }
   // A Discord thread is its own channel: an explicit --thread is the destination, as before the ref syntax existed.
   if (!to.startsWith(prefix)) return platform === "discord" ? { to: thread ?? to } : { to, ...(thread ? { thread } : {}) };
   const [parent = "", child = ""] = to.slice(prefix.length).split("/");
