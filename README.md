@@ -153,7 +153,7 @@ Tokens come from `DORI_SLACK_TOKEN` (with `DORI_SLACK_COOKIE` for a user token),
 
 ## Tests
 
-There's no CI. Run the tests locally:
+CI runs only the typecheck. Run the tests locally:
 
 ```sh
 cd skills/dori-mode/scripts
