@@ -58,7 +58,11 @@ export class Delivery {
       if (request) {
         const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane);
         if (!pane) throw new TransientSuperviseError(`lead pane ${this.deps.config.leadPane} does not exist`);
-        if (!pane.agent || pane.agent_status === "idle" || pane.agent_status === "done") {
+        const cwd = pane.cwd ?? this.deps.config.defaultCwd;
+        const models = request.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ");
+        if ((!pane.agent || pane.agent_status === "idle" || pane.agent_status === "done") &&
+            !(pane.agent && await this.lead.deferForChildren(cwd, "request", `${request.id} ${models}`))) {
+          await this.lead.noteRestart("request", `dori lead-restart ${request.id} ${models}`);
           this.lead.setRestart({ session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size, phase: "stopping", request, modelIndex: 0 });
           continue;
         }
@@ -79,6 +83,7 @@ export class Delivery {
           const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane);
           if (!pane) throw new TransientSuperviseError(`lead pane ${this.deps.config.leadPane} does not exist`);
           if (!pane.agent) {
+            await this.lead.noteRestart("no-agent", `no agent runs in lead pane ${pane.pane_id} while owner messages wait for their read window`);
             this.lead.setRestart({ session: randomUUID(), events: [], offset: statSync(this.core.eventLog).size, phase: "stopping" });
             continue;
           }
@@ -95,11 +100,16 @@ export class Delivery {
         this.owners.record(pending);
         continue;
       }
-      if (pane.agent && await this.lead.warm(pane.cwd ?? this.deps.config.defaultCwd)) {
+      const cwd = pane.cwd ?? this.deps.config.defaultCwd;
+      const cold = pane.agent ? await this.lead.coldReason(cwd) : { kind: "no-agent", detail: `no agent runs in lead pane ${pane.pane_id}`, tokens: 0 };
+      // A lead waiting on its own children takes the events in place: a cold start would kill them (bounded deferral).
+      if (!cold || (pane.agent && await this.lead.deferForChildren(cwd, cold.kind, cold.detail))) {
         this.owners.record(pending, true);
         this.core.wakes.record(this.lead.warmSession, pending, urgent.length ? urgent : pending.filter(overdue));
         continue;
       }
+      if (cold.kind === "hard-cap") console.log(`LEAD_HARD_CAP ${cold.tokens}`);
+      await this.lead.noteRestart(cold.kind, cold.detail);
       this.lead.setRestart({ session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size, phase: "stopping" });
     }
   }

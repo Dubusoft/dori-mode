@@ -21,6 +21,7 @@
   "leadQuotaBusySwitchMin": 10,
   "leadStuckRestartMin": 30,
   "leadUnreadRestartMin": 5,
+  "leadChildWaitMaxMin": 60,
   "leadEmergencyModels": [],
   "quotaGate": {
     "holdLanesHeadroomPct": 50,
