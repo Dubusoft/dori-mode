@@ -207,6 +207,11 @@ export type DoriConfig = {
    * holds its monitor events), before the lead is cold-restarted with it. Must be positive.
    */
   readonly leadUnreadRestartMin: number;
+  /**
+   * Minutes an idle lead whose omo session still waits on its own children (subagents, child tasks, background cells)
+   * keeps a lead-restart request or a cold/context-cap restart deferred, counted from when it began waiting. Must be positive.
+   */
+  readonly leadChildWaitMaxMin: number;
   /** Per machine, no herdr call of a sweep round starts later than this many ms after the round began. */
   readonly sweepMachineDeadlineMs: number;
   /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`). */
@@ -277,6 +282,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadPrimaryReturnChecks: 2,
   leadStuckRestartMin: 30,
   leadUnreadRestartMin: 5,
+  leadChildWaitMaxMin: 60,
   sweepMachineDeadlineMs: 20_000,
   store: "json",
   eventPolicy: DEFAULT_EVENT_POLICY,

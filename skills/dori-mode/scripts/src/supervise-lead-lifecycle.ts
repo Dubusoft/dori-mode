@@ -43,12 +43,8 @@ export const screenStill = (screen: string): string =>
 /** How much of the lead's session file is read from its end to find an open tool call. */
 const SESSION_TAIL_BYTES = 256 * 1024;
 
-/**
- * When the lead's current tool call started: the newest assistant message in its session ends in a tool call that has
- * no result yet. Undefined when the session is between tool calls (streaming, idle) or unreadable.
- */
-export const openToolCallSince = (file: string): number | undefined => {
-  let text: string;
+/** The last SESSION_TAIL_BYTES of the lead's session file; undefined (logged) when it cannot be read. */
+const sessionTail = (file: string): string | undefined => {
   try {
     const fd = openSync(file, "r");
     try {
@@ -56,13 +52,22 @@ export const openToolCallSince = (file: string): number | undefined => {
       const length = Math.min(size, SESSION_TAIL_BYTES);
       const buffer = Buffer.alloc(length);
       readSync(fd, buffer, 0, length, size - length);
-      text = buffer.toString("utf8");
+      return buffer.toString("utf8");
     } finally { closeSync(fd); }
   } catch (e) {
     if (!(e instanceof Error)) throw e;
     console.error(`LEAD_SESSION_UNREADABLE ${file}: ${e.message}`);
     return undefined;
   }
+};
+
+/**
+ * When the lead's current tool call started: the newest assistant message in its session ends in a tool call that has
+ * no result yet. Undefined when the session is between tool calls (streaming, idle) or unreadable.
+ */
+export const openToolCallSince = (file: string): number | undefined => {
+  const text = sessionTail(file);
+  if (text === undefined) return undefined;
   const answered = new Set<string>();
   for (const line of text.trimEnd().split("\n").reverse()) {
     let entry: unknown;
@@ -81,6 +86,47 @@ export const openToolCallSince = (file: string): number | undefined => {
   }
   return undefined;
 };
+
+/**
+ * omo's waitingOn.background sources that are the lead's own work a restart would kill: child tasks and detached code
+ * cells. Monitors, terminal sessions and queued deliveries are not; the tail monitor alone would hold every restart.
+ */
+const CHILD_SOURCES: ReadonlySet<string> = new Set(["senpi-task", "senpi-codemode"]);
+
+/** Work the lead's omo session waits on: running children, own background work, and since when it has been waiting. */
+export type ChildWork = { readonly children: number; readonly background: number; readonly since: number };
+
+export const childWorkText = (work: ChildWork): string =>
+  [work.children ? `${work.children} child task(s)` : "", work.background ? `${work.background} background job(s)` : ""].filter(Boolean).join(" and ");
+
+/**
+ * What the lead's session still waits on, from its newest session-lifecycle entry (omo writes one on every state
+ * change, e.g. waiting_children with waitingOn.children). `since` is that state's start, else the entry's time.
+ * Undefined when it waits on nothing of its own, has no such entry in the tail, or is unreadable.
+ */
+export const childWork = (file: string): ChildWork | undefined => {
+  const text = sessionTail(file);
+  if (text === undefined) return undefined;
+  for (const line of text.trimEnd().split("\n").reverse()) {
+    let entry: unknown;
+    try { entry = JSON.parse(line); }
+    catch (e) { if (e instanceof SyntaxError) continue; throw e; }
+    if (typeof entry !== "object" || entry === null || !("customType" in entry) || entry.customType !== "session-lifecycle" || !("data" in entry)) continue;
+    const data = entry.data as { since?: unknown; waitingOn?: { children?: unknown; background?: unknown } };
+    const children = typeof data.waitingOn?.children === "number" && data.waitingOn.children > 0 ? data.waitingOn.children : 0;
+    const background = (Array.isArray(data.waitingOn?.background) ? data.waitingOn.background as { source?: unknown; activeCount?: unknown }[] : [])
+      .filter((item) => typeof item.source === "string" && CHILD_SOURCES.has(item.source))
+      .reduce((sum, item) => sum + (typeof item.activeCount === "number" && item.activeCount > 0 ? item.activeCount : 0), 0);
+    if (!children && !background) return undefined;
+    const stamp = "timestamp" in entry && typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
+    const since = typeof data.since === "string" ? Date.parse(data.since) : NaN;
+    return { children, background, since: Number.isFinite(since) ? since : Number.isFinite(stamp) ? stamp : 0 };
+  }
+  return undefined;
+};
+
+/** Why an idle lead is cold-started for a delivery instead of taking it in place. */
+export type ColdReason = { readonly kind: "hard-cap" | "context-cap" | "stale"; readonly detail: string; readonly tokens: number };
 
 /** omo's footer on a session paused by Esc ("Paused · N updates held · type to continue, /resume to resume"). */
 export const PAUSED = /\bPaused\b.*\/resume\b/;
@@ -301,6 +347,7 @@ export class LeadLifecycle {
     this.patchJournal({ quotaStallSince: undefined });
     if (target === undefined) return false;
     console.log(`LEAD_MODEL_SWITCH ${chain[index]?.model} -> ${chain[target]?.model}${reason ? ` ${reason}` : ""}`);
+    await this.noteRestart("quota", `${chain[index]?.model} -> ${chain[target]?.model}: ${reason ?? `${chain[0]?.model} has quota again`}`, pane.cwd ?? config.defaultCwd);
     this.setRestart({
       session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
       phase: "stopping", modelIndex: target, ...(reason ? { reason } : {}), ...(force ? { force: true as const } : {}),
@@ -389,12 +436,13 @@ export class LeadLifecycle {
     const now = clock.now();
     const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
     if (!pane?.agent) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
-    const restart = (status: string, minutes: number, count: number): boolean => {
+    const restart = async (status: string, minutes: number, count: number): Promise<boolean> => {
       // The cap is checked before anything is announced: a refused restart must not tell the owner it is happening.
       if (this.capRefuses(`stuck ${status}`)) return false;
       this.patchJournal({ leadBusySince: undefined, leadScreen: undefined });
       const session = randomUUID();
       console.log(`LEAD_STUCK_RESTART ${config.leadPane} ${status} ${minutes} min, ${count} owner message(s) unread`);
+      await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.defaultCwd);
       this.owners.announce(`lead-stuck:${session}`, `The lead has been stuck (${status}) for ${minutes} min without reading your messages, so it is being restarted; your unanswered messages go to the new lead.`);
       this.setRestart({
         session, events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
@@ -423,7 +471,7 @@ export class LeadLifecycle {
       const times = at(new Set(waiting.map(latest)));
       if (call !== undefined && times.length) {
         const since = Math.max(Math.min(...times), call);
-        if (now - since >= unreadLimit) return restart("in one tool call", Math.round((now - since) / 60_000), waiting.length);
+        if (now - since >= unreadLimit) return await restart("in one tool call", Math.round((now - since) / 60_000), waiting.length);
       }
     }
     const unread = new Set(this.unacked(false).map(latest));
@@ -438,7 +486,7 @@ export class LeadLifecycle {
       since = Math.max(since, this.journal.leadScreen?.since ?? now);
     } else if (this.journal.leadScreen) this.patchJournal({ leadScreen: undefined });
     if (now - since < limit) return false;
-    return restart(pane.agent_status ?? "unknown", Math.round((now - since) / 60_000), unread.size);
+    return await restart(pane.agent_status ?? "unknown", Math.round((now - since) / 60_000), unread.size);
   }
 
   setRestart(restart: Restart | undefined): void {
@@ -560,24 +608,68 @@ export class LeadLifecycle {
     return pane;
   }
 
-  /** The session file the last warm() resolved: a warm wake is recorded against it. */
+  /** The session file the last coldReason() resolved: a warm wake is recorded against it. */
   warmSession = "";
 
-  async warm(cwd: string): Promise<boolean> {
+  /** Why the idle lead must be cold-started for a delivery now, or undefined when it is warm and takes it in place. */
+  async coldReason(cwd: string): Promise<ColdReason | undefined> {
+    const { config, clock } = this.deps;
     const { id, file } = await this.sessionFile(cwd);
     if (!id) throw new TransientSuperviseError("cannot resolve idle lead session; refusing an unproven cold restart");
     if (!file) throw new TransientSuperviseError(`cannot find lead session file for ${id}`);
     this.warmSession = file;
     const tokens = this.leadTokens(file);
     // Idle at delivery time (checked by the caller): a lead past the hard cap restarts even with a warm cache.
-    if (tokens >= this.deps.config.leadContextHardCapTokens) {
-      console.log(`LEAD_HARD_CAP ${tokens}`);
+    if (tokens >= config.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${config.leadContextHardCapTokens}` };
+    const idleMs = clock.now() - statSync(file).mtimeMs;
+    if (idleMs < config.cacheTtlMin * 60_000) return undefined;
+    const stale = `idle ${Math.floor(idleMs / 60_000)} min (past cacheTtlMin ${config.cacheTtlMin})`;
+    if (tokens >= config.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `${stale} with context ${tokens} tokens at or above leadContextCapTokens ${config.leadContextCapTokens}` };
+    if (new Waits(config.stateDir).list().length > 0 || (await this.deps.registry.open()).some((lane) => statusOf(lane) === "working")) return undefined;
+    return { kind: "stale", tokens, detail: `${stale} with no pending waits or working lanes` };
+  }
+
+  /** What the lead's own session still waits on; undefined when nothing, or when its session cannot be resolved (logged). */
+  async childWorkOf(cwd: string): Promise<ChildWork | undefined> {
+    try {
+      const { file } = await this.sessionFile(cwd);
+      return file ? childWork(file) : undefined;
+    } catch (e) {
+      if (!(e instanceof Error)) throw e;
+      console.error(`LEAD_SESSION_UNRESOLVED ${this.deps.config.leadPane}: ${e.message}`);
+      return undefined;
+    }
+  }
+
+  /** Per trigger kind, the child wait whose deferral was logged: each wait is logged once per kind. */
+  private readonly deferrals = new Map<string, number>();
+
+  /**
+   * A restart that may wait (a lead-restart request, a cold or context-cap start) waits while the idle lead's session
+   * still waits on its own children: stopping the lead would kill them and lose their results. It waits at most
+   * leadChildWaitMaxMin from when the lead began waiting, so a hung child cannot hold the lead forever. Each wait is
+   * logged once per trigger kind; its expiry every time it lets a restart through.
+   */
+  async deferForChildren(cwd: string, kind: string, detail: string): Promise<boolean> {
+    const work = await this.childWorkOf(cwd);
+    if (!work) return false;
+    const { clock, config } = this.deps;
+    const minutes = Math.floor((clock.now() - work.since) / 60_000);
+    if (clock.now() - work.since >= config.leadChildWaitMaxMin * 60_000) {
+      console.log(`LEAD_CHILD_WAIT_EXPIRED ${kind}: the lead has waited on ${childWorkText(work)} for ${minutes} min (leadChildWaitMaxMin ${config.leadChildWaitMaxMin}); restarting it anyway`);
       return false;
     }
-    if (this.deps.clock.now() - statSync(file).mtimeMs < this.deps.config.cacheTtlMin * 60_000) return true;
-    if (tokens >= this.deps.config.leadContextCapTokens) return false;
-    return new Waits(this.deps.config.stateDir).list().length > 0 ||
-      (await this.deps.registry.open()).some((lane) => statusOf(lane) === "working");
+    if (this.deferrals.get(kind) !== work.since) {
+      this.deferrals.set(kind, work.since);
+      console.log(`LEAD_RESTART_DEFERRED ${kind} ${detail}: the lead waits on ${childWorkText(work)} for ${minutes} min; deferred up to leadChildWaitMaxMin ${config.leadChildWaitMaxMin}, events delivered in place`);
+    }
+    return true;
+  }
+
+  /** Every restart is logged with its trigger before it starts; given the lead's cwd, it also names the children it stops. */
+  async noteRestart(kind: string, detail: string, cwd?: string): Promise<void> {
+    const work = cwd === undefined ? undefined : await this.childWorkOf(cwd);
+    console.log(`LEAD_RESTART_TRIGGER ${kind} ${detail}${work ? `; stops ${childWorkText(work)} the lead was waiting on` : ""}`);
   }
 
   /** Last recorded message.usage.totalTokens of the session file; missing or unreadable usage counts as 0. */

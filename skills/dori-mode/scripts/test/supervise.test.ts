@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, OUTBOX_ATTEMPTS, OUTBOX_RETRY_MS, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
+import { childWork } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -341,6 +342,97 @@ test("a custom hard cap controls the in-TTL restart", async () => {
   supervisor.enqueue("custom-hard", "INBOUND owner");
   await supervisor.flush();
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+});
+
+/** An omo session-lifecycle entry: the lead waits on `children` child tasks and `background` sources since `since`. */
+const lifecycle = (children: number, since: number, background: { source: string; activeCount: number }[] = []): string =>
+  JSON.stringify({
+    type: "custom", customType: "session-lifecycle", timestamp: new Date(since).toISOString(),
+    data: { state: children ? "waiting_children" : "done", since: new Date(since).toISOString(), waitingOn: { children, background, human: [] } },
+  }) + "\n";
+
+const restarted = (f: ReturnType<typeof fixture>): string[][] => f.calls.filter((call) => call[2] === "run" || call[0] === "kill");
+
+test("a lead's own child work is read from its newest session-lifecycle entry; monitors and deliveries are not its children", () => {
+  const f = fixture();
+  const at = f.clock.now();
+  writeFileSync(f.file, lifecycle(0, at, [{ source: "terminal-monitors", activeCount: 1 }, { source: "delivery:senpi-task.send-outcome", activeCount: 2 }]));
+  expect(childWork(f.file)).toBeUndefined();
+  appendFileSync(f.file, lifecycle(2, at, [{ source: "senpi-codemode", activeCount: 1 }, { source: "terminal-monitors", activeCount: 1 }]));
+  expect(childWork(f.file)).toEqual({ children: 2, background: 1, since: at });
+  appendFileSync(f.file, JSON.stringify({ type: "message", message: { role: "assistant", content: [] } }) + "\n");
+  expect(childWork(f.file)?.children).toBe(2);
+  appendFileSync(f.file, lifecycle(0, at + 1));
+  expect(childWork(f.file)).toBeUndefined();
+});
+
+test("a lead-restart request waits while the idle lead waits on its own child, and applies once the child is done", async () => {
+  const f = fixture();
+  writeFileSync(f.file, lifecycle(1, f.clock.now()));
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  const request = requestLeadRestart(f.deps.config, f.clock.now(), "test/forced");
+  const supervisor = new Supervisor(f.deps);
+  const lines = await quiet(async () => {
+    supervisor.enqueue("child-running", "INBOUND child-running");
+    await supervisor.flush();
+    await supervisor.flush();
+  });
+  expect(restarted(f)).toEqual([]);
+  expect(f.log().map((event) => event.id)).toEqual(["child-running"]);
+  expect(pendingLeadRestart(f.state.dir)?.id).toBe(request.id);
+  expect(lines.filter((line) => line.startsWith(`LEAD_RESTART_DEFERRED request ${request.id}`))).toHaveLength(1);
+  appendFileSync(f.file, lifecycle(0, f.clock.now()));
+  const after = await quiet(() => supervisor.flush());
+  expect(f.command()).toContain("--model test/forced");
+  expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
+  expect(after.filter((line) => line.startsWith(`LEAD_RESTART_TRIGGER request dori lead-restart ${request.id}`))).toHaveLength(1);
+});
+
+test.each([[59, false], [60, true]] as const)("a child wait of %s min against leadChildWaitMaxMin 60 lets the request through=%s", async (minutes, restart) => {
+  const f = fixture();
+  writeFileSync(f.file, lifecycle(1, f.clock.now() - minutes * 60_000));
+  requestLeadRestart(f.deps.config, f.clock.now(), "test/forced");
+  const lines = await quiet(() => new Supervisor(f.deps).flush());
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(lines.some((line) => line.startsWith("LEAD_CHILD_WAIT_EXPIRED request"))).toBe(restart);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED request"))).toBe(!restart);
+});
+
+test.each([true, false])("a stale idle lead with a running child=%s takes the event in place instead of a cold start", async (child) => {
+  const f = fixture();
+  writeFileSync(f.file, child ? lifecycle(1, f.clock.now()) : lifecycle(0, f.clock.now()));
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  f.cold();
+  const lines = await quiet(async () => {
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("stale", "INBOUND stale");
+    await supervisor.flush();
+  });
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(child ? 0 : 1);
+  expect(f.log().map((event) => event.id)).toEqual(["stale"]);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED stale idle 5 min"))).toBe(child);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER stale idle 5 min (past cacheTtlMin 5) with no pending waits or working lanes"))).toBe(!child);
+});
+
+test("a lead at the hard cap waiting on its own child is not restarted until the child is done", async () => {
+  const f = fixture();
+  writeFileSync(f.file, JSON.stringify({ message: { usage: { totalTokens: 300_000 } } }) + "\n" + lifecycle(1, f.clock.now()));
+  const supervisor = new Supervisor(f.deps);
+  const lines = await quiet(async () => {
+    supervisor.enqueue("capped", "INBOUND capped");
+    await supervisor.flush();
+  });
+  expect(restarted(f)).toEqual([]);
+  expect(lines.some((line) => line.startsWith("LEAD_HARD_CAP"))).toBe(false);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED hard-cap context 300000 tokens"))).toBe(true);
+  appendFileSync(f.file, lifecycle(0, f.clock.now()));
+  const after = await quiet(async () => {
+    supervisor.enqueue("capped-2", "INBOUND capped-2");
+    await supervisor.flush();
+  });
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(after).toContain("LEAD_HARD_CAP 300000");
+  expect(after.some((line) => line.startsWith("LEAD_RESTART_TRIGGER hard-cap context 300000 tokens"))).toBe(true);
 });
 
 test.each([
