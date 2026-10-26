@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { LEGACY_LANE_MCP, removeLegacyLaneMcp } from "../src/launch.ts";
-import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { claimDone, claimEventId, closeLane, discoverWorktrees, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { laneFinish } from "../src/lane-finish.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -83,13 +84,64 @@ test("five quiet minutes after a claim is handed over the lane is closed, its th
   expect(await watchTick(at(T0 + 4 * MIN))).toEqual([]);
   expect(closedVia()).toHaveLength(0);
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
-  expect(lines[0]).toStartWith("LANE_CLOSED demo-lane");
+  expect(lines[0]).toBe("LANE_CLOSED demo-lane closed");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
   expect(world.calls).toContainEqual(["notify", "chat:team/123", "Done: merged acme/app#1 abc123"]);
   expect(world.calls).toContainEqual(["git", "-C", "/repo", "worktree", "remove", WT]);
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("closed");
   expect(await watchTick(at(T0 + 9 * MIN))).toEqual([]);
+});
+
+test("claim evidence and objection reasons are capped at 300 chars in event lines, and kept whole in the registry", async () => {
+  const evidence = "e".repeat(400);
+  expect(await claimDone(at(T0), { ...lane, pane: undefined }, evidence)).toBe(`LANE_DONE_CLAIMED demo-lane - ${"e".repeat(299)}…`);
+  expect((await at(T0).registry.read("demo-lane"))?.claim?.evidence).toBe(evidence);
+  const reasons = ["r".repeat(400)];
+  expect(await objectDone(at(T0), { ...lane, pane: undefined }, reasons)).toBe(`LANE_NOT_DONE demo-lane ${"r".repeat(299)}…`);
+  expect((await at(T0).registry.read("demo-lane"))?.objection?.reasons).toEqual(reasons);
+  expect(await objectDone(at(T0), { ...lane, pane: undefined }, ["x".repeat(300)])).toBe(`LANE_NOT_DONE demo-lane ${"x".repeat(300)}`);
+});
+
+test("the watcher's claim announcement is capped too", async () => {
+  await claimDone(at(T0), lane, "w".repeat(400));
+  expect(await watchTick(at(T0))).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 ${"w".repeat(299)}…`]);
+});
+
+test("CLOSED and LANE_CLOSED carry no receipt JSON while the registry keeps the receipt", async () => {
+  livePane();
+  const r = await closeLane(at(T0), lane, "manual");
+  expect(r.closed).toBe(true);
+  expect(r.lines.at(-1)).toBe("CLOSED demo-lane");
+  expect(r.lines.some((l) => l.includes("{"))).toBe(false);
+  expect((await at(T0).registry.read("demo-lane"))?.receipt).toMatchObject({ note: "manual", cleanup: expect.arrayContaining(["pane w:p1 closed"]) });
+});
+
+test("LANE_CLOSED keeps the PR URL the claim names, so the lane-finish line still links it", async () => {
+  livePane();
+  const url = "https://github.com/acme/app/pull/1";
+  await claimDone(at(T0), lane, `merged ${url} abc123`);
+  await watchTick(at(T0));
+  const lines = await watchTick(at(T0 + 5 * MIN + 1));
+  expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed ${url}`);
+  expect(laneFinish(lines[0] ?? "")).toEqual({ lane: "demo-lane", closed: "closed", pr: url });
+});
+
+test("settling a claim reads each Done signal and lists worktrees once, reusing them in the close", async () => {
+  livePane();
+  await claimDone(at(T0), lane, "merged acme/app#1");
+  await watchTick(at(T0));
+  const listings = (from: number) => world.calls.slice(from).filter((c) => c[0] === "git" && c.includes("worktree") && c.includes("list")).length;
+  // The Done signal reads (signals.ts), not branch cleanup's own PR read (other --json fields).
+  const reads = (from: number) => world.calls.slice(from).filter((c) => c[0] === "gh" && c[2] === "view" && (c.at(-1) === "state,mergeCommit" || c.at(-1) === "state")).map((c) => c.slice(1, 4).join(" "));
+  const before = world.calls.length;
+  await discoverWorktrees(lane, at(T0).run, [at(T0).config.defaultCwd]);
+  const onePass = listings(before);
+  expect(onePass).toBeGreaterThan(0);
+  const start = world.calls.length;
+  expect((await watchTick(at(T0 + 5 * MIN + 1)))[0]).toBe("LANE_CLOSED demo-lane closed");
+  expect(listings(start)).toBe(onePass);
+  expect(reads(start).sort()).toEqual(["issue view 2", "pr view 1"]);
 });
 
 test("commits that reached no remote block the close and name the worktree", async () => {

@@ -106,7 +106,7 @@ test("closing a lane keeps its thread open while another open lane works in it, 
   const first = await closeLane(at(T0), lane, "Done: first");
   expect(first.closed).toBe(true);
   expect(notified()).toHaveLength(0);
-  expect(first.lines.at(-1)).toContain("thread kept open: lane sibling-lane still works in it");
+  expect(((await at(T0).registry.read("demo-lane"))?.receipt as { cleanup: string[] }).cleanup).toContain("thread kept open: lane sibling-lane still works in it");
   const sibling = (await at(T0).registry.read("sibling-lane")) ?? lane;
   const second = await closeLane(at(T0), sibling, "Done: second");
   expect(second.closed).toBe(true);

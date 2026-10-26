@@ -61,7 +61,8 @@ const deps = (patch: Parameters<typeof depsFor>[3] = {}) =>
   ({ ...depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo, worktreeRoot: state.dir, ...patch }), run: runner(), exists: undefined });
 const lane = (): Lane => ({ key: "demo-lane", title: "demo", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#7", cwd: wt, worktrees: [wt], openedAt: new Date(T0).toISOString() });
 const updateRefs = () => world.calls.filter((c) => c.includes("update-ref"));
-const receipt = (lines: readonly string[]): string[] => JSON.parse(lines.at(-1)?.split(" ").slice(2).join(" ") ?? "{}").cleanup;
+/** The close's cleanup lines, read from the registry receipt (the CLOSED line no longer carries it). */
+const receipt = async (key = "demo-lane"): Promise<string[]> => ((await deps().registry.read(key))?.receipt as { cleanup: string[] }).cleanup;
 
 beforeEach(async () => {
   state = withState();
@@ -88,14 +89,14 @@ test("a branch still at the merged head SHA loses its worktree and its local bra
   expect(r.closed).toBe(true);
   expect(existsSync(wt)).toBe(false);
   expect(await localTip()).toBeUndefined();
-  expect(receipt(r.lines)).toContain(`branch feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)})`);
+  expect((await receipt())).toContain(`branch feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)})`);
   expect(updateRefs()).toEqual([["git", "--git-dir", join(repo, ".git"), "update-ref", "-d", "refs/heads/feat-x", mergedHead]]);
   const ops = openOperations({ stateDir: state.dir, store: TEST_STORE });
   try {
     expect(ops.get(`demo-lane/branch-delete/acme/app#7@${mergedHead}`)?.state).toBe("verified");
     expect(ops.get(`demo-lane/remote-branch-delete/acme/app#7@${mergedHead}`)?.state).toBe("verified");
   } finally { ops.close(); }
-  expect(receipt(r.lines)).toContain(`remote branch origin/feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)})`);
+  expect((await receipt())).toContain(`remote branch origin/feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)})`);
   expect(await remoteTip()).toBe("");
 });
 
@@ -106,8 +107,8 @@ test("a commit pushed after the merge keeps the worktree and the branch, says wh
   expect(r.closed).toBe(true);
   expect(existsSync(wt)).toBe(true);
   expect(await localTip()).toBe(later);
-  expect(receipt(r.lines)).toContain(`branch-bound worktree ${wt} kept: branch feat-x tip ${later.slice(0, 10)} is not the merged head ${mergedHead.slice(0, 10)} of acme/app#7`);
-  expect(receipt(r.lines)).toContain(`branch feat-x kept: tip ${later.slice(0, 10)} is not the merged head ${mergedHead.slice(0, 10)} of acme/app#7 (a commit after the merge)`);
+  expect((await receipt())).toContain(`branch-bound worktree ${wt} kept: branch feat-x tip ${later.slice(0, 10)} is not the merged head ${mergedHead.slice(0, 10)} of acme/app#7`);
+  expect((await receipt())).toContain(`branch feat-x kept: tip ${later.slice(0, 10)} is not the merged head ${mergedHead.slice(0, 10)} of acme/app#7 (a commit after the merge)`);
   expect(updateRefs()).toEqual([]);
   expect(await watchTick(deps())).toEqual([]);
   expect(existsSync(wt)).toBe(true);
@@ -122,7 +123,7 @@ test("a remote branch that moved after the merge keeps the local branch even whe
   expect(r.closed).toBe(true);
   expect(existsSync(wt)).toBe(false);
   expect(await localTip()).toBe(mergedHead);
-  expect(receipt(r.lines).some((l) => l.startsWith(`branch feat-x kept: origin/feat-x is at `) && l.includes("a commit pushed after the merge"))).toBe(true);
+  expect((await receipt()).some((l) => l.startsWith(`branch feat-x kept: origin/feat-x is at `) && l.includes("a commit pushed after the merge"))).toBe(true);
   expect(updateRefs()).toEqual([]);
 });
 
@@ -131,7 +132,7 @@ test("another open lane naming the same PR keeps the branch", async () => {
   const r = await closeLane(deps(), lane(), "manual");
   expect(r.closed).toBe(true);
   expect(await localTip()).toBe(mergedHead);
-  expect(receipt(r.lines)).toContain("branch feat-x kept: open lane other-lane also names acme/app#7");
+  expect((await receipt())).toContain("branch feat-x kept: open lane other-lane also names acme/app#7");
 });
 
 test("a close interrupted after the worktree went still deletes the branch on resume, from the git dir it recorded", async () => {
@@ -145,7 +146,7 @@ test("a close interrupted after the worktree went still deletes the branch on re
   expect(await localTip()).toBe(mergedHead);
   const lines = await watchTick(deps());
   expect(lines[0]).toStartWith("LANE_CLOSED demo-lane");
-  expect(lines[0]).toContain("branch feat-x deleted");
+  expect((await receipt()).some((l) => l.startsWith("branch feat-x deleted"))).toBe(true);
   expect(await localTip()).toBeUndefined();
 });
 
@@ -161,7 +162,7 @@ test("a lane whose worktree branch has a PR merged into dev loses its worktree, 
   expect(existsSync(wt)).toBe(false);
   expect(await localTip()).toBeUndefined();
   expect(await remoteTip()).toBe("");
-  expect(receipt(r.lines)).toEqual([
+  expect((await receipt("plain-lane"))).toEqual([
     `worktree ${wt} removed`,
     `remote branch origin/feat-x deleted (acme/app#9 merged head ${mergedHead.slice(0, 10)})`,
     `branch feat-x deleted (acme/app#9 merged head ${mergedHead.slice(0, 10)})`,
@@ -191,7 +192,7 @@ test("a worktree branch that moved past its merged PR keeps its worktree and bot
   expect(existsSync(wt)).toBe(true);
   expect(await localTip()).toBe(later);
   expect(await remoteTip()).toBe(later);
-  expect(receipt(r.lines)).toContain(`branch feat-x kept: tip ${later.slice(0, 10)} is not the merged head ${mergedHead.slice(0, 10)} of acme/app#9 (a commit after the merge)`);
+  expect((await receipt("plain-lane"))).toContain(`branch feat-x kept: tip ${later.slice(0, 10)} is not the merged head ${mergedHead.slice(0, 10)} of acme/app#9 (a commit after the merge)`);
   expect(world.calls.filter((c) => c.includes("push") || c.includes("update-ref") || (c.includes("worktree") && c.includes("remove")))).toEqual([]);
 });
 
@@ -218,7 +219,7 @@ test("a done-claimed lane whose worktree branch GitHub reports merged at its HEA
   mergedFromBranch = [mergedPr(mergedHead)];
   const lines = await watchTick(deps());
   expect(lines[0]).toStartWith("LANE_CLOSED plain-lane");
-  expect(lines[0]).toContain("closed at once: acme/app#9 merged into dev");
+  expect((await deps().registry.read("plain-lane"))?.receipt).toMatchObject({ note: expect.stringContaining("closed at once: acme/app#9 merged into dev") });
 });
 
 test("a done-claimed lane with no merged PR waits out its claim window", async () => {

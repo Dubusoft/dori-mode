@@ -11,7 +11,7 @@ import { laneRunner, listPanes, readScreen, sendVerified } from "./panes.ts";
 import { OPEN_STATES, openOperations, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
-import { checkDone, type SignalIo } from "./signals.ts";
+import { type Check, checkDone, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings } from "./branch-cleanup.ts";
 import { otherOpenLanesOnThread } from "./routing.ts";
 import type { Discord } from "./messenger/discord.ts";
@@ -41,6 +41,22 @@ export type FlowDeps = {
 const signalIo = (deps: FlowDeps, lane: Lane): SignalIo => ({ cwd: (lane.machine ? undefined : lane.cwd) ?? deps.config.defaultCwd, ...deps.signalIo });
 
 const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
+
+/** Free text in an event line (evidence, reasons) is capped; the registry keeps it whole. */
+const EVENT_TEXT_MAX = 300;
+export const eventText = (text: string): string => text.length > EVENT_TEXT_MAX ? `${text.slice(0, EVENT_TEXT_MAX - 1)}…` : text;
+
+/** Same shape lane-finish.ts reads a PR URL with. */
+const PULL_URL = /https:\/\/\S+\/pull\/\d+/;
+
+/**
+ * The fixed close event: no receipt (the registry keeps it). The first PR URL the close note or a Done signal names is
+ * kept, so the supervisor's lane-finish line (lane-finish.ts) still links the PR.
+ */
+const closedEvent = (key: string, note: string, lines: readonly string[]): string => {
+  const pr = [note, ...lines.filter((l) => l.startsWith("SIGNAL "))].map((t) => PULL_URL.exec(t)?.[0]).find(Boolean);
+  return `LANE_CLOSED ${key} closed${pr ? ` ${pr}` : ""}`;
+};
 
 /** A lane that claims and closes with no lead wake: its brief declared `autoClose: machine`. */
 const machineClose = (lane: Lane): boolean => lane.autoClose === "machine";
@@ -100,7 +116,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): P
       : `at ${closesAt}Z (${deps.config.closeAfterMin} minutes) once its Done signals read back live`;
     await sendVerified(deps.run, deps.clock, lane.pane, `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons. Stay idle until then; an objection arrives here as [LEAD] not done.`);
   }
-  return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${evidence}`;
+  return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${eventText(evidence)}`;
 };
 
 export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly string[]): Promise<string> => {
@@ -114,7 +130,7 @@ export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly s
     ? `[LEAD] not done: the Done check of ${lane.key} did not pass; the lead has the reasons. Keep working, and print a new [REPORT] ${lane.key} | done | <updated evidence> line when fixed`
     : `[LEAD] not done: the Done check of ${lane.key} did not pass. Read the reasons with dori lane status ${lane.key}, keep working, and claim again when fixed`;
   if (lane.pane) await sendVerified(deps.run, deps.clock, lane.pane, text);
-  return `LANE_NOT_DONE ${lane.key} ${reasons.join("; ")}`;
+  return `LANE_NOT_DONE ${lane.key} ${eventText(reasons.join("; "))}`;
 };
 
 export const discoverWorktrees = async (lane: Lane, run: Runner, extraRoots: readonly string[] = []): Promise<string[]> => {
@@ -133,11 +149,11 @@ export const discoverWorktrees = async (lane: Lane, run: Runner, extraRoots: rea
   return [...found];
 };
 
-export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
+const unpushedWorkIn = async (deps: FlowDeps, lane: Lane, worktrees: readonly string[]): Promise<string[]> => {
   if (lane.machine) return [];
   const exists = deps.exists ?? existsSync;
   const reasons: string[] = [];
-  for (const wt of await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd])) {
+  for (const wt of worktrees) {
     if (!exists(wt)) continue;
     // Untracked files are work too (gitignored ones are not listed): a close would delete them with the worktree.
     const dirty = await deps.run(["git", "-C", wt, "status", "--porcelain", "--untracked-files=normal"]);
@@ -148,9 +164,17 @@ export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]
   return reasons;
 };
 
+export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]> =>
+  unpushedWorkIn(deps, lane, await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]));
+
 export type CloseOptions = {
   /** `dori close --force`: close despite unpushed/uncommitted work; a worktree git refuses to remove is kept, as before. */
   readonly force?: boolean;
+  /**
+   * Done checks and discovered worktrees the caller read just before (a claim's settlement): reused instead of read
+   * again. Unpushed work in those worktrees is still re-read under the close lock. Never persisted: a resumed close reads afresh.
+   */
+  readonly pre?: { readonly checks: readonly Check[]; readonly worktrees: readonly string[] };
 };
 
 /** The close sequence's own operation (its intent and resume data); its effects are separate operations of the lane. */
@@ -223,11 +247,12 @@ const closeSequence = async (
   deps: FlowDeps, lane: Lane, note: string, opts: CloseOptions, act: Act, store: OperationStore,
 ): Promise<{ readonly closed: boolean; readonly lines: string[] }> => {
   const exists = deps.exists ?? existsSync;
-  const checks = await checkDone(lane.done, deps.run, signalIo(deps, lane));
+  const checks = opts.pre?.checks ?? await checkDone(lane.done, deps.run, signalIo(deps, lane));
   const lines = checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`);
   if (checks.some((c) => !c.ok)) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live`] };
+  const discovered = opts.pre?.worktrees ?? await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
   if (!opts.force) {
-    const unpushed = await unpushedWork(deps, lane);
+    const unpushed = await unpushedWorkIn(deps, lane, discovered);
     if (unpushed.length) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: ${unpushed.join("; ")} (commit and push it, or dori close --force)`] };
   }
   const cleanup: string[] = [];
@@ -240,7 +265,7 @@ const closeSequence = async (
   const root = lane.cwd ?? deps.config.defaultCwd;
   // A worktree an interrupted close already removed is no longer discovered; its operation still has to settle.
   const pending = store.list({ lane: lane.key }).filter((op) => op.action === "worktree-remove" && op.state !== "verified").map((op) => op.target);
-  const worktrees = [...new Set([...(await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd])).filter(exists), ...pending])];
+  const worktrees = [...new Set([...discovered.filter(exists), ...pending])];
   // Bound before any worktree goes: a worktree whose branch moved past the merged head stays with its branch.
   // The lane's own cwd, when it is a linked worktree, goes too once it sits exactly at a PR merged into the merge base.
   const branches: BranchPlan | undefined = !lane.machine
@@ -314,7 +339,7 @@ const closeSequence = async (
   const operations = store.list({ lane: lane.key }).filter((op) => op.action !== CLOSE_ACTION).map((op) => ({ id: op.id, state: op.state }));
   const receipt = { checks, note, cleanup, ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations };
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "closed", note, at, { closedAt: at, receipt }));
-  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key} ${JSON.stringify(receipt)}`] };
+  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}`] };
 };
 
 /**
@@ -337,7 +362,7 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
     const { note, force } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean };
     const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force) });
     const last = result.lines.at(-1) ?? "";
-    if (result.closed) await push(`LANE_CLOSED ${lane.key} ${last.split(" ").slice(2).join(" ")}`, undefined, laneMeta(lane));
+    if (result.closed) await push(closedEvent(lane.key, note ?? "", result.lines), undefined, laneMeta(lane));
     else {
       const ambiguousLines = result.lines.filter((line) => line.startsWith("OPERATION_AMBIGUOUS "));
       for (const line of ambiguousLines.length ? ambiguousLines : [`OPERATION_FAILED ${op.id} the interrupted close was not finished: ${last}`]) await push(line, undefined, laneMeta(lane));
@@ -346,9 +371,11 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
 };
 
 const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
-  const blocked = await unpushedWork(deps, lane);
+  const worktrees = await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
+  const blocked = await unpushedWorkIn(deps, lane, worktrees);
   if (blocked.length) return objectDone(deps, lane, blocked);
-  const failing = (await checkDone(lane.done, deps.run, signalIo(deps, lane))).filter((c) => !c.ok).map((c) => `${c.signal} -> ${c.detail}`);
+  const checks = await checkDone(lane.done, deps.run, signalIo(deps, lane));
+  const failing = checks.filter((c) => !c.ok).map((c) => `${c.signal} -> ${c.detail}`);
   if (failing.length) return objectDone(deps, lane, failing);
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
   await withOperations(deps, async (store) => {
@@ -369,12 +396,12 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
     await withOperations(deps, async (store) => settleOperation(store, deps.clock.now(), closeId(lane.key), "failed", `superseded: lane is ${superseded.status}`));
     return `LANE_SETTLE_SKIPPED ${lane.key} is now ${superseded.status}; the done claim being settled was superseded, not closed`;
   }
-  const result = await closeLane(deps, verified, `Done: ${evidence}`);
+  const result = await closeLane(deps, verified, `Done: ${evidence}`, { pre: { checks, worktrees } });
   if (!result.closed) {
     const signals = result.lines.filter((l) => l.startsWith("SIGNAL NOT"));
     return objectDone(deps, (await deps.registry.read(lane.key)) ?? verified, signals.length ? signals : result.lines.filter((l) => l.startsWith("REFUSED")));
   }
-  return `LANE_CLOSED ${lane.key} ${result.lines.at(-1)?.split(" ").slice(2).join(" ") ?? ""}`;
+  return closedEvent(lane.key, `Done: ${evidence}`, result.lines);
 };
 
 /** The thread id of a `discord:<channel>/<thread>` ref; a lane working in a channel itself (no thread) has none. */
@@ -531,7 +558,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepVi
     // Enqueued before the emitted mark is saved: a crash in between repeats the announcement instead of losing it
     // (under the same id, so the supervisor journals it once).
     const event = !machine ? claimEventId(lane.key, claim.at) : undefined;
-    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${claim.evidence}`, event, laneMeta(lane));
+    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${eventText(claim.evidence)}`, event, laneMeta(lane));
     const announced = { emitted: true, ...(event ? { event } : {}) };
     claim = { ...claim, ...announced };
     lane = { ...lane, claim };
