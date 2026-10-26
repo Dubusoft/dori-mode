@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { type DoriConfig, fill } from "./config.ts";
+import { type DoriConfig, fillHook } from "./config.ts";
 import { type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { reportLines } from "./freshness.ts";
@@ -241,7 +241,7 @@ const closeSequence = async (
       // A hook has no read-back of the thread: it is "done" only when the hook ran here and exited 0; after a crash
       // mid-hook (no result) it cannot be told whether the thread was marked, so that stays ambiguous.
       let ran: Ran | undefined;
-      const step = await act("thread-done", lane.thread, async () => (ran = await deps.run(fill(hook, { thread: lane.thread, text: note, key: lane.key }))), async () => (ran?.code === 0 ? "done" : "unknown"));
+      const step = await act("thread-done", lane.thread, async () => (ran = await deps.run(fillHook(hook, { thread: lane.thread, text: note, key: lane.key }))), async () => (ran?.code === 0 ? "done" : "unknown"));
       if (step.state === "ambiguous") return ambiguous(step);
       cleanup.push(step.state === "verified" ? "thread marked done" : `thread hook failed: ${step.err.slice(0, 160)}`);
     }

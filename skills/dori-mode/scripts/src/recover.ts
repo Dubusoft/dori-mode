@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { Database, SQLiteError } from "bun:sqlite";
 
 import { cachedMode, usesClaudeSubscription } from "./claude-quota.ts";
-import { type ArgvTemplate, fill } from "./config.ts";
+import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, launchLane } from "./launch.ts";
 import { laneRunner, listPanes } from "./panes.ts";
@@ -135,7 +135,7 @@ const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promi
   const event = `LANE_RECOVERED ${lane.key} ${lane.pane} ${reason}`;
   const hook = deps.config.hooks.threadReply;
   if (hook && lane.thread !== "none") {
-    const notice = await deps.run(fill(hook, { thread: lane.thread, key: lane.key, title: lane.title, text: event }));
+    const notice = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, title: lane.title, text: event }));
     if (notice.code !== 0) return [event, `LANE_RECOVERY_NOTICE_ERROR ${lane.key}`];
   }
   return [event];

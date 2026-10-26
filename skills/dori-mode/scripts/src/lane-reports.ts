@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { redactSecrets } from "./redact.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { fill } from "./config.ts";
+import { fillHook } from "./config.ts";
 import { claimDone, type Emit, type FlowDeps, laneMeta, REMOTE_SEEN_MAX } from "./done-flow.ts";
 import { scrubForThread } from "./freshness.ts";
 import { readScreen } from "./panes.ts";
@@ -65,7 +66,7 @@ export const isReportKind = (value: unknown): value is ReportKind => typeof valu
 const order = (a: LaneReport, b: LaneReport): number => a.at - b.at || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0) || a.seq - b.seq;
 const withId = (report: NewReport, seq: number): LaneReport => ({
   id: `${report.lane}:${report.generation}:${seq}`, lane: report.lane, generation: report.generation, seq, kind: report.kind,
-  text: report.text, ...(report.evidence ? { evidence: report.evidence } : {}), at: report.at,
+  text: redactSecrets(report.text), ...(report.evidence ? { evidence: redactSecrets(report.evidence) } : {}), at: report.at,
 });
 
 /** `lane-reports.json` beside supervisor.json, rewritten whole under a short state lock (lanes and the supervisor both write). */
@@ -223,7 +224,7 @@ export const routeReports = async (deps: FlowDeps, store: LaneReportStore, enque
         await claimDone(deps, lane, oneLine(report.evidence ?? report.text));
         route = "claim";
       } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none") {
-        const posted = await deps.run(fill(deps.config.hooks.threadReply, { thread: lane.thread, text: scrubForThread(oneLine(report.text), home), key: lane.key }));
+        const posted = await deps.run(fillHook(deps.config.hooks.threadReply, { thread: lane.thread, text: scrubForThread(oneLine(report.text), home), key: lane.key }));
         if (posted.code === 0) route = "thread";
         else {
           const error = (posted.err || posted.out || `exit ${posted.code}`).replace(/\s+/g, " ").slice(0, 160);

@@ -1,4 +1,5 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { redactSecrets } from "./redact.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -46,7 +47,7 @@ export const recordReported = (stateDir: string, lane: string, at: number, note?
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${at}-${randomUUID()}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note } : {}) }), { mode: 0o600, flush: true });
+  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}) }), { mode: 0o600, flush: true });
   renameSync(tmp, path);
   fsyncDir(dir);
   fsyncDir(stateDir);
