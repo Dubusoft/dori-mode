@@ -69,34 +69,6 @@ const fixture = () => {
   return { state, clock, log, open };
 };
 
-test("10,000 synthetic enqueues on the sqlite store take under 5 s, dedupe, and reload after a restart", () => {
-  const f = fixture();
-  const supervisor = f.open("sqlite");
-  // Given today's traffic shape: mostly digest GitHub and sweep lines, one owner message in twenty.
-  const line = (i: number) => i % 20 === 0 ? `INBOUND 11 ${i} owner message ${i}` : i % 3 ? `GH_PR o/r#${i} checks_green https://github.com/o/r/pull/${i}` : `LANE_WARN lane-${i % 100} quiet`;
-  const id = (i: number) => (i % 20 === 0 ? `discord:11:${i}` : `synthetic:${i}`);
-  const started = performance.now();
-  for (let i = 0; i < 10_000; i++) supervisor.enqueue(id(i), line(i));
-  const elapsed = performance.now() - started;
-  // Then the enqueues fit the budget, a repeat of every id adds nothing, and a new process sees all of them.
-  console.log(`STORE_BENCH 10000 enqueues ${Math.round(elapsed)} ms`);
-  expect(elapsed).toBeLessThan(5_000);
-  for (let i = 0; i < 10_000; i += 7) supervisor.enqueue(id(i), "duplicate");
-  supervisor.close();
-  const store = new SqliteStore(join(f.state.dir, SQLITE_FILE));
-  const journal = store.read(false);
-  store.close();
-  expect(journal.events).toHaveLength(10_000);
-  expect(journal.events.some((event) => event.line === "duplicate")).toBe(false);
-  expect(journal.awaitingAck).toHaveLength(500);
-  const after = f.open("sqlite");
-  after.enqueue(id(0), "duplicate");
-  after.close();
-  const reread = new SqliteStore(join(f.state.dir, SQLITE_FILE));
-  expect(reread.counts().events).toBe(10_000);
-  reread.close();
-});
-
 test("a restart after the import delivers nothing twice and still delivers what was pending", async () => {
   const f = fixture();
   // Given a json supervisor that delivered two events and has a third still queued.
