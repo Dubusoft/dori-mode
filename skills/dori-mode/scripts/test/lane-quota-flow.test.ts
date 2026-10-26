@@ -15,7 +15,7 @@ const accounts = (...blocked: boolean[]) => JSON.stringify({ status: "not_ready"
 let state: ReturnType<typeof withState>;
 let world: World;
 let auth: Record<string, string>;
-beforeEach(() => { state = withState(); world = newWorld(); auth = {}; });
+beforeEach(() => { state = withState(); world = newWorld(); world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }]; auth = {}; });
 afterEach(() => state.done());
 
 /** fakeRunner plus omo auth check, and a pane whose goal commands print omo's confirmation lines. */

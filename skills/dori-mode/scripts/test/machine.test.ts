@@ -45,7 +45,7 @@ const deps = (remote = true) => {
     }
     return base.run(args, opts);
   };
-  world.panes = [{ pane_id: "w:p3", workspace_id: "w", agent_status: "idle" }];
+  world.panes = [{ pane_id: "w:p3", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   return { ...base, run };
 };
 
@@ -75,6 +75,7 @@ test("remote --pane launch routes checks, run and startup and persists machine",
 
 test("remote --workspace launch resolves inventory on that machine", async () => {
   const d = deps();
+  world.panes = [{ pane_id: "w:p3", workspace_id: "w", agent_status: "idle" }];
   const input = lane({ pane: undefined });
   await Bun.write(input.brief, "work\n");
   const result = await launchLane(d, { ...input, workspace: "w" });
@@ -343,7 +344,8 @@ test("after an objection a remote lane's stale done line is not re-claimed, and 
   expect(await watchTick(d)).toEqual([]);
   // The objection itself lands on the lane's screen; it must never read as a new claim.
   const objection = remoteCalls().filter((argv) => argv[4] === "send-text").at(-1)?.[6] ?? "";
-  expect(objection).toStartWith("[LEAD] not done: changelog missing");
+  expect(objection).toStartWith("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons.");
+  expect(objection).not.toContain("changelog missing");
   world.screen = `[REPORT] remote-lane | done | closed acme/app#3\n❯ ${objection}\n`;
   expect(await watchTick(d)).toEqual([]);
   world.screen = "[REPORT] remote-lane | done | closed acme/app#3, changelog added\n❯ ";

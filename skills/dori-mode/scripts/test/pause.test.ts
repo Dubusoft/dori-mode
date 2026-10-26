@@ -15,7 +15,7 @@ let world: World;
 beforeEach(() => {
   state = withState();
   world = newWorld();
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent_status: "idle" }];
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   // Escape stops a running turn, unless a test says otherwise.
   world.onEscapeStatus = "idle";
 });

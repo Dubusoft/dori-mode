@@ -22,7 +22,7 @@ export const PRE_SQLITE_FILE = "supervisor.json.pre-sqlite";
 export const WAKES_FILE = "lead-wakes.jsonl";
 /** The json store's consumed take receipts (event-trace.ts), one `{ids, at, session}` per line; sqlite keeps them on deliveries. */
 export const TAKES_FILE = "lead-takes.jsonl";
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 /** Every row belongs to the single lead today; per-lead rows arrive with Phase 3. */
 export const DEFAULT_LEAD = "dori";
 
@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS lead_state (
  * 5: lane outcome report obligations (`outcomes`, lane-outcomes.ts).
  * 6: event lane metadata (`events.meta`) and when and in which session the lead took each delivery (event-trace.ts).
  * 7: decision obligations (`pending`, decision-obligations.ts).
+ * 8: the head repository of each polled PR (`gh_prs.head_repo`), so a fork PR is never taken for a lane's own.
  */
 const MIGRATIONS: readonly (readonly [number, string | ((db: Database) => void)])[] = [[2, `
 CREATE TABLE IF NOT EXISTS event_tombstones (id TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
@@ -210,7 +211,8 @@ CREATE INDEX IF NOT EXISTS lead_wakes_at ON lead_wakes (at);
 `], [4, (db) => addColumns(db, "lead_state", ["inbox TEXT", "forced_restarts TEXT"])],
   [5, (db) => addColumns(db, "lead_state", ["outcomes TEXT"])],
   [6, (db) => { addColumns(db, "events", ["meta TEXT"]); addColumns(db, "deliveries", ["taken_at INTEGER", "taken_session TEXT"]); }],
-  [7, (db) => addColumns(db, "lead_state", ["pending TEXT"])]];
+  [7, (db) => addColumns(db, "lead_state", ["pending TEXT"])],
+  [8, (db) => addColumns(db, "gh_prs", ["head_repo TEXT"])]];
 
 /** ADD COLUMN has no IF NOT EXISTS: a migration replayed over a database that already has a column must skip it. */
 const addColumns = (db: Database, table: string, columns: readonly string[]): void => {

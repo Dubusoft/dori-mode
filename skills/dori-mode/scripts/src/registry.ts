@@ -15,7 +15,13 @@ export type Claim = {
   readonly event?: string;
   /** When the watcher first read that event delivered to the lead; the objection window starts here. */
   readonly deliveredAt?: string;
+  /**
+   * The lane's open same-repo PRs and their head SHA when it claimed (done-flow.ts claimBindings). The supervisor merges
+   * a PR only at exactly this head; a claim without it (an older dori, GitHub unreadable) never auto-merges.
+   */
+  readonly pulls?: readonly ClaimedPull[];
 };
+export type ClaimedPull = { readonly repo: string; readonly number: number; readonly sha: string };
 export type Objection = { readonly at: string; readonly reasons: readonly string[] };
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
 
