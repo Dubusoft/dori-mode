@@ -153,7 +153,7 @@ Dori 在 Slack 上发的每条消息，不管是哪个函数发出的，都会�
 
 ## 测试
 
-没有 CI,测试在本地运行:
+CI 只做类型检查,测试在本地运行:
 
 ```sh
 cd skills/dori-mode/scripts
