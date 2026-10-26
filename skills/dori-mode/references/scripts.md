@@ -4,15 +4,7 @@
 
 ## Install and test
 
-```sh
-cd skills/dori-mode/scripts
-bun install          # runtime dependencies plus types and tsc
-bun link             # puts `dori` on your PATH
-bun test             # behavior tests with fake herdr/git/gh; nothing real is touched
-bunx tsc --noEmit    # typecheck
-```
-
-Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` signals (npm for `published`). The `command`, `file` and `url` signals need nothing extra. The full list of signal kinds is in `sessions.md`. The host guard reads `sysctl`, `memory_pressure` and `df` on macOS; on Linux it reads `/proc/loadavg` and `df`, and memory and swap read as unknown.
+Installing, testing, requirements and the library modules are in [development.md](development.md).
 
 ## Configuration
 
@@ -102,29 +94,9 @@ These used to be boolean config flags; they are always on now. A config that sti
 - **Schedules** (`supervise`, `status`): the `schedule` sources managed by `dori schedule` run in the polling task (scheduled jobs inside Dori instead of system cron). Each run is an operation row in the store (`schedule:<name>/schedule-run/<slot>`), so a job's last run survives restarts, its next run follows from it, and no slot runs twice; `dori status` lists every job with its next run.
 - **Lane reports** (`report`, `watch`, `supervise`): structured lane reports (design 3.3). `dori report <key> <kind> --text T` writes one row (see `dori report`) and the supervisor routes it in its 5 s polling pass: `question` and `blocked` become urgent `LANE_REPORT <key> <kind> <text>`, `milestone` a `LANE_REPORT` classed by `eventPolicy` (`LANE_REPORT * milestone` and `LANE_REPORT * progress` are `lead-digest` unless `eventPolicy` names them), `progress` is posted to the lane's thread through `hooks.threadReply` (no hook, no thread or a failed post: a digest `LANE_REPORT ... progress` instead), and `done` is the lane's done claim, as `dori claim-done`. A row from a lane that is closed or not registered is no longer dropped: it becomes `LANE_REPORT_LATE <key> <kind> <text>` (event id `lane-report-late:<row id>`, route `late`; urgent for `question`, `blocked` and `done`, digest otherwise) and does not count as hearing from the lane. A row whose routing throws is logged as `LANE_REPORT_ERROR <id> <message>`, stays pending and is tried again on the next pass; the other rows are still routed. A remote lane's `[REPORT]` lines are read as a sequence: every line on its screen not acted on before is acted on, top to bottom, each told apart by (lane, line hash, first-seen) in the `remoteReportsSeen` registry field, so two reports printed between two polls both arrive, in order; a lane read by an older dori (newest line only) replays nothing. `launch` gives a new local lane the `dori report` footer (report with `dori report`, never by typing into the lead's pane; done is `dori report <key> done --evidence E`) and records `reportVia: "cli"` on it; remote lanes keep the `[REPORT]` footer. Such a lane's `[REPORT]` lines found in the lead's pane are counted by the `lead-pane` sweep: each distinct line once, as `leadPaneViolations` on the lane and a digest `LANE_PANE_VIOLATION <key> <count> <line>` (the sweep reads the lead's pane only while such a lane is open). Lanes on the older footer keep typing `[REPORT]` lines, which keep working.
 
-## Library modules
+## Discord commands
 
-The CLI is a thin layer over typed modules you can import in your own scripts:
-
-| Module | What it gives you |
-|---|---|
-| `src/messenger/slack.ts` | `Slack`: post, edit, thread replies, file upload (upload URL + complete), presence; 429 backoff |
-| `src/messenger/telegram.ts` | `Telegram`: send, edit, typing, `sendMessageDraft` streaming with a `Thinking…` start, forum topics (create, rename, close, reopen), HTML tables |
-| `src/messenger/discord.ts` | `Discord`: send without pings, edit, typing, threads (start, rename, archive); gateway presence |
-| `src/messenger/discord-commands.ts` | `DiscordCommands`: register guild `/quota`, `/status` and `/emergency`, defer private replies, enforce owner access and format bounded results |
-| `src/doctor.ts` | `runDoctor`: read-only checks (units, herdr, paths, config, Discord, gateway, Claude quota, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
-| `src/status.ts` | `collectStatus` / `renderStatus`: the no-LLM one-screen summary behind `dori status` and `/status` |
-| `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |
-| `src/claude-quota.ts` | `lookupQuotaResults(agentDir?)`: pi-quota through senpi's native auth storage (defaults to `~/.omo/agent`); `claudeUsage`, `gateVerdict`, `launchQuotaHold`, `claudeQuotaTick`, `quotaReport`: the Claude headroom gate over every account |
-| `src/messenger/typing.ts` | `typingWhile`: show typing while a piece of work runs, stop when it ends |
-| `src/messenger/voice.ts` | `transcribe`: voice note to text through your hook |
-| `src/messenger/thread-ledger.ts` | `ThreadLedger`: every thread the Dori posts in, persisted; given to `Slack`, it records each `chat.postMessage` (also raw `call`s) |
-| `src/messenger/slack-inbound.ts` | `pollSlackInbound`: threads view, the ledger's threads and unread counts, deduplicated, own messages filtered |
-| `src/messenger/slack-presence.ts` | `slackPresence`: hold a user account active |
-| `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
-| `src/repos.ts` | `Repos(stateDir)`: synchronous `list`, `add`, `remove`, `replace`; atomic machine-local GitHub watched list |
-
-Every module takes its HTTP, clock and timers as arguments. That is how the tests run without the network.
+The library modules are listed in [development.md](development.md).
 
 ### Discord `/status`
 

@@ -76,17 +76,19 @@ Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --chann
 
 ## 5. Monitors
 
-Arm these as persistent monitors in your own session:
+Arm these as persistent monitors in your own session. Each filter matches only lines that need the lead, so `*_READY` start-up lines never wake you:
 
 | Monitor | Command | Filter |
 |---|---|---|
 | inbound messages | your messenger's watch command | new owner messages |
-| done flow | `dori watch` | `^LANE_` |
+| done flow | `dori watch` | `^LANE_(?!WATCH_READY)` |
 | dead panes | `dori dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE)` |
-| host guard | `dori guard --loop 1` | `^HOST_GUARD` |
-| freshness | `dori freshness --loop 5` | `^(NUDGED\|POSTED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT)` |
-| Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND` |
+| host guard | `dori guard --loop 1` | `^HOST_GUARD (ALERT\|CLEAR)` |
+| freshness | `dori freshness --loop 5 \| tee -a ~/.dori/freshness.log` | `^WORKING-WHILE-PAUSED` |
+| Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND(?!_READY)` |
 | presence (optional) | `dori presence slack` or `dori presence discord` | `^PRESENCE_READY` |
+
+The done-flow filter keeps every `LANE_` line except the ready line. `LANE_WATCH_WARN` matters most there: it's the only sign that `dori watch` is failing and lanes aren't being closed. Freshness acts on its own (it nudges the lane and posts the report to the thread), so only `WORKING-WHILE-PAUSED` needs you. The other freshness lines (`NUDGED`, `POSTED`, `NO-REPORT`, `PENDING-REPORT`, `STALE-REPORT`) go only to `~/.dori/freshness.log`. Run `tail ~/.dori/freshness.log` when you want recent nudges and posts.
 
 ### Supervised mode instead
 
