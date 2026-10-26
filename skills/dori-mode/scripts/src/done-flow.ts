@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { type DoriConfig, fillHook } from "./config.ts";
-import { type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
+import { githubTargets } from "./github-events.ts";
+import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { reportLines } from "./freshness.ts";
 import { laneRunner, listPanes, readScreen, sendVerified } from "./panes.ts";
@@ -55,10 +56,43 @@ const claimWaitsForLead = (deps: FlowDeps, lane: Lane): boolean =>
 /** The journal id of a claim's announcement: stable, so a repeated announcement after a crash is the same event. */
 export const claimEventId = (key: string, claimAt: string): string => `done-claim:${key}:${claimAt}`;
 
+type PrRow = { readonly number?: unknown; readonly state?: unknown; readonly headRefOid?: unknown; readonly isCrossRepository?: unknown };
+const PR_ROW_FIELDS = "number,state,headRefOid,isCrossRepository";
+
+/**
+ * The lane's open same-repo PRs and their head SHA right now, read live from GitHub: the PRs its Done signals name and
+ * those whose head is one of its branches. The claim records them, and the supervisor merges a PR only at exactly that
+ * head (ci-follow.ts claimGate). A fork PR is never recorded, whatever its number or branch; a read that fails records
+ * nothing for that target, so that PR is not auto-merged on this claim.
+ */
+export const claimBindings = async (run: Runner, lane: Lane): Promise<ClaimedPull[]> => {
+  const found = new Map<string, ClaimedPull>();
+  const add = (repo: string, row: PrRow): void => {
+    if (row.isCrossRepository !== false || row.state !== "OPEN" || typeof row.number !== "number" || typeof row.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(row.headRefOid)) return;
+    found.set(`${repo}#${row.number}`, { repo, number: row.number, sha: row.headRefOid });
+  };
+  const read = async (repo: string, argv: readonly string[]): Promise<void> => {
+    const r = await run([...argv], { timeoutMs: 20_000 });
+    try {
+      if (r.code !== 0) throw new Error(`exit ${r.code}: ${(r.err || r.out).trim().slice(0, 160)}`);
+      const body: unknown = JSON.parse(r.out);
+      for (const row of Array.isArray(body) ? body : [body]) if (row && typeof row === "object") add(repo, row as PrRow);
+    } catch (e) {
+      console.error(`CLAIM_PR_UNREAD ${lane.key} ${argv.slice(0, 4).join(" ")} ${repo}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  for (const [repo, targets] of await githubTargets([lane], run)) {
+    for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS]);
+    for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS]);
+  }
+  return [...found.values()];
+};
+
 export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
   deps = { ...deps, run: laneRunner(deps.run, lane) };
+  const pulls = await claimBindings(deps.run, lane);
   const at = iso(deps.clock);
-  await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false } }));
+  await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls } }));
   if (lane.pane) {
     const closesAt = new Date(deps.clock.now() + windowMs(deps)).toISOString().slice(11, 16);
     const when = claimWaitsForLead(deps, lane)
@@ -75,8 +109,11 @@ export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly s
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } }));
   // A remote lane claims by printing a [REPORT] line, and the watcher acts on each distinct line once. The payload
   // stays a <placeholder>: this text lands on the lane's own screen, where a real-looking line would read as a claim.
-  const again = lane.machine ? `print a new [REPORT] ${lane.key} | done | <updated evidence> line when fixed` : "claim again when fixed";
-  if (lane.pane) await sendVerified(deps.run, deps.clock, lane.pane, `[LEAD] not done: ${reasons.join("; ")}; keep working, ${again}`);
+  // The reasons are never typed: they carry command output and paths, and a pane is a shell line. The lane reads them.
+  const text = lane.machine
+    ? `[LEAD] not done: the Done check of ${lane.key} did not pass; the lead has the reasons. Keep working, and print a new [REPORT] ${lane.key} | done | <updated evidence> line when fixed`
+    : `[LEAD] not done: the Done check of ${lane.key} did not pass. Read the reasons with dori lane status ${lane.key}, keep working, and claim again when fixed`;
+  if (lane.pane) await sendVerified(deps.run, deps.clock, lane.pane, text);
   return `LANE_NOT_DONE ${lane.key} ${reasons.join("; ")}`;
 };
 

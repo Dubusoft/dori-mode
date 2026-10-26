@@ -15,6 +15,7 @@ let auth: Record<string, string>;
 beforeEach(() => {
   state = withState();
   world = newWorld();
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   auth = {};
 });
 afterEach(() => state.done());

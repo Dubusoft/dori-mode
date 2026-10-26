@@ -63,6 +63,7 @@ const USAGE = `dori <command> [options]
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done [<key>] --evidence TEXT  key defaults to the lane registered for $HERDR_PANE_ID
   object-done <key> --reason TEXT [--reason TEXT ...]
+  lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); key defaults as for claim-done
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
@@ -478,6 +479,15 @@ try {
     case "claim-done":
       console.log(await claimDone(deps, await lane(await ownKey("claim-done", key)), need("evidence")));
       break;
+    case "lane": {
+      const [action, laneKey, ...extra] = flags.positionals;
+      if (action !== "status" || extra.length || Object.keys(flags.values).length) die("usage: dori lane status [<key>]");
+      const own = await ownKey("read the status of", laneKey);
+      const found = (own ? await deps.registry.read(own) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? ""))
+        ?? die(own ? `no registered lane "${own}"` : "no open lane is registered for this pane");
+      console.log(JSON.stringify({ key: found.key, status: statusOf(found), objection: found.objection ?? null, claim: found.claim ?? null }, null, 2));
+      break;
+    }
     case "object-done": {
       const reasons = (flags.values.reason as string[] | undefined)?.map((r) => r.trim()).filter(Boolean) ?? [];
       if (!reasons.length) die("--reason is required");

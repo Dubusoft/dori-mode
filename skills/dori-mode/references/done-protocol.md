@@ -33,7 +33,7 @@ A lane on another machine (`dori launch --machine`) has no `dori` there: it prin
 
 ## If the Dori objects, or a check fails
 
-You get `[LEAD] not done: <reasons>; keep working, claim again when fixed` in your pane, and the lane goes back to not-done. This happens when:
+You get `[LEAD] not done: the Done check of <key> did not pass. Read the reasons with dori lane status <key>, ...` in your pane, and the lane goes back to not-done. Run `dori lane status <key>`: its `objection.reasons` lists what failed. This happens when:
 
 - the Dori objects;
 - a `Done =` signal does not read back live;
@@ -43,7 +43,7 @@ Fix every reason, then claim again. A new claim starts a fresh 5-minute window.
 
 ## Messages from the supervisor
 
-A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait; the message does not replace it. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor may merge it for you; a conflict with `dev` may get its own merge lane.
+A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait; the message does not replace it. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor may merge it for you, but only at the head SHA your done claim recorded: push everything before you claim, and claim again after any later push; a conflict with `dev` may get its own merge lane.
 
 ## When the window starts
 

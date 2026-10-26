@@ -292,7 +292,7 @@ test("a version 5 database is migrated to 6: old events read without meta, new o
   // When this code opens it, saves an event with meta and records a take of both.
   const store = new SqliteStore(path);
   const journal = store.load();
-  expect(store.meta("schema_version")).toBe("7");
+  expect(store.meta("schema_version")).toBe("8");
   expect(journal?.events).toEqual([{ id: "old", line: "LANE_REPORT old", at: T0 }]);
   const meta = { lane: "alpha", thread: "discord:42", cwd: "/repo" };
   store.save({ events: [...(journal?.events ?? []), { id: "new", line: "LANE_REPORT new", at: T0 + 2, meta }] }, "full");

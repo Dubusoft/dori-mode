@@ -24,7 +24,7 @@ beforeEach(() => {
   state = withState();
   withSqliteStore(state.dir);
   world = newWorld();
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent_status: "idle" }];
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   errors = [];
   spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => { errors.push(args.join(" ")); });
 });

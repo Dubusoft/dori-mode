@@ -14,8 +14,8 @@ const lane: Lane = { key: "demo-lane", title: "demo", thread: "chat:team/123", p
 let state: ReturnType<typeof withState>;
 let world: World;
 const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadDone: ["notify", "{thread}", "{text}"] } });
-/** The lane's pane is listed, so the close's pane-close operation has something to close (its read-back sees it gone after). */
-const livePane = () => { world.panes = [{ pane_id: "w:p1", workspace_id: "w" }]; };
+/** The lane's pane is listed with its agent, so the close's pane-close operation has something to close (its read-back sees it gone after). */
+const livePane = () => { world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }]; };
 const closedVia = () => world.calls.filter((c) => c[0] === "herdr" && (c[1] === "pane" || c[1] === "tab") && c[2] === "close");
 
 beforeEach(async () => {
@@ -26,14 +26,54 @@ beforeEach(async () => {
 });
 afterEach(() => state.done());
 
-test("an objection inside the window keeps the lane open and the lane hears why", async () => {
+test("an objection inside the window keeps the lane open; the lane hears a fixed sentence and reads the reasons from its status", async () => {
+  livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
-  await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, ["changelog entry missing"]);
+  await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, ["changelog entry missing; touch /tmp/x"]);
   await watchTick(at(T0 + 6 * MIN));
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("not-done");
+  expect(after?.objection?.reasons).toEqual(["changelog entry missing; touch /tmp/x"]);
   expect(closedVia()).toHaveLength(0);
-  expect(sent(world).some((t) => t.startsWith("[LEAD] not done: changelog entry missing"))).toBe(true);
+  expect(sent(world).at(-1)).toBe("[LEAD] not done: the Done check of demo-lane did not pass. Read the reasons with dori lane status demo-lane, keep working, and claim again when fixed");
+  expect(sent(world).some((t) => t.includes("touch"))).toBe(false);
+});
+
+for (const [name, panes] of [
+  ["a bare shell", [{ pane_id: "w:p1", workspace_id: "w" }]],
+  ["a shell pane that still reports a status", [{ pane_id: "w:p1", workspace_id: "w", agent_status: "idle" }]],
+  ["a pane whose agent is gone", [{ pane_id: "w:p1", workspace_id: "w", agent: "pi" }]],
+  ["a missing pane", []],
+] as const) {
+  test(`nothing is typed into ${name}: no claim notice, no objection`, async () => {
+    world.panes = panes.map((p) => ({ ...p }));
+    await claimDone(at(T0), lane, "merged acme/app#1");
+    await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, [";printf PANE_INJECTION;#"]);
+    expect(world.calls.filter((c) => c[0] === "herdr" && (c[2] === "send-text" || c[2] === "send-keys"))).toEqual([]);
+    expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("not-done");
+  });
+}
+
+test("a done claim records the lane's open same-repo PRs at their live head SHA, never a fork PR, and nothing for a failed read", async () => {
+  const HEAD = "a".repeat(40);
+  const bound: Lane = { ...lane, done: 'merged acme/app#1; merged acme/app#5; command ["gh","pr","list","-R","acme/app","--head","feat","--json","number"]' };
+  await at(T0).registry.write(bound);
+  const base = at(T0);
+  const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
+    if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "1") return { code: 0, out: JSON.stringify({ number: 1, state: "OPEN", headRefOid: HEAD, isCrossRepository: false }), err: "" };
+    if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "5") return { code: 1, out: "", err: "HTTP 502" };
+    if (argv[0] === "gh" && argv[2] === "list") return { code: 0, out: JSON.stringify([{ number: 9, state: "OPEN", headRefOid: "b".repeat(40), isCrossRepository: true }, { number: 3, state: "OPEN", headRefOid: "c".repeat(40), isCrossRepository: false }]), err: "" };
+    return base.run(argv, opts);
+  };
+  await claimDone({ ...base, run }, bound, "merged acme/app#1");
+  expect((await base.registry.read("demo-lane"))?.claim?.pulls).toEqual([{ repo: "acme/app", number: 1, sha: HEAD }, { repo: "acme/app", number: 3, sha: "c".repeat(40) }]);
+});
+
+test("sendVerified types nothing when the pane list cannot be read", async () => {
+  const deps = at(T0);
+  const run = async (argv: readonly string[]) => (argv[2] === "list" ? { code: 1, out: "", err: "server down" } : deps.run(argv));
+  expect(await sendVerified(run, deps.clock, "w:p1", "[LEAD] hello")).toBe("failed");
+  expect(world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
 });
 
 test("five quiet minutes after a claim is handed over the lane is closed, its thread marked done and its worktree removed", async () => {

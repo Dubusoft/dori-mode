@@ -168,7 +168,7 @@ test("a version 6 database is migrated to 7 and keeps decision obligations", asy
   raw.exec("ALTER TABLE lead_state DROP COLUMN pending; UPDATE meta SET value = '6' WHERE key = 'schema_version'");
   raw.close();
   const store = new SqliteStore(path);
-  expect(store.meta("schema_version")).toBe("7");
+  expect(store.meta("schema_version")).toBe("8");
   const pending = [{ id: "wait:1", since: T0, line: "WAIT_DONE x" }];
   store.save({ events: [], pending }, "full");
   store.close();

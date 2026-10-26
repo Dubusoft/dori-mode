@@ -49,18 +49,39 @@ export const statusLookup = async (run: Runner, pane: string): Promise<{ readonl
 
 export type Delivery = "delivered" | "unconfirmed" | "failed";
 
+/** Why `pane` cannot take typed text as an agent prompt: missing from the list, or no agent runs in it (only a shell). */
+export const agentRefusal = (panes: readonly Pane[], pane: string): string | undefined => {
+  const found = panes.find((p) => p.pane_id === pane);
+  if (!found) return `pane ${pane} missing`;
+  if (!found.agent) return `pane ${pane} runs no agent`;
+  return undefined;
+};
+
 /**
- * Types the text and presses Enter exactly once. Delivery is confirmed only by a state change: the pane's agent_status
- * moving to "working" from something else. A pane that was already working cannot show that change, so its send comes
- * back "unconfirmed" and the caller decides. The screen is never read here, and Enter is never pressed again.
+ * Types the text and presses Enter exactly once, and only into a pane whose agent is running: a pane left with a bare
+ * shell (or unreadable) gets nothing, since typed text plus Enter would run there as a command. Delivery is confirmed
+ * only by a state change: the pane's agent_status moving to "working" from something else. A pane that was already
+ * working cannot show that change, so its send comes back "unconfirmed" and the caller decides. The screen is never
+ * read here, and Enter is never pressed again.
  */
 export const sendVerified = async (run: Runner, clock: Clock, pane: string, text: string): Promise<Delivery> => {
   if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
-  const before = await statusLookup(run, pane);
-  if (before.error) console.error(`sendVerified ${pane}: status lookup failed before send: ${before.error}`);
+  let refusal: string | undefined;
+  let status: string | undefined;
+  try {
+    const panes = await listPanes(run);
+    status = panes.find((p) => p.pane_id === pane)?.agent_status;
+    refusal = agentRefusal(panes, pane) ?? (status !== undefined && ALIVE_STATUSES.has(status) ? undefined : `pane ${pane} agent is not live (${status ?? "unknown"})`);
+  } catch (e) {
+    refusal = `pane list unreadable: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`;
+  }
+  if (refusal) {
+    console.error(`sendVerified ${pane}: not typed: ${refusal}`);
+    return "failed";
+  }
   if ((await run(["herdr", "pane", "send-text", pane, text])).code !== 0) return "failed";
   await run(["herdr", "pane", "send-keys", pane, "enter"]);
-  if (before.status === "working") return "unconfirmed";
+  if (status === "working") return "unconfirmed";
   for (let attempt = 0; attempt < 6; attempt++) {
     await clock.sleep(700);
     const after = await statusLookup(run, pane);
