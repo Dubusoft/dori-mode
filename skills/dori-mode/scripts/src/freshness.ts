@@ -61,8 +61,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
       }
       continue;
     }
-    // A lane stalled on quota cannot answer a nudge; the quota sweep owns it until LANE_QUOTA_CLEARED.
-    if (statusOf(lane) !== "working" || !lane.pane || lane.recoveryPending || lane.lastQuotaStall) continue;
+    if (statusOf(lane) !== "working" || !lane.pane || lane.recoveryPending) continue;
     if (reports) rows ??= lastRowAt(reports);
     const rowAt = rows?.get(lane.key);
     if (rowAt !== undefined && now - rowAt < deps.config.nudgeAfterMin * 60_000) continue;

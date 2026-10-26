@@ -4,7 +4,6 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
-import { writeQuotaState } from "../src/claude-quota.ts";
 import { writeGatewayStatus } from "../src/gateway-status.ts";
 import { pendingLeadRestart } from "../src/lead-restart.ts";
 import { Registry } from "../src/registry.ts";
@@ -52,18 +51,6 @@ test("status lists working lanes with model, age and last progress; paused and c
   expect(text).toContain("| lanes 1 |");
   expect(text).toContain("  alpha one 90m | Write the tests");
   expect(text).not.toContain("beta");
-});
-
-test("status shows the Claude headroom on the ok line, and each account as a problem once the gate holds", async () => {
-  const f = await fixture();
-  writeQuotaState(f.dir, { mode: "ok", usage: { at: NOW - 3 * 60_000, accounts: [{ name: "a", fiveHour: { usedPct: 4 }, weekly: { usedPct: 29 } }] } });
-  expect(renderStatus(await collectStatus(f.deps))).toContain("claude headroom 71% (hold-lanes < 50%, brief < 25%)");
-  const accounts = [{ name: "a", fiveHour: { usedPct: 95, resetAt: NOW + 60 * 60_000 }, weekly: { usedPct: 40 } }, { name: "b", weekly: { usedPct: 100 } }];
-  writeQuotaState(f.dir, { mode: "brief", usage: { at: NOW - 3 * 60_000, accounts } });
-  const text = renderStatus(await collectStatus(f.deps));
-  expect(text).toStartWith("DORI PROBLEM");
-  expect(text).toContain("claude brief");
-  expect(text).toContain(`! claude: brief headroom 24% (hold-lanes < 50%, brief < 25%), a 5h 95% (resets ${kst(NOW + 60 * 60_000)}) 7d 40%, b 7d 100%, read 3m ago, lanes held`);
 });
 
 test("status shows services, pending waits, watched repos with poll time and failures, and the gateway", async () => {
@@ -332,4 +319,12 @@ test("item 6: lanes pending or exhausted on recovery are a status problem and ma
   expect(text).toContain("! lanes: recovery pending (not nudged): held");
   expect(text).toContain("  !RECOVERY-EXHAUSTED dead ");
   expect(text).toContain("  !RECOVERY-PENDING held ");
+});
+
+test("a claude-quota.json left by the removed quota gate is ignored", async () => {
+  const f = await fixture();
+  writeFileSync(join(f.dir, "claude-quota.json"), JSON.stringify({ mode: "brief", holdsLanes: true, usage: { at: NOW, accounts: [{ name: "a", fiveHour: { usedPct: 95 } }] } }));
+  const text = renderStatus(await collectStatus(f.deps));
+  expect(text).not.toContain("claude");
+  expect(text).not.toContain("brief");
 });

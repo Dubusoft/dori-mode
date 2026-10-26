@@ -300,7 +300,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   const channels = await askChannels(d, token, input.channels ?? strings(raw.discordChannels));
   const discord = token && channels[0] ? await askDiscord(d, token, channels[0], raw.discord) : undefined;
   const defaultModel = (await d.prompt.ask("Default model for lanes (and the lead unless a lead model is set)", input.model ?? (str(raw.defaultModel) || base.defaultModel))).trim();
-  // A fallback chain (array) is edited in config.json; setup keeps it as written.
+  // A legacy leadModel array is kept as written; the config loader uses its first entry and warns.
   const chain = Array.isArray(raw.leadModel) ? raw.leadModel : undefined;
   const leadModel = chain ? "" : (await d.prompt.ask("Lead model (empty = same as the lane default)", str(raw.leadModel))).trim();
   const defaultCwd = (await d.prompt.ask("Default working directory for new lanes", input.cwd ?? (str(raw.defaultCwd) || "~"))).trim();

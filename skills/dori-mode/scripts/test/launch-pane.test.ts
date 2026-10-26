@@ -47,22 +47,16 @@ const input = (extra: Record<string, string> = {}) => ({ key: "pane-lane", title
 const writeBrief = () => Bun.write(join(state.dir, "brief.md"), "goal: do it\n");
 const herdr = (sub: string, action: string) => world.calls.filter((c) => c[0] === "herdr" && c[1] === sub && c[2] === action);
 
-test("a lane is never launched on a lead-only emergency model, given or as the default", async () => {
-  const d = deps();
-  const config = { ...d.config, leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] };
-  await expectRefused({ ...d, config }, { model: "og/anthropic/claude-opus-5-5" }, /lead-only emergency model/);
-  await expectRefused({ ...d, config: { ...config, defaultModel: "og/anthropic/claude-opus-5-5:max" } }, {}, /lead-only emergency model/);
-});
-
 const expectRefused = async (d: ReturnType<typeof deps>, extra: Record<string, string>, message: RegExp) => {
   await writeBrief();
-  const before = await Bun.file(join(state.dir, "brief.md")).text();
-  await expect(launchLane(d, input(extra))).rejects.toThrow(LaunchError);
-  await expect(launchLane(d, input(extra))).rejects.toThrow(message);
-  expect(await Bun.file(join(state.dir, "brief.md")).text()).toBe(before);
+  const brief = await Bun.file(join(state.dir, "brief.md")).text();
+  const attempt = launchLane(d, input(extra));
+  await expect(attempt).rejects.toBeInstanceOf(LaunchError);
+  await expect(attempt).rejects.toThrow(message);
   expect(await d.registry.read("pane-lane")).toBeNull();
   expect(herdr("pane", "run")).toEqual([]);
   expect(herdr("tab", "create")).toEqual([]);
+  expect(await Bun.file(join(state.dir, "brief.md")).text()).toBe(brief);
 };
 
 test("--pane runs the lane command in that pane, creates no tab, and registers pane and tab", async () => {

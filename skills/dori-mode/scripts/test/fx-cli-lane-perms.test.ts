@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { Registry } from "../src/registry.ts";
-import { writeJournal } from "./fakes.ts";
 
 // Each test spawns several `bun src/cli.ts` processes; under a loaded full run on a small host that outgrows bun's
 // default 5 s per test, so the limit here allows for process startup instead of failing on load.
@@ -38,31 +37,6 @@ test("lead-only commands refuse under DORI_LANE_KEY with a clear message and non
     expect(r.code).toBe(1);
     expect(r.err).toContain(`LANE_PERMISSION_DENIED lane demo-lane may not run ${args[0]}; it is lead-only`);
   }
-});
-
-test("the paid emergency models are approved only by the owner, only for an open quota episode", async () => {
-  const noEpisode = await cli(["lead-emergency", "approve"]);
-  expect(noEpisode.code).toBe(1);
-  expect(noEpisode.err).toContain("LEAD_EMERGENCY_REFUSED");
-  writeJournal(dir, ({ events: [], quotaExhausted: { since: 1_800_000_000_000, model: "a/primary" } }));
-  const selves: Record<string, string>[] = [{ DORI_SUPERVISED: "1" }, { HERDR_PANE_ID: "w1:p1", DORI_LEAD_PANE: "w1:p1" }];
-  for (const env of selves) {
-    const self = await cli(["lead-emergency", "approve"], env);
-    expect(self.code).toBe(1);
-    expect(self.err).toContain("LEAD_EMERGENCY_REFUSED");
-  }
-  expect((await cli(["lead-emergency", "status"])).out).toContain("LEAD_EMERGENCY not approved");
-  const owner = await cli(["lead-emergency", "approve"]);
-  expect(owner.code).toBe(0);
-  expect(owner.out).toContain("LEAD_EMERGENCY approved");
-});
-
-test("lead-restart refuses a paid emergency model", async () => {
-  await Bun.write(join(dir, "config.json"), JSON.stringify({ leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] }));
-  const r = await cli(["lead-restart", "--model", "og/anthropic/claude-opus-5-5"], { DORI_CONFIG: join(dir, "config.json") });
-  expect(r.code).toBe(1);
-  expect(r.err).toContain("emergency");
-  expect(r.out).not.toContain("LEAD_RESTART_REQUESTED");
 });
 
 test("the lead (no DORI_LANE_KEY) is not refused on the same commands", async () => {

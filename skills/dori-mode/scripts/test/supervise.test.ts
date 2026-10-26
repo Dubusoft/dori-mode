@@ -4,14 +4,13 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Runner } from "../src/run.ts";
-import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, OUTBOX_ATTEMPTS, OUTBOX_RETRY_MS, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
+import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
 import { childWork } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
-import { approveEmergency, clearEmergencyApproval, emergencyApproved } from "../src/emergency.ts";
 import { clearLaunchHold, dequeueLaunch, enqueueLaunch } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, writeJournal } from "./fakes.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
@@ -540,7 +539,7 @@ const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call
 
 test.each(["idle", "done"])("an %s cold lead switches session, model and thinking without relaunching omo", async (status) => {
   // Given a reusable process; even its own environment and its shell must survive cleanup.
-  const f = fixture({ leadModel: [{ model: "test/soft", thinking: "high" }] });
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
   f.cold();
   f.pane.agent_status = status;
   const old = f.session();
@@ -664,7 +663,7 @@ test.each([false, true])("a live omo blocks hard launch after soft failure, reco
 
 test("a soft restart ignores existing quota lines during commands and quota text after the prompt", async () => {
   // Given normal output mentioning quota before /new and after the startup prompt.
-  const f = fixture({ leadModel: [{ model: "test/soft", thinking: "high" }] });
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
   f.cold();
   f.world.screen = "Discussion of quota and rate limit handling\n❯ ";
   f.onWait(async () => { f.world.screen = "Startup prompt read: quota and rate limit handling\n❯ "; });
@@ -683,21 +682,6 @@ test("a soft restart ignores existing quota lines during commands and quota text
   expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4]).slice(0, 3)).toEqual([
     "/new", "/model test/soft", "/thinking high",
   ]);
-});
-
-test("a successful soft quota model switch counts once toward the restart cap", async () => {
-  // Given a pending quota switch, without an owner restart request.
-  const f = fixture({ leadModel: ["a/primary", "b/fallback"] });
-  writeJournal(f.state.dir, {
-    events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: "stopping", modelIndex: 1 },
-  });
-  // When the idle process switches successfully.
-  await quiet(() => new Supervisor(f.deps).flush());
-  // Then the quota switch counts despite keeping the same process.
-  expect(readJournal(f.state.dir).forcedRestarts).toEqual([{ at: f.clock.now(), cause: "quota" }]);
-  expect(readJournal(f.state.dir).leadModel).toBe(1);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model b/fallback"]);
 });
 
 test.each([false, true])("soft evidence only accepts prompt files modified at or after soft entry, stale=%s", async (stalePrompt) => {
@@ -1560,10 +1544,6 @@ test("a foreground process group other than the shell is not a plain shell", () 
   expect(plainShell({ foreground_processes: [] })).toBe(false);
 });
 
-const CHAIN = ["a/primary", { model: "b/fallback", thinking: "high" }];
-const BLOCKED_SCREEN = "Error: All Claude accounts for a are currently blocked\n❯ ";
-const allBlocked = JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true }, { name: "login-2", blocked: true }] });
-const oneHealthy = JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true }, { name: "login-2", blocked: false }] });
 /** Model selections through either a process launch or the interactive model commands, in argv spelling. */
 const launches = (f: ReturnType<typeof fixture>) => f.calls.flatMap((call, i) => {
   if (call[2] === "run") return [call[4] ?? ""];
@@ -1577,307 +1557,6 @@ const muted = async (work: () => Promise<void>) => {
   console.log = () => {};
   try { await work(); } finally { console.log = original; }
 };
-
-test("an idle lead stalled on quota moves to the next model with the pending events, and one line is announced", async () => {
-  const f = fixture({ leadModel: CHAIN, agentCommand: WITH_THINKING });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:9", "INBOUND 1 9 owner are you there");
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model b/fallback --thinking high");
-  expect(handed(f)).toContain("discord:1:9\t");
-  expect(f.prompt()).toContain("The previous lead stopped: a/primary is blocked on quota");
-  expect(f.log().map((event) => event.id)).toEqual(["discord:1:9"]);
-  expect(announced).toEqual(["The lead's model a/primary is out of quota, so the lead now runs on b/fallback. It moves back to a/primary once that has quota again."]);
-  expect(journal(f)).toMatchObject({ leadModel: 1 });
-  expect(f.calls.filter((call) => call[0] === "omo").every((call) => !call.includes("--credentials"))).toBe(true);
-});
-
-test("a fresh launch stalled on quota is stopped and relaunched on the next model with the same events", async () => {
-  const f = fixture({ leadModel: CHAIN });
-  f.noAgent();
-  f.cold();
-  f.auth.a = allBlocked;
-  // The first launch comes up blocked; the fallback launch comes up clean.
-  f.onWait(async () => { f.world.screen = launches(f).length === 1 ? BLOCKED_SCREEN : "❯ "; });
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("cold", "INBOUND cold");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  const [first, second] = launches(f);
-  expect(first).toContain("--model a/primary");
-  expect(second).toContain("--model b/fallback");
-  expect(/--session-id (\S+)/.exec(first ?? "")?.[1]).not.toBe(/--session-id (\S+)/.exec(second ?? "")?.[1]);
-  expect(f.prompt()).toContain(TAKE_FIRST);
-  expect(f.log().map((event) => event.id)).toEqual(["cold"]);
-  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("201");
-  expect(announced).toHaveLength(1);
-  expect(journal(f)).toMatchObject({ leadModel: 1 });
-  expect(journal(f).restart).toBeUndefined();
-  expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
-});
-
-test("on a fallback the first model is retried every leadPrimaryRetryMin and the lead moves back once it has quota on 2 checks", async () => {
-  const f = fixture({ leadModel: CHAIN, leadPrimaryRetryMin: 15 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  f.auth.a = oneHealthy;
-  f.clock.at += 5 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  f.clock.at += 11 * 60_000;
-  await muted(() => supervisor.flush());
-  // One unblocked check is not enough (leadPrimaryReturnChecks 2); the next comes leadPrimaryRetryMin later.
-  expect(launches(f)).toHaveLength(1);
-  expect(journal(f).primaryClearChecks).toBe(1);
-  f.clock.at += 15 * 60_000;
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(2);
-  expect(launches(f)[1]).toContain("--model a/primary");
-  expect(journal(f).primaryClearChecks).toBeUndefined();
-  expect(announced.at(-1)).toBe("a/primary has quota again; the lead is back on it.");
-  expect(journal(f).leadModel).toBe(0);
-});
-
-test("a blocked subscription never moves the lead to a paid emergency model without the owner's approval; approved, it moves in order and back", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5", "or/anthropic/claude-opus-5.5"], leadPrimaryRetryMin: 15, leadUnreadRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "❯ "; liveSession(f); });
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  // Without approval: no launch, the episode is reported and the approval is asked for, once.
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED a/primary "))).toHaveLength(1);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_EMERGENCY_APPROVAL og/anthropic/claude-opus-5-5 "))).toHaveLength(1);
-  expect(announced).toEqual([
-    expect.stringContaining("Every lead model is out of quota (a/primary)"),
-    "The lead can run on the paid emergency model og/anthropic/claude-opus-5-5 until a/primary has quota again. It moves only with your approval for this outage: use /emergency here, or run dori lead-emergency approve on the host.",
-  ]);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still there?");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  // Approved: the next check moves the lead to the first emergency model.
-  approveEmergency(f.state.dir, f.clock.at);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:3", "INBOUND 1 3 approved");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model og/anthropic/claude-opus-5-5");
-  expect(announced.at(-1)).toBe("The Claude subscription is blocked (a/primary is out of quota), so the lead now runs on the paid emergency model og/anthropic/claude-opus-5-5. Lanes never use it. The lead moves back to a/primary once that has quota again.");
-  // The first emergency provider fails on its own credit: its screen line alone moves the lead on.
-  f.world.screen = "Error: insufficient_quota\n❯ ";
-  f.clock.at += 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(2);
-  expect(launches(f)[1]).toContain("--model or/anthropic/claude-opus-5.5");
-  f.auth.a = oneHealthy;
-  f.clock.at += 16 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(2);
-  f.clock.at += 15 * 60_000;
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(3);
-  expect(launches(f)[2]).toContain("--model a/primary");
-  expect(announced.at(-1)).toBe("The Claude subscription has quota again: the lead is back on a/primary, and the paid emergency model or/anthropic/claude-opus-5.5 is off.");
-  expect(journal(f).leadModel).toBe(0);
-  // Back on the first model, the approval is spent: the next episode asks again.
-  expect(emergencyApproved(f.state.dir)).toBe(false);
-});
-
-test("a working lead stalled on quota is never force-switched onto an emergency model, even approved", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadQuotaBusySwitchMin: 10, leadStuckRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  expect(approveEmergency(f.state.dir, f.clock.at)).toBeDefined();
-  f.clock.at += 30 * 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still?");
-  await muted(() => supervisor.flush());
-  f.clock.at += 30 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  expect(f.calls.some((call) => call[0] === "kill")).toBe(false);
-});
-
-test("an emergency approval holds only for its own quota episode: the next episode asks again instead of moving the lead", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadStuckRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  approveEmergency(f.state.dir, f.clock.at);
-  // The subscription recovers before the working lead ever moved: the episode, and its approval, end.
-  f.world.screen = "❯ ";
-  f.auth.a = oneHealthy;
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 back?");
-  await muted(() => supervisor.flush());
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_CLEARED "))).toHaveLength(1);
-  // Later an idle lead is blocked again: a new episode, a new question, no paid model.
-  f.clock.at += 60_000;
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "idle";
-  supervisor.enqueue("discord:1:3", "INBOUND 1 3 hello again");
-  // The fixture cannot complete a cold restart here; a failed one must still show up as a planned move below.
-  await muted(() => supervisor.flush()).catch(() => {});
-  expect(journal(f).restart?.modelIndex).toBeUndefined();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_EMERGENCY_APPROVAL "))).toHaveLength(2);
-});
-
-test("a stale approval file from a closed episode never moves the lead", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadStuckRestartMin: 600 });
-  // Written for an episode a day old, e.g. by a CLI approve that raced the supervisor closing that episode.
-  await Bun.write(join(f.state.dir, "lead-emergency-approval.json"), JSON.stringify({ at: f.clock.at - 1, episode: f.clock.at - 86_400_000 }));
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush()).catch(() => {});
-  expect(journal(f).restart?.modelIndex).toBeUndefined();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((e) => e.line.startsWith("LEAD_EMERGENCY_APPROVAL "))).toHaveLength(1);
-});
-
-test("an approval given with no quota episode open is refused and never moves a later stalled lead", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  expect(approveEmergency(f.state.dir, f.clock.at)).toBeUndefined();
-  expect(emergencyApproved(f.state.dir)).toBe(false);
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_EMERGENCY_APPROVAL "))).toHaveLength(1);
-});
-
-test("an approval while the working lead is still blocked closes no episode: no LEAD_QUOTA_CLEARED, no 'quota again' notice", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadStuckRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  approveEmergency(f.state.dir, f.clock.at);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still there?");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().some((event) => event.line.startsWith("LEAD_QUOTA_CLEARED "))).toBe(false);
-  expect(announced.some((text) => text.startsWith("The lead has quota again"))).toBe(false);
-  expect(journal(f).quotaExhausted).toBeDefined();
-});
-
-test("an approved lead stays on the paid model after the episode closes, and revoking brings an idle one back to its first model", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "❯ "; liveSession(f); });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  approveEmergency(f.state.dir, f.clock.at);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 go");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:3", "INBOUND 1 3 working?");
-  await muted(() => supervisor.flush());
-  expect(journal(f).quotaExhausted).toBeUndefined();
-  expect(launches(f)).toHaveLength(1);
-  clearEmergencyApproval(f.state.dir);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:4", "INBOUND 1 4 stop paying");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(2);
-  expect(launches(f)[1]).toContain("--model a/primary");
-});
-
-test("the open episode's approval request is never dropped from the outbox; other lines are after OUTBOX_ATTEMPTS", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const supervisor = new Supervisor(f.deps, { announce: async () => { throw new Error("discord down"); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  for (let i = 0; i <= OUTBOX_ATTEMPTS; i++) {
-    f.clock.at += OUTBOX_RETRY_MS;
-    await muted(() => supervisor.flush());
-    await muted(() => supervisor.reactionsSettled());
-  }
-  expect((journal(f).outbox ?? []).map((item: { id: string }) => item.id.split(":")[0])).toEqual(["lead-emergency-approval"]);
-});
-
-test("a lead restart is never requested onto a paid emergency model", () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  expect(() => requestLeadRestart(f.deps.config, f.clock.now(), "og/anthropic/claude-opus-5-5:max")).toThrow(/emergency/);
-  expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
-});
-
-test("one blocked account next to a healthy one, a briefly busy lead, or a single lead model never switches", async () => {
-  const healthy = fixture({ leadModel: CHAIN });
-  healthy.world.screen = BLOCKED_SCREEN;
-  healthy.auth.a = oneHealthy;
-  const s1 = new Supervisor(healthy.deps);
-  s1.enqueue("discord:1:1", "INBOUND warm");
-  await s1.flush();
-  expect(launches(healthy)).toEqual([]);
-  expect(healthy.log().map((event) => event.id)).toEqual(["discord:1:1"]);
-
-  const busy = fixture({ leadModel: CHAIN });
-  busy.world.screen = BLOCKED_SCREEN;
-  busy.auth.a = allBlocked;
-  busy.pane.agent_status = "working";
-  const s2 = new Supervisor(busy.deps);
-  s2.enqueue("discord:1:2", "INBOUND busy");
-  await s2.flush();
-  expect(launches(busy)).toEqual([]);
-  expect(busy.calls.some((call) => call[0] === "kill")).toBe(false);
-
-  const single = fixture({ leadModel: "a/primary" });
-  single.world.screen = BLOCKED_SCREEN;
-  single.auth.a = allBlocked;
-  const s3 = new Supervisor(single.deps);
-  s3.enqueue("discord:1:3", "INBOUND single");
-  await muted(() => s3.flush());
-  // Nothing to switch to: the episode is reported instead (test/lead-quota-control.test.ts).
-  expect(launches(single)).toEqual([]);
-  expect(single.log().some((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED a/primary "))).toBe(true);
-});
-
-test("LANE_QUOTA_STALL is urgent", () => {
-  expect(eventPriority("LANE_QUOTA_STALL lane w:p1 2/2 anthropic-subscription accounts blocked: Usage limit reached")).toBe("urgent");
-});
 
 const inbox = (f: ReturnType<typeof fixture>): string[] =>
   readJournal(f.state.dir).events.map((e: { line: string }) => e.line);
@@ -2253,120 +1932,6 @@ test("owner message bodies and lane reports are redacted before durable journal 
 });
 
 
-// Lead quota control: exhaustion, busy switch, return hysteresis, stuck lead.
-const onModel = (f: ReturnType<typeof fixture>, journalExtra: Record<string, unknown>) =>
-  writeJournal(f.state.dir, ({ events: [], ...journalExtra }));
-const blockedUntil = (at: number) => JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true, resetAt: at }] });
-
-test("a single lead model blocked on quota: the owner is told once with the reset, LEAD_QUOTA_EXHAUSTED queued, and its end told once", async () => {
-  const f = fixture({ leadModel: "a/primary" });
-  f.world.screen = BLOCKED_SCREEN;
-  const reset = Date.parse("2027-01-15T12:00:00.000Z");
-  f.auth.a = blockedUntil(reset);
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still there?");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toEqual([]);
-  const exhausted = f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED "));
-  expect(exhausted).toHaveLength(1);
-  expect(exhausted[0].line).toStartWith("LEAD_QUOTA_EXHAUSTED a/primary reset=2027-01-15T12:00:00.000Z every lead model is blocked on quota (a/primary): ");
-  expect(announced).toEqual(["Every lead model is out of quota (a/primary), so the lead cannot answer until one resets (earliest known reset 01-15 21:00 KST). Your messages stay queued."]);
-  expect(journal(f).quotaExhausted).toMatchObject({ model: "a/primary", resetAt: reset });
-  // A supervisor restart inside the same episode does not tell the owner again.
-  const again = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  again.enqueue("discord:1:3", "INBOUND 1 3 third");
-  await muted(() => again.flush());
-  expect(announced).toHaveLength(1);
-  f.auth.a = oneHealthy;
-  again.enqueue("discord:1:4", "INBOUND 1 4 fourth");
-  await muted(() => again.flush());
-  await again.reactionsSettled();
-  expect(announced.at(-1)).toBe("The lead has quota again (a/primary); queued messages are being answered.");
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_CLEARED a/primary "))).toHaveLength(1);
-  expect(journal(f).quotaExhausted).toBeUndefined();
-});
-
-test("every model of the chain blocked: the earliest reset across the chain is reported", async () => {
-  const f = fixture({ leadModel: CHAIN });
-  onModel(f, { leadModel: 1, primaryRetryAt: f.clock.at + 15 * 60_000 });
-  f.world.screen = "Error: All accounts for b are currently blocked\n❯ ";
-  f.auth.a = blockedUntil(Date.parse("2027-01-15T12:00:00.000Z"));
-  f.auth.b = blockedUntil(Date.parse("2027-01-15T09:30:00.000Z"));
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().find((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED "))?.line).toStartWith("LEAD_QUOTA_EXHAUSTED b/fallback reset=2027-01-15T09:30:00.000Z every lead model is blocked on quota (a/primary, b/fallback)");
-  expect(announced).toEqual([expect.stringContaining("(earliest known reset 01-15 18:30 KST)")]);
-});
-
-test("a working lead stalled on quota is switched once the stall outlives leadQuotaBusySwitchMin", async () => {
-  const f = fixture({ leadModel: CHAIN, leadQuotaBusySwitchMin: 10 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  f.clock.at += 9 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  expect(f.calls.some((call) => call[0] === "kill")).toBe(false);
-  f.clock.at += 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model b/fallback");
-  expect(f.prompt()).toContain("a/primary is blocked on quota");
-  expect(f.prompt()).toContain("while working for 10 min");
-  expect(handed(f)).toContain("discord:1:1\t");
-  expect(journal(f)).toMatchObject({ leadModel: 1 });
-});
-
-test("a working lead whose stall clears in between restarts the busy clock", async () => {
-  const f = fixture({ leadModel: CHAIN, leadQuotaBusySwitchMin: 10 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  f.clock.at += 6 * 60_000;
-  f.world.screen = "❯ working";
-  await muted(() => supervisor.flush());
-  f.world.screen = BLOCKED_SCREEN;
-  f.clock.at += 6 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-});
-
-test("returning to the primary needs leadPrimaryReturnChecks unblocked checks in a row; blocked or unreadable restarts the count", async () => {
-  const f = fixture({ leadModel: CHAIN, leadPrimaryRetryMin: 15, leadPrimaryReturnChecks: 2 });
-  onModel(f, { leadModel: 1, primaryRetryAt: f.clock.at });
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  const supervisor = new Supervisor(f.deps);
-  const step = async (auth: string) => { f.auth.a = auth; await muted(() => supervisor.flush()); f.clock.at += 15 * 60_000; };
-  await step(oneHealthy);
-  expect(journal(f).primaryClearChecks).toBe(1);
-  await step(allBlocked);
-  expect(journal(f).primaryClearChecks).toBeUndefined();
-  await step(oneHealthy);
-  await step("not json");
-  expect(journal(f).primaryClearChecks).toBeUndefined();
-  await step(oneHealthy);
-  expect(launches(f)).toEqual([]);
-  await step(oneHealthy);
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model a/primary");
-  expect(journal(f)).toMatchObject({ leadModel: 0 });
-});
-
 test("a lead stuck blocked with owner messages unread is cold-restarted with them after leadStuckRestartMin, and the owner is told", async () => {
   const f = fixture({ leadStuckRestartMin: 30 });
   f.pane.agent_status = "blocked";
@@ -2524,10 +2089,7 @@ test("safety-work events reach an idle lead at once, without waiting for the dig
     "INBOUND_DELETE 1 9",
     "WAIT_FAILED release ci green (30 checks in a row failed; no --timeout set)",
     "WAITS_CORRUPT waits.json did not parse and was moved to /x; every wait in it is dropped, register them again",
-    "LANE_QUOTA_CLEARED k w:p1 0/2 a accounts blocked; auto-resumed",
     "LANE_RECOVERY_EXHAUSTED k w:p1 dead after 3 recovery attempts",
-    "LEAD_QUOTA_EXHAUSTED a/x reset=unknown every lead model is blocked on quota (a/x): hit",
-    "QUOTA_GATE_UNKNOWN Claude usage unreadable (offline); the Claude quota gate is off (fail-open)",
   ];
   for (const [i, line] of lines.entries()) {
     supervisor.enqueue(`urgent:${i}`, line);
@@ -2609,34 +2171,6 @@ test("an edit of a message already handled is tracked again as a new instruction
   expect(tracked(f, "discord:1:1")).toEqual({ id: "discord:1:1", revision: "discord:1:1:edit:2027-01-15T08:01:00.000Z", revisions: ["discord:1:1:edit:2027-01-15T08:01:00.000Z"] });
 });
 
-test("a lead stalled while working on its last fallback goes back to the first model once that has quota", async () => {
-  const f = fixture({ leadModel: CHAIN, leadPrimaryRetryMin: 15, leadPrimaryReturnChecks: 1 });
-  onModel(f, { leadModel: 1, primaryRetryAt: f.clock.at });
-  f.world.screen = "Error: All accounts for b are currently blocked\n❯ ";
-  f.auth.a = oneHealthy;
-  f.auth.b = allBlocked;
-  f.pane.agent_status = "working";
-  f.onWait(async () => { f.world.screen = "❯ "; liveSession(f); });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model a/primary");
-  expect(journal(f)).toMatchObject({ leadModel: 0 });
-});
-
-test("a cold start that comes up blocked on its last model counts as started instead of looping on STARTUP_UNCONFIRMED", async () => {
-  const f = fixture({ leadModel: "a/primary" });
-  f.cold();
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "Error: usage limit reached\n❯ "; liveSession(f); });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
-  await muted(() => supervisor.flush());
-  expect(journal(f).restart).toBeUndefined();
-  expect(f.log().some((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED a/primary "))).toBe(true);
-});
-
 test("a working lead whose screen keeps changing is not restarted as stuck; one frozen for the limit is", async () => {
   const f = fixture({ leadStuckRestartMin: 30 });
   f.pane.agent_status = "working";
@@ -2655,7 +2189,7 @@ test("a working lead whose screen keeps changing is not restarted as stuck; one 
   expect(f.prompt()).toContain("it was stuck working for");
 });
 
-test("the stuck clock and the busy-switch clock survive supervisor restarts", async () => {
+test("the stuck clock survives supervisor restarts", async () => {
   const stuck = fixture({ leadStuckRestartMin: 30 });
   stuck.pane.agent_status = "blocked";
   const first = new Supervisor(stuck.deps);
@@ -2667,22 +2201,6 @@ test("the stuck clock and the busy-switch clock survive supervisor restarts", as
   }
   expect(launches(stuck)).toHaveLength(1);
 
-  const busy = fixture({ leadModel: CHAIN, leadQuotaBusySwitchMin: 10 });
-  busy.world.screen = BLOCKED_SCREEN;
-  busy.auth.a = allBlocked;
-  busy.pane.agent_status = "working";
-  busy.onWait(async () => { busy.world.screen = "❯ "; });
-  const s = new Supervisor(busy.deps);
-  s.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => s.flush());
-  for (let i = 0; i < 3; i++) {
-    busy.clock.at += 4 * 60_000;
-    const again = new Supervisor(busy.deps);
-    again.enqueue(`discord:1:${i + 2}`, `INBOUND 1 ${i + 2} again`);
-    await muted(() => again.flush());
-  }
-  expect(launches(busy)).toHaveLength(1);
-  expect(launches(busy)[0]).toContain("--model b/fallback");
 });
 
 test("a message that arrives while a cold start boots gets its read window only once it is delivered", async () => {
@@ -2716,11 +2234,9 @@ test("owner messages handled a day ago leave the tracking list for good", async 
 });
 
 test("an owner announcement that fails to post is kept and posted by the next supervisor", async () => {
-  const f = fixture({ leadModel: "a/primary" });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
+  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "owner-only" } }) });
   const failing = new Supervisor(f.deps, { announce: async () => { throw new Error("discord down"); } });
-  failing.enqueue("discord:1:1", "INBOUND 1 1 hi");
+  failing.enqueue("notice", "CUSTOM owner notice");
   const error = console.error;
   console.error = () => {};
   try {
@@ -2732,7 +2248,7 @@ test("an owner announcement that fails to post is kept and posted by the next su
   const posted: string[] = [];
   const next = new Supervisor(f.deps, { announce: async (text) => { posted.push(text); } });
   await next.reactionsSettled();
-  expect(posted).toEqual([expect.stringContaining("Every lead model is out of quota (a/primary)")]);
+  expect(posted).toEqual(["CUSTOM owner notice"]);
   expect(journal(f).outbox).toEqual([]);
 });
 

@@ -2,7 +2,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
 import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, resumeCommand, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
-import { writeQuotaState } from "../src/claude-quota.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, withState, withSqliteStore } from "./fakes.ts";
@@ -114,11 +113,11 @@ test("failed attempts exhaust the persisted recovery budget", async () => {
   expect((await deps.registry.read("recover-lane"))?.recoveryAttempts).toBe(RECOVERY_LIMIT);
 });
 
-test.each(["exhausted", "blocked"] as const)(
-  "retries the %s notice when enqueue fails before acceptance", async (kind) => {
-    const { deps, world, lane } = await fixture();
-    if (kind === "exhausted") await deps.registry.patch(lane.key, { recoveryAttempts: RECOVERY_LIMIT });
-    const d = kind === "blocked" ? withAuth(deps, world, { out: JSON.stringify({ accounts: [{ blocked: true }] }) }) : deps;
+test.each(["exhausted"] as const)(
+  "retries the %s notice when enqueue fails before acceptance", async () => {
+    const { deps, lane } = await fixture();
+    await deps.registry.patch(lane.key, { recoveryAttempts: RECOVERY_LIMIT });
+    const d = deps;
     const ids: string[] = [];
     const enqueue = async (_line: string, id: string) => {
       ids.push(id);
@@ -126,7 +125,7 @@ test.each(["exhausted", "blocked"] as const)(
     };
     await recoverLanes(d, undefined, enqueue);
     expect((await deps.registry.read(lane.key)) as RecoveryLane).not.toMatchObject(
-      kind === "exhausted" ? { recoveryExhausted: true } : { recoveryBlocked: expect.any(String) });
+      { recoveryExhausted: true });
     await recoverLanes({ ...d, registry: new Registry(state.dir) }, undefined, enqueue);
     expect(ids).toHaveLength(2);
     expect(ids[0]).toBe(ids[1]);
@@ -136,11 +135,11 @@ test.each(["exhausted", "blocked"] as const)(
   },
 );
 
-test.each(["exhausted", "blocked"] as const)(
-  "deduplicates the %s notice after enqueue but before flag persistence", async (kind) => {
-    const { deps, world, lane } = await fixture();
-    if (kind === "exhausted") await deps.registry.patch(lane.key, { recoveryAttempts: RECOVERY_LIMIT });
-    const d = kind === "blocked" ? withAuth(deps, world, { out: JSON.stringify({ accounts: [{ blocked: true }] }) }) : deps;
+test.each(["exhausted"] as const)(
+  "deduplicates the %s notice after enqueue but before flag persistence", async () => {
+    const { deps, lane } = await fixture();
+    await deps.registry.patch(lane.key, { recoveryAttempts: RECOVERY_LIMIT });
+    const d = deps;
     const journal = new Map<string, string>();
     const ids: string[] = [];
     const enqueue = async (line: string, id: string) => { ids.push(id); journal.set(id, line); };
@@ -217,45 +216,6 @@ test("a recovered agent that later confirms clears the freshness hold", async ()
   await deps.registry.write({ ...lane, recoveryPending: true });
   expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane old:p1 startup-confirmed"]);
   expect((await deps.registry.read(lane.key))?.recoveryPending).toBeUndefined();
-});
-
-/** Answers omo auth check for provider "provider" with `accounts`; everything else goes to the fixture. */
-const withAuth = (deps: Awaited<ReturnType<typeof fixture>>["deps"], world: Awaited<ReturnType<typeof fixture>>["world"], auth: { out: string }) => ({
-  ...deps, run: async (argv: readonly string[], opts?: Parameters<typeof deps.run>[1]) => {
-    if (argv[0] === "omo" && argv[1] === "auth") { world.calls.push([...argv]); return { code: 1, out: auth.out, err: "" }; }
-    return deps.run(argv, opts);
-  },
-});
-
-test("item 5: a lane whose provider is out of quota is not relaunched; the reason is recorded and sent once", async () => {
-  const { deps, world, lane, control } = await fixture();
-  const auth = { out: JSON.stringify({ accounts: [{ name: "a", blocked: true, blockedUntil: "2026-10-22T09:30:00.000Z" }] }) };
-  const d = withAuth(deps, world, auth);
-  expect(await recoverLanes(d)).toEqual(["LANE_RECOVERY_BLOCKED recover-lane old:p1 missing-pane: quota 1/1 provider accounts blocked, resets 2026-10-22T09:30:00.000Z; not relaunched"]);
-  expect(await recoverLanes(d)).toEqual([]);
-  expect(control.next).toBe(0);
-  expect((await deps.registry.read(lane.key)) as RecoveryLane).toMatchObject({ recoveryPending: true, recoveryBlocked: "quota 1/1 provider accounts blocked, resets 2026-10-22T09:30:00.000Z" });
-  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
-  auth.out = JSON.stringify({ accounts: [{ name: "a", blocked: false }] });
-  expect(await recoverLanes(d)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
-  expect(((await deps.registry.read(lane.key)) as RecoveryLane).recoveryBlocked).toBeUndefined();
-});
-
-test("item 5: a blocked Claude subscription (the supervisor's cached read) holds recovery of a Claude lane", async () => {
-  const { deps, lane, control } = await fixture();
-  await deps.registry.write({ ...lane, model: "anthropic-subscription/claude-opus-5-5" });
-  writeQuotaState(state.dir, { mode: "blocked", usage: { at: 0, accounts: [{ name: "a", fiveHour: { usedPct: 100 } }] } });
-  expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERY_BLOCKED recover-lane old:p1 missing-pane: claude subscription blocked; not relaunched"]);
-  expect(control.next).toBe(0);
-});
-
-test("a lane on a bare model name (no provider prefix) gets the provider quota check before relaunch", async () => {
-  const { deps, world, lane, control } = await fixture();
-  await deps.registry.write({ ...lane, model: "gpt-5.5" });
-  const d = withAuth(deps, world, { out: JSON.stringify({ accounts: [{ name: "a", blocked: true }] }) });
-  const [line] = await recoverLanes(d);
-  expect(line).toStartWith("LANE_RECOVERY_BLOCKED recover-lane old:p1 missing-pane: quota");
-  expect(control.next).toBe(0);
 });
 
 test("a field changed while the relaunch runs survives the relaunch's registry write", async () => {

@@ -143,7 +143,7 @@ export class PushDelivery {
     // A take receipt written since the last pass moves the cursor before anything is decided.
     this.core.consumeTakes();
     const inbox = this.journal.inbox;
-    if (!inbox || this.journal.quotaExhausted) return false;
+    if (!inbox) return false;
     const now = clock.now();
     const covered = this.covered();
     const past = this.logPastCursor(inbox.takenOffset);

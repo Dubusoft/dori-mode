@@ -30,12 +30,10 @@ export type Restart = {
   readonly strikes?: number;
   /** Failed confirmations of this submitted session; at UNCONFIRMED_LIMIT the session is abandoned for a fresh one. */
   readonly unconfirmed?: number;
-  /** The `leadModels` entry this restart launches; absent means the lead's current one. */
-  readonly modelIndex?: number;
-  /** Why the model changes (a quota stall), told to the new lead. */
+  /** Why the lead restarts, told to the new lead. */
   readonly reason?: string;
   readonly request?: LeadRestartRequest;
-  /** Stop the lead even while it is working/blocked (a quota stall past leadQuotaBusySwitchMin, or a stuck lead). */
+  /** Stop the lead even while it is working/blocked (a stuck lead). */
   readonly force?: true;
 };
 /**
@@ -111,17 +109,7 @@ export type Journal = {
   readonly restart?: Restart;
   /** Owner messages that already got the "not taken yet" notice. */
   readonly noticed?: readonly string[];
-  /** The `leadModels` entry the running lead was started on (absent = the first). */
-  readonly leadModel?: number;
-  /** While the lead runs on a fallback: when the first model's provider is checked again. */
-  readonly primaryRetryAt?: number;
-  /** Consecutive primary checks that found it unblocked; the lead returns at leadPrimaryReturnChecks. */
-  readonly primaryClearChecks?: number;
-  /** An open exhaustion episode: every lead model is blocked on quota. The owner was told once, and is told when it ends. */
-  readonly quotaExhausted?: { readonly since: number; readonly model: string; readonly resetAt?: number };
   readonly models?: LeadRestartRequest["models"];
-  /** When a working lead was first seen quota-stalled with an automatic fallback left (leadQuotaBusySwitchMin). */
-  readonly quotaStallSince?: number;
   /** When the lead was first seen busy while owner messages handed to it were unread (leadStuckRestartMin). */
   readonly leadBusySince?: number;
   /** The working lead's screen (hash) and when it last changed: a working lead counts as stuck only while it is frozen. */
@@ -130,11 +118,9 @@ export type Journal = {
   readonly closedOwners?: readonly string[];
   /** Owner announcements not yet confirmed posted; retried until they are, so a crash or a failed post loses none. */
   readonly outbox?: readonly OutboxItem[];
-  /** While the lead runs on a paid emergency model: the quota episode whose owner approval put it there. */
-  readonly emergencyEpisode?: number;
   /** The lead's take cursor and the outstanding push (supervise-push.ts). */
   readonly inbox?: Inbox;
-  /** Forced restarts and quota switches of the last hour: the restart cap (delivery.restartMaxPerHour). */
+  /** Forced restarts of the last hour: the restart cap (delivery.restartMaxPerHour). */
   readonly forcedRestarts?: readonly ForcedRestart[];
   /** Finished lanes and whether the lead has reported them to the owner (lane-outcomes.ts). */
   readonly outcomes?: readonly LaneOutcome[];
@@ -347,12 +333,12 @@ export class JournalCore {
     }
   }
 
-  /** Forced restarts and quota switches within the cap window. */
+  /** Forced restarts within the cap window. */
   forcedRestartsSince(now: number): number {
     return (this.journal.forcedRestarts ?? []).filter((restart) => now - restart.at < RESTART_CAP_WINDOW_MS).length;
   }
 
-  /** Records a forced restart or quota switch that really stopped the lead; the list keeps only the cap window. */
+  /** Records a forced restart that really stopped the lead; the list keeps only the cap window. */
   noteForcedRestart(cause: string): void {
     const now = this.deps.clock.now();
     const kept = (this.journal.forcedRestarts ?? []).filter((restart) => now - restart.at < RESTART_CAP_WINDOW_MS);

@@ -21,10 +21,10 @@ const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
-  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "LANE_QUOTA_STALL", "ACK_MISSING", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
-  "LANE_QUOTA_CLEARED", "LANE_QUOTA_UNKNOWN", "LANE_RECOVERY_EXHAUSTED", "LANE_RECOVERY_BLOCKED",
-  "LEAD_QUOTA_EXHAUSTED", "LEAD_QUOTA_CLEARED", "QUOTA_GATE_UNKNOWN", "WAIT_FAILED", "WAITS_CORRUPT",
-  "LEAD_EMERGENCY_APPROVAL", "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
+  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "ACK_MISSING", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
+  "LANE_RECOVERY_EXHAUSTED",
+  "WAIT_FAILED", "WAITS_CORRUPT",
+  "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
   // A merged lane PR whose merge the supervisor could not read back.
@@ -33,8 +33,6 @@ const URGENT_KINDS = [
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
   "GH_ISSUE * opened", "GH_ISSUE * reopened",
-  // A move into brief/blocked changes what the lead may do now; ok/hold-lanes changes stay digest.
-  "CLAUDE_QUOTA brief", "CLAUDE_QUOTA blocked",
 ] as const;
 
 /**

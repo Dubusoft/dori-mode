@@ -2,8 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { gateVerdict, headroomNote, readQuotaState, stateHoldsLanes } from "./claude-quota.ts";
-import { configPath, defaultConfig, leadModels, loadConfig, providerOf, type DoriConfig } from "./config.ts";
+import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
@@ -109,10 +108,9 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
   // Set but blank falls back to defaultModel / agentCommand's thinking, which is rarely what was meant.
   const blank = (["leadModel", "leadThinking"] as const).filter((k) => {
     const value: unknown = c[k];
-    return k in c && !Array.isArray(value) && !(typeof value === "string" && value.trim());
+    return k in c && !(typeof value === "string" && value.trim()) && !(k === "leadModel" && typeof value === "object" && value !== null && "model" in value && typeof value.model === "string" && value.model.trim());
   });
   if (blank.length) checks.push(warn("lead command", `${blank.join(", ")} set but blank; the lead uses the lane default`, `set a value or remove ${blank.join(", ")} from ${d.configPath}`));
-  checks.push(...leadChain(d));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
   if (c.leadPane) {
@@ -122,27 +120,6 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
     } catch {
       checks.push(fail("leadPane", "cannot list herdr panes", "systemctl --user start herdr-server.service"));
     }
-  }
-  return checks;
-};
-
-/** A leadModel array: every entry usable, with a provider the quota check can name, and a quotaCheck without credentials. */
-const leadChain = (d: DoctorDeps): Check[] => {
-  const raw: unknown = d.config.leadModel;
-  if (!Array.isArray(raw)) return [];
-  const fix = `each leadModel entry is "provider/model" or {"model": "provider/model", "thinking": "..."} in ${d.configPath}`;
-  const bad = raw.flatMap((entry: unknown, i) => {
-    const model = typeof entry === "string" ? entry : typeof entry === "object" && entry !== null && "model" in entry && typeof entry.model === "string" ? entry.model : "";
-    const thinking = typeof entry === "object" && entry !== null && "thinking" in entry ? entry.thinking : undefined;
-    return !model.trim() || !providerOf(model.trim()) || (thinking !== undefined && typeof thinking !== "string") ? [`#${i + 1}`] : [];
-  });
-  const checks: Check[] = [bad.length
-    ? warn("lead model chain", `unusable entries ${bad.join(", ")} are skipped`, fix)
-    : ok("lead model chain", leadModels(d.config).map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> "))];
-  if (d.config.quotaCheck.some((part) => part.startsWith("--credentials"))) {
-    checks.push(fail("quota check", "quotaCheck asks for --credentials; it is refused and quota stalls are never detected", `remove --credentials from quotaCheck in ${d.configPath}`));
-  } else if (!d.config.quotaCheck.some((part) => part.includes("{provider}"))) {
-    checks.push(warn("quota check", "quotaCheck has no {provider}; every provider gets the same answer", `put {provider} in quotaCheck in ${d.configPath}`));
   }
   return checks;
 };
@@ -286,23 +263,13 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
   const pending = lanes.filter((l) => !l.recoveryExhausted);
   return [
     ...(exhausted.length ? [fail("lane recovery", `exhausted, not relaunched or nudged: ${exhausted.map((l) => `${l.key} (${l.recoveryAttempts ?? 0} attempts)`).join(", ")}`, "inspect each lane's pane, then relaunch it by hand or dori close <key>")] : []),
-    ...(pending.length ? [warn("lane recovery", `pending, not nudged: ${pending.map((l) => `${l.key}${l.recoveryBlocked ? ` (${l.recoveryBlocked})` : ""}`).join(", ")}`, "the supervisor's recover sweep retries; dori recover <key> runs it now")] : []),
+    ...(pending.length ? [warn("lane recovery", `pending, not nudged: ${pending.map((l) => l.key).join(", ")}`, "the supervisor's recover sweep retries; dori recover <key> runs it now")] : []),
   ];
-};
-
-/** The last Claude usage read (the supervisor's cache) with its summed headroom; informational, never WARN. */
-const claudeQuota = (d: DoctorDeps): Check[] => {
-  const s = readQuotaState(d.config.stateDir);
-  if (!s) return [ok("claude quota", "no usage read yet (dori quota reads it)")];
-  const pct = (w: { readonly usedPct: number } | undefined): string => (w ? `${w.usedPct}%` : "?");
-  const age = Math.max(0, Math.round((d.clock.now() - s.usage.at) / 60_000));
-  const accounts = s.usage.accounts.map((a) => `${a.name} 5h ${pct(a.fiveHour)} 7d ${pct(a.weekly)}`).join(", ");
-  return [ok("claude quota", `${s.mode}, ${headroomNote(gateVerdict(s.usage, d.config.quotaGate))}, ${accounts}, lanes ${stateHoldsLanes(s) ? "held" : "allowed"}, read ${age}m ago`)];
 };
 
 /** Read-only: every probe is a status query or a GET. */
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), toodo(d), Promise.resolve(issues(d)), Promise.resolve(memory(d)), Promise.resolve(claudeQuota(d)), tools(d), recovery(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), toodo(d), Promise.resolve(issues(d)), Promise.resolve(memory(d)), tools(d), recovery(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

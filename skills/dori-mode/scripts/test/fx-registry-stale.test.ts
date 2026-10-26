@@ -3,14 +3,12 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { claimDone, closeLane, objectDone, watchTick } from "../src/done-flow.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
-import { laneQuotaTick } from "../src/quota-stall.ts";
-import { recoverLanes } from "../src/recover.ts";
 import { type Lane, Registry, statusOf } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, withState, type World, withSqliteStore } from "./fakes.ts";
 
 // D4: every load-modify-save goes through the lane lock onto the fresh lane, so a field another process wrote between
-// the caller's load and its save (an objection, a pause, a claim, a quota mark) survives, and no stale write happens.
+// the caller's load and its save (an objection, a pause, a claim, a progress post) survives, and no stale write happens.
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MIN = 60_000;
 const lane: Lane = { key: "race-lane", title: "race", thread: "chat:1/2", pane: "w:p7", brief: "/b.md", done: "merged acme/app#1", cwd: "/repo", openedAt: new Date(T0).toISOString(), lastReplyAt: T0 };
@@ -61,18 +59,18 @@ const staleWrites = () => errors.filter((e) => e.includes("REGISTRY_STALE_WRITE"
 test("done-flow: claim, objection and close from a stale lane keep the fields written since it was loaded", async () => {
   await deps(T0).registry.write(lane);
   const stale = await stored();
-  await elsewhere({ lastQuotaStall: "stalled elsewhere", lastProgressPost: "todo 3" });
+  await elsewhere({ lastProgressPost: "todo 3" });
 
   await claimDone(deps(T0), stale, "merged acme/app#1");
-  expect(await stored()).toMatchObject({ status: "done-claimed", lastQuotaStall: "stalled elsewhere", lastProgressPost: "todo 3" });
+  expect(await stored()).toMatchObject({ status: "done-claimed", lastProgressPost: "todo 3" });
   await objectDone(deps(T0 + MIN), stale, ["changelog missing"]);
   let after = await stored();
-  expect(after).toMatchObject({ status: "not-done", lastQuotaStall: "stalled elsewhere", claim: { evidence: "merged acme/app#1" } });
+  expect(after).toMatchObject({ status: "not-done", lastProgressPost: "todo 3", claim: { evidence: "merged acme/app#1" } });
   expect(after.history?.map((h) => h.status)).toEqual(["done-claimed", "not-done"]);
   expect((await closeLane(deps(T0 + 2 * MIN), stale, "closed by lead")).closed).toBe(true);
   after = await stored();
   expect(statusOf(after)).toBe("closed");
-  expect(after).toMatchObject({ lastQuotaStall: "stalled elsewhere", objection: { reasons: ["changelog missing"] } });
+  expect(after).toMatchObject({ lastProgressPost: "todo 3", objection: { reasons: ["changelog missing"] } });
   expect(after.history?.map((h) => h.status)).toEqual(["done-claimed", "not-done", "closed"]);
   expect(staleWrites()).toEqual([]);
 });
@@ -89,19 +87,19 @@ test("done-flow: an objection written while the claim is being settled stands an
   expect(staleWrites()).toEqual([]);
 });
 
-test("pause: pause and resume from a stale lane keep an objection and quota mark written meanwhile", async () => {
+test("pause: pause and resume from a stale lane keep an objection and progress post written meanwhile", async () => {
   await deps(T0).registry.write(lane);
   const stale = await stored();
-  await elsewhere({ objection, lastQuotaStall: "stalled elsewhere" });
+  await elsewhere({ objection, lastProgressPost: "todo 3" });
   world.screens = ["❯ ", "Goal paused\n❯ "];
   expect((await pauseLane(deps(T0 + MIN), stale, "owner said wait")).code).toBe(0);
-  expect(await stored()).toMatchObject({ status: "paused", pausedFrom: "working", objection, lastQuotaStall: "stalled elsewhere" });
+  expect(await stored()).toMatchObject({ status: "paused", pausedFrom: "working", objection, lastProgressPost: "todo 3" });
 
   const stalePaused = await stored();
   await elsewhere({ lastProgressPost: "todo 4" });
   world.screens = ["❯ ", "Goal active\n❯ "];
   expect((await resumeLane(deps(T0 + 2 * MIN), stalePaused, "go")).code).toBe(0);
-  expect(await stored()).toMatchObject({ status: "working", objection, lastQuotaStall: "stalled elsewhere", lastProgressPost: "todo 4", lastReplyAt: T0 + 2 * MIN });
+  expect(await stored()).toMatchObject({ status: "working", objection, lastProgressPost: "todo 4", lastReplyAt: T0 + 2 * MIN });
   expect(staleWrites()).toEqual([]);
 });
 
@@ -114,25 +112,3 @@ test("freshness: a pause written while the sweep nudges the lane stands; only th
   expect(staleWrites()).toEqual([]);
 });
 
-test("quota-stall: an objection written while omo auth check runs survives the stall mark", async () => {
-  await deps(T0).registry.write(lane);
-  world.screen = "Error: All Claude accounts for anthropic-subscription are currently blocked\n❯ ";
-  const blocked = JSON.stringify({ accounts: [{ name: "a", blocked: true }] });
-  const run = racing((argv) => argv[0] === "omo", () => elsewhere({ objection }), (argv) => (argv[0] === "omo" ? { code: 1, out: blocked, err: "" } : undefined));
-  const lines = await laneQuotaTick(deps(T0, run));
-  expect(lines[0]).toStartWith("LANE_QUOTA_STALL race-lane w:p7 ");
-  expect(await stored()).toMatchObject({ objection, lastQuotaStall: expect.stringContaining("1/1 anthropic-subscription accounts blocked") });
-  expect(staleWrites()).toEqual([]);
-});
-
-test("recover: an objection written while recovery checks quota survives the blocked mark", async () => {
-  const recovering: Lane = { ...lane, pane: "old:p1", model: "provider/expected" };
-  await deps(T0).registry.write(recovering);
-  world.panes = [];
-  world.prState = "OPEN";
-  const blocked = JSON.stringify({ accounts: [{ name: "a", blocked: true }] });
-  const run = racing((argv) => argv[0] === "omo", () => elsewhere({ objection }), (argv) => (argv[0] === "omo" ? { code: 1, out: blocked, err: "" } : undefined));
-  expect(await recoverLanes(deps(T0, run), lane.key)).toEqual(["LANE_RECOVERY_BLOCKED race-lane old:p1 missing-pane: quota 1/1 provider accounts blocked; not relaunched"]);
-  expect(await stored()).toMatchObject({ objection, recoveryPending: true, recoveryBlocked: "quota 1/1 provider accounts blocked" });
-  expect(staleWrites()).toEqual([]);
-});

@@ -180,7 +180,7 @@ export const sweepRound = async (run: Runner, cache: SweepCache, lanes: readonly
       if (m === (machine ?? "") && pane !== undefined && !snap.byId.has(pane)) cache.delete(key);
     }
   }
-  // The reads the sweeps will make anyway (quota and freshness read working local lanes, watch reads remote ones,
+  // The reads the sweeps will make anyway (freshness reads working local lanes, watch reads remote ones,
   // recovery checks the process of every working lane), started together within each machine's limit.
   await Promise.all(lanes.flatMap((lane) => {
     const status = statusOf(lane);

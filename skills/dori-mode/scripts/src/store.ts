@@ -174,11 +174,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, pos INTEGER NOT NULL, text TEXT NOT NULL, attempts INTEGER, next_at INTEGER);
 CREATE TABLE IF NOT EXISTS lead_restarts (
   lead TEXT PRIMARY KEY, session TEXT NOT NULL, events TEXT NOT NULL, "offset" INTEGER NOT NULL, phase TEXT NOT NULL,
-  strikes INTEGER, unconfirmed INTEGER, model_index INTEGER, reason TEXT, request TEXT, force INTEGER);
+  strikes INTEGER, unconfirmed INTEGER, reason TEXT, request TEXT, force INTEGER);
 CREATE TABLE IF NOT EXISTS lead_state (
-  lead TEXT PRIMARY KEY, lead_model INTEGER, primary_retry_at INTEGER, primary_clear_checks INTEGER,
-  quota_exhausted TEXT, models TEXT, quota_stall_since INTEGER, lead_busy_since INTEGER, lead_screen TEXT,
-  emergency_episode INTEGER);
+  lead TEXT PRIMARY KEY, models TEXT, lead_busy_since INTEGER, lead_screen TEXT);
 `;
 
 /**
@@ -225,9 +223,7 @@ const NOTICED_KIND = "noticed";
 
 /** Journal scalars kept in lead_state, with their column. */
 const LEAD_STATE = [
-  ["leadModel", "lead_model", false], ["primaryRetryAt", "primary_retry_at", false], ["primaryClearChecks", "primary_clear_checks", false],
-  ["quotaExhausted", "quota_exhausted", true], ["models", "models", true], ["quotaStallSince", "quota_stall_since", false],
-  ["leadBusySince", "lead_busy_since", false], ["leadScreen", "lead_screen", true], ["emergencyEpisode", "emergency_episode", false],
+  ["models", "models", true], ["leadBusySince", "lead_busy_since", false], ["leadScreen", "lead_screen", true],
   ["inbox", "inbox", true], ["forcedRestarts", "forced_restarts", true], ["outcomes", "outcomes", true],
   ["pending", "pending", true],
 ] as const satisfies readonly (readonly [keyof Journal, string, boolean])[];
@@ -313,8 +309,8 @@ export class SqliteStore implements JournalStore {
       outbox: db.prepare(`INSERT INTO outbox (id, pos, text, attempts, next_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET text = excluded.text, attempts = excluded.attempts, next_at = excluded.next_at`),
       outboxDelete: db.prepare("DELETE FROM outbox WHERE id = ?"),
-      restart: db.prepare(`INSERT OR REPLACE INTO lead_restarts (lead, session, events, "offset", phase, strikes, unconfirmed, model_index, reason, request, force)
-        VALUES ($lead, $session, $events, $offset, $phase, $strikes, $unconfirmed, $model_index, $reason, $request, $force)`),
+      restart: db.prepare(`INSERT OR REPLACE INTO lead_restarts (lead, session, events, "offset", phase, strikes, unconfirmed, reason, request, force)
+        VALUES ($lead, $session, $events, $offset, $phase, $strikes, $unconfirmed, $reason, $request, $force)`),
       restartDelete: db.prepare("DELETE FROM lead_restarts WHERE lead = ?"),
       leadState: db.prepare(`INSERT OR REPLACE INTO lead_state (lead, ${LEAD_STATE.map(([, column]) => column).join(", ")})
         VALUES ($lead, ${LEAD_STATE.map(([, column]) => `$${column}`).join(", ")})`),
@@ -659,14 +655,14 @@ export const readWakes = (stateDir: string, since: number): Wake[] => {
 
 const restartRow = (restart: Restart): Row => ({
   lead: DEFAULT_LEAD, session: restart.session, events: JSON.stringify(restart.events), offset: restart.offset, phase: restart.phase,
-  strikes: restart.strikes ?? null, unconfirmed: restart.unconfirmed ?? null, model_index: restart.modelIndex ?? null,
+  strikes: restart.strikes ?? null, unconfirmed: restart.unconfirmed ?? null,
   reason: restart.reason ?? null, request: restart.request === undefined ? null : JSON.stringify(restart.request), force: restart.force ? 1 : null,
 });
 
 const restartOf = (row: Row): Restart => {
   const value: Record<string, unknown> = {
     session: String(row.session), events: json(row.events), offset: Number(row.offset), phase: String(row.phase),
-    strikes: num(row.strikes), unconfirmed: num(row.unconfirmed), modelIndex: num(row.model_index), reason: str(row.reason),
+    strikes: num(row.strikes), unconfirmed: num(row.unconfirmed), reason: str(row.reason),
     request: json(row.request), force: row.force ? true : undefined,
   };
   return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Restart;
@@ -701,7 +697,7 @@ export const storeOnDisk = (stateDir: string): StoreKind =>
   existsSync(join(stateDir, SQLITE_FILE)) && !existsSync(join(stateDir, JOURNAL_FILE)) ? "sqlite" : "json";
 
 /**
- * Read-only views for readers outside the Supervisor (status, emergency approval): they never parse the journal file
+ * Read-only views for readers outside the Supervisor (status): they never parse the journal file
  * themselves. Undefined when nothing is stored or it cannot be read.
  */
 export const readStoreView = <T>(stateDir: string, view: { readonly json: (journal: Journal) => T; readonly sqlite: (db: Database) => T }): T | undefined => {

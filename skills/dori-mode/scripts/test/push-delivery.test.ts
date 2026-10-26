@@ -213,9 +213,8 @@ test("the input guard types only into an empty input, and re-submits only our ow
 test("a pushed pointer still in the input after pasteCheckMs gets one more Enter, never a second one", async () => {
   const f = fixture({ delivery: delivery() });
   const pointer = pointerText(1, true, ["WAIT_DONE"], 200);
-  // The quota check and the input guard read an empty input; after the send the pointer still sits there.
-  f.world.screens = [EMPTY, EMPTY];
-  f.world.screen = omo(pointer);
+  // The input is empty until the send; then the pointer stays visible until the extra Enter.
+  f.onSend(() => { f.world.screen = omo(pointer); });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");
   await flush(supervisor);
@@ -424,7 +423,7 @@ test("past restartMaxPerHour the ladder refuses, logs and tells the owner once, 
   expect(f.texts().length).toBeGreaterThan(3);
 });
 
-test("the cap counts forced restarts and quota switches only: a demand-driven cold start is not counted (N4)", async () => {
+test("the cap counts forced restarts only: a demand-driven cold start is not counted (N4)", async () => {
   const f = fixture({ delivery: delivery() });
   const supervisor = new Supervisor(f.deps);
   // A stale idle session with no waits or lanes is not warm: the urgent event goes to a cold start.

@@ -16,7 +16,7 @@ import { Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
-import { canLaunch, dequeueLaunch, enqueueLaunch, journalQuotaBypass, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { canLaunch, dequeueLaunch, enqueueLaunch, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Slack } from "./messenger/slack.ts";
 import { pollSlackInbound } from "./messenger/slack-inbound.ts";
@@ -26,14 +26,13 @@ import { Telegram } from "./messenger/telegram.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
 import { DiscordCommands } from "./messenger/discord-commands.ts";
-import { gateLine, launchQuotaHold, lookupQuotaResults, NO_CLAUDE, quotaReport, readGate } from "./claude-quota.ts";
+import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
 import { supervise } from "./supervise-loop.ts";
 import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
-import { approveEmergency, clearEmergencyApproval, emergencyApprovedAt } from "./emergency.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, ackToodo, recordHandled } from "./ack.ts";
 import { TOODO_CHANNEL, type Toodo, toodoClient, ToodoError } from "./messenger/toodo.ts";
@@ -52,10 +51,10 @@ const USAGE = `dori <command> [options]
   doctor                                                         read-only health check: OK/WARN/FAIL with the exact fix; exit 1 on any FAIL
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
   setup  [--yes] [--token-file F] [--channel ID] [--autostart]   interactive install: token, channels, herdr, autostart (dori setup --help)
-  quota [--json]                                                 Claude 5h/7d usage and the gate mode (ok, hold-lanes, brief, blocked); read before taking on work
-  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR] [--ignore-quota --reason TEXT]
+  quota [--json]                                                 Claude 5h/7d usage of every account with reset times
+  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
-                HOLD (exit 4) on host limits or the quota gate queues the launch in launch-hold.json until it launches or is dropped
+                HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
@@ -73,7 +72,6 @@ const USAGE = `dori <command> [options]
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
-  lead-emergency approve|revoke|status           the owner's approval for the lead's paid emergency models
   store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field),
                                        then set "store": "sqlite" in the config
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
@@ -97,7 +95,7 @@ const USAGE = `dori <command> [options]
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
-  can-launch [--model M]               exit 0 if the host and the Claude quota gate have room for a new lane, else print why and exit 4
+  can-launch [--model M]               exit 0 if the host has room for a new lane, else print why and exit 4
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
@@ -164,7 +162,7 @@ const flags = parseArgs({
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
-    list: { type: "boolean" }, cancel: { type: "string" }, "ignore-quota": { type: "boolean" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
+    list: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
@@ -194,7 +192,7 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "lead-emergency", "store", "ops", "source", "schedule"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "store", "ops", "source", "schedule"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
@@ -241,25 +239,6 @@ try {
       if (flags.positionals.length > 1 || Object.keys(flags.values).length) die("usage: dori recover [key]");
       if (key && !(await deps.registry.read(key))) die(`no registered lane "${key}"`);
       for (const line of await recoverLanes(deps, key)) console.log(line);
-      break;
-    }
-    case "lead-emergency": {
-      const [action, ...extra] = flags.positionals;
-      if (extra.length || Object.keys(flags.values).length || (action !== "approve" && action !== "revoke" && action !== "status")) {
-        die("usage: dori lead-emergency approve|revoke|status");
-      }
-      if (action === "approve") {
-        // The lead runs with DORI_SUPERVISED=1 in the lead pane: it may relay the owner's word, never approve for itself.
-        if (process.env.DORI_SUPERVISED === "1" || (config.leadPane && process.env.HERDR_PANE_ID === config.leadPane)) {
-          die("LEAD_EMERGENCY_REFUSED the lead may not approve its own paid emergency model; the owner approves with /emergency or from their own shell");
-        }
-        if (approveEmergency(config.stateDir, realClock.now()) === undefined) {
-          die("LEAD_EMERGENCY_REFUSED no lead quota episode is open; an approval counts only for the outage it is given in");
-        }
-      }
-      if (action === "revoke") clearEmergencyApproval(config.stateDir);
-      const at = emergencyApprovedAt(config.stateDir);
-      console.log(at === undefined ? "LEAD_EMERGENCY not approved" : `LEAD_EMERGENCY approved ${new Date(at).toISOString()}`);
       break;
     }
     case "store": {
@@ -422,20 +401,15 @@ try {
       break;
     }
     case "quota": {
-      const read = await readGate(lookupQuotaResults(), config.quotaGate, config.stateDir, realClock.now(), AbortSignal.timeout(30_000));
-      if (flags.values.json) console.log(JSON.stringify(read.claude ? { ...read.claude.verdict, usage: read.claude.usage } : { mode: "unknown" }, null, 2));
-      else console.log(`${read.claude ? gateLine(read.claude.verdict) : NO_CLAUDE}\n\n${read.text}`);
+      const read = await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(30_000));
+      if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null }, null, 2));
+      else console.log(`${read.usage ? usageLine(read.usage) : NO_CLAUDE}\n\n${read.text}`);
       break;
     }
     case "launch": {
       const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
-      const ignoreQuota = Boolean(flags.values["ignore-quota"]);
-      const reason = ((flags.values.reason as string[] | undefined) ?? []).map((r) => r.trim()).filter(Boolean).join("; ");
-      if (ignoreQuota && !reason) die("--ignore-quota needs --reason TEXT (why the Claude quota gate is bypassed; it is journaled and relayed to the owner)");
       await validateLaunch(deps, input);
-      const quotaHold = await launchQuotaHold(config, lookupQuotaResults(), input.model ?? config.defaultModel, realClock.now(), (line) => console.error(line));
-      const gate = launchGate({ key: input.key, sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard, quotaHold, ignoreQuota, reason });
-      if (gate.error) die(gate.error);
+      const gate = launchGate({ sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard });
       for (const line of gate.lines) console.log(line);
       if (gate.hold) {
         const repos = doneRepos(input.done);
@@ -448,7 +422,6 @@ try {
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
       }
-      if (ignoreQuota) journalQuotaBypass(config.stateDir, { key: input.key, reason, ...(quotaHold ? { quotaHold } : {}), at: Date.now() });
       const r = await launchLane(deps, input);
       dequeueLaunch(config.stateDir, input.key);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
@@ -591,9 +564,7 @@ try {
       break;
     }
     case "can-launch": {
-      const host = canLaunch(await sampleHost(run, diskGuardPath(config)), config.guard);
-      const hold = await launchQuotaHold(config, lookupQuotaResults(), opt("model") ?? config.defaultModel, realClock.now(), (line) => console.error(line));
-      const v = hold ? { ok: false, reasons: [...host.reasons, hold] } : host;
+      const v = canLaunch(await sampleHost(run, diskGuardPath(config)), config.guard);
       recordLaunchVerdict(config.stateDir, v, Date.now());
       console.log(v.ok ? "CAN_LAUNCH" : `HOLD ${v.reasons.join(" | ")}`);
       process.exit(v.ok ? 0 : 4);
@@ -811,7 +782,7 @@ try {
         let presence: ReturnType<typeof discordPresence> | undefined;
         try {
           if (!config.discord) console.warn("PRESENCE_WARNING discord slash commands skipped: config.discord is missing; run dori setup");
-          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults(), () => config.quotaGate, config.stateDir, realClock.now), undefined, config.discordChannels, lookupStatus(deps)) : undefined;
+          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults()), undefined, config.discordChannels, lookupStatus(deps)) : undefined;
           await commands?.register();
           presence = discordPresence(openDiscordGateway, token, realTimers, commands ? (data) => commands.handle(data) : undefined);
           console.log("PRESENCE_READY discord");

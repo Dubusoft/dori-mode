@@ -3,7 +3,6 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Runner } from "../src/run.ts";
-import { openEpisode } from "../src/emergency.ts";
 import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { importStore } from "../src/store-import.ts";
 import { EXPORTED_SQLITE_FILE, exportStore } from "../src/store-export.ts";
@@ -138,9 +137,8 @@ test("the import carries every journal field and reads it back unchanged", () =>
     noticed: ["discord:11:2"],
     closedOwners: ["discord:11:0", "discord:11:0:edit:1"],
     outbox: [{ id: "lead-model:s", text: "switched", attempts: 2, retryAt: T0 + 60_000 }],
-    restart: { session: "s-1", events: [{ id: "old", line: "LANE_REPORT old" }], offset: 12, phase: "submitted", strikes: 1, unconfirmed: 2, modelIndex: 1, reason: "quota", request: { id: "r", at: T0, models: [{ model: "a/b" }] }, force: true },
-    leadModel: 1, primaryRetryAt: T0 + 1, primaryClearChecks: 1, quotaExhausted: { since: T0, model: "a/b", resetAt: T0 + 3_600_000 },
-    models: [{ model: "a/b", thinking: "high" }], quotaStallSince: T0, leadBusySince: T0 + 2, leadScreen: { hash: "ab", since: T0 }, emergencyEpisode: T0,
+    restart: { session: "s-1", events: [{ id: "old", line: "LANE_REPORT old" }], offset: 12, phase: "submitted", strikes: 1, unconfirmed: 2, reason: "stuck", request: { id: "r", at: T0, models: [{ model: "a/b" }] }, force: true },
+    models: [{ model: "a/b", thinking: "high" }], leadBusySince: T0 + 2, leadScreen: { hash: "ab", since: T0 },
   };
   writeFileSync(join(state.dir, "supervisor.json"), JSON.stringify(journal));
   writeFileSync(join(state.dir, "lead-events.log"), `${JSON.stringify({ id: "old", line: "LANE_REPORT old" })}\n{"id":"partial`);
@@ -154,7 +152,6 @@ test("the import carries every journal field and reads it back unchanged", () =>
   store.close();
   expect(report.syntheticAt).toBe(1);
   expect(report.sources.log.lines).toBe(1);
-  expect(openEpisode(state.dir)).toBe(T0);
 });
 
 test("the import refuses while a supervisor runs, or a journal field it cannot map, and changes nothing", () => {
@@ -279,4 +276,22 @@ test("a version 5 database is migrated to 6: old events read without meta, new o
       { event_id: "old", delivered_at: T0 + 1, taken_at: T0 + 3, taken_session: "sess-1" },
     ]);
   } finally { reread.close(); }
+});
+
+test("extra columns from an older database do not affect load and save", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const path = join(state.dir, SQLITE_FILE);
+  const store = new SqliteStore(path, { create: true });
+  const journal = { events: [{ id: "old", line: "HOOK old", at: T0 }], models: [{ model: "a/one" }], leadBusySince: T0 };
+  store.save(journal, "full");
+  const baseline = store.read(false);
+  store.database.exec("ALTER TABLE lead_state ADD COLUMN quota_exhausted TEXT; ALTER TABLE lead_state ADD COLUMN quota_stall_since INTEGER; ALTER TABLE lead_state ADD COLUMN primary_retry_at INTEGER; UPDATE lead_state SET quota_exhausted = '{}', quota_stall_since = 1, primary_retry_at = 1");
+  store.close();
+  const reopened = new SqliteStore(path);
+  try {
+    expect(reopened.load()).toEqual(baseline);
+    reopened.save({ ...journal, leadBusySince: T0 + 1 }, "full");
+    expect(reopened.load()).toEqual({ ...baseline, leadBusySince: T0 + 1 });
+  } finally { reopened.close(); }
 });

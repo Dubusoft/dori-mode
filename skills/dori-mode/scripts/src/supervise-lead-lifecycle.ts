@@ -4,12 +4,11 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { leadChain, leadCommand, providerOf } from "./config.ts";
+import { leadModels, leadCommand } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
-import { paneResetAt, providerQuota, QUOTA_SCREEN_LINES, quotaScreenHit, quotaStall } from "./quota-stall.ts";
-import { kst } from "./claude-quota.ts";
 import { ALIVE_STATUSES, listPanes, readScreen, sendGuarded, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
+import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { statusOf } from "./registry.ts";
@@ -17,18 +16,12 @@ import { Waits } from "./waits.ts";
 import { completeLeadRestart } from "./lead-restart.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
-import { approvedEpisode, clearEmergencyApproval } from "./emergency.ts";
 import type { Durability } from "./store.ts";
 import { type AwaitingAck, type Event, type Journal, type JournalCore, type OutboxItem, type Restart, SuperviseError, TransientSuperviseError } from "./supervise-journal.ts";
 import { COLD_START_EMOJI, HUNG_EMOJI, latest, OWNER_INBOUND, OWNER_REVISION, type OwnerTracking, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 
-/**
- * The lead lifecycle: which model the lead runs on (quota switches, the exhaustion episode, the paid emergency model),
- * a stuck lead, warm delivery or a cold restart, and the launch, confirmation and stop of the lead process.
- */
-
-/** How often an idle lead's screen is checked for a quota stall while a fallback model exists. */
-export const LEAD_QUOTA_CHECK_MS = 30_000;
+/** Lines read to inspect a paused or stuck lead. */
+const LEAD_SCREEN_LINES = 40;
 
 export const LEAD_SKILL = fileURLToPath(new URL("../../SKILL.md", import.meta.url));
 
@@ -156,7 +149,6 @@ const emptyInput = (screen: string): boolean => {
 };
 
 export class LeadLifecycle {
-  private nextQuotaCheck = 0;
   private resumedAt = 0;
 
   constructor(
@@ -173,206 +165,16 @@ export class LeadLifecycle {
   private get delivered(): Set<string> { return this.core.delivered; }
   private persist(durability?: Durability): void { this.core.persist(durability); }
 
-  /** The `leadModels` entry the lead runs on; a chain shortened in the config falls back to the first. */
-  leadIndex(): number {
-    const index = this.journal.leadModel ?? 0;
-    return index < leadChain(this.leadConfig()).length ? index : 0;
-  }
-
   private leadConfig(): FlowDeps["config"] {
-    return this.journal.models ? { ...this.deps.config, leadModel: this.journal.models, leadThinking: undefined } : this.deps.config;
-  }
-
-  /**
-   * A quota stall on the lead pane for chain entry `index`: a screen hit and every account of its provider blocked.
-   * An emergency entry is an API-key provider without accounts to check, so its screen hit alone is the stall.
-   */
-  private async leadQuotaStall(index: number): Promise<string | undefined> {
-    const entry = leadChain(this.leadConfig())[index];
-    if (!entry) return undefined;
-    const screen = await readScreen(this.deps.run, this.deps.config.leadPane, QUOTA_SCREEN_LINES);
-    if (entry.emergency) {
-      const hit = quotaScreenHit(screen);
-      return hit ? `emergency model failed: ${hit}` : undefined;
-    }
-    return quotaStall(this.deps.run, this.deps.config, screen, entry.model);
-  }
-
-  /**
-   * The owner approved the paid emergency models for this episode: the stored approval names the open exhaustion
-   * episode, or the one that put the running lead on an emergency model. An approval from any earlier episode is void.
-   */
-  private emergencyApproved(): boolean {
-    const episode = approvedEpisode(this.deps.config.stateDir);
-    return episode !== undefined && (episode === this.journal.quotaExhausted?.since || episode === this.journal.emergencyEpisode);
-  }
-
-  /**
-   * The chain entry the lead may move to by itself from `index`: the next one, unless it is a paid emergency model the
-   * owner has not approved for this episode (emergency.ts). Undefined when there is none.
-   */
-  private autoNext(chain: readonly { readonly emergency?: true }[], index: number): number | undefined {
-    const next = chain[index + 1];
-    if (!next) return undefined;
-    return next.emergency && !this.emergencyApproved() ? undefined : index + 1;
-  }
-
-  /**
-   * Every model the lead may use by itself is blocked: the lead on the last of them is stalled. Once per episode the owner
-   * is told with the earliest known reset (omo auth check of each subscription entry, or the pane), and
-   * LEAD_QUOTA_EXHAUSTED is queued; when an unapproved emergency model is next, LEAD_EMERGENCY_APPROVAL asks for it.
-   * The episode, its events and its announcements reach disk in one write, so a crash cannot bury them. The lead is told
-   * to wait for the owner: it may never approve the paid model itself.
-   */
-  private async noteExhausted(chain: readonly { readonly model: string; readonly emergency?: true }[], index: number, stall: string): Promise<void> {
-    if (this.journal.quotaExhausted) return;
-    const { run, config, clock } = this.deps;
-    const now = clock.now();
-    const usable = chain.slice(0, index + 1);
-    const resets: number[] = [];
-    for (const provider of new Set(usable.filter((m) => !m.emergency).flatMap((m) => providerOf(m.model) ?? []))) {
-      const quota = await providerQuota(run, config.quotaCheck, provider);
-      if (quota.blocked && quota.resetAt !== undefined) resets.push(quota.resetAt);
-    }
-    const screenReset = paneResetAt(await readScreen(run, config.leadPane, QUOTA_SCREEN_LINES), now);
-    if (screenReset !== undefined) resets.push(screenReset);
-    const resetAt = resets.length ? Math.min(...resets) : undefined;
-    const model = chain[index]?.model ?? "";
-    const models = usable.map((m) => m.model).join(", ");
-    const emergency = chain[index + 1]?.emergency ? chain[index + 1]?.model : undefined;
-    console.log(`LEAD_QUOTA_EXHAUSTED ${model} ${stall}`);
-    const events: Event[] = [];
-    const outbox: OutboxItem[] = [];
-    const tell = (id: string, line: string) => {
-      if (!this.core.known(id) && !events.some((event) => event.id === id)) events.push({ id, line: redactSecrets(line).replace(/[\r\n]+/g, " "), at: now });
-    };
-    const say = (id: string, text: string) => {
-      if (this.hooks.announce && !this.journal.outbox?.some((item) => item.id === id)) outbox.push({ id, text });
-    };
-    say(`lead-quota-exhausted:${now}`, `Every lead model is out of quota (${models}), so the lead cannot answer until one resets${resetAt !== undefined ? ` (earliest known reset ${kst(resetAt)} KST)` : " (reset time unknown)"}. Your messages stay queued.`);
-    if (emergency) {
-      say(`lead-emergency-approval:${now}`, `The lead can run on the paid emergency model ${emergency} until ${chain[0]?.model} has quota again. It moves only with your approval for this outage: use /emergency here, or run dori lead-emergency approve on the host.`);
-      tell(`lead-emergency-approval:${now}`, `LEAD_EMERGENCY_APPROVAL ${emergency} the paid emergency model waits for the owner's own /emergency approval for this outage; never approve it yourself`);
-    }
-    tell(`lead-quota-exhausted:${now}`,
-      `LEAD_QUOTA_EXHAUSTED ${model} reset=${resetAt !== undefined ? new Date(resetAt).toISOString() : "unknown"} every lead model is blocked on quota (${models}): ${stall}`);
-    this.journal = {
-      ...this.journal,
-      quotaExhausted: { since: now, model, ...(resetAt !== undefined ? { resetAt } : {}) },
-      events: [...this.journal.events, ...events],
-      ...(outbox.length ? { outbox: [...(this.journal.outbox ?? []), ...outbox] } : {}),
-    };
-    for (const event of events) this.core.eventIds.add(event.id);
-    this.persist();
-    this.owners.drainOutbox();
-  }
-
-  /**
-   * The exhaustion episode ended (the lead's model answers again, or it moved to one that does): told once. Unless the
-   * lead now runs on the emergency model that approval bought, the approval ends with the episode.
-   */
-  private noteCleared(entry: { readonly model: string; readonly emergency?: true } | undefined): void {
-    const episode = this.journal.quotaExhausted;
-    if (!episode) return;
-    const now = this.deps.clock.now();
-    const model = entry?.model ?? "";
-    if (!entry?.emergency) clearEmergencyApproval(this.deps.config.stateDir);
-    console.log(`LEAD_QUOTA_CLEARED ${model}`);
-    this.journal = { ...this.journal, quotaExhausted: undefined };
-    this.owners.announce(`lead-quota-cleared:${episode.since}`, `The lead has quota again (${model}); queued messages are being answered.`);
-    this.enqueue(`lead-quota-cleared:${episode.since}`, `LEAD_QUOTA_CLEARED ${model} the lead has a model with quota again after ${Math.round((now - episode.since) / 60_000)} min`);
+    return this.journal.models ? { ...this.deps.config, leadModel: this.journal.models[0], leadThinking: undefined } : this.deps.config;
   }
 
   /** Durable episode clocks (M5): a supervisor restart must not start them over. Saved only on change. */
-  private patchJournal(patch: Partial<Pick<Journal, "quotaStallSince" | "leadBusySince" | "leadScreen">>): void {
+  private patchJournal(patch: Partial<Pick<Journal, "leadBusySince" | "leadScreen">>): void {
     const changed = (Object.keys(patch) as (keyof typeof patch)[]).some((key) => JSON.stringify(this.journal[key]) !== JSON.stringify(patch[key]));
     if (!changed) return;
     this.journal = { ...this.journal, ...patch };
     this.persist("normal");
-  }
-
-  /**
-   * On a fallback, the first model's provider is checked once per leadPrimaryRetryMin whatever the lead is doing; true
-   * once leadPrimaryReturnChecks checks in a row found it unblocked. The streak stays until the lead is back on it.
-   */
-  private async primaryReady(chain: readonly { readonly model: string }[], now: number): Promise<boolean> {
-    const { config, run } = this.deps;
-    const need = Math.max(1, config.leadPrimaryReturnChecks);
-    if (now >= (this.journal.primaryRetryAt ?? 0)) {
-      const provider = providerOf(chain[0]?.model ?? "");
-      const quota = provider ? await providerQuota(run, config.quotaCheck, provider) : undefined;
-      // An unreadable check is not "unblocked"; one blocked check restarts the count.
-      const streak = quota && !quota.blocked && !quota.unknown ? (this.journal.primaryClearChecks ?? 0) + 1 : 0;
-      this.journal = { ...this.journal, primaryRetryAt: now + config.leadPrimaryRetryMin * 60_000, primaryClearChecks: streak || undefined };
-      this.persist();
-      if (streak && streak < need) console.log(`LEAD_PRIMARY_CLEAR_CHECK ${chain[0]?.model} ${streak}/${config.leadPrimaryReturnChecks}`);
-    }
-    return (this.journal.primaryClearChecks ?? 0) >= need;
-  }
-
-  /**
-   * Quota control, checked every LEAD_QUOTA_CHECK_MS or at once before an urgent delivery. An idle lead stalled on quota
-   * moves to the next model it may use by itself; a working one only once the stall has lasted leadQuotaBusySwitchMin,
-   * and never onto a paid emergency model. A lead on a fallback moves back to the first model once its provider is
-   * unblocked on leadPrimaryReturnChecks consecutive checks: when idle, or at once when it is stalled itself (working
-   * included). Either is a cold restart carrying `pending`. A stall with nothing left opens an exhaustion episode
-   * (noteExhausted), closed by noteCleared.
-   */
-  async quotaSwitch(pending: readonly Event[], urgent: boolean): Promise<boolean> {
-    const { config, run, clock } = this.deps;
-    const chain = leadChain(this.leadConfig());
-    const now = clock.now();
-    if (!urgent && now < this.nextQuotaCheck) return false;
-    // Without a fallback there is nothing to switch: digest-only traffic leaves the lead alone unless an exhaustion
-    // episode is open (its end is watched).
-    if (chain.length < 2 && !urgent && !this.journal.quotaExhausted) return false;
-    this.nextQuotaCheck = now + LEAD_QUOTA_CHECK_MS;
-    const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
-    if (!pane?.agent) return false;
-    const idle = pane.agent_status === "idle" || pane.agent_status === "done";
-    const working = pane.agent_status === "working";
-    const index = this.leadIndex();
-    const next = this.autoNext(chain, index);
-    const stall = await this.leadQuotaStall(index);
-    if (stall && next === undefined) await this.noteExhausted(chain, index, stall);
-    // Still blocked (an approval only made a move possible): the episode stays open until a model answers.
-    else if (!stall) this.noteCleared(chain[index]);
-    const primary = index > 0 && await this.primaryReady(chain, now);
-    // On a paid emergency model whose approval was revoked (or belongs to no episode): back to the first model.
-    const revoked = !!chain[index]?.emergency && !this.emergencyApproved();
-    let target: number | undefined;
-    let reason: string | undefined;
-    let force = false;
-    if (stall && primary && (idle || working)) {
-      target = 0;
-      force = !idle;
-      reason = `${chain[index]?.model} is blocked on quota (${stall}) and ${chain[0]?.model} has quota again`;
-    } else if (revoked && idle) {
-      target = 0;
-      reason = `the owner's approval for the paid emergency model ${chain[index]?.model} was revoked`;
-    } else if (stall && next !== undefined && idle) {
-      target = next;
-      reason = `${chain[index]?.model} is blocked on quota (${stall})`;
-    } else if (stall && next !== undefined && working && !chain[next]?.emergency) {
-      // A working lead stalled with a model left: the provider may be retrying. Switch once the stall outlives the limit.
-      const since = this.journal.quotaStallSince ?? now;
-      this.patchJournal({ quotaStallSince: since });
-      if (now - since < config.leadQuotaBusySwitchMin * 60_000) return false;
-      target = next;
-      force = true;
-      reason = `${chain[index]?.model} is blocked on quota (${stall}) while working for ${Math.round((now - since) / 60_000)} min`;
-    } else if (!stall && primary && idle) {
-      target = 0;
-    }
-    this.patchJournal({ quotaStallSince: undefined });
-    if (target === undefined) return false;
-    console.log(`LEAD_MODEL_SWITCH ${chain[index]?.model} -> ${chain[target]?.model}${reason ? ` ${reason}` : ""}`);
-    await this.noteRestart("quota", `${chain[index]?.model} -> ${chain[target]?.model}: ${reason ?? `${chain[0]?.model} has quota again`}`, pane.cwd ?? config.defaultCwd);
-    this.setRestart({
-      session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
-      phase: "stopping", modelIndex: target, ...(reason ? { reason } : {}), ...(force ? { force: true as const } : {}),
-    });
-    return true;
   }
 
   /** Owner messages handed to the lead with no ack and not handled; `readable` narrows to those whose read window opened. */
@@ -393,7 +195,7 @@ export class LeadLifecycle {
 
   /**
    * True when the restart cap refuses an unread-driven restart (stuckRestart, the push ladder). Forced
-   * restarts and quota switches of the last hour count (they still run past the cap). The first refusal of each hour is
+   * restarts of the last hour count (they still run past the cap). The first refusal of each hour is
    * logged and told to the owner once; the push step keeps re-pushing meanwhile.
    */
   capRefuses(what: string): boolean {
@@ -425,7 +227,7 @@ export class LeadLifecycle {
     if (!this.unacked(true).some((entry) => now - (entry.since ?? now) >= window)) return;
     const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
     if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) return;
-    const screen = await readScreen(run, config.leadPane, QUOTA_SCREEN_LINES);
+    const screen = await readScreen(run, config.leadPane, LEAD_SCREEN_LINES);
     if (!PAUSED.test(screen)) return;
     this.resumedAt = now;
     if (!emptyInput(screen)) {
@@ -443,7 +245,7 @@ export class LeadLifecycle {
    * those clocks are journaled, so a supervisor restart does not reset them.
    * A faster rule uses push.escalateMin: a working lead held inside one tool call (a foreground wait or watch cannot
    * take a pushed pointer until it returns), counted from the later of the call's start and the oldest unacked message.
-   * An idle lead is left to the push ladder. Neither applies while every lead model is out of quota.
+   * An idle lead is left to the push ladder.
    */
   async stuckRestart(pending: readonly Event[]): Promise<boolean> {
     const { config, clock, run } = this.deps;
@@ -472,13 +274,11 @@ export class LeadLifecycle {
       return true;
     };
     const at = (ids: ReadonlySet<string>): number[] => this.journal.events.filter((event) => ids.has(event.id) && event.at !== undefined).map((event) => event.at ?? 0);
-    // Every lead model out of quota: no new lead could answer either; quota control owns the lead until one resets.
-    const exhausted = this.journal.quotaExhausted !== undefined;
     if (pane.agent_status === "idle" || pane.agent_status === "done") {
       this.patchJournal({ leadBusySince: undefined, leadScreen: undefined });
       return false;
     }
-    if (pane.agent_status === "working" && !exhausted) {
+    if (pane.agent_status === "working") {
       // A lead inside one tool call cannot take a monitor event until the call returns: a foreground wait, watch or
       // sleep. Owner messages must not wait for it, however busy its screen looks.
       // A probe that cannot resolve the session must not stop delivery: the other rules still apply.
@@ -501,7 +301,7 @@ export class LeadLifecycle {
     this.patchJournal({ leadBusySince: busySince });
     let since = Math.max(Math.min(...times), busySince);
     if (pane.agent_status === "working") {
-      const hash = Bun.hash(screenStill(await readScreen(run, config.leadPane, QUOTA_SCREEN_LINES))).toString(16);
+      const hash = Bun.hash(screenStill(await readScreen(run, config.leadPane, LEAD_SCREEN_LINES))).toString(16);
       if (this.journal.leadScreen?.hash !== hash) this.patchJournal({ leadScreen: { hash, since: now } });
       since = Math.max(since, this.journal.leadScreen?.since ?? now);
     } else if (this.journal.leadScreen) this.patchJournal({ leadScreen: undefined });
@@ -800,7 +600,7 @@ export class LeadLifecycle {
         const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
         if (hit.pid && latest?.agent && (latest.agent_status === "idle" || latest.agent_status === "done")) {
           const old = (await this.sessionFile(pane.cwd ?? deps.config.defaultCwd)).id || hit.id;
-          if (restart.request) this.journal = { ...this.journal, models: restart.request.models, leadModel: 0, primaryRetryAt: undefined };
+          if (restart.request) this.journal = { ...this.journal, models: restart.request.models };
           softStartedAt = deps.clock.now();
           this.owners.record(restart.events);
           restart = { ...restart, offset: statSync(this.core.eventLog).size, phase: `soft:${old}` };
@@ -816,7 +616,7 @@ export class LeadLifecycle {
           this.carryOver(restart);
           const fd = openSync(promptPath, "w", 0o600);
           try { writeFileSync(fd, this.startupPrompt(restart)); fsyncSync(fd); } finally { closeSync(fd); }
-          const entry = leadChain(this.leadConfig())[restart.modelIndex ?? this.leadIndex()];
+          const entry = leadModels(this.leadConfig())[0];
           if (!entry) throw new TransientSuperviseError("soft restart model is missing");
           for (const command of ["/new", `/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
             await softCommand(deps, command);
@@ -855,11 +655,11 @@ export class LeadLifecycle {
         this.setRestart(undefined);
         return;
       }
-      // The restart cap counts forced restarts and quota switches once the lead really stopped; an owner's request and a
+      // The restart cap counts forced restarts once the lead really stopped; an owner's request and a
       // demand-driven cold start never count.
-      if (!restart.request && (restart.force || restart.modelIndex !== undefined)) this.core.noteForcedRestart(restart.modelIndex !== undefined ? "quota" : "forced");
+      if (!restart.request && restart.force) this.core.noteForcedRestart("forced");
       if (restart.request) {
-        this.journal = { ...this.journal, models: restart.request.models, leadModel: 0, primaryRetryAt: undefined };
+        this.journal = { ...this.journal, models: restart.request.models };
       }
       // Log the cold batch before launch. The old monitor is gone. The new lead
       // takes these lines with dori inbox take and tails strictly after this batch.
@@ -895,7 +695,7 @@ export class LeadLifecycle {
       // burst of events or a full-length multibyte Discord message.
       const fd = openSync(promptPath, "w", 0o600);
       try { writeFileSync(fd, prompt); fsyncSync(fd); } finally { closeSync(fd); }
-      const agent = leadCommand(this.leadConfig(), `@${promptPath}`, restart.modelIndex ?? this.leadIndex());
+      const agent = leadCommand(this.leadConfig(), `@${promptPath}`);
       const executable = agent[0];
       if (!executable) throw new SuperviseError("agentCommand must name an executable");
       const argv = [
@@ -911,27 +711,6 @@ export class LeadLifecycle {
       console.log("LEAD_SOFT_RESTART_FAILED reused lead lost readiness; falling back to a process restart");
       const next: Restart = { ...restart, session: promptSession, phase: "soft-failed" };
       this.setRestart(next);
-      return this.restart(next);
-    }
-    // A launch stalled on quota on a model with a fallback it may use, confirmed or not: stop exactly this session and
-    // start the next model with the same events and offset. Without one the existing handling applies.
-    const index = restart.modelIndex ?? this.leadIndex();
-    const chain = leadChain(this.leadConfig());
-    const stall = await this.leadQuotaStall(index);
-    const fallback = this.autoNext(chain, index);
-    if (stall && fallback === undefined) {
-      // The last usable model came up blocked too: the owner hears it now, not after the startup retries. A session that
-      // did initialise counts as started: quota control (exhaustion episode, return to the first model) owns it from
-      // here, instead of STARTUP_UNCONFIRMED retries that could never succeed.
-      await this.noteExhausted(chain, index, stall);
-      confirmed ||= hasStartupEvidence(deps, restart.session);
-    }
-    if (!soft && stall && fallback !== undefined) {
-      await stopHung(deps, restart.session);
-      const reason = `${chain[index]?.model} is blocked on quota (${stall})`;
-      const next: Restart = { ...this.abandon(restart), modelIndex: fallback, reason };
-      this.setRestart(next);
-      console.log(`LEAD_MODEL_SWITCH ${chain[index]?.model} -> ${chain[fallback]?.model} at startup ${restart.session} -> ${next.session}`);
       return this.restart(next);
     }
     if (!confirmed) {
@@ -969,25 +748,6 @@ export class LeadLifecycle {
       this.owners.react(restart.events, [["remove", COLD_START_EMOJI], ["add", HUNG_EMOJI]]);
       throw new TransientSuperviseError(`LEAD_STARTUP_HUNG ${restart.session}; events retained, relaunch deferred to backoff`);
     }
-    const from = this.leadIndex();
-    const to = index;
-    if (to !== from) {
-      const [old, next] = [chain[from]?.model, chain[to]?.model];
-      this.journal = {
-        ...this.journal, leadModel: to, primaryRetryAt: to > 0 ? deps.clock.now() + deps.config.leadPrimaryRetryMin * 60_000 : undefined, primaryClearChecks: undefined,
-        // The approval that allowed this move stays valid while the lead is on emergency models, and only then.
-        emergencyEpisode: chain[to]?.emergency ? approvedEpisode(deps.config.stateDir) : undefined,
-      };
-      // Back on the first model: the next emergency episode needs the owner's approval again.
-      if (to === 0) clearEmergencyApproval(deps.config.stateDir);
-      this.owners.announce(`lead-model:${restart.session}`, to === 0
-        ? chain[from]?.emergency
-          ? `The Claude subscription has quota again: the lead is back on ${next}, and the paid emergency model ${old} is off.`
-          : `${next} has quota again; the lead is back on it.`
-        : chain[to]?.emergency
-          ? `The Claude subscription is blocked (${old} is out of quota), so the lead now runs on the paid emergency model ${next}. Lanes never use it. The lead moves back to ${chain[0]?.model} once that has quota again.`
-          : `The lead's model ${old} is out of quota, so the lead now runs on ${next}. It moves back to ${chain[0]?.model} once that has quota again.`);
-    }
     // The new lead can read now: every message handed to it (in its log or carried over) and still waiting for its ack gets a
     // fresh window from here, so neither a cold-start batch nor a message the old lead never acked is escalated while
     // this lead boots. A message that arrived during startup and is not delivered yet gets its window when it is.
@@ -1003,7 +763,6 @@ export class LeadLifecycle {
     };
     // The push ladder's clock starts again for the new lead (N1): no push is outstanding to it yet.
     if (this.journal.inbox) this.journal = { ...this.journal, inbox: { ...this.journal.inbox, sessionSince: ready, push: undefined } };
-    if (soft && !restart.request && restart.modelIndex !== undefined) this.core.noteForcedRestart("quota");
     this.setRestart(undefined);
     const policy = deps.config.eventPolicy;
     const urgent = restart.events.filter((event) => eventClass(event.line, policy) === "lead-urgent");
@@ -1205,7 +964,7 @@ export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> 
   const { leadPane, sessionsDir, defaultCwd } = deps.config;
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!pane) throw new TransientSuperviseError(`lead pane ${leadPane} is missing`);
-  // `force` (a quota stall past its limit, a stuck lead) stops a working/blocked lead too.
+  // `force` (a stuck lead) stops a working/blocked lead too.
   if (!force && pane.agent && pane.agent_status !== "idle" && pane.agent_status !== "done") return false;
   const table = await procTable(deps.run);
   const hit = await resolveSession(leadPane, pane.cwd ?? defaultCwd, table, { run: deps.run, sessionsDir });

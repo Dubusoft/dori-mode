@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
-import { fill, isEmergencyModel, languageInstruction } from "./config.ts";
+import { fill, languageInstruction } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { laneRunner, readScreen, statusLookup } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
@@ -343,7 +343,6 @@ export const STARTUP_READY_READS = 2;
 
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string }> => {
   const model = input.model ?? deps.config.defaultModel;
-  if (isEmergencyModel(deps.config, model)) throw new LaunchError(`${model} is a lead-only emergency model (leadEmergencyModels); lanes never run on it`);
   if (!existing) await validateLaunch(deps, input);
   deps = { ...deps, run: laneRunner(deps.run, input) };
   const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;

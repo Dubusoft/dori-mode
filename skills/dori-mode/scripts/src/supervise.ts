@@ -7,7 +7,7 @@ import { redactMeta, redactSecrets } from "./redact.ts";
 import { type Event, type EventMeta, JournalCore, type OwnerNoticeKind } from "./supervise-journal.ts";
 import { OWNER_INBOUND, OWNER_REVISION, type OwnerMessage, OwnerTracking, quarantineDigest, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 import { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
-import { Delivery, OWNER_WARN_EVENTS } from "./supervise-delivery.ts";
+import { Delivery } from "./supervise-delivery.ts";
 import { eventClass } from "./event-policy.ts";
 import { OutcomeTracking } from "./lane-outcomes.ts";
 import { DecisionTracking } from "./decision-obligations.ts";
@@ -27,11 +27,11 @@ export {
   OWNER_NOTIFY_ATTEMPTS, type SupervisorHooks,
 } from "./supervise-owner-tracking.ts";
 export {
-  awaitStartupEvidence, confirmLead, hasStartupEvidence, LEAD_QUOTA_CHECK_MS, LEAD_SKILL, plainShell, screenStill,
+  awaitStartupEvidence, confirmLead, hasStartupEvidence, LEAD_SKILL, plainShell, screenStill,
   STARTUP_EVIDENCE_MS, stopHung, stopLead, UNCONFIRMED_LIMIT,
 } from "./supervise-lead-lifecycle.ts";
 export {
-  BACKOFF_MAX_MS, BACKOFF_MIN_MS, eventPriority, OWNER_WARN_EVENTS, RetryingDelivery, STUCK_AFTER_MS,
+  BACKOFF_MAX_MS, BACKOFF_MIN_MS, eventPriority, RetryingDelivery, STUCK_AFTER_MS,
 } from "./supervise-delivery.ts";
 
 /**
@@ -106,7 +106,6 @@ export class Supervisor {
             if (!outbox.some((item) => item.id === key)) this.core.journal = { ...this.core.journal, outbox: [...outbox, { id: key, text }] };
           };
           for (const added of before.events.slice(length)) {
-            if (OWNER_WARN_EVENTS.some((prefix) => added.line.startsWith(`${prefix} `))) queue(`warn:${added.id}`, scrubForThread(`Dori warning: ${added.line}`, homedir()));
             if (eventClass(added.line, this.core.deps.config.eventPolicy) === "owner-only") queue(`owner-only:${added.id}`, scrubForThread(added.line, homedir()));
           }
         }
@@ -188,8 +187,6 @@ export class Supervisor {
   /** Resolves when queued reactions and announcements have finished (tests and shutdown). */
   reactionsSettled(): Promise<void> { return this.owners.reactionsSettled(); }
 
-  /** The `leadModels` entry the lead runs on; a chain shortened in the config falls back to the first. */
-  leadIndex(): number { return this.lead.leadIndex(); }
 
   flush(): Promise<void> { return this.delivery.flush(); }
 

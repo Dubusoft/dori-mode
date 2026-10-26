@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { launchQuotaHold, lookupQuotaResults } from "./claude-quota.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
@@ -506,7 +505,7 @@ export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): str
   ].join("\n");
 };
 
-/** Launches a merge lane on this host: host and quota gates, a detached worktree of the PR branch, then dori launch. */
+/** Launches a merge lane on this host: host guard, a detached worktree of the PR branch, then dori launch. */
 export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest): Promise<{ readonly ok: boolean; readonly detail: string }> => {
   const { key, source, pull } = request;
   if (!LANE_KEY.test(key)) return { ok: false, detail: `merge lane key ${key} is not a valid lane key` };
@@ -520,8 +519,6 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (!deps.config.worktreeRoot) return { ok: false, detail: "worktreeRoot is not set" };
   const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config)), deps.config.guard);
   if (!host.ok) return { ok: false, detail: `HOLD ${host.reasons.join(" | ")}` };
-  const quota = await launchQuotaHold(deps.config, lookupQuotaResults(), deps.config.defaultModel, deps.clock.now(), (line) => { console.error(line); });
-  if (quota) return { ok: false, detail: `HOLD ${quota}` };
   const worktree = join(deps.config.worktreeRoot, repoName(pull.repo), key);
   if (existsSync(worktree)) return { ok: false, detail: `worktree ${worktree} already exists` };
   const fetched = await deps.run(["git", "-C", source.cwd, "fetch", "--end-of-options", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);

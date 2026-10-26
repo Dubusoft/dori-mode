@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
@@ -164,32 +164,15 @@ export const launchQueueText = (queue: readonly QueuedLaunch[]): string =>
     : "";
 
 /** What `dori launch` must do before it starts a lane: refuse, hold, or go with these stdout lines. */
-export type LaunchGate = { readonly error?: string; readonly hold?: string; readonly lines: readonly string[] };
+export type LaunchGate = { readonly hold?: string; readonly lines: readonly string[] };
 
-export const OWNER_NOTICE = "OWNER_NOTICE";
-
-/**
- * The host guard (memory, disk, pane count) always applies; `--ignore-quota` lifts only the Claude quota gate, needs a
- * reason, and yields an OWNER_NOTICE line for the lead to relay. A pane budget of 0 or less is unlimited, with a warning.
- */
-export const launchGate = (o: {
-  readonly key: string; readonly sample: HostSample; readonly guard: GuardThresholds;
-  readonly quotaHold?: string; readonly ignoreQuota?: boolean; readonly reason?: string;
-}): LaunchGate => {
-  if (o.ignoreQuota && !o.reason?.trim()) return { error: "--ignore-quota needs --reason TEXT (why the Claude quota gate is bypassed; it is journaled and relayed to the owner)", lines: [] };
+/** The host guard (memory, disk, pane count) always applies. A pane budget of 0 or less is unlimited, with a warning. */
+export const launchGate = (o: { readonly sample: HostSample; readonly guard: GuardThresholds }): LaunchGate => {
   const lines: string[] = [];
   if (o.guard.panesMax <= 0) lines.push(`LAUNCH_WARN guard.panesMax is ${o.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
-  const reasons = [...canLaunch(o.sample, o.guard).reasons];
-  if (o.quotaHold && !o.ignoreQuota) reasons.push(o.quotaHold);
+  const reasons = canLaunch(o.sample, o.guard).reasons;
   if (reasons.length) return { hold: reasons.join(" | "), lines };
-  if (o.ignoreQuota) lines.push(`${OWNER_NOTICE} lane ${o.key} is launching past the Claude quota gate with --ignore-quota (${o.quotaHold ?? "gate open now"}); reason: ${o.reason?.trim()}`);
   return { lines };
-};
-
-/** One JSON line per `--ignore-quota` launch in <stateDir>/quota-bypass.jsonl. */
-export const journalQuotaBypass = (stateDir: string, entry: { readonly key: string; readonly reason: string; readonly quotaHold?: string; readonly at: number }): void => {
-  mkdirSync(stateDir, { recursive: true });
-  appendFileSync(join(stateDir, "quota-bypass.jsonl"), `${JSON.stringify({ ...entry, at: new Date(entry.at).toISOString() })}\n`);
 };
 
 /** Other open lanes on this lane's messenger thread: while any remain, closing this lane must not mark the thread done. */

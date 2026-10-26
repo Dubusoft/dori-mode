@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { laneRunner, readScreen, sendGuarded, statusLookup } from "./panes.ts";
-import type { QuotaLane } from "./quota-stall.ts";
 import { type Lane, type LaneStatus, statusOf, withStatus } from "./registry.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
 
@@ -56,12 +55,11 @@ const isWorking = async (deps: FlowDeps, pane: string): Promise<boolean> => (awa
 /** The status a paused lane had before its pause. */
 const beforePause = (lane: Lane): LaneStatus => (lane.pausedFrom && PAUSABLE.has(lane.pausedFrom) ? lane.pausedFrom : "working");
 
-export const pauseLane = async (deps: FlowDeps, lane: Lane, note: string, automatic = false): Promise<PauseResult> => {
+export const pauseLane = async (deps: FlowDeps, lane: Lane, note: string): Promise<PauseResult> => {
   deps = { ...deps, run: laneRunner(deps.run, lane) };
   const status = statusOf(lane);
   if (status === "paused") {
-    if (automatic) return { lane, lines: [`PAUSED ${lane.key} already`], code: 0 };
-    const fields: Partial<QuotaLane> & Pick<ResumingLane, "resuming"> = { quotaAutoPaused: undefined, quotaPending: undefined, resuming: undefined };
+    const fields: Pick<ResumingLane, "resuming"> = { resuming: undefined };
     let interrupted = false;
     lane = await deps.registry.update(lane.key, (current) => {
       if (!current || statusOf(current) !== "paused") return undefined;
@@ -90,10 +88,8 @@ export const pauseLane = async (deps: FlowDeps, lane: Lane, note: string, automa
   const at = new Date(deps.clock.now()).toISOString();
   let paused: Lane = lane;
   await deps.registry.update(lane.key, (current) => {
-    const fresh: QuotaLane = current ?? lane;
-    if (automatic && (!fresh.quotaAutoPaused || fresh.quotaPending !== "pausing")) return undefined;
-    const fields: Partial<QuotaLane> = automatic ? {} : { quotaAutoPaused: undefined, quotaPending: undefined };
-    return (paused = withStatus({ ...fresh, ...fields }, "paused", note, at, { pausedFrom: status, pausedSeenWorking: undefined, lastFreshnessNote: undefined }));
+    const fresh = current ?? lane;
+    return (paused = withStatus(fresh, "paused", note, at, { pausedFrom: status, pausedSeenWorking: undefined, lastFreshnessNote: undefined }));
   });
   const running = await isWorking(deps, lane.pane);
   if (running && !(await stopTurn(deps, lane.pane))) {

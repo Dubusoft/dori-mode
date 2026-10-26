@@ -228,8 +228,8 @@ const statusFixture = (channels: readonly string[] = []) => {
   return { requests, looked, commands };
 };
 
-test("guild registration lists quota, status and emergency", () => {
-  expect(guildCommands.map((c) => c.name)).toEqual(["quota", "status", "emergency"]);
+test("guild registration lists quota and status", () => {
+  expect(guildCommands.map((c) => c.name)).toEqual(["quota", "status"]);
 });
 
 test("/status from the owner defers ephemerally, runs only the status lookup and edits in a code block", async () => {

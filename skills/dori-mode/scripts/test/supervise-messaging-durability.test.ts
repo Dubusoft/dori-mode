@@ -69,7 +69,7 @@ test.each([
   } finally { restarted.close(); }
 });
 
-test.each(["QUOTA_GATE_UNKNOWN retry", "CUSTOM retry"])("enqueue commits its event and announcement together for %s", async (line) => {
+test.each(["CUSTOM retry"])("enqueue commits its event and announcement together for %s", async (line) => {
   const f = fixture();
   const posted: string[] = [];
   const supervisor = new Supervisor({

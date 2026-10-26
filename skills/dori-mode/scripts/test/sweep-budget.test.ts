@@ -53,7 +53,7 @@ const setup = async (latencyMs: number) => {
     const lane: Lane = { key: `lane-${i}`, title: `lane ${i}`, thread: "none", pane, ...(machine ? { machine } : {}), brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0 };
     await deps.registry.write(lane);
   }
-  const sweeps = supervisorSweeps(deps, "/home/test", async () => ({ results: [], text: "" }));
+  const sweeps = supervisorSweeps(deps, "/home/test");
   const lines: string[] = [];
   const round = async (): Promise<{ readonly calls: number; readonly ms: number }> => {
     const before = h.calls.length;
