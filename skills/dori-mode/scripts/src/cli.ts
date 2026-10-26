@@ -37,7 +37,7 @@ import { approveEmergency, clearEmergencyApproval, emergencyApprovedAt } from ".
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, ackToodo, recordHandled } from "./ack.ts";
 import { TOODO_CHANNEL, type Toodo, toodoClient, ToodoError } from "./messenger/toodo.ts";
-import { InboxError, take, takeOutput } from "./inbox.ts";
+import { InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -605,12 +605,13 @@ try {
       if (parsed.positionals.join(" ") !== "take" || !Number.isSafeInteger(maxBytes) || maxBytes < 1) die("usage: dori inbox take [--max-bytes N (positive integer)] [--peek]");
       try {
         const result = take(config.stateDir, { maxBytes, peek: parsed.values.peek === true, now: realClock.now(), session: process.env.PI_SESSION_ID });
-        // Finished lanes still owed to the owner and open decisions are listed every time, before the INBOX_MORE / INBOX_EMPTY sentinel.
+        // What the last cold start carried over, finished lanes still owed to the owner and open decisions are listed every
+        // time, before the INBOX_MORE / INBOX_EMPTY sentinel.
         const { takeReminders } = await import("./lane-outcomes.ts");
         const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        for (const line of [...lines, ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir), ...sentinel]) console.log(line);
+        for (const line of [...lines, ...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir), ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;

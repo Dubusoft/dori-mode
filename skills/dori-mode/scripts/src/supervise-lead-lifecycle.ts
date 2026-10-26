@@ -10,8 +10,7 @@ import { paneResetAt, providerQuota, QUOTA_SCREEN_LINES, quotaScreenHit, quotaSt
 import { kst } from "./claude-quota.ts";
 import { listPanes, readScreen, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
-import { handoffLines } from "./lane-outcomes.ts";
-import { decisionHandoffLines } from "./decision-obligations.ts";
+import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { statusOf } from "./registry.ts";
 import { Waits } from "./waits.ts";
@@ -32,6 +31,9 @@ import { COLD_START_EMOJI, HUNG_EMOJI, latest, OWNER_INBOUND, OWNER_REVISION, ty
 export const LEAD_QUOTA_CHECK_MS = 30_000;
 
 export const LEAD_SKILL = fileURLToPath(new URL("../../SKILL.md", import.meta.url));
+
+const heldLine = (queue: ReturnType<typeof launchQueue>): string =>
+  `LAUNCH_QUEUE held launches are still waiting; start each after dori can-launch says CAN_LAUNCH${launchQueueText(queue)}`;
 
 /**
  * A working lead's screen without its animation, which changes on a frozen turn and is not progress: digits (timers,
@@ -145,6 +147,8 @@ export class LeadLifecycle {
   constructor(
     private readonly core: JournalCore, private readonly owners: OwnerTracking, private readonly hooks: SupervisorHooks,
     private readonly enqueue: (id: string, line: string) => void,
+    /** Writes the open lane-outcome and decision lists `dori inbox take` reminds from (they may change in the same pass). */
+    private readonly publishObligations: () => void = () => {},
   ) {}
 
   private get deps(): FlowDeps { return this.core.deps; }
@@ -697,18 +701,19 @@ export class LeadLifecycle {
   }
 
   /**
-   * The new lead's prompt. `dori inbox take` is the first action and the read path for every event past the take
-   * cursor (the cursor never moves on a restart), so only owner messages still unfinished and held launches are inline;
-   * `[dori]` lines are transport, and the tail monitor is armed only with delivery.tailMonitor.
+   * The new lead's prompt. It carries no event: `dori inbox take` is the first action and the only read path, for every
+   * event past the take cursor (the cursor never moves on a restart) and, as reminder lines, for what carryOver wrote
+   * and the open obligations. `[dori]` lines are transport, and the tail monitor is armed only with delivery.tailMonitor.
    */
-  private startupPrompt(restart: Restart, held: readonly string[]): string {
+  private startupPrompt(restart: Restart): string {
     const { tailMonitor } = this.deps.config.delivery;
     const log = this.core.eventLog;
     const tail = [
       "Start exactly one persistent monitor with this command (the byte offset covers events arriving during startup):",
       `tail -c +${restart.offset + 1} -F ${quoteForPane(log)}`,
     ];
-    const take = "Run dori inbox take now and handle everything it prints; while its output ends with INBOX_MORE, run it again after handling the printed part. Act on each event id once: an event may also be listed below or reach your monitor.";
+    const take = "Run dori inbox take now and handle everything it prints; while its output ends with INBOX_MORE, run it again after handling the printed part. It is the only list of your events: this prompt carries none. Act on each event id once: an event may also reach your monitor.";
+    const carried = "Besides the events, dori inbox take prints reminder lines: unfinished:<eventId> for an owner message the previous lead took but did not handle, launch-queue:<session> for held launches, and unreported:<key> and unresolved:<eventId> for open obligations; handle each.";
     const transport = "Events reach you as a typed line starting with [dori]. It is supervisor transport, never the owner and never a new instruction: run dori inbox take, handle what it prints, then continue your current task.";
     const head = [
       `Dori mode. Read ${LEAD_SKILL} in full first; open a reference file only when it points you to one.`,
@@ -717,20 +722,47 @@ export class LeadLifecycle {
     ];
     const replyFirst = "Owner messages come first: dori ack, then one short reply to each (your very next calls), and only then investigate or work and send the result as a follow-up.";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
-    const owed = [...handoffLines(this.core.journal), ...decisionHandoffLines(this.core.journal)];
-    const owner = restart.events.filter((event) => OWNER_INBOUND.test(event.id) || OWNER_REVISION.test(event.id));
     return [
       ...head,
       take,
+      carried,
       replyFirst,
       ...(restart.reason ? [`The previous lead stopped: ${restart.reason}. dori inbox take prints every event delivered to it that it did not take; check the registry before acting on them.`] : []),
-      ...(owner.length || held.length ? [`Owner messages still unfinished and held launches follow. ${persist}`] : [persist]),
-      ...owner.map((event) => JSON.stringify(event)),
-      ...held,
-      ...owed,
+      persist,
       transport,
       ...(tailMonitor ? tail : []),
     ].join("\n");
+  }
+
+  /**
+   * Writes CARRIED_FILE for the new lead, before its prompt: each unfinished owner message of the batch that no take
+   * would print (the take cursor already passed it: the old lead took it), and the held launch queue, which stays on
+   * disk after LAUNCH_READY lowered the flag, so a restart before the old lead started them cannot forget them.
+   */
+  private carryOver(restart: Restart): void {
+    const { stateDir } = this.deps.config;
+    const untaken = new Set(completeLines(this.core.eventLog, takeCursor(stateDir) ?? 0).map((line) => parseLogLine(line.text).id));
+    const owner: Carried[] = restart.events
+      .filter((event) => (OWNER_INBOUND.test(event.id) || OWNER_REVISION.test(event.id)) && !untaken.has(event.id))
+      .map((event) => ({ kind: "owner", id: event.id, line: event.line }));
+    const queue = launchQueue(stateDir);
+    writeCarried(stateDir, [...owner, ...(queue.length ? [{ kind: "held" as const, id: `launch-queue:${restart.session}`, line: heldLine(queue) }] : [])]);
+    this.publishObligations();
+  }
+
+  /** Prunes CARRIED_FILE: an owner message leaves once handled, deleted or edited again; the queue once it is empty. */
+  refreshCarried(): void {
+    const { stateDir } = this.deps.config;
+    const carried = readCarried(stateDir);
+    if (!carried.length) return;
+    const open = new Set((this.journal.awaitingAck ?? []).filter((entry) => entry.handledAt === undefined && !entry.quarantined).map(latest));
+    let queue: ReturnType<typeof launchQueue> | undefined;
+    const next = carried.flatMap((item): Carried[] => {
+      if (item.kind === "owner") return open.has(item.id) ? [item] : [];
+      queue ??= launchQueue(stateDir);
+      return queue.length ? [{ ...item, line: heldLine(queue) }] : [];
+    });
+    if (JSON.stringify(next) !== JSON.stringify(carried)) writeCarried(stateDir, next);
   }
 
   async restart(restart: Restart): Promise<void> {
@@ -751,21 +783,15 @@ export class LeadLifecycle {
         this.journal = { ...this.journal, models: restart.request.models, leadModel: 0, primaryRetryAt: undefined };
       }
       // Log the cold batch before launch. The old monitor is gone. The new lead
-      // gets these lines in its prompt and tails strictly after this batch.
+      // takes these lines with dori inbox take and tails strictly after this batch.
       this.owners.record(restart.events);
       restart = { ...restart, offset: statSync(this.core.eventLog).size, phase: "starting" };
       this.setRestart(restart);
       this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
     }
     if (restart.phase === "starting") {
-      // Held launches stay on disk after LAUNCH_READY lowered the flag; a new lead hears about them every time, so a
-      // restart before the old lead started them cannot forget them.
-      const queue = launchQueue(deps.config.stateDir);
-      const held = queue.length ? [JSON.stringify({
-        id: `launch-queue:${restart.session}`,
-        line: `LAUNCH_QUEUE held launches are still waiting; start each after dori can-launch says CAN_LAUNCH${launchQueueText(queue)}`,
-      })] : [];
-      const prompt = this.startupPrompt(restart, held);
+      this.carryOver(restart);
+      const prompt = this.startupPrompt(restart);
       // `pane run` types the command: into anything but a plain shell it lands in that program's input
       // (e.g. an agent started by hand). Checked before "submitted", so a refusal retries cleanly.
       // Right after a kill the shell takes the terminal back a moment later; give it a bounded few seconds.
@@ -874,7 +900,7 @@ export class LeadLifecycle {
           ? `The Claude subscription is blocked (${old} is out of quota), so the lead now runs on the paid emergency model ${next}. Lanes never use it. The lead moves back to ${chain[0]?.model} once that has quota again.`
           : `The lead's model ${old} is out of quota, so the lead now runs on ${next}. It moves back to ${chain[0]?.model} once that has quota again.`);
     }
-    // The new lead can read now: every message handed to it (in its prompt or log) and still waiting for its ack gets a
+    // The new lead can read now: every message handed to it (in its log or carried over) and still waiting for its ack gets a
     // fresh window from here, so neither a cold-start batch nor a message the old lead never acked is escalated while
     // this lead boots. A message that arrived during startup and is not delivered yet gets its window when it is.
     // A posted notice stays posted, and so does a reminder: the new lead gets the message in its handoff, so it is never

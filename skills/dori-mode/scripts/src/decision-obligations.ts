@@ -113,16 +113,6 @@ export const markDecisionsPushed = (core: JournalCore, ids: readonly string[], n
   core.persist();
 };
 
-/** One line per open obligation for the cold-restart handoff, empty when there is none. */
-export const decisionHandoffLines = (journal: Journal): string[] => {
-  const owed = unresolved(journal).filter((item) => item.line !== undefined);
-  if (!owed.length) return [];
-  return [
-    "Decisions still open follow: for each, decide and act on it, then run dori resolved <eventId>.",
-    ...owed.map((item) => `UNRESOLVED ${item.id} ${item.line ?? ""}`.trimEnd()),
-  ];
-};
-
 type Published = { readonly id: string; readonly since: number; readonly line?: string };
 
 /** The published open obligations (UNRESOLVED_FILE); empty when unreadable. */
@@ -193,11 +183,12 @@ export class DecisionTracking {
   /**
    * One pass: receipts first, then each open obligation past its window gets one urgent UNRESOLVED (the first after
    * resolveTimeoutMin, then after twice the previous wait, up to RESOLVE_REPEAT_MAX_MS). Nothing is reminded while a lead
-   * restart runs: the new lead's handoff lists every open obligation. Resolved rows are dropped after RESOLVED_KEEP_MS.
+   * restart runs: the published list is kept current, and the new lead's `dori inbox take` prints every open obligation.
+   * Resolved rows are dropped after RESOLVED_KEEP_MS.
    */
   tick(): void {
     this.consumeReceipts();
-    if (this.journal.restart) return;
+    if (this.journal.restart) { this.publish(); return; }
     const now = this.core.deps.clock.now();
     const window = windowMs(this.core);
     let changed = false;

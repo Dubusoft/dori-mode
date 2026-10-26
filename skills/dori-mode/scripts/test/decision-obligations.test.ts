@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { defaultConfig, loadConfig } from "../src/config.ts";
 import {
-  DEFAULT_RESOLVE_KINDS, decisionHandoffLines, isDecision, pendingResolved, recordResolved, RESOLVED_DIR, takeDecisionReminders,
+  DEFAULT_RESOLVE_KINDS, isDecision, pendingResolved, recordResolved, RESOLVED_DIR, takeDecisionReminders,
 } from "../src/decision-obligations.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { take, takeOutput } from "../src/inbox.ts";
@@ -119,7 +119,7 @@ test("decision events in the history at startup, and decision events that never 
   expect(f.reminders()).toEqual([]);
 });
 
-test("open decisions are listed for inbox take and the cold handoff until resolved", () => {
+test("open decisions are listed for inbox take until resolved", () => {
   const f = fixture();
   const supervisor = f.open();
   expect(takeDecisionReminders(f.state.dir)).toEqual([]);
@@ -128,14 +128,9 @@ test("open decisions are listed for inbox take and the cold handoff until resolv
   expect(takeDecisionReminders(f.state.dir)).toEqual([
     `unresolved:report:q\tUNRESOLVED report:q since ${new Date(T0).toISOString()}: decide and act on it, then run dori resolved report:q`,
   ]);
-  expect(decisionHandoffLines(readJournal(f.state.dir))).toEqual([
-    "Decisions still open follow: for each, decide and act on it, then run dori resolved <eventId>.",
-    "UNRESOLVED report:q LANE_REPORT alpha question which db?",
-  ]);
   recordResolved(f.state.dir, "report:q", f.clock.now());
   supervisor.resolveTick();
   expect(takeDecisionReminders(f.state.dir)).toEqual([]);
-  expect(decisionHandoffLines(readJournal(f.state.dir))).toEqual([]);
 });
 
 test("retention keeps the body of an open decision event and prunes it once resolved", async () => {
@@ -308,7 +303,9 @@ test("a decision taken but not resolved keeps an idle lead pushed (UNRESOLVED in
   expect(f.launches()).toHaveLength(1);
   const prompt = f.prompt() ?? "";
   expect(prompt).toContain("it did not take pushed events (1 decision(s) not resolved for 5 min)");
-  expect(prompt.split("\n")).toContain("UNRESOLVED wait:1 WAIT_DONE ci green");
+  // The prompt carries no obligation line: the new lead's take prints it as a reminder.
+  expect(prompt).not.toContain("UNRESOLVED wait:1");
+  expect(takeDecisionReminders(f.state.dir)).toEqual([expect.stringMatching(/^unresolved:wait:1\tUNRESOLVED wait:1 since /)]);
   recordResolved(f.state.dir, "wait:1", f.clock.now());
   supervisor.resolveTick();
   const pushed = f.texts().length;

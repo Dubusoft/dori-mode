@@ -11,13 +11,13 @@ import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
 import { approveEmergency, clearEmergencyApproval, emergencyApproved } from "../src/emergency.ts";
-import { clearLaunchHold, enqueueLaunch } from "../src/routing.ts";
+import { clearLaunchHold, dequeueLaunch, enqueueLaunch } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, writeJournal } from "./fakes.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
-import { take, takeOutput } from "../src/inbox.ts";
+import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 
 const cleanups: (() => void)[] = [];
@@ -99,6 +99,14 @@ const fixture = (extra: Record<string, unknown> = {}) => {
 const TAKE_FIRST = "Run dori inbox take now";
 /** What `dori inbox take` prints the lead now, as `id\tline`. */
 const taken = (f: ReturnType<typeof fixture>): string[] => takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }));
+/**
+ * What a new lead is handed, as `dori inbox take` prints it: the events past the cursor, then the cold start's carried
+ * reminders. The startup prompt itself carries no event line (asserted here too). Takes, so call it once per handoff.
+ */
+const handed = (f: ReturnType<typeof fixture>): string => {
+  expect(f.prompt()?.split("\n").filter((line) => line.startsWith("{") || /^(UNRESOLVED|UNREPORTED|LAUNCH_QUEUE) /.test(line))).toEqual([]);
+  return [...taken(f), ...takeCarriedReminders(f.state.dir)].join("\n");
+};
 
 test("spinner frames of any common style do not count as screen progress; text does", () => {
   const frames = ["⠙ Thinking 12s", "✻ Thinking 13s", "◐ Thinking 14s", "| Thinking 15s", "/ Thinking 16s", "- Thinking 17s", "\\ Thinking 18s", "· Thinking 19s"];
@@ -665,15 +673,15 @@ test("a lead that wakes during cold process resolution receives a warm append wi
   expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
 });
 
-test("a large multibyte event reaches the prompt without exceeding the pane command line", async () => {
+test("a large multibyte event reaches the new lead through take without exceeding the pane command line", async () => {
   const f = fixture();
   f.cold();
   const text = "한".repeat(2000);
   const supervisor = new Supervisor(f.deps);
-  // An owner message: those are the events the push prompt still carries inline.
   supervisor.enqueue("discord:123:1", `INBOUND 123 1 Owner ${text}`);
   await supervisor.flush();
-  expect(f.prompt()).toContain(text);
+  // The prompt carries no event, so a large body cannot reach the pane command line; take hands it over whole.
+  expect(handed(f)).toContain(text);
   expect(Buffer.byteLength(f.command() ?? "")).toBeLessThan(4096);
 });
 
@@ -1242,7 +1250,7 @@ test("an idle lead stalled on quota moves to the next model with the pending eve
   await supervisor.reactionsSettled();
   expect(launches(f)).toHaveLength(1);
   expect(launches(f)[0]).toContain("--model b/fallback --thinking high");
-  expect(f.prompt()).toContain('"id":"discord:1:9"');
+  expect(handed(f)).toContain("discord:1:9\t");
   expect(f.prompt()).toContain("The previous lead stopped: a/primary is blocked on quota");
   expect(f.log().map((event) => event.id)).toEqual(["discord:1:9"]);
   expect(announced).toEqual(["The lead's model a/primary is out of quota, so the lead now runs on b/fallback. It moves back to a/primary once that has quota again."]);
@@ -1709,9 +1717,42 @@ test.each([false, true])("a restart replays delivered owner work with acked=%s u
   supervisor.enqueue("restart-trigger", "WAIT_DONE release");
   await supervisor.flush();
   // Then the cold prompt includes the original request, without appending it twice.
-  const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-  expect(events?.some((event) => event.id === "discord:11:22")).toBe(true);
+  expect(handed(f).split("\n").filter((line) => line.startsWith("discord:11:22\t"))).toHaveLength(1);
   expect(f.log().filter((event) => event.id === "discord:11:22")).toHaveLength(1);
+});
+
+test("a cold start hands every event through take once; owner work taken but unhandled and held launches come back as reminders until done", async () => {
+  // Given an owner request the lead took (and acked) but did not handle, a delivered event it did not take, and a held launch.
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner project-alpha");
+  await supervisor.flush();
+  expect(taken(f)).toEqual(["discord:11:22\tINBOUND 11 22 owner project-alpha"]);
+  recordAck(f.state.dir, "11", "22", f.clock.now());
+  supervisor.ackTick(60_000);
+  supervisor.enqueue("discord:11:23", "INBOUND 11 23 owner project-beta");
+  await supervisor.flush();
+  enqueueLaunch(f.state.dir, { key: "held-lane", title: "held", done: "merged acme/app#1", brief: "/b.md", queuedAt: "2027-01-15T08:00:00.000Z", reasons: ["memory"] });
+  // When an unrelated event causes a cold restart.
+  f.cold();
+  supervisor.enqueue("restart-trigger", "WAIT_DONE release");
+  await supervisor.flush();
+  expect(launches(f)).toHaveLength(1);
+  // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
+  const lines = handed(f).split("\n");
+  const session = /--session-id (\S+)/.exec(launches(f)[0] ?? "")?.[1];
+  expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`]);
+  expect(lines[2]).toContain("INBOUND 11 22 owner project-alpha");
+  expect(lines[3]).toContain("held-lane");
+  // A second take prints only the reminders again; handling the message and starting the launch clears them.
+  expect(taken(f)).toEqual(["INBOX_EMPTY"]);
+  expect(takeCarriedReminders(f.state.dir)).toHaveLength(2);
+  recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true });
+  supervisor.ackTick(60_000);
+  expect(takeCarriedReminders(f.state.dir).map((line) => line.split("\t")[0])).toEqual([`launch-queue:${session}`]);
+  dequeueLaunch(f.state.dir, "held-lane");
+  supervisor.ackTick(60_000);
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
 });
 
 test("handled owner work is excluded from a fresh lead handoff", async () => {
@@ -1720,14 +1761,14 @@ test("handled owner work is excluded from a fresh lead handoff", async () => {
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner project-alpha");
   await supervisor.flush();
+  taken(f);
   recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true });
   // When a restart begins, it consumes receipts before selecting unfinished work.
   f.cold();
   supervisor.enqueue("restart-trigger", "WAIT_DONE release");
   await supervisor.flush();
   // Then the old request is not replayed.
-  const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-  expect(events?.some((event) => event.id === "discord:11:22")).toBe(false);
+  expect(handed(f)).not.toContain("discord:11:22");
 });
 
 test("acked but unhandled work wakes the lead with its body and escalates once after another window", async () => {
@@ -1842,8 +1883,7 @@ test("a busy lead dying before its read window starts replays the message withou
   f.noAgent();
   await supervisor.flush();
   // Then a new lead receives the request and its acknowledgment deadline starts.
-  const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-  expect(events?.some((event) => event.id === "discord:11:22")).toBe(true);
+  expect(handed(f).split("\n").filter((line) => line.startsWith("discord:11:22\t"))).toHaveLength(1);
   f.clock.at = readableSince(f, "discord:11:22") + 60_000;
   supervisor.ackTick(60_000);
   expect(reminded(f)).toEqual(["discord:11:22"]);
@@ -1944,7 +1984,7 @@ test("a working lead stalled on quota is switched once the stall outlives leadQu
   expect(launches(f)[0]).toContain("--model b/fallback");
   expect(f.prompt()).toContain("a/primary is blocked on quota");
   expect(f.prompt()).toContain("while working for 10 min");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
   expect(journal(f)).toMatchObject({ leadModel: 1 });
 });
 
@@ -2003,7 +2043,7 @@ test("a lead stuck blocked with owner messages unread is cold-restarted with the
   expect(launches(f)).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
   expect(f.prompt()).toContain("it was stuck blocked for 30 min with 1 owner message(s) unread");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
   expect(announced).toEqual(["The lead has been stuck (blocked) for 30 min without reading your messages, so it is being restarted; your unanswered messages go to the new lead."]);
   expect(journal(f).restart).toBeUndefined();
 });
@@ -2064,7 +2104,7 @@ test("a working lead held inside one tool call (a foreground watch) with an owne
   expect(launches(f)).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
   expect(f.prompt()).toContain("it was stuck in one tool call for 5 min with 1 owner message(s) unread");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
 });
 
 test("a working lead between tool calls, or one whose call started after it acked, is left alone", async () => {
@@ -2114,7 +2154,7 @@ test("an idle lead paused by Esc gets /resume typed before its pointer; still un
   await muted(() => supervisor.flush());
   expect(launches(f)).toHaveLength(1);
   expect(f.prompt()).toContain("it did not take pushed events");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
 });
 
 test("a paused lead with the owner's text in its input is not typed into, and a lead that is not paused is not resumed", async () => {
@@ -2180,8 +2220,9 @@ test("a cold handoff always carries the held launch queue, even after LAUNCH_REA
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 owner hi");
   await supervisor.flush();
-  expect(f.prompt()).toContain("LAUNCH_QUEUE held launches are still waiting");
-  expect(f.prompt()).toContain("held-lane");
+  const handoff = handed(f);
+  expect(handoff).toContain("LAUNCH_QUEUE held launches are still waiting");
+  expect(handoff).toContain("held-lane");
 });
 
 test("an edited owner message is reminded and handed to a new lead in its latest text; a deleted one never is", async () => {
@@ -2203,12 +2244,16 @@ test("an edited owner message is reminded and handed to a new lead in its latest
   const before = journal(f).awaitingAck;
   const restarted = new Supervisor(f.deps);
   expect(journal(f).awaitingAck).toEqual(before);
+  // The edit and the delete were delivered warm, then taken: only the latest text of the unfinished message comes back.
+  taken(f);
   f.cold();
   restarted.enqueue("cold", "INBOUND cold");
   await restarted.flush();
-  expect(f.prompt()).toContain("revised task");
-  expect(f.prompt()).not.toContain("original task");
-  expect(f.prompt()).not.toContain("doomed task");
+  const handoff = handed(f);
+  expect(handoff).toContain("unfinished:discord:1:1:edit:2027-01-15T08:01:00.000Z\tUNFINISHED");
+  expect(handoff).toContain("revised task");
+  expect(handoff).not.toContain("original task");
+  expect(handoff).not.toContain("doomed task");
 });
 
 test("an edit of a message already handled is tracked again as a new instruction", async () => {
@@ -2403,8 +2448,9 @@ test.each(["json", "sqlite"] as const)("an ack-flood journal on the %s store: no
   expect(digest[0]).toStartWith("OWNER_QUARANTINED 298 11:1000,1001,1004,");
   expect(eventPriority(digest[0] ?? "")).toBe("digest");
   // The cold start carried the new request and none of the quarantined history.
-  expect(f.prompt()).toContain("synthetic new request");
-  expect(f.prompt()).not.toContain("synthetic flood message");
+  const handoff = handed(f);
+  expect(handoff).toContain("synthetic new request");
+  expect(handoff).not.toContain("synthetic flood message");
   const rows = stored(f.state.dir, store).awaitingAck ?? [];
   expect(rows.filter((entry) => (entry as { quarantined?: true }).quarantined)).toHaveLength(298);
   expect(rows.find((entry) => entry.id === "discord:11:1002")).toMatchObject({ deleted: true });
