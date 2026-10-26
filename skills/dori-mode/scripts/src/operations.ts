@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { redactSecrets } from "./redact.ts";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
@@ -164,7 +165,7 @@ export const openOperations = (config: { readonly stateDir: string; readonly sto
   config.store === "sqlite" ? new SqliteOperations(join(config.stateDir, SQLITE_FILE)) : new JsonOperations(config.stateDir);
 
 const write = (store: OperationStore, op: Operation, patch: Partial<Operation>, now: number): Operation => {
-  const next: Operation = { ...op, ...patch, updatedAt: now };
+  const next: Operation = { ...op, ...patch, ...(patch.detail !== undefined ? { detail: redactSecrets(patch.detail) } : {}), updatedAt: now };
   store.put(next);
   return next;
 };

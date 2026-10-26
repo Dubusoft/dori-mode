@@ -6,7 +6,7 @@ import type { LeadRestartRequest } from "./lead-restart.ts";
 import { eventClass, forLead } from "./event-policy.ts";
 import { WakeMeter } from "./lead-wakes.ts";
 import { dropTake, pendingTakes, writeCursorFile } from "./inbox.ts";
-import { redactSecrets } from "./redact.ts";
+import { redactMeta, redactSecrets } from "./redact.ts";
 import { type Durability, type JournalStore, openStore, RETENTION, StoreError } from "./store.ts";
 
 /**
@@ -412,7 +412,7 @@ export class JournalCore {
     for (const event of events) {
       if (this.delivered.has(event.id)) continue;
       // `meta` is an extra field: `dori inbox take` (parseLogLine) reads only id and line.
-      append(this.eventLog, `${JSON.stringify({ id: event.id, line: redactSecrets(event.line), ...(event.meta ? { meta: event.meta } : {}) })}\n`);
+      append(this.eventLog, `${JSON.stringify({ id: event.id, line: redactSecrets(event.line), ...(event.meta ? { meta: redactMeta(event.meta) } : {}) })}\n`);
       this.delivered.add(event.id);
       appended.push(event.id);
     }

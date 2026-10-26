@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import type { ToodoConfig } from "./messenger/toodo.ts";
+import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -401,6 +402,10 @@ export const saveLeadPane = (path: string, leadPane: string): boolean => {
   renameSync(tmp, real);
   return true;
 };
+
+/** `fill` for the thread hooks: their `text` and `title` leave the host, so secrets are masked on the way out. */
+export const fillHook = (template: ArgvTemplate, values: Readonly<Record<string, string>>): string[] =>
+  fill(template, Object.fromEntries(Object.entries(values).map(([name, value]) => [name, name === "text" || name === "title" ? redactSecrets(value) : value])));
 
 export const fill = (template: ArgvTemplate, values: Readonly<Record<string, string>>): string[] =>
   template.map((part) => part.replace(/\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole));

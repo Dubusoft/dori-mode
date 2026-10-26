@@ -3,7 +3,7 @@ import { scrubForThread } from "./freshness.ts";
 import { homedir } from "node:os";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { redactSecrets } from "./redact.ts";
+import { redactMeta, redactSecrets } from "./redact.ts";
 import { type Event, type EventMeta, JournalCore, type OwnerNoticeKind } from "./supervise-journal.ts";
 import { OWNER_INBOUND, OWNER_REVISION, type OwnerMessage, OwnerTracking, quarantineDigest, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 import { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
@@ -84,7 +84,7 @@ export class Supervisor {
   enqueue(id: string, line: string, meta?: EventMeta): boolean {
     if (this.core.known(id)) return false;
     const queued = line === "LAUNCH_READY" || line.startsWith("LAUNCH_READY ") ? launchQueueText(launchQueue(this.core.deps.config.stateDir)) : "";
-    const event: Event = { id, line: redactSecrets(`${line}${queued}`).replace(/[\r\n]+/g, " "), at: this.core.deps.clock.now(), ...(meta ? { meta } : {}) };
+    const event: Event = { id, line: redactSecrets(`${line}${queued}`).replace(/[\r\n]+/g, " "), at: this.core.deps.clock.now(), ...(meta ? { meta: redactMeta(meta) } : {}) };
     const before = this.core.journal;
     const length = before.events.length;
     const nested = this.enqueuing;

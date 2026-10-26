@@ -1,4 +1,5 @@
-import { fill, languageInstruction } from "./config.ts";
+import { fillHook, languageInstruction } from "./config.ts";
+import { redactSecrets } from "./redact.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import type { LaneReportStore } from "./lane-reports.ts";
 import { checkPausedLane } from "./pause.ts";
@@ -20,7 +21,7 @@ export const reportLines = (screen: string, key: string): string[] => {
 export const lastReportLine = (screen: string, key: string): string | null => reportLines(screen, key).at(-1) ?? null;
 
 export const scrubForThread = (line: string, home: string): string =>
-  line
+  redactSecrets(line)
     .replace(/^\[REPORT\]\s*[^|]*\|\s*[^|]*\|\s*/, "")
     .split(home).join("~")
     .replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)")
@@ -82,7 +83,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
           const line = progressLine(progress, (s) => scrubForThread(s, home), deps.config.progressTemplate);
           // A new item posts at once; an unchanged one again every nudgeAfterMin, so a long step still shows life.
           if (line.key !== current.lastProgressPost || now - (current.lastProgressAt ?? 0) >= deps.config.nudgeAfterMin * 60_000) {
-            const posted = await deps.run(fill(hook, { thread: lane.thread, text: line.text, key: lane.key }));
+            const posted = await deps.run(fillHook(hook, { thread: lane.thread, text: line.text, key: lane.key }));
             if (posted.code === 0) {
               await save({ lastProgressPost: line.key, lastProgressAt: now, lastProgressError: undefined });
               acts.push({ kind: "progress", lane: lane.key, detail: line.text });
@@ -127,7 +128,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
         continue;
       }
       const text = `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`;
-      await deps.run(fill(hook, { thread: lane.thread, text, key: lane.key }));
+      await deps.run(fillHook(hook, { thread: lane.thread, text, key: lane.key }));
       await save({ lastSeenReport, lastAutoReplyAt: now, lastPostedReport: report ?? undefined, lastFreshnessNote: undefined });
       acts.push({ kind: "posted", lane: lane.key, detail: text });
     }

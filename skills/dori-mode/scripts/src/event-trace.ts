@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { redactMeta, redactSecrets } from "./redact.ts";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 
@@ -59,10 +60,10 @@ export const buildTrace = (id: string, src: TraceSources): Trace | undefined => 
   } else if (src.ownerClosed) steps.push({ step: "handled", detail: "owner tracking compacted" });
   const { outcome } = src;
   if (outcome) {
-    if (outcome.reportedAt !== undefined) steps.push({ step: "reported", at: outcome.reportedAt, detail: `lane ${outcome.lane}${outcome.note ? `: ${outcome.note}` : ""}` });
+    if (outcome.reportedAt !== undefined) steps.push({ step: "reported", at: outcome.reportedAt, detail: redactSecrets(`lane ${outcome.lane}${outcome.note ? `: ${outcome.note}` : ""}`) });
     else open.push("reported");
   }
-  return { id, ...(event ? { line: event.line } : {}), ...(event?.meta ? { meta: event.meta } : {}), steps, open };
+  return { id, ...(event ? { line: redactSecrets(event.line) } : {}), ...(event?.meta ? { meta: redactMeta(event.meta) } : {}), steps, open };
 };
 
 /** The trace as printed lines: a header, then one `<ISO time | ->  <step>  <detail>` per step and the open steps. */
