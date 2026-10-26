@@ -16,7 +16,33 @@ type Counted = { readonly id: string; readonly has_unreads?: boolean; readonly m
 
 export type InboundOptions = { readonly selfUserId: string; readonly threadsViewLimit?: number };
 
+const REPLIES_CONCURRENCY = 4;
+
+/** Runs fn over items with at most `limit` in flight; results keep input order. */
+const mapPool = async <T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> => {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+};
+
+/** Ledger writes are deferred to one flush per poll (also on error, so advanced cursors are not lost). */
 export const pollSlackInbound = async (slack: Slack, ledger: ThreadLedger, opts: InboundOptions): Promise<Inbound[]> => {
+  ledger.beginBatch();
+  try {
+    return await pollOnce(slack, ledger, opts);
+  } finally {
+    await ledger.flush();
+  }
+};
+
+const pollOnce = async (slack: Slack, ledger: ThreadLedger, opts: InboundOptions): Promise<Inbound[]> => {
   const out: Inbound[] = [];
   const seen = new Set<string>();
   const add = (i: Inbound) => {
@@ -38,8 +64,14 @@ export const pollSlackInbound = async (slack: Slack, ledger: ThreadLedger, opts:
     }
   }
 
-  for (const t of await ledger.list()) {
-    const r = (await slack.call("conversations.replies", { channel: t.channel, ts: t.rootTs, oldest: t.seenTs, inclusive: false, limit: 50 })) as { messages?: readonly Msg[] };
+  const threads = await ledger.list();
+  const replies = await mapPool(
+    threads,
+    REPLIES_CONCURRENCY,
+    (t) => slack.call("conversations.replies", { channel: t.channel, ts: t.rootTs, oldest: t.seenTs, inclusive: false, limit: 50 }) as Promise<{ messages?: readonly Msg[] }>,
+  );
+  for (const [idx, t] of threads.entries()) {
+    const r = replies[idx] as { messages?: readonly Msg[] };
     let newest = t.seenTs;
     for (const m of r.messages ?? []) {
       if (!m.ts || !tsAfter(m.ts, t.seenTs)) continue;
