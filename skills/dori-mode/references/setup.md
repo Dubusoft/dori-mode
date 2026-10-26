@@ -98,7 +98,7 @@ REST catches up on startup and reconnect. With a healthy gateway, `discordSafety
 
 On a supervised start the lead:
 
-1. handles every pending event the prompt lists, straight away;
+1. runs `dori inbox take` and handles everything it prints, straight away (the prompt itself lists no events);
 2. registers the one monitor from the prompt;
 3. starts no sweeps and no inbound pollers;
 4. before each turn ends, writes open questions, promises and any other state it needs into memory or the registry, since the next turn may be a fresh session.
