@@ -35,6 +35,7 @@ Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` sig
 | `sessionsDir` | `~/.omo/agent/sessions` | session-id lookup |
 | `nudgeAfterMin`, `postAfterMin` | 15, 20 | `freshness` |
 | `progressTemplate` | `{todo}` | `freshness`: the thread line for a working lane's todo item; `{todo}` and `{elapsed}` (the status line's elapsed time, empty when absent) are filled in, so the owner's language goes here, e.g. `"진행 중: {todo} ({elapsed} 경과)"` |
+| `ownerLanguage` | unset | `launch`, `freshness`: free text naming the language the owner reads, e.g. `"Korean"`. When set, the lane footer tells the lane to write every `dori report` text and every todo item in it (code, commands, commit messages and PR text follow the repo convention), and the freshness nudge asking for a progress line repeats that one line. Unset or blank adds no text. Briefs already launched keep their footer |
 | `closeAfterMin` | 5 | `watch` |
 | `worktreeRoot` | `/data/repos/worktrees` | `watch`: the closed-lane cleanup removes kept worktrees only under this directory; `""` turns it off |
 | `heavySlots`, `heavyMaxLoad` | 1, 80 | `heavy` |

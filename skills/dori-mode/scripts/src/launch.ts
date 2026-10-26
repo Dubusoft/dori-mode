@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
-import { fill, isEmergencyModel } from "./config.ts";
+import { fill, isEmergencyModel, languageInstruction } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { laneRunner, readScreen, statusLookup } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
@@ -167,12 +167,13 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
   return { ...(auto ? { autoClose: auto } : {}), ...(issue ? { ghIssue: issue } : {}) };
 };
 
-export const footer = (lane: Lane, leadPane: string): string => [
+export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string): string => [
   "",
   "## Lane footer (written by dori launch)",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}. The lane closes only when every signal reads back live.`,
   "- PR bodies, issues and commit messages carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
+  ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
   ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
   ...(lane.machine
     ? [
@@ -328,7 +329,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   if (token) draft = await reserveLane(deps, input, draft, token);
   let agentAdmitted = false;
   try {
-    const brief = existing ? await briefFile.text() : `${(await briefFile.text()).replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane)}`;
+    const brief = existing ? await briefFile.text() : `${(await briefFile.text()).replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage)}`;
     if (!existing) await Bun.write(input.brief, brief);
     let pane: string;
     let tab: string | undefined;

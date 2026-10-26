@@ -165,6 +165,8 @@ export type DoriConfig = {
   readonly closeAfterMin: number;
   /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
   readonly worktreeRoot: string;
+  /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
+  readonly ownerLanguage?: string;
   /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
   readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
@@ -299,6 +301,12 @@ let warnedRemovedFlags = false;
 let warnedRemovedQuotaKeys = false;
 let warnedRemovedPushKeys = false;
 let warnedRemovedDeliveryKeys = false;
+
+/** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
+export const languageInstruction = (ownerLanguage: string | undefined): string => {
+  const language = typeof ownerLanguage === "string" ? ownerLanguage.trim() : "";
+  return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
+};
 
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
