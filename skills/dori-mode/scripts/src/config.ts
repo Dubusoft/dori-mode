@@ -2,7 +2,8 @@ import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync,
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_EVENT_POLICY, type EventPolicy, resolveEventPolicy } from "./event-policy.ts";
+import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
+import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import type { ToodoConfig } from "./messenger/toodo.ts";
 import type { StoreKind } from "./store.ts";
 
@@ -182,6 +183,10 @@ export type DoriConfig = {
   readonly unhandledNotice: string;
   /** Minutes after a lane finished (LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
   readonly reportTimeoutMin: number;
+  /** Event kinds (eventPolicy syntax) that open a decision obligation, closed by dori resolved <eventId> (decision-obligations.ts). */
+  readonly resolveKinds: readonly string[];
+  /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
+  readonly resolveTimeoutMin: number;
   /** The supervisor posts one plain line itself for each finished lane (lane-finish.ts), in its thread or the main channel. */
   readonly laneFinishNotice: boolean;
   readonly heavySlots: number;
@@ -268,6 +273,8 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   handledTimeoutMin: 30,
   unhandledNotice: "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
   reportTimeoutMin: 5,
+  resolveKinds: DEFAULT_RESOLVE_KINDS,
+  resolveTimeoutMin: 15,
   laneFinishNotice: true,
   heavySlots: 1,
   heavyMaxLoad: 80,
@@ -314,6 +321,18 @@ export const languageInstruction = (ownerLanguage: string | undefined): string =
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
 };
 
+/** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
+const resolveKinds = (raw: unknown): readonly string[] => {
+  if (raw === undefined) return DEFAULT_RESOLVE_KINDS;
+  if (!Array.isArray(raw)) throw new EventPolicyError("resolveKinds must be an array of event kinds");
+  for (const kind of raw) {
+    if (typeof kind !== "string" || !kind || kind.split(" ").some((word) => !word) || kind.split(" ")[0] === "*") {
+      throw new EventPolicyError(`resolveKinds: ${JSON.stringify(kind)} is not a kind (words separated by single spaces, starting with the event name)`);
+    }
+  }
+  return raw as string[];
+};
+
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
 export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
@@ -353,6 +372,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   return {
     ...merged,
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
+    resolveKinds: resolveKinds(raw.resolveKinds),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),

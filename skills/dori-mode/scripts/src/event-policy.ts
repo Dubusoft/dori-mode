@@ -21,7 +21,7 @@ const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
-  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "LANE_QUOTA_STALL", "ACK_MISSING", "UNHANDLED", "UNREPORTED",
+  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "LANE_QUOTA_STALL", "ACK_MISSING", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_QUOTA_CLEARED", "LANE_QUOTA_UNKNOWN", "LANE_RECOVERY_EXHAUSTED", "LANE_RECOVERY_BLOCKED",
   "LEAD_QUOTA_EXHAUSTED", "LEAD_QUOTA_CLEARED", "QUOTA_GATE_UNKNOWN", "WAIT_FAILED", "WAITS_CORRUPT",
   "LEAD_EMERGENCY_APPROVAL", "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
@@ -29,6 +29,8 @@ const URGENT_KINDS = [
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
   // A merged lane PR whose merge the supervisor could not read back.
   "MERGE_UNVERIFIED",
+  // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
+  "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
   "GH_ISSUE * opened", "GH_ISSUE * reopened",
   // A move into brief/blocked changes what the lead may do now; ok/hold-lanes changes stay digest.
@@ -43,6 +45,7 @@ const URGENT_KINDS = [
  */
 const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
+  "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "LANE_DONE_CLAIMED", "LANE_CLOSED", "MERGE_VERIFIED",
   // The Toodo chat's finish reports and followed task events (messenger/toodo-supervisor.ts): informational, never acked.
   "TOODO_FINISH", "TOODO_TASK",

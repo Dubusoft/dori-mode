@@ -59,6 +59,14 @@ test("a kind is the most specific matching entry, else the line's first word", (
   expect(eventClass("GH_PR other/x#1 merged", policy)).toBe("lead-digest");
 });
 
+test("LANE_REPORT_LATE follows LANE_REPORT: question, blocked and done are urgent, every other kind digest", () => {
+  for (const kind of ["question", "blocked", "done"]) expect(eventClass(`LANE_REPORT_LATE gone-lane ${kind} text`)).toBe("lead-urgent");
+  for (const kind of ["progress", "milestone", "other"]) expect(eventClass(`LANE_REPORT_LATE gone-lane ${kind} text`)).toBe("lead-digest");
+  expect(eventKind("LANE_REPORT_LATE gone-lane question q")).toBe("LANE_REPORT_LATE * question");
+  // An open decision's reminder wakes the lead like UNREPORTED and UNHANDLED do.
+  expect(eventClass("UNRESOLVED wait:1 WAIT_DONE alpha ci green")).toBe("lead-urgent");
+});
+
 test("a config file changes a kind's class and the default with no code change", async () => {
   const state = withState();
   cleanups.push(state.done);

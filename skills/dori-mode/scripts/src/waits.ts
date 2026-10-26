@@ -5,6 +5,7 @@ import { Database } from "bun:sqlite";
 
 import { fetchHttp } from "./messenger/http.ts";
 import type { Runner } from "./run.ts";
+import type { EventMeta } from "./supervise-journal.ts";
 import { checkSignal, parseSignal, type Check } from "./signals.ts";
 
 export class WaitError extends Error {}
@@ -175,7 +176,7 @@ export class Waits {
   async tick(
     now: () => number,
     run: Runner,
-    emit: (id: string, line: string) => void,
+    emit: (id: string, line: string, meta?: EventMeta) => void,
     check: (wait: Wait, signal: AbortSignal) => Promise<Check> = (wait, signal) =>
       checkSignal(wait.until, (argv, opts) => run(argv, { ...opts, cwd: wait.cwd, timeoutMs: WAIT_CHECK_MS }), {
         cwd: wait.cwd, http: (req) => fetchHttp({ ...req, signal }),
@@ -236,7 +237,7 @@ export class Waits {
           if (!current) return; // cancelled/replaced during the check
           this.save(waits.map((w) => w.id === wait.id ? { ...w, outcome: terminal } : w));
           const why = terminal === "WAIT_FAILED" ? ` (${current.failures ?? 0} checks in a row failed; no --timeout set)` : "";
-          emit(`wait:${wait.id}`, `${terminal} ${wait.key} ${wait.note}${why}${wait.thread ? ` thread=${wait.thread}` : ""}`);
+          emit(`wait:${wait.id}`, `${terminal} ${wait.key} ${wait.note}${why}${wait.thread ? ` thread=${wait.thread}` : ""}`, wait.key ? { lane: wait.key } : undefined);
           this.save(waits.filter((w) => w.id !== wait.id));
         });
       } catch (e) {

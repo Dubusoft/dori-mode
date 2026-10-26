@@ -69,6 +69,39 @@ test("an effect that fails while the read-back shows it not done is failed, and 
   expect(ran).toBe(2);
 });
 
+test("an unknown read-back is ambiguous whatever the effect reported, and is never retried", async () => {
+  const cases: [string, () => Promise<{ ok: boolean; detail: string }>][] = [
+    ["throws", async () => { ran++; throw new Error("boom"); }],
+    ["fails", async () => { ran++; return { ok: false, detail: "refused" }; }],
+    ["succeeds", async () => { ran++; return { ok: true, detail: "" }; }],
+  ];
+  for (const [i, [what, fx]] of cases.entries()) {
+    const s = { ...spec, target: `t${i}` };
+    const first = await perform(store, now, s, fx, async () => "unknown");
+    expect({ what, state: first.op.state, ran: first.ran }).toEqual({ what, state: "ambiguous", ran: true });
+    expect(first.op.detail).toContain("read-back cannot tell");
+    expect((await perform(store, now, s, fx, async () => "not-done")).ran).toBe(false);
+  }
+  expect(ran).toBe(3);
+});
+
+test("an effect that throws after a side effect with an unknown read-back runs once and stays ambiguous", async () => {
+  let counter = 0;
+  const throwing = async () => { counter++; throw new Error("died after the side effect"); };
+  const unknown = async (): Promise<Observed> => "unknown";
+  const first = await perform(store, now, spec, throwing, unknown);
+  const second = await perform(store, now, spec, throwing, unknown);
+  expect({ first: first.op.state, second: second.op.state, ran: second.ran, counter }).toEqual({ first: "ambiguous", second: "ambiguous", ran: false, counter: 1 });
+  expect(second.op.detail).toContain("effect threw");
+});
+
+test("a read-back proving absence after a throwing effect is failed and may retry", async () => {
+  const throwing = async () => { ran++; throw new Error("boom"); };
+  expect((await perform(store, now, spec, throwing, readBack)).op.state).toBe("failed");
+  expect((await perform(store, now, spec, effect, readBack)).op.state).toBe("verified");
+  expect(ran).toBe(2);
+});
+
 test("operations survive a store import and export with their states", async () => {
   if (TEST_STORE === "sqlite") return;
   await perform(store, now, spec, effect, readBack);
@@ -166,12 +199,12 @@ test("an archive interrupted after its attempt is reconciled by read-back, and a
   expect(store.get("lane-a/thread-archive/222")).toMatchObject({ state: "verified", attempts: 1 });
   expect(calls.filter((c) => c.startsWith("PATCH"))).toEqual([]);
 
-  // Unknown thread (404): the read-back cannot tell, the effect failed, so the row is failed and the close goes on.
+  // Unknown thread (404): the read-back cannot tell, so the row is ambiguous (not retried, not verified) and the close goes on.
   const gone = fakeDiscord({});
   const other = { ...threadLane("lane-d"), thread: "discord:111/444" };
   await deps.registry.write(other);
   const result = await closeLane({ ...deps, discord: gone.discord }, other, "manual");
   expect(result.closed).toBe(true);
   expect(result.lines.at(-1)).toContain("thread 444 not archived");
-  expect(store.get("lane-d/thread-archive/444")?.state).toBe("failed");
+  expect(store.get("lane-d/thread-archive/444")?.state).toBe("ambiguous");
 });

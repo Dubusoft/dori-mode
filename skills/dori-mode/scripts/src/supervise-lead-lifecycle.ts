@@ -11,6 +11,7 @@ import { kst } from "./claude-quota.ts";
 import { listPanes, readScreen, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
 import { handoffLines } from "./lane-outcomes.ts";
+import { decisionHandoffLines } from "./decision-obligations.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { statusOf } from "./registry.ts";
 import { Waits } from "./waits.ts";
@@ -716,7 +717,7 @@ export class LeadLifecycle {
     ];
     const replyFirst = "Owner messages come first: dori ack, then one short reply to each (your very next calls), and only then investigate or work and send the result as a follow-up.";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
-    const owed = handoffLines(this.core.journal);
+    const owed = [...handoffLines(this.core.journal), ...decisionHandoffLines(this.core.journal)];
     const owner = restart.events.filter((event) => OWNER_INBOUND.test(event.id) || OWNER_REVISION.test(event.id));
     return [
       ...head,

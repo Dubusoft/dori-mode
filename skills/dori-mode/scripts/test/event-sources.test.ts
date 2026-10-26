@@ -63,6 +63,48 @@ test("dori emit: spooled events are journaled once per --id and delivered by the
   expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ type: "builtin", events: 2, duplicates: 2, lastKind: "DEPLOY", lastEventAt: T0 });
 });
 
+test("emit retains its spool after a failed save and retries without a false duplicate", async () => {
+  const f = fixture({ DEPLOY: "owner-only" });
+  queueEmit(f.dir, "DEPLOY", "retry", T0, "retry");
+  const files = readdirSync(join(f.dir, EMIT_DIR));
+  const save = spyOn(f.supervisor["core"].store, "save").mockImplementation(() => { throw new Error("save failed"); });
+  await f.sources.tick();
+  save.mockRestore();
+  expect(readdirSync(join(f.dir, EMIT_DIR))).toEqual(files);
+  expect(f.supervisor.journaled("emit:retry")).toBe(false);
+  expect(await f.settled()).toEqual([]);
+  expect(f.logs.some((line) => line.startsWith("SOURCE_ERROR emit save failed"))).toBe(true);
+  await f.sources.tick();
+  expect(readdirSync(join(f.dir, EMIT_DIR))).toEqual([]);
+  expect(f.events().filter((event) => event.id === "emit:retry")).toHaveLength(1);
+  expect(await f.settled()).toEqual(["DEPLOY retry"]);
+  expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ events: 1, duplicates: 0 });
+});
+
+test("webhook returns an error after a failed save and accepts a same-id retry", async () => {
+  const f = fixture({ HOOK: "owner-only" });
+  const port = freePort();
+  const secret = "s3cret-s3cret-s3cret";
+  new SourceSpecs(f.dir).add({ name: "hook", type: "webhook", kind: "HOOK", port, secret });
+  await f.sources.tick();
+  const post = () => fetch(`http://127.0.0.1:${port}/`, {
+    method: "POST", body: JSON.stringify({ id: "retry", text: "retry" }), headers: { "x-dori-secret": secret },
+  });
+  const save = spyOn(f.supervisor["core"].store, "save").mockImplementation(() => { throw new Error("save failed"); });
+  const failed = await post();
+  save.mockRestore();
+  expect(failed.status).toBe(503);
+  expect(f.supervisor.journaled("src:hook:retry")).toBe(false);
+  expect(await f.settled()).toEqual([]);
+  const retry = await post();
+  expect(retry.status).toBe(202);
+  expect(await retry.json()).toEqual({ ok: true, duplicate: false });
+  expect(f.events().filter((event) => event.id === "src:hook:retry")).toHaveLength(1);
+  expect(await f.settled()).toEqual(["HOOK retry"]);
+  f.sources.save();
+  expect(readSourceStatus(f.dir)?.sources.hook).toMatchObject({ events: 1, duplicates: 0 });
+});
+
 test("a poll source runs its command every everySec and journals each matching line once, by its capture group", async () => {
   let out = "101 green\nnoise\n102 red\n";
   const calls: (readonly string[])[] = [];
@@ -82,6 +124,15 @@ test("a poll source runs its command every everySec and journals each matching l
   expect(calls).toHaveLength(2);
   expect(f.events().filter((event) => event.line.startsWith("BUILD ")).map((event) => event.line)).toEqual(["BUILD 101 green", "BUILD 102 red", "BUILD 103 green"]);
   expect(readSourceStatus(f.dir)?.sources.ci).toMatchObject({ type: "poll", events: 3, duplicates: 1, lastKind: "BUILD" });
+});
+
+test("a poll source without a capture group lists its line-hash identity", () => {
+  const spec = validateSpec({ name: "poll", type: "poll", kind: "POLL", command: ["x"], everySec: 60, match: "^BUILD \\d+" });
+  expect(publicSpec(spec)).toMatchObject({
+    identity: "text-hash (repeats of the same line collapse; add a capture group selecting an occurrence id)",
+  });
+  const captured = validateSpec({ name: "captured", type: "poll", kind: "POLL", command: ["x"], everySec: 60, match: "^(\\d+)" });
+  expect(publicSpec(captured)).not.toHaveProperty("identity");
 });
 
 test("a file source tails from the end at first sight, journals new matching lines once and follows a truncation", async () => {
@@ -294,3 +345,13 @@ test("the real supervisor runs the built-ins and the user sources through the re
   expect(errors.some((line) => line.startsWith("SOURCE_ERROR broken "))).toBe(true);
   expect(existsSync(join(state.dir, EMIT_DIR)) ? readdirSync(join(state.dir, EMIT_DIR)) : []).toEqual([]);
 }, 30_000);
+
+test("a source enqueue hands an event's lane meta through to the journal enqueue", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const seen: unknown[][] = [];
+  const sources = new EventSources({ stateDir: state.dir, enqueue: (...args) => { seen.push(args); return true; }, now: () => T0, run: async () => ok() });
+  expect(sources.enqueueFor("waits")("wait:1", "WAIT_DONE ci green", { lane: "alpha" })).toBe(true);
+  sources.enqueueFor("waits")("wait:2", "WAIT_DONE other");
+  expect(seen).toEqual([["wait:1", "WAIT_DONE ci green", { lane: "alpha" }], ["wait:2", "WAIT_DONE other", undefined]]);
+});

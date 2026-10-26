@@ -268,3 +268,10 @@ test("removeLegacyLaneMcp deletes the old figma-off lane file, keeps a user's ow
     expect(await Bun.file(`${own}/.omo/mcp.json`).text()).toBe(text);
   }
 });
+
+test("events about a lane carry its meta: the claim announcement gets lane, thread and cwd", async () => {
+  await claimDone(at(T0), lane, "merged acme/app#1 abc123");
+  const got: [string, unknown][] = [];
+  await watchTick(at(T0 + MIN), async (line, _id, meta) => { got.push([line, meta]); });
+  expect(got).toEqual([["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123", { lane: "demo-lane", thread: "chat:team/123", cwd: "/repo" }]]);
+});

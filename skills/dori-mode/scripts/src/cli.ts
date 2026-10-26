@@ -106,6 +106,8 @@ const USAGE = `dori <command> [options]
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
   reported <key> [--note TEXT]         the lead's receipt that it told the owner a finished lane's outcome (after LANE_CLOSED or CI_MERGED);
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin
+  resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
+                                       WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on an owner message: on Discord hourglass off, eyes on;
                                        channel toodo: ack_chat and typing dots in Toodo; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--reply-id ID] [--task-id ID]
@@ -191,7 +193,7 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "inbox", "launch", "adopt", "hold", "lead-restart", "lead-emergency", "store", "ops", "source", "schedule"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "lead-emergency", "store", "ops", "source", "schedule"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
@@ -336,7 +338,7 @@ try {
         const registered = new Map(specs.list().map((spec) => [spec.name, publicSpec(spec)]));
         const rows = view.sources.map((source) => ({ ...source, ...(registered.get(source.name) ?? {}) }));
         if (flags.values.json) console.log(JSON.stringify(rows, null, 2));
-        else for (const row of rows) console.log(`${row.name} ${row.type}${row.kind ? ` ${row.kind}` : ""} events=${row.events ?? 0} duplicates=${row.duplicates ?? 0} last=${row.lastEventAt === undefined ? "never" : `${row.lastKind} ${new Date(row.lastEventAt).toISOString()}`}${row.failing ? ` FAILING ${row.lastError}` : ""}`);
+        else for (const row of rows) console.log(`${row.name} ${row.type}${row.kind ? ` ${row.kind}` : ""} events=${row.events ?? 0} duplicates=${row.duplicates ?? 0} last=${row.lastEventAt === undefined ? "never" : `${row.lastKind} ${new Date(row.lastEventAt).toISOString()}`}${row.failing ? ` FAILING ${row.lastError}` : ""}${"identity" in row && row.identity ? ` identity=${row.identity}` : ""}`);
         break;
       }
       if (action === "remove" && name) {
@@ -582,6 +584,20 @@ try {
         throw e;
       }
     }
+    case "event": {
+      // `dori event trace <id> [--json]`: enqueued -> delivered -> taken -> acked/handled or reported (event-trace.ts).
+      const parsed = parseArgs({ args: rest, allowPositionals: true, options: { json: { type: "boolean" } } });
+      const [action, id, ...extra] = parsed.positionals;
+      if (action !== "trace" || !id || extra.length) die("usage: dori event trace <eventId> [--json]");
+      const { buildTrace, loadTrace, traceText } = await import("./event-trace.ts");
+      const sources = loadTrace(config.stateDir, id ?? "");
+      if (!sources) die(`EVENT_TRACE_UNAVAILABLE the journal store in ${config.stateDir} cannot be read`, 2);
+      const trace = sources && buildTrace(id ?? "", sources);
+      if (!trace) die(`EVENT_NOT_FOUND ${id}: no journaled, pruned or delivered event has this id`);
+      else if (parsed.values.json) console.log(JSON.stringify(trace));
+      else for (const line of traceText(trace)) console.log(line);
+      break;
+    }
     case "inbox": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { "max-bytes": { type: "string" }, peek: { type: "boolean" } } });
       const raw = parsed.values["max-bytes"];
@@ -589,11 +605,12 @@ try {
       if (parsed.positionals.join(" ") !== "take" || !Number.isSafeInteger(maxBytes) || maxBytes < 1) die("usage: dori inbox take [--max-bytes N (positive integer)] [--peek]");
       try {
         const result = take(config.stateDir, { maxBytes, peek: parsed.values.peek === true, now: realClock.now(), session: process.env.PI_SESSION_ID });
-        // Finished lanes still owed to the owner are listed every time, before the INBOX_MORE / INBOX_EMPTY sentinel.
+        // Finished lanes still owed to the owner and open decisions are listed every time, before the INBOX_MORE / INBOX_EMPTY sentinel.
         const { takeReminders } = await import("./lane-outcomes.ts");
+        const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        for (const line of [...lines, ...takeReminders(config.stateDir), ...sentinel]) console.log(line);
+        for (const line of [...lines, ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir), ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;
@@ -659,6 +676,21 @@ try {
       const note = opt("note");
       recordReported(config.stateDir, key ?? "", realClock.now(), note ? oneLine(note) : undefined);
       console.log(`REPORTED_RECORDED ${key}`);
+      break;
+    }
+    case "resolved": {
+      // `dori resolved <eventId> [...] [--note T]`: the lead has decided these decision events (decision-obligations.ts). An
+      // id with no open obligation is still recorded (its event may not have arrived yet) and named as unmatched.
+      const { publishedDecisions, recordResolved, validEventId } = await import("./decision-obligations.ts");
+      const ids = flags.positionals;
+      if (!ids.length || !ids.every(validEventId) || Object.keys(flags.values).some((name) => name !== "note") || ("note" in flags.values && !opt("note"))) {
+        die("usage: dori resolved <eventId> [<eventId> ...] [--note TEXT]");
+      }
+      const open = new Set(publishedDecisions(config.stateDir).map((item) => item.id));
+      const note = opt("note");
+      const at = realClock.now();
+      for (const id of ids) recordResolved(config.stateDir, id, at, note ? oneLine(note) : undefined);
+      for (const id of ids) console.log(open.has(id) ? `RESOLVED_RECORDED ${id}` : `RESOLVED_UNMATCHED ${id}: no open decision has this id; recorded anyway`);
       break;
     }
     case "handled": {

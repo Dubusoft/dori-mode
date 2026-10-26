@@ -67,7 +67,7 @@ test.each(STORES)("%s store: rows written by another connection (a lane's CLI) a
   expect(supervisor.pending().map((r) => r.seq)).toEqual([1, 2]);
 });
 
-test("routing: progress posts to the lane's thread, done is the lane's claim, a closed lane's row is dropped; each row once", async () => {
+test("routing: progress posts to the lane's thread, done is the lane's claim, a closed lane's row is a late journal event; each row once", async () => {
   const dir = stateDir();
   const world = newWorld();
   const posts: (readonly string[])[] = [];
@@ -82,17 +82,52 @@ test("routing: progress posts to the lane's thread, done is the lane's claim, a 
   const journal: [string, string][] = [];
   const enqueue = (id: string, line: string) => { journal.push([id, line]); };
   expect(await routeReports(deps, store, enqueue, "/home/test")).toEqual([
-    "LANE_REPORT_ROUTED gone-lane:0:1 question dropped",
+    "LANE_REPORT_ROUTED gone-lane:0:1 question late",
     "LANE_REPORT_ROUTED local-lane:0:1 progress thread",
     "LANE_REPORT_ROUTED local-lane:0:2 done claim",
   ]);
   expect(posts).toEqual([["notify", "discord:1/2", "tests green in ~/repo"]]);
-  expect(journal).toEqual([]);
+  expect(journal).toEqual([["lane-report-late:gone-lane:0:1", "LANE_REPORT_LATE gone-lane question still there?"]]);
+  expect(store.list({ lane: "gone-lane" })[0]?.route).toBe("late");
   const claimed = await deps.registry.read("local-lane");
   expect(claimed && statusOf(claimed)).toBe("done-claimed");
   expect(claimed?.claim?.evidence).toBe("merged acme/app#3 abc123");
   expect(await routeReports(deps, store, enqueue, "/home/test")).toEqual([]);
   expect(posts).toHaveLength(1);
+});
+
+test("routing: an unregistered lane's row is a late event too, and one throwing row stays pending while the rest are routed", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir);
+  await deps.registry.write(lane(dir));
+  let broken = true;
+  const realRead = deps.registry.read.bind(deps.registry);
+  deps.registry.read = async (key: string) => {
+    if (key === "poison-lane" && broken) throw new Error("registry unreadable");
+    return realRead(key);
+  };
+  const flaky = deps;
+  const store = new JsonLaneReports(dir);
+  store.append({ lane: "poison-lane", generation: 0, kind: "question", text: "first", at: T0 });
+  store.append({ lane: "nobody", generation: 0, kind: "blocked", text: "never registered", at: T0 + 1 });
+  store.append({ lane: "local-lane", generation: 0, kind: "question", text: "after the poison", at: T0 + 2 });
+  const journal: [string, string][] = [];
+  const enqueue = (id: string, line: string) => { journal.push([id, line]); };
+  const errors: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.join(" ")); };
+  try {
+    expect(await routeReports(flaky, store, enqueue)).toEqual([
+      "LANE_REPORT_ROUTED nobody:0:1 blocked late", "LANE_REPORT_ROUTED local-lane:0:1 question journal",
+    ]);
+  } finally { console.error = realError; }
+  expect(errors).toEqual(["LANE_REPORT_ERROR poison-lane:0:1 registry unreadable"]);
+  expect(journal.map(([id]) => id)).toEqual(["lane-report-late:nobody:0:1", "lane-report:local-lane:0:1"]);
+  expect(store.pending().map((r) => r.id)).toEqual(["poison-lane:0:1"]);
+  // Once the fault clears the row is routed (late: that lane is not registered).
+  broken = false;
+  expect(await routeReports(flaky, store, enqueue)).toEqual(["LANE_REPORT_ROUTED poison-lane:0:1 question late"]);
+  expect(store.pending()).toEqual([]);
 });
 
 test("routing: progress with no thread hook, or a failing one, reaches the lead as a digest LANE_REPORT instead of being lost", async () => {
@@ -247,4 +282,22 @@ test("a dori-report lane's row is routed and counts as hearing from it, and an o
   const pushed: string[] = [];
   await watchTick(deps, async (line) => { pushed.push(line); });
   expect(pushed).toContain("LANE_REPORT remote-lane question need the deploy key");
+});
+
+test("routing: journal and late events carry the lane's meta (lane, thread, cwd), an unregistered lane only its key", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir);
+  await deps.registry.write(lane(dir, { cwd: "/repo/work" }));
+  await deps.registry.write(lane(dir, { key: "gone-lane", closedAt: new Date(T0).toISOString() }));
+  const store = new JsonLaneReports(dir);
+  store.append({ lane: "local-lane", generation: 0, kind: "question", text: "which base?", at: T0 });
+  store.append({ lane: "gone-lane", generation: 0, kind: "question", text: "still there?", at: T0 });
+  store.append({ lane: "nowhere", generation: 0, kind: "question", text: "anyone?", at: T0 });
+  const metas: [string, unknown][] = [];
+  await routeReports(deps, store, (id, _line, meta) => { metas.push([id, meta]); });
+  expect(metas).toEqual([
+    ["lane-report-late:gone-lane:0:1", { lane: "gone-lane", thread: "discord:1/2" }],
+    ["lane-report:local-lane:0:1", { lane: "local-lane", thread: "discord:1/2", cwd: "/repo/work" }],
+    ["lane-report-late:nowhere:0:1", { lane: "nowhere" }],
+  ]);
 });

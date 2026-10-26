@@ -147,12 +147,19 @@ const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessag
   if (refusal) return refusal === message.blocked ? message : updateLaneMessage(messages, message, { blocked: refusal }, now);
   const run = laneRunner(deps.run, lane);
   const pane = lane.pane ?? "";
-  // Only the lane's ack proves the text arrived; a pane read cannot, so an interrupted attempt stays ambiguous.
-  const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : "unknown");
+  // The lane's ack proves the text arrived. Short of it, only this attempt's own herdr exits can tell: a refused
+  // send-text typed nothing (not done), text plus enter both accepted is done. An interrupted attempt (a new process,
+  // no exits seen) or text typed without its enter stays unknown, so it is ambiguous and never retyped.
+  let typedHere: Observed = "unknown";
+  const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
   const { op } = await perform(ops, deps.clock.now, { lane: lane.key, action: "lane-message", target: message.id }, async () => {
     const typed = await run(["herdr", "pane", "send-text", pane, message.text]);
-    if (typed.code !== 0) return { ok: false, detail: typed.err || typed.out || "send-text failed" };
+    if (typed.code !== 0) {
+      typedHere = "not-done";
+      return { ok: false, detail: typed.err || typed.out || "send-text failed" };
+    }
     const entered = await run(["herdr", "pane", "send-keys", pane, "enter"]);
+    if (entered.code === 0) typedHere = "done";
     return { ok: entered.code === 0, detail: entered.code === 0 ? "" : entered.err || "send-keys failed" };
   }, readBack);
   const current = messages.get(message.id) ?? message;
