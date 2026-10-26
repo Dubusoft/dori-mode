@@ -59,7 +59,7 @@ const USAGE = `dori <command> [options]
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
-  sync   [--write]                     registry vs live panes; read-only unless --write
+  sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done [<key>] --evidence TEXT  key defaults to the lane registered for $HERDR_PANE_ID
   object-done <key> --reason TEXT [--reason TEXT ...]
@@ -161,7 +161,7 @@ const flags = parseArgs({
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
     model: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
-    reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, loop: { type: "string" },
+    reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
     list: { type: "boolean" }, cancel: { type: "string" }, "ignore-quota": { type: "boolean" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
@@ -470,8 +470,16 @@ try {
     }
     case "sync": {
       const r = await syncRegistry(deps, Boolean(flags.values.write));
-      console.log("key | thread | pane | session | status");
-      for (const row of [...r.rows, ...r.unregistered]) console.log([row.key, row.thread, row.pane, row.session, row.status].join(" | "));
+      if (flags.values.full) {
+        console.log("key | thread | pane | session | status");
+        for (const row of [...r.rows, ...r.unregistered]) console.log([row.key, row.thread, row.pane, row.session, row.status].join(" | "));
+      } else {
+        const counts = new Map<string, number>();
+        for (const row of r.rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
+        const byStatus = [...counts].map(([status, count]) => `${status} ${count}`).join(", ");
+        const unregisteredPanes = r.unregistered.length ? `: ${r.unregistered.map((row) => row.pane).join(" ")}` : "";
+        console.log(`LANES ${r.rows.length}${byStatus ? ` (${byStatus})` : ""}; UNREGISTERED ${r.unregistered.length}${unregisteredPanes}; --full for the table`);
+      }
       console.log(r.drift.length ? `DRIFT (${r.drift.length}):\n${r.drift.map((d) => `- ${d}`).join("\n")}` : "DRIFT none");
       console.log(flags.values.write ? "WROTE session ids" : "READ_ONLY");
       break;
@@ -530,12 +538,19 @@ try {
       for (const line of r.lines) console.log(line);
       process.exit(r.code);
     }
-    case "watch":
+    case "watch": {
+      let lastWatchWarnings = new Set<string>();
       console.log("LANE_WATCH_READY");
       for (;;) {
-        for (const line of await watchTick(deps).catch((e: unknown) => [`LANE_WATCH_WARN ${String(e).slice(0, 200)}`])) console.log(line);
+        const lines = await watchTick(deps).catch((e: unknown) => [`LANE_WATCH_WARN ${String(e).slice(0, 200)}`]);
+        const warnings = new Set(lines.filter((line) => line.startsWith("LANE_WATCH_WARN ")));
+        for (const line of lines) {
+          if (!warnings.has(line) || !lastWatchWarnings.has(line)) console.log(line);
+        }
+        lastWatchWarnings = warnings;
         await Bun.sleep(30_000);
       }
+    }
     case "freshness":
       await every(loopMin, async () => {
         const reports = openLaneReports(deps.config);
