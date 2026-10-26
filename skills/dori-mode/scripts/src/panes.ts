@@ -57,14 +57,19 @@ export const agentRefusal = (panes: readonly Pane[], pane: string): string | und
   return undefined;
 };
 
-/**
- * Types the text and presses Enter exactly once, and only into a pane whose agent is running: a pane left with a bare
- * shell (or unreadable) gets nothing, since typed text plus Enter would run there as a command. Delivery is confirmed
- * only by a state change: the pane's agent_status moving to "working" from something else. A pane that was already
- * working cannot show that change, so its send comes back "unconfirmed" and the caller decides. The screen is never
- * read here, and Enter is never pressed again.
- */
-export const sendVerified = async (run: Runner, clock: Clock, pane: string, text: string): Promise<Delivery> => {
+/** Sleeps between successive status lookups after Enter; the first lookup is immediate. */
+export const CONFIRM_BACKOFF_MS: readonly number[] = [150, 300, 600, 900, 1000, 1000, 1000];
+
+/** Raw send: types the text and presses Enter once. Not exported, so no caller outside this file can skip the guard below. */
+const typeAndEnter = async (run: Runner, pane: string, text: string): Promise<"sent" | "failed"> => {
+  if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
+  if ((await run(["herdr", "pane", "send-text", pane, text])).code !== 0) return "failed";
+  await run(["herdr", "pane", "send-keys", pane, "enter"]);
+  return "sent";
+};
+
+/** Every send to a pane goes through here: only a pane whose agent is running gets text, since a bare shell would run it as a command. */
+const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ readonly sent: "sent" | "failed"; readonly status?: string }> => {
   if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
   let refusal: string | undefined;
   let status: string | undefined;
@@ -77,13 +82,27 @@ export const sendVerified = async (run: Runner, clock: Clock, pane: string, text
   }
   if (refusal) {
     console.error(`sendVerified ${pane}: not typed: ${refusal}`);
-    return "failed";
+    return { sent: "failed", status };
   }
-  if ((await run(["herdr", "pane", "send-text", pane, text])).code !== 0) return "failed";
-  await run(["herdr", "pane", "send-keys", pane, "enter"]);
+  return { sent: await typeAndEnter(run, pane, text), status };
+};
+
+/** Guarded send without waiting for a status change; the caller confirms delivery some other way (e.g. from the screen). */
+export const sendGuarded = async (run: Runner, pane: string, text: string): Promise<"sent" | "failed"> => (await guardedSend(run, pane, text)).sent;
+
+/**
+ * Types the text and presses Enter exactly once, and only into a pane whose agent is running: a pane left with a bare
+ * shell (or unreadable) gets nothing, since typed text plus Enter would run there as a command. Delivery is confirmed
+ * only by a state change: the pane's agent_status moving to "working" from something else. A pane that was already
+ * working cannot show that change, so its send comes back "unconfirmed" and the caller decides. The screen is never
+ * read here, and Enter is never pressed again.
+ */
+export const sendVerified = async (run: Runner, clock: Clock, pane: string, text: string): Promise<Delivery> => {
+  const { sent, status } = await guardedSend(run, pane, text);
+  if (sent === "failed") return "failed";
   if (status === "working") return "unconfirmed";
-  for (let attempt = 0; attempt < 6; attempt++) {
-    await clock.sleep(700);
+  for (let attempt = 0; attempt <= CONFIRM_BACKOFF_MS.length; attempt++) {
+    if (attempt > 0) await clock.sleep(CONFIRM_BACKOFF_MS[attempt - 1] ?? 1000);
     const after = await statusLookup(run, pane);
     if (after.error) console.error(`sendVerified ${pane}: status lookup failed: ${after.error}`);
     if (after.status === "working") return "delivered";

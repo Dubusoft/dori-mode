@@ -225,7 +225,7 @@ test("dori resolved is lead-only, takes several ids, names unmatched ones, and w
 const pushFixture = () => {
   const state = withState();
   cleanups.push(state.done);
-  const clock: ReturnType<typeof fakeClock> = { at: T0, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; } };
+  const clock: ReturnType<typeof fakeClock> = { at: T0, now: () => clock.at, sleep: async () => {} /* confirm waits inside sendVerified must not move the escalation clock: the "N min" in the handoff reason counts only the test's own steps */ };
   const world = newWorld();
   world.screen = `\u2500\u2500 \u2022 Working ${"\u2500".repeat(40)}\n\u276f \n${"\u2500".repeat(80)}\n/repo\n(\u{1F63A} OmO Native by Q Kim)`;
   const session = "11111111-1111-4111-8111-111111111111";

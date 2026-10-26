@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { laneRunner, readScreen, sendVerified, statusLookup } from "./panes.ts";
+import { laneRunner, readScreen, sendGuarded, statusLookup } from "./panes.ts";
 import type { QuotaLane } from "./quota-stall.ts";
 import { type Lane, type LaneStatus, statusOf, withStatus } from "./registry.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
@@ -29,7 +29,7 @@ const count = (screen: string, shown: RegExp): number => screen.match(shown)?.le
 /** Sends a goal command and confirms it from the screen: one more matching line than before it was sent. */
 const goalCommand = async (deps: FlowDeps, pane: string, text: string, shown: RegExp): Promise<"confirmed" | "unconfirmed" | "failed"> => {
   const before = count(await readScreen(deps.run, pane, 200), shown);
-  if ((await sendVerified(deps.run, deps.clock, pane, text)) === "failed") return "failed";
+  if ((await sendGuarded(deps.run, pane, text)) === "failed") return "failed";
   for (let attempt = 0; attempt < READ_BACK_TRIES; attempt++) {
     if (count(await readScreen(deps.run, pane, 200), shown) > before) return "confirmed";
     await deps.clock.sleep(700);

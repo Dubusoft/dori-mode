@@ -30,7 +30,7 @@ const EMPTY = omo("");
 const fixture = (extra: Record<string, unknown> = {}) => {
   const state = withState();
   cleanups.push(state.done);
-  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; } };
+  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async () => {} /* confirm waits inside sendVerified must not move the escalation clock: the "N min" in the handoff reason counts only the test's own steps */ };
   const world = newWorld();
   world.screen = EMPTY;
   const session = "11111111-1111-4111-8111-111111111111";
