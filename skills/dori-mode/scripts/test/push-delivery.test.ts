@@ -346,6 +346,20 @@ test("with the tail monitor on, an owner message unacked for escalateMin restart
   expect(f.launches()).toHaveLength(1);
 });
 
+test("the ladder's safety restart does not wait for the lead's running child, and its log names the child it stops", async () => {
+  const f = fixture({ delivery: delivery() });
+  const since = new Date(f.clock.now()).toISOString();
+  writeFileSync(f.file, `${JSON.stringify({ type: "custom", customType: "session-lifecycle", timestamp: since, data: { state: "waiting_children", since, waitingOn: { children: 1, background: [], human: [] } } })}\n`);
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
+  await flush(supervisor);
+  f.clock.at += 5 * 60_000;
+  const lines = await flush(supervisor);
+  expect(f.launches()).toHaveLength(1);
+  expect(lines.filter((line) => line.startsWith("LEAD_RESTART_TRIGGER push-escalate ") && line.endsWith("; stops 1 child task(s) the lead was waiting on"))).toHaveLength(1);
+});
+
 test("an owner message the lead took but did not ack is left to the ack notice: no idle restart in push mode", async () => {
   const f = fixture({ delivery: delivery(), leadUnreadRestartMin: 1 });
   const supervisor = new Supervisor(f.deps);
