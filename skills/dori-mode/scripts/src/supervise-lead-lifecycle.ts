@@ -8,7 +8,7 @@ import { leadChain, leadCommand, providerOf } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
 import { paneResetAt, providerQuota, QUOTA_SCREEN_LINES, quotaScreenHit, quotaStall } from "./quota-stall.ts";
 import { kst } from "./claude-quota.ts";
-import { listPanes, readScreen, sendVerified } from "./panes.ts";
+import { ALIVE_STATUSES, listPanes, readScreen, sendGuarded, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
@@ -62,6 +62,21 @@ const sessionTail = (file: string): string | undefined => {
     console.error(`LEAD_SESSION_UNREADABLE ${file}: ${e.message}`);
     return undefined;
   }
+};
+
+/** /new keeps argv unchanged; a holder for the same process identifies its newest persisted session. */
+const heldSession = (dir: string, pid: number | undefined): { readonly id: string; readonly file: string } | undefined => {
+  if (!pid || !existsSync(dir)) return undefined;
+  return readdirSync(dir).flatMap((name) => {
+    const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
+    if (!id || !existsSync(join(dir, "session-holders", id, `${pid}.json`))) return [];
+    const file = join(dir, name);
+    try { return [{ id, file, mtime: statSync(file).mtimeMs }]; }
+    catch (e) {
+      if (e instanceof Error && "code" in e && e.code === "ENOENT") return [];
+      throw e;
+    }
+  }).sort((a, b) => b.mtime - a.mtime)[0];
 };
 
 /**
@@ -372,8 +387,8 @@ export class LeadLifecycle {
     if (!hit.id) return { id: "" };
     if (existsSync(hit.id)) return { id: hit.id, file: hit.id };
     const dir = sessionDirFor(this.deps.config.sessionsDir, cwd);
-    return { id: hit.id, file: (await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true })))
-      .find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`)) };
+    const files = await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true }));
+    return heldSession(dir, hit.pid) ?? { id: hit.id, file: files.find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`)) };
   }
 
   /**
@@ -767,12 +782,76 @@ export class LeadLifecycle {
 
   async restart(restart: Restart): Promise<void> {
     const { deps } = this;
-    const promptPath = join(deps.config.stateDir, `lead-${restart.session}.md`);
-    if (restart.phase === "stopping") {
-      if (!(await stopLead(deps, restart.force))) {
+    const promptSession = restart.phase.startsWith("soft-ready:") ? restart.phase.slice("soft-ready:".length) : restart.session;
+    const promptPath = join(deps.config.stateDir, `lead-${promptSession}.md`);
+    let soft = restart.phase.startsWith("soft-ready:");
+    let sendSoft = false;
+    let softStartedAt: number | undefined;
+    if (soft && !(await softLive(deps))) {
+      console.log("LEAD_SOFT_RESTART_FAILED reused lead is not ready; falling back to a process restart");
+      restart = { ...restart, session: promptSession, phase: "soft-failed" };
+      this.setRestart(restart);
+      soft = false;
+    }
+    if (restart.phase === "stopping" && !restart.force) {
+      const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+      if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) {
+        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.defaultCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.config.sessionsDir });
+        const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+        if (hit.pid && latest?.agent && (latest.agent_status === "idle" || latest.agent_status === "done")) {
+          const old = (await this.sessionFile(pane.cwd ?? deps.config.defaultCwd)).id || hit.id;
+          if (restart.request) this.journal = { ...this.journal, models: restart.request.models, leadModel: 0, primaryRetryAt: undefined };
+          softStartedAt = deps.clock.now();
+          this.owners.record(restart.events);
+          restart = { ...restart, offset: statSync(this.core.eventLog).size, phase: `soft:${old}` };
+          this.setRestart(restart);
+          this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
+          sendSoft = true;
+        }
+      }
+    }
+    if (restart.phase.startsWith("soft:")) {
+      try {
+        if (sendSoft) {
+          this.carryOver(restart);
+          const fd = openSync(promptPath, "w", 0o600);
+          try { writeFileSync(fd, this.startupPrompt(restart)); fsyncSync(fd); } finally { closeSync(fd); }
+          const entry = leadChain(this.leadConfig())[restart.modelIndex ?? this.leadIndex()];
+          if (!entry) throw new TransientSuperviseError("soft restart model is missing");
+          for (const command of ["/new", `/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
+            await softCommand(deps, command);
+          }
+          await softCommand(deps, `Read ${promptPath} in full and follow it exactly.`, true);
+        }
+        const old = restart.phase.slice("soft:".length);
+        const session = await softEvidence(deps, old, promptPath, softStartedAt);
+        if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
+        const table = await procTable(deps.run);
+        const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.defaultCwd, table, { run: deps.run, sessionsDir: deps.config.sessionsDir });
+        if (!hit.pid) throw new TransientSuperviseError("cannot identify reused lead process");
+        const targets = await ownedTargets(deps, table, undefined, old);
+        const protectedPids = new Set<number>();
+        for (let pid: number | undefined = hit.pid; pid && !protectedPids.has(pid); pid = table.find((p) => p.pid === pid)?.ppid) protectedPids.add(pid);
+        for (const pid of protectedPids) targets.delete(pid);
+        await killTargets(deps, targets);
+        restart = { ...restart, session, phase: `soft-ready:${restart.session}` };
+        this.setRestart(restart);
+        soft = true;
+        console.log(`LEAD_SOFT_RESTARTED ${deps.config.leadPane} ${session}`);
+      } catch (e) {
+        if (!(e instanceof Error)) throw e;
+        console.log(`LEAD_SOFT_RESTART_FAILED ${e.message.replace(/\s+/g, " ")}; falling back to a process restart`);
+        restart = { ...restart, phase: "soft-failed" };
+        this.setRestart(restart);
+      }
+    }
+    if (restart.phase === "stopping" || restart.phase === "soft-failed") {
+      const softFailed = restart.phase === "soft-failed";
+      if (!(await stopLead(deps, softFailed || restart.force))) {
         // The lead woke while identity/ownership was being resolved. Deliver
         // warm rather than interrupting it or abandoning the queued event.
-        this.owners.record(restart.events);
+        if (!softFailed) this.owners.record(restart.events);
         this.setRestart(undefined);
         return;
       }
@@ -784,10 +863,13 @@ export class LeadLifecycle {
       }
       // Log the cold batch before launch. The old monitor is gone. The new lead
       // takes these lines with dori inbox take and tails strictly after this batch.
-      this.owners.record(restart.events);
-      restart = { ...restart, offset: statSync(this.core.eventLog).size, phase: "starting" };
+      if (!softFailed) {
+        this.owners.record(restart.events);
+        restart = { ...restart, offset: statSync(this.core.eventLog).size };
+      }
+      restart = { ...restart, phase: "starting" };
       this.setRestart(restart);
-      this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
+      if (!softFailed) this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
     }
     if (restart.phase === "starting") {
       this.carryOver(restart);
@@ -824,7 +906,13 @@ export class LeadLifecycle {
       const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.defaultCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
       if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${restart.session}`);
     }
-    let confirmed = await confirmLead(deps, restart.session);
+    let confirmed = soft ? await softLive(deps) : await confirmLead(deps, restart.session);
+    if (soft && !confirmed) {
+      console.log("LEAD_SOFT_RESTART_FAILED reused lead lost readiness; falling back to a process restart");
+      const next: Restart = { ...restart, session: promptSession, phase: "soft-failed" };
+      this.setRestart(next);
+      return this.restart(next);
+    }
     // A launch stalled on quota on a model with a fallback it may use, confirmed or not: stop exactly this session and
     // start the next model with the same events and offset. Without one the existing handling applies.
     const index = restart.modelIndex ?? this.leadIndex();
@@ -838,7 +926,7 @@ export class LeadLifecycle {
       await this.noteExhausted(chain, index, stall);
       confirmed ||= hasStartupEvidence(deps, restart.session);
     }
-    if (stall && fallback !== undefined) {
+    if (!soft && stall && fallback !== undefined) {
       await stopHung(deps, restart.session);
       const reason = `${chain[index]?.model} is blocked on quota (${stall})`;
       const next: Restart = { ...this.abandon(restart), modelIndex: fallback, reason };
@@ -865,7 +953,7 @@ export class LeadLifecycle {
       console.log(`LEAD_STARTUP_ABANDONED ${restart.session} -> ${next.session}`);
       throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session} after ${unconfirmed} checks; ${pane ? `lead pane recreated as ${pane}` : "lead pane kept"}, relaunching as ${next.session}`);
     }
-    if (!(await awaitStartupEvidence(deps, restart.session))) {
+    if (!soft && !(await awaitStartupEvidence(deps, restart.session))) {
       // The process answered herdr but omo never initialised (no holder file, no session jsonl).
       // Stop exactly that process tree; the same events and tail offset go to a fresh session.
       await stopHung(deps, restart.session);
@@ -915,6 +1003,7 @@ export class LeadLifecycle {
     };
     // The push ladder's clock starts again for the new lead (N1): no push is outstanding to it yet.
     if (this.journal.inbox) this.journal = { ...this.journal, inbox: { ...this.journal.inbox, sessionSince: ready, push: undefined } };
+    if (soft && !restart.request && restart.modelIndex !== undefined) this.core.noteForcedRestart("quota");
     this.setRestart(undefined);
     const policy = deps.config.eventPolicy;
     const urgent = restart.events.filter((event) => eventClass(event.line, policy) === "lead-urgent");
@@ -933,6 +1022,67 @@ export const UNCONFIRMED_LIMIT = 5;
 
 type ForegroundProcess = { readonly pid?: number; readonly argv?: readonly string[] };
 type ProcessInfo = { readonly shell_pid?: number; readonly foreground_process_group_id?: number; readonly foreground_processes?: readonly ForegroundProcess[] };
+
+const STARTUP_ERROR = /Cannot find module|All fallback models failed|No API key|model_not_available|usage limit|rate limit|quota|Session crashed|unknown provider/i;
+
+const softLive = async (deps: FlowDeps): Promise<boolean> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  return !!pane?.agent && ALIVE_STATUSES.has(pane.agent_status ?? "");
+};
+
+/** Submit once, then observe a completed interactive command before submitting the next one. */
+const softCommand = async (deps: FlowDeps, command: string, prompt = false): Promise<void> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError("lead left idle/done before soft command");
+  const before = await readScreen(deps.run, deps.config.leadPane);
+  const previous = new Set(before.split("\n"));
+  let enterFailed = false;
+  const run: FlowDeps["run"] = async (argv, options) => {
+    const result = await deps.run(argv, options);
+    if (argv[2] === "send-keys" && result.code !== 0) enterFailed = true;
+    return result;
+  };
+  if (await sendGuarded(run, deps.config.leadPane, command) === "failed" || enterFailed) throw new TransientSuperviseError("soft command send failed");
+  if (prompt) return;
+  const deadline = deps.clock.now() + 5_000;
+  for (let attempt = 0; attempt <= 25; attempt++) {
+    const after = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+    const screen = await readScreen(deps.run, deps.config.leadPane);
+    const added = screen.split("\n").filter((line) => !previous.has(line)).join("\n");
+    if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(added)) throw new TransientSuperviseError("lead not ready after soft command");
+    if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
+    if (deps.clock.now() >= deadline) break;
+    await deps.clock.sleep(200);
+  }
+  throw new TransientSuperviseError("soft command showed no completed screen change");
+};
+
+/** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
+const softEvidence = async (deps: FlowDeps, old: string, promptPath: string, startedAt: number | undefined): Promise<string | undefined> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
+    if (!(await softLive(deps))) throw new TransientSuperviseError("reused lead is not live");
+    for (const name of readdirSync(dir)) {
+      if (deps.clock.now() >= deadline) return undefined;
+      const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
+      if (!id || id === old) continue;
+      const file = join(dir, name);
+      try {
+        if (startedAt !== undefined && statSync(file).mtimeMs < startedAt) continue;
+        if (deps.clock.now() >= deadline) return undefined;
+        if (readFileSync(file, "utf8").includes(promptPath) && deps.clock.now() < deadline) return id;
+      } catch (e) {
+        if (e instanceof Error && "code" in e && e.code === "ENOENT") continue;
+        throw e;
+      }
+    }
+    if (deps.clock.now() >= deadline) break;
+    await deps.clock.sleep(500);
+  }
+  return undefined;
+};
 
 const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> => {
   const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
@@ -971,7 +1121,7 @@ export const confirmLead = async (deps: FlowDeps, session: string): Promise<bool
     const identity = processes.some((p) => launchedAs(p, session));
     if (identity && pane && (pane.agent_status === "idle" || pane.agent_status === "working" || pane.agent_status === "done")) {
       const screen = await readScreen(deps.run, deps.config.leadPane, 40);
-      return !/Cannot find module|All fallback models failed|No API key|model_not_available|usage limit|rate limit|quota|Session crashed|unknown provider/i.test(screen);
+      return !STARTUP_ERROR.test(screen);
     }
     await deps.clock.sleep(500);
   }
@@ -1066,7 +1216,8 @@ export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> 
     const proc: { readonly shell_pid: number; readonly foreground_process_group_id?: number } = JSON.parse(info.out).result.process_info;
     if (proc.foreground_process_group_id && proc.foreground_process_group_id !== proc.shell_pid) throw new TransientSuperviseError("lead pane contains a non-agent foreground process; refusing to type into it");
   }
-  const targets = await ownedTargets(deps, table, hit.pid, hit.id);
+  const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? defaultCwd), hit.pid);
+  const targets = await ownedTargets(deps, table, hit.pid, current?.id ?? hit.id);
   const latest = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!latest) throw new TransientSuperviseError("lead pane disappeared during process resolution");
   if (!force && latest.agent && latest.agent_status !== "idle" && latest.agent_status !== "done") return false;

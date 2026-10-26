@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, OUTBOX_ATTEMPTS, OUTBOX_RETRY_MS, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
@@ -19,6 +20,7 @@ import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
 import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
+import { TransientSuperviseError } from "../src/supervise-journal.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -36,25 +38,28 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const file = join(dir, `2027-01-15T08-00-00-000Z_${session}.jsonl`);
   writeFileSync(file, "{}\n");
   utimesSync(file, clock.now() / 1000, clock.now() / 1000);
-  const pane = { pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle" };
+  const pane = { pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle", revision: 0 };
   world.panes.push(pane);
   let active = session;
+  let launchedId = session;
   let pid = 101;
   let confirm = true;
   let admitted: string | undefined;
   let prompt: string | undefined;
   let onWait: (() => Promise<void>) | undefined;
   let hangs = 0;
+  let softEvidence = true;
+  let typed = "";
   const auth: Record<string, string> = {};
   const calls: string[][] = [];
   const run: Runner = async (argv) => {
     calls.push([...argv]);
     const ok = (out = "") => ({ code: 0, out, err: "" });
     if (argv[0] === "omo" && argv[1] === "auth") return { code: 1, out: auth[argv[argv.indexOf("--provider") + 1] ?? ""] ?? "", err: "" };
-    if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${active}\n102 ${pid} tail -F events\n103 1 tail -F orphan\n104 1 other-agent` : "");
+    if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${launchedId}\n102 ${pid} tail -F events\n103 1 tail -F orphan\n104 1 other-agent\n10 1 /bin/bash` : "");
     if (argv[0] === "ps" && argv[1] === "eww") return ok(argv.at(-1) === "103" ? `tail -F orphan PI_SESSION_ID=${session}` : "PI_SESSION_ID=other");
     if (argv[0] === "herdr" && argv[2] === "list") return ok(JSON.stringify({ result: { panes: world.panes } }));
-    if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", active] }] : [] } } }));
+    if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", launchedId] }] : [] } } }));
     if (argv[0] === "kill") {
       if (argv[2] === String(pid)) { pid = 0; pane.agent = ""; pane.agent_status = ""; }
       return ok();
@@ -64,6 +69,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
       const path = /@([^'\s]+)/.exec(admitted)?.[1];
       prompt = path ? readFileSync(path, "utf8") : undefined;
       active = /--session-id ([\w-]+)/.exec(admitted)?.[1] ?? "";
+      launchedId = active;
       pid = 201;
       // A healthy omo writes its holder pid file at once; a hung cold start only creates the empty directory.
       mkdirSync(join(dir, "session-holders", active), { recursive: true });
@@ -78,7 +84,23 @@ const fixture = (extra: Record<string, unknown> = {}) => {
       return confirm ? ok() : { code: 1, out: "", err: "not ready" };
     }
     if (argv[0] === "herdr" && argv[2] === "read") return ok(world.screen);
-    if (argv[0] === "herdr" && (argv[2] === "send-text" || argv[2] === "send-keys")) return ok();
+    if (argv[0] === "herdr" && argv[2] === "send-text") { typed = argv[4] ?? ""; return ok(); }
+    if (argv[0] === "herdr" && argv[2] === "send-keys") {
+      pane.revision++;
+      if (typed === "/new") active = randomUUID();
+      const path = /^Read (.+) in full/.exec(typed)?.[1];
+      if (path) {
+        prompt = readFileSync(path, "utf8");
+        if (softEvidence) {
+          mkdirSync(join(dir, "session-holders", active), { recursive: true });
+          writeFileSync(join(dir, "session-holders", active, `${pid}.json`), "{}");
+          writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: typed } })}\n`);
+          utimesSync(join(dir, `${active}.jsonl`), clock.now() / 1000, clock.now() / 1000);
+        }
+        await onWait?.();
+      }
+      return ok();
+    }
     throw new Error(`unexpected ${argv.join(" ")}`);
   };
   const deps = { ...depsFor(world, clock, state.dir, config), run };
@@ -87,6 +109,8 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     state, deps, pane, clock, calls, log, file, world, auth,
     cold: () => { clock.at += 300_000; },
     command: () => admitted,
+    session: () => active,
+    softEvidence: (value: boolean) => { softEvidence = value; },
     prompt: () => prompt,
     setConfirm: (value: boolean) => { confirm = value; },
     hang: (launches: number) => { hangs = launches; },
@@ -94,6 +118,9 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     onWait: (callback: () => Promise<void>) => { onWait = callback; },
   };
 };
+
+const restartStarts = (f: ReturnType<typeof fixture>): string[][] =>
+  f.calls.filter((call) => call[2] === "run" || (call[2] === "send-text" && call[4] === "/new"));
 
 /** The startup prompt's first instruction: every event past the take cursor is read with `dori inbox take`. */
 const TAKE_FIRST = "Run dori inbox take now";
@@ -173,12 +200,13 @@ test("a forced restart takes a warm idle lead without traffic and applies model 
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced", "high");
   const supervisor = new Supervisor(f.deps);
   await supervisor.flush();
-  expect(f.command()).toContain("--model test/forced --thinking high");
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/model test/forced");
+  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/thinking high");
+  expect(restartStarts(f)).toHaveLength(1);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(readJournal(f.state.dir).models).toEqual([{ model: "test/forced", thinking: "high" }]);
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s lead while events still deliver warm", async (status) => {
@@ -193,7 +221,7 @@ test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s le
   expect(pendingLeadRestart(f.state.dir)?.id).toBe(request.id);
   f.pane.agent_status = "idle";
   await new Supervisor(f.deps).flush();
-  expect(f.command()).toContain("--model test/forced");
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
 });
 
@@ -207,7 +235,8 @@ test("a forced restart captures edited config and preserves a newer request arri
     f.pane.agent_status = "working";
   });
   await supervisor.flush();
-  expect(f.command()).toContain("--model edited/model --thinking medium");
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model edited/model"]);
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/thinking medium"]);
   expect(pendingLeadRestart(f.state.dir)?.models[0]?.model).toBe("newer/model");
 });
 
@@ -221,7 +250,7 @@ test.each([false, true])("a durable wait wakes a cold=%s lead through normal del
   await new Waits(f.state.dir).tick(f.clock.now, f.deps.run, (id, line) => supervisor.enqueue(id, line));
   await supervisor.flush();
   expect(f.log().map((event) => event.line)).toEqual(["WAIT_DONE release tell owner"]);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(cold ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(cold ? 1 : 0);
 });
 
 test("an unseen newly idle agent reported as done is positive startup evidence", async () => {
@@ -243,10 +272,11 @@ test("at the TTL boundary cold delivery starts a fresh session in the same pane 
   await supervisor.flush();
   expect(f.log()).toEqual([{ id: "cold", line: "INBOUND cold" }]);
   expect(f.prompt()).toContain(TAKE_FIRST);
-  const launched = f.calls.filter((call) => call[2] === "run");
+  const launched = restartStarts(f);
   expect(launched).toHaveLength(1);
   expect(launched[0]?.[3]).toBe("lead:p1");
-  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toEqual(["103", "102", "101"]);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toEqual(["103"]);
   expect(f.prompt()).toContain(`tail -c +${Buffer.byteLength(`${JSON.stringify(f.log()[0])}\n`) + 1}`);
   expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
 });
@@ -295,7 +325,7 @@ test.each([
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("cap", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
   expect(f.log().map((event) => event.id)).toEqual(["cap"]);
   expect(new Waits(f.state.dir).list()).toHaveLength(1);
 });
@@ -309,7 +339,7 @@ test("a custom context cap controls stale delivery rather than the default cap",
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("custom-cap", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test("usage above the cap does not restart a lead before its cache is stale", async () => {
@@ -337,7 +367,7 @@ test.each([
     supervisor.enqueue("hard-cap", "INBOUND owner");
     await supervisor.flush();
   } finally { console.log = original; }
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
   expect(logged.includes(`LEAD_HARD_CAP ${tokens}`)).toBe(restart);
   expect(f.log().map((event) => event.id)).toEqual(["hard-cap"]);
 });
@@ -349,7 +379,7 @@ test("a custom hard cap controls the in-TTL restart", async () => {
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("custom-hard", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 /** An omo session-lifecycle entry: the lead waits on `children` child tasks and `background` sources since `since`. */
@@ -391,7 +421,7 @@ test("a lead-restart request waits while the idle lead waits on its own child, a
   expect(lines.filter((line) => line.startsWith(`LEAD_RESTART_DEFERRED request ${request.id}`))).toHaveLength(1);
   appendFileSync(f.file, lifecycle(0, f.clock.now()));
   const after = await quiet(() => supervisor.flush());
-  expect(f.command()).toContain("--model test/forced");
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(after.filter((line) => line.startsWith(`LEAD_RESTART_TRIGGER request dori lead-restart ${request.id}`))).toHaveLength(1);
 });
@@ -401,7 +431,7 @@ test.each([[59, false], [60, true]] as const)("a child wait of %s min against le
   writeFileSync(f.file, lifecycle(1, f.clock.now() - minutes * 60_000));
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced");
   const lines = await quiet(() => new Supervisor(f.deps).flush());
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
   expect(lines.some((line) => line.startsWith("LEAD_CHILD_WAIT_EXPIRED request"))).toBe(restart);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED request"))).toBe(!restart);
 });
@@ -416,7 +446,7 @@ test.each([true, false])("a stale idle lead with a running child=%s takes the ev
     supervisor.enqueue("stale", "INBOUND stale");
     await supervisor.flush();
   });
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(child ? 0 : 1);
+  expect(restartStarts(f)).toHaveLength(child ? 0 : 1);
   expect(f.log().map((event) => event.id)).toEqual(["stale"]);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED stale idle 5 min"))).toBe(child);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER stale idle 5 min (past cacheTtlMin 5) with no pending waits or working lanes"))).toBe(!child);
@@ -438,7 +468,7 @@ test("a lead at the hard cap waiting on its own child is not restarted until the
     supervisor.enqueue("capped-2", "INBOUND capped-2");
     await supervisor.flush();
   });
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(after).toContain("LEAD_HARD_CAP 300000");
   expect(after.some((line) => line.startsWith("LEAD_RESTART_TRIGGER hard-cap context 300000 tokens"))).toBe(true);
 });
@@ -471,7 +501,7 @@ test.each(["paused", "done-claimed", "not-done", "closed"] as const)("a %s lane 
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("inactive-lane", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test("an expired but working lead receives an append and is never stopped", async () => {
@@ -500,7 +530,7 @@ test("events arriving during restart stay queued and follow the prompt handoff e
   expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.prompt()).not.toContain('"id":"first"');
   expect(f.prompt()).not.toContain('"id":"second"');
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(taken(f)).toEqual(["first\tINBOUND first", "second\tINBOUND second"]);
   expect(taken(f)).toEqual(["INBOX_EMPTY"]);
 });
@@ -508,8 +538,301 @@ test("events arriving during restart stay queued and follow the prompt handoff e
 const restartSession = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir).restart;
 const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => call[2] === "run").map((call) => /--session-id ([\w-]+)/.exec(call[4] ?? "")?.[1]);
 
+test.each(["idle", "done"])("an %s cold lead switches session, model and thinking without relaunching omo", async (status) => {
+  // Given a reusable process; even its own environment and its shell must survive cleanup.
+  const f = fixture({ leadModel: [{ model: "test/soft", thinking: "high" }] });
+  f.cold();
+  f.pane.agent_status = status;
+  const old = f.session();
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: `PI_SESSION_ID=${["101", "10"].includes(argv.at(-1) ?? "") ? old : "other"}`, err: "" };
+    return base(argv, options);
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft", "INBOUND soft");
+  // When the cold delivery restarts it.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the four submissions are ordered and all confirmation uses the actual new id.
+  const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
+  expect(texts.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(texts).toHaveLength(4);
+  expect(texts[3]).toMatch(/^Read .*\/lead-[0-9a-f-]{36}\.md in full/);
+  const path = /^Read (.+) in full/.exec(texts[3] ?? "")?.[1] ?? "";
+  expect(existsSync(path)).toBe(false);
+  expect(f.session()).not.toBe(old);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${f.session()}`);
+  expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(f.session());
+  // argv still names the old session: a later event must nevertheless reach the new, warm session.
+  supervisor.enqueue("after", "INBOUND after");
+  await supervisor.flush();
+  expect(restartStarts(f)).toHaveLength(1);
+});
+
+test("a soft restart without a new session file falls back to a process launch", async () => {
+  // Given a live idle process that accepts commands but never persists the prompt.
+  const f = fixture();
+  f.cold();
+  f.softEvidence(false);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("fallback", "INBOUND fallback");
+  const before = f.clock.now();
+  // When its evidence deadline expires.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the same batch is launched once through the hard path.
+  expect(f.clock.now() - before).toBeGreaterThanOrEqual(20_000);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("101");
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toHaveLength(1);
+  expect(lines.some((line) => line.endsWith("; falling back to a process restart"))).toBe(true);
+  expect(f.log()).toEqual([{ id: "fallback", line: "INBOUND fallback" }]);
+  expect(restartSession(f)).toBeUndefined();
+});
+
+test("a soft fallback preserves the journaled offset and records each batch event once", async () => {
+  // Given a soft entry whose log grows after its offset was journaled.
+  const f = fixture();
+  f.cold();
+  const base = f.deps.run;
+  let offset: number | undefined;
+  const run: Runner = async (argv, options) => {
+    if (argv[2] === "send-text" && argv[4] === "/new") {
+      offset = restartSession(f).offset;
+      appendFileSync(join(f.state.dir, "lead-events.log"), `${JSON.stringify({ id: "later", line: "INBOUND later" })}\n`);
+      return { code: 1, out: "", err: "send failed" };
+    }
+    return base(argv, options);
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("first", "INBOUND first");
+  supervisor.enqueue("second", "INBOUND second");
+  // When the first command fails and a hard launch takes over.
+  await quiet(() => supervisor.flush());
+  // Then neither batch recording nor the soft-entry tail offset is repeated.
+  expect(f.log()).toEqual([
+    { id: "first", line: "INBOUND first" }, { id: "second", line: "INBOUND second" }, { id: "later", line: "INBOUND later" },
+  ]);
+  expect(offset).toBeGreaterThan(0);
+  expect(f.prompt()).toContain(`tail -c +${(offset ?? 0) + 1} -F`);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+});
+
+test.each([false, true])("a live omo blocks hard launch after soft failure, recovery=%s", async (recovery) => {
+  // Given a soft failure before /new, or its recovered intent, and kills that have not taken effect.
+  const f = fixture();
+  f.cold();
+  const event = { id: "guarded", line: "INBOUND guarded" };
+  if (recovery) {
+    const log = `${JSON.stringify(event)}\n`;
+    writeFileSync(join(f.state.dir, "lead-events.log"), log);
+    writeJournal(f.state.dir, {
+      events: [event], restart: { session: randomUUID(), events: [event], offset: Buffer.byteLength(log), phase: "soft-failed" },
+    });
+  }
+  const old = f.session();
+  const base = f.deps.run;
+  const kills: string[][] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "kill") {
+      kills.push([...argv]);
+      return { code: 0, out: "", err: "" };
+    }
+    const result = await base(argv, options);
+    return argv[2] === "send-text" && argv[4] === "/new" ? { code: 1, out: "", err: "send failed before /new" } : result;
+  };
+  const deps = { ...f.deps, run };
+  const supervisor = new Supervisor(deps);
+  if (!recovery) supervisor.enqueue(event.id, event.line);
+  // When forced cleanup still reports omo in the foreground.
+  await expect(quiet(() => supervisor.flush())).rejects.toBeInstanceOf(TransientSuperviseError);
+  // Then launch was not typed, and the same transaction remains retryable with its events.
+  expect(kills.some((call) => call[2] === "101")).toBe(true);
+  expect(f.session()).toBe(old);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(restartSession(f)).toMatchObject({ phase: "soft-failed", events: [event] });
+  expect(f.log()).toEqual([event]);
+  // Once the shell actually returns, recovery can admit exactly one launch.
+  f.noAgent();
+  await quiet(() => new Supervisor(deps).flush());
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartSession(f)).toBeUndefined();
+  expect(f.log()).toEqual([event]);
+});
+
+test("a soft restart ignores existing quota lines during commands and quota text after the prompt", async () => {
+  // Given normal output mentioning quota before /new and after the startup prompt.
+  const f = fixture({ leadModel: [{ model: "test/soft", thinking: "high" }] });
+  f.cold();
+  f.world.screen = "Discussion of quota and rate limit handling\n❯ ";
+  f.onWait(async () => { f.world.screen = "Startup prompt read: quota and rate limit handling\n❯ "; });
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => argv[0] === "ps" && argv[1] === "eww"
+    ? { code: 0, out: "PI_SESSION_ID=other", err: "" } : base(argv, options);
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-quota-text", "INBOUND soft");
+  // When the new session persists the prompt pointer.
+  const lines = await quiet(() => supervisor.flush());
+  // Then live session evidence succeeds without killing or relaunching omo.
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
+  expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4]).slice(0, 3)).toEqual([
+    "/new", "/model test/soft", "/thinking high",
+  ]);
+});
+
+test("a successful soft quota model switch counts once toward the restart cap", async () => {
+  // Given a pending quota switch, without an owner restart request.
+  const f = fixture({ leadModel: ["a/primary", "b/fallback"] });
+  writeJournal(f.state.dir, {
+    events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: "stopping", modelIndex: 1 },
+  });
+  // When the idle process switches successfully.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then the quota switch counts despite keeping the same process.
+  expect(readJournal(f.state.dir).forcedRestarts).toEqual([{ at: f.clock.now(), cause: "quota" }]);
+  expect(readJournal(f.state.dir).leadModel).toBe(1);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model b/fallback"]);
+});
+
+test.each([false, true])("soft evidence only accepts prompt files modified at or after soft entry, stale=%s", async (stalePrompt) => {
+  // Given a historical jsonl that cannot be read as a regular file.
+  const f = fixture();
+  f.cold();
+  const stale = join(dirname(f.file), `${randomUUID()}.jsonl`);
+  mkdirSync(stale);
+  utimesSync(stale, (f.clock.now() - 1) / 1000, (f.clock.now() - 1) / 1000);
+  const startedAt = f.clock.now();
+  let promptWritten = false;
+  if (stalePrompt) f.onWait(async () => {
+    if (promptWritten) return;
+    promptWritten = true;
+    const file = join(dirname(f.file), `${f.session()}.jsonl`);
+    utimesSync(file, (startedAt - 1) / 1000, (startedAt - 1) / 1000);
+  });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("mtime", "INBOUND mtime");
+  // When the prompt file's mtime is either just before or exactly at soft entry.
+  const lines = await quiet(() => supervisor.flush());
+  // Then only current evidence confirms; stale evidence exhausts the bounded deadline.
+  expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTARTED "))).toBe(!stalePrompt);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(stalePrompt ? 1 : 0);
+  if (stalePrompt) expect(f.clock.now() - startedAt).toBeGreaterThanOrEqual(20_000);
+  expect(f.clock.now() - startedAt).toBeLessThan(30_000);
+});
+
+test.each([false, true])("a missing held-session jsonl is skipped during restart, force=%s", async (force) => {
+  // Given a scanned holder whose jsonl cannot be statted because its target disappeared.
+  const f = fixture();
+  f.cold();
+  const missing = randomUUID();
+  const dir = dirname(f.file);
+  mkdirSync(join(dir, "session-holders", missing), { recursive: true });
+  writeFileSync(join(dir, "session-holders", missing, "101.json"), "{}");
+  symlinkSync(join(dir, "removed-session"), join(dir, `${missing}.jsonl`));
+  writeJournal(f.state.dir, {
+    events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: "stopping", force },
+  });
+  // When sessionFile (soft) or stopLead (hard) resolves the current session.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then the absent file does not abort either restart path.
+  expect(restartSession(f)).toBeUndefined();
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(force ? 1 : 0);
+  if (!force) expect(f.calls.some((call) => call[2] === "send-text" && call[4] === "/new")).toBe(true);
+});
+
+test.each(["send", "enter", "busy", "screen"])("a soft %s failure forces a single hard fallback", async (failure) => {
+  // Given a soft step which fails, with an owner message whose restart reaction must not be duplicated.
+  const f = fixture();
+  f.cold();
+  f.onWait(async () => { f.world.screen = "❯ "; });
+  const base = f.deps.run;
+  let failed = false;
+  const run: Runner = async (argv, options) => {
+    if (!failed && argv[2] === (failure === "send" ? "send-text" : "send-keys")) {
+      failed = true;
+      const result = await base(argv, options);
+      if (failure === "busy") f.pane.agent_status = "working";
+      if (failure === "screen") f.world.screen = "Cannot find module";
+      return failure === "send" || failure === "enter" ? { code: 1, out: "", err: "send failed" } : result;
+    }
+    return base(argv, options);
+  };
+  const reactions = recordReactions();
+  const supervisor = new Supervisor({ ...f.deps, run }, reactions);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner retry");
+  // When the step fails.
+  const lines = await quiet(() => supervisor.flush());
+  await supervisor.reactionsSettled();
+  // Then a busy reused process is still stopped and the hard launch receives the batch exactly once.
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toHaveLength(1);
+  expect(reactions.ops).toEqual(["add 11/22 \u23F3"]);
+  expect(taken(f)).toEqual(["discord:11:22\tINBOUND 11 22 owner retry"]);
+});
+
+test("recovering soft intent without evidence falls back without another new command", async () => {
+  // Given intent persisted before any soft submission completed.
+  const f = fixture();
+  writeJournal(f.state.dir, { events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: `soft:${f.session()}` } });
+  // When the supervisor recovers.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then no interactive command is replayed.
+  expect(f.calls.some((call) => call[4] === "/new")).toBe(false);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
+});
+
+test("a journaled forced restart bypasses the soft path even for an idle lead", async () => {
+  // Given a forced lifecycle transaction, not an ordinary owner restart request.
+  const f = fixture();
+  writeJournal(f.state.dir, { events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: "stopping", force: true } });
+  // When it is recovered.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then only the process path is used.
+  expect(f.calls.some((call) => call[4] === "/new")).toBe(false);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
+});
+
+test.each([["json", false], ["sqlite", false], ["json", true], ["sqlite", true]] as const)("recovering a soft restart on %s, ready=%s, never resends the prompt", async (store, ready) => {
+  // Given durable intent and evidence written before the supervisor crashed.
+  const f = fixture({ store });
+  const old = f.session();
+  const planned = randomUUID();
+  const actual = randomUUID();
+  const path = join(f.state.dir, `lead-${planned}.md`);
+  writeFileSync(path, "startup");
+  writeFileSync(join(dirname(f.file), `${actual}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: path } })}\n`);
+  utimesSync(join(dirname(f.file), `${actual}.jsonl`), 0, 0);
+  const initial = { events: [], restart: { session: ready ? actual : planned, events: [], offset: 0, phase: ready ? `soft-ready:${planned}` as const : `soft:${old}` as const } };
+  if (store === "sqlite") {
+    const seeded = new SqliteStore(join(f.state.dir, SQLITE_FILE), { create: true });
+    try { seeded.save(initial, "normal"); } finally { seeded.close(); }
+  } else writeFileSync(join(f.state.dir, JOURNAL_FILE), JSON.stringify(initial));
+  // When recovery runs, only confirmation and cleanup are allowed.
+  const lines = await quiet(() => new Supervisor(f.deps).flush());
+  // Then it confirms the existing session without typing anything again.
+  expect(f.calls.some((call) => call[2] === "send-text" || call[2] === "run")).toBe(false);
+  expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${actual}`);
+  if (!ready) expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${actual}`);
+  expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(actual);
+  expect(existsSync(path)).toBe(false);
+  if (store === "sqlite") {
+    const saved = new SqliteStore(join(f.state.dir, SQLITE_FILE));
+    try { expect(saved.read(false).restart).toBeUndefined(); } finally { saved.close(); }
+  } else expect(JSON.parse(readFileSync(join(f.state.dir, JOURNAL_FILE), "utf8")).restart).toBeUndefined();
+});
+
 test("a healthy cold start with holder evidence launches once and never kills the new session", async () => {
   const f = fixture();
+  f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("healthy", "INBOUND healthy");
@@ -522,6 +845,7 @@ test("a healthy cold start with holder evidence launches once and never kills th
 test("a hung cold start is killed by exact session and relaunched once with the same events and offset", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(1);
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("hung", "INBOUND hung");
@@ -543,6 +867,7 @@ test("a hung cold start is killed by exact session and relaunched once with the 
 test("two hung launches journal LEAD_STARTUP_HUNG, retain the events, and do not relaunch in a tight loop", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(2);
   const lines: string[] = [];
   const original = console.log;
@@ -580,6 +905,7 @@ test("a supervisor restart preserves queued input and does not duplicate a prior
 test("unconfirmed startup retains the transaction and recovery confirms the same launch without resubmitting", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   const before = new Supervisor(f.deps);
   before.enqueue("pending", "INBOUND pending");
@@ -589,7 +915,7 @@ test("unconfirmed startup retains the transaction and recovery confirms the same
   const after = new Supervisor(f.deps);
   await after.flush();
   expect(f.log().map((event) => event.id)).toEqual(["pending"]);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(readJournal(f.state.dir).restart).toBeUndefined();
 });
 
@@ -618,12 +944,13 @@ test("a shell with no live agent starts the lead instead of appending into an un
   supervisor.enqueue("missing", "INBOUND missing-agent");
   await supervisor.flush();
   expect(f.prompt()).toContain(TAKE_FIRST);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(taken(f)).toEqual(["missing\tINBOUND missing-agent"]);
 });
 
 test("stale ready state from the old occupant cannot confirm a new generation", async () => {
   const f = fixture();
+  f.noAgent();
   f.cold();
   let stale = true;
   const run: Runner = async (argv, options) => {
@@ -637,7 +964,7 @@ test("stale ready state from the old occupant cannot confirm a new generation", 
   supervisor.enqueue("fresh", "INBOUND fresh");
   await supervisor.flush();
   expect(f.calls.filter((call) => call[2] === "wait")).toHaveLength(2);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test("the shell interval before a new agent registers is not a startup failure", async () => {
@@ -654,7 +981,7 @@ test("the shell interval before a new agent registers is not a startup failure",
   const supervisor = new Supervisor({ ...f.deps, run });
   supervisor.enqueue("registering", "INBOUND registering");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(readJournal(f.state.dir).restart).toBeUndefined();
 });
 
@@ -797,7 +1124,7 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
   const start = f.clock.now();
   await supervisor.flush();
   supervisor.close();
-  const session = /--session-id ([\w-]+)/.exec(f.command() ?? "")?.[1] ?? "";
+  const session = f.session();
   expect(session).not.toBe("");
   expect(readWakes(f.state.dir, 0)).toEqual([{ at: start, session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
 });
@@ -886,7 +1213,7 @@ test("the next cold urgent delivery includes held digest in the new session prom
   await supervisor.flush();
   expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.log().map((event) => event.id)).toEqual(["digest", "urgent"]);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(taken(f)).toEqual(["digest\tNUDGED lane silent", "urgent\tLANE_NOT_DONE lane reason"]);
 });
 
@@ -896,6 +1223,7 @@ const urgentClaims = () => ({ eventPolicy: resolveEventPolicy({ kinds: { LANE_DO
 test("a claim reads delivered to the lead only once a cold start carrying it confirmed", async () => {
   const f = fixture(urgentClaims());
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   const before = new Supervisor(f.deps);
   before.enqueue("done-claim:lane:t", "LANE_DONE_CLAIMED lane - proof");
@@ -933,6 +1261,7 @@ test("a machine-closed lane's claim and close are digest and wake no lead", asyn
 
 test("a cold start points the lead at the full SKILL.md and puts leadArgs on the lead command only", async () => {
   const f = fixture({ leadArgs: ["--approve"], defaultModel: "test/lead-default" });
+  f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("card", "INBOUND card");
@@ -950,6 +1279,7 @@ const WITH_THINKING = ["omo", "--model", "{model}", "--thinking", "medium", "{pr
 /** The lead's agent argv after `--session-dir <dir>`, up to the `@prompt` file. */
 const leadAgent = async (extra: Record<string, unknown>) => {
   const f = fixture({ defaultModel: "test/lane-default", ...extra });
+  f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("card", "INBOUND card");
@@ -997,6 +1327,7 @@ test("a cold restart reacts hourglass on the owner's inbound message and leaves 
 test("a final hung start swaps the hourglass for the warning sign", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(2);
   const r = recordReactions();
   const supervisor = new Supervisor(f.deps, r);
@@ -1039,7 +1370,7 @@ test("a failing reaction never fails or blocks the restart", async () => {
     await supervisor.reactionsSettled();
   } finally { console.error = original; }
   expect(restartSession(f)).toBeUndefined();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 /** Captures console.log lines and silences console.error while `body` runs. */
@@ -1123,7 +1454,7 @@ test("a starting restart is never typed into a pane whose foreground is an agent
   // "stopping" already logged the cold batch before the launch.
   writeFileSync(join(f.state.dir, "lead-events.log"), `${JSON.stringify({ id: "x", line: "INBOUND x" })}\n`);
   await expect(new Supervisor(f.deps).flush()).rejects.toThrow("LEAD_PANE_BUSY lead:p1: foreground is not a plain shell (omo)");
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(0);
+  expect(restartStarts(f)).toHaveLength(0);
   expect(restartSession(f).phase).toBe("starting");
   f.noAgent();
   await quiet(() => new Supervisor(f.deps).flush());
@@ -1134,6 +1465,7 @@ test("a starting restart is never typed into a pane whose foreground is an agent
 test("a submitted launch that never confirms is abandoned after the limit: screen saved, pane replaced, fresh session", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   f.hang(1); // the launch never initialises: no holder file, no session jsonl
   const deps = { ...f.deps, run: recreating(f, f.deps.run), config: { ...f.deps.config } };
@@ -1177,6 +1509,7 @@ test("a submitted launch that never confirms is abandoned after the limit: scree
 test("argv-less foreground entries never crash, and a pane held by a process the supervisor did not start is kept", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(1);
   let foreign = false;
   // After the launch the pane runs something else (the owner's own omo); herdr lists its entries without argv.
@@ -1208,6 +1541,7 @@ test("argv-less foreground entries never crash, and a pane held by a process the
 test("an unconfirmed session that did initialise is never killed or relaunched past the limit", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false); // e.g. blocked on a dialog: herdr never reports it ready, but omo wrote its holder file
   const supervisor = new Supervisor({ ...f.deps, run: recreating(f, f.deps.run) });
   supervisor.enqueue("blocked", "INBOUND blocked");
@@ -1230,7 +1564,13 @@ const CHAIN = ["a/primary", { model: "b/fallback", thinking: "high" }];
 const BLOCKED_SCREEN = "Error: All Claude accounts for a are currently blocked\n❯ ";
 const allBlocked = JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true }, { name: "login-2", blocked: true }] });
 const oneHealthy = JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true }, { name: "login-2", blocked: false }] });
-const launches = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => call[2] === "run").map((call) => call[4] ?? "");
+/** Model selections through either a process launch or the interactive model commands, in argv spelling. */
+const launches = (f: ReturnType<typeof fixture>) => f.calls.flatMap((call, i) => {
+  if (call[2] === "run") return [call[4] ?? ""];
+  if (call[2] !== "send-text" || !call[4]?.startsWith("/model ")) return [];
+  const next = f.calls.slice(i + 1).find((item) => item[2] === "send-text")?.[4];
+  return [`--model ${call[4].slice("/model ".length)}${next?.startsWith("/thinking ") ? ` --thinking ${next.slice("/thinking ".length)}` : ""}`];
+});
 const journal = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir);
 const muted = async (work: () => Promise<void>) => {
   const original = console.log;
@@ -1260,6 +1600,7 @@ test("an idle lead stalled on quota moves to the next model with the pending eve
 
 test("a fresh launch stalled on quota is stopped and relaunched on the next model with the same events", async () => {
   const f = fixture({ leadModel: CHAIN });
+  f.noAgent();
   f.cold();
   f.auth.a = allBlocked;
   // The first launch comes up blocked; the fallback launch comes up clean.
@@ -1740,7 +2081,7 @@ test("a cold start hands every event through take once; owner work taken but unh
   expect(launches(f)).toHaveLength(1);
   // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
   const lines = handed(f).split("\n");
-  const session = /--session-id (\S+)/.exec(launches(f)[0] ?? "")?.[1];
+  const session = /lead-([0-9a-f-]{36})\.md/.exec(f.calls.find((call) => call[2] === "send-text" && call[4]?.startsWith("Read "))?.[4] ?? "")?.[1];
   expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`]);
   expect(lines[2]).toContain("INBOUND 11 22 owner project-alpha");
   expect(lines[3]).toContain("held-lane");

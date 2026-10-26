@@ -24,7 +24,8 @@ export type Restart = {
   readonly session: string;
   readonly events: readonly Event[];
   readonly offset: number;
-  readonly phase: "stopping" | "starting" | "submitted";
+  /** Soft phases carry the old session, then the prompt-file session, in the existing durable phase column. */
+  readonly phase: "stopping" | "starting" | "submitted" | "soft-failed" | `soft:${string}` | `soft-ready:${string}`;
   /** Launches that never showed startup evidence; the first one is relaunched at once, later ones wait for backoff. */
   readonly strikes?: number;
   /** Failed confirmations of this submitted session; at UNCONFIRMED_LIMIT the session is abandoned for a fresh one. */
