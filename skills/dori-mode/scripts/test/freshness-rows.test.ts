@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { freshnessTick } from "../src/freshness.ts";
@@ -59,4 +60,19 @@ test("a lane with no row, or whose last row is older than nudgeAfterMin, keeps t
   const acts = await freshnessTick(deps(T0 + 25 * MIN), "/home/test", undefined, store);
   expect(acts.map((a) => `${a.kind} ${a.lane}`)).toEqual(["nudged old-row"]);
   expect(acts[0]?.detail).toStartWith("20 min silent");
+});
+
+test("an unchanged held report does not rewrite the lane record", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const world = newWorld();
+  world.screen = "❯ ";
+  const deps = depsFor(world, fakeClock(T0 + 21 * MIN), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
+  await deps.registry.write({ ...lane("held", "w:p1"), lastNudgeAt: T0 + 21 * MIN });
+  const record = join(state.dir, "lanes", "held.json");
+  await freshnessTick(deps, "/home/test");
+  const afterFirstHold = readFileSync(record, "utf8");
+  expect(JSON.parse(afterFirstHold).version).toBe(2);
+  await freshnessTick(deps, "/home/test");
+  expect(readFileSync(record, "utf8")).toBe(afterFirstHold);
 });

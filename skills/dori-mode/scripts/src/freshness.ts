@@ -124,7 +124,9 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
         // the older footer, into the lead's pane), so its pane having none is expected and not worth a line.
         const expected = hold.kind === "no-report" && !lane.machine;
         if (note !== current.lastFreshnessNote && !expected) acts.push({ kind: hold.kind, lane: lane.key, detail: hold.detail });
-        await save({ lastSeenReport, lastFreshnessNote: note });
+        if (note !== current.lastFreshnessNote || lastSeenReport !== current.lastSeenReport) {
+          await save({ lastSeenReport, lastFreshnessNote: note });
+        }
         continue;
       }
       const text = `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`;

@@ -254,7 +254,9 @@ export class Registry {
     const stored = await this.update(key, (current) => {
       if (!current) { missing = true; return undefined; }
       const p = typeof fields === "function" ? fields(current as T) : fields;
-      return p === undefined ? undefined : { ...current, ...p, key };
+      if (p === undefined) return undefined;
+      const next = { ...current, ...p, key };
+      return JSON.stringify(next) === JSON.stringify(current) ? undefined : next;
     });
     return missing ? null : (stored as T | null);
   }
