@@ -19,9 +19,24 @@ export const procTable = async (run: Runner): Promise<Proc[]> =>
     return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] ?? "" }] : [];
   });
 
-const descendants = (table: readonly Proc[], root: number): Proc[] => {
+// procTable results are never mutated, so one parent index per table serves every walk.
+const parentMaps = new WeakMap<readonly Proc[], Map<number, Proc[]>>();
+
+const byParentOf = (table: readonly Proc[]): Map<number, Proc[]> => {
+  const cached = parentMaps.get(table);
+  if (cached) return cached;
   const byParent = new Map<number, Proc[]>();
-  for (const p of table) byParent.set(p.ppid, [...(byParent.get(p.ppid) ?? []), p]);
+  for (const p of table) {
+    const siblings = byParent.get(p.ppid);
+    if (siblings) siblings.push(p);
+    else byParent.set(p.ppid, [p]);
+  }
+  parentMaps.set(table, byParent);
+  return byParent;
+};
+
+const descendants = (table: readonly Proc[], root: number): Proc[] => {
+  const byParent = byParentOf(table);
   const out: Proc[] = [];
   const queue = [...(byParent.get(root) ?? [])];
   for (let p = queue.shift(); p; p = queue.shift()) {
@@ -58,10 +73,20 @@ export const resolveSession = async (pane: string, cwd: string, table: readonly 
   const flagAt = argv.indexOf("--session") >= 0 ? argv.indexOf("--session") : argv.indexOf("--session-id");
   const fromFlag = flagAt >= 0 ? (argv[flagAt + 1] ?? "") : "";
   if (fromFlag) return { id: fromFlag, via: "argv", pid: agent.pid };
-  for (const child of descendants(table, agent.pid).slice(0, 40)) {
-    const env = await deps.run(["ps", "eww", "-o", "command=", "-p", String(child.pid)]);
-    const hit = ENV_ID.exec(env.out);
-    if (hit?.[1]) return { id: hit[1], via: "child-env", pid: agent.pid };
+  const children = descendants(table, agent.pid).slice(0, 40);
+  if (children.length > 0) {
+    // One ps for every child; exited pids make ps exit nonzero but the rest still print.
+    const env = await deps.run(["ps", "eww", "-o", "pid=,command=", "-p", children.map((c) => c.pid).join(",")]);
+    const idByPid = new Map<number, string>();
+    for (const line of env.out.split("\n")) {
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      const id = m ? ENV_ID.exec(m[2] ?? "")?.[1] : undefined;
+      if (m && id) idByPid.set(Number(m[1]), id);
+    }
+    for (const child of children) {
+      const id = idByPid.get(child.pid);
+      if (id) return { id, via: "child-env", pid: agent.pid };
+    }
   }
   const started = Date.parse((await deps.run(["ps", "-o", "lstart=", "-p", String(agent.pid)])).out);
   if (Number.isNaN(started)) return { id: "", via: "none", pid: agent.pid };
