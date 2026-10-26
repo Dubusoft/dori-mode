@@ -1,4 +1,4 @@
-import { fill } from "./config.ts";
+import { fill, languageInstruction } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import type { LaneReportStore } from "./lane-reports.ts";
 import { checkPausedLane } from "./pause.ts";
@@ -102,7 +102,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
           acts.push({ kind: "no-progress", lane: lane.key, detail: `${silentMin} min without a thread update while working; ${progress ? "no threadReply hook to post its todo" : "its pane shows no Todo item to post"}` });
         }
       } else if ((current.lastNudgeAt ?? 0) < heard) {
-        const delivery = await sendVerified(run, deps.clock, lane.pane, `[LEAD] your work thread has had no update for ${silentMin} min. Post a 1-2 sentence progress line (done since last, next) and keep its status true.`);
+        const delivery = await sendVerified(run, deps.clock, lane.pane, `[LEAD] your work thread has had no update for ${silentMin} min. Post a 1-2 sentence progress line (done since last, next) and keep its status true.${languageInstruction(deps.config.ownerLanguage) ? ` ${languageInstruction(deps.config.ownerLanguage)}` : ""}`);
         await save({ lastNudgeAt: now });
         acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
       }
