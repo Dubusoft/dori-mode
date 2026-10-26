@@ -782,14 +782,18 @@ export const UNCONFIRMED_LIMIT = 5;
 type ForegroundProcess = { readonly pid?: number; readonly argv?: readonly string[] };
 type ProcessInfo = { readonly shell_pid?: number; readonly foreground_process_group_id?: number; readonly foreground_processes?: readonly ForegroundProcess[] };
 
-const STARTUP_ERROR = /Cannot find module|All fallback models failed|No API key|model_not_available|usage limit|rate limit|quota|Session crashed|unknown provider/i;
+const STARTUP_ERROR = /Cannot find module|All fallback models failed|No API key|model_not_available|No model matching|usage limit|rate limit|quota|Session crashed|unknown provider/i;
 
 const softLive = async (deps: FlowDeps): Promise<boolean> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   return !!pane?.agent && ALIVE_STATUSES.has(pane.agent_status ?? "");
 };
 
-/** Submit once, then observe a completed interactive command before submitting the next one. */
+/**
+ * Submit, then observe a completed interactive command before submitting the next one. Typing alone changes the screen,
+ * and omo's argument autocomplete takes the first Enter to accept its selection, leaving the command in the editor;
+ * a command still shown there gets Enter again, so the next command is never typed onto the same line.
+ */
 const softCommand = async (deps: FlowDeps, command: string, prompt = false): Promise<void> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError("lead left idle/done before soft command");
@@ -804,12 +808,17 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
   if (await sendGuarded(run, deps.config.leadPane, command) === "failed" || enterFailed) throw new TransientSuperviseError("soft command send failed");
   if (prompt) return;
   const deadline = deps.clock.now() + 5_000;
+  let enters = 1;
   for (let attempt = 0; attempt <= 25; attempt++) {
     const after = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
     const screen = await readScreen(deps.run, deps.config.leadPane);
-    const added = screen.split("\n").filter((line) => !previous.has(line)).join("\n");
-    if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(added)) throw new TransientSuperviseError("lead not ready after soft command");
-    if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
+    const addedLines = screen.split("\n").filter((line) => !previous.has(line));
+    if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
+    if (addedLines.some((line) => line.includes(command))) {
+      if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
+      if ((await deps.run(["herdr", "pane", "send-keys", deps.config.leadPane, "enter"])).code !== 0) throw new TransientSuperviseError("soft command send failed");
+      enters++;
+    } else if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
     if (deps.clock.now() >= deadline) break;
     await deps.clock.sleep(200);
   }

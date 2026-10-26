@@ -684,6 +684,41 @@ test("a soft restart ignores existing quota lines during commands and quota text
   ]);
 });
 
+test("a soft command whose first Enter only accepts the autocomplete is entered again before the next command", async () => {
+  // Given omo's editor: typed text shows on the prompt line, and a command with an argument opens an autocomplete
+  // whose first Enter accepts the selection without submitting.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.world.screen = "❯ ";
+  const base = f.deps.run;
+  let editor = "";
+  let popup = false;
+  const submitted: string[] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
+    if (argv[0] === "herdr" && argv[2] === "send-text") {
+      editor += argv[4] ?? "";
+      popup = editor.startsWith("/") && editor.includes(" ");
+    } else if (argv[0] === "herdr" && argv[2] === "send-keys") {
+      if (popup) { popup = false; f.pane.revision++; f.world.screen = `❯ ${editor}`; return { code: 0, out: "", err: "" }; }
+      submitted.push(editor);
+      editor = "";
+    }
+    const result = await base(argv, options);
+    f.world.screen = `❯ ${editor}`;
+    return result;
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-popup", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then each command is submitted on its own line and the soft restart succeeds.
+  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(submitted[3]).toMatch(/^Read .* in full/);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+});
+
 test.each([false, true])("soft evidence only accepts prompt files modified at or after soft entry, stale=%s", async (stalePrompt) => {
   // Given a historical jsonl that cannot be read as a regular file.
   const f = fixture();
