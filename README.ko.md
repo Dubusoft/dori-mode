@@ -153,7 +153,7 @@ CLI에는 Dori에게 필요한 메신저 기능도 들어 있습니다. `scripts
 
 ## 테스트
 
-CI는 없습니다. 테스트는 로컬에서 돌립니다.
+CI는 타입 검사만 돌립니다. 테스트는 로컬에서 돌립니다.
 
 ```sh
 cd skills/dori-mode/scripts

@@ -21,6 +21,7 @@
   "leadQuotaBusySwitchMin": 10,
   "leadStuckRestartMin": 30,
   "leadUnreadRestartMin": 5,
+  "leadChildWaitMaxMin": 60,
   "leadEmergencyModels": [],
   "quotaGate": {
     "holdLanesHeadroomPct": 50,
@@ -58,6 +59,7 @@
   "closeAfterMin": 5,
   "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
+  "ownerLanguage": "Korean",
   "progressTemplate": "{todo}",
   "digestMaxDelayMin": 60,
   "ownerDelayNotice": "Got your message. The lead session is not taking it yet; it stays queued and will be answered as soon as the lead is back.",

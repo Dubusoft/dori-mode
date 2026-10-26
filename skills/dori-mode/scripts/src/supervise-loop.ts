@@ -257,6 +257,7 @@ export const supervise = async (
   if (typeof deps.config.laneFinishNotice !== "boolean") throw new SuperviseError("laneFinishNotice must be true or false");
   if (!Number.isFinite(deps.config.leadQuotaBusySwitchMin) || deps.config.leadQuotaBusySwitchMin <= 0) throw new SuperviseError("leadQuotaBusySwitchMin must be positive");
   if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
+  if (!Number.isFinite(deps.config.leadChildWaitMaxMin) || deps.config.leadChildWaitMaxMin <= 0) throw new SuperviseError("leadChildWaitMaxMin must be positive");
   if (!Number.isFinite(deps.config.leadUnreadRestartMin) || deps.config.leadUnreadRestartMin <= 0) throw new SuperviseError("leadUnreadRestartMin must be positive");
   if (!Number.isInteger(deps.config.leadPrimaryReturnChecks) || deps.config.leadPrimaryReturnChecks <= 0) throw new SuperviseError("leadPrimaryReturnChecks must be a positive integer");
   if (!Number.isInteger(deps.config.waitMaxFailures) || deps.config.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");

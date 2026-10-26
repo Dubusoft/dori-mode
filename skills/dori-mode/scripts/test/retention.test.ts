@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { join } from "node:path";
 
 import { GitHubEvents, PRE_SQLITE_GITHUB_FILE } from "../src/github-events.ts";
+import { take } from "../src/inbox.ts";
 import { Repos } from "../src/repos.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { RETENTION, SCHEMA_VERSION, SQLITE_FILE, SqliteStore } from "../src/store.ts";
@@ -275,6 +276,9 @@ test("30 days at 10x today's rate: database under 200 MB, startup under 2 s, a r
     for (const owner of owners) f.handled(owner, f.clock.now());
     supervisor.ackTick(60_000);
     await supervisor.flush();
+    // The lead reads what was delivered with `dori inbox take`, as push delivery expects: a lead that never takes leaves
+    // every line since the start untaken, which each push step then rechecks.
+    while (take(f.state.dir, { maxBytes: deps.config.delivery.push.takeMaxBytes, now: f.clock.now() }).more);
   }
   const loadMs = performance.now() - started;
   supervisor.close();
