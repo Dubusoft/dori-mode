@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, eventKind } from "./event-policy.ts";
 import { redactSecrets } from "./redact.ts";
+import type { EventMeta } from "./supervise-journal.ts";
 import type { Runner } from "./run.ts";
 import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, validateSchedule } from "./schedule.ts";
 
@@ -167,8 +168,26 @@ export class SourceSpecs {
   }
 }
 
+const hasCaptureGroup = (pattern: string): boolean => {
+  let escaped = false;
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (escaped) { escaped = false; continue; }
+    if (char === "\\") { escaped = true; continue; }
+    if (char === "[") { inClass = true; continue; }
+    if (char === "]") { inClass = false; continue; }
+    if (!inClass && char === "(" && (pattern[i + 1] !== "?" || pattern[i + 2] === "<" && pattern[i + 3] !== "=" && pattern[i + 3] !== "!")) return true;
+  }
+  return false;
+};
+
 /** A spec as printed by `dori source list`: the webhook secret is never shown. */
-export const publicSpec = (spec: SourceSpec): Record<string, unknown> => spec.type === "webhook" ? { ...spec, secret: "(set)" } : { ...spec };
+export const publicSpec = (spec: SourceSpec): Record<string, unknown> => {
+  if (spec.type === "webhook") return { ...spec, secret: "(set)" };
+  if (spec.type !== "poll" || hasCaptureGroup(spec.match)) return { ...spec };
+  return { ...spec, identity: "text-hash (repeats of the same line collapse; add a capture group selecting an occurrence id)" };
+};
 
 /**
  * `dori emit`: spools one event for the supervisor's `emit` source and returns its event id. With `id` a repeat of the
@@ -236,7 +255,7 @@ export const sourceViews = (stateDir: string): { readonly sources: readonly Sour
   };
 };
 
-export type SourceEnqueue = (id: string, line: string) => boolean;
+export type SourceEnqueue = (id: string, line: string, meta?: EventMeta) => boolean;
 export type EventSourcesDeps = {
   readonly stateDir: string;
   /** Supervisor.enqueue: durable, deduped by id, classified by the policy table. */
@@ -305,8 +324,8 @@ export class EventSources {
 
   /** Journals one event of source `name`; false when the store already had its id (a duplicate, dropped). */
   enqueueFor(name: string): SourceEnqueue {
-    return (id, line) => {
-      const added = this.deps.enqueue(id, line);
+    return (id, line, meta) => {
+      const added = this.deps.enqueue(id, line, meta);
       const entry = this.entry(name, this.typeOf(name));
       this.set(name, added
         ? { ...entry, events: entry.events + 1, lastEventAt: this.deps.now(), lastKind: eventKind(line, this.deps.policy ?? DEFAULT_EVENT_POLICY) }
@@ -426,6 +445,7 @@ export class EventSources {
       const line = sourceText(raw);
       const hit = line ? re.exec(line) : null;
       if (!hit) continue;
+      // Identity is the first capture group when present, otherwise the whole line; repeats collapse.
       put(`src:${spec.name}:${sha(hit[1] ?? line).slice(0, 32)}`, `${spec.kind} ${line}`);
     }
   }

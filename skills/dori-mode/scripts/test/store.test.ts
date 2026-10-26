@@ -16,6 +16,36 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const T0 = 1_800_000_000_000;
 
+test.each([false, true])("sqlite save retries after a failed commit with an existing baseline=%s", (existing) => {
+  const state = withState();
+  cleanups.push(state.done);
+  const store = new SqliteStore(join(state.dir, SQLITE_FILE), { create: true });
+  cleanups.unshift(() => store.close());
+  const journal = { events: [{ id: "retry", line: "HOOK retry", at: T0 }] };
+  if (existing) {
+    journal.events.length = 0;
+    store.save(journal, "full");
+    journal.events.push({ id: "retry", line: "HOOK retry", at: T0 });
+  }
+  // A deferred constraint fails at COMMIT, after every save operation has run.
+  const db = store["db"];
+  db.exec(`PRAGMA foreign_keys = ON;
+    CREATE TABLE commit_parent (id TEXT PRIMARY KEY);
+    CREATE TABLE commit_child (id TEXT REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER fail_commit AFTER INSERT ON events BEGIN INSERT INTO commit_child VALUES (NEW.id); END;`);
+  expect(() => store.save(journal, "full")).toThrow();
+  expect(store.counts().events).toBe(0);
+  if (!existing) expect(db.query("SELECT value FROM meta WHERE key = 'journal'").get()).toBeNull();
+  db.exec("DROP TRIGGER fail_commit");
+  store.save(journal, "full");
+  store.close();
+  const restarted = new SqliteStore(join(state.dir, SQLITE_FILE));
+  try {
+    expect(restarted.load()?.events).toEqual(journal.events);
+    expect(restarted.counts().events).toBe(1);
+  } finally { restarted.close(); }
+});
+
 /** A lead pane that is busy, so every due event is appended to the log without a restart. */
 const fixture = () => {
   const state = withState();
@@ -244,4 +274,37 @@ test("a supervisor refuses a state dir that belongs to the other store", () => {
   expect(() => f.open("sqlite")).toThrow("STORE_IMPORT_PENDING");
   importStore(f.state.dir, T0);
   expect(() => f.open("json")).toThrow("STORE_MISMATCH");
+});
+
+test("a version 5 database is migrated to 6: old events read without meta, new ones keep it, deliveries record their take", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const path = join(state.dir, SQLITE_FILE);
+  // Given a version 5 database (no events.meta, no deliveries.taken_*) holding one delivered event.
+  new SqliteStore(path, { create: true }).close();
+  const raw = new (await import("bun:sqlite")).Database(path);
+  raw.exec(`ALTER TABLE events DROP COLUMN meta; ALTER TABLE deliveries DROP COLUMN taken_at; ALTER TABLE deliveries DROP COLUMN taken_session;
+    UPDATE meta SET value = '5' WHERE key = 'schema_version';
+    INSERT INTO meta (key, value) VALUES ('journal', '1');
+    INSERT INTO events (id, kind, lead, line, at) VALUES ('old', 'LANE_REPORT', 'dori', 'LANE_REPORT old', ${T0});
+    INSERT INTO deliveries (event_id, lead, generation, delivered_at) VALUES ('old', 'dori', 0, ${T0 + 1});`);
+  raw.close();
+  // When this code opens it, saves an event with meta and records a take of both.
+  const store = new SqliteStore(path);
+  const journal = store.load();
+  expect(store.meta("schema_version")).toBe("7");
+  expect(journal?.events).toEqual([{ id: "old", line: "LANE_REPORT old", at: T0 }]);
+  const meta = { lane: "alpha", thread: "discord:42", cwd: "/repo" };
+  store.save({ events: [...(journal?.events ?? []), { id: "new", line: "LANE_REPORT new", at: T0 + 2, meta }] }, "full");
+  store.recordTakes(["old", "new"], T0 + 3, "sess-1");
+  store.close();
+  // Then the old event still has no meta, the new one keeps it, and both deliveries carry the take.
+  const reread = new SqliteStore(path);
+  try {
+    expect(reread.read(false).events).toEqual([{ id: "old", line: "LANE_REPORT old", at: T0 }, { id: "new", line: "LANE_REPORT new", at: T0 + 2, meta }]);
+    expect(reread.database.query("SELECT event_id, delivered_at, taken_at, taken_session FROM deliveries ORDER BY event_id").all()).toEqual([
+      { event_id: "new", delivered_at: T0 + 3, taken_at: T0 + 3, taken_session: "sess-1" },
+      { event_id: "old", delivered_at: T0 + 1, taken_at: T0 + 3, taken_session: "sess-1" },
+    ]);
+  } finally { reread.close(); }
 });

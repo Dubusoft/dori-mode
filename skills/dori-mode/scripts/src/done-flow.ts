@@ -16,6 +16,7 @@ import { otherOpenLanesOnThread } from "./routing.ts";
 import type { Discord } from "./messenger/discord.ts";
 import { type Platform, resolveTarget, type Target } from "./messenger/target.ts";
 import { eventClass } from "./event-policy.ts";
+import type { EventMeta } from "./supervise-journal.ts";
 
 export type FlowDeps = {
   readonly run: Runner;
@@ -237,8 +238,10 @@ const closeSequence = async (
   if (sharing.length) cleanup.push(`thread kept open: lane ${sharing.map((l) => l.key).join(", ")} still works in it`);
   else if (lane.thread !== "none") {
     if (hook) {
-      // A hook has no read-back: after a crash mid-hook it cannot be told whether the thread was marked, so that is ambiguous.
-      const step = await act("thread-done", lane.thread, () => deps.run(fill(hook, { thread: lane.thread, text: note, key: lane.key })), async () => "unknown");
+      // A hook has no read-back of the thread: it is "done" only when the hook ran here and exited 0; after a crash
+      // mid-hook (no result) it cannot be told whether the thread was marked, so that stays ambiguous.
+      let ran: Ran | undefined;
+      const step = await act("thread-done", lane.thread, async () => (ran = await deps.run(fill(hook, { thread: lane.thread, text: note, key: lane.key }))), async () => (ran?.code === 0 ? "done" : "unknown"));
       if (step.state === "ambiguous") return ambiguous(step);
       cleanup.push(step.state === "verified" ? "thread marked done" : `thread hook failed: ${step.err.slice(0, 160)}`);
     }
@@ -255,7 +258,7 @@ const closeSequence = async (
           return (await discord.threadArchived(thread)) ? { code: 0, out: "", err: "" } : { code: 1, out: "", err: "read back archived: false" };
         } catch (e) { return { code: 1, out: "", err: e instanceof Error ? e.message : String(e) }; }
       }, archived);
-      if (step.state === "ambiguous") return ambiguous(step);
+      // An unreadable archive state is ambiguous in the ledger but does not stop the close: the thread is only cosmetic.
       cleanup.push(step.state === "verified" ? `thread ${thread} archived` : `thread ${thread} not archived: ${step.err.slice(0, 160)}`);
     }
   }
@@ -297,10 +300,10 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
     const { note, force } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean };
     const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force) });
     const last = result.lines.at(-1) ?? "";
-    if (result.closed) await push(`LANE_CLOSED ${lane.key} ${last.split(" ").slice(2).join(" ")}`);
+    if (result.closed) await push(`LANE_CLOSED ${lane.key} ${last.split(" ").slice(2).join(" ")}`, undefined, laneMeta(lane));
     else {
       const ambiguousLines = result.lines.filter((line) => line.startsWith("OPERATION_AMBIGUOUS "));
-      for (const line of ambiguousLines.length ? ambiguousLines : [`OPERATION_FAILED ${op.id} the interrupted close was not finished: ${last}`]) await push(line);
+      for (const line of ambiguousLines.length ? ambiguousLines : [`OPERATION_FAILED ${op.id} the interrupted close was not finished: ${last}`]) await push(line, undefined, laneMeta(lane));
     }
   }
 };
@@ -414,7 +417,14 @@ export const laneSendRefusal = (caller: string | undefined, lane: Lane | null, p
 };
 
 /** Hands a line over; `id` is its journal id when the line has a stable one (else the supervisor assigns one). */
-export type Emit = (line: string, id?: string) => Promise<void>;
+export type Emit = (line: string, id?: string, meta?: EventMeta) => Promise<void>;
+
+/** The meta of an event about `lane`: its key, thread (when it has one) and cwd (when known). */
+export const laneMeta = (lane: Lane): EventMeta => ({
+  lane: lane.key,
+  ...(lane.thread && lane.thread !== "none" ? { thread: lane.thread } : {}),
+  ...(lane.cwd ? { cwd: lane.cwd } : {}),
+});
 
 /**
  * A remote lane can neither run `dori claim-done` nor message the lead pane: its newest `[REPORT]` line, read from
@@ -464,7 +474,7 @@ const actOnRemoteReport = async (deps: FlowDeps, lane: Lane, push: Emit, line: s
     await claimDone(deps, seen, what);
     return (await deps.registry.patch(lane.key, fields)) ?? seen;
   }
-  if (kind === "blocker" || kind === "question") await push(`LANE_REPORT ${lane.key} ${kind} ${what}`);
+  if (kind === "blocker" || kind === "question") await push(`LANE_REPORT ${lane.key} ${kind} ${what}`, undefined, laneMeta(lane));
   await deps.registry.patch(lane.key, fields);
   return seen;
 };
@@ -472,7 +482,7 @@ const actOnRemoteReport = async (deps: FlowDeps, lane: Lane, push: Emit, line: s
 const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepView): Promise<void> => {
   const status = statusOf(listed);
   if (status === "closed") {
-    for (const line of await closedWorktreeSweep(deps, listed)) await push(line);
+    for (const line of await closedWorktreeSweep(deps, listed)) await push(line, undefined, laneMeta(listed));
     return;
   }
   let lane = listed;
@@ -484,7 +494,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepVi
     // Enqueued before the emitted mark is saved: a crash in between repeats the announcement instead of losing it
     // (under the same id, so the supervisor journals it once).
     const event = !machine ? claimEventId(lane.key, claim.at) : undefined;
-    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${claim.evidence}`, event);
+    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${claim.evidence}`, event, laneMeta(lane));
     const announced = { emitted: true, ...(event ? { event } : {}) };
     claim = { ...claim, ...announced };
     lane = { ...lane, claim };
@@ -500,7 +510,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepVi
     evidence = `${claim.evidence} (closed at once: ${merged})`;
   }
   const line = await settle(deps, lane, evidence);
-  await push(machine && line.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${line.slice("LANE_CLOSED ".length)}` : line);
+  await push(machine && line.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${line.slice("LANE_CLOSED ".length)}` : line, undefined, laneMeta(lane));
 };
 
 /**
@@ -550,8 +560,8 @@ const windowStart = async (deps: FlowDeps, lane: Lane, claim: NonNullable<Lane["
  */
 export const watchTick = async (deps: FlowDeps, emit?: Emit, view: SweepView = passthroughView(deps.run), archived = true): Promise<string[]> => {
   const out: string[] = [];
-  const push: Emit = async (line, id) => {
-    if (emit) await emit(line, id);
+  const push: Emit = async (line, id, meta) => {
+    if (emit) await (meta ? emit(line, id, meta) : emit(line, id));
     out.push(line);
   };
   try {

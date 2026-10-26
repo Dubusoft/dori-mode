@@ -199,14 +199,14 @@ export const supervisorSweeps = (
  * watcher, SWEEP_WARN <name> otherwise) and the next sweep still runs. Nothing here ends the supervisor.
  */
 export const runSweeps = async (sweeps: readonly Sweep[], emit: Emit, now: () => number, recent: Map<string, number>, log: (line: string) => void): Promise<void> => {
-  const put: Emit = async (line, id) => {
+  const put: Emit = async (line, id, meta) => {
     if (/^\S*_WARN\b/.test(line)) {
       for (const [seen, at] of recent) if (now() - at >= WARN_REPEAT_MS) recent.delete(seen);
       const last = recent.get(line);
       if (last !== undefined && now() - last < WARN_REPEAT_MS) return;
       recent.set(line, now());
     }
-    await emit(line, id);
+    await emit(line, id, meta);
   };
   for (const [name, step] of sweeps) {
     try {
@@ -254,6 +254,7 @@ export const supervise = async (
   if (!Number.isFinite(deps.config.runTimeoutMs) || deps.config.runTimeoutMs < 0) throw new SuperviseError("runTimeoutMs must be zero or positive");
   if (!Number.isFinite(deps.config.handledTimeoutMin) || deps.config.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
   if (!Number.isFinite(deps.config.reportTimeoutMin) || deps.config.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
+  if (!Number.isFinite(deps.config.resolveTimeoutMin) || deps.config.resolveTimeoutMin <= 0) throw new SuperviseError("resolveTimeoutMin must be positive");
   if (typeof deps.config.laneFinishNotice !== "boolean") throw new SuperviseError("laneFinishNotice must be true or false");
   if (!Number.isFinite(deps.config.leadQuotaBusySwitchMin) || deps.config.leadQuotaBusySwitchMin <= 0) throw new SuperviseError("leadQuotaBusySwitchMin must be positive");
   if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
@@ -305,7 +306,7 @@ export const supervise = async (
     const ops = scheduleOps = probe.step("schedules", () => openOperations(deps.config));
     const heavyLoad = async (): Promise<number> => (await sampleHost(deps.run, diskGuardPath(deps.config))).load1;
     const registry = sources = new EventSources({
-      stateDir: deps.config.stateDir, enqueue: (id, line) => supervisor.enqueue(id, line), now: deps.clock.now, run: deps.run,
+      stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
       policy: deps.config.eventPolicy, log: (line) => { console.error(line); },
       schedules: {
         operations: ops, journaled: (id: string) => supervisor.journaled(id),
@@ -396,7 +397,7 @@ export const supervise = async (
     };
     const sweep = async (): Promise<void> => {
       const failed: string[] = [];
-      await runSweeps(sweeps, async (line, id) => { enqueueSweep(id ?? `sweep:${boot}:${sequence++}`, line); }, deps.clock.now, recentWarnings, (line) => {
+      await runSweeps(sweeps, async (line, id, meta) => { enqueueSweep(id ?? `sweep:${boot}:${sequence++}`, line, meta); }, deps.clock.now, recentWarnings, (line) => {
         console.error(line);
         if (line.startsWith("SWEEP_ERROR ")) failed.push(line.slice("SWEEP_ERROR ".length));
       });
@@ -460,6 +461,9 @@ export const supervise = async (
     const checkReported = async (): Promise<void> => {
       try { await supervisor.reportTick(); }
       catch (e) { console.error(`REPORT_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      // A decision event the lead did not close (dori resolved) in time: UNRESOLVED wakes the lead.
+      try { supervisor.resolveTick(); }
+      catch (e) { console.error(`RESOLVE_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     };
     let lastGitHub = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);

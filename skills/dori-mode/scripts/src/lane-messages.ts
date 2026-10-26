@@ -45,7 +45,8 @@ export interface LaneMessageStore {
 }
 
 export const LANE_MESSAGES_FILE = "lane-messages.json";
-const LANE_MESSAGES_LOCK = "lane-messages.lock.sqlite";
+/** Held while lane-messages.json is written; `dori store import` holds it so no message lands between its copy and the file's retirement. */
+export const LANE_MESSAGES_LOCK = "lane-messages.lock.sqlite";
 
 const order = (a: LaneMessage, b: LaneMessage): number => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 const matches = (m: LaneMessage, filter: { readonly lane?: string; readonly states?: readonly LaneMessageState[] }): boolean =>
@@ -75,6 +76,19 @@ export class JsonLaneMessages implements LaneMessageStore {
 /** Created on first use like the operations table, not by a schema migration. */
 const DDL = `CREATE TABLE IF NOT EXISTS lane_messages (id TEXT PRIMARY KEY, lane TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, body TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS lane_messages_open ON lane_messages (state, lane);`;
+
+/** Every message in `db`'s lane_messages table, in list() order; no table reads as no messages (`dori store export`). */
+export const readMessageRows = (db: Database): LaneMessage[] =>
+  db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lane_messages'").get()
+    ? (db.query("SELECT body FROM lane_messages ORDER BY at, id").all() as { body: string }[]).map((row) => JSON.parse(row.body) as LaneMessage)
+    : [];
+
+/** Inserts `messages` as they are (state and times kept), for `dori store import`; an id already there throws. */
+export const putMessageRows = (db: Database, messages: readonly LaneMessage[]): void => {
+  db.exec(DDL);
+  const insert = db.query("INSERT INTO lane_messages (id, lane, state, at, body) VALUES (?, ?, ?, ?, ?)");
+  for (const m of messages) insert.run(m.id, m.lane, m.state, m.at, JSON.stringify(m));
+};
 
 export class SqliteLaneMessages implements LaneMessageStore {
   private readonly db: Database;

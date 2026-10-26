@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -6,6 +6,8 @@ import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
 import { ACK_KEEP_MS, eventPriority, OWNER_NOTIFY_ATTEMPTS, Supervisor } from "../src/supervise.ts";
 import { enqueueLaunch, launchQueue, launchQueueText, recordLaunchVerdict } from "../src/routing.ts";
 import { supervisorSweeps } from "../src/supervise-loop.ts";
+import { SqliteStore } from "../src/store.ts";
+import { resolveEventPolicy } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -26,6 +28,63 @@ const fixture = () => {
   } => readJournal(state.dir);
   return { state, clock, pane, deps, journal };
 };
+
+test.each([
+  ["discord:11:22", "INBOUND 11 22 owner retry"],
+  ["closed:alpha", "LANE_CLOSED alpha"],
+])("failed enqueue rolls back tracking and nested notices for %s before a same-id retry", (id, line) => {
+  const f = fixture();
+  const posted: string[] = [];
+  const supervisor = new Supervisor({ ...f.deps, config: { ...f.deps.config, laneFinishNotice: true } }, {
+    announce: async (text) => { posted.push(text); },
+  });
+  cleanups.unshift(() => supervisor.close());
+  const before = structuredClone(supervisor["core"].journal);
+  const store = supervisor["core"].store;
+  const tmp = join(f.state.dir, "supervisor.json.tmp");
+  if (store instanceof SqliteStore) {
+    // All statements succeed; the deferred foreign key rejects the actual COMMIT.
+    store["db"].exec(`PRAGMA foreign_keys = ON;
+      CREATE TABLE commit_parent (id TEXT PRIMARY KEY);
+      CREATE TABLE commit_child (id TEXT REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+      CREATE TRIGGER fail_commit AFTER INSERT ON events BEGIN INSERT INTO commit_child VALUES (NEW.id); END;`);
+  } else mkdirSync(tmp);
+  expect(() => supervisor.enqueue(id, line)).toThrow();
+  if (store instanceof SqliteStore) store["db"].exec("DROP TRIGGER fail_commit");
+  else rmSync(tmp, { recursive: true });
+  expect(supervisor["core"].journal).toEqual(before);
+  expect(supervisor.journaled(id)).toBe(false);
+  expect(supervisor.journaled("lane-finish:alpha")).toBe(false);
+  expect(posted).toEqual([]);
+  expect(supervisor.enqueue(id, line)).toBe(true);
+  expect(supervisor.enqueue(id, line)).toBe(false);
+  expect(f.journal().events.filter((event) => event.id === id)).toHaveLength(1);
+  supervisor.close();
+  const restarted = new Supervisor(f.deps);
+  try {
+    expect(restarted.journaled(id)).toBe(true);
+    expect(f.journal().events.filter((event) => event.id === id)).toHaveLength(1);
+    if (id.startsWith("discord:")) expect(f.journal().awaitingAck).toEqual([{ id }]);
+    else expect(restarted.journaled("lane-finish:alpha")).toBe(true);
+  } finally { restarted.close(); }
+});
+
+test.each(["QUOTA_GATE_UNKNOWN retry", "CUSTOM retry"])("enqueue commits its event and announcement together for %s", async (line) => {
+  const f = fixture();
+  const posted: string[] = [];
+  const supervisor = new Supervisor({
+    ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "owner-only" } }) },
+  }, { announce: async (text) => { posted.push(text); } });
+  cleanups.unshift(() => supervisor.close());
+  const save = spyOn(supervisor["core"].store, "save");
+  expect(supervisor.enqueue("announce:retry", line)).toBe(true);
+  expect(save).toHaveBeenCalledTimes(1);
+  save.mockRestore();
+  expect(readJournal(f.state.dir).outbox).toHaveLength(1);
+  expect(f.journal().events.filter((event) => event.id === "announce:retry")).toHaveLength(1);
+  await supervisor.reactionsSettled();
+  expect(posted).toHaveLength(1);
+});
 
 test("owner tracking is durable before a failing delivery-log append", async () => {
   // Given a durable inbox with an unwritable delivery-log path.

@@ -185,7 +185,7 @@ export const plan = (store: OperationStore, now: number, spec: OperationSpec): O
 
 /**
  * Reconciles a row left `attempted` by a crash: done -> verified, not done -> planned (a retry is allowed), unknown ->
- * ambiguous. Rows in any other state come back unchanged.
+ * ambiguous (never retried, never verified on a guess). Rows in any other state come back unchanged.
  */
 export const reconcile = async (store: OperationStore, now: () => number, op: Operation, readBack: ReadBack): Promise<Operation> => {
   if (op.state !== "attempted") return op;
@@ -198,8 +198,10 @@ export const reconcile = async (store: OperationStore, now: () => number, op: Op
 /**
  * Runs `effect` at most once per verified operation. A verified or ambiguous row returns without acting; an attempted
  * row is reconciled first. A read-back that already shows the effect in place verifies it without acting. Otherwise the
- * row becomes attempted (durably), the effect runs and a read-back decides: done -> verified, not done -> failed (a later
- * call may retry), unknown -> the effect's own report (ok -> verified, else failed). `ran` tells whether the effect ran.
+ * row becomes attempted (durably), the effect runs and a read-back alone decides: done -> verified, not done -> failed
+ * (the read-back proves absence, so a later call may retry), unknown -> ambiguous in every case: whether the effect threw,
+ * reported failure or reported success it may have happened, so it is neither retried (failed) nor trusted (verified)
+ * and goes to the lead. `ran` tells whether the effect ran.
  */
 export const perform = async (
   store: OperationStore, now: () => number, spec: OperationSpec, effect: Effect, readBack: ReadBack,
@@ -209,11 +211,13 @@ export const perform = async (
   if ((await observe(readBack)) === "done") return { op: write(store, op, { state: "verified", detail: "read back done before acting" }, now()), ran: false };
   op = write(store, op, { state: "attempted", detail: "attempted", attempts: op.attempts + 1 }, now());
   let report: { readonly ok: boolean; readonly detail: string };
-  try { report = await effect(); } catch (e) { report = { ok: false, detail: e instanceof Error ? e.message : String(e) }; }
+  let threw = false;
+  try { report = await effect(); } catch (e) { threw = true; report = { ok: false, detail: e instanceof Error ? e.message : String(e) }; }
   const seen = await observe(readBack);
-  const verified = seen === "done" || (seen === "unknown" && report.ok);
-  const why = seen === "unknown" ? report.detail || (report.ok ? "effect reported success" : "effect failed") : `read back ${seen}${report.detail ? `: ${report.detail}` : ""}`;
-  return { op: write(store, op, { state: verified ? "verified" : "failed", detail: why.replace(/\s+/g, " ").slice(0, 300) }, now()), ran: true };
+  const state: OperationState = seen === "done" ? "verified" : seen === "not-done" ? "failed" : "ambiguous";
+  const outcome = threw ? "effect threw" : report.ok ? "effect reported success" : "effect reported failure";
+  const why = seen === "unknown" ? `read-back cannot tell (${outcome}), so the effect may have happened${report.detail ? `: ${report.detail}` : ""}` : `read back ${seen}${report.detail ? `: ${report.detail}` : ""}`;
+  return { op: write(store, op, { state, detail: why.replace(/\s+/g, " ").slice(0, 300) }, now()), ran: true };
 };
 
 /** Moves a row to a new state by hand or for a sequence (the lead's resolution, an abandoned resume); undefined when unknown. */

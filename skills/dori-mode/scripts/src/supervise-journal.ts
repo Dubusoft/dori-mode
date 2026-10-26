@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readSync, statSync, truncateSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, statSync, truncateSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
@@ -15,8 +15,10 @@ import { type Durability, type JournalStore, openStore, RETENTION, StoreError } 
  * delivery (supervise-*.ts) all read and write the journal through one JournalCore.
  */
 
-/** `at` is the enqueue time (absent on events journaled by older versions). */
-export type Event = { readonly id: string; readonly line: string; readonly at?: number };
+/** Structured context of an event: the lane it concerns, that lane's thread and checkout. */
+export type EventMeta = { readonly lane?: string; readonly thread?: string; readonly cwd?: string };
+/** `at` is the enqueue time (absent on events journaled by older versions); `meta` is absent on events without one. */
+export type Event = { readonly id: string; readonly line: string; readonly at?: number; readonly meta?: EventMeta };
 export type JournalEvent = Event;
 export type Restart = {
   readonly session: string;
@@ -83,6 +85,22 @@ export type LaneOutcome = {
   /** The first push pointer that carried it: its push escalation clock starts there at the earliest. */
   readonly pushedAt?: number;
 };
+/**
+ * One decision obligation per decision event (decision-obligations.ts), keyed by its event id: opened by that event,
+ * closed by `dori resolved <id>`. `line` is absent when resolved before the event arrived.
+ */
+export type Obligation = {
+  readonly id: string;
+  readonly since: number;
+  readonly line?: string;
+  readonly resolvedAt?: number;
+  readonly note?: string;
+  /** UNRESOLVED events enqueued so far, and when the last one was. */
+  readonly reminders?: number;
+  readonly remindedAt?: number;
+  /** The first push pointer that carried it: its push escalation clock starts there at the earliest. */
+  readonly pushedAt?: number;
+};
 export type OwnerNoticeKind = "delay" | "ack" | "unhandled";
 export type Notice = { readonly attempts: number; readonly sent?: true };
 export type Journal = {
@@ -119,6 +137,8 @@ export type Journal = {
   readonly forcedRestarts?: readonly ForcedRestart[];
   /** Finished lanes and whether the lead has reported them to the owner (lane-outcomes.ts). */
   readonly outcomes?: readonly LaneOutcome[];
+  /** Decision events and whether the lead has resolved them (decision-obligations.ts). */
+  readonly pending?: readonly Obligation[];
 };
 /**
  * `takenOffset`: lead-events.log is taken (`dori inbox take` receipts) up to this byte, always a line end. `mode` is the
@@ -167,6 +187,17 @@ const readRange = (path: string, from: number, to: number): Buffer => {
     }
     return data.subarray(0, at);
   } finally { closeSync(fd); }
+};
+
+/** The event ids and session a take receipt names (nothing when unreadable; `?` marks a line take could not parse). */
+const takeIds = (path: string): { readonly ids: readonly string[]; readonly session: string } => {
+  try {
+    const { ids, session } = JSON.parse(readFileSync(path, "utf8")) as { ids?: unknown; session?: unknown };
+    return {
+      ids: Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string" && id !== "?") : [],
+      session: typeof session === "string" ? session : "",
+    };
+  } catch { return { ids: [], session: "" }; }
 };
 
 export const append = (path: string, text: string): void => {
@@ -289,7 +320,8 @@ export class JournalCore {
   /**
    * Take receipts move the cursor forward only, in a crash-safe order: the store is persisted, then the cursor file is
    * written, and only then are the receipts dropped. A crash at any point leaves `max(cursor file, receipts)` at or past
-   * the new cursor, so a take never reprints. A moved cursor clears the outstanding push.
+   * the new cursor, so a take never reprints. A moved cursor clears the outstanding push. Before a receipt is dropped,
+   * its ids are recorded taken with its time and session (event-trace.ts).
    */
   consumeTakes(): void {
     const inbox = this.journal.inbox;
@@ -307,7 +339,11 @@ export class JournalCore {
       this.persist();
     }
     writeCursorFile(this.deps.config.stateDir, takenOffset);
-    for (const receipt of receipts) dropTake(receipt.path);
+    for (const receipt of receipts) {
+      const { ids, session } = takeIds(receipt.path);
+      this.store.recordTakes(ids, receipt.at, session);
+      dropTake(receipt.path);
+    }
   }
 
   /** Forced restarts and quota switches within the cap window. */
@@ -337,14 +373,15 @@ export class JournalCore {
 
   /**
    * Retention (RETENTION, sqlite store only), at most once per RETAIN_EVERY_MS: delivered events older than
-   * eventBodyMs leave the journal for dedupe tombstones, unless a tracked owner message or a pending restart still needs
-   * them; undelivered events are never pruned. Tombstones expire after tombstoneMs.
+   * eventBodyMs leave the journal for dedupe tombstones, unless a tracked owner message, a pending restart or an open
+   * decision obligation still needs them; undelivered events are never pruned. Tombstones expire after tombstoneMs.
    */
   retain(now: number): void {
     if (!this.store.retains || now < this.nextRetain) return;
     this.nextRetain = now + RETAIN_EVERY_MS;
     const needed = new Set(this.journal.restart?.events.map((event) => event.id) ?? []);
     for (const entry of this.journal.awaitingAck ?? []) for (const id of [entry.id, ...(entry.revisions ?? [])]) needed.add(id);
+    for (const item of this.journal.pending ?? []) if (item.resolvedAt === undefined) needed.add(item.id);
     const cutoff = now - RETENTION.eventBodyMs;
     // Events are appended in time order: only the prefix up to the first newer one is looked at (one that came out of
     // order waits for the next pass), so a pass costs the pruned events, not the whole journal.
@@ -374,7 +411,8 @@ export class JournalCore {
     const appended: string[] = [];
     for (const event of events) {
       if (this.delivered.has(event.id)) continue;
-      append(this.eventLog, `${JSON.stringify({ id: event.id, line: redactSecrets(event.line) })}\n`);
+      // `meta` is an extra field: `dori inbox take` (parseLogLine) reads only id and line.
+      append(this.eventLog, `${JSON.stringify({ id: event.id, line: redactSecrets(event.line), ...(event.meta ? { meta: event.meta } : {}) })}\n`);
       this.delivered.add(event.id);
       appended.push(event.id);
     }

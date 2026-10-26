@@ -4,12 +4,13 @@ import { homedir } from "node:os";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { redactSecrets } from "./redact.ts";
-import { type Event, JournalCore, type OwnerNoticeKind } from "./supervise-journal.ts";
+import { type Event, type EventMeta, JournalCore, type OwnerNoticeKind } from "./supervise-journal.ts";
 import { OWNER_INBOUND, OWNER_REVISION, type OwnerMessage, OwnerTracking, quarantineDigest, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 import { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
 import { Delivery, OWNER_WARN_EVENTS } from "./supervise-delivery.ts";
 import { eventClass } from "./event-policy.ts";
 import { OutcomeTracking } from "./lane-outcomes.ts";
+import { DecisionTracking } from "./decision-obligations.ts";
 import { LANE_FINISH_HOLD_MS, LANE_FINISH_PREFIX, laneFinish, laneFinishText, mergeFinish, parseFinish } from "./lane-finish.ts";
 
 /*
@@ -18,7 +19,7 @@ import { LANE_FINISH_HOLD_MS, LANE_FINISH_PREFIX, laneFinish, laneFinishText, me
  * Supervisor API and re-exports their public names, so callers import from here as before.
  */
 export {
-  type AwaitingAck, type Journal, type JournalEvent, type Notice, type OutboxItem, type OwnerNoticeKind, type Restart, RETAIN_EVERY_MS,
+  type AwaitingAck, type EventMeta, type Journal, type JournalEvent, type Notice, type OutboxItem, type OwnerNoticeKind, type Restart, RETAIN_EVERY_MS,
   SuperviseError, TransientSuperviseError,
 } from "./supervise-journal.ts";
 export {
@@ -45,6 +46,7 @@ export class Supervisor {
   private readonly lead: LeadLifecycle;
   private readonly delivery: Delivery;
   private readonly outcomes: OutcomeTracking;
+  private readonly decisions: DecisionTracking;
 
   constructor(deps: FlowDeps, hooks: SupervisorHooks = {}) {
     this.core = new JournalCore(deps);
@@ -52,6 +54,7 @@ export class Supervisor {
     const enqueue = (id: string, line: string): void => { this.enqueue(id, line); };
     this.owners = new OwnerTracking(this.core, hooks, enqueue);
     this.outcomes = new OutcomeTracking(this.core, enqueue);
+    this.decisions = new DecisionTracking(this.core, enqueue);
     this.lead = new LeadLifecycle(this.core, this.owners, hooks, enqueue);
     this.delivery = new Delivery(this.core, this.owners, this.lead, this.outcomes);
     const { tail, cursor } = this.core.recoverLog();
@@ -66,33 +69,62 @@ export class Supervisor {
     // Announcements a previous run could not post (or crashed before posting) go out now.
     this.owners.drainOutbox();
     this.outcomes.publish();
+    this.decisions.publish();
   }
 
   /** Releases the store (tests and shutdown); the supervisor must not be used afterwards. */
   close(): void { this.core.close(); }
 
-  /** Synchronous durable enqueue: callers may enqueue while flush awaits a restart. False: a duplicate id, dropped. */
-  enqueue(id: string, line: string): boolean {
+  private enqueuing = false;
+
+  /**
+   * Synchronous durable enqueue: callers may enqueue while flush awaits a restart. False: a duplicate id, dropped.
+   * `meta` (the lane, thread, cwd it concerns) is journaled with the event and rides along in the delivery log.
+   */
+  enqueue(id: string, line: string, meta?: EventMeta): boolean {
     if (this.core.known(id)) return false;
     const queued = line === "LAUNCH_READY" || line.startsWith("LAUNCH_READY ") ? launchQueueText(launchQueue(this.core.deps.config.stateDir)) : "";
-    const event = { id, line: redactSecrets(`${line}${queued}`).replace(/[\r\n]+/g, " "), at: this.core.deps.clock.now() };
-    // Appended in place: copying the whole history per event is what made every enqueue O(history).
-    (this.core.journal.events as Event[]).push(event);
-    this.core.eventIds.add(id);
-    this.owners.trackOwners([event]);
-    this.outcomes.track(event);
-    this.noticeLaneFinish(event.line);
-    // An owner message is synced at once (its Discord cursor moves on right after); the rest within one loop pass (ackTick).
-    this.core.persist(OWNER_INBOUND.test(id) || OWNER_REVISION.test(id) ? "full" : "normal");
-    if (OWNER_WARN_EVENTS.some((prefix) => line.startsWith(`${prefix} `))) this.owners.announce(`warn:${id}`, scrubForThread(`Dori warning: ${event.line}`, homedir()));
-    // owner-only goes to the owner's main channel instead of the lead (delivery skips it); engine-only goes nowhere.
-    if (eventClass(event.line, this.core.deps.config.eventPolicy) === "owner-only") this.owners.announce(`owner-only:${id}`, scrubForThread(event.line, homedir()));
+    const event: Event = { id, line: redactSecrets(`${line}${queued}`).replace(/[\r\n]+/g, " "), at: this.core.deps.clock.now(), ...(meta ? { meta } : {}) };
+    const before = this.core.journal;
+    const length = before.events.length;
+    const nested = this.enqueuing;
+    this.enqueuing = true;
+    try {
+      // Append in place, but roll back the whole staged tail (including nested lane-finish notices) on failure.
+      (before.events as Event[]).push(event);
+      this.core.eventIds.add(id);
+      this.owners.trackOwners([event]);
+      this.outcomes.track(event);
+      this.decisions.track(event);
+      this.noticeLaneFinish(event.line);
+      // Nested notices commit with their triggering event, never ahead of it.
+      if (!nested) {
+        // Stage announcements too: a second save after accepting the id could fail and report a false rejection.
+        if (this.owners.announces) {
+          const queue = (key: string, text: string): void => {
+            const outbox = this.core.journal.outbox ?? [];
+            if (!outbox.some((item) => item.id === key)) this.core.journal = { ...this.core.journal, outbox: [...outbox, { id: key, text }] };
+          };
+          for (const added of before.events.slice(length)) {
+            if (OWNER_WARN_EVENTS.some((prefix) => added.line.startsWith(`${prefix} `))) queue(`warn:${added.id}`, scrubForThread(`Dori warning: ${added.line}`, homedir()));
+            if (eventClass(added.line, this.core.deps.config.eventPolicy) === "owner-only") queue(`owner-only:${added.id}`, scrubForThread(added.line, homedir()));
+          }
+        }
+        this.core.persist(OWNER_INBOUND.test(id) || OWNER_REVISION.test(id) ? "full" : "normal");
+      }
+    } catch (e) {
+      for (const added of before.events.slice(length)) this.core.eventIds.delete(added.id);
+      (before.events as Event[]).length = length;
+      this.core.journal = before;
+      throw e;
+    } finally { this.enqueuing = nested; }
+    if (!nested) this.owners.drainOutbox();
     return true;
   }
 
   /**
    * laneFinishNotice: a line that finishes a lane queues its one finish line (lane-finish.ts). The outbox row and the
-   * LANE_FINISH_NOTICE dedupe event reach the store in the same write (the nested enqueue persists both), so a crash
+   * LANE_FINISH_NOTICE dedupe event reach the store in the same write (the outer enqueue persists both), so a crash
    * leaves both or neither. A later finish event of the same lane only adds facts while the line is still queued; once
    * posted (or ever queued before, even in a previous run) the lane gets nothing more.
    */
@@ -138,6 +170,9 @@ export class Supervisor {
     this.owners.drainOutbox();
     return this.outcomes.tick(this.core.deps.registry);
   }
+
+  /** Consumes `dori resolved` receipts and enqueues UNRESOLVED for decision events the lead left open past resolveTimeoutMin. */
+  resolveTick(): void { this.decisions.tick(); }
 
   /** Called only after the messenger confirms a successful post. Failures remain eligible on the next tick. */
   noticeSent(kind: OwnerNoticeKind, channel: string, message: string): void { this.owners.noticeSent(kind, channel, message); }
