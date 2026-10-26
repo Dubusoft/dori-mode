@@ -3,7 +3,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { eventPriority, Supervisor } from "../src/supervise.ts";
-import { handoffLines, outcomeLane, pendingReported, recordReported, REPORTED_DIR, takeReminders } from "../src/lane-outcomes.ts";
+import { outcomeLane, pendingReported, recordReported, REPORTED_DIR, takeReminders } from "../src/lane-outcomes.ts";
 import type { Lane } from "../src/registry.ts";
 import { renderStatus, type Status } from "../src/status.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
@@ -109,7 +109,7 @@ test("a lane with autoClose: machine owes no report", async () => {
   expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "robot", reportedAt: f.clock.now(), note: "autoClose: machine" });
 });
 
-test("open obligations are listed for inbox take and the cold handoff until reported", async () => {
+test("open obligations are listed for inbox take until reported", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   expect(takeReminders(f.state.dir)).toEqual([]);
@@ -118,14 +118,9 @@ test("open obligations are listed for inbox take and the cold handoff until repo
   expect(takeReminders(f.state.dir)).toEqual([
     `unreported:alpha\tUNREPORTED alpha since ${new Date(T0).toISOString()}: report the outcome to the owner yourself, then run dori reported alpha`,
   ]);
-  expect(handoffLines(readJournal(f.state.dir))).toEqual([
-    "Lane outcomes not yet reported to the owner follow: for each, report the outcome to the owner yourself, then run dori reported <key>.",
-    "UNREPORTED alpha LANE_CLOSED alpha done",
-  ]);
   recordReported(f.state.dir, "alpha", f.clock.now());
   await supervisor.reportTick();
   expect(takeReminders(f.state.dir)).toEqual([]);
-  expect(handoffLines(readJournal(f.state.dir))).toEqual([]);
 });
 
 test("dori status names unreported lanes as a problem", () => {

@@ -165,6 +165,33 @@ export const take = (stateDir: string, options: { readonly maxBytes: number; rea
   return { events, offset: start, ...(more ? { more } : {}), receipt: path };
 };
 
+/**
+ * What a cold start hands the new lead beyond the log (state/carried.json, written by the supervisor before the lead's
+ * prompt and pruned as it goes): owner messages the previous lead took but did not handle, which no take prints again,
+ * and the held launch queue. `dori inbox take` prints them as reminder lines every time until they are gone.
+ */
+export const CARRIED_FILE = "carried.json";
+export type Carried = { readonly kind: "owner" | "held"; readonly id: string; readonly line: string };
+
+export const readCarried = (stateDir: string): Carried[] => {
+  let list: unknown;
+  try { list = JSON.parse(readFileSync(join(stateDir, CARRIED_FILE), "utf8")); } catch { return []; }
+  return Array.isArray(list)
+    ? list.filter((item: Partial<Carried>) => (item?.kind === "owner" || item?.kind === "held") && typeof item.id === "string" && typeof item.line === "string")
+    : [];
+};
+
+/** Durable like the cursor file; an empty list removes the file. */
+export const writeCarried = (stateDir: string, items: readonly Carried[]): void => {
+  if (items.length) writeDurable(join(stateDir, CARRIED_FILE), stateDir, JSON.stringify(items));
+  else dropTake(join(stateDir, CARRIED_FILE));
+};
+
+/** `dori inbox take`'s reminder lines (id<TAB>line, like the events) for what the last cold start carried over. */
+export const takeCarriedReminders = (stateDir: string): string[] => readCarried(stateDir).map((item) => item.kind === "owner"
+  ? `unfinished:${item.id}\tUNFINISHED ${item.id} handed to the previous lead and not handled (dori ack it unless acked, then handle it): ${item.line}`
+  : `${item.id}\t${item.line}`);
+
 const metaHeader = (meta: TakenEvent["meta"]): string =>
   `## ${[meta?.lane ? `lane ${meta.lane}` : "", meta?.thread ? `thread ${meta.thread}` : "", meta?.cwd ? `cwd ${meta.cwd}` : ""].filter(Boolean).join("  ")}`;
 

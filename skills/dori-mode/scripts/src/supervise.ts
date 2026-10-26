@@ -55,7 +55,7 @@ export class Supervisor {
     this.owners = new OwnerTracking(this.core, hooks, enqueue);
     this.outcomes = new OutcomeTracking(this.core, enqueue);
     this.decisions = new DecisionTracking(this.core, enqueue);
-    this.lead = new LeadLifecycle(this.core, this.owners, hooks, enqueue);
+    this.lead = new LeadLifecycle(this.core, this.owners, hooks, enqueue, () => { this.outcomes.publish(); this.decisions.publish(); });
     this.delivery = new Delivery(this.core, this.owners, this.lead, this.outcomes);
     const { tail, cursor } = this.core.recoverLog();
     this.core.initInbox();
@@ -159,7 +159,12 @@ export class Supervisor {
   overdueOwnerMessages(ms: number): OwnerMessage[] { return this.owners.overdueOwnerMessages(ms); }
 
   /** Read receipts stop ACK_MISSING, but never erase unhandled owner work. */
-  ackTick(timeoutMs: number): OwnerMessage[] { return this.owners.ackTick(timeoutMs); }
+  ackTick(timeoutMs: number): OwnerMessage[] {
+    const due = this.owners.ackTick(timeoutMs);
+    // What the last cold start carried over leaves `dori inbox take` once handled (or the launch queue emptied).
+    this.lead.refreshCarried();
+    return due;
+  }
 
   /** An explicit ack starts the handling clock. A reminder gets a full second window before owner escalation. */
   handledTick(timeoutMs?: number): OwnerMessage[] { return this.owners.handledTick(timeoutMs); }
