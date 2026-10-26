@@ -167,14 +167,36 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
   return { ...(auto ? { autoClose: auto } : {}), ...(issue ? { ghIssue: issue } : {}) };
 };
 
+/**
+ * The done rules every footer carries, ahead of the lane's own values: how to claim, what the watcher checks, what happens
+ * on a refusal. Only the claim step and the close wording differ for a remote lane, a `dori report` lane and a pane-report lane.
+ * Nothing lane-specific (key, thread, pane, Done line) may appear here; that is the "### This lane" section.
+ */
+export const footerDoneRules = (lane: Lane, ownerLanguage?: string): string => {
+  const remote = Boolean(lane.machine);
+  const claim = remote ? "print the done line below in your own output" : lane.reportVia === "cli" ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
+  return [
+    `- Done rules: when every \`Done =\` signal below is live and all work is pushed, ${claim}, then stay idle and start no new work.`,
+    remote
+      ? "  The lead re-reads every signal live and closes the lane only when every signal reads back live. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits."
+      : "  The watcher re-reads every signal live and closes the lane 5 min after your claim unless the Dori objects. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits. The lane closes only when every signal reads back live.",
+    remote
+      ? "  On `[LEAD] not done: <reasons>`, fix every reason and print a done line again."
+      : "  On `[LEAD] not done: <reasons>`, fix every reason and claim again.",
+    "- PR bodies, issues and commit messages carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
+    ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
+    ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
+  ].join("\n");
+};
+
 export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string): string => [
   "",
   "## Lane footer (written by dori launch)",
+  footerDoneRules(lane, ownerLanguage),
+  "",
+  "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
-  `- Done = ${lane.done}. The lane closes only when every signal reads back live.`,
-  "- PR bodies, issues and commit messages carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
-  ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
-  ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
+  `- Done = ${lane.done}`,
   ...(lane.machine
     ? [
       `- This lane runs on machine ${lane.machine}; the lead reads this pane from another host. Report at each milestone by printing this line in your own output (do not message any pane): [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>.`,
@@ -314,6 +336,11 @@ export const powershellLaunch = (argv: readonly string[], brief: string, key: st
 /** The brief's home on a POSIX remote: a fixed path, valid on Linux and macOS, never the lead's own path. */
 export const posixRemoteBrief = (key: string): string => `/tmp/dori-brief-${key}.md`;
 
+/** Startup confirmation: a check every 2 s, at most 10 times, and 2 consecutive ready reads. */
+export const STARTUP_POLL_MS = 2_000;
+export const STARTUP_POLLS = 10;
+export const STARTUP_READY_READS = 2;
+
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string }> => {
   const model = input.model ?? deps.config.defaultModel;
   if (isEmergencyModel(deps.config, model)) throw new LaunchError(`${model} is a lead-only emergency model (leadEmergencyModels); lanes never run on it`);
@@ -388,15 +415,25 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       if (token && current?.launchReservation !== token) throw new LaunchError(`lane ${lane.key} lost its launch reservation`);
       return current ? launched(current) : lane;
     });
-    await deps.clock.sleep(20_000);
-    const { status, error } = await statusLookup(deps.run, pane);
-    // A working agent has started its task. Anything else, idle included, is scanned first: an agent that printed
-    // "No API key" or a usage-limit error and stopped at its prompt reads idle but never started the work.
-    if (status === "working") return { lane, startup: `STARTUP_OK ${input.key} ${pane}` };
-    const screen = await readScreen(deps.run, pane, 40);
-    const bad = startupFailure(screen);
-    if (bad) return { lane, startup: `STARTUP_ERROR ${input.key} ${pane}: ${bad}` };
-    if (status === "idle") return { lane, startup: `STARTUP_OK ${input.key} ${pane}` };
+    // Poll for the agent: STARTUP_OK needs STARTUP_READY_READS ready reads in a row, so one early idle blip is not a start.
+    let screen = "";
+    let status: string | undefined;
+    let error: string | undefined;
+    let ready = 0;
+    for (let poll = 0; poll < STARTUP_POLLS; poll++) {
+      await deps.clock.sleep(STARTUP_POLL_MS);
+      ({ status, error } = await statusLookup(deps.run, pane));
+      // A working agent has started its task. Anything else, idle included, is scanned first: an agent that printed
+      // "No API key" or a usage-limit error and stopped at its prompt reads idle but never started the work.
+      if (status === "working") { ready++; } else {
+        screen = await readScreen(deps.run, pane, 40);
+        const bad = startupFailure(screen);
+        if (bad) return { lane, startup: `STARTUP_ERROR ${input.key} ${pane}: ${bad}` };
+        ready = status === "idle" ? ready + 1 : 0;
+      }
+      if (ready >= STARTUP_READY_READS) return { lane, startup: `STARTUP_OK ${input.key} ${pane}` };
+    }
+    if (!screen) screen = await readScreen(deps.run, pane, 40);
     const why = error ? `status lookup failed: ${error}` : `no ready agent status (${status ?? "none"})`;
     return { lane, startup: `STARTUP_UNCONFIRMED ${input.key} ${pane}: ${why}; last lines: ${lastLines(screen)}` };
   } catch (error) {

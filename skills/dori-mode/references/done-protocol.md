@@ -1,6 +1,6 @@
 # Lane done protocol
 
-Give this file to every lane you launch.
+The `dori launch` footer already carries these rules to every lane, so the Dori does not paste them. This file is the full version.
 
 When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
 
