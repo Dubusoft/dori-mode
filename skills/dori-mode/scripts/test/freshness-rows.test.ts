@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { freshnessTick } from "../src/freshness.ts";
@@ -25,7 +26,9 @@ const lane = (key: string, pane: string): Lane => ({
 });
 
 test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep no herdr call; once rows stop for nudgeAfterMin the pane is read again", async (_name, open) => {
-  const state = withState();
+  // In memory where the host has it: 100 lanes written and then nudged are a few hundred fsyncs, which on a busy CI disk
+  // measure the disk, not the sweep.
+  const state = withState(existsSync("/dev/shm") ? "/dev/shm" : undefined);
   cleanups.push(state.done);
   const store = open(state.dir);
   cleanups.push(() => { store.close(); });
