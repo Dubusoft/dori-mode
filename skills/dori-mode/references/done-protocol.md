@@ -51,4 +51,4 @@ The window starts when the Dori actually receives your claim, not when you make 
 
 ## What you may touch
 
-`dori launch` sets `DORI_LANE_KEY` in your lane. From inside it, `claim-done`, `object-done`, `close`, `pause` and `resume` work only on your own key, and `dori send` only to your own thread. You may not run `ack`, `handled`, `launch`, `adopt`, `hold`, `lead-restart` or `lead-emergency` at all. Anything else exits 1 with `LANE_PERMISSION_DENIED`. Ask the Dori instead. A manual `dori close` runs the same worktree checks as the watcher and refuses with `REFUSED <key>: ...`; only the Dori uses `--force`.
+`dori launch` sets `DORI_LANE_KEY` in your lane. From inside it, `claim-done`, `object-done`, `close`, `pause` and `resume` work only on your own key, and `dori send` only to your own thread. You may not run `ack`, `handled`, `launch`, `adopt`, `hold` or `lead-restart` at all. Anything else exits 1 with `LANE_PERMISSION_DENIED`. Ask the Dori instead. A manual `dori close` runs the same worktree checks as the watcher and refuses with `REFUSED <key>: ...`; only the Dori uses `--force`.

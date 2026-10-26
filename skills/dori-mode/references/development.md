@@ -23,7 +23,7 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/messenger/slack.ts` | `Slack`: post, edit, thread replies, file upload (upload URL + complete), presence; 429 backoff |
 | `src/messenger/telegram.ts` | `Telegram`: send, edit, typing, `sendMessageDraft` streaming with a `Thinking…` start, forum topics (create, rename, close, reopen), HTML tables |
 | `src/messenger/discord.ts` | `Discord`: send without pings, edit, typing, threads (start, rename, archive); gateway presence |
-| `src/messenger/discord-commands.ts` | `DiscordCommands`: register guild `/quota`, `/status` and `/emergency`, defer private replies, enforce owner access and format bounded results |
+| `src/messenger/discord-commands.ts` | `DiscordCommands`: register guild `/quota` and `/status`, defer private replies, enforce owner access and format bounded results |
 | `src/messenger/discord-inbound.ts` | Discord inbound polling over REST |
 | `src/messenger/discord-supervisor.ts` | the supervisor's Discord gateway connection |
 | `src/messenger/discord-lock.ts` | the token-scoped lock that keeps one gateway per user and machine |
@@ -33,10 +33,10 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/messenger/slack-inbound.ts` | `pollSlackInbound`: threads view, ledger threads and unread counts, deduplicated, own messages filtered |
 | `src/messenger/slack-presence.ts` | `slackPresence`: hold a user account active |
 | `src/messenger/toodo.ts`, `toodo-mirror.ts`, `toodo-supervisor.ts` | the Toodo task mirror |
-| `src/doctor.ts` | `runDoctor`: read-only checks (units, herdr, paths, config, Discord, gateway, Claude quota, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
+| `src/doctor.ts` | `runDoctor`: read-only checks (units, herdr, paths, config, Discord, gateway, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
 | `src/status.ts` | `collectStatus` / `renderStatus`: the no-LLM one-screen summary behind `dori status` and `/status` |
 | `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |
-| `src/claude-quota.ts` | `lookupQuotaResults(agentDir?)`: pi-quota through senpi's native auth storage (defaults to `~/.omo/agent`); `claudeUsage`, `gateVerdict`, `launchQuotaHold`, `claudeQuotaTick`, `quotaReport`: the Claude headroom gate over every account |
+| `src/claude-quota.ts` | `lookupQuotaResults(agentDir?)`: pi-quota through senpi's native auth storage (defaults to `~/.omo/agent`); `claudeUsage` and the usage report behind `dori quota` and `/quota`: Claude 5h/7d usage and reset times for every account |
 | `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
 | `src/repos.ts` | `Repos(stateDir)`: synchronous `list`, `add`, `remove`, `replace`; atomic machine-local GitHub watched list |
 | `src/registry.ts`, `src/store.ts` | the lane registry and its store |

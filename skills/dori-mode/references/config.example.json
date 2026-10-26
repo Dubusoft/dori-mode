@@ -16,27 +16,9 @@
   "defaultModel": "anthropic-subscription/claude-opus-5-5",
   "launchKeywords": "ulw set goal and work",
   "leadArgs": [],
-  "leadPrimaryRetryMin": 15,
-  "leadPrimaryReturnChecks": 2,
-  "leadQuotaBusySwitchMin": 10,
   "leadStuckRestartMin": 30,
   "leadUnreadRestartMin": 5,
   "leadChildWaitMaxMin": 60,
-  "leadEmergencyModels": [],
-  "quotaGate": {
-    "holdLanesHeadroomPct": 50,
-    "briefHeadroomPct": 25,
-    "pollMin": 5
-  },
-  "quotaCheck": [
-    "omo",
-    "auth",
-    "check",
-    "--provider",
-    "{provider}",
-    "--json",
-    "--no-refresh"
-  ],
   "cacheTtlMin": 5,
   "leadContextCapTokens": 150000,
   "leadContextHardCapTokens": 300000,
