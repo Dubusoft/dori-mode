@@ -29,6 +29,8 @@ export type MessageCoverage = {
   readonly tasks?: number;
   readonly lanes?: readonly string[];
   readonly reply?: boolean;
+  /** The lead declares every task of the message covered (e.g. one reply answering all of them). */
+  readonly all?: boolean;
 };
 
 export const checkTasks = (tasks: number | undefined): void => {
@@ -92,7 +94,7 @@ export const recordAck = (stateDir: string, channel: string, message: string, at
 
 /** Each distinct lane and the optional reply cover one declared task; replaying the same link never adds coverage. */
 export const recordHandled = (stateDir: string, channel: string, message: string, at: number, coverage: MessageCoverage): void => {
-  if (!coverage.lanes?.length && !coverage.reply) throw new AckError("handled needs --lane <key> and/or --reply");
+  if (!coverage.lanes?.length && !coverage.reply && !coverage.all) throw new AckError("handled needs --lane <key>, --reply and/or --all");
   if (coverage.lanes?.some((lane) => !/^[\w.-]+$/.test(lane))) throw new AckError("--lane must name a lane key");
   recordReceipt(stateDir, channel, message, at, coverage);
 };
@@ -106,7 +108,7 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
     if (!m) return [];
     const path = join(ackDir(stateDir), name);
     try {
-      const { at, tasks, lanes, reply } = JSON.parse(readFileSync(path, "utf8")) as { at?: unknown; tasks?: unknown; lanes?: unknown; reply?: unknown };
+      const { at, tasks, lanes, reply, all } = JSON.parse(readFileSync(path, "utf8")) as { at?: unknown; tasks?: unknown; lanes?: unknown; reply?: unknown; all?: unknown };
       if (tasks !== undefined && (typeof tasks !== "number" || !Number.isSafeInteger(tasks) || tasks < 1)) return [];
       if (lanes !== undefined && (!Array.isArray(lanes) || !lanes.every((lane): lane is string => typeof lane === "string" && /^[\w.-]+$/.test(lane)))) return [];
       return [{
@@ -114,6 +116,7 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
         ...(typeof tasks === "number" ? { tasks } : {}),
         ...(Array.isArray(lanes) ? { lanes } : {}),
         ...(reply === true ? { reply: true } : {}),
+        ...(all === true ? { all: true } : {}),
       }];
     } catch { return []; }
   });
