@@ -113,7 +113,7 @@ const USAGE = `dori <command> [options]
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on an owner message: on Discord hourglass off, eyes on;
                                        channel toodo: ack_chat and typing dots in Toodo; the ack is recorded for the supervisor
-  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--reply-id ID] [--task-id ID]
+  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--reply-id ID] [--task-id ID]
                                        link what handled an owner message; for toodo the reply (--reply-id, else the lead's latest reply after
                                        the message) or Toodo task (--task-id) is also recorded in Toodo
   send <slack|telegram|discord|toodo> --to TARGET --text TEXT [--thread ID] [--edit ID]
@@ -706,12 +706,12 @@ try {
     case "handled": {
       const parsed = parseArgs({
         args: rest, allowPositionals: true,
-        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, tasks: { type: "string" }, "reply-id": { type: "string" }, "task-id": { type: "string" } },
+        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, all: { type: "boolean" }, tasks: { type: "string" }, "reply-id": { type: "string" }, "task-id": { type: "string" } },
       });
       const [channel, message, ...extra] = parsed.positionals;
       const replyId = parsed.values["reply-id"] === undefined ? undefined : Number(parsed.values["reply-id"]);
       const taskId = parsed.values["task-id"] === undefined ? undefined : Number(parsed.values["task-id"]);
-      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--reply-id ID] [--task-id ID]");
+      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--all] [--reply-id ID] [--task-id ID]");
       if ((replyId !== undefined || taskId !== undefined) && channel !== TOODO_CHANNEL) die("--reply-id and --task-id are for the toodo channel");
       if ([replyId, taskId].some((id) => id !== undefined && (!Number.isSafeInteger(id) || id < 1))) die("--reply-id and --task-id must be positive integers");
       for (const key of parsed.values.lane ?? []) {
@@ -720,7 +720,7 @@ try {
       const reply = parsed.values.reply === true || replyId !== undefined || taskId !== undefined;
       recordHandled(config.stateDir, channel ?? "", message ?? "", realClock.now(), {
         tasks: parsed.values.tasks === undefined ? undefined : Number(parsed.values.tasks),
-        lanes: parsed.values.lane, reply,
+        lanes: parsed.values.lane, reply, ...(parsed.values.all ? { all: true } : {}),
       });
       console.log(`HANDLED_LINKED ${channel} ${message}`);
       if (channel === TOODO_CHANNEL) {

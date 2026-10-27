@@ -268,9 +268,11 @@ export class OwnerTracking {
     const awaiting = (this.journal.awaitingAck ?? []).map((entry): AwaitingAck => {
       const matching = receipts.filter((receipt) => receipt.id === entry.id);
       if (!matching.length) return entry;
-      const tasks = Math.max(entry.tasks ?? 1, ...matching.map((receipt) => receipt.tasks ?? 1));
+      const all = matching.some((receipt) => receipt.all);
       const lanes = [...new Set([...(entry.lanes ?? []), ...matching.flatMap((receipt) => receipt.lanes ?? [])])];
-      const reply = !!(entry.reply || matching.some((receipt) => receipt.reply));
+      // --all declares every task covered: with nothing linked yet the reply counts, and the task count settles on the coverage.
+      const reply = !!(entry.reply || matching.some((receipt) => receipt.reply) || (all && !lanes.length));
+      const tasks = all ? lanes.length + Number(reply) : Math.max(entry.tasks ?? 1, ...matching.map((receipt) => receipt.tasks ?? 1));
       const covered = lanes.length + Number(reply) >= tasks;
       // The lead took on a quarantined message: from here it is tracked like any other.
       return {
