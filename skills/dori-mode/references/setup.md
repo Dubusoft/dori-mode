@@ -2,9 +2,13 @@
 
 Run these once, in order. Stop and ask the owner wherever a step needs their choice or their hand.
 
+## 0. Your name
+
+Before anything else, ask the owner what to call you. Plain "Dori" is fine, and so is a name ending in Dori (ShipDori, WorkDori), so several Doris can run side by side. Use that name everywhere: the bot's display name, your sign-off, and the mode itself, which you remember as "<name> mode" so the owner can switch it on again in one line.
+
 ## 1. herdr
 
-herdr is the terminal multiplexer the Dori runs in. Every lane is a herdr tab, and herdr lets you read a pane, type into it and see which process runs there.
+Run inside herdr. It is how you open, read and message sessions, and they survive restarts. herdr is the terminal multiplexer the Dori runs in. Every lane is a herdr tab, and herdr lets you read a pane, type into it and see which process runs there.
 
 ```sh
 curl -fsSL https://herdr.dev/install.sh | sh
@@ -76,6 +80,8 @@ Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --chann
 
 ## 5. Monitors
 
+Subscribe to new messages with your monitor tool. Transcribe voice messages (`dori transcribe`) and treat the transcript as the owner's message.
+
 Arm these as persistent monitors in your own session. Each filter matches only lines that need the lead, so `*_READY` start-up lines never wake you:
 
 | Monitor | Command | Filter |
@@ -113,6 +119,8 @@ The supervisor recovers missing working-lane panes automatically, and replaces a
 
 #### Cutting over a running Dori
 
+Switching an existing Dori over is an outside job, done on the lead only. Stop the old monitors and pollers first, then start the supervisor from outside the lead's session. Never edit a live lead's prompt or config in place.
+
 The cutover touches the lead only. Lanes keep running as they are.
 
 1. From outside the lead's session, stop the lead's old monitors and pollers: inbound, `watch`, `dead-panes`, `guard`, `freshness`. Two copies of a sweep would double every nudge and close.
@@ -126,3 +134,5 @@ Don't edit a live lead's prompt, config or monitors in place. Stop, then start.
 ## 6. First look around
 
 Once the bot is live, explore the machine: running coding-agent sessions, the tools in use, recent logs. Write what you find into memory, and adopt any running lanes with `dori adopt`.
+
+Once the bot is live and the first look around is done, run onboarding (`references/onboarding.md`), unless it has been done before.
