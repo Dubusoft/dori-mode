@@ -108,6 +108,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 | `dori claim-done` / `dori object-done` / `dori close` | the done flow |
 | `dori pause` / `dori resume` | the owner said wait: no nudges, goal paused, running turn stopped; and back |
 | `dori doctor` / `dori status [--json]` | read-only: health check with the exact fix for each problem; one-screen state (services, lead, lanes, waits, repos, gateway), also Discord `/status` |
+| `dori update [--dev] [--force]` | fast-forward this install to `origin/main` (`--dev`: `origin/dev`), keep local changes, restart the supervisor when it moved |
 | `dori supervise` | supervised mode: owns Discord presence, slash commands, inbound and the sweeps; feeds the lead through `lead-events.log` |
 | `dori watch` | the 5-minute auto-close watcher (run it as a persistent monitor) |
 | `dori freshness` | post a working lane's current todo to its thread (again every `nudgeAfterMin`), nudge idle silent lanes, post last reports |
