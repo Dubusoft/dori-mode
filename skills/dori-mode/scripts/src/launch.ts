@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
-import { fill, languageInstruction } from "./config.ts";
+import { languageInstruction, withThinking } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { laneRunner, readScreen, statusLookup } from "./panes.ts";
-import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
+import { LANE_KEY, type Lane, type LaneMode, statusOf } from "./registry.ts";
 import { iso } from "./run.ts";
 import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { acquireStateLock } from "./state-lock.ts";
@@ -16,6 +16,8 @@ export type LaunchInput = {
   readonly done: string;
   readonly thread?: string;
   readonly model?: string;
+  /** Opening keywords: `ulw` (default, `launchKeywords`) or `mass-ulw` (`massLaunchKeywords`). */
+  readonly mode?: LaneMode;
   readonly cwd?: string;
   /** Run the lane in this existing idle shell pane instead of creating a tab. */
   readonly pane?: string;
@@ -90,6 +92,11 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
   if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} is already registered`);
   const errors = doneSyntaxErrors(input.done);
   if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);
+  if (input.mode === "mass-ulw") {
+    // omo binds mass-ulw only when the message starts with /mass-ulw and has no "?" after it.
+    const keywords: unknown = deps.config.massLaunchKeywords;
+    if (typeof keywords !== "string" || !keywords.startsWith("/mass-ulw") || keywords.includes("?") || input.brief.includes("?")) throw new LaunchError("massLaunchKeywords must start with /mass-ulw and the prompt (keywords and brief path) must contain no '?'");
+  }
   const sharing = await threadSharers(deps, input);
   if (sharing.length && !input.shareThread) throw new LaunchError(`thread ${input.thread} already has open lane ${sharing.join(", ")}; one thread per lane, or pass --share-thread`);
 };
@@ -343,6 +350,7 @@ export const STARTUP_READY_READS = 2;
 
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string }> => {
   const model = input.model ?? deps.config.defaultModel;
+  const mode = input.mode ?? "ulw";
   if (!existing) await validateLaunch(deps, input);
   deps = { ...deps, run: laneRunner(deps.run, input) };
   const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
@@ -350,7 +358,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
-  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!existing && !input.machine ? { reportVia: "cli" as const } : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), model, openedAt: existing?.openedAt ?? iso(deps.clock) };
+  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!existing && !input.machine ? { reportVia: "cli" as const } : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
   let agentAdmitted = false;
@@ -381,8 +389,12 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       }
     }
     const agentArgv = (briefPath: string): string[] => {
-      const prompt = `${deps.config.launchKeywords}. Read and execute the lane brief at ${briefPath} in full. You are the ${input.key} lane; report as the brief's footer says.`;
-      const [exe, ...args] = fill(deps.config.agentCommand, { model, prompt });
+      const keywords = mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords;
+      const prompt = `${keywords}. Read and execute the lane brief at ${briefPath} in full. You are the ${input.key} lane; report as the brief's footer says.`;
+      // laneThinking only touches an omo-style command (one with a --model or --thinking flag); anything else runs as written.
+      const template = deps.config.agentCommand;
+      const takesThinking = template.some((part) => /^--(model|thinking)(=|$)/.test(part));
+      const [exe, ...args] = withThinking(template, { model, prompt }, takesThinking ? (typeof deps.config.laneThinking === "string" ? deps.config.laneThinking.trim() : "") || undefined : undefined);
       return exe ? [exe, ...args] : [];
     };
     let command: string;

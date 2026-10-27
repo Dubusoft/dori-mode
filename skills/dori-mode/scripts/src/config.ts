@@ -133,7 +133,12 @@ export type DoriConfig = {
   readonly githubTimeoutMs: number;
   /** GitHub logins whose new or reopened issues wake the lead as GH_ISSUE; anyone else is digest only. */
   readonly githubIssueAuthors: readonly string[];
+  /** Opening keywords of a `--mode ulw` lane (the default): clear, contained work. */
   readonly launchKeywords: string;
+  /** Opening keywords of a `--mode mass-ulw` lane: wide changes or vague instructions that need investigation first. */
+  readonly massLaunchKeywords: string;
+  /** `--thinking` level for lanes; absent or blank keeps whatever `agentCommand` carries. The lead never reads it. */
+  readonly laneThinking?: string;
   readonly sessionsDir: string;
   readonly nudgeAfterMin: number;
   readonly postAfterMin: number;
@@ -240,6 +245,8 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   githubTimeoutMs: 30_000,
   githubIssueAuthors: [],
   launchKeywords: "ulw set goal and work",
+  massLaunchKeywords: "/mass-ulw set goal and work",
+  laneThinking: "medium",
   sessionsDir: join(home, ".omo", "agent", "sessions"),
   nudgeAfterMin: 15,
   postAfterMin: 20,
@@ -446,10 +453,16 @@ export const providerOf = (model: string): string | undefined => {
  * none. Lanes keep `agentCommand` and `defaultModel` untouched.
  */
 export const leadCommand = (config: DoriConfig, prompt: string): string[] => {
-  const template = config.agentCommand;
   const lead = leadModels(config)[0] ?? { model: config.defaultModel };
-  const argv = fill(template, { model: lead.model, prompt });
-  const thinking = lead.thinking;
+  return withThinking(config.agentCommand, { model: lead.model, prompt }, lead.thinking);
+};
+
+/**
+ * `template` filled with `values`; a thinking level replaces the template's `--thinking` value, or goes right after
+ * the `--model` pair when the template has none. No level leaves the filled template as it is.
+ */
+export const withThinking = (template: ArgvTemplate, values: Readonly<Record<string, string>>, thinking: string | undefined): string[] => {
+  const argv = fill(template, values);
   if (!thinking) return argv;
   // fill maps element by element, so template indices are argv indices.
   const at = template.findIndex((part) => part === "--thinking" || part.startsWith("--thinking="));

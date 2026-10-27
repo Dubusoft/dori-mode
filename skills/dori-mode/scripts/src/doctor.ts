@@ -111,6 +111,12 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
     return k in c && !(typeof value === "string" && value.trim()) && !(k === "leadModel" && typeof value === "object" && value !== null && "model" in value && typeof value.model === "string" && value.model.trim());
   });
   if (blank.length) checks.push(warn("lead command", `${blank.join(", ")} set but blank; the lead uses the lane default`, `set a value or remove ${blank.join(", ")} from ${d.configPath}`));
+  const lane: string[] = [];
+  const text = (v: unknown): v is string => typeof v === "string";
+  if (!text(c.launchKeywords) || !c.launchKeywords.trim()) lane.push("launchKeywords must be a non-empty string");
+  if (!text(c.massLaunchKeywords) || !c.massLaunchKeywords.startsWith("/mass-ulw") || c.massLaunchKeywords.includes("?")) lane.push("massLaunchKeywords must be a string that starts with /mass-ulw and has no '?'");
+  if ("laneThinking" in c && !text(c.laneThinking)) lane.push("laneThinking must be a string");
+  if (lane.length) checks.push(warn("lane command", lane.join("; "), `fix the keys in ${d.configPath}`));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
   if (c.leadPane) {

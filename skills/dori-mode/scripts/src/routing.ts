@@ -30,6 +30,8 @@ export type QueuedLaunch = {
   readonly repos?: readonly string[];
   readonly thread?: string;
   readonly model?: string;
+  /** `mass-ulw` when launched with that mode; absent means `ulw`. */
+  readonly mode?: "mass-ulw";
   readonly machine?: string;
   readonly pane?: string;
   readonly workspace?: string;
@@ -57,6 +59,7 @@ const validLaunch = (value: unknown): value is QueuedLaunch =>
   (!("repos" in value) || (Array.isArray(value.repos) && value.repos.every((repo) => typeof repo === "string"))) &&
   (!("thread" in value) || typeof value.thread === "string") &&
   (!("model" in value) || typeof value.model === "string") &&
+  (!("mode" in value) || value.mode === "mass-ulw") &&
   (!("machine" in value) || typeof value.machine === "string") &&
   (!("pane" in value) || typeof value.pane === "string") &&
   (!("workspace" in value) || typeof value.workspace === "string") &&
@@ -157,6 +160,7 @@ export const launchQueueText = (queue: readonly QueuedLaunch[]): string =>
       ...(q.repos?.length ? [`repo=${q.repos.join(",")}`] : []),
       ...(q.thread && q.thread !== "none" ? [`thread=${q.thread}`] : []),
       ...(q.machine ? [`machine=${q.machine}`] : []),
+      ...(q.mode ? [`mode=${q.mode}`] : []),
       `done=${JSON.stringify(q.done)}`,
       `brief=${q.brief}`,
       `queued ${q.queuedAt}`,

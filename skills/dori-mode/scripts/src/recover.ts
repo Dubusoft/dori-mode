@@ -177,6 +177,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   const launched = await launchLane(resumeArgv ? { ...deps, config: { ...deps.config, agentCommand: resumeArgv } } : deps, {
     key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, thread: lane.thread,
     model: lane.model ?? deps.config.defaultModel,
+    ...(lane.mode ? { mode: lane.mode } : {}),
     ...(cwd ? { cwd } : {}), ...(lane.machine ? { machine: lane.machine } : {}),
   }, stored);
   if (!launched.startup.startsWith("STARTUP_OK ")) {

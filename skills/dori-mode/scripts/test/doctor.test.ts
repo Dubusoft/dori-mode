@@ -280,3 +280,13 @@ test("item 6: doctor fails on lanes whose recovery is exhausted and warns on lan
   expect(doctorExit(await runDoctor(f.deps))).toBe(1);
 });
 
+
+test("lane command keys: bad launchKeywords, massLaunchKeywords or laneThinking is WARN; the defaults say nothing", async () => {
+  const config = fixture().deps.config;
+  expect((await runDoctor(fixture().deps)).find((c) => c.id === "lane command")).toBeUndefined();
+  const bad = find(await runDoctor(fixture({ deps: { config: { ...config, launchKeywords: " ", massLaunchKeywords: "mass-ulw go?", laneThinking: 5 as unknown as string } } }).deps), "lane command");
+  expect(bad).toMatchObject({ level: "WARN" });
+  expect(bad.detail).toContain("launchKeywords");
+  expect(bad.detail).toContain("massLaunchKeywords");
+  expect(bad.detail).toContain("laneThinking");
+});
