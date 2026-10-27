@@ -119,5 +119,5 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 | `dori can-launch [--model M]` | is there room for a new lane (memory, disk, panes)? exit 4 with the reasons if not |
 | `dori quota [--json]` | Claude 5h/7d usage and reset times (Discord `/quota` shows the same usage block) |
 | `dori memory check` | read-only: `human.md` size against `memoryCheck.maxKb` and Open items naming closed lanes or merged PRs; exit 1 when you have cleanup to do |
-| `dori ack <channel> <messageId> [<channel> <messageId> ...]` | the read receipt on a Discord owner message: hourglass off, eyes on, ack recorded so the supervisor stops reminding (`ACK_MISSING`) |
+| `dori ack <channel> <messageId> [<channel> <messageId> ...]` | the read receipt on a Discord owner message: hourglass off, eyes on, ack recorded so the supervisor stops reminding (`ACK_MISSING`); also shows typing in that channel |
 | `dori send` / `dori presence` / `dori transcribe` | messenger utilities: post or edit on Slack, Telegram or Discord, or reply in the Toodo Lead chat; stay shown online; voice note to text |

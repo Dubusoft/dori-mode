@@ -121,6 +121,7 @@ const USAGE = `dori <command> [options]
                                        post or edit a message (tokens from DORI_SLACK_TOKEN, DORI_TELEGRAM_TOKEN, DORI_DISCORD_TOKEN);
                                        toodo: --to toodo posts in the Lead chat, --to <n> answers chat message n and marks it handled
   typing toodo [--off]                 show (or end) the lead's typing dots in the Toodo chat for 30 s
+  typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
   presence <slack|discord>             keep the account shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text
   inbound slack [--loop MIN]           print INBOUND lines: unread thread replies (threads view), replies in threads
@@ -778,10 +779,19 @@ try {
     }
     case "typing": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { off: { type: "boolean" } } });
-      if (parsed.positionals.join(" ") !== TOODO_CHANNEL) die("usage: dori typing toodo [--off]");
+      const typingUsage = "usage: dori typing toodo [--off] | dori typing discord <channel>";
+      const [target, ...extra] = parsed.positionals;
       const on = parsed.values.off !== true;
-      await toodoChat().typing(on);
-      console.log(`TYPING ${TOODO_CHANNEL} ${on ? "on" : "off"}`);
+      if (target === TOODO_CHANNEL && extra.length === 0) {
+        await toodoChat().typing(on);
+        console.log(`TYPING ${TOODO_CHANNEL} ${on ? "on" : "off"}`);
+      } else if (target === "discord" && extra.length === 1 && on) {
+        const { to, thread } = resolveTarget("discord", extra[0]!);
+        const id = thread ?? to;
+        const dc = new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
+        await dc.typing(id);
+        console.log(`TYPING discord ${id} on`);
+      } else die(typingUsage);
       break;
     }
     case "presence": {

@@ -40,6 +40,7 @@ export const checkTasks = (tasks: number | undefined): void => {
 export type AckReactions = {
   readonly react: (channel: string, message: string, emoji: string) => Promise<void>;
   readonly unreact: (channel: string, message: string, emoji: string) => Promise<void>;
+  readonly typing: (channel: string) => Promise<void>;
 };
 
 /**
@@ -57,6 +58,8 @@ export const ack = async (stateDir: string, discord: AckReactions, channel: stri
   }
   await discord.react(channel, message, EYES_EMOJI);
   recordAck(stateDir, channel, message, now, tasks);
+  try { await discord.typing(channel); }
+  catch (e) { console.error(`ACK_TYPING_FAILED ${channel} ${message}: ${e instanceof Error ? e.message : String(e)}`); }
 };
 
 export type ToodoAck = { readonly ack: (ids: readonly string[]) => Promise<void>; readonly typing: (on: boolean) => Promise<void> };
