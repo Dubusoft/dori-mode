@@ -8,6 +8,8 @@ export type LedgerThread = { readonly channel: string; readonly rootTs: string; 
 export class ThreadLedger {
   private threads = new Map<string, LedgerThread>();
   private loaded = false;
+  private batching = false;
+  private dirty = false;
 
   constructor(private readonly file: string) {}
 
@@ -22,7 +24,24 @@ export class ThreadLedger {
     this.loaded = true;
   }
 
+  /** Defers disk writes until flush(); mutations only mark the ledger dirty. */
+  beginBatch(): void {
+    this.batching = true;
+  }
+
+  /** Ends a batch and writes the file at most once, only if it changed. */
+  async flush(): Promise<void> {
+    this.batching = false;
+    if (this.dirty) await this.save();
+  }
+
+  private async persist(): Promise<void> {
+    this.dirty = true;
+    if (!this.batching) await this.save();
+  }
+
   private async save(): Promise<void> {
+    this.dirty = false;
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.${process.pid}.tmp`;
     await Bun.write(tmp, JSON.stringify([...this.threads.values()], null, 1));
@@ -35,7 +54,7 @@ export class ThreadLedger {
     const prev = this.threads.get(k);
     const seenTs = prev && tsAfter(prev.seenTs, postedTs) ? prev.seenTs : postedTs;
     this.threads.set(k, { channel, rootTs, seenTs });
-    await this.save();
+    await this.persist();
   }
 
   async markSeen(channel: string, rootTs: string, ts: string): Promise<void> {
@@ -43,7 +62,7 @@ export class ThreadLedger {
     const prev = this.threads.get(this.key(channel, rootTs));
     if (!prev || !tsAfter(ts, prev.seenTs)) return;
     this.threads.set(this.key(channel, rootTs), { ...prev, seenTs: ts });
-    await this.save();
+    await this.persist();
   }
 
   async list(): Promise<LedgerThread[]> {

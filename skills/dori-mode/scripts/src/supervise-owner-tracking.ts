@@ -332,14 +332,6 @@ export class OwnerTracking {
     this.draining = true;
     this.reactions = this.reactions.then(async () => {
       for (const item of this.journal.outbox ?? []) {
-        const ask = item.id.startsWith("lead-emergency-approval:");
-        const current = ask && item.id === `lead-emergency-approval:${this.journal.quotaExhausted?.since}`;
-        if (ask && !current) {
-          // An approval request outlives its episode only as a stale question: it is dropped, never posted late.
-          this.journal = { ...this.journal, outbox: (this.journal.outbox ?? []).filter((entry) => entry.id !== item.id) };
-          this.persist();
-          continue;
-        }
         if ((item.retryAt ?? 0) > this.deps.clock.now()) continue;
         let posted = false;
         const finish = item.id.startsWith(LANE_FINISH_PREFIX) ? parseFinish(item.text) : undefined;
@@ -354,8 +346,8 @@ export class OwnerTracking {
           console.error(`OWNER_ANNOUNCE_FAILED ${item.id} ${e instanceof Error ? e.message : String(e)}`);
         }
         const attempts = (item.attempts ?? 0) + 1;
-        // The approval request of the open episode and a lane-finish line are never given up: the owner would not know.
-        const drop = !posted && attempts >= OUTBOX_ATTEMPTS && !current && !finish;
+        // A lane-finish line is never given up: the owner would not know.
+        const drop = !posted && attempts >= OUTBOX_ATTEMPTS && !finish;
         if (drop) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id} after ${attempts} attempts`);
         const outbox = (this.journal.outbox ?? []).flatMap((entry) => entry.id !== item.id ? [entry]
           : posted || drop ? [] : [{ ...entry, attempts, retryAt: this.deps.clock.now() + OUTBOX_RETRY_MS }]);

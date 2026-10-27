@@ -122,3 +122,38 @@ test("the sqlite store keeps inbox and forcedRestarts, and a version 3 database 
   reread.close();
   expect({ inbox: back.inbox, forcedRestarts: back.forcedRestarts }).toEqual({ inbox: journal.inbox, forcedRestarts: journal.forcedRestarts });
 });
+
+const metaLine = (id: string, text: string, meta: object): string => `${JSON.stringify({ id, line: text, meta })}\n`;
+
+test("take groups lines under lane headers in first-seen order, lines without meta go last under ## other, and everything printed is receipted", () => {
+  const dir = state();
+  log(dir, metaLine("a", "LANE_REPORT alpha question one?", { lane: "alpha", thread: "discord:1/2", cwd: "/repo/a" })
+    + line("n", "WAIT_DONE no meta")
+    + metaLine("b", "LANE_REPORT beta blocked stuck", { lane: "beta", cwd: "/repo/b" })
+    + metaLine("c", "LANE_REPORT_LATE alpha milestone two", { lane: "alpha", thread: "discord:1/2", cwd: "/repo/a" })
+    + metaLine("d", "WAIT_DONE gamma ok", { lane: "gamma" })
+    + line("m", "WAIT_DONE also none"));
+  const result = take(dir, { maxBytes: 16_384, now: NOW });
+  expect(takeOutput(result)).toEqual([
+    "## lane alpha  thread discord:1/2  cwd /repo/a",
+    "a\tLANE_REPORT alpha question one?",
+    "c\tLANE_REPORT_LATE alpha milestone two",
+    "## lane beta  cwd /repo/b",
+    "b\tLANE_REPORT beta blocked stuck",
+    "## lane gamma",
+    "d\tWAIT_DONE gamma ok",
+    "## other",
+    "n\tWAIT_DONE no meta",
+    "m\tWAIT_DONE also none",
+  ]);
+  // Grouping is output only: the receipt covers every printed line in log order, and the cursor moves past all of them.
+  expect(result.events.map((e) => e.id)).toEqual(["a", "n", "b", "c", "d", "m"]);
+  expect(receipts(dir)).toHaveLength(1);
+  expect(takeOutput(take(dir, { maxBytes: 16_384, now: NOW }))).toEqual(["INBOX_EMPTY"]);
+});
+
+test("when no line has meta the take output is byte-identical to the ungrouped form, and malformed meta counts as none", () => {
+  const dir = state();
+  log(dir, line("a", "WAIT_DONE one") + `${JSON.stringify({ id: "b", line: "WAIT_DONE two", meta: { lane: 5, thread: "" } })}\n` + JSON.stringify({ id: "c", line: "x", meta: "bad" }) + "\n");
+  expect(takeOutput(take(dir, { maxBytes: 16_384, now: NOW, peek: true })).join("\n")).toBe("a\tWAIT_DONE one\nb\tWAIT_DONE two\nc\tx");
+});

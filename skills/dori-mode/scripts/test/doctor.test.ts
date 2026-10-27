@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { writeQuotaState } from "../src/claude-quota.ts";
 import { defaultConfig } from "../src/config.ts";
 import { type Check, type DoctorDeps, doctorExit, renderDoctor, runDoctor, tokenFrom } from "../src/doctor.ts";
 import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
@@ -174,18 +173,6 @@ test("a set but blank leadModel or leadThinking is WARN; set or absent says noth
   expect(set.find((c) => c.id === "lead command")).toBeUndefined();
 });
 
-test("a leadModel chain is listed; unusable entries WARN, and a quotaCheck with --credentials is FAIL", async () => {
-  const config = fixture().deps.config;
-  const chain = find(await runDoctor(fixture({ deps: { config: { ...config, leadModel: ["a/one", { model: "b/two", thinking: "high" }] } } }).deps), "lead model chain");
-  expect(chain).toMatchObject({ level: "OK", detail: "a/one -> b/two (thinking high)" });
-  const checks = await runDoctor(fixture({ deps: { config: { ...config, leadModel: ["bare", { model: "b/two" }] } } }).deps);
-  expect(find(checks, "lead model chain")).toMatchObject({ level: "WARN", detail: "unusable entries #1 are skipped" });
-  expect(checks.find((c) => c.id === "lead command")).toBeUndefined();
-  const creds = await runDoctor(fixture({ deps: { config: { ...config, leadModel: ["a/one", "b/two"], quotaCheck: ["omo", "auth", "check", "--provider", "{provider}", "--credentials"] } } }).deps);
-  expect(find(creds, "quota check").level).toBe("FAIL");
-  expect((await runDoctor(fixture().deps)).find((c) => c.id === "lead model chain")).toBeUndefined();
-});
-
 test("token: rejected is FAIL, absent is FAIL with no Discord call, env-only is WARN; it is never printed", async () => {
   const rejected = fixture({ http: { "/users/@me": resp(401, { message: "401: Unauthorized" }) } });
   const a = await runDoctor(rejected.deps);
@@ -283,21 +270,13 @@ test("item 6: doctor fails on lanes whose recovery is exhausted and warns on lan
   const registry = new Registry(f.deps.config.stateDir);
   const base = { title: "t", thread: "none", brief: "/b", done: "d", openedAt: new Date(NOW).toISOString() };
   await registry.write({ ...base, key: "dead-lane", recoveryPending: true, recoveryAttempts: 3, recoveryExhausted: true } as Parameters<Registry["write"]>[0]);
-  await registry.write({ ...base, key: "held-lane", recoveryPending: true, recoveryBlocked: "quota 1/1 p accounts blocked" } as Parameters<Registry["write"]>[0]);
+  await registry.write({ ...base, key: "held-lane", recoveryPending: true } as Parameters<Registry["write"]>[0]);
   await registry.write({ ...base, key: "fine-lane" });
   const checks = (await runDoctor(f.deps)).filter((c) => c.id === "lane recovery");
   expect(checks.map((c) => [c.level, c.detail])).toEqual([
     ["FAIL", "exhausted, not relaunched or nudged: dead-lane (3 attempts)"],
-    ["WARN", "pending, not nudged: held-lane (quota 1/1 p accounts blocked)"],
+    ["WARN", "pending, not nudged: held-lane"],
   ]);
   expect(doctorExit(await runDoctor(f.deps))).toBe(1);
 });
 
-test("claude quota shows the cached read with the 5h lane hold line in force, near the reset or not", async () => {
-  const f = fixture();
-  expect(find(await runDoctor(f.deps), "claude quota")).toEqual({ id: "claude quota", level: "OK", detail: "no usage read yet (dori quota reads it)" });
-  writeQuotaState(f.deps.config.stateDir, { mode: "brief", holdsLanes: true, usage: { at: NOW - 2 * 60_000, accounts: [{ name: "a", fiveHour: { usedPct: 95, resetAt: NOW + 61 * 60_000 }, weekly: { usedPct: 40 } }] } });
-  expect(find(await runDoctor(f.deps), "claude quota").detail).toBe("brief, headroom 24% (hold-lanes < 50%, brief < 25%), a 5h 95% 7d 40%, lanes held, read 2m ago");
-  writeQuotaState(f.deps.config.stateDir, { mode: "hold-lanes", holdsLanes: true, usage: { at: NOW, accounts: [{ name: "a", fiveHour: { usedPct: 85, resetAt: NOW + 3 * 3_600_000 } }, { name: "b", fiveHour: { usedPct: 100 } }] } });
-  expect(find(await runDoctor(f.deps), "claude quota").detail).toBe("hold-lanes, headroom 25% (hold-lanes < 50%, brief < 25%), a 5h 85% 7d ?, b 5h 100% 7d ?, lanes held, read 0m ago");
-});

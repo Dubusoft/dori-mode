@@ -22,7 +22,7 @@ const ok = (body: unknown, etag = '"v1"', link = ""): Ran => ({
   code: 0, err: "", out: `HTTP/2.0 200 OK\r\nETag: ${etag}\r\n${link ? `Link: ${link}\r\n` : ""}\r\n${JSON.stringify(body)}`,
 });
 const pull = (patch: Record<string, unknown> = {}) => ({
-  number: 7, state: "open", merged_at: null, head: { sha: "abc", ref: "feature" },
+  number: 7, state: "open", merged_at: null, head: { sha: "abc", ref: "feature", repo: { full_name: "Acme/App" } },
   updated_at: "2026-10-19T00:00:00Z", html_url: "https://github.com/acme/app/pull/7",
   mergeable: true, ...patch,
 });
@@ -97,6 +97,37 @@ test("a lane PR's failing checks are checks_failing, digest for the lead (CI fol
   await f.github.tick(f.deps, f.emit);
   expect(f.events.map((e) => eventPriority(e.line))).toEqual(["digest"]);
   expect(f.events[0]?.line).toContain(" checks_update ");
+});
+
+test("a PR keeps its head repo: a fork PR named like the lane's branch is not the lane's, and a cached detail without it is read again", async () => {
+  const f = await fixture();
+  await f.deps.registry.write({
+    key: "feature", title: "Feature", thread: "none", brief: "/brief", openedAt: "2026-10-19T00:00:00Z",
+    done: 'command ["gh","pr","list","-R","acme/app","--head","feature","--json","number"]',
+  });
+  const fork = pull({ number: 8, html_url: "https://github.com/acme/app/pull/8", head: { sha: "abc", ref: "feature", repo: { full_name: "outsider/app" } } });
+  f.responses.set("repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100", ok([pull(), fork], '"two"'));
+  f.responses.set("repos/acme/app/pulls/8", ok(fork));
+  for (const path of ["pulls/8/reviews", "issues/8/comments", "pulls/8/comments"]) f.responses.set(`repos/acme/app/${path}?per_page=100`, ok([]));
+  await f.github.tick(f.deps, f.emit);
+  f.events.length = 0;
+  f.responses.set("repos/acme/app/commits/abc/check-runs?per_page=100", ok({ check_runs: [{ id: 4, status: "completed", conclusion: "failure" }] }, '"failed"'));
+  await f.github.tick(f.deps, f.emit);
+  expect(f.events.filter((e) => e.line.includes("checks_")).map((e) => e.line.split(" ").slice(1, 3).join(" "))).toEqual(["acme/app#7 checks_failing", "acme/app#8 checks_update"]);
+  expect(f.github.openPulls().map((p) => [p.number, p.headRepo])).toEqual([[7, "acme/app"], [8, "outsider/app"]]);
+  expect(readGithub(f.state.dir).repos["acme/app"].pulls["8"].headRepo).toBe("outsider/app");
+
+  // A detail cached before head repos were kept answers 304 without one: it is read once more, unconditionally.
+  f.responses.set("repos/acme/app/pulls/7", ok(pull({ head: { sha: "abc", ref: "feature" } }), '"stale"'));
+  await f.github.tick(f.deps, f.emit);
+  const before = f.calls.length;
+  const run: Runner = async (argv, opts) => argv[5] === "repos/acme/app/pulls/7"
+    ? (f.calls.push({ argv }), argv.some((a) => a.startsWith("If-None-Match")) ? { code: 0, out: 'HTTP/2.0 304 Not Modified\r\nETag: "stale"', err: "" } : ok(pull(), '"fresh"'))
+    : f.deps.run(argv, opts);
+  await f.github.tick({ ...f.deps, run }, f.emit);
+  const detail = f.calls.slice(before).filter(({ argv }) => argv[5] === "repos/acme/app/pulls/7");
+  expect(detail.map(({ argv }) => argv.some((a) => a.startsWith("If-None-Match")))).toEqual([true, false]);
+  expect(f.github.openPulls().find((p) => p.number === 7)?.headRepo).toBe("acme/app");
 });
 
 // A merged lane PR is read back and settled by the supervisor (MERGE_VERIFIED), so for the lead it is digest.

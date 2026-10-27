@@ -152,7 +152,7 @@ test("a missing memory file is one MEMORY_CHECK_WARN, retried only on the next d
 test("the supervisor's sweeps include the memory sweep, so its line reaches the lead's queue", async () => {
   const { deps } = await setup();
   const queue: string[] = [];
-  const sweeps = supervisorSweeps(deps, "/home/test", async () => ({ results: [], text: "" }));
+  const sweeps = supervisorSweeps(deps, "/home/test");
   expect(sweeps.map(([name]) => name)).toContain("memory");
   await runSweeps(sweeps, async (line) => { queue.push(line); }, deps.clock.now, new Map(), () => {});
   expect(queue.filter((line) => line.startsWith("MEMORY_CHECK "))).toHaveLength(1);

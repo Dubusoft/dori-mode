@@ -7,6 +7,9 @@ import { acquireSupervisor } from "./supervise-loop.ts";
 import { JOURNAL_FIELDS, JOURNAL_FILE, PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore, StoreError } from "./store.ts";
 import type { Journal } from "./supervise.ts";
 import { byAt, JsonOperations, OPERATIONS_DDL, OPERATIONS_FILE, putRows, readRows } from "./operations.ts";
+import { JsonLaneReports, LANE_REPORTS_FILE, LANE_REPORTS_LOCK, putReportRows, readReportRows } from "./lane-reports.ts";
+import { JsonLaneMessages, LANE_MESSAGES_FILE, LANE_MESSAGES_LOCK, putMessageRows, readMessageRows } from "./lane-messages.ts";
+import { withStateLockSync } from "./state-lock.ts";
 
 /** A source file as the import read it: absent, or its byte size and sha256 (for the log: complete lines only). */
 export type SourceCursor = { readonly path: string; readonly present: boolean; readonly size: number; readonly sha256: string };
@@ -57,9 +60,11 @@ export const firstDiff = (a: unknown, b: unknown, path = "$"): string | undefine
  * journal field (Appendix D) and every delivery in lead-events.log into a temporary database, reads it back and refuses
  * unless the read-back equals the source field by field, then moves the database into place and keeps supervisor.json
  * read-only as supervisor.json.pre-sqlite; github-events.json moves into the same database the same way (importGithub).
- * lead-events.log stays where it is: the lead tails it, and the store records the byte offset it has read. Any refusal leaves the state dir exactly as it was.
+ * lead-events.log stays where it is: the lead tails it, and the store records the byte offset it has read. Lane reports
+ * and lane messages move the same way, every row with its id and consumed/delivery state (lane-reports.json and
+ * lane-messages.json become *.pre-sqlite). Any refusal leaves the state dir exactly as it was.
  */
-export const importStore = (stateDir: string, now: number, lock: (stateDir: string) => () => void = acquireSupervisor): ImportReport => {
+const importLocked = (stateDir: string, now: number, lock: (stateDir: string) => () => void): ImportReport => {
   let release: () => void;
   try { release = lock(stateDir); } catch (e) {
     throw new StoreError(`STORE_SUPERVISOR_RUNNING stop the supervisor before importing (${e instanceof Error ? e.message : String(e)})`);
@@ -71,6 +76,9 @@ export const importStore = (stateDir: string, now: number, lock: (stateDir: stri
     const jsonPath = join(stateDir, JOURNAL_FILE);
     const prePath = join(stateDir, PRE_SQLITE_FILE);
     if (existsSync(database) || existsSync(prePath)) throw new StoreError(`STORE_EXISTS ${stateDir} was already imported (${existsSync(database) ? SQLITE_FILE : PRE_SQLITE_FILE} exists)`);
+    const laneFiles = [LANE_REPORTS_FILE, LANE_MESSAGES_FILE].filter((file) => existsSync(join(stateDir, file)));
+    const retiredLane = laneFiles.find((file) => existsSync(join(stateDir, `${file}.pre-sqlite`)));
+    if (retiredLane) throw new StoreError(`STORE_EXISTS ${stateDir} was already imported (${retiredLane}.pre-sqlite exists beside ${retiredLane}); nothing imported`);
     const raw = readIf(jsonPath);
     const parsed: unknown = raw ? JSON.parse(raw.toString("utf8")) : { events: [] };
     if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { events?: unknown }).events)) {
@@ -113,6 +121,13 @@ export const importStore = (stateDir: string, now: number, lock: (stateDir: stri
         }
       }
       opsImported = ops.length > 0;
+      // Lane reports and lane messages move into their tables with every column, pending and consumed alike.
+      const reports = laneFiles.includes(LANE_REPORTS_FILE) ? new JsonLaneReports(stateDir).list() : [];
+      const messages = laneFiles.includes(LANE_MESSAGES_FILE) ? new JsonLaneMessages(stateDir).list() : [];
+      store.transaction("full", () => { putReportRows(store.database, reports); putMessageRows(store.database, messages); });
+      if (!Bun.deepEquals(readReportRows(store.database), reports) || !Bun.deepEquals(readMessageRows(store.database), messages)) {
+        throw new StoreError(`STORE_IMPORT_MISMATCH lane reports or lane messages differ from ${LANE_REPORTS_FILE}/${LANE_MESSAGES_FILE}; nothing imported`);
+      }
       store.transaction("full", () => store.setMeta("import", JSON.stringify({ at: now, sources })));
       const diff = firstDiff(normalize(store.read(true)), normalize(journal));
       if (diff) throw new StoreError(`STORE_IMPORT_MISMATCH the imported journal differs from ${jsonPath} at ${diff}; nothing imported`);
@@ -131,6 +146,10 @@ export const importStore = (stateDir: string, now: number, lock: (stateDir: stri
       renameSync(join(stateDir, OPERATIONS_FILE), join(stateDir, `${OPERATIONS_FILE}.pre-sqlite`));
       chmodSync(join(stateDir, `${OPERATIONS_FILE}.pre-sqlite`), 0o400);
     }
+    for (const file of laneFiles) {
+      renameSync(join(stateDir, file), join(stateDir, `${file}.pre-sqlite`));
+      chmodSync(join(stateDir, `${file}.pre-sqlite`), 0o400);
+    }
     fsyncPath(stateDir);
     return { at: now, database, sources, counts, syntheticAt: stamped.length };
   } catch (e) {
@@ -140,3 +159,10 @@ export const importStore = (stateDir: string, now: number, lock: (stateDir: stri
     release();
   }
 };
+
+/**
+ * importLocked under the lane-report and lane-message file locks: a `dori report` or queued message on the json store
+ * waits, so none lands between the copy and the files' retirement.
+ */
+export const importStore = (stateDir: string, now: number, lock: (stateDir: string) => () => void = acquireSupervisor): ImportReport =>
+  withStateLockSync(join(stateDir, LANE_REPORTS_LOCK), () => withStateLockSync(join(stateDir, LANE_MESSAGES_LOCK), () => importLocked(stateDir, now, lock)));

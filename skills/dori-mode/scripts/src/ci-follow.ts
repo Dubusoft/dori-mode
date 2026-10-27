@@ -1,9 +1,8 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { launchQuotaHold, lookupQuotaResults } from "./claude-quota.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { githubTargets, type OpenPull } from "./github-events.ts";
+import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
 import { launchLane } from "./launch.ts";
 import {
@@ -12,7 +11,7 @@ import {
 import {
   FINAL_STATES, type Observed, type Operation, operationId, type OperationSpec, type OperationStore, openOperations, perform, plan, type ReadBack, reconcile, settleOperation,
 } from "./operations.ts";
-import { laneRunner, listPanes, type Pane } from "./panes.ts";
+import { agentRefusal, laneRunner, listPanes, type Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
 
@@ -68,7 +67,7 @@ export const rebaseText = (pull: OpenPull, base: string, id: string): string =>
   `[LEAD] ${pull.repo}#${pull.number} conflicts with ${base} at ${short(pull.sha)} (${pull.url}). Your lane is live, so no merge lane is started: rebase your branch onto origin/${base} yourself, resolve every conflict keeping the intent of both sides, run the tests, push (--force-with-lease, your own branch only) and keep your own CI wait. Confirm you got this message: dori report ack ${id}`;
 
 /** A merged PR from the last poll (GitHubEvents.mergedPulls), for closing the issue its lane was bound to. */
-export type MergedPull = Pick<OpenPull, "repo" | "number" | "url"> & { readonly branch?: string };
+export type MergedPull = Pick<OpenPull, "repo" | "number" | "url" | "headRepo"> & { readonly branch?: string };
 
 export const MERGE_VERIFY = "merge-verify";
 
@@ -87,8 +86,8 @@ export const paneRefusal = (lane: Lane, panes: readonly Pane[] | Error): string 
   if (!lane.pane) return "lane has no pane";
   if (panes instanceof Error) return `pane list unreadable: ${panes.message.slice(0, 120)}`;
   const pane = panes.find((p) => p.pane_id === lane.pane);
-  if (!pane) return `pane ${lane.pane} missing`;
-  if (!pane.agent) return `pane ${lane.pane} runs no agent`;
+  const noAgent = agentRefusal(panes, lane.pane);
+  if (noAgent || !pane) return noAgent;
   if (pane.agent_status !== "idle" && pane.agent_status !== "done") return `pane ${lane.pane} busy (${pane.agent_status ?? "unknown"})`;
   return undefined;
 };
@@ -147,12 +146,19 @@ const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessag
   if (refusal) return refusal === message.blocked ? message : updateLaneMessage(messages, message, { blocked: refusal }, now);
   const run = laneRunner(deps.run, lane);
   const pane = lane.pane ?? "";
-  // Only the lane's ack proves the text arrived; a pane read cannot, so an interrupted attempt stays ambiguous.
-  const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : "unknown");
+  // The lane's ack proves the text arrived. Short of it, only this attempt's own herdr exits can tell: a refused
+  // send-text typed nothing (not done), text plus enter both accepted is done. An interrupted attempt (a new process,
+  // no exits seen) or text typed without its enter stays unknown, so it is ambiguous and never retyped.
+  let typedHere: Observed = "unknown";
+  const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
   const { op } = await perform(ops, deps.clock.now, { lane: lane.key, action: "lane-message", target: message.id }, async () => {
     const typed = await run(["herdr", "pane", "send-text", pane, message.text]);
-    if (typed.code !== 0) return { ok: false, detail: typed.err || typed.out || "send-text failed" };
+    if (typed.code !== 0) {
+      typedHere = "not-done";
+      return { ok: false, detail: typed.err || typed.out || "send-text failed" };
+    }
     const entered = await run(["herdr", "pane", "send-keys", pane, "enter"]);
+    if (entered.code === 0) typedHere = "done";
     return { ok: entered.code === 0, detail: entered.code === 0 ? "" : entered.err || "send-keys failed" };
   }, readBack);
   const current = messages.get(message.id) ?? message;
@@ -171,10 +177,10 @@ type PrView = {
   readonly mergeStateStatus?: string;
   readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
   readonly mergeCommit?: { readonly oid?: string } | null;
-  readonly commits?: readonly { readonly oid?: string; readonly committedDate?: string }[];
+  readonly isCrossRepository?: boolean;
 };
 
-const PR_FIELDS = "state,baseRefName,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,mergeCommit,commits";
+const PR_FIELDS = "state,baseRefName,headRefOid,isCrossRepository,isDraft,mergeable,mergeStateStatus,statusCheckRollup,mergeCommit";
 
 const viewPull = async (deps: FlowDeps, pull: Pick<OpenPull, "repo" | "number">, fields = PR_FIELDS): Promise<PrView> => {
   const r = await deps.run(["gh", "pr", "view", String(pull.number), "-R", pull.repo, "--json", fields], { timeoutMs: 20_000 });
@@ -185,14 +191,15 @@ const viewPull = async (deps: FlowDeps, pull: Pick<OpenPull, "repo" | "number">,
 const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 
 /**
- * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, not a
- * draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
+ * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
+ * branch of its own repo (never a fork), not a draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
  * conflict; `wait` (with why) otherwise.
  */
 export const mergeGate = (view: PrView, sha: string, base: string): { readonly verdict: "merge" | "conflict" | "wait"; readonly why: string } => {
   if (view.state !== "OPEN") return { verdict: "wait", why: `state ${view.state ?? "unknown"}` };
   if (view.baseRefName === "main" || view.baseRefName !== base) return { verdict: "wait", why: `base ${view.baseRefName ?? "unknown"} is not ${base}` };
   if (view.headRefOid !== sha) return { verdict: "wait", why: `head moved to ${short(view.headRefOid ?? "unknown")}` };
+  if (view.isCrossRepository !== false) return { verdict: "wait", why: "head is not a branch of this repo" };
   if (view.isDraft) return { verdict: "wait", why: "draft" };
   if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") return { verdict: "conflict", why: `mergeable ${view.mergeable} state ${view.mergeStateStatus}` };
   const checks = view.statusCheckRollup ?? [];
@@ -204,19 +211,16 @@ export const mergeGate = (view: PrView, sha: string, base: string): { readonly v
 };
 
 /**
- * Whether the lane has claimed done for this head: it holds a done claim (`dori claim-done` or a remote `done` report)
- * made at or after the head commit's date. A lane that never claimed, or pushed after its claim, is not merged.
+ * Whether the lane has claimed done for exactly this PR at exactly this head: its done claim (`dori claim-done` or a
+ * remote `done` report) recorded the PR's number and head SHA (done-flow.ts claimBindings). A lane that never claimed,
+ * pushed after its claim, or claimed before this binding was recorded is not merged; commit dates are never trusted.
  */
-export const claimGate = (lane: Lane, view: PrView, sha: string): { readonly ok: boolean; readonly why: string } => {
+export const claimGate = (lane: Lane, pull: Pick<OpenPull, "repo" | "number" | "sha">): { readonly ok: boolean; readonly why: string } => {
   const status = statusOf(lane);
   if (status !== "done-claimed" && status !== "verified-done") return { ok: false, why: `lane is ${status}, no done claim` };
-  if (!lane.claim) return { ok: false, why: "lane has no claim time" };
-  const commits = view.commits ?? [];
-  const head = commits.find((c) => c.oid === sha) ?? commits[commits.length - 1];
-  const pushed = Date.parse(head?.committedDate ?? "");
-  const claimed = Date.parse(lane.claim.at);
-  if (Number.isNaN(pushed) || Number.isNaN(claimed)) return { ok: false, why: "head commit or claim time unreadable" };
-  return claimed >= pushed ? { ok: true, why: "claimed after the head commit" } : { ok: false, why: `head ${short(sha)} is newer than the done claim` };
+  const bound = (lane.claim?.pulls ?? []).find((p) => p.repo.toLowerCase() === pull.repo.toLowerCase() && p.number === pull.number);
+  if (!bound) return { ok: false, why: `the done claim recorded no head for ${pull.repo}#${pull.number}` };
+  return bound.sha === pull.sha ? { ok: true, why: "claimed at this head" } : { ok: false, why: `head ${short(pull.sha)} is not the claimed ${short(bound.sha)}` };
 };
 
 const observedMerge = (view: PrView): Observed => (view.state === "MERGED" ? "done" : view.state === "OPEN" || view.state === "CLOSED" ? "not-done" : "unknown");
@@ -247,8 +251,11 @@ export class CiFollowUp {
     await deliverLaneMessages(this.deps, this.ops, this.messages, emit);
   }
 
-  /** The open lane of each PR (`repo#n`, repo lowercased): its Done signal names it, or a lane worktree has its branch. */
-  private async owners(pulls: readonly (Pick<OpenPull, "repo" | "number"> & { readonly branch?: string })[]): Promise<Map<string, Lane>> {
+  /**
+   * The open lane of each same-repo PR (`repo#n`, repo lowercased): its Done signal names it, or a lane worktree has its
+   * branch. A fork PR (sameRepoHead false) has no lane, so it gets no CI message, merge, merge lane or issue close.
+   */
+  private async owners(pulls: readonly (Pick<OpenPull, "repo" | "number" | "headRepo"> & { readonly branch?: string })[]): Promise<Map<string, Lane>> {
     const owner = new Map<string, Lane>();
     if (!pulls.length) return owner;
     // Oldest lane first: the lane that opened the PR keeps its operations even after a merge lane joins it.
@@ -256,7 +263,7 @@ export class CiFollowUp {
     for (const lane of lanes) {
       for (const [repo, targets] of await githubTargets([lane], this.deps.run)) {
         for (const pull of pulls) {
-          if (pull.repo.toLowerCase() !== repo || !(targets.numbers.has(pull.number) || (pull.branch !== undefined && targets.branches.has(pull.branch)))) continue;
+          if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || (pull.branch !== undefined && targets.branches.has(pull.branch)))) continue;
           const key = `${repo}#${pull.number}`;
           if (!owner.has(key)) owner.set(key, lane);
         }
@@ -421,7 +428,8 @@ export class CiFollowUp {
       }
       // Merged only once the lane says it is done with this head; read fresh so a claim made since the poll counts.
       const fresh = (await deps.registry.read(lane.key)) ?? lane;
-      if (!claimGate(fresh, view, pull.sha).ok) return;
+      if (!claimGate(fresh, pull).ok) return;
+      // pull.sha is the head the claim recorded (claimGate) and the fresh read saw (mergeGate): GitHub merges no other.
       ({ op } = await perform(this.ops, deps.clock.now, spec, async () => {
         const r = await deps.run(["gh", "pr", "merge", String(pull.number), "-R", pull.repo, "--merge", "--match-head-commit", pull.sha], { timeoutMs: 60_000 });
         return { ok: r.code === 0, detail: r.code === 0 ? "" : (r.err || r.out).trim() };
@@ -497,22 +505,25 @@ export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): str
   ].join("\n");
 };
 
-/** Launches a merge lane on this host: host and quota gates, a detached worktree of the PR branch, then dori launch. */
+/** Launches a merge lane on this host: host guard, a detached worktree of the PR branch, then dori launch. */
 export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest): Promise<{ readonly ok: boolean; readonly detail: string }> => {
   const { key, source, pull } = request;
   if (!LANE_KEY.test(key)) return { ok: false, detail: `merge lane key ${key} is not a valid lane key` };
+  // The branch name is the PR author's text and reaches git argv: never a fork's, never option-shaped, always a valid ref.
+  if (!sameRepoHead(pull)) return { ok: false, detail: `${pull.repo}#${pull.number} has its head in ${pull.headRepo ?? "an unknown repo"}; merge lanes only take same-repo branches` };
+  const branch = pull.branch;
+  const valid = !branch.startsWith("-") && (await deps.run(["git", "check-ref-format", "--branch", branch])).code === 0;
+  if (!valid) return { ok: false, detail: `branch name ${JSON.stringify(branch.slice(0, 80))} of ${pull.repo}#${pull.number} is not a valid branch` };
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
   if (!deps.config.worktreeRoot) return { ok: false, detail: "worktreeRoot is not set" };
   const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config)), deps.config.guard);
   if (!host.ok) return { ok: false, detail: `HOLD ${host.reasons.join(" | ")}` };
-  const quota = await launchQuotaHold(deps.config, lookupQuotaResults(), deps.config.defaultModel, deps.clock.now(), (line) => { console.error(line); });
-  if (quota) return { ok: false, detail: `HOLD ${quota}` };
   const worktree = join(deps.config.worktreeRoot, repoName(pull.repo), key);
   if (existsSync(worktree)) return { ok: false, detail: `worktree ${worktree} already exists` };
-  const fetched = await deps.run(["git", "-C", source.cwd, "fetch", "origin", pull.branch]);
+  const fetched = await deps.run(["git", "-C", source.cwd, "fetch", "--end-of-options", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
   if (fetched.code !== 0) return { ok: false, detail: `git fetch failed: ${(fetched.err || fetched.out).trim()}` };
-  const added = await deps.run(["git", "-C", source.cwd, "worktree", "add", "--detach", worktree, `origin/${pull.branch}`]);
+  const added = await deps.run(["git", "-C", source.cwd, "worktree", "add", "--detach", worktree, `refs/remotes/origin/${branch}`]);
   if (added.code !== 0) return { ok: false, detail: `git worktree add failed: ${(added.err || added.out).trim()}` };
   const briefs = join(deps.config.stateDir, "briefs");
   mkdirSync(briefs, { recursive: true });

@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { randomBytes, randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import { configPath, loadConfig } from "./config.ts";
@@ -16,7 +17,7 @@ import { Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
-import { canLaunch, dequeueLaunch, enqueueLaunch, journalQuotaBypass, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { canLaunch, dequeueLaunch, enqueueLaunch, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Slack } from "./messenger/slack.ts";
 import { pollSlackInbound } from "./messenger/slack-inbound.ts";
@@ -26,18 +27,17 @@ import { Telegram } from "./messenger/telegram.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
 import { DiscordCommands } from "./messenger/discord-commands.ts";
-import { gateLine, launchQuotaHold, lookupQuotaResults, NO_CLAUDE, quotaReport, readGate } from "./claude-quota.ts";
+import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
 import { supervise } from "./supervise-loop.ts";
 import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
-import { approveEmergency, clearEmergencyApproval, emergencyApprovedAt } from "./emergency.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, ackToodo, recordHandled } from "./ack.ts";
 import { TOODO_CHANNEL, type Toodo, toodoClient, ToodoError } from "./messenger/toodo.ts";
-import { InboxError, take, takeOutput } from "./inbox.ts";
+import { InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -46,23 +46,25 @@ import { isReportKind, oneLine, openLaneReports, REPORT_KINDS, type ReportKind, 
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
+import { updateInstall } from "./update.ts";
 
 const USAGE = `dori <command> [options]
 
   doctor                                                         read-only health check: OK/WARN/FAIL with the exact fix; exit 1 on any FAIL
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
   setup  [--yes] [--token-file F] [--channel ID] [--autostart]   interactive install: token, channels, herdr, autostart (dori setup --help)
-  quota [--json]                                                 Claude 5h/7d usage and the gate mode (ok, hold-lanes, brief, blocked); read before taking on work
-  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR] [--ignore-quota --reason TEXT]
+  quota [--json]                                                 Claude 5h/7d usage of every account with reset times
+  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
-                HOLD (exit 4) on host limits or the quota gate queues the launch in launch-hold.json until it launches or is dropped
+                HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
-  sync   [--write]                     registry vs live panes; read-only unless --write
+  sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done [<key>] --evidence TEXT  key defaults to the lane registered for $HERDR_PANE_ID
   object-done <key> --reason TEXT [--reason TEXT ...]
+  lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); key defaults as for claim-done
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
@@ -72,7 +74,8 @@ const USAGE = `dori <command> [options]
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
-  lead-emergency approve|revoke|status           the owner's approval for the lead's paid emergency models
+  update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
+                                       bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
   store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field),
                                        then set "store": "sqlite" in the config
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
@@ -96,7 +99,7 @@ const USAGE = `dori <command> [options]
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
-  can-launch [--model M]               exit 0 if the host and the Claude quota gate have room for a new lane, else print why and exit 4
+  can-launch [--model M]               exit 0 if the host has room for a new lane, else print why and exit 4
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
@@ -106,6 +109,8 @@ const USAGE = `dori <command> [options]
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
   reported <key> [--note TEXT]         the lead's receipt that it told the owner a finished lane's outcome (after LANE_CLOSED or CI_MERGED);
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin
+  resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
+                                       WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on an owner message: on Discord hourglass off, eyes on;
                                        channel toodo: ack_chat and typing dots in Toodo; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--reply-id ID] [--task-id ID]
@@ -158,14 +163,15 @@ const flags = parseArgs({
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
     model: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
-    reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, loop: { type: "string" },
+    reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
-    list: { type: "boolean" }, cancel: { type: "string" }, "ignore-quota": { type: "boolean" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
+    list: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
+    dev: { type: "boolean" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -191,7 +197,7 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "inbox", "launch", "adopt", "hold", "lead-restart", "lead-emergency", "store", "ops", "source", "schedule"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
@@ -240,25 +246,6 @@ try {
       for (const line of await recoverLanes(deps, key)) console.log(line);
       break;
     }
-    case "lead-emergency": {
-      const [action, ...extra] = flags.positionals;
-      if (extra.length || Object.keys(flags.values).length || (action !== "approve" && action !== "revoke" && action !== "status")) {
-        die("usage: dori lead-emergency approve|revoke|status");
-      }
-      if (action === "approve") {
-        // The lead runs with DORI_SUPERVISED=1 in the lead pane: it may relay the owner's word, never approve for itself.
-        if (process.env.DORI_SUPERVISED === "1" || (config.leadPane && process.env.HERDR_PANE_ID === config.leadPane)) {
-          die("LEAD_EMERGENCY_REFUSED the lead may not approve its own paid emergency model; the owner approves with /emergency or from their own shell");
-        }
-        if (approveEmergency(config.stateDir, realClock.now()) === undefined) {
-          die("LEAD_EMERGENCY_REFUSED no lead quota episode is open; an approval counts only for the outage it is given in");
-        }
-      }
-      if (action === "revoke") clearEmergencyApproval(config.stateDir);
-      const at = emergencyApprovedAt(config.stateDir);
-      console.log(at === undefined ? "LEAD_EMERGENCY not approved" : `LEAD_EMERGENCY approved ${new Date(at).toISOString()}`);
-      break;
-    }
     case "store": {
       const [action, ...extra] = flags.positionals;
       if (extra.length || Object.keys(flags.values).length || (action !== "import" && action !== "export")) die("usage: dori store import|export");
@@ -283,6 +270,14 @@ try {
       const request = requestLeadRestart(config, realClock.now(), opt("model"), opt("thinking"));
       console.log(`LEAD_RESTART_REQUESTED ${request.id} ${request.models[0]?.model}`);
       break;
+    }
+    case "update": {
+      if (flags.positionals.length || Object.entries(flags.values).some(([name, v]) => (name !== "dev" && name !== "force") || v !== true)) {
+        die("usage: dori update [--dev] [--force]");
+      }
+      const code = await updateInstall({ run, sleep: realClock.sleep, log: (line) => console.log(line) },
+        { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
+      process.exit(code);
     }
     case "repos": {
       const [action, repo, ...extra] = flags.positionals;
@@ -336,7 +331,7 @@ try {
         const registered = new Map(specs.list().map((spec) => [spec.name, publicSpec(spec)]));
         const rows = view.sources.map((source) => ({ ...source, ...(registered.get(source.name) ?? {}) }));
         if (flags.values.json) console.log(JSON.stringify(rows, null, 2));
-        else for (const row of rows) console.log(`${row.name} ${row.type}${row.kind ? ` ${row.kind}` : ""} events=${row.events ?? 0} duplicates=${row.duplicates ?? 0} last=${row.lastEventAt === undefined ? "never" : `${row.lastKind} ${new Date(row.lastEventAt).toISOString()}`}${row.failing ? ` FAILING ${row.lastError}` : ""}`);
+        else for (const row of rows) console.log(`${row.name} ${row.type}${row.kind ? ` ${row.kind}` : ""} events=${row.events ?? 0} duplicates=${row.duplicates ?? 0} last=${row.lastEventAt === undefined ? "never" : `${row.lastKind} ${new Date(row.lastEventAt).toISOString()}`}${row.failing ? ` FAILING ${row.lastError}` : ""}${"identity" in row && row.identity ? ` identity=${row.identity}` : ""}`);
         break;
       }
       if (action === "remove" && name) {
@@ -419,20 +414,15 @@ try {
       break;
     }
     case "quota": {
-      const read = await readGate(lookupQuotaResults(), config.quotaGate, config.stateDir, realClock.now(), AbortSignal.timeout(30_000));
-      if (flags.values.json) console.log(JSON.stringify(read.claude ? { ...read.claude.verdict, usage: read.claude.usage } : { mode: "unknown" }, null, 2));
-      else console.log(`${read.claude ? gateLine(read.claude.verdict) : NO_CLAUDE}\n\n${read.text}`);
+      const read = await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(30_000));
+      if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null }, null, 2));
+      else console.log(`${read.usage ? usageLine(read.usage) : NO_CLAUDE}\n\n${read.text}`);
       break;
     }
     case "launch": {
       const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
-      const ignoreQuota = Boolean(flags.values["ignore-quota"]);
-      const reason = ((flags.values.reason as string[] | undefined) ?? []).map((r) => r.trim()).filter(Boolean).join("; ");
-      if (ignoreQuota && !reason) die("--ignore-quota needs --reason TEXT (why the Claude quota gate is bypassed; it is journaled and relayed to the owner)");
       await validateLaunch(deps, input);
-      const quotaHold = await launchQuotaHold(config, lookupQuotaResults(), input.model ?? config.defaultModel, realClock.now(), (line) => console.error(line));
-      const gate = launchGate({ key: input.key, sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard, quotaHold, ignoreQuota, reason });
-      if (gate.error) die(gate.error);
+      const gate = launchGate({ sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard });
       for (const line of gate.lines) console.log(line);
       if (gate.hold) {
         const repos = doneRepos(input.done);
@@ -445,7 +435,6 @@ try {
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
       }
-      if (ignoreQuota) journalQuotaBypass(config.stateDir, { key: input.key, reason, ...(quotaHold ? { quotaHold } : {}), at: Date.now() });
       const r = await launchLane(deps, input);
       dequeueLaunch(config.stateDir, input.key);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
@@ -467,8 +456,16 @@ try {
     }
     case "sync": {
       const r = await syncRegistry(deps, Boolean(flags.values.write));
-      console.log("key | thread | pane | session | status");
-      for (const row of [...r.rows, ...r.unregistered]) console.log([row.key, row.thread, row.pane, row.session, row.status].join(" | "));
+      if (flags.values.full) {
+        console.log("key | thread | pane | session | status");
+        for (const row of [...r.rows, ...r.unregistered]) console.log([row.key, row.thread, row.pane, row.session, row.status].join(" | "));
+      } else {
+        const counts = new Map<string, number>();
+        for (const row of r.rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
+        const byStatus = [...counts].map(([status, count]) => `${status} ${count}`).join(", ");
+        const unregisteredPanes = r.unregistered.length ? `: ${r.unregistered.map((row) => row.pane).join(" ")}` : "";
+        console.log(`LANES ${r.rows.length}${byStatus ? ` (${byStatus})` : ""}; UNREGISTERED ${r.unregistered.length}${unregisteredPanes}; --full for the table`);
+      }
       console.log(r.drift.length ? `DRIFT (${r.drift.length}):\n${r.drift.map((d) => `- ${d}`).join("\n")}` : "DRIFT none");
       console.log(flags.values.write ? "WROTE session ids" : "READ_ONLY");
       break;
@@ -476,6 +473,15 @@ try {
     case "claim-done":
       console.log(await claimDone(deps, await lane(await ownKey("claim-done", key)), need("evidence")));
       break;
+    case "lane": {
+      const [action, laneKey, ...extra] = flags.positionals;
+      if (action !== "status" || extra.length || Object.keys(flags.values).length) die("usage: dori lane status [<key>]");
+      const own = await ownKey("read the status of", laneKey);
+      const found = (own ? await deps.registry.read(own) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? ""))
+        ?? die(own ? `no registered lane "${own}"` : "no open lane is registered for this pane");
+      console.log(JSON.stringify({ key: found.key, status: statusOf(found), objection: found.objection ?? null, claim: found.claim ?? null }, null, 2));
+      break;
+    }
     case "object-done": {
       const reasons = (flags.values.reason as string[] | undefined)?.map((r) => r.trim()).filter(Boolean) ?? [];
       if (!reasons.length) die("--reason is required");
@@ -518,12 +524,19 @@ try {
       for (const line of r.lines) console.log(line);
       process.exit(r.code);
     }
-    case "watch":
+    case "watch": {
+      let lastWatchWarnings = new Set<string>();
       console.log("LANE_WATCH_READY");
       for (;;) {
-        for (const line of await watchTick(deps).catch((e: unknown) => [`LANE_WATCH_WARN ${String(e).slice(0, 200)}`])) console.log(line);
+        const lines = await watchTick(deps).catch((e: unknown) => [`LANE_WATCH_WARN ${String(e).slice(0, 200)}`]);
+        const warnings = new Set(lines.filter((line) => line.startsWith("LANE_WATCH_WARN ")));
+        for (const line of lines) {
+          if (!warnings.has(line) || !lastWatchWarnings.has(line)) console.log(line);
+        }
+        lastWatchWarnings = warnings;
         await Bun.sleep(30_000);
       }
+    }
     case "freshness":
       await every(loopMin, async () => {
         const reports = openLaneReports(deps.config);
@@ -564,9 +577,7 @@ try {
       break;
     }
     case "can-launch": {
-      const host = canLaunch(await sampleHost(run, diskGuardPath(config)), config.guard);
-      const hold = await launchQuotaHold(config, lookupQuotaResults(), opt("model") ?? config.defaultModel, realClock.now(), (line) => console.error(line));
-      const v = hold ? { ok: false, reasons: [...host.reasons, hold] } : host;
+      const v = canLaunch(await sampleHost(run, diskGuardPath(config)), config.guard);
       recordLaunchVerdict(config.stateDir, v, Date.now());
       console.log(v.ok ? "CAN_LAUNCH" : `HOLD ${v.reasons.join(" | ")}`);
       process.exit(v.ok ? 0 : 4);
@@ -582,6 +593,20 @@ try {
         throw e;
       }
     }
+    case "event": {
+      // `dori event trace <id> [--json]`: enqueued -> delivered -> taken -> acked/handled or reported (event-trace.ts).
+      const parsed = parseArgs({ args: rest, allowPositionals: true, options: { json: { type: "boolean" } } });
+      const [action, id, ...extra] = parsed.positionals;
+      if (action !== "trace" || !id || extra.length) die("usage: dori event trace <eventId> [--json]");
+      const { buildTrace, loadTrace, traceText } = await import("./event-trace.ts");
+      const sources = loadTrace(config.stateDir, id ?? "");
+      if (!sources) die(`EVENT_TRACE_UNAVAILABLE the journal store in ${config.stateDir} cannot be read`, 2);
+      const trace = sources && buildTrace(id ?? "", sources);
+      if (!trace) die(`EVENT_NOT_FOUND ${id}: no journaled, pruned or delivered event has this id`);
+      else if (parsed.values.json) console.log(JSON.stringify(trace));
+      else for (const line of traceText(trace)) console.log(line);
+      break;
+    }
     case "inbox": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { "max-bytes": { type: "string" }, peek: { type: "boolean" } } });
       const raw = parsed.values["max-bytes"];
@@ -589,11 +614,13 @@ try {
       if (parsed.positionals.join(" ") !== "take" || !Number.isSafeInteger(maxBytes) || maxBytes < 1) die("usage: dori inbox take [--max-bytes N (positive integer)] [--peek]");
       try {
         const result = take(config.stateDir, { maxBytes, peek: parsed.values.peek === true, now: realClock.now(), session: process.env.PI_SESSION_ID });
-        // Finished lanes still owed to the owner are listed every time, before the INBOX_MORE / INBOX_EMPTY sentinel.
+        // What the last cold start carried over, finished lanes still owed to the owner and open decisions are listed every
+        // time, before the INBOX_MORE / INBOX_EMPTY sentinel.
         const { takeReminders } = await import("./lane-outcomes.ts");
+        const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        for (const line of [...lines, ...takeReminders(config.stateDir), ...sentinel]) console.log(line);
+        for (const line of [...lines, ...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir), ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;
@@ -659,6 +686,21 @@ try {
       const note = opt("note");
       recordReported(config.stateDir, key ?? "", realClock.now(), note ? oneLine(note) : undefined);
       console.log(`REPORTED_RECORDED ${key}`);
+      break;
+    }
+    case "resolved": {
+      // `dori resolved <eventId> [...] [--note T]`: the lead has decided these decision events (decision-obligations.ts). An
+      // id with no open obligation is still recorded (its event may not have arrived yet) and named as unmatched.
+      const { publishedDecisions, recordResolved, validEventId } = await import("./decision-obligations.ts");
+      const ids = flags.positionals;
+      if (!ids.length || !ids.every(validEventId) || Object.keys(flags.values).some((name) => name !== "note") || ("note" in flags.values && !opt("note"))) {
+        die("usage: dori resolved <eventId> [<eventId> ...] [--note TEXT]");
+      }
+      const open = new Set(publishedDecisions(config.stateDir).map((item) => item.id));
+      const note = opt("note");
+      const at = realClock.now();
+      for (const id of ids) recordResolved(config.stateDir, id, at, note ? oneLine(note) : undefined);
+      for (const id of ids) console.log(open.has(id) ? `RESOLVED_RECORDED ${id}` : `RESOLVED_UNMATCHED ${id}: no open decision has this id; recorded anyway`);
       break;
     }
     case "handled": {
@@ -753,7 +795,7 @@ try {
         let presence: ReturnType<typeof discordPresence> | undefined;
         try {
           if (!config.discord) console.warn("PRESENCE_WARNING discord slash commands skipped: config.discord is missing; run dori setup");
-          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults(), () => config.quotaGate, config.stateDir, realClock.now), undefined, config.discordChannels, lookupStatus(deps)) : undefined;
+          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults()), undefined, config.discordChannels, lookupStatus(deps)) : undefined;
           await commands?.register();
           presence = discordPresence(openDiscordGateway, token, realTimers, commands ? (data) => commands.handle(data) : undefined);
           console.log("PRESENCE_READY discord");

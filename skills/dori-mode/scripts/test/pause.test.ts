@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { freshnessTick } from "../src/freshness.ts";
+import { CONFIRM_BACKOFF_MS, sendGuarded, sendVerified } from "../src/panes.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";
-import { depsFor, fakeClock, newWorld, sent, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, fakeRunner, newWorld, sent, withState, type World } from "./fakes.ts";
 
 // Issue #11: telling Dori to wait must stick. One paused state silences the freshness sweep and pauses the goal,
 // and the lane is marked paused only once the pane shows the goal paused.
@@ -15,7 +16,7 @@ let world: World;
 beforeEach(() => {
   state = withState();
   world = newWorld();
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent_status: "idle" }];
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   // Escape stops a running turn, unless a test says otherwise.
   world.onEscapeStatus = "idle";
 });
@@ -284,4 +285,47 @@ test("pause is unverified (exit 3) when Escape does not stop the running turn; t
   expect(await pauseLane(deps(T0 + 2 * MIN), (await stored()) as Lane, "again")).toMatchObject({ code: 0, lines: ["PAUSED waiting-lane already; its running turn was interrupted again"] });
   expect(world.panes[0]?.agent_status).toBe("idle");
   expect(sent(world)).toEqual(["/goal pause"]);
+});
+
+/** A runner whose pane turns "working" on the n-th status lookup after Enter (never, when n is undefined). */
+const workingOnLookup = (n: number | undefined): Runner => {
+  const base = fakeRunner(world);
+  let entered = false;
+  let lookups = 0;
+  return async (argv) => {
+    if (argv[2] === "send-keys" && argv[4] === "enter") entered = true;
+    if (entered && argv[2] === "list" && ++lookups === n) paneStatus("working");
+    return base(argv);
+  };
+};
+const sleepLog = () => {
+  const sleeps: number[] = [];
+  return { sleeps, clock: { ...fakeClock(T0), sleep: async (ms: number) => void sleeps.push(ms) } };
+};
+
+test("sendVerified confirms with escalating backoff, and the first lookup after Enter has no wait", async () => {
+  const { sleeps, clock } = sleepLog();
+  expect(await sendVerified(workingOnLookup(1), clock, "w:p7", "hello")).toBe("delivered");
+  expect(sleeps).toEqual([]);
+  paneStatus("idle");
+  const third = sleepLog();
+  expect(await sendVerified(workingOnLookup(3), third.clock, "w:p7", "hello")).toBe("delivered");
+  expect(third.sleeps).toEqual([150, 300]);
+});
+
+test("sendVerified backs off 150ms growing to 1000ms and reports unconfirmed when the pane never works", async () => {
+  const { sleeps, clock } = sleepLog();
+  expect(await sendVerified(workingOnLookup(undefined), clock, "w:p7", "hello")).toBe("unconfirmed");
+  expect(sleeps).toEqual([150, 300, 600, 900, 1000, 1000, 1000]);
+  expect(sleeps).toEqual([...CONFIRM_BACKOFF_MS]);
+  expect(sent(world)).toEqual(["hello"]);
+});
+
+test("sendGuarded types without waiting, and refuses a pane with no running agent", async () => {
+  expect(await sendGuarded(fakeRunner(world), "w:p7", "hi")).toBe("sent");
+  expect(sent(world)).toEqual(["hi"]);
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w" }];
+  expect(await sendGuarded(fakeRunner(world), "w:p7", "rm -rf x")).toBe("failed");
+  expect(await sendGuarded(fakeRunner(world), "w:missing", "hi")).toBe("failed");
+  expect(sent(world)).toEqual(["hi"]);
 });

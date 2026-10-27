@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { LEGACY_LANE_MCP, removeLegacyLaneMcp } from "../src/launch.ts";
-import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { claimDone, claimEventId, closeLane, discoverWorktrees, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { laneFinish } from "../src/lane-finish.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -14,8 +15,8 @@ const lane: Lane = { key: "demo-lane", title: "demo", thread: "chat:team/123", p
 let state: ReturnType<typeof withState>;
 let world: World;
 const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadDone: ["notify", "{thread}", "{text}"] } });
-/** The lane's pane is listed, so the close's pane-close operation has something to close (its read-back sees it gone after). */
-const livePane = () => { world.panes = [{ pane_id: "w:p1", workspace_id: "w" }]; };
+/** The lane's pane is listed with its agent, so the close's pane-close operation has something to close (its read-back sees it gone after). */
+const livePane = () => { world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }]; };
 const closedVia = () => world.calls.filter((c) => c[0] === "herdr" && (c[1] === "pane" || c[1] === "tab") && c[2] === "close");
 
 beforeEach(async () => {
@@ -26,14 +27,54 @@ beforeEach(async () => {
 });
 afterEach(() => state.done());
 
-test("an objection inside the window keeps the lane open and the lane hears why", async () => {
+test("an objection inside the window keeps the lane open; the lane hears a fixed sentence and reads the reasons from its status", async () => {
+  livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
-  await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, ["changelog entry missing"]);
+  await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, ["changelog entry missing; touch /tmp/x"]);
   await watchTick(at(T0 + 6 * MIN));
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("not-done");
+  expect(after?.objection?.reasons).toEqual(["changelog entry missing; touch /tmp/x"]);
   expect(closedVia()).toHaveLength(0);
-  expect(sent(world).some((t) => t.startsWith("[LEAD] not done: changelog entry missing"))).toBe(true);
+  expect(sent(world).at(-1)).toBe("[LEAD] not done: the Done check of demo-lane did not pass. Read the reasons with dori lane status demo-lane, keep working, and claim again when fixed");
+  expect(sent(world).some((t) => t.includes("touch"))).toBe(false);
+});
+
+for (const [name, panes] of [
+  ["a bare shell", [{ pane_id: "w:p1", workspace_id: "w" }]],
+  ["a shell pane that still reports a status", [{ pane_id: "w:p1", workspace_id: "w", agent_status: "idle" }]],
+  ["a pane whose agent is gone", [{ pane_id: "w:p1", workspace_id: "w", agent: "pi" }]],
+  ["a missing pane", []],
+] as const) {
+  test(`nothing is typed into ${name}: no claim notice, no objection`, async () => {
+    world.panes = panes.map((p) => ({ ...p }));
+    await claimDone(at(T0), lane, "merged acme/app#1");
+    await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, [";printf PANE_INJECTION;#"]);
+    expect(world.calls.filter((c) => c[0] === "herdr" && (c[2] === "send-text" || c[2] === "send-keys"))).toEqual([]);
+    expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("not-done");
+  });
+}
+
+test("a done claim records the lane's open same-repo PRs at their live head SHA, never a fork PR, and nothing for a failed read", async () => {
+  const HEAD = "a".repeat(40);
+  const bound: Lane = { ...lane, done: 'merged acme/app#1; merged acme/app#5; command ["gh","pr","list","-R","acme/app","--head","feat","--json","number"]' };
+  await at(T0).registry.write(bound);
+  const base = at(T0);
+  const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
+    if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "1") return { code: 0, out: JSON.stringify({ number: 1, state: "OPEN", headRefOid: HEAD, isCrossRepository: false }), err: "" };
+    if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "5") return { code: 1, out: "", err: "HTTP 502" };
+    if (argv[0] === "gh" && argv[2] === "list") return { code: 0, out: JSON.stringify([{ number: 9, state: "OPEN", headRefOid: "b".repeat(40), isCrossRepository: true }, { number: 3, state: "OPEN", headRefOid: "c".repeat(40), isCrossRepository: false }]), err: "" };
+    return base.run(argv, opts);
+  };
+  await claimDone({ ...base, run }, bound, "merged acme/app#1");
+  expect((await base.registry.read("demo-lane"))?.claim?.pulls).toEqual([{ repo: "acme/app", number: 1, sha: HEAD }, { repo: "acme/app", number: 3, sha: "c".repeat(40) }]);
+});
+
+test("sendVerified types nothing when the pane list cannot be read", async () => {
+  const deps = at(T0);
+  const run = async (argv: readonly string[]) => (argv[2] === "list" ? { code: 1, out: "", err: "server down" } : deps.run(argv));
+  expect(await sendVerified(run, deps.clock, "w:p1", "[LEAD] hello")).toBe("failed");
+  expect(world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
 });
 
 test("five quiet minutes after a claim is handed over the lane is closed, its thread marked done and its worktree removed", async () => {
@@ -43,13 +84,64 @@ test("five quiet minutes after a claim is handed over the lane is closed, its th
   expect(await watchTick(at(T0 + 4 * MIN))).toEqual([]);
   expect(closedVia()).toHaveLength(0);
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
-  expect(lines[0]).toStartWith("LANE_CLOSED demo-lane");
+  expect(lines[0]).toBe("LANE_CLOSED demo-lane closed");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
   expect(world.calls).toContainEqual(["notify", "chat:team/123", "Done: merged acme/app#1 abc123"]);
   expect(world.calls).toContainEqual(["git", "-C", "/repo", "worktree", "remove", WT]);
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("closed");
   expect(await watchTick(at(T0 + 9 * MIN))).toEqual([]);
+});
+
+test("claim evidence and objection reasons are capped at 300 chars in event lines, and kept whole in the registry", async () => {
+  const evidence = "e".repeat(400);
+  expect(await claimDone(at(T0), { ...lane, pane: undefined }, evidence)).toBe(`LANE_DONE_CLAIMED demo-lane - ${"e".repeat(299)}…`);
+  expect((await at(T0).registry.read("demo-lane"))?.claim?.evidence).toBe(evidence);
+  const reasons = ["r".repeat(400)];
+  expect(await objectDone(at(T0), { ...lane, pane: undefined }, reasons)).toBe(`LANE_NOT_DONE demo-lane ${"r".repeat(299)}…`);
+  expect((await at(T0).registry.read("demo-lane"))?.objection?.reasons).toEqual(reasons);
+  expect(await objectDone(at(T0), { ...lane, pane: undefined }, ["x".repeat(300)])).toBe(`LANE_NOT_DONE demo-lane ${"x".repeat(300)}`);
+});
+
+test("the watcher's claim announcement is capped too", async () => {
+  await claimDone(at(T0), lane, "w".repeat(400));
+  expect(await watchTick(at(T0))).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 ${"w".repeat(299)}…`]);
+});
+
+test("CLOSED and LANE_CLOSED carry no receipt JSON while the registry keeps the receipt", async () => {
+  livePane();
+  const r = await closeLane(at(T0), lane, "manual");
+  expect(r.closed).toBe(true);
+  expect(r.lines.at(-1)).toBe("CLOSED demo-lane");
+  expect(r.lines.some((l) => l.includes("{"))).toBe(false);
+  expect((await at(T0).registry.read("demo-lane"))?.receipt).toMatchObject({ note: "manual", cleanup: expect.arrayContaining(["pane w:p1 closed"]) });
+});
+
+test("LANE_CLOSED keeps the PR URL the claim names, so the lane-finish line still links it", async () => {
+  livePane();
+  const url = "https://github.com/acme/app/pull/1";
+  await claimDone(at(T0), lane, `merged ${url} abc123`);
+  await watchTick(at(T0));
+  const lines = await watchTick(at(T0 + 5 * MIN + 1));
+  expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed ${url}`);
+  expect(laneFinish(lines[0] ?? "")).toEqual({ lane: "demo-lane", closed: "closed", pr: url });
+});
+
+test("settling a claim reads each Done signal and lists worktrees once, reusing them in the close", async () => {
+  livePane();
+  await claimDone(at(T0), lane, "merged acme/app#1");
+  await watchTick(at(T0));
+  const listings = (from: number) => world.calls.slice(from).filter((c) => c[0] === "git" && c.includes("worktree") && c.includes("list")).length;
+  // The Done signal reads (signals.ts), not branch cleanup's own PR read (other --json fields).
+  const reads = (from: number) => world.calls.slice(from).filter((c) => c[0] === "gh" && c[2] === "view" && (c.at(-1) === "state,mergeCommit" || c.at(-1) === "state")).map((c) => c.slice(1, 4).join(" "));
+  const before = world.calls.length;
+  await discoverWorktrees(lane, at(T0).run, [at(T0).config.defaultCwd]);
+  const onePass = listings(before);
+  expect(onePass).toBeGreaterThan(0);
+  const start = world.calls.length;
+  expect((await watchTick(at(T0 + 5 * MIN + 1)))[0]).toBe("LANE_CLOSED demo-lane closed");
+  expect(listings(start)).toBe(onePass);
+  expect(reads(start).sort()).toEqual(["issue view 2", "pr view 1"]);
 });
 
 test("commits that reached no remote block the close and name the worktree", async () => {
@@ -267,4 +359,11 @@ test("removeLegacyLaneMcp deletes the old figma-off lane file, keeps a user's ow
     expect(await removeLegacyLaneMcp(own)).toBe(false);
     expect(await Bun.file(`${own}/.omo/mcp.json`).text()).toBe(text);
   }
+});
+
+test("events about a lane carry its meta: the claim announcement gets lane, thread and cwd", async () => {
+  await claimDone(at(T0), lane, "merged acme/app#1 abc123");
+  const got: [string, unknown][] = [];
+  await watchTick(at(T0 + MIN), async (line, _id, meta) => { got.push([line, meta]); });
+  expect(got).toEqual([["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123", { lane: "demo-lane", thread: "chat:team/123", cwd: "/repo" }]]);
 });

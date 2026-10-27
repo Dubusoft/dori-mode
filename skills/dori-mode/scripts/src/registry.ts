@@ -15,7 +15,13 @@ export type Claim = {
   readonly event?: string;
   /** When the watcher first read that event delivered to the lead; the objection window starts here. */
   readonly deliveredAt?: string;
+  /**
+   * The lane's open same-repo PRs and their head SHA when it claimed (done-flow.ts claimBindings). The supervisor merges
+   * a PR only at exactly this head; a claim without it (an older dori, GitHub unreadable) never auto-merges.
+   */
+  readonly pulls?: readonly ClaimedPull[];
 };
+export type ClaimedPull = { readonly repo: string; readonly number: number; readonly sha: string };
 export type Objection = { readonly at: string; readonly reasons: readonly string[] };
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
 
@@ -78,8 +84,6 @@ export type Lane = {
   readonly lastSeenReport?: string;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
   readonly lastFreshnessNote?: string;
-  /** The quota stall the lead was last told about (LANE_QUOTA_STALL); cleared once the lane is no longer stalled. */
-  readonly lastQuotaStall?: string;
   readonly recoveryAttempts?: number;
   readonly lastRecoveryAt?: number;
   /** A paused lane whose pane read working on the previous freshness tick (two in a row is reported, never a resume). */
@@ -248,7 +252,9 @@ export class Registry {
     const stored = await this.update(key, (current) => {
       if (!current) { missing = true; return undefined; }
       const p = typeof fields === "function" ? fields(current as T) : fields;
-      return p === undefined ? undefined : { ...current, ...p, key };
+      if (p === undefined) return undefined;
+      const next = { ...current, ...p, key };
+      return JSON.stringify(next) === JSON.stringify(current) ? undefined : next;
     });
     return missing ? null : (stored as T | null);
   }

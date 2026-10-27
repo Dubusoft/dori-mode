@@ -2,13 +2,11 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Database, SQLiteError } from "bun:sqlite";
 
-import { cachedMode, usesClaudeSubscription } from "./claude-quota.ts";
-import { type ArgvTemplate, fill } from "./config.ts";
+import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, launchLane } from "./launch.ts";
 import { laneRunner, listPanes } from "./panes.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
-import { modelProvider, providerQuota } from "./quota-stall.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 
 export const RECOVERY_LIMIT = 3;
@@ -23,8 +21,6 @@ export type RecoveryEnqueue = (line: string, id: string) => Promise<void>;
 export type RecoveryLane = Lane & {
   /** Every recovery attempt failed; LANE_RECOVERY_EXHAUSTED was sent once. Cleared when the lane is confirmed again. */
   readonly recoveryExhausted?: boolean;
-  /** Why the last recovery was not launched (its provider is out of quota); LANE_RECOVERY_BLOCKED once per reason. */
-  readonly recoveryBlocked?: string;
   /** A session a recovery tried to resume and could not; the next attempt starts from the brief. */
   readonly recoveryResumeFailed?: string;
 };
@@ -41,22 +37,6 @@ export const resumeCommand = (template: ArgvTemplate, session: string | undefine
   if (template.some((part) => /^--(?:session|session-id|resume|continue|fork)(?:=|$)|^-[rc]$/.test(part))) return undefined;
   const at = template.findIndex((part) => part.includes("{prompt}"));
   return at < 1 ? undefined : [...template.slice(0, at), RESUME_FLAG, session, ...template.slice(at)];
-};
-
-/**
- * Why a lane must not be relaunched now, or undefined: its Claude subscription is blocked (the supervisor's cached
- * read) or every account of its provider is. An unreadable check is logged and does not hold recovery. Remote lanes
- * are not checked: the accounts read are this host's.
- */
-export const recoveryQuotaBlock = async (deps: FlowDeps, lane: Lane): Promise<string | undefined> => {
-  if (lane.machine) return undefined;
-  const model = lane.model ?? deps.config.defaultModel;
-  if (usesClaudeSubscription(model) && cachedMode(deps.config, deps.clock.now())?.mode === "blocked") return "claude subscription blocked";
-  const provider = modelProvider(model);
-  if (!provider) return undefined;
-  const quota = await providerQuota(deps.run, deps.config.quotaCheck, provider);
-  if (quota.unknown) console.error(`LANE_RECOVERY_QUOTA_UNKNOWN ${lane.key} ${quota.detail}; relaunching anyway`);
-  return quota.blocked ? `quota ${quota.detail}${quota.resetAt !== undefined ? `, resets ${new Date(quota.resetAt).toISOString()}` : ""}` : undefined;
 };
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -131,11 +111,11 @@ const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promi
     const closed = await run(["herdr", "pane", "close", previous]);
     if (closed.code !== 0) throw new LaunchError(`cannot retire recovered pane ${previous}: ${closed.err || closed.out}`);
   }
-  await deps.registry.patch<RecoveryLane>(lane.key, { recoveryPending: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined, recoveryBlocked: undefined });
+  await deps.registry.patch<RecoveryLane>(lane.key, { recoveryPending: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined });
   const event = `LANE_RECOVERED ${lane.key} ${lane.pane} ${reason}`;
   const hook = deps.config.hooks.threadReply;
   if (hook && lane.thread !== "none") {
-    const notice = await deps.run(fill(hook, { thread: lane.thread, key: lane.key, title: lane.title, text: event }));
+    const notice = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, title: lane.title, text: event }));
     if (notice.code !== 0) return [event, `LANE_RECOVERY_NOTICE_ERROR ${lane.key}`];
   }
   return [event];
@@ -184,20 +164,11 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     await deps.registry.patch<RecoveryLane>(lane.key, { recoveryPending: true, recoveryExhausted: true });
     return enqueue ? [] : [event];
   }
-  const blocked = await recoveryQuotaBlock(deps, current);
-  if (blocked) {
-    // Not an attempt: relaunching on a provider out of quota only burns the budget. Checked again on the next sweep.
-    if (current.recoveryBlocked === blocked && current.recoveryPending) return [];
-    const event = `LANE_RECOVERY_BLOCKED ${lane.key} ${lane.pane ?? "-"} ${reason}: ${blocked}; not relaunched`;
-    if (enqueue) await enqueue(event, noticeId("blocked", blocked));
-    await deps.registry.patch<RecoveryLane>(lane.key, { recoveryPending: true, recoveryBlocked: blocked });
-    return enqueue ? [] : [event];
-  }
   const now = deps.clock.now();
   // Resume the lane's own session when the registry has one, so it continues its work instead of restarting from the brief.
   const resumeArgv = current.recoveryResumeFailed === current.session ? undefined : resumeCommand(deps.config.agentCommand, current.session);
   const pending = (fresh: RecoveryLane): Partial<RecoveryLane> => ({
-    ...(resumeArgv ? {} : { session: undefined, sessionVia: undefined }), recoveryBlocked: undefined,
+    ...(resumeArgv ? {} : { session: undefined, sessionVia: undefined }),
     recoveryAttempts: (fresh.recoveryAttempts ?? 0) + 1, lastRecoveryAt: now, recoveryPending: true,
     ...(old ? { recoveryPreviousPane: old.pane_id } : {}),
   });

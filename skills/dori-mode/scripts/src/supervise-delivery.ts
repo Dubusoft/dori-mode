@@ -19,9 +19,6 @@ import { PushDelivery } from "./supervise-push.ts";
  * ending the supervisor.
  */
 
-/** Events also posted to the owner's main channel when enqueued (fail-open warnings nobody else would see). */
-export const OWNER_WARN_EVENTS = ["QUOTA_GATE_UNKNOWN"] as const;
-
 /** Only `lead-urgent` events wake the lead; `lead-digest` waits for the next urgent one, or digestMaxDelayMin (event-policy.ts). */
 export const eventPriority = (line: string, policy: EventPolicy = DEFAULT_EVENT_POLICY): "urgent" | "digest" =>
   eventClass(line, policy) === "lead-urgent" ? "urgent" : "digest";
@@ -63,7 +60,7 @@ export class Delivery {
         if ((!pane.agent || pane.agent_status === "idle" || pane.agent_status === "done") &&
             !(pane.agent && await this.lead.deferForChildren(cwd, "request", `${request.id} ${models}`))) {
           await this.lead.noteRestart("request", `dori lead-restart ${request.id} ${models}`);
-          this.lead.setRestart({ session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size, phase: "stopping", request, modelIndex: 0 });
+          this.lead.setRestart({ session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size, phase: "stopping", request });
           continue;
         }
       }
@@ -74,8 +71,6 @@ export class Delivery {
       const overdue = (event: Event) => event.at !== undefined && now - event.at >= this.deps.config.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line);
       const urgent = pending.filter((event) => eventPriority(event.line, policy) === "urgent");
       const due = urgent.length > 0 || pending.some(overdue);
-      // Before anything reaches a lead stalled on quota, it moves to a model that can answer.
-      if (await this.lead.quotaSwitch(pending, due)) continue;
       await this.lead.resumePaused();
       if (await this.lead.stuckRestart(pending)) continue;
       if (!due) {

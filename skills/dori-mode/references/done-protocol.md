@@ -1,6 +1,6 @@
 # Lane done protocol
 
-Give this file to every lane you launch.
+The `dori launch` footer already carries these rules to every lane, so the Dori does not paste them. This file is the full version.
 
 When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
 
@@ -33,7 +33,7 @@ A lane on another machine (`dori launch --machine`) has no `dori` there: it prin
 
 ## If the Dori objects, or a check fails
 
-You get `[LEAD] not done: <reasons>; keep working, claim again when fixed` in your pane, and the lane goes back to not-done. This happens when:
+You get `[LEAD] not done: the Done check of <key> did not pass. Read the reasons with dori lane status <key>, ...` in your pane, and the lane goes back to not-done. Run `dori lane status <key>`: its `objection.reasons` lists what failed. This happens when:
 
 - the Dori objects;
 - a `Done =` signal does not read back live;
@@ -43,7 +43,7 @@ Fix every reason, then claim again. A new claim starts a fresh 5-minute window.
 
 ## Messages from the supervisor
 
-A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait; the message does not replace it. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor may merge it for you; a conflict with `dev` may get its own merge lane.
+A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait; the message does not replace it. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor may merge it for you, but only at the head SHA your done claim recorded: push everything before you claim, and claim again after any later push; a conflict with `dev` may get its own merge lane.
 
 ## When the window starts
 
@@ -51,4 +51,4 @@ The window starts when the Dori actually receives your claim, not when you make 
 
 ## What you may touch
 
-`dori launch` sets `DORI_LANE_KEY` in your lane. From inside it, `claim-done`, `object-done`, `close`, `pause` and `resume` work only on your own key, and `dori send` only to your own thread. You may not run `ack`, `handled`, `launch`, `adopt`, `hold`, `lead-restart` or `lead-emergency` at all. Anything else exits 1 with `LANE_PERMISSION_DENIED`. Ask the Dori instead. A manual `dori close` runs the same worktree checks as the watcher and refuses with `REFUSED <key>: ...`; only the Dori uses `--force`.
+`dori launch` sets `DORI_LANE_KEY` in your lane. From inside it, `claim-done`, `object-done`, `close`, `pause` and `resume` work only on your own key, and `dori send` only to your own thread. You may not run `ack`, `handled`, `launch`, `adopt`, `hold` or `lead-restart` at all. Anything else exits 1 with `LANE_PERMISSION_DENIED`. Ask the Dori instead. A manual `dori close` runs the same worktree checks as the watcher and refuses with `REFUSED <key>: ...`; only the Dori uses `--force`.

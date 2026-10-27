@@ -8,7 +8,6 @@ export const guildCommands = [
     name: "status", description: "Show Dori services, lead, lanes and waits", type: 1,
     options: [{ type: 4, name: "page", description: "Page 2 and on list the lanes page 1 has no room for", required: false, min_value: 1 }],
   },
-  { name: "emergency", description: "Approve the lead's paid emergency models until its first model has quota again", type: 1 },
 ] as const;
 export type QuotaLookup = (signal: AbortSignal) => Promise<string>;
 /** The /status text source: `page` is the command's page option, 1 without it. */
@@ -20,7 +19,7 @@ type Interaction = {
   readonly application_id: string;
   readonly guild_id: string;
   readonly userId: string;
-  readonly command: "quota" | "status" | "emergency";
+  readonly command: "quota" | "status";
   readonly channelIds: readonly string[];
   /** /status page:N; 1 when absent or not a positive integer. */
   readonly page: number;
@@ -31,7 +30,7 @@ const record = (value: unknown): value is Record<string, unknown> => typeof valu
 const commandInteraction = (value: unknown): Interaction | undefined => {
   if (!record(value) || value.type !== 2 || !record(value.data) || value.data.type !== 1) return;
   const command = value.data.name;
-  if (command !== "quota" && command !== "status" && command !== "emergency") return;
+  if (command !== "quota" && command !== "status") return;
   if (typeof value.id !== "string" || typeof value.token !== "string" || typeof value.application_id !== "string" || typeof value.guild_id !== "string") return;
   if (!record(value.member) || !record(value.member.user) || typeof value.member.user.id !== "string") return;
   const channelIds = [value.channel_id, record(value.channel) ? value.channel.parent_id : undefined].filter((id): id is string => typeof id === "string");
@@ -60,8 +59,6 @@ export class DiscordCommands {
     private readonly channels: readonly string[] = [],
     /** The /status text source; without it /status is ignored. */
     private readonly statusLookup?: StatusLookup,
-    /** Records the owner's /emergency approval and returns the reply; without it /emergency is ignored. */
-    private readonly emergencyLookup?: QuotaLookup,
   ) {}
 
   private async request(method: "PUT" | "POST" | "PATCH", path: string, body: unknown, authenticated = false): Promise<void> {
@@ -85,8 +82,7 @@ export class DiscordCommands {
     const interaction = commandInteraction(value);
     if (!interaction || interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId) return;
     if (interaction.command === "status" && !this.statusLookup) return;
-    if (interaction.command === "emergency" && !this.emergencyLookup) return;
-    const label = interaction.command === "status" ? "Status" : interaction.command === "emergency" ? "Emergency approval" : "Quota";
+    const label = interaction.command === "status" ? "Status" : "Quota";
     const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
     try {
       if (this.channels.length > 0 && !interaction.channelIds.some((id) => this.channels.includes(id))) {
@@ -111,9 +107,9 @@ export class DiscordCommands {
         abort = () => reject(signal.reason);
         signal.addEventListener("abort", abort, { once: true });
       });
-      const lookup = interaction.command === "status" ? this.statusLookup : interaction.command === "emergency" ? this.emergencyLookup : this.lookup;
+      const lookup = interaction.command === "status" ? this.statusLookup : this.lookup;
       const text = await Promise.race([lookup?.(signal, interaction.page) ?? Promise.reject(new Error("no lookup")), cancelled]);
-      content = interaction.command === "status" ? quotaMessage(text, "No status available.") : interaction.command === "emergency" ? text : quotaMessage(text);
+      content = interaction.command === "status" ? quotaMessage(text, "No status available.") : quotaMessage(text);
     } catch {
       content = signal.aborted ? `${label} lookup timed out. Try again.` : `${label} lookup failed. Try again.`;
     } finally {

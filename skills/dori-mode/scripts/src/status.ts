@@ -1,7 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { gateVerdict, headroomNote, type QuotaState, readQuotaState, stateHoldsLanes } from "./claude-quota.ts";
 import type { DoriConfig } from "./config.ts";
 import { eventClass, eventKind, type EventClass } from "./event-policy.ts";
 import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./event-sources.ts";
@@ -68,10 +67,6 @@ export type Status = {
   readonly unacked: number;
   /** Finished lanes (LANE_CLOSED, CI_MERGED) the lead has not reported to the owner with dori reported, oldest first. */
   readonly unreported?: readonly { readonly lane: string; readonly since: string }[];
-  /** The supervisor's last Claude usage read (dori quota and launches refresh it too). */
-  readonly claude?: QuotaState;
-  /** That read's headroom summed over every Claude account, e.g. "headroom 315% (hold-lanes < 50%, brief < 25%)". */
-  readonly claudeHeadroom?: string;
   readonly events: EventStats;
   /** Every event source with its last event and error, and a sources.json that does not read. */
   readonly sources?: { readonly sources: readonly SourceView[]; readonly error?: string };
@@ -237,7 +232,6 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   ]);
   const gh = githubSummary(d.config.stateDir);
   const pendingRestart = pendingLeadRestart(d.config.stateDir);
-  const claude = readQuotaState(d.config.stateDir);
   let repos: string[] = [];
   try { repos = new Repos(d.config.stateDir).list(); } catch { /* unreadable list: show none */ }
   const reports = latestLaneReports(d.config);
@@ -264,7 +258,6 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     ...(d.config.toodo ? { toodo: { ...toodoView(readToodoStatus(d.config.stateDir), now), url: d.config.toodo.url } } : {}),
     unacked: readUnacked(d.config.stateDir),
     unreported: readUnreported(d.config.stateDir),
-    ...(claude ? { claude, claudeHeadroom: headroomNote(gateVerdict(claude.usage, d.config.quotaGate)) } : {}),
     events: eventStats(d.config, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
@@ -334,21 +327,12 @@ const problems = (s: Status, now: number): Problem[] => {
   const pending = recovering("pending");
   if (exhausted.length) out.push({ label: `recovery exhausted ${exhausted.length}`, line: `lanes: recovery exhausted (not relaunched or nudged): ${exhausted.join(", ")}` });
   if (pending.length) out.push({ label: `recovery pending ${pending.length}`, line: `lanes: recovery pending (not nudged): ${pending.join(", ")}` });
-  if (s.claude && s.claude.mode !== "ok") {
-    out.push({ label: `claude ${s.claude.mode}`, line: `claude: ${claudeText(s.claude, s.claudeHeadroom, now)}, lanes ${stateHoldsLanes(s.claude) ? "held" : "allowed"}` });
-  }
   if (s.sources?.error) out.push({ label: "sources.json invalid", line: `sources: ${clip(s.sources.error, 160)}` });
   for (const src of s.sources?.sources.filter((source) => source.failing) ?? []) {
     out.push({ label: `source ${src.name} failing`, line: `source ${src.name} failing since ${ago(iso(src.lastErrorAt), now)}: ${clip(src.lastError ?? "?", 160)}` });
   }
   return out;
 };
-
-const claudeWindow = (name: string, w: { readonly usedPct: number; readonly resetAt?: number } | undefined): string =>
-  w ? ` ${name} ${w.usedPct}%${w.resetAt !== undefined ? ` (resets ${kst(w.resetAt)})` : ""}` : "";
-/** "brief headroom 20% (...), default 5h 93% (resets ...) 7d 40%, read 3m ago". */
-const claudeText = (c: QuotaState, headroom: string | undefined, now: number): string =>
-  `${c.mode}${headroom ? ` ${headroom}` : ""}, ${c.usage.accounts.map((a) => `${a.name}${claudeWindow("5h", a.fiveHour)}${claudeWindow("7d", a.weekly)}`).join(", ")}, read ${ago(new Date(c.usage.at).toISOString(), now)}`;
 
 type Limits = { readonly lanes: number; readonly waits: number; readonly progress: number; readonly kinds: number };
 const LIMITS: readonly Limits[] = [
@@ -418,7 +402,6 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
     ...(s.toodo?.state === "live" ? ["toodo chat"] : []),
     ...(g.failures.length ? [] : [`github ${g.repos.length} repos, poll ${ago(g.lastPollAt, now)}`]),
     ...(g.issueAuthors.length ? [`issues ${g.issueRepos.length} repos`] : []),
-    ...(s.claude?.mode === "ok" ? [`claude ${s.claudeHeadroom ?? "ok"}`] : []),
   ];
   if (healthy.length) lines.push(`ok: ${healthy.join(", ")}`);
   lines.push(...eventLines(s.events, lim.kinds));

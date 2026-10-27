@@ -1,24 +1,26 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 
+import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
-import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, OUTBOX_ATTEMPTS, OUTBOX_RETRY_MS, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
+import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork } from "../src/supervise-lead-lifecycle.ts";
+import { childWork, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
-import { approveEmergency, clearEmergencyApproval, emergencyApproved } from "../src/emergency.ts";
-import { clearLaunchHold, enqueueLaunch } from "../src/routing.ts";
+import { clearLaunchHold, dequeueLaunch, enqueueLaunch } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, writeJournal } from "./fakes.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
-import { take, takeOutput } from "../src/inbox.ts";
+import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
+import { TransientSuperviseError } from "../src/supervise-journal.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -27,7 +29,18 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const state = withState();
   cleanups.push(state.done);
   // The evidence deadline is measured on this clock, so a sleep must move it forward.
-  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; } };
+  // A /new session's model entry is written once this clock reaches its start time (Infinity: it never starts).
+  let startDelay = 0;
+  let startedAt: number | undefined;
+  let pendingStart: { readonly at: number; readonly file: string } | undefined;
+  const startPending = () => {
+    if (!pendingStart || clock.at < pendingStart.at) return;
+    appendFileSync(pendingStart.file, `${JSON.stringify({ type: "model_change", provider: "test", modelId: "soft" })}\n`);
+    utimesSync(pendingStart.file, clock.at / 1000, clock.at / 1000);
+    startedAt = clock.at;
+    pendingStart = undefined;
+  };
+  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); } };
   const world = newWorld();
   const session = "11111111-1111-4111-8111-111111111111";
   const config = { sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo", ...extra };
@@ -36,25 +49,28 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const file = join(dir, `2027-01-15T08-00-00-000Z_${session}.jsonl`);
   writeFileSync(file, "{}\n");
   utimesSync(file, clock.now() / 1000, clock.now() / 1000);
-  const pane = { pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle" };
+  const pane = { pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle", revision: 0 };
   world.panes.push(pane);
   let active = session;
+  let launchedId = session;
   let pid = 101;
   let confirm = true;
   let admitted: string | undefined;
   let prompt: string | undefined;
   let onWait: (() => Promise<void>) | undefined;
   let hangs = 0;
+  let softEvidence = true;
+  let typed = "";
   const auth: Record<string, string> = {};
   const calls: string[][] = [];
   const run: Runner = async (argv) => {
     calls.push([...argv]);
     const ok = (out = "") => ({ code: 0, out, err: "" });
     if (argv[0] === "omo" && argv[1] === "auth") return { code: 1, out: auth[argv[argv.indexOf("--provider") + 1] ?? ""] ?? "", err: "" };
-    if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${active}\n102 ${pid} tail -F events\n103 1 tail -F orphan\n104 1 other-agent` : "");
+    if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${launchedId}\n102 ${pid} tail -F events\n103 1 tail -F orphan\n104 1 other-agent\n10 1 /bin/bash` : "");
     if (argv[0] === "ps" && argv[1] === "eww") return ok(argv.at(-1) === "103" ? `tail -F orphan PI_SESSION_ID=${session}` : "PI_SESSION_ID=other");
     if (argv[0] === "herdr" && argv[2] === "list") return ok(JSON.stringify({ result: { panes: world.panes } }));
-    if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", active] }] : [] } } }));
+    if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", launchedId] }] : [] } } }));
     if (argv[0] === "kill") {
       if (argv[2] === String(pid)) { pid = 0; pane.agent = ""; pane.agent_status = ""; }
       return ok();
@@ -64,6 +80,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
       const path = /@([^'\s]+)/.exec(admitted)?.[1];
       prompt = path ? readFileSync(path, "utf8") : undefined;
       active = /--session-id ([\w-]+)/.exec(admitted)?.[1] ?? "";
+      launchedId = active;
       pid = 201;
       // A healthy omo writes its holder pid file at once; a hung cold start only creates the empty directory.
       mkdirSync(join(dir, "session-holders", active), { recursive: true });
@@ -78,7 +95,29 @@ const fixture = (extra: Record<string, unknown> = {}) => {
       return confirm ? ok() : { code: 1, out: "", err: "not ready" };
     }
     if (argv[0] === "herdr" && argv[2] === "read") return ok(world.screen);
-    if (argv[0] === "herdr" && (argv[2] === "send-text" || argv[2] === "send-keys")) return ok();
+    if (argv[0] === "herdr" && argv[2] === "send-text") { typed = argv[4] ?? ""; return ok(); }
+    if (argv[0] === "herdr" && argv[2] === "send-keys") {
+      pane.revision++;
+      if (typed === "/new") {
+        active = randomUUID();
+        startedAt = undefined;
+        writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "session", id: active })}\n`);
+        pendingStart = { at: clock.now() + startDelay, file: join(dir, `${active}.jsonl`) };
+        startPending();
+      }
+      const path = /^Read (.+) in full/.exec(typed)?.[1];
+      if (path) {
+        prompt = readFileSync(path, "utf8");
+        if (softEvidence) {
+          mkdirSync(join(dir, "session-holders", active), { recursive: true });
+          writeFileSync(join(dir, "session-holders", active, `${pid}.json`), "{}");
+          appendFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: typed } })}\n`);
+          utimesSync(join(dir, `${active}.jsonl`), clock.now() / 1000, clock.now() / 1000);
+        }
+        await onWait?.();
+      }
+      return ok();
+    }
     throw new Error(`unexpected ${argv.join(" ")}`);
   };
   const deps = { ...depsFor(world, clock, state.dir, config), run };
@@ -87,6 +126,10 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     state, deps, pane, clock, calls, log, file, world, auth,
     cold: () => { clock.at += 300_000; },
     command: () => admitted,
+    session: () => active,
+    softEvidence: (value: boolean) => { softEvidence = value; },
+    startDelay: (ms: number) => { startDelay = ms; },
+    startedAt: () => startedAt,
     prompt: () => prompt,
     setConfirm: (value: boolean) => { confirm = value; },
     hang: (launches: number) => { hangs = launches; },
@@ -95,10 +138,21 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   };
 };
 
+const restartStarts = (f: ReturnType<typeof fixture>): string[][] =>
+  f.calls.filter((call) => call[2] === "run" || (call[2] === "send-text" && call[4] === "/new"));
+
 /** The startup prompt's first instruction: every event past the take cursor is read with `dori inbox take`. */
 const TAKE_FIRST = "Run dori inbox take now";
 /** What `dori inbox take` prints the lead now, as `id\tline`. */
 const taken = (f: ReturnType<typeof fixture>): string[] => takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }));
+/**
+ * What a new lead is handed, as `dori inbox take` prints it: the events past the cursor, then the cold start's carried
+ * reminders. The startup prompt itself carries no event line (asserted here too). Takes, so call it once per handoff.
+ */
+const handed = (f: ReturnType<typeof fixture>): string => {
+  expect(f.prompt()?.split("\n").filter((line) => line.startsWith("{") || /^(UNRESOLVED|UNREPORTED|LAUNCH_QUEUE) /.test(line))).toEqual([]);
+  return [...taken(f), ...takeCarriedReminders(f.state.dir)].join("\n");
+};
 
 test("spinner frames of any common style do not count as screen progress; text does", () => {
   const frames = ["⠙ Thinking 12s", "✻ Thinking 13s", "◐ Thinking 14s", "| Thinking 15s", "/ Thinking 16s", "- Thinking 17s", "\\ Thinking 18s", "· Thinking 19s"];
@@ -165,12 +219,13 @@ test("a forced restart takes a warm idle lead without traffic and applies model 
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced", "high");
   const supervisor = new Supervisor(f.deps);
   await supervisor.flush();
-  expect(f.command()).toContain("--model test/forced --thinking high");
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/model test/forced");
+  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/thinking high");
+  expect(restartStarts(f)).toHaveLength(1);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(readJournal(f.state.dir).models).toEqual([{ model: "test/forced", thinking: "high" }]);
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s lead while events still deliver warm", async (status) => {
@@ -185,7 +240,7 @@ test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s le
   expect(pendingLeadRestart(f.state.dir)?.id).toBe(request.id);
   f.pane.agent_status = "idle";
   await new Supervisor(f.deps).flush();
-  expect(f.command()).toContain("--model test/forced");
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
 });
 
@@ -199,7 +254,8 @@ test("a forced restart captures edited config and preserves a newer request arri
     f.pane.agent_status = "working";
   });
   await supervisor.flush();
-  expect(f.command()).toContain("--model edited/model --thinking medium");
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model edited/model"]);
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/thinking medium"]);
   expect(pendingLeadRestart(f.state.dir)?.models[0]?.model).toBe("newer/model");
 });
 
@@ -213,7 +269,7 @@ test.each([false, true])("a durable wait wakes a cold=%s lead through normal del
   await new Waits(f.state.dir).tick(f.clock.now, f.deps.run, (id, line) => supervisor.enqueue(id, line));
   await supervisor.flush();
   expect(f.log().map((event) => event.line)).toEqual(["WAIT_DONE release tell owner"]);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(cold ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(cold ? 1 : 0);
 });
 
 test("an unseen newly idle agent reported as done is positive startup evidence", async () => {
@@ -235,10 +291,11 @@ test("at the TTL boundary cold delivery starts a fresh session in the same pane 
   await supervisor.flush();
   expect(f.log()).toEqual([{ id: "cold", line: "INBOUND cold" }]);
   expect(f.prompt()).toContain(TAKE_FIRST);
-  const launched = f.calls.filter((call) => call[2] === "run");
+  const launched = restartStarts(f);
   expect(launched).toHaveLength(1);
   expect(launched[0]?.[3]).toBe("lead:p1");
-  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toEqual(["103", "102", "101"]);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toEqual(["103"]);
   expect(f.prompt()).toContain(`tail -c +${Buffer.byteLength(`${JSON.stringify(f.log()[0])}\n`) + 1}`);
   expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
 });
@@ -287,7 +344,7 @@ test.each([
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("cap", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
   expect(f.log().map((event) => event.id)).toEqual(["cap"]);
   expect(new Waits(f.state.dir).list()).toHaveLength(1);
 });
@@ -301,7 +358,7 @@ test("a custom context cap controls stale delivery rather than the default cap",
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("custom-cap", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test("usage above the cap does not restart a lead before its cache is stale", async () => {
@@ -329,7 +386,7 @@ test.each([
     supervisor.enqueue("hard-cap", "INBOUND owner");
     await supervisor.flush();
   } finally { console.log = original; }
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
   expect(logged.includes(`LEAD_HARD_CAP ${tokens}`)).toBe(restart);
   expect(f.log().map((event) => event.id)).toEqual(["hard-cap"]);
 });
@@ -341,7 +398,7 @@ test("a custom hard cap controls the in-TTL restart", async () => {
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("custom-hard", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 /** An omo session-lifecycle entry: the lead waits on `children` child tasks and `background` sources since `since`. */
@@ -383,7 +440,7 @@ test("a lead-restart request waits while the idle lead waits on its own child, a
   expect(lines.filter((line) => line.startsWith(`LEAD_RESTART_DEFERRED request ${request.id}`))).toHaveLength(1);
   appendFileSync(f.file, lifecycle(0, f.clock.now()));
   const after = await quiet(() => supervisor.flush());
-  expect(f.command()).toContain("--model test/forced");
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(after.filter((line) => line.startsWith(`LEAD_RESTART_TRIGGER request dori lead-restart ${request.id}`))).toHaveLength(1);
 });
@@ -393,7 +450,7 @@ test.each([[59, false], [60, true]] as const)("a child wait of %s min against le
   writeFileSync(f.file, lifecycle(1, f.clock.now() - minutes * 60_000));
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced");
   const lines = await quiet(() => new Supervisor(f.deps).flush());
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
   expect(lines.some((line) => line.startsWith("LEAD_CHILD_WAIT_EXPIRED request"))).toBe(restart);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED request"))).toBe(!restart);
 });
@@ -408,7 +465,7 @@ test.each([true, false])("a stale idle lead with a running child=%s takes the ev
     supervisor.enqueue("stale", "INBOUND stale");
     await supervisor.flush();
   });
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(child ? 0 : 1);
+  expect(restartStarts(f)).toHaveLength(child ? 0 : 1);
   expect(f.log().map((event) => event.id)).toEqual(["stale"]);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED stale idle 5 min"))).toBe(child);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER stale idle 5 min (past cacheTtlMin 5) with no pending waits or working lanes"))).toBe(!child);
@@ -430,7 +487,7 @@ test("a lead at the hard cap waiting on its own child is not restarted until the
     supervisor.enqueue("capped-2", "INBOUND capped-2");
     await supervisor.flush();
   });
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(after).toContain("LEAD_HARD_CAP 300000");
   expect(after.some((line) => line.startsWith("LEAD_RESTART_TRIGGER hard-cap context 300000 tokens"))).toBe(true);
 });
@@ -463,7 +520,7 @@ test.each(["paused", "done-claimed", "not-done", "closed"] as const)("a %s lane 
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("inactive-lane", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test("an expired but working lead receives an append and is never stopped", async () => {
@@ -492,7 +549,7 @@ test("events arriving during restart stay queued and follow the prompt handoff e
   expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.prompt()).not.toContain('"id":"first"');
   expect(f.prompt()).not.toContain('"id":"second"');
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(taken(f)).toEqual(["first\tINBOUND first", "second\tINBOUND second"]);
   expect(taken(f)).toEqual(["INBOX_EMPTY"]);
 });
@@ -500,8 +557,360 @@ test("events arriving during restart stay queued and follow the prompt handoff e
 const restartSession = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir).restart;
 const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => call[2] === "run").map((call) => /--session-id ([\w-]+)/.exec(call[4] ?? "")?.[1]);
 
+test.each(["idle", "done"])("an %s cold lead switches session, model and thinking without relaunching omo", async (status) => {
+  // Given a reusable process; even its own environment and its shell must survive cleanup.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.pane.agent_status = status;
+  const old = f.session();
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: `PI_SESSION_ID=${["101", "10"].includes(argv.at(-1) ?? "") ? old : "other"}`, err: "" };
+    return base(argv, options);
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft", "INBOUND soft");
+  // When the cold delivery restarts it.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the four submissions are ordered and all confirmation uses the actual new id.
+  const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
+  expect(texts.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(texts).toHaveLength(4);
+  expect(texts[3]).toMatch(/^Read .*\/lead-[0-9a-f-]{36}\.md in full/);
+  const path = /^Read (.+) in full/.exec(texts[3] ?? "")?.[1] ?? "";
+  expect(existsSync(path)).toBe(false);
+  expect(f.session()).not.toBe(old);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${f.session()}`);
+  expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(f.session());
+  // argv still names the old session: a later event must nevertheless reach the new, warm session.
+  supervisor.enqueue("after", "INBOUND after");
+  await supervisor.flush();
+  expect(restartStarts(f)).toHaveLength(1);
+});
+
+test("a soft restart without a new session file falls back to a process launch", async () => {
+  // Given a live idle process that accepts commands but never persists the prompt.
+  const f = fixture();
+  f.cold();
+  f.softEvidence(false);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("fallback", "INBOUND fallback");
+  const before = f.clock.now();
+  // When its evidence deadline expires.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the same batch is launched once through the hard path.
+  expect(f.clock.now() - before).toBeGreaterThanOrEqual(20_000);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("101");
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toHaveLength(1);
+  expect(lines.some((line) => line.endsWith("; falling back to a process restart"))).toBe(true);
+  expect(f.log()).toEqual([{ id: "fallback", line: "INBOUND fallback" }]);
+  expect(restartSession(f)).toBeUndefined();
+});
+
+test("a soft restart types nothing after /new until the new session has started", async () => {
+  // Given omo back at its editor right after /new while the new session is still starting for three seconds.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.startDelay(3_000);
+  const base = f.deps.run;
+  const sends: [string, number, number | undefined][] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
+    if (argv[2] === "send-text" && argv[4] !== "/new" && !argv[4]?.startsWith(POINTER_PREFIX)) sends.push([argv[4] ?? "", f.clock.now(), f.startedAt()]);
+    return base(argv, options);
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-start", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then /model, /thinking and the prompt are typed only once the new session has started and settled.
+  expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["/model", "/thinking", "Read"]);
+  for (const [, at, started] of sends) expect(at - (started ?? Number.POSITIVE_INFINITY)).toBeGreaterThanOrEqual(SOFT_SESSION_SETTLE_MS);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+});
+
+test("a /new session that never starts falls back to a process launch without typing more", async () => {
+  // Given omo that accepts /new but never starts the new session.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.startDelay(Number.POSITIVE_INFINITY);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-stall", "INBOUND stall");
+  // When its start deadline expires.
+  const lines = await quiet(() => supervisor.flush());
+  // Then no further command is typed into it and the batch is launched once through the hard path.
+  expect(f.calls.filter((call) => call[2] === "send-text" && /^\/(model|thinking) |^Read /.test(call[4] ?? ""))).toEqual([]);
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED new session did not start after /new"))).toHaveLength(1);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.log()).toEqual([{ id: "soft-stall", line: "INBOUND stall" }]);
+});
+
+test("a soft fallback preserves the journaled offset and records each batch event once", async () => {
+  // Given a soft entry whose log grows after its offset was journaled.
+  const f = fixture();
+  f.cold();
+  const base = f.deps.run;
+  let offset: number | undefined;
+  const run: Runner = async (argv, options) => {
+    if (argv[2] === "send-text" && argv[4] === "/new") {
+      offset = restartSession(f).offset;
+      appendFileSync(join(f.state.dir, "lead-events.log"), `${JSON.stringify({ id: "later", line: "INBOUND later" })}\n`);
+      return { code: 1, out: "", err: "send failed" };
+    }
+    return base(argv, options);
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("first", "INBOUND first");
+  supervisor.enqueue("second", "INBOUND second");
+  // When the first command fails and a hard launch takes over.
+  await quiet(() => supervisor.flush());
+  // Then neither batch recording nor the soft-entry tail offset is repeated.
+  expect(f.log()).toEqual([
+    { id: "first", line: "INBOUND first" }, { id: "second", line: "INBOUND second" }, { id: "later", line: "INBOUND later" },
+  ]);
+  expect(offset).toBeGreaterThan(0);
+  expect(f.prompt()).toContain(`tail -c +${(offset ?? 0) + 1} -F`);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+});
+
+test.each([false, true])("a live omo blocks hard launch after soft failure, recovery=%s", async (recovery) => {
+  // Given a soft failure before /new, or its recovered intent, and kills that have not taken effect.
+  const f = fixture();
+  f.cold();
+  const event = { id: "guarded", line: "INBOUND guarded" };
+  if (recovery) {
+    const log = `${JSON.stringify(event)}\n`;
+    writeFileSync(join(f.state.dir, "lead-events.log"), log);
+    writeJournal(f.state.dir, {
+      events: [event], restart: { session: randomUUID(), events: [event], offset: Buffer.byteLength(log), phase: "soft-failed" },
+    });
+  }
+  const old = f.session();
+  const base = f.deps.run;
+  const kills: string[][] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "kill") {
+      kills.push([...argv]);
+      return { code: 0, out: "", err: "" };
+    }
+    const result = await base(argv, options);
+    return argv[2] === "send-text" && argv[4] === "/new" ? { code: 1, out: "", err: "send failed before /new" } : result;
+  };
+  const deps = { ...f.deps, run };
+  const supervisor = new Supervisor(deps);
+  if (!recovery) supervisor.enqueue(event.id, event.line);
+  // When forced cleanup still reports omo in the foreground.
+  await expect(quiet(() => supervisor.flush())).rejects.toBeInstanceOf(TransientSuperviseError);
+  // Then launch was not typed, and the same transaction remains retryable with its events.
+  expect(kills.some((call) => call[2] === "101")).toBe(true);
+  expect(f.session()).toBe(old);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(restartSession(f)).toMatchObject({ phase: "soft-failed", events: [event] });
+  expect(f.log()).toEqual([event]);
+  // Once the shell actually returns, recovery can admit exactly one launch.
+  f.noAgent();
+  await quiet(() => new Supervisor(deps).flush());
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartSession(f)).toBeUndefined();
+  expect(f.log()).toEqual([event]);
+});
+
+test("a soft restart ignores existing quota lines during commands and quota text after the prompt", async () => {
+  // Given normal output mentioning quota before /new and after the startup prompt.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.world.screen = "Discussion of quota and rate limit handling\n❯ ";
+  f.onWait(async () => { f.world.screen = "Startup prompt read: quota and rate limit handling\n❯ "; });
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => argv[0] === "ps" && argv[1] === "eww"
+    ? { code: 0, out: "PI_SESSION_ID=other", err: "" } : base(argv, options);
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-quota-text", "INBOUND soft");
+  // When the new session persists the prompt pointer.
+  const lines = await quiet(() => supervisor.flush());
+  // Then live session evidence succeeds without killing or relaunching omo.
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
+  expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4]).slice(0, 3)).toEqual([
+    "/new", "/model test/soft", "/thinking high",
+  ]);
+});
+
+test("a soft command whose first Enter only accepts the autocomplete is entered again before the next command", async () => {
+  // Given omo's editor: typed text shows on the prompt line, and a command with an argument opens an autocomplete
+  // whose first Enter accepts the selection without submitting.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.world.screen = "❯ ";
+  const base = f.deps.run;
+  let editor = "";
+  let popup = false;
+  const submitted: string[] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
+    if (argv[0] === "herdr" && argv[2] === "send-text") {
+      editor += argv[4] ?? "";
+      popup = editor.startsWith("/") && editor.includes(" ");
+    } else if (argv[0] === "herdr" && argv[2] === "send-keys") {
+      if (popup) { popup = false; f.pane.revision++; f.world.screen = `❯ ${editor}`; return { code: 0, out: "", err: "" }; }
+      submitted.push(editor);
+      editor = "";
+    }
+    const result = await base(argv, options);
+    f.world.screen = `❯ ${editor}`;
+    return result;
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-popup", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then each command is submitted on its own line and the soft restart succeeds.
+  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(submitted[3]).toMatch(/^Read .* in full/);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+});
+
+test.each([false, true])("soft evidence only accepts prompt files modified at or after soft entry, stale=%s", async (stalePrompt) => {
+  // Given a historical jsonl that cannot be read as a regular file.
+  const f = fixture();
+  f.cold();
+  const stale = join(dirname(f.file), `${randomUUID()}.jsonl`);
+  mkdirSync(stale);
+  utimesSync(stale, (f.clock.now() - 1) / 1000, (f.clock.now() - 1) / 1000);
+  const startedAt = f.clock.now();
+  let promptWritten = false;
+  if (stalePrompt) f.onWait(async () => {
+    if (promptWritten) return;
+    promptWritten = true;
+    const file = join(dirname(f.file), `${f.session()}.jsonl`);
+    utimesSync(file, (startedAt - 1) / 1000, (startedAt - 1) / 1000);
+  });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("mtime", "INBOUND mtime");
+  // When the prompt file's mtime is either just before or exactly at soft entry.
+  const lines = await quiet(() => supervisor.flush());
+  // Then only current evidence confirms; stale evidence exhausts the bounded deadline.
+  expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTARTED "))).toBe(!stalePrompt);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(stalePrompt ? 1 : 0);
+  if (stalePrompt) expect(f.clock.now() - startedAt).toBeGreaterThanOrEqual(20_000);
+  expect(f.clock.now() - startedAt).toBeLessThan(30_000);
+});
+
+test.each([false, true])("a missing held-session jsonl is skipped during restart, force=%s", async (force) => {
+  // Given a scanned holder whose jsonl cannot be statted because its target disappeared.
+  const f = fixture();
+  f.cold();
+  const missing = randomUUID();
+  const dir = dirname(f.file);
+  mkdirSync(join(dir, "session-holders", missing), { recursive: true });
+  writeFileSync(join(dir, "session-holders", missing, "101.json"), "{}");
+  symlinkSync(join(dir, "removed-session"), join(dir, `${missing}.jsonl`));
+  writeJournal(f.state.dir, {
+    events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: "stopping", force },
+  });
+  // When sessionFile (soft) or stopLead (hard) resolves the current session.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then the absent file does not abort either restart path.
+  expect(restartSession(f)).toBeUndefined();
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(force ? 1 : 0);
+  if (!force) expect(f.calls.some((call) => call[2] === "send-text" && call[4] === "/new")).toBe(true);
+});
+
+test.each(["send", "enter", "busy", "screen"])("a soft %s failure forces a single hard fallback", async (failure) => {
+  // Given a soft step which fails, with an owner message whose restart reaction must not be duplicated.
+  const f = fixture();
+  f.cold();
+  f.onWait(async () => { f.world.screen = "❯ "; });
+  const base = f.deps.run;
+  let failed = false;
+  const run: Runner = async (argv, options) => {
+    if (!failed && argv[2] === (failure === "send" ? "send-text" : "send-keys")) {
+      failed = true;
+      const result = await base(argv, options);
+      if (failure === "busy") f.pane.agent_status = "working";
+      if (failure === "screen") f.world.screen = "Cannot find module";
+      return failure === "send" || failure === "enter" ? { code: 1, out: "", err: "send failed" } : result;
+    }
+    return base(argv, options);
+  };
+  const reactions = recordReactions();
+  const supervisor = new Supervisor({ ...f.deps, run }, reactions);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner retry");
+  // When the step fails.
+  const lines = await quiet(() => supervisor.flush());
+  await supervisor.reactionsSettled();
+  // Then a busy reused process is still stopped and the hard launch receives the batch exactly once.
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toHaveLength(1);
+  expect(reactions.ops).toEqual(["add 11/22 \u23F3"]);
+  expect(taken(f)).toEqual(["discord:11:22\tINBOUND 11 22 owner retry"]);
+});
+
+test("recovering soft intent without evidence falls back without another new command", async () => {
+  // Given intent persisted before any soft submission completed.
+  const f = fixture();
+  writeJournal(f.state.dir, { events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: `soft:${f.session()}` } });
+  // When the supervisor recovers.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then no interactive command is replayed.
+  expect(f.calls.some((call) => call[4] === "/new")).toBe(false);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
+});
+
+test("a journaled forced restart bypasses the soft path even for an idle lead", async () => {
+  // Given a forced lifecycle transaction, not an ordinary owner restart request.
+  const f = fixture();
+  writeJournal(f.state.dir, { events: [], restart: { session: randomUUID(), events: [], offset: 0, phase: "stopping", force: true } });
+  // When it is recovered.
+  await quiet(() => new Supervisor(f.deps).flush());
+  // Then only the process path is used.
+  expect(f.calls.some((call) => call[4] === "/new")).toBe(false);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
+});
+
+test.each([["json", false], ["sqlite", false], ["json", true], ["sqlite", true]] as const)("recovering a soft restart on %s, ready=%s, never resends the prompt", async (store, ready) => {
+  // Given durable intent and evidence written before the supervisor crashed.
+  const f = fixture({ store });
+  const old = f.session();
+  const planned = randomUUID();
+  const actual = randomUUID();
+  const path = join(f.state.dir, `lead-${planned}.md`);
+  writeFileSync(path, "startup");
+  writeFileSync(join(dirname(f.file), `${actual}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: path } })}\n`);
+  utimesSync(join(dirname(f.file), `${actual}.jsonl`), 0, 0);
+  const initial = { events: [], restart: { session: ready ? actual : planned, events: [], offset: 0, phase: ready ? `soft-ready:${planned}` as const : `soft:${old}` as const } };
+  if (store === "sqlite") {
+    const seeded = new SqliteStore(join(f.state.dir, SQLITE_FILE), { create: true });
+    try { seeded.save(initial, "normal"); } finally { seeded.close(); }
+  } else writeFileSync(join(f.state.dir, JOURNAL_FILE), JSON.stringify(initial));
+  // When recovery runs, only confirmation and cleanup are allowed.
+  const lines = await quiet(() => new Supervisor(f.deps).flush());
+  // Then it confirms the existing session without typing anything again.
+  expect(f.calls.some((call) => call[2] === "send-text" || call[2] === "run")).toBe(false);
+  expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${actual}`);
+  if (!ready) expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${actual}`);
+  expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(actual);
+  expect(existsSync(path)).toBe(false);
+  if (store === "sqlite") {
+    const saved = new SqliteStore(join(f.state.dir, SQLITE_FILE));
+    try { expect(saved.read(false).restart).toBeUndefined(); } finally { saved.close(); }
+  } else expect(JSON.parse(readFileSync(join(f.state.dir, JOURNAL_FILE), "utf8")).restart).toBeUndefined();
+});
+
 test("a healthy cold start with holder evidence launches once and never kills the new session", async () => {
   const f = fixture();
+  f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("healthy", "INBOUND healthy");
@@ -514,6 +923,7 @@ test("a healthy cold start with holder evidence launches once and never kills th
 test("a hung cold start is killed by exact session and relaunched once with the same events and offset", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(1);
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("hung", "INBOUND hung");
@@ -535,6 +945,7 @@ test("a hung cold start is killed by exact session and relaunched once with the 
 test("two hung launches journal LEAD_STARTUP_HUNG, retain the events, and do not relaunch in a tight loop", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(2);
   const lines: string[] = [];
   const original = console.log;
@@ -572,6 +983,7 @@ test("a supervisor restart preserves queued input and does not duplicate a prior
 test("unconfirmed startup retains the transaction and recovery confirms the same launch without resubmitting", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   const before = new Supervisor(f.deps);
   before.enqueue("pending", "INBOUND pending");
@@ -581,7 +993,7 @@ test("unconfirmed startup retains the transaction and recovery confirms the same
   const after = new Supervisor(f.deps);
   await after.flush();
   expect(f.log().map((event) => event.id)).toEqual(["pending"]);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(readJournal(f.state.dir).restart).toBeUndefined();
 });
 
@@ -610,12 +1022,13 @@ test("a shell with no live agent starts the lead instead of appending into an un
   supervisor.enqueue("missing", "INBOUND missing-agent");
   await supervisor.flush();
   expect(f.prompt()).toContain(TAKE_FIRST);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(taken(f)).toEqual(["missing\tINBOUND missing-agent"]);
 });
 
 test("stale ready state from the old occupant cannot confirm a new generation", async () => {
   const f = fixture();
+  f.noAgent();
   f.cold();
   let stale = true;
   const run: Runner = async (argv, options) => {
@@ -629,7 +1042,7 @@ test("stale ready state from the old occupant cannot confirm a new generation", 
   supervisor.enqueue("fresh", "INBOUND fresh");
   await supervisor.flush();
   expect(f.calls.filter((call) => call[2] === "wait")).toHaveLength(2);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 test("the shell interval before a new agent registers is not a startup failure", async () => {
@@ -646,7 +1059,7 @@ test("the shell interval before a new agent registers is not a startup failure",
   const supervisor = new Supervisor({ ...f.deps, run });
   supervisor.enqueue("registering", "INBOUND registering");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(readJournal(f.state.dir).restart).toBeUndefined();
 });
 
@@ -665,15 +1078,15 @@ test("a lead that wakes during cold process resolution receives a warm append wi
   expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
 });
 
-test("a large multibyte event reaches the prompt without exceeding the pane command line", async () => {
+test("a large multibyte event reaches the new lead through take without exceeding the pane command line", async () => {
   const f = fixture();
   f.cold();
   const text = "한".repeat(2000);
   const supervisor = new Supervisor(f.deps);
-  // An owner message: those are the events the push prompt still carries inline.
   supervisor.enqueue("discord:123:1", `INBOUND 123 1 Owner ${text}`);
   await supervisor.flush();
-  expect(f.prompt()).toContain(text);
+  // The prompt carries no event, so a large body cannot reach the pane command line; take hands it over whole.
+  expect(handed(f)).toContain(text);
   expect(Buffer.byteLength(f.command() ?? "")).toBeLessThan(4096);
 });
 
@@ -789,9 +1202,13 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
   const start = f.clock.now();
   await supervisor.flush();
   supervisor.close();
-  const session = /--session-id ([\w-]+)/.exec(f.command() ?? "")?.[1] ?? "";
+  const session = f.session();
   expect(session).not.toBe("");
-  expect(readWakes(f.state.dir, 0)).toEqual([{ at: start, session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
+  const wakes = readWakes(f.state.dir, 0);
+  expect(wakes).toMatchObject([{ session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
+  // Stamped during the soft restart, which now waits for the new session to start.
+  expect(wakes[0]?.at).toBeGreaterThanOrEqual(start);
+  expect(wakes[0]?.at).toBeLessThanOrEqual(f.clock.now());
 });
 
 test("digest waits for an urgent event, but no longer than digestMaxDelayMin", async () => {
@@ -878,7 +1295,7 @@ test("the next cold urgent delivery includes held digest in the new session prom
   await supervisor.flush();
   expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.log().map((event) => event.id)).toEqual(["digest", "urgent"]);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(taken(f)).toEqual(["digest\tNUDGED lane silent", "urgent\tLANE_NOT_DONE lane reason"]);
 });
 
@@ -888,6 +1305,7 @@ const urgentClaims = () => ({ eventPolicy: resolveEventPolicy({ kinds: { LANE_DO
 test("a claim reads delivered to the lead only once a cold start carrying it confirmed", async () => {
   const f = fixture(urgentClaims());
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   const before = new Supervisor(f.deps);
   before.enqueue("done-claim:lane:t", "LANE_DONE_CLAIMED lane - proof");
@@ -924,7 +1342,8 @@ test("a machine-closed lane's claim and close are digest and wake no lead", asyn
 });
 
 test("a cold start points the lead at the full SKILL.md and puts leadArgs on the lead command only", async () => {
-  const f = fixture({ leadArgs: ["--approve"], defaultModel: "test/lead-default" });
+  const f = fixture({ leadArgs: ["--approve"], leadDiet: false, defaultModel: "test/lead-default" });
+  f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("card", "INBOUND card");
@@ -938,10 +1357,31 @@ test("a cold start points the lead at the full SKILL.md and puts leadArgs on the
   expect(command).toContain("test/lead-default");
 });
 
+test.each([true, false])("leadDiet=%s: the lead launch carries the slim omo flags and env only when on, never the lane command", async (leadDiet) => {
+  const f = fixture({ leadArgs: ["--approve"], leadDiet });
+  f.noAgent();
+  f.cold();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("card", "INBOUND card");
+  await supervisor.flush();
+  const command = f.command() ?? "";
+  const list = LEAD_DIET_EXCLUDED_TOOLS.join(",");
+  expect(command.includes("SENPI_PROMPT_SURFACE=chat")).toBe(leadDiet);
+  expect(command.includes("--no-skills")).toBe(leadDiet);
+  expect(command.includes("--exclude-tools")).toBe(leadDiet);
+  expect(command.includes(list)).toBe(leadDiet);
+  if (leadDiet) expect(command).toMatch(/DORI_SUPERVISED=1 '?SENPI_PROMPT_SURFACE=chat'? .*'?--approve'? '?--no-skills'? '?--exclude-tools'? \S+ '?--model'?/);
+  const lane = defaultConfig().agentCommand.join(" ");
+  expect(lane).not.toContain("--no-skills");
+  expect(lane).not.toContain("--exclude-tools");
+  expect(lane).not.toContain("SENPI_PROMPT_SURFACE");
+});
+
 const WITH_THINKING = ["omo", "--model", "{model}", "--thinking", "medium", "{prompt}"];
 /** The lead's agent argv after `--session-dir <dir>`, up to the `@prompt` file. */
 const leadAgent = async (extra: Record<string, unknown>) => {
-  const f = fixture({ defaultModel: "test/lane-default", ...extra });
+  const f = fixture({ defaultModel: "test/lane-default", leadDiet: false, ...extra });
+  f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("card", "INBOUND card");
@@ -989,6 +1429,7 @@ test("a cold restart reacts hourglass on the owner's inbound message and leaves 
 test("a final hung start swaps the hourglass for the warning sign", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(2);
   const r = recordReactions();
   const supervisor = new Supervisor(f.deps, r);
@@ -1031,7 +1472,7 @@ test("a failing reaction never fails or blocks the restart", async () => {
     await supervisor.reactionsSettled();
   } finally { console.error = original; }
   expect(restartSession(f)).toBeUndefined();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
 });
 
 /** Captures console.log lines and silences console.error while `body` runs. */
@@ -1115,7 +1556,7 @@ test("a starting restart is never typed into a pane whose foreground is an agent
   // "stopping" already logged the cold batch before the launch.
   writeFileSync(join(f.state.dir, "lead-events.log"), `${JSON.stringify({ id: "x", line: "INBOUND x" })}\n`);
   await expect(new Supervisor(f.deps).flush()).rejects.toThrow("LEAD_PANE_BUSY lead:p1: foreground is not a plain shell (omo)");
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(0);
+  expect(restartStarts(f)).toHaveLength(0);
   expect(restartSession(f).phase).toBe("starting");
   f.noAgent();
   await quiet(() => new Supervisor(f.deps).flush());
@@ -1126,6 +1567,7 @@ test("a starting restart is never typed into a pane whose foreground is an agent
 test("a submitted launch that never confirms is abandoned after the limit: screen saved, pane replaced, fresh session", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   f.hang(1); // the launch never initialises: no holder file, no session jsonl
   const deps = { ...f.deps, run: recreating(f, f.deps.run), config: { ...f.deps.config } };
@@ -1169,6 +1611,7 @@ test("a submitted launch that never confirms is abandoned after the limit: scree
 test("argv-less foreground entries never crash, and a pane held by a process the supervisor did not start is kept", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(1);
   let foreign = false;
   // After the launch the pane runs something else (the owner's own omo); herdr lists its entries without argv.
@@ -1200,6 +1643,7 @@ test("argv-less foreground entries never crash, and a pane held by a process the
 test("an unconfirmed session that did initialise is never killed or relaunched past the limit", async () => {
   const f = fixture();
   f.cold();
+  f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false); // e.g. blocked on a dialog: herdr never reports it ready, but omo wrote its holder file
   const supervisor = new Supervisor({ ...f.deps, run: recreating(f, f.deps.run) });
   supervisor.enqueue("blocked", "INBOUND blocked");
@@ -1218,317 +1662,19 @@ test("a foreground process group other than the shell is not a plain shell", () 
   expect(plainShell({ foreground_processes: [] })).toBe(false);
 });
 
-const CHAIN = ["a/primary", { model: "b/fallback", thinking: "high" }];
-const BLOCKED_SCREEN = "Error: All Claude accounts for a are currently blocked\n❯ ";
-const allBlocked = JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true }, { name: "login-2", blocked: true }] });
-const oneHealthy = JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true }, { name: "login-2", blocked: false }] });
-const launches = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => call[2] === "run").map((call) => call[4] ?? "");
+/** Model selections through either a process launch or the interactive model commands, in argv spelling. */
+const launches = (f: ReturnType<typeof fixture>) => f.calls.flatMap((call, i) => {
+  if (call[2] === "run") return [call[4] ?? ""];
+  if (call[2] !== "send-text" || !call[4]?.startsWith("/model ")) return [];
+  const next = f.calls.slice(i + 1).find((item) => item[2] === "send-text")?.[4];
+  return [`--model ${call[4].slice("/model ".length)}${next?.startsWith("/thinking ") ? ` --thinking ${next.slice("/thinking ".length)}` : ""}`];
+});
 const journal = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir);
 const muted = async (work: () => Promise<void>) => {
   const original = console.log;
   console.log = () => {};
   try { await work(); } finally { console.log = original; }
 };
-
-test("an idle lead stalled on quota moves to the next model with the pending events, and one line is announced", async () => {
-  const f = fixture({ leadModel: CHAIN, agentCommand: WITH_THINKING });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:9", "INBOUND 1 9 owner are you there");
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model b/fallback --thinking high");
-  expect(f.prompt()).toContain('"id":"discord:1:9"');
-  expect(f.prompt()).toContain("The previous lead stopped: a/primary is blocked on quota");
-  expect(f.log().map((event) => event.id)).toEqual(["discord:1:9"]);
-  expect(announced).toEqual(["The lead's model a/primary is out of quota, so the lead now runs on b/fallback. It moves back to a/primary once that has quota again."]);
-  expect(journal(f)).toMatchObject({ leadModel: 1 });
-  expect(f.calls.filter((call) => call[0] === "omo").every((call) => !call.includes("--credentials"))).toBe(true);
-});
-
-test("a fresh launch stalled on quota is stopped and relaunched on the next model with the same events", async () => {
-  const f = fixture({ leadModel: CHAIN });
-  f.cold();
-  f.auth.a = allBlocked;
-  // The first launch comes up blocked; the fallback launch comes up clean.
-  f.onWait(async () => { f.world.screen = launches(f).length === 1 ? BLOCKED_SCREEN : "❯ "; });
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("cold", "INBOUND cold");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  const [first, second] = launches(f);
-  expect(first).toContain("--model a/primary");
-  expect(second).toContain("--model b/fallback");
-  expect(/--session-id (\S+)/.exec(first ?? "")?.[1]).not.toBe(/--session-id (\S+)/.exec(second ?? "")?.[1]);
-  expect(f.prompt()).toContain(TAKE_FIRST);
-  expect(f.log().map((event) => event.id)).toEqual(["cold"]);
-  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("201");
-  expect(announced).toHaveLength(1);
-  expect(journal(f)).toMatchObject({ leadModel: 1 });
-  expect(journal(f).restart).toBeUndefined();
-  expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
-});
-
-test("on a fallback the first model is retried every leadPrimaryRetryMin and the lead moves back once it has quota on 2 checks", async () => {
-  const f = fixture({ leadModel: CHAIN, leadPrimaryRetryMin: 15 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  f.auth.a = oneHealthy;
-  f.clock.at += 5 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  f.clock.at += 11 * 60_000;
-  await muted(() => supervisor.flush());
-  // One unblocked check is not enough (leadPrimaryReturnChecks 2); the next comes leadPrimaryRetryMin later.
-  expect(launches(f)).toHaveLength(1);
-  expect(journal(f).primaryClearChecks).toBe(1);
-  f.clock.at += 15 * 60_000;
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(2);
-  expect(launches(f)[1]).toContain("--model a/primary");
-  expect(journal(f).primaryClearChecks).toBeUndefined();
-  expect(announced.at(-1)).toBe("a/primary has quota again; the lead is back on it.");
-  expect(journal(f).leadModel).toBe(0);
-});
-
-test("a blocked subscription never moves the lead to a paid emergency model without the owner's approval; approved, it moves in order and back", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5", "or/anthropic/claude-opus-5.5"], leadPrimaryRetryMin: 15, leadUnreadRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "❯ "; liveSession(f); });
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  // Without approval: no launch, the episode is reported and the approval is asked for, once.
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED a/primary "))).toHaveLength(1);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_EMERGENCY_APPROVAL og/anthropic/claude-opus-5-5 "))).toHaveLength(1);
-  expect(announced).toEqual([
-    expect.stringContaining("Every lead model is out of quota (a/primary)"),
-    "The lead can run on the paid emergency model og/anthropic/claude-opus-5-5 until a/primary has quota again. It moves only with your approval for this outage: use /emergency here, or run dori lead-emergency approve on the host.",
-  ]);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still there?");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  // Approved: the next check moves the lead to the first emergency model.
-  approveEmergency(f.state.dir, f.clock.at);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:3", "INBOUND 1 3 approved");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model og/anthropic/claude-opus-5-5");
-  expect(announced.at(-1)).toBe("The Claude subscription is blocked (a/primary is out of quota), so the lead now runs on the paid emergency model og/anthropic/claude-opus-5-5. Lanes never use it. The lead moves back to a/primary once that has quota again.");
-  // The first emergency provider fails on its own credit: its screen line alone moves the lead on.
-  f.world.screen = "Error: insufficient_quota\n❯ ";
-  f.clock.at += 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(2);
-  expect(launches(f)[1]).toContain("--model or/anthropic/claude-opus-5.5");
-  f.auth.a = oneHealthy;
-  f.clock.at += 16 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(2);
-  f.clock.at += 15 * 60_000;
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toHaveLength(3);
-  expect(launches(f)[2]).toContain("--model a/primary");
-  expect(announced.at(-1)).toBe("The Claude subscription has quota again: the lead is back on a/primary, and the paid emergency model or/anthropic/claude-opus-5.5 is off.");
-  expect(journal(f).leadModel).toBe(0);
-  // Back on the first model, the approval is spent: the next episode asks again.
-  expect(emergencyApproved(f.state.dir)).toBe(false);
-});
-
-test("a working lead stalled on quota is never force-switched onto an emergency model, even approved", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadQuotaBusySwitchMin: 10, leadStuckRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  expect(approveEmergency(f.state.dir, f.clock.at)).toBeDefined();
-  f.clock.at += 30 * 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still?");
-  await muted(() => supervisor.flush());
-  f.clock.at += 30 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  expect(f.calls.some((call) => call[0] === "kill")).toBe(false);
-});
-
-test("an emergency approval holds only for its own quota episode: the next episode asks again instead of moving the lead", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadStuckRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  approveEmergency(f.state.dir, f.clock.at);
-  // The subscription recovers before the working lead ever moved: the episode, and its approval, end.
-  f.world.screen = "❯ ";
-  f.auth.a = oneHealthy;
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 back?");
-  await muted(() => supervisor.flush());
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_CLEARED "))).toHaveLength(1);
-  // Later an idle lead is blocked again: a new episode, a new question, no paid model.
-  f.clock.at += 60_000;
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "idle";
-  supervisor.enqueue("discord:1:3", "INBOUND 1 3 hello again");
-  // The fixture cannot complete a cold restart here; a failed one must still show up as a planned move below.
-  await muted(() => supervisor.flush()).catch(() => {});
-  expect(journal(f).restart?.modelIndex).toBeUndefined();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_EMERGENCY_APPROVAL "))).toHaveLength(2);
-});
-
-test("a stale approval file from a closed episode never moves the lead", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadStuckRestartMin: 600 });
-  // Written for an episode a day old, e.g. by a CLI approve that raced the supervisor closing that episode.
-  await Bun.write(join(f.state.dir, "lead-emergency-approval.json"), JSON.stringify({ at: f.clock.at - 1, episode: f.clock.at - 86_400_000 }));
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush()).catch(() => {});
-  expect(journal(f).restart?.modelIndex).toBeUndefined();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((e) => e.line.startsWith("LEAD_EMERGENCY_APPROVAL "))).toHaveLength(1);
-});
-
-test("an approval given with no quota episode open is refused and never moves a later stalled lead", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  expect(approveEmergency(f.state.dir, f.clock.at)).toBeUndefined();
-  expect(emergencyApproved(f.state.dir)).toBe(false);
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_EMERGENCY_APPROVAL "))).toHaveLength(1);
-});
-
-test("an approval while the working lead is still blocked closes no episode: no LEAD_QUOTA_CLEARED, no 'quota again' notice", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"], leadStuckRestartMin: 600 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  approveEmergency(f.state.dir, f.clock.at);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still there?");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().some((event) => event.line.startsWith("LEAD_QUOTA_CLEARED "))).toBe(false);
-  expect(announced.some((text) => text.startsWith("The lead has quota again"))).toBe(false);
-  expect(journal(f).quotaExhausted).toBeDefined();
-});
-
-test("an approved lead stays on the paid model after the episode closes, and revoking brings an idle one back to its first model", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "❯ "; liveSession(f); });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  approveEmergency(f.state.dir, f.clock.at);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 go");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:3", "INBOUND 1 3 working?");
-  await muted(() => supervisor.flush());
-  expect(journal(f).quotaExhausted).toBeUndefined();
-  expect(launches(f)).toHaveLength(1);
-  clearEmergencyApproval(f.state.dir);
-  f.clock.at += 60_000;
-  supervisor.enqueue("discord:1:4", "INBOUND 1 4 stop paying");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(2);
-  expect(launches(f)[1]).toContain("--model a/primary");
-});
-
-test("the open episode's approval request is never dropped from the outbox; other lines are after OUTBOX_ATTEMPTS", async () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  const supervisor = new Supervisor(f.deps, { announce: async () => { throw new Error("discord down"); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  for (let i = 0; i <= OUTBOX_ATTEMPTS; i++) {
-    f.clock.at += OUTBOX_RETRY_MS;
-    await muted(() => supervisor.flush());
-    await muted(() => supervisor.reactionsSettled());
-  }
-  expect((journal(f).outbox ?? []).map((item: { id: string }) => item.id.split(":")[0])).toEqual(["lead-emergency-approval"]);
-});
-
-test("a lead restart is never requested onto a paid emergency model", () => {
-  const f = fixture({ leadModel: "a/primary", leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] });
-  expect(() => requestLeadRestart(f.deps.config, f.clock.now(), "og/anthropic/claude-opus-5-5:max")).toThrow(/emergency/);
-  expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
-});
-
-test("one blocked account next to a healthy one, a briefly busy lead, or a single lead model never switches", async () => {
-  const healthy = fixture({ leadModel: CHAIN });
-  healthy.world.screen = BLOCKED_SCREEN;
-  healthy.auth.a = oneHealthy;
-  const s1 = new Supervisor(healthy.deps);
-  s1.enqueue("discord:1:1", "INBOUND warm");
-  await s1.flush();
-  expect(launches(healthy)).toEqual([]);
-  expect(healthy.log().map((event) => event.id)).toEqual(["discord:1:1"]);
-
-  const busy = fixture({ leadModel: CHAIN });
-  busy.world.screen = BLOCKED_SCREEN;
-  busy.auth.a = allBlocked;
-  busy.pane.agent_status = "working";
-  const s2 = new Supervisor(busy.deps);
-  s2.enqueue("discord:1:2", "INBOUND busy");
-  await s2.flush();
-  expect(launches(busy)).toEqual([]);
-  expect(busy.calls.some((call) => call[0] === "kill")).toBe(false);
-
-  const single = fixture({ leadModel: "a/primary" });
-  single.world.screen = BLOCKED_SCREEN;
-  single.auth.a = allBlocked;
-  const s3 = new Supervisor(single.deps);
-  s3.enqueue("discord:1:3", "INBOUND single");
-  await muted(() => s3.flush());
-  // Nothing to switch to: the episode is reported instead (test/lead-quota-control.test.ts).
-  expect(launches(single)).toEqual([]);
-  expect(single.log().some((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED a/primary "))).toBe(true);
-});
-
-test("LANE_QUOTA_STALL is urgent", () => {
-  expect(eventPriority("LANE_QUOTA_STALL lane w:p1 2/2 anthropic-subscription accounts blocked: Usage limit reached")).toBe("urgent");
-});
 
 const inbox = (f: ReturnType<typeof fixture>): string[] =>
   readJournal(f.state.dir).events.map((e: { line: string }) => e.line);
@@ -1709,9 +1855,42 @@ test.each([false, true])("a restart replays delivered owner work with acked=%s u
   supervisor.enqueue("restart-trigger", "WAIT_DONE release");
   await supervisor.flush();
   // Then the cold prompt includes the original request, without appending it twice.
-  const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-  expect(events?.some((event) => event.id === "discord:11:22")).toBe(true);
+  expect(handed(f).split("\n").filter((line) => line.startsWith("discord:11:22\t"))).toHaveLength(1);
   expect(f.log().filter((event) => event.id === "discord:11:22")).toHaveLength(1);
+});
+
+test("a cold start hands every event through take once; owner work taken but unhandled and held launches come back as reminders until done", async () => {
+  // Given an owner request the lead took (and acked) but did not handle, a delivered event it did not take, and a held launch.
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner project-alpha");
+  await supervisor.flush();
+  expect(taken(f)).toEqual(["discord:11:22\tINBOUND 11 22 owner project-alpha"]);
+  recordAck(f.state.dir, "11", "22", f.clock.now());
+  supervisor.ackTick(60_000);
+  supervisor.enqueue("discord:11:23", "INBOUND 11 23 owner project-beta");
+  await supervisor.flush();
+  enqueueLaunch(f.state.dir, { key: "held-lane", title: "held", done: "merged acme/app#1", brief: "/b.md", queuedAt: "2027-01-15T08:00:00.000Z", reasons: ["memory"] });
+  // When an unrelated event causes a cold restart.
+  f.cold();
+  supervisor.enqueue("restart-trigger", "WAIT_DONE release");
+  await supervisor.flush();
+  expect(launches(f)).toHaveLength(1);
+  // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
+  const lines = handed(f).split("\n");
+  const session = /lead-([0-9a-f-]{36})\.md/.exec(f.calls.find((call) => call[2] === "send-text" && call[4]?.startsWith("Read "))?.[4] ?? "")?.[1];
+  expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`]);
+  expect(lines[2]).toContain("INBOUND 11 22 owner project-alpha");
+  expect(lines[3]).toContain("held-lane");
+  // A second take prints only the reminders again; handling the message and starting the launch clears them.
+  expect(taken(f)).toEqual(["INBOX_EMPTY"]);
+  expect(takeCarriedReminders(f.state.dir)).toHaveLength(2);
+  recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true });
+  supervisor.ackTick(60_000);
+  expect(takeCarriedReminders(f.state.dir).map((line) => line.split("\t")[0])).toEqual([`launch-queue:${session}`]);
+  dequeueLaunch(f.state.dir, "held-lane");
+  supervisor.ackTick(60_000);
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
 });
 
 test("handled owner work is excluded from a fresh lead handoff", async () => {
@@ -1720,14 +1899,14 @@ test("handled owner work is excluded from a fresh lead handoff", async () => {
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner project-alpha");
   await supervisor.flush();
+  taken(f);
   recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true });
   // When a restart begins, it consumes receipts before selecting unfinished work.
   f.cold();
   supervisor.enqueue("restart-trigger", "WAIT_DONE release");
   await supervisor.flush();
   // Then the old request is not replayed.
-  const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-  expect(events?.some((event) => event.id === "discord:11:22")).toBe(false);
+  expect(handed(f)).not.toContain("discord:11:22");
 });
 
 test("acked but unhandled work wakes the lead with its body and escalates once after another window", async () => {
@@ -1842,8 +2021,7 @@ test("a busy lead dying before its read window starts replays the message withou
   f.noAgent();
   await supervisor.flush();
   // Then a new lead receives the request and its acknowledgment deadline starts.
-  const events = f.prompt()?.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-  expect(events?.some((event) => event.id === "discord:11:22")).toBe(true);
+  expect(handed(f).split("\n").filter((line) => line.startsWith("discord:11:22\t"))).toHaveLength(1);
   f.clock.at = readableSince(f, "discord:11:22") + 60_000;
   supervisor.ackTick(60_000);
   expect(reminded(f)).toEqual(["discord:11:22"]);
@@ -1872,120 +2050,6 @@ test("owner message bodies and lane reports are redacted before durable journal 
 });
 
 
-// Lead quota control: exhaustion, busy switch, return hysteresis, stuck lead.
-const onModel = (f: ReturnType<typeof fixture>, journalExtra: Record<string, unknown>) =>
-  writeJournal(f.state.dir, ({ events: [], ...journalExtra }));
-const blockedUntil = (at: number) => JSON.stringify({ status: "not_ready", accounts: [{ name: "default", blocked: true, resetAt: at }] });
-
-test("a single lead model blocked on quota: the owner is told once with the reset, LEAD_QUOTA_EXHAUSTED queued, and its end told once", async () => {
-  const f = fixture({ leadModel: "a/primary" });
-  f.world.screen = BLOCKED_SCREEN;
-  const reset = Date.parse("2027-01-15T12:00:00.000Z");
-  f.auth.a = blockedUntil(reset);
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  supervisor.enqueue("discord:1:2", "INBOUND 1 2 still there?");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toEqual([]);
-  const exhausted = f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED "));
-  expect(exhausted).toHaveLength(1);
-  expect(exhausted[0].line).toStartWith("LEAD_QUOTA_EXHAUSTED a/primary reset=2027-01-15T12:00:00.000Z every lead model is blocked on quota (a/primary): ");
-  expect(announced).toEqual(["Every lead model is out of quota (a/primary), so the lead cannot answer until one resets (earliest known reset 01-15 21:00 KST). Your messages stay queued."]);
-  expect(journal(f).quotaExhausted).toMatchObject({ model: "a/primary", resetAt: reset });
-  // A supervisor restart inside the same episode does not tell the owner again.
-  const again = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  again.enqueue("discord:1:3", "INBOUND 1 3 third");
-  await muted(() => again.flush());
-  expect(announced).toHaveLength(1);
-  f.auth.a = oneHealthy;
-  again.enqueue("discord:1:4", "INBOUND 1 4 fourth");
-  await muted(() => again.flush());
-  await again.reactionsSettled();
-  expect(announced.at(-1)).toBe("The lead has quota again (a/primary); queued messages are being answered.");
-  expect(f.log().filter((event) => event.line.startsWith("LEAD_QUOTA_CLEARED a/primary "))).toHaveLength(1);
-  expect(journal(f).quotaExhausted).toBeUndefined();
-});
-
-test("every model of the chain blocked: the earliest reset across the chain is reported", async () => {
-  const f = fixture({ leadModel: CHAIN });
-  onModel(f, { leadModel: 1, primaryRetryAt: f.clock.at + 15 * 60_000 });
-  f.world.screen = "Error: All accounts for b are currently blocked\n❯ ";
-  f.auth.a = blockedUntil(Date.parse("2027-01-15T12:00:00.000Z"));
-  f.auth.b = blockedUntil(Date.parse("2027-01-15T09:30:00.000Z"));
-  const announced: string[] = [];
-  const supervisor = new Supervisor(f.deps, { announce: async (text) => { announced.push(text); } });
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  await supervisor.reactionsSettled();
-  expect(launches(f)).toEqual([]);
-  expect(f.log().find((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED "))?.line).toStartWith("LEAD_QUOTA_EXHAUSTED b/fallback reset=2027-01-15T09:30:00.000Z every lead model is blocked on quota (a/primary, b/fallback)");
-  expect(announced).toEqual([expect.stringContaining("(earliest known reset 01-15 18:30 KST)")]);
-});
-
-test("a working lead stalled on quota is switched once the stall outlives leadQuotaBusySwitchMin", async () => {
-  const f = fixture({ leadModel: CHAIN, leadQuotaBusySwitchMin: 10 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  f.clock.at += 9 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-  expect(f.calls.some((call) => call[0] === "kill")).toBe(false);
-  f.clock.at += 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model b/fallback");
-  expect(f.prompt()).toContain("a/primary is blocked on quota");
-  expect(f.prompt()).toContain("while working for 10 min");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
-  expect(journal(f)).toMatchObject({ leadModel: 1 });
-});
-
-test("a working lead whose stall clears in between restarts the busy clock", async () => {
-  const f = fixture({ leadModel: CHAIN, leadQuotaBusySwitchMin: 10 });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
-  f.pane.agent_status = "working";
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => supervisor.flush());
-  f.clock.at += 6 * 60_000;
-  f.world.screen = "❯ working";
-  await muted(() => supervisor.flush());
-  f.world.screen = BLOCKED_SCREEN;
-  f.clock.at += 6 * 60_000;
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toEqual([]);
-});
-
-test("returning to the primary needs leadPrimaryReturnChecks unblocked checks in a row; blocked or unreadable restarts the count", async () => {
-  const f = fixture({ leadModel: CHAIN, leadPrimaryRetryMin: 15, leadPrimaryReturnChecks: 2 });
-  onModel(f, { leadModel: 1, primaryRetryAt: f.clock.at });
-  f.onWait(async () => { f.world.screen = "❯ "; });
-  const supervisor = new Supervisor(f.deps);
-  const step = async (auth: string) => { f.auth.a = auth; await muted(() => supervisor.flush()); f.clock.at += 15 * 60_000; };
-  await step(oneHealthy);
-  expect(journal(f).primaryClearChecks).toBe(1);
-  await step(allBlocked);
-  expect(journal(f).primaryClearChecks).toBeUndefined();
-  await step(oneHealthy);
-  await step("not json");
-  expect(journal(f).primaryClearChecks).toBeUndefined();
-  await step(oneHealthy);
-  expect(launches(f)).toEqual([]);
-  await step(oneHealthy);
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model a/primary");
-  expect(journal(f)).toMatchObject({ leadModel: 0 });
-});
-
 test("a lead stuck blocked with owner messages unread is cold-restarted with them after leadStuckRestartMin, and the owner is told", async () => {
   const f = fixture({ leadStuckRestartMin: 30 });
   f.pane.agent_status = "blocked";
@@ -2003,7 +2067,7 @@ test("a lead stuck blocked with owner messages unread is cold-restarted with the
   expect(launches(f)).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
   expect(f.prompt()).toContain("it was stuck blocked for 30 min with 1 owner message(s) unread");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
   expect(announced).toEqual(["The lead has been stuck (blocked) for 30 min without reading your messages, so it is being restarted; your unanswered messages go to the new lead."]);
   expect(journal(f).restart).toBeUndefined();
 });
@@ -2064,7 +2128,7 @@ test("a working lead held inside one tool call (a foreground watch) with an owne
   expect(launches(f)).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
   expect(f.prompt()).toContain("it was stuck in one tool call for 5 min with 1 owner message(s) unread");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
 });
 
 test("a working lead between tool calls, or one whose call started after it acked, is left alone", async () => {
@@ -2114,7 +2178,7 @@ test("an idle lead paused by Esc gets /resume typed before its pointer; still un
   await muted(() => supervisor.flush());
   expect(launches(f)).toHaveLength(1);
   expect(f.prompt()).toContain("it did not take pushed events");
-  expect(f.prompt()).toContain('"id":"discord:1:1"');
+  expect(handed(f)).toContain("discord:1:1\t");
 });
 
 test("a paused lead with the owner's text in its input is not typed into, and a lead that is not paused is not resumed", async () => {
@@ -2143,10 +2207,7 @@ test("safety-work events reach an idle lead at once, without waiting for the dig
     "INBOUND_DELETE 1 9",
     "WAIT_FAILED release ci green (30 checks in a row failed; no --timeout set)",
     "WAITS_CORRUPT waits.json did not parse and was moved to /x; every wait in it is dropped, register them again",
-    "LANE_QUOTA_CLEARED k w:p1 0/2 a accounts blocked; auto-resumed",
     "LANE_RECOVERY_EXHAUSTED k w:p1 dead after 3 recovery attempts",
-    "LEAD_QUOTA_EXHAUSTED a/x reset=unknown every lead model is blocked on quota (a/x): hit",
-    "QUOTA_GATE_UNKNOWN Claude usage unreadable (offline); the Claude quota gate is off (fail-open)",
   ];
   for (const [i, line] of lines.entries()) {
     supervisor.enqueue(`urgent:${i}`, line);
@@ -2180,8 +2241,9 @@ test("a cold handoff always carries the held launch queue, even after LAUNCH_REA
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 owner hi");
   await supervisor.flush();
-  expect(f.prompt()).toContain("LAUNCH_QUEUE held launches are still waiting");
-  expect(f.prompt()).toContain("held-lane");
+  const handoff = handed(f);
+  expect(handoff).toContain("LAUNCH_QUEUE held launches are still waiting");
+  expect(handoff).toContain("held-lane");
 });
 
 test("an edited owner message is reminded and handed to a new lead in its latest text; a deleted one never is", async () => {
@@ -2203,12 +2265,16 @@ test("an edited owner message is reminded and handed to a new lead in its latest
   const before = journal(f).awaitingAck;
   const restarted = new Supervisor(f.deps);
   expect(journal(f).awaitingAck).toEqual(before);
+  // The edit and the delete were delivered warm, then taken: only the latest text of the unfinished message comes back.
+  taken(f);
   f.cold();
   restarted.enqueue("cold", "INBOUND cold");
   await restarted.flush();
-  expect(f.prompt()).toContain("revised task");
-  expect(f.prompt()).not.toContain("original task");
-  expect(f.prompt()).not.toContain("doomed task");
+  const handoff = handed(f);
+  expect(handoff).toContain("unfinished:discord:1:1:edit:2027-01-15T08:01:00.000Z\tUNFINISHED");
+  expect(handoff).toContain("revised task");
+  expect(handoff).not.toContain("original task");
+  expect(handoff).not.toContain("doomed task");
 });
 
 test("an edit of a message already handled is tracked again as a new instruction", async () => {
@@ -2221,34 +2287,6 @@ test("an edit of a message already handled is tracked again as a new instruction
   expect(tracked(f, "discord:1:1")?.handledAt).toBeDefined();
   supervisor.enqueue("discord:1:1:edit:2027-01-15T08:01:00.000Z", "INBOUND_EDIT 1 1 owner (edited) do y instead");
   expect(tracked(f, "discord:1:1")).toEqual({ id: "discord:1:1", revision: "discord:1:1:edit:2027-01-15T08:01:00.000Z", revisions: ["discord:1:1:edit:2027-01-15T08:01:00.000Z"] });
-});
-
-test("a lead stalled while working on its last fallback goes back to the first model once that has quota", async () => {
-  const f = fixture({ leadModel: CHAIN, leadPrimaryRetryMin: 15, leadPrimaryReturnChecks: 1 });
-  onModel(f, { leadModel: 1, primaryRetryAt: f.clock.at });
-  f.world.screen = "Error: All accounts for b are currently blocked\n❯ ";
-  f.auth.a = oneHealthy;
-  f.auth.b = allBlocked;
-  f.pane.agent_status = "working";
-  f.onWait(async () => { f.world.screen = "❯ "; liveSession(f); });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
-  await muted(() => supervisor.flush());
-  expect(launches(f)).toHaveLength(1);
-  expect(launches(f)[0]).toContain("--model a/primary");
-  expect(journal(f)).toMatchObject({ leadModel: 0 });
-});
-
-test("a cold start that comes up blocked on its last model counts as started instead of looping on STARTUP_UNCONFIRMED", async () => {
-  const f = fixture({ leadModel: "a/primary" });
-  f.cold();
-  f.auth.a = allBlocked;
-  f.onWait(async () => { f.world.screen = "Error: usage limit reached\n❯ "; liveSession(f); });
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
-  await muted(() => supervisor.flush());
-  expect(journal(f).restart).toBeUndefined();
-  expect(f.log().some((event) => event.line.startsWith("LEAD_QUOTA_EXHAUSTED a/primary "))).toBe(true);
 });
 
 test("a working lead whose screen keeps changing is not restarted as stuck; one frozen for the limit is", async () => {
@@ -2269,7 +2307,7 @@ test("a working lead whose screen keeps changing is not restarted as stuck; one 
   expect(f.prompt()).toContain("it was stuck working for");
 });
 
-test("the stuck clock and the busy-switch clock survive supervisor restarts", async () => {
+test("the stuck clock survives supervisor restarts", async () => {
   const stuck = fixture({ leadStuckRestartMin: 30 });
   stuck.pane.agent_status = "blocked";
   const first = new Supervisor(stuck.deps);
@@ -2281,22 +2319,6 @@ test("the stuck clock and the busy-switch clock survive supervisor restarts", as
   }
   expect(launches(stuck)).toHaveLength(1);
 
-  const busy = fixture({ leadModel: CHAIN, leadQuotaBusySwitchMin: 10 });
-  busy.world.screen = BLOCKED_SCREEN;
-  busy.auth.a = allBlocked;
-  busy.pane.agent_status = "working";
-  busy.onWait(async () => { busy.world.screen = "❯ "; });
-  const s = new Supervisor(busy.deps);
-  s.enqueue("discord:1:1", "INBOUND 1 1 hello");
-  await muted(() => s.flush());
-  for (let i = 0; i < 3; i++) {
-    busy.clock.at += 4 * 60_000;
-    const again = new Supervisor(busy.deps);
-    again.enqueue(`discord:1:${i + 2}`, `INBOUND 1 ${i + 2} again`);
-    await muted(() => again.flush());
-  }
-  expect(launches(busy)).toHaveLength(1);
-  expect(launches(busy)[0]).toContain("--model b/fallback");
 });
 
 test("a message that arrives while a cold start boots gets its read window only once it is delivered", async () => {
@@ -2330,11 +2352,9 @@ test("owner messages handled a day ago leave the tracking list for good", async 
 });
 
 test("an owner announcement that fails to post is kept and posted by the next supervisor", async () => {
-  const f = fixture({ leadModel: "a/primary" });
-  f.world.screen = BLOCKED_SCREEN;
-  f.auth.a = allBlocked;
+  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "owner-only" } }) });
   const failing = new Supervisor(f.deps, { announce: async () => { throw new Error("discord down"); } });
-  failing.enqueue("discord:1:1", "INBOUND 1 1 hi");
+  failing.enqueue("notice", "CUSTOM owner notice");
   const error = console.error;
   console.error = () => {};
   try {
@@ -2346,7 +2366,7 @@ test("an owner announcement that fails to post is kept and posted by the next su
   const posted: string[] = [];
   const next = new Supervisor(f.deps, { announce: async (text) => { posted.push(text); } });
   await next.reactionsSettled();
-  expect(posted).toEqual([expect.stringContaining("Every lead model is out of quota (a/primary)")]);
+  expect(posted).toEqual(["CUSTOM owner notice"]);
   expect(journal(f).outbox).toEqual([]);
 });
 
@@ -2403,8 +2423,9 @@ test.each(["json", "sqlite"] as const)("an ack-flood journal on the %s store: no
   expect(digest[0]).toStartWith("OWNER_QUARANTINED 298 11:1000,1001,1004,");
   expect(eventPriority(digest[0] ?? "")).toBe("digest");
   // The cold start carried the new request and none of the quarantined history.
-  expect(f.prompt()).toContain("synthetic new request");
-  expect(f.prompt()).not.toContain("synthetic flood message");
+  const handoff = handed(f);
+  expect(handoff).toContain("synthetic new request");
+  expect(handoff).not.toContain("synthetic flood message");
   const rows = stored(f.state.dir, store).awaitingAck ?? [];
   expect(rows.filter((entry) => (entry as { quarantined?: true }).quarantined)).toHaveLength(298);
   expect(rows.find((entry) => entry.id === "discord:11:1002")).toMatchObject({ deleted: true });

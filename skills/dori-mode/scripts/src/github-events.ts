@@ -26,13 +26,25 @@ type Pull = {
   readonly state: string;
   readonly sha: string;
   readonly branch: string;
+  /**
+   * The head repository (`owner/repo`, lowercased) the PR's branch lives in; absent when GitHub reports none (a deleted
+   * fork) or the snapshot predates it. Only a head equal to the PR's own repo is a same-repo PR a lane may own.
+   */
+  readonly headRepo?: string;
   readonly updated: string;
   readonly url: string;
   readonly conflicting: boolean;
   readonly checks: "pending" | "failing" | "green" | "none";
   readonly activity: readonly string[];
 };
-export type OpenPull = Pick<Pull, "number" | "sha" | "branch" | "url" | "conflicting" | "checks"> & { readonly repo: string };
+export type OpenPull = Pick<Pull, "number" | "sha" | "branch" | "headRepo" | "url" | "conflicting" | "checks"> & { readonly repo: string };
+
+/**
+ * Whether the PR's head branch lives in the PR's own repository. A fork PR (or one whose head repo is unknown) is
+ * never owned by a lane: anyone can open one with any branch name, so neither its number nor its branch binds it.
+ */
+export const sameRepoHead = (pull: { readonly repo: string; readonly headRepo?: string }): boolean =>
+  pull.headRepo !== undefined && pull.headRepo.toLowerCase() === pull.repo.toLowerCase();
 type Issue = { readonly state: string; readonly reopens: number };
 type RepoState = {
   readonly cache: Readonly<Record<string, Cached>>;
@@ -51,7 +63,7 @@ const EMPTY: State = { repos: {}, failures: {} };
 
 /** The response fields the poll reads. The cache keeps only these: a cached PR is a few hundred bytes, not tens of KB. */
 const READ_FIELDS = new Set([
-  "number", "state", "updated_at", "merged_at", "head", "sha", "ref", "html_url", "mergeable", "mergeable_state", "check_runs",
+  "number", "state", "updated_at", "merged_at", "head", "sha", "ref", "repo", "full_name", "html_url", "mergeable", "mergeable_state", "check_runs",
   "conclusion", "status", "statuses", "id", "user", "login", "type", "submitted_at", "created_at", "pull_request",
 ]);
 export const slimBody = (value: unknown): unknown => {
@@ -222,14 +234,14 @@ export class GitHubEvents {
   openPulls(): readonly OpenPull[] {
     return Object.entries(this.state.repos).flatMap(([repo, state]) => Object.values(state.pulls)
       .filter((p) => p.state === "open")
-      .map((p) => ({ repo, number: p.number, sha: p.sha, branch: p.branch, url: p.url, conflicting: p.conflicting, checks: p.checks })));
+      .map((p) => ({ repo, number: p.number, sha: p.sha, branch: p.branch, ...headOf(p), url: p.url, conflicting: p.conflicting, checks: p.checks })));
   }
 
   /** The merged PRs the polls have seen, per repo (ci-follow.ts closes a lane's issue once its PR is among them). */
-  mergedPulls(): readonly { readonly repo: string; readonly number: number; readonly url: string; readonly branch: string }[] {
+  mergedPulls(): readonly { readonly repo: string; readonly number: number; readonly url: string; readonly branch: string; readonly headRepo?: string }[] {
     return Object.entries(this.state.repos).flatMap(([repo, state]) => Object.values(state.pulls)
       .filter((p) => p.state === "merged")
-      .map((p) => ({ repo, number: p.number, url: p.url, branch: p.branch })));
+      .map((p) => ({ repo, number: p.number, url: p.url, branch: p.branch, ...headOf(p) })));
   }
 
   /** Source progress only reaches disk after every event it produced is in the durable queue. */
@@ -265,8 +277,15 @@ export class GitHubEvents {
           const prior = old?.pulls[number];
           // Closed history is baselined cheaply; continue following previously open PRs through closure.
           const inspect = summary.state === "open" || prior?.state === "open" || Boolean(old && (!prior || prior.updated !== summary.updated_at));
-          const detail = inspect ? object((await api.get(`repos/${repo}/pulls/${number}`)).body) : summary;
+          const path = `repos/${repo}/pulls/${number}`;
+          let detail = inspect ? object((await api.get(path)).body) : summary;
+          // A detail cached before the head repo was kept would answer 304 without it: read it once unconditionally.
+          if (inspect && !("repo" in object(detail.head))) {
+            delete api.cache[path];
+            detail = object((await api.get(path)).body);
+          }
           const head = object(detail.head);
+          const headRepo = head.repo === null || head.repo === undefined ? "" : text(object(head.repo).full_name).toLowerCase();
           const sha = text(head.sha);
           const state = detail.merged_at ? "merged" : text(detail.state);
           let checks: Pull["checks"] = prior?.checks ?? "none";
@@ -300,10 +319,10 @@ export class GitHubEvents {
             }
           } else activity.push(...(prior?.activity ?? []));
           const current: Pull = {
-            number, state, sha, branch: text(head.ref), updated: text(detail.updated_at),
+            number, state, sha, branch: text(head.ref), ...(headRepo ? { headRepo } : {}), updated: text(detail.updated_at),
             url: text(detail.html_url), conflicting: detail.mergeable === false || detail.mergeable_state === "dirty", checks, activity,
           };
-          const lane = lanes.numbers.has(number) || lanes.branches.has(current.branch);
+          const lane = sameRepoHead({ repo, headRepo: current.headRepo }) && (lanes.numbers.has(number) || lanes.branches.has(current.branch));
           if (old && !prior) {
             events.push({ kind: "opened", detail: `sha=${sha}`, identity: "opened" });
             if (state === "merged" || state === "closed") events.push({ kind: state, detail: `sha=${sha}`, identity: `${state}:${current.updated}` });
@@ -410,7 +429,8 @@ export const loadGithub = (db: Database, full = true): State => {
       const repo = repos[String(row.repo)];
       if (!repo) continue;
       repo.pulls[String(row.number)] = {
-        number: Number(row.number), state: String(row.state), sha: String(row.sha), branch: String(row.branch), updated: String(row.updated),
+        number: Number(row.number), state: String(row.state), sha: String(row.sha), branch: String(row.branch),
+        ...(row.head_repo !== null && row.head_repo !== undefined ? { headRepo: String(row.head_repo) } : {}), updated: String(row.updated),
         url: String(row.url), conflicting: row.conflicting === 1, checks: String(row.checks) as Pull["checks"], activity: JSON.parse(String(row.activity)) as string[],
       };
     }
@@ -431,7 +451,9 @@ export const loadGithub = (db: Database, full = true): State => {
   return { repos, failures, ...(polledAt !== undefined ? { polledAt: Number(polledAt) } : {}) };
 };
 
-const samePull = (a: Pull | undefined, b: Pull): boolean => a !== undefined && a.state === b.state && a.sha === b.sha && a.branch === b.branch &&
+const headOf = (p: Pull): { readonly headRepo?: string } => (p.headRepo !== undefined ? { headRepo: p.headRepo } : {});
+
+const samePull = (a: Pull | undefined, b: Pull): boolean => a !== undefined && a.state === b.state && a.sha === b.sha && a.branch === b.branch && a.headRepo === b.headRepo &&
   a.updated === b.updated && a.url === b.url && a.conflicting === b.conflicting && a.checks === b.checks &&
   a.activity.length === b.activity.length && a.activity.every((id, i) => id === b.activity[i]);
 
@@ -440,8 +462,8 @@ const saveGithub = (db: Database, prev: State, next: State): void => {
   const repoRow = db.prepare(`INSERT INTO gh_repos (repo, polled, issues) VALUES (?, 1, ?)
     ON CONFLICT (repo) DO UPDATE SET polled = 1, issues = excluded.issues`);
   const failed = db.prepare(`INSERT INTO gh_repos (repo, failed_at) VALUES (?, ?) ON CONFLICT (repo) DO UPDATE SET failed_at = excluded.failed_at`);
-  const pull = db.prepare(`INSERT OR REPLACE INTO gh_prs (repo, number, state, sha, branch, updated, url, conflicting, checks, activity)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const pull = db.prepare(`INSERT OR REPLACE INTO gh_prs (repo, number, state, sha, branch, head_repo, updated, url, conflicting, checks, activity)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const issue = db.prepare("INSERT OR REPLACE INTO gh_issues (repo, number, state, reopens) VALUES (?, ?, ?, ?)");
   const cached = db.prepare("INSERT OR REPLACE INTO gh_cache (repo, path, etag, body, next, used_at) VALUES (?, ?, ?, ?, ?, ?)");
   const uncache = db.prepare("DELETE FROM gh_cache WHERE repo = ? AND path = ?");
@@ -451,7 +473,7 @@ const saveGithub = (db: Database, prev: State, next: State): void => {
       if (old === state) continue;
       if (!old || (old.issues === undefined) !== (state.issues === undefined)) repoRow.run(repo, state.issues ? 1 : 0);
       for (const [number, p] of Object.entries(state.pulls)) {
-        if (!samePull(old?.pulls[number], p)) pull.run(repo, p.number, p.state, p.sha, p.branch, p.updated, p.url, p.conflicting ? 1 : 0, p.checks, JSON.stringify(p.activity));
+        if (!samePull(old?.pulls[number], p)) pull.run(repo, p.number, p.state, p.sha, p.branch, p.headRepo ?? null, p.updated, p.url, p.conflicting ? 1 : 0, p.checks, JSON.stringify(p.activity));
       }
       for (const [number, i] of Object.entries(state.issues ?? {})) {
         const was = old?.issues?.[number];

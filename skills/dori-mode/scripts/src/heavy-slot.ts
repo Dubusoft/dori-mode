@@ -64,6 +64,14 @@ export const releaseSlot = (slot: string): void => rmSync(slot, { recursive: tru
 
 export const pidAlive = (pid: number): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
+    } catch {
+      // /proc may be unavailable in a container; use the portable check below.
+    }
+  }
   try {
     process.kill(pid, 0);
   } catch {

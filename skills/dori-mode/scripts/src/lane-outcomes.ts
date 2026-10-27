@@ -1,4 +1,5 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { redactSecrets } from "./redact.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -46,7 +47,7 @@ export const recordReported = (stateDir: string, lane: string, at: number, note?
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${at}-${randomUUID()}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note } : {}) }), { mode: 0o600, flush: true });
+  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}) }), { mode: 0o600, flush: true });
   renameSync(tmp, path);
   fsyncDir(dir);
   fsyncDir(stateDir);
@@ -82,16 +83,6 @@ const dropReported = (path: string): void => {
 export const unreported = (journal: Journal): LaneOutcome[] => (journal.outcomes ?? []).filter((outcome) => outcome.reportedAt === undefined);
 
 export const reportRule = (lane: string): string => `report the outcome to the owner yourself, then run dori reported ${lane}`;
-
-/** One line per open obligation for the cold-restart handoff, empty when there is none. */
-export const handoffLines = (journal: Journal): string[] => {
-  const owed = unreported(journal);
-  if (!owed.length) return [];
-  return [
-    "Lane outcomes not yet reported to the owner follow: for each, report the outcome to the owner yourself, then run dori reported <key>.",
-    ...owed.map((outcome) => `UNREPORTED ${outcome.lane} ${outcome.line ?? ""}`.trimEnd()),
-  ];
-};
 
 type Published = { readonly lane: string; readonly since: number; readonly line?: string };
 
@@ -179,11 +170,12 @@ export class OutcomeTracking {
    * One pass: receipts first, then each open obligation past its window gets one urgent UNREPORTED (the first after
    * reportTimeoutMin, then after twice the previous wait, up to REPORT_REPEAT_MAX_MS). A lane whose brief declared
    * `autoClose: machine` closes with no lead wake and owes no report. Nothing is reminded while a lead restart runs: the
-   * new lead's handoff lists every open obligation. Reported rows are dropped after REPORTED_KEEP_MS.
+   * published list is kept current, and the new lead's `dori inbox take` prints every open obligation. Reported rows are
+   * dropped after REPORTED_KEEP_MS.
    */
   async tick(registry: Pick<Registry, "read">): Promise<void> {
     this.consumeReceipts();
-    if (this.journal.restart) return;
+    if (this.journal.restart) { this.publish(); return; }
     const now = this.core.deps.clock.now();
     const window = this.windowMs;
     let changed = false;

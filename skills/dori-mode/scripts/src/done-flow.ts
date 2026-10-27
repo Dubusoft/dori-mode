@@ -2,20 +2,22 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { type DoriConfig, fill } from "./config.ts";
-import { type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
+import { type DoriConfig, fillHook } from "./config.ts";
+import { githubTargets } from "./github-events.ts";
+import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { reportLines } from "./freshness.ts";
 import { laneRunner, listPanes, readScreen, sendVerified } from "./panes.ts";
 import { OPEN_STATES, openOperations, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
-import { checkDone, type SignalIo } from "./signals.ts";
+import { type Check, checkDone, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings } from "./branch-cleanup.ts";
 import { otherOpenLanesOnThread } from "./routing.ts";
 import type { Discord } from "./messenger/discord.ts";
 import { type Platform, resolveTarget, type Target } from "./messenger/target.ts";
 import { eventClass } from "./event-policy.ts";
+import type { EventMeta } from "./supervise-journal.ts";
 
 export type FlowDeps = {
   readonly run: Runner;
@@ -40,6 +42,22 @@ const signalIo = (deps: FlowDeps, lane: Lane): SignalIo => ({ cwd: (lane.machine
 
 const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
 
+/** Free text in an event line (evidence, reasons) is capped; the registry keeps it whole. */
+const EVENT_TEXT_MAX = 300;
+export const eventText = (text: string): string => text.length > EVENT_TEXT_MAX ? `${text.slice(0, EVENT_TEXT_MAX - 1)}…` : text;
+
+/** Same shape lane-finish.ts reads a PR URL with. */
+const PULL_URL = /https:\/\/\S+\/pull\/\d+/;
+
+/**
+ * The fixed close event: no receipt (the registry keeps it). The first PR URL the close note or a Done signal names is
+ * kept, so the supervisor's lane-finish line (lane-finish.ts) still links the PR.
+ */
+const closedEvent = (key: string, note: string, lines: readonly string[]): string => {
+  const pr = [note, ...lines.filter((l) => l.startsWith("SIGNAL "))].map((t) => PULL_URL.exec(t)?.[0]).find(Boolean);
+  return `LANE_CLOSED ${key} closed${pr ? ` ${pr}` : ""}`;
+};
+
 /** A lane that claims and closes with no lead wake: its brief declared `autoClose: machine`. */
 const machineClose = (lane: Lane): boolean => lane.autoClose === "machine";
 
@@ -54,10 +72,43 @@ const claimWaitsForLead = (deps: FlowDeps, lane: Lane): boolean =>
 /** The journal id of a claim's announcement: stable, so a repeated announcement after a crash is the same event. */
 export const claimEventId = (key: string, claimAt: string): string => `done-claim:${key}:${claimAt}`;
 
+type PrRow = { readonly number?: unknown; readonly state?: unknown; readonly headRefOid?: unknown; readonly isCrossRepository?: unknown };
+const PR_ROW_FIELDS = "number,state,headRefOid,isCrossRepository";
+
+/**
+ * The lane's open same-repo PRs and their head SHA right now, read live from GitHub: the PRs its Done signals name and
+ * those whose head is one of its branches. The claim records them, and the supervisor merges a PR only at exactly that
+ * head (ci-follow.ts claimGate). A fork PR is never recorded, whatever its number or branch; a read that fails records
+ * nothing for that target, so that PR is not auto-merged on this claim.
+ */
+export const claimBindings = async (run: Runner, lane: Lane): Promise<ClaimedPull[]> => {
+  const found = new Map<string, ClaimedPull>();
+  const add = (repo: string, row: PrRow): void => {
+    if (row.isCrossRepository !== false || row.state !== "OPEN" || typeof row.number !== "number" || typeof row.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(row.headRefOid)) return;
+    found.set(`${repo}#${row.number}`, { repo, number: row.number, sha: row.headRefOid });
+  };
+  const read = async (repo: string, argv: readonly string[]): Promise<void> => {
+    const r = await run([...argv], { timeoutMs: 20_000 });
+    try {
+      if (r.code !== 0) throw new Error(`exit ${r.code}: ${(r.err || r.out).trim().slice(0, 160)}`);
+      const body: unknown = JSON.parse(r.out);
+      for (const row of Array.isArray(body) ? body : [body]) if (row && typeof row === "object") add(repo, row as PrRow);
+    } catch (e) {
+      console.error(`CLAIM_PR_UNREAD ${lane.key} ${argv.slice(0, 4).join(" ")} ${repo}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  for (const [repo, targets] of await githubTargets([lane], run)) {
+    for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS]);
+    for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS]);
+  }
+  return [...found.values()];
+};
+
 export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
   deps = { ...deps, run: laneRunner(deps.run, lane) };
+  const pulls = await claimBindings(deps.run, lane);
   const at = iso(deps.clock);
-  await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false } }));
+  await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls } }));
   if (lane.pane) {
     const closesAt = new Date(deps.clock.now() + windowMs(deps)).toISOString().slice(11, 16);
     const when = claimWaitsForLead(deps, lane)
@@ -65,7 +116,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): P
       : `at ${closesAt}Z (${deps.config.closeAfterMin} minutes) once its Done signals read back live`;
     await sendVerified(deps.run, deps.clock, lane.pane, `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons. Stay idle until then; an objection arrives here as [LEAD] not done.`);
   }
-  return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${evidence}`;
+  return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${eventText(evidence)}`;
 };
 
 export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly string[]): Promise<string> => {
@@ -74,9 +125,12 @@ export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly s
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } }));
   // A remote lane claims by printing a [REPORT] line, and the watcher acts on each distinct line once. The payload
   // stays a <placeholder>: this text lands on the lane's own screen, where a real-looking line would read as a claim.
-  const again = lane.machine ? `print a new [REPORT] ${lane.key} | done | <updated evidence> line when fixed` : "claim again when fixed";
-  if (lane.pane) await sendVerified(deps.run, deps.clock, lane.pane, `[LEAD] not done: ${reasons.join("; ")}; keep working, ${again}`);
-  return `LANE_NOT_DONE ${lane.key} ${reasons.join("; ")}`;
+  // The reasons are never typed: they carry command output and paths, and a pane is a shell line. The lane reads them.
+  const text = lane.machine
+    ? `[LEAD] not done: the Done check of ${lane.key} did not pass; the lead has the reasons. Keep working, and print a new [REPORT] ${lane.key} | done | <updated evidence> line when fixed`
+    : `[LEAD] not done: the Done check of ${lane.key} did not pass. Read the reasons with dori lane status ${lane.key}, keep working, and claim again when fixed`;
+  if (lane.pane) await sendVerified(deps.run, deps.clock, lane.pane, text);
+  return `LANE_NOT_DONE ${lane.key} ${eventText(reasons.join("; "))}`;
 };
 
 export const discoverWorktrees = async (lane: Lane, run: Runner, extraRoots: readonly string[] = []): Promise<string[]> => {
@@ -95,11 +149,11 @@ export const discoverWorktrees = async (lane: Lane, run: Runner, extraRoots: rea
   return [...found];
 };
 
-export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
+const unpushedWorkIn = async (deps: FlowDeps, lane: Lane, worktrees: readonly string[]): Promise<string[]> => {
   if (lane.machine) return [];
   const exists = deps.exists ?? existsSync;
   const reasons: string[] = [];
-  for (const wt of await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd])) {
+  for (const wt of worktrees) {
     if (!exists(wt)) continue;
     // Untracked files are work too (gitignored ones are not listed): a close would delete them with the worktree.
     const dirty = await deps.run(["git", "-C", wt, "status", "--porcelain", "--untracked-files=normal"]);
@@ -110,9 +164,17 @@ export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]
   return reasons;
 };
 
+export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]> =>
+  unpushedWorkIn(deps, lane, await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]));
+
 export type CloseOptions = {
   /** `dori close --force`: close despite unpushed/uncommitted work; a worktree git refuses to remove is kept, as before. */
   readonly force?: boolean;
+  /**
+   * Done checks and discovered worktrees the caller read just before (a claim's settlement): reused instead of read
+   * again. Unpushed work in those worktrees is still re-read under the close lock. Never persisted: a resumed close reads afresh.
+   */
+  readonly pre?: { readonly checks: readonly Check[]; readonly worktrees: readonly string[] };
 };
 
 /** The close sequence's own operation (its intent and resume data); its effects are separate operations of the lane. */
@@ -185,11 +247,12 @@ const closeSequence = async (
   deps: FlowDeps, lane: Lane, note: string, opts: CloseOptions, act: Act, store: OperationStore,
 ): Promise<{ readonly closed: boolean; readonly lines: string[] }> => {
   const exists = deps.exists ?? existsSync;
-  const checks = await checkDone(lane.done, deps.run, signalIo(deps, lane));
+  const checks = opts.pre?.checks ?? await checkDone(lane.done, deps.run, signalIo(deps, lane));
   const lines = checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`);
   if (checks.some((c) => !c.ok)) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live`] };
+  const discovered = opts.pre?.worktrees ?? await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
   if (!opts.force) {
-    const unpushed = await unpushedWork(deps, lane);
+    const unpushed = await unpushedWorkIn(deps, lane, discovered);
     if (unpushed.length) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: ${unpushed.join("; ")} (commit and push it, or dori close --force)`] };
   }
   const cleanup: string[] = [];
@@ -202,7 +265,7 @@ const closeSequence = async (
   const root = lane.cwd ?? deps.config.defaultCwd;
   // A worktree an interrupted close already removed is no longer discovered; its operation still has to settle.
   const pending = store.list({ lane: lane.key }).filter((op) => op.action === "worktree-remove" && op.state !== "verified").map((op) => op.target);
-  const worktrees = [...new Set([...(await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd])).filter(exists), ...pending])];
+  const worktrees = [...new Set([...discovered.filter(exists), ...pending])];
   // Bound before any worktree goes: a worktree whose branch moved past the merged head stays with its branch.
   // The lane's own cwd, when it is a linked worktree, goes too once it sits exactly at a PR merged into the merge base.
   const branches: BranchPlan | undefined = !lane.machine
@@ -237,8 +300,10 @@ const closeSequence = async (
   if (sharing.length) cleanup.push(`thread kept open: lane ${sharing.map((l) => l.key).join(", ")} still works in it`);
   else if (lane.thread !== "none") {
     if (hook) {
-      // A hook has no read-back: after a crash mid-hook it cannot be told whether the thread was marked, so that is ambiguous.
-      const step = await act("thread-done", lane.thread, () => deps.run(fill(hook, { thread: lane.thread, text: note, key: lane.key })), async () => "unknown");
+      // A hook has no read-back of the thread: it is "done" only when the hook ran here and exited 0; after a crash
+      // mid-hook (no result) it cannot be told whether the thread was marked, so that stays ambiguous.
+      let ran: Ran | undefined;
+      const step = await act("thread-done", lane.thread, async () => (ran = await deps.run(fillHook(hook, { thread: lane.thread, text: note, key: lane.key }))), async () => (ran?.code === 0 ? "done" : "unknown"));
       if (step.state === "ambiguous") return ambiguous(step);
       cleanup.push(step.state === "verified" ? "thread marked done" : `thread hook failed: ${step.err.slice(0, 160)}`);
     }
@@ -255,7 +320,7 @@ const closeSequence = async (
           return (await discord.threadArchived(thread)) ? { code: 0, out: "", err: "" } : { code: 1, out: "", err: "read back archived: false" };
         } catch (e) { return { code: 1, out: "", err: e instanceof Error ? e.message : String(e) }; }
       }, archived);
-      if (step.state === "ambiguous") return ambiguous(step);
+      // An unreadable archive state is ambiguous in the ledger but does not stop the close: the thread is only cosmetic.
       cleanup.push(step.state === "verified" ? `thread ${thread} archived` : `thread ${thread} not archived: ${step.err.slice(0, 160)}`);
     }
   }
@@ -274,7 +339,7 @@ const closeSequence = async (
   const operations = store.list({ lane: lane.key }).filter((op) => op.action !== CLOSE_ACTION).map((op) => ({ id: op.id, state: op.state }));
   const receipt = { checks, note, cleanup, ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations };
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "closed", note, at, { closedAt: at, receipt }));
-  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key} ${JSON.stringify(receipt)}`] };
+  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}`] };
 };
 
 /**
@@ -297,18 +362,20 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
     const { note, force } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean };
     const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force) });
     const last = result.lines.at(-1) ?? "";
-    if (result.closed) await push(`LANE_CLOSED ${lane.key} ${last.split(" ").slice(2).join(" ")}`);
+    if (result.closed) await push(closedEvent(lane.key, note ?? "", result.lines), undefined, laneMeta(lane));
     else {
       const ambiguousLines = result.lines.filter((line) => line.startsWith("OPERATION_AMBIGUOUS "));
-      for (const line of ambiguousLines.length ? ambiguousLines : [`OPERATION_FAILED ${op.id} the interrupted close was not finished: ${last}`]) await push(line);
+      for (const line of ambiguousLines.length ? ambiguousLines : [`OPERATION_FAILED ${op.id} the interrupted close was not finished: ${last}`]) await push(line, undefined, laneMeta(lane));
     }
   }
 };
 
 const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
-  const blocked = await unpushedWork(deps, lane);
+  const worktrees = await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
+  const blocked = await unpushedWorkIn(deps, lane, worktrees);
   if (blocked.length) return objectDone(deps, lane, blocked);
-  const failing = (await checkDone(lane.done, deps.run, signalIo(deps, lane))).filter((c) => !c.ok).map((c) => `${c.signal} -> ${c.detail}`);
+  const checks = await checkDone(lane.done, deps.run, signalIo(deps, lane));
+  const failing = checks.filter((c) => !c.ok).map((c) => `${c.signal} -> ${c.detail}`);
   if (failing.length) return objectDone(deps, lane, failing);
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
   await withOperations(deps, async (store) => {
@@ -329,12 +396,12 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
     await withOperations(deps, async (store) => settleOperation(store, deps.clock.now(), closeId(lane.key), "failed", `superseded: lane is ${superseded.status}`));
     return `LANE_SETTLE_SKIPPED ${lane.key} is now ${superseded.status}; the done claim being settled was superseded, not closed`;
   }
-  const result = await closeLane(deps, verified, `Done: ${evidence}`);
+  const result = await closeLane(deps, verified, `Done: ${evidence}`, { pre: { checks, worktrees } });
   if (!result.closed) {
     const signals = result.lines.filter((l) => l.startsWith("SIGNAL NOT"));
     return objectDone(deps, (await deps.registry.read(lane.key)) ?? verified, signals.length ? signals : result.lines.filter((l) => l.startsWith("REFUSED")));
   }
-  return `LANE_CLOSED ${lane.key} ${result.lines.at(-1)?.split(" ").slice(2).join(" ") ?? ""}`;
+  return closedEvent(lane.key, `Done: ${evidence}`, result.lines);
 };
 
 /** The thread id of a `discord:<channel>/<thread>` ref; a lane working in a channel itself (no thread) has none. */
@@ -414,7 +481,14 @@ export const laneSendRefusal = (caller: string | undefined, lane: Lane | null, p
 };
 
 /** Hands a line over; `id` is its journal id when the line has a stable one (else the supervisor assigns one). */
-export type Emit = (line: string, id?: string) => Promise<void>;
+export type Emit = (line: string, id?: string, meta?: EventMeta) => Promise<void>;
+
+/** The meta of an event about `lane`: its key, thread (when it has one) and cwd (when known). */
+export const laneMeta = (lane: Lane): EventMeta => ({
+  lane: lane.key,
+  ...(lane.thread && lane.thread !== "none" ? { thread: lane.thread } : {}),
+  ...(lane.cwd ? { cwd: lane.cwd } : {}),
+});
 
 /**
  * A remote lane can neither run `dori claim-done` nor message the lead pane: its newest `[REPORT]` line, read from
@@ -464,7 +538,7 @@ const actOnRemoteReport = async (deps: FlowDeps, lane: Lane, push: Emit, line: s
     await claimDone(deps, seen, what);
     return (await deps.registry.patch(lane.key, fields)) ?? seen;
   }
-  if (kind === "blocker" || kind === "question") await push(`LANE_REPORT ${lane.key} ${kind} ${what}`);
+  if (kind === "blocker" || kind === "question") await push(`LANE_REPORT ${lane.key} ${kind} ${what}`, undefined, laneMeta(lane));
   await deps.registry.patch(lane.key, fields);
   return seen;
 };
@@ -472,7 +546,7 @@ const actOnRemoteReport = async (deps: FlowDeps, lane: Lane, push: Emit, line: s
 const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepView): Promise<void> => {
   const status = statusOf(listed);
   if (status === "closed") {
-    for (const line of await closedWorktreeSweep(deps, listed)) await push(line);
+    for (const line of await closedWorktreeSweep(deps, listed)) await push(line, undefined, laneMeta(listed));
     return;
   }
   let lane = listed;
@@ -484,7 +558,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepVi
     // Enqueued before the emitted mark is saved: a crash in between repeats the announcement instead of losing it
     // (under the same id, so the supervisor journals it once).
     const event = !machine ? claimEventId(lane.key, claim.at) : undefined;
-    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${claim.evidence}`, event);
+    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${eventText(claim.evidence)}`, event, laneMeta(lane));
     const announced = { emitted: true, ...(event ? { event } : {}) };
     claim = { ...claim, ...announced };
     lane = { ...lane, claim };
@@ -500,7 +574,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepVi
     evidence = `${claim.evidence} (closed at once: ${merged})`;
   }
   const line = await settle(deps, lane, evidence);
-  await push(machine && line.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${line.slice("LANE_CLOSED ".length)}` : line);
+  await push(machine && line.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${line.slice("LANE_CLOSED ".length)}` : line, undefined, laneMeta(lane));
 };
 
 /**
@@ -550,8 +624,8 @@ const windowStart = async (deps: FlowDeps, lane: Lane, claim: NonNullable<Lane["
  */
 export const watchTick = async (deps: FlowDeps, emit?: Emit, view: SweepView = passthroughView(deps.run), archived = true): Promise<string[]> => {
   const out: string[] = [];
-  const push: Emit = async (line, id) => {
-    if (emit) await emit(line, id);
+  const push: Emit = async (line, id, meta) => {
+    if (emit) await (meta ? emit(line, id, meta) : emit(line, id));
     out.push(line);
   };
   try {

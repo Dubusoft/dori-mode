@@ -8,9 +8,9 @@ import { ACK_KEEP_MS, Supervisor } from "../src/supervise.ts";
 import { inputState, pointerText } from "../src/supervise-push.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { recordAck, recordHandled } from "../src/ack.ts";
-import { take, takeOutput } from "../src/inbox.ts";
+import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
-import { recordReported } from "../src/lane-outcomes.ts";
+import { recordReported, takeReminders } from "../src/lane-outcomes.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -30,7 +30,7 @@ const EMPTY = omo("");
 const fixture = (extra: Record<string, unknown> = {}) => {
   const state = withState();
   cleanups.push(state.done);
-  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; } };
+  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async () => {} /* confirm waits inside sendVerified must not move the escalation clock: the "N min" in the handoff reason counts only the test's own steps */ };
   const world = newWorld();
   world.screen = EMPTY;
   const session = "11111111-1111-4111-8111-111111111111";
@@ -213,9 +213,8 @@ test("the input guard types only into an empty input, and re-submits only our ow
 test("a pushed pointer still in the input after pasteCheckMs gets one more Enter, never a second one", async () => {
   const f = fixture({ delivery: delivery() });
   const pointer = pointerText(1, true, ["WAIT_DONE"], 200);
-  // The quota check and the input guard read an empty input; after the send the pointer still sits there.
-  f.world.screens = [EMPTY, EMPTY];
-  f.world.screen = omo(pointer);
+  // The input is empty until the send; then the pointer stays visible until the extra Enter.
+  f.onSend(() => { f.world.screen = omo(pointer); });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");
   await flush(supervisor);
@@ -223,7 +222,7 @@ test("a pushed pointer still in the input after pasteCheckMs gets one more Enter
   expect(f.enters()).toBe(2);
 });
 
-test("an untaken urgent event survives a ladder restart: the cursor stays, take prints it, unfinished owner messages stay inline", async () => {
+test("an untaken urgent event survives a ladder restart: the cursor stays, take prints it and the unfinished owner message once, the prompt neither", async () => {
   const f = fixture({ delivery: delivery({ tailMonitor: false }) });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 please fix the build");
@@ -243,12 +242,14 @@ test("an untaken urgent event survives a ladder restart: the cursor stays, take 
   const lines = prompt.split("\n");
   expect(lines[3]).toStartWith("Run dori inbox take now");
   expect(prompt).toContain("it did not take pushed events (1 urgent event(s) untaken for 5 min)");
-  expect(prompt).toContain('"id":"discord:1:1"');
-  expect(prompt).not.toContain('"id":"lane:q"');
+  expect(prompt).not.toContain("discord:1:1");
+  expect(prompt).not.toContain("lane:q");
   expect(prompt).not.toContain("tail -c +");
   expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }))).toEqual([
     "discord:1:1\tINBOUND 1 1 please fix the build", "lane:q\tLANE_REPORT k question which base branch?",
   ]);
+  // Untaken, so take prints it from the log: it is not carried over a second time.
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
   expect(readJournal(f.state.dir).forcedRestarts).toEqual([{ at: expect.any(Number), cause: "forced" }]);
 });
 
@@ -296,7 +297,9 @@ test("a finished lane taken but not reported keeps an idle lead pushed and escal
   expect(f.launches()).toHaveLength(1);
   const prompt = f.prompt() ?? "";
   expect(prompt).toContain("it did not take pushed events (1 finished lane(s) not reported to the owner for 5 min)");
-  expect(prompt.split("\n")).toContain("UNREPORTED alpha LANE_CLOSED alpha merged");
+  // The prompt carries no obligation line: the new lead's take prints it as a reminder.
+  expect(prompt).not.toContain("UNREPORTED alpha");
+  expect(takeReminders(f.state.dir)).toEqual([expect.stringMatching(/^unreported:alpha\tUNREPORTED alpha since /)]);
   recordReported(f.state.dir, "alpha", f.clock.now());
   await supervisor.reportTick();
   const pushed = f.texts().length;
@@ -420,7 +423,7 @@ test("past restartMaxPerHour the ladder refuses, logs and tells the owner once, 
   expect(f.texts().length).toBeGreaterThan(3);
 });
 
-test("the cap counts forced restarts and quota switches only: a demand-driven cold start is not counted (N4)", async () => {
+test("the cap counts forced restarts only: a demand-driven cold start is not counted (N4)", async () => {
   const f = fixture({ delivery: delivery() });
   const supervisor = new Supervisor(f.deps);
   // A stale idle session with no waits or lanes is not warm: the urgent event goes to a cold start.

@@ -6,7 +6,7 @@ import { defaultConfig } from "../src/config.ts";
 import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import {
-  clearLaunchHold, dequeueLaunch, enqueueLaunch, journalQuotaBypass, launchGate, launchHeld, launchQueue, launchQueueText,
+  clearLaunchHold, dequeueLaunch, enqueueLaunch, launchGate, launchHeld, launchQueue, launchQueueText,
   otherOpenLanesOnThread, type QueuedLaunch, recordLaunchVerdict,
 } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
@@ -68,38 +68,17 @@ test("the LAUNCH_READY text lists every queued launch with key, cwd, repo, threa
 
 // Items 2, 5, 6: the launch gate
 test("dori launch's gate holds on host memory, disk and pane limits", () => {
-  expect(launchGate({ key: "k", sample: roomy, guard })).toEqual({ lines: [] });
-  expect(launchGate({ key: "k", sample: { ...roomy, memFreePct: 5 }, guard }).hold).toBe("memory free 5% < 20%");
-  expect(launchGate({ key: "k", sample: { ...roomy, diskFreeGb: 3, panes: 20 }, guard }).hold).toBe("disk free 3 GB < 50 GB | panes 20 >= 20");
-  expect(launchGate({ key: "k", sample: roomy, guard, quotaHold: "quota hold-lanes: Claude 5h 85% >= 80%" }).hold).toBe("quota hold-lanes: Claude 5h 85% >= 80%");
-});
-
-test("--ignore-quota needs a reason, lifts only the quota gate, and yields an OWNER_NOTICE line", () => {
-  const hold = "quota hold-lanes: Claude 5h 85% >= 80%";
-  expect(launchGate({ key: "k", sample: roomy, guard, quotaHold: hold, ignoreQuota: true }).error).toContain("--reason");
-  expect(launchGate({ key: "k", sample: roomy, guard, quotaHold: hold, ignoreQuota: true, reason: "  " }).error).toContain("--reason");
-  const ok = launchGate({ key: "k", sample: roomy, guard, quotaHold: hold, ignoreQuota: true, reason: "owner asked for the hotfix now" });
-  expect(ok.hold).toBeUndefined();
-  expect(ok.lines).toEqual([`OWNER_NOTICE lane k is launching past the Claude quota gate with --ignore-quota (${hold}); reason: owner asked for the hotfix now`]);
-  // The host guard is never bypassed.
-  const host = launchGate({ key: "k", sample: { ...roomy, memFreePct: 5 }, guard, quotaHold: hold, ignoreQuota: true, reason: "r" });
-  expect(host.hold).toBe("memory free 5% < 20%");
-  expect(host.lines.some((l) => l.startsWith("OWNER_NOTICE"))).toBe(false);
-});
-
-test("a quota bypass is journaled with its reason", () => {
-  journalQuotaBypass(state.dir, { key: "k", reason: "hotfix", quotaHold: "quota hold", at: T0 });
-  journalQuotaBypass(state.dir, { key: "k2", reason: "again", at: T0 });
-  const lines = readFileSync(join(state.dir, "quota-bypass.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  expect(lines).toEqual([{ key: "k", reason: "hotfix", quotaHold: "quota hold", at: "2026-01-01T12:00:00.000Z" }, { key: "k2", reason: "again", at: "2026-01-01T12:00:00.000Z" }]);
+  expect(launchGate({ sample: roomy, guard })).toEqual({ lines: [] });
+  expect(launchGate({ sample: { ...roomy, memFreePct: 5 }, guard }).hold).toBe("memory free 5% < 20%");
+  expect(launchGate({ sample: { ...roomy, diskFreeGb: 3, panes: 20 }, guard }).hold).toBe("disk free 3 GB < 50 GB | panes 20 >= 20");
 });
 
 test("panesMax 0 means unlimited panes, with a warning on every launch", () => {
   const open = { ...guard, panesMax: 0 };
-  const g = launchGate({ key: "k", sample: { ...roomy, panes: 500 }, guard: open });
+  const g = launchGate({ sample: { ...roomy, panes: 500 }, guard: open });
   expect(g.hold).toBeUndefined();
   expect(g.lines).toEqual([expect.stringMatching(/^LAUNCH_WARN guard\.panesMax is 0: the pane-count limit is off/)]);
-  expect(launchGate({ key: "k", sample: { ...roomy, memFreePct: 1 }, guard: open }).lines[0]).toStartWith("LAUNCH_WARN");
+  expect(launchGate({ sample: { ...roomy, memFreePct: 1 }, guard: open }).lines[0]).toStartWith("LAUNCH_WARN");
 });
 
 // Items 3 and 4: placement and threads
@@ -262,12 +241,6 @@ test("dori hold list prints the queue and dori hold drop removes one item", asyn
   expect(launchQueue(state.dir).map((q) => q.key)).toEqual(["lane-b"]);
   expect((await cli(["hold", "drop", "lane-a"])).code).toBe(1);
   expect((await cli(["hold"])).code).toBe(1);
-});
-
-test("dori launch --ignore-quota without --reason is refused before anything runs", async () => {
-  const r = await cli(["launch", "k-lane", "--title", "t", "--brief", join(state.dir, "b.md"), "--done", "merged acme/app#1", "--ignore-quota"]);
-  expect(r.code).toBe(1);
-  expect(r.err).toContain("--ignore-quota needs --reason");
 });
 
 test("dori launch validates Done before a host HOLD can enqueue it", async () => {

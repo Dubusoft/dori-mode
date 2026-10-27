@@ -2,8 +2,10 @@ import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync,
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_EVENT_POLICY, type EventPolicy, resolveEventPolicy } from "./event-policy.ts";
+import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
+import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import type { ToodoConfig } from "./messenger/toodo.ts";
+import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -21,22 +23,6 @@ export type GuardThresholds = {
   readonly diskFreeMinGb: number;
   readonly panesMax: number;
 };
-
-/**
- * The Claude subscription gate, read before jobs, in percent headroom: quota left over time left until each window's
- * reset (100 is on pace), an account by its tightest window, summed over every Claude account. Under
- * `holdLanesHeadroomPct` new lanes are held (dori launch / can-launch print HOLD with the reset time); under
- * `briefHeadroomPct` the lead answers briefly or declines new work; at 0 (every account has a window used up) blocked.
- */
-export type QuotaGate = {
-  readonly holdLanesHeadroomPct: number;
-  readonly briefHeadroomPct: number;
-  /** Minutes between the supervisor's usage reads (cached for dori status). */
-  readonly pollMin: number;
-};
-
-/** quotaGate keys of the fixed percent-used gate; a config that still has them loads, with one warning. */
-export const REMOVED_QUOTA_KEYS = ["holdLanes5hPct", "holdLanes7dPct", "brief5hPct", "brief7dPct", "nearReset5hMin", "nearResetHoldLanes5hPct", "account"] as const;
 
 /** `dori memory check` and the supervisor's daily memory sweep. Read-only: the memory repo is never written. */
 export type MemoryCheckConfig = {
@@ -71,7 +57,7 @@ export type PushConfig = {
 export type DeliveryConfig = {
   /** The startup prompt also arms the tail monitor; while on, only an unacked owner message escalates an idle lead. */
   readonly tailMonitor: boolean;
-  /** Forced restarts and quota switches per rolling hour; past it, the push ladder refuses unread-driven restarts. */
+  /** Forced restarts per rolling hour; past it, the push ladder refuses unread-driven restarts. */
   readonly restartMaxPerHour: number;
   readonly push: PushConfig;
 };
@@ -128,25 +114,14 @@ export type DoriConfig = {
   readonly defaultCwd: string;
   readonly agentCommand: ArgvTemplate;
   readonly defaultModel: string;
-  /**
-   * Model for the lead session only; absent or blank means `defaultModel`. Lanes never read it. An array is an ordered
-   * fallback chain: the supervisor moves the lead to the next entry while the current one is blocked on quota.
-   */
-  readonly leadModel?: string | readonly LeadModelEntry[];
-  /**
-   * Paid emergency models for the lead only, tried in order after the `leadModel` chain when the subscription is
-   * blocked. Lanes never run on them: launch refuses these models.
-   */
-  readonly leadEmergencyModels: readonly LeadModelEntry[];
-  readonly quotaGate: QuotaGate;
-  /** Minutes between checks of the first lead model while the lead runs on a fallback. */
-  readonly leadPrimaryRetryMin: number;
-  /** Prints a provider's accounts as JSON ({accounts: [{name, blocked}]}); `{provider}` is filled. Never add --credentials. */
-  readonly quotaCheck: ArgvTemplate;
+  /** Model for the lead only; absent or blank means `defaultModel`. */
+  readonly leadModel?: LeadModelEntry;
   /** `--thinking` level for the lead session only; absent or blank keeps whatever `agentCommand` carries. */
   readonly leadThinking?: string;
   /** Extra argv for the lead session only (after the executable), e.g. ["--approve"]. */
   readonly leadArgs: ArgvTemplate;
+  /** Start the lead with a slimmer omo context (no skills list, LEAD_DIET_EXCLUDED_TOOLS removed, chat prompt surface). Lanes are unaffected. */
+  readonly leadDiet: boolean;
   readonly cacheTtlMin: number;
   readonly leadContextCapTokens: number;
   readonly leadContextHardCapTokens: number;
@@ -182,6 +157,10 @@ export type DoriConfig = {
   readonly unhandledNotice: string;
   /** Minutes after a lane finished (LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
   readonly reportTimeoutMin: number;
+  /** Event kinds (eventPolicy syntax) that open a decision obligation, closed by dori resolved <eventId> (decision-obligations.ts). */
+  readonly resolveKinds: readonly string[];
+  /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
+  readonly resolveTimeoutMin: number;
   /** The supervisor posts one plain line itself for each finished lane (lane-finish.ts), in its thread or the main channel. */
   readonly laneFinishNotice: boolean;
   readonly heavySlots: number;
@@ -196,10 +175,6 @@ export type DoriConfig = {
   readonly diskGuardPath: string;
   /** A wait without --timeout whose check errors or times out this many times in a row ends as WAIT_FAILED. */
   readonly waitMaxFailures: number;
-  /** Minutes a working lead may stay quota-stalled (with a fallback model left) before it is switched anyway. */
-  readonly leadQuotaBusySwitchMin: number;
-  /** Consecutive leadPrimaryRetryMin checks the first lead model must be unblocked on before the lead moves back to it. */
-  readonly leadPrimaryReturnChecks: number;
   /** Minutes a working/blocked lead may leave owner messages unread before it is cold-restarted with them; 0 turns it off. */
   readonly leadStuckRestartMin: number;
   /**
@@ -226,10 +201,23 @@ export type DoriConfig = {
   readonly delivery: DeliveryConfig;
 };
 
+/** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
+export const LEAD_DIET_EXCLUDED_TOOLS: readonly string[] = [
+  "task", "task_output", "task_send", "task_cancel", "workpool", "show_html_page", "ask_user_question",
+  "create_goal", "get_goal", "update_goal",
+  "codegraph_callers", "codegraph_callees", "codegraph_explore", "codegraph_files", "codegraph_impact", "codegraph_node", "codegraph_search", "codegraph_status",
+  "lsp_diagnostics", "lsp_find_references", "lsp_goto_definition", "lsp_prepare_rename", "lsp_rename", "lsp_symbols",
+  "mcp_list_resources", "mcp_read_resource",
+];
+
+/** Lead-only launch additions for `leadDiet`: the env assignments and the omo flags. */
+export const LEAD_DIET_ENV = ["SENPI_PROMPT_SURFACE=chat"] as const;
+export const LEAD_DIET_ARGS = ["--no-skills", "--exclude-tools", LEAD_DIET_EXCLUDED_TOOLS.join(",")] as const;
+
 /** One lead model: "provider/model", or an object whose `thinking` replaces `leadThinking` for this model only. */
 export type LeadModelEntry = string | { readonly model: string; readonly thinking?: string };
 
-export type LeadModel = { readonly model: string; readonly thinking?: string; readonly emergency?: true };
+export type LeadModel = { readonly model: string; readonly thinking?: string };
 
 export const defaultConfig = (home = homedir()): DoriConfig => ({
   stateDir: join(home, ".dori", "state"),
@@ -241,10 +229,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   agentCommand: ["omo", "--model", "{model}", "{prompt}"],
   defaultModel: "anthropic-subscription/claude-opus-5-5",
   leadArgs: [],
-  leadEmergencyModels: [],
-  quotaGate: { holdLanesHeadroomPct: 50, briefHeadroomPct: 25, pollMin: 5 },
-  leadPrimaryRetryMin: 15,
-  quotaCheck: ["omo", "auth", "check", "--provider", "{provider}", "--json", "--no-refresh"],
+  leadDiet: true,
   cacheTtlMin: 5,
   leadContextCapTokens: 150_000,
   leadContextHardCapTokens: 300_000,
@@ -268,6 +253,8 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   handledTimeoutMin: 30,
   unhandledNotice: "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
   reportTimeoutMin: 5,
+  resolveKinds: DEFAULT_RESOLVE_KINDS,
+  resolveTimeoutMin: 15,
   laneFinishNotice: true,
   heavySlots: 1,
   heavyMaxLoad: 80,
@@ -278,8 +265,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   runTimeoutMs: 60_000,
   diskGuardPath: "",
   waitMaxFailures: 30,
-  leadQuotaBusySwitchMin: 10,
-  leadPrimaryReturnChecks: 2,
   leadStuckRestartMin: 30,
   leadUnreadRestartMin: 5,
   leadChildWaitMaxMin: 60,
@@ -303,8 +288,19 @@ export const REMOVED_FLAGS = [
   "claimDelivery", "branchCleanup", "eventSources", "schedules", "laneReports",
 ] as const;
 
-let warnedRemovedFlags = false;
+/** Top-level keys of the removed lane quota stall sweep; a config that still has them loads, with one warning. */
+export const REMOVED_QUOTA_STALL_KEYS = ["quotaCheck"] as const;
+
+/** Top-level keys of the removed Claude quota gate (any old sub-keys included); a config that still has them loads, with one warning. */
+export const REMOVED_QUOTA_GATE_KEYS = ["quotaGate"] as const;
+
+export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
+
 let warnedRemovedQuotaKeys = false;
+let warnedLeadArray = false;
+let warnedRemovedFlags = false;
+let warnedRemovedQuotaGateKeys = false;
+let warnedRemovedQuotaStallKeys = false;
 let warnedRemovedPushKeys = false;
 let warnedRemovedDeliveryKeys = false;
 
@@ -312,6 +308,18 @@ let warnedRemovedDeliveryKeys = false;
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
   const language = typeof ownerLanguage === "string" ? ownerLanguage.trim() : "";
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
+};
+
+/** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
+const resolveKinds = (raw: unknown): readonly string[] => {
+  if (raw === undefined) return DEFAULT_RESOLVE_KINDS;
+  if (!Array.isArray(raw)) throw new EventPolicyError("resolveKinds must be an array of event kinds");
+  for (const kind of raw) {
+    if (typeof kind !== "string" || !kind || kind.split(" ").some((word) => !word) || kind.split(" ")[0] === "*") {
+      throw new EventPolicyError(`resolveKinds: ${JSON.stringify(kind)} is not a kind (words separated by single spaces, starting with the event name)`);
+    }
+  }
+  return raw as string[];
 };
 
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
@@ -327,14 +335,30 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     warnedRemovedFlags = true;
     console.error(`CONFIG_FLAGS_REMOVED ${leftover.join(", ")} in ${path}: these flags were removed and their behavior is always on; the keys are ignored and can be deleted`);
   }
-  const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !(REMOVED_FLAGS as readonly string[]).includes(key))) as Partial<DoriConfig>;
-  const rawGate = (raw.quotaGate ?? {}) as Record<string, unknown>;
-  const oldGate = REMOVED_QUOTA_KEYS.filter((key) => key in rawGate);
-  if (oldGate.length && !warnedRemovedQuotaKeys) {
-    warnedRemovedQuotaKeys = true;
-    console.error(`CONFIG_QUOTA_KEYS_REMOVED quotaGate.${oldGate.join(", quotaGate.")} in ${path}: the Claude gate now compares quota left with time left across every account (quotaGate.holdLanesHeadroomPct, briefHeadroomPct); the keys are ignored and can be deleted`);
+  const oldStall = REMOVED_QUOTA_STALL_KEYS.filter((key) => key in loaded);
+  if (oldStall.length && !warnedRemovedQuotaStallKeys) {
+    warnedRemovedQuotaStallKeys = true;
+    console.error(`CONFIG_QUOTA_STALL_KEYS_REMOVED ${oldStall.join(", ")} in ${path}: lanes are no longer checked or paused on quota; the keys are ignored and can be deleted`);
   }
-  const quotaGate = Object.fromEntries(Object.entries(rawGate).filter(([key]) => !(REMOVED_QUOTA_KEYS as readonly string[]).includes(key))) as Partial<QuotaGate>;
+  const oldGate = REMOVED_QUOTA_GATE_KEYS.filter((key) => key in loaded);
+  if (oldGate.length && !warnedRemovedQuotaGateKeys) {
+    warnedRemovedQuotaGateKeys = true;
+    console.error(`CONFIG_QUOTA_GATE_KEYS_REMOVED ${oldGate.join(", ")} in ${path}: launches are no longer gated on Claude quota; the keys are ignored and can be deleted`);
+  }
+  const oldLead = REMOVED_QUOTA_KEYS.filter((key) => key in loaded);
+  if (oldLead.length && !warnedRemovedQuotaKeys) {
+    warnedRemovedQuotaKeys = true;
+    console.error(`CONFIG_QUOTA_KEYS_REMOVED ${oldLead.join(", ")} in ${path}: the lead uses one model; the keys are ignored and can be deleted`);
+  }
+  if (Array.isArray(loaded.leadModel)) {
+    if (!warnedLeadArray) {
+      warnedLeadArray = true;
+      console.error(`CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
+    }
+    loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
+  }
+  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS];
+  const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
   const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
   const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);
   if (oldDelivery.length && !warnedRemovedDeliveryKeys) {
@@ -349,10 +373,11 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   }
   const push = Object.fromEntries(Object.entries(rawPush).filter(([key]) => !(REMOVED_PUSH_KEYS as readonly string[]).includes(key))) as Partial<PushConfig>;
   const delivery: DeliveryConfig = { ...base.delivery, ...Object.fromEntries(Object.entries(rawDelivery).filter(([key]) => !(REMOVED_DELIVERY_KEYS as readonly string[]).includes(key))), push: { ...base.delivery.push, ...push } };
-  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, quotaGate: { ...base.quotaGate, ...quotaGate }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...raw.hooks }, delivery };
+  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...raw.hooks }, delivery };
   return {
     ...merged,
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
+    resolveKinds: resolveKinds(raw.resolveKinds),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),
@@ -382,40 +407,22 @@ export const saveLeadPane = (path: string, leadPane: string): boolean => {
   return true;
 };
 
+/** `fill` for the thread hooks: their `text` and `title` leave the host, so secrets are masked on the way out. */
+export const fillHook = (template: ArgvTemplate, values: Readonly<Record<string, string>>): string[] =>
+  fill(template, Object.fromEntries(Object.entries(values).map(([name, value]) => [name, name === "text" || name === "title" ? redactSecrets(value) : value])));
+
 export const fill = (template: ArgvTemplate, values: Readonly<Record<string, string>>): string[] =>
   template.map((part) => part.replace(/\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole));
 
 /**
- * The lead's model chain, first entry first. A string entry uses `leadThinking`; an object entry's own `thinking` wins.
+ * The lead's single model. A string entry uses `leadThinking`; an object entry's own `thinking` wins.
  * Blank or malformed entries are skipped; nothing usable means one entry, `defaultModel`.
  */
 export const leadModels = (config: DoriConfig): LeadModel[] => {
   const shared = config.leadThinking?.trim() || undefined;
   const raw: readonly unknown[] = Array.isArray(config.leadModel) ? config.leadModel : [config.leadModel];
   const chain = modelEntries(raw, shared);
-  return chain.length ? chain : [{ model: config.defaultModel, ...(shared ? { thinking: shared } : {}) }];
-};
-
-/** The model id without a `:thinking` suffix, for comparing selectors. */
-const bareModel = (model: string): string => model.trim().replace(/:[a-z]+$/i, "");
-
-/** The configured `leadEmergencyModels`, flagged; malformed entries are skipped. */
-export const emergencyModels = (config: DoriConfig): LeadModel[] =>
-  modelEntries(Array.isArray(config.leadEmergencyModels) ? config.leadEmergencyModels : [], config.leadThinking?.trim() || undefined)
-    .map((m) => ({ ...m, emergency: true as const }));
-
-/** True when `model` is one of the lead-only emergency models (thinking suffix ignored). */
-export const isEmergencyModel = (config: DoriConfig, model: string): boolean =>
-  emergencyModels(config).some((m) => bareModel(m.model) === bareModel(model));
-
-/**
- * The lead's full chain: `leadModels`, then the emergency models not already in it. The supervisor moves along this
- * chain only while the current entry is blocked on quota, and back to the first once that has quota again.
- */
-export const leadChain = (config: DoriConfig): LeadModel[] => {
-  const chain = leadModels(config);
-  const seen = new Set(chain.map((m) => bareModel(m.model)));
-  return [...chain, ...emergencyModels(config).filter((m) => !seen.has(bareModel(m.model)))];
+  return chain.length ? chain.slice(0, 1) : [{ model: config.defaultModel, ...(shared ? { thinking: shared } : {}) }];
 };
 
 const modelEntries = (raw: readonly unknown[], shared: string | undefined): LeadModel[] =>
@@ -434,14 +441,13 @@ export const providerOf = (model: string): string | undefined => {
 };
 
 /**
- * The lead's agent argv: `agentCommand` filled with entry `index` of `leadChain` (clamped to the chain). Its thinking
+ * The lead's agent argv: `agentCommand` filled with its single model. Its thinking
  * level replaces the template's `--thinking` value, or is inserted right after the `--model` pair when the template has
  * none. Lanes keep `agentCommand` and `defaultModel` untouched.
  */
-export const leadCommand = (config: DoriConfig, prompt: string, index = 0): string[] => {
+export const leadCommand = (config: DoriConfig, prompt: string): string[] => {
   const template = config.agentCommand;
-  const chain = leadChain(config);
-  const lead = chain[Math.min(Math.max(index, 0), chain.length - 1)] ?? { model: config.defaultModel };
+  const lead = leadModels(config)[0] ?? { model: config.defaultModel };
   const argv = fill(template, { model: lead.model, prompt });
   const thinking = lead.thinking;
   if (!thinking) return argv;

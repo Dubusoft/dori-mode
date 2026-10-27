@@ -20,7 +20,9 @@ export const SQLITE_FILE = "supervisor.sqlite";
 export const PRE_SQLITE_FILE = "supervisor.json.pre-sqlite";
 /** The json store's lead wakes (lead-wakes.ts), one JSON object per line: a wake, or `{close, calls}` closing one. */
 export const WAKES_FILE = "lead-wakes.jsonl";
-export const SCHEMA_VERSION = 5;
+/** The json store's consumed take receipts (event-trace.ts), one `{ids, at, session}` per line; sqlite keeps them on deliveries. */
+export const TAKES_FILE = "lead-takes.jsonl";
+export const SCHEMA_VERSION = 8;
 /** Every row belongs to the single lead today; per-lead rows arrive with Phase 3. */
 export const DEFAULT_LEAD = "dori";
 
@@ -50,6 +52,8 @@ export interface JournalStore {
   logCursor(): number;
   /** Record deliveries appended to the log, and the log offset they reach. */
   recordDeliveries(ids: readonly string[], cursor: number, at: number): void;
+  /** Record that the lead took delivered events `ids` at `at` in `session` (a consumed take receipt); the first take wins. */
+  recordTakes(ids: readonly string[], at: number, session: string): void;
   /** Whether the store prunes delivered event bodies (sqlite); the json journal keeps every event. */
   readonly retains: boolean;
   /** An event id whose body was pruned: still a duplicate until its tombstone expires. */
@@ -120,6 +124,9 @@ class JsonStore implements JournalStore {
   deliveredIds(): undefined { return undefined; }
   logCursor(): number { return 0; }
   recordDeliveries(): void {}
+  recordTakes(ids: readonly string[], at: number, session: string): void {
+    if (ids.length) appendLine(join(this.path, "..", TAKES_FILE), JSON.stringify({ ids, at, ...(session ? { session } : {}) }));
+  }
   readonly retains = false;
   tombstoned(): boolean { return false; }
   expireTombstones(): string[] { return []; }
@@ -167,11 +174,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, pos INTEGER NOT NULL, text TEXT NOT NULL, attempts INTEGER, next_at INTEGER);
 CREATE TABLE IF NOT EXISTS lead_restarts (
   lead TEXT PRIMARY KEY, session TEXT NOT NULL, events TEXT NOT NULL, "offset" INTEGER NOT NULL, phase TEXT NOT NULL,
-  strikes INTEGER, unconfirmed INTEGER, model_index INTEGER, reason TEXT, request TEXT, force INTEGER);
+  strikes INTEGER, unconfirmed INTEGER, reason TEXT, request TEXT, force INTEGER);
 CREATE TABLE IF NOT EXISTS lead_state (
-  lead TEXT PRIMARY KEY, lead_model INTEGER, primary_retry_at INTEGER, primary_clear_checks INTEGER,
-  quota_exhausted TEXT, models TEXT, quota_stall_since INTEGER, lead_busy_since INTEGER, lead_screen TEXT,
-  emergency_episode INTEGER);
+  lead TEXT PRIMARY KEY, models TEXT, lead_busy_since INTEGER, lead_screen TEXT);
 `;
 
 /**
@@ -180,6 +185,9 @@ CREATE TABLE IF NOT EXISTS lead_state (
  * 3: lead wakes with their trigger kinds and model calls (lead-wakes.ts).
  * 4: the lead's take cursor and push state (`inbox`) and the forced restarts of the last hour (supervise-push.ts).
  * 5: lane outcome report obligations (`outcomes`, lane-outcomes.ts).
+ * 6: event lane metadata (`events.meta`) and when and in which session the lead took each delivery (event-trace.ts).
+ * 7: decision obligations (`pending`, decision-obligations.ts).
+ * 8: the head repository of each polled PR (`gh_prs.head_repo`), so a fork PR is never taken for a lane's own.
  */
 const MIGRATIONS: readonly (readonly [number, string | ((db: Database) => void)])[] = [[2, `
 CREATE TABLE IF NOT EXISTS event_tombstones (id TEXT PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
@@ -199,7 +207,10 @@ CREATE TABLE IF NOT EXISTS lead_wakes (
   calls INTEGER, closed INTEGER);
 CREATE INDEX IF NOT EXISTS lead_wakes_at ON lead_wakes (at);
 `], [4, (db) => addColumns(db, "lead_state", ["inbox TEXT", "forced_restarts TEXT"])],
-  [5, (db) => addColumns(db, "lead_state", ["outcomes TEXT"])]];
+  [5, (db) => addColumns(db, "lead_state", ["outcomes TEXT"])],
+  [6, (db) => { addColumns(db, "events", ["meta TEXT"]); addColumns(db, "deliveries", ["taken_at INTEGER", "taken_session TEXT"]); }],
+  [7, (db) => addColumns(db, "lead_state", ["pending TEXT"])],
+  [8, (db) => addColumns(db, "gh_prs", ["head_repo TEXT"])]];
 
 /** ADD COLUMN has no IF NOT EXISTS: a migration replayed over a database that already has a column must skip it. */
 const addColumns = (db: Database, table: string, columns: readonly string[]): void => {
@@ -212,10 +223,9 @@ const NOTICED_KIND = "noticed";
 
 /** Journal scalars kept in lead_state, with their column. */
 const LEAD_STATE = [
-  ["leadModel", "lead_model", false], ["primaryRetryAt", "primary_retry_at", false], ["primaryClearChecks", "primary_clear_checks", false],
-  ["quotaExhausted", "quota_exhausted", true], ["models", "models", true], ["quotaStallSince", "quota_stall_since", false],
-  ["leadBusySince", "lead_busy_since", false], ["leadScreen", "lead_screen", true], ["emergencyEpisode", "emergency_episode", false],
+  ["models", "models", true], ["leadBusySince", "lead_busy_since", false], ["leadScreen", "lead_screen", true],
   ["inbox", "inbox", true], ["forcedRestarts", "forced_restarts", true], ["outcomes", "outcomes", true],
+  ["pending", "pending", true],
 ] as const satisfies readonly (readonly [keyof Journal, string, boolean])[];
 
 /** Every Journal field this store maps (Appendix D). An import refuses a journal with any other field. */
@@ -274,8 +284,8 @@ export class SqliteStore implements JournalStore {
     }
     const db = this.db;
     this.stmt = {
-      event: db.prepare(`INSERT INTO events (id, kind, lead, line, at, at_synthetic) VALUES ($id, $kind, $lead, $line, $at, $synthetic)
-        ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, line = excluded.line, at = excluded.at, at_synthetic = excluded.at_synthetic`),
+      event: db.prepare(`INSERT INTO events (id, kind, lead, line, at, at_synthetic, meta) VALUES ($id, $kind, $lead, $line, $at, $synthetic, $meta)
+        ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, line = excluded.line, at = excluded.at, at_synthetic = excluded.at_synthetic, meta = excluded.meta`),
       eventDelete: db.prepare("DELETE FROM events WHERE id = ?"),
       deliveryDelete: db.prepare("DELETE FROM deliveries WHERE event_id = ?"),
       eventTombstone: db.prepare("INSERT OR IGNORE INTO event_tombstones (id, at) VALUES (?, ?)"),
@@ -299,12 +309,15 @@ export class SqliteStore implements JournalStore {
       outbox: db.prepare(`INSERT INTO outbox (id, pos, text, attempts, next_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET text = excluded.text, attempts = excluded.attempts, next_at = excluded.next_at`),
       outboxDelete: db.prepare("DELETE FROM outbox WHERE id = ?"),
-      restart: db.prepare(`INSERT OR REPLACE INTO lead_restarts (lead, session, events, "offset", phase, strikes, unconfirmed, model_index, reason, request, force)
-        VALUES ($lead, $session, $events, $offset, $phase, $strikes, $unconfirmed, $model_index, $reason, $request, $force)`),
+      restart: db.prepare(`INSERT OR REPLACE INTO lead_restarts (lead, session, events, "offset", phase, strikes, unconfirmed, reason, request, force)
+        VALUES ($lead, $session, $events, $offset, $phase, $strikes, $unconfirmed, $reason, $request, $force)`),
       restartDelete: db.prepare("DELETE FROM lead_restarts WHERE lead = ?"),
       leadState: db.prepare(`INSERT OR REPLACE INTO lead_state (lead, ${LEAD_STATE.map(([, column]) => column).join(", ")})
         VALUES ($lead, ${LEAD_STATE.map(([, column]) => `$${column}`).join(", ")})`),
       delivery: db.prepare("INSERT OR IGNORE INTO deliveries (event_id, lead, generation, delivered_at) VALUES (?, ?, 0, ?)"),
+      // A take consumed before its delivery row was rewritten (startup recovers the log tail after the takes) stands in as the delivery.
+      take: db.prepare(`INSERT INTO deliveries (event_id, lead, generation, delivered_at, taken_at, taken_session) VALUES (?1, ?2, 0, ?3, ?3, ?4)
+        ON CONFLICT (event_id) DO UPDATE SET taken_at = coalesce(taken_at, excluded.taken_at), taken_session = coalesce(taken_session, excluded.taken_session)`),
     };
   }
 
@@ -348,11 +361,12 @@ export class SqliteStore implements JournalStore {
   read(raw: boolean): Journal {
     const db = this.db;
     this.synthetic = new Set();
-    const events = (db.query("SELECT id, line, at, at_synthetic FROM events ORDER BY seq").all() as Row[]).map((row): JournalEvent => {
+    const events = (db.query("SELECT id, line, at, at_synthetic, meta FROM events ORDER BY seq").all() as Row[]).map((row): JournalEvent => {
       const id = String(row.id);
       if (row.at_synthetic) this.synthetic.add(id);
       const at = num(row.at);
-      return { id, line: String(row.line), ...(at !== undefined && !(raw && row.at_synthetic) ? { at } : {}) };
+      const meta = json(row.meta) as JournalEvent["meta"];
+      return { id, line: String(row.line), ...(at !== undefined && !(raw && row.at_synthetic) ? { at } : {}), ...(meta ? { meta } : {}) };
     });
     const revisions = new Map<string, string[]>();
     for (const row of db.query("SELECT message_id, revision_id FROM owner_revisions ORDER BY message_id, pos").all() as Row[]) {
@@ -425,12 +439,12 @@ export class SqliteStore implements JournalStore {
     }
     if (!this.journalMarked) {
       ops.push(() => this.setMeta("journal", "1"));
-      this.journalMarked = true;
     }
+    if (ops.length) this.transaction(durability, () => { for (const op of ops) op(); });
+    // The diff baseline describes committed rows, not an attempted save.
+    this.journalMarked = true;
     this.last = journal;
     this.storedEvents = journal.events.length;
-    if (!ops.length) return;
-    this.transaction(durability, () => { for (const op of ops) op(); });
   }
 
   private diffEvents(prev: readonly JournalEvent[], next: readonly JournalEvent[], ops: (() => void)[]): void {
@@ -439,7 +453,10 @@ export class SqliteStore implements JournalStore {
     const write = (event: JournalEvent, old: JournalEvent | undefined) => {
       // An event the import stamped keeps its synthetic flag while its time stays the stamped one.
       const synthetic = this.synthetic.has(event.id) && old?.at === event.at;
-      ops.push(() => this.stmt.event.run({ id: event.id, kind: kindOf(event.line), lead: DEFAULT_LEAD, line: event.line, at: event.at ?? null, synthetic: synthetic ? 1 : 0 }));
+      ops.push(() => this.stmt.event.run({
+        id: event.id, kind: kindOf(event.line), lead: DEFAULT_LEAD, line: event.line, at: event.at ?? null, synthetic: synthetic ? 1 : 0,
+        meta: event.meta ? JSON.stringify(event.meta) : null,
+      }));
     };
     if (prev === next) {
       // Appended in place: only the tail beyond what is stored is new.
@@ -578,6 +595,10 @@ export class SqliteStore implements JournalStore {
     });
   }
 
+  recordTakes(ids: readonly string[], at: number, session: string): void {
+    this.transaction("normal", () => { for (const id of ids) this.stmt.take.run(id, DEFAULT_LEAD, at, session || null); });
+  }
+
   recordWake(wake: Wake): void {
     this.transaction("normal", () => {
       this.db.query("INSERT INTO lead_wakes (lead, at, session, trigger, kinds) VALUES (?, ?, ?, ?, ?)")
@@ -634,14 +655,14 @@ export const readWakes = (stateDir: string, since: number): Wake[] => {
 
 const restartRow = (restart: Restart): Row => ({
   lead: DEFAULT_LEAD, session: restart.session, events: JSON.stringify(restart.events), offset: restart.offset, phase: restart.phase,
-  strikes: restart.strikes ?? null, unconfirmed: restart.unconfirmed ?? null, model_index: restart.modelIndex ?? null,
+  strikes: restart.strikes ?? null, unconfirmed: restart.unconfirmed ?? null,
   reason: restart.reason ?? null, request: restart.request === undefined ? null : JSON.stringify(restart.request), force: restart.force ? 1 : null,
 });
 
 const restartOf = (row: Row): Restart => {
   const value: Record<string, unknown> = {
     session: String(row.session), events: json(row.events), offset: Number(row.offset), phase: String(row.phase),
-    strikes: num(row.strikes), unconfirmed: num(row.unconfirmed), modelIndex: num(row.model_index), reason: str(row.reason),
+    strikes: num(row.strikes), unconfirmed: num(row.unconfirmed), reason: str(row.reason),
     request: json(row.request), force: row.force ? true : undefined,
   };
   return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Restart;
@@ -676,7 +697,7 @@ export const storeOnDisk = (stateDir: string): StoreKind =>
   existsSync(join(stateDir, SQLITE_FILE)) && !existsSync(join(stateDir, JOURNAL_FILE)) ? "sqlite" : "json";
 
 /**
- * Read-only views for readers outside the Supervisor (status, emergency approval): they never parse the journal file
+ * Read-only views for readers outside the Supervisor (status): they never parse the journal file
  * themselves. Undefined when nothing is stored or it cannot be read.
  */
 export const readStoreView = <T>(stateDir: string, view: { readonly json: (journal: Journal) => T; readonly sqlite: (db: Database) => T }): T | undefined => {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { CiFollowUp, type CiIo, ciMessageId, laneDown, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
+import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -18,15 +18,14 @@ const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MIN = 60_000;
 const SHA = "abcdef1234567890abcdef1234567890abcdef12";
 const lane: Lane = { key: "demo-lane", title: "demo", thread: "discord:111/222", pane: "w:p1", brief: "/b.md", done: "merged acme/app#7", cwd: "/repo", openedAt: new Date(T0).toISOString() };
-const claimedLane: Lane = { ...lane, status: "done-claimed", claim: { at: new Date(T0 + MIN).toISOString(), evidence: "PR green", emitted: true } };
-const pull = (patch: Partial<OpenPull> = {}): OpenPull => ({ repo: "acme/app", number: 7, sha: SHA, branch: "feat", url: "https://github.com/acme/app/pull/7", conflicting: false, checks: "failing", ...patch });
+const claimedLane: Lane = { ...lane, status: "done-claimed", claim: { at: new Date(T0 + MIN).toISOString(), evidence: "PR green", emitted: true, pulls: [{ repo: "acme/app", number: 7, sha: SHA }] } };
+const pull = (patch: Partial<OpenPull> = {}): OpenPull => ({ repo: "acme/app", number: 7, sha: SHA, branch: "feat", headRepo: "acme/app", url: "https://github.com/acme/app/pull/7", conflicting: false, checks: "failing", ...patch });
 const idle = { pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "idle" };
 
 type Gh = { view: Record<string, unknown>; viewCode: number; mergeCode: number; merges: string[][]; issue: string; closes: string[][] };
 const greenView = (patch: Record<string, unknown> = {}) => ({
-  state: "OPEN", baseRefName: "dev", headRefOid: SHA, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
-  statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }], mergeCommit: null,
-  commits: [{ oid: SHA, committedDate: new Date(T0).toISOString() }], ...patch,
+  state: "OPEN", baseRefName: "dev", headRefOid: SHA, isCrossRepository: false, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+  statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }], mergeCommit: null, ...patch,
 });
 
 /** herdr and git from fakes.ts; `gh pr view` / `gh pr merge` from a PR whose merge flips it to MERGED. */
@@ -171,23 +170,67 @@ test("a green, clean lane PR into dev is merged once with --match-head-commit an
   expect(gh.merges).toHaveLength(1);
 });
 
-test("a green lane PR is not merged while its lane has no done claim or pushed after claiming; the first poll after a valid claim merges it", async () => {
+test("a green lane PR is merged only at the head its done claim recorded: no claim, an older claimed head or a claim without a head never merge", async () => {
   const ci = follow();
   const green = pull({ checks: "green" });
   await deps.registry.update(lane.key, () => lane);
   await ci.tick([green], emit);
   expect(gh.merges).toEqual([]);
 
-  // Claimed, then pushed: the head commit is newer than the claim.
-  await deps.registry.update(lane.key, () => claimedLane);
-  gh.view = greenView({ commits: [{ oid: SHA, committedDate: new Date(T0 + 2 * MIN).toISOString() }] });
+  // Claimed at an older head, then pushed: the PR head is not the claimed one (commit dates are not consulted).
+  const OLD = "1111111111111111111111111111111111111111";
+  await deps.registry.update(lane.key, () => ({ ...claimedLane, claim: { ...claimedLane.claim!, at: new Date(T0 + 9 * MIN).toISOString(), pulls: [{ repo: "acme/app", number: 7, sha: OLD }] } }));
   await ci.tick([green], emit);
   expect(gh.merges).toEqual([]);
 
-  // The lane claims again after its last push: merged on the next poll.
-  await deps.registry.update(lane.key, () => ({ ...claimedLane, claim: { at: new Date(T0 + 3 * MIN).toISOString(), evidence: "again", emitted: true } }));
+  // A claim from before heads were recorded binds nothing.
+  await deps.registry.update(lane.key, () => ({ ...claimedLane, claim: { at: new Date(T0 + 9 * MIN).toISOString(), evidence: "old dori", emitted: true } }));
   await ci.tick([green], emit);
-  expect(gh.merges).toHaveLength(1);
+  expect(gh.merges).toEqual([]);
+
+  // The lane claims again at its current head: merged on the next poll, at exactly that head.
+  await deps.registry.update(lane.key, () => claimedLane);
+  await ci.tick([green], emit);
+  expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
+});
+
+test("a fork PR named like the lane's PR or branch gets no merge, CI message, merge lane or issue close", async () => {
+  // The lane owns its branch "feat" (a gh pr --head Done signal) and claimed PR #7; the outsider opens #999 from a fork.
+  await deps.registry.update(lane.key, () => ({ ...claimedLane, ghIssue: "acme/app#3", done: 'merged acme/app#7; command ["gh","pr","list","-R","acme/app","--head","feat","--json","number"]', claim: { ...claimedLane.claim!, pulls: [{ repo: "acme/app", number: 999, sha: SHA }] } }));
+  gh.view = greenView({ isCrossRepository: true });
+  const fork = (patch: Partial<OpenPull>) => pull({ number: 999, url: "https://github.com/acme/app/pull/999", headRepo: "outsider/app", ...patch });
+  const ci = follow({ launch: async () => { launches.push("launched"); return { ok: true, detail: "STARTUP_OK" }; } });
+  for (const patch of [{ checks: "green" as const }, { checks: "failing" as const }, { conflicting: true }, { checks: "green" as const, headRepo: undefined }]) {
+    await ci.tick([fork(patch)], emit, [{ repo: "acme/app", number: 999, url: "https://github.com/acme/app/pull/999", branch: "feat", headRepo: "outsider/app" }]);
+  }
+  expect(gh.merges).toEqual([]);
+  expect(launches).toEqual([]);
+  expect(gh.closes).toEqual([]);
+  expect(ci.messages.list({})).toEqual([]);
+  expect(ci.ops.list({})).toEqual([]);
+  expect(world.calls.filter((c) => c[0] === "gh" || c[2] === "send-text")).toEqual([]);
+  expect(events).toEqual([]);
+});
+
+test("mergeGate never merges a fork head, even for a lane-owned number", async () => {
+  gh.view = greenView({ isCrossRepository: true });
+  await follow().tick([pull({ checks: "green" })], emit);
+  expect(gh.merges).toEqual([]);
+});
+
+test("a merge lane refuses a fork head and an option-shaped or invalid branch before any git call", async () => {
+  const source = { ...claimedLane };
+  for (const [patch, why] of [
+    [{ headRepo: "outsider/app" }, "has its head in outsider/app"],
+    [{ branch: "--upload-pack=printf${IFS}FETCH_INJECTION>&2;#" }, "is not a valid branch"],
+  ] as const) {
+    const r = await launchMergeLane(deps, { key: mergeLaneKey(pull()), source, pull: pull(patch), base: "dev" });
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain(why);
+  }
+  const bad = await launchMergeLane({ ...deps, run: async (argv, opts) => (argv[1] === "check-ref-format" ? { code: 1, out: "", err: "" } : deps.run(argv, opts)) }, { key: mergeLaneKey(pull()), source, pull: pull({ branch: "a..b" }), base: "dev" });
+  expect(bad).toEqual({ ok: false, detail: 'branch name "a..b" of acme/app#7 is not a valid branch' });
+  expect(world.calls.filter((c) => c[0] === "git" && c[1] !== "check-ref-format")).toEqual([]);
 });
 
 test("a PR with no lane is not merged", async () => {
@@ -324,7 +367,7 @@ test("an issue-bound lane's issue is closed with one comment once its PR is merg
   // The lane closes at its green PR; the lead merges afterwards.
   await deps.registry.update(lane.key, () => ({ ...claimedLane, ghIssue: "acme/app#5", closedAt: new Date(T0 + 2 * MIN).toISOString() }));
   gh.view = greenView({ state: "MERGED", mergeCommit: { oid: "m3rge5ha" } });
-  const merged = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7" }];
+  const merged = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7", headRepo: "acme/app" }];
   await ci.tick([], emit, merged);
   await ci.tick([], emit, merged);
   await follow().tick([], emit, merged);
@@ -337,7 +380,7 @@ test("an issue is not closed for a PR merged into main, nor commented on when so
   await deps.registry.update(lane.key, () => ({ ...claimedLane, ghIssue: "acme/app#5" }));
   const ci = follow();
   await ci.tick([pull({ checks: "pending" })], emit);
-  const merged = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7" }];
+  const merged = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7", headRepo: "acme/app" }];
   gh.view = greenView({ state: "MERGED", baseRefName: "main", mergeCommit: { oid: "m41n" } });
   await ci.tick([], emit, merged);
   expect(gh.closes).toEqual([]);
@@ -350,7 +393,7 @@ test("an issue is not closed for a PR merged into main, nor commented on when so
   expect(open[1]?.ops.get("demo-lane/close-issue/acme/app#5@acme/app#7")?.state).toBe("verified");
 });
 
-const mergedSeven = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7" }];
+const mergedSeven = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7", headRepo: "acme/app" }];
 const views = () => world.calls.filter((c) => c[0] === "gh" && c[2] === "view").length;
 
 test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED with its merge SHA; later polls and a restart read nothing", async () => {
@@ -372,7 +415,7 @@ test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and 
   await ci.tick([pull({ checks: "green" })], emit);
   expect(lines("CI_MERGED")).toHaveLength(1);
   const before = views();
-  await ci.tick([], emit, [...mergedSeven, { repo: "acme/app", number: 99, url: "https://github.com/acme/app/pull/99", branch: "other" }]);
+  await ci.tick([], emit, [...mergedSeven, { repo: "acme/app", number: 99, url: "https://github.com/acme/app/pull/99", branch: "other", headRepo: "acme/app" }]);
   expect(views()).toBe(before);
   expect(lines("MERGE_")).toEqual([]);
 });

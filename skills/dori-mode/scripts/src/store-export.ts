@@ -6,6 +6,8 @@ import { acquireSupervisor } from "./supervise-loop.ts";
 import { cursor, firstDiff, fsyncPath, normalize, type SourceCursor } from "./store-import.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, StoreError } from "./store.ts";
 import { OPERATIONS_FILE, readRows } from "./operations.ts";
+import { JsonLaneReports, LANE_REPORTS_FILE, readReportRows } from "./lane-reports.ts";
+import { JsonLaneMessages, LANE_MESSAGES_FILE, readMessageRows } from "./lane-messages.ts";
 
 /** The database after an export: kept read-only for audit, never read again (a later import starts from the exported files). */
 export const EXPORTED_SQLITE_FILE = "supervisor.sqlite.exported";
@@ -23,6 +25,12 @@ export type ExportReport = {
   /** The source cursors the store held: the log offset its deliveries reach, the last GitHub poll, and the import's record. */
   readonly cursors: { readonly logOffset: number; readonly githubPolledAt?: number; readonly import?: unknown };
   readonly counts: Record<string, number>;
+};
+
+/** The id of a row the destination file holds that the store lacks or holds differently, if any. */
+const conflicting = <T extends { readonly id: string }>(store: readonly T[], file: readonly T[]): string | undefined => {
+  const byId = new Map(store.map((row) => [row.id, row]));
+  return file.find((row) => !Bun.deepEquals(byId.get(row.id), row))?.id;
 };
 
 const writeSynced = (path: string, text: string, flag: "w" | "a"): void => {
@@ -43,7 +51,9 @@ const writeSynced = (path: string, text: string, flag: "w" | "a"): void => {
  * delivery it lacks is appended. Events the store pruned to tombstones are still lines of that log, and a json
  * supervisor recovers them from it at its start. Each written file is read back and must equal the store, or nothing is
  * moved into place; supervisor.json is renamed last, and the database then becomes the read-only
- * supervisor.sqlite.exported. Afterwards the state dir is a json state dir: set "store": "json" before starting.
+ * supervisor.sqlite.exported. Lane reports and lane messages become lane-reports.json and lane-messages.json, every
+ * row with its id and consumed/delivery state; a file already there may only hold rows equal to the store's, else the
+ * export refuses (STORE_EXPORT_CONFLICT). Afterwards the state dir is a json state dir: set "store": "json" before starting.
  */
 export const exportStore = (stateDir: string, now: number, lock: (stateDir: string) => () => void = acquireSupervisor): ExportReport => {
   let release: () => void;
@@ -59,6 +69,12 @@ export const exportStore = (stateDir: string, now: number, lock: (stateDir: stri
   const opsPath = join(stateDir, OPERATIONS_FILE);
   const tmpOps = `${opsPath}.export-${process.pid}`;
   let hasOps = false;
+  const reportsPath = join(stateDir, LANE_REPORTS_FILE);
+  const tmpReports = `${reportsPath}.export-${process.pid}`;
+  const messagesPath = join(stateDir, LANE_MESSAGES_FILE);
+  const tmpMessages = `${messagesPath}.export-${process.pid}`;
+  let hasReports = false;
+  let hasMessages = false;
   try {
     if (existsSync(jsonPath)) throw new StoreError(`STORE_EXPORT_EXISTS ${jsonPath} exists: ${stateDir} is already a json state dir`);
     if (existsSync(retired)) throw new StoreError(`STORE_EXPORT_EXISTS ${retired} exists: ${stateDir} was already exported`);
@@ -67,6 +83,12 @@ export const exportStore = (stateDir: string, now: number, lock: (stateDir: stri
     let report: Omit<ExportReport, "files"> & { files: Omit<ExportReport["files"], "log"> };
     let log: ExportReport["files"]["log"];
     try {
+      // Lane rows first: a conflicting destination file refuses before anything is touched.
+      const reports = readReportRows(store.database);
+      const messages = readMessageRows(store.database);
+      for (const [path, id] of [[reportsPath, conflicting(reports, new JsonLaneReports(stateDir).list())], [messagesPath, conflicting(messages, new JsonLaneMessages(stateDir).list())]]) {
+        if (id !== undefined) throw new StoreError(`STORE_EXPORT_CONFLICT ${path} holds ${id}, which the store lacks or holds differently; nothing exported`);
+      }
       const journal = store.read(false);
       const github = loadGithub(store.database);
       const deliveries = store.database.query(`SELECT d.event_id AS id, e.line AS line FROM deliveries d LEFT JOIN events e ON e.id = d.event_id
@@ -93,6 +115,20 @@ export const exportStore = (stateDir: string, now: number, lock: (stateDir: stri
           throw new StoreError(`STORE_EXPORT_MISMATCH the exported operations differ from the store; nothing exported`);
         }
       }
+      hasReports = reports.length > 0;
+      if (hasReports) {
+        writeSynced(tmpReports, JSON.stringify({ reports }), "w");
+        if (!Bun.deepEquals((JSON.parse(readFileSync(tmpReports, "utf8")) as { reports: unknown }).reports, reports)) {
+          throw new StoreError(`STORE_EXPORT_MISMATCH the exported lane reports differ from the store; nothing exported`);
+        }
+      }
+      hasMessages = messages.length > 0;
+      if (hasMessages) {
+        writeSynced(tmpMessages, JSON.stringify({ messages: Object.fromEntries(messages.map((m) => [m.id, m])) }), "w");
+        if (!Bun.deepEquals(Object.values((JSON.parse(readFileSync(tmpMessages, "utf8")) as { messages: Record<string, unknown> }).messages), messages)) {
+          throw new StoreError(`STORE_EXPORT_MISMATCH the exported lane messages differ from the store; nothing exported`);
+        }
+      }
       const diff = firstDiff(normalize(JSON.parse(readFileSync(tmpJson, "utf8"))), normalize(journal));
       if (diff) throw new StoreError(`STORE_EXPORT_MISMATCH the exported journal differs from the store at ${diff}; nothing exported`);
       if (!Bun.deepEquals(JSON.parse(readFileSync(tmpGithub, "utf8")), JSON.parse(JSON.stringify(github)))) {
@@ -115,6 +151,8 @@ export const exportStore = (stateDir: string, now: number, lock: (stateDir: stri
     } finally { store.close(); }
     renameSync(tmpGithub, githubPath);
     if (hasOps) renameSync(tmpOps, opsPath);
+    if (hasReports) renameSync(tmpReports, reportsPath);
+    if (hasMessages) renameSync(tmpMessages, messagesPath);
     // supervisor.json is the commit point: from here the state dir is a json state dir.
     renameSync(tmpJson, jsonPath);
     fsyncPath(stateDir);
@@ -129,6 +167,8 @@ export const exportStore = (stateDir: string, now: number, lock: (stateDir: stri
     rmSync(tmpJson, { force: true });
     rmSync(tmpGithub, { force: true });
     rmSync(tmpOps, { force: true });
+    rmSync(tmpReports, { force: true });
+    rmSync(tmpMessages, { force: true });
     throw e;
   } finally {
     release();

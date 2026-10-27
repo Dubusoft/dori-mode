@@ -5,7 +5,6 @@ import { join } from "node:path";
 
 import type { Runner } from "../src/run.ts";
 import { BACKOFF_MAX_MS, BACKOFF_MIN_MS, RetryingDelivery, STUCK_AFTER_MS, SuperviseError, Supervisor, TransientSuperviseError } from "../src/supervise.ts";
-import { writeQuotaState } from "../src/claude-quota.ts";
 import { recordLaunchVerdict } from "../src/routing.ts";
 import { runSweeps, supervise, supervisorSweeps, WARN_REPEAT_MS } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal, writeJournal } from "./fakes.ts";
@@ -90,7 +89,7 @@ const sweepWorld = (fail: (argv: readonly string[]) => boolean) => {
   const queue: string[] = [];
   const logs: string[] = [];
   const recent = new Map<string, number>();
-  const sweeps = supervisorSweeps(deps, "/home/test", async () => ({ results: [], text: "" }));
+  const sweeps = supervisorSweeps(deps, "/home/test");
   const tick = () => runSweeps(sweeps, async (line) => { queue.push(line); }, clock.now, recent, (line) => { logs.push(line); });
   return { deps, clock, queue, logs, tick, world };
 };
@@ -121,18 +120,6 @@ test("a launch held by dori can-launch wakes the lead with LAUNCH_READY once the
   expect(w.queue.filter((line) => line.startsWith("LAUNCH_READY "))).toHaveLength(1);
   await w.tick();
   expect(w.queue.filter((line) => line.startsWith("LAUNCH_READY "))).toHaveLength(1);
-});
-
-test("LAUNCH_READY waits while the cached Claude quota gate still holds lanes", async () => {
-  const w = sweepWorld(() => false);
-  w.world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "working" }];
-  recordLaunchVerdict(w.deps.config.stateDir, { ok: false, reasons: ["quota hold-lanes: Claude headroom 15% < 50% (a 15% by 5h)"] }, T0);
-  writeQuotaState(w.deps.config.stateDir, { mode: "hold-lanes", usage: { at: T0, accounts: [{ name: "a", fiveHour: { usedPct: 85 } }] } });
-  await w.tick();
-  expect(w.queue.filter((line) => line.startsWith("LAUNCH_READY "))).toHaveLength(0);
-  writeQuotaState(w.deps.config.stateDir, { mode: "ok", usage: { at: T0, accounts: [{ name: "a", fiveHour: { usedPct: 20 }, weekly: { usedPct: 30 } }] } });
-  await w.tick();
-  expect(w.queue.filter((line) => line.startsWith("LAUNCH_READY "))).toEqual([expect.stringContaining("Claude headroom 70%")]);
 });
 
 test("success resets the streak so a later failure starts its own ten minutes", async () => {
@@ -207,27 +194,11 @@ test("a non-positive handledTimeoutMin exits the supervisor before it takes the 
   expect(existsSync(join(state.dir, "supervisor-lock.sqlite"))).toBe(false);
 });
 
-test("a non-positive leadQuotaBusySwitchMin exits the supervisor before it takes the lock", async () => {
-  const state = withState();
-  cleanups.push(state.done);
-  const deps = depsFor(newWorld(), fakeClock(T0), state.dir, { leadQuotaBusySwitchMin: 0 });
-  await expect(supervise(deps, new AbortController().signal)).rejects.toThrow("leadQuotaBusySwitchMin must be positive");
-  expect(existsSync(join(state.dir, "supervisor-lock.sqlite"))).toBe(false);
-});
-
 test("a non-positive leadStuckRestartMin exits the supervisor before it takes the lock", async () => {
   const state = withState();
   cleanups.push(state.done);
   const deps = depsFor(newWorld(), fakeClock(T0), state.dir, { leadStuckRestartMin: 0 });
   await expect(supervise(deps, new AbortController().signal)).rejects.toThrow("leadStuckRestartMin must be positive");
-  expect(existsSync(join(state.dir, "supervisor-lock.sqlite"))).toBe(false);
-});
-
-test("a non-positive leadPrimaryReturnChecks exits the supervisor before it takes the lock", async () => {
-  const state = withState();
-  cleanups.push(state.done);
-  const deps = depsFor(newWorld(), fakeClock(T0), state.dir, { leadPrimaryReturnChecks: 0 });
-  await expect(supervise(deps, new AbortController().signal)).rejects.toThrow("leadPrimaryReturnChecks must be a positive integer");
   expect(existsSync(join(state.dir, "supervisor-lock.sqlite"))).toBe(false);
 });
 

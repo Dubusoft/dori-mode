@@ -1,4 +1,6 @@
 import type { DoriConfig, GuardThresholds } from "./config.ts";
+import { readFile } from "node:fs/promises";
+import { loadavg } from "node:os";
 import type { Runner } from "./run.ts";
 
 export type HostSample = {
@@ -14,6 +16,19 @@ const num = (s: string | undefined, fallback: number): number => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+export const loadNow = (): number => loadavg()[0] ?? 0;
+
+type MemInfoReader = (path: string) => Promise<string>;
+
+const parseMemInfo = (text: string): Pick<HostSample, "memFreePct" | "swapFreeGb"> => {
+  const values = new Map([...text.matchAll(/^(\w+):\s+(\d+)\s+kB$/gm)].map((m) => [m[1]!, Number(m[2])]));
+  const total = values.get("MemTotal") ?? 0;
+  return {
+    memFreePct: total > 0 ? Math.round((values.get("MemAvailable") ?? 0) / total * 100) : 100,
+    swapFreeGb: (values.get("SwapFree") ?? 0) / 1_048_576,
+  };
+};
+
 /** The filesystem the disk guard checks: `diskGuardPath`, else the one holding the state directory. */
 export const diskGuardPath = (config: Pick<DoriConfig, "diskGuardPath" | "stateDir">): string => config.diskGuardPath?.trim() || config.stateDir;
 
@@ -23,18 +38,25 @@ const listedPanes = async (run: Runner): Promise<number> => {
 };
 
 /** `paneCount` (-1 when unreadable) defaults to its own `herdr pane list`; the supervisor passes its round's snapshot. */
-export const sampleHost = async (run: Runner, dataPath = "/", paneCount: () => Promise<number> = () => listedPanes(run)): Promise<HostSample> => {
-  const load = await run(["sysctl", "-n", "vm.loadavg"]);
-  const loadLinux = load.code === 0 ? null : await run(["cat", "/proc/loadavg"]);
-  const load1 = num((load.code === 0 ? load.out.replace(/[{}]/g, "").trim() : loadLinux?.out ?? "").split(/\s+/)[0], 0);
-  const mp = await run(["memory_pressure", "-Q"]);
-  const memFreePct = mp.code === 0 ? num(/free percentage: (\d+)%/.exec(mp.out)?.[1], 100) : 100;
-  const df = await run(["df", "-k", dataPath]);
+export const sampleHost = async (
+  run: Runner,
+  dataPath = "/",
+  paneCount: () => Promise<number> = () => listedPanes(run),
+  readMemInfo: MemInfoReader = (path) => readFile(path, "utf8"),
+): Promise<HostSample> => {
+  const linux = process.platform === "linux";
+  const [df, panes, mp, swap, memInfo] = await Promise.all([
+    run(["df", "-k", dataPath]),
+    paneCount(),
+    linux ? Promise.resolve(null) : run(["memory_pressure", "-Q"]),
+    linux ? Promise.resolve(null) : run(["sysctl", "-n", "vm.swapusage"]),
+    linux ? readMemInfo("/proc/meminfo") : Promise.resolve(null),
+  ]);
   const diskFreeGb = num(df.out.split("\n").at(-1)?.trim().split(/\s+/)[3], 0) / 1_048_576;
-  const swap = await run(["sysctl", "-n", "vm.swapusage"]);
-  const swapFreeGb = num(/free = ([\d.]+)M/.exec(swap.out)?.[1], 0) / 1024;
-  const panes = await paneCount();
-  return { load1, memFreePct, diskFreeGb, swapFreeGb, panes };
+  const memory = memInfo === null ? null : parseMemInfo(memInfo);
+  const memFreePct = memory?.memFreePct ?? (mp?.code === 0 ? num(/free percentage: (\d+)%/.exec(mp.out)?.[1], 100) : 100);
+  const swapFreeGb = memory?.swapFreeGb ?? num(/free = ([\d.]+)M/.exec(swap?.out ?? "")?.[1], 0) / 1024;
+  return { load1: loadNow(), memFreePct, diskFreeGb, swapFreeGb, panes };
 };
 
 export const alertReasons = (s: HostSample, t: GuardThresholds): string[] => {

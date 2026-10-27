@@ -11,8 +11,10 @@ export type HttpRequest = {
 export type HttpResponse = { readonly status: number; readonly headers: Readonly<Record<string, string>>; readonly body: string };
 export type Http = (req: HttpRequest) => Promise<HttpResponse>;
 
+export const HTTP_TIMEOUT_MS = 30_000;
+
 export const fetchHttp: Http = async (req) => {
-  const res = await fetch(req.url, { method: req.method, headers: req.headers, body: req.body, signal: req.signal });
+  const res = await fetch(req.url, { method: req.method, headers: req.headers, body: req.body, signal: req.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS) });
   const headers: Record<string, string> = {};
   res.headers.forEach((v, k) => {
     headers[k.toLowerCase()] = v;
@@ -59,7 +61,7 @@ const withDiscordNonce = (req: HttpRequest): HttpRequest | undefined => {
  * 429 is always safe to retry (not processed). Thrown fetches and 5xx are retried only for idempotent methods
  * or POSTs carrying a dedupe key (Discord nonce); other POSTs surface the failure instead of risking a duplicate.
  */
-export const withBackoff = async (http: Http, clock: Clock, original: HttpRequest, policy: RetryPolicy = DEFAULT_RETRY, retryAfterFromBody?: (body: string) => number | undefined): Promise<HttpResponse> => {
+export const withBackoff = async (http: Http, clock: Clock, original: HttpRequest, policy: RetryPolicy = DEFAULT_RETRY, retryAfterFromBody?: (body: string) => number | undefined, random: () => number = Math.random): Promise<HttpResponse> => {
   const keyed = withDiscordNonce(original);
   const req = keyed ?? original;
   const replaySafe = keyed !== undefined || original.method !== "POST";
@@ -80,7 +82,10 @@ export const withBackoff = async (http: Http, clock: Clock, original: HttpReques
     const fromBody = retryAfterFromBody?.(last.body);
     const waitS = Number.isFinite(header) && header > 0 ? header : fromBody;
     if (waitS !== undefined) waitMs = waitS * 1000;
-    if (!final) await clock.sleep(Math.min(policy.maxMs, waitMs));
+    if (!final) {
+      const jittered = last.status === 429 && waitS === undefined ? waitMs * (1 + 0.25 * random()) : waitMs;
+      await clock.sleep(Math.min(policy.maxMs, jittered));
+    }
   }
   return last as HttpResponse;
 };

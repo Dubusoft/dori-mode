@@ -4,7 +4,7 @@ import { resolveTarget } from "./messenger/target.ts";
 /**
  * The supervisor's own lane-finish line (laneFinishNotice): a lane the supervisor saw finish (LANE_CLOSED,
  * LANE_AUTO_CLOSED, CI_MERGED ... lane=<key>, MERGE_VERIFIED ... lane=<key>) gets one plain line in its thread, or the
- * main channel when it has none, so the owner hears of it even while the lead is busy, restarting or out of quota.
+ * main channel when it has none, so the owner hears of it even while the lead is busy or restarting.
  * It is not the lead's report: the lead still reports the outcome itself and runs `dori reported` (lane-outcomes.ts).
  *
  * Once per lane: the line goes through the durable owner outbox under id `lane-finish:<key>`, and the same id is

@@ -232,3 +232,11 @@ test("a check that answers resets the failure count, and a wait with a deadline 
   expect(waits.list().find((w) => w.key === "bounded")?.failures).toBe(3);
   expect(WAIT_MAX_FAILURES).toBeGreaterThan(1);
 });
+
+test("a wait's event carries its key as the lane meta", async () => {
+  const f = fixture();
+  f.waits.register(f.input, f.clock.now());
+  const got: [string, unknown][] = [];
+  await f.waits.tick(f.clock.now, run, (id, _line, meta) => { got.push([id, meta]); }, async () => ({ signal: "", ok: true, detail: "ready" }));
+  expect(got.map(([, meta]) => meta)).toEqual([{ lane: "release" }]);
+});

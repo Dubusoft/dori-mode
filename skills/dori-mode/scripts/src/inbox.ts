@@ -102,17 +102,34 @@ export const completeLines = (path: string, from: number): LogLine[] => {
   return lines;
 };
 
-/** One delivery log line as `{id, line}`; a line that does not parse keeps its raw text under the id `?`. */
-export const parseLogLine = (text: string): { readonly id: string; readonly line: string } => {
+export type TakenEvent = { readonly id: string; readonly line: string; readonly meta?: { readonly lane?: string; readonly thread?: string; readonly cwd?: string } };
+
+/** The string lane/thread/cwd of a log line's `meta` field; undefined when it has none (or only malformed parts). */
+const metaOf = (value: unknown): TakenEvent["meta"] => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { lane, thread, cwd } = value as Record<string, unknown>;
+  const meta = {
+    ...(typeof lane === "string" && lane ? { lane } : {}),
+    ...(typeof thread === "string" && thread ? { thread } : {}),
+    ...(typeof cwd === "string" && cwd ? { cwd } : {}),
+  };
+  return Object.keys(meta).length ? meta : undefined;
+};
+
+/** One delivery log line as `{id, line, meta?}`; a line that does not parse keeps its raw text under the id `?`. */
+export const parseLogLine = (text: string): TakenEvent => {
   try {
-    const event = JSON.parse(text) as { id?: unknown; line?: unknown };
-    if (typeof event.id === "string" && typeof event.line === "string") return { id: event.id, line: event.line };
+    const event = JSON.parse(text) as { id?: unknown; line?: unknown; meta?: unknown };
+    if (typeof event.id === "string" && typeof event.line === "string") {
+      const meta = metaOf(event.meta);
+      return { id: event.id, line: event.line, ...(meta ? { meta } : {}) };
+    }
   } catch (e) { if (!(e instanceof SyntaxError)) throw e; }
   return { id: "?", line: text };
 };
 
 export type Take = {
-  readonly events: readonly { readonly id: string; readonly line: string }[];
+  readonly events: readonly TakenEvent[];
   /** The end of the last printed line: what the receipt covers. */
   readonly offset: number;
   /** Complete lines (and their bytes) left past `offset` because of the byte bound. */
@@ -148,11 +165,57 @@ export const take = (stateDir: string, options: { readonly maxBytes: number; rea
   return { events, offset: start, ...(more ? { more } : {}), receipt: path };
 };
 
-/** The CLI's output for a take: one `id<TAB>line` per event, then INBOX_MORE, or INBOX_EMPTY when there was nothing. */
+/**
+ * What a cold start hands the new lead beyond the log (state/carried.json, written by the supervisor before the lead's
+ * prompt and pruned as it goes): owner messages the previous lead took but did not handle, which no take prints again,
+ * and the held launch queue. `dori inbox take` prints them as reminder lines every time until they are gone.
+ */
+export const CARRIED_FILE = "carried.json";
+export type Carried = { readonly kind: "owner" | "held"; readonly id: string; readonly line: string };
+
+export const readCarried = (stateDir: string): Carried[] => {
+  let list: unknown;
+  try { list = JSON.parse(readFileSync(join(stateDir, CARRIED_FILE), "utf8")); } catch { return []; }
+  return Array.isArray(list)
+    ? list.filter((item: Partial<Carried>) => (item?.kind === "owner" || item?.kind === "held") && typeof item.id === "string" && typeof item.line === "string")
+    : [];
+};
+
+/** Durable like the cursor file; an empty list removes the file. */
+export const writeCarried = (stateDir: string, items: readonly Carried[]): void => {
+  if (items.length) writeDurable(join(stateDir, CARRIED_FILE), stateDir, JSON.stringify(items));
+  else dropTake(join(stateDir, CARRIED_FILE));
+};
+
+/** `dori inbox take`'s reminder lines (id<TAB>line, like the events) for what the last cold start carried over. */
+export const takeCarriedReminders = (stateDir: string): string[] => readCarried(stateDir).map((item) => item.kind === "owner"
+  ? `unfinished:${item.id}\tUNFINISHED ${item.id} handed to the previous lead and not handled (dori ack it unless acked, then handle it): ${item.line}`
+  : `${item.id}\t${item.line}`);
+
+const metaHeader = (meta: TakenEvent["meta"]): string =>
+  `## ${[meta?.lane ? `lane ${meta.lane}` : "", meta?.thread ? `thread ${meta.thread}` : "", meta?.cwd ? `cwd ${meta.cwd}` : ""].filter(Boolean).join("  ")}`;
+
+/**
+ * The CLI's output for a take: one `id<TAB>line` per event, then INBOX_MORE, or INBOX_EMPTY when there was nothing.
+ * When any event carries meta, the events are grouped under `## lane <lane>  thread <thread>  cwd <cwd>` headers in
+ * first-seen order (absent parts omitted), and the events without meta follow under `## other`.
+ */
 export const takeOutput = (result: Take): string[] => {
   if (!result.events.length) return ["INBOX_EMPTY"];
+  const text = (event: TakenEvent): string => `${event.id}\t${event.line}`;
+  let body: string[];
+  if (result.events.some((event) => event.meta)) {
+    const groups = new Map<string, string[]>();
+    const other: string[] = [];
+    for (const event of result.events) {
+      if (!event.meta) { other.push(text(event)); continue; }
+      const header = metaHeader(event.meta);
+      groups.set(header, [...(groups.get(header) ?? []), text(event)]);
+    }
+    body = [...[...groups].flatMap(([header, lines]) => [header, ...lines]), ...(other.length ? ["## other", ...other] : [])];
+  } else body = result.events.map(text);
   return [
-    ...result.events.map((event) => `${event.id}\t${event.line}`),
+    ...body,
     ...(result.more ? [`INBOX_MORE ${result.more.lines} ${result.more.bytes}`] : []),
   ];
 };

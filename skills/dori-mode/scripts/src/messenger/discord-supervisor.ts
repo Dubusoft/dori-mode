@@ -9,7 +9,6 @@ import {
 import { Discord, discordPresence, openDiscordGateway, type GatewaySocket } from "./discord.ts";
 import { type Http, MessengerError } from "./http.ts";
 import { realTimers, type Timers } from "./typing.ts";
-import { approveEmergency } from "../emergency.ts";
 
 export type SupervisorDiscordOptions = {
   readonly token: string;
@@ -17,8 +16,6 @@ export type SupervisorDiscordOptions = {
   readonly emit: (id: string, line: string) => Promise<void>;
   readonly lookup: QuotaLookup;
   readonly statusLookup?: StatusLookup;
-  /** The owner's /emergency command; by default it records the approval in the state dir (emergency.ts). */
-  readonly emergencyLookup?: QuotaLookup;
   readonly open?: (url?: string) => GatewaySocket;
   readonly timers?: Timers;
   readonly log?: (line: string) => void;
@@ -35,13 +32,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   const config = deps.config.discord;
   if (!config) throw new TypeError("supervise requires config.discord; run dori setup");
   const discord = new Discord(options.http, deps.clock, options.token);
-  const approve: QuotaLookup = async () => {
-    if (approveEmergency(deps.config.stateDir, deps.clock.now()) === undefined) {
-      return "Not approved: the lead is not out of quota now. An approval counts only for the outage it is given in; you will be asked when one starts.";
-    }
-    return "Approved for this outage: the lead may use the paid emergency models until it is back on its first model. The next outage asks again.";
-  };
-  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, deps.config.discordChannels, options.statusLookup, options.emergencyLookup ?? approve);
+  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, deps.config.discordChannels, options.statusLookup);
   let lastPoll = -Infinity;
   let polling: Promise<void> | undefined;
   let catchupRequested = false;

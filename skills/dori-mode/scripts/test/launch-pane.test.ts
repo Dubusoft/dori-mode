@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { LaunchError, launchLane, LEGACY_LANE_MCP } from "../src/launch.ts";
+import { footer, footerDoneRules, LaunchError, launchLane, LEGACY_LANE_MCP, STARTUP_POLL_MS, STARTUP_POLLS } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
@@ -47,22 +47,16 @@ const input = (extra: Record<string, string> = {}) => ({ key: "pane-lane", title
 const writeBrief = () => Bun.write(join(state.dir, "brief.md"), "goal: do it\n");
 const herdr = (sub: string, action: string) => world.calls.filter((c) => c[0] === "herdr" && c[1] === sub && c[2] === action);
 
-test("a lane is never launched on a lead-only emergency model, given or as the default", async () => {
-  const d = deps();
-  const config = { ...d.config, leadEmergencyModels: ["og/anthropic/claude-opus-5-5"] };
-  await expectRefused({ ...d, config }, { model: "og/anthropic/claude-opus-5-5" }, /lead-only emergency model/);
-  await expectRefused({ ...d, config: { ...config, defaultModel: "og/anthropic/claude-opus-5-5:max" } }, {}, /lead-only emergency model/);
-});
-
 const expectRefused = async (d: ReturnType<typeof deps>, extra: Record<string, string>, message: RegExp) => {
   await writeBrief();
-  const before = await Bun.file(join(state.dir, "brief.md")).text();
-  await expect(launchLane(d, input(extra))).rejects.toThrow(LaunchError);
-  await expect(launchLane(d, input(extra))).rejects.toThrow(message);
-  expect(await Bun.file(join(state.dir, "brief.md")).text()).toBe(before);
+  const brief = await Bun.file(join(state.dir, "brief.md")).text();
+  const attempt = launchLane(d, input(extra));
+  await expect(attempt).rejects.toBeInstanceOf(LaunchError);
+  await expect(attempt).rejects.toThrow(message);
   expect(await d.registry.read("pane-lane")).toBeNull();
   expect(herdr("pane", "run")).toEqual([]);
   expect(herdr("tab", "create")).toEqual([]);
+  expect(await Bun.file(join(state.dir, "brief.md")).text()).toBe(brief);
 };
 
 test("--pane runs the lane command in that pane, creates no tab, and registers pane and tab", async () => {
@@ -152,4 +146,80 @@ test("without --pane the lane still gets a new tab", async () => {
   expect(r.lane.pane).toBe("w:p9");
   expect(r.lane.tab).toBe("w:t9");
   expect(herdr("pane", "get")).toEqual([]);
+});
+
+/** Launch into a new tab whose pane reports `statuses` on successive status lookups (the last repeats); every sleep is recorded, none waits. */
+const startup = async (statuses: (string | undefined)[], screen: string) => {
+  const key = "poll-lane";
+  state.done();
+  state = withState();
+  wt = join(state.dir, "worktree");
+  mkdirSync(wt);
+  await writeBrief();
+  world = newWorld();
+  world.screen = screen;
+  const waited: number[] = [];
+  const clock = { ...fakeClock(T0), sleep: async (ms: number) => { waited.push(ms); } };
+  const base = depsFor(world, clock, state.dir);
+  let reads = 0;
+  const d = { ...base, run: async (argv: readonly string[]) => {
+    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") return { code: 0, out: JSON.stringify({ result: { tab_id: "w:t9", root_pane: { pane_id: "w:p9" } } }), err: "" };
+    if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "list") {
+      const status = statuses[Math.min(reads++, statuses.length - 1)];
+      return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "w:p9", workspace_id: "w", ...(status ? { agent: "pi", agent_status: status } : {}) }] } }), err: "" };
+    }
+    return base.run(argv);
+  } };
+  const r = await launchLane(d, input({ key, cwd: wt }));
+  return { startup: r.startup, waited };
+};
+
+test("startup needs two consecutive ready reads, polled every 2 s", async () => {
+  expect(STARTUP_POLL_MS).toBe(2_000);
+  expect(await startup(["idle", "idle"], "❯ ")).toEqual({ startup: "STARTUP_OK poll-lane w:p9", waited: [2_000, 2_000] });
+  // A blip in between restarts the count.
+  expect((await startup(["idle", "blocked", "idle", "working"], "❯ ")).waited).toEqual([2_000, 2_000, 2_000, 2_000]);
+  expect((await startup(["working", "working"], "❯ ")).startup).toBe("STARTUP_OK poll-lane w:p9");
+});
+
+test("a lane never ready is unconfirmed after exactly 10 polls", async () => {
+  const r = await startup(["idle", "blocked"], "❯ ");
+  expect(STARTUP_POLLS).toBe(10);
+  expect(r.startup).toStartWith("STARTUP_UNCONFIRMED poll-lane w:p9");
+  expect(r.waited).toHaveLength(10);
+});
+
+test("startup keeps the scan-before-idle rule: an idle prompt over a known failure is an error on the first poll", async () => {
+  const r = await startup(["idle"], "No API key found\n❯ ");
+  expect(r).toEqual({ startup: "STARTUP_ERROR poll-lane w:p9: No API key", waited: [2_000] });
+  // A working agent is not scanned.
+  expect((await startup(["working", "working"], "No API key found\n❯ ")).startup).toBe("STARTUP_OK poll-lane w:p9");
+});
+
+const footerLane = (patch: Partial<Lane> = {}): Lane => ({ key: "k-1", title: "t", thread: "th-9", brief: "/b.md", done: "closed acme/app#3", openedAt: "x", ...patch });
+
+test("footer puts the shared done rules first and every lane value after '### This lane'", () => {
+  const variants: [string, Lane][] = [
+    ["pane report", footerLane()],
+    ["cli", footerLane({ reportVia: "cli" })],
+    ["remote", footerLane({ machine: "m1" })],
+    ["autoClose", footerLane({ reportVia: "cli", autoClose: "machine" })],
+  ];
+  for (const [name, lane] of variants) {
+    const text = footer(lane, "w:lead", "Korean");
+    const rules = footerDoneRules(lane, "Korean");
+    const at = text.indexOf("### This lane");
+    expect(at, name).toBeGreaterThan(text.indexOf(rules));
+    expect(text.indexOf(rules), name).toBeGreaterThanOrEqual(0);
+    for (const v of ["k-1", "th-9", "closed acme/app#3", ...(name === "pane report" ? ["w:lead"] : [])]) {
+      expect(rules, `${name} ${v}`).not.toContain(v);
+      expect(text.indexOf(v), `${name} ${v}`).toBeGreaterThan(at);
+    }
+    expect(rules, name).toContain("no owner quotes");
+    expect(rules, name).toContain("not done");
+  }
+  expect(footer(footerLane(), "w:lead")).toContain('dori claim-done k-1 --evidence "<merge SHA, closed issue, version>"');
+  expect(footer(footerLane({ reportVia: "cli" }), "w:lead")).toContain('dori report k-1 done --text "<one line>"');
+  expect(footer(footerLane({ machine: "m1" }), "w:lead")).not.toContain("claim-done k-1");
+  expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
 });

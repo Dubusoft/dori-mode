@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
+import { redactSecrets } from "./redact.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { fill } from "./config.ts";
-import { claimDone, type Emit, type FlowDeps, REMOTE_SEEN_MAX } from "./done-flow.ts";
+import { fillHook } from "./config.ts";
+import { claimDone, type Emit, type FlowDeps, laneMeta, REMOTE_SEEN_MAX } from "./done-flow.ts";
 import { scrubForThread } from "./freshness.ts";
 import { readScreen } from "./panes.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { withStateLockSync } from "./state-lock.ts";
+import type { EventMeta } from "./supervise-journal.ts";
 import { saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
 
 /**
@@ -18,8 +20,11 @@ import { saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.t
 export const REPORT_KINDS = ["progress", "question", "blocked", "milestone", "done"] as const;
 export type ReportKind = (typeof REPORT_KINDS)[number];
 
-/** Where a routed row went: the lead's journal, the lane's thread, a done claim, or nowhere (its lane was closed or gone). */
-export type ReportRoute = "journal" | "thread" | "claim" | "dropped";
+/**
+ * Where a routed row went: the lead's journal, the lane's thread, a done claim, a late notice in the journal (its lane
+ * was closed or gone), or nowhere (`dropped`: rows written before late notices existed).
+ */
+export type ReportRoute = "journal" | "thread" | "claim" | "dropped" | "late";
 
 export type LaneReport = {
   /** `<lane>:<generation>:<seq>`. */
@@ -53,14 +58,15 @@ export interface LaneReportStore {
 }
 
 export const LANE_REPORTS_FILE = "lane-reports.json";
-const LANE_REPORTS_LOCK = "lane-reports.lock.sqlite";
+/** Held while lane-reports.json is written; `dori store import` holds it so no row lands between its copy and the file's retirement. */
+export const LANE_REPORTS_LOCK = "lane-reports.lock.sqlite";
 
 export const isReportKind = (value: unknown): value is ReportKind => typeof value === "string" && (REPORT_KINDS as readonly string[]).includes(value);
 
 const order = (a: LaneReport, b: LaneReport): number => a.at - b.at || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0) || a.seq - b.seq;
 const withId = (report: NewReport, seq: number): LaneReport => ({
   id: `${report.lane}:${report.generation}:${seq}`, lane: report.lane, generation: report.generation, seq, kind: report.kind,
-  text: report.text, ...(report.evidence ? { evidence: report.evidence } : {}), at: report.at,
+  text: redactSecrets(report.text), ...(report.evidence ? { evidence: redactSecrets(report.evidence) } : {}), at: report.at,
 });
 
 /** `lane-reports.json` beside supervisor.json, rewritten whole under a short state lock (lanes and the supervisor both write). */
@@ -107,6 +113,19 @@ const reportOf = (row: Row): LaneReport => ({
   ...(row.evidence !== null ? { evidence: row.evidence } : {}), at: row.at,
   ...(row.consumed_at !== null ? { consumedAt: row.consumed_at } : {}), ...(row.route !== null ? { route: row.route as ReportRoute } : {}),
 });
+
+/** Every row of `db`'s lane_reports table, as stored and in list() order; no table reads as no rows (`dori store export`). */
+export const readReportRows = (db: Database): LaneReport[] =>
+  db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lane_reports'").get()
+    ? (db.query("SELECT * FROM lane_reports ORDER BY at, lane, seq").all() as Row[]).map(reportOf)
+    : [];
+
+/** Inserts `rows` with every column kept (id, seq, consumed_at, route), for `dori store import`; an id already there throws. */
+export const putReportRows = (db: Database, rows: readonly LaneReport[]): void => {
+  db.exec(DDL);
+  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null);
+};
 
 /** The `lane_reports` table of supervisor.sqlite, on its own connection (WAL: the supervisor's connection keeps writing). */
 export class SqliteLaneReports implements LaneReportStore {
@@ -179,43 +198,51 @@ export const reportLine = (report: LaneReport): string =>
   `LANE_REPORT ${report.lane} ${report.kind} ${oneLine(report.text)}${report.evidence ? ` (evidence: ${oneLine(report.evidence)})` : ""}`;
 
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
-export type ReportEnqueue = (id: string, line: string) => unknown;
+export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
 /**
  * Routes every pending row once, oldest first, and marks it consumed after its effect. question, blocked and milestone
  * become a `LANE_REPORT` event under the id `lane-report:<row id>` (its class comes from eventPolicy: question and
  * blocked wake the lead, milestone is digest by default); progress is posted to the lane's thread through
  * hooks.threadReply (without a hook or thread, or when the post fails, it is a digest LANE_REPORT instead); done is the
- * lane's done claim, as `dori claim-done`. A row whose lane is closed or unregistered is dropped. A crash between the
+ * lane's done claim, as `dori claim-done`. A row whose lane is closed or unregistered is not lost: it becomes a
+ * `LANE_REPORT_LATE <key> <kind> <text>` event under `lane-report-late:<row id>` (route `late`). A crash between the
  * effect and the mark repeats the effect: the journal dedupes the event by id, and a thread post may show twice.
+ * A row whose routing throws is logged and left pending (retried next pass); the rest are still routed.
  * Returns one log line per routed row.
  */
 export const routeReports = async (deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? ""): Promise<string[]> => {
   const out: string[] = [];
   for (const report of store.pending()) {
-    const lane = await deps.registry.read(report.lane);
-    let route: ReportRoute;
-    if (!lane || statusOf(lane) === "closed") {
-      route = "dropped";
-    } else if (report.kind === "done") {
-      await claimDone(deps, lane, oneLine(report.evidence ?? report.text));
-      route = "claim";
-    } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none") {
-      const posted = await deps.run(fill(deps.config.hooks.threadReply, { thread: lane.thread, text: scrubForThread(oneLine(report.text), home), key: lane.key }));
-      if (posted.code === 0) route = "thread";
-      else {
-        const error = (posted.err || posted.out || `exit ${posted.code}`).replace(/\s+/g, " ").slice(0, 160);
-        await enqueue(`lane-report:${report.id}`, `${reportLine(report)} (thread post failed: ${error})`);
+    try {
+      const lane = await deps.registry.read(report.lane);
+      let route: ReportRoute;
+      if (!lane || statusOf(lane) === "closed") {
+        await enqueue(`lane-report-late:${report.id}`, `LANE_REPORT_LATE ${report.lane} ${report.kind} ${oneLine(report.text)}`, lane ? laneMeta(lane) : { lane: report.lane });
+        route = "late";
+      } else if (report.kind === "done") {
+        await claimDone(deps, lane, oneLine(report.evidence ?? report.text));
+        route = "claim";
+      } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none") {
+        const posted = await deps.run(fillHook(deps.config.hooks.threadReply, { thread: lane.thread, text: scrubForThread(oneLine(report.text), home), key: lane.key }));
+        if (posted.code === 0) route = "thread";
+        else {
+          const error = (posted.err || posted.out || `exit ${posted.code}`).replace(/\s+/g, " ").slice(0, 160);
+          await enqueue(`lane-report:${report.id}`, `${reportLine(report)} (thread post failed: ${error})`, laneMeta(lane));
+          route = "journal";
+        }
+      } else {
+        await enqueue(`lane-report:${report.id}`, reportLine(report), laneMeta(lane));
         route = "journal";
       }
-    } else {
-      await enqueue(`lane-report:${report.id}`, reportLine(report));
-      route = "journal";
+      // A routed report is the lane being heard, like a thread reply: freshness neither nudges it nor raises NO-REPORT.
+      if (route !== "late") await deps.registry.patch(report.lane, { lastReplyAt: deps.clock.now() });
+      store.consume(report.id, deps.clock.now(), route);
+      out.push(`LANE_REPORT_ROUTED ${report.id} ${report.kind} ${route}`);
+    } catch (e) {
+      // Poison isolation: the row stays pending and is retried on the next supervisor pass, never in a hot loop.
+      console.error(`LANE_REPORT_ERROR ${report.id} ${e instanceof Error ? e.message : String(e)}`);
     }
-    // A routed report is the lane being heard, like a thread reply: freshness neither nudges it nor raises NO-REPORT.
-    if (route !== "dropped") await deps.registry.patch(report.lane, { lastReplyAt: deps.clock.now() });
-    store.consume(report.id, deps.clock.now(), route);
-    out.push(`LANE_REPORT_ROUTED ${report.id} ${report.kind} ${route}`);
   }
   return out;
 };

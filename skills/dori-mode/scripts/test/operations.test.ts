@@ -69,6 +69,39 @@ test("an effect that fails while the read-back shows it not done is failed, and 
   expect(ran).toBe(2);
 });
 
+test("an unknown read-back is ambiguous whatever the effect reported, and is never retried", async () => {
+  const cases: [string, () => Promise<{ ok: boolean; detail: string }>][] = [
+    ["throws", async () => { ran++; throw new Error("boom"); }],
+    ["fails", async () => { ran++; return { ok: false, detail: "refused" }; }],
+    ["succeeds", async () => { ran++; return { ok: true, detail: "" }; }],
+  ];
+  for (const [i, [what, fx]] of cases.entries()) {
+    const s = { ...spec, target: `t${i}` };
+    const first = await perform(store, now, s, fx, async () => "unknown");
+    expect({ what, state: first.op.state, ran: first.ran }).toEqual({ what, state: "ambiguous", ran: true });
+    expect(first.op.detail).toContain("read-back cannot tell");
+    expect((await perform(store, now, s, fx, async () => "not-done")).ran).toBe(false);
+  }
+  expect(ran).toBe(3);
+});
+
+test("an effect that throws after a side effect with an unknown read-back runs once and stays ambiguous", async () => {
+  let counter = 0;
+  const throwing = async () => { counter++; throw new Error("died after the side effect"); };
+  const unknown = async (): Promise<Observed> => "unknown";
+  const first = await perform(store, now, spec, throwing, unknown);
+  const second = await perform(store, now, spec, throwing, unknown);
+  expect({ first: first.op.state, second: second.op.state, ran: second.ran, counter }).toEqual({ first: "ambiguous", second: "ambiguous", ran: false, counter: 1 });
+  expect(second.op.detail).toContain("effect threw");
+});
+
+test("a read-back proving absence after a throwing effect is failed and may retry", async () => {
+  const throwing = async () => { ran++; throw new Error("boom"); };
+  expect((await perform(store, now, spec, throwing, readBack)).op.state).toBe("failed");
+  expect((await perform(store, now, spec, effect, readBack)).op.state).toBe("verified");
+  expect(ran).toBe(2);
+});
+
 test("operations survive a store import and export with their states", async () => {
   if (TEST_STORE === "sqlite") return;
   await perform(store, now, spec, effect, readBack);
@@ -120,6 +153,10 @@ const fakeDiscord = (threads: Record<string, boolean>) => {
   return { calls, discord: new Discord(http, fakeClock(T0), "bot") };
 };
 
+/** A closed lane's cleanup lines, from its registry receipt (the CLOSED line no longer carries the receipt). */
+const cleanupOf = async (deps: { readonly registry: { read(key: string): Promise<Lane | null> } }, key: string): Promise<string[]> =>
+  ((await deps.registry.read(key))?.receipt as { cleanup: string[] }).cleanup;
+
 const threadLane = (key: string): Lane => ({ key, title: key, thread: "discord:111/222", brief: "/b.md", done: "merged acme/app#1", cwd: "/repo", openedAt: new Date(T0).toISOString() });
 
 test("a close archives the lane's thread, reads it back archived and never archives it twice", async () => {
@@ -129,7 +166,7 @@ test("a close archives the lane's thread, reads it back archived and never archi
   await deps.registry.write(lane);
   const first = await closeLane(deps, lane, "manual");
   expect(first.closed).toBe(true);
-  expect(first.lines.at(-1)).toContain("thread 222 archived");
+  expect(await cleanupOf(deps, "lane-a")).toContain("thread 222 archived");
   expect(calls).toEqual(["GET 222", "PATCH 222 {\"archived\":true}", "GET 222", "GET 222"]);
   expect(store.get("lane-a/thread-archive/222")?.state).toBe("verified");
   await closeLane(deps, lane, "manual");
@@ -142,10 +179,10 @@ test("a shared thread stays open until its last lane closes, and a lane in a pla
   await deps.registry.write(threadLane("lane-a"));
   await deps.registry.write(threadLane("lane-b"));
   const first = await closeLane(deps, threadLane("lane-a"), "manual");
-  expect(first.lines.at(-1)).toContain("thread kept open: lane lane-b still works in it");
+  expect(await cleanupOf(deps, "lane-a")).toContain("thread kept open: lane lane-b still works in it");
   expect(calls).toEqual([]);
   const last = await closeLane(deps, threadLane("lane-b"), "manual");
-  expect(last.lines.at(-1)).toContain("thread 222 archived");
+  expect(await cleanupOf(deps, "lane-b")).toContain("thread 222 archived");
 
   const off = fakeDiscord({ "333": false });
   const plain = { ...depsFor(newWorld(), fakeClock(T0), state.dir), discord: off.discord };
@@ -166,12 +203,12 @@ test("an archive interrupted after its attempt is reconciled by read-back, and a
   expect(store.get("lane-a/thread-archive/222")).toMatchObject({ state: "verified", attempts: 1 });
   expect(calls.filter((c) => c.startsWith("PATCH"))).toEqual([]);
 
-  // Unknown thread (404): the read-back cannot tell, the effect failed, so the row is failed and the close goes on.
+  // Unknown thread (404): the read-back cannot tell, so the row is ambiguous (not retried, not verified) and the close goes on.
   const gone = fakeDiscord({});
   const other = { ...threadLane("lane-d"), thread: "discord:111/444" };
   await deps.registry.write(other);
   const result = await closeLane({ ...deps, discord: gone.discord }, other, "manual");
   expect(result.closed).toBe(true);
-  expect(result.lines.at(-1)).toContain("thread 444 not archived");
-  expect(store.get("lane-d/thread-archive/444")?.state).toBe("failed");
+  expect((await cleanupOf(deps, "lane-d")).some((l) => l.startsWith("thread 444 not archived"))).toBe(true);
+  expect(store.get("lane-d/thread-archive/444")?.state).toBe("ambiguous");
 });

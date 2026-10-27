@@ -2,9 +2,13 @@
 
 Run these once, in order. Stop and ask the owner wherever a step needs their choice or their hand.
 
+## 0. Your name
+
+Before anything else, ask the owner what to call you. Plain "Dori" is fine, and so is a name ending in Dori (ShipDori, WorkDori), so several Doris can run side by side. Use that name everywhere: the bot's display name, your sign-off, and the mode itself, which you remember as "<name> mode" so the owner can switch it on again in one line.
+
 ## 1. herdr
 
-herdr is the terminal multiplexer the Dori runs in. Every lane is a herdr tab, and herdr lets you read a pane, type into it and see which process runs there.
+Run inside herdr. It is how you open, read and message sessions, and they survive restarts. herdr is the terminal multiplexer the Dori runs in. Every lane is a herdr tab, and herdr lets you read a pane, type into it and see which process runs there.
 
 ```sh
 curl -fsSL https://herdr.dev/install.sh | sh
@@ -61,7 +65,7 @@ The installer clones the repo, links the skill, runs `bun link` (puts `dori` on 
 1. **Bot token**: saved as `DORI_DISCORD_TOKEN` in `~/.dori/env` (mode 600, other lines kept). Input is hidden and the token is never printed.
 2. **Main channel ids**: `discordChannels`. Each id is checked with the token (`GET /channels/{id}`); a 401 means a bad token, a 403 means the bot is not in the server or cannot view the channel.
    With a token and at least one channel, setup reads `GET /oauth2/applications/@me` and the first channel's `guild_id`, then asks for the Discord owner user id (defaults to the application owner). It writes `discord.applicationId`, `discord.guildId`, and `discord.ownerId` for slash commands, preserving existing values on reruns.
-3. **`defaultModel`, `leadModel`, `defaultCwd`, `stateDir`**: defaults are the subscription model, empty (the lead uses `defaultModel`), `~` and `~/.dori/state`. `defaultModel` is for lanes; `leadModel` only changes the lead. For a quota fallback, make `leadModel` an array in `config.json` (see `references/scripts.md`); setup keeps an array and does not ask.
+3. **`defaultModel`, `leadModel`, `defaultCwd`, `stateDir`**: defaults are the subscription model, empty (the lead uses `defaultModel`), `~` and `~/.dori/state`. `defaultModel` is for lanes; `leadModel` only changes the lead. `leadModel` is one model; a legacy array uses its first entry with a warning.
    It also asks for optional GitHub repos to watch on this machine and saves them in the state directory; `dori repos add/remove/list` changes the list without a supervisor restart.
    Then it asks which GitHub accounts' new issues start work automatically (`githubIssueAuthors`, optional, comma separated; `--issue-author LOGIN` non-interactively). Issues from anyone else never wake the lead.
 4. **herdr**: keeps `leadPane` and `laneWorkspace` when they still exist, otherwise creates a `dori-lead` tab in a `Dori` workspace and a `lanes` workspace, and writes `leadPane`, `laneWorkspace`, `workspaces` and `ignorePanes` (the shell pane a new workspace starts with). The herdr server must be running.
@@ -76,17 +80,21 @@ Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --chann
 
 ## 5. Monitors
 
-Arm these as persistent monitors in your own session:
+Subscribe to new messages with your monitor tool. Transcribe voice messages (`dori transcribe`) and treat the transcript as the owner's message.
+
+Arm these as persistent monitors in your own session. Each filter matches only lines that need the lead, so `*_READY` start-up lines never wake you:
 
 | Monitor | Command | Filter |
 |---|---|---|
 | inbound messages | your messenger's watch command | new owner messages |
-| done flow | `dori watch` | `^LANE_` |
+| done flow | `dori watch` | `^LANE_(?!WATCH_READY)` |
 | dead panes | `dori dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE)` |
-| host guard | `dori guard --loop 1` | `^HOST_GUARD` |
-| freshness | `dori freshness --loop 5` | `^(NUDGED\|POSTED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT)` |
-| Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND` |
+| host guard | `dori guard --loop 1` | `^HOST_GUARD (ALERT\|CLEAR)` |
+| freshness | `dori freshness --loop 5 \| tee -a ~/.dori/freshness.log` | `^WORKING-WHILE-PAUSED` |
+| Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND(?!_READY)` |
 | presence (optional) | `dori presence slack` or `dori presence discord` | `^PRESENCE_READY` |
+
+The done-flow filter keeps every `LANE_` line except the ready line. `LANE_WATCH_WARN` matters most there: it's the only sign that `dori watch` is failing and lanes aren't being closed. Freshness acts on its own (it nudges the lane and posts the report to the thread), so only `WORKING-WHILE-PAUSED` needs you. The other freshness lines (`NUDGED`, `POSTED`, `NO-REPORT`, `PENDING-REPORT`, `STALE-REPORT`) go only to `~/.dori/freshness.log`. Run `tail ~/.dori/freshness.log` when you want recent nudges and posts.
 
 ### Supervised mode instead
 
@@ -98,7 +106,7 @@ REST catches up on startup and reconnect. With a healthy gateway, `discordSafety
 
 On a supervised start the lead:
 
-1. handles every pending event the prompt lists, straight away;
+1. runs `dori inbox take` and handles everything it prints, straight away (the prompt itself lists no events);
 2. registers the one monitor from the prompt;
 3. starts no sweeps and no inbound pollers;
 4. before each turn ends, writes open questions, promises and any other state it needs into memory or the registry, since the next turn may be a fresh session.
@@ -107,9 +115,11 @@ Set `discordChannels` (the channel ids to watch, as strings), and `cacheTtlMin` 
 
 After editing `leadModel` or `leadThinking`, run `dori lead-restart` to request a fresh lead at its next idle moment; `--model ID` and `--thinking LEVEL` override those settings for the request. `dori status` and `dori doctor` show pending requests. If herdr lost the lead pane, `doctor` names it and gives `dori lead-restart` as the repair command; keep the supervisor running to recreate it.
 
-The supervisor recovers missing working-lane panes automatically, and replaces a restored `omo` whose live model is absent or differs from its registry model. `dori recover [key]` runs this immediately. Paused and closed lanes stay untouched and attempts are capped. Each recovery posts one thread line. Quota stalls are reported as `LANE_QUOTA_STALL`; they never switch a lane's model.
+The supervisor recovers missing working-lane panes automatically, and replaces a restored `omo` whose live model is absent or differs from its registry model. `dori recover [key]` runs this immediately. Paused and closed lanes stay untouched and attempts are capped. Each recovery posts one thread line.
 
 #### Cutting over a running Dori
+
+Switching an existing Dori over is an outside job, done on the lead only. Stop the old monitors and pollers first, then start the supervisor from outside the lead's session. Never edit a live lead's prompt or config in place.
 
 The cutover touches the lead only. Lanes keep running as they are.
 
@@ -124,3 +134,5 @@ Don't edit a live lead's prompt, config or monitors in place. Stop, then start.
 ## 6. First look around
 
 Once the bot is live, explore the machine: running coding-agent sessions, the tools in use, recent logs. Write what you find into memory, and adopt any running lanes with `dori adopt`.
+
+Once the bot is live and the first look around is done, run onboarding (`references/onboarding.md`), unless it has been done before.

@@ -15,16 +15,15 @@ const LEGACY_URGENT = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_DONE_CLAIMED", "LANE_NOT_DONE", "LANE_CLOSED", "LANE_REPORT",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
-  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "LANE_QUOTA_STALL", "ACK_MISSING", "UNHANDLED",
-  "LANE_QUOTA_CLEARED", "LANE_QUOTA_UNKNOWN", "LANE_RECOVERY_EXHAUSTED", "LANE_RECOVERY_BLOCKED",
-  "LEAD_QUOTA_EXHAUSTED", "LEAD_QUOTA_CLEARED", "QUOTA_GATE_UNKNOWN", "WAIT_FAILED", "WAITS_CORRUPT",
-  "LEAD_EMERGENCY_APPROVAL", "TASK_STALLED",
+  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "ACK_MISSING", "UNHANDLED",
+  "LANE_RECOVERY_EXHAUSTED",
+  "WAIT_FAILED", "WAITS_CORRUPT",
+  "TASK_STALLED",
 ];
 const legacyPriority = (line: string): "urgent" | "digest" =>
   LEGACY_URGENT.some((prefix) => line === prefix || line.startsWith(`${prefix} `)) ||
   /^GH_PR \S+ (checks_failing|merged|closed|review|comment|conflicting)(?: |$)/.test(line) ||
-  /^GH_ISSUE \S+ (opened|reopened) /.test(line) ||
-  /^CLAUDE_QUOTA (brief|blocked)(?: |$)/.test(line) ? "urgent" : "digest";
+  /^GH_ISSUE \S+ (opened|reopened) /.test(line) ? "urgent" : "digest";
 
 const corpus = [
   ...LEGACY_URGENT.flatMap((kind) => [kind, `${kind} detail here`, `${kind}X detail`, `${kind}_MORE detail`]),
@@ -32,7 +31,6 @@ const corpus = [
     .flatMap((kind) => [`GH_PR acme/app#7 ${kind} sha=abc https://github.com/acme/app/pull/7`, `GH_PR acme/app#7 ${kind}`]),
   "GH_PR merged", "GH_PR acme/app#7", "GH_ISSUE acme/app#3 opened author=a https://x", "GH_ISSUE acme/app#3 reopened author=a https://x",
   "GH_ISSUE acme/app#3 closed author=a https://x", "GH_ISSUE_UNTRUSTED acme/app#3 opened author=b https://x",
-  "CLAUDE_QUOTA ok | 5h 4%", "CLAUDE_QUOTA hold-lanes | 5h 81%", "CLAUDE_QUOTA brief | 5h 91%", "CLAUDE_QUOTA blocked", "CLAUDE_QUOTA briefly",
   "HOST_GUARD", "HOST_GUARD WARN x", "HOST_GUARD ALERTS x", "SWEEP_WARN watch boom", "MEMORY_CHECK stale", "PROGRESS lane x", "NUDGED lane",
   "OWNER_QUARANTINED 2 1:2,3", "COMPUTE_READY", "", " INBOUND leading space", "inbound lower case", "NEW_SOURCE_KIND something",
 ];
@@ -57,6 +55,14 @@ test("a kind is the most specific matching entry, else the line's first word", (
   expect(eventKind("GH_PR acme/app#7 merged", policy)).toBe("GH_PR acme/app#7 merged");
   expect(eventClass("GH_PR acme/app#7 merged", policy)).toBe("engine-only");
   expect(eventClass("GH_PR other/x#1 merged", policy)).toBe("lead-digest");
+});
+
+test("LANE_REPORT_LATE follows LANE_REPORT: question, blocked and done are urgent, every other kind digest", () => {
+  for (const kind of ["question", "blocked", "done"]) expect(eventClass(`LANE_REPORT_LATE gone-lane ${kind} text`)).toBe("lead-urgent");
+  for (const kind of ["progress", "milestone", "other"]) expect(eventClass(`LANE_REPORT_LATE gone-lane ${kind} text`)).toBe("lead-digest");
+  expect(eventKind("LANE_REPORT_LATE gone-lane question q")).toBe("LANE_REPORT_LATE * question");
+  // An open decision's reminder wakes the lead like UNREPORTED and UNHANDLED do.
+  expect(eventClass("UNRESOLVED wait:1 WAIT_DONE alpha ci green")).toBe("lead-urgent");
 });
 
 test("a config file changes a kind's class and the default with no code change", async () => {
