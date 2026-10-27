@@ -612,11 +612,12 @@ export class LeadLifecycle {
     }
     if (restart.phase.startsWith("soft:")) {
       const old = restart.phase.slice("soft:".length);
+      // The reused lead gets the prompt itself, on one line so a single Enter submits it. A file named in a "Read it"
+      // prompt is removed once the restart is confirmed, which can be before the new lead's first tool call reads it.
+      const softPrompt = this.startupPrompt(restart).split("\n").join(" ");
       try {
         if (sendSoft) {
           this.carryOver(restart);
-          const fd = openSync(promptPath, "w", 0o600);
-          try { writeFileSync(fd, this.startupPrompt(restart)); fsyncSync(fd); } finally { closeSync(fd); }
           const entry = leadModels(this.leadConfig())[0];
           if (!entry) throw new TransientSuperviseError("soft restart model is missing");
           await softCommand(deps, "/new");
@@ -626,9 +627,10 @@ export class LeadLifecycle {
           for (const command of [`/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
             await softCommand(deps, command);
           }
-          await softCommand(deps, `Read ${promptPath} in full and follow it exactly.`, true);
+          await softCommand(deps, softPrompt, true);
         }
-        const session = await softEvidence(deps, old, promptPath, softStartedAt);
+        // A soft start journaled before the prompt was typed inline is recognised by its file path.
+        const session = await softEvidence(deps, old, [JSON.stringify(softPrompt).slice(1, -1), promptPath], softStartedAt);
         if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
         const table = await procTable(deps.run);
         const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
@@ -865,7 +867,7 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
 };
 
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
-const softEvidence = async (deps: FlowDeps, old: string, promptPath: string, startedAt: number | undefined): Promise<string | undefined> => {
+const softEvidence = async (deps: FlowDeps, old: string, markers: readonly string[], startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
@@ -879,7 +881,8 @@ const softEvidence = async (deps: FlowDeps, old: string, promptPath: string, sta
       try {
         if (startedAt !== undefined && statSync(file).mtimeMs < startedAt) continue;
         if (deps.clock.now() >= deadline) return undefined;
-        if (readFileSync(file, "utf8").includes(promptPath) && deps.clock.now() < deadline) return id;
+        const text = readFileSync(file, "utf8");
+        if (markers.some((marker) => text.includes(marker)) && deps.clock.now() < deadline) return id;
       } catch (e) {
         if (e instanceof Error && "code" in e && e.code === "ENOENT") continue;
         throw e;
