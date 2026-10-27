@@ -29,6 +29,8 @@ const URGENT_KINDS = [
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
   // A merged lane PR whose merge the supervisor could not read back.
   "MERGE_UNVERIFIED",
+  // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
+  "LANE_DONE_CLAIMED",
   // A lane that ended is news the lead acts on: report to the owner, free the slot.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
@@ -40,13 +42,15 @@ const URGENT_KINDS = [
 /**
  * Kinds that stay digest whatever `default` says. The lane hears about its PR first (CI follow-up messages it and merges
  * or opens a merge lane), and a lane's milestone and progress reports wait for the next urgent delivery. The supervisor
- * settles the rest itself: a done claim is re-checked live (then closed, which is urgent LANE_CLOSED, or objected to,
+ * settles the rest itself: a done claim (urgent LANE_DONE_CLAIMED) is re-checked live (then closed, or objected to,
  * LANE_NOT_DONE, which is urgent), and a merged lane PR has its merge read back (MERGE_VERIFIED, or urgent MERGE_UNVERIFIED).
+ * A close whose LANE_DONE_CLAIMED the lead already received (`LANE_CLOSED <key> closed seen-claim`) is digest: the lead
+ * heard of the claim, and the close only confirms it. A close of an undelivered claim stays urgent.
  */
 const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
-  "LANE_DONE_CLAIMED", "MERGE_VERIFIED",
+  "MERGE_VERIFIED", "LANE_CLOSED * closed seen-claim",
   // The Toodo chat's finish reports and followed task events (messenger/toodo-supervisor.ts): informational, never acked.
   "TOODO_FINISH", "TOODO_TASK",
 ] as const;

@@ -1092,8 +1092,9 @@ test("a large multibyte event reaches the new lead through take without exceedin
 
 test.each([
   ["INBOUND 123 1 Owner hello", "urgent"],
-  // The supervisor settles a claim itself (live re-check, close or LANE_NOT_DONE): the claim is digest, the close urgent.
-  ["LANE_DONE_CLAIMED lane proof", "digest"],
+  // A claim wakes the lead; the close after the lead received it is digest (seen-claim), any other close urgent.
+  ["LANE_DONE_CLAIMED lane proof", "urgent"],
+  ["LANE_CLOSED lane closed seen-claim", "digest"],
   ["LANE_NOT_DONE lane reason", "urgent"],
   ["LANE_CLOSED lane", "urgent"],
   ["LANE_AUTO_CLOSED lane {}", "urgent"],
@@ -1301,11 +1302,8 @@ test("the next cold urgent delivery includes held digest in the new session prom
   expect(taken(f)).toEqual(["digest\tNUDGED lane silent", "urgent\tLANE_NOT_DONE lane reason"]);
 });
 
-/** A config that makes done claims wake the lead again: only then does the claim's window wait for its delivery. */
-const urgentClaims = () => ({ eventPolicy: resolveEventPolicy({ kinds: { LANE_DONE_CLAIMED: "lead-urgent" } }) });
-
 test("a claim reads delivered to the lead only once a cold start carrying it confirmed", async () => {
-  const f = fixture(urgentClaims());
+  const f = fixture();
   f.cold();
   f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
@@ -1324,7 +1322,7 @@ test("a claim reads delivered to the lead only once a cold start carrying it con
 });
 
 test("a claim delivered warm reads delivered at once", async () => {
-  const f = fixture(urgentClaims());
+  const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("done-claim:lane:t", "LANE_DONE_CLAIMED lane - proof");
   await supervisor.flush();

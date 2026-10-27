@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { LEGACY_LANE_MCP, removeLegacyLaneMcp } from "../src/launch.ts";
 import { claimDone, claimEventId, closeLane, discoverWorktrees, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
 import { laneFinish } from "../src/lane-finish.ts";
-import { resolveEventPolicy } from "../src/event-policy.ts";
+import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World, WT, withSqliteStore } from "./fakes.ts";
@@ -84,7 +84,7 @@ test("five quiet minutes after a claim is handed over the lane is closed, its th
   expect(await watchTick(at(T0 + 4 * MIN))).toEqual([]);
   expect(closedVia()).toHaveLength(0);
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
-  expect(lines[0]).toBe("LANE_CLOSED demo-lane closed");
+  expect(lines[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
   expect(world.calls).toContainEqual(["notify", "chat:team/123", "Done: merged acme/app#1 abc123"]);
   expect(world.calls).toContainEqual(["git", "-C", "/repo", "worktree", "remove", WT]);
@@ -123,7 +123,7 @@ test("LANE_CLOSED keeps the PR URL the claim names, so the lane-finish line stil
   await claimDone(at(T0), lane, `merged ${url} abc123`);
   await watchTick(at(T0));
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
-  expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed ${url}`);
+  expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed seen-claim ${url}`);
   expect(laneFinish(lines[0] ?? "")).toEqual({ lane: "demo-lane", closed: "closed", pr: url });
 });
 
@@ -139,7 +139,7 @@ test("settling a claim reads each Done signal and lists worktrees once, reusing 
   const onePass = listings(before);
   expect(onePass).toBeGreaterThan(0);
   const start = world.calls.length;
-  expect((await watchTick(at(T0 + 5 * MIN + 1)))[0]).toBe("LANE_CLOSED demo-lane closed");
+  expect((await watchTick(at(T0 + 5 * MIN + 1)))[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
   expect(listings(start)).toBe(onePass);
   expect(reads(start).sort()).toEqual(["issue view 2", "pr view 1"]);
 });
@@ -276,46 +276,47 @@ test("one lane's failure is a LANE_WATCH_WARN line and the other lanes are still
 });
 
 /** `received` is the supervisor's answer for journaled ids (absent: `dori watch`, no supervisor). */
-const onDelivery = (ms: number, received?: (id: string) => boolean, urgentClaims = false): FlowDeps => ({
+const onDelivery = (ms: number, received?: (id: string) => boolean, digestClaims = false): FlowDeps => ({
   ...depsFor(world, fakeClock(ms), state.dir, {
     hooks: { threadDone: ["notify", "{thread}", "{text}"] },
-    ...(urgentClaims ? { eventPolicy: resolveEventPolicy({ kinds: { LANE_DONE_CLAIMED: "lead-urgent" } }) } : {}),
+    ...(digestClaims ? { eventPolicy: resolveEventPolicy({ kinds: { LANE_DONE_CLAIMED: "lead-digest" } }) } : {}),
   }),
   ...(received ? { leadDelivered: received } : {}),
 });
 
-test("by default a claim is the supervisor's to settle: its window runs from the hand-over even while the lead never receives it", async () => {
+test("with claims made digest, a claim is the supervisor's to settle: its window runs from the hand-over even while the lead never receives it", async () => {
   livePane();
-  await claimDone(onDelivery(T0), lane, "merged acme/app#1 abc123");
+  await claimDone(onDelivery(T0, undefined, true), lane, "merged acme/app#1 abc123");
   expect(sent(world).at(-1)).toContain("closes automatically at 12:05Z (5 minutes) once its Done signals read back live");
   const never = () => false;
-  expect(await watchTick(onDelivery(T0 + MIN, never))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(onDelivery(T0 + MIN, never, true))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
   expect((await at(T0).registry.read("demo-lane"))?.claim?.deliveredAt).toBe(new Date(T0 + MIN).toISOString());
-  expect(await watchTick(onDelivery(T0 + 5 * MIN, never))).toEqual([]);
-  const lines = await watchTick(onDelivery(T0 + 6 * MIN + 1, never));
+  expect(await watchTick(onDelivery(T0 + 5 * MIN, never, true))).toEqual([]);
+  const lines = await watchTick(onDelivery(T0 + 6 * MIN + 1, never, true));
   expect(lines[0]).toStartWith("LANE_CLOSED demo-lane");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
 });
 
-test("with claims made urgent, a claim the lead receives 40 minutes late still gets the full window from that delivery", async () => {
+test("by default a claim the lead receives 40 minutes late still gets the full window from that delivery, and its close is digest", async () => {
   livePane();
   let received = false;
   const claimAt = new Date(T0).toISOString();
   const lead = (id: string) => received && id === claimEventId("demo-lane", claimAt);
-  await claimDone(onDelivery(T0, undefined, true), lane, "merged acme/app#1 abc123");
+  await claimDone(onDelivery(T0), lane, "merged acme/app#1 abc123");
   expect(sent(world).at(-1)).toContain("closes automatically 5 minutes after the lead receives this claim");
   const ids: (string | undefined)[] = [];
-  expect(await watchTick(onDelivery(T0 + MIN, lead, true), async (_line, id) => { ids.push(id); })).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(onDelivery(T0 + MIN, lead), async (_line, id) => { ids.push(id); })).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
   expect(ids).toEqual([`done-claim:demo-lane:${claimAt}`]);
   // Undelivered (the lead is down): the claim waits, however old.
-  expect(await watchTick(onDelivery(T0 + 39 * MIN, lead, true))).toEqual([]);
+  expect(await watchTick(onDelivery(T0 + 39 * MIN, lead))).toEqual([]);
   received = true;
-  expect(await watchTick(onDelivery(T0 + 40 * MIN, lead, true))).toEqual([]);
+  expect(await watchTick(onDelivery(T0 + 40 * MIN, lead))).toEqual([]);
   expect((await at(T0).registry.read("demo-lane"))?.claim?.deliveredAt).toBe(new Date(T0 + 40 * MIN).toISOString());
-  expect(await watchTick(onDelivery(T0 + 44 * MIN, lead, true))).toEqual([]);
+  expect(await watchTick(onDelivery(T0 + 44 * MIN, lead))).toEqual([]);
   expect(closedVia()).toHaveLength(0);
-  const lines = await watchTick(onDelivery(T0 + 45 * MIN + 1, lead, true));
-  expect(lines[0]).toStartWith("LANE_CLOSED demo-lane");
+  const lines = await watchTick(onDelivery(T0 + 45 * MIN + 1, lead));
+  expect(lines[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
+  expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
 });
 
@@ -324,6 +325,32 @@ test("with no supervisor (dori watch) the window starts when the claim is handed
   expect(await watchTick(onDelivery(T0 + 20 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1"]);
   expect(await watchTick(onDelivery(T0 + 24 * MIN))).toEqual([]);
   expect((await watchTick(onDelivery(T0 + 25 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+});
+
+test("a close whose claim the lead already received is digest (seen-claim); a merge that closes the lane before the lead received its claim wakes the lead", async () => {
+  livePane();
+  await claimDone(onDelivery(T0), lane, "merged acme/app#1");
+  await watchTick(onDelivery(T0, () => true));
+  const seen = (await watchTick(onDelivery(T0 + 5 * MIN + 1, () => true)))[0] ?? "";
+  expect(seen).toStartWith("LANE_CLOSED demo-lane closed seen-claim");
+  expect(eventClass(seen)).toBe("lead-digest");
+
+  await at(T0).registry.write(lane);
+  livePane();
+  await claimDone(onDelivery(T0), lane, "merged acme/app#1");
+  // The lead never receives the claim: its window never starts, so the lane stays open however long it waits.
+  expect(await watchTick(onDelivery(T0, () => false))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1"]);
+  expect(await watchTick(onDelivery(T0 + 60 * MIN, () => false))).toEqual([]);
+  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("done-claimed");
+  // Its PR then reads merged: the lane closes at once, before the lead got the claim, so this close wakes the lead.
+  const base = onDelivery(T0 + 61 * MIN, () => false);
+  const merged = JSON.stringify({ state: "MERGED", headRefName: "demo-lane", headRefOid: "a".repeat(40), baseRefName: "dev", isCrossRepository: false });
+  const run: FlowDeps["run"] = async (argv, opts) =>
+    argv[0] === "gh" && argv[2] === "view" && argv.includes("state,headRefName,headRefOid,baseRefName,isCrossRepository") ? { code: 0, out: merged, err: "" } : base.run(argv, opts);
+  const unseen = (await watchTick({ ...base, run }))[0] ?? "";
+  expect(unseen).toStartWith("LANE_CLOSED demo-lane closed");
+  expect(unseen).not.toContain("seen-claim");
+  expect(eventClass(unseen)).toBe("lead-urgent");
 });
 
 test("a claim announced by an older dori (no event id) keeps its window from the claim", async () => {
