@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statS
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
@@ -1279,7 +1280,7 @@ test("a machine-closed lane's claim and close are digest and wake no lead", asyn
 });
 
 test("a cold start points the lead at the full SKILL.md and puts leadArgs on the lead command only", async () => {
-  const f = fixture({ leadArgs: ["--approve"], defaultModel: "test/lead-default" });
+  const f = fixture({ leadArgs: ["--approve"], leadDiet: false, defaultModel: "test/lead-default" });
   f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);
@@ -1294,10 +1295,30 @@ test("a cold start points the lead at the full SKILL.md and puts leadArgs on the
   expect(command).toContain("test/lead-default");
 });
 
+test.each([true, false])("leadDiet=%s: the lead launch carries the slim omo flags and env only when on, never the lane command", async (leadDiet) => {
+  const f = fixture({ leadArgs: ["--approve"], leadDiet });
+  f.noAgent();
+  f.cold();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("card", "INBOUND card");
+  await supervisor.flush();
+  const command = f.command() ?? "";
+  const list = LEAD_DIET_EXCLUDED_TOOLS.join(",");
+  expect(command.includes("SENPI_PROMPT_SURFACE=chat")).toBe(leadDiet);
+  expect(command.includes("--no-skills")).toBe(leadDiet);
+  expect(command.includes("--exclude-tools")).toBe(leadDiet);
+  expect(command.includes(list)).toBe(leadDiet);
+  if (leadDiet) expect(command).toMatch(/DORI_SUPERVISED=1 '?SENPI_PROMPT_SURFACE=chat'? .*'?--approve'? '?--no-skills'? '?--exclude-tools'? \S+ '?--model'?/);
+  const lane = defaultConfig().agentCommand.join(" ");
+  expect(lane).not.toContain("--no-skills");
+  expect(lane).not.toContain("--exclude-tools");
+  expect(lane).not.toContain("SENPI_PROMPT_SURFACE");
+});
+
 const WITH_THINKING = ["omo", "--model", "{model}", "--thinking", "medium", "{prompt}"];
 /** The lead's agent argv after `--session-dir <dir>`, up to the `@prompt` file. */
 const leadAgent = async (extra: Record<string, unknown>) => {
-  const f = fixture({ defaultModel: "test/lane-default", ...extra });
+  const f = fixture({ defaultModel: "test/lane-default", leadDiet: false, ...extra });
   f.noAgent();
   f.cold();
   const supervisor = new Supervisor(f.deps);

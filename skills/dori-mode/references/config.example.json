@@ -16,6 +16,7 @@
   "defaultModel": "anthropic-subscription/claude-opus-5-5",
   "launchKeywords": "ulw set goal and work",
   "leadArgs": [],
+  "leadDiet": true,
   "leadStuckRestartMin": 30,
   "leadUnreadRestartMin": 5,
   "leadChildWaitMaxMin": 60,

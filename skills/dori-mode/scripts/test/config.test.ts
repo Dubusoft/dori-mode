@@ -15,6 +15,15 @@ test("the shipped example config loads, with ~ paths expanded and unset fields d
   expect(c.defaultCwd).toBe("/home/ana/code/my-project");
   expect(c.closeAfterMin).toBe(5);
   expect(c.guard.diskFreeMinGb).toBe(50);
+  expect(c.leadDiet).toBe(true);
+});
+
+test("leadDiet defaults to true when absent and parses false from the file", async () => {
+  const path = join(state.dir, "diet.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(true);
+  await Bun.write(path, JSON.stringify({ leadDiet: false }));
+  expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(false);
 });
 
 test("a missing config file falls back to defaults and DORI_STATE_DIR wins over the file", async () => {

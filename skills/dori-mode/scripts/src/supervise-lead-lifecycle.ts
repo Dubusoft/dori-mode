@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { leadModels, leadCommand } from "./config.ts";
+import { leadModels, leadCommand, LEAD_DIET_ARGS, LEAD_DIET_ENV } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
 import { ALIVE_STATUSES, listPanes, readScreen, sendGuarded, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
@@ -699,9 +699,9 @@ export class LeadLifecycle {
       const executable = agent[0];
       if (!executable) throw new SuperviseError("agentCommand must name an executable");
       const argv = [
-        "env", "DORI_SUPERVISED=1", executable, "--session-id", restart.session,
+        "env", "DORI_SUPERVISED=1", ...(deps.config.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
         "--session-dir", sessionDirFor(deps.config.sessionsDir, deps.config.defaultCwd),
-        ...deps.config.leadArgs, ...agent.slice(1),
+        ...deps.config.leadArgs, ...(deps.config.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
       ];
       const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.defaultCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
       if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${restart.session}`);

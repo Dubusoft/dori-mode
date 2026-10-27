@@ -31,6 +31,7 @@ Installing, testing, requirements and the library modules are in [development.md
 | `guard` | load 150/80, 20% memory, 50 GB disk, 20 panes | `guard` |
 | `hooks.threadReply`, `hooks.threadDone` | none | `freshness`, `close` |
 | `hooks.transcribe` | none | `transcribe` (argv with `{file}`, prints the text) |
+| `leadDiet` | `true` | `supervise`: start the lead with a slimmer omo context. Adds `--no-skills`, `--exclude-tools <tools the lead never uses: task*, workpool, goals, codegraph_*, lsp_*, mcp resources, show_html_page, ask_user_question>` (after `leadArgs`) and `SENPI_PROMPT_SURFACE=chat` to the lead launch only; lanes are unchanged. Set `false` to give the lead the full tool and skill set |
 | `leadArgs` | `[]` | `supervise`: extra argv for the lead session only, placed right after `omo`. `["--approve"]` trusts the lead folder's `.omo/` files; `assets/lead-mcp.json` is an optional project file that keeps the Figma MCP on with search exposure |
 | `cacheTtlMin` | 5 | `supervise`: the prompt-cache lifetime it plans lead turns around |
 | `leadContextHardCapTokens` | 300000 | `supervise`: last recorded session usage at or above this cap restarts an idle lead on the next delivery even inside `cacheTtlMin` and regardless of waits or lanes; the journal logs `LEAD_HARD_CAP <tokens>` |

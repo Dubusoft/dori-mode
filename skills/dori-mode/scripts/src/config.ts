@@ -120,6 +120,8 @@ export type DoriConfig = {
   readonly leadThinking?: string;
   /** Extra argv for the lead session only (after the executable), e.g. ["--approve"]. */
   readonly leadArgs: ArgvTemplate;
+  /** Start the lead with a slimmer omo context (no skills list, LEAD_DIET_EXCLUDED_TOOLS removed, chat prompt surface). Lanes are unaffected. */
+  readonly leadDiet: boolean;
   readonly cacheTtlMin: number;
   readonly leadContextCapTokens: number;
   readonly leadContextHardCapTokens: number;
@@ -199,6 +201,19 @@ export type DoriConfig = {
   readonly delivery: DeliveryConfig;
 };
 
+/** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
+export const LEAD_DIET_EXCLUDED_TOOLS: readonly string[] = [
+  "task", "task_output", "task_send", "task_cancel", "workpool", "show_html_page", "ask_user_question",
+  "create_goal", "get_goal", "update_goal",
+  "codegraph_callers", "codegraph_callees", "codegraph_explore", "codegraph_files", "codegraph_impact", "codegraph_node", "codegraph_search", "codegraph_status",
+  "lsp_diagnostics", "lsp_find_references", "lsp_goto_definition", "lsp_prepare_rename", "lsp_rename", "lsp_symbols",
+  "mcp_list_resources", "mcp_read_resource",
+];
+
+/** Lead-only launch additions for `leadDiet`: the env assignments and the omo flags. */
+export const LEAD_DIET_ENV = ["SENPI_PROMPT_SURFACE=chat"] as const;
+export const LEAD_DIET_ARGS = ["--no-skills", "--exclude-tools", LEAD_DIET_EXCLUDED_TOOLS.join(",")] as const;
+
 /** One lead model: "provider/model", or an object whose `thinking` replaces `leadThinking` for this model only. */
 export type LeadModelEntry = string | { readonly model: string; readonly thinking?: string };
 
@@ -214,6 +229,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   agentCommand: ["omo", "--model", "{model}", "{prompt}"],
   defaultModel: "anthropic-subscription/claude-opus-5-5",
   leadArgs: [],
+  leadDiet: true,
   cacheTtlMin: 5,
   leadContextCapTokens: 150_000,
   leadContextHardCapTokens: 300_000,
