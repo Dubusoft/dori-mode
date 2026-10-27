@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { randomBytes, randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 
 import { configPath, loadConfig } from "./config.ts";
@@ -45,6 +46,7 @@ import { isReportKind, oneLine, openLaneReports, REPORT_KINDS, type ReportKind, 
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
+import { updateInstall } from "./update.ts";
 
 const USAGE = `dori <command> [options]
 
@@ -72,6 +74,8 @@ const USAGE = `dori <command> [options]
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
+  update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
+                                       bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
   store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field),
                                        then set "store": "sqlite" in the config
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
@@ -167,6 +171,7 @@ const flags = parseArgs({
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
+    dev: { type: "boolean" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -192,7 +197,7 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "store", "ops", "source", "schedule"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
@@ -265,6 +270,14 @@ try {
       const request = requestLeadRestart(config, realClock.now(), opt("model"), opt("thinking"));
       console.log(`LEAD_RESTART_REQUESTED ${request.id} ${request.models[0]?.model}`);
       break;
+    }
+    case "update": {
+      if (flags.positionals.length || Object.entries(flags.values).some(([name, v]) => (name !== "dev" && name !== "force") || v !== true)) {
+        die("usage: dori update [--dev] [--force]");
+      }
+      const code = await updateInstall({ run, sleep: realClock.sleep, log: (line) => console.log(line) },
+        { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
+      process.exit(code);
     }
     case "repos": {
       const [action, repo, ...extra] = flags.positionals;
