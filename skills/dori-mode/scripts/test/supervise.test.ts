@@ -7,7 +7,7 @@ import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork } from "../src/supervise-lead-lifecycle.ts";
+import { childWork, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -29,7 +29,18 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const state = withState();
   cleanups.push(state.done);
   // The evidence deadline is measured on this clock, so a sleep must move it forward.
-  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; } };
+  // A /new session's model entry is written once this clock reaches its start time (Infinity: it never starts).
+  let startDelay = 0;
+  let startedAt: number | undefined;
+  let pendingStart: { readonly at: number; readonly file: string } | undefined;
+  const startPending = () => {
+    if (!pendingStart || clock.at < pendingStart.at) return;
+    appendFileSync(pendingStart.file, `${JSON.stringify({ type: "model_change", provider: "test", modelId: "soft" })}\n`);
+    utimesSync(pendingStart.file, clock.at / 1000, clock.at / 1000);
+    startedAt = clock.at;
+    pendingStart = undefined;
+  };
+  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); } };
   const world = newWorld();
   const session = "11111111-1111-4111-8111-111111111111";
   const config = { sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo", ...extra };
@@ -87,14 +98,20 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     if (argv[0] === "herdr" && argv[2] === "send-text") { typed = argv[4] ?? ""; return ok(); }
     if (argv[0] === "herdr" && argv[2] === "send-keys") {
       pane.revision++;
-      if (typed === "/new") active = randomUUID();
+      if (typed === "/new") {
+        active = randomUUID();
+        startedAt = undefined;
+        writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "session", id: active })}\n`);
+        pendingStart = { at: clock.now() + startDelay, file: join(dir, `${active}.jsonl`) };
+        startPending();
+      }
       const path = /^Read (.+) in full/.exec(typed)?.[1];
       if (path) {
         prompt = readFileSync(path, "utf8");
         if (softEvidence) {
           mkdirSync(join(dir, "session-holders", active), { recursive: true });
           writeFileSync(join(dir, "session-holders", active, `${pid}.json`), "{}");
-          writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: typed } })}\n`);
+          appendFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: typed } })}\n`);
           utimesSync(join(dir, `${active}.jsonl`), clock.now() / 1000, clock.now() / 1000);
         }
         await onWait?.();
@@ -111,6 +128,8 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     command: () => admitted,
     session: () => active,
     softEvidence: (value: boolean) => { softEvidence = value; },
+    startDelay: (ms: number) => { startDelay = ms; },
+    startedAt: () => startedAt,
     prompt: () => prompt,
     setConfirm: (value: boolean) => { confirm = value; },
     hang: (launches: number) => { hangs = launches; },
@@ -590,6 +609,45 @@ test("a soft restart without a new session file falls back to a process launch",
   expect(lines.some((line) => line.endsWith("; falling back to a process restart"))).toBe(true);
   expect(f.log()).toEqual([{ id: "fallback", line: "INBOUND fallback" }]);
   expect(restartSession(f)).toBeUndefined();
+});
+
+test("a soft restart types nothing after /new until the new session has started", async () => {
+  // Given omo back at its editor right after /new while the new session is still starting for three seconds.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.startDelay(3_000);
+  const base = f.deps.run;
+  const sends: [string, number, number | undefined][] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
+    if (argv[2] === "send-text" && argv[4] !== "/new" && !argv[4]?.startsWith(POINTER_PREFIX)) sends.push([argv[4] ?? "", f.clock.now(), f.startedAt()]);
+    return base(argv, options);
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-start", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then /model, /thinking and the prompt are typed only once the new session has started and settled.
+  expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["/model", "/thinking", "Read"]);
+  for (const [, at, started] of sends) expect(at - (started ?? Number.POSITIVE_INFINITY)).toBeGreaterThanOrEqual(SOFT_SESSION_SETTLE_MS);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+});
+
+test("a /new session that never starts falls back to a process launch without typing more", async () => {
+  // Given omo that accepts /new but never starts the new session.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.startDelay(Number.POSITIVE_INFINITY);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-stall", "INBOUND stall");
+  // When its start deadline expires.
+  const lines = await quiet(() => supervisor.flush());
+  // Then no further command is typed into it and the batch is launched once through the hard path.
+  expect(f.calls.filter((call) => call[2] === "send-text" && /^\/(model|thinking) |^Read /.test(call[4] ?? ""))).toEqual([]);
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED new session did not start after /new"))).toHaveLength(1);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.log()).toEqual([{ id: "soft-stall", line: "INBOUND stall" }]);
 });
 
 test("a soft fallback preserves the journaled offset and records each batch event once", async () => {
@@ -1146,7 +1204,11 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
   supervisor.close();
   const session = f.session();
   expect(session).not.toBe("");
-  expect(readWakes(f.state.dir, 0)).toEqual([{ at: start, session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
+  const wakes = readWakes(f.state.dir, 0);
+  expect(wakes).toMatchObject([{ session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
+  // Stamped during the soft restart, which now waits for the new session to start.
+  expect(wakes[0]?.at).toBeGreaterThanOrEqual(start);
+  expect(wakes[0]?.at).toBeLessThanOrEqual(f.clock.now());
 });
 
 test("digest waits for an urgent event, but no longer than digestMaxDelayMin", async () => {

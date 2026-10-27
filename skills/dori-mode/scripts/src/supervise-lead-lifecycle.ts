@@ -611,6 +611,7 @@ export class LeadLifecycle {
       }
     }
     if (restart.phase.startsWith("soft:")) {
+      const old = restart.phase.slice("soft:".length);
       try {
         if (sendSoft) {
           this.carryOver(restart);
@@ -618,12 +619,15 @@ export class LeadLifecycle {
           try { writeFileSync(fd, this.startupPrompt(restart)); fsyncSync(fd); } finally { closeSync(fd); }
           const entry = leadModels(this.leadConfig())[0];
           if (!entry) throw new TransientSuperviseError("soft restart model is missing");
-          for (const command of ["/new", `/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
+          await softCommand(deps, "/new");
+          // The editor is back before omo has switched to the new session; anything typed meanwhile lands in the old
+          // session or is lost, so the next command waits until the new session has finished starting.
+          if (!(await softSessionStarted(deps, old, softStartedAt))) throw new TransientSuperviseError("new session did not start after /new");
+          for (const command of [`/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
             await softCommand(deps, command);
           }
           await softCommand(deps, `Read ${promptPath} in full and follow it exactly.`, true);
         }
-        const old = restart.phase.slice("soft:".length);
         const session = await softEvidence(deps, old, promptPath, softStartedAt);
         if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
         const table = await procTable(deps.run);
@@ -823,6 +827,41 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
     await deps.clock.sleep(200);
   }
   throw new TransientSuperviseError("soft command showed no completed screen change");
+};
+
+/**
+ * After /new omo writes the new session's header at once, its model entry while still starting, and its startup
+ * bookkeeping right after; the session takes input once that file has stopped growing for this long.
+ */
+export const SOFT_SESSION_SETTLE_MS = 1_000;
+
+const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<boolean> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
+  while (deps.clock.now() < deadline) {
+    if (!(await softLive(deps))) throw new TransientSuperviseError("reused lead is not live");
+    let found: { readonly file: string; readonly size: number } | undefined;
+    for (const name of readdirSync(dir)) {
+      const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
+      if (!id || id === old) continue;
+      const file = join(dir, name);
+      try {
+        const stat = statSync(file);
+        if (startedAt !== undefined && stat.mtimeMs < startedAt) continue;
+        if (readFileSync(file, "utf8").includes('"type":"model_change"')) found = { file, size: stat.size };
+      } catch (e) {
+        if (e instanceof Error && "code" in e && e.code === "ENOENT") continue;
+        throw e;
+      }
+    }
+    if (found && seen?.file === found.file && seen.size === found.size) {
+      if (deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return true;
+    } else seen = found && { ...found, since: deps.clock.now() };
+    await deps.clock.sleep(200);
+  }
+  return false;
 };
 
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
