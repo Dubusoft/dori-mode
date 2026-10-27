@@ -124,6 +124,19 @@ test("an urgent event for an idle lead gets exactly one [dori] pointer and one E
   expect(lines.some((line) => /^LEAD_PUSH \w+ 1 WAIT_DONE delivered attempt=1$/.test(line))).toBe(true);
 });
 
+test("a lone LANE_CLOSED (default policy, no INBOUND, no UNREPORTED) is logged and pushed to an idle lead at once, not after digestMaxDelayMin", async () => {
+  const f = fixture({ delivery: delivery() });
+  f.onEnter("working");
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha closed https://github.com/acme/app/pull/7");
+  const lines = await flush(supervisor);
+  expect(readFileSync(join(f.state.dir, "lead-events.log"), "utf8")).toContain('"id":"lane-closed:alpha"');
+  expect(f.texts()).toHaveLength(1);
+  expect(f.texts()[0]).toStartWith("[dori] supervisor: 1 new event (urgent: LANE_CLOSED).");
+  expect(f.enters()).toBe(1);
+  expect(lines.some((line) => /^LEAD_PUSH \w+ 1 LANE_CLOSED delivered attempt=1$/.test(line))).toBe(true);
+});
+
 test("an untaken event is pushed again after ackSec though nothing is pending, and a take receipt past it stops the pushes", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }) });
   const supervisor = new Supervisor(f.deps);

@@ -1092,10 +1092,12 @@ test("a large multibyte event reaches the new lead through take without exceedin
 
 test.each([
   ["INBOUND 123 1 Owner hello", "urgent"],
-  // The supervisor settles a claim itself (live re-check, close or LANE_NOT_DONE): claim and close are digest.
+  // The supervisor settles a claim itself (live re-check, close or LANE_NOT_DONE): the claim is digest, the close urgent.
   ["LANE_DONE_CLAIMED lane proof", "digest"],
   ["LANE_NOT_DONE lane reason", "urgent"],
-  ["LANE_CLOSED lane", "digest"],
+  ["LANE_CLOSED lane", "urgent"],
+  ["LANE_AUTO_CLOSED lane {}", "urgent"],
+  ["CI_MERGED acme/app#7 into dev lane=lane head=abc merge=def https://github.com/acme/app/pull/7", "urgent"],
   ["DEAD_PANE scratch:p1", "urgent"],
   ["HOST_GUARD ALERT low disk", "urgent"],
   ["WORKING-WHILE-PAUSED lane detail", "urgent"],
@@ -1329,13 +1331,12 @@ test("a claim delivered warm reads delivered at once", async () => {
   expect(supervisor.leadDelivered("done-claim:lane:t")).toBe(true);
 });
 
-test("a machine-closed lane's claim and close are digest and wake no lead", async () => {
+test("a machine-closed lane's claim is digest and wakes no lead; its close is urgent", async () => {
   const f = fixture();
   expect(eventPriority("LANE_AUTO_CLAIMED lane w:p1 merged acme/app#1")).toBe("digest");
-  expect(eventPriority("LANE_AUTO_CLOSED lane {}")).toBe("digest");
+  expect(eventPriority("LANE_AUTO_CLOSED lane {}")).toBe("urgent");
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("sweep:1", "LANE_AUTO_CLAIMED lane w:p1 merged acme/app#1");
-  supervisor.enqueue("sweep:2", "LANE_AUTO_CLOSED lane {}");
   await supervisor.flush();
   expect(f.log()).toEqual([]);
   expect(f.calls).toEqual([]);
