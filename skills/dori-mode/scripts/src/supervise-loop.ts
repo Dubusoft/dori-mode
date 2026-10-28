@@ -36,6 +36,10 @@ import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, leadPaneViolationTick, openLaneReports, routeReports } from "./lane-reports.ts";
 
+/** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
+export const SYSTEM_PREFIX = "[System] ";
+export const systemText = (text: string): string => text.startsWith(SYSTEM_PREFIX) ? text : `${SYSTEM_PREFIX}${text}`;
+
 /** One supervisor writer per stateDir, including across competing CLI invocations. */
 export const acquireSupervisor = (stateDir: string): (() => void) => {
   mkdirSync(stateDir, { recursive: true });
@@ -279,7 +283,7 @@ export const supervise = async (
     const toodo = toodoConfig ? toodoClient(fetchHttp, toodoConfig) : undefined;
     // An owner notice goes where the message came from: its Discord channel or thread, or the Toodo chat.
     const ownerNotice = async (channel: string, text: string, id: string): Promise<void> => {
-      if (channel !== TOODO_CHANNEL) { await discord.send(channel, text, id); return; }
+      if (channel !== TOODO_CHANNEL) { await discord.send(channel, systemText(text), id); return; }
       if (!toodo) throw new Error("config.toodo is not set");
       await toodo.reply(text);
     };
@@ -288,7 +292,7 @@ export const supervise = async (
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(loadedConfig, pane); },
-      announce: async (text, id, thread) => { await postOwnerLine(discord, deps.config.discordChannels[0], thread, text, id); },
+      announce: async (text, id, thread) => { await postOwnerLine(discord, deps.config.discordChannels[0], thread, systemText(text), id); },
     }));
     // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
     // run too, each run an operation row; a heavy job takes a heavy slot like `dori heavy`, without waiting for one.
@@ -340,7 +344,7 @@ export const supervise = async (
       notify: async (text) => {
         const channel = deps.config.discordChannels[0];
         if (!channel) throw new Error("no discordChannels configured");
-        await discord.send(channel, text);
+        await discord.send(channel, systemText(text));
       },
       log: (line) => { console.error(line); },
     }, boot);
@@ -536,7 +540,7 @@ export const supervise = async (
         // a hung post must not stop this loop.
         const channel = deps.config.discordChannels[0];
         if (which === "delivery" && channel) {
-          void discord.send(channel, scrubForThread(`Dori warning: ${line}`, homedir()), id)
+          void discord.send(channel, systemText(scrubForThread(`Dori warning: ${line}`, homedir())), id)
             .catch((e: unknown) => { console.error(`TASK_STALLED_NOTIFY_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); });
         }
       }
