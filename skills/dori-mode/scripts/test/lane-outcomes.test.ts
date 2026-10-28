@@ -31,6 +31,8 @@ test("outcome lines name their lane; other lines and malformed keys name none", 
   expect(outcomeLane("LANE_CLOSED alpha {\"checks\":[]}")).toBe("alpha");
   expect(outcomeLane("CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x")).toBe("alpha");
   expect(outcomeLane("CI_MERGED acme/app#7 into dev head=abc")).toBeUndefined();
+  expect(outcomeLane("LANE_DONE_CLAIMED alpha w:p1 proof")).toBe("alpha");
+  expect(outcomeLane("LANE_AUTO_CLAIMED alpha w:p1 proof")).toBeUndefined();
   expect(outcomeLane("LANE_AUTO_CLOSED alpha x")).toBeUndefined();
   expect(outcomeLane("LANE_CLOSED $(rm) x")).toBeUndefined();
 });
@@ -107,6 +109,119 @@ test("a lane with autoClose: machine owes no report", async () => {
   await supervisor.reportTick();
   expect(f.unreported()).toEqual([]);
   expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "robot", reportedAt: f.clock.now(), note: "autoClose: machine" });
+});
+
+const CLAIM = "LANE_DONE_CLAIMED alpha w:p1 merged acme/app#1";
+
+test("a done claim opens the lane's obligation: listed for inbox take, UNREPORTED after reportTimeoutMin", async () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  expect(readJournal(f.state.dir).outcomes).toEqual([{ lane: "alpha", since: T0, line: CLAIM, events: ["done-claim:alpha:1"], claim: true }]);
+  await supervisor.reportTick();
+  expect(takeReminders(f.state.dir)).toEqual([
+    `unreported:alpha\tUNREPORTED alpha since ${new Date(T0).toISOString()}: report the outcome to the owner yourself, then run dori reported alpha`,
+  ]);
+  f.clock.at += 5 * MIN;
+  await supervisor.reportTick();
+  const [first] = f.unreported();
+  expect(first?.line).toBe(`UNREPORTED alpha claimed done 5 min ago and the owner has not been told: report the outcome to the owner yourself, then run dori reported alpha. ${CLAIM}`);
+});
+
+test("the seen-claim close joins the claim's obligation: a reported claim is not owed again", async () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  recordReported(f.state.dir, "alpha", f.clock.now());
+  await supervisor.reportTick();
+  f.clock.at += 10 * MIN;
+  supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim {}");
+  f.clock.at += 10 * MIN;
+  await supervisor.reportTick();
+  expect(f.unreported()).toEqual([]);
+  expect(readJournal(f.state.dir).outcomes).toEqual([
+    { lane: "alpha", since: T0, line: CLAIM, events: ["done-claim:alpha:1", "lane-closed:alpha"], reportedAt: T0 },
+  ]);
+  // Joined by a real outcome, the row is no longer the claim's: a later rejection leaves it.
+  supervisor.enqueue("not-done:alpha", "LANE_NOT_DONE alpha dirty tree");
+  expect(readJournal(f.state.dir).outcomes).toHaveLength(1);
+});
+
+test("a machine lane's LANE_AUTO_CLAIMED opens nothing", async () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("auto-claim:robot", "LANE_AUTO_CLAIMED robot w:p1 proof");
+  f.clock.at += 10 * MIN;
+  await supervisor.reportTick();
+  expect(readJournal(f.state.dir).outcomes ?? []).toEqual([]);
+  expect(f.unreported()).toEqual([]);
+});
+
+test("LANE_NOT_DONE drops an unreported claim's obligation", async () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  await supervisor.reportTick();
+  f.clock.at += MIN;
+  supervisor.enqueue("not-done:alpha", "LANE_NOT_DONE alpha dirty tree");
+  expect(readJournal(f.state.dir).outcomes).toEqual([]);
+  f.clock.at += 10 * MIN;
+  await supervisor.reportTick();
+  expect(f.unreported()).toEqual([]);
+  expect(takeReminders(f.state.dir)).toEqual([]);
+});
+
+test("LANE_NOT_DONE drops a reported claim's row, so the next claim is owed afresh", async () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  recordReported(f.state.dir, "alpha", f.clock.now());
+  await supervisor.reportTick();
+  f.clock.at += MIN;
+  supervisor.enqueue("not-done:alpha", "LANE_NOT_DONE alpha dirty tree");
+  expect(readJournal(f.state.dir).outcomes).toEqual([]);
+  f.clock.at += 30 * MIN;
+  const again = f.clock.now();
+  supervisor.enqueue("done-claim:alpha:2", `${CLAIM} fixed`);
+  expect(readJournal(f.state.dir).outcomes).toEqual([{ lane: "alpha", since: again, line: `${CLAIM} fixed`, events: ["done-claim:alpha:2"], claim: true }]);
+  f.clock.at += 5 * MIN;
+  await supervisor.reportTick();
+  expect(f.unreported().map((event) => event.line.split(" ").slice(0, 3).join(" "))).toEqual(["UNREPORTED alpha claimed"]);
+});
+
+test("dori object-done (a registry objection, no event) drops the claim's obligation at the next tick; an older objection does not", async () => {
+  const f = fixture();
+  const objection = (at: number) => lane("alpha", { status: "not-done", objection: { at: new Date(at).toISOString(), reasons: ["dirty tree"] } });
+  await f.deps.registry.write(objection(T0 - MIN));
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  await supervisor.reportTick();
+  expect(readJournal(f.state.dir).outcomes).toHaveLength(1);
+  f.clock.at += MIN;
+  await f.deps.registry.write(objection(f.clock.now()));
+  await supervisor.reportTick();
+  expect(readJournal(f.state.dir).outcomes).toEqual([]);
+  expect(takeReminders(f.state.dir)).toEqual([]);
+  f.clock.at += 10 * MIN;
+  await supervisor.reportTick();
+  expect(f.unreported()).toEqual([]);
+});
+
+test("a claim joined by CI_MERGED or LANE_CLOSED is a real outcome: LANE_NOT_DONE and objections leave it", async () => {
+  for (const [id, line] of [["ci-merged:acme/app#1", "CI_MERGED acme/app#1 into dev lane=alpha head=abc merge=def https://x"], ["lane-closed:alpha", "LANE_CLOSED alpha closed {}"]] as const) {
+    const f = fixture();
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("done-claim:alpha:1", CLAIM);
+    supervisor.enqueue(id, line);
+    f.clock.at += MIN;
+    await f.deps.registry.write(lane("alpha", { status: "not-done", objection: { at: new Date(f.clock.now()).toISOString(), reasons: ["x"] } }));
+    supervisor.enqueue("not-done:alpha", "LANE_NOT_DONE alpha dirty tree");
+    f.clock.at += 4 * MIN;
+    await supervisor.reportTick();
+    expect(readJournal(f.state.dir).outcomes).toEqual([expect.objectContaining({ lane: "alpha", events: ["done-claim:alpha:1", id] })]);
+    expect(readJournal(f.state.dir).outcomes[0].claim).toBeUndefined();
+    expect(f.unreported().map((event) => event.line.split(" ").slice(0, 3).join(" "))).toEqual(["UNREPORTED alpha finished"]);
+  }
 });
 
 test("open obligations are listed for inbox take until reported", async () => {
