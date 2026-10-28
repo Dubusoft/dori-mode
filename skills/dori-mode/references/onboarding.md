@@ -14,7 +14,7 @@ Wait for the answer. If it is no, record that onboarding was declined and stop. 
 
 Look only at what is visible without opening anyone's data: installed CLIs, logged-in apps, the platforms agent-messenger supports, config files that name a workspace. Usual candidates:
 
-- messengers: Telegram, Discord, Slack, KakaoTalk, LINE
+- messengers: Discord, KakaoTalk, LINE
 - docs and knowledge: Notion, Google Docs, Confluence
 - tickets: Linear, Jira, GitHub Issues
 - code: GitHub, GitLab
@@ -26,11 +26,7 @@ For each tool, say which integration you would use, what it reads, and why. Ask 
 
 > zele is a CLI that reads your Gmail and Google Calendar, so I can keep an eye on your schedule and your mail. Allow?
 
-> agent-slack reads your Slack workspaces (channels, threads, DMs you're in) so I learn who you work with and on what. Allow?
-
 > The GitHub CLI (gh) reads your repos, issues and pull requests so I know what you're building. Allow?
-
-If the messenger is Slack, the token choice from setup also sets what onboarding can read there. A user token sees what that member sees. A bot token sees only the channels it was invited to, so ask the owner to invite it where the real work happens.
 
 A no skips that tool. Remember every no, and do not ask about that tool again unless the owner raises it.
 
@@ -40,7 +36,7 @@ Read; never post, react, edit, mark read, accept or send. Go deep enough to unde
 
 | Tool | Read |
 |---|---|
-| messengers, Slack | the busiest channels and threads of the last few weeks, pinned messages, who talks to whom about what |
+| messengers | the busiest channels and threads of the last few weeks, pinned messages, who talks to whom about what |
 | Notion, docs | top-level pages, databases and their recent rows, anything named roadmap, plan, OKR, strategy, onboarding |
 | Linear, Jira | open projects, active cycles, issues assigned to or created by the owner |
 | GitHub | repos the owner pushed to recently, open PRs and issues, READMEs |

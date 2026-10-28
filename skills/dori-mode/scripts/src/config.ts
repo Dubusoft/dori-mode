@@ -4,7 +4,6 @@ import { join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
-import type { ToodoConfig } from "./messenger/toodo.ts";
 import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
 
@@ -104,8 +103,6 @@ export type DiscordConfig = {
 
 export type DoriConfig = {
   readonly discord?: DiscordConfig;
-  /** The Toodo Lead chat as a channel (Toodo started with TOODO_LEAD=external); absent turns the channel off. */
-  readonly toodo?: ToodoConfig;
   readonly stateDir: string;
   readonly laneWorkspace: string;
   readonly workspaces: readonly string[];
@@ -301,6 +298,9 @@ export const REMOVED_QUOTA_GATE_KEYS = ["quotaGate"] as const;
 /** Keys of the removed supervisor lane-finish line: the supervisor no longer posts to the owner itself; one warning. */
 export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
 
+/** Keys of the removed Toodo integration (the Toodo Lead chat channel and its Discord mirror); one warning. */
+export const REMOVED_TOODO_KEYS = ["toodo"] as const;
+
 export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
 
 let warnedRemovedQuotaKeys = false;
@@ -311,6 +311,7 @@ let warnedRemovedQuotaStallKeys = false;
 let warnedRemovedPushKeys = false;
 let warnedRemovedDeliveryKeys = false;
 let warnedRemovedOwnerPostKeys = false;
+let warnedRemovedToodoKeys = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -363,6 +364,11 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     warnedRemovedOwnerPostKeys = true;
     console.error(`CONFIG_OWNER_POST_KEYS_REMOVED ${oldOwnerPost.join(", ")} in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`);
   }
+  const oldToodo = REMOVED_TOODO_KEYS.filter((key) => key in loaded);
+  if (oldToodo.length && !warnedRemovedToodoKeys) {
+    warnedRemovedToodoKeys = true;
+    console.error(`CONFIG_TOODO_KEYS_REMOVED ${oldToodo.join(", ")} in ${path}: the Toodo integration was removed (Discord is the only messenger); the keys are ignored and can be deleted`);
+  }
   if (Array.isArray(loaded.leadModel)) {
     if (!warnedLeadArray) {
       warnedLeadArray = true;
@@ -370,7 +376,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     }
     loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
   }
-  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS];
+  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS, ...REMOVED_TOODO_KEYS];
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
   const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
   const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);

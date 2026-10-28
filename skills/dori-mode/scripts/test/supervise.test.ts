@@ -1725,28 +1725,21 @@ test("still unacked after a second window: one notice per message, kept across a
   expect(ackMissing(f)).toEqual([]);
 });
 
-test("a Toodo chat message is reminded, gets the owner notice and UNHANDLED like a Discord one, and its receipts clear them", async () => {
+test("an old journal's Toodo chat row (toodo:chat:<n>, the removed channel) is never tracked, noticed or escalated", async () => {
   const f = fixture();
+  writeJournal(f.state.dir, {
+    events: [{ id: "toodo:chat:12", line: "INBOUND toodo 12 user plan it", at: 0 }],
+    awaitingAck: [{ id: "toodo:chat:12", since: 0, ackedAt: 0 }],
+  });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("toodo:chat:12", "INBOUND toodo 12 user plan it");
+  supervisor.enqueue("toodo:chat:13", "INBOUND toodo 13 user plan it");
   await supervisor.flush();
-  f.clock.at = readableSince(f, "toodo:chat:12") + 60_000;
-  supervisor.ackTick(60_000);
-  expect(reminded(f)).toEqual(["toodo:chat:12"]);
-  expect(ackMissing(f)).toEqual([]);
-  f.clock.at += 60_000;
-  expect(supervisor.ackTick(60_000)).toEqual([{ channel: "toodo", message: "12" }]);
-  supervisor.noticeSent("ack", "toodo", "12");
+  f.clock.at += f.deps.config.handledTimeoutMin * 60_000 + 120_000;
+  expect(supervisor.overdueOwnerMessages(60_000)).toEqual([]);
   expect(supervisor.ackTick(60_000)).toEqual([]);
-  recordAck(f.state.dir, "toodo", "12", f.clock.now());
-  supervisor.ackTick(60_000);
-  expect(pendingAcks(f.state.dir)).toEqual([]);
-  f.clock.at += f.deps.config.handledTimeoutMin * 60_000;
-  supervisor.handledTick();
-  expect(inbox(f).filter((line) => line.startsWith("UNHANDLED "))).toEqual(["UNHANDLED toodo 12 coverage=0/1 INBOUND toodo 12 user plan it"]);
-  recordHandled(f.state.dir, "toodo", "12", f.clock.now(), { reply: true });
-  supervisor.handledTick();
-  expect(readJournal(f.state.dir).awaitingAck[0].handledAt).toBe(f.clock.now());
+  expect(supervisor.handledTick()).toEqual([]);
+  expect(inbox(f).filter((line) => line.startsWith("UNHANDLED "))).toEqual([]);
+  expect(readJournal(f.state.dir).awaitingAck.map((entry: { id: string }) => entry.id)).toEqual(["toodo:chat:12"]);
 });
 
 test("dori ack clears the message: no reminder, no notice, and the ack file is consumed", async () => {

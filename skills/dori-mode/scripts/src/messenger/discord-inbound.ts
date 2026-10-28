@@ -12,7 +12,7 @@ export type InboundMessage = {
   readonly content: string;
   readonly attachments: readonly unknown[];
   readonly bot?: boolean;
-  /** Set on a message posted through a webhook (the Toodo mirror's copies of the owner's Toodo messages among them). */
+  /** Set on a message posted through a webhook. */
   readonly webhookId?: string;
 };
 
@@ -181,11 +181,6 @@ export type DiscordInboundOptions = {
   readonly onMissingContent?: () => void;
   /** Called after an owner message is emitted, e.g. to track it for edit and delete notices. */
   readonly onOwner?: (channel: string, id: string) => void;
-  /**
-   * Called before the emit for an owner message (author "user") and for a message of the bot itself (author "lead"), so
-   * the Toodo mirror records it durably before the REST cursor can move past it (toodo-mirror.ts).
-   */
-  readonly onMirror?: (channel: string, m: InboundMessage, author: "user" | "lead") => void;
   readonly log?: (line: string) => void;
 };
 
@@ -222,13 +217,9 @@ export const emitDiscordInbound = async (
   options: DiscordInboundOptions = {},
 ): Promise<void> => {
   if (m.webhookId !== undefined) return;
-  if (m.bot || (options.botId !== undefined && m.authorId === options.botId)) {
-    if (options.botId !== undefined && m.authorId === options.botId) options.onMirror?.(channel, m, "lead");
-    return;
-  }
+  if (m.bot || (options.botId !== undefined && m.authorId === options.botId)) return;
   const text = discordMessageText(m, options);
   const owner = discordOwnerConfigured(ownerId) && m.authorId === ownerId;
-  if (owner) options.onMirror?.(channel, m, "user");
   await emit(`discord:${channel}:${m.id}`, owner
     ? `INBOUND ${channel} ${m.id} ${m.author} ${text}`
     : `VISITOR ${channel} ${m.id} ${m.author} ${VISITOR_NOTE} ${text}`);

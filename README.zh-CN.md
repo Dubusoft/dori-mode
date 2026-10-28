@@ -6,7 +6,7 @@
 
 # omo-dori-mode-experimental
 
-Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只需要在 Telegram 或 Discord 上和一个机器人对话。Dori 把每件事交给 herdr 标签页里单独启动的智能体会话，记住自己启动过的每个会话，只有在工作真正完成后才关闭它:PR 已合并、issue 已关闭、版本已发布。
+Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只需要在 Discord 上和一个机器人对话。Dori 把每件事交给 herdr 标签页里单独启动的智能体会话，记住自己启动过的每个会话，只有在工作真正完成后才关闭它:PR 已合并、issue 已关闭、版本已发布。
 
 它由一个技能(`skills/dori-mode/SKILL.md` 和 references)以及一个用 bun + TypeScript 写的小 CLI `dori` 组成。目前还是实验版本，会有不完善的地方。
 
@@ -35,13 +35,6 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/ma
 ## 给你的 Dori 起名
 
 Dori 第一件事就是问你该怎么称呼它。直接叫 "Dori" 可以，用 Dori 结尾的名字也可以，比如 ShipDori 或 WorkDori,同时运行好几个时更好区分。定下的名字会用在机器人名、消息落款和模式名上，下次只要说一句 "ShipDori mode" 就能重新开启。
-
-## 用 Slack 时
-
-如果你选 Slack,Dori 会再问一个问题，等你回答:
-
-- **用户令牌**:作为工作区里的真实成员行动。需要一个付费席位，费用由你承担。这个成员能看到的它都能读，也能一直显示绿色在线点。
-- **机器人令牌**:作为 Slack 应用行动。没有席位费用，但只能看到被邀请进的频道，并且受限于你给应用的权限范围。
 
 ## Dori 怎么说话
 
@@ -135,21 +128,16 @@ CLI 还带有 Dori 需要的消息相关功能，也可以作为 `scripts/src/me
 
 | 命令 | 作用 |
 |---|---|
-| `dori send slack\|telegram\|discord --to T --text X [--thread ID] [--edit ID]` | 发送或编辑消息。遇到限流会等待后重发，含有 `$(` 的文字会被拒绝 |
-| `dori presence slack\|discord` | 让账号保持在线显示。Discord 机器人通过网关保持;Slack 用户账号通过每分钟发一次信号的网页客户端连接保持 |
+| `dori send discord --to T --text X [--thread ID] [--edit ID]` | 发送或编辑消息。遇到限流会等待后重发，含有 `$(` 的文字会被拒绝 |
+| `dori presence discord` | 通过 Discord 网关让机器人保持在线显示 |
 | `dori transcribe <file>` | 用 `hooks.transcribe` 的命令把语音消息转成文字 |
 | `dori can-launch` | 看看还有没有余量再开一条 lane |
-| `dori inbound slack [--loop MIN]` | 不漏掉 Slack 上发给 Dori 的任何消息:Threads 视图里的未读回复、Dori 发过言的线程里的新回复(没 @ 也算)、有未读提及的私信和频道 |
 
 没有对应命令、但模块里提供的功能:
-- Telegram:以 "Thinking…" 开头的 `sendMessageDraft` 流式输出、论坛话题、HTML 表格
 - Discord:创建线程、改名、归档
-- Slack:上传文件
 - `typingWhile`:工作进行时一直显示"正在输入"
 
-Dori 在 Slack 上发的每条消息，不管是哪个函数发出的，都会记下所在线程。即使根消息是用原始 API 调用发的，下面没 @ 它的回复也能收到；只监听消息事件的做法会漏掉这种回复。
-
-令牌从 `DORI_SLACK_TOKEN`(用户令牌还需要 `DORI_SLACK_COOKIE`)、`DORI_TELEGRAM_TOKEN` 和 `DORI_DISCORD_TOKEN` 读取。
+令牌从 `DORI_DISCORD_TOKEN` 读取。
 
 ## 测试
 
@@ -174,7 +162,6 @@ MIT
 
 1. **起一个 Dori 名字。** 就叫 "Dori",或者用 Dori 结尾的名字，比如 ShipDori、WorkDori。对智能体说:"从现在起你叫 ShipDori,这是 ShipDori mode。"之后开启模式的说法就从 "OmOMeow mode" 换成 "ShipDori mode"。
 2. **改机器人的名字和头像。**
-   - Telegram:在 @BotFather 里发送 `/setname`,选中机器人，再发新名字。接着发送 `/setuserpic`,选中机器人，再发新图片。默认的 Dori 头像是 [`skills/dori-mode/assets/dori-avatar.png`](skills/dori-mode/assets/dori-avatar.png),也可以换成你喜欢的图片。机器人的名字和头像只能通过 BotFather 修改。
    - Discord:在 Developer Portal 打开你的应用。在 **Bot** 页面改用户名和图标，在 **General Information** 页面改应用名和图标(可以用同一张默认头像),然后保存。
 3. **安装这个仓库。** 运行上面的一行安装命令，再对智能体说 "ShipDori mode",它就会用这个技能和 `dori` CLI,不再用以前粘贴的提示词。
 4. **做一次初次了解。** 如果 OmOMeow 时期没做过，说一句"做一下 onboarding"就行。

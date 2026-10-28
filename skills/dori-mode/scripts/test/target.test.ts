@@ -13,15 +13,7 @@ test("discord: a plain channel id with --thread posts to the thread, not the par
   expect(resolveTarget("discord", "1100000000000000259", "1200000000000000866")).toEqual({ to: "1200000000000000866" });
 });
 
-test("telegram and slack: a ref splits into destination and thread", () => {
-  expect(resolveTarget("telegram", "telegram:-100123/45")).toEqual({ to: "-100123", thread: "45" });
-  expect(resolveTarget("telegram", "telegram:-100123")).toEqual({ to: "-100123" });
-  expect(resolveTarget("slack", "slack:C0123/1700000000.000100")).toEqual({ to: "C0123", thread: "1700000000.000100" });
-  expect(resolveTarget("slack", "slack:C0123/1.1", "2.2")).toEqual({ to: "C0123", thread: "2.2" });
-  expect(resolveTarget("slack", "C0123", "2.2")).toEqual({ to: "C0123", thread: "2.2" });
-});
-
-test("a ref of another platform is left alone, an empty ref throws", () => {
-  expect(resolveTarget("discord", "slack:C1/2")).toEqual({ to: "slack:C1/2" });
+test("a ref without the discord prefix is left alone, an empty ref throws", () => {
+  expect(resolveTarget("discord", "other:C1/2")).toEqual({ to: "other:C1/2" });
   expect(() => resolveTarget("discord", "discord:")).toThrow();
 });

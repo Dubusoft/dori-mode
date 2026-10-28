@@ -131,12 +131,10 @@ test("a lane may act only on its own key and send only into its own thread; the 
   expect(laneSendRefusal("demo-lane", lane, "discord", { to: "222" })).toBeUndefined();
   expect(laneSendRefusal("demo-lane", lane, "discord", { to: "111" })).toStartWith("LANE_PERMISSION_DENIED");
   expect(laneSendRefusal("demo-lane", lane, "discord", { to: "333" })).toStartWith("LANE_PERMISSION_DENIED");
-  expect(laneSendRefusal("demo-lane", lane, "slack", { to: "222" })).toStartWith("LANE_PERMISSION_DENIED");
   expect(laneSendRefusal("demo-lane", { ...lane, thread: "none" }, "discord", { to: "222" })).toStartWith("LANE_PERMISSION_DENIED");
   expect(laneSendRefusal("demo-lane", null, "discord", { to: "222" })).toStartWith("LANE_PERMISSION_DENIED");
-  const slackLane = { ...lane, thread: "slack:C1/1700.1" };
-  expect(laneSendRefusal("demo-lane", slackLane, "slack", { to: "C1", thread: "1700.1" })).toBeUndefined();
-  expect(laneSendRefusal("demo-lane", slackLane, "slack", { to: "C1" })).toStartWith("LANE_PERMISSION_DENIED");
+  // A lane bound to a thread of a removed platform may not send anywhere.
+  expect(laneSendRefusal("demo-lane", { ...lane, thread: "other:C1/1700.1" }, "discord", { to: "1700.1" })).toStartWith("LANE_PERMISSION_DENIED");
 });
 
 const cli = async (args: string[], env: Record<string, string>) => {

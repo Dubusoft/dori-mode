@@ -35,7 +35,3 @@ test("the freshness filter wakes only on a paused lane that is working; the rest
   expect(wakes("freshness", kinds.map((k) => `${k.toUpperCase()} lane-a detail`))).toEqual(["WORKING-WHILE-PAUSED lane-a detail"]);
 });
 
-test("the Slack inbound filter wakes on messages, edits and errors, never on the ready line", () => {
-  const lines = ["INBOUND unread C1 - 1.2 U1 \"hi\"", "INBOUND_EDIT C1 1.2", "INBOUND_ERROR 500"];
-  expect(wakes("Slack inbound (Slack only)", ["INBOUND_READY slack", ...lines])).toEqual(lines);
-});

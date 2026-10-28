@@ -19,9 +19,6 @@ import { Discord } from "./messenger/discord.ts";
 import { acquireDiscordGateway } from "./messenger/discord-lock.ts";
 import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/discord-supervisor.ts";
 import { fetchHttp } from "./messenger/http.ts";
-import { listenToodoEvents, TOODO_CHANNEL, TOODO_POLL_SECONDS, toodoClient, toodoConfigError } from "./messenger/toodo.ts";
-import { supervisorToodo, writeToodoStatus } from "./messenger/toodo-supervisor.ts";
-import { mirrorDiscord, toodoMirror } from "./messenger/toodo-mirror.ts";
 import { postOwnerLine } from "./lane-finish.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
@@ -257,14 +254,11 @@ export const supervise = async (
   if (!Number.isInteger(deps.config.waitMaxFailures) || deps.config.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
   const deliveryProblem = deliveryConfigError(deps.config.delivery);
   if (deliveryProblem) throw new SuperviseError(deliveryProblem);
-  const toodoProblem = toodoConfigError(deps.config.toodo);
-  if (toodoProblem) throw new SuperviseError(toodoProblem);
   setDefaultRunTimeout(deps.config.runTimeoutMs);
   let release: (() => void) | undefined;
   let ready = false;
   let releaseGateway: (() => void) | undefined;
   let inbound: ReturnType<typeof supervisorDiscord> | undefined;
-  let toodoInbound: ReturnType<typeof supervisorToodo> | undefined;
   let sources: EventSources | undefined;
   let scheduleOps: OperationStore | undefined;
   let reports: LaneReportStore | undefined;
@@ -279,13 +273,9 @@ export const supervise = async (
     if (!token) throw new SuperviseError("supervise requires DORI_DISCORD_TOKEN for lossless paginated Discord polling");
     releaseGateway = probe.step("gateway-lock", () => acquireDiscordGateway(token));
     const discord = new Discord(fetchHttp, deps.clock, token);
-    const toodoConfig = deps.config.toodo;
-    const toodo = toodoConfig ? toodoClient(fetchHttp, toodoConfig) : undefined;
-    // An owner notice goes where the message came from: its Discord channel or thread, or the Toodo chat.
+    // An owner notice goes where the message came from: its Discord channel or thread.
     const ownerNotice = async (channel: string, text: string, id: string): Promise<void> => {
-      if (channel !== TOODO_CHANNEL) { await discord.send(channel, systemText(text), id); return; }
-      if (!toodo) throw new Error("config.toodo is not set");
-      await toodo.reply(text);
+      await discord.send(channel, systemText(text), id);
     };
     // Resolved once: the file this process loaded (DORI_CONFIG or ~/.dori/config.json).
     const loadedConfig = configPath();
@@ -318,7 +308,6 @@ export const supervise = async (
     const enqueueWait = enqueueOf("waits");
     const enqueueGitHub = enqueueOf("github");
     const enqueueDiscord = enqueueOf("discord");
-    const enqueueToodo = enqueueOf("toodo");
     const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.config.waitMaxFailures));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
     const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps));
@@ -351,17 +340,8 @@ export const supervise = async (
     let sequence = 0;
     let deliveryError: unknown;
     const emit = async (id: string, line: string): Promise<void> => { enqueueDiscord(id, line); };
-    // The Toodo chat mirrored to one Discord channel: Discord messages recorded by the inbound side, both directions run
-    // in the Toodo pass, which a recorded message wakes.
-    const mirrorConfig = toodoConfig?.discordMirror;
-    const mirror = mirrorConfig ? probe.step("toodo-mirror", () => toodoMirror({
-      channel: mirrorConfig.channel, stateDir: deps.config.stateDir, now: deps.clock.now, log: (line) => { console.error(line); },
-      discord: mirrorDiscord(discord, mirrorConfig, deps.config.discord?.ownerId),
-      wake: () => { toodoInbound?.wake(); },
-    })) : undefined;
     const discordInbound = probe.step("inbound", () => supervisorDiscord(deps, {
       ...discordOptions, token, emit,
-      ...(mirror ? { mirror: { channel: mirror.channel, record: mirror.record } } : {}),
       http: discordOptions.http ?? ((request) => fetchHttp({
         ...request, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
       })),
@@ -371,21 +351,10 @@ export const supervise = async (
         lookupStatus({ ...deps, config: { ...deps.config, leadPane: supervisor.leadPane } })(lookupSignal, page)),
     }));
     inbound = discordInbound;
-    // The Toodo Lead chat: woken by its event stream, read again every pollSeconds whatever the stream does.
-    if (toodo && toodoConfig) {
-      registry.register("toodo");
-      toodoInbound = probe.step("toodo", () => supervisorToodo({
-        toodo: () => toodo, enqueue: enqueueToodo, stateDir: deps.config.stateDir, now: deps.clock.now,
-        pollMs: (toodoConfig.pollSeconds ?? TOODO_POLL_SECONDS) * 1_000, log: (line) => { console.error(line); },
-        listen: (wake, abort, onOpen) => listenToodoEvents(toodoConfig, wake, abort, onOpen),
-        ...(mirror ? { mirror } : {}),
-      }));
-    }
     const heartbeat = (): void => {
       try {
         const gateway = inbound?.state() ?? { connected: false, messageContent: false };
         writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), ...gateway });
-        if (toodoInbound && toodoConfig) writeToodoStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), url: toodoConfig.url, ...toodoInbound.state() });
       } catch (e) {
         console.error(`GATEWAY_STATUS_ERROR ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -485,9 +454,6 @@ export const supervise = async (
     tasks = Promise.all([
       task("inbound", 5_000, async () => {
         try { await guarded("discord", discordInbound.tick()); } catch (e) { console.error(`INBOUND_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        if (toodoInbound) {
-          try { await guarded("toodo", toodoInbound.tick()); } catch (e) { console.error(`TOODO_INBOUND_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        }
         heartbeat();
       }),
       task("delivery", 5_000, async () => {
@@ -562,8 +528,6 @@ export const supervise = async (
     await tasks;
     await inbound?.close();
     if (inbound) writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, messageContent: false });
-    await toodoInbound?.close();
-    if (toodoInbound && deps.config.toodo) writeToodoStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, url: deps.config.toodo.url });
     reports?.close();
     sources?.close();
     scheduleOps?.close();

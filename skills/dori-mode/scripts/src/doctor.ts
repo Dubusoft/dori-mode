@@ -8,8 +8,6 @@ import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
-import { readToodoToken, Toodo, toodoConfigError } from "./messenger/toodo.ts";
-import { readToodoStatus, toodoView } from "./messenger/toodo-supervisor.ts";
 import { listPanes } from "./panes.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { Registry, statusOf } from "./registry.ts";
@@ -185,33 +183,6 @@ const gateway = (d: DoctorDeps): Check[] => {
   return [fail("gateway", v.text, RESTART)];
 };
 
-/**
- * The Toodo Lead chat (config.toodo): the config is usable, the lead token file reads, the server answers peek_pending
- * with it (side-effect free), and the supervisor holds the event stream open.
- */
-const toodo = async (d: DoctorDeps): Promise<Check[]> => {
-  const t = d.config.toodo;
-  if (!t) return [ok("toodo", "not configured; skipped")];
-  const problem = toodoConfigError(t);
-  if (problem) return [fail("toodo", problem, `fix toodo in ${d.configPath}`)];
-  try { readToodoToken(t); } catch (e) {
-    return [fail("toodo token", e instanceof Error ? e.message : String(e), "point toodo.leadTokenFile at lead-token in the Toodo server's data directory (TOODO_LEAD=external writes it)")];
-  }
-  const checks: Check[] = [];
-  try {
-    const pending = await new Toodo(d.http, t.url, () => readToodoToken(t), T.timeoutMs).peek();
-    checks.push(ok("toodo", `${t.url} answers with the lead token; ${pending.items.length + (pending.remaining ?? 0)} inbox item(s) pending`));
-  } catch (e) {
-    const why = e instanceof Error ? e.message : String(e);
-    checks.push(fail("toodo", why, /TOODO_LEAD|only the Toodo lead|401/.test(why)
-      ? "start the Toodo server with TOODO_LEAD=external and use its lead-token file"
-      : `check that the Toodo server runs at ${t.url}`));
-  }
-  const v = toodoView(readToodoStatus(d.config.stateDir), d.clock.now());
-  checks.push(v.state === "live" ? ok("toodo stream", v.text) : warn("toodo stream", v.text, `the safety poll still reads the inbox every toodo.pollSeconds; if this lasts, ${RESTART}`));
-  return checks;
-};
-
 const issues = (d: DoctorDeps): Check[] => {
   const gh = githubSummary(d.config.stateDir);
   const poll = gh.polledAt === undefined ? "never polled" : `last poll ${new Date(gh.polledAt).toISOString().slice(0, 19)}Z`;
@@ -275,7 +246,7 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
 
 /** Read-only: every probe is a status query or a GET. */
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), toodo(d), Promise.resolve(issues(d)), Promise.resolve(memory(d)), tools(d), recovery(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(memory(d)), tools(d), recovery(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

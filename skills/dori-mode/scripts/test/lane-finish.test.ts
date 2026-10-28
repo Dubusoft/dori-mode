@@ -65,7 +65,7 @@ test("postOwnerLine: the lane thread first, the main channel without a Discord t
   expect(await postOwnerLine(channel.discord, "main", "discord:111", "hi", "x")).toBe("111");
   expect(channel.calls).toEqual(["send 111 x hi"]);
 
-  for (const thread of [undefined, "none", "slack:C1/123.4"]) {
+  for (const thread of [undefined, "none", "other:C1/123.4"]) {
     const plain = fakeDiscord();
     expect(await postOwnerLine(plain.discord, "main", thread, "hi", "x")).toBe("main");
     expect(plain.calls).toEqual(["send main x hi"]);

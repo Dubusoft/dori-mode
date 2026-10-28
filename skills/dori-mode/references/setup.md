@@ -22,33 +22,13 @@ Install agent-messenger (github.com/agent-messenger/agent-messenger) and read wh
 
 agent-messenger wraps part of each platform. Read the platform's current bot API changelog and call the API directly for the rest:
 
-- Telegram: stream a reply as it grows and show "Thinking…" with message drafts, send rich messages for tables and headings, and use topics in the private chat (turn on threaded mode in BotFather's mini app; there is no API for that switch).
 - Discord: edit your own messages to grow them, and use threads.
-
-### If the owner picks Slack: user token or bot token
-
-Ask which mode, give the trade-off as a short list, and wait for the choice:
-
-- **User token**: the Dori acts as a real member of the workspace.
-  - It needs a paid seat, which the owner pays for.
-  - It reads everything that member can see.
-  - It can keep a green online dot (`dori presence slack`).
-- **Bot token**: the Dori is a Slack app.
-  - There's no seat cost.
-  - It only sees channels it is invited to, within the scopes the app was granted.
-  - It shows as an app, not a person.
-
-Record the choice. With a user token, set `DORI_SLACK_TOKEN` and `DORI_SLACK_COOKIE` (the `d` cookie from that member's browser session). With a bot token, set `DORI_SLACK_TOKEN` to the `xoxb-` token.
 
 ## 3. Bot
 
 Finish every login in the browser. Create the bot with agent-messenger and finish its setup. Then give it its avatar: the default is `assets/dori-avatar.png` in this skill, and the owner can swap in any image.
 
-- **Telegram**: @BotFather → `/setuserpic` → pick the bot → send the image.
 - **Discord**: Developer Portal → your application → **General Information** → App Icon, and **Bot** → Icon. On the **Bot** tab, enable the privileged **Message Content Intent** setting for supervised inbound messages.
-- **Slack**:
-  - bot token: the app's **Basic Information** → Display Information → App icon;
-  - user token: the member's profile photo (`users.setPhoto`, or the profile page).
 
 Greet the owner through the bot before doing anything else.
 
@@ -91,8 +71,7 @@ Arm these as persistent monitors in your own session. Each filter matches only l
 | dead panes | `dori dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE)` |
 | host guard | `dori guard --loop 1` | `^HOST_GUARD (ALERT\|CLEAR)` |
 | freshness | `dori freshness --loop 5 \| tee -a ~/.dori/freshness.log` | `^WORKING-WHILE-PAUSED` |
-| Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND(?!_READY)` |
-| presence (optional) | `dori presence slack` or `dori presence discord` | `^PRESENCE_READY` |
+| presence (optional) | `dori presence discord` | `^PRESENCE_READY` |
 
 The done-flow filter keeps every `LANE_` line except the ready line. `LANE_WATCH_WARN` matters most there: it's the only sign that `dori watch` is failing and lanes aren't being closed. Freshness acts on its own (it nudges the lane and posts the report to the thread), so only `WORKING-WHILE-PAUSED` needs you. The other freshness lines (`NUDGED`, `POSTED`, `NO-REPORT`, `PENDING-REPORT`, `STALE-REPORT`) go only to `~/.dori/freshness.log`. Run `tail ~/.dori/freshness.log` when you want recent nudges and posts.
 

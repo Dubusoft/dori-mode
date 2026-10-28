@@ -32,12 +32,15 @@ export type SupervisorHooks = {
   readonly announce?: (text: string, id: string, thread?: string) => Promise<void>;
 };
 
-/** An owner message: discord:<channel>:<message>, or toodo:chat:<message> (the Toodo chat, channel `toodo`). */
-export const OWNER_INBOUND = /^(?:discord:(\d+)|toodo:chat):(\d+)$/;
-/** The channel and message of an owner message id; the Toodo chat's channel is `toodo`. */
+/**
+ * An owner message: discord:<channel>:<message>. A row left in an old journal by the removed Toodo chat
+ * (toodo:chat:<message>) does not match, so it is never reminded, noticed or handed over.
+ */
+export const OWNER_INBOUND = /^discord:(\d+):(\d+)$/;
+/** The channel and message of an owner message id. */
 export const ownerRef = (id: string): OwnerMessage | undefined => {
   const m = OWNER_INBOUND.exec(id);
-  return m?.[2] ? { channel: m[1] ?? "toodo", message: m[2] } : undefined;
+  return m?.[1] && m[2] ? { channel: m[1], message: m[2] } : undefined;
 };
 /** INBOUND_EDIT / INBOUND_DELETE ids (discord-inbound.ts): they revise the owner message discord:<channel>:<message>. */
 export const OWNER_REVISION = /^discord:(\d+):(\d+):(?:edit:.+|delete)$/;
@@ -165,7 +168,10 @@ export class OwnerTracking {
         return entry;
       }
       if (now - (entry.handlingSince ?? entry.ackedAt) < timeoutMs) return entry;
-      const { channel, message } = ownerRef(entry.id) ?? {};
+      const ref = ownerRef(entry.id);
+      // An old journal's row of the removed Toodo chat (toodo:chat:<message>) has no channel to escalate in.
+      if (!ref) return entry;
+      const { channel, message } = ref;
       this.enqueue(`unhandled:${entry.id}:${entry.handlingSince ?? entry.ackedAt}`,
         `UNHANDLED ${channel} ${message} coverage=${(entry.lanes?.length ?? 0) + Number(!!entry.reply)}/${entry.tasks ?? 1} ${this.messageBody(entry.id)}`);
       return { ...entry, unhandledRemindedAt: now };
@@ -295,8 +301,7 @@ export class OwnerTracking {
   }
 
   /**
-   * Reactions on the owner's inbound Discord messages (ids discord:<channel>:<message>, INBOUND lines only); the Toodo
-   * chat has no reactions.
+   * Reactions on the owner's inbound Discord messages (ids discord:<channel>:<message>, INBOUND lines only).
    * Serialized on one chain so add/remove order holds, never awaited by a restart, failures swallowed.
    */
   react(events: readonly Event[], steps: readonly (readonly ["add" | "remove", string])[]): void {

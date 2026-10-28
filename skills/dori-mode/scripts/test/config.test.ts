@@ -118,6 +118,20 @@ test("an old config's laneFinishNotice loads fine: the key is dropped and named 
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_OWNER_POST_KEYS_REMOVED laneFinishNotice in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`]);
 });
 
+test("an old config's toodo (the removed Toodo integration) loads fine: the key is dropped and named in one warning per process", async () => {
+  const path = join(state.dir, "old-toodo.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7, toodo: { url: "http://127.0.0.1:1", leadTokenFile: "~/lead-token", discordMirror: { channel: "123" } } }));
+  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
+    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
+    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
+    console.log(JSON.stringify({ closeAfterMin: a.closeAfterMin, leftover: ["toodo" in a, "toodo" in b] }));`;
+  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
+  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  expect(code).toBe(0);
+  expect(JSON.parse(out)).toEqual({ closeAfterMin: 7, leftover: [false, false] });
+  expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_TOODO_KEYS_REMOVED toodo in ${path}: the Toodo integration was removed (Discord is the only messenger); the keys are ignored and can be deleted`]);
+});
+
 test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ciToodoWorkspaces) load without error", async () => {
   const path = join(state.dir, "old-tracker.json");
   await Bun.write(path, JSON.stringify({
