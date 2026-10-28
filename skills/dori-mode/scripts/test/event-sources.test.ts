@@ -216,8 +216,8 @@ test("a failing source is isolated: the others keep delivering, it is reported o
   expect(failed[1]).toStartWith("SOURCE_FAILED missing file: ENOENT");
   const status = await collectStatus({ ...f.deps, run: async () => ok("active") });
   const text = renderStatus(status);
-  expect(text).toContain("source bad failing");
-  expect(text).toMatch(/sources: discord -, github -, sweeps -, waits -, emit -, bad\(poll\) - !failing, good\(poll\) GOOD just now, missing\(file\) - !failing/);
+  expect(text).toContain("- Source bad failing since just now: bad exited 2: boom: no such host");
+  expect(text).toContain("- Event sources: discord no events yet, github no events yet, sweeps no events yet, waits no events yet, emit no events yet, bad (poll) no events yet FAILING, good (poll) GOOD just now, missing (file) no events yet FAILING");
   // Recovered: no longer failing, and its last error stays visible.
   broken = false;
   f.clock.at += 5_000;

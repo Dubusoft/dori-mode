@@ -48,8 +48,8 @@ test("status lists working lanes with model, age and last progress; paused and c
   const s = await collectStatus(f.deps);
   expect(s.lanes).toEqual([{ key: "alpha", model: "m/one", ageMin: 90, progress: "Write the tests" }]);
   const text = renderStatus(s);
-  expect(text).toContain("| lanes 1 |");
-  expect(text).toContain("  alpha one 90m | Write the tests");
+  expect(text).toContain("1 lane working");
+  expect(text).toContain("\nLanes (1)\n- alpha (90m, one): Write the tests");
   expect(text).not.toContain("beta");
 });
 
@@ -61,17 +61,18 @@ test("status shows services, pending waits, watched repos with poll time and fai
   writeGatewayStatus(f.dir, { pid: 1, at: NOW - 4_000, connected: true, messageContent: true });
   const s = await collectStatus(f.deps);
   const text = renderStatus(s);
-  expect(text).toContain("ok: services, gateway\n");
-  expect(text).toContain("waits\n  ci-pr-7 on signal, timeout 10-19 10:30 KST (0m left) | n");
-  expect(text).toContain("! github: failures: o/r 20m ago");
-  expect(text).toContain("! issues: no trusted authors (githubIssueAuthors)");
-  expect(text.startsWith("DORI PROBLEM 10-19 10:30 KST | github poll failing, no trusted issue authors | lanes 0 | waits 1")).toBe(true);
+  expect(text).toContain("\nServices\n- herdr-server: running\n- dori-supervisor: running\n");
+  expect(text).toContain("\n- Discord gateway: connected\n- GitHub: 1 repo watched, last poll 2m ago, 1 repo failing\n");
+  expect(text).toContain("\nWaits (1)\n- ci-pr-7: on signal, times out 10-19 10:30 KST (in 0m) - n");
+  expect(text).toContain("\nProblems\n- GitHub poll failing: o/r 20m ago\n");
+  expect(text).toContain("- No trusted issue authors (githubIssueAuthors)");
+  expect(text.startsWith("Dori status - 10-19 10:30 KST\nNeeds attention: github poll failing, no trusted issue authors. 0 lanes working, 1 wait.\n")).toBe(true);
   expect(s.gateway.state).toBe("live");
   expect(s.waits[0]).toMatchObject({ note: "n" });
   const trusted = renderStatus(await collectStatus({ ...f.deps, config: { ...f.deps.config, githubIssueAuthors: ["octo-owner", "octo-alt"] } }));
-  expect(trusted).toContain("! github: failures: o/r 20m ago");
-  expect(trusted).not.toContain("issues: no trusted");
-  expect(trusted).toContain("ok: services, gateway, issues 1 repos");
+  expect(trusted).toContain("- GitHub poll failing: o/r 20m ago");
+  expect(trusted).not.toContain("trusted");
+  expect(trusted).toContain("- Issues: watching 1 repo");
 });
 
 test("lead state: missing pane, and a pane with no agent is cold; cap and ttl come from config", async () => {
@@ -80,7 +81,7 @@ test("lead state: missing pane, and a pane with no agent is cold; cap and ttl co
   const bare = await fixture();
   const s = await collectStatus(bare.deps);
   expect(s.lead.state).toBe("cold");
-  expect(renderStatus(s)).toContain("lead lead:p1 cold - no agent running in the lead pane");
+  expect(renderStatus(s)).toContain("\nLead\n- lead:p1: stopped - no agent running in the lead pane\n");
 });
 
 test("status --json shape round-trips and an empty state dir needs no files and creates none", async () => {
@@ -126,15 +127,15 @@ test("/status pages through 100 lanes: every page fits Discord, every lane is li
     expect(page.length).toBeLessThanOrEqual(STATUS_MAX_CHARS);
     expect(quotaMessage(page, "No status available.").length).toBeLessThan(2000);
   }
-  const listed = pages.flatMap((page) => page.split("\n").filter((line) => line.startsWith("  scale-lane-")).map((line) => line.trim().split(" ")[0]));
+  const listed = pages.flatMap((page) => page.split("\n").filter((line) => line.startsWith("- scale-lane-")).map((line) => line.slice(2).split(" ")[0]));
   expect(listed.sort()).toEqual([...keys].sort());
   expect(pages[0]).toContain(`more on pages 2-${pages.length}`);
-  expect(pages[1]!.split("\n")[0]).toBe(`DORI lanes ${kst(NOW)} KST | page 2/${pages.length} | lanes 100`);
-  expect(pages[1]).toEndWith("\nnext: page 3");
-  expect(pages.at(-1)).not.toContain("next: page");
+  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`Dori lanes - page 2 of ${pages.length} - ${kst(NOW)} KST`, "", "Lanes (100), continued"]);
+  expect(pages[1]).toEndWith("\n\nNext: page 3");
+  expect(pages.at(-1)).not.toContain("Next: page");
   // The slash command's page option picks the page; past the end it says how many there are.
   expect(await lookupStatus(f.deps)(AbortSignal.timeout(5_000), 2)).toBe(pages[1]!);
-  expect(await lookupStatus(f.deps)(AbortSignal.timeout(5_000), 999)).toBe(`DORI status has ${pages.length} pages; there is no page 999.`);
+  expect(await lookupStatus(f.deps)(AbortSignal.timeout(5_000), 999)).toBe(`Dori status has ${pages.length} pages; there is no page 999.`);
 });
 
 test("few lanes stay one page, the same text as renderStatus", async () => {
@@ -208,8 +209,8 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
     { kind: "NUDGED", cls: "lead-digest", events: 3, wakes: 0, measured: 0, calls: 0 },
   ]);
   const text = renderStatus(s);
-  expect(text).toContain("\nwakes 24h 3, 6.5 calls/wake\n");
-  expect(text).toContain("\nkinds 24h: INBOUND 2ev 2w 6.5c/w, GH_PR * merged 1ev 1w 9.0c/w, (restart) 0ev 1w ?c/w, NUDGED 3ev");
+  expect(text).toContain("\nActivity (last 24h)\n- Lead woke 3 times, 6.5 model calls per wake\n");
+  expect(text).toContain("\n- Busiest: INBOUND 2 events, 2 wakes; GH_PR * merged 1 event, 1 wake; (restart) 0 events, 1 wake; NUDGED 3 events");
   // A kind moved by config is counted and classed under the config's table, with no code change.
   const moved = await collectStatus({ ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
   expect(moved.events.kinds.find((k) => k.kind === "NUDGED lane")).toEqual({ kind: "NUDGED lane", cls: "engine-only", events: 3, wakes: 0, measured: 0, calls: 0 });
@@ -233,29 +234,51 @@ const base: Status = {
 
 test("owner messages reminded with ACK_MISSING and still unacked make the status a problem", () => {
   const text = renderStatus({ ...base, unacked: 2 });
-  expect(text.split("\n")[0]).toBe("DORI PROBLEM 10-21 09:53 KST | unacked 2 | lanes 0 | waits 0");
-  expect(text).toContain("! acks: 2 owner messages handed to the lead without its read receipt (dori ack) after ACK_MISSING");
+  expect(text.split("\n")[1]).toBe("Needs attention: unacked 2. 0 lanes working, no waits.");
+  expect(text).toContain("\nProblems\n- 2 owner messages handed to the lead and still not acked (dori ack) after ACK_MISSING\n");
 });
 
-test("healthy status collapses to a summary, the lead line and one ok line, in KST", () => {
-  const text = renderStatus({ ...base, lanes: [{ key: "ops", model: "anthropic-subscription/claude-opus-5-5", ageMin: 27, repo: "dori-mode", pr: 55, progress: "Full run" }] });
+test("healthy status reads as titled sections with one line per item, in KST", () => {
+  const text = renderStatus({ ...base, lanes: [{ key: "ops", model: "anthropic-subscription/claude-opus-5-5", ageMin: 27, repo: "dori-mode", pr: 55, progress: "Full run\nthen  the docs" }] });
   expect(text).toBe([
-    "DORI OK 10-21 09:53 KST | lanes 1 | waits 0",
-    "lead wL1:p4 warm idle 0m ctx 52k/150k",
-    "ok: services, gateway, github 3 repos, poll 1m ago, issues 1 repos",
-    "lanes",
-    "  ops opus-5-5 27m dori-mode #55 | Full run",
+    "Dori status - 10-21 09:53 KST",
+    "All good. 1 lane working, no waits.",
+    "",
+    "Services",
+    "- herdr-server: running",
+    "- dori-supervisor: running",
+    "",
+    "Lead",
+    "- wL1:p4: active (last turn just now, prompt cache warm), context 52k of 150k tokens",
+    "",
+    "Lanes (1)",
+    "- ops (27m, opus-5-5, dori-mode #55): Full run then the docs",
+    "",
+    "Waits (0)",
+    "- none",
+    "",
+    "Gateway and repos",
+    "- Discord gateway: connected",
+    "- GitHub: 3 repos watched, last poll 1m ago",
+    "- Issues: watching 1 repo",
   ].join("\n"));
+});
+
+test("long progress is cut at a word with ..., never mid-word", () => {
+  const text = renderStatus({ ...base, lanes: [{ key: "ops", ageMin: 3, progress: `${"word ".repeat(60)}tail` }] });
+  const line = text.split("\n").find((l) => l.startsWith("- ops (3m): "))!;
+  expect(line).toEndWith("word...");
+  expect(line.length).toBeLessThanOrEqual("- ops (3m): ".length + 200);
 });
 
 test("a failing service expands on its own line and the legacy unit counts only when it is active", () => {
   const down = renderStatus({ ...base, services: [{ name: "herdr-server.service", enabled: "enabled", active: "active" }, { name: "dori-supervisor.service", enabled: "enabled", active: "failed" }, base.services[2]!] });
-  expect(down.split("\n")[0]).toBe("DORI PROBLEM 10-21 09:53 KST | dori-supervisor failed | lanes 0 | waits 0");
-  expect(down).toContain("! services: dori-supervisor failed/enabled");
-  expect(down).toContain("ok: gateway,");
-  expect(down).not.toContain("ok: services");
+  expect(down.split("\n")[1]).toBe("Needs attention: dori-supervisor failed. 0 lanes working, no waits.");
+  expect(down).toContain("\nProblems\n- Service dori-supervisor: failed\n");
+  expect(down).toContain("\nServices\n- herdr-server: running\n- dori-supervisor: failed\n");
+  expect(down).not.toContain("dori-presence");
   const legacy = renderStatus({ ...base, services: [base.services[0]!, base.services[1]!, { name: "dori-presence.service", enabled: "enabled", active: "active" }] });
-  expect(legacy).toContain("! services: dori-presence (legacy, should be off) active/enabled");
+  expect(legacy).toContain("- Service dori-presence: running (legacy, should be off)");
 });
 
 test("wait time: a date-epoch signal is the fire time; the deadline field is only a labelled timeout; else the clipped signal", () => {
@@ -270,9 +293,9 @@ test("wait time: a date-epoch signal is the fire time; the deadline field is onl
     w({ key: "t", until: "merged o/r#8", deadline: timeout }),
     w({ key: "m", until: "merged o/r#7" }),
   ] });
-  expect(text).toContain("  k 10-22 07:00 KST (21h left) | token refresh");
-  expect(text).toContain("  t on signal, timeout 10-22 14:00 KST (28h left)");
-  expect(text).toContain("  m until merged o/r#7");
+  expect(text).toContain("\nWaits (3)\n- k: fires 10-22 07:00 KST (in 21h) - token refresh\n");
+  expect(text).toContain("\n- t: on signal, times out 10-22 14:00 KST (in 28h)\n");
+  expect(text).toContain("\n- m: until merged o/r#7\n");
 });
 
 test("a (#N) in the lane title is never shown as a PR", async () => {
@@ -313,12 +336,12 @@ test("item 6: lanes pending or exhausted on recovery are a status problem and ma
   const s = await collectStatus(f.deps);
   expect(s.lanes.map((l) => [l.key, l.recovery])).toEqual(expect.arrayContaining([["dead", "exhausted"], ["held", "pending"], ["fine", undefined]]));
   const text = renderStatus(s);
-  expect(text).toStartWith("DORI PROBLEM");
+  expect(text.split("\n")[1]).toStartWith("Needs attention: ");
   expect(text).toContain("recovery exhausted 1");
-  expect(text).toContain("! lanes: recovery exhausted (not relaunched or nudged): dead");
-  expect(text).toContain("! lanes: recovery pending (not nudged): held");
-  expect(text).toContain("  !RECOVERY-EXHAUSTED dead ");
-  expect(text).toContain("  !RECOVERY-PENDING held ");
+  expect(text).toContain("- Lane recovery gave up (not relaunched or nudged): dead");
+  expect(text).toContain("- Lane recovery pending (not nudged): held");
+  expect(text).toContain("\n- [recovery gave up] dead (");
+  expect(text).toContain("\n- [recovery pending] held (");
 });
 
 test("a claude-quota.json left by the removed quota gate is ignored", async () => {

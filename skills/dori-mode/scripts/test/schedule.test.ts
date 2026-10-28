@@ -174,7 +174,7 @@ test("a heavy command job waits for a free slot, releases it, and a failing comm
   expect(readSourceStatus(w.dir)?.sources.backup?.lastResult).toBe("failed exit 2");
   expect(readSourceStatus(w.dir)?.sources.nightly?.waiting).toBeUndefined();
   const status = await collectStatus({ ...w.deps, run: async () => ok("active") });
-  expect(renderStatus(status)).toContain("schedules: nightly next 10-24 09:00 KST (24h left), backup next 10-24 09:00 KST (24h left) last failed exit 2");
+  expect(renderStatus(status)).toContain("\nSchedules\n- nightly: next 10-24 09:00 KST (in 24h)\n- backup: next 10-24 09:00 KST (in 24h), last run failed exit 2\n");
 });
 
 test("a crash mid-command leaves an attempted row: it reads back ambiguous once and never reruns until resolved", async () => {
