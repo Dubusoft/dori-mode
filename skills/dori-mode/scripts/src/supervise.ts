@@ -1,6 +1,4 @@
 import { launchQueue, launchQueueText } from "./routing.ts";
-import { scrubForThread } from "./freshness.ts";
-import { homedir } from "node:os";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { redactMeta, redactSecrets } from "./redact.ts";
@@ -8,10 +6,8 @@ import { type Event, type EventMeta, JournalCore, type OwnerNoticeKind } from ".
 import { OWNER_INBOUND, OWNER_REVISION, type OwnerMessage, OwnerTracking, quarantineDigest, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 import { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
 import { Delivery } from "./supervise-delivery.ts";
-import { eventClass } from "./event-policy.ts";
 import { OutcomeTracking } from "./lane-outcomes.ts";
 import { DecisionTracking } from "./decision-obligations.ts";
-import { LANE_FINISH_HOLD_MS, LANE_FINISH_PREFIX, laneFinish, laneFinishText, mergeFinish, parseFinish } from "./lane-finish.ts";
 
 /*
  * The supervisor in four parts: the journal (supervise-journal.ts), owner tracking (supervise-owner-tracking.ts), the
@@ -93,25 +89,14 @@ export class Supervisor {
     const nested = this.enqueuing;
     this.enqueuing = true;
     try {
-      // Append in place, but roll back the whole staged tail (including nested lane-finish notices) on failure.
+      // Append in place, but roll back the whole staged tail (including nested notices) on failure.
       (before.events as Event[]).push(event);
       this.core.eventIds.add(id);
       this.owners.trackOwners([event]);
       this.outcomes.track(event);
       this.decisions.track(event);
-      this.noticeLaneFinish(event.line);
       // Nested notices commit with their triggering event, never ahead of it.
       if (!nested) {
-        // Stage announcements too: a second save after accepting the id could fail and report a false rejection.
-        if (this.owners.announces) {
-          const queue = (key: string, text: string): void => {
-            const outbox = this.core.journal.outbox ?? [];
-            if (!outbox.some((item) => item.id === key)) this.core.journal = { ...this.core.journal, outbox: [...outbox, { id: key, text }] };
-          };
-          for (const added of before.events.slice(length)) {
-            if (eventClass(added.line, this.core.deps.config.eventPolicy) === "owner-only") queue(`owner-only:${added.id}`, scrubForThread(added.line, homedir()));
-          }
-        }
         this.core.persist(OWNER_INBOUND.test(id) || OWNER_REVISION.test(id) ? "full" : "normal");
       }
     } catch (e) {
@@ -122,32 +107,6 @@ export class Supervisor {
     } finally { this.enqueuing = nested; }
     if (!nested) this.owners.drainOutbox();
     return true;
-  }
-
-  /**
-   * laneFinishNotice: a line that finishes a lane queues its one finish line (lane-finish.ts). The outbox row and the
-   * LANE_FINISH_NOTICE dedupe event reach the store in the same write (the outer enqueue persists both), so a crash
-   * leaves both or neither. A later finish event of the same lane only adds facts while the line is still queued; once
-   * posted (or ever queued before, even in a previous run) the lane gets nothing more.
-   */
-  private noticeLaneFinish(line: string): void {
-    if (!this.core.deps.config.laneFinishNotice || !this.owners.announces) return;
-    const finish = laneFinish(line);
-    if (!finish) return;
-    const id = `${LANE_FINISH_PREFIX}${finish.lane}`;
-    const outbox = this.core.journal.outbox ?? [];
-    const queued = outbox.find((item) => item.id === id);
-    if (queued) {
-      const known = parseFinish(queued.text);
-      const text = JSON.stringify(known ? mergeFinish(known, finish) : finish);
-      if (text === queued.text) return;
-      this.core.journal = { ...this.core.journal, outbox: outbox.map((item) => (item.id === id ? { ...item, text } : item)) };
-      return;
-    }
-    if (this.core.known(id)) return;
-    const retryAt = this.core.deps.clock.now() + LANE_FINISH_HOLD_MS;
-    this.core.journal = { ...this.core.journal, outbox: [...outbox, { id, text: JSON.stringify(finish), retryAt }] };
-    this.enqueue(id, `LANE_FINISH_NOTICE ${finish.lane} queued: ${laneFinishText(finish)}`);
   }
 
   /** Event `id` is journaled, or was and left a dedupe tombstone: a scheduled run's read-back. */
@@ -173,7 +132,7 @@ export class Supervisor {
 
   /** Consumes `dori reported` receipts and enqueues UNREPORTED for finished lanes the owner was not told about in time. */
   reportTick(): Promise<void> {
-    // Due outbox lines (a held lane-finish line) go out on this pass too, even while lead delivery is backing off.
+    // Due outbox lines (a retried announcement) go out on this pass too, even while lead delivery is backing off.
     this.owners.drainOutbox();
     return this.outcomes.tick(this.core.deps.registry);
   }

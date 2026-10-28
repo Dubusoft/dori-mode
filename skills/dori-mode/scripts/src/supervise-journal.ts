@@ -384,7 +384,7 @@ export class JournalCore {
     let i = 0;
     for (; i < all.length && ((all[i] as Event).at ?? now) <= cutoff; i++) {
       const event = all[i] as Event;
-      // An owner-only or engine-only event is never delivered to the lead: it ages out like a delivered one.
+      // An engine-only event is never delivered to the lead: it ages out like a delivered one.
       const waiting = !this.delivered.has(event.id) && forLead(eventClass(event.line, this.deps.config.eventPolicy));
       if (waiting || needed.has(event.id)) { kept.push(event); continue; }
       this.eventIds.delete(event.id);

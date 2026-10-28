@@ -59,7 +59,7 @@ export class Delivery {
         continue;
       }
       const policy = this.deps.config.eventPolicy;
-      // owner-only and engine-only events stay in the journal (dedupe, counts) but never reach the lead.
+      // engine-only events stay in the journal (dedupe, counts) but never reach the lead.
       const pending = this.journal.events.filter((event) => !this.delivered.has(event.id) && forLead(eventClass(event.line, policy)));
       const request = pendingLeadRestart(this.deps.config.stateDir);
       if (request) {

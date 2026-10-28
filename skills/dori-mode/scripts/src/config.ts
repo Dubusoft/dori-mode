@@ -166,8 +166,6 @@ export type DoriConfig = {
   readonly resolveKinds: readonly string[];
   /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
   readonly resolveTimeoutMin: number;
-  /** The supervisor posts one plain line itself for each finished lane (lane-finish.ts), in its thread or the main channel. */
-  readonly laneFinishNotice: boolean;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
   readonly deadPanePatterns: readonly string[];
@@ -262,7 +260,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   reportTimeoutMin: 5,
   resolveKinds: DEFAULT_RESOLVE_KINDS,
   resolveTimeoutMin: 15,
-  laneFinishNotice: true,
   heavySlots: 1,
   heavyMaxLoad: 80,
   deadPanePatterns: ["has stopped", "no suitable jobs"],
@@ -301,6 +298,9 @@ export const REMOVED_QUOTA_STALL_KEYS = ["quotaCheck"] as const;
 /** Top-level keys of the removed Claude quota gate (any old sub-keys included); a config that still has them loads, with one warning. */
 export const REMOVED_QUOTA_GATE_KEYS = ["quotaGate"] as const;
 
+/** Keys of the removed supervisor lane-finish line: the supervisor no longer posts to the owner itself; one warning. */
+export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
+
 export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
 
 let warnedRemovedQuotaKeys = false;
@@ -310,6 +310,7 @@ let warnedRemovedQuotaGateKeys = false;
 let warnedRemovedQuotaStallKeys = false;
 let warnedRemovedPushKeys = false;
 let warnedRemovedDeliveryKeys = false;
+let warnedRemovedOwnerPostKeys = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -357,6 +358,11 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     warnedRemovedQuotaKeys = true;
     console.error(`CONFIG_QUOTA_KEYS_REMOVED ${oldLead.join(", ")} in ${path}: the lead uses one model; the keys are ignored and can be deleted`);
   }
+  const oldOwnerPost = REMOVED_OWNER_POST_KEYS.filter((key) => key in loaded);
+  if (oldOwnerPost.length && !warnedRemovedOwnerPostKeys) {
+    warnedRemovedOwnerPostKeys = true;
+    console.error(`CONFIG_OWNER_POST_KEYS_REMOVED ${oldOwnerPost.join(", ")} in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`);
+  }
   if (Array.isArray(loaded.leadModel)) {
     if (!warnedLeadArray) {
       warnedLeadArray = true;
@@ -364,7 +370,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     }
     loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
   }
-  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS];
+  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS];
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
   const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
   const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);

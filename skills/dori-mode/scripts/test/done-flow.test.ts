@@ -2,7 +2,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { LEGACY_LANE_MCP, removeLegacyLaneMcp } from "../src/launch.ts";
 import { claimDone, claimEventId, closeLane, discoverWorktrees, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
-import { laneFinish } from "../src/lane-finish.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -117,14 +116,13 @@ test("CLOSED and LANE_CLOSED carry no receipt JSON while the registry keeps the 
   expect((await at(T0).registry.read("demo-lane"))?.receipt).toMatchObject({ note: "manual", cleanup: expect.arrayContaining(["pane w:p1 closed"]) });
 });
 
-test("LANE_CLOSED keeps the PR URL the claim names, so the lane-finish line still links it", async () => {
+test("LANE_CLOSED keeps the PR URL the claim names", async () => {
   livePane();
   const url = "https://github.com/acme/app/pull/1";
   await claimDone(at(T0), lane, `merged ${url} abc123`);
   await watchTick(at(T0));
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
   expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed seen-claim ${url}`);
-  expect(laneFinish(lines[0] ?? "")).toEqual({ lane: "demo-lane", closed: "closed", pr: url });
 });
 
 test("settling a claim reads each Done signal and lists worktrees once, reusing them in the close", async () => {

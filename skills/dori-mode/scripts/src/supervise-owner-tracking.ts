@@ -1,9 +1,5 @@
-import { homedir } from "node:os";
-
 import { dropAck, ownerMessageId, pendingAcks } from "./ack.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { scrubForThread } from "./freshness.ts";
-import { LANE_FINISH_PREFIX, laneFinishText, parseFinish } from "./lane-finish.ts";
 import { redactSecrets } from "./redact.ts";
 import type { Durability } from "./store.ts";
 import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "./supervise-journal.ts";
@@ -12,6 +8,15 @@ import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "
  * Owner tracking: one row per owner message (ack, coverage, revisions, deletion, quarantine), the owner notices owed
  * for it (delay, ack, unhandled), the reactions on it, and the durable outbox of owner announcements.
  */
+
+/**
+ * Outbox id prefixes of removed owner posts (the lane-finish line, the owner-only event class); a leftover row from an
+ * older store or journal is dropped, never posted.
+ */
+const STALE_OUTBOX = [
+  { prefix: "lane-finish:", why: "lane-finish lines are no longer posted" },
+  { prefix: "owner-only:", why: "owner-only events are no longer posted" },
+] as const;
 
 export const COLD_START_EMOJI = "\u23F3";
 export const HUNG_EMOJI = "\u26A0\uFE0F";
@@ -22,7 +27,7 @@ export type SupervisorHooks = {
   readonly persistLeadPane?: (pane: string) => void;
   /**
    * One plain line for the owner's main channel (lead model switches); `id` is stable across retries of the same line.
-   * `thread` is a lane's thread ref (lane-finish lines): post there, falling back to the main channel.
+   * `thread` is a lane's thread ref: post there, falling back to the main channel.
    */
   readonly announce?: (text: string, id: string, thread?: string) => Promise<void>;
 };
@@ -312,8 +317,6 @@ export class OwnerTracking {
   /** Resolves when queued reactions and announcements have finished (tests and shutdown). */
   reactionsSettled(): Promise<void> { return this.reactions; }
 
-  /** Whether owner announcements are posted at all (an announce hook is set). */
-  get announces(): boolean { return this.hooks.announce !== undefined; }
 
   /**
    * One line for the owner's main channel, through a durable outbox: it is journaled first (with a stable id, so a
@@ -334,23 +337,20 @@ export class OwnerTracking {
     this.draining = true;
     this.reactions = this.reactions.then(async () => {
       for (const item of this.journal.outbox ?? []) {
-        if ((item.retryAt ?? 0) > this.deps.clock.now()) continue;
+        // A lane-finish line or owner-only event left by an older version (the supervisor no longer posts them) is dropped unposted.
+        const stale = STALE_OUTBOX.find(({ prefix }) => item.id.startsWith(prefix));
+        if (!stale && (item.retryAt ?? 0) > this.deps.clock.now()) continue;
         let posted = false;
-        const finish = item.id.startsWith(LANE_FINISH_PREFIX) ? parseFinish(item.text) : undefined;
-        try {
-          if (finish) {
-            // Title and thread are read at post time: the lane may be archived by now, which read() still finds.
-            const lane = await this.deps.registry.read(finish.lane);
-            await announce(scrubForThread(laneFinishText(finish, lane?.title), homedir()), item.id, lane?.thread);
-          } else await announce(item.text, item.id);
+        if (stale) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id}: ${stale.why}`);
+        else try {
+          await announce(item.text, item.id);
           posted = true;
         } catch (e) {
           console.error(`OWNER_ANNOUNCE_FAILED ${item.id} ${e instanceof Error ? e.message : String(e)}`);
         }
         const attempts = (item.attempts ?? 0) + 1;
-        // A lane-finish line is never given up: the owner would not know.
-        const drop = !posted && attempts >= OUTBOX_ATTEMPTS && !finish;
-        if (drop) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id} after ${attempts} attempts`);
+        const drop = stale !== undefined || (!posted && attempts >= OUTBOX_ATTEMPTS);
+        if (drop && !stale) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id} after ${attempts} attempts`);
         const outbox = (this.journal.outbox ?? []).flatMap((entry) => entry.id !== item.id ? [entry]
           : posted || drop ? [] : [{ ...entry, attempts, retryAt: this.deps.clock.now() + OUTBOX_RETRY_MS }]);
         this.journal = { ...this.journal, outbox };

@@ -32,10 +32,10 @@ const fixture = () => {
 test.each([
   ["discord:11:22", "INBOUND 11 22 owner retry"],
   ["closed:alpha", "LANE_CLOSED alpha"],
-])("failed enqueue rolls back tracking and nested notices for %s before a same-id retry", (id, line) => {
+])("failed enqueue rolls back tracking for %s before a same-id retry", (id, line) => {
   const f = fixture();
   const posted: string[] = [];
-  const supervisor = new Supervisor({ ...f.deps, config: { ...f.deps.config, laneFinishNotice: true } }, {
+  const supervisor = new Supervisor(f.deps, {
     announce: async (text) => { posted.push(text); },
   });
   cleanups.unshift(() => supervisor.close());
@@ -54,7 +54,6 @@ test.each([
   else rmSync(tmp, { recursive: true });
   expect(supervisor["core"].journal).toEqual(before);
   expect(supervisor.journaled(id)).toBe(false);
-  expect(supervisor.journaled("lane-finish:alpha")).toBe(false);
   expect(posted).toEqual([]);
   expect(supervisor.enqueue(id, line)).toBe(true);
   expect(supervisor.enqueue(id, line)).toBe(false);
@@ -65,25 +64,24 @@ test.each([
     expect(restarted.journaled(id)).toBe(true);
     expect(f.journal().events.filter((event) => event.id === id)).toHaveLength(1);
     if (id.startsWith("discord:")) expect(f.journal().awaitingAck).toEqual([{ id }]);
-    else expect(restarted.journaled("lane-finish:alpha")).toBe(true);
   } finally { restarted.close(); }
 });
 
-test.each(["CUSTOM retry"])("enqueue commits its event and announcement together for %s", async (line) => {
+test.each(["lead-digest", "engine-only"] as const)("enqueue commits a %s event in one save and stages nothing for the owner", async (cls) => {
   const f = fixture();
   const posted: string[] = [];
   const supervisor = new Supervisor({
-    ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "owner-only" } }) },
+    ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: cls } }) },
   }, { announce: async (text) => { posted.push(text); } });
   cleanups.unshift(() => supervisor.close());
   const save = spyOn(supervisor["core"].store, "save");
-  expect(supervisor.enqueue("announce:retry", line)).toBe(true);
+  expect(supervisor.enqueue("announce:retry", "CUSTOM retry")).toBe(true);
   expect(save).toHaveBeenCalledTimes(1);
   save.mockRestore();
-  expect(readJournal(f.state.dir).outbox).toHaveLength(1);
+  expect(readJournal(f.state.dir).outbox ?? []).toEqual([]);
   expect(f.journal().events.filter((event) => event.id === "announce:retry")).toHaveLength(1);
   await supervisor.reactionsSettled();
-  expect(posted).toHaveLength(1);
+  expect(posted).toEqual([]);
 });
 
 test("owner tracking is durable before a failing delivery-log append", async () => {

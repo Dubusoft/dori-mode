@@ -77,16 +77,33 @@ test("a config file changes a kind's class and the default with no code change",
   const state = withState();
   cleanups.push(state.done);
   const path = join(state.dir, "config.json");
-  writeFileSync(path, JSON.stringify({ eventPolicy: { default: "lead-urgent", kinds: { "GH_PR * opened": "lead-urgent", LANE_REPORT: "owner-only", NUDGED: "engine-only" } } }));
+  writeFileSync(path, JSON.stringify({ eventPolicy: { default: "lead-urgent", kinds: { "GH_PR * opened": "lead-urgent", LANE_REPORT: "lead-digest", NUDGED: "engine-only" } } }));
   const policy = (await loadConfig(path, state.dir)).eventPolicy;
   expect(eventPriority("GH_PR acme/app#7 opened", policy)).toBe("urgent");
-  expect(eventClass("LANE_REPORT lane question", policy)).toBe("owner-only");
+  expect(eventClass("LANE_REPORT lane question", policy)).toBe("lead-digest");
   expect(eventClass("NUDGED lane", policy)).toBe("engine-only");
   // Unknown kinds take the configured default; kinds the file does not name keep the default table.
   expect(eventClass("NEW_SOURCE_KIND x", policy)).toBe("lead-urgent");
   expect(eventClass("INBOUND 1 2 hi", policy)).toBe("lead-urgent");
   writeFileSync(path, "{}");
   expect((await loadConfig(path, state.dir)).eventPolicy).toBe(DEFAULT_EVENT_POLICY);
+});
+
+test("an old config's removed owner-only class loads as lead-digest, named in one warning per process", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const policy = { default: "owner-only", kinds: { DEPLOY: "owner-only", NUDGED: "engine-only" } };
+  const script = `const { eventClass, resolveEventPolicy } = await import(${JSON.stringify(join(import.meta.dir, "../src/event-policy.ts"))});
+    const a = resolveEventPolicy(${JSON.stringify(policy)});
+    const b = resolveEventPolicy(${JSON.stringify(policy)});
+    console.log(JSON.stringify([a.default, eventClass("DEPLOY web", a), eventClass("NUDGED x", a), b.default, eventClass("DEPLOY web", b)]));`;
+  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
+  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  expect(code).toBe(0);
+  expect(JSON.parse(out)).toEqual(["lead-digest", "lead-digest", "engine-only", "lead-digest", "lead-digest"]);
+  expect(err.split("\n").filter((line) => line.startsWith("EVENT_POLICY_"))).toEqual([
+    "EVENT_POLICY_OWNER_ONLY_REMOVED default, DEPLOY: the owner-only class was removed (the supervisor no longer posts events to the owner); treated as lead-digest",
+  ]);
 });
 
 test.each([

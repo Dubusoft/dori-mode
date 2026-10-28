@@ -40,7 +40,8 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
 | `src/repos.ts` | `Repos(stateDir)`: synchronous `list`, `add`, `remove`, `replace`; atomic machine-local GitHub watched list |
 | `src/registry.ts`, `src/store.ts` | the lane registry and its store |
-| `src/launch.ts`, `src/done-flow.ts`, `src/lane-finish.ts` | launching lanes and the done flow |
+| `src/launch.ts`, `src/done-flow.ts` | launching lanes and the done flow |
+| `src/lane-finish.ts` | `postOwnerLine`, which posts the supervisor's lead-status announcements |
 | `src/freshness.ts`, `src/host-guard.ts`, `src/dead-panes.ts` | the sweeps behind `freshness`, `guard` and `dead-panes` |
 | `src/pause.ts` | `pause` and `resume` |
 | `src/inbox.ts` | the lead's event inbox (`dori inbox take`) |

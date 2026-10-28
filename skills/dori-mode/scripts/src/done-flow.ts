@@ -46,12 +46,12 @@ const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
 const EVENT_TEXT_MAX = 300;
 export const eventText = (text: string): string => text.length > EVENT_TEXT_MAX ? `${text.slice(0, EVENT_TEXT_MAX - 1)}…` : text;
 
-/** Same shape lane-finish.ts reads a PR URL with. */
+/** A GitHub pull request URL. */
 const PULL_URL = /https:\/\/\S+\/pull\/\d+/;
 
 /**
  * The fixed close event: no receipt (the registry keeps it). The first PR URL the close note or a Done signal names is
- * kept, so the supervisor's lane-finish line (lane-finish.ts) still links the PR.
+ * kept, so the lead sees which PR the lane closed with.
  */
 const closedEvent = (key: string, note: string, lines: readonly string[]): string => {
   const pr = [note, ...lines.filter((l) => l.startsWith("SIGNAL "))].map((t) => PULL_URL.exec(t)?.[0]).find(Boolean);

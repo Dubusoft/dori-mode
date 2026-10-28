@@ -1155,8 +1155,8 @@ test("digest-only events survive restart without appending or touching a cold le
   expect(readJournal(f.state.dir).events).toHaveLength(1);
 });
 
-test("a kind's class comes from config: owner-only is posted to the owner, engine-only stays journaled, neither reaches the lead", async () => {
-  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { "GH_PR * opened": "lead-urgent", NUDGED: "engine-only", LANE_REPORT: "owner-only" } }) });
+test("a kind's class comes from config: engine-only stays journaled and never reaches the lead, lead-digest rides the next urgent delivery, nothing is posted to the owner", async () => {
+  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { "GH_PR * opened": "lead-urgent", NUDGED: "engine-only", LANE_REPORT: "lead-digest" } }) });
   const posted: string[] = [];
   const supervisor = new Supervisor(f.deps, { announce: async (text) => { posted.push(text); } });
   supervisor.enqueue("nudged", "NUDGED lane silent");
@@ -1166,11 +1166,11 @@ test("a kind's class comes from config: owner-only is posted to the owner, engin
   supervisor.enqueue("pr", "GH_PR acme/app#7 opened sha=1 https://github.com/acme/app/pull/7");
   await supervisor.flush();
   await supervisor.reactionsSettled();
-  expect(f.log().map((event) => event.id)).toEqual(["pr"]);
-  expect(posted).toEqual(["LANE_REPORT lane question which base?"]);
+  expect(f.log().map((event) => event.id)).toEqual(["report", "pr"]);
+  expect(posted).toEqual([]);
   f.clock.at += 2 * 60 * 60_000;
   await supervisor.flush();
-  expect(f.log().map((event) => event.id)).toEqual(["pr"]);
+  expect(f.log().map((event) => event.id)).toEqual(["report", "pr"]);
   expect(readJournal(f.state.dir).events.map((event: { id: string }) => event.id)).toEqual(["nudged", "report", "pr"]);
   supervisor.close();
 });
@@ -2356,9 +2356,9 @@ test("owner messages handled a day ago leave the tracking list for good", async 
 });
 
 test("an owner announcement that fails to post is kept and posted by the next supervisor", async () => {
-  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "owner-only" } }) });
+  const f = fixture();
+  writeJournal(f.state.dir, { events: [], outbox: [{ id: "lead-stuck:1", text: "The lead is stuck." }] });
   const failing = new Supervisor(f.deps, { announce: async () => { throw new Error("discord down"); } });
-  failing.enqueue("notice", "CUSTOM owner notice");
   const error = console.error;
   console.error = () => {};
   try {
@@ -2370,8 +2370,34 @@ test("an owner announcement that fails to post is kept and posted by the next su
   const posted: string[] = [];
   const next = new Supervisor(f.deps, { announce: async (text) => { posted.push(text); } });
   await next.reactionsSettled();
-  expect(posted).toEqual(["CUSTOM owner notice"]);
+  expect(posted).toEqual(["The lead is stuck."]);
   expect(journal(f).outbox).toEqual([]);
+});
+
+test("an owner-only event is no longer posted: it is journaled for the lead, and a leftover owner-only outbox row is dropped with one log line", async () => {
+  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "lead-digest" } }) });
+  writeJournal(f.state.dir, {
+    events: [],
+    outbox: [
+      { id: "owner-only:x", text: "CUSTOM old owner notice", retryAt: f.clock.now() + 60_000 },
+      { id: "lead-stuck:1", text: "The lead is stuck." },
+    ],
+  });
+  const posted: { text: string; id: string }[] = [];
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    const supervisor = new Supervisor(f.deps, { announce: async (text, id) => { posted.push({ text, id }); } });
+    supervisor.enqueue("custom", "CUSTOM new notice");
+    await supervisor.flush();
+    await supervisor.reactionsSettled();
+    supervisor.close();
+  } finally { console.error = error; }
+  expect(posted).toEqual([{ text: "The lead is stuck.", id: "lead-stuck:1" }]);
+  expect(journal(f).outbox ?? []).toEqual([]);
+  expect(logged.filter((line) => line.includes("owner-only:x"))).toEqual(["OWNER_ANNOUNCE_DROPPED owner-only:x: owner-only events are no longer posted"]);
+  expect(journal(f).events.map((event: { id: string }) => event.id)).toEqual(["custom"]);
 });
 
 // Phase 0.3: owner tracking from rows. Each case runs on the json store and on the sqlite store after dori store import.

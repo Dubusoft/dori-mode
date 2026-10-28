@@ -1,108 +1,36 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 
-import { LANE_FINISH_HOLD_MS, laneFinish, laneFinishText, postOwnerLine, type FinishDiscord } from "../src/lane-finish.ts";
+import { postOwnerLine, type FinishDiscord } from "../src/lane-finish.ts";
 import { MessengerError } from "../src/messenger/http.ts";
-import type { Lane } from "../src/registry.ts";
-import { OUTBOX_ATTEMPTS, OUTBOX_RETRY_MS, Supervisor, type SupervisorHooks } from "../src/supervise.ts";
-import { depsFor, fakeClock, newWorld, readJournal, withState } from "./fakes.ts";
+import { Supervisor } from "../src/supervise.ts";
+import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const T0 = 1_800_000_000_000;
-const MERGED = "CI_MERGED acme/app#7 into dev lane=alpha head=abc1234 merge=def1234567890abc https://github.com/acme/app/pull/7";
 
-const fixture = () => {
+test("a lane-finish outbox row left by an older journal is dropped with one log line and never posted", async () => {
   const state = withState();
   cleanups.push(state.done);
-  const clock = fakeClock(T0);
-  const deps = depsFor(newWorld(), clock, state.dir);
-  const posts: { text: string; id: string; thread?: string }[] = [];
-  let failures = 0;
-  const hooks: SupervisorHooks = {
-    announce: async (text, id, thread) => {
-      if (failures > 0) { failures--; throw new Error("discord down"); }
-      posts.push({ text, id, ...(thread ? { thread } : {}) });
-    },
-  };
-  const tick = async (supervisor: Supervisor): Promise<void> => {
-    await supervisor.reportTick();
+  writeJournal(state.dir, {
+    events: [],
+    outbox: [
+      { id: "lane-finish:x", text: JSON.stringify({ lane: "x", closed: "closed" }), retryAt: T0 + 60_000 },
+      { id: "lead-stuck:1", text: "The lead is stuck." },
+    ],
+  });
+  const posts: { text: string; id: string }[] = [];
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const supervisor = new Supervisor(depsFor(newWorld(), fakeClock(T0), state.dir), { announce: async (text, id) => { posts.push({ text, id }); } });
+    cleanups.unshift(() => supervisor.close());
     await supervisor.reactionsSettled();
-  };
-  return { state, clock, deps, posts, hooks, tick, fail: (n: number) => { failures = n; } };
-};
-
-const lane = (key: string, extra: Partial<Lane> = {}): Lane => ({
-  key, title: `${key} work`, thread: "discord:111/222", brief: "/tmp/brief.md", done: "merged acme/app#7", openedAt: new Date(T0).toISOString(), ...extra,
-} as Lane);
-
-test("finish lines name their lane, outcome, PR and merge; other lines finish nothing", () => {
-  expect(laneFinish(MERGED)).toEqual({ lane: "alpha", merged: true, pr: "https://github.com/acme/app/pull/7", merge: "def1234567890abc" });
-  expect(laneFinish("MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def1234 https://github.com/acme/app/pull/7")).toMatchObject({ lane: "alpha", merged: true, merge: "def1234" });
-  expect(laneFinish("LANE_AUTO_CLOSED robot {}")).toEqual({ lane: "robot", closed: "auto-closed" });
-  expect(laneFinish("CI_MERGED acme/app#7 into dev head=abc")).toBeUndefined();
-  expect(laneFinish("LANE_CLOSED $(rm) x")).toBeUndefined();
-  expect(laneFinish("LANE_DONE_CLAIMED alpha x")).toBeUndefined();
-  expect(laneFinishText({ lane: "beta", closed: "closed" })).toBe("Lane beta finished: closed.");
-});
-
-test("one line per lane: merge and close fold into it, and neither later events nor a restarted supervisor post again", async () => {
-  const f = fixture();
-  await f.deps.registry.write(lane("alpha"));
-  const first = new Supervisor(f.deps, f.hooks);
-  first.enqueue("ci-merged:acme/app#7", MERGED);
-  first.enqueue("lane-closed:alpha", "LANE_CLOSED alpha {\"checks\":[]}");
-  await f.tick(first);
-  expect(f.posts).toEqual([]);
-  // Restarted while the line is held: the journaled outbox row still goes out once.
-  const second = new Supervisor(f.deps, f.hooks);
-  f.clock.at += LANE_FINISH_HOLD_MS;
-  await f.tick(second);
-  expect(f.posts).toEqual([{
-    text: "Lane alpha finished (alpha work): merged and closed. PR https://github.com/acme/app/pull/7. Merge def123456789.",
-    id: "lane-finish:alpha", thread: "discord:111/222",
-  }]);
-  second.enqueue("merge-verified:acme/app#7", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def1234 https://github.com/acme/app/pull/7");
-  const third = new Supervisor(f.deps, f.hooks);
-  third.enqueue("lane-closed:alpha:again", "LANE_CLOSED alpha again");
-  f.clock.at += 10 * LANE_FINISH_HOLD_MS;
-  await f.tick(third);
-  expect(f.posts).toHaveLength(1);
-  expect(readJournal(f.state.dir).outbox ?? []).toEqual([]);
-});
-
-test("a failing post is retried past OUTBOX_ATTEMPTS, never dropped, and posted once when it succeeds", async () => {
-  const f = fixture();
-  await f.deps.registry.write(lane("alpha", { thread: "none" }));
-  const supervisor = new Supervisor(f.deps, f.hooks);
-  f.fail(OUTBOX_ATTEMPTS + 2);
-  supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha x");
-  f.clock.at += LANE_FINISH_HOLD_MS;
-  for (let i = 0; i < OUTBOX_ATTEMPTS + 2; i++) {
-    await f.tick(supervisor);
-    f.clock.at += OUTBOX_RETRY_MS;
-  }
-  expect(f.posts).toEqual([]);
-  expect(readJournal(f.state.dir).outbox).toMatchObject([{ id: "lane-finish:alpha", attempts: OUTBOX_ATTEMPTS + 2 }]);
-  await f.tick(supervisor);
-  await f.tick(supervisor);
-  expect(f.posts).toEqual([{ text: "Lane alpha finished (alpha work): closed.", id: "lane-finish:alpha", thread: "none" }]);
-  expect(readJournal(f.state.dir).outbox ?? []).toEqual([]);
-});
-
-test("an autoClose: machine lane gets its line; laneFinishNotice false posts nothing", async () => {
-  const f = fixture();
-  await f.deps.registry.write(lane("robot", { autoClose: "machine" }));
-  const on = new Supervisor(f.deps, f.hooks);
-  on.enqueue("lane-closed:robot", "LANE_AUTO_CLOSED robot {}");
-  f.clock.at += LANE_FINISH_HOLD_MS;
-  await f.tick(on);
-  expect(f.posts.map((post) => post.text)).toEqual(["Lane robot finished (robot work): auto-closed."]);
-  const off = new Supervisor({ ...f.deps, config: { ...f.deps.config, laneFinishNotice: false } }, f.hooks);
-  off.enqueue("lane-closed:quiet", "LANE_CLOSED quiet x");
-  f.clock.at += LANE_FINISH_HOLD_MS;
-  await f.tick(off);
-  expect(f.posts).toHaveLength(1);
+    expect(posts).toEqual([{ text: "The lead is stuck.", id: "lead-stuck:1" }]);
+    expect(readJournal(state.dir).outbox ?? []).toEqual([]);
+    expect(errors.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("lane-finish:x")))
+      .toEqual(["OWNER_ANNOUNCE_DROPPED lane-finish:x: lane-finish lines are no longer posted"]);
+  } finally { errors.mockRestore(); }
 });
 
 const fakeDiscord = (opts: { archived?: boolean; fail?: MessengerError | Error } = {}) => {
