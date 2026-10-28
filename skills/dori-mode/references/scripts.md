@@ -357,7 +357,7 @@ Prints `HOST_GUARD ALERT <reasons>` when load, free memory, free disk or the pan
 `list` prints the launches waiting after a HOLD as JSON. `drop` removes one and prints `HOLD_DROPPED <key>`, or exits 1 when the key is not queued.
 
 ### `dori quota [--json]`
-Reads Claude usage now (pi-quota, no session or model turn) and prints the 5h and 7d usage with reset times (KST) for every Claude account, then pi-quota's own block. It shows usage only: nothing is gated on it. `--json` prints the same usage as JSON. Without a Claude account it says so.
+Reads Claude usage now (pi-quota, no session or model turn) and prints the 5h and 7d usage with the time left to each reset (pi-quota's format: `2d 6h`, `2d`, `3.5h`, `40m`) and the reset time (KST) for every Claude account, then pi-quota's own block. It shows usage only: nothing is gated on it. `--json` prints the same usage as JSON. Without a Claude account it says so.
 
 ### `dori can-launch [--model M]`
 Prints `CAN_LAUNCH` and exits 0 when the host has room for another lane. Otherwise it prints `HOLD <reasons>` and exits 4. The reasons come from the guard's memory, disk and pane-count thresholds. CPU load alone never holds a launch, because it moves too fast to plan around. A HOLD leaves `<stateDir>/launch-hold.json` behind (its blocked flag is lowered by the next `CAN_LAUNCH`, or by the supervisor when it sends `LAUNCH_READY`; queued launches stay), so run it when you are about to launch, not as a status probe: every HOLD answer is read as queued work.

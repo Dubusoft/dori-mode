@@ -57,14 +57,30 @@ export const kst = (ms: number): string => {
   return `${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}`;
 };
 
-const windowText = (name: string, w: ClaudeWindow): string =>
-  `${name} ${w.usedPct}% used${w.resetAt !== undefined ? ` (resets ${kst(w.resetAt)} KST)` : ""}`;
+/**
+ * Time left until a reset, in pi-quota's format: whole days plus whole hours ("2d 6h", days alone when no hour
+ * remains) from 24h up, half-hours below 24h, whole minutes below 1h. Every step rounds down.
+ */
+export const resetIn = (resetAt: number, now: number): string => {
+  if (resetAt - now <= 0) return "now";
+  const totalMinutes = Math.floor((resetAt - now) / 60_000);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const days = Math.floor(totalMinutes / 1440);
+  if (days > 0) {
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  }
+  return `${Math.floor(totalMinutes / 30) / 2}h`;
+};
 
-/** One line: "QUOTA | Claude default: 5h 85% used (resets ...), 7d 40% used | login-2: 7d 10% used". Usage only, no verdict. */
+const windowText = (name: string, w: ClaudeWindow, now: number): string =>
+  `${name} ${w.usedPct}% used${w.resetAt !== undefined ? ` (resets in ${resetIn(w.resetAt, now)}, ${kst(w.resetAt)} KST)` : ""}`;
+
+/** One line: "QUOTA | Claude default: 5h 85% used (resets in 3h, ...), 7d 40% used | login-2: 7d 10% used". Usage only, no verdict. */
 export const usageLine = (usage: ClaudeUsage): string =>
   `QUOTA | Claude ${usage.accounts.map((a) => `${a.name}: ${[
-    ...(a.fiveHour ? [windowText("5h", a.fiveHour)] : []),
-    ...(a.weekly ? [windowText("7d", a.weekly)] : []),
+    ...(a.fiveHour ? [windowText("5h", a.fiveHour, usage.at)] : []),
+    ...(a.weekly ? [windowText("7d", a.weekly, usage.at)] : []),
   ].join(", ")}`).join(" | ")}`;
 
 export const NO_CLAUDE = "QUOTA | no Claude subscription usage reported";
