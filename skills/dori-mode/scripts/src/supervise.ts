@@ -72,6 +72,9 @@ export class Supervisor {
     this.decisions.publish();
   }
 
+  /** The lead pane in use now: repairLeadPane replaces the configured one when it recreates the pane. */
+  get leadPane(): string { return this.core.deps.config.leadPane; }
+
   /** Releases the store (tests and shutdown); the supervisor must not be used afterwards. */
   close(): void { this.core.close(); }
 

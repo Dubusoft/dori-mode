@@ -363,7 +363,9 @@ export const supervise = async (
         ...request, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
       })),
       lookup: discordOptions.lookup ?? quotaReport(lookupQuotaResults()),
-      statusLookup: discordOptions.statusLookup ?? lookupStatus(deps),
+      // The lead pane is read per request: a pane recreated after startup is in the supervisor, not in deps.
+      statusLookup: discordOptions.statusLookup ?? ((lookupSignal, page) =>
+        lookupStatus({ ...deps, config: { ...deps.config, leadPane: supervisor.leadPane } })(lookupSignal, page)),
     }));
     inbound = discordInbound;
     // The Toodo Lead chat: woken by its event stream, read again every pollSeconds whatever the stream does.
