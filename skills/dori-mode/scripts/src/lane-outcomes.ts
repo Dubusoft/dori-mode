@@ -9,8 +9,10 @@ import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journ
 
 /**
  * Lane outcome reports: "a lane finished, so the owner is told", enforced the way owner messages are (ack, handled,
- * UNHANDLED). A finished lane (LANE_CLOSED <key>, or CI_MERGED ... lane=<key>) opens one report obligation per lane key;
- * the lead tells the owner itself and then records `dori reported <key>`, an immutable receipt the supervisor consumes.
+ * UNHANDLED). A lane claimed done (LANE_DONE_CLAIMED <key>) or finished (LANE_CLOSED <key>, or CI_MERGED ... lane=<key>)
+ * opens one report obligation per lane key; a rejected claim (LANE_NOT_DONE, or the lead's `dori object-done`) drops the
+ * obligation it opened while no real outcome has joined it. The lead tells the owner itself and then records
+ * `dori reported <key>`, an immutable receipt the supervisor consumes.
  * An obligation still open after reportTimeoutMin comes back as urgent `UNREPORTED <key> ...`, re-sent with backoff; in
  * push mode it also keeps the lead pushed and counts toward the push escalation. The supervisor never posts the report.
  */
@@ -29,11 +31,20 @@ const RECEIPT_FILE = /^\d+-[\w-]+\.json$/;
 
 export class ReportedError extends Error {}
 
-/** The lane a finished-lane event names: `LANE_CLOSED <key> ...` or `CI_MERGED ... lane=<key> ...`. */
-export const outcomeLane = (line: string): string | undefined => {
-  const lane = line.startsWith("LANE_CLOSED ") ? line.split(" ")[1] : line.startsWith("CI_MERGED ") ? / lane=(\S+)/.exec(line)?.[1] : undefined;
-  return lane && LANE_KEY.test(lane) ? lane : undefined;
-};
+const CLAIM = "LANE_DONE_CLAIMED ";
+const REJECTED = "LANE_NOT_DONE ";
+
+const keyOf = (lane: string | undefined): string | undefined => (lane && LANE_KEY.test(lane) ? lane : undefined);
+
+/**
+ * The lane an obligation-opening event names: a done claim `LANE_DONE_CLAIMED <key> ...`, or a finished lane
+ * `LANE_CLOSED <key> ...` / `CI_MERGED ... lane=<key> ...`. A machine lane's LANE_AUTO_CLAIMED names none.
+ */
+export const outcomeLane = (line: string): string | undefined =>
+  keyOf(line.startsWith("LANE_CLOSED ") || line.startsWith(CLAIM) ? line.split(" ")[1] : line.startsWith("CI_MERGED ") ? / lane=(\S+)/.exec(line)?.[1] : undefined);
+
+/** The lane whose done claim was rejected: `LANE_NOT_DONE <key> ...`. */
+export const rejectedLane = (line: string): string | undefined => keyOf(line.startsWith(REJECTED) ? line.split(" ")[1] : undefined);
 
 const fsyncDir = (dir: string): void => {
   const fd = openSync(dir, "r");
@@ -106,10 +117,14 @@ export class OutcomeTracking {
   private get windowMs(): number { return this.core.deps.config.reportTimeoutMin * 60_000; }
 
   /**
-   * A live event that finishes a lane opens its obligation; another one for the same lane (CI_MERGED, then LANE_CLOSED)
-   * joins it, so one closed lane is one report. Only an event that reaches the lead counts. The caller persists.
+   * A live done claim or finished-lane event opens its lane's obligation; a later one of the same lane (the claim, then
+   * its seen-claim close; CI_MERGED, then LANE_CLOSED) joins it, so one lane is one report. Only an event that reaches
+   * the lead counts. A row opened by a claim stays marked `claim` until a real outcome joins it; LANE_NOT_DONE drops
+   * such a row, reported or not, so the next claim is owed afresh. The caller persists.
    */
   track(event: Event): void {
+    const rejected = rejectedLane(event.line);
+    if (rejected) { this.dropClaim(rejected); return; }
     const lane = outcomeLane(event.line);
     if (!lane || !forLead(eventClass(event.line, this.core.deps.config.eventPolicy))) return;
     const outcomes = this.journal.outcomes ?? [];
@@ -117,10 +132,19 @@ export class OutcomeTracking {
     const line = event.line.slice(0, OUTCOME_LINE_MAX);
     const found = at < 0 ? undefined : outcomes[at];
     if (found?.events?.includes(event.id)) return;
-    const next: LaneOutcome = found
-      ? { ...found, line: found.line ?? line, events: [...(found.events ?? []), event.id] }
-      : { lane, since: event.at ?? this.core.deps.clock.now(), line, events: [event.id] };
+    // Claim-only while every event in the row is a claim (a receipt-only row has none yet).
+    const claim = event.line.startsWith(CLAIM) && (!found || found.claim === true || !found.events?.length);
+    const { claim: _was, ...kept } = found ?? { lane, since: event.at ?? this.core.deps.clock.now() };
+    const next: LaneOutcome = { ...kept, line: kept.line ?? line, events: [...(kept.events ?? []), event.id], ...(claim ? { claim } : {}) };
     this.journal = { ...this.journal, outcomes: at < 0 ? [...outcomes, next] : outcomes.map((outcome, i) => (i === at ? next : outcome)) };
+  }
+
+  /** Drops `lane`'s row if a claim opened it and no real outcome joined it. */
+  private dropClaim(lane: string): void {
+    const outcomes = this.journal.outcomes ?? [];
+    if (!outcomes.some((outcome) => outcome.lane === lane && outcome.claim)) return;
+    this.journal = { ...this.journal, outcomes: outcomes.filter((outcome) => !(outcome.lane === lane && outcome.claim)) };
+    console.log(`LANE_OUTCOME_CLAIM_DROPPED ${lane}`);
   }
 
   /**
@@ -171,7 +195,8 @@ export class OutcomeTracking {
    * reportTimeoutMin, then after twice the previous wait, up to REPORT_REPEAT_MAX_MS). A lane whose brief declared
    * `autoClose: machine` closes with no lead wake and owes no report. Nothing is reminded while a lead restart runs: the
    * published list is kept current, and the new lead's `dori inbox take` prints every open obligation. Reported rows are
-   * dropped after REPORTED_KEEP_MS.
+   * dropped after REPORTED_KEEP_MS. A claim-only row is dropped once the registry holds an objection made at or after it
+   * opened: `dori object-done` writes only the registry and is never an event.
    */
   async tick(registry: Pick<Registry, "read">): Promise<void> {
     this.consumeReceipts();
@@ -181,6 +206,12 @@ export class OutcomeTracking {
     let changed = false;
     const outcomes: LaneOutcome[] = [];
     for (const outcome of this.journal.outcomes ?? []) {
+      const objection = outcome.claim ? (await registry.read(outcome.lane))?.objection : undefined;
+      if (objection && Date.parse(objection.at) >= outcome.since) {
+        console.log(`LANE_OUTCOME_CLAIM_DROPPED ${outcome.lane}`);
+        changed = true;
+        continue;
+      }
       if (outcome.reportedAt !== undefined) {
         if (now - outcome.reportedAt >= REPORTED_KEEP_MS) changed = true;
         else outcomes.push(outcome);
@@ -196,7 +227,7 @@ export class OutcomeTracking {
       }
       const minutes = Math.round((now - outcome.since) / 60_000);
       this.enqueue(`unreported:${outcome.lane}:${outcome.since}:${reminders + 1}`,
-        `UNREPORTED ${outcome.lane} finished ${minutes} min ago and the owner has not been told: ${reportRule(outcome.lane)}. ${outcome.line ?? ""}`.trimEnd());
+        `UNREPORTED ${outcome.lane} ${outcome.claim ? "claimed done" : "finished"} ${minutes} min ago and the owner has not been told: ${reportRule(outcome.lane)}. ${outcome.line ?? ""}`.trimEnd());
       outcomes.push({ ...outcome, reminders: reminders + 1, remindedAt: now });
       changed = true;
     }

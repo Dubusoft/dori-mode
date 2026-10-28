@@ -160,7 +160,7 @@ export type DoriConfig = {
   /** Minutes after reading an owner message to link all tasks with dori handled; a second window notifies the owner. */
   readonly handledTimeoutMin: number;
   readonly unhandledNotice: string;
-  /** Minutes after a lane finished (LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
+  /** Minutes after a lane claimed done or finished (LANE_DONE_CLAIMED, LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
   readonly reportTimeoutMin: number;
   /** Event kinds (eventPolicy syntax) that open a decision obligation, closed by dori resolved <eventId> (decision-obligations.ts). */
   readonly resolveKinds: readonly string[];

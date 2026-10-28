@@ -67,8 +67,9 @@ export type AwaitingAck = {
   readonly quarantined?: true;
 };
 /**
- * One report obligation per finished lane (lane-outcomes.ts): opened by its first LANE_CLOSED or CI_MERGED, joined by
- * later ones, closed by `dori reported <key>`. `since` is the first outcome's enqueue time.
+ * One report obligation per claimed or finished lane (lane-outcomes.ts): opened by its first LANE_DONE_CLAIMED,
+ * LANE_CLOSED or CI_MERGED, joined by later ones, closed by `dori reported <key>`. `since` is the first outcome's enqueue
+ * time.
  */
 export type LaneOutcome = {
   readonly lane: string;
@@ -83,6 +84,8 @@ export type LaneOutcome = {
   readonly remindedAt?: number;
   /** The first push pointer that carried it: its push escalation clock starts there at the earliest. */
   readonly pushedAt?: number;
+  /** Opened by a done claim and no LANE_CLOSED/CI_MERGED joined yet: a rejected claim drops the row. */
+  readonly claim?: true;
 };
 /**
  * One decision obligation per decision event (decision-obligations.ts), keyed by its event id: opened by that event,
