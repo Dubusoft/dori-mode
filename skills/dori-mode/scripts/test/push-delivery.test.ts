@@ -137,6 +137,25 @@ test("a lone LANE_CLOSED (default policy, no INBOUND, no UNREPORTED) is logged a
   expect(lines.some((line) => /^LEAD_PUSH \w+ 1 LANE_CLOSED delivered attempt=1$/.test(line))).toBe(true);
 });
 
+test("a taken outcome still ends its reporting turn and pushes UNREPORTED before the timeout", async () => {
+  const f = fixture({ delivery: delivery() });
+  f.onEnter("working");
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("closed:alpha", "LANE_CLOSED alpha x");
+  await flush(supervisor);
+  expect(readJournal(f.state.dir).outcomes[0].deliveredAt).toBe(f.clock.now());
+  expect(readJournal(f.state.dir).outcomes[0].deliveredWorking).toBe(true);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  f.pane.agent_status = "idle";
+  f.clock.at += 2_000;
+  await flush(supervisor);
+  const reminders = readJournal(f.state.dir).events.filter((event: { line: string }) => event.line.startsWith("UNREPORTED "));
+  expect(reminders).toHaveLength(1);
+  expect(reminders[0].id).toBe(`unreported:alpha:${f.clock.now() - 2_000}:1`);
+  expect(f.texts()).toHaveLength(2);
+  expect(f.texts()[1]).toStartWith("[dori] supervisor: 1 new event (urgent: UNREPORTED).");
+});
+
 test("an untaken event is pushed again after ackSec though nothing is pending, and a take receipt past it stops the pushes", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }) });
   const supervisor = new Supervisor(f.deps);
@@ -290,7 +309,7 @@ test("a new lead is not escalated before escalateMin after its start, and gets a
 });
 
 test("a finished lane taken but not reported keeps an idle lead pushed and escalates it like an untaken urgent event; dori reported ends it", async () => {
-  const f = fixture({ delivery: delivery({ tailMonitor: false }), eventPolicy: resolveEventPolicy({ kinds: { LANE_CLOSED: "lead-urgent" } }) });
+  const f = fixture({ cacheTtlMin: 60, delivery: delivery({ tailMonitor: false }), eventPolicy: resolveEventPolicy({ kinds: { LANE_CLOSED: "lead-urgent" } }) });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha merged");
   await flush(supervisor);
@@ -303,6 +322,8 @@ test("a finished lane taken but not reported keeps an idle lead pushed and escal
   await flush(supervisor);
   expect(f.texts()).toHaveLength(2);
   expect(f.texts()[1]).toStartWith("[dori] supervisor: 1 new event (urgent: UNREPORTED).");
+  // The supervisor now journals the timeout reminder during flush; take it so the ladder below tests the report debt.
+  expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }))?.[0]).toStartWith(`unreported:alpha:${f.clock.now() - 5 * 60_000}:1\tUNREPORTED alpha `);
   for (let i = 0; i < 8 && !f.launches().length; i++) {
     f.clock.at += 60_000;
     await flush(supervisor);

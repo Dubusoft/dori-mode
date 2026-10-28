@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { FlowDeps } from "./done-flow.ts";
 import { leadModels, leadCommand, LEAD_DIET_ARGS, LEAD_DIET_ENV } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
-import { ALIVE_STATUSES, listPanes, readScreen, sendGuarded, sendVerified } from "./panes.ts";
+import { ALIVE_STATUSES, listPanes, type Pane, readScreen, sendGuarded, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
 import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
@@ -219,13 +219,14 @@ export class LeadLifecycle {
    * unacked past the ack window is resumed: `/resume` is typed once per ack window, only into an empty input line.
    * One that stays silent is restarted by the push ladder after push.escalateMin.
    */
-  async resumePaused(): Promise<void> {
+  async resumePaused(readPane = async (): Promise<Pane | undefined> =>
+    (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<void> {
     const { config, clock, run } = this.deps;
     const now = clock.now();
     const window = config.ackTimeoutSec * 1000;
     if (now - this.resumedAt < window) return;
     if (!this.unacked(true).some((entry) => now - (entry.since ?? now) >= window)) return;
-    const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
+    const pane = await readPane();
     if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) return;
     const screen = await readScreen(run, config.leadPane, LEAD_SCREEN_LINES);
     if (!PAUSED.test(screen)) return;
@@ -247,7 +248,8 @@ export class LeadLifecycle {
    * take a pushed pointer until it returns), counted from the later of the call's start and the oldest unacked message.
    * An idle lead is left to the push ladder.
    */
-  async stuckRestart(pending: readonly Event[]): Promise<boolean> {
+  async stuckRestart(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
+    (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<boolean> {
     const { config, clock, run } = this.deps;
     const limit = config.leadStuckRestartMin * 60_000;
     if (!(limit > 0)) return false;
@@ -256,7 +258,7 @@ export class LeadLifecycle {
     const waiting = this.unacked();
     if (!waiting.length) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const now = clock.now();
-    const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
+    const pane = await readPane();
     if (!pane?.agent) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const restart = async (status: string, minutes: number, count: number): Promise<boolean> => {
       // The cap is checked before anything is announced: a refused restart must not tell the owner it is happening.

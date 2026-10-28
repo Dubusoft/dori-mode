@@ -5,7 +5,7 @@ import { parseArgs } from "node:util";
 
 import { configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
-import { resolveTarget } from "./messenger/target.ts";
+import { type Platform, resolveTarget } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
@@ -37,7 +37,7 @@ import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, ackToodo, recordHandled } from "./ack.ts";
 import { TOODO_CHANNEL, type Toodo, toodoClient, ToodoError } from "./messenger/toodo.ts";
-import { InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
+import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -108,7 +108,9 @@ const USAGE = `dori <command> [options]
   report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up)
   inbox take [--max-bytes N] [--peek]  the lead's read path: delivered events past the take cursor as id<TAB>line, whole lines
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
-  reported <key> [--note TEXT]         the lead's receipt that it told the owner a finished lane's outcome (after LANE_CLOSED or CI_MERGED);
+  reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]
+                                       post a finished lane's outcome (after LANE_CLOSED or CI_MERGED) to the owner in the lane's thread
+                                       (--to/--thread override it, as for send) and, once the post returns a message id, record the receipt;
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
@@ -230,6 +232,19 @@ const latestLeadReply = async (toodo: Toodo, after: number, replyId: number | un
     cursor = last;
   }
   return latest === undefined ? undefined : { replyId: latest };
+};
+
+const PLATFORMS: readonly Platform[] = ["slack", "telegram", "discord", "toodo"];
+const messengerToken = (name: string): string => resolveCredential(name) ?? die(`${name} is not set in the environment or in ${envFilePath()}`);
+const slackClient = (): Slack => new Slack(fetchHttp, realClock, { token: messengerToken("DORI_SLACK_TOKEN"), cookie: resolveCredential("DORI_SLACK_COOKIE") }, undefined, new ThreadLedger(`${config.stateDir}/slack-threads.json`));
+
+/** Posts `text` to a resolved target with that platform's messenger client and returns the new message's id. */
+const postMessage = async (platform: Platform, to: string, thread: string | undefined, text: string): Promise<string> => {
+  if (platform === "slack") return (await slackClient().post(to, text, thread)).ts;
+  if (platform === "telegram") return String(await new Telegram(fetchHttp, realClock, messengerToken("DORI_TELEGRAM_TOKEN")).send({ chatId: to, ...(thread ? { threadId: Number(thread) } : {}) }, text));
+  // Each post is its own message: without a unique id Discord would dedupe a repeat of the same text.
+  if (platform === "discord") return new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).send(to, text, randomUUID());
+  return String((await toodoChat().reply(text, thread ? [`chat-${thread}`] : [])).id);
 };
 
 const every = async (minutes: number, tick: () => Promise<void>): Promise<void> => {
@@ -626,7 +641,10 @@ try {
         const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        for (const line of [...lines, ...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir), ...sentinel]) console.log(line);
+        const reminders = [...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
+        // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
+        const checklist = checklistLine([...result.events.map((event) => `${event.id}\t${event.line}`), ...reminders]);
+        for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;
@@ -683,15 +701,25 @@ try {
       break;
     }
     case "reported": {
-      // `dori reported <key> [--note T]`: the lead has told the owner about lane <key>'s outcome itself.
+      // `dori reported <key> --text T`: post lane <key>'s outcome to the owner (the lane's thread unless --to/--thread),
+      // then record the receipt. A failed post records nothing, so the obligation stays open.
       const { recordReported } = await import("./lane-outcomes.ts");
-      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => name !== "note") || ("note" in flags.values && !opt("note"))) {
-        die("usage: dori reported <key> [--note TEXT]");
+      const options = ["text", "to", "thread", "note"];
+      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !options.includes(name)) || options.some((name) => name in flags.values && !opt(name)) || !opt("text")) {
+        die("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]");
       }
-      if (!(await deps.registry.read(key ?? ""))) die(`no registered lane "${key}"`);
+      const found = (await deps.registry.read(key ?? "")) ?? die(`no registered lane "${key}"`);
+      const bound = found.thread && found.thread !== "none" ? found.thread : undefined;
+      const ref = opt("to") ?? bound ?? die(`lane ${key} has no bound thread; name where to post with --to TARGET (a thread ref such as discord:<channel>/<thread>)`);
+      // The platform is the target's ref prefix (or `toodo`), else the bound thread's: a bare --to id posts on the lane's platform.
+      const platformOf = (r: string | undefined): Platform | undefined => PLATFORMS.find((p) => r === p || r?.startsWith(`${p}:`));
+      const platform = platformOf(ref) ?? platformOf(bound) ?? die(`cannot tell the platform of "${ref}"; use a thread ref such as discord:<channel>/<thread>`);
+      const { to, thread } = resolveTarget(platform, ref, opt("thread"));
+      const message = await postMessage(platform, to, thread, opt("text") ?? "");
+      if (!message) die(`REPORT_NOT_POSTED ${key}: ${platform} returned no message id; nothing recorded`);
       const note = opt("note");
-      recordReported(config.stateDir, key ?? "", realClock.now(), note ? oneLine(note) : undefined);
-      console.log(`REPORTED_RECORDED ${key}`);
+      recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, { message, target: `${platform}:${to}${thread ? `/${thread}` : ""}` });
+      console.log(`REPORTED_RECORDED ${found.key} ${message}`);
       break;
     }
     case "resolved": {
@@ -753,28 +781,15 @@ try {
       if (sendRefusal) die(sendRefusal);
       const text = need("text");
       const edit = opt("edit");
-      const token = (name: string) => resolveCredential(name) ?? die(`${name} is not set in the environment or in ${envFilePath()}`);
-      if (platform === "slack") {
-        const slack = new Slack(fetchHttp, realClock, { token: token("DORI_SLACK_TOKEN"), cookie: resolveCredential("DORI_SLACK_COOKIE") }, undefined, new ThreadLedger(`${config.stateDir}/slack-threads.json`));
-        if (edit) await slack.edit(to, edit, text);
-        else console.log(`SENT ${(await slack.post(to, text, thread)).ts}`);
-      } else if (platform === "telegram") {
-        const tg = new Telegram(fetchHttp, realClock, token("DORI_TELEGRAM_TOKEN"));
-        const target = { chatId: to, ...(thread ? { threadId: Number(thread) } : {}) };
-        if (edit) await tg.edit(target, Number(edit), text);
-        else console.log(`SENT ${await tg.send(target, text)}`);
-      } else if (platform === "discord") {
-        const dc = new Discord(fetchHttp, realClock, token("DORI_DISCORD_TOKEN"));
-        if (edit) await dc.edit(to, edit, text);
-        // Each dori send is its own message: without a unique id Discord would dedupe a repeat of the same text.
-        else console.log(`SENT ${await dc.send(to, text, randomUUID())}`);
-      } else if (platform === "toodo") {
-        if (edit) die("the Toodo chat has no edits; send a new reply");
-        // `--to <n>` answers message n: Toodo records the reply as what handled it, and so does the supervisor.
-        const sent = await toodoChat().reply(text, thread ? [`chat-${thread}`] : []);
-        if (thread) recordHandled(config.stateDir, TOODO_CHANNEL, thread, realClock.now(), { reply: true });
-        console.log(`SENT ${sent.id}`);
-      }
+      if (!edit) {
+        const sent = await postMessage(named, to, thread, text);
+        // `--to <n>` answers Toodo message n: Toodo records the reply as what handled it, and so does the supervisor.
+        if (named === "toodo" && thread) recordHandled(config.stateDir, TOODO_CHANNEL, thread, realClock.now(), { reply: true });
+        console.log(`SENT ${sent}`);
+      } else if (platform === "slack") await slackClient().edit(to, edit, text);
+      else if (platform === "telegram") await new Telegram(fetchHttp, realClock, messengerToken("DORI_TELEGRAM_TOKEN")).edit({ chatId: to, ...(thread ? { threadId: Number(thread) } : {}) }, Number(edit), text);
+      else if (platform === "discord") await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);
+      else die("the Toodo chat has no edits; send a new reply");
       break;
     }
     case "typing": {

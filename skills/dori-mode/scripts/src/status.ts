@@ -352,7 +352,7 @@ const problems = (s: Status, now: number): Problem[] => {
   if (owed.length) {
     out.push({
       label: `unreported ${owed.length}`,
-      line: `Finished lanes not reported to the owner yet (report, then dori reported <key>): ${list(owed.map((o) => `${o.lane} ${ago(o.since, now)}`), 6, 300)}`,
+      line: `Finished lanes not reported to the owner yet (dori reported <key> --text TEXT): ${list(owed.map((o) => `${o.lane} ${ago(o.since, now)}`), 6, 300)}`,
     });
   }
   const recovering = (kind: "pending" | "exhausted") => s.lanes.filter((lane) => lane.recovery === kind).map((lane) => lane.key);

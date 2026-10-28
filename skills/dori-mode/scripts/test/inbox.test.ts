@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { defaultConfig, deliveryConfigError, loadConfig } from "../src/config.ts";
-import { EVENT_LOG, InboxError, readCursorFile, take, takeCursor, takeOutput, takesDir, writeCursorFile } from "../src/inbox.ts";
+import { checklistLine, EVENT_LOG, InboxError, readCursorFile, take, takeCursor, takeOutput, takesDir, writeCursorFile } from "../src/inbox.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -156,4 +156,20 @@ test("when no line has meta the take output is byte-identical to the ungrouped f
   const dir = state();
   log(dir, line("a", "WAIT_DONE one") + `${JSON.stringify({ id: "b", line: "WAIT_DONE two", meta: { lane: 5, thread: "" } })}\n` + JSON.stringify({ id: "c", line: "x", meta: "bad" }) + "\n");
   expect(takeOutput(take(dir, { maxBytes: 16_384, now: NOW, peek: true })).join("\n")).toBe("a\tWAIT_DONE one\nb\tWAIT_DONE two\nc\tx");
+});
+
+test("checklistLine: owner chat plus an outcome event puts one checklist line first, deduping lane keys", () => {
+  expect(checklistLine(["e1\tINBOUND discord 1 hi", "e2\tLANE_DONE_CLAIMED alpha ok", "e3\tVISITOR x hello", "e4\tLANE_CLOSED alpha", "e5\tCI_MERGED pr=1 lane=beta"]))
+    .toBe("checklist:e1\tCHECKLIST this batch owes: reply to 2 owner message(s); report lane alpha, beta (dori reported <key> --text ...)");
+});
+
+test("checklistLine: owner-only and outcome-only batches get none", () => {
+  expect(checklistLine(["e1\tINBOUND discord 1 hi", "e2\tWAIT_DONE x"])).toBeUndefined();
+  expect(checklistLine(["e1\tLANE_CLOSED alpha", "unreported:beta\tUNREPORTED beta since now: run it"])).toBeUndefined();
+  expect(checklistLine([])).toBeUndefined();
+});
+
+test("checklistLine: an UNREPORTED reminder plus owner chat gives the checklist", () => {
+  expect(checklistLine(["e9\tINBOUND discord 2 yo", "unreported:gamma\tUNREPORTED gamma since 2026: run dori reported gamma --text TEXT"]))
+    .toBe("checklist:e9\tCHECKLIST this batch owes: reply to 1 owner message(s); report lane gamma (dori reported <key> --text ...)");
 });

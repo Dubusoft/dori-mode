@@ -79,6 +79,10 @@ export type LaneOutcome = {
   readonly events?: readonly string[];
   readonly reportedAt?: number;
   readonly note?: string;
+  /** When an outcome first reached the lead's delivery log (after a cold restart, only once confirmed). */
+  readonly deliveredAt?: number;
+  /** A working pane observation made after delivery; idle/done can now end that turn. */
+  readonly deliveredWorking?: true;
   /** UNREPORTED events enqueued so far, and when the last one was. */
   readonly reminders?: number;
   readonly remindedAt?: number;

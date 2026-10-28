@@ -2,6 +2,8 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, r
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { outcomeLane } from "./lane-outcomes.ts";
+
 /**
  * The lead's read path for delivered events (`dori inbox take`). It prints lead-events.log from the take cursor to the
  * last complete line, at most `maxBytes` of whole lines, and writes an immutable take receipt for exactly what it
@@ -218,4 +220,28 @@ export const takeOutput = (result: Take): string[] => {
     ...body,
     ...(result.more ? [`INBOX_MORE ${result.more.lines} ${result.more.bytes}`] : []),
   ];
+};
+
+/**
+ * The one-line checklist for a taken batch that mixes owner chat (INBOUND / VISITOR) with lane outcome obligations (an
+ * outcome event, or an UNREPORTED reminder): `checklist:<first id>\tCHECKLIST this batch owes: ...`, in the same
+ * id<TAB>line shape as the other lines. `lines` are id<TAB>line texts (events plus reminders). Undefined unless both
+ * kinds are present.
+ */
+export const checklistLine = (lines: readonly string[]): string | undefined => {
+  let owner = 0;
+  const lanes: string[] = [];
+  let firstId: string | undefined;
+  for (const text of lines) {
+    const tab = text.indexOf("\t");
+    if (tab < 0) continue;
+    const id = text.slice(0, tab);
+    const line = text.slice(tab + 1);
+    firstId ??= id;
+    if (/^(INBOUND|VISITOR)\b/.test(line)) owner += 1;
+    const lane = outcomeLane(line) ?? (line.startsWith("UNREPORTED ") ? line.split(" ")[1] : undefined);
+    if (lane && !lanes.includes(lane)) lanes.push(lane);
+  }
+  if (!owner || !lanes.length || firstId === undefined) return undefined;
+  return `checklist:${firstId}\tCHECKLIST this batch owes: reply to ${owner} owner message(s); report lane ${lanes.join(", ")} (dori reported <key> --text ...)`;
 };

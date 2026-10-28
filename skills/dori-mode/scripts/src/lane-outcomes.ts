@@ -51,21 +51,28 @@ const fsyncDir = (dir: string): void => {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 };
 
-/** The lead's receipt that it told the owner about lane `lane`'s outcome: tmp, fsync, rename, then both directories. */
-export const recordReported = (stateDir: string, lane: string, at: number, note?: string): string => {
-  if (!LANE_KEY.test(lane)) throw new ReportedError("usage: dori reported <key> [--note TEXT] (a lane key)");
+/** Where `dori reported` posted the report: the message id and its target (`platform:to[/thread]`). */
+export type ReportedPost = { readonly message: string; readonly target: string };
+
+/**
+ * The lead's receipt that it told the owner about lane `lane`'s outcome: tmp, fsync, rename, then both directories.
+ * `dori reported` writes it only after its post returned `posted.message`.
+ */
+export const recordReported = (stateDir: string, lane: string, at: number, note?: string, posted?: ReportedPost): string => {
+  if (!LANE_KEY.test(lane)) throw new ReportedError("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT] (a lane key)");
   const dir = join(stateDir, REPORTED_DIR);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${at}-${randomUUID()}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}) }), { mode: 0o600, flush: true });
+  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}), ...(posted ? { message: posted.message, target: posted.target } : {}) }), { mode: 0o600, flush: true });
   renameSync(tmp, path);
   fsyncDir(dir);
   fsyncDir(stateDir);
   return path;
 };
 
-export type ReportedReceipt = { readonly path: string; readonly lane: string; readonly at: number; readonly note?: string };
+/** `message` and `target` are absent in receipts written before `dori reported` posted the report itself. */
+export type ReportedReceipt = { readonly path: string; readonly lane: string; readonly at: number; readonly note?: string; readonly message?: string; readonly target?: string };
 
 /** Receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
 export const pendingReported = (stateDir: string): ReportedReceipt[] => {
@@ -75,11 +82,13 @@ export const pendingReported = (stateDir: string): ReportedReceipt[] => {
   return names.filter((name) => RECEIPT_FILE.test(name)).flatMap((name) => {
     const path = join(dir, name);
     try {
-      const { lane, at, note } = JSON.parse(readFileSync(path, "utf8")) as { lane?: unknown; at?: unknown; note?: unknown };
+      const { lane, at, note, message, target } = JSON.parse(readFileSync(path, "utf8")) as { lane?: unknown; at?: unknown; note?: unknown; message?: unknown; target?: unknown };
       if (typeof lane !== "string" || !LANE_KEY.test(lane)) return [];
       return [{
         path, lane, at: typeof at === "number" && Number.isFinite(at) ? at : statSync(path).mtimeMs,
         ...(typeof note === "string" && note ? { note } : {}),
+        ...(typeof message === "string" && message ? { message } : {}),
+        ...(typeof target === "string" && target ? { target } : {}),
       }];
     } catch { return []; }
   });
@@ -93,7 +102,7 @@ const dropReported = (path: string): void => {
 
 export const unreported = (journal: Journal): LaneOutcome[] => (journal.outcomes ?? []).filter((outcome) => outcome.reportedAt === undefined);
 
-export const reportRule = (lane: string): string => `report the outcome to the owner yourself, then run dori reported ${lane}`;
+export const reportRule = (lane: string): string => `run dori reported ${lane} --text TEXT to post the outcome to the owner in its thread`;
 
 type Published = { readonly lane: string; readonly since: number; readonly line?: string };
 
@@ -174,9 +183,20 @@ export class OutcomeTracking {
     this.publish();
   }
 
-  /** Open obligations whose first window has passed: they keep a pushed lead pushed (supervise-push.ts). */
+  /** Reminded obligations, or those past their first window: they keep a pushed lead pushed (supervise-push.ts). */
   due(now: number): LaneOutcome[] {
-    return unreported(this.journal).filter((outcome) => now - outcome.since >= this.windowMs);
+    return unreported(this.journal).filter((outcome) => (outcome.reminders ?? 0) > 0 || now - outcome.since >= this.windowMs);
+  }
+
+  /** The delivery log is the handoff boundary. Do not use a pane sample taken before this write as working evidence. */
+  markDelivered(): void {
+    if (this.journal.restart) return;
+    const ready = (outcome: LaneOutcome) => outcome.reportedAt === undefined && outcome.deliveredAt === undefined &&
+      outcome.events?.some((id) => this.core.delivered.has(id));
+    if (!this.journal.outcomes?.some(ready)) return;
+    const now = this.core.deps.clock.now();
+    this.journal = { ...this.journal, outcomes: this.journal.outcomes.map((outcome) => ready(outcome) ? { ...outcome, deliveredAt: now } : outcome) };
+    this.core.persist("normal");
   }
 
   /** The first pointer that carried an obligation starts its escalation clock (no escalation before a pointer, N1). */
@@ -191,21 +211,26 @@ export class OutcomeTracking {
   }
 
   /**
-   * One pass: receipts first, then each open obligation past its window gets one urgent UNREPORTED (the first after
-   * reportTimeoutMin, then after twice the previous wait, up to REPORT_REPEAT_MAX_MS). A lane whose brief declared
+   * One pass: receipts first, then one urgent UNREPORTED when a delivered turn ends (working observed after delivery,
+   * then idle/done), or reportTimeoutMin passes. Later reminders back off up to REPORT_REPEAT_MAX_MS. A lane whose brief declared
    * `autoClose: machine` closes with no lead wake and owes no report. Nothing is reminded while a lead restart runs: the
    * published list is kept current, and the new lead's `dori inbox take` prints every open obligation. Reported rows are
    * dropped after REPORTED_KEEP_MS. A claim-only row is dropped once the registry holds an objection made at or after it
    * opened: `dori object-done` writes only the registry and is never an event.
    */
-  async tick(registry: Pick<Registry, "read">): Promise<void> {
+  async tick(registry: Pick<Registry, "read">, leadStatus?: () => Promise<string | undefined>): Promise<void> {
+    this.consumeReceipts();
+    if (this.journal.restart) { this.publish(); return; }
+    const watching = (outcome: LaneOutcome) => outcome.reportedAt === undefined && outcome.deliveredAt !== undefined && !(outcome.reminders ?? 0);
+    const status = leadStatus && this.journal.outcomes?.some(watching) ? await leadStatus() : undefined;
+    // A receipt arriving during the pane lookup wins too.
     this.consumeReceipts();
     if (this.journal.restart) { this.publish(); return; }
     const now = this.core.deps.clock.now();
     const window = this.windowMs;
     let changed = false;
     const outcomes: LaneOutcome[] = [];
-    for (const outcome of this.journal.outcomes ?? []) {
+    for (let outcome of this.journal.outcomes ?? []) {
       const objection = outcome.claim ? (await registry.read(outcome.lane))?.objection : undefined;
       if (objection && Date.parse(objection.at) >= outcome.since) {
         console.log(`LANE_OUTCOME_CLAIM_DROPPED ${outcome.lane}`);
@@ -218,8 +243,13 @@ export class OutcomeTracking {
         continue;
       }
       const reminders = outcome.reminders ?? 0;
+      const turnEnded = watching(outcome) && outcome.deliveredWorking && (status === "idle" || status === "done");
+      if (watching(outcome) && status === "working" && !outcome.deliveredWorking) {
+        outcome = { ...outcome, deliveredWorking: true };
+        changed = true;
+      }
       const wait = reminders === 0 ? window : Math.min(window * 2 ** (reminders - 1), Math.max(REPORT_REPEAT_MAX_MS, window));
-      if (now - (outcome.remindedAt ?? outcome.since) < wait) { outcomes.push(outcome); continue; }
+      if (!turnEnded && now - (outcome.remindedAt ?? outcome.since) < wait) { outcomes.push(outcome); continue; }
       if (reminders === 0 && (await registry.read(outcome.lane))?.autoClose === "machine") {
         outcomes.push({ ...outcome, reportedAt: now, note: "autoClose: machine" });
         changed = true;

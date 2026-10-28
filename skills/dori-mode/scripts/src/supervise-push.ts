@@ -4,7 +4,7 @@ import { eventClass, eventKind } from "./event-policy.ts";
 import { completeLines, parseLogLine } from "./inbox.ts";
 import type { OutcomeTracking } from "./lane-outcomes.ts";
 import { dueDecisions, markDecisionsPushed } from "./decision-obligations.ts";
-import { listPanes, readScreen, sendVerified } from "./panes.ts";
+import { listPanes, type Pane, readScreen, sendVerified } from "./panes.ts";
 import { type AwaitingAck, type Event, type InboxPush, type Journal, type JournalCore, type LaneOutcome, type Obligation, TransientSuperviseError } from "./supervise-journal.ts";
 import { type LeadLifecycle, PAUSED } from "./supervise-lead-lifecycle.ts";
 import { latest } from "./supervise-owner-tracking.ts";
@@ -136,7 +136,8 @@ export class PushDelivery {
    * The push step of one delivery pass. Returns true when it set a restart (the caller's loop carries it out). Makes no
    * herdr call while nothing untaken is due.
    */
-  async tick(pending: readonly Event[]): Promise<boolean> {
+  async tick(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
+    (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane)): Promise<boolean> {
     const { config, clock, run } = this.core.deps;
     const { delivery } = config;
     if (this.journal.restart) return false;
@@ -152,7 +153,9 @@ export class PushDelivery {
     for (const event of this.journal.events) if (want.has(event.id) && event.at !== undefined) at.set(event.id, event.at);
     const push = inbox.push;
     const ageOf = (id: string): number => at.get(id) ?? push?.first ?? now;
-    const untaken = past.filter((event) => !covered(event.id, at.get(event.id)));
+    // A report receipt also covers its already-journaled reminders: they must not keep pushing a settled report.
+    const reported = new Set(this.journal.outcomes?.filter((outcome) => outcome.reportedAt !== undefined).map((outcome) => outcome.lane));
+    const untaken = past.filter((event) => !covered(event.id, at.get(event.id)) && !reported.has(/^UNREPORTED (\S+)/.exec(event.line)?.[1] ?? ""));
     const policy = config.eventPolicy;
     const urgent = untaken.filter((event) => eventClass(event.line, policy) === "lead-urgent");
     const overdue = untaken.filter((event) => eventClass(event.line, policy) !== "lead-urgent" &&
@@ -168,7 +171,7 @@ export class PushDelivery {
     const named = new Set(untaken.flatMap((event) => [event.id, /^UNRESOLVED (\S+)/.exec(event.line)?.[1] ?? event.id]));
     const open = decisions.filter((item) => !named.has(item.id));
     if (!urgent.length && !overdue.length && !due.length && !decisions.length) return false;
-    const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
+    const pane = await readPane();
     if (!pane) throw new TransientSuperviseError(`lead pane ${config.leadPane} does not exist`);
     if (!pane.agent) return false;
     const status = pane.agent_status;
@@ -227,7 +230,11 @@ export class PushDelivery {
     this.savePush(next);
     const sent = await sendVerified(run, clock, config.leadPane, pointer);
     console.log(`LEAD_PUSH ${batch} ${total} ${kinds.join(",")} ${sent} attempt=${next.attempts}`);
-    if (sent === "delivered") return false;
+    if (sent === "delivered") {
+      // sendVerified already observed the post-handoff transition to working; do not poll the pane again.
+      await this.outcomes.tick(this.core.deps.registry, async () => "working");
+      return false;
+    }
     await clock.sleep(delivery.push.pasteCheckMs);
     const after = inputState(await readScreen(run, config.leadPane));
     if (after === "ours") {
