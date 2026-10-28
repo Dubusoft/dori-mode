@@ -27,7 +27,7 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/messenger/discord-inbound.ts` | Discord inbound polling over REST |
 | `src/messenger/discord-supervisor.ts` | the supervisor's Discord gateway connection |
 | `src/messenger/discord-lock.ts` | the token-scoped lock that keeps one gateway per user and machine |
-| `src/messenger/typing.ts` | `typingWhile`: show typing while a piece of work runs, stop when it ends |
+| `src/messenger/typing.ts` | `Timers`: the interval timers seam (`realTimers` in production) |
 | `src/messenger/voice.ts` | `transcribe`: voice note to text through your hook |
 | `src/messenger/thread-ledger.ts` | `ThreadLedger`: every thread the Dori posts in, persisted; given to `Slack`, it records each `chat.postMessage` (also raw `call`s) |
 | `src/messenger/slack-inbound.ts` | `pollSlackInbound`: threads view, ledger threads and unread counts, deduplicated, own messages filtered |

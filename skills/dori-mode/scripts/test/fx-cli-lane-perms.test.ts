@@ -63,6 +63,13 @@ test("object-done is limited to the lane's own key; the lead may object on any l
   expect(asLead.err).not.toContain("LANE_PERMISSION_DENIED");
 });
 
+test("typing discord refuses --off with the usage text before any token lookup", async () => {
+  const r = await cli(["typing", "discord", "123", "--off"]);
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("usage: dori typing toodo [--off] | dori typing discord <channel>");
+  expect(r.err).not.toContain("DORI_DISCORD_TOKEN");
+});
+
 test("read-only commands stay allowed under DORI_LANE_KEY", async () => {
   const r = await cli(["can-launch"], { DORI_LANE_KEY: "demo-lane" });
   expect(r.err).not.toContain("LANE_PERMISSION_DENIED");

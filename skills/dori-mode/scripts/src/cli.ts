@@ -13,7 +13,7 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
-import { Registry, statusOf } from "./registry.ts";
+import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
@@ -55,6 +55,7 @@ const USAGE = `dori <command> [options]
   setup  [--yes] [--token-file F] [--channel ID] [--autostart]   interactive install: token, channels, herdr, autostart (dori setup --help)
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
+                [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
@@ -113,13 +114,14 @@ const USAGE = `dori <command> [options]
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on an owner message: on Discord hourglass off, eyes on;
                                        channel toodo: ack_chat and typing dots in Toodo; the ack is recorded for the supervisor
-  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--reply-id ID] [--task-id ID]
+  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--reply-id ID] [--task-id ID]
                                        link what handled an owner message; for toodo the reply (--reply-id, else the lead's latest reply after
                                        the message) or Toodo task (--task-id) is also recorded in Toodo
   send <slack|telegram|discord|toodo> --to TARGET --text TEXT [--thread ID] [--edit ID]
                                        post or edit a message (tokens from DORI_SLACK_TOKEN, DORI_TELEGRAM_TOKEN, DORI_DISCORD_TOKEN);
                                        toodo: --to toodo posts in the Lead chat, --to <n> answers chat message n and marks it handled
   typing toodo [--off]                 show (or end) the lead's typing dots in the Toodo chat for 30 s
+  typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
   presence <slack|discord>             keep the account shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text
   inbound slack [--loop MIN]           print INBOUND lines: unread thread replies (threads view), replies in threads
@@ -162,7 +164,7 @@ const flags = parseArgs({
   strict: false,
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
+    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
@@ -420,7 +422,9 @@ try {
       break;
     }
     case "launch": {
-      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
+      const mode = opt("mode");
+      if (mode !== undefined && !(LANE_MODES as readonly string[]).includes(mode)) die(`--mode must be one of ${LANE_MODES.join(", ")}`);
+      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
       await validateLaunch(deps, input);
       const gate = launchGate({ sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard });
       for (const line of gate.lines) console.log(line);
@@ -429,6 +433,7 @@ try {
         const queue = enqueueLaunch(config.stateDir, {
           key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [gate.hold],
           ...(input.cwd ? { cwd: input.cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
+          ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}),
           ...(input.machine ? { machine: input.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
         });
         console.log(`HOLD ${gate.hold}`);
@@ -450,6 +455,7 @@ try {
       break;
     }
     case "adopt": {
+      if (opt("mode") !== undefined) die("--mode applies to launch only");
       const l = await adoptLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) });
       console.log(`ADOPTED ${l.key} pane=${l.pane} thread=${l.thread}`);
       break;
@@ -706,12 +712,12 @@ try {
     case "handled": {
       const parsed = parseArgs({
         args: rest, allowPositionals: true,
-        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, tasks: { type: "string" }, "reply-id": { type: "string" }, "task-id": { type: "string" } },
+        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, all: { type: "boolean" }, tasks: { type: "string" }, "reply-id": { type: "string" }, "task-id": { type: "string" } },
       });
       const [channel, message, ...extra] = parsed.positionals;
       const replyId = parsed.values["reply-id"] === undefined ? undefined : Number(parsed.values["reply-id"]);
       const taskId = parsed.values["task-id"] === undefined ? undefined : Number(parsed.values["task-id"]);
-      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--reply-id ID] [--task-id ID]");
+      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--all] [--reply-id ID] [--task-id ID]");
       if ((replyId !== undefined || taskId !== undefined) && channel !== TOODO_CHANNEL) die("--reply-id and --task-id are for the toodo channel");
       if ([replyId, taskId].some((id) => id !== undefined && (!Number.isSafeInteger(id) || id < 1))) die("--reply-id and --task-id must be positive integers");
       for (const key of parsed.values.lane ?? []) {
@@ -720,7 +726,7 @@ try {
       const reply = parsed.values.reply === true || replyId !== undefined || taskId !== undefined;
       recordHandled(config.stateDir, channel ?? "", message ?? "", realClock.now(), {
         tasks: parsed.values.tasks === undefined ? undefined : Number(parsed.values.tasks),
-        lanes: parsed.values.lane, reply,
+        lanes: parsed.values.lane, reply, ...(parsed.values.all ? { all: true } : {}),
       });
       console.log(`HANDLED_LINKED ${channel} ${message}`);
       if (channel === TOODO_CHANNEL) {
@@ -773,10 +779,19 @@ try {
     }
     case "typing": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { off: { type: "boolean" } } });
-      if (parsed.positionals.join(" ") !== TOODO_CHANNEL) die("usage: dori typing toodo [--off]");
+      const typingUsage = "usage: dori typing toodo [--off] | dori typing discord <channel>";
+      const [target, ...extra] = parsed.positionals;
       const on = parsed.values.off !== true;
-      await toodoChat().typing(on);
-      console.log(`TYPING ${TOODO_CHANNEL} ${on ? "on" : "off"}`);
+      if (target === TOODO_CHANNEL && extra.length === 0) {
+        await toodoChat().typing(on);
+        console.log(`TYPING ${TOODO_CHANNEL} ${on ? "on" : "off"}`);
+      } else if (target === "discord" && extra.length === 1 && on) {
+        const { to, thread } = resolveTarget("discord", extra[0]!);
+        const id = thread ?? to;
+        const dc = new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
+        await dc.typing(id);
+        console.log(`TYPING discord ${id} on`);
+      } else die(typingUsage);
       break;
     }
     case "presence": {

@@ -7,8 +7,10 @@ A lane is one agent session doing one job in its own herdr tab. You launch it, t
 ```sh
 dori launch fix-login --title "Fix the login redirect loop" \
   --brief ~/briefs/fix-login.md --done "merged acme/app#412; closed acme/app#398" \
-  --thread "telegram:<chat>/<topic>" --model anthropic/claude-opus-5-5
+  --thread "telegram:<chat>/<topic>" --mode ulw
 ```
+
+Every lane runs on `defaultModel` with `laneThinking` (opus-5-5, effort medium by default); pick the mode, not the model. `--mode ulw` (the default, opened with `launchKeywords`) is for clear, contained work whose instructions say exactly what to change. `--mode mass-ulw` (opened with `massLaunchKeywords`) is for work that touches many places or whose instructions are vague enough that it has to investigate before it can decide what to change. `--model` stays only for the relaunch after a `STARTUP_ERROR`.
 
 `launch` checks the key and the `Done =` line, appends a footer to the brief, opens a tab in `laneWorkspace`, starts the agent, and after 20 seconds checks the start: `STARTUP_ERROR` on a known failure (missing module, no API key, rate limit, quota), `STARTUP_OK` when herdr reports the agent working, or idle with no such failure on its screen, `STARTUP_UNCONFIRMED` otherwise. On `STARTUP_ERROR`, relaunch on another model; on `STARTUP_UNCONFIRMED`, look at the pane before doing anything else.
 
@@ -18,7 +20,7 @@ To run a lane on another machine, add `--machine <label-or-id>` naming a saved h
 
 Write the brief like a careful prompt:
 
-- open with the keywords you would type yourself (for example `ulw set goal and work`);
+- leave the opening keywords out: `launch` puts the mode's keywords (`ulw ...` or `/mass-ulw ...`) in front of the prompt;
 - where the code is and what has been learned so far;
 - the ideal end state, from the point of view of whoever uses the result;
 - what not to touch;

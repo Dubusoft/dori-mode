@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import type { DoriConfig } from "./config.ts";
 import { eventClass, eventKind, type EventClass } from "./event-policy.ts";
@@ -166,10 +166,14 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
     const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.config.sessionsDir });
     if (!hit.id) return { pane, state: "unknown", note: "cannot resolve the lead session" };
     const dir = sessionDirFor(d.config.sessionsDir, cwd);
-    const file = existsSync(hit.id) ? hit.id :
-      (await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true })))
-        .find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`));
-    if (!file) return { pane, state: "unknown", note: "lead session file not found" };
+    const files = await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true }));
+    const started = existsSync(hit.id) ? hit.id :
+      files.find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`));
+    if (!started) return { pane, state: "unknown", note: "lead session file not found" };
+    // The omo process keeps the session id it was launched with, and /new opens a newer session file in the same directory.
+    // File names start with their creation time, so the current lead session is the latest-written file created after the launch one.
+    const file = files.filter((path) => basename(path) > basename(started))
+      .reduce((best, path) => statSync(path).mtimeMs > statSync(best).mtimeMs ? path : best, started);
     const idleMs = d.clock.now() - statSync(file).mtimeMs;
     return { pane, state: idleMs < d.config.cacheTtlMin * 60_000 ? "warm" : "cold", idleMin: Math.floor(idleMs / 60_000), tokens: lastTokens(file) };
   } catch (e) {

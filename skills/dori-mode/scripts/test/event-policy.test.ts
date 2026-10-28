@@ -37,12 +37,20 @@ const corpus = [
 
 test("the default table classifies every line as the hard-coded list did, except the events the supervisor settles itself", () => {
   const differ = corpus.filter((line) => eventPriority(line) !== legacyPriority(line));
-  // CI follow-up messages the lane about failing checks and conflicts first; a merged PR is read back and a done claim
-  // re-checked and closed by the supervisor. For the lead all of these are digest.
-  expect(differ).toEqual(corpus.filter((line) =>
-    /^GH_PR \S+ (checks_failing|conflicting|merged)(?: |$)/.test(line) || /^(LANE_DONE_CLAIMED|LANE_CLOSED)(?: |$)/.test(line)));
+  // CI follow-up messages the lane about failing checks and conflicts first, and a merged PR is read back by the
+  // supervisor: for the lead these are digest. The done claim and the lane close are urgent like LEGACY_URGENT.
+  expect(differ).toEqual(corpus.filter((line) => /^GH_PR \S+ (checks_failing|conflicting|merged)(?: |$)/.test(line)));
   expect(differ.every((line) => eventPriority(line) === "digest")).toBe(true);
   expect(corpus.filter((line) => eventPriority(line) === "urgent").length).toBeGreaterThan(LEGACY_URGENT.length);
+});
+
+test("the done claim and lane-ending events are lead-urgent; a close after a received claim and the merge readback stay lead-digest", () => {
+  for (const line of ["LANE_DONE_CLAIMED alpha w:p1 proof", "LANE_CLOSED alpha closed", "LANE_AUTO_CLOSED alpha {}", "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x"]) {
+    expect(eventClass(line)).toBe("lead-urgent");
+  }
+  for (const line of ["LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
+    expect(eventClass(line)).toBe("lead-digest");
+  }
 });
 
 test("a kind is the most specific matching entry, else the line's first word", () => {

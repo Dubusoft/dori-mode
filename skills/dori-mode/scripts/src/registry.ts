@@ -6,6 +6,10 @@ export { LOCK_WAIT_MS, StateLockError as RegistryLockError } from "./state-lock.
 
 export const LANE_KEY = /^[a-z0-9][a-z0-9._-]{1,60}$/;
 
+/** `ulw` for clear, contained work; `mass-ulw` for wide changes or vague instructions that need investigation first. */
+export const LANE_MODES = ["ulw", "mass-ulw"] as const;
+export type LaneMode = (typeof LANE_MODES)[number];
+
 export type LaneStatus = "working" | "paused" | "done-claimed" | "verified-done" | "not-done" | "closed";
 export type Claim = {
   readonly at: string;
@@ -43,6 +47,8 @@ export type Lane = {
   /** A remote lane's working directory on its machine; never used as a local path. */
   readonly remoteCwd?: string;
   readonly model?: string;
+  /** How the lane was opened (`dori launch --mode`); absent means `ulw`. Recovery relaunches with the same mode. */
+  readonly mode?: LaneMode;
   /** The GitHub issue the lane works on (`owner/repo#N`, the brief's `issue:` line); closed once its PR merges into ciMergeBase. */
   readonly ghIssue?: string;
   readonly recoveryPending?: boolean;

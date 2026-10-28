@@ -105,9 +105,8 @@ const fixture = (extra: Record<string, unknown> = {}) => {
         pendingStart = { at: clock.now() + startDelay, file: join(dir, `${active}.jsonl`) };
         startPending();
       }
-      const path = /^Read (.+) in full/.exec(typed)?.[1];
-      if (path) {
-        prompt = readFileSync(path, "utf8");
+      if (typed.startsWith("Dori mode. ")) {
+        prompt = typed;
         if (softEvidence) {
           mkdirSync(join(dir, "session-holders", active), { recursive: true });
           writeFileSync(join(dir, "session-holders", active, `${pid}.json`), "{}");
@@ -576,9 +575,12 @@ test.each(["idle", "done"])("an %s cold lead switches session, model and thinkin
   const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
   expect(texts.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
   expect(texts).toHaveLength(4);
-  expect(texts[3]).toMatch(/^Read .*\/lead-[0-9a-f-]{36}\.md in full/);
-  const path = /^Read (.+) in full/.exec(texts[3] ?? "")?.[1] ?? "";
-  expect(existsSync(path)).toBe(false);
+  // The prompt itself is typed, on one line; no prompt file exists for the new lead to miss.
+  expect(texts[3]).toStartWith("Dori mode. ");
+  expect(texts[3]).toContain(TAKE_FIRST);
+  expect(texts[3]).not.toContain("\n");
+  expect(f.calls.some((call) => call[2] === "send-text" && /lead-[0-9a-f-]{36}\.md/.test(call[4] ?? ""))).toBe(false);
+  expect(readdirSync(f.state.dir).filter((name) => /^lead-.*\.md$/.test(name))).toEqual([]);
   expect(f.session()).not.toBe(old);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
   expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
@@ -628,7 +630,7 @@ test("a soft restart types nothing after /new until the new session has started"
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
   // Then /model, /thinking and the prompt are typed only once the new session has started and settled.
-  expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["/model", "/thinking", "Read"]);
+  expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["/model", "/thinking", "Dori"]);
   for (const [, at, started] of sends) expect(at - (started ?? Number.POSITIVE_INFINITY)).toBeGreaterThanOrEqual(SOFT_SESSION_SETTLE_MS);
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
@@ -644,7 +646,7 @@ test("a /new session that never starts falls back to a process launch without ty
   // When its start deadline expires.
   const lines = await quiet(() => supervisor.flush());
   // Then no further command is typed into it and the batch is launched once through the hard path.
-  expect(f.calls.filter((call) => call[2] === "send-text" && /^\/(model|thinking) |^Read /.test(call[4] ?? ""))).toEqual([]);
+  expect(f.calls.filter((call) => call[2] === "send-text" && /^\/(model|thinking) |^Dori mode\. /.test(call[4] ?? ""))).toEqual([]);
   expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED new session did not start after /new"))).toHaveLength(1);
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
   expect(f.log()).toEqual([{ id: "soft-stall", line: "INBOUND stall" }]);
@@ -773,7 +775,7 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
   const lines = await quiet(() => supervisor.flush());
   // Then each command is submitted on its own line and the soft restart succeeds.
   expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
-  expect(submitted[3]).toMatch(/^Read .* in full/);
+  expect(submitted[3]).toStartWith("Dori mode. ");
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
 });
@@ -1092,10 +1094,13 @@ test("a large multibyte event reaches the new lead through take without exceedin
 
 test.each([
   ["INBOUND 123 1 Owner hello", "urgent"],
-  // The supervisor settles a claim itself (live re-check, close or LANE_NOT_DONE): claim and close are digest.
-  ["LANE_DONE_CLAIMED lane proof", "digest"],
+  // A claim wakes the lead; the close after the lead received it is digest (seen-claim), any other close urgent.
+  ["LANE_DONE_CLAIMED lane proof", "urgent"],
+  ["LANE_CLOSED lane closed seen-claim", "digest"],
   ["LANE_NOT_DONE lane reason", "urgent"],
-  ["LANE_CLOSED lane", "digest"],
+  ["LANE_CLOSED lane", "urgent"],
+  ["LANE_AUTO_CLOSED lane {}", "urgent"],
+  ["CI_MERGED acme/app#7 into dev lane=lane head=abc merge=def https://github.com/acme/app/pull/7", "urgent"],
   ["DEAD_PANE scratch:p1", "urgent"],
   ["HOST_GUARD ALERT low disk", "urgent"],
   ["WORKING-WHILE-PAUSED lane detail", "urgent"],
@@ -1299,11 +1304,8 @@ test("the next cold urgent delivery includes held digest in the new session prom
   expect(taken(f)).toEqual(["digest\tNUDGED lane silent", "urgent\tLANE_NOT_DONE lane reason"]);
 });
 
-/** A config that makes done claims wake the lead again: only then does the claim's window wait for its delivery. */
-const urgentClaims = () => ({ eventPolicy: resolveEventPolicy({ kinds: { LANE_DONE_CLAIMED: "lead-urgent" } }) });
-
 test("a claim reads delivered to the lead only once a cold start carrying it confirmed", async () => {
-  const f = fixture(urgentClaims());
+  const f = fixture();
   f.cold();
   f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
@@ -1322,20 +1324,19 @@ test("a claim reads delivered to the lead only once a cold start carrying it con
 });
 
 test("a claim delivered warm reads delivered at once", async () => {
-  const f = fixture(urgentClaims());
+  const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("done-claim:lane:t", "LANE_DONE_CLAIMED lane - proof");
   await supervisor.flush();
   expect(supervisor.leadDelivered("done-claim:lane:t")).toBe(true);
 });
 
-test("a machine-closed lane's claim and close are digest and wake no lead", async () => {
+test("a machine-closed lane's claim is digest and wakes no lead; its close is urgent", async () => {
   const f = fixture();
   expect(eventPriority("LANE_AUTO_CLAIMED lane w:p1 merged acme/app#1")).toBe("digest");
-  expect(eventPriority("LANE_AUTO_CLOSED lane {}")).toBe("digest");
+  expect(eventPriority("LANE_AUTO_CLOSED lane {}")).toBe("urgent");
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("sweep:1", "LANE_AUTO_CLAIMED lane w:p1 merged acme/app#1");
-  supervisor.enqueue("sweep:2", "LANE_AUTO_CLOSED lane {}");
   await supervisor.flush();
   expect(f.log()).toEqual([]);
   expect(f.calls).toEqual([]);
@@ -1873,12 +1874,15 @@ test("a cold start hands every event through take once; owner work taken but unh
   enqueueLaunch(f.state.dir, { key: "held-lane", title: "held", done: "merged acme/app#1", brief: "/b.md", queuedAt: "2027-01-15T08:00:00.000Z", reasons: ["memory"] });
   // When an unrelated event causes a cold restart.
   f.cold();
+  // The held queue is named after the restart's session, as journaled when the prompt is typed.
+  let session: string | undefined;
+  f.onWait(async () => { session ??= restartSession(f)?.phase.startsWith("soft:") ? restartSession(f)?.session : undefined; });
   supervisor.enqueue("restart-trigger", "WAIT_DONE release");
   await supervisor.flush();
   expect(launches(f)).toHaveLength(1);
+  expect(session).toMatch(/^[0-9a-f-]{36}$/);
   // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
   const lines = handed(f).split("\n");
-  const session = /lead-([0-9a-f-]{36})\.md/.exec(f.calls.find((call) => call[2] === "send-text" && call[4]?.startsWith("Read "))?.[4] ?? "")?.[1];
   expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`]);
   expect(lines[2]).toContain("INBOUND 11 22 owner project-alpha");
   expect(lines[3]).toContain("held-lane");

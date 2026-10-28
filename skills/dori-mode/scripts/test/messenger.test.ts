@@ -5,7 +5,6 @@ import { type Http, type HttpRequest, type HttpResponse, MessengerError, UnsafeM
 import { Slack } from "../src/messenger/slack.ts";
 import { slackPresence } from "../src/messenger/slack-presence.ts";
 import { htmlTable, startThinking, Telegram, THINKING } from "../src/messenger/telegram.ts";
-import { typingWhile } from "../src/messenger/typing.ts";
 import { transcribe, TranscriptionError } from "../src/messenger/voice.ts";
 import { fakeClock } from "./fakes.ts";
 
@@ -107,18 +106,6 @@ test("Discord messages are sent without pinging anyone and edited in place; thre
   await dc.setThread("T1", { name: "[done] fix login", archived: true });
   expect(JSON.parse(String(seen[0]?.body)).allowed_mentions).toEqual({ parse: [] });
   expect(seen.map((r) => `${r.method} ${r.url.replace("https://discord.com/api/v10", "")}`)).toEqual(["POST /channels/C1/messages", "PATCH /channels/C1/messages/M1", "POST /channels/C1/messages/M1/threads", "PATCH /channels/T1"]);
-});
-
-test("the typing indicator is sent at once, repeats while work runs, and stops when it ends even on failure", async () => {
-  const sent: number[] = [];
-  const t = fakeTimers();
-  const send = async () => { sent.push(1); };
-  const result = await typingWhile(send, t.timers, async () => { t.fire(); t.fire(); return 42; });
-  expect(result).toBe(42);
-  expect(sent).toHaveLength(3);
-  expect(t.live.size).toBe(0);
-  await expect(typingWhile(send, t.timers, async () => { throw new Error("boom"); })).rejects.toThrow("boom");
-  expect(t.live.size).toBe(0);
 });
 
 test("a voice note becomes text through the configured hook, and a failing or empty transcription is an error", async () => {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { footer, footerDoneRules, LaunchError, launchLane, LEGACY_LANE_MCP, STARTUP_POLL_MS, STARTUP_POLLS } from "../src/launch.ts";
+import { footer, footerDoneRules, LaunchError, launchLane, LEGACY_LANE_MCP, STARTUP_POLL_MS, STARTUP_POLLS, validateLaunch } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
@@ -90,6 +90,37 @@ test("leadModel and leadThinking leave a lane on defaultModel and agentCommand's
   expect(command).toContain("--model test/lane-default --thinking medium ");
   expect(command).not.toContain("test/lead");
   expect(command).not.toContain("--thinking high");
+});
+
+test("--mode mass-ulw opens the prompt with massLaunchKeywords and records the mode; the default is ulw", async () => {
+  await writeBrief();
+  world.panes = [];
+  const d = deps({});
+  const mass = await launchLane(d, { ...input({ pane: "w:p3" }), mode: "mass-ulw" });
+  const command = herdr("pane", "run")[0]?.[4] ?? "";
+  expect(command).toContain("'/mass-ulw set goal and work. Read and execute the lane brief");
+  expect(mass.lane.mode).toBe("mass-ulw");
+  expect((await d.registry.read("pane-lane"))?.mode).toBe("mass-ulw");
+  await d.registry.write({ ...mass.lane, closedAt: new Date(T0).toISOString() });
+  const plain = await launchLane(deps({}), input({ key: "pane-lane-2", pane: "w:p3" }));
+  expect(herdr("pane", "run")[1]?.[4]).toContain("'ulw set goal and work. Read and execute the lane brief");
+  expect(plain.lane.mode).toBe("ulw");
+});
+
+test("laneThinking is inserted after the --model pair, replaces agentCommand's --thinking, and blank keeps the template", async () => {
+  let n = 0;
+  const command = async (laneThinking: string, agentCommand: string[]) => {
+    await writeBrief();
+    world.calls.length = 0;
+    const base = deps({});
+    const r = await launchLane({ ...base, config: { ...base.config, agentCommand, defaultModel: "test/lane", laneThinking } }, input({ key: `pane-lane-${++n}`, pane: "w:p3" }));
+    await base.registry.write({ ...r.lane, closedAt: new Date(T0).toISOString() });
+    return herdr("pane", "run")[0]?.[4] ?? "";
+  };
+  expect(await command("medium", ["omo", "--model", "{model}", "{prompt}"])).toContain("omo --model test/lane --thinking medium 'ulw set goal and work.");
+  expect(await command("high", ["omo", "--model", "{model}", "--thinking", "low", "{prompt}"])).toContain("--model test/lane --thinking high '");
+  expect(await command(" ", ["omo", "--model", "{model}", "{prompt}"])).toContain("omo --model test/lane 'ulw");
+  expect(await command("medium", ["run-agent", "{prompt}"])).toContain("run-agent 'ulw");
 });
 
 test("cwd comes from the pane unless --cwd is given", async () => {
@@ -222,4 +253,17 @@ test("footer puts the shared done rules first and every lane value after '### Th
   expect(footer(footerLane({ reportVia: "cli" }), "w:lead")).toContain('dori report k-1 done --text "<one line>"');
   expect(footer(footerLane({ machine: "m1" }), "w:lead")).not.toContain("claim-done k-1");
   expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
+});
+
+test("a mass-ulw launch refuses keywords or a brief path that omo would not bind, and a non-string laneThinking keeps the template", async () => {
+  await writeBrief();
+  const base = deps({});
+  const mass = (massLaunchKeywords: string, extra: Record<string, string> = {}) =>
+    validateLaunch({ ...base, config: { ...base.config, massLaunchKeywords } }, { ...input({ pane: "w:p3", ...extra }), mode: "mass-ulw" });
+  await expect(mass("mass-ulw set goal and work")).rejects.toThrow(LaunchError);
+  await expect(mass("/mass-ulw set goal and work?")).rejects.toThrow(LaunchError);
+  await expect(mass("/mass-ulw set goal and work", { brief: join(state.dir, "what?.md") })).rejects.toThrow(LaunchError);
+  await mass("/mass-ulw set goal and work");
+  const odd = await launchLane({ ...base, config: { ...base.config, agentCommand: ["omo", "--model", "{model}", "{prompt}"], laneThinking: 5 as unknown as string } }, input({ pane: "w:p3" }));
+  expect(odd.lane.mode).toBe("ulw");
 });

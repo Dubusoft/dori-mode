@@ -38,6 +38,9 @@ test("a stray leadModel key in the config file is ignored, and the default model
   await Bun.write(path, JSON.stringify({ leadModel: "old/model" }));
   const c = await loadConfig(path, "/home/ana");
   expect(c.defaultModel).toBe("anthropic-subscription/claude-opus-5-5");
+  expect(c.laneThinking).toBe("medium");
+  expect(c.launchKeywords).toBe("ulw set goal and work");
+  expect(c.massLaunchKeywords).toBe("/mass-ulw set goal and work");
 });
 
 test("an old config's removed feature flags load fine: the keys are dropped and named in one warning per process", async () => {

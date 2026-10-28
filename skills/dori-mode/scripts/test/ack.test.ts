@@ -19,6 +19,7 @@ const reactions = (fail: { unreact?: Error; react?: Error } = {}) => {
     ops,
     react: async (channel: string, message: string, emoji: string) => { ops.push(`add ${channel}/${message} ${emoji}`); if (fail.react) throw fail.react; },
     unreact: async (channel: string, message: string, emoji: string) => { ops.push(`remove ${channel}/${message} ${emoji}`); if (fail.unreact) throw fail.unreact; },
+    typing: async (channel: string) => { ops.push(`typing ${channel}`); },
   };
 };
 
@@ -26,8 +27,40 @@ test("dori ack removes the hourglass, adds the eyes back to back, then records t
   const dir = state();
   const r = reactions();
   await ack(dir, r, "11", "22", 1_000);
-  expect(r.ops).toEqual(["remove 11/22 \u23F3", `add 11/22 ${EYES_EMOJI}`]);
+  expect(r.ops).toEqual(["remove 11/22 \u23F3", `add 11/22 ${EYES_EMOJI}`, "typing 11"]);
   expect(pendingAcks(dir).map((a) => a.id)).toEqual(["discord:11:22"]);
+});
+
+test("dori ack sends typing after the eyes reaction and records the receipt", async () => {
+  const dir = state();
+  const r = reactions();
+  const typing = r.typing;
+  r.typing = async (channel: string) => {
+    expect(r.ops).toEqual(["remove 11/22 \u23F3", `add 11/22 ${EYES_EMOJI}`]);
+    expect(pendingAcks(dir).map((a) => a.id)).toEqual(["discord:11:22"]);
+    await typing(channel);
+  };
+  await ack(dir, r, "11", "22", 1_000);
+  expect(r.ops).toEqual(["remove 11/22 \u23F3", `add 11/22 ${EYES_EMOJI}`, "typing 11"]);
+});
+
+test("typing rejection does not prevent or undo the recorded ack", async () => {
+  const dir = state();
+  const r = reactions();
+  r.typing = async (channel: string) => {
+    r.ops.push(`typing ${channel}`);
+    throw new Error("indicator unavailable");
+  };
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    await expect(ack(dir, r, "11", "22", 1_000)).resolves.toBeUndefined();
+  } finally {
+    console.error = originalError;
+  }
+  expect(pendingAcks(dir).map((a) => a.id)).toEqual(["discord:11:22"]);
+  expect(errors).toEqual(["ACK_TYPING_FAILED 11 22: indicator unavailable"]);
 });
 
 test("a message without an hourglass (404) is still acked; any other removal failure is not", async () => {

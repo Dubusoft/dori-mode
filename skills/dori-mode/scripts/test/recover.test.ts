@@ -230,7 +230,7 @@ test("item 7: a recovered lane resumes its registered session instead of restart
   await deps.registry.write({ ...lane, session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", sessionVia: "argv" });
   expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
   const ran = world.calls.find((c) => c[0] === "herdr" && c[2] === "run")?.[4] ?? "";
-  expect(ran).toStartWith("DORI_LANE_KEY=recover-lane omo --model provider/expected --session 0b1c2d3e-aaaa-bbbb-cccc-123456789abc ");
+  expect(ran).toStartWith("DORI_LANE_KEY=recover-lane omo --model provider/expected --thinking medium --session 0b1c2d3e-aaaa-bbbb-cccc-123456789abc ");
   expect(await deps.registry.read(lane.key)).toMatchObject({ session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", pane: "new:p1" });
 });
 

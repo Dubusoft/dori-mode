@@ -69,3 +69,15 @@ test("invalid queue entries are dropped while valid entries survive", () => {
     state.done();
   }
 });
+
+test("a queue entry with a mode other than mass-ulw is dropped", () => {
+  const state = withState();
+  try {
+    const base = { key: "k", title: "t", done: "d", brief: "b", queuedAt: "2026-01-01T00:00:00Z", reasons: ["held"] };
+    const good = { ...base, key: "good", mode: "mass-ulw" as const };
+    writeFileSync(join(state.dir, "launch-hold.json"), JSON.stringify({ blocked: true, queue: [good, { ...base, mode: 5 }] }));
+    expect(launchQueue(state.dir)).toEqual([good]);
+  } finally {
+    state.done();
+  }
+});

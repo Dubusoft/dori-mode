@@ -192,6 +192,7 @@ test("PowerShell remote launch ships the brief as bytes and quotes every argumen
   // Evaluate the argument list with $doriBrief bound to a Windows temp path; it must equal the agent argv.
   expect(psArgv(head[1], literals, "C:\\Temp\\x.md")).toEqual([
     ...d.config.agentCommand.slice(0, -1).map((a) => a.replace("{model}", d.config.defaultModel)),
+    "--thinking", "medium",
     "ulw it's $go \u2018x\u2019. Read and execute the lane brief at C:\\Temp\\x.md in full. You are the remote-lane lane; report as the brief's footer says.",
   ]);
   expect(result.lane).toMatchObject({ machine: MACHINE, remoteCwd: "D:\\dev\\worktrees\\app" });
