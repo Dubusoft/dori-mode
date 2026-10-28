@@ -248,8 +248,8 @@ test("dori status names unreported lanes as a problem", () => {
   } as unknown as Status;
   expect(renderStatus(base)).not.toContain("unreported");
   const text = renderStatus({ ...base, unreported: [{ lane: "alpha", since: new Date(T0 - 12 * MIN).toISOString() }] });
-  expect(text.split("\n")[0]).toContain("unreported 1");
-  expect(text).toContain("! reports: finished lanes not reported to the owner (report, then dori reported <key>): alpha 12m ago");
+  expect(text.split("\n")[1]).toContain("unreported 1");
+  expect(text).toContain("- Finished lanes not reported to the owner yet (report, then dori reported <key>): alpha 12m ago");
 });
 
 const cli = async (dir: string, args: string[], env: Record<string, string> = {}) => {

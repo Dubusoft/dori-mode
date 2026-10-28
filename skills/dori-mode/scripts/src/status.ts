@@ -268,7 +268,31 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   };
 };
 
-const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, Math.max(1, n - 1))}~` : s);
+/** Whitespace (newlines included) collapsed, so every item stays on one line. */
+const flat = (s: string): string => s.replace(/\s+/g, " ").trim();
+/** One line of at most n characters, cut at a word when one is near and marked "...", never inside a surrogate pair. */
+const clip = (s: string, n: number): string => {
+  const t = flat(s);
+  if (t.length <= n) return t;
+  const room = Math.max(1, n - 3);
+  const cut = t.slice(0, room).replace(/[\uD800-\uDBFF]$/, "");
+  const space = cut.lastIndexOf(" ");
+  return `${(space >= room / 2 ? cut.slice(0, space) : cut).trimEnd()}...`;
+};
+const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? "" : "s"}`;
+/** Whole items joined by `sep`: at most `count` of them in about `max` characters, then "+N more". */
+const list = (items: readonly string[], count: number, max: number, sep = ", "): string => {
+  const shown: string[] = [];
+  let size = 0;
+  for (const item of items.slice(0, count)) {
+    if (shown.length && size + item.length + sep.length > max - 12) break;
+    const one = shown.length ? item : clip(item, max - 12);
+    shown.push(one);
+    size += one.length + sep.length;
+  }
+  const hidden = items.length - shown.length;
+  return `${shown.join(sep)}${hidden ? `${sep}+${hidden} more` : ""}`;
+};
 const kilo = (n: number): string => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 const dur = (min: number): string => (min < 120 ? `${min}m` : min < 2880 ? `${Math.round(min / 60)}h` : `${Math.round(min / 1440)}d`);
 const ago = (iso: string | undefined, now: number): string => {
@@ -301,39 +325,44 @@ const waitTimeoutMs = (w: Status["waits"][number]): number | null => {
 };
 const left = (ms: number, now: number): string => {
   const min = Math.round(Math.abs(ms - now) / 60_000);
-  return ms >= now ? `${dur(min)} left` : `${dur(min)} overdue`;
+  return ms >= now ? `in ${dur(min)}` : `${dur(min)} overdue`;
 };
+
+const RUN_WORDS: Readonly<Record<string, string>> = { active: "running", inactive: "stopped", failed: "failed", activating: "starting", deactivating: "stopping", reloading: "reloading" };
+const unitWords = (u: UnitState): string => {
+  const run = RUN_WORDS[u.active] ?? u.active;
+  if (u.name === LEGACY_PRESENCE) return `${run} (legacy, should be off)`;
+  return u.enabled === "enabled" ? run : `${run}, ${u.enabled === "disabled" ? "not started at boot" : `boot setting ${u.enabled}`}`;
+};
+const unitName = (u: UnitState): string => u.name.replace(/\.service$/, "");
 
 type Problem = { readonly label: string; readonly line: string };
 const problems = (s: Status, now: number): Problem[] => {
   const out: Problem[] = [];
   const bad = s.services.filter((u) => (u.name === LEGACY_PRESENCE ? u.active === "active" : u.active !== "active" || u.enabled !== "enabled"));
-  for (const u of bad) {
-    const name = u.name.replace(/\.service$/, "");
-    out.push({ label: `${name} ${u.active}`, line: `services: ${name}${u.name === LEGACY_PRESENCE ? " (legacy, should be off)" : ""} ${u.active}/${u.enabled}` });
-  }
-  if (s.gateway.state !== "live") out.push({ label: `gateway ${s.gateway.state}`, line: `gateway: ${s.gateway.text}` });
-  if (s.toodo && s.toodo.state !== "live") out.push({ label: `toodo ${s.toodo.state}`, line: `toodo: ${s.toodo.text}` });
+  for (const u of bad) out.push({ label: `${unitName(u)} ${RUN_WORDS[u.active] ?? u.active}`, line: `Service ${unitName(u)}: ${unitWords(u)}` });
+  if (s.gateway.state !== "live") out.push({ label: `gateway ${s.gateway.state}`, line: `Discord gateway: ${s.gateway.text}` });
+  if (s.toodo && s.toodo.state !== "live") out.push({ label: `toodo ${s.toodo.state}`, line: `Toodo chat: ${s.toodo.text}` });
   const g = s.github;
-  if (g.failures.length) out.push({ label: "github poll failing", line: `github: failures: ${g.failures.slice(0, 4).map((f) => `${f.repo} ${ago(f.at, now)}`).join(", ")}` });
-  if (!g.issueAuthors.length) out.push({ label: "no trusted issue authors", line: "issues: no trusted authors (githubIssueAuthors), new issues never wake the lead" });
+  if (g.failures.length) out.push({ label: "github poll failing", line: `GitHub poll failing: ${list(g.failures.map((f) => `${f.repo} ${ago(f.at, now)}`), 4, 200)}` });
+  if (!g.issueAuthors.length) out.push({ label: "no trusted issue authors", line: "No trusted issue authors (githubIssueAuthors): new issues never wake the lead" });
   if (s.lead.state === "missing" || s.lead.state === "unknown") out.push({ label: `lead ${s.lead.state}`, line: "" });
-  if (s.unacked > 0) out.push({ label: `unacked ${s.unacked}`, line: `acks: ${s.unacked} owner message${s.unacked === 1 ? "" : "s"} handed to the lead without its read receipt (dori ack) after ACK_MISSING` });
+  if (s.unacked > 0) out.push({ label: `unacked ${s.unacked}`, line: `${plural(s.unacked, "owner message")} handed to the lead and still not acked (dori ack) after ACK_MISSING` });
   const owed = s.unreported ?? [];
   if (owed.length) {
     out.push({
       label: `unreported ${owed.length}`,
-      line: `reports: finished lanes not reported to the owner (report, then dori reported <key>): ${owed.slice(0, 6).map((o) => `${o.lane} ${ago(o.since, now)}`).join(", ")}${owed.length > 6 ? `, +${owed.length - 6} more` : ""}`,
+      line: `Finished lanes not reported to the owner yet (report, then dori reported <key>): ${list(owed.map((o) => `${o.lane} ${ago(o.since, now)}`), 6, 300)}`,
     });
   }
   const recovering = (kind: "pending" | "exhausted") => s.lanes.filter((lane) => lane.recovery === kind).map((lane) => lane.key);
   const exhausted = recovering("exhausted");
   const pending = recovering("pending");
-  if (exhausted.length) out.push({ label: `recovery exhausted ${exhausted.length}`, line: `lanes: recovery exhausted (not relaunched or nudged): ${exhausted.join(", ")}` });
-  if (pending.length) out.push({ label: `recovery pending ${pending.length}`, line: `lanes: recovery pending (not nudged): ${pending.join(", ")}` });
-  if (s.sources?.error) out.push({ label: "sources.json invalid", line: `sources: ${clip(s.sources.error, 160)}` });
+  if (exhausted.length) out.push({ label: `recovery exhausted ${exhausted.length}`, line: `Lane recovery gave up (not relaunched or nudged): ${list(exhausted, 10, 300)}` });
+  if (pending.length) out.push({ label: `recovery pending ${pending.length}`, line: `Lane recovery pending (not nudged): ${list(pending, 10, 300)}` });
+  if (s.sources?.error) out.push({ label: "sources.json invalid", line: `sources.json does not read: ${clip(s.sources.error, 160)}` });
   for (const src of s.sources?.sources.filter((source) => source.failing) ?? []) {
-    out.push({ label: `source ${src.name} failing`, line: `source ${src.name} failing since ${ago(iso(src.lastErrorAt), now)}: ${clip(src.lastError ?? "?", 160)}` });
+    out.push({ label: `source ${src.name} failing`, line: `Source ${src.name} failing since ${ago(iso(src.lastErrorAt), now)}: ${clip(src.lastError ?? "?", 160)}` });
   }
   return out;
 };
@@ -346,93 +375,119 @@ const LIMITS: readonly Limits[] = [
 
 const iso = (ms: number | undefined): string | undefined => (ms === undefined ? undefined : new Date(ms).toISOString());
 
-/** "sources: discord INBOUND 2m, github -, deploys(poll) DEPLOY 1h !failing": each source's last event kind and age. */
-const sourceLine = (s: Status, now: number): string[] => {
+/** "- Event sources: discord 2m ago, github no events yet, deploys (poll) 1h ago FAILING": each source's last event age. */
+const sourceLine = (s: Status, now: number, max: number): string[] => {
   if (!s.sources) return [];
   const parts = s.sources.sources.map((src) => {
-    const last = src.lastEventAt === undefined ? "-" : `${src.lastKind ?? "?"} ${ago(iso(src.lastEventAt), now)}`;
-    return `${src.name}${src.type === "builtin" ? "" : `(${src.type})`} ${last}${src.failing ? " !failing" : ""}`;
+    const last = src.lastEventAt === undefined ? "no events yet" : `${src.lastKind ?? "?"} ${ago(iso(src.lastEventAt), now)}`;
+    return `${src.name}${src.type === "builtin" ? "" : ` (${src.type})`} ${last}${src.failing ? " FAILING" : ""}`;
   });
-  return [clip(`sources: ${parts.join(", ")}`, 400)];
+  return parts.length ? [`- Event sources: ${list(parts, max, 400)}`] : [];
 };
 
-/** "schedules: brief next 10-24 09:00 KST (20h left), backup next 10-23 15:00 KST (2h left) last failed exit 1". */
-const scheduleLine = (s: Status, now: number): string[] => {
-  if (!s.schedules?.length) return [];
-  const parts = s.schedules.map((job) => {
-    const next = job.waiting ? `waiting for a ${job.waiting}` : job.nextRunAt === undefined ? "never" : `next ${kst(job.nextRunAt)} KST (${left(job.nextRunAt, now)})`;
-    return `${job.name} ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? ` last ${job.lastResult}` : ""}`;
-  });
-  return [clip(`schedules: ${parts.join(", ")}`, 400)];
-};
+/** "- brief: next 10-24 09:00 KST (in 20h)", "- backup: next ... last run failed exit 1": one line per scheduled job. */
+const scheduleLines = (s: Status, now: number): string[] => (s.schedules ?? []).map((job) => {
+  const next = job.waiting ? `waiting for a ${job.waiting}` : job.nextRunAt === undefined ? "no next run" : `next ${kst(job.nextRunAt)} KST (${left(job.nextRunAt, now)})`;
+  return clip(`- ${job.name}: ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? `, last run ${job.lastResult}` : ""}`, 200);
+});
 
 const perWake = (calls: number, measured: number): string => (measured ? (calls / measured).toFixed(1) : "?");
 
-/** "wakes 24h 12, 8.3 calls/wake" and "kinds 24h: INBOUND 20ev 5w 9.2c/w, ..." (calls per wake only for kinds that woke the lead). */
+/** "- Lead woke 12 times, 8.3 model calls per wake" and "- Busiest: INBOUND 20 events, 5 wakes; ..." (wakes only for kinds that woke the lead). */
 const eventLines = (e: EventStats, max: number): string[] => {
   if (!e.kinds.length) return [];
-  const head = `wakes ${e.hours}h ${e.wakes}${e.wakes ? `, ${perWake(e.calls, e.measured)} calls/wake` : ""}`;
-  const shown = e.kinds.slice(0, max).map((k) => `${k.kind} ${k.events}ev${k.wakes ? ` ${k.wakes}w ${perWake(k.calls, k.measured)}c/w` : ""}`);
-  return [head, `kinds ${e.hours}h: ${shown.join(", ")}${e.kinds.length > max ? `, +${e.kinds.length - max} more` : ""}`];
+  const head = `- Lead woke ${plural(e.wakes, "time")}${e.wakes ? `, ${perWake(e.calls, e.measured)} model calls per wake` : ""}`;
+  const shown = e.kinds.map((k) => `${k.kind} ${plural(k.events, "event")}${k.wakes ? `, ${plural(k.wakes, "wake")}` : ""}`);
+  return [head, `- Busiest: ${list(shown, Math.min(max, 5), 220, "; ")}`];
 };
 /** Discord's limit is 2000 including the code fence the command adds; stay well inside. */
 export const STATUS_MAX_CHARS = 1900;
 
 type Lanes = Status["lanes"];
+/** "- ops (27m, opus-5-5, dori-mode #55): Full run"; a lane in recovery starts with "[recovery gave up]" or "[recovery pending]". */
 const laneLine = (lane: Lanes[number], progress: number): string => {
   const where = [lane.repo, lane.pr !== undefined ? `#${lane.pr}` : ""].filter(Boolean).join(" ");
-  return `  ${[lane.recovery ? `!RECOVERY-${lane.recovery.toUpperCase()}` : "", lane.key, lane.model ? shortModel(lane.model) : "", dur(lane.ageMin), where].filter(Boolean).join(" ")}${lane.progress ? ` | ${clip(lane.progress, progress)}` : ""}`;
+  const facts = [dur(lane.ageMin), lane.model ? shortModel(lane.model) : "", where].filter(Boolean).join(", ");
+  const flag = lane.recovery ? `[recovery ${lane.recovery === "exhausted" ? "gave up" : "pending"}] ` : "";
+  return `- ${flag}${lane.key} (${facts})${lane.progress ? `: ${clip(lane.progress, progress)}` : ""}`;
+};
+
+const LEAD_WORDS: Readonly<Record<LeadState["state"], string>> = { warm: "active", cold: "idle", missing: "missing", unknown: "unknown" };
+const leadLine = (l: Status["lead"]): string => {
+  const state = l.state === "cold" && l.idleMin === undefined ? "stopped" : LEAD_WORDS[l.state];
+  const parts = [
+    `${state}${l.idleMin !== undefined ? ` (last turn ${l.idleMin < 1 ? "just now" : `${dur(l.idleMin)} ago`}, prompt cache ${l.state})` : ""}`,
+    ...(l.tokens !== undefined ? [`context ${kilo(l.tokens)} of ${kilo(l.capTokens)} tokens`] : []),
+  ];
+  return `- ${l.pane || "(no leadPane)"}: ${parts.join(", ")}${l.note ? ` - ${clip(l.note, 100)}` : ""}`;
 };
 
 /** The line under page 1's lanes naming how many more there are (and, paged, where). */
 type More = (hidden: number) => string;
 const plainMore: More = (hidden) => `+${hidden} more`;
 
+/** Short titled sections: a two-line summary, then problems, services, lead, lanes, waits, schedules, gateway and repos, activity. */
 const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const now = Date.parse(s.at);
   const probs = problems(s, now);
-  const head = probs.length
-    ? `DORI PROBLEM ${kst(now)} KST | ${probs.slice(0, 3).map((p) => p.label).join(", ")}${probs.length > 3 ? ` +${probs.length - 3}` : ""}`
-    : `DORI OK ${kst(now)} KST`;
-  const lines = [`${head} | lanes ${s.lanes.length} | waits ${s.waits.length}`];
-  const l = s.lead;
-  lines.push(`lead ${l.pane || "(no leadPane)"} ${l.state}${l.idleMin !== undefined ? ` idle ${dur(l.idleMin)}` : ""}${l.tokens !== undefined ? ` ctx ${kilo(l.tokens)}/${kilo(l.capTokens)}` : ""}${l.note ? ` - ${l.note}` : ""}`);
-  if (l.pendingRestart) lines.push(`lead restart ${l.pendingRestart.id} pending: ${l.pendingRestart.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; next idle boundary`);
-  for (const p of probs) if (p.line) lines.push(`! ${p.line}`);
-  const g = s.github;
-  const healthy = [
-    ...(probs.some((p) => p.line.startsWith("services:")) ? [] : ["services"]),
-    ...(s.gateway.state === "live" ? ["gateway"] : []),
-    ...(s.toodo?.state === "live" ? ["toodo chat"] : []),
-    ...(g.failures.length ? [] : [`github ${g.repos.length} repos, poll ${ago(g.lastPollAt, now)}`]),
-    ...(g.issueAuthors.length ? [`issues ${g.issueRepos.length} repos`] : []),
+  const counts = `${plural(s.lanes.length, "lane")} working, ${s.waits.length ? plural(s.waits.length, "wait") : "no waits"}.`;
+  const lines = [
+    `Dori status - ${kst(now)} KST`,
+    probs.length ? `Needs attention: ${probs.slice(0, 3).map((p) => p.label).join(", ")}${probs.length > 3 ? ` +${probs.length - 3} more` : ""}. ${counts}` : `All good. ${counts}`,
   ];
-  if (healthy.length) lines.push(`ok: ${healthy.join(", ")}`);
-  lines.push(...eventLines(s.events, lim.kinds));
-  lines.push(...sourceLine(s, now));
-  lines.push(...scheduleLine(s, now));
-  if (s.lanes.length) {
-    lines.push("lanes");
-    for (const lane of s.lanes.slice(0, lim.lanes)) lines.push(laneLine(lane, lim.progress));
-    if (s.lanes.length > lim.lanes) lines.push(`  ${more(s.lanes.length - lim.lanes)}`);
-  }
-  if (s.waits.length) {
-    lines.push("waits");
-    for (const w of s.waits.slice(0, lim.waits)) {
+  const section = (title: string, items: readonly string[]) => { if (items.length) lines.push("", title, ...items); };
+
+  section("Problems", probs.filter((p) => p.line).map((p) => `- ${p.line}`));
+  section("Services", s.services.filter((u) => u.name !== LEGACY_PRESENCE || u.active === "active").map((u) => `- ${unitName(u)}: ${unitWords(u)}`));
+
+  const l = s.lead;
+  section("Lead", [
+    leadLine(l),
+    ...(l.pendingRestart ? [clip(`- Restart ${l.pendingRestart.id} pending: ${l.pendingRestart.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}, at the next idle moment`, 300)] : []),
+  ]);
+
+  section(`Lanes (${s.lanes.length})`, s.lanes.length ? [
+    ...s.lanes.slice(0, lim.lanes).map((lane) => laneLine(lane, lim.progress)),
+    ...(s.lanes.length > lim.lanes ? [`- ${more(s.lanes.length - lim.lanes)}`] : []),
+  ] : ["- none"]);
+
+  section(`Waits (${s.waits.length})`, s.waits.length ? [
+    ...s.waits.slice(0, lim.waits).map((w) => {
       const fire = waitFireMs(w);
       const timeout = waitTimeoutMs(w);
-      const when = fire !== null ? `${kst(fire)} KST (${left(fire, now)})`
-        : timeout !== null ? `on signal, timeout ${kst(timeout)} KST (${left(timeout, now)})`
+      const when = fire !== null ? `fires ${kst(fire)} KST (${left(fire, now)})`
+        : timeout !== null ? `on signal, times out ${kst(timeout)} KST (${left(timeout, now)})`
         : `until ${clip(w.until, 50)}`;
-      lines.push(`  ${w.key} ${when}${w.note ? ` | ${clip(w.note, lim.progress)}` : ""}`);
-    }
-    if (s.waits.length > lim.waits) lines.push(`  +${s.waits.length - lim.waits} more`);
-  }
+      return `- ${w.key}: ${when}${w.note ? ` - ${clip(w.note, lim.progress)}` : ""}`;
+    }),
+    ...(s.waits.length > lim.waits ? [`- +${s.waits.length - lim.waits} more`] : []),
+  ] : ["- none"]);
+
+  section("Schedules", scheduleLines(s, now));
+
+  const g = s.github;
+  section("Gateway and repos", [
+    `- Discord gateway: ${s.gateway.state === "live" ? "connected" : clip(s.gateway.text, 120)}`,
+    ...(s.toodo ? [`- Toodo chat: ${s.toodo.state === "live" ? "connected" : clip(s.toodo.text, 120)}`] : []),
+    `- GitHub: ${plural(g.repos.length, "repo")} watched, last poll ${ago(g.lastPollAt, now)}${g.failures.length ? `, ${plural(g.failures.length, "repo")} failing` : ""}`,
+    g.issueAuthors.length ? `- Issues: watching ${plural(g.issueRepos.length, "repo")}` : "- Issues: off (no trusted authors)",
+    ...sourceLine(s, now, lim.kinds),
+  ]);
+
+  section(`Activity (last ${s.events.hours}h)`, eventLines(s.events, lim.kinds));
   return lines.join("\n");
 };
 
-const bounded = (text: string): string =>
-  text.length <= STATUS_MAX_CHARS ? text : `${text.slice(0, STATUS_MAX_CHARS - 12).replace(/[\uD800-\uDBFF]$/, "")}\n[truncated]`;
+/** Over the limit even at the tightest LIMITS row: drop whole lines from the end, never part of one. */
+const bounded = (text: string): string => {
+  if (text.length <= STATUS_MAX_CHARS) return text;
+  const note = "(rest not shown)";
+  const lines = text.split("\n");
+  let size = text.length;
+  while (lines.length > 1 && size + note.length + 1 > STATUS_MAX_CHARS) size -= lines.pop()!.length + 1;
+  const kept = lines.length === 1 ? [clip(lines[0]!, STATUS_MAX_CHARS - note.length - 1)] : lines;
+  return [...kept, note].join("\n");
+};
 
 /** The first LIMITS row whose page 1 fits, and that text. */
 const fit = (s: Status, more: More): { readonly text: string; readonly lim: Limits } => {
@@ -444,7 +499,7 @@ const fit = (s: Status, more: More): { readonly text: string; readonly lim: Limi
   return { text: bounded(build(s, lim, more)), lim };
 };
 
-/** Plain text (no fence; the Discord command adds it), at most STATUS_MAX_CHARS. Healthy parts collapse to one ok line. */
+/** Plain text (no fence; the Discord command adds it), at most STATUS_MAX_CHARS, in short titled sections. */
 export const renderStatus = (s: Status): string => fit(s, plainMore).text;
 
 /** Lane lines on pages 2+: progress clipped like the roomiest page 1, and a line never longer than this. */
@@ -454,8 +509,8 @@ const PAGE_LINE_MAX = 300;
 const PAGE_BODY_MAX = STATUS_MAX_CHARS - 120;
 
 /**
- * `/status` as pages, each at most STATUS_MAX_CHARS: page 1 is renderStatus (the summary with its first lanes) naming the
- * pages that hold the rest, and pages 2.. list the remaining lanes in order, as many as fit, under a one-line header.
+ * `/status` as pages, each at most STATUS_MAX_CHARS: page 1 is renderStatus (the report with its first lanes) naming the
+ * pages that hold the rest, and pages 2.. list the remaining lanes in order, as many as fit, under a short header.
  */
 export const statusPages = (s: Status): string[] => {
   // Choose page 1's limits with the longest "more" line it can get, so the real one never pushes it over.
@@ -476,16 +531,18 @@ export const statusPages = (s: Status): string[] => {
   const now = kst(Date.parse(s.at));
   const first = bounded(build(s, lim, (hidden) => `+${hidden} more on page${total > 2 ? `s 2-${total}` : " 2"}`));
   return [first, ...chunks.map((lines, i) => [
-    `DORI lanes ${now} KST | page ${i + 2}/${total} | lanes ${s.lanes.length}`,
+    `Dori lanes - page ${i + 2} of ${total} - ${now} KST`,
+    "",
+    `Lanes (${s.lanes.length}), continued`,
     ...lines,
-    ...(i + 2 < total ? [`next: page ${i + 3}`] : []),
+    ...(i + 2 < total ? ["", `Next: page ${i + 3}`] : []),
   ].join("\n"))];
 };
 
 /** One page of `/status` (1-based); a page past the end says how many there are. */
 export const statusPage = (s: Status, page: number): string => {
   const pages = statusPages(s);
-  return pages[page - 1] ?? `DORI status has ${pages.length} page${pages.length === 1 ? "" : "s"}; there is no page ${page}.`;
+  return pages[page - 1] ?? `Dori status has ${plural(pages.length, "page")}; there is no page ${page}.`;
 };
 
 /** The /status slash command text: page 1 unless the command named another. */
