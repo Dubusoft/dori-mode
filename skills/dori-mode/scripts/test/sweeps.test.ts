@@ -151,9 +151,9 @@ test("launch reports STARTUP_OK only on a ready agent status after the screen sc
 });
 
 test("the host guard alerts on low disk, clears when it recovers, and flips compute readiness on load", () => {
-  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 };
+  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 };
   const st = { alerting: false } as { alerting: boolean; computeReady?: boolean };
-  const healthy = { load1: 40, memFreePct: 50, diskFreeGb: 200, swapFreeGb: 4, panes: 5 };
+  const healthy = { load1: 40, memFreePct: 50, diskFreeGb: 200, swapFreeGb: 4, swapTotalGb: 8, panes: 5 };
   expect(guardTick(healthy, t, st)).toEqual(["HOST_GUARD COMPUTE_READY load 40 < 80"]);
   expect(guardTick({ ...healthy, diskFreeGb: 12 }, t, st)).toEqual(["HOST_GUARD ALERT disk free 12 GB < 50 GB"]);
   expect(guardTick({ ...healthy, diskFreeGb: 12 }, t, st)).toEqual([]);

@@ -18,6 +18,10 @@ export type GuardThresholds = {
   readonly loadAlert: number;
   readonly loadOk: number;
   readonly memFreeMinPct: number;
+  /** Critical stage: memory free below this percent. */
+  readonly memFreeCritPct: number;
+  /** Critical stage: swap free below this percent of swap total (only when swap exists). */
+  readonly swapFreeCritPct: number;
   readonly diskFreeMinGb: number;
   readonly panesMax: number;
 };
@@ -178,6 +182,8 @@ export type DoriConfig = {
   /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
   readonly resolveTimeoutMin: number;
   readonly heavySlots: number;
+  /** Critical memory pressure kills processes whose full command line contains any of these substrings. */
+  readonly heavyKill: readonly string[];
   readonly heavyMaxLoad: number;
   /** Remote guard: machine label -> ssh target, for machines herdr does not list (overrides a herdr entry of the same label). */
   readonly guardMachines: Readonly<Record<string, string>>;
@@ -277,10 +283,11 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   resolveKinds: DEFAULT_RESOLVE_KINDS,
   resolveTimeoutMin: 15,
   heavySlots: 1,
+  heavyKill: ["qemu-system", "emulator", "expo export"],
   heavyMaxLoad: 80,
   guardMachines: {},
   deadPanePatterns: ["has stopped", "no suitable jobs"],
-  guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 },
+  guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 },
   memoryCheck: { repo: "", maxKb: 15 },
   hooks: {},
   runTimeoutMs: 60_000,
@@ -349,6 +356,13 @@ const laneRules = (raw: unknown): readonly string[] => {
   if (raw === undefined) return [];
   if (!Array.isArray(raw) || raw.some((rule) => typeof rule !== "string")) throw new TypeError("laneRules must be an array of strings");
   return (raw as string[]).map((rule) => rule.trim()).filter(Boolean);
+};
+
+/** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */
+const heavyKill = (raw: unknown, fallback: readonly string[]): readonly string[] => {
+  if (raw === undefined) return fallback;
+  if (!Array.isArray(raw) || raw.some((p) => typeof p !== "string")) throw new TypeError("heavyKill must be an array of strings");
+  return (raw as string[]).map((p) => p.trim()).filter(Boolean);
 };
 
 /** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
@@ -456,6 +470,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
     resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
+    heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },

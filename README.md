@@ -118,7 +118,7 @@ The watcher runs each check itself when it closes the lane, with no shell, and n
 | `dori freshness [--loop MIN]` | nudge lanes that went quiet, then post their last report to their thread |
 | `dori dead-panes [--loop MIN]` | report agent panes that stopped |
 | `dori guard [--loop MIN]` | alert on load, memory, disk and pane count, per worker machine too (`guard install`, `guard machines`) |
-| `dori heavy <label> -- <cmd>` | run a build or test suite only when a slot is free and load is low |
+| `dori heavy <label> -- <cmd>` | run a build, test suite or emulator only when a slot is free and load is low (one per machine) |
 
 Text sent to a pane always goes as one argument, never through a shell string, and the CLI reports each send as delivered or unconfirmed.
 

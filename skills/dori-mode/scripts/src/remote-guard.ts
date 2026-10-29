@@ -13,6 +13,7 @@ const REMOTE_VERSION = '"$HOME/.dori/guard-agent.version"';
 const HEREDOC = "DORI_GUARD_EOF";
 const INSTALL_TIMEOUT_MS = 30_000;
 const SAMPLE_TIMEOUT_MS = 20_000;
+const KILL_TIMEOUT_MS = 30_000;
 
 /** First 12 hex chars of the script's sha256: what `guard-agent.version` holds once installed. */
 export const guardAgentVersion = (script: string): string => createHash("sha256").update(script).digest("hex").slice(0, 12);
@@ -64,6 +65,8 @@ export type MachineSample = {
   readonly load1: number;
   readonly memFreePct: number;
   readonly swapFreeGb: number;
+  /** Total swap in GB; -1 when unknown, including agents that predate the field. */
+  readonly swapTotalGb: number;
   readonly diskFreeGb: number;
 };
 
@@ -79,7 +82,7 @@ export const parseAgentSample = (out: string): MachineSample | undefined => {
     const v = f.get(k);
     return v === undefined || v === "" ? NaN : Number(v);
   };
-  const s = { version: f.get("version") ?? "", os: f.get("os") ?? "", load1: n("load1"), memFreePct: n("mem_free_pct"), swapFreeGb: n("swap_free_gb"), diskFreeGb: n("disk_free_gb") };
+  const s = { version: f.get("version") ?? "", os: f.get("os") ?? "", load1: n("load1"), memFreePct: n("mem_free_pct"), swapFreeGb: n("swap_free_gb"), swapTotalGb: Number.isFinite(n("swap_total_gb")) ? n("swap_total_gb") : -1, diskFreeGb: n("disk_free_gb") };
   if (!s.version || !s.os || ![s.load1, s.memFreePct, s.swapFreeGb, s.diskFreeGb].every(Number.isFinite)) return undefined;
   return s;
 };
@@ -101,6 +104,38 @@ const sampleWith = async (run: Runner, m: GuardMachine, timeoutMs: number): Prom
 
 /** Runs the installed agent's `sample` over ssh. */
 export const sampleMachine = (run: Runner, m: GuardMachine): Promise<SampleResult> => sampleWith(run, m, SAMPLE_TIMEOUT_MS);
+
+export type KillResult =
+  | { ok: true; killed: { pid: number; rssKb: number; cmd: string }[] }
+  | { ok: false; detail: string };
+
+const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/** Parses the agent's `DORI_GUARD_KILLED` lines; undefined without the closing `DORI_GUARD_KILL_DONE` line. */
+const parseKillOutput = (out: string): { pid: number; rssKb: number; cmd: string }[] | undefined => {
+  const killed: { pid: number; rssKb: number; cmd: string }[] = [];
+  let done = false;
+  for (const line of out.split("\n").map((l) => l.trim())) {
+    if (line.startsWith("DORI_GUARD_KILL_DONE")) done = true;
+    const m = /^DORI_GUARD_KILLED pid=(\d+) rss_kb=(\d+) cmd=(\S*)$/.exec(line);
+    if (m) killed.push({ pid: Number(m[1]), rssKb: Number(m[2]), cmd: m[3]! });
+  }
+  return done ? killed : undefined;
+};
+
+/** Runs the installed agent's `kill` over ssh: ends that machine's processes whose command line contains any of `patterns`. */
+export const killOnMachine = async (run: Runner, m: GuardMachine, patterns: readonly string[]): Promise<KillResult> => {
+  const pats = patterns.filter((p) => p.trim());
+  if (pats.length === 0) return { ok: true, killed: [] };
+  const r = await run(sshArgv(m.target, `sh ${REMOTE_SCRIPT} kill ${pats.map(shellQuote).join(" ")}`), { timeoutMs: KILL_TIMEOUT_MS });
+  if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, detail: `unreachable: ${firstLine(r.err) || `ssh exit ${r.code}`}` };
+  if (r.code === 127 || (r.code !== 0 && /No such file|Can't open|cannot open/i.test(r.err))) {
+    return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
+  }
+  if (r.code !== 0) return { ok: false, detail: `kill failed (exit ${r.code}): ${firstLine(r.err) || firstLine(r.out)}` };
+  const killed = parseKillOutput(r.out);
+  return killed ? { ok: true, killed } : { ok: false, detail: `bad kill output: ${firstLine(r.out).slice(0, 200) || "(empty)"}` };
+};
 
 export type InstallResult = { ok: true; version: string } | { ok: false; detail: string };
 
@@ -136,7 +171,6 @@ const machineReasons = (s: MachineSample, t: GuardThresholds): string[] => alert
   load1: s.load1,
   memFreePct: s.memFreePct === -1 ? Infinity : s.memFreePct,
   diskFreeGb: s.diskFreeGb === -1 ? Infinity : s.diskFreeGb,
-  swapFreeGb: s.swapFreeGb,
   panes: -1,
 }, t);
 

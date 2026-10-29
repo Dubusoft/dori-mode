@@ -235,3 +235,18 @@ test("placement refuses a non-object and a malformed fallback", async () => {
     await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement.fallback must be an array of machine names");
   }
 });
+
+test("critical pressure keys default, merge into guard, and heavyKill drops blanks and refuses non-arrays", async () => {
+  const path = join(state.dir, "crit.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  const c = await loadConfig(path, "/home/ana");
+  expect(c.guard.memFreeCritPct).toBe(5);
+  expect(c.guard.swapFreeCritPct).toBe(5);
+  expect(c.heavyKill).toEqual(["qemu-system", "emulator", "expo export"]);
+  await Bun.write(path, JSON.stringify({ guard: { memFreeCritPct: 3 }, heavyKill: [" gradle ", "  "] }));
+  const d = await loadConfig(path, "/home/ana");
+  expect(d.guard).toMatchObject({ memFreeCritPct: 3, swapFreeCritPct: 5, memFreeMinPct: 20 });
+  expect(d.heavyKill).toEqual(["gradle"]);
+  await Bun.write(path, JSON.stringify({ heavyKill: "qemu-system" }));
+  await expect(loadConfig(path, "/home/ana")).rejects.toThrow("heavyKill must be an array of strings");
+});

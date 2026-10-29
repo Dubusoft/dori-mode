@@ -8,7 +8,7 @@ import { canLaunch, clearLaunchHold, enqueueLaunch, heldMachines, idleLaneFor, l
 import { withState } from "./fakes.ts";
 
 const t = defaultConfig("/home/test").guard;
-const roomy = { load1: 200, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, panes: 6 };
+const roomy = { load1: 200, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, swapTotalGb: 4, panes: 6 };
 
 test("a busy CPU alone does not stop a launch; only memory, disk and pane count do", () => {
   expect(canLaunch(roomy, t)).toEqual({ ok: true, reasons: [] });

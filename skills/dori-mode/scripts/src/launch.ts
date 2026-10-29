@@ -197,6 +197,7 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
     "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
     `- For any owner decision, ${ask} and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.`,
     ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
+    `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${remote ? "sh ~/.dori/guard-agent.sh heavy" : "dori heavy"} <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
     ...laneRules.map((rule) => `- ${rule}`),
     ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
   ].join("\n");

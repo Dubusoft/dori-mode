@@ -68,6 +68,11 @@
   ],
   "unhandledNotice": "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
   "heavySlots": 1,
+  "heavyKill": [
+    "qemu-system",
+    "emulator",
+    "expo export"
+  ],
   "heavyMaxLoad": 80,
   "deadPanePatterns": [
     "has stopped",
@@ -77,6 +82,8 @@
     "loadAlert": 150,
     "loadOk": 80,
     "memFreeMinPct": 20,
+    "memFreeCritPct": 5,
+    "swapFreeCritPct": 5,
     "diskFreeMinGb": 50,
     "panesMax": 20
   },

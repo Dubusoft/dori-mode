@@ -8,6 +8,8 @@ export type HostSample = {
   readonly memFreePct: number;
   readonly diskFreeGb: number;
   readonly swapFreeGb: number;
+  /** Total swap in GB; 0 when the host has none, -1 when unreadable. */
+  readonly swapTotalGb: number;
   readonly panes: number;
 };
 
@@ -20,12 +22,13 @@ export const loadNow = (): number => loadavg()[0] ?? 0;
 
 type MemInfoReader = (path: string) => Promise<string>;
 
-const parseMemInfo = (text: string): Pick<HostSample, "memFreePct" | "swapFreeGb"> => {
+const parseMemInfo = (text: string): Pick<HostSample, "memFreePct" | "swapFreeGb" | "swapTotalGb"> => {
   const values = new Map([...text.matchAll(/^(\w+):\s+(\d+)\s+kB$/gm)].map((m) => [m[1]!, Number(m[2])]));
   const total = values.get("MemTotal") ?? 0;
   return {
     memFreePct: total > 0 ? Math.round((values.get("MemAvailable") ?? 0) / total * 100) : 100,
     swapFreeGb: (values.get("SwapFree") ?? 0) / 1_048_576,
+    swapTotalGb: (values.get("SwapTotal") ?? 0) / 1_048_576,
   };
 };
 
@@ -56,15 +59,31 @@ export const sampleHost = async (
   const memory = memInfo === null ? null : parseMemInfo(memInfo);
   const memFreePct = memory?.memFreePct ?? (mp?.code === 0 ? num(/free percentage: (\d+)%/.exec(mp.out)?.[1], 100) : 100);
   const swapFreeGb = memory?.swapFreeGb ?? num(/free = ([\d.]+)M/.exec(swap?.out ?? "")?.[1], 0) / 1024;
-  return { load1: loadNow(), memFreePct, diskFreeGb, swapFreeGb, panes };
+  const macTotal = /total = ([\d.]+)M/.exec(swap?.out ?? "")?.[1];
+  const swapTotalGb = memory?.swapTotalGb ?? (macTotal === undefined ? -1 : num(macTotal, 0) / 1024);
+  return { load1: loadNow(), memFreePct, diskFreeGb, swapFreeGb, swapTotalGb, panes };
 };
 
-export const alertReasons = (s: HostSample, t: GuardThresholds): string[] => {
+export const alertReasons = (s: Pick<HostSample, "load1" | "memFreePct" | "diskFreeGb" | "panes">, t: GuardThresholds): string[] => {
   const r: string[] = [];
   if (s.load1 > t.loadAlert) r.push(`load ${s.load1.toFixed(0)} > ${t.loadAlert}`);
   if (s.memFreePct < t.memFreeMinPct) r.push(`memory free ${s.memFreePct}% < ${t.memFreeMinPct}%`);
   if (s.diskFreeGb < t.diskFreeMinGb) r.push(`disk free ${s.diskFreeGb.toFixed(0)} GB < ${t.diskFreeMinGb} GB`);
   if (t.panesMax > 0 && s.panes > t.panesMax) r.push(`panes ${s.panes} > ${t.panesMax}`);
+  return r;
+};
+
+/**
+ * Why memory is critical: free memory under `memFreeCritPct`, or swap (when the host has any) under `swapFreeCritPct`
+ * free. A negative metric (-1: unreadable) never counts.
+ */
+export const criticalReasons = (s: Pick<HostSample, "memFreePct" | "swapFreeGb" | "swapTotalGb">, t: GuardThresholds): string[] => {
+  const r: string[] = [];
+  if (s.memFreePct >= 0 && s.memFreePct < t.memFreeCritPct) r.push(`memory free ${s.memFreePct}% < ${t.memFreeCritPct}%`);
+  if (s.swapTotalGb > 0 && s.swapFreeGb >= 0) {
+    const pct = s.swapFreeGb / s.swapTotalGb * 100;
+    if (pct < t.swapFreeCritPct) r.push(`swap free ${s.swapFreeGb.toFixed(2)} GB of ${s.swapTotalGb.toFixed(1)} GB (${Math.round(pct)}%) < ${t.swapFreeCritPct}%`);
+  }
   return r;
 };
 

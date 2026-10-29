@@ -56,6 +56,7 @@ export const machineVerdict = (result: SampleResult, panes: number, t: GuardThre
     memFreePct: s.memFreePct === -1 ? Infinity : s.memFreePct,
     diskFreeGb: s.diskFreeGb === -1 ? Infinity : s.diskFreeGb,
     swapFreeGb: s.swapFreeGb,
+    swapTotalGb: s.swapTotalGb,
     panes,
   }, t).reasons];
   if (panes < 0) reasons.push("pane count unreadable");

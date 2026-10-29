@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { GuardThresholds } from "../src/config.ts";
 import {
@@ -8,6 +11,7 @@ import {
   type MachineSample,
   guardAgentVersion,
   installGuardAgent,
+  killOnMachine,
   listGuardMachines,
   machineGuardTick,
   parseAgentSample,
@@ -33,8 +37,8 @@ const fake = (answer: (argv: readonly string[], n: number) => Ran): { run: Runne
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
 const sampleLine = (v: string, extra = "load1=1.5 mem_free_pct=40 swap_free_gb=2.0 disk_free_gb=100") => `DORI_GUARD_SAMPLE version=${v} os=darwin ${extra}`;
 const mac: GuardMachine = { label: "mac mini", target: "me@mac" };
-const T: GuardThresholds = { loadAlert: 10, loadOk: 4, memFreeMinPct: 10, diskFreeMinGb: 20, panesMax: 5 };
-const healthy: MachineSample = { version: "v1", os: "darwin", load1: 1, memFreePct: 50, swapFreeGb: 2, diskFreeGb: 100 };
+const T: GuardThresholds = { loadAlert: 10, loadOk: 4, memFreeMinPct: 10, diskFreeMinGb: 20, panesMax: 5, memFreeCritPct: 5, swapFreeCritPct: 5 };
+const healthy: MachineSample = { version: "v1", os: "darwin", load1: 1, memFreePct: 50, swapFreeGb: 2, swapTotalGb: 4, diskFreeGb: 100 };
 
 test("template path and version", () => {
   expect(GUARD_AGENT_TEMPLATE.endsWith("/templates/guard-agent.sh")).toBe(true);
@@ -67,8 +71,10 @@ test("listGuardMachines merges overrides and sorts; herdr failure yields only ov
 
 test("parseAgentSample reads the sample line, keeps -1 values, rejects junk", () => {
   expect(parseAgentSample(`motd\n${sampleLine("abc", "load1=-1 mem_free_pct=-1 swap_free_gb=-1 disk_free_gb=12.5")}\n`)).toEqual({
-    version: "abc", os: "darwin", load1: -1, memFreePct: -1, swapFreeGb: -1, diskFreeGb: 12.5,
+    version: "abc", os: "darwin", load1: -1, memFreePct: -1, swapFreeGb: -1, swapTotalGb: -1, diskFreeGb: 12.5,
   });
+  expect(parseAgentSample(sampleLine("abc", "load1=1 mem_free_pct=1 swap_free_gb=1 swap_total_gb=4.5 disk_free_gb=1"))?.swapTotalGb).toBe(4.5);
+  expect(parseAgentSample(sampleLine("abc", "load1=1 mem_free_pct=1 swap_free_gb=1 swap_total_gb=junk disk_free_gb=1"))?.swapTotalGb).toBe(-1);
   expect(parseAgentSample("nothing")).toBeUndefined();
   expect(parseAgentSample(sampleLine("abc", "load1=x mem_free_pct=1 swap_free_gb=1 disk_free_gb=1"))).toBeUndefined();
   expect(parseAgentSample(sampleLine("abc", "load1=1 mem_free_pct=1 swap_free_gb=1"))).toBeUndefined();
@@ -76,9 +82,9 @@ test("parseAgentSample reads the sample line, keeps -1 values, rejects junk", ()
 
 test("sampleMachine runs the agent over ssh and maps failures", async () => {
   const good = fake(() => ok(sampleLine("v1")));
-  expect(await sampleMachine(good.run, mac)).toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, diskFreeGb: 100 } });
+  expect(await sampleMachine(good.run, mac)).toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, swapTotalGb: -1, diskFreeGb: 100 } });
   expect(await sampleMachine(fake(() => ({ ...ok(sampleLine("v1")), err: "bash: /x: No such file or directory" })).run, mac))
-    .toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, diskFreeGb: 100 } });
+    .toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, swapTotalGb: -1, diskFreeGb: 100 } });
   expect(good.calls[0]).toEqual({ argv: sshArgv("me@mac", 'sh "$HOME/.dori/guard-agent.sh" sample'), opts: { timeoutMs: 20_000 } });
   expect(sshArgv("t", "c")).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "t", "c"]);
 
@@ -92,6 +98,33 @@ test("sampleMachine runs the agent over ssh and maps failures", async () => {
   expect(await detail({ code: 127, out: "", err: "sh: not found" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
   expect(await detail({ code: 2, out: "", err: "sh: 0: Can't open /home/me/.dori/guard-agent.sh" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
   expect(await detail(ok("garbage"))).toBe("bad sample: garbage");
+});
+
+test("killOnMachine single-quotes patterns, parses killed lines, maps failures", async () => {
+  const out = "DORI_GUARD_KILLED pid=4242 rss_kb=4000000 cmd=qemu-system-x86\nDORI_GUARD_KILLED pid=7 rss_kb=10 cmd=emulator\nDORI_GUARD_KILL_DONE count=2\n";
+  const f = fake(() => ok(out));
+  expect(await killOnMachine(f.run, mac, ["qemu-system", "it's; rm -rf $HOME", "  "])).toEqual({
+    ok: true,
+    killed: [{ pid: 4242, rssKb: 4_000_000, cmd: "qemu-system-x86" }, { pid: 7, rssKb: 10, cmd: "emulator" }],
+  });
+  expect(f.calls[0]).toEqual({
+    argv: sshArgv("me@mac", `sh "$HOME/.dori/guard-agent.sh" kill 'qemu-system' 'it'\\''s; rm -rf $HOME'`),
+    opts: { timeoutMs: 30_000 },
+  });
+  expect(await killOnMachine(fake(() => ok("DORI_GUARD_KILL_DONE count=0")).run, mac, ["x"])).toEqual({ ok: true, killed: [] });
+  const none = fake(() => ok());
+  expect(await killOnMachine(none.run, mac, [" "])).toEqual({ ok: true, killed: [] });
+  expect(none.calls).toHaveLength(0);
+
+  const detail = async (r: Ran) => {
+    const res = await killOnMachine(fake(() => r).run, mac, ["x"]);
+    return res.ok ? "ok" : res.detail;
+  };
+  expect(await detail({ code: 255, out: "", err: "No route to host" })).toBe("unreachable: No route to host");
+  expect(await detail({ code: 124, out: "", err: "timed out", timedOut: true })).toBe("unreachable: timed out");
+  expect(await detail({ code: 127, out: "", err: "" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
+  expect(await detail({ code: 2, out: "", err: "usage: kill" })).toBe("kill failed (exit 2): usage: kill");
+  expect(await detail(ok("garbage"))).toBe("bad kill output: garbage");
 });
 
 test("installGuardAgent writes both files in one heredoc call, then checks the version", async () => {
@@ -215,3 +248,68 @@ test("refreshGuardAgents: current, updated, failed", async () => {
   expect(f.calls.find((c) => c.argv[5] === "c")!.argv[6]).toBe('cat "$HOME/.dori/guard-agent.version"');
   expect(f.calls.filter((c) => c.argv[5] === "c")).toHaveLength(1);
 });
+
+const sh = (args: string[], env: Record<string, string> = {}) =>
+  Bun.spawn(["sh", GUARD_AGENT_TEMPLATE, ...args], { env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+
+/** Reads `stream` until it contains `needle`; the surrounding test timeout bounds the wait. */
+const readUntil = async (stream: ReadableStream<Uint8Array>, needle: string): Promise<string> => {
+  const dec = new TextDecoder();
+  let text = "";
+  for await (const chunk of stream) {
+    text += dec.decode(chunk);
+    if (text.includes(needle)) return text;
+  }
+  throw new Error(`stream ended before ${needle}: ${text}`);
+};
+
+test("agent script: sample prints swap_total_gb", async () => {
+  const p = sh(["sample"]);
+  const out = await new Response(p.stdout).text();
+  expect(await p.exited).toBe(0);
+  expect(out).toMatch(/ swap_free_gb=-?[0-9.]+ swap_total_gb=-?[0-9.]+ disk_free_gb=/);
+  expect(parseAgentSample(out)).toBeDefined();
+});
+
+test("agent script: kill ends only matching processes and reports them", async () => {
+  const uniq = `300.${Date.now()}${process.pid}`;
+  const victim = Bun.spawn(["sleep", uniq], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+  try {
+    const p = sh(["kill", `sleep ${uniq}`]);
+    const out = await new Response(p.stdout).text();
+    expect(await p.exited).toBe(0);
+    const lines = out.trim().split("\n");
+    expect(lines[0]).toMatch(new RegExp(`^DORI_GUARD_KILLED pid=${victim.pid} rss_kb=\\d+ cmd=sleep$`));
+    expect(lines.at(-1)).toBe("DORI_GUARD_KILL_DONE count=1");
+    expect(lines).toHaveLength(2);
+    await victim.exited;
+    expect(victim.signalCode).not.toBeNull();
+
+    const none = sh(["kill", `no-such-process-${uniq}`]);
+    expect((await new Response(none.stdout).text()).trim()).toBe("DORI_GUARD_KILL_DONE count=0");
+  } finally {
+    victim.kill("SIGKILL");
+  }
+});
+
+test("agent script: heavy runs the command, a second one waits for the slot, slot dir is removed", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dori-heavy-"));
+  const env = { HOME: home, DORI_HEAVY_POLL_SEC: "0.1" };
+  try {
+    const first = sh(["heavy", "first", "--", "sh", "-c", `echo first-started; while [ ! -f "${home}/release" ]; do sleep 0.05; done; exit 3`], env);
+    await readUntil(first.stdout, "first-started");
+    expect(existsSync(join(home, ".dori", "heavy", "slot.1", "owner"))).toBe(true);
+
+    const second = sh(["heavy", "second", "--", "echo", "second-ran"], env);
+    const warned = await readUntil(second.stderr, "DORI_HEAVY_WAITING second slot held by ");
+    expect(warned).toMatch(/slot held by \d+ first \d{4}-\d\d-\d\dT/);
+
+    await Bun.write(join(home, "release"), "");
+    expect(await first.exited).toBe(3);
+    expect(await second.exited).toBe(0);
+    expect((await new Response(second.stdout).text()).trim()).toBe("second-ran");
+    expect(readdirSync(join(home, ".dori", "heavy"))).toEqual([]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 20_000);
