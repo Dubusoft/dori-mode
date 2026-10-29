@@ -20,7 +20,8 @@ import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./regi
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
-import { canLaunch, dequeueLaunch, enqueueLaunch, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
@@ -99,7 +100,9 @@ const USAGE = `dori <command> [options]
   guard machines                       the remote guard agent of every saved machine: version and load, memory, swap, disk (GUARD_MACHINE lines)
   guard install [--machine LABEL]      install or update the guard agent over ssh on all listed machines, or one (exit 1 on any failure)
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
-  can-launch [--model M]               exit 0 if the host has room for a new lane, else print why and exit 4
+  can-launch [--machine M] [--cwd D] [--done "..."] [--all]
+                                       exit 0 if the machine a launch with these flags is placed on (none: placement.defaultMachine)
+                                       has room for a new lane, else print why and exit 4; --all checks local and every listed machine
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
@@ -435,21 +438,24 @@ try {
       if (mode !== undefined && !(LANE_MODES as readonly string[]).includes(mode)) die(`--mode must be one of ${LANE_MODES.join(", ")}`);
       const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
       await validateLaunch(deps, input);
-      const gate = launchGate({ sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard });
-      for (const line of gate.lines) console.log(line);
-      if (gate.hold) {
+      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
+      for (const line of plan.lines) console.log(line);
+      const target = plan.check.machine;
+      const machine = target === LOCAL_MACHINE ? undefined : target;
+      if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
+      if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
         const queue = enqueueLaunch(config.stateDir, {
-          key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [gate.hold],
+          key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [plan.check.verdict.reasons.join(" | ")],
           ...(input.cwd ? { cwd: input.cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
           ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}),
-          ...(input.machine ? { machine: input.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
+          ...(machine ? { machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
         });
-        console.log(`HOLD ${gate.hold}`);
+        console.log(verdictLine(target, plan.check.verdict));
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
       }
-      const r = await launchLane(deps, input);
+      const r = await launchLane(deps, { ...input, machine });
       dequeueLaunch(config.stateDir, input.key);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
@@ -620,10 +626,17 @@ try {
       break;
     }
     case "can-launch": {
-      const v = canLaunch(await sampleHost(run, diskGuardPath(config)), config.guard);
-      recordLaunchVerdict(config.stateDir, v, Date.now());
-      console.log(v.ok ? "CAN_LAUNCH" : `HOLD ${v.reasons.join(" | ")}`);
-      process.exit(v.ok ? 0 : 4);
+      const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines) : [];
+      const machines = flags.values.all
+        ? [LOCAL_MACHINE, ...listed.map((m) => m.label)]
+        : [resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement).machine];
+      const checks = await Promise.all(machines.map((m) => checkMachine(run, config, m, flags.values.all ? { listMachines: async () => listed } : {})));
+      const at = Date.now();
+      for (const c of checks) {
+        recordLaunchVerdict(config.stateDir, c.verdict, at, c.machine);
+        console.log(verdictLine(c.machine, c.verdict));
+      }
+      process.exit(checks.every((c) => c.verdict.ok) ? 0 : 4);
     }
     case "memory": {
       if (key !== "check" || flags.positionals.length > 1 || Object.keys(flags.values).length) die("usage: dori memory check", 2);

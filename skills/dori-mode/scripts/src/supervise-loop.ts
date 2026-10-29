@@ -22,6 +22,7 @@ import { GUARD_AGENT_TEMPLATE, type GuardMachine, guardAgentVersion, listGuardMa
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
 import { canLaunch, clearLaunchHold, launchHeld } from "./routing.ts";
+import { machineVerdict, summaryOf } from "./placement.ts";
 import { Discord } from "./messenger/discord.ts";
 import { acquireDiscordGateway } from "./messenger/discord-lock.ts";
 import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/discord-supervisor.ts";
@@ -238,6 +239,14 @@ export const supervisorSweeps = (
           return keys.length ? `lanes on this machine: ${keys.join(", ")}` : undefined;
         };
         for (const line of machineGuardTick(results, deps.config.guard, want, machineGuard, lanesOn)) await emit(line);
+        // A machine held by `dori can-launch --machine` or a queued launch resumes the same way, from this round's pane list.
+        for (const { machine: { label }, result } of results) {
+          if (!result.ok || !launchHeld(deps.config.stateDir, label)) continue;
+          const panes = await view.panes(label).then((p) => p.length, () => -1);
+          if (!machineVerdict(result, panes, deps.config.guard, label).ok) continue;
+          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
+          clearLaunchHold(deps.config.stateDir, label);
+        }
       }
       return [];
     }],
