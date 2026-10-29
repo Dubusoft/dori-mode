@@ -10,10 +10,9 @@ import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
-import { readFile } from "node:fs/promises";
 import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
 import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
-import { GUARD_AGENT_TEMPLATE, guardAgentVersion, installGuardAgent, listGuardMachines, refreshGuardAgents, sampleMachine } from "./remote-guard.ts";
+import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -288,7 +287,7 @@ try {
       }
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
-        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readFile(GUARD_AGENT_TEMPLATE, "utf8"), (line) => console.log(line)),
+        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readGuardAgentScripts(), (line) => console.log(line)),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
@@ -579,12 +578,12 @@ try {
         if (flags.positionals.length > 1 || (key === "machines" && opt("machine") !== undefined)) die("usage: dori guard machines | dori guard install [--machine LABEL]", 2);
         const listed = await listGuardMachines(run, config.guardMachines);
         if (key === "machines") {
-          const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
+          const want = guardAgentWants(await readGuardAgentScripts());
           const results = await Promise.all(listed.map(async (m) => ({ m, r: await sampleMachine(run, m) })));
           for (const { m, r } of results) {
             if (!r.ok) { console.log(`GUARD_MACHINE ${m.label} offline ${r.detail.replace(/\s*\n\s*/g, " ")}`); continue; }
             const s = r.sample;
-            console.log(`GUARD_MACHINE ${m.label} online version=${s.version} ${s.version === want ? "current" : "outdated"} load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, swap free ${s.swapFreeGb.toFixed(1)} GB, disk free ${s.diskFreeGb.toFixed(0)} GB`);
+            console.log(`GUARD_MACHINE ${m.label} online version=${s.version} ${s.version === wantFor(want, s.os) ? "current" : "outdated"} load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, swap free ${s.swapFreeGb.toFixed(1)} GB, disk free ${s.diskFreeGb.toFixed(0)} GB`);
           }
           break;
         }
@@ -592,11 +591,13 @@ try {
         const targets = wanted === undefined ? listed : listed.filter((m) => m.label === wanted);
         if (wanted !== undefined && !targets.length) die(`unknown machine ${wanted}; known: ${listed.map((m) => m.label).join(", ") || "(none)"}`);
         if (!targets.length) die("GUARD_AGENT_INSTALL_FAILED - no machines listed (herdr machine list, config guardMachines)");
-        const script = await readFile(GUARD_AGENT_TEMPLATE, "utf8");
+        const scripts = await readGuardAgentScripts();
         const outcomes = await Promise.all(targets.map(async (m) => {
-          const r = await installGuardAgent(run, m, script).catch((e: unknown): { ok: false; detail: string } => ({ ok: false, detail: e instanceof Error ? e.message : String(e) }));
-          console.log(r.ok ? `GUARD_AGENT_INSTALLED ${m.label} ${r.version}` : `GUARD_AGENT_INSTALL_FAILED ${m.label} ${r.detail.replace(/\s*\n\s*/g, " ")}`);
-          return r.ok;
+          const r = await installGuardAgent(run, m, scripts).catch((e: unknown): InstallResult => ({ ok: false, detail: e instanceof Error ? e.message : String(e) }));
+          console.log(r.ok ? `GUARD_AGENT_INSTALLED ${m.label} ${r.version}`
+            : `${r.unsupported ? "GUARD_AGENT_SKIPPED" : "GUARD_AGENT_INSTALL_FAILED"} ${m.label} ${r.detail.replace(/\s*\n\s*/g, " ")}`);
+          // A worker whose shell is not POSIX sh is skipped, not failed.
+          return r.ok || r.unsupported === true;
         }));
         if (outcomes.includes(false)) process.exitCode = 1;
         break;

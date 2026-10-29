@@ -1,7 +1,7 @@
 import type { DoriConfig, GuardThresholds, PlacementConfig } from "./config.ts";
 import { diskGuardPath, type HostSample, sampleHost } from "./host-guard.ts";
 import { doneRepos } from "./launch.ts";
-import { type GuardMachine, listGuardMachines, type SampleResult, sampleMachine } from "./remote-guard.ts";
+import { type GuardMachine, listGuardMachines, type SampleResult, sampleMachine, UNSUPPORTED_SHELL } from "./remote-guard.ts";
 import { canLaunch, type LaunchVerdict } from "./routing.ts";
 import type { Runner } from "./run.ts";
 
@@ -47,10 +47,13 @@ export const resolvePlacement = (input: PlacementInput, placement: PlacementConf
 
 export type MachineCheck = { readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string };
 
-/** A remote machine's launch verdict: canLaunch's memory/disk/pane rules; -1 metrics never hold, CPU load never holds. */
+/**
+ * A remote machine's launch verdict: canLaunch's memory/disk/pane rules; -1 metrics never hold, CPU load never holds.
+ * A machine whose shell cannot run the guard agent has no metrics, so only its pane count holds.
+ */
 export const machineVerdict = (result: SampleResult, panes: number, t: GuardThresholds, label: string): LaunchVerdict => {
-  if (!result.ok) return { ok: false, reasons: [`machine ${label} unreachable: ${result.detail}`] };
-  const s = result.sample;
+  if (!result.ok && !result.detail.startsWith(UNSUPPORTED_SHELL)) return { ok: false, reasons: [`machine ${label} unreachable: ${result.detail}`] };
+  const s = result.ok ? result.sample : { load1: 0, memFreePct: -1, diskFreeGb: -1, swapFreeGb: -1, swapTotalGb: -1 };
   const reasons = [...canLaunch({
     load1: s.load1,
     memFreePct: s.memFreePct === -1 ? Infinity : s.memFreePct,
