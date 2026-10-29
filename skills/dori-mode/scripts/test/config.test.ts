@@ -208,3 +208,30 @@ test("legacy arrays with no usable entry fall back to the lane model", async () 
   await Bun.write(path, JSON.stringify({ leadModel: [null, " ", {}], defaultModel: "m/default", leadThinking: "low" }));
   expect(leadModels(await loadConfig(path))).toEqual([{ model: "m/default", thinking: "low" }]);
 });
+
+test("placement defaults to local with no workspace rules or fallback", async () => {
+  expect(defaultConfig("/home/ana").placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+  const path = join(state.dir, "placement-none.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+});
+
+test("placement parses trimmed machines, drops blank workspace values, and blank defaultMachine means local", async () => {
+  const path = join(state.dir, "placement.json");
+  await Bun.write(path, JSON.stringify({ placement: { defaultMachine: " big ", workspaces: { "/data/repos": " mini ", "acme/app": "", "*": 3 }, fallback: [" mini ", "big"] } }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "big", workspaces: { "/data/repos": "mini" }, fallback: ["mini", "big"] });
+  await Bun.write(path, JSON.stringify({ placement: { defaultMachine: "  " } }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+});
+
+test("placement refuses a non-object and a malformed fallback", async () => {
+  const path = join(state.dir, "placement-bad.json");
+  for (const placement of ["big", ["big"], null]) {
+    await Bun.write(path, JSON.stringify({ placement }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement must be an object");
+  }
+  for (const fallback of ["big", ["big", " "], [1]]) {
+    await Bun.write(path, JSON.stringify({ placement: { fallback } }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement.fallback must be an array of machine names");
+  }
+});

@@ -97,6 +97,16 @@ export const deliveryConfigError = (delivery: DeliveryConfig): string | undefine
 export const MIN_POINTER_CHARS = 140;
 export const MAX_POINTER_CHARS = 800;
 
+/** Where `dori launch` starts a lane (placement.ts): "local" is this host, anything else a machine label. */
+export type PlacementConfig = {
+  /** Machine for workspace-less launches: "local" (default) or a machine label. */
+  readonly defaultMachine: string;
+  /** Workspace -> machine. Key: an absolute path prefix matched against --cwd, an owner/repo matched (case-insensitive) against the Done line's repos, or "*" for every other workspace task. Value: "local" or a machine label. */
+  readonly workspaces: Readonly<Record<string, string>>;
+  /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
+  readonly fallback: readonly string[];
+};
+
 export type DiscordConfig = {
   readonly applicationId: string;
   readonly guildId: string;
@@ -206,6 +216,8 @@ export type DoriConfig = {
   readonly ciMergeBase: string;
   /** How events reach the lead: pushed pointers with take receipts. */
   readonly delivery: DeliveryConfig;
+  /** Which machine a launch runs on. */
+  readonly placement: PlacementConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -286,6 +298,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
     tailMonitor: true, restartMaxPerHour: 3,
     push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
   },
+  placement: { defaultMachine: "local", workspaces: {}, fallback: [] },
 });
 
 /**
@@ -359,6 +372,20 @@ const stringRecord = (v: unknown): Record<string, string> =>
   typeof v !== "object" || v === null || Array.isArray(v) ? {}
     : Object.fromEntries(Object.entries(v).filter((e): e is [string, string] => typeof e[1] === "string" && e[1].trim() !== ""));
 
+/** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
+const placement = (raw: unknown): PlacementConfig => {
+  if (raw === undefined) return { defaultMachine: "local", workspaces: {}, fallback: [] };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("placement must be an object");
+  const o = raw as Record<string, unknown>;
+  const fallback = o.fallback ?? [];
+  if (!Array.isArray(fallback) || fallback.some((m) => typeof m !== "string" || !m.trim())) throw new TypeError("placement.fallback must be an array of machine names");
+  return {
+    defaultMachine: typeof o.defaultMachine === "string" && o.defaultMachine.trim() ? o.defaultMachine.trim() : "local",
+    workspaces: Object.fromEntries(Object.entries(stringRecord(o.workspaces)).map(([key, machine]) => [key, machine.trim()])),
+    fallback: (fallback as string[]).map((m) => m.trim()),
+  };
+};
+
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
   const base = defaultConfig(home);
   const file = Bun.file(path);
@@ -430,6 +457,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
     guardMachines: stringRecord(raw.guardMachines),
+    placement: placement(raw.placement),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),
