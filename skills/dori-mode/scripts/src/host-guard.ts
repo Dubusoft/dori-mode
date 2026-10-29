@@ -70,13 +70,14 @@ export const alertReasons = (s: HostSample, t: GuardThresholds): string[] => {
 
 export type GuardState = { alerting: boolean; computeReady?: boolean };
 
-export const guardTick = (s: HostSample, t: GuardThresholds, state: GuardState): string[] => {
+/** `alertDetail` (the lanes by memory, who was warned) is appended to an ALERT line after `; `. */
+export const guardTick = (s: HostSample, t: GuardThresholds, state: GuardState, alertDetail?: string): string[] => {
   const out: string[] = [];
   const reasons = alertReasons(s, t);
   const alerting = reasons.length > 0;
   if (alerting !== state.alerting) {
     out.push(alerting
-      ? `HOST_GUARD ALERT ${reasons.join(" | ")}`
+      ? `HOST_GUARD ALERT ${reasons.join(" | ")}${alertDetail ? `; ${alertDetail}` : ""}`
       : `HOST_GUARD CLEAR load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, disk free ${s.diskFreeGb.toFixed(0)} GB, swap free ${s.swapFreeGb.toFixed(1)} GB`);
     state.alerting = alerting;
   }
