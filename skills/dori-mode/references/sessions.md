@@ -24,8 +24,9 @@ Write the brief like a careful prompt:
 - where the code is and what has been learned so far;
 - the ideal end state, from the point of view of whoever uses the result;
 - what not to touch;
-- how and when to report;
-- that PR bodies, issues and commit messages carry no owner quotes, chat message ids, or quota, usage or cost numbers.
+- any exception to the config's `laneRules` this lane needs (for example a lane that merges its own PR).
+
+Leave out what the footer already says to every lane: how to report and claim done, how to ask the owner (`dori report <key> question`, never only an on-screen prompt), that PR bodies, issues, commits and repo docs carry no owner quotes, chat message ids, or quota, usage or cost numbers, that decisions and conversations stay out of the repo, the owner's language (`ownerLanguage`), and the owner's standing policy lines (`laneRules`, such as stopping at a green PR or keeping CI to the typecheck).
 
 **Why the `Done =` line has to be checkable:** the watcher closes lanes on its own, so it can only trust what it can read back itself. `launch` and `adopt` refuse any signal outside this list. Signals are joined with `;`, and every one has to pass.
 

@@ -26,6 +26,16 @@ test("leadDiet defaults to true when absent and parses false from the file", asy
   expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(false);
 });
 
+test("laneRules defaults to none, keeps trimmed non-blank lines, and refuses anything but an array of strings", async () => {
+  const path = join(state.dir, "rules.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  expect((await loadConfig(path, "/home/ana")).laneRules).toEqual([]);
+  await Bun.write(path, JSON.stringify({ laneRules: [" Do not merge. ", "  ", "CI runs the typecheck only."] }));
+  expect((await loadConfig(path, "/home/ana")).laneRules).toEqual(["Do not merge.", "CI runs the typecheck only."]);
+  await Bun.write(path, JSON.stringify({ laneRules: "Do not merge." }));
+  await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
+});
+
 test("a missing config file falls back to defaults and DORI_STATE_DIR wins over the file", async () => {
   process.env.DORI_STATE_DIR = state.dir;
   const c = await loadConfig("/nonexistent/config.json", "/home/ana");

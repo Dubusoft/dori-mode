@@ -146,6 +146,8 @@ export type DoriConfig = {
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
   readonly ownerLanguage?: string;
+  /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
+  readonly laneRules?: readonly string[];
   /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
   readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
@@ -326,6 +328,13 @@ export const languageInstruction = (ownerLanguage: string | undefined): string =
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
 };
 
+/** The config's `laneRules`, trimmed, blanks dropped; throws TypeError unless absent or an array of strings. */
+const laneRules = (raw: unknown): readonly string[] => {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.some((rule) => typeof rule !== "string")) throw new TypeError("laneRules must be an array of strings");
+  return (raw as string[]).map((rule) => rule.trim()).filter(Boolean);
+};
+
 /** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
 const resolveKinds = (raw: unknown): readonly string[] => {
   if (raw === undefined) return DEFAULT_RESOLVE_KINDS;
@@ -411,6 +420,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...merged,
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
     resolveKinds: resolveKinds(raw.resolveKinds),
+    laneRules: laneRules(raw.laneRules),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),
