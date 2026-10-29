@@ -34,7 +34,7 @@ const machineWorld = () => {
   const mem: Record<string, number> = { "u@big": 60, "u@mini": 5, "u@spare": 60 };
   const run: Runner = async (argv) => {
     if (argv[0] === "df") return ok("Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200");
-    if (argv[0] === "ssh") return ok(agentLine(mem[argv[5] ?? ""] ?? 0));
+    if (argv[0] === "ssh") return ok(agentLine(mem[argv[argv.indexOf("--") + 1] ?? ""] ?? 0));
     if (argv[0] === "herdr" && argv[1] === "--machine" && argv[3] === "pane" && argv[4] === "list") {
       return ok(JSON.stringify({ result: { panes: [{ pane_id: `${argv[2]}:p1`, workspace_id: "w" }] } }));
     }
@@ -47,7 +47,7 @@ const machineWorld = () => {
   return { deps, state, queue, tick };
 };
 
-test("the guard sweep emits LAUNCH_READY machine=<label> only for a held remote machine with room, then clears its flag", async () => {
+test("the machine-guard sweep emits LAUNCH_READY machine=<label> only for a held remote machine with room, then clears its flag", async () => {
   const w = machineWorld();
   enqueueLaunch(w.state.dir, held("big-lane", "big"));
   recordLaunchVerdict(w.state.dir, { ok: false, reasons: ["memory free 5% < 20%"] }, T0, "mini");

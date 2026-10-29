@@ -73,6 +73,8 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       await refreshAgents();
       return 0;
     }
+    // Agents first: the restarted supervisor then samples the new agents instead of reporting the old ones OUTDATED.
+    await refreshAgents();
     const restart = await d.run(["systemctl", "--user", "restart", SUPERVISOR_UNIT], { timeoutMs: 120_000 });
     if (restart.code !== 0) d.log(`WARN systemctl restart ${SUPERVISOR_UNIT}: ${(restart.err || restart.out).split("\n")[0]}`);
     let state = "unknown";
@@ -82,7 +84,6 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       await d.sleep(ACTIVE_POLL_MS);
     }
     d.log(`UPDATED ${o.branch} ${short(old)}..${short(now)} supervisor=${state}`);
-    await refreshAgents();
     return state === "active" ? 0 : 1;
   } catch (e) {
     if (!(e instanceof UpdateStop)) throw e;

@@ -54,6 +54,16 @@ test("the done claim and lane-ending events are lead-urgent; a close after a rec
   }
 });
 
+test("a worker machine going OFFLINE or OUTDATED wakes the lead; NOT_INSTALLED, CURRENT and ONLINE are digest", () => {
+  expect(eventClass("HOST_GUARD OFFLINE machine=mac unreachable: timeout")).toBe("lead-urgent");
+  expect(eventClass("HOST_GUARD OUTDATED machine=mac have=a want=b; run dori update")).toBe("lead-urgent");
+  expect(eventClass("HOST_GUARD NOT_INSTALLED machine=mac guard agent not installed; run dori guard install --machine mac")).toBe("lead-digest");
+  expect(eventClass("HOST_GUARD CURRENT machine=mac abcdef012345")).toBe("lead-digest");
+  expect(eventClass("HOST_GUARD ONLINE machine=mac")).toBe("lead-digest");
+  // Digest even under a config whose default is urgent.
+  expect(eventClass("HOST_GUARD NOT_INSTALLED machine=mac x", resolveEventPolicy({ default: "lead-urgent" }))).toBe("lead-digest");
+});
+
 test("LEAD_UNRESPONSIVE (restart cap refused) wakes the lead; a leftover ACK_MISSING line is digest", () => {
   expect(eventClass("LEAD_UNRESPONSIVE push ladder: you did not take pushed events")).toBe("lead-urgent");
   expect(eventClass("ACK_MISSING 1 2 hi")).toBe("lead-digest");

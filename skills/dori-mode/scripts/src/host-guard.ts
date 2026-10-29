@@ -87,6 +87,13 @@ export const criticalReasons = (s: Pick<HostSample, "memFreePct" | "swapFreeGb" 
   return r;
 };
 
+/** Free memory must recover this many points above the threshold before the low-memory flag clears. */
+export const MEM_LOW_CLEAR_MARGIN_PCT = 2;
+
+/** Low memory latches below the threshold and clears only at threshold + MEM_LOW_CLEAR_MARGIN_PCT. */
+export const memIsLow = (s: HostSample, t: GuardThresholds, wasLow = false): boolean =>
+  s.memFreePct < t.memFreeMinPct || (wasLow && s.memFreePct < t.memFreeMinPct + MEM_LOW_CLEAR_MARGIN_PCT);
+
 export type GuardState = { alerting: boolean; computeReady?: boolean; memLow?: boolean };
 
 /** `alertDetail` (the lanes by memory, who was warned) is appended to an ALERT line after `; `. */
@@ -94,7 +101,7 @@ export const guardTick = (s: HostSample, t: GuardThresholds, state: GuardState, 
   const out: string[] = [];
   const reasons = alertReasons(s, t);
   const alerting = reasons.length > 0;
-  const memLow = s.memFreePct < t.memFreeMinPct;
+  const memLow = memIsLow(s, t, state.memLow);
   const alertLine = `HOST_GUARD ALERT ${reasons.join(" | ")}${alertDetail ? `; ${alertDetail}` : ""}`;
   if (alerting === state.alerting) {
     // Already alerting for another reason: memory running low is still reported once.

@@ -351,11 +351,11 @@ export const languageInstruction = (ownerLanguage: string | undefined): string =
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
 };
 
-/** The config's `laneRules`, trimmed, blanks dropped; throws TypeError unless absent or an array of strings. */
+/** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
 const laneRules = (raw: unknown): readonly string[] => {
-  if (raw === undefined) return [];
+  if (raw == null) return [];
   if (!Array.isArray(raw) || raw.some((rule) => typeof rule !== "string")) throw new TypeError("laneRules must be an array of strings");
-  return (raw as string[]).map((rule) => rule.trim()).filter(Boolean);
+  return (raw as string[]).map((rule) => rule.replace(/\s+/g, " ").trim()).filter(Boolean);
 };
 
 /** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */

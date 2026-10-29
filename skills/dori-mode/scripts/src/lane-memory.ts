@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { Runner } from "./run.ts";
+import { LANE_KEY } from "./registry.ts";
 
 /**
  * One process: its parent, resident memory, command name and the DORI_LANE_KEY in its own environment, if any.
@@ -95,7 +96,10 @@ export const sampleProcs = async (
   const rows = ps.out.split("\n").map((line) => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line)).filter((m) => m !== null);
   return Promise.all(rows.map(async (m) => {
     const pid = Number(m[1]);
-    const lane = await readEnviron(pid).then((env) => LANE_ENV.exec(env)?.[1]?.trim() || undefined, () => undefined);
+    const lane = await readEnviron(pid).then((env) => {
+      const key = LANE_ENV.exec(env)?.[1]?.trim();
+      return key && LANE_KEY.test(key) ? key : undefined;
+    }, () => undefined);
     // A command name lands in event lines and pane text, which must not carry shell syntax.
     return { pid, ppid: Number(m[2]), rssKb: Number(m[3]), comm: m[4]!.replace(/[^\w.:+-]/g, "_"), ...(lane ? { lane } : {}), ...(argsByPid.has(pid) ? { args: argsByPid.get(pid)! } : {}) };
   }));
