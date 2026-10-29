@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import type { GuardThresholds } from "../src/config.ts";
 import {
+  clearShellModes,
   GUARD_AGENT_TEMPLATE,
   type GuardMachine,
   type MachineGuardState,
@@ -29,11 +30,13 @@ import type { Ran, RunOptions, Runner } from "../src/run.ts";
 
 type Call = { argv: string[]; opts: RunOptions | undefined };
 
-/** A Runner answering each call from `answer`, recording argv and options. */
+/** A Runner answering each call from `answer`, recording argv and options; a fresh fake forgets every machine's shell mode and its login shell answers the POSIX probe. */
 const fake = (answer: (argv: readonly string[], n: number) => Ran): { run: Runner; calls: Call[] } => {
+  clearShellModes();
   const calls: Call[] = [];
   const run: Runner = async (argv, opts) => {
     calls.push({ argv: [...argv], opts });
+    if (argv.at(-1)?.startsWith("x=6;")) return ok("DORI_POSIX_42");
     return answer(argv, calls.length - 1);
   };
   return { run, calls };
@@ -44,7 +47,7 @@ const sampleLine = (v: string, extra = "load1=1.5 mem_free_pct=40 swap_free_gb=2
 const mac: GuardMachine = { label: "mac mini", target: "me@mac" };
 const T: GuardThresholds = { loadAlert: 10, loadOk: 4, memFreeMinPct: 10, diskFreeMinGb: 20, panesMax: 5, memFreeCritPct: 5, swapFreeCritPct: 5 };
 const healthy: MachineSample = { version: "v1", os: "darwin", load1: 1, memFreePct: 50, swapFreeGb: 2, swapTotalGb: 4, diskFreeGb: 100 };
-const settled = { notInstalled: false, failures: 0, nextAttemptAt: 0 };
+const settled = { notInstalled: false, unsupported: false, failures: 0, nextAttemptAt: 0 };
 
 test("template path and version", () => {
   expect(GUARD_AGENT_TEMPLATE.endsWith("/templates/guard-agent.sh")).toBe(true);
@@ -102,7 +105,7 @@ test("sampleMachine runs the agent over ssh and maps failures", async () => {
   expect(await sampleMachine(good.run, mac)).toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, swapTotalGb: -1, diskFreeGb: 100 } });
   expect(await sampleMachine(fake(() => ({ ...ok(sampleLine("v1")), err: "bash: /x: No such file or directory" })).run, mac))
     .toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, swapTotalGb: -1, diskFreeGb: 100 } });
-  expect(good.calls[0]).toEqual({ argv: sshArgv("me@mac", 'sh "$HOME/.dori/guard-agent.sh" sample'), opts: { timeoutMs: 20_000 } });
+  expect(good.calls[1]).toEqual({ argv: sshArgv("me@mac", 'sh "$HOME/.dori/guard-agent.sh" sample'), opts: { timeoutMs: 20_000 } });
   expect(sshArgv("t", "c")).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "t", "c"]);
   // A target that looks like an option stays a target.
   expect(sshArgv("-oProxyCommand=x", "c").slice(-3)).toEqual(["--", "-oProxyCommand=x", "c"]);
@@ -126,7 +129,7 @@ test("killOnMachine single-quotes patterns, parses killed lines, maps failures",
     ok: true,
     killed: [{ pid: 4242, rssKb: 4_000_000, cmd: "qemu-system-x86" }, { pid: 7, rssKb: 10, cmd: "emulator" }],
   });
-  expect(f.calls[0]).toEqual({
+  expect(f.calls[1]).toEqual({
     argv: sshArgv("me@mac", `sh "$HOME/.dori/guard-agent.sh" kill 'qemu-system' 'it'\\''s; rm -rf $HOME'`),
     opts: { timeoutMs: 30_000 },
   });
@@ -149,10 +152,10 @@ test("killOnMachine single-quotes patterns, parses killed lines, maps failures",
 test("installGuardAgent writes both files to temp files and moves them into place in one call, then checks the version", async () => {
   const script = "#!/bin/sh\necho hi\n";
   const v = guardAgentVersion(script);
-  const f = fake((_argv, n) => (n === 0 ? ok() : ok(sampleLine(v))));
-  expect(await installGuardAgent(f.run, mac, script)).toEqual({ ok: true, version: v });
-  expect(f.calls).toHaveLength(2);
-  const [first, second] = f.calls;
+  const f = fake((_argv, n) => (n === 1 ? ok() : ok(sampleLine(v))));
+  expect(await installGuardAgent(f.run, mac, { sh: script, ps: "" })).toEqual({ ok: true, version: v });
+  expect(f.calls).toHaveLength(3);
+  const [, first, second] = f.calls;
   expect(first!.opts).toEqual({ timeoutMs: 30_000 });
   expect(second!.opts).toEqual({ timeoutMs: 30_000 });
   expect(first!.argv.slice(0, 7)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "me@mac"]);
@@ -169,11 +172,11 @@ test("installGuardAgent writes both files to temp files and moves them into plac
   ].join("\n"));
   expect(second!.argv.at(-1)).toBe('sh "$HOME/.dori/guard-agent.sh" sample');
 
-  const mismatch = await installGuardAgent(fake((_a, n) => (n === 0 ? ok() : ok(sampleLine("old")))).run, mac, script);
+  const mismatch = await installGuardAgent(fake((_a, n) => (n === 1 ? ok() : ok(sampleLine("old")))).run, mac, { sh: script, ps: "" });
   expect(mismatch).toEqual({ ok: false, detail: `version check failed: have=old want=${v}` });
-  const down = await installGuardAgent(fake(() => ({ code: 255, out: "", err: "Connection refused" })).run, mac, script);
+  const down = await installGuardAgent(fake(() => ({ code: 255, out: "", err: "Connection refused" })).run, mac, { sh: script, ps: "" });
   expect(down).toEqual({ ok: false, detail: "unreachable: Connection refused" });
-  await expect(installGuardAgent(f.run, mac, "a\nDORI_GUARD_EOF\nb")).rejects.toThrow("heredoc delimiter");
+  await expect(installGuardAgent(f.run, mac, { sh: "a\nDORI_GUARD_EOF\nb", ps: "" })).rejects.toThrow("heredoc delimiter");
 });
 
 test("machineGuardTick: first sight reports only problems", () => {
@@ -281,7 +284,7 @@ test("machineGuardTick: offline keeps alert and outdated state; online resumes",
   expect(tick({ ok: false, detail: "unreachable: timeout" })).toEqual([]);
   expect(tick({ ok: false, detail: "unreachable: timeout" })).toEqual(["HOST_GUARD OFFLINE machine=mac_mini unreachable: timeout"]);
   expect(tick({ ok: false, detail: "unreachable: still" })).toEqual([]);
-  expect(state.get("mac mini")).toEqual({ alerting: true, offline: true, outdated: true, notInstalled: false, failures: 3, nextAttemptAt: 8 * 60_000 });
+  expect(state.get("mac mini")).toEqual({ alerting: true, offline: true, outdated: true, notInstalled: false, unsupported: false, failures: 3, nextAttemptAt: 8 * 60_000 });
   // Back with the same problems: only ONLINE.
   expect(tick({ ok: true, sample: { ...healthy, version: "v0", load1: 20 } })).toEqual(["HOST_GUARD ONLINE machine=mac_mini"]);
   // Updated and healthy: CLEAR, and CURRENT for the version.
@@ -326,7 +329,7 @@ test("refreshGuardAgents: current, updated, unreachable, failed", async () => {
     return ok();
   });
   const logs: string[] = [];
-  expect(await refreshGuardAgents(f.run, machines, script, (l) => logs.push(l))).toBe(3);
+  expect(await refreshGuardAgents(f.run, machines, { sh: script, ps: "" }, (l) => logs.push(l))).toBe(3);
   expect(logs.sort()).toEqual([
     `GUARD_AGENT_CURRENT cur ${v}`,
     "GUARD_AGENT_FAILED odd version probe failed (exit 2): Permission denied",
@@ -336,10 +339,9 @@ test("refreshGuardAgents: current, updated, unreachable, failed", async () => {
     `GUARD_AGENT_UPDATED new none..${v}`,
     `GUARD_AGENT_UPDATED old aaaaaaaaaaaa..${v}`,
   ]);
-  expect(f.calls.find((c) => c.argv[6] === "c")!.argv[7]).toBe('cat "$HOME/.dori/guard-agent.version"');
-  expect(f.calls.filter((c) => c.argv[6] === "c")).toHaveLength(1);
-  // Unreachable and failed probes never attempt an install.
-  for (const t of ["d", "s", "x"]) expect(f.calls.filter((c) => c.argv[6] === t)).toHaveLength(1);
+  expect(f.calls.filter((c) => c.argv[6] === "c").map((c) => c.argv[7])).toEqual(['x=6; echo "DORI_POSIX_$((x*7))"', 'cat "$HOME/.dori/guard-agent.version"']);
+  // Unreachable and failed version probes never attempt an install.
+  for (const t of ["d", "s", "x"]) expect(f.calls.filter((c) => c.argv[6] === t)).toHaveLength(2);
 });
 
 const sh = (args: string[], env: Record<string, string> = {}) =>

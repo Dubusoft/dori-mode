@@ -181,7 +181,7 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
  * here so a brief need not repeat them; the owner's own policy lines (`laneRules`: merge policy, CI policy) follow them.
  * Nothing lane-specific (key, thread, pane, Done line) may appear here; that is the "### This lane" section.
  */
-export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => {
+export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = [], shell?: PaneShell): string => {
   const remote = Boolean(lane.machine);
   const claim = remote ? "print the done line below in your own output" : lane.reportVia === "cli" ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
   const ask = remote ? "print a question report line below in your own output" : lane.reportVia === "cli" ? "run the dori report question command below" : "send a question report line below";
@@ -197,7 +197,7 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
     "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
     `- For any owner decision, ${ask} and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.`,
     ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
-    `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${remote ? "sh ~/.dori/guard-agent.sh heavy" : "dori heavy"} <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
+    `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${remote ? (shell === "powershell" ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\\.dori\\guard-agent.ps1" heavy' : "sh ~/.dori/guard-agent.sh heavy") : "dori heavy"} <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
     ...laneRules.map((rule) => `- ${rule}`),
     ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
   ].join("\n");
@@ -205,10 +205,10 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
 
 const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 
-export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, laneRules?: readonly string[]): string => [
+export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, laneRules?: readonly string[], shell?: PaneShell): string => [
   "",
   FOOTER_HEADING.slice(1),
-  footerDoneRules(lane, ownerLanguage, laneRules),
+  footerDoneRules(lane, ownerLanguage, laneRules, shell),
   "",
   "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
@@ -373,12 +373,6 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   if (token) draft = await reserveLane(deps, input, draft, token);
   let agentAdmitted = false;
   try {
-    // A relaunched local lane still on the old [REPORT] footer gets its footer replaced by the dori report one.
-    const migrate = Boolean(existing && !existing.reportVia && !input.machine);
-    const text = await briefFile.text();
-    const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;
-    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage, deps.config.laneRules)}`;
-    if (!existing || migrate) await Bun.write(input.brief, brief);
     let pane: string;
     let tab: string | undefined;
     let shell: PaneShell = "posix";
@@ -402,6 +396,13 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
         }
       }
     }
+    // The footer is written once the pane's shell is known: a PowerShell pane gets the PowerShell guard agent form.
+    // A relaunched local lane still on the old [REPORT] footer gets its footer replaced by the dori report one.
+    const migrate = Boolean(existing && !existing.reportVia && !input.machine);
+    const text = await briefFile.text();
+    const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;
+    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage, deps.config.laneRules, shell)}`;
+    if (!existing || migrate) await Bun.write(input.brief, brief);
     const agentArgv = (briefPath: string): string[] => {
       const keywords = mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords;
       const prompt = `${keywords}. Read and execute the lane brief at ${briefPath} in full. You are the ${input.key} lane; report as the brief's footer says.`;

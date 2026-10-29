@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { Lane } from "../src/registry.ts";
-import { GUARD_AGENT_TEMPLATE, guardAgentVersion } from "../src/remote-guard.ts";
+import { clearShellModes, GUARD_AGENT_TEMPLATE, guardAgentVersion } from "../src/remote-guard.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { MACHINE_GUARD_STATE_FILE, supervisorSweeps } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -20,6 +20,7 @@ const sample = (load1 = 1): Ran => ({ code: 0, out: `DORI_GUARD_SAMPLE version=$
 const world = () => {
   const s = withState();
   cleanups.push(s.done);
+  clearShellModes();
   const clock = fakeClock(T0);
   let list: () => Ran = () => ({ code: 0, out: JSON.stringify([{ label: "mac", ssh_target: "me@mac" }]), err: "" });
   let ssh: (target: string) => Ran = () => sample();
@@ -27,7 +28,11 @@ const world = () => {
   const run: Runner = async (argv) => {
     calls.push([...argv]);
     if (argv.join(" ") === "herdr machine list --json") return list();
-    if (argv[0] === "ssh") return ssh(argv[argv.indexOf("--") + 1] ?? "");
+    if (argv[0] === "ssh") {
+      const r = ssh(argv[argv.indexOf("--") + 1] ?? "");
+      // The login shell is POSIX sh: a reachable machine answers the shell probe.
+      return argv.at(-1)?.startsWith("x=6;") && r.code === 0 ? { ...r, out: "DORI_POSIX_42" } : r;
+    }
     return { code: 1, out: "", err: "unexpected" };
   };
   const deps = { ...depsFor(newWorld(), clock, s.dir), run };
@@ -89,7 +94,8 @@ test("OFFLINE only on the second failure in a row, failed machines back off, and
   expect(await w.tick()).toEqual(["HOST_GUARD ONLINE machine=mac"]);
   w.clock.at += 30_000;
   expect(await w.tick()).toEqual([]);
-  expect(w.sshCalls()).toBe(5);
+  // The first reachable round also probes the shell once.
+  expect(w.sshCalls()).toBe(6);
 });
 
 test("a failed herdr machine list keeps the previous list, warns, and is retried within a minute", async () => {
@@ -99,7 +105,7 @@ test("a failed herdr machine list keeps the previous list, warns, and is retried
   w.setList(() => ({ code: 1, out: "", err: "herdr: server unreachable" }));
   w.clock.at += 10 * 60_000;
   expect(await w.tick()).toEqual(["SWEEP_WARN machine-guard herdr machine list failed: herdr: server unreachable"]);
-  expect(w.sshCalls()).toBe(2);
+  expect(w.sshCalls()).toBe(3);
   w.clock.at += 30_000;
   await w.tick();
   expect(w.listCalls()).toBe(2);
@@ -109,7 +115,7 @@ test("a failed herdr machine list keeps the previous list, warns, and is retried
   expect(w.listCalls()).toBe(3);
   expect(lines).toHaveLength(1);
   expect(lines[0]).toStartWith("SWEEP_WARN machine-guard herdr machine list failed: invalid JSON: ");
-  expect(w.sshCalls()).toBe(4);
+  expect(w.sshCalls()).toBe(5);
 });
 
 test("a machine ALERT names lanes whose machine is the herdr machine id as well as the label", async () => {

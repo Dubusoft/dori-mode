@@ -1,6 +1,6 @@
 export type Ran = { readonly code: number; readonly out: string; readonly err: string; readonly timedOut?: boolean };
-/** `timeoutMs` overrides the default for one call; 0 means no limit. */
-export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number };
+/** `timeoutMs` overrides the default for one call; 0 means no limit. `stdin`, when set, is written to the command's stdin. */
+export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number; readonly stdin?: string };
 export type Runner = (argv: readonly string[], opts?: RunOptions) => Promise<Ran>;
 
 /** Exit code a timed-out call reports (as coreutils `timeout` does). */
@@ -28,7 +28,10 @@ export const run: Runner = async (argv, opts = {}) => {
   const limit = opts.timeoutMs ?? defaultTimeoutMs;
   let p: ReturnType<typeof Bun.spawn>;
   try {
-    p = Bun.spawn([...argv], { detached: true, stdout: "pipe", stderr: "pipe", ...(opts.cwd ? { cwd: opts.cwd } : {}) });
+    p = Bun.spawn([...argv], {
+      detached: true, stdout: "pipe", stderr: "pipe", ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts.stdin !== undefined ? { stdin: new Blob([opts.stdin]) } : {}),
+    });
   } catch (e) {
     return { code: 127, out: "", err: e instanceof Error ? e.message : String(e) };
   }
