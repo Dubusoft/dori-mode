@@ -12,7 +12,10 @@ import { freshnessTick, scrubForThread } from "./freshness.ts";
 import { lookupQuotaResults, quotaReport } from "./claude-quota.ts";
 import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
 import { memorySweep } from "./memory-check.ts";
-import { diskGuardPath, type GuardState, guardTick, sampleHost } from "./host-guard.ts";
+import { alertReasons, diskGuardPath, type GuardState, guardTick, type HostSample, sampleHost } from "./host-guard.ts";
+import { describeLane, type LaneMemory, laneMemory, laneMemoryDetail, type Proc, sampleProcs } from "./lane-memory.ts";
+import { sendGuarded } from "./panes.ts";
+import type { Lane } from "./registry.ts";
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
 import { canLaunch, clearLaunchHold, launchHeld } from "./routing.ts";
 import { Discord } from "./messenger/discord.ts";
@@ -128,6 +131,39 @@ export class Watchdog {
   }
 }
 
+/**
+ * Types a memory warning into the pane of the heaviest open local lane (remote lanes run on another host's memory), so
+ * the lane stops what it does not need without the lead relaying it. Returns what happened, for the lead's ALERT line.
+ */
+export const warnHeaviestLane = async (run: Runner, lanes: readonly LaneMemory[], open: readonly Lane[], reason: string): Promise<string> => {
+  const local = new Map(open.filter((l) => l.pane && !l.machine).map((l) => [l.key, l]));
+  const target = lanes.find((l) => local.has(l.lane));
+  const lane = target && local.get(target.lane);
+  if (!target || !lane?.pane) return "no open local lane to warn";
+  const text = systemText(`HOST_GUARD memory warning: ${reason} on this host, and this lane (${target.lane}) uses the most memory: ${describeLane(target)}. `
+    + "Stop what you are not using now (an emulator, an expo or dev server, a watcher or test runner), then go on with your task. The lead has been told.");
+  return await sendGuarded(run, lane.pane, text) === "sent" ? `warned ${target.lane} in its pane ${lane.pane}` : `could not warn ${target.lane} in its pane ${lane.pane}`;
+};
+
+/**
+ * The detail of a new HOST_GUARD ALERT: the heaviest lanes by memory and, when free memory is below its threshold, the
+ * warning sent to the heaviest lane. A failure here never costs the ALERT itself.
+ */
+export const guardAlertDetail = async (
+  deps: Pick<FlowDeps, "run" | "config" | "registry">, sample: HostSample, procs: () => Promise<Proc[]> = () => sampleProcs(deps.run),
+): Promise<string | undefined> => {
+  try {
+    const lanes = laneMemory(await procs());
+    const detail = laneMemoryDetail(lanes);
+    const min = deps.config.guard.memFreeMinPct;
+    if (sample.memFreePct >= min) return detail;
+    const warned = await warnHeaviestLane(deps.run, lanes, await deps.registry.open(), `memory free ${sample.memFreePct}% < ${min}%`);
+    return [detail, warned].filter(Boolean).join("; ");
+  } catch (e) {
+    return `lane memory unreadable: ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 120)}`;
+  }
+};
+
 /** A named sweep. It may hand lines over itself through `emit` (as they happen) and/or return them. */
 export type Sweep = readonly [name: string, step: (emit: Emit) => Promise<readonly string[]>];
 
@@ -167,7 +203,8 @@ export const supervisorSweeps = (
     }],
     ["guard", async (emit) => {
       const sample = await sampleHost(deps.run, diskGuardPath(deps.config), () => view.panes().then((panes) => panes.length, () => -1));
-      for (const line of guardTick(sample, deps.config.guard, guard)) await emit(line);
+      const detail = !guard.alerting && alertReasons(sample, deps.config.guard).length ? await guardAlertDetail(deps, sample) : undefined;
+      for (const line of guardTick(sample, deps.config.guard, guard, detail)) await emit(line);
       // Work queued on a HOLD from `dori can-launch` resumes on this, whichever host threshold kept it held. An
       // unreadable pane count (-1) proves no room.
       if (sample.panes >= 0 && launchHeld(deps.config.stateDir) && canLaunch(sample, deps.config.guard).ok) {

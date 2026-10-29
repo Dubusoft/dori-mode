@@ -10,7 +10,8 @@ import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
-import { diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
+import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
+import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -560,7 +561,9 @@ try {
       const state = { alerting: false };
       console.log("HOST_GUARD_READY");
       await every(loopMin, async () => {
-        for (const line of guardTick(await sampleHost(run, diskGuardPath(config)), config.guard, state)) console.log(line);
+        const sample = await sampleHost(run, diskGuardPath(config));
+        const detail = !state.alerting && alertReasons(sample, config.guard).length ? laneMemoryDetail(laneMemory(await sampleProcs(run))) : undefined;
+        for (const line of guardTick(sample, config.guard, state, detail)) console.log(line);
       });
       break;
     }
