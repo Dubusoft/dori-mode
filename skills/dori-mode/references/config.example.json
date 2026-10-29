@@ -56,6 +56,7 @@
   "resolveKinds": [
     "LANE_REPORT * question",
     "LANE_REPORT * blocked",
+    "LANE_ASKING",
     "LANE_REPORT_LATE * question",
     "LANE_REPORT_LATE * blocked",
     "LANE_REPORT_LATE * done",
