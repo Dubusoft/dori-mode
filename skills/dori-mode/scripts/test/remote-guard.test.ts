@@ -77,6 +77,8 @@ test("parseAgentSample reads the sample line, keeps -1 values, rejects junk", ()
 test("sampleMachine runs the agent over ssh and maps failures", async () => {
   const good = fake(() => ok(sampleLine("v1")));
   expect(await sampleMachine(good.run, mac)).toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, diskFreeGb: 100 } });
+  expect(await sampleMachine(fake(() => ({ ...ok(sampleLine("v1")), err: "bash: /x: No such file or directory" })).run, mac))
+    .toEqual({ ok: true, sample: { version: "v1", os: "darwin", load1: 1.5, memFreePct: 40, swapFreeGb: 2, diskFreeGb: 100 } });
   expect(good.calls[0]).toEqual({ argv: sshArgv("me@mac", 'sh "$HOME/.dori/guard-agent.sh" sample'), opts: { timeoutMs: 20_000 } });
   expect(sshArgv("t", "c")).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "t", "c"]);
 

@@ -147,6 +147,8 @@ export const warnHeaviestLane = async (run: Runner, lanes: readonly LaneMemory[]
   const target = lanes.find((l) => local.has(l.lane));
   const lane = target && local.get(target.lane);
   if (!target || !lane?.pane) return "no open local lane to warn";
+  // The question dialog reads digits, space and 'c' as keys, so typing there could submit an answer nobody chose.
+  if (lane.lastAskPrompt) return `not typed: ${target.lane} is on a question prompt`;
   const text = systemText(`HOST_GUARD memory warning: ${reason} on this host, and this lane (${target.lane}) uses the most memory: ${describeLane(target)}. `
     + "Stop what you are not using now (an emulator, an expo or dev server, a watcher or test runner), then go on with your task. The lead has been told.");
   return await sendGuarded(run, lane.pane, text) === "sent" ? `warned ${target.lane} in its pane ${lane.pane}` : `could not warn ${target.lane} in its pane ${lane.pane}`;
@@ -213,7 +215,8 @@ export const supervisorSweeps = (
     }],
     ["guard", async (emit) => {
       const sample = await sampleHost(deps.run, diskGuardPath(deps.config), () => view.panes().then((panes) => panes.length, () => -1));
-      const detail = !guard.alerting && alertReasons(sample, deps.config.guard).length ? await guardAlertDetail(deps, sample) : undefined;
+      const memJustLow = sample.memFreePct < deps.config.guard.memFreeMinPct && !guard.memLow;
+      const detail = (memJustLow || (!guard.alerting && alertReasons(sample, deps.config.guard).length)) ? await guardAlertDetail(deps, sample) : undefined;
       for (const line of guardTick(sample, deps.config.guard, guard, detail)) await emit(line);
       // Work queued on a HOLD from `dori can-launch` resumes on this, whichever host threshold kept it held. An
       // unreadable pane count (-1) proves no room.

@@ -82,6 +82,22 @@ test("a remote or closed heaviest lane is skipped for the next open local one", 
   expect(await warnHeaviestLane(run, lanes, [], "memory free 4% < 10%")).toBe("no open local lane to warn");
 });
 
+test("a lane on a question prompt is not typed into", async () => {
+  const { run, sent } = herdr(["w:emu-lane"]);
+  const lanes = laneMemory(procs);
+  expect(await warnHeaviestLane(run, lanes, [openLane("emu-lane", { lastAskPrompt: "Which one?" } as Partial<Lane>)], "memory free 4% < 10%")).toBe("not typed: emu-lane is on a question prompt");
+  expect(sent).toEqual([]);
+});
+
+test("memory turning low while already alerting for disk emits one more ALERT line", () => {
+  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 10, diskFreeMinGb: 50, panesMax: 0 };
+  const state = { alerting: false } as { alerting: boolean; memLow?: boolean };
+  const sample = { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, panes: 3 };
+  expect(guardTick(sample, t, state)).toEqual(expect.arrayContaining([expect.stringContaining("HOST_GUARD ALERT disk")]));
+  expect(guardTick({ ...sample, memFreePct: 4 }, t, state, "warned x")).toEqual(["HOST_GUARD ALERT memory free 4% < 10% | disk free 5 GB < 50 GB; warned x"]);
+  expect(guardTick({ ...sample, memFreePct: 4 }, t, state, "warned x")).toEqual([]);
+});
+
 test("sampleHost reads Linux memory and swap from injected meminfo", async () => {
   const calls: string[][] = [];
   const run: Runner = async (argv) => {

@@ -68,19 +68,25 @@ export const alertReasons = (s: HostSample, t: GuardThresholds): string[] => {
   return r;
 };
 
-export type GuardState = { alerting: boolean; computeReady?: boolean };
+export type GuardState = { alerting: boolean; computeReady?: boolean; memLow?: boolean };
 
 /** `alertDetail` (the lanes by memory, who was warned) is appended to an ALERT line after `; `. */
 export const guardTick = (s: HostSample, t: GuardThresholds, state: GuardState, alertDetail?: string): string[] => {
   const out: string[] = [];
   const reasons = alertReasons(s, t);
   const alerting = reasons.length > 0;
-  if (alerting !== state.alerting) {
+  const memLow = s.memFreePct < t.memFreeMinPct;
+  const alertLine = `HOST_GUARD ALERT ${reasons.join(" | ")}${alertDetail ? `; ${alertDetail}` : ""}`;
+  if (alerting === state.alerting) {
+    // Already alerting for another reason: memory running low is still reported once.
+    if (alerting && memLow && !state.memLow) out.push(alertLine);
+  } else {
     out.push(alerting
-      ? `HOST_GUARD ALERT ${reasons.join(" | ")}${alertDetail ? `; ${alertDetail}` : ""}`
+      ? alertLine
       : `HOST_GUARD CLEAR load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, disk free ${s.diskFreeGb.toFixed(0)} GB, swap free ${s.swapFreeGb.toFixed(1)} GB`);
     state.alerting = alerting;
   }
+  state.memLow = memLow;
   const ready = s.load1 < t.loadOk;
   if (ready !== state.computeReady) {
     out.push(ready ? `HOST_GUARD COMPUTE_READY load ${s.load1.toFixed(0)} < ${t.loadOk}` : `HOST_GUARD COMPUTE_BUSY load ${s.load1.toFixed(0)}`);
