@@ -10,8 +10,10 @@ import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
+import { readFile } from "node:fs/promises";
 import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
 import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
+import { GUARD_AGENT_TEMPLATE, guardAgentVersion, installGuardAgent, listGuardMachines, refreshGuardAgents, sampleMachine } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -94,6 +96,8 @@ const USAGE = `dori <command> [options]
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
+  guard machines                       the remote guard agent of every saved machine: version and load, memory, swap, disk (GUARD_MACHINE lines)
+  guard install [--machine LABEL]      install or update the guard agent over ssh on all listed machines, or one (exit 1 on any failure)
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
   can-launch [--model M]               exit 0 if the host has room for a new lane, else print why and exit 4
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
@@ -196,6 +200,10 @@ if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
 }
+if (command === "guard" && flags.positionals[0] === "install") {
+  const caller = await callerLane(deps);
+  if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run guard install; it is lead-only`);
+}
 
 /**
  * Why the calling process may not report as lane `lane` (claim-done, report), or undefined when it may. Ownership
@@ -275,7 +283,10 @@ try {
       if (flags.positionals.length || Object.entries(flags.values).some(([name, v]) => (name !== "dev" && name !== "force") || v !== true)) {
         die("usage: dori update [--dev] [--force]");
       }
-      const code = await updateInstall({ run, sleep: realClock.sleep, log: (line) => console.log(line) },
+      const code = await updateInstall({
+        run, sleep: realClock.sleep, log: (line) => console.log(line),
+        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readFile(GUARD_AGENT_TEMPLATE, "utf8"), (line) => console.log(line)),
+      },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
     }
@@ -558,6 +569,32 @@ try {
       break;
     }
     case "guard": {
+      if (key === "machines" || key === "install") {
+        if (flags.positionals.length > 1 || (key === "machines" && opt("machine") !== undefined)) die("usage: dori guard machines | dori guard install [--machine LABEL]", 2);
+        const listed = await listGuardMachines(run, config.guardMachines);
+        if (key === "machines") {
+          const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
+          const results = await Promise.all(listed.map(async (m) => ({ m, r: await sampleMachine(run, m) })));
+          for (const { m, r } of results) {
+            if (!r.ok) { console.log(`GUARD_MACHINE ${m.label} offline ${r.detail.replace(/\s*\n\s*/g, " ")}`); continue; }
+            const s = r.sample;
+            console.log(`GUARD_MACHINE ${m.label} online version=${s.version} ${s.version === want ? "current" : "outdated"} load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, swap free ${s.swapFreeGb.toFixed(1)} GB, disk free ${s.diskFreeGb.toFixed(0)} GB`);
+          }
+          break;
+        }
+        const wanted = opt("machine");
+        const targets = wanted === undefined ? listed : listed.filter((m) => m.label === wanted);
+        if (wanted !== undefined && !targets.length) die(`unknown machine ${wanted}; known: ${listed.map((m) => m.label).join(", ") || "(none)"}`);
+        if (!targets.length) die("GUARD_AGENT_INSTALL_FAILED - no machines listed (herdr machine list, config guardMachines)");
+        const script = await readFile(GUARD_AGENT_TEMPLATE, "utf8");
+        const outcomes = await Promise.all(targets.map(async (m) => {
+          const r = await installGuardAgent(run, m, script).catch((e: unknown): { ok: false; detail: string } => ({ ok: false, detail: e instanceof Error ? e.message : String(e) }));
+          console.log(r.ok ? `GUARD_AGENT_INSTALLED ${m.label} ${r.version}` : `GUARD_AGENT_INSTALL_FAILED ${m.label} ${r.detail.replace(/\s*\n\s*/g, " ")}`);
+          return r.ok;
+        }));
+        if (outcomes.includes(false)) process.exitCode = 1;
+        break;
+      }
       const state = { alerting: false };
       console.log("HOST_GUARD_READY");
       await every(loopMin, async () => {

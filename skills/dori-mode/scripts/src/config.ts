@@ -169,6 +169,8 @@ export type DoriConfig = {
   readonly resolveTimeoutMin: number;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
+  /** Remote guard: machine label -> ssh target, for machines herdr does not list (overrides a herdr entry of the same label). */
+  readonly guardMachines: Readonly<Record<string, string>>;
   readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly memoryCheck: MemoryCheckConfig;
@@ -264,6 +266,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   resolveTimeoutMin: 15,
   heavySlots: 1,
   heavyMaxLoad: 80,
+  guardMachines: {},
   deadPanePatterns: ["has stopped", "no suitable jobs"],
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 },
   memoryCheck: { repo: "", maxKb: 15 },
@@ -351,6 +354,11 @@ export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(
 
 export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
 
+/** An object's string-valued entries; anything else is no entries. */
+const stringRecord = (v: unknown): Record<string, string> =>
+  typeof v !== "object" || v === null || Array.isArray(v) ? {}
+    : Object.fromEntries(Object.entries(v).filter((e): e is [string, string] => typeof e[1] === "string" && e[1].trim() !== ""));
+
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
   const base = defaultConfig(home);
   const file = Bun.file(path);
@@ -421,6 +429,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
     resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
+    guardMachines: stringRecord(raw.guardMachines),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),
