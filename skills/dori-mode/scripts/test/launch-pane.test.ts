@@ -253,6 +253,8 @@ test("footer puts the shared done rules first and every lane value after '### Th
   }
   expect(footerDoneRules(footerLane({ reportVia: "cli" }))).toContain("run the dori report question command below");
   expect(footerDoneRules(footerLane({ machine: "m1" }))).toContain("print a question report line below");
+  expect(footerDoneRules(footerLane())).toContain("only through `dori heavy <label> -- <command>`");
+  expect(footerDoneRules(footerLane({ machine: "m1" }))).toContain("only through `sh ~/.dori/guard-agent.sh heavy <label> -- <command>`");
   // laneRules lines follow the shared rules, in config order, for every report mode; none adds nothing.
   for (const [, lane] of variants) {
     const rules = footerDoneRules(lane, "Korean", ["Stop at an open PR with CI green; do not merge.", "CI runs the typecheck only."]);

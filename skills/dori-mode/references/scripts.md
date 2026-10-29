@@ -31,7 +31,8 @@ Installing, testing, requirements and the library modules are in [development.md
 | `worktreeRoot` | `/data/repos/worktrees` | `watch`: the closed-lane cleanup removes kept worktrees only under this directory; `""` turns it off |
 | `heavySlots`, `heavyMaxLoad` | 1, 80 | `heavy` |
 | `deadPanePatterns` | `has stopped`, `no suitable jobs` | `dead-panes` |
-| `guard` | load 150/80, 20% memory, 50 GB disk, 20 panes | `guard` |
+| `guard` | load 150/80, 20% memory, 50 GB disk, 20 panes; critical at 5% memory free (`memFreeCritPct`) or 5% swap free (`swapFreeCritPct`) | `guard` |
+| `heavyKill` | `["qemu-system", "emulator", "expo export"]` | `supervise`: substrings of a full command line that the critical memory stage kills |
 | `hooks.threadReply` | none | `freshness`, lane reports (`watch`, `supervise`), `recover` |
 | `hooks.transcribe` | none | `transcribe` (argv with `{file}`, prints the text) |
 | `leadDiet` | `true` | `supervise`: start the lead with a slimmer omo context. Adds `--no-skills`, `--exclude-tools <tools the lead never uses: task*, workpool, goals, codegraph_*, lsp_*, mcp resources, show_html_page, ask_user_question>` (after `leadArgs`) and `SENPI_PROMPT_SURFACE=chat` to the lead launch only; lanes are unchanged. Set `false` to give the lead the full tool and skill set |
@@ -364,6 +365,14 @@ Under `dori supervise` the same sweep also covers each worker machine: every sav
 
 The agent's version is the first 12 hex chars of the sha256 of `scripts/templates/guard-agent.sh`, computed on the server; the install writes it to `~/.dori/guard-agent.version` next to `~/.dori/guard-agent.sh`.
 
+Memory pressure has two stages. ALERT (free memory below `memFreeMinPct`) is the warning above: the ALERT line plus the typed warning to the heaviest lane. CRITICAL (free memory below `memFreeCritPct`, or free swap below `swapFreeCritPct` of a non-zero swap total) makes the supervisor kill every process whose full command line contains a `heavyKill` substring and that belongs to an open lane on this host (on a worker machine: any process of the ssh user). If it killed nothing, it pauses the heaviest local lane (on a machine: the most recently opened lane there). Each entry into critical emits one lead-urgent line; relay it to the owner:
+
+- `HOST_GUARD CRITICAL <reasons>; killed <lane> <comm> <size> (pid <n>), ...`
+- `HOST_GUARD CRITICAL <reasons>; paused <lane>`
+- `HOST_GUARD CRITICAL machine=<label> <reasons>; killed ...`
+
+The guard agent has two more subcommands for this: `sh ~/.dori/guard-agent.sh kill PATTERN...` (TERM, 5 s, then KILL for the ssh user's processes matching a pattern; prints `DORI_GUARD_KILLED pid=<pid> rss_kb=<n> cmd=<name>` per process and `DORI_GUARD_KILL_DONE count=<n>`) and `sh ~/.dori/guard-agent.sh heavy <label> -- <command ...>` (the `dori heavy` slot for a remote lane: `DORI_HEAVY_SLOTS` slots, default 1, under `~/.dori/heavy`).
+
 ### `dori guard machines` / `dori guard install [--machine LABEL]`
 
 `machines` samples every guard machine once and prints `GUARD_MACHINE <label> online version=<v> current|outdated load <n>, memory free <n>%, swap free <n.n> GB, disk free <n> GB`, or `GUARD_MACHINE <label> offline <detail>`. `install` is lead-only: it copies the template over ssh to all guard machines, or one, reads a sample back and prints `GUARD_AGENT_INSTALLED <label> <version>` or `GUARD_AGENT_INSTALL_FAILED <label> <detail>`. It exits 1 on any failure or when no machines are listed; an unknown label exits with the known ones.
@@ -394,4 +403,4 @@ Keeps the account shown as online until stopped.
 Runs `hooks.transcribe` and prints the transcript. A failed or empty transcription is an error, never an empty message.
 
 ### `dori heavy <label> -- <command ...>`
-Waits until load is under `heavyMaxLoad` and one of `heavySlots` is free, then runs the command and frees the slot when it exits. A slot held by a process that no longer exists (or a zombie) is taken over. Use it for full builds and test suites. Installs, focused tests and git do not need it.
+Waits until load is under `heavyMaxLoad` and one of `heavySlots` is free, then runs the command and frees the slot when it exits. A slot held by a process that no longer exists (or a zombie) is taken over. Use it for full builds, test suites, emulators and simulators: one heavy job runs per machine at a time. Remote lanes use `sh ~/.dori/guard-agent.sh heavy <label> -- <command ...>`. Installs, focused tests and git do not need it.

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 
 import type { Runner } from "../src/run.ts";
-import { guardTick, sampleHost } from "../src/host-guard.ts";
-import { laneMemory, type Proc, sampleProcs } from "../src/lane-memory.ts";
+import { criticalReasons, guardTick, sampleHost } from "../src/host-guard.ts";
+import { laneMemory, type Proc, procLanes, sampleProcs } from "../src/lane-memory.ts";
 import { guardAlertDetail, warnHeaviestLane } from "../src/supervise-loop.ts";
 import type { DoriConfig } from "../src/config.ts";
 import type { Lane } from "../src/registry.ts";
@@ -26,7 +26,7 @@ test("laneMemory sums each lane's process tree, its own DORI_LANE_KEY winning ov
 });
 
 test("sampleProcs reads the lane from each environment and skips unreadable ones", async () => {
-  const run: Runner = async () => ({ code: 0, out: "  10     1 1024 omo\n  11    10 2048 node\n  12    11 512 bad$(name\n", err: "" });
+  const run: Runner = async (argv) => argv.at(-1) === "pid=,args=" ? { code: 1, out: "", err: "" } : ({ code: 0, out: "  10     1 1024 omo\n  11    10 2048 node\n  12    11 512 bad$(name\n", err: "" });
   const env = async (pid: number) => {
     if (pid === 12) throw new Error("EACCES");
     return pid === 10 ? "HOME=/x\0DORI_LANE_KEY=a-lane\0" : "HOME=/x\0";
@@ -54,9 +54,9 @@ const herdr = (agentPanes: string[]) => {
 test("on a memory alert the heaviest open local lane is warned in its pane and the ALERT says so", async () => {
   const { run, sent } = herdr(["w:emu-lane", "w:small-lane"]);
   const deps = { run, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane"), openLane("small-lane")] } };
-  const sample = { load1: 1, memFreePct: 4, diskFreeGb: 200, swapFreeGb: 0.1, panes: 3 };
+  const sample = { load1: 1, memFreePct: 4, diskFreeGb: 200, swapFreeGb: 0.1, swapTotalGb: 4, panes: 3 };
   const detail = await guardAlertDetail(deps as never, sample, async () => procs);
-  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 10, diskFreeMinGb: 50, panesMax: 0 };
+  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 10, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 0 };
   const [alert] = guardTick(sample, t, { alerting: false }, detail);
   expect(alert).toBe("HOST_GUARD ALERT memory free 4% < 10%; lanes by memory: emu-lane 4.4 GB (qemu-system-x86 3.8 GB, node x2 488 MB, omo 98 MB), "
     + "small-lane 264 MB (omo 146 MB, adb 68 MB, tsserver 49 MB); warned emu-lane in its pane w:emu-lane");
@@ -68,7 +68,7 @@ test("on a memory alert the heaviest open local lane is warned in its pane and t
 test("a disk-only alert lists the lanes but warns nobody", async () => {
   const { run, sent } = herdr(["w:emu-lane"]);
   const deps = { run, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane")] } };
-  const detail = await guardAlertDetail(deps as never, { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, panes: 3 }, async () => procs);
+  const detail = await guardAlertDetail(deps as never, { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, swapTotalGb: 8, panes: 3 }, async () => procs);
   expect(detail).toStartWith("lanes by memory: emu-lane 4.4 GB");
   expect(detail).not.toContain("warned");
   expect(sent).toEqual([]);
@@ -90,9 +90,9 @@ test("a lane on a question prompt is not typed into", async () => {
 });
 
 test("memory turning low while already alerting for disk emits one more ALERT line", () => {
-  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 10, diskFreeMinGb: 50, panesMax: 0 };
+  const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 10, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 0 };
   const state = { alerting: false } as { alerting: boolean; memLow?: boolean };
-  const sample = { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, panes: 3 };
+  const sample = { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, swapTotalGb: 8, panes: 3 };
   expect(guardTick(sample, t, state)).toEqual(expect.arrayContaining([expect.stringContaining("HOST_GUARD ALERT disk")]));
   expect(guardTick({ ...sample, memFreePct: 4 }, t, state, "warned x")).toEqual(["HOST_GUARD ALERT memory free 4% < 10% | disk free 5 GB < 50 GB; warned x"]);
   expect(guardTick({ ...sample, memFreePct: 4 }, t, state, "warned x")).toEqual([]);
@@ -114,6 +114,35 @@ test("sampleHost reads Linux memory and swap from injected meminfo", async () =>
     },
   );
 
-  expect(sample).toMatchObject({ memFreePct: 25, diskFreeGb: 2, swapFreeGb: 1, panes: 3 });
+  expect(sample).toMatchObject({ memFreePct: 25, diskFreeGb: 2, swapFreeGb: 1, swapTotalGb: 4000000 / 1_048_576, panes: 3 });
   expect(calls).toEqual([["df", "-k", "/data"]]);
+});
+
+test("sampleHost reads macOS swap total from vm.swapusage, and -1 when it is unreadable", async () => {
+  if (process.platform === "linux") return;
+  const mk = (swap: string): Runner => async (argv) => ({ code: 0, out: argv[0] === "sysctl" ? swap : "Filesystem 1K-blocks Used Available\n/dev/x 1 1 2097152", err: "" });
+  const ok = await sampleHost(mk("total = 2048.00M  used = 1024.00M  free = 1024.00M  (encrypted)"), "/", async () => 1);
+  expect(ok).toMatchObject({ swapTotalGb: 2, swapFreeGb: 1 });
+  expect((await sampleHost(mk(""), "/", async () => 1)).swapTotalGb).toBe(-1);
+});
+
+const crit = { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 };
+
+test("criticalReasons names low memory and low swap, and ignores unreadable metrics and hosts without swap", () => {
+  expect(criticalReasons({ memFreePct: 3, swapFreeGb: 0.07, swapTotalGb: 4 }, crit))
+    .toEqual(["memory free 3% < 5%", "swap free 0.07 GB of 4.0 GB (2%) < 5%"]);
+  expect(criticalReasons({ memFreePct: 50, swapFreeGb: 2, swapTotalGb: 4 }, crit)).toEqual([]);
+  expect(criticalReasons({ memFreePct: -1, swapFreeGb: -1, swapTotalGb: 4 }, crit)).toEqual([]);
+  expect(criticalReasons({ memFreePct: 50, swapFreeGb: 0, swapTotalGb: -1 }, crit)).toEqual([]);
+  expect(criticalReasons({ memFreePct: 50, swapFreeGb: 0, swapTotalGb: 0 }, crit)).toEqual([]);
+});
+
+test("sampleProcs merges the full command line by pid and procLanes attributes by nearest ancestor", async () => {
+  const run: Runner = async (argv) => argv.at(-1) === "pid=,args="
+    ? { code: 0, out: "  10 omo --lane x\n  11 qemu-system-x86_64 -m 4096\n", err: "" }
+    : { code: 0, out: "  10 1 100 omo\n  11 10 200 qemu-system-x86\n  12 10 5 sleep\n", err: "" };
+  const got = await sampleProcs(run, async (pid) => (pid === 10 ? "DORI_LANE_KEY=lane-x\0" : ""), true);
+  expect(got.find((p) => p.pid === 11)?.args).toBe("qemu-system-x86_64 -m 4096");
+  expect(got.find((p) => p.pid === 12)?.args).toBeUndefined();
+  expect(procLanes(got).get(11)).toBe("lane-x");
 });

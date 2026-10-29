@@ -13,7 +13,7 @@ import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts"
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const guard = defaultConfig("/home/test").guard;
-const roomy = { load1: 10, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, panes: 6 };
+const roomy = { load1: 10, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, swapTotalGb: 4, panes: 6 };
 let state: ReturnType<typeof withState>;
 let world: World;
 beforeEach(() => { state = withState(); world = newWorld(); });

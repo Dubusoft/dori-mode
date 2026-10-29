@@ -54,7 +54,7 @@ test("a workspace-less launch goes to defaultMachine and may fall back", () => {
   expect(resolvePlacement({ done: RESEARCH }, config({ defaultMachine: "big", workspaces: { "*": "mini" } }))).toEqual({ machine: "big", source: "default", movable: true });
 });
 
-const sample = (s: Partial<MachineSample> = {}): SampleResult => ({ ok: true, sample: { version: "v", os: "linux", load1: 999, memFreePct: 60, swapFreeGb: 4, diskFreeGb: 200, ...s } });
+const sample = (s: Partial<MachineSample> = {}): SampleResult => ({ ok: true, sample: { version: "v", os: "linux", load1: 999, memFreePct: 60, swapFreeGb: 4, swapTotalGb: 8, diskFreeGb: 200, ...s } });
 
 test("machineVerdict: offline is one unreachable reason", () => {
   expect(machineVerdict({ ok: false, detail: "unreachable: timeout" }, 3, T, "big")).toEqual({ ok: false, reasons: ["machine big unreachable: unreachable: timeout"] });
@@ -90,7 +90,7 @@ const cfg = { ...defaultConfig("/home/test"), stateDir: "/state" };
 
 test("checkMachine local samples the host on the disk guard path and applies canLaunch", async () => {
   const seen: string[] = [];
-  const host: HostSample = { load1: 500, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, panes: T.panesMax };
+  const host: HostSample = { load1: 500, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2, panes: T.panesMax };
   const c = await checkMachine(remoteRunner({}, []), cfg, "local", { sampleHost: async (_run, path) => { seen.push(path); return host; } });
   expect(seen).toEqual(["/state"]);
   expect(c).toEqual({ machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}` });
