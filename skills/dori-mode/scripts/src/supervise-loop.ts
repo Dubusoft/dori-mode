@@ -1,5 +1,4 @@
 import { mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { configPath, deliveryConfigError, saveLeadPane } from "./config.ts";
@@ -21,8 +20,8 @@ import { pauseLane, type PauseResult } from "./pause.ts";
 import { describeKilled, heavyTargets, type KilledProc, killProcs } from "./pressure.ts";
 import type { Lane } from "./registry.ts";
 import {
-  GUARD_AGENT_TEMPLATE, type GuardMachine, guardAgentVersion, killOnMachine, type KillResult, loadMachineGuardState,
-  machineDue, machineGuardTick, type MachineSample, readGuardMachines, sampleMachine, saveMachineGuardState,
+  type GuardMachine, guardAgentWants, killOnMachine, type KillResult, loadMachineGuardState,
+  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, readGuardMachines, sampleMachine, saveMachineGuardState,
 } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -306,8 +305,9 @@ export const machineCriticalTick = async (
   deps: Pick<FlowDeps, "run" | "config">, machine: GuardMachine, sample: MachineSample, open: readonly Lane[],
   state: Map<string, boolean>, io: PressureIo,
 ): Promise<string | undefined> => {
-  // macOS grows its swap files on demand, so a nearly full swap there is normal; its memory pressure reading decides.
-  const reasons = criticalReasons(sample.os === "darwin" ? { ...sample, swapTotalGb: -1 } : sample, deps.config.guard);
+  // macOS swap files and a system-managed Windows page file grow on demand, so a nearly full swap there is normal;
+  // the memory reading decides.
+  const reasons = criticalReasons(sample.os === "darwin" || sample.os === "windows" ? { ...sample, swapTotalGb: -1 } : sample, deps.config.guard);
   if (!reasons.length) {
     state.delete(machine.label);
     return undefined;
@@ -437,7 +437,7 @@ export const supervisorSweeps = (
       const due = guardMachines.list.filter((m) => machineDue(machineGuard, m.label, now));
       if (!due.length) return [];
       const results = await Promise.all(due.map(async (machine) => ({ machine, result: await sampleMachine(deps.run, machine) })));
-      const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
+      const want = guardAgentWants(await readGuardAgentScripts());
       const open = await deps.registry.open();
       // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
       // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.

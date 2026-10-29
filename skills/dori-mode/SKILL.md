@@ -114,7 +114,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 | `dori dead-panes` | report agent panes that stopped |
 | `dori guard` | host load, memory, disk and pane-count alerts, plus each worker machine under `supervise` |
 | `dori guard install\|machines` | install the guard agent on worker machines over ssh; show each machine's agent and load |
-| `dori heavy <label> -- <cmd>` | run a heavy command (builds, emulators) only when a slot is free and load is low, one per machine; blocking, so lanes only, never the lead; remote lanes use `sh ~/.dori/guard-agent.sh heavy <label> -- <cmd>` |
+| `dori heavy <label> -- <cmd>` | run a heavy command (builds, emulators) only when a slot is free and load is low, one per machine; blocking, so lanes only, never the lead; remote lanes use `sh ~/.dori/guard-agent.sh heavy <label> -- <cmd>` (Windows: the PowerShell line in the lane footer) |
 | `dori can-launch [--machine M] [--cwd D] [--done "..."] [--all]` | is there room for a new lane (memory, disk, panes) on the machine it would be placed on, or on every machine with `--all`? exit 4 with the reasons if not |
 | `dori quota [--json]` | Claude 5h/7d usage and reset times (Discord `/quota` shows the same usage block) |
 | `dori memory check` | read-only: `human.md` size against `memoryCheck.maxKb` and Open items naming closed lanes or merged PRs; exit 1 when you have cleanup to do |
