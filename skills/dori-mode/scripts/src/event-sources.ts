@@ -11,8 +11,7 @@ import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, valid
 /*
  * The event source registry (design 1.8). Every event the supervisor journals comes from a named
  * source and goes through Supervisor.enqueue, so the store dedupes it and the policy table (event-policy.ts) decides
- * who hears it. The built-ins are the code paths that existed before (discord, github, sweeps, waits), `toodo` (the Toodo
- * Lead chat, messenger/toodo-supervisor.ts, only when config.toodo is set) and `emit`, the
+ * who hears it. The built-ins are the code paths that existed before (discord, github, sweeps, waits) and `emit`, the
  * spool `dori emit` writes. The user sources live in <stateDir>/sources.json, managed by `dori source add/remove/list`:
  *   poll     runs an argv every `everySec`; each stdout line matching `match` is one `<kind> <line>` event, deduped by its
  *            first capture group (else the whole line), so a source polls for ever and reports each match once;
@@ -24,10 +23,8 @@ import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, valid
  * and the others keep running. The per-source last event and error are written to sources-status.json for dori status.
  */
 
-export const BUILTIN_SOURCES = ["discord", "toodo", "github", "sweeps", "waits", "emit"] as const;
+export const BUILTIN_SOURCES = ["discord", "github", "sweeps", "waits", "emit"] as const;
 export type BuiltinSource = (typeof BUILTIN_SOURCES)[number];
-/** Built-ins that run only when configured (toodo: config.toodo): listed once the supervisor has registered them. */
-const OPTIONAL_BUILTINS: ReadonlySet<string> = new Set<BuiltinSource>(["toodo"]);
 export const SOURCE_TYPES = ["poll", "webhook", "file", "schedule"] as const;
 export type SourceType = (typeof SOURCE_TYPES)[number];
 
@@ -248,7 +245,7 @@ export const sourceViews = (stateDir: string): { readonly sources: readonly Sour
   };
   return {
     sources: [
-      ...BUILTIN_SOURCES.filter((name) => !OPTIONAL_BUILTINS.has(name) || status[name]).map((name) => view(name, "builtin")),
+      ...BUILTIN_SOURCES.map((name) => view(name, "builtin")),
       ...specs.map((spec) => view(spec.name, spec.type, spec.kind)),
     ],
     ...(error ? { error } : {}),
@@ -301,13 +298,11 @@ export class EventSources {
         ...(deps.log ? { log: deps.log } : {}),
       }, deps.schedules);
     }
-    for (const [name, entry] of Object.entries(readSourceStatus(deps.stateDir)?.sources ?? {})) this.status.set(name, entry);
-    for (const name of BUILTIN_SOURCES) if (!OPTIONAL_BUILTINS.has(name) && !this.status.has(name)) this.status.set(name, { type: "builtin", events: 0, duplicates: 0 });
-  }
-
-  /** An optional built-in this supervisor runs (toodo when configured): listed in dori status from now on. */
-  register(name: BuiltinSource): void {
-    if (!this.status.has(name)) this.set(name, { type: "builtin", events: 0, duplicates: 0 });
+    // A built-in no longer in BUILTIN_SOURCES (an old status file's `toodo`, the removed Toodo chat) is dropped.
+    for (const [name, entry] of Object.entries(readSourceStatus(deps.stateDir)?.sources ?? {})) {
+      if (entry.type !== "builtin" || (BUILTIN_SOURCES as readonly string[]).includes(name)) this.status.set(name, entry);
+    }
+    for (const name of BUILTIN_SOURCES) if (!this.status.has(name)) this.status.set(name, { type: "builtin", events: 0, duplicates: 0 });
   }
 
   private entry(name: string, type: SourceStatus["type"]): SourceStatus {

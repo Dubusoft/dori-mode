@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { type DeliveryConfig, defaultConfig } from "../src/config.ts";
@@ -137,6 +137,25 @@ test("a lone LANE_CLOSED (default policy, no INBOUND, no UNREPORTED) is logged a
   expect(lines.some((line) => /^LEAD_PUSH \w+ 1 LANE_CLOSED delivered attempt=1$/.test(line))).toBe(true);
 });
 
+test("a taken outcome still ends its reporting turn and pushes UNREPORTED before the timeout", async () => {
+  const f = fixture({ delivery: delivery() });
+  f.onEnter("working");
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("closed:alpha", "LANE_CLOSED alpha x");
+  await flush(supervisor);
+  expect(readJournal(f.state.dir).outcomes[0].deliveredAt).toBe(f.clock.now());
+  expect(readJournal(f.state.dir).outcomes[0].deliveredWorking).toBe(true);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  f.pane.agent_status = "idle";
+  f.clock.at += 2_000;
+  await flush(supervisor);
+  const reminders = readJournal(f.state.dir).events.filter((event: { line: string }) => event.line.startsWith("UNREPORTED "));
+  expect(reminders).toHaveLength(1);
+  expect(reminders[0].id).toBe(`unreported:alpha:${f.clock.now() - 2_000}:1`);
+  expect(f.texts()).toHaveLength(2);
+  expect(f.texts()[1]).toStartWith("[dori] supervisor: 1 new event (urgent: UNREPORTED; lanes: alpha).");
+});
+
 test("an untaken event is pushed again after ackSec though nothing is pending, and a take receipt past it stops the pushes", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }) });
   const supervisor = new Supervisor(f.deps);
@@ -167,7 +186,7 @@ test("a burst within one tick and more within ackSec become a single push", asyn
   expect(f.texts()[0]).toContain("3 new events (urgent: WAIT_DONE x3)");
 });
 
-test("a blocked lead is never typed into, a working one only with toWorking, and every state still appends", async () => {
+test("a blocked lead is never typed into, a working one only with toWorking and after ackSec, and every state still appends", async () => {
   for (const [status, toWorking, pushes] of [["blocked", true, 0], ["working", false, 0], ["working", true, 1]] as const) {
     const f = fixture({ delivery: delivery({ push: { toWorking } }) });
     f.pane.agent_status = status;
@@ -175,6 +194,9 @@ test("a blocked lead is never typed into, a working one only with toWorking, and
     supervisor.enqueue("wait:1", "WAIT_DONE ci green");
     await flush(supervisor);
     expect(readFileSync(join(f.state.dir, "lead-events.log"), "utf8")).toContain('"id":"wait:1"');
+    expect(f.texts()).toEqual([]);
+    f.clock.at += 45_000;
+    await flush(supervisor);
     expect(f.texts()).toHaveLength(pushes);
     if (status === "blocked") expect(f.enters()).toBe(0);
     // A pointer queued into a working turn never confirms by a status change; its empty input needs no second Enter.
@@ -235,7 +257,7 @@ test("a pushed pointer still in the input after pasteCheckMs gets one more Enter
   expect(f.enters()).toBe(2);
 });
 
-test("an untaken urgent event survives a ladder restart: the cursor stays, take prints it and the unfinished owner message once, the prompt neither", async () => {
+test("an untaken urgent event survives a ladder restart: the cursor stays, take prints it and preserves owner recovery text, the prompt neither", async () => {
   const f = fixture({ delivery: delivery({ tailMonitor: false }) });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 please fix the build");
@@ -261,8 +283,8 @@ test("an untaken urgent event survives a ladder restart: the cursor stays, take 
   expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }))).toEqual([
     "discord:1:1\tINBOUND 1 1 please fix the build", "lane:q\tLANE_REPORT k question which base branch?",
   ]);
-  // Untaken, so take prints it from the log: it is not carried over a second time.
-  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
+  // The take itself now preserves owner text before its receipt, including after a cold start.
+  expect(takeCarriedReminders(f.state.dir)).toEqual([expect.stringContaining("INBOUND 1 1 please fix the build")]);
   expect(readJournal(f.state.dir).forcedRestarts).toEqual([{ at: expect.any(Number), cause: "forced" }]);
 });
 
@@ -290,7 +312,7 @@ test("a new lead is not escalated before escalateMin after its start, and gets a
 });
 
 test("a finished lane taken but not reported keeps an idle lead pushed and escalates it like an untaken urgent event; dori reported ends it", async () => {
-  const f = fixture({ delivery: delivery({ tailMonitor: false }), eventPolicy: resolveEventPolicy({ kinds: { LANE_CLOSED: "lead-urgent" } }) });
+  const f = fixture({ cacheTtlMin: 60, delivery: delivery({ tailMonitor: false }), eventPolicy: resolveEventPolicy({ kinds: { LANE_CLOSED: "lead-urgent" } }) });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha merged");
   await flush(supervisor);
@@ -302,7 +324,9 @@ test("a finished lane taken but not reported keeps an idle lead pushed and escal
   f.clock.at += 5 * 60_000;
   await flush(supervisor);
   expect(f.texts()).toHaveLength(2);
-  expect(f.texts()[1]).toStartWith("[dori] supervisor: 1 new event (urgent: UNREPORTED).");
+  expect(f.texts()[1]).toStartWith("[dori] supervisor: 1 new event (urgent: UNREPORTED; lanes: alpha).");
+  // The supervisor now journals the timeout reminder during flush; take it so the ladder below tests the report debt.
+  expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }))?.[0]).toStartWith(`unreported:alpha:${f.clock.now() - 5 * 60_000}:1\tUNREPORTED alpha `);
   for (let i = 0; i < 8 && !f.launches().length; i++) {
     f.clock.at += 60_000;
     await flush(supervisor);
@@ -376,17 +400,73 @@ test("the ladder's safety restart does not wait for the lead's running child, an
   expect(lines.filter((line) => line.startsWith("LEAD_RESTART_TRIGGER push-escalate ") && line.endsWith("; stops 1 child task(s) the lead was waiting on"))).toHaveLength(1);
 });
 
-test("an owner message the lead took but did not ack is left to the ack notice: no idle restart in push mode", async () => {
+test("an owner message the lead took but did not ack still restarts an idle lead in push mode", async () => {
   const f = fixture({ delivery: delivery(), leadUnreadRestartMin: 1 });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
   await flush(supervisor);
   take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
-  for (let i = 0; i < 10; i++) {
-    f.clock.at += 60_000;
-    await flush(supervisor);
-  }
-  expect(f.launches()).toEqual([]);
+  f.clock.at += 5 * 60_000;
+  await flush(supervisor);
+  expect(f.launches()).toHaveLength(1);
+  expect(takeCarriedReminders(f.state.dir).join("\n")).toContain("INBOUND 1 1 hi");
+});
+
+test.each([false, true])("a mixed take followed by only the lane receipt keeps the owner pushed across supervisor restart (tail=%s)", async (tailMonitor) => {
+  const f = fixture({ delivery: delivery({ tailMonitor }), cacheTtlMin: 60 });
+  let supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:1:1", "INBOUND 1 1 please reply");
+  supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha merged");
+  await flush(supervisor);
+  expect(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }).events.map((event) => event.id))
+    .toEqual(["discord:1:1", "lane-closed:alpha"]);
+  recordReported(f.state.dir, "alpha", f.clock.now());
+  await supervisor.reportTick();
+  supervisor.close();
+  supervisor = new Supervisor(f.deps);
+  f.clock.at += 60_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+  expect(f.texts()[1]).toContain("urgent: INBOUND");
+  expect(takeCarriedReminders(f.state.dir).join("\n")).toContain("INBOUND 1 1 please reply");
+  // Repeated takes must not keep resetting the escalation clock.
+  supervisor.enqueue("wait:more", "WAIT_DONE more");
+  await flush(supervisor);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  f.clock.at += 4 * 60_000;
+  await flush(supervisor);
+  expect(f.launches()).toHaveLength(1);
+  recordHandled(f.state.dir, "1", "1", f.clock.now(), { all: true });
+  supervisor.ackTick(60_000);
+  const pushed = f.texts().length;
+  f.clock.at += 60_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(pushed);
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
+  supervisor.close();
+});
+
+test.each([false, true])("an acked owner still pushes and escalates after its one UNHANDLED reminder was taken (tail=%s)", async (tailMonitor) => {
+  const f = fixture({ delivery: delivery({ tailMonitor }), handledTimeoutMin: 1, cacheTtlMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:1:1", "INBOUND 1 1 unfinished");
+  await flush(supervisor);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  recordAck(f.state.dir, "1", "1", f.clock.now());
+  supervisor.ackTick(60_000);
+  f.clock.at += 60_000;
+  supervisor.handledTick();
+  await flush(supervisor);
+  expect(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() }).events.map((event) => event.line))
+    .toEqual([expect.stringMatching(/^UNHANDLED 1 1 /)]);
+  f.clock.at += 60_000;
+  await flush(supervisor);
+  expect(f.texts().at(-1)).toContain("urgent: UNHANDLED");
+  f.clock.at += 4 * 60_000;
+  await flush(supervisor);
+  expect(f.launches()).toHaveLength(1);
+  expect(readJournal(f.state.dir).events.filter((event: { line: string }) => event.line.startsWith("UNHANDLED "))).toHaveLength(1);
+  supervisor.close();
 });
 
 test("a working lead is never ladder-restarted for a non-owner event, but one tool call with an unacked owner message is, on escalateMin", async () => {
@@ -434,6 +514,13 @@ test("past restartMaxPerHour the ladder refuses, logs and tells the owner once, 
   expect(lines.filter((line) => line.startsWith("LEAD_RESTART_CAPPED"))).toHaveLength(1);
   expect(announced.filter((text) => text.includes("not restarted again"))).toHaveLength(1);
   expect(f.texts().length).toBeGreaterThan(3);
+  // The lead hears why nobody restarts it: one urgent LEAD_UNRESPONSIVE per hour, named in its next pointer; it
+  // reaches a stale idle lead in place, never as a cold start the cap would not allow.
+  const unresponsive = readJournal(f.state.dir).events.filter((event: { line: string }) => event.line.startsWith("LEAD_UNRESPONSIVE "));
+  expect(unresponsive).toHaveLength(1);
+  expect(unresponsive[0].line).toContain("push ladder");
+  expect(readFileSync(join(f.state.dir, "lead-events.log"), "utf8")).toContain("LEAD_UNRESPONSIVE push ladder");
+  expect(f.texts().some((text) => text.includes("LEAD_UNRESPONSIVE"))).toBe(true);
 });
 
 test("the cap counts forced restarts only: a demand-driven cold start is not counted (N4)", async () => {
@@ -577,4 +664,91 @@ test("a journal written under the old tail mode moves the take cursor to the log
   expect(takeOutput(take(f.state.dir, { maxBytes: 16_384, now: f.clock.now(), peek: true }))).toEqual(["INBOX_EMPTY"]);
   const again = await logged(async () => { new Supervisor(f.deps).close(); });
   expect(again.some((line) => line.startsWith("INBOX_CURSOR_ADVANCED"))).toBe(false);
+});
+
+test("by default a working lead gets the pointer once its events waited ackSec, only into an empty input box", async () => {
+  expect(defaultConfig().delivery.push.toWorking).toBe(true);
+  const f = fixture({ delivery: delivery() });
+  f.pane.agent_status = "working";
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
+  await flush(supervisor);
+  f.clock.at += 44_000;
+  await flush(supervisor);
+  expect(f.texts()).toEqual([]);
+  // The owner's own draft sits in the input: nothing is typed over it, however long the events wait.
+  f.world.screen = omo("half-typed owner text");
+  f.clock.at += 1_000;
+  const busy = await flush(supervisor);
+  expect(f.texts()).toEqual([]);
+  expect(f.enters()).toBe(0);
+  expect(busy.some((line) => line.startsWith("LEAD_PUSH_INPUT_BUSY "))).toBe(true);
+  f.world.screen = EMPTY;
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  expect(f.texts()[0]).toStartWith("[dori] supervisor: 1 new event (urgent: INBOUND).");
+});
+
+test("a take restarts a working lead's ackSec wait: a newer event is not typed at once", async () => {
+  const f = fixture({ delivery: delivery() });
+  f.pane.agent_status = "working";
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
+  await flush(supervisor);
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  supervisor.enqueue("wait:2", "WAIT_DONE deploy done");
+  f.clock.at += 5_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+});
+
+test("the pointer names the lanes its events concern (meta.lane, UNREPORTED), cut to fit maxChars", async () => {
+  const f = fixture({ delivery: delivery() });
+  f.onEnter("working");
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("r:1", "LANE_REPORT alpha question which base?", { lane: "alpha" });
+  supervisor.enqueue("r:2", "LANE_REPORT beta blocked no token", { lane: "beta" });
+  supervisor.enqueue("r:3", "LANE_REPORT alpha blocked again", { lane: "alpha" });
+  await flush(supervisor);
+  expect(f.texts()).toEqual(["[dori] supervisor: 3 new events (urgent: LANE_REPORT x3; lanes: alpha, beta). Not an owner message. Run dori inbox take, then continue your task."]);
+  expect(pointerText(1, true, ["WAIT_DONE"], 200)).toBe("[dori] supervisor: 1 new event (urgent: WAIT_DONE). Not an owner message. Run dori inbox take, then continue your task.");
+  const lanes = Array.from({ length: 12 }, (_, i) => `lane-number-${i}`);
+  const cut = pointerText(12, true, ["LANE_REPORT"], 200, lanes);
+  expect(cut.length).toBeLessThanOrEqual(200);
+  expect(cut).toContain("lanes: lane-number-0");
+  expect(cut).toMatch(/\+\d+ more\)\. Not an owner message/);
+});
+
+test("a working lead whose session file cannot be resolved is restarted on the escalateMin clock, not after 30 min", async () => {
+  const unresolved = fixture({ delivery: delivery() });
+  unresolved.pane.agent_status = "working";
+  unlinkSync(unresolved.file);
+  const s1 = new Supervisor(unresolved.deps);
+  s1.enqueue("discord:1:1", "INBOUND 1 1 hi");
+  for (let i = 0; i < 5; i++) {
+    await flush(s1);
+    unresolved.clock.at += 60_000;
+  }
+  expect(unresolved.launches()).toEqual([]);
+  await flush(s1);
+  expect(unresolved.launches()).toHaveLength(1);
+  expect(unresolved.prompt()).toContain("it was stuck with its session unresolved for 5 min");
+
+  // Resolved and outside any tool call, the same busy lead is left to the 30 min rule.
+  const resolved = fixture({ delivery: delivery() });
+  resolved.pane.agent_status = "working";
+  const s2 = new Supervisor(resolved.deps);
+  s2.enqueue("discord:1:1", "INBOUND 1 1 hi");
+  for (let i = 0; i < 7; i++) {
+    await flush(s2);
+    resolved.clock.at += 60_000;
+  }
+  expect(resolved.launches()).toEqual([]);
 });

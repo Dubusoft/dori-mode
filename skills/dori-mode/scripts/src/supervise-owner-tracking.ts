@@ -1,9 +1,5 @@
-import { homedir } from "node:os";
-
 import { dropAck, ownerMessageId, pendingAcks } from "./ack.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { scrubForThread } from "./freshness.ts";
-import { LANE_FINISH_PREFIX, laneFinishText, parseFinish } from "./lane-finish.ts";
 import { redactSecrets } from "./redact.ts";
 import type { Durability } from "./store.ts";
 import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "./supervise-journal.ts";
@@ -12,6 +8,15 @@ import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "
  * Owner tracking: one row per owner message (ack, coverage, revisions, deletion, quarantine), the owner notices owed
  * for it (delay, ack, unhandled), the reactions on it, and the durable outbox of owner announcements.
  */
+
+/**
+ * Outbox id prefixes of removed owner posts (the lane-finish line, the owner-only event class); a leftover row from an
+ * older store or journal is dropped, never posted.
+ */
+const STALE_OUTBOX = [
+  { prefix: "lane-finish:", why: "lane-finish lines are no longer posted" },
+  { prefix: "owner-only:", why: "owner-only events are no longer posted" },
+] as const;
 
 export const COLD_START_EMOJI = "\u23F3";
 export const HUNG_EMOJI = "\u26A0\uFE0F";
@@ -22,22 +27,31 @@ export type SupervisorHooks = {
   readonly persistLeadPane?: (pane: string) => void;
   /**
    * One plain line for the owner's main channel (lead model switches); `id` is stable across retries of the same line.
-   * `thread` is a lane's thread ref (lane-finish lines): post there, falling back to the main channel.
+   * `thread` is a lane's thread ref: post there, falling back to the main channel.
    */
   readonly announce?: (text: string, id: string, thread?: string) => Promise<void>;
 };
 
-/** An owner message: discord:<channel>:<message>, or toodo:chat:<message> (the Toodo chat, channel `toodo`). */
-export const OWNER_INBOUND = /^(?:discord:(\d+)|toodo:chat):(\d+)$/;
-/** The channel and message of an owner message id; the Toodo chat's channel is `toodo`. */
+/**
+ * An owner message: discord:<channel>:<message>. A row left in an old journal by the removed Toodo chat
+ * (toodo:chat:<message>) does not match, so it is never reminded, noticed or handed over.
+ */
+export const OWNER_INBOUND = /^discord:(\d+):(\d+)$/;
+/** The channel and message of an owner message id. */
 export const ownerRef = (id: string): OwnerMessage | undefined => {
   const m = OWNER_INBOUND.exec(id);
-  return m?.[2] ? { channel: m[1] ?? "toodo", message: m[2] } : undefined;
+  return m?.[1] && m[2] ? { channel: m[1], message: m[2] } : undefined;
 };
 /** INBOUND_EDIT / INBOUND_DELETE ids (discord-inbound.ts): they revise the owner message discord:<channel>:<message>. */
 export const OWNER_REVISION = /^discord:(\d+):(\d+):(?:edit:.+|delete)$/;
 /** The event that carries an owner message's current text: its latest edit, else the original. */
 export const latest = (entry: AwaitingAck): string => entry.revision ?? entry.id;
+/** Readable owner work remains owed independently of take receipts; an ack grants the handling window. */
+export const dueOwners = (core: JournalCore, now: number): AwaitingAck[] =>
+  (core.journal.awaitingAck ?? []).filter((entry) => OWNER_INBOUND.test(entry.id) && !entry.quarantined &&
+    entry.handledAt === undefined && entry.since !== undefined && core.delivered.has(latest(entry)) &&
+    (entry.ackedAt === undefined || entry.unhandledRemindedAt !== undefined ||
+      now - (entry.handlingSince ?? entry.ackedAt) >= core.deps.config.handledTimeoutMin * 60_000));
 const unquarantined = (entry: AwaitingAck): AwaitingAck => {
   if (!entry.quarantined) return entry;
   const { quarantined: _, ...rest } = entry;
@@ -117,9 +131,7 @@ export class OwnerTracking {
       return { ...entry, reminded: true };
     });
     this.journal = { ...this.journal, awaitingAck: awaiting };
-    // One ACK_MISSING per tick lists every overdue message, so an incident costs the lead one wake, not one per message.
-    // It is enqueued after the reminded marks, so both reach the store in the same write.
-    // Push delivery re-pushes untaken events itself, so ACK_MISSING (which would travel the same way) is never enqueued.
+    // Push delivery keeps owner obligations alive even after take, so a separate ACK_MISSING event is unnecessary.
     this.compactOwners(now);
     this.core.retain(now);
     this.persist("normal");
@@ -160,7 +172,10 @@ export class OwnerTracking {
         return entry;
       }
       if (now - (entry.handlingSince ?? entry.ackedAt) < timeoutMs) return entry;
-      const { channel, message } = ownerRef(entry.id) ?? {};
+      const ref = ownerRef(entry.id);
+      // An old journal's row of the removed Toodo chat (toodo:chat:<message>) has no channel to escalate in.
+      if (!ref) return entry;
+      const { channel, message } = ref;
       this.enqueue(`unhandled:${entry.id}:${entry.handlingSince ?? entry.ackedAt}`,
         `UNHANDLED ${channel} ${message} coverage=${(entry.lanes?.length ?? 0) + Number(!!entry.reply)}/${entry.tasks ?? 1} ${this.messageBody(entry.id)}`);
       return { ...entry, unhandledRemindedAt: now };
@@ -290,8 +305,7 @@ export class OwnerTracking {
   }
 
   /**
-   * Reactions on the owner's inbound Discord messages (ids discord:<channel>:<message>, INBOUND lines only); the Toodo
-   * chat has no reactions.
+   * Reactions on the owner's inbound Discord messages (ids discord:<channel>:<message>, INBOUND lines only).
    * Serialized on one chain so add/remove order holds, never awaited by a restart, failures swallowed.
    */
   react(events: readonly Event[], steps: readonly (readonly ["add" | "remove", string])[]): void {
@@ -312,8 +326,6 @@ export class OwnerTracking {
   /** Resolves when queued reactions and announcements have finished (tests and shutdown). */
   reactionsSettled(): Promise<void> { return this.reactions; }
 
-  /** Whether owner announcements are posted at all (an announce hook is set). */
-  get announces(): boolean { return this.hooks.announce !== undefined; }
 
   /**
    * One line for the owner's main channel, through a durable outbox: it is journaled first (with a stable id, so a
@@ -334,23 +346,20 @@ export class OwnerTracking {
     this.draining = true;
     this.reactions = this.reactions.then(async () => {
       for (const item of this.journal.outbox ?? []) {
-        if ((item.retryAt ?? 0) > this.deps.clock.now()) continue;
+        // A lane-finish line or owner-only event left by an older version (the supervisor no longer posts them) is dropped unposted.
+        const stale = STALE_OUTBOX.find(({ prefix }) => item.id.startsWith(prefix));
+        if (!stale && (item.retryAt ?? 0) > this.deps.clock.now()) continue;
         let posted = false;
-        const finish = item.id.startsWith(LANE_FINISH_PREFIX) ? parseFinish(item.text) : undefined;
-        try {
-          if (finish) {
-            // Title and thread are read at post time: the lane may be archived by now, which read() still finds.
-            const lane = await this.deps.registry.read(finish.lane);
-            await announce(scrubForThread(laneFinishText(finish, lane?.title), homedir()), item.id, lane?.thread);
-          } else await announce(item.text, item.id);
+        if (stale) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id}: ${stale.why}`);
+        else try {
+          await announce(item.text, item.id);
           posted = true;
         } catch (e) {
           console.error(`OWNER_ANNOUNCE_FAILED ${item.id} ${e instanceof Error ? e.message : String(e)}`);
         }
         const attempts = (item.attempts ?? 0) + 1;
-        // A lane-finish line is never given up: the owner would not know.
-        const drop = !posted && attempts >= OUTBOX_ATTEMPTS && !finish;
-        if (drop) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id} after ${attempts} attempts`);
+        const drop = stale !== undefined || (!posted && attempts >= OUTBOX_ATTEMPTS);
+        if (drop && !stale) console.error(`OWNER_ANNOUNCE_DROPPED ${item.id} after ${attempts} attempts`);
         const outbox = (this.journal.outbox ?? []).flatMap((entry) => entry.id !== item.id ? [entry]
           : posted || drop ? [] : [{ ...entry, attempts, retryAt: this.deps.clock.now() + OUTBOX_RETRY_MS }]);
         this.journal = { ...this.journal, outbox };

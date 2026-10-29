@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { openOperations, settleOperation } from "../src/operations.ts";
+import { openOperations } from "../src/operations.ts";
 import { type Lane, Registry, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { TEST_STORE, withState } from "./fakes.ts";
@@ -50,14 +50,14 @@ const ops = () => {
   try { return store.list(); } finally { store.close(); }
 };
 const laneStatus = async () => statusOf((await new Registry(stateDir()).read("demo-lane")) as Lane);
-const ALL_EFFECTS = [`worktree-remove ${join("WORLD", "wt/demo-lane")}`, `worktree-remove ${join("WORLD", "wt/demo-lane-2")}`, "thread-done discord:111/222", "pane-close w:p1"].sort();
+const ALL_EFFECTS = [`worktree-remove ${join("WORLD", "wt/demo-lane")}`, `worktree-remove ${join("WORLD", "wt/demo-lane-2")}`, "pane-close w:p1"].sort();
 
 test("an uninterrupted automatic close runs each effect once and verifies every operation", async () => {
   const run = await worker(-1);
   expect(run.lines.at(-1)).toStartWith("LANE_CLOSED demo-lane ");
   expect(effects().map((line) => line.replace(world, "WORLD")).sort()).toEqual(ALL_EFFECTS);
   expect(ops().map((op) => `${op.action} ${op.state}`).sort()).toEqual([
-    "close verified", "pane-close verified", "thread-done verified", "worktree-remove verified", "worktree-remove verified",
+    "close verified", "pane-close verified", "worktree-remove verified", "worktree-remove verified",
   ]);
   expect(await laneStatus()).toBe("closed");
 }, 30_000);
@@ -65,7 +65,8 @@ test("an uninterrupted automatic close runs each effect once and verifies every 
 /**
  * The acceptance test of design 1.1: a SIGKILL after every step of the close sequence (each operation write, so before
  * every effect and between effects, each effect itself, each registry write), then a restart. Every run ends with each
- * effect done at most once and every operation verified or ambiguous; the lane is closed exactly when none is ambiguous.
+ * effect done at most once and every operation verified or ambiguous. Every effect of a close has a read-back, so no
+ * effect operation is left ambiguous and the restart always finishes the close.
  */
 test("a kill at every step of a close ends verified or ambiguous after restart, never with a repeated effect", async () => {
   const total = (await worker(-1)).steps;
@@ -76,29 +77,14 @@ test("a kill at every step of a close ends verified or ambiguous after restart, 
     await seed();
     const first = await worker(killAt);
     expect({ killAt, killed: first.killed }).toEqual({ killAt, killed: true });
-    const restart = await worker(-1);
+    await worker(-1);
     await worker(-1);
     const done = effects().map((line) => line.replace(world, "WORLD"));
     expect({ killAt, repeated: done.filter((line, i) => done.indexOf(line) !== i) }).toEqual({ killAt, repeated: [] });
     const rows = ops();
     expect({ killAt, open: rows.filter((op) => op.state !== "verified" && op.state !== "ambiguous").map((op) => `${op.id} ${op.state}`) }).toEqual({ killAt, open: [] });
     const ambiguous = rows.filter((op) => op.state === "ambiguous" && op.action !== "close");
-    if (!ambiguous.length) {
-      expect({ killAt, status: await laneStatus(), effects: [...done].sort() }).toEqual({ killAt, status: "closed", effects: ALL_EFFECTS });
-      continue;
-    }
-    // Only the hook has no read-back: a kill between its attempted row and its verified row leaves it ambiguous.
-    expect({ killAt, ambiguous: ambiguous.map((op) => op.action), closed: (await laneStatus()) === "closed" }).toEqual({ killAt, ambiguous: ["thread-done"], closed: false });
-    expect(restart.lines.some((line) => line.startsWith("OPERATION_AMBIGUOUS demo-lane/thread-done/discord:111/222 "))).toBe(true);
-    expect(done).not.toContain("pane-close w:p1");
-    // The lead checks the thread, resolves the operation and closes again: the rest runs, the hook does not run again.
-    const store = openOperations({ stateDir: stateDir(), store: TEST_STORE });
-    try { settleOperation(store, T0, ambiguous[0]?.id ?? "", "verified", "resolved by the lead"); } finally { store.close(); }
-    const closed = await worker(-1, "close");
-    expect({ killAt, last: closed.lines.at(-1)?.split(" ", 2).join(" ") }).toEqual({ killAt, last: "CLOSED demo-lane" });
-    const after = effects().map((line) => line.replace(world, "WORLD"));
-    expect({ killAt, after: after.filter((line) => line.startsWith("thread-done")).length, pane: after.filter((line) => line === "pane-close w:p1").length })
-      .toEqual({ killAt, after: done.filter((line) => line.startsWith("thread-done")).length, pane: 1 });
-    expect(await laneStatus()).toBe("closed");
+    expect({ killAt, ambiguous: ambiguous.map((op) => op.id) }).toEqual({ killAt, ambiguous: [] });
+    expect({ killAt, status: await laneStatus(), effects: [...done].sort() }).toEqual({ killAt, status: "closed", effects: ALL_EFFECTS });
   }
 }, 300_000);

@@ -2,7 +2,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { LEGACY_LANE_MCP, removeLegacyLaneMcp } from "../src/launch.ts";
 import { claimDone, claimEventId, closeLane, discoverWorktrees, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
-import { laneFinish } from "../src/lane-finish.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -14,7 +13,7 @@ const lane: Lane = { key: "demo-lane", title: "demo", thread: "chat:team/123", p
 
 let state: ReturnType<typeof withState>;
 let world: World;
-const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadDone: ["notify", "{thread}", "{text}"] } });
+const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir);
 /** The lane's pane is listed with its agent, so the close's pane-close operation has something to close (its read-back sees it gone after). */
 const livePane = () => { world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }]; };
 const closedVia = () => world.calls.filter((c) => c[0] === "herdr" && (c[1] === "pane" || c[1] === "tab") && c[2] === "close");
@@ -77,7 +76,7 @@ test("sendVerified types nothing when the pane list cannot be read", async () =>
   expect(world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
 });
 
-test("five quiet minutes after a claim is handed over the lane is closed, its thread marked done and its worktree removed", async () => {
+test("five quiet minutes after a claim is handed over the lane is closed and its worktree removed", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
   expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
@@ -86,11 +85,36 @@ test("five quiet minutes after a claim is handed over the lane is closed, its th
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
   expect(lines[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
-  expect(world.calls).toContainEqual(["notify", "chat:team/123", "Done: merged acme/app#1 abc123"]);
   expect(world.calls).toContainEqual(["git", "-C", "/repo", "worktree", "remove", WT]);
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("closed");
   expect(await watchTick(at(T0 + 9 * MIN))).toEqual([]);
+});
+
+test("a second done with the same evidence keeps the first claim: one LANE_DONE_CLAIMED, one notice, the window unmoved", async () => {
+  livePane();
+  await claimDone(at(T0), lane, "merged acme/app#1 abc123");
+  expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  const notices = sent(world).length;
+  const ghCalls = world.calls.filter((c) => c[0] === "gh").length;
+  expect(await claimDone(at(T0 + 2 * MIN), lane, "merged acme/app#1 abc123")).toBe(`LANE_DONE_ALREADY_CLAIMED demo-lane ${new Date(T0).toISOString()} merged acme/app#1 abc123`);
+  const after = await at(T0).registry.read("demo-lane");
+  expect(after?.claim).toMatchObject({ at: new Date(T0).toISOString(), emitted: true });
+  expect(sent(world)).toHaveLength(notices);
+  expect(world.calls.filter((c) => c[0] === "gh")).toHaveLength(ghCalls);
+  expect(await watchTick(at(T0 + 3 * MIN))).toEqual([]);
+  // New evidence is a new claim, announced again.
+  await claimDone(at(T0 + 4 * MIN), lane, "merged acme/app#1 def456");
+  expect(await watchTick(at(T0 + 4 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 def456"]);
+});
+
+test("after an objection the same evidence claims again", async () => {
+  await claimDone(at(T0), lane, "merged acme/app#1");
+  await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, ["tests red"]);
+  expect(await claimDone(at(T0 + 2 * MIN), lane, "merged acme/app#1")).toStartWith("LANE_DONE_CLAIMED demo-lane");
+  const after = await at(T0).registry.read("demo-lane");
+  expect(after && statusOf(after)).toBe("done-claimed");
+  expect(after?.claim?.at).toBe(new Date(T0 + 2 * MIN).toISOString());
 });
 
 test("claim evidence and objection reasons are capped at 300 chars in event lines, and kept whole in the registry", async () => {
@@ -117,14 +141,13 @@ test("CLOSED and LANE_CLOSED carry no receipt JSON while the registry keeps the 
   expect((await at(T0).registry.read("demo-lane"))?.receipt).toMatchObject({ note: "manual", cleanup: expect.arrayContaining(["pane w:p1 closed"]) });
 });
 
-test("LANE_CLOSED keeps the PR URL the claim names, so the lane-finish line still links it", async () => {
+test("LANE_CLOSED keeps the PR URL the claim names", async () => {
   livePane();
   const url = "https://github.com/acme/app/pull/1";
   await claimDone(at(T0), lane, `merged ${url} abc123`);
   await watchTick(at(T0));
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
   expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed seen-claim ${url}`);
-  expect(laneFinish(lines[0] ?? "")).toEqual({ lane: "demo-lane", closed: "closed", pr: url });
 });
 
 test("settling a claim reads each Done signal and lists worktrees once, reusing them in the close", async () => {
@@ -278,7 +301,6 @@ test("one lane's failure is a LANE_WATCH_WARN line and the other lanes are still
 /** `received` is the supervisor's answer for journaled ids (absent: `dori watch`, no supervisor). */
 const onDelivery = (ms: number, received?: (id: string) => boolean, digestClaims = false): FlowDeps => ({
   ...depsFor(world, fakeClock(ms), state.dir, {
-    hooks: { threadDone: ["notify", "{thread}", "{text}"] },
     ...(digestClaims ? { eventPolicy: resolveEventPolicy({ kinds: { LANE_DONE_CLAIMED: "lead-digest" } }) } : {}),
   }),
   ...(received ? { leadDelivered: received } : {}),

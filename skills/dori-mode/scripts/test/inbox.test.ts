@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { defaultConfig, deliveryConfigError, loadConfig } from "../src/config.ts";
-import { EVENT_LOG, InboxError, readCursorFile, take, takeCursor, takeOutput, takesDir, writeCursorFile } from "../src/inbox.ts";
+import { checklistLine, EVENT_LOG, InboxError, readCursorFile, take, takeCursor, takeOutput, takesDir, writeCursorFile } from "../src/inbox.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -156,4 +156,56 @@ test("when no line has meta the take output is byte-identical to the ungrouped f
   const dir = state();
   log(dir, line("a", "WAIT_DONE one") + `${JSON.stringify({ id: "b", line: "WAIT_DONE two", meta: { lane: 5, thread: "" } })}\n` + JSON.stringify({ id: "c", line: "x", meta: "bad" }) + "\n");
   expect(takeOutput(take(dir, { maxBytes: 16_384, now: NOW, peek: true })).join("\n")).toBe("a\tWAIT_DONE one\nb\tWAIT_DONE two\nc\tx");
+});
+
+test("checklistLine: owner chat plus an outcome event puts one checklist line first, deduping lane keys", () => {
+  expect(checklistLine(["e1\tINBOUND discord 1 hi", "e2\tLANE_DONE_CLAIMED alpha ok", "e3\tVISITOR x hello", "e4\tLANE_CLOSED alpha", "e5\tCI_MERGED pr=1 lane=beta"]))
+    .toBe("checklist:e1\tCHECKLIST this batch owes: reply to 2 owner message(s); report lane alpha, beta (dori reported <key> --text ...)");
+});
+
+test("checklistLine: owner-only and outcome-only batches get none", () => {
+  expect(checklistLine(["e1\tINBOUND discord 1 hi", "e2\tWAIT_DONE x"])).toBeUndefined();
+  expect(checklistLine(["e1\tLANE_CLOSED alpha", "unreported:beta\tUNREPORTED beta since now: run it"])).toBeUndefined();
+  expect(checklistLine([])).toBeUndefined();
+});
+
+test("checklistLine: an UNREPORTED reminder plus owner chat gives the checklist", () => {
+  expect(checklistLine(["e9\tINBOUND discord 2 yo", "unreported:gamma\tUNREPORTED gamma since 2026: run dori reported gamma --text TEXT"]))
+    .toBe("checklist:e9\tCHECKLIST this batch owes: reply to 1 owner message(s); report lane gamma (dori reported <key> --text ...)");
+});
+
+test("take prints owner messages and edits first, before lane groups and ## other, without changing the receipt order", () => {
+  const dir = state();
+  log(dir, metaLine("a", "LANE_REPORT alpha question one?", { lane: "alpha", cwd: "/repo/a" })
+    + line("n", "WAIT_DONE no meta")
+    + line("discord:1:2", "INBOUND discord 1 hello")
+    + line("discord:1:2:edit:x", "INBOUND_EDIT discord 1 hello there")
+    + line("v", "VISITOR someone hi"));
+  const result = take(dir, { maxBytes: 16_384, now: NOW });
+  expect(takeOutput(result)).toEqual([
+    "## owner",
+    "discord:1:2\tINBOUND discord 1 hello",
+    "discord:1:2:edit:x\tINBOUND_EDIT discord 1 hello there",
+    "v\tVISITOR someone hi",
+    "## lane alpha  cwd /repo/a",
+    "a\tLANE_REPORT alpha question one?",
+    "## other",
+    "n\tWAIT_DONE no meta",
+  ]);
+  expect(result.events.map((e) => e.id)).toEqual(["a", "n", "discord:1:2", "discord:1:2:edit:x", "v"]);
+});
+
+test("without any meta, owner lines still lead the ungrouped output", () => {
+  const dir = state();
+  log(dir, line("n", "WAIT_DONE x") + line("discord:1:2", "INBOUND discord 1 hi"));
+  expect(takeOutput(take(dir, { maxBytes: 16_384, now: NOW, peek: true }))).toEqual(["discord:1:2\tINBOUND discord 1 hi", "n\tWAIT_DONE x"]);
+});
+
+test("checklistLine counts INBOUND_EDIT and carried owner notices, once per owner message", () => {
+  expect(checklistLine(["e1\tINBOUND_EDIT discord 1 fixed", "e2\tLANE_CLOSED alpha"]))
+    .toBe("checklist:e1\tCHECKLIST this batch owes: reply to 1 owner message(s); report lane alpha (dori reported <key> --text ...)");
+  expect(checklistLine(["unfinished:discord:1:2\tUNFINISHED discord:1:2 taken and not handled (dori ack it unless acked, then handle it): INBOUND discord 1 hi", "e2\tLANE_CLOSED alpha"]))
+    .toBe("checklist:unfinished:discord:1:2\tCHECKLIST this batch owes: reply to 1 owner message(s); report lane alpha (dori reported <key> --text ...)");
+  expect(checklistLine(["discord:1:2\tINBOUND discord 1 hi", "unfinished:discord:1:2\tUNFINISHED discord:1:2 taken and not handled (x): INBOUND discord 1 hi", "e2\tLANE_CLOSED alpha"]))
+    .toContain("reply to 1 owner message(s)");
 });

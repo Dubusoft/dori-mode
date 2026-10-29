@@ -4,7 +4,6 @@ import { join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
-import type { ToodoConfig } from "./messenger/toodo.ts";
 import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
 
@@ -12,7 +11,6 @@ export type ArgvTemplate = readonly string[];
 
 export type Hooks = {
   readonly threadReply?: ArgvTemplate;
-  readonly threadDone?: ArgvTemplate;
   readonly transcribe?: ArgvTemplate;
 };
 
@@ -48,7 +46,10 @@ export type PushConfig = {
   readonly maxChars: number;
   /** After a push that did not visibly start a turn, the input line is checked again this many ms later. */
   readonly pasteCheckMs: number;
-  /** Push into a working lead too (its pointer is queued into the running turn). */
+  /**
+   * Push into a working lead too (its pointer is queued into the running turn): only once its due events waited ackSec,
+   * and only into an empty input box. On by default, so owner messages do not wait for the turn to end.
+   */
   readonly toWorking: boolean;
   /** Default for `dori inbox take --max-bytes`. */
   readonly takeMaxBytes: number;
@@ -104,8 +105,6 @@ export type DiscordConfig = {
 
 export type DoriConfig = {
   readonly discord?: DiscordConfig;
-  /** The Toodo Lead chat as a channel (Toodo started with TOODO_LEAD=external); absent turns the channel off. */
-  readonly toodo?: ToodoConfig;
   readonly stateDir: string;
   readonly laneWorkspace: string;
   readonly workspaces: readonly string[];
@@ -153,7 +152,7 @@ export type DoriConfig = {
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
   readonly ownerDelayNotice: string;
-  /** Seconds the lead has to ack (`dori ack`) an owner message it was handed before ACK_MISSING; twice this posts `ackMissingNotice`. */
+  /** Seconds the lead has to ack (`dori ack`) an owner message it was handed before it is reminded (push delivery re-pushes it); twice this posts `ackMissingNotice`. */
   readonly ackTimeoutSec: number;
   /** Posted once in the owner's channel or thread when the lead got their message but has not acked it after two windows. */
   readonly ackMissingNotice: string;
@@ -166,8 +165,6 @@ export type DoriConfig = {
   readonly resolveKinds: readonly string[];
   /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
   readonly resolveTimeoutMin: number;
-  /** The supervisor posts one plain line itself for each finished lane (lane-finish.ts), in its thread or the main channel. */
-  readonly laneFinishNotice: boolean;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
   readonly deadPanePatterns: readonly string[];
@@ -190,6 +187,7 @@ export type DoriConfig = {
   /**
    * Minutes an idle lead whose omo session still waits on its own children (subagents, child tasks, background cells)
    * keeps a lead-restart request or a cold/context-cap restart deferred, counted from when it began waiting. Must be positive.
+   * 60 is kept: a deferred lead still gets its events in place, and push-ladder and stuck restarts never wait for it.
    */
   readonly leadChildWaitMaxMin: number;
   /** Per machine, no herdr call of a sweep round starts later than this many ms after the round began. */
@@ -262,7 +260,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   reportTimeoutMin: 5,
   resolveKinds: DEFAULT_RESOLVE_KINDS,
   resolveTimeoutMin: 15,
-  laneFinishNotice: true,
   heavySlots: 1,
   heavyMaxLoad: 80,
   deadPanePatterns: ["has stopped", "no suitable jobs"],
@@ -282,7 +279,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   ciMergeBase: "dev",
   delivery: {
     tailMonitor: true, restartMaxPerHour: 3,
-    push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: false, takeMaxBytes: 16_384 },
+    push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
   },
 });
 
@@ -301,6 +298,15 @@ export const REMOVED_QUOTA_STALL_KEYS = ["quotaCheck"] as const;
 /** Top-level keys of the removed Claude quota gate (any old sub-keys included); a config that still has them loads, with one warning. */
 export const REMOVED_QUOTA_GATE_KEYS = ["quotaGate"] as const;
 
+/** Keys of the removed supervisor lane-finish line: the supervisor no longer posts to the owner itself; one warning. */
+export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
+
+/** Keys of the removed Toodo integration (the Toodo Lead chat channel and its Discord mirror); one warning. */
+export const REMOVED_TOODO_KEYS = ["toodo"] as const;
+
+/** Keys of the removed `hooks` entry that marked a messenger thread done on close (the Discord thread is archived instead); one warning. */
+export const REMOVED_HOOK_KEYS = ["threadDone"] as const;
+
 export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
 
 let warnedRemovedQuotaKeys = false;
@@ -310,6 +316,9 @@ let warnedRemovedQuotaGateKeys = false;
 let warnedRemovedQuotaStallKeys = false;
 let warnedRemovedPushKeys = false;
 let warnedRemovedDeliveryKeys = false;
+let warnedRemovedOwnerPostKeys = false;
+let warnedRemovedToodoKeys = false;
+let warnedRemovedHookKeys = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -357,6 +366,16 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     warnedRemovedQuotaKeys = true;
     console.error(`CONFIG_QUOTA_KEYS_REMOVED ${oldLead.join(", ")} in ${path}: the lead uses one model; the keys are ignored and can be deleted`);
   }
+  const oldOwnerPost = REMOVED_OWNER_POST_KEYS.filter((key) => key in loaded);
+  if (oldOwnerPost.length && !warnedRemovedOwnerPostKeys) {
+    warnedRemovedOwnerPostKeys = true;
+    console.error(`CONFIG_OWNER_POST_KEYS_REMOVED ${oldOwnerPost.join(", ")} in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`);
+  }
+  const oldToodo = REMOVED_TOODO_KEYS.filter((key) => key in loaded);
+  if (oldToodo.length && !warnedRemovedToodoKeys) {
+    warnedRemovedToodoKeys = true;
+    console.error(`CONFIG_TOODO_KEYS_REMOVED ${oldToodo.join(", ")} in ${path}: the Toodo integration was removed (Discord is the only messenger); the keys are ignored and can be deleted`);
+  }
   if (Array.isArray(loaded.leadModel)) {
     if (!warnedLeadArray) {
       warnedLeadArray = true;
@@ -364,7 +383,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     }
     loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
   }
-  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS];
+  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS, ...REMOVED_TOODO_KEYS];
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
   const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
   const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);
@@ -380,7 +399,14 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   }
   const push = Object.fromEntries(Object.entries(rawPush).filter(([key]) => !(REMOVED_PUSH_KEYS as readonly string[]).includes(key))) as Partial<PushConfig>;
   const delivery: DeliveryConfig = { ...base.delivery, ...Object.fromEntries(Object.entries(rawDelivery).filter(([key]) => !(REMOVED_DELIVERY_KEYS as readonly string[]).includes(key))), push: { ...base.delivery.push, ...push } };
-  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...raw.hooks }, delivery };
+  const rawHooks = (typeof raw.hooks === "object" && raw.hooks !== null && !Array.isArray(raw.hooks) ? raw.hooks : {}) as Record<string, unknown>;
+  const oldHooks = REMOVED_HOOK_KEYS.filter((key) => key in rawHooks);
+  if (oldHooks.length && !warnedRemovedHookKeys) {
+    warnedRemovedHookKeys = true;
+    console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is archived on Discord, no hook marks it done; the keys are ignored and can be deleted`);
+  }
+  const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => !(REMOVED_HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
+  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...hooks }, delivery };
   return {
     ...merged,
     eventPolicy: resolveEventPolicy(raw.eventPolicy),

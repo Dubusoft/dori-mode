@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { type DoriConfig, fillHook } from "./config.ts";
+import type { DoriConfig } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
@@ -15,7 +15,6 @@ import { type Check, checkDone, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings } from "./branch-cleanup.ts";
 import { otherOpenLanesOnThread } from "./routing.ts";
 import type { Discord } from "./messenger/discord.ts";
-import { type Platform, resolveTarget, type Target } from "./messenger/target.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 
@@ -46,12 +45,12 @@ const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
 const EVENT_TEXT_MAX = 300;
 export const eventText = (text: string): string => text.length > EVENT_TEXT_MAX ? `${text.slice(0, EVENT_TEXT_MAX - 1)}…` : text;
 
-/** Same shape lane-finish.ts reads a PR URL with. */
+/** A GitHub pull request URL. */
 const PULL_URL = /https:\/\/\S+\/pull\/\d+/;
 
 /**
  * The fixed close event: no receipt (the registry keeps it). The first PR URL the close note or a Done signal names is
- * kept, so the supervisor's lane-finish line (lane-finish.ts) still links the PR.
+ * kept, so the lead sees which PR the lane closed with.
  */
 const closedEvent = (key: string, note: string, lines: readonly string[]): string => {
   const pr = [note, ...lines.filter((l) => l.startsWith("SIGNAL "))].map((t) => PULL_URL.exec(t)?.[0]).find(Boolean);
@@ -105,6 +104,13 @@ export const claimBindings = async (run: Runner, lane: Lane): Promise<ClaimedPul
 };
 
 export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
+  // A repeated claim with the same evidence is the claim already recorded: it keeps that claim (and its single
+  // LANE_DONE_CLAIMED, its window and its PR bindings) instead of re-issuing it and waking the lead again.
+  const recorded = await deps.registry.read(lane.key);
+  const status = recorded ? statusOf(recorded) : undefined;
+  if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
+    return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
+  }
   deps = { ...deps, run: laneRunner(deps.run, lane) };
   const pulls = await claimBindings(deps.run, lane);
   const at = iso(deps.clock);
@@ -295,19 +301,10 @@ const closeSequence = async (
       cleanup.push(r.line);
     }
   }
-  const hook = deps.config.hooks.threadDone;
   const sharing = otherOpenLanesOnThread(await deps.registry.open(), lane);
   if (sharing.length) cleanup.push(`thread kept open: lane ${sharing.map((l) => l.key).join(", ")} still works in it`);
   else if (lane.thread !== "none") {
-    if (hook) {
-      // A hook has no read-back of the thread: it is "done" only when the hook ran here and exited 0; after a crash
-      // mid-hook (no result) it cannot be told whether the thread was marked, so that stays ambiguous.
-      let ran: Ran | undefined;
-      const step = await act("thread-done", lane.thread, async () => (ran = await deps.run(fillHook(hook, { thread: lane.thread, text: note, key: lane.key }))), async () => (ran?.code === 0 ? "done" : "unknown"));
-      if (step.state === "ambiguous") return ambiguous(step);
-      cleanup.push(step.state === "verified" ? "thread marked done" : `thread hook failed: ${step.err.slice(0, 160)}`);
-    }
-    // After the hook: a post into an archived thread would reopen it.
+    // A post into an archived thread would reopen it, so nothing posts to the thread after this.
     const thread = discordThreadId(lane.thread);
     if (thread && !deps.discord) cleanup.push("thread archive skipped: DORI_DISCORD_TOKEN is not set");
     else if (thread && deps.discord) {
@@ -468,17 +465,13 @@ export const laneActRefusal = (caller: string | undefined, command: string, targ
   caller === undefined || caller === target ? undefined : `LANE_PERMISSION_DENIED lane ${caller} may not ${command} lane ${target}; only its own key (the lead can act on any lane)`;
 
 /**
- * Why a lane may not send to `target`, or undefined when it may. A lane posts only into its own work thread
- * (`lane.thread`, resolved for that platform the way `dori send --to <ref>` resolves it); the lead may send anywhere.
+ * Why `caller` may not run `dori send`, or undefined for the lead. Only the lead talks to the owner: a lane, even in its
+ * own work thread, asks through `dori report <key> question` and the lead relays the answer.
  */
-export const laneSendRefusal = (caller: string | undefined, lane: Lane | null, platform: Platform, target: Target): string | undefined => {
-  if (caller === undefined) return undefined;
-  const denied = `LANE_PERMISSION_DENIED lane ${caller} may send only to its own work thread (${lane?.thread ?? "unregistered"}), not ${platform} ${target.to}${target.thread ? `/${target.thread}` : ""}`;
-  if (!lane || lane.key !== caller || !lane.thread.startsWith(`${platform}:`)) return denied;
-  let own: Target;
-  try { own = resolveTarget(platform, lane.thread); } catch { return denied; }
-  return own.to === target.to && (own.thread ?? "") === (target.thread ?? "") ? undefined : denied;
-};
+export const laneSendRefusal = (caller: string | undefined): string | undefined =>
+  caller === undefined
+    ? undefined
+    : `LANE_PERMISSION_DENIED lane ${caller} may not run send; it is lead-only. Ask the lead instead: dori report ${caller} question --text "..."`;
 
 /** Hands a line over; `id` is its journal id when the line has a stable one (else the supervisor assigns one). */
 export type Emit = (line: string, id?: string, meta?: EventMeta) => Promise<void>;

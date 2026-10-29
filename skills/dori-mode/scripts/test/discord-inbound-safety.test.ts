@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import {
   discordAttachments, discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound,
-  MISSING_CONTENT_NOTE, pollDiscordInbound,
+  MISSING_CONTENT_NOTE, pollDiscordInbound, unresolvedHydration,
 } from "../src/messenger/discord-inbound.ts";
 import { Discord, DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from "../src/messenger/discord.ts";
 import type { HttpRequest } from "../src/messenger/http.ts";
@@ -62,6 +62,23 @@ test("item 2: content-less messages are forwarded marked and reported; attachmen
     ["discord:100:12", "INBOUND 100 12 Owner  [attachment name=a.png type=image/png url=https://x/a.png]"],
   ]);
   expect(missing).toBe(1);
+});
+
+test("C5#3: recovered placeholder content is enqueued as a separate revision once, via re-delivery or a partial update", async () => {
+  const c = collect();
+  await emitDiscordInbound("700", owner("21", { content: "" }), c.emit, "300");
+  await emitDiscordInbound("700", owner("22", { content: "" }), c.emit, "300");
+  expect(unresolvedHydration().filter((k) => k.startsWith("700:"))).toEqual(["700:21", "700:22"]);
+  await emitDiscordInbound("700", owner("21", { content: "hello" }), c.emit, "300");
+  expect(await emitDiscordEdit("700", { id: "22", channel_id: "700", author: { id: "300", username: "Owner" }, content: "world", attachments: [] }, c.emit, "300")).toBe(true);
+  // Already resolved: a repeat keeps the original id so ordinary dedup applies.
+  await emitDiscordInbound("700", owner("21", { content: "hello" }), c.emit, "300");
+  expect(c.emitted.map(([id]) => id)).toEqual([
+    "discord:700:21", "discord:700:22", "discord:700:21:rev:content", "discord:700:22:rev:content", "discord:700:21",
+  ]);
+  expect(c.emitted[2]?.[1]).toBe("INBOUND 700 21 Owner hello");
+  expect(c.emitted[3]?.[1]).toBe("INBOUND 700 22 Owner world");
+  expect(unresolvedHydration().filter((k) => k.startsWith("700:"))).toEqual([]);
 });
 
 test("item 1: owner edits become distinct INBOUND_EDIT events, others and partial updates are ignored; deletes are marked", async () => {

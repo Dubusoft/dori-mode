@@ -4,7 +4,7 @@ import { createHmac } from "node:crypto";
 import { join } from "node:path";
 
 import * as quota from "../src/claude-quota.ts";
-import { resolveEventPolicy } from "../src/event-policy.ts";
+import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import {
   EMIT_DIR, EventSources, publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews, validateSpec,
 } from "../src/event-sources.ts";
@@ -24,7 +24,7 @@ afterEach(() => {
 const T0 = 1_800_000_000_000;
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
 
-/** A Supervisor whose owner-only posts are captured, and a source registry enqueueing into it. */
+/** A Supervisor whose owner posts are captured (there must be none), and a source registry enqueueing into it. */
 const fixture = (kinds: Record<string, string>, run: Runner = async () => ok()) => {
   const state = withState();
   cleanups.push(state.done);
@@ -45,7 +45,7 @@ const fixture = (kinds: Record<string, string>, run: Runner = async () => ok()) 
 };
 
 test("dori emit: spooled events are journaled once per --id and delivered by their policy class", async () => {
-  const f = fixture({ DEPLOY: "owner-only" });
+  const f = fixture({ DEPLOY: "lead-digest" });
   queueEmit(f.dir, "DEPLOY", "web v2\nrolled out", T0, "deploy-42");
   queueEmit(f.dir, "DEPLOY", "web v2 rolled out again", T0 + 1, "deploy-42");
   queueEmit(f.dir, "DEPLOY", "no id: its own event", T0 + 2);
@@ -53,8 +53,8 @@ test("dori emit: spooled events are journaled once per --id and delivered by the
   const deploys = f.events().filter((event) => event.line.startsWith("DEPLOY "));
   expect(deploys.map((event) => event.line)).toEqual(["DEPLOY web v2 rolled out", "DEPLOY no id: its own event"]);
   expect(deploys[0]?.id).toBe("emit:deploy-42");
-  // owner-only: posted to the owner's channel, never journaled for the lead's delivery.
-  expect(await f.settled()).toEqual(["DEPLOY web v2 rolled out", "DEPLOY no id: its own event"]);
+  // Journaled for the lead's delivery; the supervisor never posts an event to the owner itself.
+  expect(await f.settled()).toEqual([]);
   expect(readdirSync(join(f.dir, EMIT_DIR))).toEqual([]);
   // A later emit with the same id is still a duplicate.
   queueEmit(f.dir, "DEPLOY", "replayed", T0 + 3, "deploy-42");
@@ -64,7 +64,7 @@ test("dori emit: spooled events are journaled once per --id and delivered by the
 });
 
 test("emit retains its spool after a failed save and retries without a false duplicate", async () => {
-  const f = fixture({ DEPLOY: "owner-only" });
+  const f = fixture({ DEPLOY: "lead-digest" });
   queueEmit(f.dir, "DEPLOY", "retry", T0, "retry");
   const files = readdirSync(join(f.dir, EMIT_DIR));
   const save = spyOn(f.supervisor["core"].store, "save").mockImplementation(() => { throw new Error("save failed"); });
@@ -77,12 +77,12 @@ test("emit retains its spool after a failed save and retries without a false dup
   await f.sources.tick();
   expect(readdirSync(join(f.dir, EMIT_DIR))).toEqual([]);
   expect(f.events().filter((event) => event.id === "emit:retry")).toHaveLength(1);
-  expect(await f.settled()).toEqual(["DEPLOY retry"]);
+  expect(await f.settled()).toEqual([]);
   expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ events: 1, duplicates: 0 });
 });
 
 test("webhook returns an error after a failed save and accepts a same-id retry", async () => {
-  const f = fixture({ HOOK: "owner-only" });
+  const f = fixture({ HOOK: "lead-digest" });
   const port = freePort();
   const secret = "s3cret-s3cret-s3cret";
   new SourceSpecs(f.dir).add({ name: "hook", type: "webhook", kind: "HOOK", port, secret });
@@ -100,7 +100,7 @@ test("webhook returns an error after a failed save and accepts a same-id retry",
   expect(retry.status).toBe(202);
   expect(await retry.json()).toEqual({ ok: true, duplicate: false });
   expect(f.events().filter((event) => event.id === "src:hook:retry")).toHaveLength(1);
-  expect(await f.settled()).toEqual(["HOOK retry"]);
+  expect(await f.settled()).toEqual([]);
   f.sources.save();
   expect(readSourceStatus(f.dir)?.sources.hook).toMatchObject({ events: 1, duplicates: 0 });
 });
@@ -108,12 +108,14 @@ test("webhook returns an error after a failed save and accepts a same-id retry",
 test("a poll source runs its command every everySec and journals each matching line once, by its capture group", async () => {
   let out = "101 green\nnoise\n102 red\n";
   const calls: (readonly string[])[] = [];
-  const f = fixture({ BUILD: "engine-only", "BUILD * red": "owner-only" }, async (argv) => { calls.push(argv); return ok(out); });
+  const f = fixture({ BUILD: "engine-only", "BUILD * red": "lead-digest" }, async (argv) => { calls.push(argv); return ok(out); });
   new SourceSpecs(f.dir).add({ name: "ci", type: "poll", kind: "BUILD", command: ["ci-status"], everySec: 60, match: "^(\\d+) " });
   await f.sources.tick();
   expect(f.events().filter((event) => event.line.startsWith("BUILD ")).map((event) => event.line)).toEqual(["BUILD 101 green", "BUILD 102 red"]);
-  // The policy table decides per kind: `BUILD * red` reaches the owner, plain BUILD stays engine-only.
-  expect(await f.settled()).toEqual(["BUILD 102 red"]);
+  // The policy table decides per kind: `BUILD * red` reaches the lead, plain BUILD stays engine-only.
+  expect(eventClass("BUILD 102 red", f.deps.config.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("BUILD 101 green", f.deps.config.eventPolicy)).toBe("engine-only");
+  expect(await f.settled()).toEqual([]);
   // Not due yet: no second run.
   await f.sources.tick();
   expect(calls).toHaveLength(1);
@@ -136,7 +138,7 @@ test("a poll source without a capture group lists its line-hash identity", () =>
 });
 
 test("a file source tails from the end at first sight, journals new matching lines once and follows a truncation", async () => {
-  const f = fixture({ ALERT: "owner-only" });
+  const f = fixture({ ALERT: "lead-digest" });
   const log = join(f.dir, "app.log");
   writeFileSync(log, "ERROR old, before the source existed\n");
   new SourceSpecs(f.dir).add({ name: "app-log", type: "file", kind: "ALERT", path: log, match: "ERROR" });
@@ -153,7 +155,7 @@ test("a file source tails from the end at first sight, journals new matching lin
   writeFileSync(log, "ERROR after rotation\n");
   await f.sources.tick();
   expect(f.events().map((event) => event.line)).toEqual(["ALERT ERROR disk full", "ALERT ERROR half a line", "ALERT ERROR after rotation"]);
-  expect(await f.settled()).toEqual(["ALERT ERROR disk full", "ALERT ERROR half a line", "ALERT ERROR after rotation"]);
+  expect(await f.settled()).toEqual([]);
   expect(readSourceStatus(f.dir)?.sources["app-log"]?.cursor).toEqual({ path: log, offset: statSync(log).size });
 });
 
@@ -165,7 +167,7 @@ const freePort = (): number => {
 };
 
 test("a webhook source accepts a POST with its secret on 127.0.0.1 only, dedupes by id and refuses a wrong secret", async () => {
-  const f = fixture({ HOOK: "owner-only" });
+  const f = fixture({ HOOK: "lead-digest" });
   const port = freePort();
   const secret = "s3cret-s3cret-s3cret";
   new SourceSpecs(f.dir).add({ name: "hook", type: "webhook", kind: "HOOK", port, secret });
@@ -188,7 +190,7 @@ test("a webhook source accepts a POST with its secret on 127.0.0.1 only, dedupes
     ["src:hook:r1", "HOOK release v1 published"],
     ["src:hook:d-1", `HOOK ${body}`],
   ]);
-  expect(await f.settled()).toEqual(["HOOK release v1 published", `HOOK ${body}`]);
+  expect(await f.settled()).toEqual([]);
   f.sources.save();
   expect(readSourceStatus(f.dir)?.sources.hook).toMatchObject({ events: 2, duplicates: 1, rejected: 2 });
   // Removing the source stops its listener.

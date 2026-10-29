@@ -31,6 +31,7 @@ test("lead-only commands refuse under DORI_LANE_KEY with a clear message and non
     ["ack", "11", "22"], ["handled", "11", "22"], ["launch", "k", "--title", "t", "--brief", "b", "--done", "d"],
     ["adopt", "k", "--title", "t", "--brief", "b", "--done", "d", "--pane", "p"],
     ["hold", "list"], ["hold", "drop", "k"], ["lead-restart"], ["inbox", "take"], ["update"],
+    ["send", "discord", "--to", "discord:1/2", "--text", "hi"],
   ];
   for (const args of cmds) {
     const r = await cli(args, inLane);
@@ -66,7 +67,7 @@ test("object-done is limited to the lane's own key; the lead may object on any l
 test("typing discord refuses --off with the usage text before any token lookup", async () => {
   const r = await cli(["typing", "discord", "123", "--off"]);
   expect(r.code).toBe(1);
-  expect(r.err).toContain("usage: dori typing toodo [--off] | dori typing discord <channel>");
+  expect(r.err).toContain("usage: dori typing discord <channel>");
   expect(r.err).not.toContain("DORI_DISCORD_TOKEN");
 });
 

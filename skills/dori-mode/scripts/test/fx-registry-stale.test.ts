@@ -32,7 +32,7 @@ afterEach(() => {
 });
 
 const deps = (ms: number, run?: Runner) => ({
-  ...depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"], threadDone: ["notify", "{thread}", "{text}"] } }),
+  ...depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } }),
   ...(run ? { run } : {}),
 });
 /** A real independent process writing this lane while the caller holds a stale copy. */

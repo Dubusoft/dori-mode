@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
@@ -108,13 +107,18 @@ test("POSIX remote launch copies the complete brief to a remote-valid path befor
   const command = calls.find((argv) => argv[4] === "run")?.[6];
   if (!command) throw new Error("launch did not submit a command");
   expect(command).not.toContain(state.dir);
+  expect(command).toContain(remote);
+  // Emulate the remote host's /tmp in a separate TMPDIR-backed filesystem fixture.
+  // The submitted path remains checked above; the lead's /tmp need not be writable.
+  const remoteState = withState();
+  const remoteBrief = join(remoteState.dir, `dori-brief-${input.key}.md`);
   try {
-    const executed = await realRun(["sh", "-c", command], { timeoutMs: 5_000 });
+    const executed = await realRun(["sh", "-c", command.replaceAll(remote, remoteBrief)], { timeoutMs: 5_000 });
     expect(executed.code).toBe(0);
-    expect(executed.out).toContain(`lane brief at ${remote} in full`);
-    expect(await Bun.file(remote).text()).toBe(shipped);
+    expect(executed.out).toContain(`lane brief at ${remoteBrief} in full`);
+    expect(await Bun.file(remoteBrief).text()).toBe(shipped);
   } finally {
-    if (await Bun.file(remote).exists()) unlinkSync(remote);
+    remoteState.done();
   }
 });
 

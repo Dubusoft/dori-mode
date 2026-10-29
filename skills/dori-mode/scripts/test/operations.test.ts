@@ -105,7 +105,7 @@ test("a read-back proving absence after a throwing effect is failed and may retr
 test("operations survive a store import and export with their states", async () => {
   if (TEST_STORE === "sqlite") return;
   await perform(store, now, spec, effect, readBack);
-  await perform(store, now, { ...spec, action: "thread-done", target: "discord:1/2" }, effect, async () => "unknown");
+  await perform(store, now, { ...spec, action: "pane-close", target: "w:p2" }, effect, async () => "unknown");
   const before = store.list();
   writeFileSync(join(state.dir, "supervisor.json"), JSON.stringify({ events: [] }));
   importStore(state.dir, T0, () => () => {});
@@ -120,7 +120,7 @@ test("operations survive a store import and export with their states", async () 
 test("a close records its effects and a second close of the same lane repeats none of them", async () => {
   const w: World = newWorld();
   w.panes = [{ pane_id: "w:p1", workspace_id: "w" }];
-  const base = depsFor(w, fakeClock(T0), state.dir, { hooks: { threadDone: ["notify", "{thread}", "{text}"] } });
+  const base = depsFor(w, fakeClock(T0), state.dir);
   const run: typeof base.run = async (argv, opts) => {
     if (argv[0] === "herdr" && argv[2] === "close") w.panes = w.panes.filter((p) => p.pane_id !== argv[3]);
     return base.run(argv, opts);
@@ -132,12 +132,12 @@ test("a close records its effects and a second close of the same lane repeats no
   const removing: typeof run = async (argv, opts) => { if (argv.includes("remove")) removed = true; return run(argv, opts); };
   const first = await closeLane({ ...deps, run: removing }, lane, "manual");
   expect(first.closed).toBe(true);
-  const effects = () => w.calls.filter((c) => c.includes("remove") || c[0] === "notify" || c[2] === "close").length;
-  expect(effects()).toBe(3);
-  expect(store.list().map((op) => `${op.action} ${op.state}`).sort()).toEqual(["close verified", "pane-close verified", "thread-done verified", "worktree-remove verified"]);
+  const effects = () => w.calls.filter((c) => c.includes("remove") || c[2] === "close").length;
+  expect(effects()).toBe(2);
+  expect(store.list().map((op) => `${op.action} ${op.state}`).sort()).toEqual(["close verified", "pane-close verified", "worktree-remove verified"]);
   const second = await closeLane({ ...deps, run: removing }, lane, "manual");
   expect(second).toEqual({ closed: true, lines: ["CLOSED demo-lane already closed"] });
-  expect(effects()).toBe(3);
+  expect(effects()).toBe(2);
 });
 
 /** A fake Discord API behind the real client: threads by id with their archived flag; every request is recorded. */

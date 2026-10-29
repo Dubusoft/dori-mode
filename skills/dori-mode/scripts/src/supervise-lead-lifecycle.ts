@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { FlowDeps } from "./done-flow.ts";
 import { leadModels, leadCommand, LEAD_DIET_ARGS, LEAD_DIET_ENV } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
-import { ALIVE_STATUSES, listPanes, readScreen, sendGuarded, sendVerified } from "./panes.ts";
+import { ALIVE_STATUSES, listPanes, type Pane, readScreen, sendGuarded, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
 import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
@@ -196,7 +196,8 @@ export class LeadLifecycle {
   /**
    * True when the restart cap refuses an unread-driven restart (stuckRestart, the push ladder). Forced
    * restarts of the last hour count (they still run past the cap). The first refusal of each hour is
-   * logged and told to the owner once; the push step keeps re-pushing meanwhile.
+   * logged, told to the owner once and journaled for the lead as an urgent LEAD_UNRESPONSIVE event (so its next pointer
+   * says why nobody restarts it); the push step keeps re-pushing meanwhile.
    */
   capRefuses(what: string): boolean {
     const { delivery } = this.deps.config;
@@ -209,6 +210,7 @@ export class LeadLifecycle {
       console.log(`LEAD_RESTART_CAPPED ${what}: ${count} forced restarts in the last hour (delivery.restartMaxPerHour ${delivery.restartMaxPerHour}); re-pushing instead`);
       this.journal = { ...this.journal, inbox: { ...inbox, capNotice: hour } };
       this.persist();
+      this.enqueue(`lead-unresponsive:${hour}`, `LEAD_UNRESPONSIVE ${what}: you did not take pushed events or handle owner messages, and ${count} forced restarts in the last hour reached delivery.restartMaxPerHour ${delivery.restartMaxPerHour}, so you are not restarted; run dori inbox take now`);
       this.owners.announce(`lead-restart-capped:${hour}`, `The lead is not taking new events, but it was already restarted ${count} times in the last hour, so it is not restarted again for now. The supervisor keeps notifying it.`);
     }
     return true;
@@ -219,13 +221,14 @@ export class LeadLifecycle {
    * unacked past the ack window is resumed: `/resume` is typed once per ack window, only into an empty input line.
    * One that stays silent is restarted by the push ladder after push.escalateMin.
    */
-  async resumePaused(): Promise<void> {
+  async resumePaused(readPane = async (): Promise<Pane | undefined> =>
+    (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<void> {
     const { config, clock, run } = this.deps;
     const now = clock.now();
     const window = config.ackTimeoutSec * 1000;
     if (now - this.resumedAt < window) return;
     if (!this.unacked(true).some((entry) => now - (entry.since ?? now) >= window)) return;
-    const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
+    const pane = await readPane();
     if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) return;
     const screen = await readScreen(run, config.leadPane, LEAD_SCREEN_LINES);
     if (!PAUSED.test(screen)) return;
@@ -245,9 +248,12 @@ export class LeadLifecycle {
    * those clocks are journaled, so a supervisor restart does not reset them.
    * A faster rule uses push.escalateMin: a working lead held inside one tool call (a foreground wait or watch cannot
    * take a pushed pointer until it returns), counted from the later of the call's start and the oldest unacked message.
-   * An idle lead is left to the push ladder.
+   * A working lead whose process is identified but whose session file is not found (no tool-call evidence either way)
+   * gets the same clock from the oldest unacked message, not the 30 min rule. One whose process cannot be identified
+   * keeps the 30 min rule: stopLead refuses to stop an unidentified lead. An idle lead is left to the push ladder.
    */
-  async stuckRestart(pending: readonly Event[]): Promise<boolean> {
+  async stuckRestart(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
+    (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<boolean> {
     const { config, clock, run } = this.deps;
     const limit = config.leadStuckRestartMin * 60_000;
     if (!(limit > 0)) return false;
@@ -256,7 +262,7 @@ export class LeadLifecycle {
     const waiting = this.unacked();
     if (!waiting.length) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const now = clock.now();
-    const pane = (await listPanes(run)).find((p) => p.pane_id === config.leadPane);
+    const pane = await readPane();
     if (!pane?.agent) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const restart = async (status: string, minutes: number, count: number): Promise<boolean> => {
       // The cap is checked before anything is announced: a refused restart must not tell the owner it is happening.
@@ -283,7 +289,8 @@ export class LeadLifecycle {
       // sleep. Owner messages must not wait for it, however busy its screen looks.
       // A probe that cannot resolve the session must not stop delivery: the other rules still apply.
       let file: string | undefined;
-      try { ({ file } = await this.sessionFile(pane.cwd ?? config.defaultCwd)); } catch (e) {
+      let id = "";
+      try { ({ id, file } = await this.sessionFile(pane.cwd ?? config.defaultCwd)); } catch (e) {
         if (!(e instanceof Error)) throw e;
         console.error(`LEAD_SESSION_UNRESOLVED ${config.leadPane}: ${e.message}`);
       }
@@ -292,6 +299,10 @@ export class LeadLifecycle {
       if (call !== undefined && times.length) {
         const since = Math.max(Math.min(...times), call);
         if (now - since >= unreadLimit) return await restart("in one tool call", Math.round((now - since) / 60_000), waiting.length);
+      } else if (id && !file && times.length) {
+        // The lead process is identified (a restart can stop it) but its session file is not: no tool-call evidence.
+        const since = Math.min(...times);
+        if (now - since >= unreadLimit) return await restart("with its session unresolved", Math.round((now - since) / 60_000), waiting.length);
       }
     }
     const unread = new Set(this.unacked(false).map(latest));

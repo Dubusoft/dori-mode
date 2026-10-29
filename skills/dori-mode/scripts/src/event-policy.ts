@@ -1,14 +1,15 @@
 /**
  * The event policy table (design 1.7): every event kind is delivered by class. `lead-urgent` wakes the lead,
- * `lead-digest` waits for the next urgent delivery (or `digestMaxDelayMin`), `owner-only` is posted to the owner's main
- * channel and never reaches the lead, `engine-only` is journaled for the engine and the counts only.
+ * `lead-digest` waits for the next urgent delivery (or `digestMaxDelayMin`), `engine-only` is journaled for the engine and
+ * the counts only. The supervisor never posts an event to the owner itself: everything the owner hears goes through the lead.
+ * The removed `owner-only` class still loads from an old config, as `lead-digest`, with one warning per process.
  *
  * A kind is the event line's first word, optionally followed by more words that must match the line's next words in
  * order; `*` matches any one word. `HOST_GUARD ALERT` matches `HOST_GUARD ALERT load 40`, `GH_PR * merged` matches
  * `GH_PR acme/app#7 merged ...`. The most specific matching kind wins (more words, then fewer `*`); a line no kind
  * matches gets `default`. Kinds are open-ended: a new event source needs only a config entry, or none at all.
  */
-export const EVENT_CLASSES = ["lead-urgent", "lead-digest", "owner-only", "engine-only"] as const;
+export const EVENT_CLASSES = ["lead-urgent", "lead-digest", "engine-only"] as const;
 export type EventClass = (typeof EVENT_CLASSES)[number];
 
 export type EventPolicy = {
@@ -21,8 +22,10 @@ const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
-  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "ACK_MISSING", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
+  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_RECOVERY_EXHAUSTED",
+  // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
+  "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
@@ -51,11 +54,9 @@ const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED", "LANE_CLOSED * closed seen-claim",
-  // The Toodo chat's finish reports and followed task events (messenger/toodo-supervisor.ts): informational, never acked.
-  "TOODO_FINISH", "TOODO_TASK",
 ] as const;
 
-/** The supervisor's own records: LANE_FINISH_NOTICE only dedupes its lane-finish line (lane-finish.ts). */
+/** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */
 const ENGINE_KINDS = ["LANE_FINISH_NOTICE"] as const;
 
 /** The actionable kinds wake the lead, every other line is digest. */
@@ -74,6 +75,10 @@ export class EventPolicyError extends Error {}
 
 const isClass = (value: unknown): value is EventClass => typeof value === "string" && (EVENT_CLASSES as readonly string[]).includes(value);
 
+/** The removed class an old config may still name; it now means `lead-digest`. */
+const REMOVED_OWNER_ONLY = "owner-only";
+let warnedOwnerOnly = false;
+
 /**
  * The policy from a config's `eventPolicy` (absent: the default). Its `kinds` are laid over the default table, so a
  * config names only the kinds it changes. Throws EventPolicyError on a value that is not a class or a malformed kind.
@@ -81,11 +86,19 @@ const isClass = (value: unknown): value is EventClass => typeof value === "strin
 export const resolveEventPolicy = (raw: unknown): EventPolicy => {
   if (raw === undefined) return DEFAULT_EVENT_POLICY;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new EventPolicyError("eventPolicy must be an object");
-  const { default: fallback, kinds } = raw as { default?: unknown; kinds?: unknown };
+  const { default: rawFallback, kinds } = raw as { default?: unknown; kinds?: unknown };
+  const ownerOnly: string[] = [];
+  const compat = (name: string, value: unknown): unknown => {
+    if (value !== REMOVED_OWNER_ONLY) return value;
+    ownerOnly.push(name);
+    return "lead-digest";
+  };
+  const fallback = compat("default", rawFallback);
   if (fallback !== undefined && !isClass(fallback)) throw new EventPolicyError(`eventPolicy.default must be one of ${EVENT_CLASSES.join(", ")}`);
   if (kinds !== undefined && (typeof kinds !== "object" || kinds === null || Array.isArray(kinds))) throw new EventPolicyError("eventPolicy.kinds must be an object");
   const merged: Record<string, EventClass> = { ...DEFAULT_EVENT_POLICY.kinds };
-  for (const [kind, value] of Object.entries(kinds ?? {})) {
+  for (const [kind, rawValue] of Object.entries(kinds ?? {})) {
+    const value = compat(kind, rawValue);
     if (!isClass(value)) throw new EventPolicyError(`eventPolicy.kinds["${kind}"] must be one of ${EVENT_CLASSES.join(", ")}`);
     const words = kind.split(" ");
     if (!kind || words.some((word) => !word) || words[0] === "*") throw new EventPolicyError(`eventPolicy.kinds["${kind}"]: a kind is words separated by single spaces, starting with the event name`);
@@ -93,6 +106,10 @@ export const resolveEventPolicy = (raw: unknown): EventPolicy => {
       throw new EventPolicyError(`eventPolicy.kinds["${kind}"]: owner messages must reach the lead (lead-urgent or lead-digest)`);
     }
     merged[kind] = value;
+  }
+  if (ownerOnly.length && !warnedOwnerOnly) {
+    warnedOwnerOnly = true;
+    console.error(`EVENT_POLICY_OWNER_ONLY_REMOVED ${ownerOnly.join(", ")}: the owner-only class was removed (the supervisor no longer posts events to the owner); treated as lead-digest`);
   }
   return { default: fallback ?? DEFAULT_EVENT_POLICY.default, kinds: merged };
 };
@@ -128,5 +145,5 @@ export const eventKind = (line: string, policy: EventPolicy = DEFAULT_EVENT_POLI
 
 export const eventClass = (line: string, policy: EventPolicy = DEFAULT_EVENT_POLICY): EventClass => match(line, policy)?.cls ?? policy.default;
 
-/** Lead classes are journaled for the lead; owner-only and engine-only never reach it. */
+/** Lead classes are journaled for the lead; engine-only never reaches it. */
 export const forLead = (cls: EventClass): boolean => cls === "lead-urgent" || cls === "lead-digest";

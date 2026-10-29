@@ -13,17 +13,12 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
-import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
+import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
 import { canLaunch, dequeueLaunch, enqueueLaunch, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
-import { Slack } from "./messenger/slack.ts";
-import { pollSlackInbound } from "./messenger/slack-inbound.ts";
-import { ThreadLedger } from "./messenger/thread-ledger.ts";
-import { slackPresence } from "./messenger/slack-presence.ts";
-import { Telegram } from "./messenger/telegram.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
 import { DiscordCommands } from "./messenger/discord-commands.ts";
@@ -35,14 +30,13 @@ import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
-import { ack, AckError, ackToodo, recordHandled } from "./ack.ts";
-import { TOODO_CHANNEL, type Toodo, toodoClient, ToodoError } from "./messenger/toodo.ts";
-import { InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
+import { ack, AckError, recordHandled } from "./ack.ts";
+import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
 import { ackLaneMessage, LaneMessageError, openLaneMessages } from "./lane-messages.ts";
-import { isReportKind, oneLine, openLaneReports, REPORT_KINDS, type ReportKind, UNFENCED_GENERATION } from "./lane-reports.ts";
+import { isReportKind, laneGeneration, oneLine, openLaneReports, REPORT_KINDS, type ReportKind } from "./lane-reports.ts";
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
@@ -69,7 +63,7 @@ const USAGE = `dori <command> [options]
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
-                                       inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, and send posts only to its own thread
+                                       inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, send is lead-only (a lane asks with report <key> question), and a session replaced by recovery may not claim-done or report
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
@@ -108,24 +102,21 @@ const USAGE = `dori <command> [options]
   report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up)
   inbox take [--max-bytes N] [--peek]  the lead's read path: delivered events past the take cursor as id<TAB>line, whole lines
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
-  reported <key> [--note TEXT]         the lead's receipt that it told the owner a finished lane's outcome (after LANE_CLOSED or CI_MERGED);
+  reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]
+                                       post a finished lane's outcome (after LANE_CLOSED or CI_MERGED) to the owner in the lane's thread
+                                       (--to/--thread override it, as for send) and, once the post returns a message id, record the receipt;
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
-  ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on an owner message: on Discord hourglass off, eyes on;
-                                       channel toodo: ack_chat and typing dots in Toodo; the ack is recorded for the supervisor
-  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--reply-id ID] [--task-id ID]
-                                       link what handled an owner message; for toodo the reply (--reply-id, else the lead's latest reply after
-                                       the message) or Toodo task (--task-id) is also recorded in Toodo
-  send <slack|telegram|discord|toodo> --to TARGET --text TEXT [--thread ID] [--edit ID]
-                                       post or edit a message (tokens from DORI_SLACK_TOKEN, DORI_TELEGRAM_TOKEN, DORI_DISCORD_TOKEN);
-                                       toodo: --to toodo posts in the Lead chat, --to <n> answers chat message n and marks it handled
-  typing toodo [--off]                 show (or end) the lead's typing dots in the Toodo chat for 30 s
+  ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
+                                       hourglass off, eyes on; the ack is recorded for the supervisor
+  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
+                                       link what handled an owner message
+  send discord --to TARGET --text TEXT [--thread ID] [--edit ID]
+                                       post or edit a Discord message (token from DORI_DISCORD_TOKEN)
   typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
-  presence <slack|discord>             keep the account shown as online until stopped
-  transcribe <audio-file>              run hooks.transcribe and print the text
-  inbound slack [--loop MIN]           print INBOUND lines: unread thread replies (threads view), replies in threads
-                                       the Dori posted in (any helper), DMs and channels with unread mentions`;
+  presence discord                     keep the bot shown as online until stopped
+  transcribe <audio-file>              run hooks.transcribe and print the text`;
 
 const die = (message: string, code = 1): never => {
   console.error(message);
@@ -199,11 +190,30 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule", "send"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
-  if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
+  if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
 }
+
+/**
+ * Why the calling process may not report as lane `lane` (claim-done, report), or undefined when it may. Ownership
+ * fencing on the CLI side: a lane's active session is the one in its registered pane, so a session replaced by
+ * recovery (still alive in the old pane, DORI_LANE_KEY unchanged) cannot claim or report for the lane that replaced it.
+ * The lead (no caller lane) and a process with no pane id are not fenced.
+ */
+const staleLaneRefusal = (caller: string | undefined, lane: Lane, env: Readonly<Record<string, string | undefined>> = process.env): string | undefined => {
+  const pane = env.HERDR_PANE_ID?.trim();
+  if (caller === undefined || caller !== lane.key || !pane || !lane.pane || pane === lane.pane) return undefined;
+  return `LANE_STALE_SESSION lane ${lane.key} is now owned by pane ${lane.pane}; this session (pane ${pane}) was replaced and may not report for it`;
+};
+
+/** `lane(k)` for a command that reports as the lane (claim-done, report): a session replaced by recovery is refused. */
+const activeLane = async (command: string, k: string | undefined) => {
+  const found = await lane(await ownKey(command, k));
+  const stale = staleLaneRefusal(await callerLane(deps), found);
+  return stale ? die(stale) : found;
+};
 
 const lane = async (k: string | undefined) => {
   const found = k ? await deps.registry.read(k) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? "", opt("machine"));
@@ -212,25 +222,12 @@ const lane = async (k: string | undefined) => {
   return found;
 };
 
-/** The Toodo chat client, from config.toodo (the lead token is read from its file). */
-const toodoChat = (): Toodo => {
-  if (!config.toodo) return die("config.toodo is not set: add { \"url\": ..., \"leadTokenFile\": ... } (references/scripts.md)");
-  return toodoClient(fetchHttp, config.toodo);
-};
+const messengerToken = (name: string): string => resolveCredential(name) ?? die(`${name} is not set in the environment or in ${envFilePath()}`);
 
-/** `--reply-id`, else the newest reply of the lead (not an imported one) after chat message `after`. */
-const latestLeadReply = async (toodo: Toodo, after: number, replyId: number | undefined): Promise<{ readonly replyId: number } | undefined> => {
-  if (replyId !== undefined) return { replyId };
-  let latest: number | undefined;
-  for (let cursor = after; ;) {
-    const feed = await toodo.listChat(cursor);
-    for (const m of feed.messages) if (m.author === "lead" && !m.origin) latest = m.id;
-    const last = feed.messages.at(-1)?.id;
-    if (!feed.more || last === undefined) break;
-    cursor = last;
-  }
-  return latest === undefined ? undefined : { replyId: latest };
-};
+/** Posts `text` to a resolved Discord target and returns the new message's id. */
+const postMessage = async (to: string, text: string): Promise<string> =>
+  // Each post is its own message: without a unique id Discord would dedupe a repeat of the same text.
+  new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).send(to, text, randomUUID());
 
 const every = async (minutes: number, tick: () => Promise<void>): Promise<void> => {
   for (;;) {
@@ -477,7 +474,7 @@ try {
       break;
     }
     case "claim-done":
-      console.log(await claimDone(deps, await lane(await ownKey("claim-done", key)), need("evidence")));
+      console.log(await claimDone(deps, await activeLane("claim-done", key), need("evidence")));
       break;
     case "lane": {
       const [action, laneKey, ...extra] = flags.positionals;
@@ -626,7 +623,10 @@ try {
         const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        for (const line of [...lines, ...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir), ...sentinel]) console.log(line);
+        const reminders = [...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
+        // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
+        const checklist = checklistLine([...result.events.map((event) => `${event.id}\t${event.line}`), ...reminders]);
+        for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;
@@ -642,14 +642,10 @@ try {
       }
       const tasks = parsed.values.tasks === undefined ? undefined : Number(parsed.values.tasks);
       let discord: Discord | undefined;
-      let toodo: Toodo | undefined;
       for (let i = 0; i < pairs.length; i += 2) {
         const [channel = "", message = ""] = [pairs[i], pairs[i + 1]];
-        if (channel === TOODO_CHANNEL) await ackToodo(config.stateDir, toodo ??= toodoChat(), message, realClock.now(), tasks);
-        else {
-          discord ??= new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
-          await ack(config.stateDir, discord, channel, message, realClock.now(), tasks);
-        }
+        discord ??= new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
+        await ack(config.stateDir, discord, channel, message, realClock.now(), tasks);
         console.log(`ACKED ${channel} ${message}`);
       }
       break;
@@ -662,12 +658,13 @@ try {
         if (!action || !isReportKind(kind) || extra.length || Object.keys(flags.values).some((name) => name !== "text" && name !== "evidence")) {
           die(`usage: dori report <key> <${REPORT_KINDS.join("|")}> --text T [--evidence E] | dori report ack <id>`);
         }
-        const text = oneLine(need("text"));
-        const evidence = opt("evidence") ? oneLine(opt("evidence") ?? "") : undefined;
-        const target = await lane(await ownKey("report", action));
+        // Newlines stay: the store redacts, and routeReports saves a multi-line body to a file for the lead.
+        const text = need("text").trim();
+        const evidence = opt("evidence")?.trim();
+        const target = await activeLane("report", action);
         const reports = openLaneReports(config);
         try {
-          const row = reports.append({ lane: target.key, generation: UNFENCED_GENERATION, kind: kind as ReportKind, text, ...(evidence ? { evidence } : {}), at: realClock.now() });
+          const row = reports.append({ lane: target.key, generation: laneGeneration(target), kind: kind as ReportKind, text, ...(evidence ? { evidence } : {}), at: realClock.now() });
           console.log(`LANE_REPORTED ${row.id} ${row.kind}`);
         } finally { reports.close(); }
         break;
@@ -683,15 +680,26 @@ try {
       break;
     }
     case "reported": {
-      // `dori reported <key> [--note T]`: the lead has told the owner about lane <key>'s outcome itself.
+      // `dori reported <key> --text T`: post lane <key>'s outcome to the owner (the lane's thread unless --to/--thread),
+      // then record the receipt. A failed post records nothing, so the obligation stays open.
       const { recordReported } = await import("./lane-outcomes.ts");
-      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => name !== "note") || ("note" in flags.values && !opt("note"))) {
-        die("usage: dori reported <key> [--note TEXT]");
+      const options = ["text", "to", "thread", "note"];
+      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !options.includes(name)) || options.some((name) => name in flags.values && !opt(name)) || !opt("text")) {
+        die("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]");
       }
-      if (!(await deps.registry.read(key ?? ""))) die(`no registered lane "${key}"`);
+      const found = (await deps.registry.read(key ?? "")) ?? die(`no registered lane "${key}"`);
+      const bound = found.thread && found.thread !== "none" ? found.thread : undefined;
+      const ref = opt("to") ?? bound ?? die(`lane ${key} has no bound thread; name where to post with --to TARGET (a thread ref such as discord:<channel>/<thread>)`);
+      // A Discord ref posts there; a bare --to id posts on Discord only when the lane's bound thread is a Discord one.
+      const isDiscord = (r: string | undefined): boolean => r?.startsWith("discord:") === true;
+      if (!isDiscord(ref) && (ref.includes(":") || !isDiscord(bound))) die(`cannot tell the platform of "${ref}"; use a thread ref such as discord:<channel>/<thread>`);
+      const platform = "discord";
+      const { to, thread } = resolveTarget(platform, ref, opt("thread"));
+      const message = await postMessage(to, opt("text") ?? "");
+      if (!message) die(`REPORT_NOT_POSTED ${key}: ${platform} returned no message id; nothing recorded`);
       const note = opt("note");
-      recordReported(config.stateDir, key ?? "", realClock.now(), note ? oneLine(note) : undefined);
-      console.log(`REPORTED_RECORDED ${key}`);
+      recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, { message, target: `${platform}:${to}${thread ? `/${thread}` : ""}` });
+      console.log(`REPORTED_RECORDED ${found.key} ${message}`);
       break;
     }
     case "resolved": {
@@ -712,80 +720,39 @@ try {
     case "handled": {
       const parsed = parseArgs({
         args: rest, allowPositionals: true,
-        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, all: { type: "boolean" }, tasks: { type: "string" }, "reply-id": { type: "string" }, "task-id": { type: "string" } },
+        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, all: { type: "boolean" }, tasks: { type: "string" } },
       });
       const [channel, message, ...extra] = parsed.positionals;
-      const replyId = parsed.values["reply-id"] === undefined ? undefined : Number(parsed.values["reply-id"]);
-      const taskId = parsed.values["task-id"] === undefined ? undefined : Number(parsed.values["task-id"]);
-      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--all] [--reply-id ID] [--task-id ID]");
-      if ((replyId !== undefined || taskId !== undefined) && channel !== TOODO_CHANNEL) die("--reply-id and --task-id are for the toodo channel");
-      if ([replyId, taskId].some((id) => id !== undefined && (!Number.isSafeInteger(id) || id < 1))) die("--reply-id and --task-id must be positive integers");
+      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--all]");
       for (const key of parsed.values.lane ?? []) {
         if (!(await deps.registry.read(key))) die(`no registered lane "${key}"`);
       }
-      const reply = parsed.values.reply === true || replyId !== undefined || taskId !== undefined;
+      const reply = parsed.values.reply === true;
       recordHandled(config.stateDir, channel ?? "", message ?? "", realClock.now(), {
         tasks: parsed.values.tasks === undefined ? undefined : Number(parsed.values.tasks),
         lanes: parsed.values.lane, reply, ...(parsed.values.all ? { all: true } : {}),
       });
       console.log(`HANDLED_LINKED ${channel} ${message}`);
-      if (channel === TOODO_CHANNEL) {
-        // Toodo's own receipt: a reply of the lead newer than the message, or a Toodo task made for it. Lanes have no
-        // Toodo counterpart, so a lanes-only link stays with the supervisor.
-        const toodo = toodoChat();
-        const id = `chat-${message}`;
-        const link = taskId !== undefined ? { taskId } : reply ? await latestLeadReply(toodo, Number(message), replyId) : undefined;
-        if (link) {
-          await toodo.markHandled(id, link);
-          console.log(`TOODO_HANDLED ${message}`);
-        } else {
-          console.log(`TOODO_HANDLED_LOCAL ${reply ? `no reply of the lead after chat ${message} in Toodo` : "lanes have no Toodo receipt"}; recorded for the supervisor only`);
-        }
-      }
       break;
     }
     case "send": {
-      const platform = key ?? die("send needs slack, telegram, discord or toodo");
-      const named = platform === "slack" || platform === "telegram" || platform === "discord" || platform === "toodo" ? platform : die(`unknown platform ${platform}`);
-      const { to, thread } = resolveTarget(named, need("to"), opt("thread"));
-      const me = await callerLane(deps);
-      const sendRefusal = laneSendRefusal(me, me ? await deps.registry.read(me) : null, named, { to, ...(thread ? { thread } : {}) });
-      if (sendRefusal) die(sendRefusal);
+      const platform = key ?? die("send needs discord");
+      const named = platform === "discord" ? platform : die(`unknown platform ${platform}`);
+      const { to } = resolveTarget(named, need("to"), opt("thread"));
       const text = need("text");
       const edit = opt("edit");
-      const token = (name: string) => resolveCredential(name) ?? die(`${name} is not set in the environment or in ${envFilePath()}`);
-      if (platform === "slack") {
-        const slack = new Slack(fetchHttp, realClock, { token: token("DORI_SLACK_TOKEN"), cookie: resolveCredential("DORI_SLACK_COOKIE") }, undefined, new ThreadLedger(`${config.stateDir}/slack-threads.json`));
-        if (edit) await slack.edit(to, edit, text);
-        else console.log(`SENT ${(await slack.post(to, text, thread)).ts}`);
-      } else if (platform === "telegram") {
-        const tg = new Telegram(fetchHttp, realClock, token("DORI_TELEGRAM_TOKEN"));
-        const target = { chatId: to, ...(thread ? { threadId: Number(thread) } : {}) };
-        if (edit) await tg.edit(target, Number(edit), text);
-        else console.log(`SENT ${await tg.send(target, text)}`);
-      } else if (platform === "discord") {
-        const dc = new Discord(fetchHttp, realClock, token("DORI_DISCORD_TOKEN"));
-        if (edit) await dc.edit(to, edit, text);
-        // Each dori send is its own message: without a unique id Discord would dedupe a repeat of the same text.
-        else console.log(`SENT ${await dc.send(to, text, randomUUID())}`);
-      } else if (platform === "toodo") {
-        if (edit) die("the Toodo chat has no edits; send a new reply");
-        // `--to <n>` answers message n: Toodo records the reply as what handled it, and so does the supervisor.
-        const sent = await toodoChat().reply(text, thread ? [`chat-${thread}`] : []);
-        if (thread) recordHandled(config.stateDir, TOODO_CHANNEL, thread, realClock.now(), { reply: true });
-        console.log(`SENT ${sent.id}`);
-      }
+      if (!edit) {
+        const sent = await postMessage(to, text);
+        console.log(`SENT ${sent}`);
+      } else await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);
       break;
     }
     case "typing": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { off: { type: "boolean" } } });
-      const typingUsage = "usage: dori typing toodo [--off] | dori typing discord <channel>";
+      const typingUsage = "usage: dori typing discord <channel>";
       const [target, ...extra] = parsed.positionals;
       const on = parsed.values.off !== true;
-      if (target === TOODO_CHANNEL && extra.length === 0) {
-        await toodoChat().typing(on);
-        console.log(`TYPING ${TOODO_CHANNEL} ${on ? "on" : "off"}`);
-      } else if (target === "discord" && extra.length === 1 && on) {
+      if (target === "discord" && extra.length === 1 && on) {
         const { to, thread } = resolveTarget("discord", extra[0]!);
         const id = thread ?? to;
         const dc = new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
@@ -795,16 +762,7 @@ try {
       break;
     }
     case "presence": {
-      if (key === "slack") {
-        const auth = { token: resolveCredential("DORI_SLACK_TOKEN") ?? die(`DORI_SLACK_TOKEN is not set in the environment or in ${envFilePath()}`), cookie: resolveCredential("DORI_SLACK_COOKIE") ?? die("DORI_SLACK_COOKIE is not set (user-token presence needs the d cookie)") };
-        const p = slackPresence(new Slack(fetchHttp, realClock, auth), (url, headers) => {
-          const options: Bun.WebSocketOptions = { headers: { ...headers } };
-          const ws = new WebSocket(url, options);
-          return { isOpen: () => ws.readyState === WebSocket.OPEN, send: (f) => ws.send(f), close: () => ws.close() };
-        }, auth);
-        console.log("PRESENCE_READY slack");
-        await every(1, async () => console.log(`PRESENCE slack ${await p.hold()}`));
-      } else if (key === "discord") {
+      if (key === "discord") {
         const token = resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`);
         const release = acquireDiscordGateway(token);
         let presence: ReturnType<typeof discordPresence> | undefined;
@@ -823,19 +781,7 @@ try {
           await presence?.settled();
           release();
         }
-      } else die("presence needs slack or discord");
-      break;
-    }
-    case "inbound": {
-      if (key !== "slack") die("inbound supports slack");
-      const auth = { token: resolveCredential("DORI_SLACK_TOKEN") ?? die(`DORI_SLACK_TOKEN is not set in the environment or in ${envFilePath()}`), cookie: resolveCredential("DORI_SLACK_COOKIE") };
-      const ledger = new ThreadLedger(`${config.stateDir}/slack-threads.json`);
-      const slack = new Slack(fetchHttp, realClock, auth, undefined, ledger);
-      const me = String((await slack.call("auth.test", {})).user_id ?? die("auth.test returned no user_id"));
-      console.log("INBOUND_READY slack");
-      await every(loopMin, async () => {
-        for (const i of await pollSlackInbound(slack, ledger, { selfUserId: me })) console.log(`INBOUND ${i.source} ${i.channel} ${i.threadTs ?? "-"} ${i.ts || "-"} ${i.user ?? "-"} ${JSON.stringify((i.text ?? "").slice(0, 200))}`);
-      });
+      } else die("presence needs discord");
       break;
     }
     case "transcribe":
@@ -846,6 +792,6 @@ try {
       process.exit(command ? 1 : 0);
   }
 } catch (e) {
-  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof ReposError || e instanceof DiscordGatewayOwnedError || e instanceof AckError || e instanceof LeadRestartError || e instanceof StoreError || e instanceof LaneMessageError || e instanceof SourceError || e instanceof ToodoError) die(e.message);
+  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof ReposError || e instanceof DiscordGatewayOwnedError || e instanceof AckError || e instanceof LeadRestartError || e instanceof StoreError || e instanceof LaneMessageError || e instanceof SourceError) die(e.message);
   throw e;
 }

@@ -19,8 +19,6 @@ export type SupervisorDiscordOptions = {
   readonly open?: (url?: string) => GatewaySocket;
   readonly timers?: Timers;
   readonly log?: (line: string) => void;
-  /** The Toodo mirror (toodo-mirror.ts): its channel is watched like a configured one, its messages recorded for import. */
-  readonly mirror?: { readonly channel: string; readonly record: NonNullable<DiscordInboundOptions["onMirror"]> };
 };
 
 /**
@@ -39,7 +37,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   let stopped = false;
   let watched: readonly string[] = [];
   const statePath = join(deps.config.stateDir, "discord-inbound.json");
-  const configuredChannels = [...deps.config.discordChannels, ...(options.mirror ? [options.mirror.channel] : [])];
+  const configuredChannels = deps.config.discordChannels;
   const configured = () => discordChannels(configuredChannels, []);
   if (!discordOwnerConfigured(config.ownerId)) {
     log("DISCORD_INBOUND_WARNING discord.ownerId is not configured; every Discord author is treated as a VISITOR, never the owner (run dori setup)");
@@ -51,7 +49,6 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   const inboundOptions: DiscordInboundOptions = {
     get botId() { return botId; },
     log,
-    ...(options.mirror ? { onMirror: options.mirror.record } : {}),
     onMissingContent: () => {
       if (contentWarned) return;
       contentWarned = true;

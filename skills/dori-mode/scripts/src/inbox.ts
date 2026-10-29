@@ -2,6 +2,8 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, r
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { outcomeLane } from "./lane-outcomes.ts";
+
 /**
  * The lead's read path for delivered events (`dori inbox take`). It prints lead-events.log from the take cursor to the
  * last complete line, at most `maxBytes` of whole lines, and writes an immutable take receipt for exactly what it
@@ -157,6 +159,15 @@ export const take = (stateDir: string, options: { readonly maxBytes: number; rea
   const rest = lines.slice(printed.length);
   const more = rest.length ? { lines: rest.length, bytes: (rest.at(-1)?.end ?? start) - start } : undefined;
   if (!printed.length || options.peek) return { events, offset: start, ...(more ? { more } : {}) };
+  // A receipt advances the next take before the CLI prints. Preserve owner text first, so even a process dying
+  // immediately after that write cannot hide it from the next take. The supervisor prunes these once handled.
+  const owners = events.filter((event) => /^(INBOUND|INBOUND_EDIT) /.test(event.line) &&
+    /^discord:\d+:\d+(?::edit:.+)?$/.test(event.id));
+  if (owners.length) {
+    const carried = new Map(readCarried(stateDir).map((item) => [item.id, item]));
+    for (const event of owners) carried.set(event.id, { kind: "owner", id: event.id, line: event.line });
+    writeCarried(stateDir, [...carried.values()]);
+  }
   const dir = takesDir(stateDir);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${options.now}-${randomUUID()}.json`);
@@ -166,9 +177,9 @@ export const take = (stateDir: string, options: { readonly maxBytes: number; rea
 };
 
 /**
- * What a cold start hands the new lead beyond the log (state/carried.json, written by the supervisor before the lead's
- * prompt and pruned as it goes): owner messages the previous lead took but did not handle, which no take prints again,
- * and the held launch queue. `dori inbox take` prints them as reminder lines every time until they are gone.
+ * Durable reminders beyond the take cursor (state/carried.json): owner text preserved before a take receipt and
+ * unfinished work handed over at a cold start, plus the held launch queue. The supervisor prunes them as work is
+ * handled. `dori inbox take` prints them as reminder lines every time until they are gone.
  */
 export const CARRIED_FILE = "carried.json";
 export type Carried = { readonly kind: "owner" | "held"; readonly id: string; readonly line: string };
@@ -187,10 +198,13 @@ export const writeCarried = (stateDir: string, items: readonly Carried[]): void 
   else dropTake(join(stateDir, CARRIED_FILE));
 };
 
-/** `dori inbox take`'s reminder lines (id<TAB>line, like the events) for what the last cold start carried over. */
+/** `dori inbox take`'s reminder lines (id<TAB>line, like the events) for unfinished taken or carried work. */
 export const takeCarriedReminders = (stateDir: string): string[] => readCarried(stateDir).map((item) => item.kind === "owner"
-  ? `unfinished:${item.id}\tUNFINISHED ${item.id} handed to the previous lead and not handled (dori ack it unless acked, then handle it): ${item.line}`
+  ? `unfinished:${item.id}\tUNFINISHED ${item.id} taken and not handled (dori ack it unless acked, then handle it): ${item.line}`
   : `${item.id}\t${item.line}`);
+
+/** Owner chat lines: a message, an edit of one, or a visitor's message. */
+const OWNER_LINE = /^(INBOUND|INBOUND_EDIT|VISITOR)\b/;
 
 const metaHeader = (meta: TakenEvent["meta"]): string =>
   `## ${[meta?.lane ? `lane ${meta.lane}` : "", meta?.thread ? `thread ${meta.thread}` : "", meta?.cwd ? `cwd ${meta.cwd}` : ""].filter(Boolean).join("  ")}`;
@@ -203,19 +217,51 @@ const metaHeader = (meta: TakenEvent["meta"]): string =>
 export const takeOutput = (result: Take): string[] => {
   if (!result.events.length) return ["INBOX_EMPTY"];
   const text = (event: TakenEvent): string => `${event.id}\t${event.line}`;
+  // Owner chat leads, whatever lane groups follow: it never hides behind lane output (log order kept within each part).
+  const isOwner = (event: TakenEvent): boolean => OWNER_LINE.test(event.line);
+  const events = [...result.events.filter(isOwner), ...result.events.filter((event) => !isOwner(event))];
   let body: string[];
-  if (result.events.some((event) => event.meta)) {
+  if (events.some((event) => event.meta)) {
     const groups = new Map<string, string[]>();
+    const owner = events.filter(isOwner).map(text);
     const other: string[] = [];
-    for (const event of result.events) {
+    for (const event of events) {
+      if (isOwner(event)) continue;
       if (!event.meta) { other.push(text(event)); continue; }
       const header = metaHeader(event.meta);
       groups.set(header, [...(groups.get(header) ?? []), text(event)]);
     }
-    body = [...[...groups].flatMap(([header, lines]) => [header, ...lines]), ...(other.length ? ["## other", ...other] : [])];
-  } else body = result.events.map(text);
+    body = [...(owner.length ? ["## owner", ...owner] : []), ...[...groups].flatMap(([header, lines]) => [header, ...lines]), ...(other.length ? ["## other", ...other] : [])];
+  } else body = events.map(text);
   return [
     ...body,
     ...(result.more ? [`INBOX_MORE ${result.more.lines} ${result.more.bytes}`] : []),
   ];
+};
+
+/**
+ * The one-line checklist for a taken batch that mixes owner chat (INBOUND / VISITOR) with lane outcome obligations (an
+ * outcome event, or an UNREPORTED reminder): `checklist:<first id>\tCHECKLIST this batch owes: ...`, in the same
+ * id<TAB>line shape as the other lines. `lines` are id<TAB>line texts (events plus reminders). Undefined unless both
+ * kinds are present.
+ */
+export const checklistLine = (lines: readonly string[]): string | undefined => {
+  // Distinct owner messages: a just-taken one also comes back as its own `unfinished:<id>` reminder (same id).
+  const owners = new Set<string>();
+  const lanes: string[] = [];
+  let firstId: string | undefined;
+  for (const text of lines) {
+    const tab = text.indexOf("\t");
+    if (tab < 0) continue;
+    const id = text.slice(0, tab);
+    const line = text.slice(tab + 1);
+    firstId ??= id;
+    if (OWNER_LINE.test(line)) owners.add(id);
+    else if (id.startsWith("unfinished:") && line.startsWith("UNFINISHED ")) owners.add(id.slice("unfinished:".length));
+    const lane = outcomeLane(line) ?? (line.startsWith("UNREPORTED ") ? line.split(" ")[1] : undefined);
+    if (lane && !lanes.includes(lane)) lanes.push(lane);
+  }
+  const owner = owners.size;
+  if (!owner || !lanes.length || firstId === undefined) return undefined;
+  return `checklist:${firstId}\tCHECKLIST this batch owes: reply to ${owner} owner message(s); report lane ${lanes.join(", ")} (dori reported <key> --text ...)`;
 };

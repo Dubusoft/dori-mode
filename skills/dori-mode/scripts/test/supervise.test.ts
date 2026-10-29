@@ -1155,8 +1155,8 @@ test("digest-only events survive restart without appending or touching a cold le
   expect(readJournal(f.state.dir).events).toHaveLength(1);
 });
 
-test("a kind's class comes from config: owner-only is posted to the owner, engine-only stays journaled, neither reaches the lead", async () => {
-  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { "GH_PR * opened": "lead-urgent", NUDGED: "engine-only", LANE_REPORT: "owner-only" } }) });
+test("a kind's class comes from config: engine-only stays journaled and never reaches the lead, lead-digest rides the next urgent delivery, nothing is posted to the owner", async () => {
+  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { "GH_PR * opened": "lead-urgent", NUDGED: "engine-only", LANE_REPORT: "lead-digest" } }) });
   const posted: string[] = [];
   const supervisor = new Supervisor(f.deps, { announce: async (text) => { posted.push(text); } });
   supervisor.enqueue("nudged", "NUDGED lane silent");
@@ -1166,11 +1166,11 @@ test("a kind's class comes from config: owner-only is posted to the owner, engin
   supervisor.enqueue("pr", "GH_PR acme/app#7 opened sha=1 https://github.com/acme/app/pull/7");
   await supervisor.flush();
   await supervisor.reactionsSettled();
-  expect(f.log().map((event) => event.id)).toEqual(["pr"]);
-  expect(posted).toEqual(["LANE_REPORT lane question which base?"]);
+  expect(f.log().map((event) => event.id)).toEqual(["report", "pr"]);
+  expect(posted).toEqual([]);
   f.clock.at += 2 * 60 * 60_000;
   await supervisor.flush();
-  expect(f.log().map((event) => event.id)).toEqual(["pr"]);
+  expect(f.log().map((event) => event.id)).toEqual(["report", "pr"]);
   expect(readJournal(f.state.dir).events.map((event: { id: string }) => event.id)).toEqual(["nudged", "report", "pr"]);
   supervisor.close();
 });
@@ -1725,28 +1725,21 @@ test("still unacked after a second window: one notice per message, kept across a
   expect(ackMissing(f)).toEqual([]);
 });
 
-test("a Toodo chat message is reminded, gets the owner notice and UNHANDLED like a Discord one, and its receipts clear them", async () => {
+test("an old journal's Toodo chat row (toodo:chat:<n>, the removed channel) is never tracked, noticed or escalated", async () => {
   const f = fixture();
+  writeJournal(f.state.dir, {
+    events: [{ id: "toodo:chat:12", line: "INBOUND toodo 12 user plan it", at: 0 }],
+    awaitingAck: [{ id: "toodo:chat:12", since: 0, ackedAt: 0 }],
+  });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("toodo:chat:12", "INBOUND toodo 12 user plan it");
+  supervisor.enqueue("toodo:chat:13", "INBOUND toodo 13 user plan it");
   await supervisor.flush();
-  f.clock.at = readableSince(f, "toodo:chat:12") + 60_000;
-  supervisor.ackTick(60_000);
-  expect(reminded(f)).toEqual(["toodo:chat:12"]);
-  expect(ackMissing(f)).toEqual([]);
-  f.clock.at += 60_000;
-  expect(supervisor.ackTick(60_000)).toEqual([{ channel: "toodo", message: "12" }]);
-  supervisor.noticeSent("ack", "toodo", "12");
+  f.clock.at += f.deps.config.handledTimeoutMin * 60_000 + 120_000;
+  expect(supervisor.overdueOwnerMessages(60_000)).toEqual([]);
   expect(supervisor.ackTick(60_000)).toEqual([]);
-  recordAck(f.state.dir, "toodo", "12", f.clock.now());
-  supervisor.ackTick(60_000);
-  expect(pendingAcks(f.state.dir)).toEqual([]);
-  f.clock.at += f.deps.config.handledTimeoutMin * 60_000;
-  supervisor.handledTick();
-  expect(inbox(f).filter((line) => line.startsWith("UNHANDLED "))).toEqual(["UNHANDLED toodo 12 coverage=0/1 INBOUND toodo 12 user plan it"]);
-  recordHandled(f.state.dir, "toodo", "12", f.clock.now(), { reply: true });
-  supervisor.handledTick();
-  expect(readJournal(f.state.dir).awaitingAck[0].handledAt).toBe(f.clock.now());
+  expect(supervisor.handledTick()).toEqual([]);
+  expect(inbox(f).filter((line) => line.startsWith("UNHANDLED "))).toEqual([]);
+  expect(readJournal(f.state.dir).awaitingAck.map((entry: { id: string }) => entry.id)).toEqual(["toodo:chat:12"]);
 });
 
 test("dori ack clears the message: no reminder, no notice, and the ack file is consumed", async () => {
@@ -1883,13 +1876,15 @@ test("a cold start hands every event through take once; owner work taken but unh
   expect(session).toMatch(/^[0-9a-f-]{36}$/);
   // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
   const lines = handed(f).split("\n");
-  expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`]);
+  expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`, "unfinished:discord:11:23"]);
   expect(lines[2]).toContain("INBOUND 11 22 owner project-alpha");
   expect(lines[3]).toContain("held-lane");
+  expect(lines[4]).toContain("INBOUND 11 23 owner project-beta");
   // A second take prints only the reminders again; handling the message and starting the launch clears them.
   expect(taken(f)).toEqual(["INBOX_EMPTY"]);
-  expect(takeCarriedReminders(f.state.dir)).toHaveLength(2);
+  expect(takeCarriedReminders(f.state.dir)).toHaveLength(3);
   recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true });
+  recordHandled(f.state.dir, "11", "23", f.clock.now(), { reply: true });
   supervisor.ackTick(60_000);
   expect(takeCarriedReminders(f.state.dir).map((line) => line.split("\t")[0])).toEqual([`launch-queue:${session}`]);
   dequeueLaunch(f.state.dir, "held-lane");
@@ -2356,9 +2351,9 @@ test("owner messages handled a day ago leave the tracking list for good", async 
 });
 
 test("an owner announcement that fails to post is kept and posted by the next supervisor", async () => {
-  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "owner-only" } }) });
+  const f = fixture();
+  writeJournal(f.state.dir, { events: [], outbox: [{ id: "lead-stuck:1", text: "The lead is stuck." }] });
   const failing = new Supervisor(f.deps, { announce: async () => { throw new Error("discord down"); } });
-  failing.enqueue("notice", "CUSTOM owner notice");
   const error = console.error;
   console.error = () => {};
   try {
@@ -2370,8 +2365,34 @@ test("an owner announcement that fails to post is kept and posted by the next su
   const posted: string[] = [];
   const next = new Supervisor(f.deps, { announce: async (text) => { posted.push(text); } });
   await next.reactionsSettled();
-  expect(posted).toEqual(["CUSTOM owner notice"]);
+  expect(posted).toEqual(["The lead is stuck."]);
   expect(journal(f).outbox).toEqual([]);
+});
+
+test("an owner-only event is no longer posted: it is journaled for the lead, and a leftover owner-only outbox row is dropped with one log line", async () => {
+  const f = fixture({ eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: "lead-digest" } }) });
+  writeJournal(f.state.dir, {
+    events: [],
+    outbox: [
+      { id: "owner-only:x", text: "CUSTOM old owner notice", retryAt: f.clock.now() + 60_000 },
+      { id: "lead-stuck:1", text: "The lead is stuck." },
+    ],
+  });
+  const posted: { text: string; id: string }[] = [];
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    const supervisor = new Supervisor(f.deps, { announce: async (text, id) => { posted.push({ text, id }); } });
+    supervisor.enqueue("custom", "CUSTOM new notice");
+    await supervisor.flush();
+    await supervisor.reactionsSettled();
+    supervisor.close();
+  } finally { console.error = error; }
+  expect(posted).toEqual([{ text: "The lead is stuck.", id: "lead-stuck:1" }]);
+  expect(journal(f).outbox ?? []).toEqual([]);
+  expect(logged.filter((line) => line.includes("owner-only:x"))).toEqual(["OWNER_ANNOUNCE_DROPPED owner-only:x: owner-only events are no longer posted"]);
+  expect(journal(f).events.map((event: { id: string }) => event.id)).toEqual(["custom"]);
 });
 
 // Phase 0.3: owner tracking from rows. Each case runs on the json store and on the sqlite store after dori store import.

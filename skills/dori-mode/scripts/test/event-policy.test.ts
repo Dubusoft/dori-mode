@@ -39,7 +39,8 @@ test("the default table classifies every line as the hard-coded list did, except
   const differ = corpus.filter((line) => eventPriority(line) !== legacyPriority(line));
   // CI follow-up messages the lane about failing checks and conflicts first, and a merged PR is read back by the
   // supervisor: for the lead these are digest. The done claim and the lane close are urgent like LEGACY_URGENT.
-  expect(differ).toEqual(corpus.filter((line) => /^GH_PR \S+ (checks_failing|conflicting|merged)(?: |$)/.test(line)));
+  // ACK_MISSING is no longer enqueued (push delivery re-pushes unacked owner messages): an old journal's line is digest.
+  expect(differ).toEqual(corpus.filter((line) => /^GH_PR \S+ (checks_failing|conflicting|merged)(?: |$)/.test(line) || /^ACK_MISSING( |$)/.test(line)));
   expect(differ.every((line) => eventPriority(line) === "digest")).toBe(true);
   expect(corpus.filter((line) => eventPriority(line) === "urgent").length).toBeGreaterThan(LEGACY_URGENT.length);
 });
@@ -51,6 +52,12 @@ test("the done claim and lane-ending events are lead-urgent; a close after a rec
   for (const line of ["LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
     expect(eventClass(line)).toBe("lead-digest");
   }
+});
+
+test("LEAD_UNRESPONSIVE (restart cap refused) wakes the lead; a leftover ACK_MISSING line is digest", () => {
+  expect(eventClass("LEAD_UNRESPONSIVE push ladder: you did not take pushed events")).toBe("lead-urgent");
+  expect(eventClass("ACK_MISSING 1 2 hi")).toBe("lead-digest");
+  expect(Object.keys(DEFAULT_EVENT_POLICY.kinds)).not.toContain("ACK_MISSING");
 });
 
 test("a kind is the most specific matching entry, else the line's first word", () => {
@@ -77,16 +84,33 @@ test("a config file changes a kind's class and the default with no code change",
   const state = withState();
   cleanups.push(state.done);
   const path = join(state.dir, "config.json");
-  writeFileSync(path, JSON.stringify({ eventPolicy: { default: "lead-urgent", kinds: { "GH_PR * opened": "lead-urgent", LANE_REPORT: "owner-only", NUDGED: "engine-only" } } }));
+  writeFileSync(path, JSON.stringify({ eventPolicy: { default: "lead-urgent", kinds: { "GH_PR * opened": "lead-urgent", LANE_REPORT: "lead-digest", NUDGED: "engine-only" } } }));
   const policy = (await loadConfig(path, state.dir)).eventPolicy;
   expect(eventPriority("GH_PR acme/app#7 opened", policy)).toBe("urgent");
-  expect(eventClass("LANE_REPORT lane question", policy)).toBe("owner-only");
+  expect(eventClass("LANE_REPORT lane question", policy)).toBe("lead-digest");
   expect(eventClass("NUDGED lane", policy)).toBe("engine-only");
   // Unknown kinds take the configured default; kinds the file does not name keep the default table.
   expect(eventClass("NEW_SOURCE_KIND x", policy)).toBe("lead-urgent");
   expect(eventClass("INBOUND 1 2 hi", policy)).toBe("lead-urgent");
   writeFileSync(path, "{}");
   expect((await loadConfig(path, state.dir)).eventPolicy).toBe(DEFAULT_EVENT_POLICY);
+});
+
+test("an old config's removed owner-only class loads as lead-digest, named in one warning per process", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const policy = { default: "owner-only", kinds: { DEPLOY: "owner-only", NUDGED: "engine-only" } };
+  const script = `const { eventClass, resolveEventPolicy } = await import(${JSON.stringify(join(import.meta.dir, "../src/event-policy.ts"))});
+    const a = resolveEventPolicy(${JSON.stringify(policy)});
+    const b = resolveEventPolicy(${JSON.stringify(policy)});
+    console.log(JSON.stringify([a.default, eventClass("DEPLOY web", a), eventClass("NUDGED x", a), b.default, eventClass("DEPLOY web", b)]));`;
+  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
+  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  expect(code).toBe(0);
+  expect(JSON.parse(out)).toEqual(["lead-digest", "lead-digest", "engine-only", "lead-digest", "lead-digest"]);
+  expect(err.split("\n").filter((line) => line.startsWith("EVENT_POLICY_"))).toEqual([
+    "EVENT_POLICY_OWNER_ONLY_REMOVED default, DEPLOY: the owner-only class was removed (the supervisor no longer posts events to the owner); treated as lead-digest",
+  ]);
 });
 
 test.each([

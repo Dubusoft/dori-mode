@@ -9,6 +9,7 @@ import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
 import { pendingLeadRestart } from "../src/lead-restart.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Registry } from "../src/registry.ts";
+import { WAKES_FILE } from "../src/store.ts";
 import type { Ran } from "../src/run.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
@@ -116,6 +117,16 @@ test("doctor warns when a lead restart is pending without consuming it or touchi
   expect(pendingLeadRestart(f.deps.config.stateDir)).toEqual(request);
   expect(f.calls).toEqual(expect.arrayContaining(["herdr pane list"]));
   expect(f.calls.filter((c) => c.startsWith("herdr ") && c !== "herdr pane list" && c !== "herdr workspace list")).toEqual([]);
+});
+
+test("doctor warns when lead wakes exceed the 24-hour threshold", async () => {
+  const f = fixture();
+  writeFileSync(join(f.deps.config.stateDir, WAKES_FILE), Array.from({ length: 21 }, (_, i) => JSON.stringify({
+    at: NOW - i, session: "lead", trigger: ["INBOUND"], kinds: { INBOUND: 1 },
+  })).join("\n"));
+  const check = find(await runDoctor(f.deps), "lead wakes");
+  expect(check).toMatchObject({ level: "WARN", detail: "21 lead wakes in the last 24 hours (threshold 20)" });
+  expect(doctorExit([check])).toBe(0);
 });
 
 test("an inactive supervisor is FAIL with the enable command and exit 1; not-found points at setup", async () => {

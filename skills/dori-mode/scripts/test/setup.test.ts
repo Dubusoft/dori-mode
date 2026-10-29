@@ -212,7 +212,7 @@ test("a missing defaultCwd, stateDir and unit dir are created, the rendered file
     expect(log).toContain(`SETUP created ${dir}`);
   }
   expect(readFileSync(join(d.unitDir, "dori-supervisor.service"), "utf8")).toContain(`WorkingDirectory=${cwd}\n`);
-  for (const f of [...UNITS.map((u) => join(d.unitDir, u)), join(d.home, ".dori", "dori-boot-prep.sh")]) expect(readFileSync(f, "utf8")).not.toMatch(/\/home\/ubuntu|\/data\b/);
+  for (const f of [...UNITS.map((u) => join(d.unitDir, u)), join(d.home, ".dori", "dori-boot-prep.sh")]) expect(readFileSync(f, "utf8").split(state.dir).join("<TMP>")).not.toMatch(/\/home\/ubuntu|\/data\b/);
   log = [];
   expect(await runSetup(d, { autostart: true })).toBe(0);
   expect(log.some((l) => l.startsWith("SETUP created"))).toBe(false);

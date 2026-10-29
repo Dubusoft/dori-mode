@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { ack, AckError, EYES_EMOJI, pendingAcks, recordHandled } from "../src/ack.ts";
 import { MessengerError } from "../src/messenger/http.ts";
@@ -118,4 +120,14 @@ test("handled requires explicit lane or reply coverage and validates ids", () =>
   expect(() => recordHandled(dir, "11", "22", 1_000, { lanes: ["../alpha"] })).toThrow(AckError);
   // Then none falsely mark the message handled.
   expect(pendingAcks(dir)).toEqual([]);
+});
+
+test("receipts of a removed channel left in the acks directory are ignored, Discord ones still read", async () => {
+  // Given an old toodo-* receipt next to a Discord ack.
+  const dir = state();
+  await ack(dir, reactions(), "11", "22", 1_000);
+  writeFileSync(join(dir, "acks", "toodo-12-x.json"), JSON.stringify({ channel: "toodo", message: "12", at: 1_000 }));
+  // Then only the Discord ack is pending, and the channel name is refused for new receipts.
+  expect(pendingAcks(dir).map((a) => a.id)).toEqual(["discord:11:22"]);
+  expect(() => recordHandled(dir, "toodo", "12", 1_000, { reply: true })).toThrow(AckError);
 });

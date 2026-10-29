@@ -109,10 +109,10 @@ test.each(["delay", "ack", "unhandled"] as const)("the production loop retries a
   await f.tick(false);
   expect(f.journal().notifications?.[`${kind}:${id}`]).toEqual({ attempts: 1 });
   await f.tick(true);
-  // Then both requests used the configured notice and success was absent until Discord accepted the second.
+  // Then both requests used the configured notice, marked as a supervisor post, and success was absent until Discord accepted the second.
   expect(f.posts).toEqual([
-    { content: `${kind}-notice`, notification: { attempts: 1 } },
-    { content: `${kind}-notice`, notification: { attempts: 2 } },
+    { content: `[System] ${kind}-notice`, notification: { attempts: 1 } },
+    { content: `[System] ${kind}-notice`, notification: { attempts: 2 } },
   ]);
   expect(f.journal().notifications?.[`${kind}:${id}`]).toEqual({ attempts: 2, sent: true });
   // A further complete loop pass must not send again after its success marker is loaded.

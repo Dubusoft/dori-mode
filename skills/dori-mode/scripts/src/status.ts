@@ -7,7 +7,6 @@ import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./e
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { githubSummary } from "./github-events.ts";
 import { gatewayView, readGatewayStatus, type GatewayView } from "./gateway-status.ts";
-import { readToodoStatus, toodoView, type ToodoView } from "./messenger/toodo-supervisor.ts";
 import { type LaneReport, latestLaneReports } from "./lane-reports.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { listPanes } from "./panes.ts";
@@ -61,9 +60,7 @@ export type Status = {
     readonly issueRepos: readonly string[];
   };
   readonly gateway: GatewayView;
-  /** The Toodo Lead chat channel, when config.toodo is set: its URL and whether the supervisor holds its event stream. */
-  readonly toodo?: ToodoView & { readonly url: string };
-  /** Owner messages the lead was handed and reminded about (ACK_MISSING) without acking them yet. */
+  /** Owner messages the lead was handed and reminded about after the ack window, without acking them yet. */
   readonly unacked: number;
   /** Finished lanes (LANE_CLOSED, CI_MERGED) the lead has not reported to the owner with dori reported, oldest first. */
   readonly unreported?: readonly { readonly lane: string; readonly since: string }[];
@@ -259,7 +256,6 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
       issueRepos: gh.issueRepos,
     },
     gateway: gatewayView(readGatewayStatus(d.config.stateDir), now),
-    ...(d.config.toodo ? { toodo: { ...toodoView(readToodoStatus(d.config.stateDir), now), url: d.config.toodo.url } } : {}),
     unacked: readUnacked(d.config.stateDir),
     unreported: readUnreported(d.config.stateDir),
     events: eventStats(d.config, now),
@@ -342,17 +338,16 @@ const problems = (s: Status, now: number): Problem[] => {
   const bad = s.services.filter((u) => (u.name === LEGACY_PRESENCE ? u.active === "active" : u.active !== "active" || u.enabled !== "enabled"));
   for (const u of bad) out.push({ label: `${unitName(u)} ${RUN_WORDS[u.active] ?? u.active}`, line: `Service ${unitName(u)}: ${unitWords(u)}` });
   if (s.gateway.state !== "live") out.push({ label: `gateway ${s.gateway.state}`, line: `Discord gateway: ${s.gateway.text}` });
-  if (s.toodo && s.toodo.state !== "live") out.push({ label: `toodo ${s.toodo.state}`, line: `Toodo chat: ${s.toodo.text}` });
   const g = s.github;
   if (g.failures.length) out.push({ label: "github poll failing", line: `GitHub poll failing: ${list(g.failures.map((f) => `${f.repo} ${ago(f.at, now)}`), 4, 200)}` });
   if (!g.issueAuthors.length) out.push({ label: "no trusted issue authors", line: "No trusted issue authors (githubIssueAuthors): new issues never wake the lead" });
   if (s.lead.state === "missing" || s.lead.state === "unknown") out.push({ label: `lead ${s.lead.state}`, line: "" });
-  if (s.unacked > 0) out.push({ label: `unacked ${s.unacked}`, line: `${plural(s.unacked, "owner message")} handed to the lead and still not acked (dori ack) after ACK_MISSING` });
+  if (s.unacked > 0) out.push({ label: `unacked ${s.unacked}`, line: `${plural(s.unacked, "owner message")} handed to the lead and still not acked (dori ack) after the ack window` });
   const owed = s.unreported ?? [];
   if (owed.length) {
     out.push({
       label: `unreported ${owed.length}`,
-      line: `Finished lanes not reported to the owner yet (report, then dori reported <key>): ${list(owed.map((o) => `${o.lane} ${ago(o.since, now)}`), 6, 300)}`,
+      line: `Finished lanes not reported to the owner yet (dori reported <key> --text TEXT): ${list(owed.map((o) => `${o.lane} ${ago(o.since, now)}`), 6, 300)}`,
     });
   }
   const recovering = (kind: "pending" | "exhausted") => s.lanes.filter((lane) => lane.recovery === kind).map((lane) => lane.key);
@@ -468,7 +463,6 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const g = s.github;
   section("Gateway and repos", [
     `- Discord gateway: ${s.gateway.state === "live" ? "connected" : clip(s.gateway.text, 120)}`,
-    ...(s.toodo ? [`- Toodo chat: ${s.toodo.state === "live" ? "connected" : clip(s.toodo.text, 120)}`] : []),
     `- GitHub: ${plural(g.repos.length, "repo")} watched, last poll ${ago(g.lastPollAt, now)}${g.failures.length ? `, ${plural(g.failures.length, "repo")} failing` : ""}`,
     g.issueAuthors.length ? `- Issues: watching ${plural(g.issueRepos.length, "repo")}` : "- Issues: off (no trusted authors)",
     ...sourceLine(s, now, lim.kinds),

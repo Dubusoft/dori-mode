@@ -7,7 +7,7 @@ A lane is one agent session doing one job in its own herdr tab. You launch it, t
 ```sh
 dori launch fix-login --title "Fix the login redirect loop" \
   --brief ~/briefs/fix-login.md --done "merged acme/app#412; closed acme/app#398" \
-  --thread "telegram:<chat>/<topic>" --mode ulw
+  --thread "discord:<channel>/<thread>" --mode ulw
 ```
 
 Every lane runs on `defaultModel` with `laneThinking` (opus-5-5, effort medium by default); pick the mode, not the model. `--mode ulw` (the default, opened with `launchKeywords`) is for clear, contained work whose instructions say exactly what to change. `--mode mass-ulw` (opened with `massLaunchKeywords`) is for work that touches many places or whose instructions are vague enough that it has to investigate before it can decide what to change. `--model` stays only for the relaunch after a `STARTUP_ERROR`.

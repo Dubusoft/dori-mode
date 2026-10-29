@@ -79,6 +79,10 @@ export type LaneOutcome = {
   readonly events?: readonly string[];
   readonly reportedAt?: number;
   readonly note?: string;
+  /** When an outcome first reached the lead's delivery log (after a cold restart, only once confirmed). */
+  readonly deliveredAt?: number;
+  /** A working pane observation made after delivery; idle/done can now end that turn. */
+  readonly deliveredWorking?: true;
   /** UNREPORTED events enqueued so far, and when the last one was. */
   readonly reminders?: number;
   readonly remindedAt?: number;
@@ -310,8 +314,8 @@ export class JournalCore {
   /**
    * Take receipts move the cursor forward only, in a crash-safe order: the store is persisted, then the cursor file is
    * written, and only then are the receipts dropped. A crash at any point leaves `max(cursor file, receipts)` at or past
-   * the new cursor, so a take never reprints. A moved cursor clears the outstanding push. Before a receipt is dropped,
-   * its ids are recorded taken with its time and session (event-trace.ts).
+   * the new cursor, so a take never reprints. A moved cursor clears the push only when no owner work remains.
+   * Before a receipt is dropped, its ids are recorded taken with its time and session (event-trace.ts).
    */
   consumeTakes(): void {
     const inbox = this.journal.inbox;
@@ -325,7 +329,8 @@ export class JournalCore {
       takenOffset = size;
     }
     if (takenOffset !== inbox.takenOffset) {
-      this.journal = { ...this.journal, inbox: { ...inbox, takenOffset, push: undefined } };
+      const ownerOpen = this.journal.awaitingAck?.some((entry) => !entry.quarantined && entry.handledAt === undefined);
+      this.journal = { ...this.journal, inbox: { ...inbox, takenOffset, push: ownerOpen ? inbox.push : undefined } };
       this.persist();
     }
     writeCursorFile(this.deps.config.stateDir, takenOffset);
@@ -380,7 +385,7 @@ export class JournalCore {
     let i = 0;
     for (; i < all.length && ((all[i] as Event).at ?? now) <= cutoff; i++) {
       const event = all[i] as Event;
-      // An owner-only or engine-only event is never delivered to the lead: it ages out like a delivered one.
+      // An engine-only event is never delivered to the lead: it ages out like a delivered one.
       const waiting = !this.delivered.has(event.id) && forLead(eventClass(event.line, this.deps.config.eventPolicy));
       if (waiting || needed.has(event.id)) { kept.push(event); continue; }
       this.eventIds.delete(event.id);

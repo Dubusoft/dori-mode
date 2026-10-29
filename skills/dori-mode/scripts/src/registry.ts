@@ -76,7 +76,7 @@ export type Lane = {
   /** Every [REPORT] line the watcher has acted on, by line hash and first-seen time, newest last. */
   readonly remoteReportsSeen?: readonly { readonly hash: string; readonly at: string }[];
   /**
-   * `cli`: launched on the `dori report` footer, so it reports with `dori report` and never types into the lead's pane;
+   * `cli`: every local launch and relaunch sets this for the `dori report` footer, so it reports with `dori report` and never types into the lead's pane;
    * its [REPORT] lines found there are counted as violations. Absent: an older lane on the [REPORT] footer, or a remote one.
    */
   readonly reportVia?: "cli";

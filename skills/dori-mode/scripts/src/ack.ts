@@ -9,17 +9,11 @@ import { MessengerError } from "./messenger/http.ts";
 export const EYES_EMOJI = "\u{1F440}";
 
 const DISCORD_ID = /^\d+$/;
-const ACK_FILE = /^(\d+|toodo)-(\d+)(?:-[\w-]+)?\.json$/;
+/** Only Discord receipts match; any other file left in the acks directory (from a removed channel) is ignored. */
+const ACK_FILE = /^(\d+)-(\d+)(?:-[\w-]+)?\.json$/;
 
-/** The Toodo chat's channel name (messenger/toodo.ts TOODO_CHANNEL); its message ids are the chat's numbers. */
-const TOODO = "toodo";
-
-/** A Discord channel id, or the Toodo chat. */
-const ownerChannel = (channel: string): boolean => DISCORD_ID.test(channel) || channel === TOODO;
-
-/** The journal id of an owner message: discord:<channel>:<message>, or toodo:chat:<message> for the Toodo chat. */
-export const ownerMessageId = (channel: string, message: string): string =>
-  channel === TOODO ? `toodo:chat:${message}` : `discord:${channel}:${message}`;
+/** The journal id of an owner message: discord:<channel>:<message>. */
+export const ownerMessageId = (channel: string, message: string): string => `discord:${channel}:${message}`;
 
 const ackDir = (stateDir: string): string => join(stateDir, "acks");
 
@@ -62,23 +56,9 @@ export const ack = async (stateDir: string, discord: AckReactions, channel: stri
   catch (e) { console.error(`ACK_TYPING_FAILED ${channel} ${message}: ${e instanceof Error ? e.message : String(e)}`); }
 };
 
-export type ToodoAck = { readonly ack: (ids: readonly string[]) => Promise<void>; readonly typing: (on: boolean) => Promise<void> };
-
-/**
- * The read receipt on a Toodo chat message: ack_chat in Toodo (its `ackedAt`), the typing dots on (best effort: they
- * say the lead is on it, as the eyes do on Discord), then the ack recorded for the supervisor.
- */
-export const ackToodo = async (stateDir: string, toodo: ToodoAck, message: string, now: number, tasks?: number): Promise<void> => {
-  if (!DISCORD_ID.test(message)) throw new AckError("usage: dori ack toodo <messageId> (the Toodo chat message number)");
-  checkTasks(tasks);
-  await toodo.ack([`chat-${message}`]);
-  await toodo.typing(true).catch(() => {});
-  recordAck(stateDir, TOODO, message, now, tasks);
-};
-
 /** Immutable receipts avoid a concurrent supervisor consuming a newer lead update by unlinking an older one. */
 const recordReceipt = (stateDir: string, channel: string, message: string, at: number, coverage: MessageCoverage): void => {
-  if (!ownerChannel(channel) || !DISCORD_ID.test(message)) throw new AckError("channel must be a Discord channel id or toodo, and message its message id (digits only)");
+  if (!DISCORD_ID.test(channel) || !DISCORD_ID.test(message)) throw new AckError("channel must be a Discord channel id, and message its message id (digits only)");
   checkTasks(coverage.tasks);
   const dir = ackDir(stateDir);
   mkdirSync(dir, { recursive: true });
@@ -102,7 +82,7 @@ export const recordHandled = (stateDir: string, channel: string, message: string
   recordReceipt(stateDir, channel, message, at, coverage);
 };
 
-/** Acks waiting for the supervisor, as inbound ids (discord:<channel>:<message>, toodo:chat:<message>) with their file paths and ack times. */
+/** Acks waiting for the supervisor, as inbound ids (discord:<channel>:<message>) with their file paths and ack times. */
 export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id: string; readonly path: string; readonly at: number })[] => {
   let names: string[];
   try { names = readdirSync(ackDir(stateDir)); } catch { return []; }

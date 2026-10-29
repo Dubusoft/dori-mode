@@ -12,7 +12,7 @@ export type InboundMessage = {
   readonly content: string;
   readonly attachments: readonly unknown[];
   readonly bot?: boolean;
-  /** Set on a message posted through a webhook (the Toodo mirror's copies of the owner's Toodo messages among them). */
+  /** Set on a message posted through a webhook. */
   readonly webhookId?: string;
 };
 
@@ -181,11 +181,6 @@ export type DiscordInboundOptions = {
   readonly onMissingContent?: () => void;
   /** Called after an owner message is emitted, e.g. to track it for edit and delete notices. */
   readonly onOwner?: (channel: string, id: string) => void;
-  /**
-   * Called before the emit for an owner message (author "user") and for a message of the bot itself (author "lead"), so
-   * the Toodo mirror records it durably before the REST cursor can move past it (toodo-mirror.ts).
-   */
-  readonly onMirror?: (channel: string, m: InboundMessage, author: "user" | "lead") => void;
   readonly log?: (line: string) => void;
 };
 
@@ -209,6 +204,15 @@ export const discordMessageText = (m: InboundMessage, options: DiscordInboundOpt
   return `${text || (m.attachments.length ? "" : MISSING_CONTENT_NOTE)}${discordAttachments(m.attachments)}`;
 };
 
+const PENDING_HYDRATION_LIMIT = 1000;
+/** Messages first enqueued as a no-content placeholder, keyed `channel:id`; the oldest is evicted past the limit. */
+const pendingHydration = new Map<string, true>();
+
+/** Unresolved placeholder records (`channel:id`), oldest first. */
+export const unresolvedHydration = (): readonly string[] => [...pendingHydration.keys()];
+
+const hasRealContent = (m: InboundMessage): boolean => m.content.trim() !== "" || m.attachments.length > 0;
+
 /**
  * Gateway and REST share identity filtering and the durable queue's deduplication key. Only the configured owner's
  * messages are INBOUND requests; everyone else's are VISITOR notices, and with no owner configured no one is the owner.
@@ -222,16 +226,21 @@ export const emitDiscordInbound = async (
   options: DiscordInboundOptions = {},
 ): Promise<void> => {
   if (m.webhookId !== undefined) return;
-  if (m.bot || (options.botId !== undefined && m.authorId === options.botId)) {
-    if (options.botId !== undefined && m.authorId === options.botId) options.onMirror?.(channel, m, "lead");
-    return;
-  }
+  if (m.bot || (options.botId !== undefined && m.authorId === options.botId)) return;
   const text = discordMessageText(m, options);
   const owner = discordOwnerConfigured(ownerId) && m.authorId === ownerId;
-  if (owner) options.onMirror?.(channel, m, "user");
-  await emit(`discord:${channel}:${m.id}`, owner
+  const pendingKey = `${channel}:${m.id}`;
+  // Recovered content cannot reuse the original id (dedup would drop it), so it is a separate revision.
+  const revision = hasRealContent(m) && pendingHydration.has(pendingKey);
+  await emit(`discord:${channel}:${m.id}${revision ? ":rev:content" : ""}`, owner
     ? `INBOUND ${channel} ${m.id} ${m.author} ${text}`
     : `VISITOR ${channel} ${m.id} ${m.author} ${VISITOR_NOTE} ${text}`);
+  if (revision) pendingHydration.delete(pendingKey);
+  else if (!hasRealContent(m)) {
+    pendingHydration.delete(pendingKey);
+    pendingHydration.set(pendingKey, true);
+    if (pendingHydration.size > PENDING_HYDRATION_LIMIT) pendingHydration.delete(pendingHydration.keys().next().value as string);
+  }
   if (owner) options.onOwner?.(channel, m.id);
 };
 
@@ -251,6 +260,15 @@ export const emitDiscordEdit = async (
   ownerId?: string,
   options: DiscordInboundOptions = {},
 ): Promise<boolean> => {
+  // A partial update without edited_timestamp that now carries content recovers a placeholder message.
+  if (record(value) && typeof value.edited_timestamp !== "string" && snowflake(value.id) && pendingHydration.has(`${channel}:${value.id}`)
+    && record(value.author) && typeof value.author.username === "string" && typeof value.content === "string") {
+    const m = parseDiscordMessage({ ...value, attachments: Array.isArray(value.attachments) ? value.attachments : [] });
+    if (hasRealContent(m)) {
+      await emitDiscordInbound(channel, m, emit, ownerId, options);
+      return true;
+    }
+  }
   if (!record(value) || typeof value.edited_timestamp !== "string" || !record(value.author) || typeof value.content !== "string") return false;
   const m = parseDiscordMessage({ ...value, attachments: Array.isArray(value.attachments) ? value.attachments : [] });
   if (m.bot || !discordOwnerConfigured(ownerId) || m.authorId !== ownerId) return false;
