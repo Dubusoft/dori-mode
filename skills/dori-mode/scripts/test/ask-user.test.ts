@@ -37,6 +37,11 @@ test("the async question widget is read with its option chips and pending count"
   expect(screenQuestion(WIDGET)).toEqual({ header: "Region", question: "QA442B which region?", options: ["seoul", "tokyo"], pending: 2 });
 });
 
+test("a wrapped widget question retains its chips", () => {
+  expect(screenQuestion("? Question pending (1 unanswered) · 30m\n Deploy - which target should I use for\n this environment?\n [ staging ]  [ production ]"))
+    .toEqual({ header: "Deploy", question: "which target should I use for this environment?", options: ["staging", "production"], pending: 1 });
+});
+
 test("a question left in scrollback, or only quoted by the transcript, is no prompt", () => {
   expect(screenQuestion(IDLE)).toBeNull();
   expect(screenQuestion(`${DIALOG}\n${Array.from({ length: 12 }, (_, i) => ` line ${i}`).join("\n")}`)).toBeNull();
@@ -55,6 +60,33 @@ test("one urgent LANE_ASKING per question, with its text and options, raised aga
   expect((await tick(DIALOG)).length).toBe(1);
   const next = await tick(WIDGET);
   expect(next.map((e) => e.line)).toEqual(["LANE_ASKING ask-lane waits on an on-screen question, not dori report: [Region] QA442B which region? | options: seoul / tokyo | 2 questions pending"]);
+});
+
+test("switching tabs in one dialog does not raise another prompt", async () => {
+  const registry = depsFor(world, fakeClock(T0), state.dir).registry;
+  await registry.write(lane);
+  const dialog = DIALOG.replace("→ Deploy    Submit", "→ Deploy    Review    Submit");
+  const tab = (current: string, question: string) => dialog.replace("→ Deploy    Review", `${current === "Deploy" ? "→ Deploy" : "  Deploy"}    ${current === "Review" ? "→ Review" : "  Review"}`).replace("QA442 which target should I deploy to?", question);
+  const first = await tick(tab("Review", "which target should I deploy to?"));
+  const second = await tick(tab("Deploy", "is the plan ready?"));
+  expect(first).toHaveLength(1);
+  expect(second).toEqual([]);
+});
+
+test("a patch failure does not prevent processing later lanes", async () => {
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  await deps.registry.write(lane);
+  await deps.registry.write({ ...lane, key: "ask-lane-2", pane: "w:p8" });
+  const patch = deps.registry.patch.bind(deps.registry);
+  deps.registry.patch = async (key, value) => {
+    if (key === lane.key) throw new Error("patch failed");
+    return patch(key, value);
+  };
+  const emitted: string[] = [];
+  world.screens = [DIALOG, DIALOG];
+  await expect(askUserTick(deps, async (line) => { emitted.push(line); })).rejects.toThrow("patch failed");
+  expect(emitted).toHaveLength(2);
+  expect((await deps.registry.open()).find((item) => item.key === "ask-lane-2")?.lastAskPrompt).toBeTruthy();
 });
 
 test("a paused lane's question is not raised", async () => {

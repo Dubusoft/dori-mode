@@ -26,11 +26,13 @@ test("leadDiet defaults to true when absent and parses false from the file", asy
   expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(false);
 });
 
-test("laneRules defaults to none, keeps trimmed non-blank lines, and refuses anything but an array of strings", async () => {
+test("laneRules defaults to none, collapses whitespace, drops blanks, and refuses anything but an array of strings", async () => {
   const path = join(state.dir, "rules.json");
   await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
   expect((await loadConfig(path, "/home/ana")).laneRules).toEqual([]);
-  await Bun.write(path, JSON.stringify({ laneRules: [" Do not merge. ", "  ", "CI runs the typecheck only."] }));
+  await Bun.write(path, JSON.stringify({ laneRules: null }));
+  expect((await loadConfig(path, "/home/ana")).laneRules).toEqual([]);
+  await Bun.write(path, JSON.stringify({ laneRules: [" Do not\n merge. ", "  ", "CI runs the typecheck only."] }));
   expect((await loadConfig(path, "/home/ana")).laneRules).toEqual(["Do not merge.", "CI runs the typecheck only."]);
   await Bun.write(path, JSON.stringify({ laneRules: "Do not merge." }));
   await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");

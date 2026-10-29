@@ -58,6 +58,8 @@ const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED", "LANE_CLOSED * closed seen-claim",
+  // A worker machine without the guard agent, or one whose agent is current again, needs no action now.
+  "HOST_GUARD NOT_INSTALLED", "HOST_GUARD CURRENT",
 ] as const;
 
 /** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */

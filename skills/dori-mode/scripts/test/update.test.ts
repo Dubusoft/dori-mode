@@ -92,6 +92,12 @@ test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or 
   expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
 });
 
+test("guard agents are refreshed before the supervisor restarts", async () => {
+  await commit(origin, "notes.txt", "two\n");
+  expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);
+  expect(calls).toEqual(["refresh", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+});
+
 test("guard agents are not refreshed when the update fails", async () => {
   await sh(install, "git", "checkout", "-q", "main");
   await commit(install, "mine.txt", "local commit\n");

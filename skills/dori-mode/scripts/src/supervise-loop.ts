@@ -14,15 +14,15 @@ import { freshnessTick, scrubForThread } from "./freshness.ts";
 import { lookupQuotaResults, quotaReport } from "./claude-quota.ts";
 import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
 import { memorySweep } from "./memory-check.ts";
-import { alertReasons, criticalReasons, diskGuardPath, type GuardState, guardTick, type HostSample, sampleHost } from "./host-guard.ts";
+import { alertReasons, criticalReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
 import { describeLane, formatKb, type LaneMemory, laneMemory, laneMemoryDetail, type Proc, procLanes, sampleProcs } from "./lane-memory.ts";
 import { laneRunner, sendGuarded } from "./panes.ts";
 import { pauseLane, type PauseResult } from "./pause.ts";
 import { describeKilled, heavyTargets, type KilledProc, killProcs } from "./pressure.ts";
 import type { Lane } from "./registry.ts";
 import {
-  GUARD_AGENT_TEMPLATE, type GuardMachine, guardAgentVersion, killOnMachine, type KillResult, listGuardMachines, type MachineGuardState,
-  machineGuardTick, type MachineSample, sampleMachine,
+  GUARD_AGENT_TEMPLATE, type GuardMachine, guardAgentVersion, killOnMachine, type KillResult, loadMachineGuardState,
+  machineDue, machineGuardTick, type MachineSample, readGuardMachines, sampleMachine, saveMachineGuardState,
 } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -46,8 +46,12 @@ import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, leadPaneViolationTick, openLaneReports, routeReports } from "./lane-reports.ts";
 
-/** How long the guard reuses `herdr machine list` before reading it again. */
+/** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
+/** After a failed `herdr machine list`, the previous list is kept and the read is retried this much later. */
+const MACHINE_LIST_RETRY_MS = 60_000;
+/** The machine guard's state file in the supervisor stateDir, so a restart does not re-report unchanged machines. */
+export const MACHINE_GUARD_STATE_FILE = "machine-guard.json";
 
 /** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
 export const SYSTEM_PREFIX = "[System] ";
@@ -144,20 +148,35 @@ export class Watchdog {
   }
 }
 
+/** A lane lighter than this is never told it uses the most memory. */
+export const LANE_WARN_MIN_KB = 1_048_576;
+
+/** A lane warned in its pane is not warned again for this long. */
+export const WARN_COOLDOWN_MS = 30 * 60_000;
+
 /**
- * Types a memory warning into the pane of the heaviest open local lane (remote lanes run on another host's memory), so
- * the lane stops what it does not need without the lead relaying it. Returns what happened, for the lead's ALERT line.
+ * Types a memory warning into the pane of the heaviest lane overall, when that lane is an open local one (remote lanes
+ * run on another host's memory) of at least LANE_WARN_MIN_KB and was not warned within WARN_COOLDOWN_MS, so the lane
+ * stops what it does not need without the lead relaying it. Returns what happened, for the lead's ALERT line.
  */
-export const warnHeaviestLane = async (run: Runner, lanes: readonly LaneMemory[], open: readonly Lane[], reason: string): Promise<string> => {
-  const local = new Map(open.filter((l) => l.pane && !l.machine).map((l) => [l.key, l]));
-  const target = lanes.find((l) => local.has(l.lane));
-  const lane = target && local.get(target.lane);
-  if (!target || !lane?.pane) return "no open local lane to warn";
+export const warnHeaviestLane = async (
+  run: Runner, lanes: readonly LaneMemory[], open: readonly Lane[], reason: string,
+  warnedAt: Map<string, number> = new Map(), now: () => number = Date.now,
+): Promise<string> => {
+  const target = lanes[0];
+  if (!target) return "no open local lane to warn";
+  const lane = open.find((l) => l.key === target.lane && l.pane && !l.machine);
+  if (!lane?.pane) return `not typed: heaviest lane ${target.lane} is not open here`;
+  if (target.rssKb < LANE_WARN_MIN_KB) return `not typed: heaviest lane ${target.lane} is below ${(LANE_WARN_MIN_KB / 1_048_576).toFixed(1)} GB`;
   // The question dialog reads digits, space and 'c' as keys, so typing there could submit an answer nobody chose.
   if (lane.lastAskPrompt) return `not typed: ${target.lane} is on a question prompt`;
+  const last = warnedAt.get(target.lane);
+  if (last !== undefined && now() - last < WARN_COOLDOWN_MS) return `not typed: ${target.lane} was warned ${Math.floor((now() - last) / 60_000)} min ago`;
   const text = systemText(`HOST_GUARD memory warning: ${reason} on this host, and this lane (${target.lane}) uses the most memory: ${describeLane(target)}. `
     + "Stop what you are not using now (an emulator, an expo or dev server, a watcher or test runner), then go on with your task. The lead has been told.");
-  return await sendGuarded(run, lane.pane, text) === "sent" ? `warned ${target.lane} in its pane ${lane.pane}` : `could not warn ${target.lane} in its pane ${lane.pane}`;
+  if (await sendGuarded(run, lane.pane, text) !== "sent") return `could not warn ${target.lane} in its pane ${lane.pane}`;
+  warnedAt.set(target.lane, now());
+  return `warned ${target.lane} in its pane ${lane.pane}`;
 };
 
 /**
@@ -166,13 +185,14 @@ export const warnHeaviestLane = async (run: Runner, lanes: readonly LaneMemory[]
  */
 export const guardAlertDetail = async (
   deps: Pick<FlowDeps, "run" | "config" | "registry">, sample: HostSample, procs: () => Promise<Proc[]> = () => sampleProcs(deps.run),
+  warnedAt: Map<string, number> = new Map(), now: () => number = Date.now,
 ): Promise<string | undefined> => {
   try {
     const lanes = laneMemory(await procs());
     const detail = laneMemoryDetail(lanes);
     const min = deps.config.guard.memFreeMinPct;
     if (sample.memFreePct >= min) return detail;
-    const warned = await warnHeaviestLane(deps.run, lanes, await deps.registry.open(), `memory free ${sample.memFreePct}% < ${min}%`);
+    const warned = await warnHeaviestLane(deps.run, lanes, await deps.registry.open(), `memory free ${sample.memFreePct}% < ${min}%`, warnedAt, now);
     return [detail, warned].filter(Boolean).join("; ");
   } catch (e) {
     return `lane memory unreadable: ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 120)}`;
@@ -295,7 +315,7 @@ export const machineCriticalTick = async (
   const entering = !state.get(machine.label);
   state.set(machine.label, true);
   const head = `HOST_GUARD CRITICAL ${machineTag(machine.label)} ${reasons.join(" | ")}`;
-  const lanes = open.filter((l) => l.pane && l.machine === machine.label);
+  const lanes = open.filter((l) => l.pane && l.machine !== undefined && (l.machine === machine.label || l.machine === machine.id));
   let failure = "";
   try {
     const res = await io.killRemote(machine, deps.config.heavyKill);
@@ -324,7 +344,7 @@ export const warnMachineLanes = async (
   run: Runner, machine: GuardMachine, sample: MachineSample, open: readonly Lane[], minPct: number,
 ): Promise<string | undefined> => {
   if (sample.memFreePct < 0 || sample.memFreePct >= minPct) return undefined;
-  const lanes = open.filter((l) => l.pane && l.machine === machine.label);
+  const lanes = open.filter((l) => l.pane && l.machine !== undefined && (l.machine === machine.label || l.machine === machine.id));
   if (!lanes.length) return undefined;
   const reason = `memory free ${sample.memFreePct}% < ${minPct}%`;
   const failed = await notifyKilled(run, lanes, (lane) => `HOST_GUARD memory warning: ${reason} on machine ${machine.label}, where this lane (${lane.key}) runs. `
@@ -353,8 +373,10 @@ export const supervisorSweeps = (
 ): readonly Sweep[] => {
   const guard: GuardState = { alerting: false };
   const critical = { critical: false };
-  const machineGuard: MachineGuardState = new Map();
   const machineCritical = new Map<string, boolean>();
+  const warnedAt = new Map<string, number>();
+  const machineGuardPath = join(deps.config.stateDir, MACHINE_GUARD_STATE_FILE);
+  const machineGuard = loadMachineGuardState(machineGuardPath);
   // The saved machines change rarely: re-listed every MACHINE_LIST_TTL_MS, so a steady round adds no herdr call.
   let guardMachines: { readonly at: number; readonly list: GuardMachine[] } | undefined;
   const seen = new Set<string>();
@@ -378,8 +400,8 @@ export const supervisorSweeps = (
     }],
     ["guard", async (emit) => {
       const sample = await sampleHost(deps.run, diskGuardPath(deps.config), () => view.panes().then((panes) => panes.length, () => -1));
-      const memJustLow = sample.memFreePct < deps.config.guard.memFreeMinPct && !guard.memLow;
-      const detail = (memJustLow || (!guard.alerting && alertReasons(sample, deps.config.guard).length)) ? await guardAlertDetail(deps, sample) : undefined;
+      const memJustLow = memIsLow(sample, deps.config.guard, guard.memLow) && !guard.memLow;
+      const detail = (memJustLow || (!guard.alerting && alertReasons(sample, deps.config.guard).length)) ? await guardAlertDetail(deps, sample, undefined, warnedAt, deps.clock.now) : undefined;
       for (const line of guardTick(sample, deps.config.guard, guard, detail)) await emit(line);
       const criticalLine = await localCriticalTick(deps, sample, critical, io);
       if (criticalLine) await emit(criticalLine);
@@ -388,39 +410,6 @@ export const supervisorSweeps = (
       if (sample.panes >= 0 && launchHeld(deps.config.stateDir) && canLaunch(sample, deps.config.guard).ok) {
         await emit(`LAUNCH_READY the host has room again (load ${sample.load1.toFixed(0)}, memory free ${sample.memFreePct}%, disk free ${sample.diskFreeGb.toFixed(0)} GB, panes ${sample.panes}); start the held work after dori can-launch`);
         clearLaunchHold(deps.config.stateDir);
-      }
-      if (!guardMachines || deps.clock.now() - guardMachines.at >= MACHINE_LIST_TTL_MS) {
-        guardMachines = { at: deps.clock.now(), list: await listGuardMachines(deps.run, deps.config.guardMachines) };
-      }
-      const machines = guardMachines.list;
-      if (machines.length) {
-        const results = await Promise.all(machines.map(async (machine) => ({ machine, result: await sampleMachine(deps.run, machine) })));
-        const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
-        const open = await deps.registry.open();
-        // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
-        // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.
-        const warned = new Map<string, string>();
-        await Promise.all(results.map(async ({ machine, result }) => {
-          if (!result.ok || machineGuard.get(machine.label)?.alerting) return;
-          const note = await warnMachineLanes(deps.run, machine, result.sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
-          if (note) warned.set(machine.label, note);
-        }));
-        const lanesOn = (m: GuardMachine): string | undefined => {
-          const keys = open.filter((l) => l.machine === m.label).map((l) => l.key);
-          return [keys.length ? `lanes on this machine: ${keys.join(", ")}` : "", warned.get(m.label) ?? ""].filter(Boolean).join("; ") || undefined;
-        };
-        for (const line of machineGuardTick(results, deps.config.guard, want, machineGuard, lanesOn)) await emit(line);
-        // A machine held by `dori can-launch --machine` or a queued launch resumes the same way, from this round's pane list.
-        for (const { machine: { label }, result } of results) {
-          if (!result.ok || !launchHeld(deps.config.stateDir, label)) continue;
-          const panes = await view.panes(label).then((p) => p.length, () => -1);
-          if (!machineVerdict(result, panes, deps.config.guard, label).ok) continue;
-          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
-          clearLaunchHold(deps.config.stateDir, label);
-        }
-        const criticalLines = await Promise.all(results.map(({ machine, result }) =>
-          result.ok ? machineCriticalTick(deps, machine, result.sample, open, machineCritical, io) : Promise.resolve(undefined)));
-        for (const line of criticalLines) if (line) await emit(line);
       }
       return [];
     }],
@@ -433,6 +422,54 @@ export const supervisorSweeps = (
     ["memory", async () => memorySweep(deps, home)],
     // Counts [REPORT] lines of `dori report` lanes found in the lead's pane; reads nothing while no such lane is open.
     ["lead-pane", async (emit) => { await leadPaneViolationTick(deps, emit); return []; }],
+    // Last, so a slow or unreachable worker machine never delays the pane reads of the sweeps before it. A machine
+    // whose sample failed waits out its backoff instead of costing an ssh timeout every round.
+    ["machine-guard", async (emit) => {
+      const now = deps.clock.now();
+      if (!guardMachines || now - guardMachines.at >= MACHINE_LIST_TTL_MS) {
+        const listed = await readGuardMachines(deps.run, deps.config.guardMachines);
+        if (listed.ok) guardMachines = { at: now, list: listed.machines };
+        else {
+          guardMachines = { at: now - MACHINE_LIST_TTL_MS + MACHINE_LIST_RETRY_MS, list: guardMachines?.list ?? listed.machines };
+          await emit(`SWEEP_WARN machine-guard herdr machine list failed: ${listed.detail}`);
+        }
+      }
+      const due = guardMachines.list.filter((m) => machineDue(machineGuard, m.label, now));
+      if (!due.length) return [];
+      const results = await Promise.all(due.map(async (machine) => ({ machine, result: await sampleMachine(deps.run, machine) })));
+      const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
+      const open = await deps.registry.open();
+      // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
+      // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.
+      const warned = new Map<string, string>();
+      await Promise.all(results.map(async ({ machine, result }) => {
+        if (!result.ok || machineGuard.get(machine.label)?.alerting) return;
+        const note = await warnMachineLanes(deps.run, machine, result.sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
+        if (note) warned.set(machine.label, note);
+      }));
+      const lanesOn = (m: GuardMachine): string | undefined => {
+        const keys = open.filter((l) => l.machine !== undefined && (l.machine === m.label || l.machine === m.id)).map((l) => l.key);
+        return [keys.length ? `lanes on this machine: ${keys.join(", ")}` : "", warned.get(m.label) ?? ""].filter(Boolean).join("; ") || undefined;
+      };
+      const lines = machineGuardTick(results, deps.config.guard, want, machineGuard, lanesOn, now);
+      try {
+        for (const line of lines) await emit(line);
+        // A machine held by `dori can-launch --machine` or a queued launch resumes the same way, from this round's pane list.
+        for (const { machine: { label }, result } of results) {
+          if (!result.ok || !launchHeld(deps.config.stateDir, label)) continue;
+          const panes = await view.panes(label).then((p) => p.length, () => -1);
+          if (!machineVerdict(result, panes, deps.config.guard, label).ok) continue;
+          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
+          clearLaunchHold(deps.config.stateDir, label);
+        }
+        const criticalLines = await Promise.all(results.map(({ machine, result }) =>
+          result.ok ? machineCriticalTick(deps, machine, result.sample, open, machineCritical, io) : Promise.resolve(undefined)));
+        for (const line of criticalLines) if (line) await emit(line);
+      } finally {
+        saveMachineGuardState(machineGuardPath, machineGuard);
+      }
+      return [];
+    }],
   ];
 };
 

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
 import { alertReasons } from "./host-guard.ts";
@@ -10,6 +11,9 @@ export const GUARD_AGENT_TEMPLATE = join(import.meta.dir, "..", "templates", "gu
 
 const REMOTE_SCRIPT = '"$HOME/.dori/guard-agent.sh"';
 const REMOTE_VERSION = '"$HOME/.dori/guard-agent.version"';
+// Written next to the live files and moved over them, so a running sample never reads a half-written script.
+const REMOTE_SCRIPT_TMP = '"$HOME/.dori/guard-agent.sh.tmp.$$"';
+const REMOTE_VERSION_TMP = '"$HOME/.dori/guard-agent.version.tmp.$$"';
 const HEREDOC = "DORI_GUARD_EOF";
 const INSTALL_TIMEOUT_MS = 30_000;
 const SAMPLE_TIMEOUT_MS = 20_000;
@@ -18,7 +22,8 @@ const KILL_TIMEOUT_MS = 30_000;
 /** First 12 hex chars of the script's sha256: what `guard-agent.version` holds once installed. */
 export const guardAgentVersion = (script: string): string => createHash("sha256").update(script).digest("hex").slice(0, 12);
 
-export type GuardMachine = { readonly label: string; readonly target: string };
+/** `id` is herdr's machine id when the list has one; a lane may name its machine by label or by id. */
+export type GuardMachine = { readonly label: string; readonly target: string; readonly id?: string };
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : typeof v === "number" ? String(v) : undefined);
 
@@ -38,26 +43,41 @@ export const parseMachineList = (json: string): GuardMachine[] => {
     if (!e || typeof e !== "object") continue;
     const o = e as Record<string, unknown>;
     if (o.enabled === false) continue;
-    const label = str(o.label) ?? str(o.id);
+    const id = str(o.id);
+    const label = str(o.label) ?? id;
     if (!label) continue;
-    out.push({ label, target: str(o.ssh_target) ?? str(o.target) ?? str(o.ssh) ?? str(o.host) ?? label });
+    out.push({ label, target: str(o.ssh_target) ?? str(o.target) ?? str(o.ssh) ?? str(o.host) ?? label, ...(id ? { id } : {}) });
   }
   return out;
 };
 
-/** herdr's saved machines (none when herdr fails), with `overrides` (label -> ssh target) replacing or adding by label. */
-export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<GuardMachine[]> => {
-  const r = await run(["herdr", "machine", "list", "--json"]);
-  let listed: GuardMachine[] = [];
-  if (r.code === 0) {
-    try { listed = parseMachineList(r.out); } catch { listed = []; }
-  }
+/** A machine list read; on failure `machines` holds only the overrides and `detail` says why herdr's list is missing. */
+export type MachineListResult = { ok: true; machines: GuardMachine[] } | { ok: false; detail: string; machines: GuardMachine[] };
+
+const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Record<string, string>>): GuardMachine[] => {
   const byLabel = new Map(listed.map((m) => [m.label, m]));
-  for (const [label, target] of Object.entries(overrides)) byLabel.set(label, { label, target });
+  for (const [label, target] of Object.entries(overrides)) byLabel.set(label, { ...byLabel.get(label), label, target });
   return [...byLabel.values()].sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 };
 
-export const sshArgv = (target: string, command: string): string[] => ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, command];
+/** herdr's saved machines with `overrides` (label -> ssh target) replacing or adding by label; a herdr failure or invalid JSON is not ok. */
+export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<MachineListResult> => {
+  const r = await run(["herdr", "machine", "list", "--json"]);
+  if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides) };
+  try {
+    return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides) };
+  } catch (e) {
+    return { ok: false, detail: `invalid JSON: ${e instanceof Error ? e.message : String(e)}`, machines: withOverrides([], overrides) };
+  }
+};
+
+/** readGuardMachines' machines, failure or not (only the overrides when herdr fails). */
+export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<GuardMachine[]> =>
+  (await readGuardMachines(run, overrides)).machines;
+
+export const sshArgv = (target: string, command: string): string[] => ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, command];
+
+const firstLine = (s: string): string => s.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
 
 export type MachineSample = {
   readonly version: string;
@@ -87,15 +107,16 @@ export const parseAgentSample = (out: string): MachineSample | undefined => {
   return s;
 };
 
-const firstLine = (s: string): string => s.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
-
 export type SampleResult = { ok: true; sample: MachineSample } | { ok: false; detail: string };
+
+const NOT_INSTALLED = "guard agent not installed";
+const unreachable = (r: { timedOut?: boolean; code: number }): boolean => Boolean(r.timedOut) || r.code === RUN_TIMEOUT_CODE || r.code === 255;
 
 const sampleWith = async (run: Runner, m: GuardMachine, timeoutMs: number): Promise<SampleResult> => {
   const r = await run(sshArgv(m.target, `sh ${REMOTE_SCRIPT} sample`), { timeoutMs });
-  if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, detail: `unreachable: ${firstLine(r.err) || `ssh exit ${r.code}`}` };
+  if (unreachable(r)) return { ok: false, detail: `unreachable: ${firstLine(r.err) || `ssh exit ${r.code}`}` };
   if (r.code === 127 || (r.code !== 0 && /No such file|Can't open|cannot open/i.test(r.err))) {
-    return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
+    return { ok: false, detail: `${NOT_INSTALLED}; run dori guard install --machine ${m.label}` };
   }
   if (r.code !== 0) return { ok: false, detail: `sample failed (exit ${r.code}): ${firstLine(r.err) || firstLine(r.out)}` };
   const sample = parseAgentSample(r.out);
@@ -139,7 +160,7 @@ export const killOnMachine = async (run: Runner, m: GuardMachine, patterns: read
 
 export type InstallResult = { ok: true; version: string } | { ok: false; detail: string };
 
-/** Writes the script and its version file in one ssh call, then samples to confirm the installed version. */
+/** Writes the script and its version file to temp files and moves them into place in one ssh call, then samples to confirm the installed version. */
 export const installGuardAgent = async (run: Runner, m: GuardMachine, script: string): Promise<InstallResult> => {
   if (script.split("\n").some((l) => l.replace(/\r$/, "") === HEREDOC)) throw new Error(`guard agent script contains the heredoc delimiter ${HEREDOC}`);
   const version = guardAgentVersion(script);
@@ -147,13 +168,15 @@ export const installGuardAgent = async (run: Runner, m: GuardMachine, script: st
   const command = [
     "umask 077",
     'mkdir -p "$HOME/.dori" || exit 1',
-    `cat > ${REMOTE_SCRIPT} <<'${HEREDOC}' || exit 1`,
+    `cat > ${REMOTE_SCRIPT_TMP} <<'${HEREDOC}' || exit 1`,
     `${body}${HEREDOC}`,
-    `printf '%s\\n' '${version}' > ${REMOTE_VERSION} || exit 1`,
+    `printf '%s\\n' '${version}' > ${REMOTE_VERSION_TMP} || exit 1`,
+    `mv -f ${REMOTE_SCRIPT_TMP} ${REMOTE_SCRIPT} || exit 1`,
+    `mv -f ${REMOTE_VERSION_TMP} ${REMOTE_VERSION} || exit 1`,
   ].join("\n");
   const w = await run(sshArgv(m.target, command), { timeoutMs: INSTALL_TIMEOUT_MS });
   if (w.code !== 0) {
-    const why = w.timedOut || w.code === RUN_TIMEOUT_CODE || w.code === 255 ? "unreachable" : `install failed (exit ${w.code})`;
+    const why = unreachable(w) ? "unreachable" : `install failed (exit ${w.code})`;
     return { ok: false, detail: `${why}: ${firstLine(w.err) || firstLine(w.out)}` };
   }
   const s = await sampleWith(run, m, INSTALL_TIMEOUT_MS);
@@ -162,7 +185,58 @@ export const installGuardAgent = async (run: Runner, m: GuardMachine, script: st
   return { ok: true, version };
 };
 
-export type MachineGuardState = Map<string, { alerting: boolean; offline: boolean; outdated: boolean }>;
+/**
+ * Per-machine guard state. `failures` counts consecutive failed samples; a machine with failures is not sampled again
+ * before `nextAttemptAt` (epoch ms, 0 = every round).
+ */
+export type MachineGuardEntry = {
+  alerting: boolean;
+  offline: boolean;
+  outdated: boolean;
+  notInstalled: boolean;
+  failures: number;
+  nextAttemptAt: number;
+};
+export type MachineGuardState = Map<string, MachineGuardEntry>;
+
+/** Failed samples before a machine is reported OFFLINE. */
+export const OFFLINE_AFTER_FAILURES = 2;
+const BACKOFF_START_MS = 2 * 60_000;
+const BACKOFF_MAX_MS = 30 * 60_000;
+
+/** The wait after the `failures`-th consecutive failure: 2 min, doubling, at most 30 min. */
+export const machineBackoffMs = (failures: number): number => Math.min(BACKOFF_MAX_MS, BACKOFF_START_MS * 2 ** Math.max(0, failures - 1));
+
+/** Whether `label` is sampled this round: always after a success, after a failure only once its backoff has passed. */
+export const machineDue = (state: MachineGuardState, label: string, now: number): boolean => (state.get(label)?.nextAttemptAt ?? 0) <= now;
+
+const bool = (v: unknown): boolean => v === true;
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
+
+/** The state saved at `path`; a missing or unreadable file, or one that is not an object, is empty state. */
+export const loadMachineGuardState = (path: string): MachineGuardState => {
+  const state: MachineGuardState = new Map();
+  let data: unknown;
+  try { data = JSON.parse(readFileSync(path, "utf8")); } catch { return state; }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return state;
+  for (const [label, e] of Object.entries(data as Record<string, unknown>)) {
+    if (!e || typeof e !== "object") continue;
+    const o = e as Record<string, unknown>;
+    state.set(label, {
+      alerting: bool(o.alerting), offline: bool(o.offline), outdated: bool(o.outdated), notInstalled: bool(o.notInstalled),
+      failures: num(o.failures), nextAttemptAt: num(o.nextAttemptAt),
+    });
+  }
+  return state;
+};
+
+/** Saves `state` to `path` through a temp file and a rename, so a crash never leaves a half-written file. */
+export const saveMachineGuardState = (path: string, state: MachineGuardState): void => {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(Object.fromEntries(state), null, 2)}\n`);
+  renameSync(tmp, path);
+};
 
 const tag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
 
@@ -175,9 +249,12 @@ const machineReasons = (s: MachineSample, t: GuardThresholds): string[] => alert
 }, t);
 
 /**
- * HOST_GUARD lines for state changes since the last tick. First sight reports only OFFLINE, ALERT and OUTDATED; while
- * a machine is offline its alert and outdated state stand. Machines absent from `results` keep their state.
- * `alertDetail` (for example the lanes running there) is appended to an ALERT line after `; `, as on the host's own.
+ * HOST_GUARD lines for state changes since the last tick. First sight reports only OFFLINE, NOT_INSTALLED, ALERT and
+ * OUTDATED; while a machine is offline its alert and outdated state stand. A missing guard agent is NOT_INSTALLED at
+ * once; any other failure is OFFLINE only at the OFFLINE_AFTER_FAILURES-th failure in a row. Each failure pushes the
+ * next sample out by machineBackoffMs from `now`. An OUTDATED machine reporting the wanted version again is CURRENT.
+ * Machines absent from `results` keep their state. `alertDetail` (for example the lanes running there) is appended
+ * to an ALERT line after `; `, as on the host's own.
  */
 export const machineGuardTick = (
   results: readonly { machine: GuardMachine; result: SampleResult }[],
@@ -185,18 +262,34 @@ export const machineGuardTick = (
   want: string,
   state: MachineGuardState,
   alertDetail: (machine: GuardMachine) => string | undefined = () => undefined,
+  now = 0,
 ): string[] => {
   const out: string[] = [];
   for (const { machine, result } of results) {
     const id = tag(machine.label);
     const prev = state.get(machine.label);
     if (!result.ok) {
-      if (!prev?.offline) out.push(`HOST_GUARD OFFLINE ${id} ${result.detail.replace(/\s*\n\s*/g, " ").trim()}`);
-      state.set(machine.label, { alerting: prev?.alerting ?? false, offline: true, outdated: prev?.outdated ?? false });
+      const failures = (prev?.failures ?? 0) + 1;
+      const detail = result.detail.replace(/\s*\n\s*/g, " ").trim();
+      let offline = prev?.offline ?? false;
+      let notInstalled = prev?.notInstalled ?? false;
+      if (result.detail.startsWith(NOT_INSTALLED)) {
+        if (!notInstalled) out.push(`HOST_GUARD NOT_INSTALLED ${id} ${detail}`);
+        notInstalled = true;
+        offline = false;
+      } else if (failures >= OFFLINE_AFTER_FAILURES) {
+        if (!offline) out.push(`HOST_GUARD OFFLINE ${id} ${detail}`);
+        offline = true;
+        notInstalled = false;
+      }
+      state.set(machine.label, {
+        alerting: prev?.alerting ?? false, offline, outdated: prev?.outdated ?? false, notInstalled,
+        failures, nextAttemptAt: now + machineBackoffMs(failures),
+      });
       continue;
     }
     const s = result.sample;
-    if (prev?.offline) out.push(`HOST_GUARD ONLINE ${id}`);
+    if (prev?.offline || prev?.notInstalled) out.push(`HOST_GUARD ONLINE ${id}`);
     const reasons = machineReasons(s, t);
     const alerting = reasons.length > 0;
     if (alerting !== (prev?.alerting ?? false)) {
@@ -209,12 +302,17 @@ export const machineGuardTick = (
     if (outdated && !(prev?.outdated ?? false)) {
       out.push(`HOST_GUARD OUTDATED ${id} have=${s.version} want=${want}; run dori update or dori guard install --machine ${machine.label}`);
     }
-    state.set(machine.label, { alerting, offline: false, outdated });
+    if (!outdated && prev?.outdated) out.push(`HOST_GUARD CURRENT ${id} ${s.version}`);
+    state.set(machine.label, { alerting, offline: false, outdated, notInstalled: false, failures: 0, nextAttemptAt: 0 });
   }
   return out;
 };
 
-/** Reinstalls the agent on every machine whose installed version differs from `script`'s; returns how many failed. */
+/**
+ * Reinstalls the agent on every machine whose installed version differs from `script`'s (or that has none: the
+ * version probe exits 1 or prints nothing); returns how many failed. An unreachable machine, or a probe failing
+ * otherwise, is logged and skipped, counted as failed.
+ */
 export const refreshGuardAgents = async (
   run: Runner,
   machines: readonly GuardMachine[],
@@ -224,6 +322,14 @@ export const refreshGuardAgents = async (
   const want = guardAgentVersion(script);
   const failed = await Promise.all(machines.map(async (m) => {
     const r = await run(sshArgv(m.target, `cat ${REMOTE_VERSION}`), { timeoutMs: SAMPLE_TIMEOUT_MS });
+    if (unreachable(r)) {
+      log(`GUARD_AGENT_UNREACHABLE ${m.label} ${firstLine(r.err) || `ssh exit ${r.code}`}`);
+      return true;
+    }
+    if (r.code !== 0 && r.code !== 1) {
+      log(`GUARD_AGENT_FAILED ${m.label} version probe failed (exit ${r.code}): ${firstLine(r.err) || firstLine(r.out)}`);
+      return true;
+    }
     const have = (r.code === 0 && firstLine(r.out)) || "none";
     if (have === want) {
       log(`GUARD_AGENT_CURRENT ${m.label} ${want}`);

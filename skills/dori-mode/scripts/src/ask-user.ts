@@ -13,7 +13,7 @@ import { passthroughView, type SweepView } from "./sweep-view.ts";
  */
 
 /** A question prompt on screen: the current question's header, text and options, and how many questions it holds. */
-export type ScreenQuestion = { readonly header?: string; readonly question: string; readonly options: readonly string[]; readonly pending: number };
+export type ScreenQuestion = { readonly header?: string; readonly question: string; readonly options: readonly string[]; readonly pending: number; readonly tabs?: readonly string[] };
 
 /** How many bottom lines of a pane are read: the prompt is part of the live UI at the bottom, never scrollback. */
 export const ASK_SCREEN_LINES = 60;
@@ -32,6 +32,7 @@ const DIALOG_HEAD = /^\s*Ask user\b/;
 const WIDGET_HEAD = /^\? (?:Question pending \((\d+) unanswered\)|(\d+) questions pending)/;
 /** The widget's option chips: "[ seoul ]  [ tokyo ]  [ own answer… ]". */
 const CHIP = /\[ (.+?) \]/g;
+const CHIP_LINE = /\[ .+? \]/;
 
 const clean = (s: string): string => s.replace(/\s+/g, " ").trim();
 const nonEmptyAfter = (lines: readonly string[], i: number): number => lines.slice(i + 1).filter((l) => l.trim()).length;
@@ -62,7 +63,7 @@ const dialog = (lines: readonly string[]): ScreenQuestion | null => {
   const header = tabNames.find((t) => t.startsWith("→"))?.replace(/^→\s*/, "");
   const question = clean(lines.slice(tabs + 1, firstOption).join(" "));
   if (!question) return null;
-  return { ...(header ? { header } : {}), question, options: optionsFrom(lines, firstOption, hint), pending: Math.max(tabNames.length, 1) };
+  return { ...(header ? { header } : {}), question, options: optionsFrom(lines, firstOption, hint), pending: Math.max(tabNames.length, 1), ...(tabNames.length > 1 ? { tabs: tabNames.map((t) => t.replace(/^→\s*/, "")) } : {}) };
 };
 
 /** The collapsed widget: "? Question pending (N unanswered) · 30m", "  <header> - <question>", then its option chips. */
@@ -72,12 +73,22 @@ const widget = (lines: readonly string[]): ScreenQuestion | null => {
   const counted = WIDGET_HEAD.exec(lines[head] ?? "");
   const pending = Number(counted?.[1] ?? counted?.[2] ?? 1);
   const at = lines.findIndex((l, i) => i > head && l.trim() !== "");
-  const first = at < 0 ? "" : clean(lines[at] ?? "");
+  if (at < 0) return null;
+  let chipAt = -1;
+  const questionLines: string[] = [];
+  for (let i = at; i < lines.length && questionLines.length < 4; i++) {
+    const line = lines[i] ?? "";
+    if (!line.trim() || CHIP_LINE.test(line) || OPTION.test(line) || OWN_ANSWER.test(line)) { chipAt = i; break; }
+    questionLines.push(clean(line));
+  }
+  const first = questionLines[0] ?? "";
   if (!first) return null;
-  const chips = [...(lines[at + 1] ?? "").matchAll(CHIP)].map((m) => clean(m[1] ?? "")).filter((c) => !/^own answer/.test(c));
-  const options = chips.length ? chips : optionsFrom(lines, at + 1, lines.length);
+  const chipLine = chipAt < 0 ? -1 : lines.slice(chipAt, chipAt + 3).findIndex((line) => CHIP_LINE.test(line));
+  const chips = chipLine < 0 ? [] : [...(lines[chipAt + chipLine] ?? "").matchAll(CHIP)].map((m) => clean(m[1] ?? "")).filter((c) => !/^own answer/.test(c));
+  const options = chips.length ? chips : optionsFrom(lines, chipAt >= 0 ? chipAt : at + questionLines.length, lines.length);
   const split = /^(.+?) - (.+)$/.exec(first);
-  return { ...(split?.[1] ? { header: split[1] } : {}), question: split?.[2] ?? first, options, pending };
+  const question = [split?.[2] ?? first, ...questionLines.slice(1)].join(" ");
+  return { ...(split?.[1] ? { header: split[1] } : {}), question: clean(question), options, pending };
 };
 
 /** The question prompt waiting at the bottom of `screen`, or null when there is none. */
@@ -99,7 +110,7 @@ export const askingLine = (key: string, q: ScreenQuestion): string => {
  * owner opens the collapsed widget into the dialog (their pending counts differ, so the count is left out).
  */
 const questionKey = (q: ScreenQuestion): string =>
-  createHash("sha256").update(JSON.stringify([q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
+  createHash("sha256").update(JSON.stringify(q.tabs && q.tabs.length > 1 ? [q.tabs] : [q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
 
 /**
  * One pass over the open lanes (a paused lane is skipped: it is stopped on purpose). A prompt not raised yet is emitted
@@ -108,14 +119,18 @@ const questionKey = (q: ScreenQuestion): string =>
  * records it, so a crash in between repeats it, never drops it.
  */
 export const askUserTick = async (deps: FlowDeps, emit: Emit, view: SweepView = passthroughView(deps.run)): Promise<void> => {
+  let firstError: unknown;
   for (const lane of await deps.registry.open()) {
-    if (!lane.pane || lane.recoveryPending || statusOf(lane) === "paused") continue;
-    const screen = await view.screen(lane, ASK_SCREEN_LINES);
-    if (!screen.trim()) continue;
-    const asked = screenQuestion(screen);
-    const seen = asked ? questionKey(asked) : undefined;
-    if (seen === lane.lastAskPrompt) continue;
-    if (asked) await emit(askingLine(lane.key, asked), undefined, laneMeta(lane));
-    await deps.registry.patch(lane.key, { lastAskPrompt: seen });
+    try {
+      if (!lane.pane || lane.recoveryPending || statusOf(lane) === "paused") continue;
+      const screen = await view.screen(lane, ASK_SCREEN_LINES);
+      if (!screen.trim()) continue;
+      const asked = screenQuestion(screen);
+      const seen = asked ? questionKey(asked) : undefined;
+      if (seen === lane.lastAskPrompt) continue;
+      if (asked) await emit(askingLine(lane.key, asked), undefined, laneMeta(lane));
+      await deps.registry.patch(lane.key, { lastAskPrompt: seen });
+    } catch (error) { firstError ??= error; }
   }
+  if (firstError !== undefined) throw firstError;
 };
