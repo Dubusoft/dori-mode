@@ -39,7 +39,8 @@ test("the default table classifies every line as the hard-coded list did, except
   const differ = corpus.filter((line) => eventPriority(line) !== legacyPriority(line));
   // CI follow-up messages the lane about failing checks and conflicts first, and a merged PR is read back by the
   // supervisor: for the lead these are digest. The done claim and the lane close are urgent like LEGACY_URGENT.
-  expect(differ).toEqual(corpus.filter((line) => /^GH_PR \S+ (checks_failing|conflicting|merged)(?: |$)/.test(line)));
+  // ACK_MISSING is no longer enqueued (push delivery re-pushes unacked owner messages): an old journal's line is digest.
+  expect(differ).toEqual(corpus.filter((line) => /^GH_PR \S+ (checks_failing|conflicting|merged)(?: |$)/.test(line) || /^ACK_MISSING( |$)/.test(line)));
   expect(differ.every((line) => eventPriority(line) === "digest")).toBe(true);
   expect(corpus.filter((line) => eventPriority(line) === "urgent").length).toBeGreaterThan(LEGACY_URGENT.length);
 });
@@ -51,6 +52,12 @@ test("the done claim and lane-ending events are lead-urgent; a close after a rec
   for (const line of ["LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
     expect(eventClass(line)).toBe("lead-digest");
   }
+});
+
+test("LEAD_UNRESPONSIVE (restart cap refused) wakes the lead; a leftover ACK_MISSING line is digest", () => {
+  expect(eventClass("LEAD_UNRESPONSIVE push ladder: you did not take pushed events")).toBe("lead-urgent");
+  expect(eventClass("ACK_MISSING 1 2 hi")).toBe("lead-digest");
+  expect(Object.keys(DEFAULT_EVENT_POLICY.kinds)).not.toContain("ACK_MISSING");
 });
 
 test("a kind is the most specific matching entry, else the line's first word", () => {

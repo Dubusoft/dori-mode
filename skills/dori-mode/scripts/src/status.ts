@@ -60,7 +60,7 @@ export type Status = {
     readonly issueRepos: readonly string[];
   };
   readonly gateway: GatewayView;
-  /** Owner messages the lead was handed and reminded about (ACK_MISSING) without acking them yet. */
+  /** Owner messages the lead was handed and reminded about after the ack window, without acking them yet. */
   readonly unacked: number;
   /** Finished lanes (LANE_CLOSED, CI_MERGED) the lead has not reported to the owner with dori reported, oldest first. */
   readonly unreported?: readonly { readonly lane: string; readonly since: string }[];
@@ -342,7 +342,7 @@ const problems = (s: Status, now: number): Problem[] => {
   if (g.failures.length) out.push({ label: "github poll failing", line: `GitHub poll failing: ${list(g.failures.map((f) => `${f.repo} ${ago(f.at, now)}`), 4, 200)}` });
   if (!g.issueAuthors.length) out.push({ label: "no trusted issue authors", line: "No trusted issue authors (githubIssueAuthors): new issues never wake the lead" });
   if (s.lead.state === "missing" || s.lead.state === "unknown") out.push({ label: `lead ${s.lead.state}`, line: "" });
-  if (s.unacked > 0) out.push({ label: `unacked ${s.unacked}`, line: `${plural(s.unacked, "owner message")} handed to the lead and still not acked (dori ack) after ACK_MISSING` });
+  if (s.unacked > 0) out.push({ label: `unacked ${s.unacked}`, line: `${plural(s.unacked, "owner message")} handed to the lead and still not acked (dori ack) after the ack window` });
   const owed = s.unreported ?? [];
   if (owed.length) {
     out.push({

@@ -13,7 +13,7 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
-import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
+import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
@@ -36,7 +36,7 @@ import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
 import { ackLaneMessage, LaneMessageError, openLaneMessages } from "./lane-messages.ts";
-import { isReportKind, oneLine, openLaneReports, REPORT_KINDS, type ReportKind, UNFENCED_GENERATION } from "./lane-reports.ts";
+import { isReportKind, laneGeneration, oneLine, openLaneReports, REPORT_KINDS, type ReportKind } from "./lane-reports.ts";
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
@@ -63,7 +63,7 @@ const USAGE = `dori <command> [options]
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
-                                       inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, and send posts only to its own thread
+                                       inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, send is lead-only (a lane asks with report <key> question), and a session replaced by recovery may not claim-done or report
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
@@ -190,11 +190,30 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule", "send"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
-  if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
+  if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
 }
+
+/**
+ * Why the calling process may not report as lane `lane` (claim-done, report), or undefined when it may. Ownership
+ * fencing on the CLI side: a lane's active session is the one in its registered pane, so a session replaced by
+ * recovery (still alive in the old pane, DORI_LANE_KEY unchanged) cannot claim or report for the lane that replaced it.
+ * The lead (no caller lane) and a process with no pane id are not fenced.
+ */
+const staleLaneRefusal = (caller: string | undefined, lane: Lane, env: Readonly<Record<string, string | undefined>> = process.env): string | undefined => {
+  const pane = env.HERDR_PANE_ID?.trim();
+  if (caller === undefined || caller !== lane.key || !pane || !lane.pane || pane === lane.pane) return undefined;
+  return `LANE_STALE_SESSION lane ${lane.key} is now owned by pane ${lane.pane}; this session (pane ${pane}) was replaced and may not report for it`;
+};
+
+/** `lane(k)` for a command that reports as the lane (claim-done, report): a session replaced by recovery is refused. */
+const activeLane = async (command: string, k: string | undefined) => {
+  const found = await lane(await ownKey(command, k));
+  const stale = staleLaneRefusal(await callerLane(deps), found);
+  return stale ? die(stale) : found;
+};
 
 const lane = async (k: string | undefined) => {
   const found = k ? await deps.registry.read(k) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? "", opt("machine"));
@@ -455,7 +474,7 @@ try {
       break;
     }
     case "claim-done":
-      console.log(await claimDone(deps, await lane(await ownKey("claim-done", key)), need("evidence")));
+      console.log(await claimDone(deps, await activeLane("claim-done", key), need("evidence")));
       break;
     case "lane": {
       const [action, laneKey, ...extra] = flags.positionals;
@@ -639,12 +658,13 @@ try {
         if (!action || !isReportKind(kind) || extra.length || Object.keys(flags.values).some((name) => name !== "text" && name !== "evidence")) {
           die(`usage: dori report <key> <${REPORT_KINDS.join("|")}> --text T [--evidence E] | dori report ack <id>`);
         }
-        const text = oneLine(need("text"));
-        const evidence = opt("evidence") ? oneLine(opt("evidence") ?? "") : undefined;
-        const target = await lane(await ownKey("report", action));
+        // Newlines stay: the store redacts, and routeReports saves a multi-line body to a file for the lead.
+        const text = need("text").trim();
+        const evidence = opt("evidence")?.trim();
+        const target = await activeLane("report", action);
         const reports = openLaneReports(config);
         try {
-          const row = reports.append({ lane: target.key, generation: UNFENCED_GENERATION, kind: kind as ReportKind, text, ...(evidence ? { evidence } : {}), at: realClock.now() });
+          const row = reports.append({ lane: target.key, generation: laneGeneration(target), kind: kind as ReportKind, text, ...(evidence ? { evidence } : {}), at: realClock.now() });
           console.log(`LANE_REPORTED ${row.id} ${row.kind}`);
         } finally { reports.close(); }
         break;
@@ -718,10 +738,7 @@ try {
     case "send": {
       const platform = key ?? die("send needs discord");
       const named = platform === "discord" ? platform : die(`unknown platform ${platform}`);
-      const { to, thread } = resolveTarget(named, need("to"), opt("thread"));
-      const me = await callerLane(deps);
-      const sendRefusal = laneSendRefusal(me, me ? await deps.registry.read(me) : null, named, { to, ...(thread ? { thread } : {}) });
-      if (sendRefusal) die(sendRefusal);
+      const { to } = resolveTarget(named, need("to"), opt("thread"));
       const text = need("text");
       const edit = opt("edit");
       if (!edit) {

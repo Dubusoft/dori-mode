@@ -39,11 +39,11 @@ test("a working lane is never nudged: its todo text is posted scrubbed, at once 
   world.screen = REAL;
   expect(await freshnessTick(deps(T0 + 10 * MIN), "/home/test")).toEqual([]);
   expect((await freshnessTick(deps(T0 + 16 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["progress"]);
-  expect(posts()).toEqual(["Read lane brief dori-lean.md in full"]);
+  expect(posts()).toEqual(["[System] relayed from lane busy-lane: Read lane brief dori-lean.md in full"]);
   expect(await freshnessTick(deps(T0 + 17 * MIN), "/home/test")).toEqual([]);
   world.screen = REAL.replace("Read lane brief dori-lean.md in full", "Fix /home/test/repo/x.ts on w3E:p1").replace("(3s", "(40s");
   expect((await freshnessTick(deps(T0 + 18 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["progress"]);
-  expect(posts().at(-1)).toBe("Fix ~/repo/x.ts on (pane)");
+  expect(posts().at(-1)).toBe("[System] relayed from lane busy-lane: Fix ~/repo/x.ts on (pane)");
   // 14 minutes after the last post nothing is posted, and a local lane's pane having no [REPORT] line is no event.
   expect(await freshnessTick(deps(T0 + 32 * MIN), "/home/test")).toEqual([]);
   expect((await freshnessTick(deps(T0 + 33 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["progress"]);
@@ -57,7 +57,7 @@ test("progressTemplate shapes the line in the owner's language, with the elapsed
   world.screen = REAL;
   const custom = depsFor(world, fakeClock(T0 + 16 * MIN), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] }, progressTemplate: "진행 중: {todo} ({elapsed} 경과)" });
   await freshnessTick(custom, "/home/test");
-  expect(posts()).toEqual(["진행 중: Read lane brief dori-lean.md in full (3s 경과)"]);
+  expect(posts()).toEqual(["[System] relayed from lane busy-lane: 진행 중: Read lane brief dori-lean.md in full (3s 경과)"]);
 });
 
 test("a failed progress post is not recorded as posted: it is retried next tick and its error is reported once", async () => {

@@ -31,6 +31,7 @@ test("lead-only commands refuse under DORI_LANE_KEY with a clear message and non
     ["ack", "11", "22"], ["handled", "11", "22"], ["launch", "k", "--title", "t", "--brief", "b", "--done", "d"],
     ["adopt", "k", "--title", "t", "--brief", "b", "--done", "d", "--pane", "p"],
     ["hold", "list"], ["hold", "drop", "k"], ["lead-restart"], ["inbox", "take"], ["update"],
+    ["send", "discord", "--to", "discord:1/2", "--text", "hi"],
   ];
   for (const args of cmds) {
     const r = await cli(args, inLane);

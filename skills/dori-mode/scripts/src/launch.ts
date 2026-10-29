@@ -196,9 +196,11 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string): string => {
   ].join("\n");
 };
 
+const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
+
 export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string): string => [
   "",
-  "## Lane footer (written by dori launch)",
+  FOOTER_HEADING.slice(1),
   footerDoneRules(lane, ownerLanguage),
   "",
   "### This lane",
@@ -214,6 +216,7 @@ export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string): st
         `- Report to the lead with dori report, never by typing into the lead's pane: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". question and blocked wake the lead, milestone reaches it with its next update, progress is posted to your work thread.`,
         `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>" (the same claim as dori claim-done). See references/done-protocol.md.`,
       ]
+      // Only a lane record without reportVia reaches this; launchLane sets reportVia on every local launch and relaunch.
       : [
         `- Report to the lead at each milestone: [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>, sent to pane ${leadPane || "(lead pane)"} as an argv array, never a shell string.`,
         `- When done: dori claim-done ${lane.key} --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
@@ -358,13 +361,17 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
-  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!existing && !input.machine ? { reportVia: "cli" as const } : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
+  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!input.machine ? { reportVia: "cli" as const } /* an old-footer lane moves onto dori report when recovery relaunches it */ : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
   let agentAdmitted = false;
   try {
-    const brief = existing ? await briefFile.text() : `${(await briefFile.text()).replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage)}`;
-    if (!existing) await Bun.write(input.brief, brief);
+    // A relaunched local lane still on the old [REPORT] footer gets its footer replaced by the dori report one.
+    const migrate = Boolean(existing && !existing.reportVia && !input.machine);
+    const text = await briefFile.text();
+    const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;
+    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage)}`;
+    if (!existing || migrate) await Bun.write(input.brief, brief);
     let pane: string;
     let tab: string | undefined;
     let shell: PaneShell = "posix";

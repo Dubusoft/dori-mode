@@ -47,7 +47,10 @@ export type PushConfig = {
   readonly maxChars: number;
   /** After a push that did not visibly start a turn, the input line is checked again this many ms later. */
   readonly pasteCheckMs: number;
-  /** Push into a working lead too (its pointer is queued into the running turn). */
+  /**
+   * Push into a working lead too (its pointer is queued into the running turn): only once its due events waited ackSec,
+   * and only into an empty input box. On by default, so owner messages do not wait for the turn to end.
+   */
   readonly toWorking: boolean;
   /** Default for `dori inbox take --max-bytes`. */
   readonly takeMaxBytes: number;
@@ -150,7 +153,7 @@ export type DoriConfig = {
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
   readonly ownerDelayNotice: string;
-  /** Seconds the lead has to ack (`dori ack`) an owner message it was handed before ACK_MISSING; twice this posts `ackMissingNotice`. */
+  /** Seconds the lead has to ack (`dori ack`) an owner message it was handed before it is reminded (push delivery re-pushes it); twice this posts `ackMissingNotice`. */
   readonly ackTimeoutSec: number;
   /** Posted once in the owner's channel or thread when the lead got their message but has not acked it after two windows. */
   readonly ackMissingNotice: string;
@@ -185,6 +188,7 @@ export type DoriConfig = {
   /**
    * Minutes an idle lead whose omo session still waits on its own children (subagents, child tasks, background cells)
    * keeps a lead-restart request or a cold/context-cap restart deferred, counted from when it began waiting. Must be positive.
+   * 60 is kept: a deferred lead still gets its events in place, and push-ladder and stuck restarts never wait for it.
    */
   readonly leadChildWaitMaxMin: number;
   /** Per machine, no herdr call of a sweep round starts later than this many ms after the round began. */
@@ -276,7 +280,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   ciMergeBase: "dev",
   delivery: {
     tailMonitor: true, restartMaxPerHour: 3,
-    push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: false, takeMaxBytes: 16_384 },
+    push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
   },
 });
 

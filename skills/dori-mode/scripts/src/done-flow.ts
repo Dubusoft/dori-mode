@@ -15,7 +15,6 @@ import { type Check, checkDone, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings } from "./branch-cleanup.ts";
 import { otherOpenLanesOnThread } from "./routing.ts";
 import type { Discord } from "./messenger/discord.ts";
-import { type Platform, resolveTarget, type Target } from "./messenger/target.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 
@@ -105,6 +104,13 @@ export const claimBindings = async (run: Runner, lane: Lane): Promise<ClaimedPul
 };
 
 export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
+  // A repeated claim with the same evidence is the claim already recorded: it keeps that claim (and its single
+  // LANE_DONE_CLAIMED, its window and its PR bindings) instead of re-issuing it and waking the lead again.
+  const recorded = await deps.registry.read(lane.key);
+  const status = recorded ? statusOf(recorded) : undefined;
+  if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
+    return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
+  }
   deps = { ...deps, run: laneRunner(deps.run, lane) };
   const pulls = await claimBindings(deps.run, lane);
   const at = iso(deps.clock);
@@ -468,17 +474,13 @@ export const laneActRefusal = (caller: string | undefined, command: string, targ
   caller === undefined || caller === target ? undefined : `LANE_PERMISSION_DENIED lane ${caller} may not ${command} lane ${target}; only its own key (the lead can act on any lane)`;
 
 /**
- * Why a lane may not send to `target`, or undefined when it may. A lane posts only into its own work thread
- * (`lane.thread`, resolved for that platform the way `dori send --to <ref>` resolves it); the lead may send anywhere.
+ * Why `caller` may not run `dori send`, or undefined for the lead. Only the lead talks to the owner: a lane, even in its
+ * own work thread, asks through `dori report <key> question` and the lead relays the answer.
  */
-export const laneSendRefusal = (caller: string | undefined, lane: Lane | null, platform: Platform, target: Target): string | undefined => {
-  if (caller === undefined) return undefined;
-  const denied = `LANE_PERMISSION_DENIED lane ${caller} may send only to its own work thread (${lane?.thread ?? "unregistered"}), not ${platform} ${target.to}${target.thread ? `/${target.thread}` : ""}`;
-  if (!lane || lane.key !== caller || !lane.thread.startsWith(`${platform}:`)) return denied;
-  let own: Target;
-  try { own = resolveTarget(platform, lane.thread); } catch { return denied; }
-  return own.to === target.to && (own.thread ?? "") === (target.thread ?? "") ? undefined : denied;
-};
+export const laneSendRefusal = (caller: string | undefined): string | undefined =>
+  caller === undefined
+    ? undefined
+    : `LANE_PERMISSION_DENIED lane ${caller} may not run send; it is lead-only. Ask the lead instead: dori report ${caller} question --text "..."`;
 
 /** Hands a line over; `id` is its journal id when the line has a stable one (else the supervisor assigns one). */
 export type Emit = (line: string, id?: string, meta?: EventMeta) => Promise<void>;

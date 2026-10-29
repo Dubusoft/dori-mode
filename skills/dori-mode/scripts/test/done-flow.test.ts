@@ -92,6 +92,32 @@ test("five quiet minutes after a claim is handed over the lane is closed, its th
   expect(await watchTick(at(T0 + 9 * MIN))).toEqual([]);
 });
 
+test("a second done with the same evidence keeps the first claim: one LANE_DONE_CLAIMED, one notice, the window unmoved", async () => {
+  livePane();
+  await claimDone(at(T0), lane, "merged acme/app#1 abc123");
+  expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  const notices = sent(world).length;
+  const ghCalls = world.calls.filter((c) => c[0] === "gh").length;
+  expect(await claimDone(at(T0 + 2 * MIN), lane, "merged acme/app#1 abc123")).toBe(`LANE_DONE_ALREADY_CLAIMED demo-lane ${new Date(T0).toISOString()} merged acme/app#1 abc123`);
+  const after = await at(T0).registry.read("demo-lane");
+  expect(after?.claim).toMatchObject({ at: new Date(T0).toISOString(), emitted: true });
+  expect(sent(world)).toHaveLength(notices);
+  expect(world.calls.filter((c) => c[0] === "gh")).toHaveLength(ghCalls);
+  expect(await watchTick(at(T0 + 3 * MIN))).toEqual([]);
+  // New evidence is a new claim, announced again.
+  await claimDone(at(T0 + 4 * MIN), lane, "merged acme/app#1 def456");
+  expect(await watchTick(at(T0 + 4 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 def456"]);
+});
+
+test("after an objection the same evidence claims again", async () => {
+  await claimDone(at(T0), lane, "merged acme/app#1");
+  await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, ["tests red"]);
+  expect(await claimDone(at(T0 + 2 * MIN), lane, "merged acme/app#1")).toStartWith("LANE_DONE_CLAIMED demo-lane");
+  const after = await at(T0).registry.read("demo-lane");
+  expect(after && statusOf(after)).toBe("done-claimed");
+  expect(after?.claim?.at).toBe(new Date(T0 + 2 * MIN).toISOString());
+});
+
 test("claim evidence and objection reasons are capped at 300 chars in event lines, and kept whole in the registry", async () => {
   const evidence = "e".repeat(400);
   expect(await claimDone(at(T0), { ...lane, pane: undefined }, evidence)).toBe(`LANE_DONE_CLAIMED demo-lane - ${"e".repeat(299)}…`);

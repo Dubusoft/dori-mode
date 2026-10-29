@@ -22,8 +22,10 @@ const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
-  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "ACK_MISSING", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
+  "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_RECOVERY_EXHAUSTED",
+  // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
+  "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.

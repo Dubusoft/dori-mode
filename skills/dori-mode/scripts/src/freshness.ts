@@ -29,6 +29,12 @@ export const scrubForThread = (line: string, home: string): string =>
     .replace(/`/g, "'")
     .trim();
 
+/**
+ * A thread post the supervisor makes for a lane (its todo item, its last [REPORT] line, a `dori report progress` row):
+ * marked `[System]` and relayed, so the owner never reads it as the lane, or the lead, speaking.
+ */
+export const relayedText = (key: string, text: string): string => `[System] relayed from lane ${key}: ${text}`;
+
 export type SweepAct = { readonly kind: "nudged" | "progress" | "progress-failed" | "no-progress" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
 
 const lastHeard = (lane: Lane): number => lane.lastReplyAt ?? Date.parse(lane.openedAt);
@@ -82,7 +88,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
           const line = progressLine(progress, (s) => scrubForThread(s, home), deps.config.progressTemplate);
           // A new item posts at once; an unchanged one again every nudgeAfterMin, so a long step still shows life.
           if (line.key !== current.lastProgressPost || now - (current.lastProgressAt ?? 0) >= deps.config.nudgeAfterMin * 60_000) {
-            const posted = await deps.run(fillHook(hook, { thread: lane.thread, text: line.text, key: lane.key }));
+            const posted = await deps.run(fillHook(hook, { thread: lane.thread, text: relayedText(lane.key, line.text), key: lane.key }));
             if (posted.code === 0) {
               await save({ lastProgressPost: line.key, lastProgressAt: now, lastProgressError: undefined });
               acts.push({ kind: "progress", lane: lane.key, detail: line.text });
@@ -128,7 +134,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
         }
         continue;
       }
-      const text = `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`;
+      const text = relayedText(lane.key, `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`);
       await deps.run(fillHook(hook, { thread: lane.thread, text, key: lane.key }));
       await save({ lastSeenReport, lastAutoReplyAt: now, lastPostedReport: report ?? undefined, lastFreshnessNote: undefined });
       acts.push({ kind: "posted", lane: lane.key, detail: text });

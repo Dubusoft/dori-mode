@@ -46,6 +46,12 @@ export const ownerRef = (id: string): OwnerMessage | undefined => {
 export const OWNER_REVISION = /^discord:(\d+):(\d+):(?:edit:.+|delete)$/;
 /** The event that carries an owner message's current text: its latest edit, else the original. */
 export const latest = (entry: AwaitingAck): string => entry.revision ?? entry.id;
+/** Readable owner work remains owed independently of take receipts; an ack grants the handling window. */
+export const dueOwners = (core: JournalCore, now: number): AwaitingAck[] =>
+  (core.journal.awaitingAck ?? []).filter((entry) => OWNER_INBOUND.test(entry.id) && !entry.quarantined &&
+    entry.handledAt === undefined && entry.since !== undefined && core.delivered.has(latest(entry)) &&
+    (entry.ackedAt === undefined || entry.unhandledRemindedAt !== undefined ||
+      now - (entry.handlingSince ?? entry.ackedAt) >= core.deps.config.handledTimeoutMin * 60_000));
 const unquarantined = (entry: AwaitingAck): AwaitingAck => {
   if (!entry.quarantined) return entry;
   const { quarantined: _, ...rest } = entry;
@@ -125,9 +131,7 @@ export class OwnerTracking {
       return { ...entry, reminded: true };
     });
     this.journal = { ...this.journal, awaitingAck: awaiting };
-    // One ACK_MISSING per tick lists every overdue message, so an incident costs the lead one wake, not one per message.
-    // It is enqueued after the reminded marks, so both reach the store in the same write.
-    // Push delivery re-pushes untaken events itself, so ACK_MISSING (which would travel the same way) is never enqueued.
+    // Push delivery keeps owner obligations alive even after take, so a separate ACK_MISSING event is unnecessary.
     this.compactOwners(now);
     this.core.retain(now);
     this.persist("normal");

@@ -123,18 +123,13 @@ test("callerLane is DORI_LANE_KEY, else the open lane registered for HERDR_PANE_
   expect(await callerLane(d, { HERDR_PANE_ID: "w:unknown" })).toBeUndefined();
 });
 
-test("a lane may act only on its own key and send only into its own thread; the lead may do both anywhere", () => {
+test("a lane may act only on its own key and may not send at all; the lead may do both anywhere", () => {
   expect(laneActRefusal(undefined, "close", "other-lane")).toBeUndefined();
   expect(laneActRefusal("demo-lane", "close", "demo-lane")).toBeUndefined();
   expect(laneActRefusal("demo-lane", "close", "other-lane")).toStartWith("LANE_PERMISSION_DENIED lane demo-lane may not close lane other-lane");
-  expect(laneSendRefusal(undefined, null, "discord", { to: "999" })).toBeUndefined();
-  expect(laneSendRefusal("demo-lane", lane, "discord", { to: "222" })).toBeUndefined();
-  expect(laneSendRefusal("demo-lane", lane, "discord", { to: "111" })).toStartWith("LANE_PERMISSION_DENIED");
-  expect(laneSendRefusal("demo-lane", lane, "discord", { to: "333" })).toStartWith("LANE_PERMISSION_DENIED");
-  expect(laneSendRefusal("demo-lane", { ...lane, thread: "none" }, "discord", { to: "222" })).toStartWith("LANE_PERMISSION_DENIED");
-  expect(laneSendRefusal("demo-lane", null, "discord", { to: "222" })).toStartWith("LANE_PERMISSION_DENIED");
-  // A lane bound to a thread of a removed platform may not send anywhere.
-  expect(laneSendRefusal("demo-lane", { ...lane, thread: "other:C1/1700.1" }, "discord", { to: "1700.1" })).toStartWith("LANE_PERMISSION_DENIED");
+  expect(laneSendRefusal(undefined)).toBeUndefined();
+  // Even its own work thread: only the lead talks to the owner; the lane asks with a question report.
+  expect(laneSendRefusal("demo-lane")).toBe('LANE_PERMISSION_DENIED lane demo-lane may not run send; it is lead-only. Ask the lead instead: dori report demo-lane question --text "..."');
 });
 
 const cli = async (args: string[], env: Record<string, string>) => {
@@ -155,9 +150,11 @@ test("the dori CLI inside a lane refuses close/pause/claim-done on another lane 
     expect(r.code).toBe(1);
     expect(r.err).toContain(`LANE_PERMISSION_DENIED lane demo-lane may not ${args[0]} lane other-lane`);
   }
-  const send = await cli(["send", "discord", "--to", "discord:111/333", "--text", "hi from Dori"], inLane);
-  expect(send.code).toBe(1);
-  expect(send.err).toContain("LANE_PERMISSION_DENIED lane demo-lane may send only to its own work thread (discord:111/222)");
+  for (const to of ["discord:111/333", "discord:111/222"]) {
+    const send = await cli(["send", "discord", "--to", to, "--text", "hi from Dori"], inLane);
+    expect(send.code).toBe(1);
+    expect(send.err).toContain("LANE_PERMISSION_DENIED lane demo-lane may not run send; it is lead-only. Ask the lead instead: dori report demo-lane question");
+  }
   expect(statusOf((await d.registry.read("other-lane")) ?? lane)).toBe("working");
 });
 
@@ -167,6 +164,20 @@ test("the dori CLI inside a lane claims its own lane when no key is given", asyn
   expect(r.code).toBe(0);
   expect(r.out).toStartWith("LANE_DONE_CLAIMED demo-lane - merged acme/app#1");
   expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("done-claimed");
+});
+
+test("the dori CLI refuses claim-done and report from a replaced session's old pane, and accepts them from the lane's pane", async () => {
+  await at(T0).registry.write({ ...lane, pane: "w:p2" });
+  const old = { DORI_LANE_KEY: "demo-lane", HERDR_PANE_ID: "w:p1" };
+  for (const args of [["claim-done", "--evidence", "merged acme/app#1"], ["report", "demo-lane", "done", "--text", "done", "--evidence", "merged acme/app#1"]]) {
+    const r = await cli(args, old);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("LANE_STALE_SESSION lane demo-lane is now owned by pane w:p2; this session (pane w:p1) was replaced");
+  }
+  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("working");
+  const report = await cli(["report", "demo-lane", "question", "--text", "which base?"], { DORI_LANE_KEY: "demo-lane", HERDR_PANE_ID: "w:p2" });
+  expect(report.code).toBe(0);
+  expect(report.out).toStartWith("LANE_REPORTED demo-lane:0:");
 });
 
 test("a local lane is launched with DORI_LANE_KEY in its command", async () => {

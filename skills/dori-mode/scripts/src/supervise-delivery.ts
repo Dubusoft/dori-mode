@@ -107,7 +107,9 @@ export class Delivery {
         continue;
       }
       const cwd = pane.cwd ?? this.deps.config.defaultCwd;
-      const cold = pane.agent ? await this.lead.coldReason(cwd) : { kind: "no-agent", detail: `no agent runs in lead pane ${pane.pane_id}`, tokens: 0 };
+      // A LEAD_UNRESPONSIVE alone says the restart cap holds: it must not cold-start the lead the cap spares.
+      const capped = pending.every((event) => event.line.startsWith("LEAD_UNRESPONSIVE "));
+      const cold = pane.agent ? (capped ? undefined : await this.lead.coldReason(cwd)) : { kind: "no-agent", detail: `no agent runs in lead pane ${pane.pane_id}`, tokens: 0 };
       // A lead waiting on its own children takes the events in place: a cold start would kill them (bounded deferral).
       if (!cold || (pane.agent && await this.lead.deferForChildren(cwd, cold.kind, cold.detail))) {
         this.owners.record(pending, true);

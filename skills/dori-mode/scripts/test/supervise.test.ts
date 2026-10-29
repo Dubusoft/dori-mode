@@ -1876,13 +1876,15 @@ test("a cold start hands every event through take once; owner work taken but unh
   expect(session).toMatch(/^[0-9a-f-]{36}$/);
   // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
   const lines = handed(f).split("\n");
-  expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`]);
+  expect(lines.map((line) => line.split("\t")[0])).toEqual(["discord:11:23", "restart-trigger", "unfinished:discord:11:22", `launch-queue:${session}`, "unfinished:discord:11:23"]);
   expect(lines[2]).toContain("INBOUND 11 22 owner project-alpha");
   expect(lines[3]).toContain("held-lane");
+  expect(lines[4]).toContain("INBOUND 11 23 owner project-beta");
   // A second take prints only the reminders again; handling the message and starting the launch clears them.
   expect(taken(f)).toEqual(["INBOX_EMPTY"]);
-  expect(takeCarriedReminders(f.state.dir)).toHaveLength(2);
+  expect(takeCarriedReminders(f.state.dir)).toHaveLength(3);
   recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true });
+  recordHandled(f.state.dir, "11", "23", f.clock.now(), { reply: true });
   supervisor.ackTick(60_000);
   expect(takeCarriedReminders(f.state.dir).map((line) => line.split("\t")[0])).toEqual([`launch-queue:${session}`]);
   dequeueLaunch(f.state.dir, "held-lane");

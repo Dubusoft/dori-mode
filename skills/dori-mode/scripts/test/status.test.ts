@@ -232,10 +232,10 @@ const base: Status = {
   events: { hours: 24, wakes: 0, measured: 0, calls: 0, kinds: [] },
 };
 
-test("owner messages reminded with ACK_MISSING and still unacked make the status a problem", () => {
+test("owner messages still unacked after the ack window make the status a problem", () => {
   const text = renderStatus({ ...base, unacked: 2 });
   expect(text.split("\n")[1]).toBe("Needs attention: unacked 2. 0 lanes working, no waits.");
-  expect(text).toContain("\nProblems\n- 2 owner messages handed to the lead and still not acked (dori ack) after ACK_MISSING\n");
+  expect(text).toContain("\nProblems\n- 2 owner messages handed to the lead and still not acked (dori ack) after the ack window\n");
 });
 
 test("healthy status reads as titled sections with one line per item, in KST", () => {

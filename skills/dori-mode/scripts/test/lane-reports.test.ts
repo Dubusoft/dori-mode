@@ -3,12 +3,12 @@ import { join } from "node:path";
 
 import { loadConfig } from "../src/config.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { JsonLaneReports, type LaneReportStore, leadPaneViolationTick, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { JsonLaneReports, type LaneReportStore, leadPaneViolationTick, openLaneReports, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { footer, launchLane } from "../src/launch.ts";
 import { watchTick } from "../src/done-flow.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withSqliteStore, withState } from "./fakes.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; a loaded full run on a small host needs more than bun's default 5 s per test.
 setDefaultTimeout(30_000);
@@ -86,7 +86,8 @@ test("routing: progress posts to the lane's thread, done is the lane's claim, a 
     "LANE_REPORT_ROUTED local-lane:0:1 progress thread",
     "LANE_REPORT_ROUTED local-lane:0:2 done claim",
   ]);
-  expect(posts).toEqual([["notify", "discord:1/2", "tests green in ~/repo"]]);
+  // Posted as a [System] relay, never as the lane (or the lead) speaking to the owner.
+  expect(posts).toEqual([["notify", "discord:1/2", "[System] relayed from lane local-lane: tests green in ~/repo"]]);
   expect(journal).toEqual([["lane-report-late:gone-lane:0:1", "LANE_REPORT_LATE gone-lane question still there?"]]);
   expect(store.list({ lane: "gone-lane" })[0]?.route).toBe("late");
   const claimed = await deps.registry.read("local-lane");
@@ -138,7 +139,7 @@ test("routing: progress with no thread hook, or a failing one, reaches the lead 
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   const journal: [string, string][] = [];
   await routeReports(deps, store, (id, line) => { journal.push([id, line]); });
-  expect(journal).toEqual([["lane-report:local-lane:0:1", "LANE_REPORT local-lane progress half way (thread post failed: unexpected false-hook half way)"]]);
+  expect(journal).toEqual([["lane-report:local-lane:0:1", "LANE_REPORT local-lane progress half way (thread post failed: unexpected false-hook [System] relayed from lane local-lane: half way)"]]);
   expect(store.list()[0]?.route).toBe("journal");
 });
 
@@ -178,7 +179,7 @@ test("dori report: a lane writes a row for its own key only", async () => {
 
   const ok = await cli(dir, ["local-lane", "question", "--text", "which base\nbranch?", "--evidence", "PR #4"], inLane);
   expect(ok).toMatchObject({ code: 0, out: "LANE_REPORTED local-lane:0:1 question\n" });
-  expect(new JsonLaneReports(dir).list()).toMatchObject([{ lane: "local-lane", seq: 1, kind: "question", text: "which base branch?", evidence: "PR #4" }]);
+  expect(new JsonLaneReports(dir).list()).toMatchObject([{ lane: "local-lane", seq: 1, kind: "question", text: "which base\nbranch?", evidence: "PR #4" }]);
 
   const denied = await cli(dir, ["other-lane", "blocked", "--text", "x"], inLane);
   expect(denied.code).toBe(1);
@@ -228,6 +229,7 @@ test("lead-pane violations: each distinct [REPORT] line of a dori-report lane in
   const dir = stateDir();
   const world = newWorld();
   const deps = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });
+  withSqliteStore(dir);
   await deps.registry.write(lane(dir, { key: "cli-lane", reportVia: "cli" }));
   await deps.registry.write(lane(dir, { key: "old-lane", pane: "w:p8" }));
   const emitted: string[] = [];
@@ -240,10 +242,16 @@ test("lead-pane violations: each distinct [REPORT] line of a dori-report lane in
   await leadPaneViolationTick(deps, emit);
   // The same screen on the next round is the same line: not counted again.
   await leadPaneViolationTick(deps, emit);
-  expect(emitted).toEqual(["LANE_PANE_VIOLATION cli-lane 1 [REPORT] cli-lane | milestone | tests green, PR #9"]);
+  expect(emitted).toEqual(["LANE_PANE_VIOLATION cli-lane 1 [REPORT] cli-lane | milestone | tests green, PR #9 (rerouted as report cli-lane:0:1)"]);
   world.screen += "\n> [REPORT] cli-lane | question | which base?";
   await leadPaneViolationTick(deps, emit);
-  expect(emitted.at(-1)).toBe("LANE_PANE_VIOLATION cli-lane 2 [REPORT] cli-lane | question | which base?");
+  expect(emitted.at(-1)).toBe("LANE_PANE_VIOLATION cli-lane 2 [REPORT] cli-lane | question | which base? (rerouted as report cli-lane:0:2)");
+  // Each counted line became one pending row of that lane, which routeReports acts on like a dori report.
+  const rerouted = openLaneReports(deps.config);
+  cleanups.push(() => { rerouted.close(); });
+  expect(rerouted.pending().map((r) => [r.lane, r.kind, r.text])).toEqual([
+    ["cli-lane", "milestone", "tests green, PR #9"], ["cli-lane", "question", "which base?"],
+  ]);
   expect((await deps.registry.read("cli-lane"))?.leadPaneViolations).toBe(2);
   expect((await deps.registry.read("old-lane"))?.leadPaneViolations).toBeUndefined();
   expect(eventClass("LANE_PANE_VIOLATION cli-lane 2 x", deps.config.eventPolicy)).toBe("lead-digest");

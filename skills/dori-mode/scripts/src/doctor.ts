@@ -6,6 +6,7 @@ import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
+import { readWakes } from "./store.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
 import { listPanes } from "./panes.ts";
@@ -41,6 +42,7 @@ const API = "https://discord.com/api/v10";
 const MESSAGE_CONTENT = 1 << 18;
 const MESSAGE_CONTENT_LIMITED = 1 << 19;
 const RESTART = "systemctl --user restart dori-supervisor.service";
+const LEAD_WAKE_WARNING_THRESHOLD = 20;
 
 export const tokenFrom = (envText: string | undefined): string | undefined => {
   const m = /^\s*(?:export\s+)?DORI_DISCORD_TOKEN=(.*)$/m.exec(envText ?? "");
@@ -192,6 +194,13 @@ const issues = (d: DoctorDeps): Check[] => {
     : ok("github issues", `no trusted authors (githubIssueAuthors; set with dori setup), new issues stay digest; ${detail}`)];
 };
 
+const leadWakes = (d: DoctorDeps): Check[] => {
+  const wakes = readWakes(d.config.stateDir, d.clock.now() - 24 * 60 * 60_000);
+  return wakes.length > LEAD_WAKE_WARNING_THRESHOLD
+    ? [warn("lead wakes", `${wakes.length} lead wakes in the last 24 hours (threshold ${LEAD_WAKE_WARNING_THRESHOLD})`, "review dori status --stats for wake triggers and model calls")]
+    : [];
+};
+
 /** memoryCheck: the lead's human.md is found and within maxKb. */
 const memory = (d: DoctorDeps): Check[] => {
   const m = d.config.memoryCheck;
@@ -246,7 +255,7 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
 
 /** Read-only: every probe is a status query or a GET. */
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(memory(d)), tools(d), recovery(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

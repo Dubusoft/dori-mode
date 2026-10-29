@@ -119,7 +119,7 @@ export class Supervisor {
    */
   overdueOwnerMessages(ms: number): OwnerMessage[] { return this.owners.overdueOwnerMessages(ms); }
 
-  /** Read receipts stop ACK_MISSING, but never erase unhandled owner work. */
+  /** Read receipts stop re-pushing, but never erase unhandled owner work. */
   ackTick(timeoutMs: number): OwnerMessage[] {
     const due = this.owners.ackTick(timeoutMs);
     // What the last cold start carried over leaves `dori inbox take` once handled (or the launch queue emptied).

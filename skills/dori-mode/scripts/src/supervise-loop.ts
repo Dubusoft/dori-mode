@@ -176,7 +176,7 @@ export const supervisorSweeps = (
       }
       return [];
     }],
-    ["dead-panes", async () => deadPaneTick(deps.run, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view)],
+    ["dead-panes", async () => deadPaneTick(deps.run, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now)],
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
     ["freshness", async () => (await freshnessTick(deps, home, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
@@ -390,7 +390,7 @@ export const supervise = async (
         catch (e) { console.error(`OWNER_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
       }
     };
-    // A message the lead was handed but never acked: ACK_MISSING wakes it, and after a second window the owner gets one line.
+    // A message the lead was handed but never acked is re-pushed, and after a second window the owner gets one line.
     const noticeUnacked = async (): Promise<void> => {
       let due: ReturnType<typeof supervisor.ackTick>;
       try { due = supervisor.ackTick(deps.config.ackTimeoutSec * 1_000); }

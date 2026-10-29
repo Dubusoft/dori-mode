@@ -314,8 +314,8 @@ export class JournalCore {
   /**
    * Take receipts move the cursor forward only, in a crash-safe order: the store is persisted, then the cursor file is
    * written, and only then are the receipts dropped. A crash at any point leaves `max(cursor file, receipts)` at or past
-   * the new cursor, so a take never reprints. A moved cursor clears the outstanding push. Before a receipt is dropped,
-   * its ids are recorded taken with its time and session (event-trace.ts).
+   * the new cursor, so a take never reprints. A moved cursor clears the push only when no owner work remains.
+   * Before a receipt is dropped, its ids are recorded taken with its time and session (event-trace.ts).
    */
   consumeTakes(): void {
     const inbox = this.journal.inbox;
@@ -329,7 +329,8 @@ export class JournalCore {
       takenOffset = size;
     }
     if (takenOffset !== inbox.takenOffset) {
-      this.journal = { ...this.journal, inbox: { ...inbox, takenOffset, push: undefined } };
+      const ownerOpen = this.journal.awaitingAck?.some((entry) => !entry.quarantined && entry.handledAt === undefined);
+      this.journal = { ...this.journal, inbox: { ...inbox, takenOffset, push: ownerOpen ? inbox.push : undefined } };
       this.persist();
     }
     writeCursorFile(this.deps.config.stateDir, takenOffset);
