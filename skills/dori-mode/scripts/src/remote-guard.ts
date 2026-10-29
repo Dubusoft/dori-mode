@@ -91,7 +91,7 @@ export type SampleResult = { ok: true; sample: MachineSample } | { ok: false; de
 const sampleWith = async (run: Runner, m: GuardMachine, timeoutMs: number): Promise<SampleResult> => {
   const r = await run(sshArgv(m.target, `sh ${REMOTE_SCRIPT} sample`), { timeoutMs });
   if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, detail: `unreachable: ${firstLine(r.err) || `ssh exit ${r.code}`}` };
-  if (r.code === 127 || /No such file|Can't open|cannot open/i.test(r.err)) {
+  if (r.code === 127 || (r.code !== 0 && /No such file|Can't open|cannot open/i.test(r.err))) {
     return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
   }
   if (r.code !== 0) return { ok: false, detail: `sample failed (exit ${r.code}): ${firstLine(r.err) || firstLine(r.out)}` };

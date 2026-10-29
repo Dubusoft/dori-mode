@@ -61,3 +61,14 @@ test("a paused lane's question is not raised", async () => {
   await depsFor(world, fakeClock(T0), state.dir).registry.write({ ...lane, status: "paused" });
   expect(await tick(DIALOG)).toEqual([]);
 });
+
+test("an empty screen read preserves the remembered question without emitting or patching", async () => {
+  const registry = depsFor(world, fakeClock(T0), state.dir).registry;
+  await registry.write({ ...lane, lastAskPrompt: "remembered-question" });
+  const patch = registry.patch.bind(registry);
+  let patches = 0;
+  registry.patch = async (...args) => { patches++; return patch(...args); };
+  expect(await tick("")).toEqual([]);
+  expect(patches).toBe(0);
+  expect((await registry.open())[0]?.lastAskPrompt).toBe("remembered-question");
+});

@@ -104,12 +104,15 @@ const questionKey = (q: ScreenQuestion): string =>
 /**
  * One pass over the open lanes (a paused lane is skipped: it is stopped on purpose). A prompt not raised yet is emitted
  * as urgent LANE_ASKING and remembered on the lane (`lastAskPrompt`); a lane whose prompt is gone forgets it, so its next
- * question is raised again. The line is emitted before the lane records it, so a crash in between repeats it, never drops it.
+ * question is raised again. Empty screen reads leave the remembered prompt unchanged. The line is emitted before the lane
+ * records it, so a crash in between repeats it, never drops it.
  */
 export const askUserTick = async (deps: FlowDeps, emit: Emit, view: SweepView = passthroughView(deps.run)): Promise<void> => {
   for (const lane of await deps.registry.open()) {
     if (!lane.pane || lane.recoveryPending || statusOf(lane) === "paused") continue;
-    const asked = screenQuestion(await view.screen(lane, ASK_SCREEN_LINES));
+    const screen = await view.screen(lane, ASK_SCREEN_LINES);
+    if (!screen.trim()) continue;
+    const asked = screenQuestion(screen);
     const seen = asked ? questionKey(asked) : undefined;
     if (seen === lane.lastAskPrompt) continue;
     if (asked) await emit(askingLine(lane.key, asked), undefined, laneMeta(lane));
