@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { configPath, deliveryConfigError, saveLeadPane } from "./config.ts";
@@ -17,6 +18,8 @@ import { alertReasons, diskGuardPath, type GuardState, guardTick, type HostSampl
 import { describeLane, type LaneMemory, laneMemory, laneMemoryDetail, type Proc, sampleProcs } from "./lane-memory.ts";
 import { sendGuarded } from "./panes.ts";
 import type { Lane } from "./registry.ts";
+import { GUARD_AGENT_TEMPLATE, type GuardMachine, guardAgentVersion, listGuardMachines, type MachineGuardState, machineGuardTick, sampleMachine } from "./remote-guard.ts";
+
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
 import { canLaunch, clearLaunchHold, launchHeld } from "./routing.ts";
 import { Discord } from "./messenger/discord.ts";
@@ -36,6 +39,9 @@ import { type BuiltinSource, EventSources, type SourceEnqueue } from "./event-so
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, leadPaneViolationTick, openLaneReports, routeReports } from "./lane-reports.ts";
+
+/** How long the guard reuses `herdr machine list` before reading it again. */
+const MACHINE_LIST_TTL_MS = 10 * 60_000;
 
 /** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
 export const SYSTEM_PREFIX = "[System] ";
@@ -183,6 +189,9 @@ export const supervisorSweeps = (
   laneReports: () => LaneReportStore | undefined = () => undefined,
 ): readonly Sweep[] => {
   const guard: GuardState = { alerting: false };
+  const machineGuard: MachineGuardState = new Map();
+  // The saved machines change rarely: re-listed every MACHINE_LIST_TTL_MS, so a steady round adds no herdr call.
+  let guardMachines: { readonly at: number; readonly list: GuardMachine[] } | undefined;
   const seen = new Set<string>();
   const dead = newDeadPaneState();
   const cache = newSweepCache();
@@ -211,6 +220,21 @@ export const supervisorSweeps = (
       if (sample.panes >= 0 && launchHeld(deps.config.stateDir) && canLaunch(sample, deps.config.guard).ok) {
         await emit(`LAUNCH_READY the host has room again (load ${sample.load1.toFixed(0)}, memory free ${sample.memFreePct}%, disk free ${sample.diskFreeGb.toFixed(0)} GB, panes ${sample.panes}); start the held work after dori can-launch`);
         clearLaunchHold(deps.config.stateDir);
+      }
+      if (!guardMachines || deps.clock.now() - guardMachines.at >= MACHINE_LIST_TTL_MS) {
+        guardMachines = { at: deps.clock.now(), list: await listGuardMachines(deps.run, deps.config.guardMachines) };
+      }
+      const machines = guardMachines.list;
+      if (machines.length) {
+        const results = await Promise.all(machines.map(async (machine) => ({ machine, result: await sampleMachine(deps.run, machine) })));
+        const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
+        const open = await deps.registry.open();
+        // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
+        const lanesOn = (m: GuardMachine): string | undefined => {
+          const keys = open.filter((l) => l.machine === m.label).map((l) => l.key);
+          return keys.length ? `lanes on this machine: ${keys.join(", ")}` : undefined;
+        };
+        for (const line of machineGuardTick(results, deps.config.guard, want, machineGuard, lanesOn)) await emit(line);
       }
       return [];
     }],

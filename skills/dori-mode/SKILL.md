@@ -107,12 +107,13 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 | `dori claim-done` / `dori object-done` / `dori close` | the done flow |
 | `dori pause` / `dori resume` | the owner said wait: no nudges, goal paused, running turn stopped; and back |
 | `dori doctor` / `dori status [--json]` | read-only: health check with the exact fix for each problem; one-screen state (services, lead, lanes, waits, repos, gateway), also Discord `/status` |
-| `dori update [--dev] [--force]` | fast-forward this install to `origin/main` (`--dev`: `origin/dev`), keep local changes, restart the supervisor when it moved |
+| `dori update [--dev] [--force]` | fast-forward this install to `origin/main` (`--dev`: `origin/dev`), keep local changes, restart the supervisor when it moved, re-install outdated guard agents |
 | `dori supervise` | supervised mode: owns Discord presence, slash commands, inbound and the sweeps; feeds the lead through `lead-events.log` |
 | `dori watch` | the 5-minute auto-close watcher (run it as a persistent monitor) |
 | `dori freshness` | post a working lane's current todo to its thread (again every `nudgeAfterMin`), nudge idle silent lanes, post last reports |
 | `dori dead-panes` | report agent panes that stopped |
-| `dori guard` | host load, memory, disk and pane-count alerts |
+| `dori guard` | host load, memory, disk and pane-count alerts, plus each worker machine under `supervise` |
+| `dori guard install\|machines` | install the guard agent on worker machines over ssh; show each machine's agent and load |
 | `dori heavy <label> -- <cmd>` | run a heavy command only when a slot is free and load is low; blocking, so lanes only, never the lead |
 | `dori can-launch [--model M]` | is there room for a new lane (memory, disk, panes)? exit 4 with the reasons if not |
 | `dori quota [--json]` | Claude 5h/7d usage and reset times (Discord `/quota` shows the same usage block) |

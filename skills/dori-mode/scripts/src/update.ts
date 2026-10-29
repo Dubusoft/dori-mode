@@ -8,6 +8,8 @@ export type UpdateDeps = {
   readonly run: Runner;
   readonly sleep: (ms: number) => Promise<void>;
   readonly log: (line: string) => void;
+  /** Re-installs outdated remote guard agents; returns the failure count (logged by the callee, never changes the exit code). */
+  readonly refreshGuardAgents?: () => Promise<number>;
 };
 export type UpdateOptions = {
   readonly packageDir: string;
@@ -29,6 +31,10 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     return r.out;
   };
   let root = o.packageDir;
+  const refreshAgents = async (): Promise<void> => {
+    if (!d.refreshGuardAgents) return;
+    try { await d.refreshGuardAgents(); } catch (e) { d.log(`WARN guard agents: ${e instanceof Error ? e.message : String(e)}`); }
+  };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);
     await git(["fetch", "-q", "origin", o.branch]);
@@ -64,6 +70,7 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     }
     if (now === old && !o.force) {
       d.log(`UP_TO_DATE ${o.branch} ${short(now)}`);
+      await refreshAgents();
       return 0;
     }
     const restart = await d.run(["systemctl", "--user", "restart", SUPERVISOR_UNIT], { timeoutMs: 120_000 });
@@ -75,6 +82,7 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       await d.sleep(ACTIVE_POLL_MS);
     }
     d.log(`UPDATED ${o.branch} ${short(old)}..${short(now)} supervisor=${state}`);
+    await refreshAgents();
     return state === "active" ? 0 : 1;
   } catch (e) {
     if (!(e instanceof UpdateStop)) throw e;
