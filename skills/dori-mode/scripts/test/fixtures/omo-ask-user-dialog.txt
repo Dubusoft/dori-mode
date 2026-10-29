@@ -1,0 +1,59 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ Tip: Use /mcp to inspect and manage the MCP servers wired into this session.
+ ↳ Want the full story on any tip? Ask about it: the give-me-tips skill has the tour.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Ask user · 30m
+ → Deploy    Submit
+ QA442 which target should I deploy to?
+ → 1. staging
+   2. production
+   Type your own answer...
+ Submit (0/1 answered) - Enter advances
+ ↑↓ move  1-9 select  space select  enter next  tab next question  c comment  esc cancel
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/repo • CH0.0% • $0.000 • 1K/1M (0.1%) (auto)                                   (anthropic-subscription) claude-opus-5-5 • effort medium (shift+tab)
+(😺 OmO Native by Q Kim)

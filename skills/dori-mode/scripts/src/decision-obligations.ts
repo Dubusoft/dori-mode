@@ -27,7 +27,7 @@ export const OBLIGATION_LINE_MAX = 300;
 export const UNRESOLVED_LINE_MAX = 160;
 
 export const DEFAULT_RESOLVE_KINDS: readonly string[] = [
-  "LANE_REPORT * question", "LANE_REPORT * blocked",
+  "LANE_REPORT * question", "LANE_REPORT * blocked", "LANE_ASKING",
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "LANE_NOT_DONE", "WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED", "DEAD_PANE",
 ];

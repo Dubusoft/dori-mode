@@ -36,6 +36,9 @@ const runner: Runner = async (argv, opts) => {
 const update = (branch: "main" | "dev", force = false) =>
   updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l) }, { packageDir: pkg, branch, force });
 
+const updateWith = (refreshGuardAgents: () => Promise<number>, branch: "main" | "dev") =>
+  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), refreshGuardAgents }, { packageDir: pkg, branch, force: false });
+
 beforeEach(async () => {
   dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "dori-update-"));
   calls = []; lines = []; unitState = "active";
@@ -76,6 +79,33 @@ test("switches dev -> main, keeps local changes, installs on a lockfile change, 
   expect(readFileSync(join(install, "local.txt"), "utf8")).toBe("untracked\n");
   expect(await sh(install, "git", "stash", "list")).toBe("");
   expect(calls).toEqual(["bun install --frozen-lockfile", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+});
+
+test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or exception keeps the exit code", async () => {
+  let n = 0;
+  expect(await updateWith(async () => { n++; return 2; }, "dev")).toBe(0);
+  expect(n).toBe(1);
+  await commit(origin, "notes.txt", "two\n");
+  expect(await updateWith(async () => { n++; throw new Error("boom"); }, "main")).toBe(0);
+  expect(n).toBe(2);
+  expect(lines).toContain("WARN guard agents: boom");
+  expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
+});
+
+test("guard agents are refreshed before the supervisor restarts", async () => {
+  await commit(origin, "notes.txt", "two\n");
+  expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);
+  expect(calls).toEqual(["refresh", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+});
+
+test("guard agents are not refreshed when the update fails", async () => {
+  await sh(install, "git", "checkout", "-q", "main");
+  await commit(install, "mine.txt", "local commit\n");
+  await commit(origin, "notes.txt", "upstream\n");
+  let n = 0;
+  expect(await updateWith(async () => { n++; return 0; }, "main")).toBe(1);
+  expect(lines.at(-1)).toMatch(/^UPDATE_NOT_FAST_FORWARD /);
+  expect(n).toBe(0);
 });
 
 test("a supervisor that is not active afterwards exits 1", async () => {

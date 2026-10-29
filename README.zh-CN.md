@@ -117,8 +117,8 @@ Done = command ["bun","test"] stdout~" 0 fail"; file qa/report.json json:.passed
 | `dori watch` | 自动关闭的 watcher,作为常驻监控运行 |
 | `dori freshness [--loop MIN]` | 提醒变安静的 lane,再把它最后一条汇报发到线程里 |
 | `dori dead-panes [--loop MIN]` | 报告已停止的智能体 pane |
-| `dori guard [--loop MIN]` | 负载、内存、磁盘和 pane 数量告警 |
-| `dori heavy <label> -- <cmd>` | 只在有空闲槽位且负载低时运行构建或测试 |
+| `dori guard [--loop MIN]` | 负载、内存、磁盘和 pane 数量告警，也按工作机器 (`guard install`、`guard machines`) |
+| `dori heavy <label> -- <cmd>` | 只在有空闲槽位且负载低时运行构建、测试或模拟器 (每台机器一个) |
 
 发给 pane 的文字总是作为一个参数传入，从不经过 shell 字符串，并把每次发送报告为已送达或未确认。
 

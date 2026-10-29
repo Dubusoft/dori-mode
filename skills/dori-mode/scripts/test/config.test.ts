@@ -26,6 +26,18 @@ test("leadDiet defaults to true when absent and parses false from the file", asy
   expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(false);
 });
 
+test("laneRules defaults to none, collapses whitespace, drops blanks, and refuses anything but an array of strings", async () => {
+  const path = join(state.dir, "rules.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  expect((await loadConfig(path, "/home/ana")).laneRules).toEqual([]);
+  await Bun.write(path, JSON.stringify({ laneRules: null }));
+  expect((await loadConfig(path, "/home/ana")).laneRules).toEqual([]);
+  await Bun.write(path, JSON.stringify({ laneRules: [" Do not\n merge. ", "  ", "CI runs the typecheck only."] }));
+  expect((await loadConfig(path, "/home/ana")).laneRules).toEqual(["Do not merge.", "CI runs the typecheck only."]);
+  await Bun.write(path, JSON.stringify({ laneRules: "Do not merge." }));
+  await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
+});
+
 test("a missing config file falls back to defaults and DORI_STATE_DIR wins over the file", async () => {
   process.env.DORI_STATE_DIR = state.dir;
   const c = await loadConfig("/nonexistent/config.json", "/home/ana");
@@ -197,4 +209,46 @@ test("legacy arrays with no usable entry fall back to the lane model", async () 
   const path = join(state.dir, "empty-lead.json");
   await Bun.write(path, JSON.stringify({ leadModel: [null, " ", {}], defaultModel: "m/default", leadThinking: "low" }));
   expect(leadModels(await loadConfig(path))).toEqual([{ model: "m/default", thinking: "low" }]);
+});
+
+test("placement defaults to local with no workspace rules or fallback", async () => {
+  expect(defaultConfig("/home/ana").placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+  const path = join(state.dir, "placement-none.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+});
+
+test("placement parses trimmed machines, drops blank workspace values, and blank defaultMachine means local", async () => {
+  const path = join(state.dir, "placement.json");
+  await Bun.write(path, JSON.stringify({ placement: { defaultMachine: " big ", workspaces: { "/data/repos": " mini ", "acme/app": "", "*": 3 }, fallback: [" mini ", "big"] } }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "big", workspaces: { "/data/repos": "mini" }, fallback: ["mini", "big"] });
+  await Bun.write(path, JSON.stringify({ placement: { defaultMachine: "  " } }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+});
+
+test("placement refuses a non-object and a malformed fallback", async () => {
+  const path = join(state.dir, "placement-bad.json");
+  for (const placement of ["big", ["big"], null]) {
+    await Bun.write(path, JSON.stringify({ placement }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement must be an object");
+  }
+  for (const fallback of ["big", ["big", " "], [1]]) {
+    await Bun.write(path, JSON.stringify({ placement: { fallback } }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement.fallback must be an array of machine names");
+  }
+});
+
+test("critical pressure keys default, merge into guard, and heavyKill drops blanks and refuses non-arrays", async () => {
+  const path = join(state.dir, "crit.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  const c = await loadConfig(path, "/home/ana");
+  expect(c.guard.memFreeCritPct).toBe(5);
+  expect(c.guard.swapFreeCritPct).toBe(5);
+  expect(c.heavyKill).toEqual(["qemu-system", "emulator", "expo export"]);
+  await Bun.write(path, JSON.stringify({ guard: { memFreeCritPct: 3 }, heavyKill: [" gradle ", "  "] }));
+  const d = await loadConfig(path, "/home/ana");
+  expect(d.guard).toMatchObject({ memFreeCritPct: 3, swapFreeCritPct: 5, memFreeMinPct: 20 });
+  expect(d.heavyKill).toEqual(["gradle"]);
+  await Bun.write(path, JSON.stringify({ heavyKill: "qemu-system" }));
+  await expect(loadConfig(path, "/home/ana")).rejects.toThrow("heavyKill must be an array of strings");
 });

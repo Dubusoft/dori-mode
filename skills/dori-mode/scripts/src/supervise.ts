@@ -1,4 +1,4 @@
-import { launchQueue, launchQueueText } from "./routing.ts";
+import { launchQueue, launchQueueText, queueFor } from "./routing.ts";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { redactMeta, redactSecrets } from "./redact.ts";
@@ -82,7 +82,10 @@ export class Supervisor {
    */
   enqueue(id: string, line: string, meta?: EventMeta): boolean {
     if (this.core.known(id)) return false;
-    const queued = line === "LAUNCH_READY" || line.startsWith("LAUNCH_READY ") ? launchQueueText(launchQueue(this.core.deps.config.stateDir)) : "";
+    // A LAUNCH_READY lists the queued launches of its machine (`LAUNCH_READY machine=<label> ...`; none named: local).
+    const queued = line === "LAUNCH_READY" || line.startsWith("LAUNCH_READY ")
+      ? launchQueueText(queueFor(launchQueue(this.core.deps.config.stateDir), /^LAUNCH_READY machine=(\S+)/.exec(line)?.[1]))
+      : "";
     const event: Event = { id, line: redactSecrets(`${line}${queued}`).replace(/[\r\n]+/g, " "), at: this.core.deps.clock.now(), ...(meta ? { meta: redactMeta(meta) } : {}) };
     const before = this.core.journal;
     const length = before.events.length;

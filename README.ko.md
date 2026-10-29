@@ -117,8 +117,8 @@ watcher는 레인을 닫을 때 셸 없이 이 확인을 직접 다시 돌리고
 | `dori watch` | 자동 닫기 watcher. 지속 모니터로 돌립니다 |
 | `dori freshness [--loop MIN]` | 조용해진 레인을 깨우고, 마지막 보고를 스레드에 올림 |
 | `dori dead-panes [--loop MIN]` | 멈춘 에이전트 pane 보고 |
-| `dori guard [--loop MIN]` | 부하, 메모리, 디스크, pane 수 경고 |
-| `dori heavy <label> -- <cmd>` | 슬롯이 비고 부하가 낮을 때만 빌드나 테스트 실행 |
+| `dori guard [--loop MIN]` | 부하, 메모리, 디스크, pane 수 경고, 작업 머신별로도 (`guard install`, `guard machines`) |
+| `dori heavy <label> -- <cmd>` | 슬롯이 비고 부하가 낮을 때만 빌드, 테스트, 에뮬레이터 실행 (머신당 하나) |
 
 pane에 보내는 글은 항상 인자 하나로 넘기고 셸 문자열을 거치지 않습니다. 전송 결과는 전달됨 또는 미확인으로 보고합니다.
 

@@ -18,6 +18,10 @@ export type GuardThresholds = {
   readonly loadAlert: number;
   readonly loadOk: number;
   readonly memFreeMinPct: number;
+  /** Critical stage: memory free below this percent. */
+  readonly memFreeCritPct: number;
+  /** Critical stage: swap free below this percent of swap total (only when swap exists). */
+  readonly swapFreeCritPct: number;
   readonly diskFreeMinGb: number;
   readonly panesMax: number;
 };
@@ -97,6 +101,16 @@ export const deliveryConfigError = (delivery: DeliveryConfig): string | undefine
 export const MIN_POINTER_CHARS = 140;
 export const MAX_POINTER_CHARS = 800;
 
+/** Where `dori launch` starts a lane (placement.ts): "local" is this host, anything else a machine label. */
+export type PlacementConfig = {
+  /** Machine for workspace-less launches: "local" (default) or a machine label. */
+  readonly defaultMachine: string;
+  /** Workspace -> machine. Key: an absolute path prefix matched against --cwd, an owner/repo matched (case-insensitive) against the Done line's repos, or "*" for every other workspace task. Value: "local" or a machine label. */
+  readonly workspaces: Readonly<Record<string, string>>;
+  /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
+  readonly fallback: readonly string[];
+};
+
 export type DiscordConfig = {
   readonly applicationId: string;
   readonly guildId: string;
@@ -146,6 +160,8 @@ export type DoriConfig = {
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
   readonly ownerLanguage?: string;
+  /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
+  readonly laneRules?: readonly string[];
   /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
   readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
@@ -166,7 +182,11 @@ export type DoriConfig = {
   /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
   readonly resolveTimeoutMin: number;
   readonly heavySlots: number;
+  /** Critical memory pressure kills processes whose full command line contains any of these substrings. */
+  readonly heavyKill: readonly string[];
   readonly heavyMaxLoad: number;
+  /** Remote guard: machine label -> ssh target, for machines herdr does not list (overrides a herdr entry of the same label). */
+  readonly guardMachines: Readonly<Record<string, string>>;
   readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly memoryCheck: MemoryCheckConfig;
@@ -202,6 +222,8 @@ export type DoriConfig = {
   readonly ciMergeBase: string;
   /** How events reach the lead: pushed pointers with take receipts. */
   readonly delivery: DeliveryConfig;
+  /** Which machine a launch runs on. */
+  readonly placement: PlacementConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -261,9 +283,11 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   resolveKinds: DEFAULT_RESOLVE_KINDS,
   resolveTimeoutMin: 15,
   heavySlots: 1,
+  heavyKill: ["qemu-system", "emulator", "expo export"],
   heavyMaxLoad: 80,
+  guardMachines: {},
   deadPanePatterns: ["has stopped", "no suitable jobs"],
-  guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 },
+  guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 },
   memoryCheck: { repo: "", maxKb: 15 },
   hooks: {},
   runTimeoutMs: 60_000,
@@ -281,6 +305,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
     tailMonitor: true, restartMaxPerHour: 3,
     push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
   },
+  placement: { defaultMachine: "local", workspaces: {}, fallback: [] },
 });
 
 /**
@@ -326,6 +351,20 @@ export const languageInstruction = (ownerLanguage: string | undefined): string =
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
 };
 
+/** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
+const laneRules = (raw: unknown): readonly string[] => {
+  if (raw == null) return [];
+  if (!Array.isArray(raw) || raw.some((rule) => typeof rule !== "string")) throw new TypeError("laneRules must be an array of strings");
+  return (raw as string[]).map((rule) => rule.replace(/\s+/g, " ").trim()).filter(Boolean);
+};
+
+/** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */
+const heavyKill = (raw: unknown, fallback: readonly string[]): readonly string[] => {
+  if (raw === undefined) return fallback;
+  if (!Array.isArray(raw) || raw.some((p) => typeof p !== "string")) throw new TypeError("heavyKill must be an array of strings");
+  return (raw as string[]).map((p) => p.trim()).filter(Boolean);
+};
+
 /** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
 const resolveKinds = (raw: unknown): readonly string[] => {
   if (raw === undefined) return DEFAULT_RESOLVE_KINDS;
@@ -341,6 +380,25 @@ const resolveKinds = (raw: unknown): readonly string[] => {
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
 export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
+
+/** An object's string-valued entries; anything else is no entries. */
+const stringRecord = (v: unknown): Record<string, string> =>
+  typeof v !== "object" || v === null || Array.isArray(v) ? {}
+    : Object.fromEntries(Object.entries(v).filter((e): e is [string, string] => typeof e[1] === "string" && e[1].trim() !== ""));
+
+/** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
+const placement = (raw: unknown): PlacementConfig => {
+  if (raw === undefined) return { defaultMachine: "local", workspaces: {}, fallback: [] };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("placement must be an object");
+  const o = raw as Record<string, unknown>;
+  const fallback = o.fallback ?? [];
+  if (!Array.isArray(fallback) || fallback.some((m) => typeof m !== "string" || !m.trim())) throw new TypeError("placement.fallback must be an array of machine names");
+  return {
+    defaultMachine: typeof o.defaultMachine === "string" && o.defaultMachine.trim() ? o.defaultMachine.trim() : "local",
+    workspaces: Object.fromEntries(Object.entries(stringRecord(o.workspaces)).map(([key, machine]) => [key, machine.trim()])),
+    fallback: (fallback as string[]).map((m) => m.trim()),
+  };
+};
 
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
   const base = defaultConfig(home);
@@ -411,6 +469,10 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...merged,
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
     resolveKinds: resolveKinds(raw.resolveKinds),
+    laneRules: laneRules(raw.laneRules),
+    heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
+    guardMachines: stringRecord(raw.guardMachines),
+    placement: placement(raw.placement),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),

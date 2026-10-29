@@ -70,7 +70,8 @@ const MACHINES = 2;
 test("with 100 open lanes a round makes at most machines + changed lanes x 2 herdr calls, within 10 s and 4 calls per machine", async () => {
   const { h, round, lines } = await setup(5);
   const first = await round();
-  expect(first.calls).toBeLessThanOrEqual(MACHINES + 100 * 2);
+  // + 1: the guard's `herdr machine list`, re-read only every 10 minutes, so steady rounds make none.
+  expect(first.calls).toBeLessThanOrEqual(MACHINES + 1 + 100 * 2);
   expect(first.ms).toBeLessThan(10_000);
   const steady = await round();
   expect(steady.calls).toBe(MACHINES);

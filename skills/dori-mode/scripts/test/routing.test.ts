@@ -4,11 +4,11 @@ import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import type { Lane } from "../src/registry.ts";
-import { canLaunch, enqueueLaunch, idleLaneFor, launchHeld, launchQueue } from "../src/routing.ts";
+import { canLaunch, clearLaunchHold, enqueueLaunch, heldMachines, idleLaneFor, launchHeld, launchQueue, queueFor, recordLaunchVerdict } from "../src/routing.ts";
 import { withState } from "./fakes.ts";
 
 const t = defaultConfig("/home/test").guard;
-const roomy = { load1: 200, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, panes: 6 };
+const roomy = { load1: 200, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, swapTotalGb: 4, panes: 6 };
 
 test("a busy CPU alone does not stop a launch; only memory, disk and pane count do", () => {
   expect(canLaunch(roomy, t)).toEqual({ ok: true, reasons: [] });
@@ -79,5 +79,109 @@ test("a queue entry with a mode other than mass-ulw is dropped", () => {
     expect(launchQueue(state.dir)).toEqual([good]);
   } finally {
     state.done();
+  }
+});
+
+const hold = (reason: string) => ({ ok: false, reasons: [reason] });
+const item = (key: string, machine?: string) => ({
+  key, title: key, done: "d", brief: "b", queuedAt: "2026-01-01T00:00:00Z", reasons: ["held"], ...(machine ? { machine } : {}),
+});
+
+test("a remote HOLD does not block the local host and vice versa", () => {
+  const state = withState();
+  try {
+    recordLaunchVerdict(state.dir, hold("memory"), 1, "box");
+    expect(launchHeld(state.dir, "box")).toBe(true);
+    expect(launchHeld(state.dir)).toBe(false);
+    expect(launchHeld(state.dir, "local")).toBe(false);
+    recordLaunchVerdict(state.dir, hold("disk"), 2);
+    recordLaunchVerdict(state.dir, { ok: true, reasons: [] }, 3, "box");
+    expect(launchHeld(state.dir, "box")).toBe(false);
+    expect(launchHeld(state.dir)).toBe(true);
+  } finally {
+    state.done();
+  }
+});
+
+test("enqueueing a remote item raises only that machine", () => {
+  const state = withState();
+  try {
+    enqueueLaunch(state.dir, item("r", "box"));
+    expect(launchHeld(state.dir, "box")).toBe(true);
+    expect(launchHeld(state.dir)).toBe(false);
+    enqueueLaunch(state.dir, item("l"));
+    expect(launchHeld(state.dir)).toBe(true);
+    enqueueLaunch(state.dir, item("l2", "local"));
+    expect(heldMachines(state.dir)).toEqual(["box"]);
+  } finally {
+    state.done();
+  }
+});
+
+test("heldMachines lists blocked labels sorted", () => {
+  const state = withState();
+  try {
+    expect(heldMachines(state.dir)).toEqual([]);
+    recordLaunchVerdict(state.dir, hold("x"), 1, "zed");
+    recordLaunchVerdict(state.dir, hold("x"), 1, "alpha");
+    recordLaunchVerdict(state.dir, hold("x"), 1, "mid");
+    recordLaunchVerdict(state.dir, { ok: true, reasons: [] }, 2, "mid");
+    expect(heldMachines(state.dir)).toEqual(["alpha", "zed"]);
+  } finally {
+    state.done();
+  }
+});
+
+test("clearLaunchHold for a machine respects the revision observed for that machine", () => {
+  const state = withState();
+  try {
+    recordLaunchVerdict(state.dir, hold("x"), 1, "box");
+    expect(launchHeld(state.dir, "box")).toBe(true);
+    recordLaunchVerdict(state.dir, hold("y"), 2, "box");
+    clearLaunchHold(state.dir, "box");
+    expect(launchHeld(state.dir, "box")).toBe(true);
+    clearLaunchHold(state.dir, "box");
+    expect(launchHeld(state.dir, "box")).toBe(false);
+    recordLaunchVerdict(state.dir, hold("z"), 3);
+    expect(launchHeld(state.dir)).toBe(true);
+    clearLaunchHold(state.dir, "box");
+    expect(launchHeld(state.dir)).toBe(true);
+  } finally {
+    state.done();
+  }
+});
+
+test("queueFor keeps only the entries of one machine", () => {
+  const queue = [item("a"), item("b", "box"), item("c", "local"), item("d", "other")];
+  expect(queueFor(queue).map((q) => q.key)).toEqual(["a", "c"]);
+  expect(queueFor(queue, "local").map((q) => q.key)).toEqual(["a", "c"]);
+  expect(queueFor(queue, "box").map((q) => q.key)).toEqual(["b"]);
+  expect(queueFor(queue, "none")).toEqual([]);
+});
+
+test("a hold file without machines loads unchanged", () => {
+  const state = withState();
+  try {
+    writeFileSync(join(state.dir, "launch-hold.json"), JSON.stringify({ blocked: true, reasons: ["old"] }));
+    expect(launchHeld(state.dir)).toBe(true);
+    expect(launchHeld(state.dir, "box")).toBe(false);
+    expect(heldMachines(state.dir)).toEqual([]);
+    expect(readdirSync(state.dir).some((name) => name.includes("corrupt"))).toBe(false);
+  } finally {
+    state.done();
+  }
+});
+
+test("an invalid machines shape is treated as corrupt", () => {
+  for (const machines of [[], "box", { box: { blocked: "yes" } }, { box: null }, { box: { blocked: true, reasons: [1] } }]) {
+    const state = withState();
+    try {
+      writeFileSync(join(state.dir, "launch-hold.json"), JSON.stringify({ blocked: false, machines }));
+      expect(launchHeld(state.dir)).toBe(true);
+      expect(readdirSync(state.dir).some((name) => name.startsWith("launch-hold.json.corrupt-"))).toBe(true);
+      expect(heldMachines(state.dir)).toEqual([]);
+    } finally {
+      state.done();
+    }
   }
 });

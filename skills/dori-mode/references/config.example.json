@@ -45,6 +45,7 @@
   "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
   "ownerLanguage": "Korean",
+  "laneRules": ["Open a PR into the repo's dev branch and stop once its CI is green; do not merge.", "CI runs the typecheck only; do not add tests to CI."],
   "progressTemplate": "{todo}",
   "digestMaxDelayMin": 60,
   "ownerDelayNotice": "Got your message. The lead session is not taking it yet; it stays queued and will be answered as soon as the lead is back.",
@@ -55,6 +56,7 @@
   "resolveKinds": [
     "LANE_REPORT * question",
     "LANE_REPORT * blocked",
+    "LANE_ASKING",
     "LANE_REPORT_LATE * question",
     "LANE_REPORT_LATE * blocked",
     "LANE_REPORT_LATE * done",
@@ -66,6 +68,11 @@
   ],
   "unhandledNotice": "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
   "heavySlots": 1,
+  "heavyKill": [
+    "qemu-system",
+    "emulator",
+    "expo export"
+  ],
   "heavyMaxLoad": 80,
   "deadPanePatterns": [
     "has stopped",
@@ -75,6 +82,8 @@
     "loadAlert": 150,
     "loadOk": 80,
     "memFreeMinPct": 20,
+    "memFreeCritPct": 5,
+    "swapFreeCritPct": 5,
     "diskFreeMinGb": 50,
     "panesMax": 20
   },
@@ -97,6 +106,7 @@
     }
   },
   "diskGuardPath": "",
+  "guardMachines": {},
   "memoryCheck": {
     "repo": "",
     "maxKb": 15

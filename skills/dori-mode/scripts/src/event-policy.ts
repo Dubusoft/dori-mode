@@ -20,8 +20,12 @@ export type EventPolicy = {
 
 const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
+  // A lane waiting on its agent's on-screen question instead of dori report (ask-user.ts).
+  "LANE_ASKING",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
-  "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
+  "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "HOST_GUARD OUTDATED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
+  // The supervisor killed or paused something because memory ran critically low; the lead relays it to the owner.
+  "HOST_GUARD CRITICAL",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_RECOVERY_EXHAUSTED",
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
@@ -54,6 +58,8 @@ const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED", "LANE_CLOSED * closed seen-claim",
+  // A worker machine without the guard agent, or one whose agent is current again, needs no action now.
+  "HOST_GUARD NOT_INSTALLED", "HOST_GUARD CURRENT",
 ] as const;
 
 /** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */

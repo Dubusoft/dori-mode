@@ -40,13 +40,37 @@ export type QueuedLaunch = {
 };
 
 /** `blocked` false keeps the queue after LAUNCH_READY; a file without `blocked` (older versions) counts as held. */
-type HoldState = { readonly revision?: string; readonly blocked?: boolean; readonly at?: number; readonly reasons?: readonly string[]; readonly queue?: readonly QueuedLaunch[] };
+type HoldFlag = { readonly blocked?: boolean; readonly at?: number; readonly reasons?: readonly string[] };
+/** The top-level flag is the local host's; `machines` holds one flag per remote label. */
+type HoldState = HoldFlag & { readonly revision?: string; readonly machines?: Readonly<Record<string, HoldFlag & { readonly blocked: boolean }>>; readonly queue?: readonly QueuedLaunch[] };
+
+const LOCAL = "local";
+const remoteLabel = (machine?: string): string | undefined => machine === undefined || machine === LOCAL ? undefined : machine;
+
+const flagOf = (hold: HoldState | undefined, machine?: string): HoldFlag | undefined => {
+  const label = remoteLabel(machine);
+  return label === undefined ? hold : hold?.machines?.[label];
+};
+
+const withFlag = (hold: HoldState | undefined, machine: string | undefined, flag: HoldFlag & { readonly blocked: boolean }): HoldState => {
+  const label = remoteLabel(machine);
+  if (label === undefined) return { ...hold, ...flag };
+  const base = hold ?? { blocked: false };
+  return { ...base, machines: { ...base.machines, [label]: { ...base.machines?.[label], ...flag } } };
+};
+
+const validFlag = (value: unknown): boolean =>
+  typeof value === "object" && value !== null && !Array.isArray(value) &&
+  "blocked" in value && typeof value.blocked === "boolean" &&
+  (!("at" in value) || (typeof value.at === "number" && Number.isFinite(value.at))) &&
+  (!("reasons" in value) || (Array.isArray(value.reasons) && value.reasons.every((reason) => typeof reason === "string")));
 
 const lockedHold = <T>(stateDir: string, act: () => T): T =>
   withStateLockSync(join(stateDir, "launch-hold.lock.sqlite"), act);
 
 // clearLaunchHold acknowledges the exact HOLD a supervisor observed before its asynchronous LAUNCH_READY emission.
 const observedHolds = new Map<string, string>();
+const observedKey = (stateDir: string, machine?: string): string => `${stateDir}\0${remoteLabel(machine) ?? LOCAL}`;
 const holdRevision = (hold: HoldState): string => hold.revision ?? JSON.stringify(hold);
 
 const validLaunch = (value: unknown): value is QueuedLaunch =>
@@ -75,6 +99,7 @@ const readHold = (stateDir: string): HoldState | undefined => {
         ("blocked" in raw && typeof raw.blocked !== "boolean") ||
         ("at" in raw && (typeof raw.at !== "number" || !Number.isFinite(raw.at))) ||
         ("reasons" in raw && (!Array.isArray(raw.reasons) || !raw.reasons.every((reason) => typeof reason === "string"))) ||
+        ("machines" in raw && (typeof raw.machines !== "object" || raw.machines === null || Array.isArray(raw.machines) || !Object.values(raw.machines).every(validFlag))) ||
         ("queue" in raw && !Array.isArray(raw.queue))) throw new Error("invalid launch hold state");
     const entries = "queue" in raw ? raw.queue as unknown[] : undefined;
     const queue = entries?.filter(validLaunch);
@@ -106,31 +131,43 @@ const writeHold = (stateDir: string, state: HoldState): HoldState => {
  * waiting on the host and can wake the lead (LAUNCH_READY) the moment there is room again. CAN_LAUNCH lowers it.
  * The queued launches are kept either way.
  */
-export const recordLaunchVerdict = (stateDir: string, verdict: LaunchVerdict, at: number): void => {
+export const recordLaunchVerdict = (stateDir: string, verdict: LaunchVerdict, at: number, machine?: string): void => {
   lockedHold(stateDir, () => {
     const hold = readHold(stateDir);
     if (verdict.ok) {
-      if (hold) writeHold(stateDir, { ...hold, blocked: false });
-    } else writeHold(stateDir, { ...hold, blocked: true, at, reasons: verdict.reasons });
+      if (flagOf(hold, machine)) writeHold(stateDir, withFlag(hold, machine, { blocked: false }));
+    } else writeHold(stateDir, withFlag(hold, machine, { blocked: true, at, reasons: verdict.reasons }));
   });
 };
 
-export const launchHeld = (stateDir: string): boolean => lockedHold(stateDir, () => {
+/** True while `machine` (default: the local host) is blocked; a file without a local `blocked` counts as held. */
+export const launchHeld = (stateDir: string, machine?: string): boolean => lockedHold(stateDir, () => {
   const hold = readHold(stateDir);
-  if (!hold || hold.blocked === false) { observedHolds.delete(stateDir); return false; }
-  observedHolds.set(stateDir, holdRevision(hold));
+  const flag = flagOf(hold, machine);
+  const held = remoteLabel(machine) === undefined ? !!hold && hold.blocked !== false : flag?.blocked === true;
+  if (!hold || !held) { observedHolds.delete(observedKey(stateDir, machine)); return false; }
+  observedHolds.set(observedKey(stateDir, machine), holdRevision(hold));
   return true;
 });
 
 /** Lowers the blocked flag (LAUNCH_READY fired or CAN_LAUNCH); queued launches stay until they launch or are dropped. */
-export const clearLaunchHold = (stateDir: string): void => {
+export const clearLaunchHold = (stateDir: string, machine?: string): void => {
   lockedHold(stateDir, () => {
-    const observed = observedHolds.get(stateDir);
-    observedHolds.delete(stateDir);
+    const key = observedKey(stateDir, machine);
+    const observed = observedHolds.get(key);
+    observedHolds.delete(key);
     const hold = readHold(stateDir);
-    if (hold && (observed === undefined || observed === holdRevision(hold))) writeHold(stateDir, { ...hold, blocked: false });
+    if (hold && (observed === undefined || observed === holdRevision(hold))) writeHold(stateDir, withFlag(hold, machine, { blocked: false }));
   });
 };
+
+/** Remote labels whose flag is blocked, sorted. */
+export const heldMachines = (stateDir: string): string[] => lockedHold(stateDir, () =>
+  Object.entries(readHold(stateDir)?.machines ?? {}).filter(([, flag]) => flag.blocked).map(([label]) => label).sort());
+
+/** The queued launches that target `machine` (default: the local host; entries without a machine are local). */
+export const queueFor = (queue: readonly QueuedLaunch[], machine?: string): readonly QueuedLaunch[] =>
+  queue.filter((q) => remoteLabel(q.machine) === remoteLabel(machine));
 
 export const launchQueue = (stateDir: string): readonly QueuedLaunch[] => lockedHold(stateDir, () => readHold(stateDir)?.queue ?? []);
 
@@ -139,7 +176,7 @@ export const enqueueLaunch = (stateDir: string, item: QueuedLaunch): readonly Qu
   const hold = readHold(stateDir) ?? { blocked: false };
   const old = (hold.queue ?? []).find((q) => q.key === item.key);
   const queue = [...(hold.queue ?? []).filter((q) => q.key !== item.key), { ...item, queuedAt: old?.queuedAt ?? item.queuedAt }];
-  writeHold(stateDir, { ...hold, queue, blocked: true, at: Date.parse(item.queuedAt), reasons: item.reasons });
+  writeHold(stateDir, { ...withFlag(hold, item.machine, { blocked: true, at: Date.parse(item.queuedAt), reasons: item.reasons }), queue });
   return queue;
 });
 

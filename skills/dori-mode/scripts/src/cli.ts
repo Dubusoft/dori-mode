@@ -10,14 +10,18 @@ import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
-import { diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
+import { readFile } from "node:fs/promises";
+import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
+import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
+import { GUARD_AGENT_TEMPLATE, guardAgentVersion, installGuardAgent, listGuardMachines, refreshGuardAgents, sampleMachine } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
-import { canLaunch, dequeueLaunch, enqueueLaunch, launchGate, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
@@ -93,8 +97,12 @@ const USAGE = `dori <command> [options]
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
+  guard machines                       the remote guard agent of every saved machine: version and load, memory, swap, disk (GUARD_MACHINE lines)
+  guard install [--machine LABEL]      install or update the guard agent over ssh on all listed machines, or one (exit 1 on any failure)
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
-  can-launch [--model M]               exit 0 if the host has room for a new lane, else print why and exit 4
+  can-launch [--machine M] [--cwd D] [--done "..."] [--all]
+                                       exit 0 if the machine a launch with these flags is placed on (none: placement.defaultMachine)
+                                       has room for a new lane, else print why and exit 4; --all checks local and every listed machine
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
@@ -195,6 +203,10 @@ if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
 }
+if (command === "guard" && flags.positionals[0] === "install") {
+  const caller = await callerLane(deps);
+  if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run guard install; it is lead-only`);
+}
 
 /**
  * Why the calling process may not report as lane `lane` (claim-done, report), or undefined when it may. Ownership
@@ -274,7 +286,10 @@ try {
       if (flags.positionals.length || Object.entries(flags.values).some(([name, v]) => (name !== "dev" && name !== "force") || v !== true)) {
         die("usage: dori update [--dev] [--force]");
       }
-      const code = await updateInstall({ run, sleep: realClock.sleep, log: (line) => console.log(line) },
+      const code = await updateInstall({
+        run, sleep: realClock.sleep, log: (line) => console.log(line),
+        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readFile(GUARD_AGENT_TEMPLATE, "utf8"), (line) => console.log(line)),
+      },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
     }
@@ -423,21 +438,24 @@ try {
       if (mode !== undefined && !(LANE_MODES as readonly string[]).includes(mode)) die(`--mode must be one of ${LANE_MODES.join(", ")}`);
       const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
       await validateLaunch(deps, input);
-      const gate = launchGate({ sample: await sampleHost(run, diskGuardPath(config)), guard: config.guard });
-      for (const line of gate.lines) console.log(line);
-      if (gate.hold) {
+      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
+      for (const line of plan.lines) console.log(line);
+      const target = plan.check.machine;
+      const machine = target === LOCAL_MACHINE ? undefined : target;
+      if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
+      if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
         const queue = enqueueLaunch(config.stateDir, {
-          key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [gate.hold],
+          key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [plan.check.verdict.reasons.join(" | ")],
           ...(input.cwd ? { cwd: input.cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
           ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}),
-          ...(input.machine ? { machine: input.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
+          ...(machine ? { machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
         });
-        console.log(`HOLD ${gate.hold}`);
+        console.log(verdictLine(target, plan.check.verdict));
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
       }
-      const r = await launchLane(deps, input);
+      const r = await launchLane(deps, { ...input, machine });
       dequeueLaunch(config.stateDir, input.key);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
@@ -557,10 +575,38 @@ try {
       break;
     }
     case "guard": {
+      if (key === "machines" || key === "install") {
+        if (flags.positionals.length > 1 || (key === "machines" && opt("machine") !== undefined)) die("usage: dori guard machines | dori guard install [--machine LABEL]", 2);
+        const listed = await listGuardMachines(run, config.guardMachines);
+        if (key === "machines") {
+          const want = guardAgentVersion(await readFile(GUARD_AGENT_TEMPLATE, "utf8"));
+          const results = await Promise.all(listed.map(async (m) => ({ m, r: await sampleMachine(run, m) })));
+          for (const { m, r } of results) {
+            if (!r.ok) { console.log(`GUARD_MACHINE ${m.label} offline ${r.detail.replace(/\s*\n\s*/g, " ")}`); continue; }
+            const s = r.sample;
+            console.log(`GUARD_MACHINE ${m.label} online version=${s.version} ${s.version === want ? "current" : "outdated"} load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, swap free ${s.swapFreeGb.toFixed(1)} GB, disk free ${s.diskFreeGb.toFixed(0)} GB`);
+          }
+          break;
+        }
+        const wanted = opt("machine");
+        const targets = wanted === undefined ? listed : listed.filter((m) => m.label === wanted);
+        if (wanted !== undefined && !targets.length) die(`unknown machine ${wanted}; known: ${listed.map((m) => m.label).join(", ") || "(none)"}`);
+        if (!targets.length) die("GUARD_AGENT_INSTALL_FAILED - no machines listed (herdr machine list, config guardMachines)");
+        const script = await readFile(GUARD_AGENT_TEMPLATE, "utf8");
+        const outcomes = await Promise.all(targets.map(async (m) => {
+          const r = await installGuardAgent(run, m, script).catch((e: unknown): { ok: false; detail: string } => ({ ok: false, detail: e instanceof Error ? e.message : String(e) }));
+          console.log(r.ok ? `GUARD_AGENT_INSTALLED ${m.label} ${r.version}` : `GUARD_AGENT_INSTALL_FAILED ${m.label} ${r.detail.replace(/\s*\n\s*/g, " ")}`);
+          return r.ok;
+        }));
+        if (outcomes.includes(false)) process.exitCode = 1;
+        break;
+      }
       const state = { alerting: false };
       console.log("HOST_GUARD_READY");
       await every(loopMin, async () => {
-        for (const line of guardTick(await sampleHost(run, diskGuardPath(config)), config.guard, state)) console.log(line);
+        const sample = await sampleHost(run, diskGuardPath(config));
+        const detail = !state.alerting && alertReasons(sample, config.guard).length ? laneMemoryDetail(laneMemory(await sampleProcs(run))) : undefined;
+        for (const line of guardTick(sample, config.guard, state, detail)) console.log(line);
       });
       break;
     }
@@ -580,10 +626,17 @@ try {
       break;
     }
     case "can-launch": {
-      const v = canLaunch(await sampleHost(run, diskGuardPath(config)), config.guard);
-      recordLaunchVerdict(config.stateDir, v, Date.now());
-      console.log(v.ok ? "CAN_LAUNCH" : `HOLD ${v.reasons.join(" | ")}`);
-      process.exit(v.ok ? 0 : 4);
+      const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines) : [];
+      const machines = flags.values.all
+        ? [LOCAL_MACHINE, ...listed.map((m) => m.label)]
+        : [resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement).machine];
+      const checks = await Promise.all(machines.map((m) => checkMachine(run, config, m, flags.values.all ? { listMachines: async () => listed } : {})));
+      const at = Date.now();
+      for (const c of checks) {
+        recordLaunchVerdict(config.stateDir, c.verdict, at, c.machine);
+        console.log(verdictLine(c.machine, c.verdict));
+      }
+      process.exit(checks.every((c) => c.verdict.ok) ? 0 : 4);
     }
     case "memory": {
       if (key !== "check" || flags.positionals.length > 1 || Object.keys(flags.values).length) die("usage: dori memory check", 2);
