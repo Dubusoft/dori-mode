@@ -177,11 +177,14 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
 /**
  * The done rules every footer carries, ahead of the lane's own values: how to claim, what the watcher checks, what happens
  * on a refusal. Only the claim step and the close wording differ for a remote lane, a `dori report` lane and a pane-report lane.
+ * The rules every lane shares (no quotes, ids or usage numbers; no decision records in the repo; how to ask the owner) sit
+ * here so a brief need not repeat them; the owner's own policy lines (`laneRules`: merge policy, CI policy) follow them.
  * Nothing lane-specific (key, thread, pane, Done line) may appear here; that is the "### This lane" section.
  */
-export const footerDoneRules = (lane: Lane, ownerLanguage?: string): string => {
+export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => {
   const remote = Boolean(lane.machine);
   const claim = remote ? "print the done line below in your own output" : lane.reportVia === "cli" ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
+  const ask = remote ? "print a question report line below in your own output" : lane.reportVia === "cli" ? "run the dori report question command below" : "send a question report line below";
   return [
     `- Done rules: when every \`Done =\` signal below is live and all work is pushed, ${claim}, then stay idle and start no new work.`,
     remote
@@ -190,18 +193,21 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string): string => {
     remote
       ? "  On `[LEAD] not done: <reasons>`, fix every reason and print a done line again."
       : "  On `[LEAD] not done: <reasons>`, fix every reason and claim again.",
-    "- PR bodies, issues and commit messages carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
+    "- PR bodies, issues, commit messages, code comments and repo docs carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
+    "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
+    `- For any owner decision, ${ask} and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.`,
     ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
+    ...laneRules.map((rule) => `- ${rule}`),
     ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
   ].join("\n");
 };
 
 const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 
-export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string): string => [
+export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, laneRules?: readonly string[]): string => [
   "",
   FOOTER_HEADING.slice(1),
-  footerDoneRules(lane, ownerLanguage),
+  footerDoneRules(lane, ownerLanguage, laneRules),
   "",
   "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
@@ -370,7 +376,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     const migrate = Boolean(existing && !existing.reportVia && !input.machine);
     const text = await briefFile.text();
     const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;
-    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage)}`;
+    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage, deps.config.laneRules)}`;
     if (!existing || migrate) await Bun.write(input.brief, brief);
     let pane: string;
     let tab: string | undefined;

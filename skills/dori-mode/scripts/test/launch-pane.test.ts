@@ -248,6 +248,16 @@ test("footer puts the shared done rules first and every lane value after '### Th
     }
     expect(rules, name).toContain("no owner quotes");
     expect(rules, name).toContain("not done");
+    expect(rules, name).toContain("Keep decisions and conversations out of the repo");
+    expect(rules, name).toContain("never ask only through an on-screen ask-user prompt");
+  }
+  expect(footerDoneRules(footerLane({ reportVia: "cli" }))).toContain("run the dori report question command below");
+  expect(footerDoneRules(footerLane({ machine: "m1" }))).toContain("print a question report line below");
+  // laneRules lines follow the shared rules, in config order, for every report mode; none adds nothing.
+  for (const [, lane] of variants) {
+    const rules = footerDoneRules(lane, "Korean", ["Stop at an open PR with CI green; do not merge.", "CI runs the typecheck only."]);
+    expect(rules).toContain("- Stop at an open PR with CI green; do not merge.\n- CI runs the typecheck only.");
+    expect(footerDoneRules(lane, "Korean", [])).toBe(footerDoneRules(lane, "Korean"));
   }
   expect(footer(footerLane(), "w:lead")).toContain('dori claim-done k-1 --evidence "<merge SHA, closed issue, version>"');
   expect(footer(footerLane({ reportVia: "cli" }), "w:lead")).toContain('dori report k-1 done --text "<one line>"');

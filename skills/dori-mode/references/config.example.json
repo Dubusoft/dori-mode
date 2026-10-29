@@ -45,6 +45,7 @@
   "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
   "ownerLanguage": "Korean",
+  "laneRules": ["Open a PR into the repo's dev branch and stop once its CI is green; do not merge.", "CI runs the typecheck only; do not add tests to CI."],
   "progressTemplate": "{todo}",
   "digestMaxDelayMin": 60,
   "ownerDelayNotice": "Got your message. The lead session is not taking it yet; it stays queued and will be answered as soon as the lead is back.",
