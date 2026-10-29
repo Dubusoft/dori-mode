@@ -90,6 +90,8 @@ export type Lane = {
   readonly lastSeenReport?: string;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
   readonly lastFreshnessNote?: string;
+  /** The on-screen question (ask-user prompt) last raised as LANE_ASKING, so one prompt wakes the lead once. */
+  readonly lastAskPrompt?: string;
   readonly recoveryAttempts?: number;
   readonly lastRecoveryAt?: number;
   /** A paused lane whose pane read working on the previous freshness tick (two in a row is reported, never a resume). */

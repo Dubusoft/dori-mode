@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 
+import { askUserTick } from "./ask-user.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
 import { freshnessTick, scrubForThread } from "./freshness.ts";
@@ -217,6 +218,8 @@ export const supervisorSweeps = (
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
     ["freshness", async () => (await freshnessTick(deps, home, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
+    // A lane asking through its agent's on-screen question UI instead of dori report: one urgent LANE_ASKING per question.
+    ["ask-user", async (emit) => { await askUserTick(deps, emit, view); return []; }],
     ["memory", async () => memorySweep(deps, home)],
     // Counts [REPORT] lines of `dori report` lanes found in the lead's pane; reads nothing while no such lane is open.
     ["lead-pane", async (emit) => { await leadPaneViolationTick(deps, emit); return []; }],
