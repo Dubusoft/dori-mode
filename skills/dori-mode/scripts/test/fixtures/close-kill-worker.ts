@@ -43,7 +43,6 @@ const runner: Runner = async (argv) => {
   }
   if (cmd === "git" && argv.includes("status")) return ok("");
   if (cmd === "git" && argv.includes("rev-list")) return ok("0");
-  if (cmd === "notify") { effect(`thread-done ${a1}`); return ok(); }
   if (cmd === "herdr" && a1 === "pane" && a2 === "list") return ok(JSON.stringify({ result: { panes: panes() } }));
   if (cmd === "herdr" && a1 === "pane" && a2 === "close") {
     writeFileSync(worldFile, JSON.stringify({ panes: panes().filter((p) => p.pane_id !== argv[3]) }));
@@ -62,7 +61,7 @@ class StepRegistry extends Registry {
   }
 }
 
-const config = { ...defaultConfig("/home/test"), stateDir, defaultCwd: repo, leadPane: "lead:p1", store: TEST_STORE, hooks: { threadDone: ["notify", "{thread}", "{text}"] } };
+const config = { ...defaultConfig("/home/test"), stateDir, defaultCwd: repo, leadPane: "lead:p1", store: TEST_STORE };
 const inner = openOperations(config);
 const operations: OperationStore = {
   get: (id) => inner.get(id),

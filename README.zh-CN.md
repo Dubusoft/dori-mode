@@ -50,7 +50,7 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 | `laneWorkspace` | 新 lane 标签页打开的 herdr workspace |
 | `defaultCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
 | `agentCommand` | 启动智能体的命令，写成含 `{model}` 和 `{prompt}` 的 argv 列表 |
-| `hooks.threadReply`, `hooks.threadDone` | 你的消息 CLI,写成含 `{thread}` 和 `{text}` 的 argv 列表，用来发布 lane 进度和标记完成 |
+| `hooks.threadReply` | 你的消息 CLI,写成含 `{thread}` 和 `{text}` 的 argv 列表，用来发布 lane 进度 |
 
 其余项(时间、阈值、heavy 槽位数)用默认值就够了。完整表格见 [`references/scripts.md`](skills/dori-mode/references/scripts.md)。环境变量 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` 优先于配置文件。
 

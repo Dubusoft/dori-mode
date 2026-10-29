@@ -15,10 +15,9 @@ const lane: Lane = { key: "demo-lane", title: "demo", thread: "discord:111/222",
 
 let state: ReturnType<typeof withState>;
 let world: World;
-const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadDone: ["notify", "{thread}", "{text}"] } });
+const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir);
 const closes = () => world.calls.filter((c) => c[0] === "herdr" && (c[1] === "pane" || c[1] === "tab") && c[2] === "close");
 const removes = () => world.calls.filter((c) => c[0] === "git" && c.includes("worktree") && c.includes("remove"));
-const notified = () => world.calls.filter((c) => c[0] === "notify");
 
 beforeEach(async () => {
   state = withState();
@@ -73,7 +72,6 @@ test("dori close refuses unpushed work unless forced, and leaves pane, worktree 
   expect(r.lines.at(-1)).toBe(`REFUSED demo-lane: unpushed work in ${WT} (commit and push it, or dori close --force)`);
   expect(closes()).toHaveLength(0);
   expect(removes()).toHaveLength(0);
-  expect(notified()).toHaveLength(0);
   expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("working");
   const forced = await closeLane(at(T0), lane, "manual", { force: true });
   expect(forced.closed).toBe(true);
@@ -94,23 +92,25 @@ test("a failed worktree removal refuses the close and keeps the pane, the thread
   expect(r.closed).toBe(false);
   expect(r.lines.at(-1)).toStartWith(`REFUSED demo-lane: worktree ${WT} not removed: fatal: locked`);
   expect(closes()).toHaveLength(0);
-  expect(notified()).toHaveLength(0);
   expect(statusOf((await base.registry.read("demo-lane")) ?? lane)).toBe("working");
   expect((await closeLane(failing, lane, "manual", { force: true })).closed).toBe(true);
   expect(closes()).toEqual([["herdr", "pane", "close", "w:p1"]]);
 });
 
-// Item 3: a shared thread is marked done only by the last open lane in it.
-test("closing a lane keeps its thread open while another open lane works in it, and marks it done once none does", async () => {
+// Item 3: a shared thread is archived only by the last open lane in it.
+test("closing a lane keeps its thread open while another open lane works in it, and archives it once none does", async () => {
   await at(T0).registry.write({ ...lane, key: "sibling-lane", pane: "w:p2", cwd: "/repo2" });
   const first = await closeLane(at(T0), lane, "Done: first");
   expect(first.closed).toBe(true);
-  expect(notified()).toHaveLength(0);
-  expect(((await at(T0).registry.read("demo-lane"))?.receipt as { cleanup: string[] }).cleanup).toContain("thread kept open: lane sibling-lane still works in it");
+  const firstCleanup = ((await at(T0).registry.read("demo-lane"))?.receipt as { cleanup: string[] }).cleanup;
+  expect(firstCleanup).toContain("thread kept open: lane sibling-lane still works in it");
+  expect(firstCleanup).not.toContain("thread archive skipped: DORI_DISCORD_TOKEN is not set");
   const sibling = (await at(T0).registry.read("sibling-lane")) ?? lane;
   const second = await closeLane(at(T0), sibling, "Done: second");
   expect(second.closed).toBe(true);
-  expect(notified()).toEqual([["notify", "discord:111/222", "Done: second"]]);
+  const secondCleanup = ((await at(T0).registry.read("sibling-lane"))?.receipt as { cleanup: string[] }).cleanup;
+  expect(secondCleanup).toContain("thread archive skipped: DORI_DISCORD_TOKEN is not set");
+  expect(secondCleanup.some((line) => line.startsWith("thread kept open"))).toBe(false);
 });
 
 // Item 4: lane identity and permissions.

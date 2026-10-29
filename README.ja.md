@@ -50,7 +50,7 @@ Dori はあなたの話し方に合わせます。短く、くだけた調子で
 | `laneWorkspace` | 新しいレーンのタブを開く herdr workspace |
 | `defaultCwd` | レーンが始まるディレクトリで、レーンが worktree を作るリポジトリ |
 | `agentCommand` | エージェントの起動コマンド。`{model}` と `{prompt}` を含む argv のリスト |
-| `hooks.threadReply`, `hooks.threadDone` | メッセンジャー CLI を `{thread}` と `{text}` を含む argv のリストで。レーンの進捗投稿と完了表示に使います。 |
+| `hooks.threadReply` | メッセンジャー CLI を `{thread}` と `{text}` を含む argv のリストで。レーンの進捗投稿に使います。 |
 
 残り(時間、しきい値、heavy スロット数)は既定値で十分です。全項目の表は [`references/scripts.md`](skills/dori-mode/references/scripts.md) にあります。環境変数 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` はファイルより優先されます。
 

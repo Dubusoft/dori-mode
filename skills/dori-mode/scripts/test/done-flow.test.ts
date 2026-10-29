@@ -13,7 +13,7 @@ const lane: Lane = { key: "demo-lane", title: "demo", thread: "chat:team/123", p
 
 let state: ReturnType<typeof withState>;
 let world: World;
-const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadDone: ["notify", "{thread}", "{text}"] } });
+const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir);
 /** The lane's pane is listed with its agent, so the close's pane-close operation has something to close (its read-back sees it gone after). */
 const livePane = () => { world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }]; };
 const closedVia = () => world.calls.filter((c) => c[0] === "herdr" && (c[1] === "pane" || c[1] === "tab") && c[2] === "close");
@@ -76,7 +76,7 @@ test("sendVerified types nothing when the pane list cannot be read", async () =>
   expect(world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
 });
 
-test("five quiet minutes after a claim is handed over the lane is closed, its thread marked done and its worktree removed", async () => {
+test("five quiet minutes after a claim is handed over the lane is closed and its worktree removed", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
   expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
@@ -85,7 +85,6 @@ test("five quiet minutes after a claim is handed over the lane is closed, its th
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
   expect(lines[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
-  expect(world.calls).toContainEqual(["notify", "chat:team/123", "Done: merged acme/app#1 abc123"]);
   expect(world.calls).toContainEqual(["git", "-C", "/repo", "worktree", "remove", WT]);
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("closed");
@@ -302,7 +301,6 @@ test("one lane's failure is a LANE_WATCH_WARN line and the other lanes are still
 /** `received` is the supervisor's answer for journaled ids (absent: `dori watch`, no supervisor). */
 const onDelivery = (ms: number, received?: (id: string) => boolean, digestClaims = false): FlowDeps => ({
   ...depsFor(world, fakeClock(ms), state.dir, {
-    hooks: { threadDone: ["notify", "{thread}", "{text}"] },
     ...(digestClaims ? { eventPolicy: resolveEventPolicy({ kinds: { LANE_DONE_CLAIMED: "lead-digest" } }) } : {}),
   }),
   ...(received ? { leadDelivered: received } : {}),

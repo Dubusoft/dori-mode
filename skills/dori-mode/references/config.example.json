@@ -110,16 +110,6 @@
       "--text",
       "{text}"
     ],
-    "threadDone": [
-      "my-messenger",
-      "set-status",
-      "--thread",
-      "{thread}",
-      "--status",
-      "done",
-      "--note",
-      "{text}"
-    ],
     "transcribe": [
       "my-stt",
       "--file",

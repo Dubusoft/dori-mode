@@ -50,7 +50,7 @@ Everything lives in `~/.dori/config.json`, and every field is optional. The ones
 | `laneWorkspace` | the herdr workspace new lane tabs open in |
 | `defaultCwd` | where lanes start, and the repo whose worktrees they own |
 | `agentCommand` | how to start an agent, as an argv list with `{model}` and `{prompt}` |
-| `hooks.threadReply`, `hooks.threadDone` | your messenger CLI, as argv lists with `{thread}` and `{text}`, so lanes can post progress and be marked done |
+| `hooks.threadReply` | your messenger CLI, as an argv list with `{thread}` and `{text}`, so lanes can post progress |
 
 The rest (timings, thresholds, heavy-slot count) has sensible defaults. The full table is in [`references/scripts.md`](skills/dori-mode/references/scripts.md). `DORI_CONFIG`, `DORI_STATE_DIR` and `DORI_LEAD_PANE` override the file.
 

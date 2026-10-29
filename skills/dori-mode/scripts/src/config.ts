@@ -11,7 +11,6 @@ export type ArgvTemplate = readonly string[];
 
 export type Hooks = {
   readonly threadReply?: ArgvTemplate;
-  readonly threadDone?: ArgvTemplate;
   readonly transcribe?: ArgvTemplate;
 };
 
@@ -305,6 +304,9 @@ export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
 /** Keys of the removed Toodo integration (the Toodo Lead chat channel and its Discord mirror); one warning. */
 export const REMOVED_TOODO_KEYS = ["toodo"] as const;
 
+/** Keys of the removed `hooks` entry that marked a messenger thread done on close (the Discord thread is archived instead); one warning. */
+export const REMOVED_HOOK_KEYS = ["threadDone"] as const;
+
 export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
 
 let warnedRemovedQuotaKeys = false;
@@ -316,6 +318,7 @@ let warnedRemovedPushKeys = false;
 let warnedRemovedDeliveryKeys = false;
 let warnedRemovedOwnerPostKeys = false;
 let warnedRemovedToodoKeys = false;
+let warnedRemovedHookKeys = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -396,7 +399,14 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   }
   const push = Object.fromEntries(Object.entries(rawPush).filter(([key]) => !(REMOVED_PUSH_KEYS as readonly string[]).includes(key))) as Partial<PushConfig>;
   const delivery: DeliveryConfig = { ...base.delivery, ...Object.fromEntries(Object.entries(rawDelivery).filter(([key]) => !(REMOVED_DELIVERY_KEYS as readonly string[]).includes(key))), push: { ...base.delivery.push, ...push } };
-  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...raw.hooks }, delivery };
+  const rawHooks = (typeof raw.hooks === "object" && raw.hooks !== null && !Array.isArray(raw.hooks) ? raw.hooks : {}) as Record<string, unknown>;
+  const oldHooks = REMOVED_HOOK_KEYS.filter((key) => key in rawHooks);
+  if (oldHooks.length && !warnedRemovedHookKeys) {
+    warnedRemovedHookKeys = true;
+    console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is archived on Discord, no hook marks it done; the keys are ignored and can be deleted`);
+  }
+  const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => !(REMOVED_HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
+  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...hooks }, delivery };
   return {
     ...merged,
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
