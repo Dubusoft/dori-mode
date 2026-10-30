@@ -400,16 +400,19 @@ export class LeadLifecycle {
     return pane;
   }
 
-  /** The lead pane's last 80 lines, saved to the state dir: the only evidence of why a start failed once the pane is gone. */
-  private async saveLeadScreen(): Promise<void> {
+  /**
+   * The lead pane's last 80 lines, saved to the state dir: the only evidence of why a start failed once the pane is gone.
+   * A soft restart's failure saves the visible screen instead, since omo's full-screen editor keeps no scrollback.
+   */
+  private async saveLeadScreen(kind = "lead-pane", source: readonly string[] = ["--source", "recent", "--lines", "80"]): Promise<void> {
     const { run, config, clock } = this.deps;
     const pane = config.leadPane;
-    const screen = await run(["herdr", "pane", "read", pane, "--source", "recent", "--lines", "80"]);
+    const screen = await run(["herdr", "pane", "read", pane, ...source]);
     if (screen.code !== 0) {
       console.error(`LEAD_PANE_SCREEN_UNREADABLE ${pane}: ${screen.err || screen.out}`);
       return;
     }
-    const path = join(config.stateDir, `lead-pane-${pane.replace(/[^\w.-]/g, "_")}-${clock.now()}.txt`);
+    const path = join(config.stateDir, `${kind}-${pane.replace(/[^\w.-]/g, "_")}-${clock.now()}.txt`);
     const fd = openSync(path, "w", 0o600);
     try { writeFileSync(fd, redactSecrets(screen.out)); fsyncSync(fd); } finally { closeSync(fd); }
     console.log(`LEAD_PANE_SCREEN_SAVED ${pane} ${path}`);
@@ -634,10 +637,16 @@ export class LeadLifecycle {
           await softCommand(deps, "/new");
           // The editor is back before omo has switched to the new session; anything typed meanwhile lands in the old
           // session or is lost, so the next command waits until the new session has finished starting.
-          if (!(await softSessionStarted(deps, old, softStartedAt))) throw new TransientSuperviseError("new session did not start after /new");
-          for (const command of [`/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
-            await softCommand(deps, command);
-          }
+          const started = await softSessionStarted(deps, old, softStartedAt);
+          if (!started) throw new TransientSuperviseError("new session did not start after /new");
+          // /new keeps the process's model and thinking, which usually already are the configured ones; only a
+          // different value is typed.
+          const current = sessionModel(started);
+          const commands = [
+            ...(current.model === entry.model ? [] : [`/model ${entry.model}`]),
+            ...(entry.thinking && current.thinking !== entry.thinking ? [`/thinking ${entry.thinking}`] : []),
+          ];
+          for (const command of commands) await softCommand(deps, command);
           await softCommand(deps, softPrompt, true);
         }
         // A soft start journaled before the prompt was typed inline is recognised by its file path.
@@ -659,6 +668,7 @@ export class LeadLifecycle {
       } catch (e) {
         if (!(e instanceof Error)) throw e;
         console.log(`LEAD_SOFT_RESTART_FAILED ${e.message.replace(/\s+/g, " ")}; falling back to a process restart`);
+        await this.saveLeadScreen("lead-soft-failure", ["--source", "visible"]);
         restart = { ...restart, phase: "soft-failed" };
         this.setRestart(restart);
       }
@@ -812,8 +822,9 @@ const softLive = async (deps: FlowDeps): Promise<boolean> => {
  * a command still shown there gets Enter again, so the next command is never typed onto the same line.
  */
 const softCommand = async (deps: FlowDeps, command: string, prompt = false): Promise<void> => {
+  const name = JSON.stringify(command.length > 60 ? `${command.slice(0, 60)}...` : command);
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError("lead left idle/done before soft command");
+  if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError(`lead left idle/done before soft command ${name}`);
   const before = await readScreen(deps.run, deps.config.leadPane);
   const previous = new Set(before.split("\n"));
   let enterFailed = false;
@@ -822,7 +833,7 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
     if (argv[2] === "send-keys" && result.code !== 0) enterFailed = true;
     return result;
   };
-  if (await sendGuarded(run, deps.config.leadPane, command) === "failed" || enterFailed) throw new TransientSuperviseError("soft command send failed");
+  if (await sendGuarded(run, deps.config.leadPane, command) === "failed" || enterFailed) throw new TransientSuperviseError(`soft command ${name} send failed`);
   if (prompt) return;
   const deadline = deps.clock.now() + 5_000;
   let enters = 1;
@@ -833,16 +844,34 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
     // omo's herdr integration can release the pane's agent once /new has shut the old session down; that is /new
     // taking effect, and softSessionStarted waits for the agent to come back.
     if (command === "/new" && !after?.agent) return;
-    if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
-    if (addedLines.some((line) => line.includes(command))) {
-      if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
-      if ((await deps.run(["herdr", "pane", "send-keys", deps.config.leadPane, "enter"])).code !== 0) throw new TransientSuperviseError("soft command send failed");
+    if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError(`lead not ready after soft command ${name}`);
+    // Only the editor's input line counts: output or a notice that repeats the command is not the command left unsent.
+    if (addedLines.some((line) => EDITOR_LINE.test(line) && line.includes(command))) {
+      if (enters >= 3) throw new TransientSuperviseError(`soft command ${name} stayed in the editor`);
+      if ((await deps.run(["herdr", "pane", "send-keys", deps.config.leadPane, "enter"])).code !== 0) throw new TransientSuperviseError(`soft command ${name} send failed`);
       enters++;
     } else if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
     if (deps.clock.now() >= deadline) break;
     await deps.clock.sleep(200);
   }
-  throw new TransientSuperviseError("soft command showed no completed screen change");
+  throw new TransientSuperviseError(`soft command ${name} showed no completed screen change`);
+};
+
+/** omo's editor input line: the prompt marker, then whatever is typed. */
+const EDITOR_LINE = /^\s*❯/;
+
+/** The model (`provider/modelId`) and thinking level a session file last recorded. */
+const sessionModel = (file: string): { model?: string; thinking?: string } => {
+  let model: string | undefined;
+  let thinking: string | undefined;
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"model_change"') && !line.includes('"thinking_level_change"')) continue;
+    let entry: { type?: unknown; provider?: unknown; modelId?: unknown; thinkingLevel?: unknown };
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") model = `${entry.provider}/${entry.modelId}`;
+    if (entry.type === "thinking_level_change" && typeof entry.thinkingLevel === "string") thinking = entry.thinkingLevel;
+  }
+  return { model, thinking };
 };
 
 /**
@@ -878,7 +907,8 @@ const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
   };
 };
 
-const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<boolean> => {
+/** The settled new session's file, or undefined when none started in time. */
+const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
@@ -902,11 +932,11 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
       }
     }
     if (found && seen?.file === found.file && seen.size === found.size) {
-      if (ready && deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return true;
+      if (ready && deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return found.file;
     } else seen = found && { ...found, since: deps.clock.now() };
     await deps.clock.sleep(200);
   }
-  return false;
+  return undefined;
 };
 
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */

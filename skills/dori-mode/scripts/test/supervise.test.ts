@@ -33,9 +33,12 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   let startDelay = 0;
   let startedAt: number | undefined;
   let pendingStart: { readonly at: number; readonly file: string } | undefined;
+  // The model and thinking a /new session starts with (the process's own, by default not the configured ones).
+  let startModel: { readonly provider: string; readonly modelId: string; readonly thinking?: string } = { provider: "test", modelId: "previous" };
   const startPending = () => {
     if (!pendingStart || clock.at < pendingStart.at) return;
-    appendFileSync(pendingStart.file, `${JSON.stringify({ type: "model_change", provider: "test", modelId: "soft" })}\n`);
+    appendFileSync(pendingStart.file, `${JSON.stringify({ type: "model_change", provider: startModel.provider, modelId: startModel.modelId })}\n`);
+    if (startModel.thinking) appendFileSync(pendingStart.file, `${JSON.stringify({ type: "thinking_level_change", thinkingLevel: startModel.thinking })}\n`);
     utimesSync(pendingStart.file, clock.at / 1000, clock.at / 1000);
     startedAt = clock.at;
     pendingStart = undefined;
@@ -144,6 +147,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     session: () => active,
     softEvidence: (value: boolean) => { softEvidence = value; },
     startDelay: (ms: number) => { startDelay = ms; },
+    startModel: (model: typeof startModel) => { startModel = model; },
     releaseAfterNew: (delay: number, gap: number, dead = false) => { release = { from: Infinity, to: Infinity, dead, pending: { delay, gap, dead } }; },
     startedAt: () => startedAt,
     prompt: () => prompt,
@@ -872,6 +876,81 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
   expect(submitted[3]).toStartWith("Dori mode. ");
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+});
+
+test.each([
+  ["high", []],
+  ["low", ["/thinking high"]],
+] as const)("a /new session already on the configured model with thinking %s types only what differs", async (thinking, expected) => {
+  // Given a /new session that starts on the configured model, with the configured or another thinking level.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.startModel({ provider: "test", modelId: "soft", thinking });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-same", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then /model is skipped, /thinking only when it differs, and the soft restart succeeds.
+  const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4] ?? "");
+  expect(texts.slice(0, -1)).toEqual(["/new", ...expected]);
+  expect(texts.at(-1)).toStartWith("Dori mode. ");
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+});
+
+/** A soft restart whose omo editor submits /new but keeps /model (or echoes it once submitted, `echo`). */
+const editorRun = (f: ReturnType<typeof fixture>, echo: boolean): { run: Runner; submitted: string[] } => {
+  const base = f.deps.run;
+  let editor = "";
+  let notice = "";
+  const submitted: string[] = [];
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
+    if (argv[0] === "herdr" && argv[2] === "send-text") editor += argv[4] ?? "";
+    else if (argv[0] === "herdr" && argv[2] === "send-keys" && (echo || !editor.startsWith("/model "))) {
+      submitted.push(editor);
+      if (echo && editor.startsWith("/")) notice = `Applied ${editor}\n`;
+      editor = "";
+    }
+    const result = await base(argv, options);
+    if (argv[0] === "herdr" && (argv[2] === "send-text" || argv[2] === "send-keys")) f.world.screen = `${notice}❯ ${editor}`;
+    return result;
+  };
+  return { run, submitted };
+};
+
+test("a soft command left in the editor names the command and saves the screen before the process restart", async () => {
+  // Given omo's editor which never submits /model.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  const { run } = editorRun(f, false);
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-stuck", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the failure names /model, the visible screen is saved, and one process launch follows.
+  expect(lines).toContain('LEAD_SOFT_RESTART_FAILED soft command "/model test/soft" stayed in the editor; falling back to a process restart');
+  const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-soft-failure-lead_p1-"));
+  expect(saved).toHaveLength(1);
+  expect(readFileSync(join(f.state.dir, saved[0] ?? ""), "utf8")).toBe("❯ /model test/soft");
+  expect(f.calls).toContainEqual(["herdr", "pane", "read", "lead:p1", "--source", "visible"]);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+});
+
+test("a submitted soft command echoed outside the editor line is not entered again", async () => {
+  // Given omo which shows each submitted command in a notice above an empty editor.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  const { run, submitted } = editorRun(f, true);
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-echo", "INBOUND soft");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then every command is entered once and the soft restart succeeds.
+  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(submitted[3]).toStartWith("Dori mode. ");
+  expect(submitted).not.toContain("");
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
 });
 
 test.each([false, true])("soft evidence only accepts prompt files modified at or after soft entry, stale=%s", async (stalePrompt) => {
