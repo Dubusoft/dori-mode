@@ -7,7 +7,7 @@ import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
+import { childWork, SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -40,7 +40,18 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     startedAt = clock.at;
     pendingStart = undefined;
   };
-  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); } };
+  // After /new omo's herdr integration can release the pane's agent for a moment while the old session shuts down;
+  // `dead` instead ends the process for good.
+  let release: { from: number; to: number; dead: boolean; pending?: { readonly delay: number; readonly gap: number; readonly dead: boolean } } | undefined;
+  const syncRelease = () => {
+    if (!release || clock.at < release.from) return;
+    if (release.dead) { pid = 0; pane.agent = ""; pane.agent_status = "unknown"; return; }
+    if (clock.at < release.to) { pane.agent = ""; pane.agent_status = "unknown"; return; }
+    pane.agent = "omo";
+    pane.agent_status = "idle";
+    release = undefined;
+  };
+  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); syncRelease(); } };
   const world = newWorld();
   const session = "11111111-1111-4111-8111-111111111111";
   const config = { sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo", ...extra };
@@ -104,6 +115,11 @@ const fixture = (extra: Record<string, unknown> = {}) => {
         writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "session", id: active })}\n`);
         pendingStart = { at: clock.now() + startDelay, file: join(dir, `${active}.jsonl`) };
         startPending();
+        if (release?.pending) {
+          const { delay, gap, dead } = release.pending;
+          release = { from: clock.now() + delay, to: clock.now() + delay + gap, dead };
+          syncRelease();
+        }
       }
       if (typed.startsWith("Dori mode. ")) {
         prompt = typed;
@@ -128,6 +144,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     session: () => active,
     softEvidence: (value: boolean) => { softEvidence = value; },
     startDelay: (ms: number) => { startDelay = ms; },
+    releaseAfterNew: (delay: number, gap: number, dead = false) => { release = { from: Infinity, to: Infinity, dead, pending: { delay, gap, dead } }; },
     startedAt: () => startedAt,
     prompt: () => prompt,
     setConfirm: (value: boolean) => { confirm = value; },
@@ -558,7 +575,7 @@ const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call
 
 test.each(["idle", "done"])("an %s cold lead switches session, model and thinking without relaunching omo", async (status) => {
   // Given a reusable process; even its own environment and its shell must survive cleanup.
-  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  const f = fixture({ leadModel: { model: "test/other", thinking: "high" } });
   f.cold();
   f.pane.agent_status = status;
   const old = f.session();
@@ -573,7 +590,7 @@ test.each(["idle", "done"])("an %s cold lead switches session, model and thinkin
   const lines = await quiet(() => supervisor.flush());
   // Then the four submissions are ordered and all confirmation uses the actual new id.
   const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
-  expect(texts.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(texts.slice(0, 3)).toEqual(["/new", "/model test/other", "/thinking high"]);
   expect(texts).toHaveLength(4);
   // The prompt itself is typed, on one line; no prompt file exists for the new lead to miss.
   expect(texts[3]).toStartWith("Dori mode. ");
@@ -615,7 +632,7 @@ test("a soft restart without a new session file falls back to a process launch",
 
 test("a soft restart types nothing after /new until the new session has started", async () => {
   // Given omo back at its editor right after /new while the new session is still starting for three seconds.
-  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  const f = fixture({ leadModel: { model: "test/other", thinking: "high" } });
   f.cold();
   f.startDelay(3_000);
   const base = f.deps.run;
@@ -650,6 +667,69 @@ test("a /new session that never starts falls back to a process launch without ty
   expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED new session did not start after /new"))).toHaveLength(1);
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
   expect(f.log()).toEqual([{ id: "soft-stall", line: "INBOUND stall" }]);
+});
+
+test.each([
+  ["a bare model the session already runs", { model: "soft", thinking: "high" }, undefined, ["/thinking high"]],
+  ["a bare model the session does not run", { model: "other", thinking: "high" }, "test/default", ["/model test/other", "/thinking high"]],
+  ["the qualified model the session already runs", { model: "test/soft", thinking: "high" }, undefined, ["/thinking high"]],
+] as const)("a soft restart compares and types %s as provider/model", async (_name, leadModel, defaultModel, commands) => {
+  // Given a lead model from the config, journal or lead-restart, while the /new session runs test/soft.
+  const f = fixture({ leadModel, ...(defaultModel ? { defaultModel } : {}) });
+  f.cold();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-model", "INBOUND model");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then only a differing value is typed, and a model always with its provider.
+  const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
+  expect(texts.slice(1, -1)).toEqual([...commands]);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+});
+
+test("a bare lead-restart model is stored with the configured provider", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const config = { ...defaultConfig(state.dir), leadModel: "anthropic-subscription/claude-opus-5-5" };
+  expect(requestLeadRestart(config, 1, "claude-opus-5-6", "low").models).toEqual([{ model: "anthropic-subscription/claude-opus-5-6", thinking: "low" }]);
+  expect(requestLeadRestart(config, 2, "openai/gpt-6").models).toEqual([{ model: "openai/gpt-6" }]);
+});
+
+test("a soft restart waits out the agent release gap while omo switches to the /new session", async () => {
+  // Given omo whose pane shows no agent from one second after /new until three seconds after it.
+  const f = fixture({ leadModel: { model: "test/other", thinking: "high" } });
+  f.cold();
+  f.releaseAfterNew(1_000, 2_000);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-gap", "INBOUND gap");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the same process is reused: nothing is killed or launched.
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).not.toContain("101");
+});
+
+test.each([["dead", 1_000, Infinity, true], ["missing past the grace", 1_000, 60_000, false]] as const)("a lead %s after /new falls back to one process launch", async (_name, delay, gap, dead) => {
+  // Given omo that exits after /new, or whose agent never comes back.
+  const f = fixture({ leadModel: { model: "test/other", thinking: "high" } });
+  f.cold();
+  f.releaseAfterNew(delay, gap, dead);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-dead", "INBOUND dead");
+  const before = f.clock.now();
+  // When the cold delivery restarts it.
+  const lines = await quiet(() => supervisor.flush());
+  // Then a dead process fails the soft path at once, a missing agent only after the grace, and one launch follows.
+  const failed = lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "));
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toContain("reused lead is not live");
+  if (dead) expect(f.clock.now() - before).toBeLessThan(SOFT_RELEASE_GRACE_MS);
+  else expect(f.clock.now() - before).toBeGreaterThanOrEqual(SOFT_RELEASE_GRACE_MS);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.log()).toEqual([{ id: "soft-dead", line: "INBOUND dead" }]);
+  expect(restartSession(f)).toBeUndefined();
 });
 
 test("a soft fallback preserves the journaled offset and records each batch event once", async () => {
@@ -724,7 +804,7 @@ test.each([false, true])("a live omo blocks hard launch after soft failure, reco
 
 test("a soft restart ignores existing quota lines during commands and quota text after the prompt", async () => {
   // Given normal output mentioning quota before /new and after the startup prompt.
-  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  const f = fixture({ leadModel: { model: "test/other", thinking: "high" } });
   f.cold();
   f.world.screen = "Discussion of quota and rate limit handling\n❯ ";
   f.onWait(async () => { f.world.screen = "Startup prompt read: quota and rate limit handling\n❯ "; });
@@ -741,14 +821,14 @@ test("a soft restart ignores existing quota lines during commands and quota text
   expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
   expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4]).slice(0, 3)).toEqual([
-    "/new", "/model test/soft", "/thinking high",
+    "/new", "/model test/other", "/thinking high",
   ]);
 });
 
 test("a soft command whose first Enter only accepts the autocomplete is entered again before the next command", async () => {
   // Given omo's editor: typed text shows on the prompt line, and a command with an argument opens an autocomplete
   // whose first Enter accepts the selection without submitting.
-  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  const f = fixture({ leadModel: { model: "test/other", thinking: "high" } });
   f.cold();
   f.world.screen = "❯ ";
   const base = f.deps.run;
@@ -774,7 +854,7 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
   // Then each command is submitted on its own line and the soft restart succeeds.
-  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
+  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/other", "/thinking high"]);
   expect(submitted[3]).toStartWith("Dori mode. ");
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
