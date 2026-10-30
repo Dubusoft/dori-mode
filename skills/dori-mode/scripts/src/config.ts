@@ -536,6 +536,18 @@ export const providerOf = (model: string): string | undefined => {
 };
 
 /**
+ * `model` as "provider/model". A bare name takes the provider of `running` (the "provider/model" a session runs) when
+ * that is the same model, else the first provider found in `fallbacks`; with no provider anywhere it stays bare.
+ */
+export const qualifiedModel = (model: string, running: string | undefined, fallbacks: readonly (string | undefined)[]): string => {
+  if (providerOf(model)) return model;
+  const provider = running ? providerOf(running) : undefined;
+  if (running && provider && running.slice(provider.length + 1) === model) return running;
+  const fallback = fallbacks.map((entry) => entry && providerOf(entry)).find(Boolean);
+  return fallback ? `${fallback}/${model}` : model;
+};
+
+/**
  * The lead's agent argv: `agentCommand` filled with its single model. Its thinking
  * level replaces the template's `--thinking` value, or is inserted right after the `--model` pair when the template has
  * none. Lanes keep `agentCommand` and `defaultModel` untouched.
