@@ -830,6 +830,9 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
     const after = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
     const screen = await readScreen(deps.run, deps.config.leadPane);
     const addedLines = screen.split("\n").filter((line) => !previous.has(line));
+    // omo's herdr integration can release the pane's agent once /new has shut the old session down; that is /new
+    // taking effect, and softSessionStarted waits for the agent to come back.
+    if (command === "/new" && !after?.agent) return;
     if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
     if (addedLines.some((line) => line.includes(command))) {
       if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
@@ -848,13 +851,42 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
  */
 export const SOFT_SESSION_SETTLE_MS = 1_000;
 
+/**
+ * After /new omo's herdr integration can release the pane's agent while the old session shuts down and report it again
+ * once the new one has started (about two seconds). For this long a missing agent whose process still holds the pane's
+ * foreground is that switch, not a dead lead.
+ */
+export const SOFT_RELEASE_GRACE_MS = 10_000;
+
+/**
+ * One soft wait's liveness: true when the agent is ready, false during a release gap. Throws at once when only the
+ * shell is left in the pane, and once the agent has been missing for longer than the grace.
+ */
+const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
+  let missingSince: number | undefined;
+  return async () => {
+    if (await softLive(deps)) {
+      missingSince = undefined;
+      return true;
+    }
+    const now = deps.clock.now();
+    missingSince ??= now;
+    const info = await processInfo(deps);
+    if (!info || plainShell(info)) throw new TransientSuperviseError("reused lead is not live");
+    if (now - missingSince >= SOFT_RELEASE_GRACE_MS) throw new TransientSuperviseError(`reused lead is not live after ${SOFT_RELEASE_GRACE_MS / 1000}s`);
+    return false;
+  };
+};
+
 const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<boolean> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  const live = softLiveCheck(deps);
   let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
   while (deps.clock.now() < deadline) {
-    if (!(await softLive(deps))) throw new TransientSuperviseError("reused lead is not live");
+    // The next command is typed only into a settled new session whose agent is back.
+    const ready = await live();
     let found: { readonly file: string; readonly size: number } | undefined;
     for (const name of readdirSync(dir)) {
       const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
@@ -870,7 +902,7 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
       }
     }
     if (found && seen?.file === found.file && seen.size === found.size) {
-      if (deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return true;
+      if (ready && deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return true;
     } else seen = found && { ...found, since: deps.clock.now() };
     await deps.clock.sleep(200);
   }
@@ -882,9 +914,9 @@ const softEvidence = async (deps: FlowDeps, old: string, markers: readonly strin
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  const live = softLiveCheck(deps);
   for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
-    if (!(await softLive(deps))) throw new TransientSuperviseError("reused lead is not live");
-    for (const name of readdirSync(dir)) {
+    for (const name of (await live()) ? readdirSync(dir) : []) {
       if (deps.clock.now() >= deadline) return undefined;
       const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
       if (!id || id === old) continue;
@@ -987,10 +1019,16 @@ const ownedTargets = async (deps: FlowDeps, table: Awaited<ReturnType<typeof pro
   if (id) {
     // Detached monitor processes inherit PI_SESSION_ID. Do not match command text
     // (which may quote another session), and never kill the supervisor itself.
-    for (const p of table) {
-      if (targets.has(p.pid) || p.pid === process.pid) continue;
-      const env = await deps.run(["ps", "eww", "-o", "command=", "-p", String(p.pid)]);
-      if (new RegExp(`(?:^|\\s)PI_SESSION_ID=${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`).test(env.out)) targets.add(p.pid);
+    // One ps reads every environment: a ps per process takes tens of seconds on a busy machine. Exited pids make ps
+    // exit nonzero but the rest still print.
+    const candidates = new Set(table.map((p) => p.pid).filter((pid) => !targets.has(pid) && pid !== process.pid));
+    if (candidates.size) {
+      const owned = new RegExp(`(?:^|\\s)PI_SESSION_ID=${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`);
+      const env = await deps.run(["ps", "eww", "-o", "pid=,command=", "-p", [...candidates].join(",")]);
+      for (const line of env.out.split("\n")) {
+        const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+        if (m && candidates.has(Number(m[1])) && owned.test(m[2] ?? "")) targets.add(Number(m[1]));
+      }
     }
   }
   targets.delete(process.pid);
@@ -1004,13 +1042,21 @@ const killTargets = async (deps: FlowDeps, targets: ReadonlySet<number>): Promis
   }
   // Waiting for the foreground process group to exit is an observable gate, not
   // a fixed delay. The runner is bounded and never sends keys to a shell.
-  if (targets.size) {
+  // A killed process stays listed until it is reaped, so the check repeats for a bounded few seconds.
+  if (!targets.size) return;
+  const deadline = deps.clock.now() + KILL_EXIT_WAIT_MS;
+  for (let attempt = 0; attempt <= KILL_EXIT_WAIT_MS / 200; attempt++) {
     const released = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
     if (released.code !== 0) throw new TransientSuperviseError("cannot verify lead termination");
     const live: readonly ForegroundProcess[] = JSON.parse(released.out).result.process_info.foreground_processes ?? [];
-    if (live.some((p) => p.pid !== undefined && targets.has(p.pid))) throw new TransientSuperviseError("old lead has not exited; events retained");
+    if (!live.some((p) => p.pid !== undefined && targets.has(p.pid))) return;
+    if (deps.clock.now() >= deadline) break;
+    await deps.clock.sleep(200);
   }
+  throw new TransientSuperviseError("old lead has not exited; events retained");
 };
+
+export const KILL_EXIT_WAIT_MS = 5_000;
 
 /** Kill only the process tree launched with `--session-id <session>`; status gates do not apply to a hung start. */
 export const stopHung = async (deps: FlowDeps, session: string): Promise<void> => {

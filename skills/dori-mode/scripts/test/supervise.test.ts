@@ -7,7 +7,7 @@ import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
+import { childWork, SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS, stopLead } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -40,7 +40,18 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     startedAt = clock.at;
     pendingStart = undefined;
   };
-  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); } };
+  // After /new omo's herdr integration can release the pane's agent for a moment while the old session shuts down;
+  // `dead` instead ends the process for good.
+  let release: { from: number; to: number; dead: boolean; pending?: { readonly delay: number; readonly gap: number; readonly dead: boolean } } | undefined;
+  const syncRelease = () => {
+    if (!release || clock.at < release.from) return;
+    if (release.dead) { pid = 0; pane.agent = ""; pane.agent_status = "unknown"; return; }
+    if (clock.at < release.to) { pane.agent = ""; pane.agent_status = "unknown"; return; }
+    pane.agent = "omo";
+    pane.agent_status = "idle";
+    release = undefined;
+  };
+  const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); syncRelease(); } };
   const world = newWorld();
   const session = "11111111-1111-4111-8111-111111111111";
   const config = { sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo", ...extra };
@@ -68,7 +79,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     const ok = (out = "") => ({ code: 0, out, err: "" });
     if (argv[0] === "omo" && argv[1] === "auth") return { code: 1, out: auth[argv[argv.indexOf("--provider") + 1] ?? ""] ?? "", err: "" };
     if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${launchedId}\n102 ${pid} tail -F events\n103 1 tail -F orphan\n104 1 other-agent\n10 1 /bin/bash` : "");
-    if (argv[0] === "ps" && argv[1] === "eww") return ok(argv.at(-1) === "103" ? `tail -F orphan PI_SESSION_ID=${session}` : "PI_SESSION_ID=other");
+    if (argv[0] === "ps" && argv[1] === "eww") return ok((argv.at(-1) ?? "").split(",").map((p) => p === "103" ? `103 tail -F orphan PI_SESSION_ID=${session}` : `${p} PI_SESSION_ID=other`).join("\n"));
     if (argv[0] === "herdr" && argv[2] === "list") return ok(JSON.stringify({ result: { panes: world.panes } }));
     if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", launchedId] }] : [] } } }));
     if (argv[0] === "kill") {
@@ -104,6 +115,11 @@ const fixture = (extra: Record<string, unknown> = {}) => {
         writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "session", id: active })}\n`);
         pendingStart = { at: clock.now() + startDelay, file: join(dir, `${active}.jsonl`) };
         startPending();
+        if (release?.pending) {
+          const { delay, gap, dead } = release.pending;
+          release = { from: clock.now() + delay, to: clock.now() + delay + gap, dead };
+          syncRelease();
+        }
       }
       if (typed.startsWith("Dori mode. ")) {
         prompt = typed;
@@ -128,6 +144,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     session: () => active,
     softEvidence: (value: boolean) => { softEvidence = value; },
     startDelay: (ms: number) => { startDelay = ms; },
+    releaseAfterNew: (delay: number, gap: number, dead = false) => { release = { from: Infinity, to: Infinity, dead, pending: { delay, gap, dead } }; },
     startedAt: () => startedAt,
     prompt: () => prompt,
     setConfirm: (value: boolean) => { confirm = value; },
@@ -564,7 +581,7 @@ test.each(["idle", "done"])("an %s cold lead switches session, model and thinkin
   const old = f.session();
   const base = f.deps.run;
   const run: Runner = async (argv, options) => {
-    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: `PI_SESSION_ID=${["101", "10"].includes(argv.at(-1) ?? "") ? old : "other"}`, err: "" };
+    if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: (argv.at(-1) ?? "").split(",").map((p) => `${p} PI_SESSION_ID=${["101", "10"].includes(p) ? old : "other"}`).join("\n"), err: "" };
     return base(argv, options);
   };
   const supervisor = new Supervisor({ ...f.deps, run });
@@ -650,6 +667,83 @@ test("a /new session that never starts falls back to a process launch without ty
   expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED new session did not start after /new"))).toHaveLength(1);
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
   expect(f.log()).toEqual([{ id: "soft-stall", line: "INBOUND stall" }]);
+});
+
+test("a soft restart waits out the agent release gap while omo switches to the /new session", async () => {
+  // Given omo whose pane shows no agent from one second after /new until three seconds after it.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.releaseAfterNew(1_000, 2_000);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-gap", "INBOUND gap");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then the same process is reused: nothing is killed or launched.
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
+  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).not.toContain("101");
+});
+
+test.each([["dead", 1_000, Infinity, true], ["missing past the grace", 1_000, 60_000, false]] as const)("a lead %s after /new falls back to one process launch", async (_name, delay, gap, dead) => {
+  // Given omo that exits after /new, or whose agent never comes back.
+  const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
+  f.cold();
+  f.releaseAfterNew(delay, gap, dead);
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("soft-dead", "INBOUND dead");
+  const before = f.clock.now();
+  // When the cold delivery restarts it.
+  const lines = await quiet(() => supervisor.flush());
+  // Then a dead process fails the soft path at once, a missing agent only after the grace, and one launch follows.
+  const failed = lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "));
+  expect(failed).toHaveLength(1);
+  expect(failed[0]).toContain("reused lead is not live");
+  if (dead) expect(f.clock.now() - before).toBeLessThan(SOFT_RELEASE_GRACE_MS);
+  else expect(f.clock.now() - before).toBeGreaterThanOrEqual(SOFT_RELEASE_GRACE_MS);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.log()).toEqual([{ id: "soft-dead", line: "INBOUND dead" }]);
+  expect(restartSession(f)).toBeUndefined();
+});
+
+test("cleanup reads every process environment with one ps call", async () => {
+  // Given a cold lead and its detached monitor (103) that carries the session id only in its environment.
+  const f = fixture();
+  f.cold();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("one-ps", "INBOUND one ps");
+  // When a forced restart stops it.
+  await quiet(() => supervisor.flush());
+  // Then one batched ps found the monitor, and it was killed.
+  const envReads = f.calls.filter((call) => call[0] === "ps" && call[1] === "eww");
+  expect(envReads.length).toBeGreaterThan(0);
+  for (const call of envReads) expect(call.at(-1)?.split(",").length).toBeGreaterThan(1);
+  expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("103");
+});
+
+test.each([[1_000, true], [60_000, false]] as const)("a killed lead that leaves the foreground after %pms is waited for, ok=%p", async (lag, ok) => {
+  // Given a lead whose pane still lists the killed process for a while.
+  const f = fixture();
+  f.noAgent();
+  let gone: number | undefined;
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "kill" && argv[2] === "101") { gone = f.clock.now() + lag; return { code: 0, out: "", err: "" }; }
+    if (argv[2] === "process-info" && gone !== undefined) {
+      const fg = f.clock.now() < gone ? [{ pid: 101 }] : [];
+      return { code: 0, out: JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: fg } } }), err: "" };
+    }
+    return base(argv, options);
+  };
+  f.pane.agent = "omo";
+  f.pane.agent_status = "idle";
+  const table = "101 10 /usr/bin/omo --session-id 11111111-1111-4111-8111-111111111111\n10 1 /bin/bash";
+  const deps = { ...f.deps, run: (async (argv, options) => argv[0] === "ps" && argv[1] === "-A" ? { code: 0, out: table, err: "" } : run(argv, options)) as Runner };
+  // When the lead is stopped.
+  const stopping = stopLead(deps, true);
+  // Then the stop waits for the exit within its bound, and only reports a lead that stays.
+  if (ok) expect(await stopping).toBe(true);
+  else await expect(stopping).rejects.toThrow("old lead has not exited");
 });
 
 test("a soft fallback preserves the journaled offset and records each batch event once", async () => {
