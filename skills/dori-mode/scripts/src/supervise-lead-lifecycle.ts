@@ -1,5 +1,5 @@
 import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -639,14 +639,14 @@ export class LeadLifecycle {
           // session or is lost, so the next command waits until the new session has finished starting.
           const started = await softSessionStarted(deps, old, softStartedAt);
           if (!started) throw new TransientSuperviseError("new session did not start after /new");
-          // /new keeps the process's model and thinking, which usually already are the configured ones; only a
-          // different value is typed.
+          // /new keeps the process's model and thinking. A soft restart never switches them interactively (omo's
+          // /model opens its model picker for an id it does not list); a session on another model or thinking level
+          // goes to the process restart, which launches omo with the configured --model and --thinking.
           const current = sessionModel(started);
-          const commands = [
-            ...(current.model === entry.model ? [] : [`/model ${entry.model}`]),
-            ...(entry.thinking && current.thinking !== entry.thinking ? [`/thinking ${entry.thinking}`] : []),
-          ];
-          for (const command of commands) await softCommand(deps, command);
+          console.log(`LEAD_SOFT_MODEL file=${basename(started)} model=${current.model ?? "-"} thinking=${current.thinking ?? "-"} want=${entry.model}/${entry.thinking ?? "-"}`);
+          if (current.model !== entry.model) throw new TransientSuperviseError(`soft restart model differs (session ${current.model ?? "-"}, want ${entry.model})`);
+          if (entry.thinking && current.thinking !== entry.thinking) throw new TransientSuperviseError(`soft restart thinking differs (session ${current.thinking ?? "-"}, want ${entry.thinking})`);
+          await softEditorReady(deps);
           await softCommand(deps, softPrompt, true);
         }
         // A soft start journaled before the prompt was typed inline is recognised by its file path.
@@ -860,6 +860,24 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
 /** omo's editor input line: the prompt marker, then whatever is typed. */
 const EDITOR_LINE = /^\s*❯/;
 
+/** Text of omo's interactive overlays (the model picker): typed text there goes to the overlay, not to the editor. */
+export const SOFT_OVERLAY = /enter select|ctrl\+s select as default|Only showing models from configured providers|No matching models/;
+
+/**
+ * The startup prompt is typed only into an empty editor with no overlay on screen. Otherwise Escape closes whatever
+ * holds the input and the soft restart fails, so the process restart takes over.
+ */
+const softEditorReady = async (deps: FlowDeps): Promise<void> => {
+  const screen = await readScreen(deps.run, deps.config.leadPane);
+  const editor = screen.split("\n").filter((line) => EDITOR_LINE.test(line)).at(-1);
+  const overlay = SOFT_OVERLAY.exec(screen)?.[0];
+  const typed = editor?.replace(EDITOR_LINE, "").trim();
+  const reason = overlay ? `overlay visible (${overlay})` : editor === undefined ? "no editor input line" : typed ? `editor holds text (${typed.slice(0, 40)})` : undefined;
+  if (!reason) return;
+  await deps.run(["herdr", "pane", "send-keys", deps.config.leadPane, "escape"]);
+  throw new TransientSuperviseError(`soft restart editor is not ready: ${reason}`);
+};
+
 /** The model (`provider/modelId`) and thinking level a session file last recorded. */
 const sessionModel = (file: string): { model?: string; thinking?: string } => {
   let model: string | undefined;
@@ -907,7 +925,11 @@ const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
   };
 };
 
-/** The settled new session's file, or undefined when none started in time. */
+/**
+ * The settled new session's file, or undefined when none started in time. A candidate's first line is a session header
+ * whose timestamp is at or after `startedAt` (an older session file can still be appended to after /new), and among
+ * candidates the one with the newest header timestamp is the new session.
+ */
 const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
@@ -917,7 +939,7 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
   while (deps.clock.now() < deadline) {
     // The next command is typed only into a settled new session whose agent is back.
     const ready = await live();
-    let found: { readonly file: string; readonly size: number } | undefined;
+    let found: { readonly file: string; readonly size: number; readonly at: number } | undefined;
     for (const name of readdirSync(dir)) {
       const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
       if (!id || id === old) continue;
@@ -925,7 +947,10 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
       try {
         const stat = statSync(file);
         if (startedAt !== undefined && stat.mtimeMs < startedAt) continue;
-        if (readFileSync(file, "utf8").includes('"type":"model_change"')) found = { file, size: stat.size };
+        const text = readFileSync(file, "utf8");
+        const at = headerTime(text.slice(0, text.indexOf("\n") >>> 0));
+        if (at === undefined || (startedAt !== undefined && !(at >= startedAt))) continue;
+        if (text.includes('"type":"model_change"') && (!found || at >= found.at)) found = { file, size: stat.size, at };
       } catch (e) {
         if (e instanceof Error && "code" in e && e.code === "ENOENT") continue;
         throw e;
@@ -937,6 +962,17 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
     await deps.clock.sleep(200);
   }
   return undefined;
+};
+
+/**
+ * A session header line's timestamp in epoch ms: NaN when it has none or it does not parse, undefined when the line
+ * is not a session header.
+ */
+const headerTime = (line: string): number | undefined => {
+  let header: { type?: unknown; timestamp?: unknown };
+  try { header = JSON.parse(line); } catch { return undefined; }
+  if (header?.type !== "session") return undefined;
+  return typeof header.timestamp === "string" ? Date.parse(header.timestamp) : Number.NaN;
 };
 
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */

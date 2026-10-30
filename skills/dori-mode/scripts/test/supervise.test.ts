@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statS
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
+import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS, leadModels } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
@@ -33,12 +33,18 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   let startDelay = 0;
   let startedAt: number | undefined;
   let pendingStart: { readonly at: number; readonly file: string } | undefined;
-  // The model and thinking a /new session starts with (the process's own, by default not the configured ones).
-  let startModel: { readonly provider: string; readonly modelId: string; readonly thinking?: string } = { provider: "test", modelId: "previous" };
+  // The model and thinking a /new session starts with (the process's own; by default the configured lead model).
+  let startModel: { readonly provider: string; readonly modelId: string; readonly thinking?: string } | undefined;
+  const configuredModel = () => {
+    const entry = leadModels(deps.config)[0];
+    const [provider = "", ...rest] = (entry?.model ?? "").split("/");
+    return { provider, modelId: rest.join("/"), thinking: entry?.thinking };
+  };
   const startPending = () => {
     if (!pendingStart || clock.at < pendingStart.at) return;
-    appendFileSync(pendingStart.file, `${JSON.stringify({ type: "model_change", provider: startModel.provider, modelId: startModel.modelId })}\n`);
-    if (startModel.thinking) appendFileSync(pendingStart.file, `${JSON.stringify({ type: "thinking_level_change", thinkingLevel: startModel.thinking })}\n`);
+    const start = startModel ?? configuredModel();
+    appendFileSync(pendingStart.file, `${JSON.stringify({ type: "model_change", provider: start.provider, modelId: start.modelId })}\n`);
+    if (start.thinking) appendFileSync(pendingStart.file, `${JSON.stringify({ type: "thinking_level_change", thinkingLevel: start.thinking })}\n`);
     utimesSync(pendingStart.file, clock.at / 1000, clock.at / 1000);
     startedAt = clock.at;
     pendingStart = undefined;
@@ -110,12 +116,13 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     }
     if (argv[0] === "herdr" && argv[2] === "read") return ok(world.screen);
     if (argv[0] === "herdr" && argv[2] === "send-text") { typed = argv[4] ?? ""; return ok(); }
+    if (argv[0] === "herdr" && argv[2] === "send-keys" && argv[4] === "escape") return ok();
     if (argv[0] === "herdr" && argv[2] === "send-keys") {
       pane.revision++;
       if (typed === "/new") {
         active = randomUUID();
         startedAt = undefined;
-        writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "session", id: active })}\n`);
+        writeFileSync(join(dir, `${active}.jsonl`), `${JSON.stringify({ type: "session", id: active, timestamp: new Date(clock.now()).toISOString() })}\n`);
         pendingStart = { at: clock.now() + startDelay, file: join(dir, `${active}.jsonl`) };
         startPending();
         if (release?.pending) {
@@ -147,7 +154,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     session: () => active,
     softEvidence: (value: boolean) => { softEvidence = value; },
     startDelay: (ms: number) => { startDelay = ms; },
-    startModel: (model: typeof startModel) => { startModel = model; },
+    startModel: (model: NonNullable<typeof startModel>) => { startModel = model; },
     releaseAfterNew: (delay: number, gap: number, dead = false) => { release = { from: Infinity, to: Infinity, dead, pending: { delay, gap, dead } }; },
     startedAt: () => startedAt,
     prompt: () => prompt,
@@ -238,14 +245,16 @@ test("a forced restart takes a warm idle lead without traffic and applies model 
   const f = fixture();
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced", "high");
   const supervisor = new Supervisor(f.deps);
-  await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/model test/forced");
-  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/thinking high");
-  expect(restartStarts(f)).toHaveLength(1);
+  const lines = await quiet(() => supervisor.flush());
+  // The /new session keeps the process's model, so the soft attempt falls back to a launch with the requested ones.
+  expect(f.calls.some((call) => call[2] === "send-text" && /^\/(model|thinking) /.test(call[4] ?? ""))).toBe(false);
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED soft restart model differs (session "))).toHaveLength(1);
+  expect(f.command()).toMatch(/'?--model'? '?test\/forced'? '?--thinking'? '?high'?/);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(readJournal(f.state.dir).models).toEqual([{ model: "test/forced", thinking: "high" }]);
   await supervisor.flush();
-  expect(restartStarts(f)).toHaveLength(1);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
 });
 
 test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s lead while events still deliver warm", async (status) => {
@@ -259,8 +268,8 @@ test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s le
   expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
   expect(pendingLeadRestart(f.state.dir)?.id).toBe(request.id);
   f.pane.agent_status = "idle";
-  await new Supervisor(f.deps).flush();
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
+  await quiet(() => new Supervisor(f.deps).flush());
+  expect(f.command()).toMatch(/'?--model'? '?test\/forced'?/);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
 });
 
@@ -273,9 +282,8 @@ test("a forced restart captures edited config and preserves a newer request arri
     requestLeadRestart(f.deps.config, f.clock.now(), "newer/model", "high");
     f.pane.agent_status = "working";
   });
-  await supervisor.flush();
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model edited/model"]);
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/thinking medium"]);
+  await quiet(() => supervisor.flush());
+  expect(f.command()).toMatch(/'?--model'? '?edited\/model'? '?--thinking'? '?medium'?/);
   expect(pendingLeadRestart(f.state.dir)?.models[0]?.model).toBe("newer/model");
 });
 
@@ -460,7 +468,7 @@ test("a lead-restart request waits while the idle lead waits on its own child, a
   expect(lines.filter((line) => line.startsWith(`LEAD_RESTART_DEFERRED request ${request.id}`))).toHaveLength(1);
   appendFileSync(f.file, lifecycle(0, f.clock.now()));
   const after = await quiet(() => supervisor.flush());
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
+  expect(f.command()).toMatch(/'?--model'? '?test\/forced'?/);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(after.filter((line) => line.startsWith(`LEAD_RESTART_TRIGGER request dori lead-restart ${request.id}`))).toHaveLength(1);
 });
@@ -470,7 +478,7 @@ test.each([[59, false], [60, true]] as const)("a child wait of %s min against le
   writeFileSync(f.file, lifecycle(1, f.clock.now() - minutes * 60_000));
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced");
   const lines = await quiet(() => new Supervisor(f.deps).flush());
-  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(restart ? 1 : 0);
   expect(lines.some((line) => line.startsWith("LEAD_CHILD_WAIT_EXPIRED request"))).toBe(restart);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED request"))).toBe(!restart);
 });
@@ -577,8 +585,8 @@ test("events arriving during restart stay queued and follow the prompt handoff e
 const restartSession = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir).restart;
 const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => call[2] === "run").map((call) => /--session-id ([\w-]+)/.exec(call[4] ?? "")?.[1]);
 
-test.each(["idle", "done"])("an %s cold lead switches session, model and thinking without relaunching omo", async (status) => {
-  // Given a reusable process; even its own environment and its shell must survive cleanup.
+test.each(["idle", "done"])("an %s cold lead already on the configured model switches session without relaunching omo", async (status) => {
+  // Given a reusable process on the configured model and thinking; even its own environment and its shell must survive cleanup.
   const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
   f.cold();
   f.pane.agent_status = status;
@@ -592,14 +600,15 @@ test.each(["idle", "done"])("an %s cold lead switches session, model and thinkin
   supervisor.enqueue("soft", "INBOUND soft");
   // When the cold delivery restarts it.
   const lines = await quiet(() => supervisor.flush());
-  // Then the four submissions are ordered and all confirmation uses the actual new id.
+  // Then only /new and the prompt are typed, and all confirmation uses the actual new id.
   const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
-  expect(texts.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
-  expect(texts).toHaveLength(4);
+  expect(texts[0]).toBe("/new");
+  expect(texts).toHaveLength(2);
+  expect(lines).toContain(`LEAD_SOFT_MODEL file=${f.session()}.jsonl model=test/soft thinking=high want=test/soft/high`);
   // The prompt itself is typed, on one line; no prompt file exists for the new lead to miss.
-  expect(texts[3]).toStartWith("Dori mode. ");
-  expect(texts[3]).toContain(TAKE_FIRST);
-  expect(texts[3]).not.toContain("\n");
+  expect(texts[1]).toStartWith("Dori mode. ");
+  expect(texts[1]).toContain(TAKE_FIRST);
+  expect(texts[1]).not.toContain("\n");
   expect(f.calls.some((call) => call[2] === "send-text" && /lead-[0-9a-f-]{36}\.md/.test(call[4] ?? ""))).toBe(false);
   expect(readdirSync(f.state.dir).filter((name) => /^lead-.*\.md$/.test(name))).toEqual([]);
   expect(f.session()).not.toBe(old);
@@ -650,8 +659,8 @@ test("a soft restart types nothing after /new until the new session has started"
   supervisor.enqueue("soft-start", "INBOUND soft");
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
-  // Then /model, /thinking and the prompt are typed only once the new session has started and settled.
-  expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["/model", "/thinking", "Dori"]);
+  // Then the prompt is typed only once the new session has started and settled.
+  expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["Dori"]);
   for (const [, at, started] of sends) expect(at - (started ?? Number.POSITIVE_INFINITY)).toBeGreaterThanOrEqual(SOFT_SESSION_SETTLE_MS);
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
@@ -838,14 +847,14 @@ test("a soft restart ignores existing quota lines during commands and quota text
   expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
   expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
-  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4]).slice(0, 3)).toEqual([
-    "/new", "/model test/soft", "/thinking high",
-  ]);
+  const texts = f.calls.filter((call) => call[2] === "send-text").map((call) => call[4] ?? "");
+  expect(texts[0]).toBe("/new");
+  expect(texts[1]).toStartWith("Dori mode. ");
 });
 
 test("a soft command whose first Enter only accepts the autocomplete is entered again before the next command", async () => {
-  // Given omo's editor: typed text shows on the prompt line, and a command with an argument opens an autocomplete
-  // whose first Enter accepts the selection without submitting.
+  // Given omo's editor: typed text shows on the prompt line, and a slash command opens an autocomplete whose first
+  // Enter accepts the selection without submitting.
   const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
   f.cold();
   f.world.screen = "❯ ";
@@ -857,7 +866,7 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
     if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
     if (argv[0] === "herdr" && argv[2] === "send-text") {
       editor += argv[4] ?? "";
-      popup = editor.startsWith("/") && editor.includes(" ");
+      popup = editor.startsWith("/");
     } else if (argv[0] === "herdr" && argv[2] === "send-keys") {
       if (popup) { popup = false; f.pane.revision++; f.world.screen = `❯ ${editor}`; return { code: 0, out: "", err: "" }; }
       submitted.push(editor);
@@ -871,34 +880,67 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
   supervisor.enqueue("soft-popup", "INBOUND soft");
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
-  // Then each command is submitted on its own line and the soft restart succeeds.
-  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
-  expect(submitted[3]).toStartWith("Dori mode. ");
+  // Then /new is submitted on its own line before the prompt and the soft restart succeeds.
+  expect(submitted[0]).toBe("/new");
+  expect(submitted[1]).toStartWith("Dori mode. ");
+  expect(f.calls.filter((call) => call[2] === "send-keys" && call[4] === "enter").length).toBeGreaterThanOrEqual(3);
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
   expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
 });
 
 test.each([
-  ["high", []],
-  ["low", ["/thinking high"]],
-] as const)("a /new session already on the configured model with thinking %s types only what differs", async (thinking, expected) => {
-  // Given a /new session that starts on the configured model, with the configured or another thinking level.
+  ["soft", "high", undefined],
+  ["soft", "low", "soft restart thinking differs (session low, want high)"],
+  ["other", "high", "soft restart model differs (session test/other, want test/soft)"],
+] as const)("a /new session on model test/%s with thinking %s soft-restarts only when both match", async (modelId, thinking, failure) => {
+  // Given a /new session that starts on the configured model and thinking, or on another one.
   const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
   f.cold();
-  f.startModel({ provider: "test", modelId: "soft", thinking });
+  f.startModel({ provider: "test", modelId, thinking });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("soft-same", "INBOUND soft");
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
-  // Then /model is skipped, /thinking only when it differs, and the soft restart succeeds.
+  // Then nothing but /new is typed before the prompt; a mismatch never types the prompt and goes to one process launch.
   const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4] ?? "");
-  expect(texts.slice(0, -1)).toEqual(["/new", ...expected]);
-  expect(texts.at(-1)).toStartWith("Dori mode. ");
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(texts.some((text) => /^\/(model|thinking)\b/.test(text))).toBe(false);
+  expect(lines.filter((line) => line.startsWith("LEAD_SOFT_MODEL "))).toHaveLength(1);
+  if (failure) {
+    expect(texts).toEqual(["/new"]);
+    expect(lines).toContain(`LEAD_SOFT_RESTART_FAILED ${failure}; falling back to a process restart`);
+    expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+    expect(f.command()).toContain("test/soft");
+  } else {
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toStartWith("Dori mode. ");
+    expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+    expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  }
 });
 
-/** A soft restart whose omo editor submits /new but keeps /model (or echoes it once submitted, `echo`). */
+test("a soft restart does not type the prompt over an overlay; it sends Escape and falls back to a process launch", async () => {
+  // Given omo showing its model picker once /new has been submitted.
+  const f = fixture();
+  f.cold();
+  const base = f.deps.run;
+  const run: Runner = async (argv, options) => {
+    const result = await base(argv, options);
+    if (argv[2] === "send-keys" && argv[4] === "enter") f.world.screen = "enter select  ctrl+s select as default  ctrl+f favorite\n> \nNo matching models\n❯ ";
+    return result;
+  };
+  const supervisor = new Supervisor({ ...f.deps, run });
+  supervisor.enqueue("soft-overlay", "INBOUND overlay");
+  // When the cold delivery restarts it in place.
+  const lines = await quiet(() => supervisor.flush());
+  // Then Escape closes the overlay, the prompt is never typed into it, and one process launch takes the batch.
+  expect(f.calls).toContainEqual(["herdr", "pane", "send-keys", "lead:p1", "escape"]);
+  expect(f.calls.some((call) => call[2] === "send-text" && call[4]?.startsWith("Dori mode. "))).toBe(false);
+  expect(lines).toContain("LEAD_SOFT_RESTART_FAILED soft restart editor is not ready: overlay visible (enter select); falling back to a process restart");
+  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.log()).toEqual([{ id: "soft-overlay", line: "INBOUND overlay" }]);
+});
+
+/** A soft restart whose omo editor keeps /new (or echoes each submitted command, `echo`). */
 const editorRun = (f: ReturnType<typeof fixture>, echo: boolean): { run: Runner; submitted: string[] } => {
   const base = f.deps.run;
   let editor = "";
@@ -907,7 +949,7 @@ const editorRun = (f: ReturnType<typeof fixture>, echo: boolean): { run: Runner;
   const run: Runner = async (argv, options) => {
     if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
     if (argv[0] === "herdr" && argv[2] === "send-text") editor += argv[4] ?? "";
-    else if (argv[0] === "herdr" && argv[2] === "send-keys" && (echo || !editor.startsWith("/model "))) {
+    else if (argv[0] === "herdr" && argv[2] === "send-keys" && (echo || editor !== "/new")) {
       submitted.push(editor);
       if (echo && editor.startsWith("/")) notice = `Applied ${editor}\n`;
       editor = "";
@@ -920,7 +962,7 @@ const editorRun = (f: ReturnType<typeof fixture>, echo: boolean): { run: Runner;
 };
 
 test("a soft command left in the editor names the command and saves the screen before the process restart", async () => {
-  // Given omo's editor which never submits /model.
+  // Given omo's editor which never submits /new.
   const f = fixture({ leadModel: { model: "test/soft", thinking: "high" } });
   f.cold();
   const { run } = editorRun(f, false);
@@ -928,11 +970,11 @@ test("a soft command left in the editor names the command and saves the screen b
   supervisor.enqueue("soft-stuck", "INBOUND soft");
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
-  // Then the failure names /model, the visible screen is saved, and one process launch follows.
-  expect(lines).toContain('LEAD_SOFT_RESTART_FAILED soft command "/model test/soft" stayed in the editor; falling back to a process restart');
+  // Then the failure names /new, the visible screen is saved, and one process launch follows.
+  expect(lines).toContain('LEAD_SOFT_RESTART_FAILED soft command "/new" stayed in the editor; falling back to a process restart');
   const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-soft-failure-lead_p1-"));
   expect(saved).toHaveLength(1);
-  expect(readFileSync(join(f.state.dir, saved[0] ?? ""), "utf8")).toBe("❯ /model test/soft");
+  expect(readFileSync(join(f.state.dir, saved[0] ?? ""), "utf8")).toBe("❯ /new");
   expect(f.calls).toContainEqual(["herdr", "pane", "read", "lead:p1", "--source", "visible"]);
   expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
 });
@@ -947,8 +989,8 @@ test("a submitted soft command echoed outside the editor line is not entered aga
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
   // Then every command is entered once and the soft restart succeeds.
-  expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/soft", "/thinking high"]);
-  expect(submitted[3]).toStartWith("Dori mode. ");
+  expect(submitted[0]).toBe("/new");
+  expect(submitted[1]).toStartWith("Dori mode. ");
   expect(submitted).not.toContain("");
   expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
 });
@@ -1836,13 +1878,8 @@ test("a foreground process group other than the shell is not a plain shell", () 
   expect(plainShell({ foreground_processes: [] })).toBe(false);
 });
 
-/** Model selections through either a process launch or the interactive model commands, in argv spelling. */
-const launches = (f: ReturnType<typeof fixture>) => f.calls.flatMap((call, i) => {
-  if (call[2] === "run") return [call[4] ?? ""];
-  if (call[2] !== "send-text" || !call[4]?.startsWith("/model ")) return [];
-  const next = f.calls.slice(i + 1).find((item) => item[2] === "send-text")?.[4];
-  return [`--model ${call[4].slice("/model ".length)}${next?.startsWith("/thinking ") ? ` --thinking ${next.slice("/thinking ".length)}` : ""}`];
-});
+/** Process launch commands; a model is only ever selected by a launch's --model and --thinking. */
+const launches = (f: ReturnType<typeof fixture>) => f.calls.flatMap((call) => call[2] === "run" ? [call[4] ?? ""] : []);
 const journal = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir);
 const muted = async (work: () => Promise<void>) => {
   const original = console.log;
@@ -2045,7 +2082,7 @@ test("a cold start hands every event through take once; owner work taken but unh
   f.onWait(async () => { session ??= restartSession(f)?.phase.startsWith("soft:") ? restartSession(f)?.session : undefined; });
   supervisor.enqueue("restart-trigger", "WAIT_DONE release");
   await supervisor.flush();
-  expect(launches(f)).toHaveLength(1);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(session).toMatch(/^[0-9a-f-]{36}$/);
   // Then the prompt lists nothing, and take prints each id exactly once: the untaken events, then the reminders.
   const lines = handed(f).split("\n");
