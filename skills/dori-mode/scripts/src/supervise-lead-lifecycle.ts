@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { leadModels, leadCommand, LEAD_DIET_ARGS, LEAD_DIET_ENV } from "./config.ts";
+import { leadModels, leadCommand, LEAD_DIET_ARGS, LEAD_DIET_ENV, qualifiedModel } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
 import { ALIVE_STATUSES, listPanes, type Pane, readScreen, sendGuarded, sendVerified } from "./panes.ts";
 import { quoteForPane } from "./launch.ts";
@@ -634,10 +634,17 @@ export class LeadLifecycle {
           await softCommand(deps, "/new");
           // The editor is back before omo has switched to the new session; anything typed meanwhile lands in the old
           // session or is lost, so the next command waits until the new session has finished starting.
-          if (!(await softSessionStarted(deps, old, softStartedAt))) throw new TransientSuperviseError("new session did not start after /new");
-          for (const command of [`/model ${entry.model}`, ...(entry.thinking ? [`/thinking ${entry.thinking}`] : [])]) {
-            await softCommand(deps, command);
-          }
+          const started = await softSessionStarted(deps, old, softStartedAt);
+          if (!started) throw new TransientSuperviseError("new session did not start after /new");
+          // /new keeps the process's model and thinking. A bare lead model is compared, and typed, as provider/model:
+          // omo's /model picker does not submit a bare name on the first Enter.
+          const current = sessionModel(started);
+          const model = qualifiedModel(entry.model, current.model, [leadModels(deps.config)[0]?.model, deps.config.defaultModel]);
+          const commands = [
+            ...(current.model === model ? [] : [`/model ${model}`]),
+            ...(entry.thinking && current.thinking !== entry.thinking ? [`/thinking ${entry.thinking}`] : []),
+          ];
+          for (const command of commands) await softCommand(deps, command);
           await softCommand(deps, softPrompt, true);
         }
         // A soft start journaled before the prompt was typed inline is recognised by its file path.
@@ -830,6 +837,9 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
     const after = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
     const screen = await readScreen(deps.run, deps.config.leadPane);
     const addedLines = screen.split("\n").filter((line) => !previous.has(line));
+    // omo's herdr integration can release the pane's agent once /new has shut the old session down; that is /new
+    // taking effect, and softSessionStarted waits for the agent to come back.
+    if (command === "/new" && !after?.agent) return;
     if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
     if (addedLines.some((line) => line.includes(command))) {
       if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
@@ -848,13 +858,57 @@ const softCommand = async (deps: FlowDeps, command: string, prompt = false): Pro
  */
 export const SOFT_SESSION_SETTLE_MS = 1_000;
 
-const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<boolean> => {
+/** The model (`provider/modelId`) and thinking level a session file last recorded. */
+const sessionModel = (file: string): { model?: string; thinking?: string } => {
+  let model: string | undefined;
+  let thinking: string | undefined;
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"model_change"') && !line.includes('"thinking_level_change"')) continue;
+    let entry: { type?: unknown; provider?: unknown; modelId?: unknown; thinkingLevel?: unknown };
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") model = `${entry.provider}/${entry.modelId}`;
+    if (entry.type === "thinking_level_change" && typeof entry.thinkingLevel === "string") thinking = entry.thinkingLevel;
+  }
+  return { model, thinking };
+};
+
+/**
+ * After /new omo's herdr integration can release the pane's agent while the old session shuts down and report it again
+ * once the new one has started (about two seconds). For this long a missing agent whose process still holds the pane's
+ * foreground is that switch, not a dead lead.
+ */
+export const SOFT_RELEASE_GRACE_MS = 10_000;
+
+/**
+ * One soft wait's liveness: true when the agent is ready, false during a release gap. Throws at once when only the
+ * shell is left in the pane, and once the agent has been missing for longer than the grace.
+ */
+const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
+  let missingSince: number | undefined;
+  return async () => {
+    if (await softLive(deps)) {
+      missingSince = undefined;
+      return true;
+    }
+    const now = deps.clock.now();
+    missingSince ??= now;
+    const info = await processInfo(deps);
+    if (!info || plainShell(info)) throw new TransientSuperviseError("reused lead is not live");
+    if (now - missingSince >= SOFT_RELEASE_GRACE_MS) throw new TransientSuperviseError(`reused lead is not live after ${SOFT_RELEASE_GRACE_MS / 1000}s`);
+    return false;
+  };
+};
+
+/** The new session's file once it has started and settled with its agent back, or undefined at the deadline. */
+const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  const live = softLiveCheck(deps);
   let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
   while (deps.clock.now() < deadline) {
-    if (!(await softLive(deps))) throw new TransientSuperviseError("reused lead is not live");
+    // The next command is typed only into a settled new session whose agent is back.
+    const ready = await live();
     let found: { readonly file: string; readonly size: number } | undefined;
     for (const name of readdirSync(dir)) {
       const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
@@ -870,11 +924,11 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
       }
     }
     if (found && seen?.file === found.file && seen.size === found.size) {
-      if (deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return true;
+      if (ready && deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return found.file;
     } else seen = found && { ...found, since: deps.clock.now() };
     await deps.clock.sleep(200);
   }
-  return false;
+  return undefined;
 };
 
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
@@ -882,9 +936,9 @@ const softEvidence = async (deps: FlowDeps, old: string, markers: readonly strin
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
   const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  const live = softLiveCheck(deps);
   for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
-    if (!(await softLive(deps))) throw new TransientSuperviseError("reused lead is not live");
-    for (const name of readdirSync(dir)) {
+    for (const name of (await live()) ? readdirSync(dir) : []) {
       if (deps.clock.now() >= deadline) return undefined;
       const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
       if (!id || id === old) continue;
