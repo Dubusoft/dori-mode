@@ -64,6 +64,10 @@ export type Lane = {
   readonly closedAt?: string;
   readonly lastReplyAt?: number;
   readonly lastNudgeAt?: number;
+  /** IDLE-ESCALATE events sent for the current silence; set to 0 by the idle nudge, unset when no nudge was sent for it. */
+  readonly idleEscalations?: number;
+  /** When the last IDLE-ESCALATE was sent, so the next one for the same silence waits twice as long. */
+  readonly lastIdleEscalateAt?: number;
   readonly lastAutoReplyAt?: number;
   /** The todo item the freshness sweep last posted from a working lane's pane, so an unchanged item is never posted twice. */
   readonly lastProgressPost?: string;

@@ -115,7 +115,7 @@ Done = command ["bun","test"] stdout~" 0 fail"; file qa/report.json json:.passed
 | `dori claim-done` / `object-done` / `close` | 完成流程 |
 | `dori pause` / `resume` | 所有者说"等一下"时:不再提醒、暂停目标、停止正在运行的回合;以及恢复 |
 | `dori watch` | 自动关闭的 watcher,作为常驻监控运行 |
-| `dori freshness [--loop MIN]` | 提醒变安静的 lane,再把它最后一条汇报发到线程里 |
+| `dori freshness [--loop MIN]` | 提醒变安静的 lane,提醒后仍无动静就上报给 lead,再把它最后一条汇报发到线程里 |
 | `dori dead-panes [--loop MIN]` | 报告已停止的智能体 pane |
 | `dori guard [--loop MIN]` | 负载、内存、磁盘和 pane 数量告警，也按工作机器 (`guard install`、`guard machines`) |
 | `dori heavy <label> -- <cmd>` | 只在有空闲槽位且负载低时运行构建、测试或模拟器 (每台机器一个) |

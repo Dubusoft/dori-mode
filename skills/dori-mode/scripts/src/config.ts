@@ -155,6 +155,11 @@ export type DoriConfig = {
   readonly sessionsDir: string;
   readonly nudgeAfterMin: number;
   readonly postAfterMin: number;
+  /**
+   * Minutes an idle lane may stay silent after its freshness nudge before the lead hears urgent IDLE-ESCALATE; each
+   * further one for the same silence waits twice as long. Must be positive.
+   */
+  readonly idleEscalateMin: number;
   readonly closeAfterMin: number;
   /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
   readonly worktreeRoot: string;
@@ -270,6 +275,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   sessionsDir: join(home, ".omo", "agent", "sessions"),
   nudgeAfterMin: 15,
   postAfterMin: 20,
+  idleEscalateMin: 30,
   closeAfterMin: 5,
   worktreeRoot: "/data/repos/worktrees",
   progressTemplate: "{todo}",

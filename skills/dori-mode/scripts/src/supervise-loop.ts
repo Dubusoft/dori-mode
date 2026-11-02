@@ -538,6 +538,7 @@ export const supervise = async (
   if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
   if (!Number.isFinite(deps.config.leadChildWaitMaxMin) || deps.config.leadChildWaitMaxMin <= 0) throw new SuperviseError("leadChildWaitMaxMin must be positive");
   if (!Number.isFinite(deps.config.leadUnreadRestartMin) || deps.config.leadUnreadRestartMin <= 0) throw new SuperviseError("leadUnreadRestartMin must be positive");
+  if (!Number.isFinite(deps.config.idleEscalateMin) || deps.config.idleEscalateMin <= 0) throw new SuperviseError("idleEscalateMin must be positive");
   if (!Number.isInteger(deps.config.waitMaxFailures) || deps.config.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
   const deliveryProblem = deliveryConfigError(deps.config.delivery);
   if (deliveryProblem) throw new SuperviseError(deliveryProblem);

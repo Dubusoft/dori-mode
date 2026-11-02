@@ -115,7 +115,7 @@ watcher는 레인을 닫을 때 셸 없이 이 확인을 직접 다시 돌리고
 | `dori claim-done` / `object-done` / `close` | 완료 흐름 |
 | `dori pause` / `resume` | 소유자가 기다리라고 할 때: 깨우지 않고, 목표를 멈추고, 진행 중인 턴을 멈춤. 그리고 재개 |
 | `dori watch` | 자동 닫기 watcher. 지속 모니터로 돌립니다 |
-| `dori freshness [--loop MIN]` | 조용해진 레인을 깨우고, 마지막 보고를 스레드에 올림 |
+| `dori freshness [--loop MIN]` | 조용해진 레인을 깨우고, 깨운 뒤에도 조용하면 리드에게 올리고, 마지막 보고를 스레드에 올림 |
 | `dori dead-panes [--loop MIN]` | 멈춘 에이전트 pane 보고 |
 | `dori guard [--loop MIN]` | 부하, 메모리, 디스크, pane 수 경고, 작업 머신별로도 (`guard install`, `guard machines`) |
 | `dori heavy <label> -- <cmd>` | 슬롯이 비고 부하가 낮을 때만 빌드, 테스트, 에뮬레이터 실행 (머신당 하나) |

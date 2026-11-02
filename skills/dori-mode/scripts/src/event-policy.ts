@@ -23,6 +23,8 @@ const URGENT_KINDS = [
   // A lane waiting on its agent's on-screen question instead of dori report (ask-user.ts).
   "LANE_ASKING",
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
+  // An idle lane still silent idleEscalateMin after its freshness nudge (freshness.ts); the lane itself gets no more input.
+  "IDLE-ESCALATE",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "HOST_GUARD OUTDATED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   // The supervisor killed or paused something because memory ran critically low; the lead relays it to the owner.
   "HOST_GUARD CRITICAL",
