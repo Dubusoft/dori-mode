@@ -115,7 +115,7 @@ The watcher runs each check itself when it closes the lane, with no shell, and n
 | `dori claim-done` / `object-done` / `close` | the done flow |
 | `dori pause` / `resume` | the owner said wait: no nudges, goal paused, running turn stopped; and back |
 | `dori watch` | the auto-close watcher; run it as a persistent monitor |
-| `dori freshness [--loop MIN]` | nudge lanes that went quiet, then post their last report to their thread |
+| `dori freshness [--loop MIN]` | nudge lanes that went quiet, escalate to the lead when one stays silent after the nudge, then post their last report to their thread |
 | `dori dead-panes [--loop MIN]` | report agent panes that stopped |
 | `dori guard [--loop MIN]` | alert on load, memory, disk and pane count, per worker machine too (`guard install`, `guard machines`) |
 | `dori heavy <label> -- <cmd>` | run a build, test suite or emulator only when a slot is free and load is low (one per machine) |

@@ -11,7 +11,7 @@ import {
 import {
   FINAL_STATES, type Observed, type Operation, operationId, type OperationSpec, type OperationStore, openOperations, perform, plan, type ReadBack, reconcile, settleOperation,
 } from "./operations.ts";
-import { agentRefusal, laneRunner, listPanes, type Pane } from "./panes.ts";
+import { agentRefusal, holds, inputState, laneRunner, leftInInput, listPanes, type Pane, readScreen } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
 
@@ -146,20 +146,35 @@ const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessag
   if (refusal) return refusal === message.blocked ? message : updateLaneMessage(messages, message, { blocked: refusal }, now);
   const run = laneRunner(deps.run, lane);
   const pane = lane.pane ?? "";
+  // Text in the lane's input box may be the owner's: ours would be appended and submitted with it, so the message waits
+  // (and reaches the lead as LANE_MESSAGE_UNCONFIRMED if it keeps waiting). Our own text left there unsubmitted by an
+  // earlier attempt only gets Enter.
+  const input = inputState(await readScreen(run, pane), holds(message.text));
+  if (input === "busy") {
+    const why = `pane ${pane} input line holds other text (or shows no prompt)`;
+    return why === message.blocked ? message : updateLaneMessage(messages, message, { blocked: why }, now);
+  }
   // The lane's ack proves the text arrived. Short of it, only this attempt's own herdr exits can tell: a refused
   // send-text typed nothing (not done), text plus enter both accepted is done. An interrupted attempt (a new process,
   // no exits seen) or text typed without its enter stays unknown, so it is ambiguous and never retyped.
   let typedHere: Observed = "unknown";
   const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
   const { op } = await perform(ops, deps.clock.now, { lane: lane.key, action: "lane-message", target: message.id }, async () => {
-    const typed = await run(["herdr", "pane", "send-text", pane, message.text]);
-    if (typed.code !== 0) {
+    const typed = input === "ours" ? undefined : await run(["herdr", "pane", "send-text", pane, message.text]);
+    if (typed && typed.code !== 0) {
       typedHere = "not-done";
       return { ok: false, detail: typed.err || typed.out || "send-text failed" };
     }
     const entered = await run(["herdr", "pane", "send-keys", pane, "enter"]);
-    if (entered.code === 0) typedHere = "done";
-    return { ok: entered.code === 0, detail: entered.code === 0 ? "" : entered.err || "send-keys failed" };
+    if (entered.code !== 0) return { ok: false, detail: entered.err || "send-keys failed" };
+    // Enter accepted is not the text submitted: still in the input box after a second Enter, it did not reach the
+    // agent, so this attempt fails and the next pass only presses Enter.
+    if (await leftInInput(run, deps.clock, pane, message.text)) {
+      typedHere = "not-done";
+      return { ok: false, detail: "text stayed in the input line" };
+    }
+    typedHere = "done";
+    return { ok: true, detail: "" };
   }, readBack);
   const current = messages.get(message.id) ?? message;
   if (current.state === "acked") return current;
@@ -193,7 +208,8 @@ const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 /**
  * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
  * branch of its own repo (never a fork), not a draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
- * conflict; `wait` (with why) otherwise.
+ * conflict; `wait` (with why) otherwise. Green needs at least one check that passed: a rollup of only SKIPPED or NEUTRAL
+ * checks is treated like no checks at all.
  */
 export const mergeGate = (view: PrView, sha: string, base: string): { readonly verdict: "merge" | "conflict" | "wait"; readonly why: string } => {
   if (view.state !== "OPEN") return { verdict: "wait", why: `state ${view.state ?? "unknown"}` };
@@ -206,6 +222,7 @@ export const mergeGate = (view: PrView, sha: string, base: string): { readonly v
   if (!checks.length) return { verdict: "wait", why: "no checks" };
   const red = checks.filter((c) => c.__typename === "StatusContext" ? c.state !== "SUCCESS" : c.status !== "COMPLETED" || !CHECK_OK.has(c.conclusion ?? ""));
   if (red.length) return { verdict: "wait", why: `${red.length} check(s) not green` };
+  if (!checks.some((c) => c.__typename === "StatusContext" || c.conclusion === "SUCCESS")) return { verdict: "wait", why: "every check skipped or neutral" };
   if (view.mergeable !== "MERGEABLE" || view.mergeStateStatus !== "CLEAN") return { verdict: "wait", why: `mergeable ${view.mergeable} state ${view.mergeStateStatus}` };
   return { verdict: "merge", why: "green and clean" };
 };
@@ -496,7 +513,7 @@ export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): str
     `1. Your worktree ${worktree} is a detached checkout of origin/${pull.branch}. Run git fetch origin, merge origin/${base} into it and resolve every conflict, keeping the intent of both sides. Run the repo's tests.`,
     `2. Push to the PR branch: git push origin HEAD:${pull.branch}. Never force-push, never push to ${base} or main.`,
     "3. Wait for CI yourself with your own monitor; fix failures and push again.",
-    `4. When every check is green and the PR is mergeable, merge it: gh pr merge ${pull.number} -R ${pull.repo} --merge --match-head-commit <the head SHA you pushed>. Never --admin, never into main. The supervisor may merge it first; that is fine.`,
+    `4. When every check is green (at least one passed; all skipped or neutral is not green) and the PR is mergeable, merge it: gh pr merge ${pull.number} -R ${pull.repo} --merge --match-head-commit <the head SHA you pushed>. Never --admin, never into main. The supervisor may merge it first; that is fine.`,
     "5. If a conflict needs a product decision, report a question to the lead instead of guessing.",
     "",
     "## Done",

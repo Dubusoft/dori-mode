@@ -225,10 +225,29 @@ test("delivery is confirmed by the pane's agent status moving to working, with e
   expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
 });
 
-test("a screen that still shows the text never causes another Enter; no status change is unconfirmed", async () => {
+test("text still in the input line gets exactly one more Enter, and still there after it the send failed", async () => {
   world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
-  world.stuckReads = 10;
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] stuck text still here")).toBe("unconfirmed");
+  world.screens = ["❯ ", ...Array<string>(10).fill("❯ [LEAD] stuck text still here")];
+  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] stuck text still here")).toBe("failed");
+  expect(sent(world)).toEqual(["[LEAD] stuck text still here"]);
+  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(2);
+});
+
+test("other text in the input line (maybe the owner's) is never typed into or submitted", async () => {
+  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.screen = "❯ half a sentence";
+  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("failed");
+  world.screen = "an ask-user dialog, no prompt";
+  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("failed");
+  expect(world.calls.filter((c) => c[2] === "send-text" || c[2] === "send-keys")).toEqual([]);
+});
+
+test("the same text left unsubmitted by an earlier send only gets Enter, never a second copy", async () => {
+  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.onEnterStatus = "working";
+  world.screens = ["❯ [LEAD] please report"];
+  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("delivered");
+  expect(sent(world)).toEqual([]);
   expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
 });
 

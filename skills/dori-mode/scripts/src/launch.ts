@@ -186,6 +186,8 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
   const claim = remote ? "print the done line below in your own output" : lane.reportVia === "cli" ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
   const ask = remote ? "print a question report line below in your own output" : lane.reportVia === "cli" ? "run the dori report question command below" : "send a question report line below";
   return [
+    "- Set a goal first: restate the deliverable and the observable condition that ends this lane. The `Done =` signals below still decide when the lane closes; your restatement does not replace them.",
+    "- Work until that condition holds. Do not stop to ask permission for reversible steps the brief already covers; only a decision the brief leaves open goes to the owner, as below.",
     `- Done rules: when every \`Done =\` signal below is live and all work is pushed, ${claim}, then stay idle and start no new work.`,
     remote
       ? "  The lead re-reads every signal live and closes the lane only when every signal reads back live. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits."

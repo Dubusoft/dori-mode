@@ -35,7 +35,21 @@ export const scrubForThread = (line: string, home: string): string =>
  */
 export const relayedText = (key: string, text: string): string => `[System] relayed from lane ${key}: ${text}`;
 
-export type SweepAct = { readonly kind: "nudged" | "progress" | "progress-failed" | "no-progress" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
+export type SweepAct = { readonly kind: "nudged" | "progress" | "progress-failed" | "no-progress" | "idle-escalate" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
+
+/**
+ * The nudge an idle silent lane gets: three ways out, each in the lane's own report form (its footer's): claim done,
+ * report a blocker outside the lane, or post a progress line and keep working. One line, since it is typed into the pane.
+ */
+export const nudgeText = (lane: Lane, silentMin: number, ownerLanguage?: string): string => {
+  const [done, blocked] = lane.machine
+    ? [`print [REPORT] ${lane.key} | done | <merge SHA, closed issue, version> in your own output`, `print [REPORT] ${lane.key} | blocker | <what blocks you> in your own output`]
+    : lane.reportVia === "cli"
+      ? [`claim it: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>"`, `report it: dori report ${lane.key} blocked --text "<what blocks you>"`]
+      : [`claim it: dori claim-done ${lane.key} --evidence "<merge SHA, closed issue, version>"`, `send the lead a [REPORT] ${lane.key} | blocker | <what blocks you> line as your footer says`];
+  const language = languageInstruction(ownerLanguage);
+  return `[LEAD] your work thread has had no update for ${silentMin} min. If the deliverable is done and every Done signal is live, ${done}. If you are blocked on something outside this lane, ${blocked}. Otherwise post a 1-2 sentence progress line (done since last, next), keep its status true, and continue the work now.${language ? ` ${language}` : ""}`;
+};
 
 const lastHeard = (lane: Lane): number => lane.lastReplyAt ?? Date.parse(lane.openedAt);
 
@@ -103,14 +117,31 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
           }
         } else if (lane.thread !== "none" && (current.lastNudgeAt ?? 0) < heard) {
           // Nothing can be posted for it (no Todo item on its pane, or no thread hook), and a working lane is not
-          // interrupted: the lead hears once per silence and decides.
-          await save({ lastNudgeAt: now });
+          // interrupted: the lead hears once per silence and decides. No nudge was sent, so this silence never escalates.
+          await save({ lastNudgeAt: now, idleEscalations: undefined, lastIdleEscalateAt: undefined });
           acts.push({ kind: "no-progress", lane: lane.key, detail: `${silentMin} min without a thread update while working; ${progress ? "no threadReply hook to post its todo" : "its pane shows no Todo item to post"}` });
         }
       } else if ((current.lastNudgeAt ?? 0) < heard) {
-        const delivery = await sendVerified(run, deps.clock, lane.pane, `[LEAD] your work thread has had no update for ${silentMin} min. Post a 1-2 sentence progress line (done since last, next) and keep its status true.${languageInstruction(deps.config.ownerLanguage) ? ` ${languageInstruction(deps.config.ownerLanguage)}` : ""}`);
-        await save({ lastNudgeAt: now });
-        acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+        const delivery = await sendVerified(run, deps.clock, lane.pane, nudgeText(lane, silentMin, deps.config.ownerLanguage));
+        if (delivery !== "failed") {
+          await save({ lastNudgeAt: now, idleEscalations: 0, lastIdleEscalateAt: undefined });
+          acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+        } else if ((current.lastNudgeFailedAt ?? 0) < heard) {
+          // Not typed (its input line holds other text, or the pane is not live) or not submitted: not counted as
+          // nudged, so the next tick tries again; the lead hears it once per silence.
+          await save({ lastNudgeFailedAt: now });
+          acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery failed; retried each tick` });
+        }
+      } else if (current.idleEscalations !== undefined && current.lastNudgeAt !== undefined) {
+        // Nudged this silence and still idle with no update: the lane is not nudged again, the lead hears instead,
+        // idleEscalateMin after the nudge and then after twice the previous wait each time, until the lane speaks.
+        const count = current.idleEscalations;
+        const since = current.lastIdleEscalateAt ?? current.lastNudgeAt;
+        if (now - since >= deps.config.idleEscalateMin * 2 ** count * 60_000) {
+          const nudgedMin = Math.round((now - current.lastNudgeAt) / 60_000);
+          await save({ idleEscalations: count + 1, lastIdleEscalateAt: now });
+          acts.push({ kind: "idle-escalate", lane: lane.key, detail: `${silentMin} min silent and idle, no update ${nudgedMin} min after its nudge (escalation ${count + 1}); it is not nudged again: read its pane, steer it, or dori close ${lane.key}` });
+        }
       }
     }
     if (silentMin >= deps.config.postAfterMin && hook && lane.thread !== "none" && (current.lastAutoReplyAt ?? 0) < heard) {
