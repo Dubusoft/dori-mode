@@ -38,8 +38,6 @@ const URGENT_KINDS = [
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
   // A merged lane PR whose merge the supervisor could not read back.
   "MERGE_UNVERIFIED",
-  // The independent review blocked the automatic merge at a head, or could not run: the lead merges by hand or follows up.
-  "REVIEW_BLOCKED", "REVIEW_FAILED",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
   "LANE_DONE_CLAIMED",
   // A lane that ended is news the lead acts on: report to the owner, free the slot.
