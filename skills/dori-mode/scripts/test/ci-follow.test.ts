@@ -218,6 +218,18 @@ test("mergeGate never merges a fork head, even for a lane-owned number", async (
   expect(gh.merges).toEqual([]);
 });
 
+test("mergeGate never merges a PR whose checks were all skipped or neutral; one passing check makes it green", async () => {
+  const skipped = { __typename: "CheckRun", status: "COMPLETED", conclusion: "SKIPPED" };
+  const neutral = { __typename: "CheckRun", status: "COMPLETED", conclusion: "NEUTRAL" };
+  const ci = follow();
+  gh.view = greenView({ statusCheckRollup: [skipped, neutral] });
+  await ci.tick([pull({ checks: "green" })], emit);
+  expect(gh.merges).toEqual([]);
+  gh.view = greenView({ statusCheckRollup: [skipped, neutral, { __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }] });
+  await ci.tick([pull({ checks: "green" })], emit);
+  expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
+});
+
 test("a merge lane refuses a fork head and an option-shaped or invalid branch before any git call", async () => {
   const source = { ...claimedLane };
   for (const [patch, why] of [
