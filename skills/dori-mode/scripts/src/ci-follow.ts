@@ -193,7 +193,8 @@ const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 /**
  * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
  * branch of its own repo (never a fork), not a draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
- * conflict; `wait` (with why) otherwise.
+ * conflict; `wait` (with why) otherwise. Green needs at least one check that passed: a rollup of only SKIPPED or NEUTRAL
+ * checks is treated like no checks at all.
  */
 export const mergeGate = (view: PrView, sha: string, base: string): { readonly verdict: "merge" | "conflict" | "wait"; readonly why: string } => {
   if (view.state !== "OPEN") return { verdict: "wait", why: `state ${view.state ?? "unknown"}` };
@@ -206,6 +207,7 @@ export const mergeGate = (view: PrView, sha: string, base: string): { readonly v
   if (!checks.length) return { verdict: "wait", why: "no checks" };
   const red = checks.filter((c) => c.__typename === "StatusContext" ? c.state !== "SUCCESS" : c.status !== "COMPLETED" || !CHECK_OK.has(c.conclusion ?? ""));
   if (red.length) return { verdict: "wait", why: `${red.length} check(s) not green` };
+  if (!checks.some((c) => c.__typename === "StatusContext" || c.conclusion === "SUCCESS")) return { verdict: "wait", why: "every check skipped or neutral" };
   if (view.mergeable !== "MERGEABLE" || view.mergeStateStatus !== "CLEAN") return { verdict: "wait", why: `mergeable ${view.mergeable} state ${view.mergeStateStatus}` };
   return { verdict: "merge", why: "green and clean" };
 };
@@ -496,7 +498,7 @@ export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): str
     `1. Your worktree ${worktree} is a detached checkout of origin/${pull.branch}. Run git fetch origin, merge origin/${base} into it and resolve every conflict, keeping the intent of both sides. Run the repo's tests.`,
     `2. Push to the PR branch: git push origin HEAD:${pull.branch}. Never force-push, never push to ${base} or main.`,
     "3. Wait for CI yourself with your own monitor; fix failures and push again.",
-    `4. When every check is green and the PR is mergeable, merge it: gh pr merge ${pull.number} -R ${pull.repo} --merge --match-head-commit <the head SHA you pushed>. Never --admin, never into main. The supervisor may merge it first; that is fine.`,
+    `4. When every check is green (at least one passed; all skipped or neutral is not green) and the PR is mergeable, merge it: gh pr merge ${pull.number} -R ${pull.repo} --merge --match-head-commit <the head SHA you pushed>. Never --admin, never into main. The supervisor may merge it first; that is fine.`,
     "5. If a conflict needs a product decision, report a question to the lead instead of guessing.",
     "",
     "## Done",
