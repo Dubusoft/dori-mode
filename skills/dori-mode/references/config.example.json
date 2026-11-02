@@ -41,6 +41,7 @@
   "sessionsDir": "~/.omo/agent/sessions",
   "nudgeAfterMin": 15,
   "postAfterMin": 20,
+  "idleEscalateMin": 30,
   "closeAfterMin": 5,
   "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
