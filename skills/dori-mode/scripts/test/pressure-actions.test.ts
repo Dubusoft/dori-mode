@@ -26,12 +26,13 @@ const procs: Proc[] = [
 ];
 const noHeavy = procs.filter((p) => p.pid !== 13);
 
-/** A herdr runner whose panes all exist; records every other call. */
+/** A herdr runner whose panes all exist with an empty input line; records every other call. */
 const herdr = (panes: string[]) => {
   const sent: string[][] = [];
   const run: Runner = async (argv) => {
     const a = argv[1] === "--machine" ? argv.slice(3) : argv.slice(1);
     if (a[0] === "pane" && a[1] === "list") return { code: 0, out: JSON.stringify({ result: { panes: panes.map((p) => ({ pane_id: p, workspace_id: "w", agent: "omo", agent_status: "working" })) } }), err: "" };
+    if (a[0] === "pane" && a[1] === "read") return { code: 0, out: "❯ ", err: "" };
     sent.push([...argv]);
     return { code: 0, out: "", err: "" };
   };

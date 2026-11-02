@@ -45,6 +45,7 @@ const herdr = (agentPanes: string[]) => {
   const sent: string[][] = [];
   const run: Runner = async (argv) => {
     if (argv[1] === "pane" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { panes: agentPanes.map((p) => ({ pane_id: p, workspace_id: "w", agent: "omo", agent_status: "working" })) } }), err: "" };
+    if (argv[1] === "pane" && argv[2] === "read") return { code: 0, out: "❯ ", err: "" };
     sent.push([...argv]);
     return { code: 0, out: "", err: "" };
   };

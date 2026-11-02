@@ -68,6 +68,8 @@ export type Lane = {
   readonly idleEscalations?: number;
   /** When the last IDLE-ESCALATE was sent, so the next one for the same silence waits twice as long. */
   readonly lastIdleEscalateAt?: number;
+  /** When a nudge last could not be typed (input line busy, pane not live); it is retried each tick, reported once per silence. */
+  readonly lastNudgeFailedAt?: number;
   readonly lastAutoReplyAt?: number;
   /** The todo item the freshness sweep last posted from a working lane's pane, so an unchanged item is never posted twice. */
   readonly lastProgressPost?: string;

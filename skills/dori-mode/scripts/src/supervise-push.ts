@@ -4,7 +4,7 @@ import { eventClass, eventKind } from "./event-policy.ts";
 import { completeLines, parseLogLine } from "./inbox.ts";
 import type { OutcomeTracking } from "./lane-outcomes.ts";
 import { dueDecisions, markDecisionsPushed } from "./decision-obligations.ts";
-import { listPanes, type Pane, readScreen, sendVerified } from "./panes.ts";
+import { type InputState, inputState as boxState, listPanes, type Pane, PASTE_PLACEHOLDER, readScreen, sendVerified, squash } from "./panes.ts";
 import { type AwaitingAck, type Event, type InboxPush, type Journal, type JournalCore, type LaneOutcome, type Obligation, TransientSuperviseError } from "./supervise-journal.ts";
 import { type LeadLifecycle, PAUSED } from "./supervise-lead-lifecycle.ts";
 import { dueOwners, latest } from "./supervise-owner-tracking.ts";
@@ -25,34 +25,12 @@ export const REPUSH_MAX_MS = 10 * 60_000;
 
 type Untaken = { readonly id: string; readonly line: string; readonly meta?: { readonly lane?: string } };
 
-const squash = (text: string): string => text.replace(/\s+/g, "");
-
 /**
- * omo's input box: the `❯` line and its two-space continuation lines, up to the full-width `───` separator under it.
- * Without a separator below the prompt only the `❯` line counts. Undefined when the screen shows no prompt.
+ * What the lead's input box holds: nothing, only our own pointer (or omo's paste placeholder for it), or anything else,
+ * which may be the owner's text and is never typed into or submitted.
  */
-export const inputRegion = (screen: string): string | undefined => {
-  const lines = screen.split("\n");
-  let at = -1;
-  for (let i = lines.length - 1; i >= 0; i--) if ((lines[i] ?? "").trimStart().startsWith("\u276f")) { at = i; break; }
-  if (at < 0) return undefined;
-  const end = lines.findIndex((line, i) => i > at && /^\s*\u2500{3,}/.test(line));
-  const region = [(lines[at] ?? "").trimStart().slice(1), ...(end < 0 ? [] : lines.slice(at + 1, end))];
-  return region.join("\n").trim();
-};
-
-/**
- * What the input box holds: nothing, only our own pointer (or omo's paste placeholder for it), or anything else, which
- * may be the owner's text and is never typed into or submitted.
- */
-export const inputState = (screen: string): "empty" | "ours" | "busy" => {
-  const region = inputRegion(screen);
-  if (region === undefined) return "busy";
-  if (region === "") return "empty";
-  const text = squash(region);
-  if (text.startsWith(squash(POINTER_PREFIX)) && text.endsWith(squash(POINTER_TAIL))) return "ours";
-  return /^\[paste#\d+[^\]]*\]$/.test(text) ? "ours" : "busy";
-};
+export const inputState = (screen: string): InputState => boxState(screen, (text) =>
+  (text.startsWith(squash(POINTER_PREFIX)) && text.endsWith(squash(POINTER_TAIL))) || PASTE_PLACEHOLDER.test(text));
 
 /**
  * One ASCII line of at most `maxChars`: how many events wait, their kinds and the lanes they concern (each list cut to
@@ -257,7 +235,8 @@ export class PushDelivery {
     if (PAUSED.test(screen)) console.log(`LEAD_RESUMED ${config.leadPane} ${await sendVerified(run, clock, config.leadPane, "/resume")}`);
     // Persisted before the send: a crash mid-send re-pushes at most once, and a take is idempotent.
     this.savePush(next);
-    const sent = await sendVerified(run, clock, config.leadPane, pointer);
+    // The pointer's input line is read back below, after pasteCheckMs.
+    const sent = await sendVerified(run, clock, config.leadPane, pointer, false);
     console.log(`LEAD_PUSH ${batch} ${total} ${kinds.join(",")} ${sent} attempt=${next.attempts}`);
     if (sent === "delivered") {
       // sendVerified already observed the post-handoff transition to working; do not poll the pane again.

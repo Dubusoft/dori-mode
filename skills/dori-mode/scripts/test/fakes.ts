@@ -46,7 +46,6 @@ export type World = {
   issueState: string;
   aheadCount: string;
   dirty: string;
-  stuckReads: number;
   screen: string;
   panes: { pane_id: string; workspace_id: string; agent?: string; agent_status?: string; title?: string; cwd?: string }[];
   /** agent_status the target pane moves to when Enter is pressed (models a lane picking up the message). */
@@ -62,17 +61,13 @@ export type World = {
 
 export const WT = "/repo/.wt/demo-lane";
 
-export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", stuckReads: 0, screen: "❯ ", panes: [], removed: [], calls: [] });
+export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [] });
 
 export const fakeRunner = (w: World): Runner => async (argv) => {
   w.calls.push([...argv]);
   const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
   const [cmd, a1, a2] = argv;
   if (cmd === "herdr" && a1 === "pane" && a2 === "read") {
-    if (w.stuckReads > 0) {
-      w.stuckReads--;
-      return ok("❯ [LEAD] stuck text still here");
-    }
     return ok(w.screens?.length ? (w.screens.shift() ?? w.screen) : w.screen);
   }
   if (cmd === "herdr" && a1 === "pane" && a2 === "send-keys" && argv[4] === "escape" && w.onEscapeStatus) {

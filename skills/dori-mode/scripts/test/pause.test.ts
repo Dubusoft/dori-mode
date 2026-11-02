@@ -25,8 +25,9 @@ afterEach(() => state.done());
 const working: Lane = { key: "waiting-lane", title: "wait", thread: "chat:team/9", pane: "w:p7", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0 };
 const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
 const stored = async (): Promise<Lane | null> => deps(T0).registry.read(working.key);
-const paneSays = (...screens: string[]) => {
-  world.screens = [...screens];
+/** Successive screens: the first is read before the goal command and again by the send's input-line guard. */
+const paneSays = (first: string, ...after: string[]) => {
+  world.screens = [first, first, ...after];
 };
 const paneStatus = (status: string) => {
   for (const pane of world.panes) pane.agent_status = status;

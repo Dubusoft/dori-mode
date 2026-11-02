@@ -91,13 +91,13 @@ test("pause: pause and resume from a stale lane keep an objection and progress p
   await deps(T0).registry.write(lane);
   const stale = await stored();
   await elsewhere({ objection, lastProgressPost: "todo 3" });
-  world.screens = ["❯ ", "Goal paused\n❯ "];
+  world.screens = ["❯ ", "❯ ", "Goal paused\n❯ "];
   expect((await pauseLane(deps(T0 + MIN), stale, "owner said wait")).code).toBe(0);
   expect(await stored()).toMatchObject({ status: "paused", pausedFrom: "working", objection, lastProgressPost: "todo 3" });
 
   const stalePaused = await stored();
   await elsewhere({ lastProgressPost: "todo 4" });
-  world.screens = ["❯ ", "Goal active\n❯ "];
+  world.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
   expect((await resumeLane(deps(T0 + 2 * MIN), stalePaused, "go")).code).toBe(0);
   expect(await stored()).toMatchObject({ status: "working", objection, lastProgressPost: "todo 4", lastReplyAt: T0 + 2 * MIN });
   expect(staleWrites()).toEqual([]);
