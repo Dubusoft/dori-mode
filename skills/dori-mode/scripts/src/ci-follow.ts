@@ -13,6 +13,7 @@ import {
 } from "./operations.ts";
 import { agentRefusal, laneRunner, listPanes, type Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
+import { REVIEW_ACTION, runReview } from "./review-receipt.ts";
 import { canLaunch } from "./routing.ts";
 
 /**
@@ -29,6 +30,10 @@ import { canLaunch } from "./routing.ts";
  * - a merged PR of an open lane that the supervisor did not merge itself: its merge is read back once (a `merge-verify`
  *   operation) as digest MERGE_VERIFIED with the merge SHA, or urgent MERGE_UNVERIFIED when it cannot be confirmed.
  *   The watcher then closes a done-claimed lane at once (done-flow.ts mergeConfirmed), with its worktree and branch.
+ * - before its own merge, a CLEAR review receipt at the exact head (review-receipt.ts): a `review` operation row the
+ *   supervisor alone writes. No receipt starts one background review (one at a time) and waits; BLOCK never merges at
+ *   that head and goes to the lead (REVIEW_BLOCKED) and the lane; a review that cannot run MERGE_ATTEMPTS times is
+ *   REVIEW_FAILED.
  * Each merge and launch is an operation (operations.ts), keyed by PR and head SHA, so a restart never repeats it. The
  * lanes keep waiting on their own CI; nothing here replaces that wait.
  */
@@ -76,6 +81,11 @@ export const parseIssueRef = (ref: string): { readonly repo: string; readonly nu
   const m = /^([\w.-]+\/[\w.-]+)#([1-9]\d*)$/.exec(ref.trim());
   return m?.[1] && m[2] ? { repo: m[1], number: Number(m[2]) } : undefined;
 };
+
+export const reviewMessageId = (pull: OpenPull): string => `review-${repoName(pull.repo)}-${pull.number}-${short(pull.sha)}`;
+
+export const reviewBlockedText = (pull: OpenPull, reportPath: string, id: string): string =>
+  `[LEAD] An independent review blocked the automatic merge of ${pull.repo}#${pull.number} at ${short(pull.sha)} (${pull.url}). Read ${reportPath}, fix the findings, push, wait for green and claim done again. Confirm you got this message: dori report ack ${id}`;
 
 export const ciFailingText = (pull: OpenPull, id: string): string =>
   `[LEAD] CI is failing on ${pull.repo}#${pull.number} at ${short(pull.sha)} (${pull.url}). Keep your own CI wait: read the failing check, fix it, push and wait for green again. Confirm you got this message: dori report ack ${id}`;
@@ -235,10 +245,17 @@ export class CiFollowUp {
   private readonly settled = new Set<string>();
   /** Subjects of this poll's conflicting PRs whose live lane was asked to rebase; any other rebase message is stale. */
   private rebasing = new Set<string>();
+  /** Reviews in flight by subject; the poll never awaits them. */
+  private readonly reviews = new Map<string, Promise<void>>();
 
   constructor(private readonly deps: FlowDeps, private readonly io: CiIo = defaultCiIo, stores?: { readonly ops: OperationStore; readonly messages: LaneMessageStore }) {
     this.ops = stores?.ops ?? deps.operations ?? openOperations(deps.config);
     this.messages = stores?.messages ?? openLaneMessages(deps.config);
+  }
+
+  /** Resolves once no review is in flight. */
+  async reviewsSettled(): Promise<void> {
+    while (this.reviews.size) await Promise.all([...this.reviews.values()]);
   }
 
   close(): void {
@@ -278,6 +295,7 @@ export class CiFollowUp {
     const deps = this.deps;
     const owner = await this.owners(pulls);
     const failing = new Set<string>();
+    const reviewBlocked = new Set<string>();
     this.rebasing = new Set();
     for (const pull of pulls) {
       const lane = owner.get(`${pull.repo.toLowerCase()}#${pull.number}`);
@@ -290,6 +308,7 @@ export class CiFollowUp {
           failing.add(subjectOf(pull));
           queueLaneMessage(this.messages, deps.clock.now(), { id: ciMessageId(pull), lane: lane.key, subject: subjectOf(pull), text: ciFailingText(pull, ciMessageId(pull)) });
         }
+        if (this.receipt(lane, pull)?.verdict === "BLOCK") reviewBlocked.add(subjectOf(pull));
         if (pull.conflicting) await this.conflict(lane, pull, emit);
         else if (pull.checks === "green") await this.merge(lane, pull, emit);
       } catch (e) {
@@ -301,6 +320,7 @@ export class CiFollowUp {
       if (message.id.startsWith("ci-") && !failing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "CI no longer failing at this head" }, deps.clock.now());
       // A rebase request whose PR moved on, stopped conflicting, or went to a merge lane (its lane went down) is stale.
       if (message.id.startsWith("rebase-") && !this.rebasing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "no longer a conflict for this live lane at this head" }, deps.clock.now());
+      if (message.id.startsWith("review-") && !reviewBlocked.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "review no longer blocks at this head" }, deps.clock.now());
     }
   }
 
@@ -431,6 +451,7 @@ export class CiFollowUp {
       // Merged only once the lane says it is done with this head; read fresh so a claim made since the poll counts.
       const fresh = (await deps.registry.read(lane.key)) ?? lane;
       if (!claimGate(fresh, pull).ok) return;
+      if (this.reviewGate(lane, pull, emit) !== "CLEAR") return;
       // pull.sha is the head the claim recorded (claimGate) and the fresh read saw (mergeGate): GitHub merges no other.
       ({ op } = await perform(this.ops, deps.clock.now, spec, async () => {
         const r = await deps.run(["gh", "pr", "merge", String(pull.number), "-R", pull.repo, "--merge", "--match-head-commit", pull.sha], { timeoutMs: 60_000 });
@@ -440,6 +461,59 @@ export class CiFollowUp {
     }
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
+  }
+
+  /** The review receipt of `pull` at its head: a verified `review` row reading CLEAR or `BLOCK <report>`; else undefined. */
+  private receipt(lane: Lane, pull: OpenPull): { readonly verdict: "CLEAR" | "BLOCK"; readonly reportPath: string } | undefined {
+    const row = this.ops.get(operationId({ lane: lane.key, action: REVIEW_ACTION, target: subjectOf(pull) }));
+    if (row?.state !== "verified") return undefined;
+    if (row.detail === "CLEAR") return { verdict: "CLEAR", reportPath: "" };
+    if (row.detail.startsWith("BLOCK")) return { verdict: "BLOCK", reportPath: row.detail.slice("BLOCK".length).trim() };
+    return undefined;
+  }
+
+  /**
+   * CLEAR lets the merge go ahead. BLOCK tells the lead and the lane once and never merges at this head. Without a
+   * receipt a review starts in the background (none in flight for any subject, attempts left) and the merge waits.
+   */
+  private reviewGate(lane: Lane, pull: OpenPull, emit: CiEmit): "CLEAR" | "BLOCK" | "wait" {
+    const subject = subjectOf(pull);
+    const receipt = this.receipt(lane, pull);
+    if (receipt?.verdict === "CLEAR") return "CLEAR";
+    if (receipt?.verdict === "BLOCK") {
+      emit(`review-blocked:${subject}`, `REVIEW_BLOCKED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} findings=${receipt.reportPath} ${pull.url}`);
+      const id = reviewMessageId(pull);
+      queueLaneMessage(this.messages, this.deps.clock.now(), { id, lane: lane.key, subject, text: reviewBlockedText(pull, receipt.reportPath, id) });
+      return "BLOCK";
+    }
+    const spec: OperationSpec = { lane: lane.key, action: REVIEW_ACTION, target: subject };
+    const row = this.ops.get(operationId(spec));
+    if (row?.state === "failed" && row.attempts >= MERGE_ATTEMPTS) {
+      emit(`review-failed:${subject}`, `REVIEW_FAILED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} review could not run ${row.attempts} times: ${row.detail}; merge ${pull.url} by hand`);
+      return "wait";
+    }
+    if (this.reviews.size === 0) {
+      const running = this.review(spec, pull).finally(() => { this.reviews.delete(subject); });
+      this.reviews.set(subject, running);
+    }
+    return "wait";
+  }
+
+  /** Runs one review and records its receipt (verified CLEAR or `BLOCK <report>`), or one more failed attempt. */
+  private async review(spec: OperationSpec, pull: OpenPull): Promise<void> {
+    const deps = this.deps;
+    try {
+      const op = plan(this.ops, deps.clock.now(), spec);
+      const result = await runReview(deps, pull, deps.config.ciMergeBase);
+      if ("error" in result) {
+        const current = this.ops.get(op.id) ?? op;
+        this.ops.put({ ...current, state: "failed", attempts: current.attempts + 1, detail: result.error.replace(/\s+/g, " ").slice(0, 200), updatedAt: deps.clock.now() });
+        return;
+      }
+      settleOperation(this.ops, deps.clock.now(), op.id, "verified", result.verdict === "CLEAR" ? "CLEAR" : `BLOCK ${result.reportPath}`);
+    } catch (e) {
+      console.error(`CI_REVIEW_ERROR ${spec.target} ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   private async conflict(lane: Lane, pull: OpenPull, emit: CiEmit): Promise<void> {

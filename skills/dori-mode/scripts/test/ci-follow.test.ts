@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
+import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId, reviewMessageId } from "../src/ci-follow.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -22,19 +23,38 @@ const claimedLane: Lane = { ...lane, status: "done-claimed", claim: { at: new Da
 const pull = (patch: Partial<OpenPull> = {}): OpenPull => ({ repo: "acme/app", number: 7, sha: SHA, branch: "feat", headRepo: "acme/app", url: "https://github.com/acme/app/pull/7", conflicting: false, checks: "failing", ...patch });
 const idle = { pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "idle" };
 
-type Gh = { view: Record<string, unknown>; viewCode: number; mergeCode: number; merges: string[][]; issue: string; closes: string[][] };
+type Review = { argv: string[]; stdin: string; cwd?: string };
+type Gh = {
+  view: Record<string, unknown>; viewCode: number; mergeCode: number; merges: string[][]; issue: string; closes: string[][];
+  /** The reviewer's last line: a verdict for the prompt's nonce, or any other text. */
+  verdict: "CLEAR" | "BLOCK" | "garbage"; reviews: Review[]; onReview?: () => void;
+};
 const greenView = (patch: Record<string, unknown> = {}) => ({
   state: "OPEN", baseRefName: "dev", headRefOid: SHA, isCrossRepository: false, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
   statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }], mergeCommit: null, ...patch,
 });
 
-/** herdr and git from fakes.ts; `gh pr view` / `gh pr merge` from a PR whose merge flips it to MERGED. */
+/**
+ * herdr and git from fakes.ts; `gh pr view` / `gh pr merge` from a PR whose merge flips it to MERGED; `gh api` compare
+ * returns a small diff; `omo` (the reviewer) answers with a verdict line for the nonce its prompt names.
+ */
 const runner = (w: World, gh: Gh): Runner => {
   const base = fakeRunner(w);
   return async (argv, opts): Promise<Ran> => {
     if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "view") {
       w.calls.push([...argv]);
       return gh.viewCode === 0 ? { code: 0, out: JSON.stringify(gh.view), err: "" } : { code: gh.viewCode, out: "", err: "HTTP 502" };
+    }
+    if (argv[0] === "gh" && argv[1] === "api") {
+      w.calls.push([...argv]);
+      return { code: 0, out: "diff --git a/x.ts b/x.ts\n+export const x = 1;", err: "" };
+    }
+    if (argv[0] === "omo") {
+      gh.reviews.push({ argv: [...argv], stdin: opts?.stdin ?? "", cwd: opts?.cwd });
+      gh.onReview?.();
+      const nonce = /VERDICT ([0-9a-f]+) CLEAR/.exec(opts?.stdin ?? "")?.[1] ?? "";
+      const last = gh.verdict === "garbage" ? "Looks fine to me." : `VERDICT ${nonce} ${gh.verdict}`;
+      return { code: 0, out: `HIGH src/x.ts:1 example finding\n${last}`, err: "" };
     }
     if (argv[0] === "gh" && argv[1] === "issue" && argv[2] === "view") return { code: 0, out: JSON.stringify({ state: gh.issue }), err: "" };
     if (argv[0] === "gh" && argv[1] === "issue" && argv[2] === "close") {
@@ -69,13 +89,19 @@ const follow = (patch: Partial<CiIo> = {}): CiFollowUp => {
   open.push(ci);
   return ci;
 };
+/** A poll that starts the review, the review settling, and the poll that acts on its receipt. */
+const reviewed = async (ci: CiFollowUp, pulls: readonly OpenPull[]): Promise<void> => {
+  await ci.tick(pulls, emit);
+  await ci.reviewsSettled();
+  await ci.tick(pulls, emit);
+};
 
 beforeEach(async () => {
   state = withState();
   if (TEST_STORE === "sqlite") new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
   world = newWorld();
   world.panes = [{ ...idle }];
-  gh = { view: greenView(), viewCode: 0, mergeCode: 0, merges: [], issue: "OPEN", closes: [] };
+  gh = { view: greenView(), viewCode: 0, mergeCode: 0, merges: [], issue: "OPEN", closes: [], verdict: "CLEAR", reviews: [] };
   clock = fakeClock(T0);
   deps = { ...depsFor(world, clock, state.dir, {}), run: runner(world, gh) };
   await deps.registry.update(lane.key, () => claimedLane);
@@ -161,8 +187,9 @@ test("a delivered message whose PR went green is superseded and never reaches th
 });
 
 test("a green, clean lane PR into dev is merged once with --match-head-commit and no --admin; a second poll and a restart merge nothing", async () => {
-  await follow().tick([pull({ checks: "green" })], emit);
+  await reviewed(follow(), [pull({ checks: "green" })]);
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
+  expect(gh.reviews).toHaveLength(1);
   expect(lines("CI_MERGED")).toEqual(["CI_MERGED acme/app#7 into dev lane=demo-lane head=abcdef1 merge=m3rge5ha https://github.com/acme/app/pull/7"]);
   gh.view = greenView();
   await open[0]?.tick([pull({ checks: "green" })], emit);
@@ -189,8 +216,9 @@ test("a green lane PR is merged only at the head its done claim recorded: no cla
   expect(gh.merges).toEqual([]);
 
   // The lane claims again at its current head: merged on the next poll, at exactly that head.
+  expect(gh.reviews).toEqual([]);
   await deps.registry.update(lane.key, () => claimedLane);
-  await ci.tick([green], emit);
+  await reviewed(ci, [green]);
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
 });
 
@@ -226,7 +254,7 @@ test("mergeGate never merges a PR whose checks were all skipped or neutral; one 
   await ci.tick([pull({ checks: "green" })], emit);
   expect(gh.merges).toEqual([]);
   gh.view = greenView({ statusCheckRollup: [skipped, neutral, { __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }] });
-  await ci.tick([pull({ checks: "green" })], emit);
+  await reviewed(ci, [pull({ checks: "green" })]);
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
 });
 
@@ -277,7 +305,7 @@ test("never merges into main; into dev a green, claimed PR merges with no other 
 
   deps = { ...deps, config: Object.assign({}, deps.config, { ciToodoWorkspaces: { "Acme/App": 3 } }) };
   gh.view = greenView();
-  await follow().tick([pull({ checks: "green" })], emit);
+  await reviewed(follow(), [pull({ checks: "green" })]);
   expect(gh.merges).toHaveLength(1);
   expect(lines("CI_MERGE_SKIPPED")).toEqual([]);
 });
@@ -424,7 +452,7 @@ test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED wit
 
 test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and a PR of no open lane is never read", async () => {
   const ci = follow();
-  await ci.tick([pull({ checks: "green" })], emit);
+  await reviewed(ci, [pull({ checks: "green" })]);
   expect(lines("CI_MERGED")).toHaveLength(1);
   const before = views();
   await ci.tick([], emit, [...mergedSeven, { repo: "acme/app", number: 99, url: "https://github.com/acme/app/pull/99", branch: "other", headRepo: "acme/app" }]);
@@ -445,6 +473,89 @@ test("a merged lane PR that cannot be read back wakes the lead once as MERGE_UNV
   ]);
   expect(views()).toBe(3);
   expect(eventClass(lines("MERGE_UNVERIFIED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+});
+
+const reviewId = `demo-lane/review/acme/app#7@${SHA}`;
+
+test("a green, claimed PR waits for its review without awaiting it; the merge follows the CLEAR receipt pinned to the head", async () => {
+  const ci = follow();
+  const green = pull({ checks: "green" });
+  await ci.tick([green], emit);
+  expect(gh.merges).toEqual([]);
+  // A second poll while the review is in flight starts no second review.
+  await ci.tick([green], emit);
+  await ci.reviewsSettled();
+  expect(gh.reviews).toHaveLength(1);
+  expect(ci.ops.get(reviewId)).toMatchObject({ state: "verified", detail: "CLEAR" });
+  await ci.tick([green], emit);
+  expect(gh.merges).toHaveLength(1);
+
+  // A new head is a new subject: its own review, the old receipt is not consulted.
+  const NEW = "2222222222222222222222222222222222222222";
+  gh.view = greenView({ headRefOid: NEW });
+  await deps.registry.update(lane.key, () => ({ ...claimedLane, claim: { ...claimedLane.claim!, pulls: [{ repo: "acme/app", number: 7, sha: NEW }] } }));
+  await ci.tick([pull({ checks: "green", sha: NEW })], emit);
+  await ci.reviewsSettled();
+  expect(gh.reviews).toHaveLength(2);
+});
+
+test("the reviewer runs with no tools in an empty temp dir, its prompt (with the diff) on stdin, never in argv", async () => {
+  await reviewed(follow(), [pull({ checks: "green" })]);
+  const review = gh.reviews[0]!;
+  expect(review.argv).toContain("--no-tools");
+  expect(review.argv.slice(0, 2)).toEqual(["omo", "-p"]);
+  expect(review.argv.at(-1)).toBe("-");
+  expect(review.argv.join(" ")).not.toContain("export const x");
+  expect(review.stdin).toContain("export const x = 1;");
+  expect(review.stdin).toContain(`acme/app#7 at exactly head ${SHA}`);
+  expect(review.cwd).toStartWith(tmpdir());
+  expect(world.calls).toContainEqual(["gh", "api", "-H", "Accept: application/vnd.github.v3.diff", `repos/acme/app/compare/dev...${SHA}`]);
+});
+
+test("a BLOCK receipt never merges at that head: REVIEW_BLOCKED reaches the lead once and the lane gets one message, superseded at a new head", async () => {
+  gh.verdict = "BLOCK";
+  const ci = follow();
+  const green = pull({ checks: "green" });
+  await reviewed(ci, [green]);
+  await ci.tick([green], emit);
+  expect(gh.merges).toEqual([]);
+  expect(gh.reviews).toHaveLength(1);
+  const report = join(state.dir, "reviews", "app-7-abcdef1.md");
+  expect(ci.ops.get(reviewId)).toMatchObject({ state: "verified", detail: `BLOCK ${report}` });
+  expect(lines("REVIEW_BLOCKED")).toEqual([`REVIEW_BLOCKED acme/app#7 lane=demo-lane head=abcdef1 findings=${report} https://github.com/acme/app/pull/7`]);
+  expect(eventClass(lines("REVIEW_BLOCKED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  const id = reviewMessageId(green);
+  expect(sent(world)).toHaveLength(1);
+  expect(sent(world)[0]).toContain(`Read ${report}`);
+  expect(sent(world)[0]).toContain(`dori report ack ${id}`);
+  expect(await Bun.file(report).text()).toContain("verdict: BLOCK");
+
+  await ci.tick([pull({ checks: "pending", sha: "3333333333333333333333333333333333333333" })], emit);
+  expect(ci.messages.get(id)?.state).toBe("superseded");
+});
+
+test("a head that moves during the review writes no receipt and merges nothing", async () => {
+  gh.onReview = () => { gh.view = greenView({ headRefOid: "4444444444444444444444444444444444444444" }); };
+  const ci = follow();
+  await reviewed(ci, [pull({ checks: "green" })]);
+  expect(ci.ops.get(reviewId)).toMatchObject({ state: "failed", attempts: 1, detail: expect.stringContaining("head moved during review") });
+  expect(gh.merges).toEqual([]);
+  expect(lines("REVIEW_")).toEqual([]);
+});
+
+test("a review with no valid verdict line is retried up to MERGE_ATTEMPTS times, then REVIEW_FAILED once and no more runs", async () => {
+  gh.verdict = "garbage";
+  const ci = follow();
+  const green = pull({ checks: "green" });
+  for (let i = 0; i < 4; i++) {
+    await ci.tick([green], emit);
+    await ci.reviewsSettled();
+  }
+  await ci.tick([green], emit);
+  expect(gh.reviews).toHaveLength(3);
+  expect(gh.merges).toEqual([]);
+  expect(lines("REVIEW_FAILED")).toEqual(["REVIEW_FAILED acme/app#7 lane=demo-lane head=abcdef1 review could not run 3 times: no valid verdict line; merge https://github.com/acme/app/pull/7 by hand"]);
+  expect(eventClass(lines("REVIEW_FAILED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
 });
 
 test("GH_PR checks_failing and conflicting are digest by default, unless eventPolicy names them", async () => {
