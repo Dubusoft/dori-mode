@@ -121,6 +121,7 @@ for (const [name, setup, reason] of [
   ["busy", () => { world.panes = [{ ...idle, agent_status: "working" }]; }, "busy (working)"],
   ["paused", async () => { await deps.registry.update(lane.key, () => ({ ...lane, status: "paused" })); }, "lane paused"],
   ["missing", () => { world.panes = []; }, "pane w:p1 missing"],
+  ["owner-draft", () => { world.screen = "❯ half a sentence"; }, "input line holds other text"],
 ] as const) {
   test(`a ${name} pane keeps the message queued, untyped, and wakes the lead once after the deadline`, async () => {
     await setup();

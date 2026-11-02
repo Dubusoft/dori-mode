@@ -123,8 +123,15 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
         }
       } else if ((current.lastNudgeAt ?? 0) < heard) {
         const delivery = await sendVerified(run, deps.clock, lane.pane, nudgeText(lane, silentMin, deps.config.ownerLanguage));
-        await save({ lastNudgeAt: now, idleEscalations: 0, lastIdleEscalateAt: undefined });
-        acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+        if (delivery !== "failed") {
+          await save({ lastNudgeAt: now, idleEscalations: 0, lastIdleEscalateAt: undefined });
+          acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+        } else if ((current.lastNudgeFailedAt ?? 0) < heard) {
+          // Not typed (its input line holds other text, or the pane is not live) or not submitted: not counted as
+          // nudged, so the next tick tries again; the lead hears it once per silence.
+          await save({ lastNudgeFailedAt: now });
+          acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery failed; retried each tick` });
+        }
       } else if (current.idleEscalations !== undefined && current.lastNudgeAt !== undefined) {
         // Nudged this silence and still idle with no update: the lane is not nudged again, the lead hears instead,
         // idleEscalateMin after the nudge and then after twice the previous wait each time, until the lane speaks.

@@ -314,7 +314,7 @@ test("remote pause reads back the goal and interrupts only the remote turn", asy
   const input = lane();
   for (const pane of world.panes) pane.agent_status = "working";
   world.onEscapeStatus = "idle";
-  world.screens = ["", "Goal paused\n"];
+  world.screens = ["", "❯ ", "Goal paused\n"];
   const result = await pauseLane(d, input, "wait");
   expect(result.code).toBe(0);
   expect(result.lane.status).toBe("paused");
@@ -325,7 +325,7 @@ test("remote pause reads back the goal and interrupts only the remote turn", asy
 
 test("remote resume reads back the remote goal before restoring lane state", async () => {
   const d = deps();
-  world.screens = ["Goal paused\n", "Goal active\n"];
+  world.screens = ["Goal paused\n", "❯ ", "Goal active\n"];
   const result = await resumeLane(d, lane({ status: "paused" }), "go");
   expect(result.code).toBe(0);
   expect(result.lane.status).toBe("working");
