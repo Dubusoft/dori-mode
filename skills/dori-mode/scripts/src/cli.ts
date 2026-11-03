@@ -24,7 +24,7 @@ import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine 
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
-import { DiscordCommands } from "./messenger/discord-commands.ts";
+import { closeThreadButton, DiscordCommands } from "./messenger/discord-commands.ts";
 import { discordOwnerConfigured } from "./messenger/discord-inbound.ts";
 import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
@@ -240,9 +240,9 @@ const lane = async (k: string | undefined) => {
 const messengerToken = (name: string): string => resolveCredential(name) ?? die(`${name} is not set in the environment or in ${envFilePath()}`);
 
 /** Posts `text` to a resolved Discord target and returns the new message's id. */
-const postMessage = async (to: string, text: string): Promise<string> =>
+const postMessage = async (to: string, text: string, components?: readonly unknown[]): Promise<string> =>
   // Each post is its own message: without a unique id Discord would dedupe a repeat of the same text.
-  new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).send(to, text, randomUUID());
+  new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).send(to, text, randomUUID(), components);
 
 const every = async (minutes: number, tick: () => Promise<void>): Promise<void> => {
   for (;;) {
@@ -753,7 +753,9 @@ try {
       if (!isDiscord(ref) && (ref.includes(":") || !isDiscord(bound))) die(`cannot tell the platform of "${ref}"; use a thread ref such as discord:<channel>/<thread>`);
       const platform = "discord";
       const { to, thread } = resolveTarget(platform, ref, opt("thread"));
-      const message = await postMessage(to, opt("text") ?? "");
+      // A report posted into a thread carries the owner's close-thread button (handled by `dori supervise`).
+      const threadId = opt("thread") ?? /^discord:[^/]+\/(\d+)$/.exec(ref)?.[1];
+      const message = await postMessage(to, opt("text") ?? "", threadId === to ? closeThreadButton(to) : undefined);
       if (!message) die(`REPORT_NOT_POSTED ${key}: ${platform} returned no message id; nothing recorded`);
       const note = opt("note");
       recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, { message, target: `${platform}:${to}${thread ? `/${thread}` : ""}` });

@@ -79,11 +79,14 @@ export class Discord {
    * Ordered chunks; returns the first id. Retries reuse nonces within Discord's few-minute dedupe window.
    * Without a stable id, identical content in the same channel is treated as a retry; use distinct ids for repeats.
    */
-  async send(channelId: string, content: string, stableId?: string): Promise<string> {
+  async send(channelId: string, content: string, stableId?: string, components?: readonly unknown[]): Promise<string> {
     let first: string | undefined;
-    for (const [index, chunk] of splitDiscordMessage(guardText(content)).entries()) {
+    const chunks = splitDiscordMessage(guardText(content));
+    for (const [index, chunk] of chunks.entries()) {
       const nonce = createHash("sha256").update(JSON.stringify([channelId, stableId ?? content, index])).digest("hex").slice(0, 25);
-      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true })).id;
+      // Components (buttons) ride on the last chunk, under the whole text.
+      const extra = components && index === chunks.length - 1 ? { components } : {};
+      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true, ...extra })).id;
       first ??= id;
     }
     return first ?? "";
