@@ -8,6 +8,7 @@ import { LANE_KEY, type Lane, type LaneMode, statusOf } from "./registry.ts";
 import { iso } from "./run.ts";
 import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { acquireStateLock } from "./state-lock.ts";
+import type { ToodoStart } from "./toodo-start.ts";
 
 export type LaunchInput = {
   readonly key: string;
@@ -24,6 +25,8 @@ export type LaunchInput = {
   /** Run the lane in this workspace's idle shell pane (the only one without an agent). */
   readonly workspace?: string;
   readonly machine?: string;
+  /** A Toodo start_task response: run in its first shell pane, found again through its herdr workspace, else a new tab. */
+  readonly toodo?: ToodoStart;
   /** Allow a second open lane on the same messenger thread (`--share-thread`); the lanes are recorded in `threadSharedWith`. */
   readonly shareThread?: boolean;
   /** Allow a cwd whose git remotes name none of the Done line's repos (`--allow-repo-mismatch`). */
@@ -319,6 +322,28 @@ const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<Ta
   return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(cwd ? { cwd } : {}), shell };
 };
 
+/**
+ * Where a Toodo task's lane runs: the first shell pane start_task listed, else the one shell pane of the task's herdr
+ * workspace (a listed id goes stale when herdr restarts), else a new tab, with the reason in a LAUNCH_FALLBACK line.
+ */
+const toodoTarget = async (deps: FlowDeps, input: LaunchInput, start: ToodoStart): Promise<{ readonly target?: TargetPane; readonly notes: readonly string[] }> => {
+  const attempts = [
+    ...start.shellPanes.slice(0, 1).map((pane) => ({ pane, workspace: undefined })),
+    ...(start.herdrWorkspaceId ? [{ pane: undefined, workspace: start.herdrWorkspaceId }] : []),
+  ];
+  const failed: string[] = start.shellPanes.length ? [] : [`start_task listed no shell pane (${start.paneError ?? "panes is empty"})`];
+  for (const at of attempts) {
+    try {
+      const target = await resolveTargetPane(deps, { ...input, ...at });
+      return { target, notes: failed.length ? [`LAUNCH_PANE_REFOUND ${input.key} pane=${target.pane}: ${failed.join("; ")}`] : [] };
+    } catch (error) {
+      if (!(error instanceof LaunchError)) throw error;
+      failed.push(error.message);
+    }
+  }
+  return { notes: [`LAUNCH_FALLBACK ${input.key} new tab: ${failed.join("; ")}`] };
+};
+
 const CMD_REFUSED = (pane: string) => `pane ${pane} runs cmd.exe; start pwsh or powershell in it (or a POSIX shell) and launch again`;
 
 /** A freshly created remote pane: its shell and directory, read leniently (an unreadable answer means POSIX, as before). */
@@ -360,12 +385,14 @@ export const STARTUP_POLL_MS = 2_000;
 export const STARTUP_POLLS = 10;
 export const STARTUP_READY_READS = 2;
 
-export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string }> => {
+export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string; readonly notes: readonly string[] }> => {
   const model = input.model ?? deps.config.defaultModel;
   const mode = input.mode ?? "ulw";
   if (!existing) await validateLaunch(deps, input);
   deps = { ...deps, run: laneRunner(deps.run, input) };
-  const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
+  const placed = input.toodo && !input.pane && !input.workspace ? await toodoTarget(deps, input, input.toodo) : undefined;
+  const target = placed ? placed.target : input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
+  const notes = placed?.notes ?? [];
   const dir = input.cwd ?? target?.cwd;
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
@@ -456,14 +483,14 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       if (status === "working") { ready++; } else {
         screen = await readScreen(deps.run, pane, 40);
         const bad = startupFailure(screen);
-        if (bad) return { lane, startup: `STARTUP_ERROR ${input.key} ${pane}: ${bad}` };
+        if (bad) return { lane, notes, startup: `STARTUP_ERROR ${input.key} ${pane}: ${bad}` };
         ready = status === "idle" ? ready + 1 : 0;
       }
-      if (ready >= STARTUP_READY_READS) return { lane, startup: `STARTUP_OK ${input.key} ${pane}` };
+      if (ready >= STARTUP_READY_READS) return { lane, notes, startup: `STARTUP_OK ${input.key} ${pane}` };
     }
     if (!screen) screen = await readScreen(deps.run, pane, 40);
     const why = error ? `status lookup failed: ${error}` : `no ready agent status (${status ?? "none"})`;
-    return { lane, startup: `STARTUP_UNCONFIRMED ${input.key} ${pane}: ${why}; last lines: ${lastLines(screen)}` };
+    return { lane, notes, startup: `STARTUP_UNCONFIRMED ${input.key} ${pane}: ${why}; last lines: ${lastLines(screen)}` };
   } catch (error) {
     if (token && !agentAdmitted) await deps.registry.releaseReservation(input.key, token);
     throw error;
