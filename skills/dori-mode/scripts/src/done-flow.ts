@@ -13,8 +13,6 @@ import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts"
 import { passthroughView, type SweepView } from "./sweep-view.ts";
 import { type Check, checkDone, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings } from "./branch-cleanup.ts";
-import { otherOpenLanesOnThread } from "./routing.ts";
-import type { Discord } from "./messenger/discord.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 
@@ -27,8 +25,6 @@ export type FlowDeps = {
   readonly signalIo?: SignalIo;
   /** The operation rows; absent opens the configured store per call. */
   readonly operations?: OperationStore;
-  /** Discord threads for the close's thread archive; absent (no DORI_DISCORD_TOKEN) skips the archive with a receipt line. */
-  readonly discord?: Pick<Discord, "setThread" | "threadArchived">;
   /**
    * The supervisor's answer to "has the lead received this journaled event" (a claim's window start). Absent (`dori watch`,
    * which hands its lines to stdout) an event counts as received once it is handed over.
@@ -301,26 +297,7 @@ const closeSequence = async (
       cleanup.push(r.line);
     }
   }
-  const sharing = otherOpenLanesOnThread(await deps.registry.open(), lane);
-  if (sharing.length) cleanup.push(`thread kept open: lane ${sharing.map((l) => l.key).join(", ")} still works in it`);
-  else if (lane.thread !== "none") {
-    // A post into an archived thread would reopen it, so nothing posts to the thread after this.
-    const thread = discordThreadId(lane.thread);
-    if (thread && !deps.discord) cleanup.push("thread archive skipped: DORI_DISCORD_TOKEN is not set");
-    else if (thread && deps.discord) {
-      const discord = deps.discord;
-      const archived: ReadBack = async () => ((await discord.threadArchived(thread)) ? "done" : "not-done");
-      const step = await act("thread-archive", thread, async () => {
-        try {
-          await discord.setThread(thread, { archived: true });
-          // The effect only counts once Discord reports it archived.
-          return (await discord.threadArchived(thread)) ? { code: 0, out: "", err: "" } : { code: 1, out: "", err: "read back archived: false" };
-        } catch (e) { return { code: 1, out: "", err: e instanceof Error ? e.message : String(e) }; }
-      }, archived);
-      // An unreadable archive state is ambiguous in the ledger but does not stop the close: the thread is only cosmetic.
-      cleanup.push(step.state === "verified" ? `thread ${thread} archived` : `thread ${thread} not archived: ${step.err.slice(0, 160)}`);
-    }
-  }
+  // The lane's thread stays open: only the owner closes it, with the button on the lead's report.
   if (lane.tab) {
     const tab = lane.tab;
     const step = await act("tab-close", tab, () => deps.run(["herdr", "tab", "close", tab]), paneGone(deps, (p) => p.tab_id === tab));
@@ -399,12 +376,6 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
     return objectDone(deps, (await deps.registry.read(lane.key)) ?? verified, signals.length ? signals : result.lines.filter((l) => l.startsWith("REFUSED")));
   }
   return closedEvent(lane.key, `Done: ${evidence}`, result.lines);
-};
-
-/** The thread id of a `discord:<channel>/<thread>` ref; a lane working in a channel itself (no thread) has none. */
-const discordThreadId = (ref: string): string | undefined => {
-  const [, thread] = /^discord:[^/]+\/(\d+)$/.exec(ref) ?? [];
-  return thread;
 };
 
 const remoteWorktreeNote = (lane: Lane): string =>

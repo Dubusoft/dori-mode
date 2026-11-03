@@ -335,7 +335,7 @@ export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
 /** Keys of the removed Toodo integration (the Toodo Lead chat channel and its Discord mirror); one warning. */
 export const REMOVED_TOODO_KEYS = ["toodo"] as const;
 
-/** Keys of the removed `hooks` entry that marked a messenger thread done on close (the Discord thread is archived instead); one warning. */
+/** Keys of the removed `hooks` entry that marked a messenger thread done on close (a close leaves the thread open); one warning. */
 export const REMOVED_HOOK_KEYS = ["threadDone"] as const;
 
 export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
@@ -467,7 +467,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const oldHooks = REMOVED_HOOK_KEYS.filter((key) => key in rawHooks);
   if (oldHooks.length && !warnedRemovedHookKeys) {
     warnedRemovedHookKeys = true;
-    console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is archived on Discord, no hook marks it done; the keys are ignored and can be deleted`);
+    console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is left open for the owner to close, no hook marks it done; the keys are ignored and can be deleted`);
   }
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => !(REMOVED_HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
   const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...hooks }, delivery };
