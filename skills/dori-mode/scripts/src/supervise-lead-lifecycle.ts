@@ -11,8 +11,6 @@ import { quoteForPane } from "./launch.ts";
 import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
-import { statusOf } from "./registry.ts";
-import { Waits } from "./waits.ts";
 import { completeLeadRestart } from "./lead-restart.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
@@ -456,8 +454,9 @@ export class LeadLifecycle {
     if (idleMs < config.cacheTtlMin * 60_000) return undefined;
     const stale = `idle ${Math.floor(idleMs / 60_000)} min (past cacheTtlMin ${config.cacheTtlMin})`;
     if (tokens >= config.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `${stale} with context ${tokens} tokens at or above leadContextCapTokens ${config.leadContextCapTokens}` };
-    if (new Waits(config.stateDir).list().length > 0 || (await this.deps.registry.open()).some((lane) => statusOf(lane) === "working")) return undefined;
-    return { kind: "stale", tokens, detail: `${stale} with no pending waits or working lanes` };
+    // Pending waits and working lanes do not keep a stale lead: their events stay in the log past the take cursor, and
+    // the fresh lead is reminded of open decisions and unreported lane outcomes until it settles them.
+    return { kind: "stale", tokens, detail: stale };
   }
 
   /** What the lead's own session still waits on; undefined when nothing, or when its session cannot be resolved (logged). */

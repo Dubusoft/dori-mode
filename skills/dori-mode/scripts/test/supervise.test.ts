@@ -316,18 +316,19 @@ test("at the TTL boundary cold delivery starts a fresh session in the same pane 
   expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
 });
 
-test("a stale lead with a pending durable wait delivers warm", async () => {
+test("a stale lead with a pending durable wait is cold-started and the wait survives for the fresh lead", async () => {
   const f = fixture();
   new Waits(f.state.dir).register({ key: "release", until: "file absent", note: "tell owner", cwd: f.state.dir }, f.clock.now());
   f.cold();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("wait-active", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run" || call[0] === "kill")).toEqual([]);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(f.log().map((event) => event.id)).toEqual(["wait-active"]);
+  expect(new Waits(f.state.dir).list()).toHaveLength(1);
 });
 
-test("a stale lead with a working registry lane delivers warm", async () => {
+test("a stale lead with a working registry lane is cold-started and the lane keeps working", async () => {
   const f = fixture();
   await f.deps.registry.write({
     key: "working", title: "Working lane", thread: "discord:1/2", brief: "/brief",
@@ -337,13 +338,14 @@ test("a stale lead with a working registry lane delivers warm", async () => {
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("lane-active", "INBOUND owner");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run" || call[0] === "kill")).toEqual([]);
+  expect(restartStarts(f)).toHaveLength(1);
   expect(f.log().map((event) => event.id)).toEqual(["lane-active"]);
+  expect((await f.deps.registry.read("working"))?.status).toBe("working");
 });
 
 test.each([
-  [149_999, false], [150_000, true], [150_001, true],
-] as const)("stale usage %s restarts=%s despite waits and working lanes", async (tokens, restart) => {
+  [149_999, "stale"], [150_000, "context-cap"], [150_001, "context-cap"],
+] as const)("stale usage %s restarts as %s despite waits and working lanes", async (tokens, kind) => {
   const f = fixture();
   new Waits(f.state.dir).register({ key: "release", until: "file absent", note: "tell owner", cwd: f.state.dir }, f.clock.now());
   await f.deps.registry.write({
@@ -357,10 +359,13 @@ test.each([
   ].join("\n") + "\n");
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   f.cold();
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("cap", "INBOUND owner");
-  await supervisor.flush();
-  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
+  const lines = await quiet(async () => {
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("cap", "INBOUND owner");
+    await supervisor.flush();
+  });
+  expect(restartStarts(f)).toHaveLength(1);
+  expect(lines.some((line) => line.startsWith(`LEAD_RESTART_TRIGGER ${kind} `))).toBe(true);
   expect(f.log().map((event) => event.id)).toEqual(["cap"]);
   expect(new Waits(f.state.dir).list()).toHaveLength(1);
 });
@@ -484,7 +489,7 @@ test.each([true, false])("a stale idle lead with a running child=%s takes the ev
   expect(restartStarts(f)).toHaveLength(child ? 0 : 1);
   expect(f.log().map((event) => event.id)).toEqual(["stale"]);
   expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED stale idle 5 min"))).toBe(child);
-  expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER stale idle 5 min (past cacheTtlMin 5) with no pending waits or working lanes"))).toBe(!child);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER stale idle 5 min (past cacheTtlMin 5)"))).toBe(!child);
 });
 
 test("a lead at the hard cap waiting on its own child is not restarted until the child is done", async () => {
@@ -515,15 +520,20 @@ test.each([
   '{"message":{"usage":null}}\n',
   '{"message":{"usage":{"totalTokens":-1}}}\n',
 ])("unreadable usage is under-cap for a stale lead with a wait: %s", async (text) => {
+  // Under-cap: the stale restart is named stale, never context-cap.
   const f = fixture();
   new Waits(f.state.dir).register({ key: "release", until: "file absent", note: "tell owner", cwd: f.state.dir }, f.clock.now());
   writeFileSync(f.file, text);
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   f.cold();
-  const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("unreadable", "INBOUND owner");
-  await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run" || call[0] === "kill")).toEqual([]);
+  const lines = await quiet(async () => {
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("unreadable", "INBOUND owner");
+    await supervisor.flush();
+  });
+  expect(restartStarts(f)).toHaveLength(1);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER stale "))).toBe(true);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_TRIGGER context-cap "))).toBe(false);
 });
 
 test.each(["paused", "done-claimed", "not-done", "closed"] as const)("a %s lane does not retain a stale lead", async (status) => {
