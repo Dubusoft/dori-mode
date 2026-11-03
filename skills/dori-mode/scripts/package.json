@@ -11,7 +11,7 @@
   "engines": { "bun": ">=1.3.0" },
   "dependencies": {
     "@code-yeongyu/senpi": "2026.10.18-1",
-    "pi-quota": "git+https://github.com/dev-bokdong/pi-quota.git#9555126b9b9c5313a17c19596d7ea5f2a8a960e4"
+    "pi-quota": "git+https://github.com/dev-bokdong/pi-quota.git#83c96e4597373ee2dbad3acde1b0d41cb88d19a9"
   },
   "devDependencies": {
     "@types/bun": "^1.3.0",
