@@ -41,10 +41,29 @@ test("Discord messages are sent without pinging anyone and edited in place; thre
   const dc = new Discord(http, sleeps().clock, "b");
   expect(await dc.send("C1", "hello @everyone")).toBe("M1");
   await dc.edit("C1", "M1", "hello again");
-  expect(await dc.startThread("C1", "M1", "[working] fix login")).toBe("T1");
+  expect(await dc.startThread("C1", "M1", "[working] fix login")).toEqual({ id: "T1", member: "skipped" });
   await dc.setThread("T1", { name: "[done] fix login", archived: true });
   expect(JSON.parse(String(seen[0]?.body)).allowed_mentions).toEqual({ parse: [] });
   expect(seen.map((r) => `${r.method} ${r.url.replace("https://discord.com/api/v10", "")}`)).toEqual(["POST /channels/C1/messages", "PATCH /channels/C1/messages/M1", "POST /channels/C1/messages/M1/threads", "PATCH /channels/T1"]);
+});
+
+test("startThread adds the owner, reports an owner Discord already joined, and returns a failed add instead of hiding it", async () => {
+  const run = async (member: number, put: number) => {
+    const { http, seen } = fakeHttp((req) => req.url.endsWith("/threads") ? ok({ id: "T1" }, 201)
+      : req.method === "GET" ? ok(member === 200 ? { user_id: "42" } : { code: 10007 }, member)
+      : ok(put === 204 ? "" : { message: "Missing Access" }, put));
+    const result = await new Discord(http, sleeps().clock, "b").startThread("C1", "M1", "t", "42");
+    return { result, calls: seen.map((r) => `${r.method} ${r.url.replace("https://discord.com/api/v10", "")}`) };
+  };
+  const added = await run(404, 204);
+  expect(added.result).toEqual({ id: "T1", member: "added" });
+  expect(added.calls).toEqual(["POST /channels/C1/messages/M1/threads", "GET /channels/T1/thread-members/42", "PUT /channels/T1/thread-members/42"]);
+  const already = await run(200, 204);
+  expect(already.result).toEqual({ id: "T1", member: "already" });
+  expect(already.calls).not.toContain("PUT /channels/T1/thread-members/42");
+  const failed = await run(404, 403);
+  expect(failed.result.id).toBe("T1");
+  expect(failed.result.member).toEqual({ failed: expect.stringContaining("403") });
 });
 
 test("a voice note becomes text through the configured hook, and a failing or empty transcription is an error", async () => {
