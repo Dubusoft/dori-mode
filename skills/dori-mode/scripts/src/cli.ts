@@ -808,15 +808,21 @@ try {
     }
     case "thread": {
       // `dori thread discord --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
-      // add discord.ownerId as a member; a failed add is logged and the thread ref is printed either way.
+      // make discord.ownerId a member. The thread ref is printed either way; a failed add prints THREAD_OWNER_FAILED and exits 1.
       if (key !== "discord" || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
         die("usage: dori thread discord --to CHANNEL [--message ID] --name NAME");
       }
       const { to } = resolveTarget("discord", need("to"));
       const owner = config.discord?.ownerId;
       if (!discordOwnerConfigured(owner)) console.error("THREAD_OWNER_SKIPPED discord.ownerId is not configured; the thread is created without adding the owner");
-      const thread = await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).startThread(to, opt("message"), need("name"), discordOwnerConfigured(owner) ? owner : undefined);
-      console.log(`THREAD discord:${to}/${thread}`);
+      const { id, member } = await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).startThread(to, opt("message"), need("name"), discordOwnerConfigured(owner) ? owner : undefined);
+      console.log(`THREAD discord:${to}/${id}`);
+      if (member === "added") console.log(`THREAD_OWNER_ADDED ${id}`);
+      else if (member === "already") console.log(`THREAD_OWNER_ALREADY_MEMBER ${id}: Discord joined the owner as the thread started (the starter message mentions them), so no "added" line shows`);
+      else if (member !== "skipped") {
+        console.log(`THREAD_OWNER_FAILED ${id} ${owner}: ${member.failed}`);
+        process.exitCode = 1;
+      }
       break;
     }
     case "typing": {
