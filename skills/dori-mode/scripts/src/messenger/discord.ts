@@ -59,6 +59,9 @@ export const splitDiscordMessage = (text: string, limit = DISCORD_MESSAGE_LIMIT)
   }
 };
 
+/** How `Discord.startThread` left the owner: joined by the add, already a member, not configured, or the add's error. */
+export type ThreadMember = "added" | "already" | "skipped" | { readonly failed: string };
+
 export class Discord {
   constructor(
     private readonly http: Http,
@@ -126,20 +129,36 @@ export class Discord {
   }
 
   /**
-   * Starts a thread on `messageId`, or a standalone public thread in `channelId` when it is undefined, then adds `memberId`
-   * (the owner) as a thread member so the thread shows up in their list without a mention. A failed member add is
-   * logged and never fails the thread: the thread id is returned either way. A non-numeric or absent id skips the add.
+   * Starts a thread on `messageId`, or a standalone public thread in `channelId` when it is undefined, then makes `memberId`
+   * (the owner) a thread member so the thread shows up in their list. When the starter message mentions them, Discord has
+   * already joined them as the thread starts: that reads back as "already", and Discord shows no "added" line for it.
+   * A failed add never fails the thread; it comes back as `failed` for the caller to surface. A non-numeric or absent id
+   * is "skipped".
    */
-  async startThread(channelId: string, messageId: string | undefined, name: string, memberId?: string, log: (line: string) => void = console.error): Promise<string> {
+  async startThread(channelId: string, messageId: string | undefined, name: string, memberId?: string): Promise<{ readonly id: string; readonly member: ThreadMember }> {
     const title = guardText(name).slice(0, 100);
     const id = (messageId
       ? await this.call<{ id: string }>("POST", `/channels/${channelId}/messages/${messageId}/threads`, { name: title })
       : await this.call<{ id: string }>("POST", `/channels/${channelId}/threads`, { name: title, type: 11 })).id;
-    if (memberId !== undefined && /^\d+$/.test(memberId)) {
-      try { await this.addThreadMember(id, memberId); }
-      catch (e) { log(`DISCORD_THREAD_MEMBER_FAILED ${id} ${memberId}: ${e instanceof Error ? e.message : String(e)}`); }
+    if (memberId === undefined || !/^\d+$/.test(memberId)) return { id, member: "skipped" };
+    try {
+      if (await this.isThreadMember(id, memberId)) return { id, member: "already" };
+      await this.addThreadMember(id, memberId);
+      return { id, member: "added" };
+    } catch (e) {
+      return { id, member: { failed: e instanceof Error ? e.message : String(e) } };
     }
-    return id;
+  }
+
+  /** Whether `userId` is a member of thread `threadId`: Discord's 404 (unknown member) is false, any other error throws. */
+  async isThreadMember(threadId: string, userId: string): Promise<boolean> {
+    try {
+      await this.call("GET", `/channels/${threadId}/thread-members/${userId}`);
+      return true;
+    } catch (e) {
+      if (e instanceof MessengerError && e.status === 404) return false;
+      throw e;
+    }
   }
 
   async addThreadMember(threadId: string, userId: string): Promise<void> {
