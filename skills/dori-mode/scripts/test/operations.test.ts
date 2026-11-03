@@ -3,8 +3,6 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { closeLane } from "../src/done-flow.ts";
-import { Discord } from "../src/messenger/discord.ts";
-import type { Http } from "../src/messenger/http.ts";
 import { type Observed, openOperations, type OperationStore, OPERATIONS_FILE, perform } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
@@ -140,75 +138,3 @@ test("a close records its effects and a second close of the same lane repeats no
   expect(effects()).toBe(2);
 });
 
-/** A fake Discord API behind the real client: threads by id with their archived flag; every request is recorded. */
-const fakeDiscord = (threads: Record<string, boolean>) => {
-  const calls: string[] = [];
-  const http: Http = async (req) => {
-    const id = req.url.split("/channels/")[1] ?? "";
-    calls.push(`${req.method} ${id}${req.body ? ` ${req.body}` : ""}`);
-    if (!(id in threads)) return { status: 404, headers: {}, body: JSON.stringify({ message: "Unknown Channel" }) };
-    if (req.method === "PATCH") threads[id] = (JSON.parse(String(req.body)) as { archived: boolean }).archived;
-    return { status: 200, headers: {}, body: JSON.stringify({ id, type: 11, thread_metadata: { archived: threads[id], locked: false } }) };
-  };
-  return { calls, discord: new Discord(http, fakeClock(T0), "bot") };
-};
-
-/** A closed lane's cleanup lines, from its registry receipt (the CLOSED line no longer carries the receipt). */
-const cleanupOf = async (deps: { readonly registry: { read(key: string): Promise<Lane | null> } }, key: string): Promise<string[]> =>
-  ((await deps.registry.read(key))?.receipt as { cleanup: string[] }).cleanup;
-
-const threadLane = (key: string): Lane => ({ key, title: key, thread: "discord:111/222", brief: "/b.md", done: "merged acme/app#1", cwd: "/repo", openedAt: new Date(T0).toISOString() });
-
-test("a close archives the lane's thread, reads it back archived and never archives it twice", async () => {
-  const { calls, discord } = fakeDiscord({ "222": false });
-  const deps = { ...depsFor(newWorld(), fakeClock(T0), state.dir, {}), discord };
-  const lane = threadLane("lane-a");
-  await deps.registry.write(lane);
-  const first = await closeLane(deps, lane, "manual");
-  expect(first.closed).toBe(true);
-  expect(await cleanupOf(deps, "lane-a")).toContain("thread 222 archived");
-  expect(calls).toEqual(["GET 222", "PATCH 222 {\"archived\":true}", "GET 222", "GET 222"]);
-  expect(store.get("lane-a/thread-archive/222")?.state).toBe("verified");
-  await closeLane(deps, lane, "manual");
-  expect(calls.filter((c) => c.startsWith("PATCH"))).toHaveLength(1);
-});
-
-test("a shared thread stays open until its last lane closes, and a lane in a plain channel makes no Discord call", async () => {
-  const { calls, discord } = fakeDiscord({ "222": false });
-  const deps = { ...depsFor(newWorld(), fakeClock(T0), state.dir, {}), discord };
-  await deps.registry.write(threadLane("lane-a"));
-  await deps.registry.write(threadLane("lane-b"));
-  const first = await closeLane(deps, threadLane("lane-a"), "manual");
-  expect(await cleanupOf(deps, "lane-a")).toContain("thread kept open: lane lane-b still works in it");
-  expect(calls).toEqual([]);
-  const last = await closeLane(deps, threadLane("lane-b"), "manual");
-  expect(await cleanupOf(deps, "lane-b")).toContain("thread 222 archived");
-
-  const off = fakeDiscord({ "333": false });
-  const plain = { ...depsFor(newWorld(), fakeClock(T0), state.dir), discord: off.discord };
-  // A lane working in the channel itself (no thread id) has no thread to archive.
-  const lane = { ...threadLane("lane-c"), thread: "discord:333" };
-  await plain.registry.write(lane);
-  expect((await closeLane(plain, lane, "manual")).closed).toBe(true);
-  expect(off.calls).toEqual([]);
-});
-
-test("an archive interrupted after its attempt is reconciled by read-back, and a refused archive does not stop the close", async () => {
-  const { calls, discord } = fakeDiscord({ "222": true });
-  const deps = { ...depsFor(newWorld(), fakeClock(T0), state.dir, {}), discord };
-  const lane = threadLane("lane-a");
-  await deps.registry.write(lane);
-  store.put({ id: "lane-a/thread-archive/222", lane: "lane-a", action: "thread-archive", target: "222", state: "attempted", detail: "attempted", attempts: 1, at: T0, updatedAt: T0 });
-  expect((await closeLane(deps, lane, "manual")).closed).toBe(true);
-  expect(store.get("lane-a/thread-archive/222")).toMatchObject({ state: "verified", attempts: 1 });
-  expect(calls.filter((c) => c.startsWith("PATCH"))).toEqual([]);
-
-  // Unknown thread (404): the read-back cannot tell, so the row is ambiguous (not retried, not verified) and the close goes on.
-  const gone = fakeDiscord({});
-  const other = { ...threadLane("lane-d"), thread: "discord:111/444" };
-  await deps.registry.write(other);
-  const result = await closeLane({ ...deps, discord: gone.discord }, other, "manual");
-  expect(result.closed).toBe(true);
-  expect((await cleanupOf(deps, "lane-d")).some((l) => l.startsWith("thread 444 not archived"))).toBe(true);
-  expect(store.get("lane-d/thread-archive/444")?.state).toBe("ambiguous");
-});

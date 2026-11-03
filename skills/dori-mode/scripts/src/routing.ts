@@ -216,9 +216,5 @@ export const launchGate = (o: { readonly sample: HostSample; readonly guard: Gua
   return { lines };
 };
 
-/** Other open lanes on this lane's messenger thread: while any remain, closing this lane must not mark the thread done. */
-export const otherOpenLanesOnThread = (lanes: readonly Lane[], lane: Pick<Lane, "key" | "thread">): Lane[] =>
-  lane.thread === "none" ? [] : lanes.filter((l) => l.key !== lane.key && l.thread === lane.thread && statusOf(l) !== "closed");
-
 export const idleLaneFor = (lanes: readonly Lane[], cwd: string, idlePanes: ReadonlySet<string>): Lane | null =>
   lanes.find((l) => statusOf(l) === "working" && l.cwd === cwd && l.pane !== undefined && idlePanes.has(l.pane)) ?? null;

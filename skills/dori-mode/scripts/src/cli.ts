@@ -156,8 +156,7 @@ if (process.argv[2] === "status") {
 
 const config = await loadConfig();
 setDefaultRunTimeout(config.runTimeoutMs);
-const archiveToken = resolveCredential("DORI_DISCORD_TOKEN");
-const deps: FlowDeps = { run, clock: realClock, registry: new Registry(config.stateDir), config, ...(archiveToken ? { discord: new Discord(fetchHttp, realClock, archiveToken) } : {}) };
+const deps: FlowDeps = { run, clock: realClock, registry: new Registry(config.stateDir), config };
 const [command = "", ...rest] = process.argv.slice(2);
 
 const flags = parseArgs({

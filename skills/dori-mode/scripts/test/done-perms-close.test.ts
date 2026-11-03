@@ -97,20 +97,18 @@ test("a failed worktree removal refuses the close and keeps the pane, the thread
   expect(closes()).toEqual([["herdr", "pane", "close", "w:p1"]]);
 });
 
-// Item 3: a shared thread is archived only by the last open lane in it.
-test("closing a lane keeps its thread open while another open lane works in it, and archives it once none does", async () => {
+// Item 3: a close never touches the lane's thread, shared or not; the owner closes it.
+test("closing a lane leaves its thread alone, whether another open lane shares it or not", async () => {
   await at(T0).registry.write({ ...lane, key: "sibling-lane", pane: "w:p2", cwd: "/repo2" });
   const first = await closeLane(at(T0), lane, "Done: first");
   expect(first.closed).toBe(true);
   const firstCleanup = ((await at(T0).registry.read("demo-lane"))?.receipt as { cleanup: string[] }).cleanup;
-  expect(firstCleanup).toContain("thread kept open: lane sibling-lane still works in it");
-  expect(firstCleanup).not.toContain("thread archive skipped: DORI_DISCORD_TOKEN is not set");
+  expect(firstCleanup.filter((line) => line.startsWith("thread"))).toEqual([]);
   const sibling = (await at(T0).registry.read("sibling-lane")) ?? lane;
   const second = await closeLane(at(T0), sibling, "Done: second");
   expect(second.closed).toBe(true);
   const secondCleanup = ((await at(T0).registry.read("sibling-lane"))?.receipt as { cleanup: string[] }).cleanup;
-  expect(secondCleanup).toContain("thread archive skipped: DORI_DISCORD_TOKEN is not set");
-  expect(secondCleanup.some((line) => line.startsWith("thread kept open"))).toBe(false);
+  expect(secondCleanup.filter((line) => line.startsWith("thread"))).toEqual([]);
 });
 
 // Item 4: lane identity and permissions.
