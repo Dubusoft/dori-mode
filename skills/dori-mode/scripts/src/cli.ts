@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -19,6 +20,7 @@ import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./regi
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { syncRegistry } from "./sync.ts";
+import { readToodoStart } from "./toodo-start.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
@@ -57,6 +59,8 @@ const USAGE = `dori <command> [options]
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
+                [--toodo-start FILE-OR-JSON]   a Toodo task the lead started: run in the worktree and first shell pane of its start_task response
+                                       (no pane, or a stale one not found again in its herdr workspace: a new tab there, LAUNCH_FALLBACK <reason>)
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
@@ -165,7 +169,7 @@ const flags = parseArgs({
   strict: false,
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
+    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, "toodo-start": { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
@@ -438,12 +442,16 @@ try {
     case "launch": {
       const mode = opt("mode");
       if (mode !== undefined && !(LANE_MODES as readonly string[]).includes(mode)) die(`--mode must be one of ${LANE_MODES.join(", ")}`);
-      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
+      const toodoArg = opt("toodo-start");
+      if (toodoArg !== undefined && (opt("cwd") || opt("pane") || opt("workspace"))) die("--toodo-start takes the directory and pane from the start_task response; drop --cwd, --pane and --workspace");
+      const toodo = toodoArg === undefined ? undefined : await readToodoStart(toodoArg).catch((error: unknown) => die(error instanceof Error ? error.message : String(error)));
+      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
       await validateLaunch(deps, input);
       const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
       const machine = target === LOCAL_MACHINE ? undefined : target;
+      if (!machine && toodo?.worktreePath && !existsSync(toodo.worktreePath)) die(`start_task's worktree ${toodo.worktreePath} is not on this host; for a task on a remote workspace pass --machine <its herdr machine>`);
       if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
       if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
@@ -459,6 +467,7 @@ try {
       }
       const r = await launchLane(deps, { ...input, machine });
       dequeueLaunch(config.stateDir, input.key);
+      for (const note of r.notes) console.log(note);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
       process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
