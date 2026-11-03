@@ -27,6 +27,34 @@ type Interaction = {
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
+/** The close-thread button's custom_id carries the thread id, so a click works after a restart with no stored state. */
+const CLOSE_THREAD = /^dori:close-thread:(\d+)$/;
+const closeRow = (threadId: string, closed: boolean) => [{
+  type: 1,
+  components: [{ type: 2, style: 2, label: closed ? "닫았습니다" : "스레드 닫기", custom_id: `dori:close-thread:${threadId}`, ...(closed ? { disabled: true } : {}) }],
+}];
+/** The action row `dori reported` attaches to a lane's finish report in its thread. */
+export const closeThreadButton = (threadId: string): unknown[] => closeRow(threadId, false);
+/** Called after the owner's click archived `threadId`; `interactionId` is unique per click. */
+export type ThreadClosed = (threadId: string, interactionId: string) => Promise<void>;
+
+type CloseInteraction = {
+  readonly id: string;
+  readonly token: string;
+  readonly application_id: string;
+  readonly guild_id: string;
+  readonly userId: string;
+  readonly threadId: string;
+};
+
+const closeInteraction = (value: unknown): CloseInteraction | undefined => {
+  if (!record(value) || value.type !== 3 || !record(value.data) || value.data.component_type !== 2 || typeof value.data.custom_id !== "string") return;
+  const threadId = CLOSE_THREAD.exec(value.data.custom_id)?.[1];
+  if (!threadId || typeof value.id !== "string" || typeof value.token !== "string" || typeof value.application_id !== "string" || typeof value.guild_id !== "string") return;
+  if (!record(value.member) || !record(value.member.user) || typeof value.member.user.id !== "string") return;
+  return { id: value.id, token: value.token, application_id: value.application_id, guild_id: value.guild_id, userId: value.member.user.id, threadId };
+};
+
 const commandInteraction = (value: unknown): Interaction | undefined => {
   if (!record(value) || value.type !== 2 || !record(value.data) || value.data.type !== 1) return;
   const command = value.data.name;
@@ -59,6 +87,8 @@ export class DiscordCommands {
     private readonly channels: readonly string[] = [],
     /** The /status text source; without it /status is ignored. */
     private readonly statusLookup?: StatusLookup,
+    /** Told about each thread the owner's close button archived; without it the close is only logged. */
+    private readonly threadClosed?: ThreadClosed,
   ) {}
 
   private async request(method: "PUT" | "POST" | "PATCH", path: string, body: unknown, authenticated = false): Promise<void> {
@@ -78,7 +108,38 @@ export class DiscordCommands {
     await this.request("PUT", `/applications/${applicationId}/guilds/${guildId}/commands`, guildCommands, true);
   }
 
+  /**
+   * A close-thread button click, handled in code: a non-owner gets an ephemeral refusal; the owner's click is answered
+   * at once by updating the message (button disabled), then the thread is archived and `threadClosed` is told. A failed
+   * archive re-enables the button so the owner can retry.
+   */
+  private async closeThread(interaction: CloseInteraction): Promise<void> {
+    if (interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId) return;
+    const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
+    try {
+      if (interaction.userId !== this.config.ownerId) {
+        await this.request("POST", callback, { type: 4, data: { flags: 64, content: "스레드 닫기는 오너만 할 수 있습니다." } });
+        return;
+      }
+      await this.request("POST", callback, { type: 7, data: { components: closeRow(interaction.threadId, true) } });
+    } catch {
+      console.error("Discord close-thread acknowledgement failed");
+      return;
+    }
+    try {
+      await this.request("PATCH", `/channels/${interaction.threadId}`, { archived: true }, true);
+    } catch {
+      console.error(`Discord close-thread archive failed ${interaction.threadId}`);
+      await this.request("PATCH", `/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`, { components: closeRow(interaction.threadId, false) })
+        .catch(() => { console.error("Discord close-thread button restore failed"); });
+      return;
+    }
+    await this.threadClosed?.(interaction.threadId, interaction.id).catch(() => { console.error(`Discord close-thread event failed ${interaction.threadId}`); });
+  }
+
   async handle(value: unknown): Promise<void> {
+    const close = closeInteraction(value);
+    if (close) return this.closeThread(close);
     const interaction = commandInteraction(value);
     if (!interaction || interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId) return;
     if (interaction.command === "status" && !this.statusLookup) return;

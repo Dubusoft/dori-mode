@@ -7,7 +7,7 @@ import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src
 import type { Lane } from "../src/registry.ts";
 import {
   clearLaunchHold, dequeueLaunch, enqueueLaunch, launchGate, launchHeld, launchQueue, launchQueueText,
-  otherOpenLanesOnThread, type QueuedLaunch, recordLaunchVerdict,
+  type QueuedLaunch, recordLaunchVerdict,
 } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
@@ -211,14 +211,6 @@ test("a registration failure after agent admission keeps its paused reservation 
     await expect(launchLane(d, input("visible-lane", { cwd: "/scratch" }))).rejects.toThrow("registration disk error");
     expect(await d.registry.read("visible-lane")).toMatchObject({ status: "paused", pane: expect.any(String), launchReservation: expect.any(String) });
   } finally { spy.mockRestore(); }
-});
-
-test("otherOpenLanesOnThread tells the done flow whether the thread still has an open lane", () => {
-  const lane = (key: string, thread: string, closed = false): Lane => ({ key, title: key, thread, brief: "", done: "", openedAt: "2026-01-01T00:00:00Z", ...(closed ? { closedAt: "2026-01-02T00:00:00Z" } : {}) });
-  const lanes = [lane("a", "t1"), lane("b", "t1"), lane("c", "t1", true), lane("d", "t2"), lane("e", "none"), lane("f", "none")];
-  expect(otherOpenLanesOnThread(lanes, lanes[0] as Lane).map((l) => l.key)).toEqual(["b"]);
-  expect(otherOpenLanesOnThread(lanes, lanes[3] as Lane)).toEqual([]);
-  expect(otherOpenLanesOnThread(lanes, lanes[4] as Lane)).toEqual([]);
 });
 
 // The CLI paths that need no host or network

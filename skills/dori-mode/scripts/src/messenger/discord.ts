@@ -79,11 +79,14 @@ export class Discord {
    * Ordered chunks; returns the first id. Retries reuse nonces within Discord's few-minute dedupe window.
    * Without a stable id, identical content in the same channel is treated as a retry; use distinct ids for repeats.
    */
-  async send(channelId: string, content: string, stableId?: string): Promise<string> {
+  async send(channelId: string, content: string, stableId?: string, components?: readonly unknown[]): Promise<string> {
     let first: string | undefined;
-    for (const [index, chunk] of splitDiscordMessage(guardText(content)).entries()) {
+    const chunks = splitDiscordMessage(guardText(content));
+    for (const [index, chunk] of chunks.entries()) {
       const nonce = createHash("sha256").update(JSON.stringify([channelId, stableId ?? content, index])).digest("hex").slice(0, 25);
-      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true })).id;
+      // Components (buttons) ride on the last chunk, under the whole text.
+      const extra = components && index === chunks.length - 1 ? { components } : {};
+      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true, ...extra })).id;
       first ??= id;
     }
     return first ?? "";
@@ -122,8 +125,25 @@ export class Discord {
     await this.call("POST", `/channels/${channelId}/typing`);
   }
 
-  async startThread(channelId: string, messageId: string, name: string): Promise<string> {
-    return (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages/${messageId}/threads`, { name: guardText(name).slice(0, 100) })).id;
+  /**
+   * Starts a thread on `messageId`, or a standalone public thread in `channelId` when it is undefined, then adds `memberId`
+   * (the owner) as a thread member so the thread shows up in their list without a mention. A failed member add is
+   * logged and never fails the thread: the thread id is returned either way. A non-numeric or absent id skips the add.
+   */
+  async startThread(channelId: string, messageId: string | undefined, name: string, memberId?: string, log: (line: string) => void = console.error): Promise<string> {
+    const title = guardText(name).slice(0, 100);
+    const id = (messageId
+      ? await this.call<{ id: string }>("POST", `/channels/${channelId}/messages/${messageId}/threads`, { name: title })
+      : await this.call<{ id: string }>("POST", `/channels/${channelId}/threads`, { name: title, type: 11 })).id;
+    if (memberId !== undefined && /^\d+$/.test(memberId)) {
+      try { await this.addThreadMember(id, memberId); }
+      catch (e) { log(`DISCORD_THREAD_MEMBER_FAILED ${id} ${memberId}: ${e instanceof Error ? e.message : String(e)}`); }
+    }
+    return id;
+  }
+
+  async addThreadMember(threadId: string, userId: string): Promise<void> {
+    await this.call("PUT", `/channels/${threadId}/thread-members/${userId}`);
   }
 
   async setThread(threadId: string, patch: { readonly name?: string; readonly archived?: boolean }): Promise<void> {
