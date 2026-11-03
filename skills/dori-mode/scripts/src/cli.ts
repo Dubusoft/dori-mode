@@ -25,6 +25,7 @@ import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
 import { DiscordCommands } from "./messenger/discord-commands.ts";
+import { discordOwnerConfigured } from "./messenger/discord-inbound.ts";
 import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
@@ -121,6 +122,9 @@ const USAGE = `dori <command> [options]
                                        link what handled an owner message
   send discord --to TARGET --text TEXT [--thread ID] [--edit ID]
                                        post or edit a Discord message (token from DORI_DISCORD_TOKEN)
+  thread discord --to CHANNEL [--message ID] --name NAME
+                                       start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
+                                       prints THREAD discord:<channel>/<thread>
   typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
   presence discord                     keep the bot shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text`;
@@ -164,7 +168,7 @@ const flags = parseArgs({
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
     model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
-    to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
+    to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
     list: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
@@ -197,7 +201,7 @@ const ownKey = async (command: string, k: string | undefined): Promise<string | 
 };
 
 /** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule", "send"]);
+const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule", "send", "thread"]);
 if (LEAD_ONLY.has(command)) {
   const caller = await callerLane(deps);
   if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
@@ -799,6 +803,19 @@ try {
         const sent = await postMessage(to, text);
         console.log(`SENT ${sent}`);
       } else await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);
+      break;
+    }
+    case "thread": {
+      // `dori thread discord --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
+      // add discord.ownerId as a member; a failed add is logged and the thread ref is printed either way.
+      if (key !== "discord" || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
+        die("usage: dori thread discord --to CHANNEL [--message ID] --name NAME");
+      }
+      const { to } = resolveTarget("discord", need("to"));
+      const owner = config.discord?.ownerId;
+      if (!discordOwnerConfigured(owner)) console.error("THREAD_OWNER_SKIPPED discord.ownerId is not configured; the thread is created without adding the owner");
+      const thread = await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).startThread(to, opt("message"), need("name"), discordOwnerConfigured(owner) ? owner : undefined);
+      console.log(`THREAD discord:${to}/${thread}`);
       break;
     }
     case "typing": {
