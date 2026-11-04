@@ -522,6 +522,94 @@ test("receipts without a thread (written before this check) never post a button"
   f.supervisor.close();
 });
 
+test("a repeat report of a lane after its --final button does not post a second button", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha", { button: true });
+  await f.tick();
+  f.clock.at += MIN;
+  f.report("alpha");
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  expect(readCloseButtons(f.state.dir)).toEqual({ "200": T0 });
+  f.supervisor.close();
+});
+
+test("repeat reports of a lane into the same thread get one supervisor button", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha");
+  await f.tick();
+  for (let i = 0; i < 2; i++) {
+    f.clock.at += 1_000;
+    f.report("alpha");
+    await f.tick();
+  }
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0}` }]);
+  expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "alpha", thread: "200", lastReportAt: T0, reportedAt: T0 });
+  f.supervisor.close();
+});
+
+test("receipts are taken in time order, and a replayed receipt re-arms nothing", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  const posted = { message: "m", target: "discord:200", thread: "200" };
+  // Both pending in one pass, the later plain report written first.
+  recordReported(f.state.dir, "alpha", T0 + 1_000, undefined, posted);
+  recordReported(f.state.dir, "alpha", T0, undefined, { ...posted, button: true });
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  recordReported(f.state.dir, "alpha", T0 + 1_000, undefined, posted);
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lastReportAt: T0 });
+  f.supervisor.close();
+});
+
+test("the first explicit report after a machine lane closed itself gets the button", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("robot", { thread: "discord:100/200", autoClose: "machine", closedAt: new Date(T0).toISOString() }));
+  f.supervisor.enqueue("lane-closed:robot", "LANE_CLOSED robot x");
+  f.clock.at += 5 * MIN;
+  await f.tick();
+  expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "robot", note: "autoClose: machine" });
+  expect(f.posts).toEqual([]);
+  f.report("robot");
+  await f.tick();
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${f.clock.now()}` }]);
+  f.supervisor.close();
+});
+
+test("another lane reported into a thread after its --final button gets a button of its own", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha", { button: true });
+  await f.tick();
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.clock.at += 1_000;
+  f.report("beta");
+  await f.tick();
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0 + 1_000}` }]);
+  f.supervisor.close();
+});
+
+test("a repeat report while the lane is open keeps the button waiting for its close", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200" }));
+  f.report("alpha");
+  await f.tick();
+  f.clock.at += 1_000;
+  f.report("alpha");
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  f.clock.at += 1_000;
+  await f.close("alpha");
+  await f.tick();
+  await f.tick();
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0}` }]);
+  f.supervisor.close();
+});
+
 test("dori reported --final records its button and thread; one after the supervisor's button is withheld", async () => {
   const f = fixture();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
