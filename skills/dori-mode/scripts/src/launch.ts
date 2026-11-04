@@ -31,8 +31,8 @@ export type LaunchInput = {
   readonly shareThread?: boolean;
   /** Allow a cwd whose git remotes name none of the Done line's repos (`--allow-repo-mismatch`). */
   readonly allowRepoMismatch?: boolean;
-  /** Wrap the agent in `laneSandbox.command` (`--sandbox`/`--no-sandbox`); absent: the config's `laneSandbox.default` for a local lane. */
-  readonly sandbox?: boolean;
+  /** Wrap the agent in `laneSandbox.command` even where the sandbox would pass the lane through (`--sandbox`, or a relaunch of a lane recorded as sandboxed). */
+  readonly sandbox?: true;
 };
 
 /** A lane launched with --share-thread: the keys of the other open lanes on its thread at launch time. */
@@ -388,17 +388,18 @@ export const STARTUP_POLLS = 10;
 export const STARTUP_READY_READS = 2;
 
 /**
- * Whether this launch wraps its agent in laneSandbox.command. An explicit `--sandbox`/`--no-sandbox` (and a relaunch's recorded
- * choice) is taken as given; the config default passes a lane through, with the reason, where the sandbox does not fit.
+ * Whether this launch wraps its agent in laneSandbox.command. Every local lane is wrapped; there is no opt-out. `--sandbox` (and a
+ * relaunch's recorded choice) wraps it even where it would otherwise pass through, with the reason, because the sandbox does not fit.
+ * A config without laneSandbox (only an in-code config: loadConfig always fills it) wraps nothing.
  */
 export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, which: (cmd: string) => string | null): { readonly on: boolean; readonly skipped?: string } => {
-  if (input.sandbox !== undefined) return { on: input.sandbox };
+  if (input.sandbox) return { on: true };
   const configured = config.laneSandbox;
-  if (!configured?.default) return { on: false };
+  if (!configured) return { on: false };
   if (input.machine) return { on: false, skipped: `remote lane on ${input.machine}; laneSandbox wraps local lanes only` };
   if (input.pane) return { on: false, skipped: `--pane ${input.pane} reuses an existing pane whose directory the sandbox may not bind; pass --sandbox to wrap it anyway` };
   const exe = configured.command[0] ?? "";
-  if (!which(exe)) return { on: false, skipped: `${exe} is not on PATH; install scripts/templates/lane-sandbox.sh as ${exe}, set laneSandbox.command, or set laneSandbox.default to false` };
+  if (!which(exe)) return { on: false, skipped: `${exe} is not on PATH; install scripts/templates/lane-sandbox.sh as ${exe} or set laneSandbox.command` };
   return { on: true };
 };
 
