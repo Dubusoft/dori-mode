@@ -385,7 +385,7 @@ test("dori reported is lead-only, needs a registered lane, and needs --text", as
   expect(unknown.err).toContain('no registered lane "nope"');
   const bare = await cli(f.state.dir, ["reported", "alpha", "--note", "told"]);
   expect(bare.code).toBe(1);
-  expect(bare.err).toContain("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]");
+  expect(bare.err).toContain("usage: dori reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT]");
   expect([...denied.requests, ...unknown.requests, ...bare.requests]).toEqual([]);
   expect(existsSync(join(f.state.dir, REPORTED_DIR))).toBe(false);
 }, CLI_TIMEOUT);
