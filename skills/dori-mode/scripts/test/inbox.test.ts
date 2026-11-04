@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { defaultConfig, deliveryConfigError, loadConfig } from "../src/config.ts";
-import { checklistLine, EVENT_LOG, InboxError, readCursorFile, take, takeCursor, takeOutput, takesDir, writeCursorFile } from "../src/inbox.ts";
+import { checklistLine, EVENT_LOG, InboxError, readCarried, readCursorFile, take, takeCursor, takeOutput, takesDir, unreadAfterAck, writeCursorFile } from "../src/inbox.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -208,4 +208,54 @@ test("checklistLine counts INBOUND_EDIT and carried owner notices, once per owne
     .toBe("checklist:unfinished:discord:1:2\tCHECKLIST this batch owes: reply to 1 owner message(s); report lane alpha (dori reported <key> --text ...)");
   expect(checklistLine(["discord:1:2\tINBOUND discord 1 hi", "unfinished:discord:1:2\tUNFINISHED discord:1:2 taken and not handled (x): INBOUND discord 1 hi", "e2\tLANE_CLOSED alpha"]))
     .toContain("reply to 1 owner message(s)");
+});
+
+test("unreadAfterAck lists same-channel owner events past the cursor, leaving out only the acked original, and moves nothing", () => {
+  const dir = state();
+  log(dir, line("discord:11:20", "INBOUND 11 20 owner earlier, already taken"));
+  writeCursorFile(dir, Buffer.byteLength(line("discord:11:20", "INBOUND 11 20 owner earlier, already taken")));
+  log(dir, line("discord:11:22", "INBOUND 11 22 owner build the thing")
+    + line("discord:11:22:edit:2026-11-05T00:00:00Z", "INBOUND_EDIT 11 22 owner (edited) build the other thing")
+    + line("discord:11:23", "INBOUND 11 23 owner   and\n  the docs too")
+    + line("discord:11:22:delete", "INBOUND_DELETE 11 22 (deleted)")
+    + line("discord:99:5", "INBOUND 99 5 owner another channel")
+    + line("discord:11:24", "VISITOR 11 24 guest (not the owner) hi")
+    + line("w1", "WAIT_DONE k note"));
+  const before = readCursorFile(dir);
+  expect(unreadAfterAck(dir, [{ channel: "11", message: "22" }])).toEqual([
+    "UNREAD 11 INBOUND_EDIT discord:11:22:edit:2026-11-05T00:00:00Z owner (edited) build the other thing",
+    "UNREAD 11 INBOUND discord:11:23 owner and the docs too",
+    "UNREAD 11 INBOUND_DELETE discord:11:22:delete (deleted)",
+  ]);
+  // Read only: no take receipt, no carried owner text, the same cursor; the next take still prints everything.
+  expect(receipts(dir)).toEqual([]);
+  expect(readCarried(dir)).toEqual([]);
+  expect(readCursorFile(dir)).toBe(before);
+  expect(take(dir, { maxBytes: 16_384, now: NOW }).events.map((event) => event.id)).toContain("discord:11:22");
+});
+
+test("unreadAfterAck caps each channel and counts the overflow, prints each channel once, and says none when nothing waits", () => {
+  const dir = state();
+  log(dir, Array.from({ length: 7 }, (_, i) => line(`discord:11:${30 + i}`, `INBOUND 11 ${30 + i} owner m${i}`)).join("")
+    + line("discord:44:1", "INBOUND 44 1 owner acked one"));
+  expect(unreadAfterAck(dir, [{ channel: "11", message: "30" }, { channel: "44", message: "1" }, { channel: "11", message: "31" }], 3)).toEqual([
+    "UNREAD 11 INBOUND discord:11:32 owner m2",
+    "UNREAD 11 INBOUND discord:11:33 owner m3",
+    "UNREAD 11 INBOUND discord:11:34 owner m4",
+    "UNREAD_MORE 11 2",
+    "UNREAD_NONE 44",
+  ]);
+});
+
+test("unreadAfterAck cuts a long preview and reports UNREAD_UNAVAILABLE instead of throwing without a cursor or on a read failure", () => {
+  const dir = state();
+  log(dir, line("discord:11:2", `INBOUND 11 2 owner ${"x".repeat(400)}`));
+  const [first] = unreadAfterAck(dir, [{ channel: "11", message: "1" }]);
+  expect(first?.endsWith("...")).toBe(true);
+  expect(first?.length).toBeLessThan(260);
+  expect(unreadAfterAck(state(null), [{ channel: "11", message: "1" }])[0]).toStartWith("UNREAD_UNAVAILABLE ");
+  const broken = state();
+  mkdirSync(join(broken, EVENT_LOG));
+  writeFileSync(join(broken, "inbox-cursor.json"), JSON.stringify({ offset: 0 }));
+  expect(unreadAfterAck(broken, [{ channel: "11", message: "1" }])[0]).toStartWith("UNREAD_UNAVAILABLE ");
 });

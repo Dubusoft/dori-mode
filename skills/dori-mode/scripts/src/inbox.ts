@@ -239,6 +239,47 @@ export const takeOutput = (result: Take): string[] => {
   ];
 };
 
+/** How many unread owner events `dori ack` previews per acked channel, and how much of each line it shows. */
+export const UNREAD_PREVIEW_MAX = 5;
+const UNREAD_PREVIEW_CHARS = 160;
+
+const UNREAD_KIND = /^(INBOUND|INBOUND_EDIT|INBOUND_DELETE) (\d+) (\d+)(?: (.*))?$/s;
+
+/**
+ * `dori ack`'s read-only follow-up: the owner events (INBOUND, INBOUND_EDIT, INBOUND_DELETE) past the take cursor in
+ * each acked channel, so a follow-up that arrived with or after the acked message is seen before the reply. It never
+ * writes a take receipt or carried owner text, so the next `dori inbox take` still prints these events. Only the acked
+ * originals are left out: their edits and deletes stay. Per channel (first-acked order, each once) it prints at most
+ * `max` lines `UNREAD <channel> <kind> <eventId> <preview>`, then `UNREAD_MORE <channel> <n>` for the rest, or
+ * `UNREAD_NONE <channel>`. A missing cursor or a failed read prints one `UNREAD_UNAVAILABLE` line instead of throwing:
+ * the ack is already recorded and must not fail because of the preview.
+ */
+export const unreadAfterAck = (stateDir: string, acked: readonly { readonly channel: string; readonly message: string }[], max = UNREAD_PREVIEW_MAX): string[] => {
+  try {
+    const from = takeCursor(stateDir);
+    if (from === undefined) return [`UNREAD_UNAVAILABLE the supervisor has not published ${cursorPath(stateDir)} yet; run dori inbox take`];
+    const skip = new Set(acked.map(({ channel, message }) => `discord:${channel}:${message}`));
+    const channels = [...new Set(acked.map(({ channel }) => channel))];
+    const byChannel = new Map<string, string[]>(channels.map((channel) => [channel, []]));
+    for (const { text } of completeLines(join(stateDir, EVENT_LOG), from)) {
+      const event = parseLogLine(text);
+      const m = UNREAD_KIND.exec(event.line);
+      const lines = m ? byChannel.get(m[2] ?? "") : undefined;
+      if (!m || !lines || skip.has(event.id) || !event.id.startsWith(`discord:${m[2]}:`)) continue;
+      const body = (m[4] ?? "").replace(/\s+/g, " ").trim();
+      const preview = body.length > UNREAD_PREVIEW_CHARS ? `${body.slice(0, UNREAD_PREVIEW_CHARS)}...` : body;
+      lines.push(`UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}`);
+    }
+    return channels.flatMap((channel) => {
+      const lines = byChannel.get(channel) ?? [];
+      if (!lines.length) return [`UNREAD_NONE ${channel}`];
+      return [...lines.slice(0, max), ...(lines.length > max ? [`UNREAD_MORE ${channel} ${lines.length - max}`] : [])];
+    });
+  } catch (e) {
+    return [`UNREAD_UNAVAILABLE ${e instanceof Error ? e.message : String(e)}; run dori inbox take`];
+  }
+};
+
 /**
  * The one-line checklist for a taken batch that mixes owner chat (INBOUND / VISITOR) with lane outcome obligations (an
  * outcome event, or an UNREPORTED reminder): `checklist:<first id>\tCHECKLIST this batch owes: ...`, in the same
