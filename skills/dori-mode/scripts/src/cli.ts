@@ -27,6 +27,7 @@ import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
 import { closeThreadButton, DiscordCommands } from "./messenger/discord-commands.ts";
+import { buttonRow } from "./messenger/discord-buttons.ts";
 import { discordOwnerConfigured } from "./messenger/discord-inbound.ts";
 import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
@@ -126,7 +127,7 @@ const USAGE = `dori <command> [options]
                                        hourglass off, eyes on; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
                                        link what handled an owner message
-  send discord --to TARGET --text TEXT [--thread ID] [--edit ID]
+  send discord --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON]
                                        post or edit a Discord message (token from DORI_DISCORD_TOKEN)
   thread discord --to CHANNEL [--message ID] --name NAME
                                        start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
@@ -180,7 +181,7 @@ const flags = parseArgs({
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
-    dev: { type: "boolean" },
+    dev: { type: "boolean" }, buttons: { type: "string" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -820,8 +821,12 @@ try {
       const { to } = resolveTarget(named, need("to"), opt("thread"));
       const text = need("text");
       const edit = opt("edit");
+      const buttons = opt("buttons");
+      if (buttons !== undefined && edit) die("--buttons cannot be used with --edit");
+      let components: unknown[] | undefined;
+      try { components = buttons === undefined ? undefined : buttonRow(buttons); } catch (e) { die(e instanceof Error ? e.message : String(e)); }
       if (!edit) {
-        const sent = await postMessage(to, text);
+        const sent = await postMessage(to, text, components);
         console.log(`SENT ${sent}`);
       } else await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);
       break;
