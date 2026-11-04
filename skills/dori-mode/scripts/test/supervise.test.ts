@@ -382,20 +382,46 @@ test("a custom context cap controls stale delivery rather than the default cap",
   expect(restartStarts(f)).toHaveLength(1);
 });
 
-test("usage above the cap does not restart a lead before its cache is stale", async () => {
+test.each([
+  [149_999, false], [150_000, true], [200_000, true],
+] as const)("usage %s with a warm cache restarts=%s as context-cap", async (tokens, restart) => {
   const f = fixture();
-  writeFileSync(f.file, JSON.stringify({ message: { usage: { totalTokens: 200_000 } } }) + "\n");
+  new Waits(f.state.dir).register({ key: "release", until: "file absent", note: "tell owner", cwd: f.state.dir }, f.clock.now());
+  writeFileSync(f.file, JSON.stringify({ message: { usage: { totalTokens: tokens } } }) + "\n");
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  const lines = await quiet(async () => {
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("fresh-cap", "INBOUND owner");
+    await supervisor.flush();
+  });
+  expect(restartStarts(f)).toHaveLength(restart ? 1 : 0);
+  expect(lines.some((line) => line.startsWith(`LEAD_RESTART_TRIGGER context-cap context ${tokens} tokens at or above leadContextCapTokens 150000`) && line.includes("cache warm"))).toBe(restart);
+  expect(f.log().map((event) => event.id)).toEqual(["fresh-cap"]);
+});
+
+test("a warm lead over the context cap waiting on its own child restarts only once the child is done", async () => {
+  const f = fixture();
+  writeFileSync(f.file, JSON.stringify({ message: { usage: { totalTokens: 160_000 } } }) + "\n" + lifecycle(1, f.clock.now()));
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("fresh-cap", "INBOUND owner");
-  await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "run" || call[0] === "kill")).toEqual([]);
+  const lines = await quiet(async () => {
+    supervisor.enqueue("over-cap", "INBOUND over-cap");
+    await supervisor.flush();
+  });
+  expect(restarted(f)).toEqual([]);
+  expect(lines.some((line) => line.startsWith("LEAD_RESTART_DEFERRED context-cap context 160000 tokens"))).toBe(true);
+  appendFileSync(f.file, lifecycle(0, f.clock.now()));
+  const after = await quiet(async () => {
+    supervisor.enqueue("over-cap-2", "INBOUND over-cap-2");
+    await supervisor.flush();
+  });
+  expect(restartStarts(f)).toHaveLength(1);
+  expect(after.some((line) => line.startsWith("LEAD_RESTART_TRIGGER context-cap context 160000 tokens"))).toBe(true);
 });
 
 test.each([
   [299_999, false], [300_000, true], [300_001, true],
 ] as const)("usage %s inside the TTL restarts=%s at the hard cap, logging LEAD_HARD_CAP", async (tokens, restart) => {
-  const f = fixture();
+  const f = fixture({ leadContextCapTokens: 1_000_000 });
   new Waits(f.state.dir).register({ key: "release", until: "file absent", note: "tell owner", cwd: f.state.dir }, f.clock.now());
   writeFileSync(f.file, JSON.stringify({ message: { usage: { totalTokens: tokens } } }) + "\n");
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
@@ -413,7 +439,7 @@ test.each([
 });
 
 test("a custom hard cap controls the in-TTL restart", async () => {
-  const f = fixture({ leadContextHardCapTokens: 180_000 });
+  const f = fixture({ leadContextCapTokens: 1_000_000, leadContextHardCapTokens: 180_000 });
   writeFileSync(f.file, JSON.stringify({ message: { usage: { totalTokens: 200_000 } } }) + "\n");
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   const supervisor = new Supervisor(f.deps);
