@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 import { eventPriority, Supervisor } from "../src/supervise.ts";
 import { outcomeLane, pendingReported, recordReported, REPORTED_DIR, takeReminders } from "../src/lane-outcomes.ts";
+import { CLOSE_BUTTONS_FILE, readCloseButtons } from "../src/thread-finality.ts";
+import { Waits } from "../src/waits.ts";
 import type { Lane } from "../src/registry.ts";
 import { renderStatus, type Status } from "../src/status.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
@@ -385,7 +387,7 @@ test("dori reported is lead-only, needs a registered lane, and needs --text", as
   expect(unknown.err).toContain('no registered lane "nope"');
   const bare = await cli(f.state.dir, ["reported", "alpha", "--note", "told"]);
   expect(bare.code).toBe(1);
-  expect(bare.err).toContain("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]");
+  expect(bare.err).toContain("usage: dori reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT]");
   expect([...denied.requests, ...unknown.requests, ...bare.requests]).toEqual([]);
   expect(existsSync(join(f.state.dir, REPORTED_DIR))).toBe(false);
 }, CLI_TIMEOUT);
@@ -436,3 +438,101 @@ test("pendingReported reads receipts written before reports carried a message id
   writeFileSync(join(f.state.dir, REPORTED_DIR, `${T0}-old.json`), JSON.stringify({ lane: "alpha", at: T0, note: "told" }));
   expect(pendingReported(f.state.dir).map(({ path: _path, ...rest }) => rest)).toEqual([{ lane: "alpha", at: T0, note: "told" }]);
 });
+
+const closeButtons = () => {
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  const posts: { thread: string; id: string }[] = [];
+  const tick = async () => { await supervisor.reportTick(); await supervisor.closeButtonTick(async (thread, id) => { posts.push({ thread, id }); }); };
+  const close = (key: string) => f.deps.registry.patch(key, { closedAt: new Date(f.clock.now()).toISOString() });
+  const report = (key: string, extra: { button?: boolean } = {}) => recordReported(f.state.dir, key, f.clock.now(), undefined, { message: "m", target: "discord:200", thread: "200", ...extra });
+  return { ...f, supervisor, posts, tick, close, report };
+};
+
+test("the supervisor posts the close button once the last lane on a thread is closed and reported, once per report", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200" }));
+  f.supervisor.enqueue("claim:alpha", "LANE_DONE_CLAIMED alpha w:p1 proof");
+  f.clock.at += 1_000;
+  f.report("alpha");
+  // Reported at the claim: the lane is still open, so the button waits for its close.
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  f.clock.at += 1_000;
+  await f.close("alpha");
+  await f.tick();
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0 + 1_000}` }]);
+  expect(readCloseButtons(f.state.dir)).toEqual({ "200": T0 + 2_000 });
+  await f.tick();
+  expect(f.posts).toHaveLength(1);
+  // New work on the thread, finished and reported later, gets a button of its own.
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
+  f.clock.at += 1_000;
+  await f.close("beta");
+  f.report("beta");
+  await f.tick();
+  expect(f.posts.map((post) => post.id)).toEqual([`close-button:200:${T0 + 1_000}`, `close-button:200:${T0 + 3_000}`]);
+  f.supervisor.close();
+});
+
+test("a --final report's button stands for the thread: the supervisor posts none", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha", { button: true });
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  expect(readCloseButtons(f.state.dir)).toEqual({ "200": T0 });
+  f.supervisor.close();
+});
+
+test("an open lane, an unreported lane, a wait or an open decision on the thread holds the button back", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
+  await f.deps.registry.write(lane("gamma", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.supervisor.enqueue("closed:gamma", "LANE_CLOSED gamma x");
+  f.report("alpha");
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  await f.close("beta");
+  f.report("gamma");
+  const waits = new Waits(f.state.dir);
+  waits.register({ key: "release", until: "file ready", note: "n", cwd: f.state.dir, thread: "discord:100/200" }, f.clock.now());
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  waits.cancel("release");
+  f.supervisor.enqueue("q:alpha", "LANE_REPORT alpha question which one?");
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  // Resolved: nothing is left on the thread.
+  mkdirSync(join(f.state.dir, "resolved"), { recursive: true });
+  writeFileSync(join(f.state.dir, "resolved", `${T0}-q.json`), JSON.stringify({ id: "q:alpha", at: T0 }));
+  f.supervisor.resolveTick();
+  await f.tick();
+  expect(f.posts.map((post) => post.thread)).toEqual(["200"]);
+  f.supervisor.close();
+});
+
+test("receipts without a thread (written before this check) never post a button", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  recordReported(f.state.dir, "alpha", T0, undefined, { message: "m", target: "discord:200" });
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  f.supervisor.close();
+});
+
+test("dori reported --final records its button and thread; one after the supervisor's button is withheld", async () => {
+  const f = fixture();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  const final = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final"]);
+  expect(final.code).toBe(0);
+  expect(final.out).not.toContain("REPORT_BUTTON_WITHHELD");
+  expect(JSON.stringify(final.requests[0]?.body)).toContain("dori:close-thread:200");
+  expect(pendingReported(f.state.dir).map(({ thread, button }) => ({ thread, button }))).toEqual([{ thread: "200", button: true }]);
+  writeFileSync(join(f.state.dir, CLOSE_BUTTONS_FILE), JSON.stringify({ "200": T0 + 1 }));
+  const again = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final"]);
+  expect(again.code).toBe(0);
+  expect(again.out).toContain("REPORT_BUTTON_WITHHELD alpha: the close button is already posted on this thread");
+  expect(JSON.stringify(again.requests[0]?.body)).not.toContain("dori:close-thread");
+}, CLI_TIMEOUT);

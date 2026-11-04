@@ -90,6 +90,9 @@ export type LaneOutcome = {
   readonly pushedAt?: number;
   /** Opened by a done claim and no LANE_CLOSED/CI_MERGED joined yet: a rejected claim drops the row. */
   readonly claim?: true;
+  /** The lane's thread id and its latest report there, from `dori reported` receipts: the close-button check reads them. */
+  readonly thread?: string;
+  readonly lastReportAt?: number;
 };
 /**
  * One decision obligation per decision event (decision-obligations.ts), keyed by its event id: opened by that event,

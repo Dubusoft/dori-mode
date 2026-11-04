@@ -20,7 +20,7 @@ Each piece of work gets its own thread (or topic) with:
 - one status message you edit in place: `working: <work> · <time elapsed>` while working, `done: <work>` when done;
 - a status word at the start of the thread name: `[working]`, `[waiting]` (on the owner or someone else), `[done]`.
 
-When the work is done, remove your "eyes" reaction and leave the thread open: the owner closes it with the **스레드 닫기** button on your `dori reported` post. If the owner writes in a closed thread, reopen it, set it back to `[working]`, and carry on there. Threads the owner started get the same treatment.
+When the work is done, remove your "eyes" reaction and leave the thread open: the owner closes it with the **스레드 닫기** button, which the supervisor posts into the thread once nothing is left on it (every lane closed and reported, no follow-up wait or open question); a `dori reported --final` post carries it instead when it already can. If the owner writes in a closed thread, reopen it, set it back to `[working]`, and carry on there. Threads the owner started get the same treatment.
 
 ## Files
 

@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { eventClass, forLead } from "./event-policy.ts";
+import { unresolved } from "./decision-obligations.ts";
 import type { Registry } from "./registry.ts";
+import { readCloseButtons, recordCloseButton, threadBlockers, threadIdOf } from "./thread-finality.ts";
+import { Waits } from "./waits.ts";
 import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journal.ts";
 
 /**
@@ -51,8 +54,12 @@ const fsyncDir = (dir: string): void => {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 };
 
-/** Where `dori reported` posted the report: the message id and its target (`platform:to[/thread]`). */
-export type ReportedPost = { readonly message: string; readonly target: string };
+/**
+ * Where `dori reported` posted the report: the message id and its target (`platform:to[/thread]`); `thread` is the id of
+ * the lane's thread (its bound thread, else the thread the report went into), `button` that the post carried the owner's
+ * close-thread button.
+ */
+export type ReportedPost = { readonly message: string; readonly target: string; readonly thread?: string; readonly button?: boolean };
 
 /**
  * The lead's receipt that it told the owner about lane `lane`'s outcome: tmp, fsync, rename, then both directories.
@@ -64,7 +71,8 @@ export const recordReported = (stateDir: string, lane: string, at: number, note?
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${at}-${randomUUID()}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}), ...(posted ? { message: posted.message, target: posted.target } : {}) }), { mode: 0o600, flush: true });
+  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}), ...(posted ? { message: posted.message, target: posted.target } : {}),
+    ...(posted?.thread ? { thread: posted.thread } : {}), ...(posted?.button ? { button: true } : {}) }), { mode: 0o600, flush: true });
   renameSync(tmp, path);
   fsyncDir(dir);
   fsyncDir(stateDir);
@@ -72,7 +80,10 @@ export const recordReported = (stateDir: string, lane: string, at: number, note?
 };
 
 /** `message` and `target` are absent in receipts written before `dori reported` posted the report itself. */
-export type ReportedReceipt = { readonly path: string; readonly lane: string; readonly at: number; readonly note?: string; readonly message?: string; readonly target?: string };
+export type ReportedReceipt = {
+  readonly path: string; readonly lane: string; readonly at: number; readonly note?: string; readonly message?: string; readonly target?: string;
+  readonly thread?: string; readonly button?: true;
+};
 
 /** Receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
 export const pendingReported = (stateDir: string): ReportedReceipt[] => {
@@ -82,13 +93,17 @@ export const pendingReported = (stateDir: string): ReportedReceipt[] => {
   return names.filter((name) => RECEIPT_FILE.test(name)).flatMap((name) => {
     const path = join(dir, name);
     try {
-      const { lane, at, note, message, target } = JSON.parse(readFileSync(path, "utf8")) as { lane?: unknown; at?: unknown; note?: unknown; message?: unknown; target?: unknown };
+      const { lane, at, note, message, target, thread, button } = JSON.parse(readFileSync(path, "utf8")) as {
+        lane?: unknown; at?: unknown; note?: unknown; message?: unknown; target?: unknown; thread?: unknown; button?: unknown;
+      };
       if (typeof lane !== "string" || !LANE_KEY.test(lane)) return [];
       return [{
         path, lane, at: typeof at === "number" && Number.isFinite(at) ? at : statSync(path).mtimeMs,
         ...(typeof note === "string" && note ? { note } : {}),
         ...(typeof message === "string" && message ? { message } : {}),
         ...(typeof target === "string" && target ? { target } : {}),
+        ...(typeof thread === "string" && /^\d+$/.test(thread) ? { thread } : {}),
+        ...(button === true ? { button: true as const } : {}),
       }];
     } catch { return []; }
   });
@@ -169,11 +184,15 @@ export class OutcomeTracking {
       const at = outcomes.findIndex((outcome) => outcome.lane === receipt.lane);
       const found = at < 0 ? undefined : outcomes[at];
       const note = found?.note ?? receipt.note;
+      const thread = receipt.thread ?? found?.thread;
       const next: LaneOutcome = {
         ...(found ?? { lane: receipt.lane, since: receipt.at }),
         reportedAt: Math.min(found?.reportedAt ?? Infinity, receipt.at),
         ...(note ? { note } : {}),
+        ...(thread ? { thread, lastReportAt: Math.max(found?.lastReportAt ?? -Infinity, receipt.at) } : {}),
       };
+      // A --final report's button counts as the thread's close button: the supervisor posts none for that report.
+      if (receipt.button && receipt.thread) recordCloseButton(this.core.deps.config.stateDir, receipt.thread, receipt.at);
       if (at < 0) outcomes.push(next); else outcomes[at] = next;
       if (found?.reportedAt === undefined) console.log(`LANE_OUTCOME_REPORTED ${receipt.lane}`);
     }
@@ -266,6 +285,46 @@ export class OutcomeTracking {
       this.core.persist("normal");
     }
     this.publish();
+  }
+
+  /**
+   * Posts the owner's close-thread button into each thread whose work is finished: a report into it was recorded after the
+   * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. Run
+   * every pass, so it fires right after the last report or right after the last lane closes, whichever comes later. A
+   * failed post is retried on the next pass; `post` gets a stable id per thread and report, so a retry is not doubled.
+   */
+  async closeButtonTick(registry: Pick<Registry, "open" | "read">, post: (thread: string, id: string) => Promise<void>): Promise<void> {
+    const stateDir = this.core.deps.config.stateDir;
+    const outcomes = this.journal.outcomes ?? [];
+    const buttons = readCloseButtons(stateDir);
+    const latest = new Map<string, number>();
+    for (const outcome of outcomes) {
+      if (outcome.thread === undefined || outcome.lastReportAt === undefined) continue;
+      latest.set(outcome.thread, Math.max(latest.get(outcome.thread) ?? -Infinity, outcome.lastReportAt));
+    }
+    const due = [...latest].filter(([thread, at]) => at > (buttons[thread] ?? -Infinity));
+    if (!due.length) return;
+    const open = await registry.open();
+    const waits = new Waits(stateDir).list();
+    const decisions = unresolved(this.journal).map(({ id, line }) => ({ id, ...(line ? { line } : {}) }));
+    // Unreported lanes have no receipt yet: their thread comes from the registry (an open lane, else the archive).
+    const threadOf = new Map<string, string | undefined>();
+    for (const outcome of unreported(this.journal)) {
+      const bound = open.find((lane) => lane.key === outcome.lane)?.thread ?? (await registry.read(outcome.lane))?.thread;
+      threadOf.set(outcome.lane, bound && bound !== "none" ? threadIdOf(bound) : undefined);
+    }
+    for (const [thread, at] of due) {
+      const blockers = threadBlockers({
+        thread, open, waits, decisions,
+        lanes: outcomes.filter((outcome) => outcome.thread === thread).map((outcome) => outcome.lane),
+        unreported: [...threadOf].filter(([, on]) => on === thread).map(([lane]) => lane),
+      });
+      if (blockers.length) continue;
+      try { await post(thread, `close-button:${thread}:${at}`); }
+      catch (e) { console.error(`CLOSE_BUTTON_FAILED ${thread}: ${e instanceof Error ? e.message : String(e)}`); continue; }
+      recordCloseButton(stateDir, thread, this.core.deps.clock.now());
+      console.log(`CLOSE_BUTTON_POSTED ${thread}`);
+    }
   }
 
   /** Writes UNREPORTED_FILE when the open obligations changed (tmp + rename; it is derived, the store is the record). */

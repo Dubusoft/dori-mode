@@ -32,8 +32,21 @@ export type FlowDeps = {
   readonly leadDelivered?: (eventId: string) => boolean;
 };
 
-/** Signals run on this host: a remote lane's cwd (older entries stored the remote path there) is never a local directory. */
-const signalIo = (deps: FlowDeps, lane: Lane): SignalIo => ({ cwd: (lane.machine ? undefined : lane.cwd) ?? deps.config.defaultCwd, ...deps.signalIo });
+/**
+ * Where a lane's command signals and git calls run on this host: its cwd, else defaultCwd. A remote lane's cwd (older
+ * entries stored the remote path there) is never a local directory, and a local cwd that is gone (its worktree was
+ * removed) cannot be spawned in, so both run in defaultCwd.
+ */
+const localCwd = (deps: FlowDeps, lane: Lane): string =>
+  !lane.machine && lane.cwd && (deps.exists ?? existsSync)(lane.cwd) ? lane.cwd : deps.config.defaultCwd;
+
+/** The line a close prints when the lane's own cwd is gone and its signals ran in defaultCwd instead. */
+const cwdFallbackLine = (deps: FlowDeps, lane: Lane): string | undefined =>
+  !lane.machine && lane.cwd && localCwd(deps, lane) !== lane.cwd
+    ? `SIGNAL_CWD ${lane.key}: lane cwd ${lane.cwd} no longer exists; Done signals and git ran in defaultCwd ${deps.config.defaultCwd}`
+    : undefined;
+
+const signalIo = (deps: FlowDeps, lane: Lane): SignalIo => ({ cwd: localCwd(deps, lane), ...deps.signalIo });
 
 const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
 
@@ -173,6 +186,11 @@ export type CloseOptions = {
   /** `dori close --force`: close despite unpushed/uncommitted work; a worktree git refuses to remove is kept, as before. */
   readonly force?: boolean;
   /**
+   * `dori close --cancelled --reason`: the owner cancelled the work or its Done can never hold. The Done signals are not
+   * checked; the worktree checks and cleanup run as usual, and the close is recorded with the reason as cancelled.
+   */
+  readonly cancelled?: { readonly reason: string };
+  /**
    * Done checks and discovered worktrees the caller read just before (a claim's settlement): reused instead of read
    * again. Unpushed work in those worktrees is still re-read under the close lock. Never persisted: a resumed close reads afresh.
    */
@@ -232,7 +250,7 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string, opts: 
         if (store.get(id)?.state === "planned") settleOperation(store, deps.clock.now(), id, "verified", "lane recorded closed");
         return { closed: true, lines: [`CLOSED ${lane.key} already closed`] };
       }
-      const data = JSON.stringify({ note, force: Boolean(opts.force) });
+      const data = JSON.stringify({ note, force: Boolean(opts.force), ...(opts.cancelled ? { cancelled: opts.cancelled } : {}) });
       const prior = store.get(id);
       if (!prior) plan(store, deps.clock.now(), { lane: lane.key, action: CLOSE_ACTION, target: lane.key, data });
       else store.put({ ...prior, state: "planned", detail: "close planned", data, updatedAt: deps.clock.now() });
@@ -249,8 +267,14 @@ const closeSequence = async (
   deps: FlowDeps, lane: Lane, note: string, opts: CloseOptions, act: Act, store: OperationStore,
 ): Promise<{ readonly closed: boolean; readonly lines: string[] }> => {
   const exists = deps.exists ?? existsSync;
-  const checks = opts.pre?.checks ?? await checkDone(lane.done, deps.run, signalIo(deps, lane));
-  const lines = checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`);
+  const cancelled = opts.cancelled;
+  const checks = cancelled ? [] : opts.pre?.checks ?? await checkDone(lane.done, deps.run, signalIo(deps, lane));
+  const fallback = cancelled ? undefined : cwdFallbackLine(deps, lane);
+  const lines = [
+    ...(fallback ? [fallback] : []),
+    ...(cancelled ? [`SIGNAL SKIPPED ${lane.key}: cancelled by the lead: ${cancelled.reason}`] : []),
+    ...checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`),
+  ];
   if (checks.some((c) => !c.ok)) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live`] };
   const discovered = opts.pre?.worktrees ?? await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
   if (!opts.force) {
@@ -264,10 +288,13 @@ const closeSequence = async (
       `REFUSED ${lane.key}: the close stopped at an operation that may or may not have happened; check it, run dori ops resolve ${step.id} --as verified|retry, then close again`] };
   };
   if (lane.machine) cleanup.push(remoteWorktreeNote(lane));
-  const root = lane.cwd ?? deps.config.defaultCwd;
+  const root = localCwd(deps, lane);
   // A worktree an interrupted close already removed is no longer discovered; its operation still has to settle.
   const pending = store.list({ lane: lane.key }).filter((op) => op.action === "worktree-remove" && op.state !== "verified").map((op) => op.target);
   const worktrees = [...new Set([...discovered.filter(exists), ...pending])];
+  // A lane worktree removed before the close (Toodo removes a finished task's worktree) is already cleaned, never a refusal.
+  const gone = lane.machine ? [] : [...new Set([...(lane.cwd ? [lane.cwd] : []), ...discovered])].filter((wt) => !exists(wt) && !pending.includes(wt));
+  cleanup.push(...gone.map((wt) => `worktree ${wt} already removed`));
   // Bound before any worktree goes: a worktree whose branch moved past the merged head stays with its branch.
   // The lane's own cwd, when it is a linked worktree, goes too once it sits exactly at a PR merged into the merge base.
   const branches: BranchPlan | undefined = !lane.machine
@@ -311,9 +338,9 @@ const closeSequence = async (
   }
   const at = iso(deps.clock);
   const operations = store.list({ lane: lane.key }).filter((op) => op.action !== CLOSE_ACTION).map((op) => ({ id: op.id, state: op.state }));
-  const receipt = { checks, note, cleanup, ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations };
+  const receipt = { checks, note, cleanup, ...(cancelled ? { cancelled } : {}), ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations };
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "closed", note, at, { closedAt: at, receipt }));
-  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}`] };
+  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}${cancelled ? " cancelled" : ""}`] };
 };
 
 /**
@@ -333,8 +360,8 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
       await withOperations(deps, async (store) => settleOperation(store, deps.clock.now(), op.id, lane ? "verified" : "failed", lane ? "lane recorded closed" : "lane not registered"));
       continue;
     }
-    const { note, force } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean };
-    const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force) });
+    const { note, force, cancelled } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean; cancelled?: { reason: string } };
+    const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force), ...(cancelled ? { cancelled } : {}) });
     const last = result.lines.at(-1) ?? "";
     if (result.closed) await push(closedEvent(lane.key, note ?? "", result.lines), undefined, laneMeta(lane));
     else {
@@ -401,7 +428,7 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
   const root = deps.config.worktreeRoot.replace(/\/+$/, "");
   if (lane.machine || statusOf(lane) !== "closed" || !root) return [];
   const exists = deps.exists ?? existsSync;
-  const repo = lane.cwd ?? deps.config.defaultCwd;
+  const repo = localCwd(deps, lane);
   const removed: string[] = [];
   const out: string[] = [];
   for (const wt of keptWorktrees(lane)) {
