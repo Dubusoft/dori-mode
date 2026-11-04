@@ -8,9 +8,9 @@ import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { withState } from "./fakes.ts";
 
 const config = { applicationId: "100", guildId: "200", ownerId: "300" };
-const hooks = { blog: ["/hooks/approve.sh", "--record-button", "{arg}", "--interaction", "{interaction}", "--channel", "{channel}", "--text", "{text}", "--msg", "{message}", "{name}"] };
+const hooks = { blog: ["/hooks/approve.sh", "--record-button", "{arg}", "--interaction", "{interaction}", "--channel", "{channel}", "--msg", "{message}", "{name}"] };
 const PUBLISH = "dori:hook:blog:publish:12:abcdef012345";
-const REVISE = "dori:hookm:blog:revise:12:abcdef012345";
+const REVISE = "dori:hook:blog:revise:12:abcdef012345";
 const rows = [{ type: 1, components: [
   { type: 2, style: 3, label: "게시", custom_id: PUBLISH },
   { type: 2, style: 2, label: "수정 요청", custom_id: REVISE },
@@ -19,10 +19,6 @@ const click = (customId: string, userId = "300") => ({
   type: 3, id: "400", token: "interaction-secret", application_id: "100", guild_id: "200", channel_id: "700",
   data: { component_type: 2, custom_id: customId }, member: { user: { id: userId } },
   message: { id: "800", content: "draft ready", components: rows },
-});
-const submit = (customId: string, text: string) => ({
-  ...click(customId), type: 5, id: "401",
-  data: { custom_id: customId, components: [{ type: 1, components: [{ type: 4, custom_id: "text", value: text }] }] },
 });
 
 const fixture = () => {
@@ -48,7 +44,7 @@ test("the owner's plain hook click disables every button, marks the clicked one,
     { type: 2, style: 3, label: "게시 - 접수됨", custom_id: PUBLISH, disabled: true },
     { type: 2, style: 2, label: "수정 요청", custom_id: REVISE, disabled: true },
   ] }] } });
-  expect(spawned).toEqual([{ name: "blog", argv: ["/hooks/approve.sh", "--record-button", "publish:12:abcdef012345", "--interaction", "400", "--channel", "700", "--text", "", "--msg", "800", "blog"] }]);
+  expect(spawned).toEqual([{ name: "blog", argv: ["/hooks/approve.sh", "--record-button", "publish:12:abcdef012345", "--interaction", "400", "--channel", "700", "--msg", "800", "blog"] }]);
   expect(emitted).toEqual(["discord:700:button:400 BUTTON_CLICKED_BY_OWNER blog publish:12:abcdef012345"]);
 });
 
@@ -71,24 +67,21 @@ test("an unconfigured hook name gets the ephemeral unknown-button reply and no h
   expect(spawned).toEqual([]);
 });
 
-test("the owner's hookm click opens the text modal and runs nothing yet", async () => {
+test("clicking the other button of the row marks that one and passes its own arg", async () => {
   const { commands, requests, spawned } = fixture();
-  await commands.handle(click(REVISE));
-  expect(payload(requests[0])).toEqual({ type: 9, data: {
-    custom_id: REVISE, title: "수정 요청",
-    components: [{ type: 1, components: [{ type: 4, custom_id: "text", label: "내용", style: 2, required: true, max_length: 2000 }] }],
-  } });
-  expect(spawned).toEqual([]);
-});
-
-test("the modal submit disables every button and runs the hook with the submitted text", async () => {
-  const { commands, requests, spawned, emitted } = fixture();
-  await commands.handle(submit(REVISE, "제목을 바꿔 주세요\n$(rm -rf /)"));
+  await commands.handle({ ...click(REVISE), id: "401" });
   expect(payload(requests[0])).toMatchObject({ type: 7, data: { components: [{ components: [
     { label: "게시", disabled: true }, { label: "수정 요청 - 접수됨", disabled: true },
   ] }] } });
-  expect(spawned[0]?.argv).toEqual(["/hooks/approve.sh", "--record-button", "revise:12:abcdef012345", "--interaction", "401", "--channel", "700", "--text", "제목을 바꿔 주세요\n$(rm -rf /)", "--msg", "800", "blog"]);
-  expect(emitted).toEqual(["discord:700:button:401 BUTTON_CLICKED_BY_OWNER blog revise:12:abcdef012345"]);
+  expect(spawned[0]?.argv).toEqual(["/hooks/approve.sh", "--record-button", "revise:12:abcdef012345", "--interaction", "401", "--channel", "700", "--msg", "800", "blog"]);
+});
+
+test("modal-style ids and modal submits are not hook buttons: no reply, no hook", async () => {
+  const { commands, requests, spawned } = fixture();
+  await commands.handle(click("dori:hookm:blog:revise:12"));
+  await commands.handle({ ...click(PUBLISH), type: 5, data: { custom_id: PUBLISH, components: [] } });
+  expect(requests).toEqual([]);
+  expect(spawned).toEqual([]);
 });
 
 test("a failed acknowledgement runs no hook", async () => {
@@ -107,6 +100,7 @@ test("buttonRow builds one action row and rejects bad ids, counts and styles", (
   expect(() => buttonRow("nope")).toThrow("JSON array");
   expect(() => buttonRow(JSON.stringify([{ label: "x", id: "dori:hook:Blog:x" }]))).toThrow("--buttons[0].id must match");
   expect(() => buttonRow(JSON.stringify([{ label: "x", id: "dori:close-thread:1" }]))).toThrow("--buttons[0].id must match");
+  expect(() => buttonRow(JSON.stringify([{ label: "x", id: "dori:hookm:blog:x" }]))).toThrow("--buttons[0].id must match ^dori:hook:");
   expect(() => buttonRow(JSON.stringify([{ label: "x", id: PUBLISH, style: "link" }]))).toThrow("style");
   expect(() => buttonRow(JSON.stringify([{ label: "a", id: PUBLISH }, { label: "b", id: PUBLISH }]))).toThrow("repeats");
 });

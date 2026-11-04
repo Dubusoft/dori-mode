@@ -1,11 +1,11 @@
 /**
- * Generic owner-only button hooks. `dori send --buttons` posts buttons whose custom_id names a configured hook
- * (`dori:hook:<name>:<arg>` runs it on click, `dori:hookm:<name>:<arg>` first asks for text in a modal); the supervisor's
- * gateway answers the click and spawns `buttonHooks[<name>]`. The id carries everything, so no state is stored.
+ * Generic owner-only button hooks. `dori send --buttons` posts buttons whose custom_id `dori:hook:<name>:<arg>` names a
+ * configured hook; the supervisor's gateway answers the click and spawns `buttonHooks[<name>]`. The id carries
+ * everything, so no state is stored.
  */
 
-/** A hook button's custom_id: kind, configured hook name, free argument. */
-export const HOOK_BUTTON_ID = /^dori:(hook|hookm):([a-z0-9-]{1,20}):([A-Za-z0-9._:-]{1,70})$/;
+/** A hook button's custom_id: configured hook name, free argument. */
+export const HOOK_BUTTON_ID = /^dori:hook:([a-z0-9-]{1,20}):([A-Za-z0-9._:-]{1,70})$/;
 
 const STYLES = { primary: 1, secondary: 2, success: 3, danger: 4 } as const;
 
@@ -42,59 +42,27 @@ export type HookInteraction = {
   readonly application_id: string;
   readonly guild_id: string;
   readonly userId: string;
-  /** Component click (3) or modal submit (5). */
-  readonly type: 3 | 5;
   readonly customId: string;
-  readonly kind: "hook" | "hookm";
   readonly name: string;
   readonly arg: string;
   /** The message's channel: the thread id when the message is in a thread. */
   readonly channel: string;
-  readonly message?: { readonly id: string; readonly components: readonly unknown[] };
-  /** The modal's "text" value; "" for a plain click. */
-  readonly text: string;
+  readonly message: { readonly id: string; readonly components: readonly unknown[] };
 };
 
-/** The submitted value of the modal input whose custom_id is "text" (classic action rows or label components). */
-const modalText = (value: unknown): string | undefined => {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = modalText(item);
-      if (found !== undefined) return found;
-    }
-    return;
-  }
-  if (!record(value)) return;
-  if (value.custom_id === "text" && typeof value.value === "string") return value.value;
-  return modalText(value.components) ?? modalText(value.component);
-};
-
-/** A hook button click or its modal submit, else undefined. */
+/** A hook button click, else undefined. */
 export const hookInteraction = (value: unknown): HookInteraction | undefined => {
-  if (!record(value) || (value.type !== 3 && value.type !== 5) || !record(value.data) || typeof value.data.custom_id !== "string") return;
-  if (value.type === 3 && value.data.component_type !== 2) return;
+  if (!record(value) || value.type !== 3 || !record(value.data) || value.data.component_type !== 2 || typeof value.data.custom_id !== "string") return;
   const match = HOOK_BUTTON_ID.exec(value.data.custom_id);
   if (!match) return;
   if (typeof value.id !== "string" || typeof value.token !== "string" || typeof value.application_id !== "string" || typeof value.guild_id !== "string") return;
   if (typeof value.channel_id !== "string" || !record(value.member) || !record(value.member.user) || typeof value.member.user.id !== "string") return;
-  const message = record(value.message) && typeof value.message.id === "string"
-    ? { id: value.message.id, components: Array.isArray(value.message.components) ? value.message.components : [] }
-    : undefined;
-  const text = value.type === 5 ? modalText(value.data.components) ?? "" : "";
+  if (!record(value.message) || typeof value.message.id !== "string") return;
   return {
     id: value.id, token: value.token, application_id: value.application_id, guild_id: value.guild_id, userId: value.member.user.id,
-    type: value.type, customId: value.data.custom_id, kind: match[1] as "hook" | "hookm", name: match[2]!, arg: match[3]!,
-    channel: value.channel_id, ...(message ? { message } : {}), text,
+    customId: value.data.custom_id, name: match[1]!, arg: match[2]!, channel: value.channel_id,
+    message: { id: value.message.id, components: Array.isArray(value.message.components) ? value.message.components : [] },
   };
-};
-
-/** The label of the button with `customId` in a message's rows. */
-export const buttonLabel = (rows: readonly unknown[], customId: string): string | undefined => {
-  for (const row of rows) {
-    if (!record(row) || !Array.isArray(row.components)) continue;
-    for (const c of row.components) if (record(c) && c.custom_id === customId && typeof c.label === "string") return c.label;
-  }
-  return;
 };
 
 const RECEIVED = " - 접수됨";
@@ -107,13 +75,6 @@ export const disabledRows = (rows: readonly unknown[], customId: string): unknow
       ...c, disabled: true, ...(c.custom_id === customId ? { label: `${(typeof c.label === "string" ? c.label : "").slice(0, 80 - RECEIVED.length)}${RECEIVED}` } : {}),
     }),
   });
-
-/** The modal a `dori:hookm:` click opens: one required paragraph input "text". */
-export const hookModal = (customId: string, label: string | undefined) => ({
-  custom_id: customId,
-  title: (label?.trim() || "내용").slice(0, 45),
-  components: [{ type: 1, components: [{ type: 4, custom_id: "text", label: "내용", style: 2, required: true, max_length: 2000 }] }],
-});
 
 /** Starts a filled hook argv; must not throw. */
 export type HookSpawner = (argv: readonly string[], name: string) => void;
