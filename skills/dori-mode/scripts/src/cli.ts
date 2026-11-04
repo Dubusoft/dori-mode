@@ -121,7 +121,8 @@ const USAGE = `dori <command> [options]
                                        post a finished lane's outcome (after LANE_CLOSED or CI_MERGED) to the owner in the lane's thread
                                        (--to/--thread override it, as for send) and, once the post returns a message id, record the receipt;
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin;
-                                       --final adds the owner's close-thread button unless the thread still has work (REPORT_BUTTON_WITHHELD)
+                                       --final adds the owner's close-thread button unless the thread still has work or already got it
+                                       (REPORT_BUTTON_WITHHELD); without --final, supervise posts it once the thread's work is finished
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
@@ -776,22 +777,30 @@ try {
       const platform = "discord";
       const { to, thread } = resolveTarget(platform, ref, opt("thread"));
       // Only a --final report posted into a thread with nothing left on it carries the owner's close-thread button
-      // (handled by `dori supervise`); otherwise it posts without one.
+      // (handled by `dori supervise`); otherwise it posts without one. `dori supervise` also posts the button itself once
+      // the thread's work is finished and reported, so one it posted after this lane closed withholds this one.
+      const { finalityBlockers, readCloseButtons, threadIdOf } = await import("./thread-finality.ts");
       const threadId = opt("thread") ?? /^discord:[^/]+\/(\d+)$/.exec(ref)?.[1];
       let withheld: string[] = [];
       if (final) {
-        const { finalityBlockers } = await import("./thread-finality.ts");
         const { publishedDecisions } = await import("./decision-obligations.ts");
         withheld = threadId !== to ? ["the report is not posted into a thread"] : finalityBlockers({
           lane: found, thread: to, open: await deps.registry.open(), waits: new Waits(config.stateDir).list(), decisions: publishedDecisions(config.stateDir),
         });
+        const posted = readCloseButtons(config.stateDir)[to];
+        if (!withheld.length && posted !== undefined && found.closedAt && posted >= Date.parse(found.closedAt)) withheld = ["the close button is already posted on this thread"];
       }
       const button = final && !withheld.length;
       const message = await postMessage(to, opt("text") ?? "", button ? closeThreadButton(to) : undefined);
       if (!message) die(`REPORT_NOT_POSTED ${key}: ${platform} returned no message id; nothing recorded`);
       if (withheld.length) console.log(`REPORT_BUTTON_WITHHELD ${found.key}: ${withheld.join("; ")}`);
       const note = opt("note");
-      recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, { message, target: `${platform}:${to}${thread ? `/${thread}` : ""}` });
+      // The lane's thread for the supervisor's close-button check: the thread that got this report's button, else its bound
+      // thread, else the thread this report went into.
+      const laneThread = button ? to : bound && isDiscord(bound) ? threadIdOf(bound) : threadId === to ? to : undefined;
+      recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, {
+        message, target: `${platform}:${to}${thread ? `/${thread}` : ""}`, ...(laneThread ? { thread: laneThread } : {}), ...(button ? { button } : {}),
+      });
       console.log(`REPORTED_RECORDED ${found.key} ${message}`);
       break;
     }
