@@ -32,6 +32,18 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/ma
 
 호스트 감시는 macOS에서 전부 동작합니다. 리눅스에서는 부하와 디스크만 보고, 메모리와 스왑은 알 수 없음으로 나옵니다.
 
+## 처음 실행하기
+
+아무것도 없는 상태에서 첫 작업이 끝날 때까지:
+
+1. **디스코드 봇 만들기.** [Discord Developer Portal](https://discord.com/developers/applications)에서 애플리케이션을 만들고, **Bot** 페이지에서 **Message Content Intent**를 켜고 토큰을 복사합니다. 봇을 서버에 초대하고(OAuth2 URL generator, `bot` scope), 봇과 대화할 채널의 ID를 복사합니다(개발자 모드를 켠 뒤 채널 우클릭, 채널 ID 복사).
+2. **herdr를 실행**(`herdr`)하고 그 안에서 위의 한 줄 설치를 실행합니다. `dori setup`이 그 토큰과 채널 ID, 모델과 폴더를 묻고 `dori-lead` 패인과 `lanes` 워크스페이스를 만듭니다.
+3. **설치 확인**: `dori doctor`가 항목마다 OK, WARN, FAIL을 보여 주고, 실패한 항목에는 정확한 해결 방법을 알려 줍니다.
+4. **켜기**: `dori-lead` 패인에서 코딩 에이전트를 열고 "Dori mode"라고 말합니다. Dori가 자기 이름을 묻고, 봇으로 인사한 뒤 온보딩을 제안합니다.
+5. **일 맡기기**: 채널에서 봇에게 예를 들어 "acme/app README 오타 고치고 PR 올려 줘"라고 씁니다. herdr에 레인을 열고, 스레드에 진행 상황을 올리고, PR이 머지되면 레인을 닫습니다.
+
+슬래시 명령, 모니터, 자동 시작까지 포함한 전체 설정 안내는 [`references/setup.md`](skills/dori-mode/references/setup.md)에 있습니다.
+
 ## Dori 이름 짓기
 
 Dori는 맨 처음에 자기를 뭐라고 부를지 묻습니다. 그냥 "Dori"도 되고, ShipDori나 WorkDori처럼 끝이 Dori로 끝나는 이름도 됩니다. 여러 개를 함께 돌릴 때 구분하기 좋습니다. 정한 이름은 봇 이름과 메시지 끝 서명, 모드 이름에 그대로 쓰입니다. 다음부터는 "ShipDori mode"라고만 하면 다시 켜집니다.

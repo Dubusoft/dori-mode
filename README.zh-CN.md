@@ -32,6 +32,18 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/ma
 
 主机监控在 macOS 上功能完整。在 Linux 上只看负载和磁盘，内存和 swap 显示为未知。
 
+## 第一次运行
+
+从零到完成第一件工作:
+
+1. **创建 Discord 机器人。** 在 [Discord Developer Portal](https://discord.com/developers/applications) 创建应用，在 **Bot** 页面打开 **Message Content Intent** 并复制令牌。把机器人邀请进你的服务器(OAuth2 URL generator,`bot` scope),再复制你要和它对话的频道 ID(打开开发者模式，右键频道，复制频道 ID)。
+2. **启动 herdr**(`herdr`),在里面运行上面的一行安装命令。`dori setup` 会询问这个令牌和频道 ID、模型和目录，并创建 `dori-lead` 窗格和 `lanes` 工作区。
+3. **检查安装**:`dori doctor` 逐项显示 OK、WARN 或 FAIL,失败的项目会给出具体的修复方法。
+4. **开启**:在 `dori-lead` 窗格里启动编程智能体，说一句 "Dori mode"。Dori 会问你怎么称呼它，通过机器人跟你打招呼，并提议做 onboarding。
+5. **交给它一件工作**:在频道里给机器人写，比如 "修一下 acme/app README 里的错别字并开个 PR"。它会在 herdr 里开一条 lane,在帖子里汇报进度，PR 合并后关闭这条 lane。
+
+包括斜杠命令、监控和开机自启在内的完整设置说明见 [`references/setup.md`](skills/dori-mode/references/setup.md)。
+
 ## 给你的 Dori 起名
 
 Dori 第一件事就是问你该怎么称呼它。直接叫 "Dori" 可以，用 Dori 结尾的名字也可以，比如 ShipDori 或 WorkDori,同时运行好几个时更好区分。定下的名字会用在机器人名、消息落款和模式名上，下次只要说一句 "ShipDori mode" 就能重新开启。
