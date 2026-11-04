@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 export { LOCK_WAIT_MS, StateLockError as RegistryLockError } from "./state-lock.ts";
 
@@ -122,9 +123,15 @@ export const withStatus = (lane: Lane, status: LaneStatus, note: string, at: str
 
 const missing = (e: unknown): boolean => e instanceof Error && "code" in e && e.code === "ENOENT";
 
-/** The parsed lane file, or null when there is none (a lane moved to the archive meanwhile reads as missing here). */
+/**
+ * The parsed lane file, or null when there is none (a lane moved to the archive meanwhile reads as missing here). A bare
+ * thread id from an older launch reads as `discord:<id>`, and the next write of that lane stores it so.
+ */
 const readLaneFile = (path: string): Lane | null => {
-  try { return JSON.parse(readFileSync(path, "utf8")) as Lane; }
+  try {
+    const lane = JSON.parse(readFileSync(path, "utf8")) as Lane;
+    return typeof lane.thread === "string" ? { ...lane, thread: normalizeThreadRef(lane.thread) } : lane;
+  }
   catch (e) { if (missing(e)) return null; throw e; }
 };
 
