@@ -140,6 +140,14 @@ export class Supervisor {
     return this.outcomes.tick(this.core.deps.registry);
   }
 
+  /**
+   * Posts the owner's close-thread button (through `post`) into threads whose work is finished and reported, once per
+   * report; see OutcomeTracking.closeButtonTick.
+   */
+  closeButtonTick(post: (thread: string, id: string) => Promise<void>): Promise<void> {
+    return this.outcomes.closeButtonTick(this.core.deps.registry, post);
+  }
+
   /** Consumes `dori resolved` receipts and enqueues UNRESOLVED for decision events the lead left open past resolveTimeoutMin. */
   resolveTick(): void { this.decisions.tick(); }
 
