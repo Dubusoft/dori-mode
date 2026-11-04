@@ -31,6 +31,8 @@ export type LaunchInput = {
   readonly shareThread?: boolean;
   /** Allow a cwd whose git remotes name none of the Done line's repos (`--allow-repo-mismatch`). */
   readonly allowRepoMismatch?: boolean;
+  /** Wrap the agent in `laneSandbox.command` (`--sandbox`/`--no-sandbox`); absent: the config's `laneSandbox.default` for a local lane. */
+  readonly sandbox?: boolean;
 };
 
 /** A lane launched with --share-thread: the keys of the other open lanes on its thread at launch time. */
@@ -389,6 +391,9 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const model = input.model ?? deps.config.defaultModel;
   const mode = input.mode ?? "ulw";
   if (!existing) await validateLaunch(deps, input);
+  const sandbox = input.sandbox ?? (!input.machine && deps.config.laneSandbox?.default === true);
+  if (sandbox && !deps.config.laneSandbox) throw new LaunchError("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
+  if (sandbox && input.machine) throw new LaunchError(`--sandbox wraps local lanes only; machine ${input.machine} cannot run it, drop --sandbox`);
   deps = { ...deps, run: laneRunner(deps.run, input) };
   const placed = input.toodo && !input.pane && !input.workspace ? await toodoTarget(deps, input, input.toodo) : undefined;
   const target = placed ? placed.target : input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
@@ -397,7 +402,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
-  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!input.machine ? { reportVia: "cli" as const } /* an old-footer lane moves onto dori report when recovery relaunches it */ : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
+  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!input.machine ? { reportVia: "cli" as const } /* an old-footer lane moves onto dori report when recovery relaunches it */ : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
   let agentAdmitted = false;
@@ -446,7 +451,9 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       const [exe, ...args] = agentArgv(input.brief);
       await removeLegacyLaneMcp(cwd);
       // DORI_LANE_KEY tells the dori CLI it runs inside this lane, which limits it to the lane's own key and thread.
-      command = (exe ? [`DORI_LANE_KEY=${input.key}`, exe, ...args] : []).map(quoteForPane).join(" ");
+      // A sandboxed lane runs its agent behind laneSandbox.command; the lead's command never gets this prefix.
+      const prefix = sandbox ? deps.config.laneSandbox?.command ?? [] : [];
+      command = (exe ? [`DORI_LANE_KEY=${input.key}`, ...prefix, exe, ...args] : []).map(quoteForPane).join(" ");
     } else if (shell === "powershell") {
       command = powershellLaunch(agentArgv(BRIEF_AT), brief, input.key);
     } else {

@@ -179,6 +179,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     model: lane.model ?? deps.config.defaultModel,
     ...(lane.mode ? { mode: lane.mode } : {}),
     ...(cwd ? { cwd } : {}), ...(lane.machine ? { machine: lane.machine } : {}),
+    sandbox: lane.sandbox === true,
   }, stored);
   if (!launched.startup.startsWith("STARTUP_OK ")) {
     if (!resumeArgv) return [launched.startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed`];

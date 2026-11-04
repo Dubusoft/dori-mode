@@ -123,6 +123,41 @@ test("laneThinking is inserted after the --model pair, replaces agentCommand's -
   expect(await command("medium", ["run-agent", "{prompt}"])).toContain("run-agent 'ulw");
 });
 
+test("laneSandbox wraps a local lane's agent after DORI_LANE_KEY only when sandbox is on, and records it", async () => {
+  const base = deps({});
+  const laneSandbox = { command: ["lane-sandbox"], default: false };
+  let n = 0;
+  const launch = async (config: typeof base.config, sandbox?: boolean) => {
+    await writeBrief();
+    world.panes = [];
+    world.calls.length = 0;
+    const key = `sandbox-lane-${++n}`;
+    const r = await launchLane({ ...base, config }, { ...input({ key, pane: "w:p3" }), ...(sandbox === undefined ? {} : { sandbox }) });
+    await base.registry.update(key, (lane) => ({ ...lane!, status: "closed", pane: undefined }));
+    return { command: herdr("pane", "run")[0]?.[4] ?? "", lane: r.lane };
+  };
+  const on = await launch({ ...base.config, laneSandbox }, true);
+  expect(on.command).toStartWith("DORI_LANE_KEY=sandbox-lane-1 lane-sandbox omo ");
+  expect(on.lane.sandbox).toBe(true);
+  const off = await launch({ ...base.config, laneSandbox });
+  expect(off.command).toStartWith("DORI_LANE_KEY=sandbox-lane-2 omo ");
+  expect(off.lane.sandbox).toBeUndefined();
+  expect((await launch({ ...base.config, laneSandbox: { ...laneSandbox, default: true } })).command).toStartWith("DORI_LANE_KEY=sandbox-lane-3 lane-sandbox omo ");
+  expect((await launch({ ...base.config, laneSandbox: { ...laneSandbox, default: true } }, false)).command).toStartWith("DORI_LANE_KEY=sandbox-lane-4 omo ");
+  expect((await launch(base.config)).command).toStartWith("DORI_LANE_KEY=sandbox-lane-5 omo ");
+});
+
+test("--sandbox is refused without laneSandbox and for a remote lane, before anything is written", async () => {
+  await writeBrief();
+  world.panes = [];
+  const base = deps({});
+  await expect(launchLane(base, { ...input({ pane: "w:p3" }), sandbox: true })).rejects.toThrow(/needs laneSandbox/);
+  const remote = launchLane({ ...base, config: { ...base.config, laneSandbox: { command: ["lane-sandbox"], default: false } } }, { ...input({ machine: "m1" }), sandbox: true });
+  await expect(remote).rejects.toThrow(/local lanes only/);
+  expect(await base.registry.read("pane-lane")).toBeNull();
+  expect(herdr("pane", "run")).toEqual([]);
+});
+
 test("cwd comes from the pane unless --cwd is given", async () => {
   await writeBrief();
   const d = deps({});
