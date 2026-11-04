@@ -6,7 +6,8 @@ import { randomUUID } from "node:crypto";
 import { eventClass, forLead } from "./event-policy.ts";
 import { unresolved } from "./decision-obligations.ts";
 import type { Registry } from "./registry.ts";
-import { readCloseButtons, recordCloseButton, threadBlockers, threadIdOf } from "./thread-finality.ts";
+import { discordThreadOf } from "./messenger/target.ts";
+import { readCloseButtons, recordCloseButton, threadBlockers } from "./thread-finality.ts";
 import { Waits } from "./waits.ts";
 import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journal.ts";
 
@@ -311,7 +312,7 @@ export class OutcomeTracking {
     const threadOf = new Map<string, string | undefined>();
     for (const outcome of unreported(this.journal)) {
       const bound = open.find((lane) => lane.key === outcome.lane)?.thread ?? (await registry.read(outcome.lane))?.thread;
-      threadOf.set(outcome.lane, bound && bound !== "none" ? threadIdOf(bound) : undefined);
+      threadOf.set(outcome.lane, bound && bound !== "none" ? discordThreadOf(bound, this.core.deps.config.discordChannels) : undefined);
     }
     for (const [thread, at] of due) {
       const blockers = threadBlockers({

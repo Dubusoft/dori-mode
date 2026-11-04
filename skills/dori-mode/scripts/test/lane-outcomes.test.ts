@@ -536,3 +536,35 @@ test("dori reported --final records its button and thread; one after the supervi
   expect(again.out).toContain("REPORT_BUTTON_WITHHELD alpha: the close button is already posted on this thread");
   expect(JSON.stringify(again.requests[0]?.body)).not.toContain("dori:close-thread");
 }, CLI_TIMEOUT);
+
+test("a lane stored with a bare thread id (older launches) gets its --final button and its supervisor button", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "200", closedAt: new Date(T0).toISOString() }));
+  expect((await f.deps.registry.read("alpha"))?.thread).toBe("discord:200");
+  const final = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final"]);
+  expect(final.code).toBe(0);
+  expect(final.out).not.toContain("REPORT_BUTTON_WITHHELD");
+  expect(JSON.stringify(final.requests[0]?.body)).toContain("dori:close-thread:200");
+  await f.deps.registry.write(lane("beta", { thread: "300", closedAt: new Date(T0).toISOString() }));
+  const plain = await cli(f.state.dir, ["reported", "beta", "--text", "done"]);
+  expect(plain.code).toBe(0);
+  // The CLI stamps its receipts with the real clock; an old supervisor clock would prune them as long reported.
+  f.clock.at = Date.now();
+  await f.tick();
+  expect(f.posts.map((post) => post.thread)).toEqual(["300"]);
+  f.supervisor.close();
+}, CLI_TIMEOUT);
+
+test("dori reported --to discord:<thread> --final posts into that thread with the button; a configured channel is no thread", async () => {
+  const f = fixture();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  const final = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final", "--to", "discord:200"]);
+  expect(final.code).toBe(0);
+  expect(final.out).not.toContain("REPORT_BUTTON_WITHHELD");
+  expect(JSON.stringify(final.requests[0]?.body)).toContain("dori:close-thread:200");
+  const config = join(f.state.dir, "config.json");
+  writeFileSync(config, JSON.stringify({ discordChannels: ["100"] }));
+  const channel = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final", "--to", "discord:100"], { DORI_CONFIG: config });
+  expect(channel.code).toBe(0);
+  expect(channel.out).toContain("REPORT_BUTTON_WITHHELD alpha: the report is not posted into a thread");
+}, CLI_TIMEOUT);
