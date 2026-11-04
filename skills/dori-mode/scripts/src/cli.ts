@@ -38,7 +38,7 @@ import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, recordHandled } from "./ack.ts";
-import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
+import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -746,6 +746,10 @@ try {
         await ack(config.stateDir, discord, channel, message, realClock.now(), tasks);
         console.log(`ACKED ${channel} ${message}`);
       }
+      // Read-only: unread owner events in the acked channels, so follow-ups are seen before the reply. Never fails the ack.
+      const acked: { channel: string; message: string }[] = [];
+      for (let i = 0; i < pairs.length; i += 2) acked.push({ channel: pairs[i] ?? "", message: pairs[i + 1] ?? "" });
+      for (const line of unreadAfterAck(config.stateDir, acked)) console.log(line);
       break;
     }
     case "report": {
