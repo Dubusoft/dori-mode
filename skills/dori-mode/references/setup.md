@@ -18,9 +18,9 @@ herdr --skill                       # load its skill unless it is already in you
 
 ## 2. Messenger
 
-Install agent-messenger (github.com/agent-messenger/agent-messenger) and read which platforms it supports. Ask the owner which one to use and wait for the answer.
+Dori runs on Discord only. Install agent-messenger (github.com/agent-messenger/agent-messenger) for the Discord bot.
 
-agent-messenger wraps part of each platform. Read the platform's current bot API changelog and call the API directly for the rest:
+agent-messenger wraps part of Discord. Read Discord's current bot API changelog and call the API directly for the rest:
 
 - Discord: edit your own messages to grow them, and use threads.
 
