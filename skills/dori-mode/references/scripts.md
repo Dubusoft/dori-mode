@@ -36,6 +36,7 @@ Installing, testing, requirements and the library modules are in [development.md
 | `heavyKill` | `["qemu-system", "emulator", "expo export"]` | `supervise`: substrings of a full command line that the critical memory stage kills |
 | `hooks.threadReply` | none | `freshness`, lane reports (`watch`, `supervise`), `recover` |
 | `hooks.transcribe` | none | `transcribe` (argv with `{file}`, prints the text) |
+| `buttonHooks` | none | `supervise`: owner-only Discord button hooks, name (1-20 of `a-z`, `0-9`, `-`) to an argv array run without a shell when the owner clicks a `dori:hook:<name>:<arg>` button (see [Discord button hooks](#discord-button-hooks)). Invalid entries are dropped with one `CONFIG_BUTTON_HOOKS_INVALID` warning |
 | `leadDiet` | `true` | `supervise`: start the lead with a slimmer omo context. Adds `--no-skills`, `--exclude-tools <tools the lead never uses: task*, workpool, goals, codegraph_*, lsp_*, mcp resources, show_html_page, ask_user_question>` (after `leadArgs`) and `SENPI_PROMPT_SURFACE=chat` to the lead launch only; lanes are unchanged. Set `false` to give the lead the full tool and skill set |
 | `leadArgs` | `[]` | `supervise`: extra argv for the lead session only, placed right after `omo`. `["--approve"]` trusts the lead folder's `.omo/` files; `assets/lead-mcp.json` is an optional project file that keeps the Figma MCP on with search exposure |
 | `cacheTtlMin` | 5 | `supervise`: the prompt-cache lifetime it plans lead turns around |
@@ -101,6 +102,16 @@ The library modules are listed in [development.md](development.md).
 ### Discord `/status`
 
 Registered next to `/quota` and handled the same way (owner only, ephemeral, same per-channel rule). It replies with the `dori status` text in a code block, bounded to 2000 characters. It is paged: page 1 (no option) is the report with its first lanes, and its lanes section ends `- +N more on pages 2-T` when more lanes are open; `/status page:N` (integer option, at least 1) starts `Dori lanes - page N of T - <time> KST`, then `Lanes (<count>), continued` and the next lanes in order, as many as fit 1,900 characters, with `Next: page N+1` until the last page. A page past the end says how many pages there are. The supervisor passes it `statusLookup`; without one the command is ignored. The option is part of the guild registration, so a supervisor restart re-registers it.
+
+### Discord button hooks
+
+`dori send discord ... --buttons JSON` posts buttons whose `custom_id` names a `buttonHooks` entry: `dori:hook:<name>:<arg>` runs the hook on click, `dori:hookm:<name>:<arg>` first opens a modal asking for text. `<arg>` is 1-70 of `A-Za-z0-9._:-` and travels in the id, so a click works after any restart with no stored state. `dori supervise` handles the click on its gateway without the lead:
+
+- A non-owner (or a foreign application or guild) gets an ephemeral refusal; an unconfigured `<name>` gets the ephemeral reply 알 수 없는 버튼입니다. Nothing runs.
+- `dori:hook:` from the owner: the message is updated at once (content kept, every button disabled, the clicked one relabelled `<label> - 접수됨`), then the hook runs.
+- `dori:hookm:` from the owner: a modal titled with the button's label (45 characters at most) with one required paragraph input `text` (2000 characters at most). Its submit updates the message the same way, then the hook runs with `{text}` set.
+- Running the hook spawns `buttonHooks[<name>]` detached, no shell, with `{name}`, `{arg}`, `{text}` (empty for a plain button), `{channel}` (the message's channel, the thread id in a thread), `{message}` and `{interaction}` replaced in each element. Its stdout and stderr go to the supervisor log as `BUTTON_HOOK <name> ...` lines, and its exit as `BUTTON_HOOK <name> exited <code>`. Then the journal gets `BUTTON_CLICKED_BY_OWNER <name> <arg>` (id `discord:<channel>:button:<interaction>`).
+- A failed update of the message leaves the buttons live and runs nothing, so the owner can click again.
 
 ### Discord `/quota`
 
@@ -402,7 +413,9 @@ Reads Claude usage now (pi-quota, no session or model turn) and prints the 5h an
 ### `dori can-launch [--machine M] [--cwd D] [--done "..."] [--all]`
 Checks the machine a `dori launch` with the same flags would be placed on (no flags: `placement.defaultMachine`; no fallback is tried). Prints `CAN_LAUNCH` and exits 0 when it has room for another lane. Otherwise it prints `HOLD <reasons>` and exits 4. A remote machine's line names it: `CAN_LAUNCH machine=<label>` or `HOLD machine=<label> <reasons>`; an unlisted label holds with `unknown machine <label>; see dori guard machines`, an unreachable one with `machine <label> unreachable: <detail>`. `--all` checks local and every listed machine, prints one line each, and exits 0 only when all have room. The reasons come from the guard's memory, disk and pane-count thresholds. CPU load alone never holds a launch, because it moves too fast to plan around. A HOLD leaves `<stateDir>/launch-hold.json` behind (one blocked flag per machine, lowered by that machine's next `CAN_LAUNCH`, or by the supervisor when it sends `LAUNCH_READY`, or `LAUNCH_READY machine=<label>` for a remote machine, which lists only that machine's queued launches; queued launches stay), so run it when you are about to launch, not as a status probe: every HOLD answer is read as queued work.
 
-### `dori send discord --to TARGET --text TEXT [--thread ID] [--edit ID]`
+### `dori send discord --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON]`
+`--buttons` attaches one action row to the message's last chunk: a JSON array of 1-5 `{"label": ..., "id": ..., "style"?: "primary"|"secondary"|"success"|"danger"}` (default `secondary`, labels up to 80 characters, ids unique) whose ids match `^dori:(hook|hookm):[a-z0-9-]{1,20}:[A-Za-z0-9._:-]{1,70}$` (see [Discord button hooks](#discord-button-hooks)). A malformed value exits 1 with the first problem on stderr and posts nothing; it cannot be combined with `--edit`.
+
 Posts a message, or edits one with `--edit`. `--to` is a plain id or a lane thread ref (`platform:parent/thread`, as in `lane.thread`), so the default hooks can pass `{thread}` straight in: Discord posts to the thread id. An explicit `--thread` wins; on Discord, `--to <channel> --thread <thread>` posts in the thread. The token comes from `DORI_DISCORD_TOKEN`, read from the process environment first and then from `~/.dori/env` (the supervisor's EnvironmentFile), so a lead that did not inherit them still sends. A token missing from both exits non-zero with the error on stderr, which means the message was not delivered. Text containing `$(` is refused, since it can only come from a shell string. Rate limits are retried with the server's wait time; other errors fail at once.
 
 Lead-only: inside a lane, `dori send` (and `--edit`) exits 1 with `LANE_PERMISSION_DENIED`, even to the lane's own thread. A lane asks with `dori report <key> question --text ...` and the lead relays the answer.

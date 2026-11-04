@@ -139,6 +139,8 @@ export type DoriConfig = {
   readonly leadContextCapTokens: number;
   readonly leadContextHardCapTokens: number;
   readonly discordChannels: readonly string[];
+  /** Owner-only Discord button hooks: name ([a-z0-9-]{1,20}) -> argv run on a `dori:hook:<name>:...` click. */
+  readonly buttonHooks?: Readonly<Record<string, ArgvTemplate>>;
   readonly discordSafetyPollSeconds: number;
   /** Messages fetched (one REST page, 1-100) the first time a Discord channel is caught up with no saved cursor. */
   readonly discordFirstSeenLimit: number;
@@ -392,6 +394,19 @@ const stringRecord = (v: unknown): Record<string, string> =>
   typeof v !== "object" || v === null || Array.isArray(v) ? {}
     : Object.fromEntries(Object.entries(v).filter((e): e is [string, string] => typeof e[1] === "string" && e[1].trim() !== ""));
 
+/** The config's `buttonHooks`: entries with a valid name and a non-empty string argv; the rest dropped with one warning. */
+const buttonHooks = (raw: unknown, path: string): Readonly<Record<string, ArgvTemplate>> | undefined => {
+  if (raw === undefined) return undefined;
+  const object = typeof raw === "object" && raw !== null && !Array.isArray(raw);
+  const entries = object ? Object.entries(raw) : [];
+  const valid = entries.filter(([name, argv]) => /^[a-z0-9-]{1,20}$/.test(name) && Array.isArray(argv) && argv.length > 0 && argv.every((part) => typeof part === "string") && String(argv[0]).trim() !== "");
+  const invalid = object ? entries.filter((entry) => !valid.includes(entry)).map(([name]) => `buttonHooks.${name}`) : ["buttonHooks"];
+  if (invalid.length) {
+    console.error(`CONFIG_BUTTON_HOOKS_INVALID ${invalid.join(", ")} in ${path}: buttonHooks must map names of 1-20 lowercase letters, digits or dashes to non-empty argv arrays of strings; these entries are ignored`);
+  }
+  return Object.fromEntries(valid) as Record<string, string[]>;
+};
+
 /** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
 const placement = (raw: unknown): PlacementConfig => {
   if (raw === undefined) return { defaultMachine: "local", workspaces: {}, fallback: [] };
@@ -479,6 +494,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
+    buttonHooks: buttonHooks(raw.buttonHooks, path),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
     defaultCwd: expandHome(merged.defaultCwd, home),

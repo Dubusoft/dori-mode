@@ -1,4 +1,5 @@
-import type { DiscordConfig } from "../config.ts";
+import { type ArgvTemplate, type DiscordConfig, fill } from "../config.ts";
+import { buttonLabel, disabledRows, type HookInteraction, hookInteraction, hookModal, type HookSpawner, spawnButtonHook } from "./discord-buttons.ts";
 import type { Http } from "./http.ts";
 import { MessengerError } from "./http.ts";
 
@@ -37,6 +38,14 @@ const closeRow = (threadId: string, closed: boolean) => [{
 export const closeThreadButton = (threadId: string): unknown[] => closeRow(threadId, false);
 /** Called after the owner's click archived `threadId`; `interactionId` is unique per click. */
 export type ThreadClosed = (threadId: string, interactionId: string) => Promise<void>;
+/** Called after the owner's button click started hook `name`; `channel` is the message's channel or thread. */
+export type ButtonClicked = (name: string, arg: string, channel: string, interactionId: string) => Promise<void>;
+export type ButtonHookOptions = {
+  /** config `buttonHooks`: hook name -> argv template. */
+  readonly hooks?: Readonly<Record<string, ArgvTemplate>>;
+  readonly spawn?: HookSpawner;
+  readonly clicked?: ButtonClicked;
+};
 
 type CloseInteraction = {
   readonly id: string;
@@ -89,6 +98,8 @@ export class DiscordCommands {
     private readonly statusLookup?: StatusLookup,
     /** Told about each thread the owner's close button archived; without it the close is only logged. */
     private readonly threadClosed?: ThreadClosed,
+    /** Owner-only `dori:hook:` / `dori:hookm:` buttons; without hooks every such click gets the unknown-button reply. */
+    private readonly buttons: ButtonHookOptions = {},
   ) {}
 
   private async request(method: "PUT" | "POST" | "PATCH", path: string, body: unknown, authenticated = false): Promise<void> {
@@ -137,9 +148,48 @@ export class DiscordCommands {
     await this.threadClosed?.(interaction.threadId, interaction.id).catch(() => { console.error(`Discord close-thread event failed ${interaction.threadId}`); });
   }
 
+  /**
+   * A hook button click or its modal submit. A non-owner (or a foreign application or guild) gets an ephemeral refusal
+   * and an unconfigured hook name the unknown-button reply. The owner's `dori:hookm:` click opens the text modal; a
+   * `dori:hook:` click or the modal's submit updates the message at once (every button disabled, the clicked one marked
+   * 접수됨), then spawns the hook and reports the click. A failed update leaves the buttons live and runs nothing.
+   */
+  private async hookButton(interaction: HookInteraction): Promise<void> {
+    const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
+    const refuse = (content: string) => this.request("POST", callback, { type: 4, data: { flags: 64, content } });
+    const argv = this.buttons.hooks?.[interaction.name];
+    const rows = interaction.message?.components ?? [];
+    try {
+      if (interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId || interaction.userId !== this.config.ownerId) {
+        await refuse("이 버튼은 오너만 누를 수 있습니다.");
+        return;
+      }
+      if (!argv) {
+        await refuse("알 수 없는 버튼입니다.");
+        return;
+      }
+      if (interaction.kind === "hookm" && interaction.type === 3) {
+        await this.request("POST", callback, { type: 9, data: hookModal(interaction.customId, buttonLabel(rows, interaction.customId)) });
+        return;
+      }
+      await this.request("POST", callback, interaction.message ? { type: 7, data: { components: disabledRows(rows, interaction.customId) } } : { type: 6 });
+    } catch {
+      console.error(`Discord button ${interaction.name} acknowledgement failed`);
+      return;
+    }
+    (this.buttons.spawn ?? spawnButtonHook)(fill(argv, {
+      name: interaction.name, arg: interaction.arg, text: interaction.text, channel: interaction.channel,
+      message: interaction.message?.id ?? "", interaction: interaction.id,
+    }), interaction.name);
+    await this.buttons.clicked?.(interaction.name, interaction.arg, interaction.channel, interaction.id)
+      .catch(() => { console.error(`Discord button ${interaction.name} event failed`); });
+  }
+
   async handle(value: unknown): Promise<void> {
     const close = closeInteraction(value);
     if (close) return this.closeThread(close);
+    const hook = hookInteraction(value);
+    if (hook) return this.hookButton(hook);
     const interaction = commandInteraction(value);
     if (!interaction || interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId) return;
     if (interaction.command === "status" && !this.statusLookup) return;

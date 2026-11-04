@@ -35,7 +35,11 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     const lane = (await deps.registry.open()).find((l) => l.thread.endsWith(`/${threadId}`))?.key;
     await options.emit(`discord:${threadId}:close:${interactionId}`, `THREAD_CLOSED_BY_OWNER ${threadId}${lane ? ` lane ${lane}` : ""}`);
   };
-  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, deps.config.discordChannels, options.statusLookup, threadClosed);
+  // The owner's hook button click reaches the lead as one journal line after the configured hook was started.
+  const clicked = (name: string, arg: string, channel: string, interactionId: string): Promise<void> =>
+    options.emit(`discord:${channel}:button:${interactionId}`, `BUTTON_CLICKED_BY_OWNER ${name} ${arg}`);
+  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, deps.config.discordChannels, options.statusLookup, threadClosed,
+    { hooks: deps.config.buttonHooks ?? {}, clicked });
   let lastPoll = -Infinity;
   let polling: Promise<void> | undefined;
   let catchupRequested = false;
