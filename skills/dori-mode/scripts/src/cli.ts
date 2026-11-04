@@ -71,6 +71,8 @@ const USAGE = `dori <command> [options]
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
+  close  <key> --cancelled --reason TEXT [--force]   lead-only: close a lane whose work was cancelled or whose Done can never hold;
+                                       Done signals are not checked, the lane is recorded closed as cancelled with the reason
                                        inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, send is lead-only (a lane asks with report <key> question), and a session replaced by recovery may not claim-done or report
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
@@ -173,7 +175,7 @@ const flags = parseArgs({
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
-    list: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" },
+    list: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
@@ -545,7 +547,16 @@ try {
       break;
     }
     case "close": {
-      const r = await closeLane(deps, await lane(await ownKey("close", key ?? die("close needs a lane key"))), opt("note") ?? "closed by the lead", { force: Boolean(flags.values.force) });
+      let cancelled: { reason: string } | undefined;
+      if (flags.values.cancelled) {
+        const caller = await callerLane(deps);
+        if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run close --cancelled; it is lead-only`);
+        const reasons = (Array.isArray(flags.values.reason) ? flags.values.reason : []).filter((r): r is string => typeof r === "string" && r.trim() !== "");
+        if (!reasons.length) die("usage: dori close <key> --cancelled --reason TEXT [--force]");
+        cancelled = { reason: reasons.map((r) => r.trim()).join("; ") };
+      }
+      const note = opt("note") ?? (cancelled ? `cancelled: ${cancelled.reason}` : "closed by the lead");
+      const r = await closeLane(deps, await lane(await ownKey("close", key ?? die("close needs a lane key"))), note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
       for (const line of r.lines) console.log(line);
       process.exit(r.closed ? 0 : 2);
     }
