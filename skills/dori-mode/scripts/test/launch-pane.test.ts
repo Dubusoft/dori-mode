@@ -134,7 +134,7 @@ test("laneSandbox wraps a local lane's agent after DORI_LANE_KEY only when sandb
     const key = `sandbox-lane-${++n}`;
     const r = await launchLane({ ...base, config }, { ...input({ key, pane: "w:p3" }), ...(sandbox === undefined ? {} : { sandbox }) });
     await base.registry.update(key, (lane) => ({ ...lane!, status: "closed", pane: undefined }));
-    return { command: herdr("pane", "run")[0]?.[4] ?? "", lane: r.lane };
+    return { command: herdr("pane", "run")[0]?.[4] ?? "", lane: r.lane, notes: r.notes };
   };
   const on = await launch({ ...base.config, laneSandbox }, true);
   expect(on.command).toStartWith("DORI_LANE_KEY=sandbox-lane-1 lane-sandbox omo ");
@@ -142,7 +142,10 @@ test("laneSandbox wraps a local lane's agent after DORI_LANE_KEY only when sandb
   const off = await launch({ ...base.config, laneSandbox });
   expect(off.command).toStartWith("DORI_LANE_KEY=sandbox-lane-2 omo ");
   expect(off.lane.sandbox).toBeUndefined();
-  expect((await launch({ ...base.config, laneSandbox: { ...laneSandbox, default: true } })).command).toStartWith("DORI_LANE_KEY=sandbox-lane-3 lane-sandbox omo ");
+  // The default does not wrap a --pane lane: it runs as before and says why.
+  const reused = await launch({ ...base.config, laneSandbox: { ...laneSandbox, default: true } });
+  expect(reused.command).toStartWith("DORI_LANE_KEY=sandbox-lane-3 omo ");
+  expect(reused.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-3: --pane w:p3 /));
   expect((await launch({ ...base.config, laneSandbox: { ...laneSandbox, default: true } }, false)).command).toStartWith("DORI_LANE_KEY=sandbox-lane-4 omo ");
   expect((await launch(base.config)).command).toStartWith("DORI_LANE_KEY=sandbox-lane-5 omo ");
 });
