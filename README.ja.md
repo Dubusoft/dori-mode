@@ -32,6 +32,18 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/ma
 
 ホスト監視は macOS ですべて動きます。Linux では負荷とディスクだけを見て、メモリとスワップは不明として扱います。
 
+## はじめての起動
+
+ゼロから最初の仕事が終わるまで:
+
+1. **Discord ボットを作る。** [Discord Developer Portal](https://discord.com/developers/applications) でアプリケーションを作り、**Bot** ページで **Message Content Intent** をオンにしてトークンをコピーします。ボットをサーバーに招待し(OAuth2 URL generator、`bot` スコープ)、ボットと話すチャンネルの ID をコピーします(開発者モードをオンにして、チャンネルを右クリック、チャンネル ID をコピー)。
+2. **herdr を起動**(`herdr`)し、その中で上のワンライナーでインストールします。`dori setup` がそのトークンとチャンネル ID、モデルとフォルダーを尋ね、`dori-lead` ペインと `lanes` ワークスペースを作ります。
+3. **インストールを確認**: `dori doctor` が項目ごとに OK、WARN、FAIL を表示し、失敗した項目には正確な直し方を出します。
+4. **オンにする**: `dori-lead` ペインでコーディングエージェントを開き、「Dori mode」と言います。Dori は自分の名前を尋ね、ボットからあいさつし、オンボーディングを提案します。
+5. **仕事を頼む**: チャンネルでボットに、たとえば「acme/app の README のタイポを直して PR を出して」と書きます。herdr にレーンを開き、スレッドに進捗を投稿し、PR がマージされたらレーンを閉じます。
+
+スラッシュコマンド、モニター、自動起動を含む設定の全体は [`references/setup.md`](skills/dori-mode/references/setup.md) にあります。
+
 ## Dori の名前
 
 Dori は最初に、自分を何と呼べばいいかを聞いてきます。「Dori」のままでもいいし、ShipDori や WorkDori のように Dori で終わる名前でも構いません。複数動かすときに見分けやすくなります。決めた名前はボット名、メッセージの署名、モード名にそのまま使われ、次からは「ShipDori mode」の一言で戻せます。

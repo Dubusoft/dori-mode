@@ -32,6 +32,18 @@ Then open your agent inside herdr and say "Dori mode".
 
 macOS gets the full host guard. On Linux, load and disk work, and memory and swap read as unknown.
 
+## First run
+
+From nothing to your first finished job:
+
+1. **Make a Discord bot.** In the [Discord Developer Portal](https://discord.com/developers/applications), create an application, open its **Bot** page, turn on **Message Content Intent**, and copy the token. Invite the bot to your server (OAuth2 URL generator, `bot` scope), and copy the id of the channel you will talk to it in (turn on Developer Mode, then right-click the channel, Copy Channel ID).
+2. **Start herdr** (`herdr`), then run the one-line install above inside it. `dori setup` asks for that token and channel id, a model and folders, and creates the `dori-lead` pane and the `lanes` workspace.
+3. **Check the install** with `dori doctor`. It prints OK, WARN or FAIL for each part, with the exact fix for anything that failed.
+4. **Switch it on.** Start your coding agent in the `dori-lead` pane and say "Dori mode". The Dori asks what to call itself, greets you through the bot, and offers onboarding.
+5. **Give it a job.** Write to the bot in your channel, for example "fix the typo in the README of acme/app and open a PR". It opens a lane in herdr, posts progress in a thread, and closes the lane once the PR is merged.
+
+The full setup reference, including slash commands, monitors and autostart, is in [`references/setup.md`](skills/dori-mode/references/setup.md).
+
 ## Naming your Dori
 
 The first thing a Dori does is ask you what it should be called. "Dori" is fine. So is a name that ends in Dori, like ShipDori or WorkDori, which helps when you run more than one. It uses that name for the bot, for how it signs off, and for the mode, so next time "ShipDori mode" is all you have to say.
