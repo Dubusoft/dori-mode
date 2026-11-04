@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lane-sandbox: run a dori lane agent command inside a bubblewrap sandbox.
 # Usage: lane-sandbox <cmd> [args...]
-# Passthrough (no sandbox) when DORI_LANE_KEY is empty/unset or LANE_SANDBOX=off.
+# Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
@@ -12,7 +12,7 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-if [ -z "${DORI_LANE_KEY:-}" ] || [ "${LANE_SANDBOX:-}" = "off" ]; then
+if [ -z "${DORI_LANE_KEY:-}" ]; then
   exec "$@"
 fi
 
