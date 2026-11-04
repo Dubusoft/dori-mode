@@ -86,6 +86,8 @@ export type Lane = {
    * its [REPORT] lines found there are counted as violations. Absent: an older lane on the [REPORT] footer, or a remote one.
    */
   readonly reportVia?: "cli";
+  /** Launched behind `laneSandbox.command` (`dori launch --sandbox`, or the config default); recovery relaunches it the same way. */
+  readonly sandbox?: true;
   /** [REPORT] lines of a `reportVia: cli` lane found in the lead's pane, by line hash and first-seen time, newest last. */
   readonly leadPaneSeen?: readonly { readonly hash: string; readonly at: string }[];
   /** How many distinct such lines were found: the lane's lead-pane violations. */

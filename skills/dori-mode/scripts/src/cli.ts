@@ -58,6 +58,7 @@ const USAGE = `dori <command> [options]
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
+                [--sandbox|--no-sandbox]   wrap the local lane's agent in laneSandbox.command (default: laneSandbox.default); refused for --machine
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
                 [--toodo-start FILE-OR-JSON]   a Toodo task the lead started: run in the worktree and first shell pane of its start_task response
@@ -178,7 +179,7 @@ const flags = parseArgs({
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
-    list: { type: "boolean" }, final: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
+    list: { type: "boolean" }, final: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, sandbox: { type: "boolean" }, "no-sandbox": { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
@@ -447,10 +448,13 @@ try {
     case "launch": {
       const mode = opt("mode");
       if (mode !== undefined && !(LANE_MODES as readonly string[]).includes(mode)) die(`--mode must be one of ${LANE_MODES.join(", ")}`);
+      if (flags.values.sandbox && flags.values["no-sandbox"]) die("--sandbox and --no-sandbox are exclusive");
+      if (flags.values.sandbox && !config.laneSandbox) die("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
+      const sandbox = flags.values.sandbox ? true : flags.values["no-sandbox"] ? false : undefined;
       const toodoArg = opt("toodo-start");
       if (toodoArg !== undefined && (opt("cwd") || opt("pane") || opt("workspace"))) die("--toodo-start takes the directory and pane from the start_task response; drop --cwd, --pane and --workspace");
       const toodo = toodoArg === undefined ? undefined : await readToodoStart(toodoArg).catch((error: unknown) => die(error instanceof Error ? error.message : String(error)));
-      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
+      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
       for (const line of plan.lines) console.log(line);

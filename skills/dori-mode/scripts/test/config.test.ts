@@ -38,6 +38,26 @@ test("laneRules defaults to none, collapses whitespace, drops blanks, and refuse
   await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
 });
 
+test("laneSandbox is off when absent, defaults to opt-in, and refuses a bad shape", async () => {
+  const path = join(state.dir, "sandbox.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  expect((await loadConfig(path, "/home/ana")).laneSandbox).toBeUndefined();
+  await Bun.write(path, JSON.stringify({ laneSandbox: { command: ["lane-sandbox"] } }));
+  expect((await loadConfig(path, "/home/ana")).laneSandbox).toEqual({ command: ["lane-sandbox"], default: false });
+  await Bun.write(path, JSON.stringify({ laneSandbox: { command: ["lane-sandbox", "--strict"], default: true } }));
+  expect((await loadConfig(path, "/home/ana")).laneSandbox).toEqual({ command: ["lane-sandbox", "--strict"], default: true });
+  for (const bad of [["lane-sandbox"], "lane-sandbox", { command: [] }, { command: "lane-sandbox" }, { command: ["lane-sandbox", " "] }, { command: [1] }, { command: ["lane-sandbox"], default: "yes" }]) {
+    await Bun.write(path, JSON.stringify({ laneSandbox: bad }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow(TypeError);
+  }
+});
+
+test("laneSandbox never touches the lead's command", () => {
+  const config = { ...defaultConfig("/home/test"), defaultModel: "m/lane" };
+  expect(leadCommand({ ...config, laneSandbox: { command: ["lane-sandbox"], default: true } }, "@p")).toEqual(leadCommand(config, "@p"));
+  expect(leadCommand({ ...config, laneSandbox: { command: ["lane-sandbox"], default: true } }, "@p")).not.toContain("lane-sandbox");
+});
+
 test("a missing config file falls back to defaults and DORI_STATE_DIR wins over the file", async () => {
   process.env.DORI_STATE_DIR = state.dir;
   const c = await loadConfig("/nonexistent/config.json", "/home/ana");

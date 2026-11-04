@@ -169,6 +169,11 @@ export type DoriConfig = {
   readonly ownerLanguage?: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
+  /**
+   * Argv prefix that wraps a local lane's agent command (e.g. ["lane-sandbox"]); `default` decides whether a launch without
+   * `--sandbox`/`--no-sandbox` uses it. Absent: no lane is wrapped and `--sandbox` is refused. The lead is never wrapped.
+   */
+  readonly laneSandbox?: LaneSandbox;
   /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
   readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
@@ -366,6 +371,19 @@ const laneRules = (raw: unknown): readonly string[] => {
   return (raw as string[]).map((rule) => rule.replace(/\s+/g, " ").trim()).filter(Boolean);
 };
 
+export type LaneSandbox = { readonly command: readonly string[]; readonly default: boolean };
+
+/** The config's `laneSandbox`, or undefined when absent; throws TypeError unless { command: non-empty string[], default?: boolean }. */
+const laneSandbox = (raw: unknown): LaneSandbox | undefined => {
+  if (raw == null) return undefined;
+  const bad = () => new TypeError("laneSandbox must be { \"command\": [non-empty strings, at least one], \"default\": boolean }");
+  if (typeof raw !== "object" || Array.isArray(raw)) throw bad();
+  const { command, default: on } = raw as Record<string, unknown>;
+  if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string" || !part.trim())) throw bad();
+  if (on !== undefined && typeof on !== "boolean") throw bad();
+  return { command: command as string[], default: on === true };
+};
+
 /** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */
 const heavyKill = (raw: unknown, fallback: readonly string[]): readonly string[] => {
   if (raw === undefined) return fallback;
@@ -491,6 +509,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
     resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
+    laneSandbox: laneSandbox(raw.laneSandbox),
     heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),

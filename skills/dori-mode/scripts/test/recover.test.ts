@@ -234,6 +234,16 @@ test("item 7: a recovered lane resumes its registered session instead of restart
   expect(await deps.registry.read(lane.key)).toMatchObject({ session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", pane: "new:p1" });
 });
 
+test("a sandboxed lane is relaunched behind laneSandbox.command, resumed session included", async () => {
+  const { deps, world, lane } = await fixture();
+  await deps.registry.write({ ...lane, sandbox: true, session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", sessionVia: "argv" });
+  const wrapped = { ...deps, config: { ...deps.config, laneSandbox: { command: ["lane-sandbox"], default: false } } };
+  expect(await recoverLanes(wrapped)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
+  const ran = world.calls.find((c) => c[0] === "herdr" && c[2] === "run")?.[4] ?? "";
+  expect(ran).toStartWith("DORI_LANE_KEY=recover-lane lane-sandbox omo --model provider/expected --thinking medium --session 0b1c2d3e-aaaa-bbbb-cccc-123456789abc ");
+  expect((await deps.registry.read(lane.key))?.sandbox).toBe(true);
+});
+
 test("item 7: a resume that does not start falls back to the brief on the next attempt", async () => {
   const { deps, world, lane, control, clock } = await fixture();
   await deps.registry.write({ ...lane, session: "gone-session" });
