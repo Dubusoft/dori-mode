@@ -165,6 +165,11 @@ bunx tsc --noEmit  # typecheck
 
 The tests never touch a real pane, repo or GitHub.
 
+## Sponsoring
+
+If Dori mode is useful to you, you can support its development through
+[GitHub Sponsors](https://github.com/sponsors/dev-bokdong).
+
 ## License
 
 MIT
