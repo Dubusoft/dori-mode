@@ -387,17 +387,33 @@ export const STARTUP_POLL_MS = 2_000;
 export const STARTUP_POLLS = 10;
 export const STARTUP_READY_READS = 2;
 
+/**
+ * Whether this launch wraps its agent in laneSandbox.command. An explicit `--sandbox`/`--no-sandbox` (and a relaunch's recorded
+ * choice) is taken as given; the config default passes a lane through, with the reason, where the sandbox does not fit.
+ */
+export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, which: (cmd: string) => string | null): { readonly on: boolean; readonly skipped?: string } => {
+  if (input.sandbox !== undefined) return { on: input.sandbox };
+  const configured = config.laneSandbox;
+  if (!configured?.default) return { on: false };
+  if (input.machine) return { on: false, skipped: `remote lane on ${input.machine}; laneSandbox wraps local lanes only` };
+  if (input.pane) return { on: false, skipped: `--pane ${input.pane} reuses an existing pane whose directory the sandbox may not bind; pass --sandbox to wrap it anyway` };
+  const exe = configured.command[0] ?? "";
+  if (!which(exe)) return { on: false, skipped: `${exe} is not on PATH; install scripts/templates/lane-sandbox.sh as ${exe}, set laneSandbox.command, or set laneSandbox.default to false` };
+  return { on: true };
+};
+
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string; readonly notes: readonly string[] }> => {
   const model = input.model ?? deps.config.defaultModel;
   const mode = input.mode ?? "ulw";
   if (!existing) await validateLaunch(deps, input);
-  const sandbox = input.sandbox ?? (!input.machine && deps.config.laneSandbox?.default === true);
+  const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which);
+  const sandbox = choice.on;
   if (sandbox && !deps.config.laneSandbox) throw new LaunchError("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
   if (sandbox && input.machine) throw new LaunchError(`--sandbox wraps local lanes only; machine ${input.machine} cannot run it, drop --sandbox`);
   deps = { ...deps, run: laneRunner(deps.run, input) };
   const placed = input.toodo && !input.pane && !input.workspace ? await toodoTarget(deps, input, input.toodo) : undefined;
   const target = placed ? placed.target : input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
-  const notes = placed?.notes ?? [];
+  const notes = [...(placed?.notes ?? []), ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const dir = input.cwd ?? target?.cwd;
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);

@@ -38,11 +38,13 @@ test("laneRules defaults to none, collapses whitespace, drops blanks, and refuse
   await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
 });
 
-test("laneSandbox is off when absent, defaults to opt-in, and refuses a bad shape", async () => {
+test("laneSandbox is lane-sandbox when absent, defaults to on, and refuses a bad shape", async () => {
   const path = join(state.dir, "sandbox.json");
   await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
-  expect((await loadConfig(path, "/home/ana")).laneSandbox).toBeUndefined();
+  expect((await loadConfig(path, "/home/ana")).laneSandbox).toEqual({ command: ["lane-sandbox"], default: true });
   await Bun.write(path, JSON.stringify({ laneSandbox: { command: ["lane-sandbox"] } }));
+  expect((await loadConfig(path, "/home/ana")).laneSandbox).toEqual({ command: ["lane-sandbox"], default: true });
+  await Bun.write(path, JSON.stringify({ laneSandbox: { command: ["lane-sandbox"], default: false } }));
   expect((await loadConfig(path, "/home/ana")).laneSandbox).toEqual({ command: ["lane-sandbox"], default: false });
   await Bun.write(path, JSON.stringify({ laneSandbox: { command: ["lane-sandbox", "--strict"], default: true } }));
   expect((await loadConfig(path, "/home/ana")).laneSandbox).toEqual({ command: ["lane-sandbox", "--strict"], default: true });

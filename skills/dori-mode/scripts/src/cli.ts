@@ -58,7 +58,7 @@ const USAGE = `dori <command> [options]
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
-                [--sandbox|--no-sandbox]   wrap the local lane's agent in laneSandbox.command (default: laneSandbox.default); refused for --machine
+                [--sandbox|--no-sandbox]   wrap the local lane's agent in laneSandbox.command (default: on; a --machine or --pane lane, or a missing command, passes through with SANDBOX_SKIPPED); --sandbox refused for --machine
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
                 [--toodo-start FILE-OR-JSON]   a Toodo task the lead started: run in the worktree and first shell pane of its start_task response
