@@ -18,12 +18,38 @@ fi
 
 H="${HOME:?}"
 
-opts=(
-  --ro-bind / /
+# Per-lane private TMPDIR. The host dir lives under ~/.cache (which may be
+# group-writable), so it is mounted inside at $H/.lane-tmp, whose ancestors are
+# all namespace-owned 0755 dirs (omo's trust-ancestor check needs that).
+key=${DORI_LANE_KEY//[^A-Za-z0-9._-]/_}
+case "$key" in . | ..) key="_$key" ;; esac
+LT="$H/.cache/omo-tmp/lane-sandbox/${key:?}"
+mkdir -p "$LT"
+chmod 700 "$LT"
+
+# Root is a namespace-owned tmpfs (uid = us, 0755) instead of --ro-bind / /, so
+# / and the parent of $HOME do not show up as nobody-owned. Host top-level
+# entries are re-bound read-only and top-level symlinks recreated.
+top=/${H#/}
+top=${top%%/*}
+opts=(--perms 0755 --tmpfs /)
+shopt -s nullglob dotglob
+for e in /*; do
+  case "$e" in "$top" | /tmp | /proc | /dev) continue ;; esac
+  if [ -L "$e" ]; then
+    opts+=(--symlink "$(readlink "$e")" "$e")
+  else
+    opts+=(--ro-bind "$e" "$e")
+  fi
+done
+shopt -u nullglob dotglob
+
+opts+=(
   --dev /dev
   --proc /proc
   --unshare-pid
   --die-with-parent
+  --perms 0755 --dir "$(dirname "$H")"
   --tmpfs "$H"
   --bind /tmp /tmp
   --setenv LANE_SANDBOX_ACTIVE 1
@@ -100,5 +126,10 @@ case "$broad" in
     ;;
 esac
 opts+=(--chdir "$C")
+
+# Private TMPDIR last, so the broad ~/.cache rw bind cannot shadow it
+opts+=(--bind "$LT" "$H/.lane-tmp" --setenv TMPDIR "$H/.lane-tmp")
+# Keep the root tmpfs read-only like the old --ro-bind / / (after all mountpoints exist)
+opts+=(--remount-ro /)
 
 exec bwrap "${opts[@]}" -- "$@"
