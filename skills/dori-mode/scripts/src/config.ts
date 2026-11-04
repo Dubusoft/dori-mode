@@ -169,6 +169,11 @@ export type DoriConfig = {
   readonly ownerLanguage?: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
+  /**
+   * Argv prefix that wraps every new local lane's agent command (e.g. ["lane-sandbox"]). Absent from the file: DEFAULT_LANE_SANDBOX.
+   * The lead is never wrapped.
+   */
+  readonly laneSandbox?: LaneSandbox;
   /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
   readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
@@ -352,6 +357,7 @@ let warnedRemovedDeliveryKeys = false;
 let warnedRemovedOwnerPostKeys = false;
 let warnedRemovedToodoKeys = false;
 let warnedRemovedHookKeys = false;
+let warnedSandboxDefault = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -364,6 +370,28 @@ const laneRules = (raw: unknown): readonly string[] => {
   if (raw == null) return [];
   if (!Array.isArray(raw) || raw.some((rule) => typeof rule !== "string")) throw new TypeError("laneRules must be an array of strings");
   return (raw as string[]).map((rule) => rule.replace(/\s+/g, " ").trim()).filter(Boolean);
+};
+
+export type LaneSandbox = { readonly command: readonly string[] };
+
+/** Used when the config has no `laneSandbox`: new local lanes run behind `lane-sandbox` on PATH, and pass through when it is missing. */
+export const DEFAULT_LANE_SANDBOX: LaneSandbox = { command: ["lane-sandbox"] };
+
+/**
+ * The config's `laneSandbox`, or DEFAULT_LANE_SANDBOX when absent; throws TypeError unless { command: non-empty string[] }.
+ * The removed `default` key (the sandbox is always on) is ignored with one warning, whatever its value.
+ */
+const laneSandbox = (raw: unknown, path: string): LaneSandbox => {
+  if (raw == null) return DEFAULT_LANE_SANDBOX;
+  const bad = () => new TypeError("laneSandbox must be { \"command\": [non-empty strings, at least one] }");
+  if (typeof raw !== "object" || Array.isArray(raw)) throw bad();
+  const { command } = raw as Record<string, unknown>;
+  if ("default" in raw && !warnedSandboxDefault) {
+    warnedSandboxDefault = true;
+    console.error(`CONFIG_SANDBOX_DEFAULT_REMOVED laneSandbox.default in ${path}: every new local lane runs in the sandbox; the key is ignored and can be deleted`);
+  }
+  if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string" || !part.trim())) throw bad();
+  return { command: command as string[] };
 };
 
 /** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */
@@ -491,6 +519,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     eventPolicy: resolveEventPolicy(raw.eventPolicy),
     resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
+    laneSandbox: laneSandbox(raw.laneSandbox, path),
     heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),

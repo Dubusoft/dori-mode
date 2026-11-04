@@ -123,6 +123,51 @@ test("laneThinking is inserted after the --model pair, replaces agentCommand's -
   expect(await command("medium", ["run-agent", "{prompt}"])).toContain("run-agent 'ulw");
 });
 
+test("laneSandbox wraps every local lane's agent after DORI_LANE_KEY, passes a --pane lane through unless --sandbox, and records it", async () => {
+  const base = deps({});
+  const laneSandbox = { command: ["lane-sandbox"] };
+  let n = 0;
+  const launch = async (config: typeof base.config, target: Record<string, string>, sandbox?: true, which: (cmd: string) => string | null = () => null) => {
+    await writeBrief();
+    world.panes = target.workspace ? [{ pane_id: "w:p3", workspace_id: target.workspace }] : [];
+    world.calls.length = 0;
+    const key = `sandbox-lane-${++n}`;
+    const r = await launchLane({ ...base, config, which }, { ...input({ key, ...target }), ...(sandbox ? { sandbox } : {}) });
+    await base.registry.update(key, (lane) => ({ ...lane!, status: "closed", pane: undefined }));
+    return { command: herdr("pane", "run")[0]?.[4] ?? "", lane: r.lane, notes: r.notes };
+  };
+  const onPath = (cmd: string) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null);
+  // No flag and no setting: a lane in a new tab is wrapped.
+  const always = await launch({ ...base.config, laneSandbox }, { workspace: "w" }, undefined, onPath);
+  expect(always.command).toStartWith("DORI_LANE_KEY=sandbox-lane-1 lane-sandbox omo ");
+  expect(always.lane.sandbox).toBe(true);
+  expect(always.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
+  const forced = await launch({ ...base.config, laneSandbox }, { pane: "w:p3" }, true);
+  expect(forced.command).toStartWith("DORI_LANE_KEY=sandbox-lane-2 lane-sandbox omo ");
+  expect(forced.lane.sandbox).toBe(true);
+  // A --pane lane runs as before and says why.
+  const reused = await launch({ ...base.config, laneSandbox }, { pane: "w:p3" }, undefined, onPath);
+  expect(reused.command).toStartWith("DORI_LANE_KEY=sandbox-lane-3 omo ");
+  expect(reused.lane.sandbox).toBeUndefined();
+  expect(reused.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-3: --pane w:p3 /));
+  // A wrapper missing from PATH passes through and says why.
+  const missing = await launch({ ...base.config, laneSandbox }, { workspace: "w" });
+  expect(missing.command).toStartWith("DORI_LANE_KEY=sandbox-lane-4 omo ");
+  expect(missing.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-4: lane-sandbox is not on PATH/));
+  expect((await launch(base.config, { pane: "w:p3" })).command).toStartWith("DORI_LANE_KEY=sandbox-lane-5 omo ");
+});
+
+test("--sandbox is refused without laneSandbox and for a remote lane, before anything is written", async () => {
+  await writeBrief();
+  world.panes = [];
+  const base = deps({});
+  await expect(launchLane(base, { ...input({ pane: "w:p3" }), sandbox: true })).rejects.toThrow(/needs laneSandbox/);
+  const remote = launchLane({ ...base, config: { ...base.config, laneSandbox: { command: ["lane-sandbox"] } } }, { ...input({ machine: "m1" }), sandbox: true });
+  await expect(remote).rejects.toThrow(/local lanes only/);
+  expect(await base.registry.read("pane-lane")).toBeNull();
+  expect(herdr("pane", "run")).toEqual([]);
+});
+
 test("cwd comes from the pane unless --cwd is given", async () => {
   await writeBrief();
   const d = deps({});

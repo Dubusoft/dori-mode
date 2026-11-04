@@ -22,6 +22,8 @@ export type FlowDeps = {
   readonly registry: Registry;
   readonly config: DoriConfig;
   readonly exists?: (path: string) => boolean;
+  /** PATH lookup for laneSandbox.command; absent uses Bun.which. */
+  readonly which?: (cmd: string) => string | null;
   readonly signalIo?: SignalIo;
   /** The operation rows; absent opens the configured store per call. */
   readonly operations?: OperationStore;
