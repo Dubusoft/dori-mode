@@ -451,9 +451,11 @@ export class LeadLifecycle {
     // Idle at delivery time (checked by the caller): a lead past the hard cap restarts even with a warm cache.
     if (tokens >= config.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${config.leadContextHardCapTokens}` };
     const idleMs = clock.now() - statSync(file).mtimeMs;
+    const idle = `idle ${Math.floor(idleMs / 60_000)} min`;
+    // A lead at or above the context cap always restarts at this safe point (idle, its own children done), warm cache or not.
+    if (tokens >= config.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `context ${tokens} tokens at or above leadContextCapTokens ${config.leadContextCapTokens} (${idle}, cache ${idleMs < config.cacheTtlMin * 60_000 ? "warm" : "stale"})` };
     if (idleMs < config.cacheTtlMin * 60_000) return undefined;
-    const stale = `idle ${Math.floor(idleMs / 60_000)} min (past cacheTtlMin ${config.cacheTtlMin})`;
-    if (tokens >= config.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `${stale} with context ${tokens} tokens at or above leadContextCapTokens ${config.leadContextCapTokens}` };
+    const stale = `${idle} (past cacheTtlMin ${config.cacheTtlMin})`;
     // Pending waits and working lanes do not keep a stale lead: their events stay in the log past the take cursor, and
     // the fresh lead is reminded of open decisions and unreported lane outcomes until it settles them.
     return { kind: "stale", tokens, detail: stale };
