@@ -85,6 +85,18 @@ test("the worktree is removed before the pane closes, and a failed removal keeps
   expect(order).toEqual(["remove", "close"]);
 });
 
+test("a lane whose worktree was removed before the close (Toodo got there first) closes and records it as already removed", async () => {
+  world.removed = [WT];
+  const toodoLane: Lane = { ...lane, cwd: WT };
+  await at(T0).registry.write(toodoLane);
+  const r = await closeLane(at(T0), toodoLane, "manual");
+  expect(r.closed).toBe(true);
+  expect(r.lines).toContain(`SIGNAL_CWD demo-lane: lane cwd ${WT} no longer exists; Done signals and git ran in defaultCwd /repo`);
+  expect(removes()).toHaveLength(0);
+  const receipt = (await at(T0).registry.read("demo-lane"))?.receipt as { cleanup?: string[] } | undefined;
+  expect(receipt?.cleanup).toContain(`worktree ${WT} already removed`);
+});
+
 test("a failed worktree removal refuses the close and keeps the pane, the thread and the lane open", async () => {
   const base = at(T0);
   const failing = { ...base, run: async (argv: readonly string[]) => (argv.includes("remove") ? { code: 128, out: "", err: "fatal: locked" } : base.run(argv)) };
