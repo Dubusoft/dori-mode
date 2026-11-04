@@ -27,7 +27,6 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/messenger/discord-lock.ts` | the token-scoped lock that keeps one gateway per user and machine |
 | `src/messenger/typing.ts` | `Timers`: the interval timers seam (`realTimers` in production) |
 | `src/messenger/voice.ts` | `transcribe`: voice note to text through your hook |
-| `src/messenger/thread-ledger.ts` | `ThreadLedger`: every thread the Dori posts in, persisted |
 | `src/doctor.ts` | `runDoctor`: read-only checks (units, herdr, paths, config, Discord, gateway, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
 | `src/status.ts` | `collectStatus` / `renderStatus`: the no-LLM one-screen summary behind `dori status` and `/status` |
 | `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |

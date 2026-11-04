@@ -6,7 +6,7 @@ import { parseArgs } from "node:util";
 
 import { configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
-import { resolveTarget } from "./messenger/target.ts";
+import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
@@ -28,7 +28,7 @@ import { Discord, discordPresence, openDiscordGateway } from "./messenger/discor
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
 import { closeThreadButton, DiscordCommands } from "./messenger/discord-commands.ts";
 import { buttonRow } from "./messenger/discord-buttons.ts";
-import { discordOwnerConfigured } from "./messenger/discord-inbound.ts";
+import { discordOwnerConfigured, discordThread } from "./messenger/discord-inbound.ts";
 import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
@@ -38,7 +38,7 @@ import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, recordHandled } from "./ack.ts";
-import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput } from "./inbox.ts";
+import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -248,6 +248,20 @@ const lane = async (k: string | undefined) => {
 
 const messengerToken = (name: string): string => resolveCredential(name) ?? die(`${name} is not set in the environment or in ${envFilePath()}`);
 
+/**
+ * A launch's `--thread` as the lane stores it: `discord:<channel>/<thread>`, the parent read from Discord when the value names
+ * only the thread. Without a token or an answer it is kept in ref form (`discord:<id>`), with THREAD_PARENT_UNKNOWN on stderr.
+ */
+const laneThreadRef = async (value: string | undefined, channels: readonly string[]): Promise<string | undefined> => {
+  if (value === undefined || value === "none") return value;
+  const token = resolveCredential("DORI_DISCORD_TOKEN");
+  return withThreadParent(value, channels, async (id) => {
+    if (!token) { console.error(`THREAD_PARENT_UNKNOWN ${id}: DORI_DISCORD_TOKEN is not set; the lane keeps discord:${id}`); return undefined; }
+    try { return discordThread(await new Discord(fetchHttp, realClock, token).call("GET", `/channels/${id}`))?.parent; }
+    catch (e) { console.error(`THREAD_PARENT_UNKNOWN ${id}: ${e instanceof Error ? e.message : String(e)}; the lane keeps discord:${id}`); return undefined; }
+  });
+};
+
 /** Posts `text` to a resolved Discord target and returns the new message's id. */
 const postMessage = async (to: string, text: string, components?: readonly unknown[]): Promise<string> =>
   // Each post is its own message: without a unique id Discord would dedupe a repeat of the same text.
@@ -454,7 +468,7 @@ try {
       const toodoArg = opt("toodo-start");
       if (toodoArg !== undefined && (opt("cwd") || opt("pane") || opt("workspace"))) die("--toodo-start takes the directory and pane from the start_task response; drop --cwd, --pane and --workspace");
       const toodo = toodoArg === undefined ? undefined : await readToodoStart(toodoArg).catch((error: unknown) => die(error instanceof Error ? error.message : String(error)));
-      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
+      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
       for (const line of plan.lines) console.log(line);
@@ -491,7 +505,7 @@ try {
     }
     case "adopt": {
       if (opt("mode") !== undefined) die("--mode applies to launch only");
-      const l = await adoptLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) });
+      const l = await adoptLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) });
       console.log(`ADOPTED ${l.key} pane=${l.pane} thread=${l.thread}`);
       break;
     }
@@ -732,6 +746,10 @@ try {
         await ack(config.stateDir, discord, channel, message, realClock.now(), tasks);
         console.log(`ACKED ${channel} ${message}`);
       }
+      // Read-only: unread owner events in the acked channels, so follow-ups are seen before the reply. Never fails the ack.
+      const acked: { channel: string; message: string }[] = [];
+      for (let i = 0; i < pairs.length; i += 2) acked.push({ channel: pairs[i] ?? "", message: pairs[i + 1] ?? "" });
+      for (const line of unreadAfterAck(config.stateDir, acked)) console.log(line);
       break;
     }
     case "report": {
@@ -783,8 +801,9 @@ try {
       // Only a --final report posted into a thread with nothing left on it carries the owner's close-thread button
       // (handled by `dori supervise`); otherwise it posts without one. `dori supervise` also posts the button itself once
       // the thread's work is finished and reported, so one it posted after this lane closed withholds this one.
-      const { finalityBlockers, readCloseButtons, threadIdOf } = await import("./thread-finality.ts");
-      const threadId = opt("thread") ?? /^discord:[^/]+\/(\d+)$/.exec(ref)?.[1];
+      const { finalityBlockers, readCloseButtons } = await import("./thread-finality.ts");
+      // `discord:<thread>` and a bare thread id count as a thread too, unless the id is a configured channel.
+      const threadId = opt("thread") ?? discordThreadOf(ref, config.discordChannels);
       let withheld: string[] = [];
       if (final) {
         const { publishedDecisions } = await import("./decision-obligations.ts");
@@ -801,7 +820,7 @@ try {
       const note = opt("note");
       // The lane's thread for the supervisor's close-button check: the thread that got this report's button, else its bound
       // thread, else the thread this report went into.
-      const laneThread = button ? to : bound && isDiscord(bound) ? threadIdOf(bound) : threadId === to ? to : undefined;
+      const laneThread = button ? to : (bound && isDiscord(bound) ? discordThreadOf(bound, config.discordChannels) : undefined) ?? (threadId === to ? to : undefined);
       recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, {
         message, target: `${platform}:${to}${thread ? `/${thread}` : ""}`, ...(laneThread ? { thread: laneThread } : {}), ...(button ? { button } : {}),
       });

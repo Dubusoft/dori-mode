@@ -6,7 +6,8 @@ import { randomUUID } from "node:crypto";
 import { eventClass, forLead } from "./event-policy.ts";
 import { unresolved } from "./decision-obligations.ts";
 import type { Registry } from "./registry.ts";
-import { readCloseButtons, recordCloseButton, threadBlockers, threadIdOf } from "./thread-finality.ts";
+import { discordThreadOf } from "./messenger/target.ts";
+import { readCloseButtons, recordCloseButton, threadBlockers } from "./thread-finality.ts";
 import { Waits } from "./waits.ts";
 import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journal.ts";
 
@@ -174,10 +175,12 @@ export class OutcomeTracking {
   /**
    * `dori reported` receipts close their lane's obligation; one for a lane with none yet (reported before its outcome
    * event arrived) is kept, so that event opens nothing. Persisted before the receipts are dropped: a replay only takes
-   * the earliest report time again.
+   * the earliest report time again. A repeat report of a lane into the same thread without a button keeps its last report
+   * time, so it does not re-arm that thread's close button; new work in a thread runs under a new lane key. Receipts are
+   * taken in time order.
    */
   consumeReceipts(): void {
-    const receipts = pendingReported(this.core.deps.config.stateDir);
+    const receipts = pendingReported(this.core.deps.config.stateDir).sort((a, b) => a.at - b.at);
     if (!receipts.length) return;
     const outcomes = [...(this.journal.outcomes ?? [])];
     for (const receipt of receipts) {
@@ -185,11 +188,12 @@ export class OutcomeTracking {
       const found = at < 0 ? undefined : outcomes[at];
       const note = found?.note ?? receipt.note;
       const thread = receipt.thread ?? found?.thread;
+      const repeat = found?.lastReportAt !== undefined && receipt.thread === found.thread && !receipt.button;
       const next: LaneOutcome = {
         ...(found ?? { lane: receipt.lane, since: receipt.at }),
         reportedAt: Math.min(found?.reportedAt ?? Infinity, receipt.at),
         ...(note ? { note } : {}),
-        ...(thread ? { thread, lastReportAt: Math.max(found?.lastReportAt ?? -Infinity, receipt.at) } : {}),
+        ...(thread ? { thread, lastReportAt: repeat ? found.lastReportAt : Math.max(found?.lastReportAt ?? -Infinity, receipt.at) } : {}),
       };
       // A --final report's button counts as the thread's close button: the supervisor posts none for that report.
       if (receipt.button && receipt.thread) recordCloseButton(this.core.deps.config.stateDir, receipt.thread, receipt.at);
@@ -311,7 +315,7 @@ export class OutcomeTracking {
     const threadOf = new Map<string, string | undefined>();
     for (const outcome of unreported(this.journal)) {
       const bound = open.find((lane) => lane.key === outcome.lane)?.thread ?? (await registry.read(outcome.lane))?.thread;
-      threadOf.set(outcome.lane, bound && bound !== "none" ? threadIdOf(bound) : undefined);
+      threadOf.set(outcome.lane, bound && bound !== "none" ? discordThreadOf(bound, this.core.deps.config.discordChannels) : undefined);
     }
     for (const [thread, at] of due) {
       const blockers = threadBlockers({

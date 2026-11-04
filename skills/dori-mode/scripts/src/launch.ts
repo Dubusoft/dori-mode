@@ -7,7 +7,9 @@ import { laneRunner, readScreen, statusLookup } from "./panes.ts";
 import { LANE_KEY, type Lane, type LaneMode, statusOf } from "./registry.ts";
 import { iso } from "./run.ts";
 import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
+import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
+import { threadIdOf } from "./thread-finality.ts";
 import type { ToodoStart } from "./toodo-start.ts";
 
 export type LaunchInput = {
@@ -106,8 +108,9 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
   if (sharing.length && !input.shareThread) throw new LaunchError(`thread ${input.thread} already has open lane ${sharing.join(", ")}; one thread per lane, or pass --share-thread`);
 };
 
+/** Open lanes on the input's thread, by thread id: `discord:<thread>` and `discord:<channel>/<thread>` are the same thread. */
 const threadSharers = async (deps: FlowDeps, input: LaunchInput): Promise<string[]> =>
-  !input.thread || input.thread === "none" ? [] : (await deps.registry.open()).filter((l) => l.key !== input.key && l.thread === input.thread).map((l) => l.key);
+  !input.thread || input.thread === "none" ? [] : (await deps.registry.open()).filter((l) => l.key !== input.key && l.thread !== "none" && threadIdOf(l.thread) === threadIdOf(input.thread ?? "")).map((l) => l.key);
 
 /** owner/repo names in the Done line's merged/closed signals, lowercased. */
 export const doneRepos = (done: string): string[] => [...new Set(splitDone(done).flatMap((part) => {
@@ -243,7 +246,7 @@ const laneDirs = (machine: string | undefined, dir: string | undefined, defaultC
   machine ? (dir ? { remoteCwd: dir } : {}) : { cwd: dir ?? defaultCwd };
 
 export const adoptLane = async (deps: FlowDeps, input: LaunchInput & { readonly pane: string }): Promise<Lane> => {
-  const lane: Lane = { key: input.key, title: input.title, thread: input.thread ?? "none", pane: input.pane, ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(await autoCloseOf(input.brief)), ...laneDirs(input.machine, input.cwd, deps.config.defaultCwd), openedAt: iso(deps.clock) };
+  const lane: Lane = { key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), pane: input.pane, ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(await autoCloseOf(input.brief)), ...laneDirs(input.machine, input.cwd, deps.config.defaultCwd), openedAt: iso(deps.clock) };
   return reserveLane(deps, input, lane);
 };
 
@@ -419,7 +422,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
-  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: input.thread ?? "none", ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!input.machine ? { reportVia: "cli" as const } /* an old-footer lane moves onto dori report when recovery relaunches it */ : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
+  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!input.machine ? { reportVia: "cli" as const } /* an old-footer lane moves onto dori report when recovery relaunches it */ : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
   let agentAdmitted = false;
