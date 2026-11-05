@@ -2,22 +2,31 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openOperations } from "../src/operations.ts";
+import { openOperations, plan, type OperationStore } from "../src/operations.ts";
 import { LivenessMonitor, type ProbeOutcome } from "../src/runner/liveness.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-const rig = (probe: () => ProbeOutcome, lanes: readonly string[] = []) => {
+type RigOptions = {
+  /** Runs inside the restart command, before it returns (a hello can arrive while systemctl is still running). */
+  readonly duringRestart?: (monitor: LivenessMonitor) => Promise<void>;
+  /** Rows already in the operations store when the monitor starts (a supervisor restart). */
+  readonly seed?: (operations: OperationStore, wallNow: number) => void;
+};
+
+const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOutcome>, lanes: readonly string[] = [], options: RigOptions = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "runner-liveness-"));
   dirs.push(dir);
   let at = 0;
   const lines: string[] = [];
   const restarts: number[] = [];
   const operations = openOperations({ stateDir: dir, store: "json" });
-  const monitor = new LivenessMonitor({
+  options.seed?.(operations, 1_800_000_000_000);
+  const monitor: LivenessMonitor = new LivenessMonitor({
     monotonic: () => at, now: () => 1_800_000_000_000 + at, epoch: 7,
-    probe: async () => probe(), restart: async () => { restarts.push(at); return { ok: true, detail: "restarted" }; },
+    probe: async () => probe(monitor),
+    restart: async () => { restarts.push(at); await options.duringRestart?.(monitor); return { ok: true, detail: "restarted" }; },
     ownedLanes: async () => lanes, operations, emit: (line) => { lines.push(line); },
   });
   monitor.track("worker-a", 1);
@@ -74,4 +83,28 @@ test("a runner that keeps dying is restarted 3 times in the hour, then each open
   expect(lost[0]).toStartWith("LANE_RUNNER_LOST lane-a runner=worker-a restart circuit open");
   expect(lost[1]).toStartWith("LANE_RUNNER_LOST lane-b runner=worker-a");
   expect(["runner:worker-a/restart/7-1", "runner:worker-a/restart/7-2", "runner:worker-a/restart/7-3"].map((id) => r.operations.get(id)?.state)).toEqual(["failed", "failed", "failed"]);
+});
+
+test("a runner that reconnects while it is being probed is not restarted", async () => {
+  const r = rig(async (monitor) => { await monitor.heartbeat("worker-a"); return { kind: "dead", detail: "health read before the reconnect" }; });
+  await r.runTo(180_000);
+  expect(r.restarts).toEqual([]);
+  expect(r.lines.at(-1)).toBe("HOST_GUARD ONLINE machine=worker-a");
+});
+
+test("a hello that arrives while the restart command is still running verifies the restart", async () => {
+  const r = rig(() => ({ kind: "dead", detail: "no process" }), [], { duringRestart: (monitor) => monitor.hello("worker-a", 2) });
+  await r.runTo(180_000);
+  expect(r.restarts).toEqual([180_000]);
+  expect(r.lines).toContain("RUNNER_RESTARTED machine=worker-a gen=2");
+  expect(r.operations.get("runner:worker-a/restart/7-1")?.state).toBe("verified");
+});
+
+test("restarts from before a supervisor restart still count toward the circuit", async () => {
+  const r = rig(() => ({ kind: "dead", detail: "no process" }), ["lane-a"], {
+    seed: (ops, wallNow) => { for (const n of [1, 2, 3]) plan(ops, wallNow - n * 10 * 60_000, { lane: "runner:worker-a", action: "restart", target: `6-${n}` }); },
+  });
+  await r.runTo(180_000);
+  expect(r.restarts).toEqual([]);
+  expect(r.lines.at(-1)).toStartWith("LANE_RUNNER_LOST lane-a runner=worker-a restart circuit open");
 });

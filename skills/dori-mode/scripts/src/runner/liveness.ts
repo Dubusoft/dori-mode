@@ -107,10 +107,18 @@ export class LivenessMonitor {
 
   constructor(private readonly deps: LivenessDeps) {}
 
-  /** Starts watching `label` as if it had just been seen (a supervisor start counts from then). */
+  /**
+   * Starts watching `label` as if it had just been seen (a supervisor start counts from then). Restarts already in the
+   * operations store from the last hour count toward the circuit, so a supervisor restart does not reset it.
+   */
   track(label: string, gen = 0): void {
     if (!this.runners.has(label)) {
-      this.runners.set(label, { lastSeen: this.deps.monotonic(), gen, stale: false, offline: false, unreachableSaid: false, lost: false, failures: 0, nextDecisionAt: 0, restarts: [], seq: 0 });
+      const mono = this.deps.monotonic();
+      const wall = this.deps.now();
+      const restarts = this.deps.operations.list({ lane: `runner:${label}` })
+        .filter((op) => op.action === "restart" && wall - op.at < RESTART_CIRCUIT_WINDOW_MS)
+        .map((op) => mono - (wall - op.at));
+      this.runners.set(label, { lastSeen: mono, gen, stale: false, offline: false, unreachableSaid: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0 });
     }
   }
 
@@ -179,6 +187,8 @@ export class LivenessMonitor {
     if (r.offlineSince !== undefined && at - r.offlineSince >= LOST_AFTER_OFFLINE_MS) { await this.lose(label, r, `offline for ${LOST_AFTER_OFFLINE_MS / 60_000} min`); return; }
     if (at < r.nextDecisionAt) return;
     const outcome = await this.deps.probe(label);
+    // A heartbeat or hello during the probe ended the outage; the probe's answer is older than that.
+    if (!r.offline) return;
     if (outcome.kind !== "dead") {
       if (outcome.kind === "alive" && !r.unreachableSaid) {
         r.unreachableSaid = true;
@@ -194,15 +204,16 @@ export class LivenessMonitor {
     const op = plan(this.deps.operations, this.deps.now(), { lane: `runner:${label}`, action: "restart", target: `${this.deps.epoch}-${r.seq}`, data: outcome.detail });
     settleOperation(this.deps.operations, this.deps.now(), op.id, "attempted", "restart requested");
     r.restarts.push(at);
+    // Pending before the effect: the restarted runner's hello can arrive while the restart command is still running.
+    r.pending = { opId: op.id, at, gen: r.gen };
     const done = await this.deps.restart(label).catch((e: unknown) => ({ ok: false, detail: e instanceof Error ? e.message : String(e) }));
-    if (!done.ok) {
+    if (!done.ok && r.pending?.opId === op.id) {
+      r.pending = undefined;
       settleOperation(this.deps.operations, this.deps.now(), op.id, "failed", done.detail);
       await this.deps.emit(`RUNNER_RESTART_FAILED ${tag(label)} ${done.detail}`);
       r.failures += 1;
       r.nextDecisionAt = at + machineBackoffMs(r.failures);
-      return;
     }
-    r.pending = { opId: op.id, at, gen: r.gen };
   }
 
   private async lose(label: string, r: Watched, why: string): Promise<void> {
