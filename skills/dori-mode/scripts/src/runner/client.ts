@@ -29,6 +29,13 @@ export const RECONNECT_MAX_MS = 60_000;
 export const RECONNECT_JITTER = 0.2;
 export const HEARTBEAT_MS = 15_000;
 
+/**
+ * Waits one turn of the event loop. The reconnect loops await it after every attempt, so a sleep that resolves at
+ * once (a fake clock) or a connection that fails without I/O can never keep the loop on microtasks alone, which would
+ * starve timers, aborts and everything else on the event loop.
+ */
+export const yieldTurn = (): Promise<void> => new Promise((resolve) => { setImmediate(resolve); });
+
 export type ClientConfig = {
   readonly label: string;
   readonly hostId: string;
@@ -155,6 +162,7 @@ export class RunnerClient {
         this.transport?.close(outcome.code);
         attempt += 1;
       }
+      await yieldTurn();
       if (signal.aborted) break;
       await this.deps.clock.sleep(backoffMs(Math.max(0, attempt - 1), this.deps.random));
     }

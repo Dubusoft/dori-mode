@@ -6,7 +6,7 @@ import { laneGeneration } from "../lane-reports.ts";
 import type { Pane } from "../panes.ts";
 import type { Lane } from "../registry.ts";
 import type { Clock } from "../run.ts";
-import { backoffMs, type RunnerClient } from "./client.ts";
+import { backoffMs, type RunnerClient, yieldTurn } from "./client.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { HUB_FILE, type CommitFn, type RunnerHub } from "./hub.ts";
 import { fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
@@ -532,6 +532,7 @@ export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise
         deps.log(`${outcome.code} ${outcome.detail}`);
         attempt += 1;
       }
+      await yieldTurn();
       if (signal.aborted) break;
       await Promise.race([aborted, deps.clock.sleep(backoffMs(Math.max(0, attempt - 1), deps.random))]);
     }
