@@ -1,0 +1,18 @@
+[Unit]
+Description=Dori runner (reports lane observations on this machine to the supervisor)
+# Its own unit, separate from herdr's: a runner restart never touches herdr or the lanes running in it.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# No EnvironmentFile: a runner host holds no supervisor or Discord credentials, only its own runner key.
+Type=simple
+Environment=LANG=C.UTF-8
+Environment=PATH=@PATH@
+UMask=0077
+ExecStart=@BUN@ %h/.dori/runner/bin/dori.js runner serve --label @LABEL@ --connect @CONNECT@
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -84,7 +84,11 @@ const USAGE = `dori <command> [options]
                                        a runner (needs a runners section in the config): connects to the supervisor over
                                        ~/.dori/runner/sock/control (or --connect), signed handshake, heartbeats, reports lane
                                        observations; commands are checked against ~/.dori/runner/runner-config.json;
-                                       --enroll reads code= and fingerprint= lines on stdin first
+                                       --enroll reads code= and fingerprint= lines on stdin first; --enroll-only enrolls and exits
+  runner install --machine LABEL       install or upgrade the runner on a Linux worker over ssh (bundle, unit, linger, enrollment
+                                       through ssh stdin); needs runners.listen and bun on the worker
+  runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
+  runner shadow-report [--runner L]    per runner: shadow differences by class and the failure count (every class but timing)
   runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
   runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
   runner rotate LABEL                  have the connected runner switch to a new key; prints the new key fingerprint
@@ -174,12 +178,16 @@ if (process.argv[2] === "status") {
 }
 
 if (process.argv[2] === "runner") {
-  // `dori runner serve` is the runner (P2: shadow observation, every command answered by the dispatcher); enroll,
-  // revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll] [--connect ws://HOST:PORT] | enroll --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL";
+  // serve and probe run on runner hosts and live in runner/main.ts, which the worker bundle (runner/bin.ts) also runs.
+  if (process.argv[3] === "serve" || process.argv[3] === "probe") {
+    const { runnerHostMain } = await import("./runner/main.ts");
+    process.exit(await runnerHostMain(process.argv.slice(3)));
+  }
+  // enroll, install, shadow-report, revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | shadow-report [--runner LABEL] | revoke LABEL | rotate LABEL | reset-gen LABEL";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
-    options: { label: { type: "string" }, machine: { type: "string" }, enroll: { type: "boolean" }, connect: { type: "string" } },
+    options: { machine: { type: "string" }, runner: { type: "string" } },
   });
   const [sub = "", target, ...extra] = parsed.positionals;
   if (extra.length) die(usage);
@@ -199,6 +207,42 @@ if (process.argv[2] === "runner") {
       const issued = auth.issueCode(label);
       process.stdout.write(`code=${issued.code}\nfingerprint=${auth.fingerprint}\n`);
       process.stderr.write(`RUNNER_ENROLL_CODE runner=${label} expiresAt=${new Date(issued.expiresAt).toISOString()}\n`);
+    } finally {
+      auth.close();
+    }
+    process.exit(0);
+  }
+  if (sub === "shadow-report") {
+    if (target !== undefined) die(usage);
+    const runner = parsed.values.runner === undefined ? undefined : labelArg(parsed.values.runner);
+    const cfg = await loadConfig();
+    const { renderShadowReport, shadowReport } = await import("./runner/shadow-store.ts");
+    const rows = shadowReport(cfg.stateDir, runner ? { runner } : {});
+    console.log(rows.length ? renderShadowReport(rows) : `RUNNER_SHADOW_REPORT none${runner ? ` runner=${runner}` : ""}`);
+    process.exit(0);
+  }
+  if (sub === "install") {
+    const label = labelArg(parsed.values.machine);
+    if (target !== undefined) die(usage);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    const listen = cfg.runners?.listen;
+    if (!listen) die("RUNNER_INSTALL_NO_LISTEN set runners.listen to the supervisor's private address first");
+    const { readGuardMachines } = await import("./remote-guard.ts");
+    const machines = await readGuardMachines(run, cfg.guardMachines);
+    const machine = machines.machines.find((m) => m.label === label);
+    if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const { buildBundle, installRunner } = await import("./runner/install.ts");
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      // The code is issued in this process and handed to the installer as data; it never enters an argv.
+      const result = await installRunner({ run, bundle: buildBundle(run) }, {
+        machine: machine as NonNullable<typeof machine>, label, connectUrl: `ws://${listen}`,
+        issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
+      });
+      if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""}`);
     } finally {
       auth.close();
     }
@@ -251,80 +295,7 @@ if (process.argv[2] === "runner") {
       auth.close();
     }
   }
-  if (sub !== "serve" || target !== undefined) die(usage);
-  const { defaultRunnerDir, runStartupCheck } = await import("./runner/fs-safety.ts");
-  const runnerDir = defaultRunnerDir();
-  // RUNNER_DIR_UNSAFE on stderr and exit 1 before anything is opened.
-  if (!runStartupCheck(runnerDir, { stderr: (text) => { process.stderr.write(text); }, exit: (code) => process.exit(code) })) process.exit(1);
-  const { realpathSync } = await import("node:fs");
-  const { hostname } = await import("node:os");
-  const { runnerMode } = await import("./config.ts");
-  const { listPanes } = await import("./panes.ts");
-  const { enrollRunner, RunnerAuth } = await import("./runner/auth.ts");
-  const { HEARTBEAT_MS, RunnerClient } = await import("./runner/client.ts");
-  const { Outbox } = await import("./runner/outbox.ts");
-  const { loadPolicy } = await import("./runner/policy.ts");
-  const { RunnerState } = await import("./runner/state.ts");
-  const { commandDispatcher, LOCAL_RUNNER, loadIdentity, observeLanes, parseEnrollInput, realEvery, serveRunner, trackedConnector } = await import("./runner/serve.ts");
-  const { connectUnix, controlSocketPath } = await import("./runner/unix-transport.ts");
-  const { connectWs } = await import("./runner/ws-transport.ts");
-  const cfg = await loadConfig();
-  setDefaultRunTimeout(cfg.runTimeoutMs);
-  const identity = loadIdentity(runnerDir, parsed.values.label ?? LOCAL_RUNNER, hostname());
-  const connector = parsed.values.connect ? connectWs(parsed.values.connect) : connectUnix(controlSocketPath(runnerDir));
-  const endpoint = parsed.values.connect ?? controlSocketPath(runnerDir);
-  const auth = new RunnerAuth(runnerDir);
-  if (parsed.values.enroll) {
-    // The one-time code and the supervisor fingerprint arrive on stdin (`dori runner enroll` output), never in argv.
-    const input = parseEnrollInput(await Bun.stdin.text());
-    if (!input) die("RUNNER_ENROLL_INPUT_INVALID stdin must carry code=<code> and fingerprint=sha256:<hex> lines");
-    const enrolled = await enrollRunner({
-      auth, connect: connector, code: input?.code as string, label: identity.label, hostId: identity.hostId,
-      expectedFingerprint: input?.fingerprint as string,
-    });
-    if (!enrolled.ok) die(`${enrolled.code} ${enrolled.detail}`);
-    console.log(`RUNNER_ENROLLED runner=${identity.label} supervisor=${enrolled.ok ? enrolled.supervisorFingerprint : ""}`);
-  }
-  if (!auth.enrolled) die(`RUNNER_NOT_ENROLLED runner=${identity.label}: start once with --enroll (the local runner is enrolled by the supervisor)`);
-  const policy = loadPolicy(runnerDir);
-  const state = new RunnerState(runnerDir, { now: realClock.now });
-  const gen = state.boot();
-  const outbox = new Outbox(runnerDir, { now: realClock.now });
-  const mode = runnerMode(cfg, identity.label);
-  const registry = new Registry(cfg.stateDir);
-  let inventory: { key: string; pane: string; tab: string; session?: string }[] = [];
-  const observe = mode === "shadow" ? async () => {
-    const lanes = observeLanes(identity.label, await registry.open(), await listPanes(run));
-    inventory = lanes.map(({ status: _status, ...lane }) => lane);
-    return lanes;
-  } : undefined;
-  const head = await run(["git", "-C", import.meta.dir, "rev-parse", "--short", "HEAD"], { timeoutMs: 5_000 }).catch(() => undefined);
-  const version = head?.code === 0 ? head.out.trim() || undefined : undefined;
-  const log = (line: string): void => { console.log(line); };
-  const tracked = trackedConnector(connector);
-  let client: InstanceType<typeof RunnerClient> | undefined;
-  const dispatch = commandDispatcher({
-    state, policy, realpath: realpathSync, log,
-    publish: (body) => { client?.publish("cmd.result", body); },
-  });
-  client = new RunnerClient(
-    { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
-    { connect: tracked.connect, outbox, state, clock: realClock, inventory: () => inventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch },
-  );
-  const controller = new AbortController();
-  process.on("SIGINT", () => controller.abort());
-  process.on("SIGTERM", () => controller.abort());
-  console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=${mode} endpoint=${endpoint}`);
-  try {
-    await serveRunner({
-      client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
-      ...(observe ? { observe } : {}), log,
-    }, controller.signal);
-  } finally {
-    outbox.close();
-    state.close();
-  }
-  process.exit(0);
+  die(usage);
 }
 
 const config = await loadConfig();
