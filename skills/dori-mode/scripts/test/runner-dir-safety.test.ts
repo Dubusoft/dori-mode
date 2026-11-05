@@ -78,6 +78,26 @@ describe("runner dir checks", () => {
     expect(reasonOf(() => checkRunnerDir(d))).toBe("mode");
   });
 
+  test("files under bin/ and bun/ may be 0700 executables, owner-only; elsewhere 0700 files stay unsafe", () => {
+    const d = goodDir();
+    for (const sub of ["bin", "bun"]) mkdirSync(join(d, sub), { mode: 0o700 });
+    writeFileSync(join(d, "bin/dori"), "#!/bin/sh\n", { mode: 0o700 });
+    writeFileSync(join(d, "bin/dori.js"), "", { mode: 0o600 });
+    writeFileSync(join(d, "bun/bun"), "", { mode: 0o700 });
+    checkRunnerDir(d);
+    chmodSync(join(d, "bin/dori"), 0o755);
+    expect(reasonOf(() => checkRunnerDir(d))).toBe("mode");
+    chmodSync(join(d, "bin/dori"), 0o700);
+    writeFileSync(join(d, "health"), "");
+    chmodSync(join(d, "health"), 0o700);
+    expect(reasonOf(() => checkRunnerDir(d))).toBe("mode");
+    rmSync(join(d, "health"));
+    mkdirSync(join(d, "logs"), { mode: 0o700 });
+    writeFileSync(join(d, "logs/x"), "");
+    chmodSync(join(d, "logs/x"), 0o700);
+    expect(reasonOf(() => checkRunnerDir(d))).toBe("mode");
+  });
+
   test("symlink or wrong type inside is unsafe", () => {
     const d = goodDir();
     writeFileSync(join(d, "sock"), "", { mode: 0o600 });

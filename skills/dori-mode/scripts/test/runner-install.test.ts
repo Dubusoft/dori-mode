@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { INSTALL_EXIT, bundleVersion, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
 import type { Ran, RunOptions } from "../src/run.ts";
+import { checkRunnerDir } from "../src/runner/fs-safety.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
 const FINGERPRINT = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
@@ -214,6 +215,7 @@ test.skipIf(!Bun.which("zip") || CANDIDATES.some((p) => existsSync(p)))("on Darw
   expect(readFileSync(join(host.home, ".dori/runner/bin/dori"), "utf8")).toContain(`exec "${bun}"`);
   const left = new Bun.Glob("bun-download.*").scanSync({ cwd: join(host.home, ".dori/runner"), onlyFiles: false });
   expect([...left]).toEqual([]);
+  checkRunnerDir(join(host.home, ".dori/runner"));
 });
 
 test("on Darwin a failing download exits with the no-bun code", async () => {
@@ -255,6 +257,20 @@ test("on any other OS the script exits with the unsupported code before touching
   const result = await runScript(host, darwinScript());
   expect(result.code).toBe(INSTALL_EXIT.notLinux);
   expect(existsSync(join(host.home, ".dori"))).toBe(false);
+});
+
+test("the runner directory the script leaves passes the runner's own safety check, on Linux and on Darwin", async () => {
+  const linux = fakeHost();
+  const linuxScript = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://h:1"), "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT });
+  expect((await runScript(linux, linuxScript)).code).toBe(0);
+  checkRunnerDir(join(linux.home, ".dori/runner"));
+  const darwin = darwinHost();
+  mkdirSync(join(darwin.home, ".dori/runner"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(darwin.home, ".dori/runner/runner.log"), "old\n", { mode: 0o644 });
+  expect((await runDarwin(darwin, darwinScript())).code).toBe(0);
+  expect(statSync(join(darwin.home, ".dori/runner/runner.log")).mode & 0o777).toBe(0o600);
+  expect(readFileSync(join(darwin.home, ".dori/runner/runner.log"), "utf8")).toBe("old\n");
+  checkRunnerDir(join(darwin.home, ".dori/runner"));
 });
 
 test("the launchd plist is checked against the heredoc delimiter too", () => {

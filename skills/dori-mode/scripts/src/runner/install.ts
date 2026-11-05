@@ -144,6 +144,8 @@ export const installScript = (
     `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(dirname "$BUN"):$PATH|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$PL" || exit 1`,
     `rm -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp"`,
     'chmod 644 "$PL"',
+    // launchd appends the agent's output here; created 0600 beforehand so the runner's directory check accepts it.
+    ': >> "$R/runner.log" && chmod 600 "$R/runner.log" || exit 1',
     "fi",
     `C=${quote(issue.code)}`,
     `F=${quote(issue.fingerprint)}`,

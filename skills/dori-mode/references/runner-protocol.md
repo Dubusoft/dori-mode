@@ -199,7 +199,8 @@ Everything lives under `~/.dori/runner`:
 
 The hub's table is `<stateDir>/runners.sqlite` on the supervisor side.
 
-Directories must be 0700 and files 0600, owned by the runner's uid, with no symlinks anywhere. `dori runner serve`
+Directories must be 0700 and files 0600 (under `bin/` and `bun/`, where `dori runner install` puts the wrapper and
+bun, 0600 or 0700), owned by the runner's uid, with no symlinks anywhere. `dori runner serve`
 checks this with lstat before opening anything; on the first bad entry it prints `RUNNER_DIR_UNSAFE <path> <reason>`
 to stderr and exits 1. It never repairs permissions. The supervisor creates `~/.dori/runner` and `sock/` as 0700
 when they're missing, and the socket itself is 0600.
