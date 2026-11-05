@@ -61,7 +61,10 @@ const shadowObservation = (deps: LaneHubDeps, label: string, frame: AnyRunnerEve
 
 export type JournaledLaneEvent = { readonly rowid: number; readonly label: string; readonly frame: AnyRunnerEvent };
 
-const EVENT_LINE = /^RUNNER_EVENT runner=(\S+) seq=(\d+) type=(lane\.\S+) (.*)$/s;
+const EVENT_LINE = /^RUNNER_EVENT runner=(\S+) seq=(\d+) type=(lane\.\S+|cmd\.result) (.*)$/s;
+
+/** The cmdId prefix launch-via-runner.ts gives a `lane.start`: `lane-start:<key>:<ms>`. */
+const LANE_START_CMD = /^lane-start:([^:]+):\d+$/;
 
 /** The lane events in the hub's journal after `afterRowid`, oldest first; a line that does not parse is skipped. */
 export const laneEventsAfter = (stateDir: string, afterRowid: number): JournaledLaneEvent[] => {
@@ -87,6 +90,16 @@ export const laneEventsAfter = (stateDir: string, afterRowid: number): Journaled
 };
 
 export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: AnyRunnerEvent): Promise<void> => {
+  if (frame.type === "cmd.result") {
+    // A refused or failed lane.start leaves a registered lane with no agent: the lead has to hear of it.
+    const b = frame.body;
+    const key = LANE_START_CMD.exec(b.cmdId)?.[1];
+    if (!key || b.state !== "failed") return;
+    const lane = await deps.registry.read(key);
+    if (!lane || lane.closedAt || lane.runner !== label || lane.pane) return;
+    deps.emit(`runner-launch-failed:${label}:${frame.seq}`, `RUNNER_LAUNCH_FAILED ${key} runner=${label} ${b.detail.replace(/\s+/g, " ").slice(0, 200)}; the lane has no agent: fix the runner, dori close ${key} --cancelled and launch again`);
+    return;
+  }
   if (!LANE_EVENTS.has(frame.type)) return;
   const key = (frame.body as { readonly key: string }).key;
   const lane = await deps.registry.read(key);

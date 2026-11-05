@@ -6,12 +6,14 @@ import { INSTALL_EXIT, buildBundle, bundleVersion, installRunner, installScript,
 import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
 import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
+import { loadPolicy } from "../src/runner/policy.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
 const FINGERPRINT = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
 const UNIT = "ExecStart=@BUN@ %h/.dori/runner/bin/dori.js runner serve --label @LABEL@ --connect @CONNECT@\nEnvironment=PATH=@PATH@\n";
 const BUNDLE = "console.log('runner bundle');\n";
 const machine = { label: "worker-a", target: "dori@worker-a" };
+const AGENT = ["omo", "--model", "{model}", "{prompt}"];
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
@@ -25,7 +27,7 @@ const fakeRun = (result: Partial<Ran> = {}) => {
   return { run, calls };
 };
 const request = (issued: { count: number }) => ({
-  machine, label: "worker-a", connectUrl: "ws://100.101.1.2:7411",
+  machine, label: "worker-a", connectUrl: "ws://100.101.1.2:7411", agentCommand: AGENT,
   issue: () => { issued.count += 1; return { code: CODE, fingerprint: FINGERPRINT }; },
 });
 
@@ -111,7 +113,7 @@ const runDarwin = async (host: ReturnType<typeof fakeHost>, script: string) => {
   return { code: await p.exited, err: await new Response(p.stderr).text() };
 };
 const darwinScript = () =>
-  installScript(BUNDLE, UNIT, "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, remoteUnit(PLIST, "worker-a", "ws://100.101.1.2:7411"));
+  installScript(BUNDLE, UNIT, "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, remoteUnit(PLIST, "worker-a", "ws://100.101.1.2:7411"), AGENT);
 const ARGS = ["runner", "serve", "--label", "worker-a", "--connect", "ws://100.101.1.2:7411"];
 
 const runScript = async (host: ReturnType<typeof fakeHost>, script: string) => {
@@ -124,9 +126,12 @@ const runScript = async (host: ReturnType<typeof fakeHost>, script: string) => {
 
 test("run by sh, the script installs, enrolls through a pipe, and keeps the keys on reinstall", async () => {
   const host = fakeHost();
-  const script = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://100.101.1.2:7411"), "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT });
+  const script = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://100.101.1.2:7411"), "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
   const first = await runScript(host, script);
   expect(first).toEqual({ code: 0, err: "" });
+  const policyFile = join(host.home, ".dori/runner/runner-config.json");
+  expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ agents: { default: AGENT }, allowedRoots: [host.home, "/tmp"] });
+  expect(statSync(policyFile).mode & 0o777).toBe(0o600);
   const argvLog = readFileSync(host.log, "utf8");
   expect(argvLog).not.toContain(CODE);
   expect(argvLog).not.toContain(FINGERPRINT);
@@ -146,8 +151,10 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   expect(existsSync(join(host.home, ".dori/runner/dori-runner.service.tmp"))).toBe(false);
 
   writeFileSync(host.log, "");
+  writeFileSync(policyFile, '{"agents":{"mine":["claude"]}}\n', { mode: 0o600 });
   const again = await runScript(host, script);
   expect(again.code).toBe(0);
+  expect(readFileSync(policyFile, "utf8")).toBe('{"agents":{"mine":["claude"]}}\n');
   const second = readFileSync(host.log, "utf8");
   expect(second).not.toContain("--enroll-only");
   expect(second).toContain("systemctl --user restart dori-runner.service");
@@ -169,6 +176,7 @@ test("on Darwin with bun on PATH, the script writes the launchd agent, boots it 
   const host = darwinHost();
   const result = await runDarwin(host, darwinScript());
   expect(result).toEqual({ code: 0, err: "" });
+  expect(loadPolicy(join(host.home, ".dori/runner")).allowedRoots).toEqual([host.home, "/private/tmp"]);
   const bun = join(host.bin, "bun");
   const plist = readFileSync(plistPath(host.home), "utf8");
   expect(plist).not.toMatch(/@[A-Z]+@/);
@@ -262,7 +270,7 @@ test("on any other OS the script exits with the unsupported code before touching
 
 test("the runner directory the script leaves passes the runner's own safety check, on Linux and on Darwin", async () => {
   const linux = fakeHost();
-  const linuxScript = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://h:1"), "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT });
+  const linuxScript = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://h:1"), "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
   expect((await runScript(linux, linuxScript)).code).toBe(0);
   checkRunnerDir(join(linux.home, ".dori/runner"));
   const darwin = darwinHost();
