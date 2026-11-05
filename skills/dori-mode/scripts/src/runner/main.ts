@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
-import { type Observation, resolveInterrupted } from "./durability.ts";
+import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { LANE_SOCKET, RunnerLanes, serveLaneSocket } from "./lanes.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
@@ -134,6 +134,12 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     try { return (await observeHost({ run })).some((l) => l.key === key) ? "present" : "absent"; } catch { return "unknown"; }
   };
   for (const line of await resolveInterrupted({ state, observeLane, publish: (body) => { client?.publish("cmd.result", body); } })) log(line);
+  const pruneCommands = (): void => {
+    const pruned = pruneCommandRecords(state, realClock.now());
+    if (pruned > 0) log(`RUNNER_CMD_PRUNED ${pruned} command records past retention`);
+  };
+  pruneCommands();
+  const stopPrune = realEvery(24 * 60 * 60_000, pruneCommands);
   const controller = new AbortController();
   process.on("SIGINT", () => controller.abort());
   process.on("SIGTERM", () => controller.abort());
@@ -162,6 +168,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   } finally {
     stopLaneSocket();
     stopGuard();
+    stopPrune();
     stopHealth();
     outbox.close();
     state.close();

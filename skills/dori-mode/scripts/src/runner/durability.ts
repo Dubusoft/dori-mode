@@ -16,6 +16,17 @@ import type { RunnerState } from "./state.ts";
 
 export type Observation = "present" | "absent" | "unknown";
 
+/**
+ * How long a final command record is kept (design 5.6): longer than the supervisor's longest outage plus its recovery
+ * window, so a supervisor back from a restart still gets an answer to `cmd.status`. A record still at `intent` is
+ * never pruned.
+ */
+export const COMMAND_RETENTION_MS = 30 * 24 * 60 * 60_000;
+
+/** Deletes final command records older than `COMMAND_RETENTION_MS`; returns how many went. */
+export const pruneCommandRecords = (state: Pick<RunnerState, "pruneCommands">, now: number): number =>
+  state.pruneCommands(now - COMMAND_RETENTION_MS);
+
 const fromObservation = (seen: Observation): CommandOutcome => (seen === "present" ? "verified" : seen === "absent" ? "failed" : "ambiguous");
 
 export type ResolveDeps = {

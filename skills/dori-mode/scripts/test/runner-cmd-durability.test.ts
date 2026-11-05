@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Ran } from "../src/run.ts";
-import { type Observation, resolveInterrupted, settleAttempted } from "../src/runner/durability.ts";
+import { COMMAND_RETENTION_MS, type Observation, pruneCommandRecords, resolveInterrupted, settleAttempted } from "../src/runner/durability.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import type { CommandStatusState } from "../src/runner/protocol.ts";
 import { RunnerState } from "../src/runner/state.ts";
@@ -55,6 +55,26 @@ test("a runner that crashed after lane.start's effect and before its result sett
   expect(published).toEqual([{ cmdId: START.cmdId, cmdSeq: 1, state: "verified", detail: "interrupted lane.start; observed present" }]);
   expect(lines).toHaveLength(1);
   after.close();
+});
+
+test("final command records past the 30-day retention are pruned; intent rows and the command cursor stay", () => {
+  const dir = runnerDir();
+  const clock = fakeClock(1_000);
+  const state = new RunnerState(dir, { now: clock.now });
+  state.boot();
+  state.recordIntent({ cmdId: "old-final", cmdSeq: 1, type: "lane.stop", epoch: 1, key: "lane-a" });
+  state.recordResult("old-final", "verified", "stopped");
+  state.recordIntent({ cmdId: "old-intent", cmdSeq: 2, type: "lane.start", epoch: 1, key: "lane-b" });
+  clock.at += COMMAND_RETENTION_MS;
+  state.recordIntent({ cmdId: "recent", cmdSeq: 3, type: "lane.send", epoch: 1, key: "lane-c" });
+  state.recordResult("recent", "verified", "sent");
+  clock.at += 1;
+  expect(pruneCommandRecords(state, clock.now())).toBe(1);
+  expect(state.command("old-final")).toBeUndefined();
+  expect(state.command("old-intent")?.state).toBe("intent");
+  expect(state.command("recent")?.state).toBe("verified");
+  expect(state.cmdAck()).toBe(1);
+  state.close();
 });
 
 test("with the runner's command records gone, the supervisor observes instead of resending: present is verified, herdr silent is one OPERATION_AMBIGUOUS", async () => {
