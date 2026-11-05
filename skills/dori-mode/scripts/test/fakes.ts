@@ -47,7 +47,7 @@ export type World = {
   aheadCount: string;
   dirty: string;
   screen: string;
-  panes: { pane_id: string; workspace_id: string; agent?: string; agent_status?: string; title?: string; cwd?: string }[];
+  panes: { pane_id: string; workspace_id: string; tab_id?: string; agent?: string; agent_status?: string; title?: string; terminal_title?: string; cwd?: string }[];
   /** agent_status the target pane moves to when Enter is pressed (models a lane picking up the message). */
   onEnterStatus?: string;
   /** agent_status the target pane moves to when Escape is pressed (models a running turn stopping). */

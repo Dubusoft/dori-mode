@@ -8,6 +8,9 @@ import { passthroughView, type SweepView } from "./sweep-view.ts";
 /** Unrecognised ticks in a row before one alert names the pane. */
 export const UNRECOGNISED_ALERT_AFTER = 3;
 
+/** Terminal title of the DAG viewer a mass-ulw lane opens next to its agent pane. It runs no agent, so herdr reports no status. */
+export const DAG_VIEWER_TITLE = "OmO DAG";
+
 /** Per-pane memory across ticks: the CLI keeps one of these for the life of the loop. */
 export type DeadPaneState = { readonly unknown: Map<string, number>; readonly lastTail: Map<string, string> };
 export const newDeadPaneState = (): DeadPaneState => ({ unknown: new Map(), lastTail: new Map() });
@@ -17,6 +20,7 @@ export const newDeadPaneState = (): DeadPaneState => ({ unknown: new Map(), last
  * dead only when this tick's tail carries a configured dead marker AND equals the previous tick's tail, so the two
  * reads are a full loop interval apart and a screen mid-redraw never counts. A marker seen once is pending. Anything
  * else is unrecognised, counted per pane, with one alert after UNRECOGNISED_ALERT_AFTER ticks in a row.
+ * A DAG viewer pane in the same tab as a registered lane's pane belongs to that lane and is never counted.
  * A dead pane that is a registered lane's pane also leaves a synthetic `blocked` report row under that lane's key (lane-reports.ts appendDeadPaneReport), so the lane's result is not lost.
  */
 export const deadPaneTick = async (run: Runner, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState = newDeadPaneState(), lanes: readonly Lane[] = [], view: SweepView = passthroughView(run), now: () => number = Date.now): Promise<string[]> => {
@@ -44,11 +48,18 @@ const inspect = async (view: SweepView, config: DoriConfig, seen: Set<string>, h
   const watch = new Set(config.workspaces);
   const skip = new Set([config.leadPane, ...config.ignorePanes].filter(Boolean));
   const marked = (tail: string) => config.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
-  for (const pane of await view.panes(machine)) {
+  const panes = await view.panes(machine);
+  const laneTabs = new Set(panes.flatMap((p) => p.tab_id && ctx.byPane.has(machine ? `${machine}/${p.pane_id}` : p.pane_id) ? [p.tab_id] : []));
+  for (const pane of panes) {
     if (owned && !owned.has(pane.pane_id)) continue;
     if (skip.has(pane.pane_id) || (watch.size > 0 && !watch.has(pane.workspace_id))) continue;
     const id = machine ? `${machine}/${pane.pane_id}` : pane.pane_id;
     if (pane.agent_status && ALIVE_STATUSES.has(pane.agent_status)) {
+      state.unknown.delete(id);
+      state.lastTail.delete(id);
+      continue;
+    }
+    if (pane.tab_id && laneTabs.has(pane.tab_id) && pane.terminal_title?.trim().startsWith(DAG_VIEWER_TITLE)) {
       state.unknown.delete(id);
       state.lastTail.delete(id);
       continue;

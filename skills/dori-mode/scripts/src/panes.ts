@@ -16,6 +16,8 @@ export type Pane = {
   readonly agent?: string;
   readonly agent_status?: string;
   readonly title?: string;
+  /** The title the program in the pane set for its terminal. */
+  readonly terminal_title?: string;
   readonly cwd?: string;
   /** Bumped by herdr whenever the pane's content changes. */
   readonly revision?: number;

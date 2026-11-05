@@ -65,6 +65,35 @@ test("a reworded stop message is not dead: with no alive status it is unrecognis
   expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
 });
 
+test("a DAG viewer pane in a registered lane's tab is part of that lane and never raises UNRECOGNISED_PANE", async () => {
+  world.panes = [
+    { pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2", agent: "pi", agent_status: "working" },
+    { pane_id: "w:p8", workspace_id: "w", tab_id: "w:t2", agent_status: "unknown", terminal_title: "OmO DAG" },
+  ];
+  world.screen = "wave 2/3 running\n";
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  const st = newDeadPaneState();
+  for (let i = 0; i < 5; i++) expect(await deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st, [working])).toEqual([]);
+});
+
+test("a DAG viewer pane outside every lane's tab, and any other unknown pane in a lane's tab, still raise UNRECOGNISED_PANE", async () => {
+  world.panes = [
+    { pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2", agent: "pi", agent_status: "working" },
+    { pane_id: "w:p8", workspace_id: "w", tab_id: "w:t2", agent_status: "unknown", terminal_title: "ubuntu@host:~" },
+    { pane_id: "w:p9", workspace_id: "w", tab_id: "w:t3", agent_status: "unknown", terminal_title: "OmO DAG" },
+  ];
+  world.screen = "wave 2/3 running\n";
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  const st = newDeadPaneState();
+  const tick = () => deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st, [working]);
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual([
+    "UNRECOGNISED_PANE w:p8 dead-panes: no alive status and no dead marker for 3 ticks",
+    "UNRECOGNISED_PANE w:p9 dead-panes: no alive status and no dead marker for 3 ticks",
+  ]);
+});
+
 test("a pane whose agent status says it is alive is never reported dead, whatever the screen shows", async () => {
   world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "working" }];
   world.screen = "grep output: has stopped\n❯ ";
