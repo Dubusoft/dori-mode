@@ -29,7 +29,7 @@ import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
 import { memorySweep } from "./memory-check.ts";
 import { alertReasons, criticalReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
 import { describeLane, formatKb, type LaneMemory, laneMemory, laneMemoryDetail, type Proc, procLanes, sampleProcs } from "./lane-memory.ts";
-import { laneRunner, sendGuarded } from "./panes.ts";
+import { laneRunner, type Pane, sendGuarded } from "./panes.ts";
 import { pauseLane, type PauseResult } from "./pause.ts";
 import { describeKilled, heavyTargets, type KilledProc, killProcs } from "./pressure.ts";
 import type { Lane } from "./registry.ts";
@@ -212,18 +212,39 @@ export const openRunnerHub = (
   };
 };
 
+/** The supervisor's own side of a shadow pass. */
+export type ShadowPassDeps = {
+  /** The supervisor clock's now. */
+  readonly now: number;
+  /** herdr's pane list on a machine (undefined: this host), e.g. `passthroughView(run).panes`. */
+  readonly panes: (machine?: string) => Promise<Pane[]>;
+  /** Keys of archived (closed) lanes. */
+  readonly archived: () => readonly string[];
+  /** Where a pane list that could not be read is reported. */
+  readonly error: (line: string) => void;
+};
+
 /**
  * One runners-task pass: a shadow cycle per runner in shadow mode, each difference logged as RUNNER_SHADOW_DIFF and
- * handed to `record` (the shadow report store) in one batch.
+ * handed to `record` (the shadow report store) in one batch. Each runner's lanes are judged alive from the supervisor's
+ * own pane list for that runner's machine; when it cannot be read the error is reported and that runner's lane states
+ * are not compared this pass.
  */
 export const runnersPass = async (
-  handle: RunnerHubHandle, config: Parameters<typeof runnerMode>[0], open: () => Promise<Lane[]>, log: (line: string) => void,
-  record: (lines: readonly string[]) => void = () => {},
+  handle: RunnerHubHandle, config: Parameters<typeof runnerMode>[0], open: () => Promise<Lane[]>, side: ShadowPassDeps,
+  log: (line: string) => void, record: (lines: readonly string[]) => void = () => {},
 ): Promise<void> => {
   const labels = handle.shadow.labels().filter((label) => runnerMode(config, label) === "shadow");
   if (!labels.length) return;
   const lanes = await open();
-  const lines = labels.flatMap((label) => handle.shadow.cycle(label, lanes));
+  const archived = new Set(side.archived());
+  const lines: string[] = [];
+  for (const label of labels) {
+    let panes: Pane[] | undefined;
+    try { panes = await side.panes(label === LOCAL_RUNNER ? undefined : label); }
+    catch (e) { side.error(`RUNNER_SHADOW_ERROR runner=${label} legacy pane list unreadable: ${e instanceof Error ? e.message : String(e)}`); }
+    lines.push(...handle.shadow.cycle(label, lanes, side.now, { panes, archived }));
+  }
   for (const line of lines) log(line);
   if (lines.length) record(lines);
 };
@@ -974,8 +995,10 @@ export const supervise = async (
         try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now())) console.log(line); }
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         try {
-          await runnersPass(handle, deps.config, () => deps.registry.open(), (line) => { console.log(line); },
-            (lines) => { recordDiffLines(deps.config.stateDir, lines, deps.clock.now()); });
+          await runnersPass(handle, deps.config, () => deps.registry.open(), {
+            now: deps.clock.now(), panes: passthroughView(deps.run).panes, archived: () => deps.registry.archivedKeys(),
+            error: (line) => { console.error(line); },
+          }, (line) => { console.log(line); }, (lines) => { recordDiffLines(deps.config.stateDir, lines, deps.clock.now()); });
         }
         catch (e) { console.error(`RUNNER_SHADOW_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {

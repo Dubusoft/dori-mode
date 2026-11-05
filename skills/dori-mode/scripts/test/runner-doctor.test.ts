@@ -40,7 +40,7 @@ test("a missing listen address warns; a healthy runner is OK", () => {
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
   const s = setup({ listen: "100.101.1.2:7411" });
-  addRunner(s.stateDir, "worker-a", 3);
+  addRunner(s.stateDir, "worker-a", 4);
   const ops = openOperations(s.config);
   for (const n of [1, 2, 3]) plan(ops, NOW - n * 60_000, { lane: "runner:worker-a", action: "restart", target: `1-${n}` });
   plan(ops, NOW - 2 * 60 * 60_000, { lane: "runner:worker-a", action: "restart", target: "0-9" });
@@ -49,5 +49,5 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   expect(checks.find((c) => c.id === "runner listen")).toMatchObject({ level: "OK", detail: "100.101.1.2:7411 (private)" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
-  expect(row?.detail).toBe("proto 3 is not 1 or 0; restart circuit open (3 restarts in the last hour)");
+  expect(row?.detail).toBe("proto 4 is not 2 or 1; restart circuit open (3 restarts in the last hour)");
 });

@@ -271,8 +271,16 @@ from the file's mtime, so it is measured on the host's own clock.
 
 A runner is in shadow mode when the config's `runners.mode` maps its label to `"shadow"`; unnamed labels are
 `"off"`. Without a `runners` section the supervisor opens no hub and nothing changes. In shadow mode the local
-runner reads the registry's open local lanes and herdr's pane list every 30 seconds, publishes `lane.state` when a
-status changes, and sends the latest list as the hello inventory. It never starts, stops or edits a lane.
+runner reads the registry's open local lanes and herdr's pane list every 30 seconds, publishes
+`lane.state {key, status, pane}` when a lane's status or pane changes, and sends the latest list as the hello
+inventory. A lane it no longer sees is forgotten, so it is published again if it comes back. `pane` was added in
+protocol 2; a protocol 1 runner leaves it out, and the supervisor then relies on the hello inventory alone. It never
+starts, stops or edits a lane.
+
+A lane's agent is alive when its pane is in herdr's pane list and its `agent_status` is `idle`, `working`, `blocked`
+or `done` (`paneAlive` in `panes.ts`). Both sides use that rule: the runner reports no pane as `missing`, a pane
+whose agent is not alive as `dead`, and an alive one as `working` or `idle`; the supervisor applies it to its own
+pane list for the runner's machine. A paused lane whose pane is gone is therefore not alive on either side.
 
 A runner started with `--connect` is a worker's runner. It has no registry, so it always observes its host on the
 same 30-second timer. A pane belongs to a lane when one of its foreground processes (from `herdr pane
@@ -283,8 +291,16 @@ that hash changes. The line itself never leaves the host. The supervisor compare
 own screen scraping recorded (`Lane.lastRemoteReport`), as `kind=lane.report field=latest`.
 
 On the supervisor, the `runners` task (every 5 seconds, under the usual watchdog) compares what the runner reported
-with what the legacy path sees. A new difference waits one cycle. If it's still there next cycle it's logged with
-its class; if it went away it's logged as `timing`:
+with what the legacy path sees. Per lane it compares the pane id (the registry's against the runner's, taken from
+the hello inventory and replaced by the `pane` of each later `lane.state`) and whether the agent is alive. If the
+supervisor can't read the pane list for a runner's machine in a pass, it logs the error and compares no lane states
+for that runner in that pass. A lane that is closed (archived and no longer open) is dropped from the runner's side
+and never reported; a key that is neither open nor archived is still `missing-in-legacy`.
+
+The runner observes every 30 seconds while the supervisor compares every 5, so a difference is reported with its
+class only once it has lasted the settle window of 65 seconds (two observation periods plus 5 seconds). One that goes
+away sooner is logged once as `timing`. A reported difference that persists is reported again only after another
+full settle window:
 
 ```
 RUNNER_SHADOW_DIFF runner=<label> class=<c> kind=<k> lane=<key> gen=<n> field=<f> runnerHash=<h|-> legacyHash=<h|->
@@ -295,12 +311,15 @@ RUNNER_SHADOW_DIFF runner=<label> class=<c> kind=<k> lane=<key> gen=<n> field=<f
 | `missing-in-runner` | the legacy path has the value, the runner doesn't |
 | `missing-in-legacy` | the runner has the value, the legacy path doesn't |
 | `value-differs` | both have it, with different values |
-| `timing` | a difference that settled within one cycle; not a failure |
+| `timing` | a difference that went away within the settle window; not a failure |
 
 Every reported difference is also stored in `<stateDir>/runners.sqlite` (table `shadow_diffs`). `dori runner
 shadow-report [--runner <label>]` prints one line per runner,
 `RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`,
 where `failures` counts every class but `timing`, or `RUNNER_SHADOW_REPORT none` when nothing was recorded.
+
+The `gen` in a `RUNNER_SHADOW_DIFF` line is the lane generation (the lane's `lastRecoveryAt`, or 0 for a lane never
+recovered), not the runner's boot generation that `dori status` shows as `RUNNER <label> ... gen=<n>`.
 
 Values are compared as short sha256 hashes. Guard verdicts compare level and reasons, never raw figures. If the
 hub can't open (an unsafe directory, a bad socket file) the supervisor logs `RUNNER_HUB_DISABLED` and keeps running.
