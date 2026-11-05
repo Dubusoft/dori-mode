@@ -89,6 +89,14 @@ test.each(["paused", "closed", "done-claimed"] as const)("does not recover a mis
   expect(events).toEqual([]);
 });
 
+test("a runner-owned lane whose pane is unknown is left to its runner, never relaunched here", async () => {
+  const { deps, world, lane } = await fixture();
+  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a" });
+  expect(await recoverLanes(deps, lane.key)).toEqual([]);
+  expect(world.calls.some((call) => call[1] === "tab" && call[2] === "create")).toBe(false);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
+});
+
 test("does not interpret list failure as a missing pane", async () => {
   const { deps, control } = await fixture();
   control.listCode = 1;

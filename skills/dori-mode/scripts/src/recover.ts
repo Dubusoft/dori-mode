@@ -123,6 +123,9 @@ const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promi
 
 const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue | undefined, view: SweepView): Promise<string[]> => {
   if (statusOf(lane) !== "working") return [];
+  // A runner-owned lane is recovered by its runner (lane.recover, lanes-hub.ts reconcileInventory). Relaunched here it
+  // would run outside the runner, without the lane token its reports need.
+  if (lane.runner) return [];
   const old = lane.pane ? await view.find(lane) : undefined;
   let reason = "missing-pane";
   if (old) {

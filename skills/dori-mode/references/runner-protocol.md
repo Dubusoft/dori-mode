@@ -110,7 +110,12 @@ random 0.8 to 1.2.
 
 The runner checks every command against `<runnerDir>/runner-config.json` before it records or runs anything. The
 file is optional; without it there are no agent profiles and no allowed roots, so every command that needs one is
-refused.
+refused. `dori runner install` writes a starter file when the worker has none: `agents.default` is the lead's
+`agentCommand` (the profile every runner launch names) and `allowedRoots` is the worker's `$HOME` plus its temp
+directory (`/tmp` on Linux, `/private/tmp` on macOS). An existing file is never rewritten. A `lane.start` the runner
+refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAILED <key> runner=<label> <detail>`
+(urgent); the supervisor's own recovery never relaunches a runner-owned lane, which only its runner recovers
+(`lane.recover`).
 
 | Key | Meaning | Default |
 |---|---|---|
@@ -376,7 +381,7 @@ The update then waits up to 2 minutes for a hello with a higher gen before it go
 runner that fails stops the rollout with `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent), and the runners after
 it keep their version.
 
-The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
+The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_FAILED`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
 `RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
 `RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
 

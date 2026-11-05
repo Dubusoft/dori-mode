@@ -70,6 +70,8 @@ export type InstallRequest = {
   readonly connectUrl: string;
   /** Issues the one-time enrollment code; called only after every input checked out. */
   readonly issue: () => EnrollIssue;
+  /** The lead's agent command: the `default` profile of the starter runner-config.json the script writes when there is none. */
+  readonly agentCommand: readonly string[];
 };
 
 export const bundleVersion = (bundle: string): string => createHash("sha256").update(bundle).digest("hex").slice(0, 12);
@@ -92,6 +94,7 @@ export const installScript = (
   connectUrl: string,
   issue: EnrollIssue,
   plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, connectUrl),
+  agentCommand: readonly string[] = [],
 ): string => {
   for (const text of [bundle, unit, plist]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
@@ -126,6 +129,17 @@ export const installScript = (
     '  mkdir -p "$R/bin" "$HOME/Library/LaunchAgents" || exit 1',
     "fi",
     'chmod 700 "$HOME/.dori" "$R" "$R/bin" || exit 1',
+    // A starter command policy, only when the host has none: without an agent profile and a root every lane.start is
+    // refused. An existing runner-config.json is the operator's and is never rewritten.
+    ...(agentCommand.length ? [
+      'if [ ! -e "$R/runner-config.json" ]; then',
+      `  A=${quote(JSON.stringify(agentCommand))}`,
+      '  case "$OS" in Darwin) TR=/private/tmp ;; *) TR=/tmp ;; esac',
+      `  H=$(printf '%s' "$HOME" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')`,
+      `  printf '{"agents":{"default":%s},"allowedRoots":["%s","%s"]}\\n' "$A" "$H" "$TR" > "$R/runner-config.json.tmp" && mv -f "$R/runner-config.json.tmp" "$R/runner-config.json" || exit 1`,
+      "  unset A H TR",
+      "fi",
+    ] : []),
     `cat > "$R/bin/dori.js.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(bundle)}${HEREDOC}`,
     'mv -f "$R/bin/dori.js.tmp" "$R/bin/dori.js" || exit 1',
@@ -193,7 +207,7 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   const plist = remoteUnit(deps.plistTemplate ?? readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), req.label, req.connectUrl);
   const issue = req.issue();
   if (!ENROLL_VALUE.test(issue.code) || !ENROLL_VALUE.test(issue.fingerprint)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: "bad enrollment code or fingerprint" };
-  const script = installScript(bundle, unit, req.label, req.connectUrl, issue, plist);
+  const script = installScript(bundle, unit, req.label, req.connectUrl, issue, plist, req.agentCommand);
   const r = await deps.run(sshArgv(req.machine.target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   const detail = (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}`;
   if (r.code === 0) return { ok: true, version: bundleVersion(bundle) };

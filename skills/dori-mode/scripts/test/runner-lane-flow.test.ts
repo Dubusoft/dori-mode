@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
-import { acceptLaneEvent, type LaneHubDeps } from "../src/runner/lanes-hub.ts";
+import { Database } from "bun:sqlite";
+import { eventLine, HUB_FILE } from "../src/runner/hub.ts";
+import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps } from "../src/runner/lanes-hub.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import type { AnyRunnerEvent, RunnerEventType } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -80,6 +82,25 @@ test("the same milestone text twice is two report rows and two journal events", 
   expect(rows).toHaveLength(2);
   expect(new Set(rows.map((r) => r.id)).size).toBe(2);
   expect(t.journal).toEqual(rows.map((r) => `lane-report:${r.id}`));
+});
+
+test("a lane.start the runner refused, read back from the hub journal, raises one RUNNER_LAUNCH_FAILED; other results raise nothing", async () => {
+  const t = await setup();
+  const db = new Database(join(t.s.dir, HUB_FILE), { create: true });
+  db.run("CREATE TABLE runner_events (id TEXT PRIMARY KEY, line TEXT NOT NULL, at INTEGER NOT NULL)");
+  const results = [
+    { cmdId: "lane-start:lane-a:1", cmdSeq: 1, state: "failed", detail: "RUNNER_CMD_REJECTED agent-profile" },
+    { cmdId: "lane-start:lane-a:2", cmdSeq: 2, state: "verified", detail: "started" },
+    { cmdId: "lane-stop:lane-a:3", cmdSeq: 3, state: "failed", detail: "gone" },
+  ];
+  for (const body of results) { const e = t.event("cmd.result", body); db.query("INSERT INTO runner_events VALUES (?, ?, ?)").run(`runner:worker-a:${e.seq}`, eventLine(e), T0); }
+  db.close();
+  for (const e of laneEventsAfter(t.s.dir, 0)) await acceptLaneEvent(t.hub, e.label, e.frame);
+  expect(t.emitted).toEqual([["runner-launch-failed:worker-a:1", expect.stringMatching(/^RUNNER_LAUNCH_FAILED lane-a runner=worker-a RUNNER_CMD_REJECTED agent-profile; /)]]);
+  // Once the lane has a pane, a late failure for an older start says nothing.
+  await t.deps.registry.update("lane-a", (l) => (l ? { ...l, pane: "p7" } : undefined));
+  await acceptLaneEvent(t.hub, "worker-a", t.event("cmd.result", results[0] as object));
+  expect(t.emitted).toHaveLength(1);
 });
 
 test("one runner event stored twice (an evacuate import of an event that already arrived) is one row", async () => {

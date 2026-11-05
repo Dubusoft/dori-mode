@@ -241,6 +241,7 @@ if (process.argv[2] === "runner") {
       // The code is issued in this process and handed to the installer as data; it never enters an argv.
       const result = await installRunner({ run, bundle: buildBundle(run) }, {
         machine: machine as NonNullable<typeof machine>, label, connectUrl: `ws://${listen}`,
+        agentCommand: cfg.agentCommand,
         issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
       });
       if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
@@ -363,6 +364,7 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
         bundle ??= await buildBundle(run)();
         const done = await installRunner({ run, bundle: async () => bundle as string }, {
           machine, label, connectUrl: `ws://${cfg.runners.listen}`,
+          agentCommand: cfg.agentCommand,
           issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
         });
         return done.ok ? { ok: true, version: done.version } : { ok: false, detail: `${done.code} ${done.detail}` };

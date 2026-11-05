@@ -33,7 +33,7 @@ const URGENT_KINDS = [
   // Runners: a lane whose runner is gone or unknown, a forged or unauthenticated frame, a backed-up outbox, and a
   // failed runner upgrade need the lead. RUNNER_STALE, RUNNER_UNREACHABLE, RUNNER_RESTARTED, RUNNER_RESTART_FAILED,
   // RUNNER_PROTO_MISMATCH and RUNNER_CONFLICT stay digest (the default).
-  "LANE_RUNNER_LOST", "LANE_ORPHAN", "RUNNER_FORGED_EVENT", "RUNNER_AUTH_FAILED", "RUNNER_OUTBOX_LARGE", "RUNNER_UPGRADE_FAILED",
+  "LANE_RUNNER_LOST", "LANE_ORPHAN", "RUNNER_LAUNCH_FAILED", "RUNNER_FORGED_EVENT", "RUNNER_AUTH_FAILED", "RUNNER_OUTBOX_LARGE", "RUNNER_UPGRADE_FAILED",
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
   "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",
