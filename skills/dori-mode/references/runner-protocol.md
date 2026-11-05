@@ -310,9 +310,48 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
+## Liveness and restarts
+
+The supervisor judges each runner by when its heartbeats arrive, on its own monotonic clock; a runner's wall clock is
+never used. A supervisor start counts as the last time it saw each runner it knows.
+
+| Silent for | What happens |
+|---|---|
+| 60 s | `RUNNER_STALE machine=<label>` (digest), once |
+| 180 s | `HOST_GUARD OFFLINE machine=<label> runner heartbeat missing ...`, once, and restart decisions start |
+| 30 min offline, or the restart circuit open | the runner is lost: `LANE_RUNNER_LOST <key> runner=<label>` (urgent) once for each open lane it owns; nothing is moved |
+
+Each decision runs `dori runner probe --json` on the runner's host: over ssh for a worker, using
+`~/.dori/runner/bin/dori.js`, and directly for the local runner. It ends one of three ways:
+
+- **Unreachable** (ssh fails or times out after 20 s, the machine is unknown, or there is no probe answer): no
+  restart; the next decision waits 2 min, doubling to 30 min.
+- **Alive** (`healthy` or `stalled`): the runner is fine and only its connection is down, so it is not restarted.
+  `RUNNER_UNREACHABLE machine=<label>` (digest) is said once per outage.
+- **Dead**: a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>`, and then
+  `systemctl --user restart dori-runner.service` runs on that host. A hello with a higher gen within 2 minutes
+  verifies it: `RUNNER_RESTARTED`. Without one the row fails, `RUNNER_RESTART_FAILED` is said, and the next decision
+  follows the backoff.
+
+The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello ends an outage, with
+`HOST_GUARD ONLINE machine=<label>` when it had gone offline. The runner's unit is separate from herdr's, so a
+restart never touches a lane's pane.
+
+`dori status` shows the restarts of the last hour (`restarts1h`). `dori doctor` checks the listen address, the local
+runner directory, and each runner's protocol, outbox backlog and restart circuit.
+
+`dori update` restarts the supervisor first. Only once it is active again does it move the runners, one at a time.
+The local runner's unit is restarted; every other runner gets the new bundle the way `dori runner install` sends it.
+The update then waits up to 2 minutes for a hello with a higher gen before it goes to the next runner. The first
+runner that fails stops the rollout with `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent), and the runners after
+it keep their version.
+
+The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
+`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
+`RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
+
 ## Not yet
 
 Later phases add:
 
 - lane control: supervisor commands with real effects and `authoritative` mode
-- full liveness: `lost` and `revoked` states, restart counts and the restart circuit

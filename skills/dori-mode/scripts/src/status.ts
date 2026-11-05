@@ -17,6 +17,7 @@ import type { Clock, Runner } from "./run.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { readStoreView, readWakes } from "./store.ts";
 import { readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_STALE_MS, type RunnerRow } from "./runner/hub.ts";
+import { openOperations } from "./operations.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const LEGACY_PRESENCE = "dori-presence.service";
@@ -95,7 +96,16 @@ export type RunnerView = {
  * connection has not closed since; `stale` up to RUNNER_OFFLINE_MS; otherwise (or never heard from) `offline`. The
  * heartbeat time is the supervisor's own wall clock, written by the hub on this host.
  */
-export const runnerView = (row: RunnerRow, now: number): RunnerView => {
+/** Restarts the liveness monitor planned for `label` in the last hour (operations rows `runner:<label>/restart/...`). */
+const runnerRestarts = (config: Parameters<typeof openOperations>[0], label: string, now: number): number | undefined => {
+  try {
+    const ops = openOperations(config);
+    try { return ops.list({ lane: `runner:${label}` }).filter((op) => op.action === "restart" && now - op.at < 60 * 60_000).length; }
+    finally { ops.close(); }
+  } catch { return undefined; }
+};
+
+export const runnerView = (row: RunnerRow, now: number, restarts1h?: number): RunnerView => {
   const hb = row.lastHeartbeatAt;
   const age = hb === undefined ? undefined : Math.max(0, now - hb);
   const closed = hb === undefined || (row.disconnectedAt !== undefined && row.disconnectedAt >= hb);
@@ -107,6 +117,7 @@ export const runnerView = (row: RunnerRow, now: number): RunnerView => {
     ...(age !== undefined ? { heartbeatAgeSec: Math.floor(age / 1000) } : {}),
     ...(row.outbox ? { outbox: { unacked: row.outbox.unacked, oldestAgeSec: Math.floor(row.outbox.oldestAgeMs / 1000) } } : {}),
     ...(row.lanes !== undefined ? { lanes: row.lanes } : {}),
+    ...(restarts1h !== undefined ? { restarts1h } : {}),
   };
 };
 
@@ -307,7 +318,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     events: eventStats(d.config, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
-    runners: readRunnerRows(d.config.stateDir).map((row) => runnerView(row, now)),
+    runners: readRunnerRows(d.config.stateDir).map((row) => runnerView(row, now, d.config.runners ? runnerRestarts(d.config, row.label, now) : undefined)),
   };
 };
 

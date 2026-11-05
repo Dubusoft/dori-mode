@@ -10,6 +10,11 @@ export type UpdateDeps = {
   readonly log: (line: string) => void;
   /** Re-installs outdated remote guard agents; returns the failure count (logged by the callee, never changes the exit code). */
   readonly refreshGuardAgents?: () => Promise<number>;
+  /**
+   * Upgrades the runners one at a time once the restarted supervisor is active (runner/upgrade.ts); returns the failure
+   * count, which is logged by the callee and never changes the exit code.
+   */
+  readonly upgradeRunners?: () => Promise<number>;
 };
 export type UpdateOptions = {
   readonly packageDir: string;
@@ -84,7 +89,11 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       await d.sleep(ACTIVE_POLL_MS);
     }
     d.log(`UPDATED ${o.branch} ${short(old)}..${short(now)} supervisor=${state}`);
-    return state === "active" ? 0 : 1;
+    if (state !== "active") return 1;
+    if (d.upgradeRunners) {
+      try { await d.upgradeRunners(); } catch (e) { d.log(`WARN runners: ${e instanceof Error ? e.message : String(e)}`); }
+    }
+    return 0;
   } catch (e) {
     if (!(e instanceof UpdateStop)) throw e;
     d.log(e.message);
