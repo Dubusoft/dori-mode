@@ -679,9 +679,10 @@ const pause: Pause = (ms, signal) => new Promise<void>((resolve) => {
  * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
  */
 export const supervise = async (
-  deps: FlowDeps, signal: AbortSignal, discordOptions: Partial<Omit<SupervisorDiscordOptions, "emit">> = {},
+  deps: FlowDeps, signal: AbortSignal, options: Partial<Omit<SupervisorDiscordOptions, "emit">> & { readonly gatewayLockDir?: string } = {},
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
+  const { gatewayLockDir, ...discordOptions } = options;
   if (!deps.config.leadPane) throw new SuperviseError("supervise requires leadPane");
   if (!Number.isFinite(deps.config.cacheTtlMin) || deps.config.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
   if (!Number.isFinite(deps.config.leadContextCapTokens) || deps.config.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
@@ -720,7 +721,7 @@ export const supervise = async (
     release = probe.step("lock", () => acquireSupervisor(deps.config.stateDir));
     const token = discordOptions.token ?? probe.step("credential", () => resolveCredential("DORI_DISCORD_TOKEN"));
     if (!token) throw new SuperviseError("supervise requires DORI_DISCORD_TOKEN for lossless paginated Discord polling");
-    releaseGateway = probe.step("gateway-lock", () => acquireDiscordGateway(token));
+    releaseGateway = probe.step("gateway-lock", () => acquireDiscordGateway(token, gatewayLockDir));
     const discord = new Discord(fetchHttp, deps.clock, token);
     // An owner notice goes where the message came from: its Discord channel or thread.
     const ownerNotice = async (channel: string, text: string, id: string): Promise<void> => {

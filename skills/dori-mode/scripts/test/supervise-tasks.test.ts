@@ -126,7 +126,7 @@ const setup = (stalled: SupervisorTask) => {
   const pause = (ms: number, signal: AbortSignal) => { const parked = pauses.pause(ms, signal); changed(); return parked; };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `supervise-tasks-test-${state.dir}`, http, lookup: async () => "", statusLookup: async () => "",
+    token: `supervise-tasks-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
     open: () => {
       let closed = (_code: number) => {};
       return {

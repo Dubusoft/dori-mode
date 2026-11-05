@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { Http } from "../../src/messenger/http.ts";
 import { StartupProbe } from "../../src/startup-probe.ts";
 import { supervise } from "../../src/supervise-loop.ts";
@@ -20,7 +21,7 @@ export const superviseWith = (stateDir: string, probe: StartupProbe, signal: Abo
   };
   const http: Http = async (request) => ({ status: 200, headers: {}, body: request.url.endsWith("/threads/active") ? JSON.stringify({ threads: [] }) : "[]" });
   return supervise(deps, signal, {
-    token: `startup-test-${stateDir}`, http, lookup: async () => "", statusLookup: async () => "",
+    token: `startup-test-${stateDir}`, gatewayLockDir: join(stateDir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
     open: () => {
       let closed = (_code: number) => {};
       return {

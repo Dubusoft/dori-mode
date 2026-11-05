@@ -88,7 +88,7 @@ const setup = () => {
   const pause = (ms: number, signal: AbortSignal) => { const parked = pauses.pause(ms, signal); for (const listener of parkListeners) listener(); return parked; };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `sweep-task-test-${state.dir}`, http, lookup: async () => "", statusLookup: async () => "",
+    token: `sweep-task-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
     open: () => {
       let closed = (_code: number) => {};
       return {
