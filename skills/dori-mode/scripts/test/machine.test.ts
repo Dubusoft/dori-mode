@@ -275,6 +275,16 @@ test("adopt --machine keeps the given directory as the remote path, never as a l
   expect((await adoptLane(d, { ...lane({ key: "local-adopted", machine: undefined, cwd: "/repo/x" }), pane: "w:p4" })).cwd).toBe("/repo/x");
 });
 
+test("adopt without --machine refuses a pane id this host's herdr does not list; with --machine the same id is adopted", async () => {
+  const d = deps();
+  const run: Runner = (argv, opts) => argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "get"
+    ? Promise.resolve({ code: 1, out: "", err: "pane w:p3 not found" })
+    : d.run(argv, opts);
+  await expect(adoptLane({ ...d, run }, { ...lane({ machine: undefined }), pane: "w:p3" })).rejects.toThrow("needs --machine");
+  expect(await d.registry.read("remote-lane")).toBeNull();
+  expect((await adoptLane({ ...d, run }, { ...lane(), pane: "w:p3" })).machine).toBe(MACHINE);
+});
+
 test("a failed remote pane run is not registered as a launched lane", async () => {
   const d = deps();
   const input = lane();

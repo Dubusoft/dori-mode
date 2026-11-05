@@ -259,7 +259,16 @@ export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, lan
 const laneDirs = (machine: string | undefined, dir: string | undefined, defaultCwd: string): Pick<Lane, "cwd" | "remoteCwd"> =>
   machine ? (dir ? { remoteCwd: dir } : {}) : { cwd: dir ?? defaultCwd };
 
+/** The hint for a pane id this host's herdr does not list: lanes without --machine are local lanes. */
+const REMOTE_PANE_HINT = "a pane on another machine needs --machine LABEL";
+
 export const adoptLane = async (deps: FlowDeps, input: LaunchInput & { readonly pane: string }): Promise<Lane> => {
+  // Without --machine the lane is local: the local runner, the sweeps and recovery look its pane up on this host, so a
+  // remote pane id registered here would read as gone and be relaunched locally.
+  if (!input.machine) {
+    const got = await deps.run(["herdr", "pane", "get", input.pane]);
+    if (got.code !== 0) throw new LaunchError(`pane ${input.pane} is not on this host (${(got.err || got.out).trim() || `exit ${got.code}`}); ${REMOTE_PANE_HINT}`);
+  }
   const lane: Lane = { key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), pane: input.pane, ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(await autoCloseOf(input.brief)), ...laneDirs(input.machine, input.cwd, deps.config.defaultCwd), openedAt: iso(deps.clock) };
   return reserveLane(deps, input, lane);
 };
@@ -325,7 +334,7 @@ const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<Ta
   }
   if (!id) throw new LaunchError("no target pane");
   const got = await deps.run(["herdr", "pane", "get", id]);
-  if (got.code !== 0) throw new LaunchError(`pane ${id} does not exist: ${got.err || got.out}`);
+  if (got.code !== 0) throw new LaunchError(`pane ${id} does not exist: ${got.err || got.out}${input.machine ? "" : `; ${REMOTE_PANE_HINT}`}`);
   const info = parse<{ result: { pane: PaneInfo } }>(got.out, `herdr pane get ${id}`).result.pane;
   if (input.workspace && info.workspace_id !== input.workspace) throw new LaunchError(`pane ${id} is in workspace ${info.workspace_id}, not ${input.workspace}`);
   if (info.agent) throw new LaunchError(`pane ${id} runs an agent (${info.agent}); a lane needs an idle shell`);

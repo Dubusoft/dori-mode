@@ -88,8 +88,10 @@ test("a QA-only lane's claim is re-checked at close time: the lane says done, bu
   const world = newWorld();
   const clock = fakeClock(Date.parse("2026-01-01T00:00:00Z"));
   const flag = join(state.dir, "qa-passed");
-  const deps = { ...depsFor(world, clock, state.dir), run, signalIo: { cwd: state.dir } };
-  const lane = await adoptLane(deps, { key: "local-setup", title: "setup", brief: "/b.md", done: `command ["test","-f","${flag}"]`, pane: "w:p3", cwd: state.dir });
+  const fake = depsFor(world, clock, state.dir);
+  const deps = { ...fake, run, signalIo: { cwd: state.dir } };
+  // Adoption looks the pane up in herdr: the fake world answers, so the test never reaches the host's herdr.
+  const lane = await adoptLane(fake, { key: "local-setup", title: "setup", brief: "/b.md", done: `command ["test","-f","${flag}"]`, pane: "w:p3", cwd: state.dir });
   await claimDone(deps, lane, "I ran the setup and it works");
   // The first pass hands the claim over; its window runs from there.
   await watchTick(deps);
