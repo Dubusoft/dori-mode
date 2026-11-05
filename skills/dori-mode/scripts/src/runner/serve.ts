@@ -14,7 +14,7 @@ import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
   decodeFrame, encodeFrame, LABEL_PATTERN, ProtocolError, supervisorCommand, supervisorControl,
-  type AnyRunnerEvent, type Frame, type InventoryLane, type LaneStatus, type RejectCode, type RunnerControl,
+  type AnyRunnerEvent, type AnySupervisorCommand, type Frame, type InventoryLane, type LaneStatus, type RejectCode, type RunnerControl,
   type RunnerEventBodies, type SupervisorCommandBodies, type SupervisorCommandType,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
@@ -577,6 +577,8 @@ export type DispatchDeps = {
   /** Publishes the `cmd.result` event (through the outbox). */
   readonly publish: (body: RunnerEventBodies["cmd.result"]) => void;
   readonly log: (line: string) => void;
+  /** The effect of each command type the runner carries out; it resolves to the result detail. Others are unsupported. */
+  readonly effects?: { readonly [T in SupervisorCommandType]?: (command: Extract<AnySupervisorCommand, { readonly type: T }>) => Promise<string> };
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -588,7 +590,8 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
  * 2. The intent row is committed in the state; a cmdId already recorded is not run again.
  * 3. Right before the effect, fencing.ts `checkEffectEpoch` against a fresh read of `maxEpoch`; a stale command is
  *    recorded and answered `failed` with the `RUNNER_CMD_REJECTED stale-epoch ...` detail.
- * 4. The effect. No command type has one yet, so each is answered `failed "RUNNER_CMD_UNSUPPORTED <type>"`.
+ * 4. The effect from `effects`: its detail is recorded `verified`, a throw `failed`. A type without one is answered
+ *    `failed "RUNNER_CMD_UNSUPPORTED <type>"`.
  * A frame without a usable cmdId and cmdSeq cannot be answered and is only logged.
  */
 export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void => {
@@ -603,10 +606,10 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
   const seq = cmdSeq as number;
   const epoch = isRecord(raw) && Number.isSafeInteger(raw.epoch) ? (raw.epoch as number) : 0;
   const key = typeof body?.key === "string" ? body.key : undefined;
-  const finish = (detail: string): void => {
-    deps.state.recordResult(cmdId, "failed", detail);
-    deps.publish({ cmdId, cmdSeq: seq, state: "failed", detail });
-    deps.log(`RUNNER_CMD_FAILED cmdId=${cmdId} type=${type} ${detail}`);
+  const finish = (detail: string, outcome: "verified" | "failed" = "failed"): void => {
+    deps.state.recordResult(cmdId, outcome, detail);
+    deps.publish({ cmdId, cmdSeq: seq, state: outcome, detail });
+    deps.log(`${outcome === "verified" ? "RUNNER_CMD_DONE" : "RUNNER_CMD_FAILED"} cmdId=${cmdId} type=${type} ${detail}`);
   };
   const intent = { cmdId, cmdSeq: seq, type: type as SupervisorCommandType, epoch, ...(key !== undefined ? { key } : {}) };
   const checked = checkCommand(deps.policy, raw, deps.realpath);
@@ -615,7 +618,12 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
   deps.state.observeEpoch(checked.command.epoch);
   const fence = checkEffectEpoch(checked.command.epoch, deps.state.maxEpoch());
   if (!fence.ok) { finish(fence.detail); return; }
-  finish(`RUNNER_CMD_UNSUPPORTED ${checked.command.type}`);
+  const effect = deps.effects?.[checked.command.type] as ((command: AnySupervisorCommand) => Promise<string>) | undefined;
+  if (!effect) { finish(`RUNNER_CMD_UNSUPPORTED ${checked.command.type}`); return; }
+  void effect(checked.command).then(
+    (detail) => { finish(detail, "verified"); },
+    (error: unknown) => { finish(`RUNNER_CMD_FAILED ${error instanceof Error ? error.message : String(error)}`); },
+  );
 };
 
 /** Wraps `connect` so `serveRunner` sees each connection; pass the result to both the client and `serveRunner`. */

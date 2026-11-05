@@ -1,14 +1,17 @@
 import { realpathSync } from "node:fs";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
+import { sampleHost } from "../host-guard.ts";
+import { sampleProcs } from "../lane-memory.ts";
 import { parseArgs } from "node:util";
 import { loadConfig, runnerMode } from "../config.ts";
 import { listPanes } from "../panes.ts";
 import { Registry } from "../registry.ts";
 import { realClock, run, setDefaultRunTimeout } from "../run.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
+import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
 import { defaultRunnerDir, runStartupCheck } from "./fs-safety.ts";
-import { probe, startHealth } from "./health.ts";
+import { pidAlive, probe, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
 import { Outbox } from "./outbox.ts";
 import { loadPolicy } from "./policy.ts";
@@ -86,9 +89,18 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const log = (line: string): void => { console.log(line); };
   const tracked = trackedConnector(connector);
   let client: RunnerClient | undefined;
+  // Only a worker's runner guards its host: on the lead host the supervisor's own guard sweep samples and kills, and
+  // two killers there would race. Thresholds and heavyKill come from runner-config.json, else the config defaults.
+  const guard = remote ? new RunnerGuard({
+    sample: () => sampleHost(run, homedir()), thresholds: { ...cfg.guard, ...policy.guard }, heavyKill: policy.heavyKill ?? cfg.heavyKill,
+    procs: () => sampleProcs(run), self: process.pid, now: realClock.now, os: process.platform,
+    kill: { clock: realClock, alive: pidAlive, signal: (pid, sig) => { process.kill(pid, sig); } },
+    publish: (type, body) => { client?.publish(type, body); },
+  }) : undefined;
   const dispatch = commandDispatcher({
     state, policy, realpath: realpathSync, log,
     publish: (body) => { client?.publish("cmd.result", body); },
+    ...(guard ? { effects: { "guard.kill": async (command) => `killed ${(await guard.killLanes(command.body.keys)).length}` } } : {}),
   });
   client = new RunnerClient(
     { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
@@ -99,12 +111,21 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   process.on("SIGTERM", () => controller.abort());
   console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=${mode} endpoint=${endpoint}`);
   const stopHealth = startHealth({ runnerDir, pid: process.pid, gen, now: realClock.now, monotonic: () => Math.round(performance.now()), every: realEvery, log });
+  let guarding = false;
+  const guardTick = (): void => {
+    if (!guard || guarding) return;
+    guarding = true;
+    void guard.tick().catch((e: unknown) => { log(`RUNNER_GUARD_FAILED ${e instanceof Error ? e.message : String(e)}`); }).finally(() => { guarding = false; });
+  };
+  guardTick();
+  const stopGuard = guard ? realEvery(GUARD_SAMPLE_MS, guardTick) : () => {};
   try {
     await serveRunner({
       client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
       ...(observe ? { observe } : {}), log,
     }, controller.signal);
   } finally {
+    stopGuard();
     stopHealth();
     outbox.close();
     state.close();

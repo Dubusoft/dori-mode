@@ -2,8 +2,10 @@
 
 The runner is a small per-machine process (`dori runner serve`) that talks to the supervisor over one line-based
 connection: a unix socket on the lead host, or a WebSocket on a private address for other machines. Both sides
-authenticate every connection. In this release the runner runs in shadow mode only: it reports what it sees on its
-machine, answers commands with a refusal or `RUNNER_CMD_UNSUPPORTED`, and changes nothing.
+authenticate every connection. In this release a runner reports what it sees on its machine and changes no lane. A
+worker's runner also guards its host (below): it samples memory, load and disk, and under critical memory kills its
+lanes' heavy processes. Every command but `guard.kill` and `runner.rotate` is answered with a refusal or
+`RUNNER_CMD_UNSUPPORTED`.
 The modules live in `scripts/src/runner/`; see [development.md](development.md) for the module table and
 [scripts.md](scripts.md) for the commands.
 
@@ -43,11 +45,12 @@ Control frames, used in this release:
 fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
-`wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. The
-shadow runner publishes only `lane.state` today. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`,
+`wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. Today
+a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`,
 `lane.resume`, `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`,
-`runner.rotate`) are part of the schema. Only `runner.rotate` is sent today. Every command the runner receives goes
-through the command policy (below): a refused one is answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, an
+`runner.rotate`) are part of the schema. A worker's runner carries out `guard.kill`; `runner.rotate` is handled by
+the connection itself. Every command the runner receives goes through the command policy (below): a refused one is
+answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, a carried-out one `cmd.result verified <detail>`, and an
 accepted one that this release cannot carry out yet `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Both get an
 intent row and a final row, so `cmdAck` moves past them and they are not sent again. A command with an unknown type
 or field still gets an answer instead of being dropped.
@@ -113,6 +116,8 @@ refused.
 | `allowedRoots` | directories every `cwd` must be under | none |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
 | `jobs` | `deny` refuses `job.run` and `wait.check` | `allow` |
+| `guard` | this host's guard thresholds (`loadAlert`, `loadOk`, `memFreeMinPct`, `memFreeCritPct`, `swapFreeCritPct`, `diskFreeMinGb`, `panesMax`), each optional | the config's `guard` |
+| `heavyKill` | command-line patterns killed under critical memory | the config's `heavyKill` |
 
 A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
 `unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
@@ -224,6 +229,30 @@ It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's
 `RUNNER_INSTALL_NO_BUN`, `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd or linger step
 named when that failed).
 
+## Guard
+
+A worker's runner (one started with `--connect`) samples its host every 30 seconds with the same readings the
+supervisor takes of its own host, judged against `runner-config.json`'s `guard` thresholds:
+
+- `guard.sample {level, reasons, sampledAt, load1, memFreePct, diskFreeGb, swapFreeGb, swapTotalGb, os}` goes out once
+  a minute and on every level change (`ok`, `alert`, `critical`); `guard.alert {reasons}` on entering alert or
+  critical.
+- Under critical memory the runner kills by itself. It targets only processes whose command line matches a
+  `heavyKill` pattern and that belong to a lane on the host (`DORI_LANE_KEY` in their own or an ancestor's
+  environment). The runner and its ancestors are never targets. Each gets SIGTERM, then SIGKILL after 5 seconds. The
+  kills go out in `guard.critical {killed, paused, reasons, rssKb, cmds}`.
+- `guard.kill {keys}` runs the same kill limited to those lanes. The supervisor sends lane keys, never patterns.
+
+The local runner on the lead host does none of this: the supervisor's own guard sweep samples and kills there.
+
+On the supervisor, the machine-guard sweep takes a runner's sample when it is at most 90 seconds old and then makes
+no ssh call to that machine. The sample goes through the same transitions as an ssh sample, so `HOST_GUARD ALERT`,
+`CLEAR`, `OFFLINE`, `ONLINE` and `LAUNCH_READY machine=<label>` read exactly as before. A runner machine never reads
+as `OUTDATED`, because it has no guard agent. Its critical stage reports the runner's kills (`HOST_GUARD CRITICAL
+machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane on entering critical with nothing
+killed, but it kills nothing over ssh. Without a fresh runner sample (no runner, or it went quiet) the machine is
+sampled over ssh again, as before.
+
 ## Health and probe
 
 The runner rewrites `~/.dori/runner/health` (`{pid, gen, monotonicMs, wallAt}`, 0600) at start and then every
@@ -286,5 +315,4 @@ must handle its absence. On disk, new hub columns are added with `ALTER TABLE` a
 Later phases add:
 
 - lane control: supervisor commands with real effects and `authoritative` mode
-- guard samples and alerts from the runner
 - full liveness: `lost` and `revoked` states, restart counts and the restart circuit
