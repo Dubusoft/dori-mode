@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sshArgv, type GuardMachine } from "../remote-guard.ts";
 import { RUN_TIMEOUT_CODE, type Runner } from "../run.ts";
+import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
 
 /**
  * Installs or upgrades the runner on a remote Linux or macOS machine over ssh, as design 3.2 and 5.4 lay out. The ssh
@@ -203,11 +204,17 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: r.code === INSTALL_EXIT.systemd ? `service manager: ${detail}` : detail };
 };
 
-export const buildBundle = (run: Runner) => async (): Promise<string> => {
+/**
+ * Bundles the CLI for a remote runner. The bundle has no git checkout on the remote host, so the source's short SHA is
+ * baked in as `DORI_RUNNER_VERSION` (version.ts), which the runner reports in its hello.
+ */
+export const buildBundle = (run: Runner, entry: string = RUNNER_CLI_ENTRY) => async (): Promise<string> => {
   const dir = mkdtempSync(join(tmpdir(), "dori-runner-bundle-"));
   try {
     const out = join(dir, "dori.js");
-    const r = await run(["bun", "build", RUNNER_CLI_ENTRY, "--target=bun", "--outfile", out], { timeoutMs: 120_000 });
+    const version = await gitVersion(run, import.meta.dir);
+    const define = version ? ["--define", `${RUNNER_VERSION_DEFINE}=${JSON.stringify(version)}`] : [];
+    const r = await run(["bun", "build", entry, "--target=bun", ...define, "--outfile", out], { timeoutMs: 120_000 });
     if (r.code !== 0) throw new Error(`RUNNER_BUNDLE_FAILED ${r.err.trim().split("\n").at(-1) ?? `exit ${r.code}`}`);
     return readFileSync(out, "utf8");
   } finally {

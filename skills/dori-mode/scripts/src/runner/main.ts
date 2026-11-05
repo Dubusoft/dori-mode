@@ -13,6 +13,7 @@ import { loadConfig, runnerMode } from "../config.ts";
 import { listPanes } from "../panes.ts";
 import { Registry } from "../registry.ts";
 import { realClock, run, setDefaultRunTimeout } from "../run.ts";
+import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
@@ -93,8 +94,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     inventory = [...owned, ...observed.filter((l) => !owned.some((o) => o.key === l.key))];
     return lanes;
   } : undefined;
-  const head = await run(["git", "-C", import.meta.dir, "rev-parse", "--short", "HEAD"], { timeoutMs: 5_000 }).catch(() => undefined);
-  const version = head?.code === 0 ? head.out.trim() || undefined : undefined;
+  const version = await runnerVersion(run, import.meta.dir);
   const log = (line: string): void => { console.log(line); };
   const tracked = trackedConnector(connector);
   let client: RunnerClient | undefined;
