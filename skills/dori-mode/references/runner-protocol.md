@@ -1,7 +1,9 @@
 # Runner protocol
 
 The runner is a small per-machine process (`dori runner serve`) that talks to the supervisor over one line-based
-connection. In this release it runs in shadow mode only: it reports what it sees on its machine and changes nothing.
+connection: a unix socket on the lead host, or a WebSocket on a private address for other machines. Both sides
+authenticate every connection. In this release the runner runs in shadow mode only: it reports what it sees on its
+machine, answers commands with a refusal or `RUNNER_CMD_UNSUPPORTED`, and changes nothing.
 The modules live in `scripts/src/runner/`; see [development.md](development.md) for the module table and
 [scripts.md](scripts.md) for the commands.
 
@@ -19,7 +21,7 @@ Every frame is one JSON object followed by `\n`, at most 1 MiB (`MAX_FRAME_BYTES
 | `cmdSeq` | supervisor commands only: the command sequence |
 | `type` | the frame type |
 | `body` | the type's body |
-| `mac` | optional string; accepted but not checked yet |
+| `mac` | base64 HMAC-SHA256 of the frame without `mac`, under the session key; required on every frame after the handshake |
 
 Validation is strict. An unknown envelope or body field, an unknown type, a type sent by the wrong side, `seq` on a
 non-event, `cmdSeq` on a non-command, a missing or zero sequence, a wrong field shape or a bad label is rejected
@@ -30,20 +32,109 @@ frame closes the connection without an ack.
 
 Control frames, used in this release:
 
-- Runner to supervisor: `hello {proto, gen, label, hostId, cmdAck, version?, inventory?}`,
-  `heartbeat {outbox?: {unacked, oldestAgeMs}}`, `cmd.status.result {cmdId, state, detail?}`.
-- Supervisor to runner: `hello.ok {proto, epoch, eventAck}`, `hello.reject {code, detail}`, `ack {eventAck}`,
-  `cmd.status {cmdId}`.
+- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, nonce, dh}`,
+  `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
+  `cmd.status.result {cmdId, state, detail?}`.
+- Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
+  `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`.
 
-`hello` must be the first frame on a connection. The hub rejects it with `RUNNER_PROTO_MISMATCH` when the protocol
-version isn't accepted, and with `RUNNER_CONFLICT` when the label is already pinned to another `hostId` or the
-`gen` is lower than the highest one it has seen for that label. A newer connection for a label replaces an older one.
+`hello` must be the first frame on a connection (after an `enroll` connection has closed). After the handshake
+(below) the hub applies its hello rules: `RUNNER_PROTO_MISMATCH` when the protocol version isn't accepted, then the
+fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
 `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. The
 shadow runner publishes only `lane.state` today. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`,
 `lane.resume`, `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`,
-`runner.rotate`) are part of the schema but never sent; a shadow runner drops any command it receives.
+`runner.rotate`) are part of the schema. Only `runner.rotate` is sent today. Every command the runner receives goes
+through the command policy (below): a refused one is answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, an
+accepted one that this release cannot carry out yet `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Both get an
+intent row and a final row, so `cmdAck` moves past them and they are not sent again. A command with an unknown type
+or field still gets an answer instead of being dropped.
+
+## Authentication
+
+Each side has an Ed25519 key pair. The supervisor's lives in `<stateDir>/runner-keys/supervisor.key`; the runner's in
+`<runnerDir>/keys/runner.key`, next to the pinned `keys/supervisor.pub`. Enrolled runner keys and enrollment codes
+are kept in `<stateDir>/runners.sqlite` (`runner_keys`, `enroll_codes`). There is no TLS: confidentiality is left to
+the private network.
+
+**Enrollment.** `dori runner enroll --machine <label>` issues a one-time code (32 random bytes, valid 10 minutes,
+bound to that label) and prints it with the supervisor key fingerprint as `code=<code>` and
+`fingerprint=sha256:<hex>` lines on stdout. That text is fed to `dori runner serve --enroll` on stdin, never in argv
+or the environment. The runner makes its key pair and sends `enroll {label, hostId, runnerPubKey, proof}`, where
+`proof` is an HMAC keyed with the code, so the code itself never crosses the connection. The supervisor accepts it
+only for an unused, unexpired code of that label, marks the code used, stores the key and `hostId`, and answers
+`enroll.ok` with its public key and its own proof. The runner checks that key against the fingerprint from stdin and
+the proof, pins it, and closes. A refusal is `RUNNER_ENROLL_REFUSED`. The local runner on the lead host is enrolled
+by the supervisor in-process when the hub opens, unless it is already enrolled to this supervisor or was revoked.
+
+**Connection handshake.** The runner sends `hello` with a nonce and an ephemeral X25519 key. The supervisor answers
+`hello.challenge` with its nonce, its ephemeral key and a signature over the handshake transcript; the runner
+verifies it with the pinned key and answers `auth.proof`, its own signature over the transcript, which the supervisor
+verifies with the stored key. A failed signature on either side closes the connection with `RUNNER_AUTH_FAILED`; an
+unenrolled label or another host is refused the same way, a revoked one with `RUNNER_REVOKED`. The session key is
+HKDF over the X25519 shared secret, salted with both nonces, with both identity keys as info, so someone who only
+watched the handshake cannot compute it. From then on every frame both ways carries a `mac`, compared in constant
+time; a frame with a missing or wrong `mac` is dropped and logged `RUNNER_AUTH_FAILED ... bad mac`. Authentication is
+always on for the unix socket and the WebSocket listener alike.
+
+**Rotation.** `dori runner rotate <label>` sends `runner.rotate` to the connected runner. It writes a new key pair
+next to the old one and answers `runner.rotated`, signed with the new key. The supervisor stores the new key and
+answers `rotate.ok`; on that ack the runner replaces the old key, which is refused from then on. If the ack is lost,
+the next `hello.challenge` names the new key's fingerprint and the runner switches then. The command prints
+`RUNNER_KEY_ROTATED runner=<label> key=<fingerprint>`.
+
+**Revocation.** `dori runner revoke <label>` deletes the stored key at once and has the live hub close the
+connection; every later hello is refused with `RUNNER_REVOKED`. A revoked runner comes back only by enrolling again.
+
+`rotate` and `revoke` reach the running supervisor through a request table (`runner_admin` in `runners.sqlite`) that
+the `runners` task drains every 5 seconds; a request not answered within 2 minutes is answered `expired`.
+
+## Network listener
+
+With `runners.listen` set (`host:port`), the supervisor also listens for runners on a WebSocket at that address,
+next to the local unix socket. The host must be a single private address: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
+192.168.0.0/16, 100.64.0.0/10 (tailnet), fd00::/8 or ::1, IPv6 written `[addr]:port`. A wildcard such as `0.0.0.0`,
+a hostname or a public address fails config loading with `CONFIG_RUNNER_LISTEN_INVALID`. If the address cannot be
+bound the supervisor logs `RUNNER_LISTEN_FAILED` and keeps serving the local socket. A remote runner connects with
+`dori runner serve --connect ws://<host>:<port>` and reconnects with backoff: 1 s doubling to 60 s, scaled by a
+random 0.8 to 1.2.
+
+## Command policy
+
+The runner checks every command against `<runnerDir>/runner-config.json` before it records or runs anything. The
+file is optional; without it there are no agent profiles and no allowed roots, so every command that needs one is
+refused.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
+| `allowedRoots` | directories every `cwd` must be under | none |
+| `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
+| `jobs` | `deny` refuses `job.run` and `wait.check` | `allow` |
+
+A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
+`unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
+(compared by path segment after resolving symlinks on both sides, so `/data/repos-evil` is not under `/data/repos`),
+`sandbox-required`, `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
+`guard.kill` accepts only lane keys.
+
+## Fencing
+
+The runner's `gen` is bumped and committed before its first hello; the supervisor's `epoch` before its hub opens.
+
+- The runner keeps the highest epoch it has seen and re-reads it right before any command's effect. A command from
+  a lower epoch is refused there with `RUNNER_CMD_REJECTED stale-epoch`, even if it was accepted earlier.
+- The hub keeps each label's `hostId` and highest `gen`. A hello from another `hostId` for the same label is refused
+  `RUNNER_CONFLICT`, as is a lower `gen` on the same host, or the same `gen` while that connection is still live. A
+  higher `gen` on the same host replaces the old connection (`RUNNER_REPLACED`).
+- After restoring a runner's state from a backup, `dori runner reset-gen <label>` clears the stored `gen` (the
+  `hostId` stays) so its next hello is accepted.
+
+Only the supervisor's key makes a supervisor: a second supervisor started from another state directory has a
+different key, and every runner refuses it. Moving the lead to another host therefore means moving
+`<stateDir>/runner-keys/` with it, or enrolling every runner again.
 
 ## Cursors and ordering
 
@@ -93,6 +184,8 @@ Everything lives under `~/.dori/runner`:
 | `state.sqlite` (+ `-wal`, `-shm`) | `gen`, highest seen epoch, command rows (kept 30 days) |
 | `outbox.sqlite` (+ `-wal`, `-shm`) | the outbox |
 | `bodies/<seq>.body` | moved report and job bodies |
+| `keys/runner.key`, `keys/supervisor.pub` | the runner's private key and the pinned supervisor key (`keys/runner.next.key` during a rotation) |
+| `runner-config.json` | the command policy (optional) |
 | `sock/control` | the unix socket the supervisor listens on and the runner connects to |
 
 The hub's table is `<stateDir>/runners.sqlite` on the supervisor side.
@@ -102,8 +195,9 @@ checks this with lstat before opening anything; on the first bad entry it prints
 to stderr and exits 1. It never repairs permissions. The supervisor creates `~/.dori/runner` and `sock/` as 0700
 when they're missing, and the socket itself is 0600.
 
-There's no peer credential check on the socket. Bun's unix sockets don't expose the peer's uid (no `SO_PEERCRED`),
-so the 0700 `sock/` directory inside the 0700 runner directory is the only access boundary for now.
+There's no peer credential check on the socket. Bun's unix sockets don't expose the peer's uid (no `SO_PEERCRED`).
+The 0700 `sock/` directory keeps other users out, and the signed handshake keeps another process of the same user
+from posing as the supervisor or the runner.
 
 ## Shadow mode
 
@@ -141,8 +235,7 @@ must handle its absence. On disk, new hub columns are added with `ALTER TABLE` a
 
 Later phases add:
 
-- authentication: enrollment, keys and `mac` checking (`RUNNER_AUTH_FAILED`, `RUNNER_REVOKED`)
-- remote install of runners on worker machines
-- lane control: supervisor commands, `cmd.result` and `cmdAck` actually moving, `authoritative` mode
+- remote install of runners on worker machines (`dori runner install`, probe, health file)
+- lane control: supervisor commands with real effects and `authoritative` mode
 - guard samples and alerts from the runner
 - full liveness: `lost` and `revoked` states, restart counts and the restart circuit

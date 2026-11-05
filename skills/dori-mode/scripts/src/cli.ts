@@ -80,8 +80,15 @@ const USAGE = `dori <command> [options]
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
-  runner serve [--label LABEL]         the local runner (P1: shadow only, needs a runners section in the config): connects to
-                                       the supervisor over ~/.dori/runner/sock/control, heartbeats, reports lane observations
+  runner serve [--label LABEL] [--enroll] [--connect ws://HOST:PORT]
+                                       a runner (needs a runners section in the config): connects to the supervisor over
+                                       ~/.dori/runner/sock/control (or --connect), signed handshake, heartbeats, reports lane
+                                       observations; commands are checked against ~/.dori/runner/runner-config.json;
+                                       --enroll reads code= and fingerprint= lines on stdin first
+  runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
+  runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
+  runner rotate LABEL                  have the connected runner switch to a new key; prints the new key fingerprint
+  runner reset-gen LABEL               forget the runner's highest gen (after restoring its state from a backup)
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
@@ -167,24 +174,119 @@ if (process.argv[2] === "status") {
 }
 
 if (process.argv[2] === "runner") {
-  // `dori runner serve`: the local runner. P1 runs it in shadow mode only: it reports what it sees and changes nothing.
-  const parsed = parseArgs({ args: process.argv.slice(3), allowPositionals: true, options: { label: { type: "string" } } });
-  if (parsed.positionals.join(" ") !== "serve") { console.error("usage: dori runner serve [--label LABEL]"); process.exit(1); }
+  // `dori runner serve` is the runner (P2: shadow observation, every command answered by the dispatcher); enroll,
+  // revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll] [--connect ws://HOST:PORT] | enroll --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL";
+  const parsed = parseArgs({
+    args: process.argv.slice(3), allowPositionals: true,
+    options: { label: { type: "string" }, machine: { type: "string" }, enroll: { type: "boolean" }, connect: { type: "string" } },
+  });
+  const [sub = "", target, ...extra] = parsed.positionals;
+  if (extra.length) die(usage);
+  const { LABEL_PATTERN } = await import("./runner/protocol.ts");
+  const labelArg = (value: string | undefined): string => {
+    if (!value || !LABEL_PATTERN.test(value)) die(usage);
+    return value as string;
+  };
+  if (sub === "enroll") {
+    // The code and fingerprint go to stdout only: the installer pipes them into the runner's stdin over ssh.
+    const label = labelArg(parsed.values.machine);
+    if (target !== undefined) die(usage);
+    const cfg = await loadConfig();
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      const issued = auth.issueCode(label);
+      process.stdout.write(`code=${issued.code}\nfingerprint=${auth.fingerprint}\n`);
+      process.stderr.write(`RUNNER_ENROLL_CODE runner=${label} expiresAt=${new Date(issued.expiresAt).toISOString()}\n`);
+    } finally {
+      auth.close();
+    }
+    process.exit(0);
+  }
+  if (sub === "revoke" || sub === "rotate" || sub === "reset-gen") {
+    const label = labelArg(target);
+    const cfg = await loadConfig();
+    if (sub === "reset-gen") {
+      const { resetRunnerGen } = await import("./runner/hub.ts");
+      if (!resetRunnerGen(cfg.stateDir, label)) die(`RUNNER_UNKNOWN ${label}`);
+      console.log(`RUNNER_GEN_RESET runner=${label}`);
+      process.exit(0);
+    }
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const { queueRunnerAdmin, runnerAdminResult } = await import("./runner/serve.ts");
+    // The supervisor's runners task answers queued requests every few seconds.
+    const waitFor = async <T>(read: () => T | undefined, ms: number): Promise<T | undefined> => {
+      for (const until = realClock.now() + ms; realClock.now() < until; await realClock.sleep(500)) {
+        const value = read();
+        if (value !== undefined) return value;
+      }
+      return read();
+    };
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      if (sub === "revoke") {
+        // The key is deleted here at once, so later hellos are refused even with the supervisor down; the live link
+        // closes when the supervisor takes the request.
+        if (!auth.revoke(label)) die(`RUNNER_UNKNOWN ${label} is not enrolled`);
+        const id = queueRunnerAdmin(cfg.stateDir, "revoke", label, realClock.now());
+        const result = await waitFor(() => runnerAdminResult(cfg.stateDir, id), 15_000);
+        console.log(`RUNNER_REVOKED runner=${label} link=${result ?? "pending (supervisor has not answered)"}`);
+        process.exit(0);
+      }
+      const before = auth.key(label);
+      if (!before?.pubKey) die(`RUNNER_UNKNOWN ${label} is not enrolled`);
+      const id = queueRunnerAdmin(cfg.stateDir, "rotate", label, realClock.now());
+      const result = await waitFor(() => runnerAdminResult(cfg.stateDir, id), 15_000);
+      if (!result?.startsWith("sent ")) die(`RUNNER_ROTATE_FAILED runner=${label} ${result ?? "the supervisor did not answer"}`);
+      const rotated = await waitFor(() => {
+        const row = auth.key(label);
+        return row?.pubKey && row.pubKey !== before?.pubKey ? row.pubKey : undefined;
+      }, 15_000);
+      if (!rotated) die(`RUNNER_ROTATE_PENDING runner=${label} ${result} (the runner has not answered yet)`);
+      const { fingerprint } = await import("./runner/auth.ts");
+      console.log(`RUNNER_KEY_ROTATED runner=${label} key=${fingerprint(rotated as string)}`);
+      process.exit(0);
+    } finally {
+      auth.close();
+    }
+  }
+  if (sub !== "serve" || target !== undefined) die(usage);
   const { defaultRunnerDir, runStartupCheck } = await import("./runner/fs-safety.ts");
   const runnerDir = defaultRunnerDir();
   // RUNNER_DIR_UNSAFE on stderr and exit 1 before anything is opened.
   if (!runStartupCheck(runnerDir, { stderr: (text) => { process.stderr.write(text); }, exit: (code) => process.exit(code) })) process.exit(1);
+  const { realpathSync } = await import("node:fs");
   const { hostname } = await import("node:os");
   const { runnerMode } = await import("./config.ts");
   const { listPanes } = await import("./panes.ts");
+  const { enrollRunner, RunnerAuth } = await import("./runner/auth.ts");
   const { HEARTBEAT_MS, RunnerClient } = await import("./runner/client.ts");
   const { Outbox } = await import("./runner/outbox.ts");
+  const { loadPolicy } = await import("./runner/policy.ts");
   const { RunnerState } = await import("./runner/state.ts");
-  const { LOCAL_RUNNER, loadIdentity, observeLanes, realEvery, serveRunner, trackedConnector } = await import("./runner/serve.ts");
+  const { commandDispatcher, LOCAL_RUNNER, loadIdentity, observeLanes, parseEnrollInput, realEvery, serveRunner, trackedConnector } = await import("./runner/serve.ts");
   const { connectUnix, controlSocketPath } = await import("./runner/unix-transport.ts");
+  const { connectWs } = await import("./runner/ws-transport.ts");
   const cfg = await loadConfig();
   setDefaultRunTimeout(cfg.runTimeoutMs);
   const identity = loadIdentity(runnerDir, parsed.values.label ?? LOCAL_RUNNER, hostname());
+  const connector = parsed.values.connect ? connectWs(parsed.values.connect) : connectUnix(controlSocketPath(runnerDir));
+  const endpoint = parsed.values.connect ?? controlSocketPath(runnerDir);
+  const auth = new RunnerAuth(runnerDir);
+  if (parsed.values.enroll) {
+    // The one-time code and the supervisor fingerprint arrive on stdin (`dori runner enroll` output), never in argv.
+    const input = parseEnrollInput(await Bun.stdin.text());
+    if (!input) die("RUNNER_ENROLL_INPUT_INVALID stdin must carry code=<code> and fingerprint=sha256:<hex> lines");
+    const enrolled = await enrollRunner({
+      auth, connect: connector, code: input?.code as string, label: identity.label, hostId: identity.hostId,
+      expectedFingerprint: input?.fingerprint as string,
+    });
+    if (!enrolled.ok) die(`${enrolled.code} ${enrolled.detail}`);
+    console.log(`RUNNER_ENROLLED runner=${identity.label} supervisor=${enrolled.ok ? enrolled.supervisorFingerprint : ""}`);
+  }
+  if (!auth.enrolled) die(`RUNNER_NOT_ENROLLED runner=${identity.label}: start once with --enroll (the local runner is enrolled by the supervisor)`);
+  const policy = loadPolicy(runnerDir);
   const state = new RunnerState(runnerDir, { now: realClock.now });
   const gen = state.boot();
   const outbox = new Outbox(runnerDir, { now: realClock.now });
@@ -198,19 +300,25 @@ if (process.argv[2] === "runner") {
   } : undefined;
   const head = await run(["git", "-C", import.meta.dir, "rev-parse", "--short", "HEAD"], { timeoutMs: 5_000 }).catch(() => undefined);
   const version = head?.code === 0 ? head.out.trim() || undefined : undefined;
-  const tracked = trackedConnector(connectUnix(controlSocketPath(runnerDir)));
-  const client = new RunnerClient(
+  const log = (line: string): void => { console.log(line); };
+  const tracked = trackedConnector(connector);
+  let client: InstanceType<typeof RunnerClient> | undefined;
+  const dispatch = commandDispatcher({
+    state, policy, realpath: realpathSync, log,
+    publish: (body) => { client?.publish("cmd.result", body); },
+  });
+  client = new RunnerClient(
     { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
-    { connect: tracked.connect, outbox, state, clock: realClock, inventory: () => inventory },
+    { connect: tracked.connect, outbox, state, clock: realClock, inventory: () => inventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch },
   );
   const controller = new AbortController();
   process.on("SIGINT", () => controller.abort());
   process.on("SIGTERM", () => controller.abort());
-  console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=${mode} socket=${controlSocketPath(runnerDir)}`);
+  console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=${mode} endpoint=${endpoint}`);
   try {
     await serveRunner({
       client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
-      ...(observe ? { observe } : {}), log: (line) => { console.log(line); },
+      ...(observe ? { observe } : {}), log,
     }, controller.signal);
   } finally {
     outbox.close();

@@ -1,12 +1,17 @@
 import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { configPath, deliveryConfigError, runnerMode, saveLeadPane } from "./config.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } from "./runner/fs-safety.ts";
+import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { RunnerHub } from "./runner/hub.ts";
-import { acceptRunners, type HubHooks, nextEpoch, openRunnerJournal, type RunnerJournal, ShadowObserver } from "./runner/serve.ts";
+import {
+  acceptRunners, drainRunnerAdmin, type HubHooks, LOCAL_RUNNER, loadIdentity, nextEpoch, openRunnerJournal, type RunnerAccept,
+  type RunnerJournal, ShadowObserver,
+} from "./runner/serve.ts";
 import type { Listener } from "./runner/transport.ts";
 import { controlSocketPath, listenUnix } from "./runner/unix-transport.ts";
+import { listenWs, type WsListener } from "./runner/ws-transport.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -113,44 +118,90 @@ export const RUNNERS_PASS_MS = 5_000;
 /** How often the runners task drops old rows from the hub's runner event journal. */
 const RUNNER_JOURNAL_PRUNE_MS = 60 * 60_000;
 
-/** The open runner hub: its listener on the local control socket, the hub, its journal and the shadow observer. */
+/** The open runner hub: its listeners, the hub, its journal, the key store, the live connections and the shadow observer. */
 export type RunnerHubHandle = {
   readonly hub: RunnerHub;
   readonly journal: RunnerJournal;
+  /** The local control socket. */
   readonly listener: Listener;
+  /** The network listener on `runners.listen`, when configured and bound. */
+  readonly network?: WsListener;
+  readonly auth: SupervisorAuth;
+  /** Live connection operations (revoke, rotate, commands). */
+  readonly accept: RunnerAccept;
   readonly shadow: ShadowObserver;
   close(): void;
 };
 
+export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent"> & {
+  /** `runners.listen` (already checked private by the config loader): also accept runners over WebSocket there. */
+  readonly listen?: string;
+  /** hostId of a local runner identity created here (default `os.hostname()`). */
+  readonly hostId?: string;
+};
+
 /**
- * Opens the runner hub on `<runnerDir>/sock/control` (P1: the local runner only, shadow-only and unauthenticated). The
- * runner directory and its 0700 `sock/` are created or checked first; the supervisor epoch is committed before the
- * hub is built. Runner events are committed to the hub's own journal table, never to the lead's events, and nothing
- * here changes a lane.
+ * Enrolls the local runner in-process when it has never been enrolled with this supervisor, or its pinned supervisor
+ * key is not this one (both key stores are on this host, so no code crosses a link). A revoked local runner stays
+ * revoked until `dori runner enroll`.
+ */
+const enrollLocalRunner = (auth: SupervisorAuth, hub: RunnerHub, runnerDir: string, hostId: string, log: (line: string) => void): void => {
+  const identity = loadIdentity(runnerDir, LOCAL_RUNNER, hostId);
+  const runnerAuth = new RunnerAuth(runnerDir);
+  const row = auth.key(identity.label);
+  if (row?.revokedAt !== undefined) return;
+  if (row && runnerAuth.supervisorKey() === auth.publicKey) return;
+  const { code } = auth.issueCode(identity.label);
+  const request = runnerAuth.enrollRequest(code, identity.label, identity.hostId);
+  const enrolled = auth.enroll(request);
+  if (!enrolled.ok) throw new Error(`${enrolled.code} ${enrolled.detail}`);
+  runnerAuth.pinSupervisor(code, request, enrolled.reply, auth.fingerprint);
+  hub.bindHost(identity.label, identity.hostId);
+  log(`RUNNER_ENROLLED runner=${identity.label} hostId=${identity.hostId} local`);
+};
+
+/**
+ * Opens the runner hub on `<runnerDir>/sock/control` and, with `options.listen`, on that private address over
+ * WebSocket. Every connection runs the signed handshake (auth.ts) against the keys in `<stateDir>`; the local runner is
+ * enrolled in-process first. The runner directory and its 0700 `sock/` are created or checked first; the supervisor
+ * epoch is committed before any listener opens. A network listener that cannot bind is logged
+ * `RUNNER_LISTEN_FAILED` and the local socket keeps serving. Runner events are committed to the hub's own journal
+ * table, never to the lead's events, and nothing here changes a lane.
  */
 export const openRunnerHub = (
   stateDir: string, runnerDir: string, now: () => number, monotonic: () => number, log: (line: string) => void,
-  hooks: Pick<HubHooks, "onHeartbeat"> = {},
+  options: RunnerHubOptions = {},
 ): RunnerHubHandle => {
   ensureRunnerDir(runnerDir);
   ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
   const epoch = nextEpoch(stateDir);
   const journal = openRunnerJournal(stateDir, now);
   const hub = new RunnerHub({ stateDir, commit: journal.commit, now, monotonic, epoch });
+  let auth: SupervisorAuth | undefined;
   let listener: Listener;
-  try { listener = listenUnix(controlSocketPath(runnerDir)); }
-  catch (e) { hub.close(); journal.close(); throw e; }
+  try {
+    auth = new SupervisorAuth(stateDir, { now });
+    enrollLocalRunner(auth, hub, runnerDir, options.hostId ?? hostname(), log);
+    listener = listenUnix(controlSocketPath(runnerDir));
+  } catch (e) { auth?.close(); hub.close(); journal.close(); throw e; }
+  let network: WsListener | undefined;
+  if (options.listen) {
+    try { network = listenWs(options.listen); }
+    catch (e) { log(`RUNNER_LISTEN_FAILED listen=${options.listen} ${e instanceof Error ? e.message : String(e)}`); }
+  }
   const shadow = new ShadowObserver();
-  const stop = acceptRunners(hub, listener, {
-    onHello: (label, body) => { shadow.hello(label, body.inventory); },
-    onEvent: (label, frame) => { shadow.event(label, frame); },
-    ...hooks,
+  const accept = acceptRunners(hub, network ? [listener, network] : [listener], {
+    ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
+    onHello: (label, body) => { shadow.hello(label, body.inventory); options.onHello?.(label, body); },
+    onEvent: (label, frame) => { shadow.event(label, frame); options.onEvent?.(label, frame); },
+    auth,
     log,
   });
-  log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}`);
+  log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}${network ? ` listen=${network.host}:${network.port}` : ""}`);
+  const keys = auth;
   return {
-    hub, journal, listener, shadow,
-    close() { stop(); listener.close(); hub.close(); journal.close(); },
+    hub, journal, listener, auth: keys, accept, shadow, ...(network ? { network } : {}),
+    close() { accept(); listener.close(); network?.close(); keys.close(); hub.close(); journal.close(); },
   };
 };
 
@@ -788,7 +839,8 @@ export const supervise = async (
     // Only with a `runners` section; an unsafe runner directory or a busy socket costs the hub, never the supervisor.
     if (deps.config.runners) {
       try {
-        runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }));
+        const listen = deps.config.runners.listen;
+        runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }, listen ? { listen } : {}));
       } catch (e) {
         console.error(`RUNNER_HUB_DISABLED ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -850,6 +902,9 @@ export const supervise = async (
       }),
       ...(runnerHub ? [task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
         const handle = runnerHub as RunnerHubHandle;
+        // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
+        try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now())) console.log(line); }
+        catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         try { await runnersPass(handle, deps.config, () => deps.registry.open(), (line) => { console.log(line); }); }
         catch (e) { console.error(`RUNNER_SHADOW_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {

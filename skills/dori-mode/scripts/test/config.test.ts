@@ -67,6 +67,14 @@ test("a missing config file falls back to defaults and DORI_STATE_DIR wins over 
   expect(c.agentCommand).toEqual(["omo", "--model", "{model}", "{prompt}"]);
 });
 
+test("runner listen accepts private addresses and rejects public binds", async () => {
+  const path = join(state.dir, "runner-listen.json");
+  await Bun.write(path, JSON.stringify({ runners: { listen: "0.0.0.0:7411" } }));
+  await expect(loadConfig(path, "/home/ana")).rejects.toThrow("CONFIG_RUNNER_LISTEN_INVALID 0.0.0.0:7411");
+  await Bun.write(path, JSON.stringify({ runners: { listen: "100.101.1.2:7411" } }));
+  expect((await loadConfig(path, "/home/ana")).runners?.listen).toBe("100.101.1.2:7411");
+});
+
 test("a stray leadModel key in the config file is ignored, and the default model is the subscription one", async () => {
   const path = join(state.dir, "stray.json");
   await Bun.write(path, JSON.stringify({ leadModel: "old/model" }));

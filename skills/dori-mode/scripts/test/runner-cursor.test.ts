@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { RunnerHub, formatRunnerStatus, readRunnerRows, type CommitFn } from "../src/runner/hub.ts";
+import { acceptRunners } from "../src/runner/serve.ts";
 import { RunnerClient, backoffMs } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { memoryNetwork } from "../src/runner/transport.ts";
-import { journalId, runnerControl, runnerEvent, type RunnerFrame } from "../src/runner/protocol.ts";
-import { decodeFrame, encodeFrame } from "../src/runner/protocol.ts";
+import { journalId, runnerControl, runnerEvent } from "../src/runner/protocol.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const LABEL = "r1";
@@ -46,6 +47,15 @@ const rig = (commitOverride?: (hub: () => RunnerHub, committed: string[]) => Com
   const hub = new RunnerHub({ stateDir: join(tmp.dir, "sup"), commit, now: clock.now, monotonic: clock.now, epoch: 3 });
   hubRef = hub;
 
+  // Enrolled up front, so every connection below runs the signed handshake and every frame carries a MAC.
+  const supervisorAuth = new SupervisorAuth(join(tmp.dir, "sup"), { now: clock.now });
+  const runnerAuth = new RunnerAuth(runnerDir);
+  const code = supervisorAuth.issueCode(LABEL).code;
+  const request = runnerAuth.enrollRequest(code, LABEL, "host-1");
+  const enrolled = supervisorAuth.enroll(request);
+  if (!enrolled.ok) throw new Error(enrolled.detail);
+  runnerAuth.pinSupervisor(code, request, enrolled.reply, supervisorAuth.fingerprint);
+
   let dropping = false;
   // Drops the first transmission of events 41..60 while `dropping` is on.
   const net = memoryNetwork({
@@ -55,15 +65,15 @@ const rig = (commitOverride?: (hub: () => RunnerHub, committed: string[]) => Com
       return frame.seq !== undefined && frame.seq >= 41 && frame.seq <= 60;
     },
   });
-  net.listener.onConnection((transport) => {
-    transport.onLine((line) => {
-      const reply = hub.handle(decodeFrame(line, "runner") as RunnerFrame);
-      if (reply) transport.send(encodeFrame(reply));
-    });
-    transport.onClose(() => hub.disconnected(LABEL));
+  const authFailures: string[] = [];
+  const stop = acceptRunners(hub, net.listener, {
+    auth: supervisorAuth,
+    log: (line) => { if (line.startsWith("RUNNER_AUTH_FAILED")) authFailures.push(line); },
   });
 
-  const client = new RunnerClient({ label: LABEL, hostId: "host-1", version: "t1" }, { connect: net.connect, outbox, state, clock });
+  const client = new RunnerClient({ label: LABEL, hostId: "host-1", version: "t1" }, {
+    connect: net.connect, outbox, state, clock, auth: runnerAuth, log: (line) => { authFailures.push(line); },
+  });
   const reconnect = async () => {
     const before = net.pairs.length;
     const attempt = client.connectOnce();
@@ -76,7 +86,10 @@ const rig = (commitOverride?: (hub: () => RunnerHub, committed: string[]) => Com
   return {
     hub, client, outbox, net, committed, reconnect,
     setDropping: (on) => { dropping = on; },
-    close: () => { hub.close(); outbox.close(); state.close(); },
+    close: () => {
+      expect(authFailures).toEqual([]);
+      stop(); hub.close(); supervisorAuth.close(); outbox.close(); state.close();
+    },
   };
 };
 
