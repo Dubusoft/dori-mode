@@ -16,6 +16,7 @@ import { Repos } from "./repos.ts";
 import type { Clock, Runner } from "./run.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { readStoreView, readWakes } from "./store.ts";
+import { readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_STALE_MS, type RunnerRow } from "./runner/hub.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const LEGACY_PRESENCE = "dori-presence.service";
@@ -69,6 +70,51 @@ export type Status = {
   readonly sources?: { readonly sources: readonly SourceView[]; readonly error?: string };
   /** Every scheduled job with its next run, its last run and how that ended. */
   readonly schedules?: readonly ScheduleRow[];
+  /** Every runner in the hub's table (`runners.sqlite`); none while the hub was never opened. */
+  readonly runners?: readonly RunnerView[];
+};
+
+/** One runner as `dori status` shows it. Fields the hub does not track yet are absent and print `-`. */
+export type RunnerView = {
+  readonly label: string;
+  readonly state: "connected" | "stale" | "offline" | "lost" | "revoked";
+  readonly proto?: number;
+  readonly version?: string;
+  readonly gen: number;
+  /** Seconds since the last heartbeat the supervisor recorded. */
+  readonly heartbeatAgeSec?: number;
+  readonly outbox?: { readonly unacked: number; readonly oldestAgeSec: number };
+  /** Commands issued and not yet acknowledged (cmdSeq - cmdAck). */
+  readonly cmds: number;
+  readonly restarts1h?: number;
+  readonly lanes?: number;
+};
+
+/**
+ * A runner's view from its persisted row. `connected` while the last heartbeat is younger than RUNNER_STALE_MS and the
+ * connection has not closed since; `stale` up to RUNNER_OFFLINE_MS; otherwise (or never heard from) `offline`. The
+ * heartbeat time is the supervisor's own wall clock, written by the hub on this host.
+ */
+export const runnerView = (row: RunnerRow, now: number): RunnerView => {
+  const hb = row.lastHeartbeatAt;
+  const age = hb === undefined ? undefined : Math.max(0, now - hb);
+  const closed = hb === undefined || (row.disconnectedAt !== undefined && row.disconnectedAt >= hb);
+  const state = closed || age === undefined || age >= RUNNER_OFFLINE_MS ? "offline" : age >= RUNNER_STALE_MS ? "stale" : "connected";
+  return {
+    label: row.label, state, gen: row.maxGen, cmds: Math.max(0, row.cmdSeq - row.cmdAck),
+    ...(row.proto !== undefined ? { proto: row.proto } : {}),
+    ...(row.version !== undefined ? { version: row.version } : {}),
+    ...(age !== undefined ? { heartbeatAgeSec: Math.floor(age / 1000) } : {}),
+    ...(row.outbox ? { outbox: { unacked: row.outbox.unacked, oldestAgeSec: Math.floor(row.outbox.oldestAgeMs / 1000) } } : {}),
+    ...(row.lanes !== undefined ? { lanes: row.lanes } : {}),
+  };
+};
+
+/** `RUNNER <label> <state> proto=<n> version=<sha> gen=<n> hb=<sec> outbox=<unacked>/<oldest sec> cmds=<n> restarts1h=<n> lanes=<n>` */
+export const runnerLine = (r: RunnerView): string => {
+  const or = (v: number | string | undefined): string => (v === undefined ? "-" : String(v));
+  return `RUNNER ${r.label} ${r.state} proto=${or(r.proto)} version=${or(r.version)} gen=${r.gen} hb=${or(r.heartbeatAgeSec)} `
+    + `outbox=${r.outbox ? `${r.outbox.unacked}/${r.outbox.oldestAgeSec}` : "-"} cmds=${r.cmds} restarts1h=${or(r.restarts1h)} lanes=${or(r.lanes)}`;
 };
 
 /** The scheduled jobs in sources.json with their next run; none when it does not read (dori status shows that error). */
@@ -261,6 +307,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     events: eventStats(d.config, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
+    runners: readRunnerRows(d.config.stateDir).map((row) => runnerView(row, now)),
   };
 };
 
@@ -459,6 +506,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   ] : ["- none"]);
 
   section("Schedules", scheduleLines(s, now));
+  section("Runners", (s.runners ?? []).map(runnerLine));
 
   const g = s.github;
   section("Gateway and repos", [

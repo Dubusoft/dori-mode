@@ -80,6 +80,8 @@ const USAGE = `dori <command> [options]
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
+  runner serve [--label LABEL]         the local runner (P1: shadow only, needs a runners section in the config): connects to
+                                       the supervisor over ~/.dori/runner/sock/control, heartbeats, reports lane observations
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
@@ -161,6 +163,59 @@ if (process.argv[2] === "status") {
   setDefaultRunTimeout(cfg.runTimeoutMs);
   const status = await collectStatus({ run, clock: realClock, config: cfg, registry: new Registry(cfg.stateDir) });
   console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
+  process.exit(0);
+}
+
+if (process.argv[2] === "runner") {
+  // `dori runner serve`: the local runner. P1 runs it in shadow mode only: it reports what it sees and changes nothing.
+  const parsed = parseArgs({ args: process.argv.slice(3), allowPositionals: true, options: { label: { type: "string" } } });
+  if (parsed.positionals.join(" ") !== "serve") { console.error("usage: dori runner serve [--label LABEL]"); process.exit(1); }
+  const { defaultRunnerDir, runStartupCheck } = await import("./runner/fs-safety.ts");
+  const runnerDir = defaultRunnerDir();
+  // RUNNER_DIR_UNSAFE on stderr and exit 1 before anything is opened.
+  if (!runStartupCheck(runnerDir, { stderr: (text) => { process.stderr.write(text); }, exit: (code) => process.exit(code) })) process.exit(1);
+  const { hostname } = await import("node:os");
+  const { runnerMode } = await import("./config.ts");
+  const { listPanes } = await import("./panes.ts");
+  const { HEARTBEAT_MS, RunnerClient } = await import("./runner/client.ts");
+  const { Outbox } = await import("./runner/outbox.ts");
+  const { RunnerState } = await import("./runner/state.ts");
+  const { LOCAL_RUNNER, loadIdentity, observeLanes, realEvery, serveRunner, trackedConnector } = await import("./runner/serve.ts");
+  const { connectUnix, controlSocketPath } = await import("./runner/unix-transport.ts");
+  const cfg = await loadConfig();
+  setDefaultRunTimeout(cfg.runTimeoutMs);
+  const identity = loadIdentity(runnerDir, parsed.values.label ?? LOCAL_RUNNER, hostname());
+  const state = new RunnerState(runnerDir, { now: realClock.now });
+  const gen = state.boot();
+  const outbox = new Outbox(runnerDir, { now: realClock.now });
+  const mode = runnerMode(cfg, identity.label);
+  const registry = new Registry(cfg.stateDir);
+  let inventory: { key: string; pane: string; tab: string; session?: string }[] = [];
+  const observe = mode === "shadow" ? async () => {
+    const lanes = observeLanes(identity.label, await registry.open(), await listPanes(run));
+    inventory = lanes.map(({ status: _status, ...lane }) => lane);
+    return lanes;
+  } : undefined;
+  const head = await run(["git", "-C", import.meta.dir, "rev-parse", "--short", "HEAD"], { timeoutMs: 5_000 }).catch(() => undefined);
+  const version = head?.code === 0 ? head.out.trim() || undefined : undefined;
+  const tracked = trackedConnector(connectUnix(controlSocketPath(runnerDir)));
+  const client = new RunnerClient(
+    { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
+    { connect: tracked.connect, outbox, state, clock: realClock, inventory: () => inventory },
+  );
+  const controller = new AbortController();
+  process.on("SIGINT", () => controller.abort());
+  process.on("SIGTERM", () => controller.abort());
+  console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=${mode} socket=${controlSocketPath(runnerDir)}`);
+  try {
+    await serveRunner({
+      client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
+      ...(observe ? { observe } : {}), log: (line) => { console.log(line); },
+    }, controller.signal);
+  } finally {
+    outbox.close();
+    state.close();
+  }
   process.exit(0);
 }
 
