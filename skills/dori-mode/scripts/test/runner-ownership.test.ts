@@ -19,16 +19,23 @@ const setup = async () => {
   await deps.registry.write(lane("lane-a", { machine: "worker-a", runner: "worker-a", pane: "pa", tab: "ta" }));
   await deps.registry.write(lane("lane-b", { machine: "worker-b", runner: "worker-b", pane: "pb", tab: "tb" }));
   await deps.registry.write(lane("legacy-c", { machine: "worker-a", pane: "pc" }));
+  await deps.registry.write(lane("local-d", { pane: "pd", tab: "td", status: "paused" }));
+  await deps.registry.write(lane("closed-e", { pane: "pe", closedAt: new Date(T0).toISOString() }));
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });
   const emitted: [string, string][] = [];
   const recovered: [string, string][] = [];
+  const shadow = new Set<string>();
   const hub: LaneHubDeps = {
     registry: deps.registry, reports: () => store, now: clock.now,
     emit: (id, line) => { emitted.push([id, line]); }, recover: (label, key) => { recovered.push([label, key]); return 1; },
+    shadow: (label) => shadow.has(label),
   };
-  return { deps, store, hub, emitted, recovered };
+  return { deps, store, hub, emitted, recovered, shadow };
 };
+
+const event = (runner: string, seq: number, type: string, body: object): AnyRunnerEvent =>
+  ({ v: 1, runner, gen: 1, epoch: 1, seq, type, body }) as unknown as AnyRunnerEvent;
 
 const done = (runner: string, seq: number, key: string): AnyRunnerEvent =>
   ({ v: 1, runner, gen: 1, epoch: 1, seq, type: "lane.report", body: { key, kind: "done", text: "merged", evidence: "abc" } }) as unknown as AnyRunnerEvent;
@@ -53,6 +60,43 @@ test("a lane no runner owns and a key the registry does not have are not taken f
     "RUNNER_FORGED_EVENT runner=worker-a key=legacy-c type=lane.report (no such runner lane)",
     "RUNNER_FORGED_EVENT runner=worker-a key=ghost type=lane.report (no such runner lane)",
   ]);
+});
+
+test("a shadow runner's lane.state and lane.progress about an open unowned lane on its machine are not forged", async () => {
+  const t = await setup();
+  t.shadow.add("local").add("worker-a");
+  await acceptLaneEvent(t.hub, "local", event("local", 1, "lane.state", { key: "local-d", status: "idle" }));
+  await acceptLaneEvent(t.hub, "worker-a", event("worker-a", 2, "lane.state", { key: "legacy-c", status: "working" }));
+  await acceptLaneEvent(t.hub, "worker-a", event("worker-a", 3, "lane.progress", { key: "legacy-c", reportHash: "abc" }));
+  expect(t.emitted).toEqual([]);
+  expect(t.store.list()).toEqual([]);
+  const d = await t.deps.registry.read("local-d");
+  expect([d?.status, d?.pane, d?.runner]).toEqual(["paused", "pd", undefined]);
+});
+
+test("a shadow runner's control events, other runners' lanes, closed, unknown or other-machine lanes and non-shadow runners stay forged", async () => {
+  const t = await setup();
+  t.shadow.add("local").add("worker-b");
+  await acceptLaneEvent(t.hub, "local", done("local", 1, "local-d"));
+  await acceptLaneEvent(t.hub, "local", event("local", 2, "lane.started", { key: "local-d", pane: "px", tab: "tx", session: "s" }));
+  await acceptLaneEvent(t.hub, "local", event("local", 3, "lane.asking", { key: "local-d", text: "?" }));
+  await acceptLaneEvent(t.hub, "worker-b", event("worker-b", 4, "lane.state", { key: "lane-a", status: "dead" }));
+  await acceptLaneEvent(t.hub, "local", event("local", 5, "lane.state", { key: "ghost", status: "idle" }));
+  await acceptLaneEvent(t.hub, "local", event("local", 6, "lane.state", { key: "closed-e", status: "idle" }));
+  await acceptLaneEvent(t.hub, "worker-b", event("worker-b", 7, "lane.state", { key: "legacy-c", status: "idle" }));
+  await acceptLaneEvent(t.hub, "worker-a", event("worker-a", 8, "lane.state", { key: "legacy-c", status: "idle" }));
+  expect(t.emitted.map(([, line]) => line)).toEqual([
+    "RUNNER_FORGED_EVENT runner=local key=local-d type=lane.report (no such runner lane)",
+    "RUNNER_FORGED_EVENT runner=local key=local-d type=lane.started (no such runner lane)",
+    "RUNNER_FORGED_EVENT runner=local key=local-d type=lane.asking (no such runner lane)",
+    "RUNNER_FORGED_EVENT runner=worker-b key=lane-a type=lane.state owner=worker-a",
+    "RUNNER_FORGED_EVENT runner=local key=ghost type=lane.state (no such runner lane)",
+    "RUNNER_FORGED_EVENT runner=local key=closed-e type=lane.state (no such runner lane)",
+    "RUNNER_FORGED_EVENT runner=worker-b key=legacy-c type=lane.state (no such runner lane)",
+    "RUNNER_FORGED_EVENT runner=worker-a key=legacy-c type=lane.state (no such runner lane)",
+  ]);
+  expect(t.store.list()).toEqual([]);
+  expect((await t.deps.registry.read("local-d"))?.pane).toBe("pd");
 });
 
 test("the hello inventory: an unknown key is LANE_ORPHAN with no registry entry; a missing owned lane is recovered; a moved pane is patched", async () => {
