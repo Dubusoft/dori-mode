@@ -406,7 +406,13 @@ accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dor
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not
-have) is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). A `lane.report` becomes a row of the lane
+have) is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). The one exception is a shadow runner's
+observation: a `lane.state` or `lane.progress` from a runner whose `runners.mode` is `shadow`, about an open lane that
+no runner owns on that runner's own machine (no `machine` for the local runner, `machine` equal to the label for a
+worker's), goes only to the shadow comparison and is not journaled. These two types only report what the runner sees.
+The same runner's `lane.started`, `lane.report` or `lane.asking` about such a lane would act on it, so they are still
+forged, as is an observation about a closed lane, another machine's lane, another runner's lane, or from a runner
+not in shadow mode. A `lane.report` becomes a row of the lane
 report store whose `source` is the event's journal id (`runner:<label>:<seq>`), so the same event never makes two
 rows. From there it is routed exactly as a local `dori report`: a done report becomes the claim through `claimDone`
 (the same evidence again is `LANE_DONE_ALREADY_CLAIMED`); the rest is journaled or posted to the thread. The

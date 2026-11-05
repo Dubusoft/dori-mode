@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { laneGeneration, type LaneReportStore } from "../lane-reports.ts";
 import { HUB_FILE } from "./hub.ts";
+import { LOCAL_RUNNER } from "./serve.ts";
 import type { Lane, Registry } from "../registry.ts";
 import { journalId, type AnyRunnerEvent, type InventoryLane } from "./protocol.ts";
 
@@ -12,7 +13,10 @@ import { journalId, type AnyRunnerEvent, type InventoryLane } from "./protocol.t
  * Ownership: `Lane.runner` names the runner that owns a lane. An event about a lane is taken only from the runner whose
  * authenticated connection carried it and that `Lane.runner` names; anything else - another runner's lane, a lane
  * the registry does not have - is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). The hub still
- * acks it, so the runner does not resend it forever.
+ * acks it, so the runner does not resend it forever. One exception: an observation (`lane.state`, `lane.progress`)
+ * from a runner in shadow mode about an open lane on its own machine that no runner owns is what that runner is there
+ * to send; the shadow comparison already took it from the connection, so it is dropped here without a line. A shadow
+ * runner's `lane.started`, `lane.report` or `lane.asking` about such a lane is still forged: a shadow runner controls no lane.
  *
  * Reports: a `lane.report` becomes a row of the lane report store, its `source` the event's journal id, so the same
  * event imported again (`dori runner evacuate`) is the same row. The store's routing then does the rest exactly as for
@@ -37,6 +41,8 @@ export type LaneHubDeps = {
   readonly now: () => number;
   /** Sends a command to the runner; undefined when it is not connected. */
   readonly recover: (label: string, key: string) => number | undefined;
+  /** Whether `runners.mode` marks the runner `label` as shadow. */
+  readonly shadow: (label: string) => boolean;
 };
 
 const patch = async (deps: LaneHubDeps, key: string, fields: Partial<Lane>): Promise<void> => {
@@ -44,6 +50,14 @@ const patch = async (deps: LaneHubDeps, key: string, fields: Partial<Lane>): Pro
 };
 
 const LANE_EVENTS = new Set(["lane.started", "lane.state", "lane.report", "lane.asking", "lane.progress"]);
+
+/** Lane events that only describe what a runner sees; a shadow runner sends them about lanes it does not own. */
+const OBSERVATION_EVENTS = new Set(["lane.state", "lane.progress"]);
+
+/** A shadow runner's observation of an open, unowned lane on its own machine (the lanes `observeLanes` covers). */
+const shadowObservation = (deps: LaneHubDeps, label: string, frame: AnyRunnerEvent, lane: Lane): boolean =>
+  OBSERVATION_EVENTS.has(frame.type) && !lane.runner && !lane.closedAt
+  && (label === LOCAL_RUNNER ? !lane.machine : lane.machine === label) && deps.shadow(label);
 
 export type JournaledLaneEvent = { readonly rowid: number; readonly label: string; readonly frame: AnyRunnerEvent };
 
@@ -76,6 +90,7 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
   if (!LANE_EVENTS.has(frame.type)) return;
   const key = (frame.body as { readonly key: string }).key;
   const lane = await deps.registry.read(key);
+  if (lane && shadowObservation(deps, label, frame, lane)) return;
   if (!lane || lane.runner !== label) {
     deps.emit(`runner-forged:${label}:${frame.seq}`, `RUNNER_FORGED_EVENT runner=${label} key=${key} type=${frame.type}${lane?.runner ? ` owner=${lane.runner}` : " (no such runner lane)"}`);
     return;
