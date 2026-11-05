@@ -5,7 +5,8 @@ import { writeFileAtomic } from "../setup.ts";
 
 /**
  * The runner directory and its safety rules. The directory (default `~/.dori/runner`) and every directory under it
- * are 0700, every file is 0600, nothing in it is a symlink, and everything is owned by the runner's user. A runner
+ * are 0700, every file is 0600 (0600 or 0700 under `bin/` and `bun/`, where `dori runner install` puts the runner's
+ * wrapper and bun), nothing in it is a symlink, and everything is owned by the runner's user. A runner
  * that finds otherwise at start writes `RUNNER_DIR_UNSAFE <path> <reason>` to stderr and exits 1. Files are replaced
  * atomically (temporary file, fsync, rename) through `writeFileAtomic` from setup.ts.
  */
@@ -24,6 +25,8 @@ export const RUNNER_PATHS = {
   sock: "sock",
   health: "health",
   logs: "logs",
+  bin: "bin",
+  bun: "bun",
 } as const;
 
 /** `~/.dori/runner` under `home`; every runner module takes the directory as an argument and defaults to this. */
@@ -47,11 +50,13 @@ const expectedOwner = (options: FsSafetyOptions): number | undefined =>
   options.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
 
 const DIRECTORY_ENTRIES: ReadonlySet<string> = new Set([
-  RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs,
+  RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs, RUNNER_PATHS.bin, RUNNER_PATHS.bun,
 ]);
+/** Directories holding executables: their files may also be 0700, still owner-only. */
+const EXECUTABLE_DIRS: ReadonlySet<string> = new Set([RUNNER_PATHS.bin, RUNNER_PATHS.bun]);
 const FILE_ENTRIES: ReadonlySet<string> = new Set([RUNNER_PATHS.identity, RUNNER_PATHS.state, RUNNER_PATHS.outbox]);
 
-const inspect = (path: string, uid: number | undefined, kind: "dir" | "file"): Stats => {
+const inspect = (path: string, uid: number | undefined, kind: "dir" | "file", executable = false): Stats => {
   const st = lstatSync(path);
   if (st.isSymbolicLink()) throw new RunnerDirUnsafe(path, "symlink");
   if (kind === "dir" && !st.isDirectory()) throw new RunnerDirUnsafe(path, "not-directory");
@@ -61,12 +66,12 @@ const inspect = (path: string, uid: number | undefined, kind: "dir" | "file"): S
   if (!st.isSocket()) {
     const mode = st.mode & 0o777;
     const want = kind === "dir" ? RUNNER_DIR_MODE : RUNNER_FILE_MODE;
-    if (mode !== want) throw new RunnerDirUnsafe(path, "mode", `mode=${mode.toString(8).padStart(4, "0")}`);
+    if (mode !== want && !(kind === "file" && executable && mode === RUNNER_DIR_MODE)) throw new RunnerDirUnsafe(path, "mode", `mode=${mode.toString(8).padStart(4, "0")}`);
   }
   return st;
 };
 
-const walk = (dir: string, uid: number | undefined, top: boolean): void => {
+const walk = (dir: string, uid: number | undefined, top: boolean, executable = false): void => {
   inspect(dir, uid, "dir");
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
@@ -75,14 +80,14 @@ const walk = (dir: string, uid: number | undefined, top: boolean): void => {
     const isTopDir = top && DIRECTORY_ENTRIES.has(name);
     const isTopFile = top && (FILE_ENTRIES.has(name) || /^(state|outbox)\.sqlite-(wal|shm)$/.test(name));
     if (st.isSymbolicLink()) throw new RunnerDirUnsafe(path, "symlink");
-    if (isTopDir || (st.isDirectory() && !isTopFile)) walk(path, uid, false);
-    else inspect(path, uid, "file");
+    if (isTopDir || (st.isDirectory() && !isTopFile)) walk(path, uid, false, top ? EXECUTABLE_DIRS.has(name) : executable);
+    else inspect(path, uid, "file", executable);
   }
 };
 
 /**
  * Checks `dir` and everything under it (lstat, never following links). Throws `RunnerDirUnsafe` for the first entry
- * that is a symlink, is not mode 0700 (directories) or 0600 (files), is owned by another user, or is a file where a
+ * that is a symlink, is not mode 0700 (directories) or 0600 (files; 0700 also under `bin/` and `bun/`), is owned by another user, or is a file where a
  * directory belongs (or the reverse) for a known `RUNNER_PATHS` entry. A missing `dir` is unsafe as `not-directory`.
  */
 export const checkRunnerDir = (dir: string, options: FsSafetyOptions = {}): void => {
