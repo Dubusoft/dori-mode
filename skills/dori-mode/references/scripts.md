@@ -161,9 +161,23 @@ When the last 24 h journaled any event, `Activity (last 24h)` holds `- Lead woke
 
 When the config has a `runners` section, a `Runners` section lists one line per runner from the hub's table: `RUNNER <label> <connected|stale|offline> proto=<n> version=<v> gen=<n> hb=<sec> outbox=<unacked>/<oldest sec> cmds=<n> restarts1h=<n> lanes=<n>`, unknown values as `-`. `connected` means a heartbeat younger than 60 s and no disconnect since, `stale` under 180 s, otherwise `offline`.
 
-### `dori runner serve [--label LABEL] [--enroll] [--connect ws://HOST:PORT]`
+### `dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT]`
 
 The runner, shadow only for now (see [runner-protocol.md](runner-protocol.md)). It checks `~/.dori/runner` (dirs 0700, files 0600, no symlinks; otherwise `RUNNER_DIR_UNSAFE` on stderr and exit 1), bumps its boot generation, prints `RUNNER_SERVE label=<l> gen=<n> mode=<m> endpoint=<socket or url>` and connects to the supervisor over `~/.dori/runner/sock/control`, or with `--connect` to the supervisor's `runners.listen` WebSocket, reconnecting with backoff. Every connection runs the signed handshake; a runner that was never enrolled exits 1 with `RUNNER_NOT_ENROLLED`. `--enroll` first reads the `code=` and `fingerprint=` lines of `dori runner enroll` from stdin, enrolls (`RUNNER_ENROLLED`) and then serves; the local runner is enrolled by the supervisor itself. Commands are checked against `~/.dori/runner/runner-config.json` and answered with `RUNNER_CMD_REJECTED <rule>` or, for now, `RUNNER_CMD_UNSUPPORTED <type>`. It heartbeats every 15 s and, when `runners.mode` names its label `shadow`, reports lane observations every 30 s. It changes nothing. The label defaults to `local`. `templates/dori-runner.service` runs it as a user unit; setup doesn't install that unit yet.
+
+`--enroll-only` enrolls and exits 0, which is how `dori runner install` enrolls a worker. With `--connect` the runner is a worker's: it always observes its host (lanes found by `DORI_LANE_KEY` in their processes, plus a hash of each lane's newest `[REPORT]` line) because a worker has no registry. The runner rewrites `~/.dori/runner/health` every 15 s.
+
+### `dori runner probe [--json]`
+
+Run on a runner's host. Reads `~/.dori/runner/health` and prints `RUNNER_PROBE <healthy|stalled|dead> process=<alive|dead> age=<ms> gen=<n>` (with `--json`, the same as JSON). It exits 0 only when healthy: the pid is alive and the file is at most 60 s old. 60 to 120 s is stalled; no file, no process or more than 120 s is dead.
+
+### `dori runner install --machine LABEL`
+
+Installs or upgrades the runner on a Linux worker (a herdr saved machine or a `guardMachines` entry). It needs `runners.listen` (else `RUNNER_INSTALL_NO_LISTEN`) and `bun` on the worker. It runs `ssh <target> sh -s` and sends everything on stdin: the runner bundle (to `~/.dori/runner/bin/dori.js`), the user unit `dori-runner.service` (no `EnvironmentFile`), and a one-time enrollment code issued in-process that reaches `runner serve --enroll-only` through a pipe, never an argv. A worker that is already enrolled keeps its keys. Then it turns on linger and enables and restarts the unit. It prints `RUNNER_INSTALLED runner=<label> version=<v>`, or exits 1 with `RUNNER_INSTALL_UNREACHABLE`, `RUNNER_INSTALL_UNSUPPORTED` (not Linux), `RUNNER_INSTALL_NO_BUN`, `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED`.
+
+### `dori runner shadow-report [--runner LABEL]`
+
+One line per runner from the shadow differences the supervisor stored: `RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`; `failures` counts every class but `timing`. `RUNNER_SHADOW_REPORT none` when there is nothing yet.
 
 ### `dori runner enroll --machine LABEL` / `revoke LABEL` / `rotate LABEL` / `reset-gen LABEL`
 

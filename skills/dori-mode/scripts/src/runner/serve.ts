@@ -18,7 +18,7 @@ import {
   type RunnerEventBodies, type SupervisorCommandBodies, type SupervisorCommandType,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
-import { diffUnits, settleCycle, shadowDiffLine, shadowUnit, type ShadowDiff, type ShadowUnit } from "./shadow.ts";
+import { diffUnits, settleCycle, shadowDiffLine, shadowUnit, valueHash, type ShadowDiff, type ShadowUnit } from "./shadow.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 
 /**
@@ -393,11 +393,11 @@ const ALIVE: ReadonlySet<LaneStatus> = new Set(["working", "idle"]);
  * alive). A difference waits one cycle (`settleCycle`) before it is reported as a `RUNNER_SHADOW_DIFF` line.
  */
 export class ShadowObserver {
-  private readonly runners = new Map<string, { inventory?: readonly InventoryLane[]; states: Map<string, LaneStatus>; pending: readonly ShadowDiff[] }>();
+  private readonly runners = new Map<string, { inventory?: readonly InventoryLane[]; states: Map<string, LaneStatus>; reports: Map<string, string>; pending: readonly ShadowDiff[] }>();
 
   private entry(label: string) {
     let entry = this.runners.get(label);
-    if (!entry) this.runners.set(label, entry = { states: new Map(), pending: [] });
+    if (!entry) this.runners.set(label, entry = { states: new Map(), reports: new Map(), pending: [] });
     return entry;
   }
 
@@ -408,6 +408,7 @@ export class ShadowObserver {
 
   event(label: string, frame: AnyRunnerEvent): void {
     if (frame.type === "lane.state") this.entry(label).states.set(frame.body.key, frame.body.status);
+    if (frame.type === "lane.progress" && frame.body.reportHash) this.entry(label).reports.set(frame.body.key, frame.body.reportHash);
   }
 
   /** Labels that have said hello since this supervisor started. */
@@ -421,13 +422,17 @@ export class ShadowObserver {
     const lanes = lanesFor(label, open);
     const generation = new Map(lanes.map((l) => [l.key, laneGeneration(l)]));
     const gen = (key: string): number => generation.get(key) ?? 0;
+    // A remote lane's newest [REPORT] line: the line the supervisor's screen scraping recorded, against the hash the
+    // runner read from the same pane. Both sides hash with valueHash, so the runner never sends the line itself.
     const legacy: ShadowUnit[] = lanes.flatMap((l) => [
       shadowUnit("inventory.pane", l.key, gen(l.key), "pane", l.pane ?? ""),
       shadowUnit("lane.state", l.key, gen(l.key), "alive", "yes"),
+      ...(l.machine && l.lastRemoteReport ? [shadowUnit("lane.report", l.key, gen(l.key), "latest", valueHash(l.lastRemoteReport))] : []),
     ]);
     const runner: ShadowUnit[] = [
       ...(entry.inventory ?? []).map((lane) => shadowUnit("inventory.pane", lane.key, gen(lane.key), "pane", lane.pane)),
       ...[...entry.states].map(([key, status]) => shadowUnit("lane.state", key, gen(key), "alive", ALIVE.has(status) ? "yes" : "no")),
+      ...[...entry.reports].map(([key, hash]) => shadowUnit("lane.report", key, gen(key), "latest", hash)),
     ];
     const settled = settleCycle(entry.pending, diffUnits(legacy, runner));
     entry.pending = settled.pending;
@@ -440,7 +445,7 @@ export class ShadowObserver {
 // ---------------------------------------------------------------------------------------------------------------
 
 /** One lane as a shadow runner sees it on its host. */
-export type ObservedLane = InventoryLane & { readonly status: LaneStatus };
+export type ObservedLane = InventoryLane & { readonly status: LaneStatus; readonly reportHash?: string };
 
 /**
  * What a runner sees of the lanes it covers: the registry's open lanes for the label, each matched against herdr's
@@ -486,13 +491,19 @@ export type ServeDeps = {
  */
 export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise<void> => {
   const published = new Map<string, LaneStatus>();
+  const publishedReport = new Map<string, string>();
   const observeOnce = async (): Promise<void> => {
     if (!deps.observe) return;
     try {
       for (const lane of await deps.observe()) {
-        if (published.get(lane.key) === lane.status) continue;
-        published.set(lane.key, lane.status);
-        deps.client.publish("lane.state", { key: lane.key, status: lane.status });
+        if (published.get(lane.key) !== lane.status) {
+          published.set(lane.key, lane.status);
+          deps.client.publish("lane.state", { key: lane.key, status: lane.status });
+        }
+        if (lane.reportHash && publishedReport.get(lane.key) !== lane.reportHash) {
+          publishedReport.set(lane.key, lane.reportHash);
+          deps.client.publish("lane.progress", { key: lane.key, reportHash: lane.reportHash });
+        }
       }
     } catch (error) {
       deps.log(`RUNNER_OBSERVE_FAILED ${error instanceof Error ? error.message : String(error)}`);

@@ -186,6 +186,8 @@ Everything lives under `~/.dori/runner`:
 | `bodies/<seq>.body` | moved report and job bodies |
 | `keys/runner.key`, `keys/supervisor.pub` | the runner's private key and the pinned supervisor key (`keys/runner.next.key` during a rotation) |
 | `runner-config.json` | the command policy (optional) |
+| `health` | `{pid, gen, monotonicMs, wallAt}`, rewritten every 15 s |
+| `bin/dori.js` | the runner bundle, on workers installed by `dori runner install` |
 | `sock/control` | the unix socket the supervisor listens on and the runner connects to |
 
 The hub's table is `<stateDir>/runners.sqlite` on the supervisor side.
@@ -199,12 +201,55 @@ There's no peer credential check on the socket. Bun's unix sockets don't expose 
 The 0700 `sock/` directory keeps other users out, and the signed handshake keeps another process of the same user
 from posing as the supervisor or the runner.
 
+## Remote install
+
+`dori runner install --machine <label>` puts a runner on a Linux worker. The machine is looked up like the guard's
+machines (herdr's saved machines plus `guardMachines`), and `runners.listen` must be set; otherwise it stops with
+`RUNNER_INSTALL_NO_LISTEN`. The supervisor issues the enrollment code in its own process and runs
+`ssh <target> sh -s`. That command line never changes: everything else goes on ssh's stdin as one sh script.
+
+- The bundle is `bun build src/runner/bin.ts --target=bun`, a single file holding only the runner. It is written to
+  `~/.dori/runner/bin/dori.js` through a temporary file and `mv`. The worker needs `bun` on its PATH.
+- `~/.config/systemd/user/dori-runner.service` (from `templates/dori-runner-remote.service`) runs
+  `bun ~/.dori/runner/bin/dori.js runner serve --label <label> --connect ws://<runners.listen>`. It has no
+  `EnvironmentFile`: a worker holds no supervisor or Discord credentials.
+- The enrollment code and the supervisor fingerprint are shell variables in the script. They reach
+  `runner serve --enroll-only` through a pipe from the `printf` builtin, so they appear in no process's argv on either
+  machine. A worker that already has `~/.dori/runner/keys/supervisor.pub` skips enrollment: a reinstall or an upgrade
+  keeps its keys.
+- Then linger is turned on and the unit is enabled and restarted, so a new bundle takes effect.
+
+It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256>`, or exits 1 with
+`RUNNER_INSTALL_UNREACHABLE` (ssh failed or timed out), `RUNNER_INSTALL_UNSUPPORTED` (not Linux, or no POSIX shell),
+`RUNNER_INSTALL_NO_BUN`, `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd or linger step
+named when that failed).
+
+## Health and probe
+
+The runner rewrites `~/.dori/runner/health` (`{pid, gen, monotonicMs, wallAt}`, 0600) at start and then every
+15 seconds, on a timer of its own. `dori runner probe [--json]` runs on the runner's host and reads it. The age comes
+from the file's mtime, so it is measured on the host's own clock.
+
+| Verdict | When | Exit |
+|---|---|---|
+| `healthy` | the pid is alive and the file is at most 60 s old | 0 |
+| `stalled` | the pid is alive and the file is 60 to 120 s old | 1 |
+| `dead` | no file, no such process, or the file is older than 120 s | 1 |
+
 ## Shadow mode
 
 A runner is in shadow mode when the config's `runners.mode` maps its label to `"shadow"`; unnamed labels are
-`"off"`. Without a `runners` section the supervisor opens no hub and nothing changes. In shadow mode the runner reads
-the registry's open local lanes and herdr's pane list every 30 seconds, publishes `lane.state` when a status changes,
-and sends the latest list as the hello inventory. It never starts, stops or edits a lane.
+`"off"`. Without a `runners` section the supervisor opens no hub and nothing changes. In shadow mode the local
+runner reads the registry's open local lanes and herdr's pane list every 30 seconds, publishes `lane.state` when a
+status changes, and sends the latest list as the hello inventory. It never starts, stops or edits a lane.
+
+A runner started with `--connect` is a worker's runner. It has no registry, so it always observes its host on the
+same 30-second timer. A pane belongs to a lane when one of its foreground processes (from `herdr pane
+process-info`) has `DORI_LANE_KEY` in its environment or inherits it from an ancestor. For each such pane it also
+hashes the newest `[REPORT]` line in the pane's last 200 lines and publishes `lane.progress {key, reportHash}` when
+that hash changes. The line itself never leaves the host. The supervisor compares only the labels its own
+`runners.mode` marks `shadow`. For a remote lane it also compares the runner's hash with the hash of the line its
+own screen scraping recorded (`Lane.lastRemoteReport`), as `kind=lane.report field=latest`.
 
 On the supervisor, the `runners` task (every 5 seconds, under the usual watchdog) compares what the runner reported
 with what the legacy path sees. A new difference waits one cycle. If it's still there next cycle it's logged with
@@ -221,6 +266,11 @@ RUNNER_SHADOW_DIFF runner=<label> class=<c> kind=<k> lane=<key> gen=<n> field=<f
 | `value-differs` | both have it, with different values |
 | `timing` | a difference that settled within one cycle; not a failure |
 
+Every reported difference is also stored in `<stateDir>/runners.sqlite` (table `shadow_diffs`). `dori runner
+shadow-report [--runner <label>]` prints one line per runner,
+`RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`,
+where `failures` counts every class but `timing`, or `RUNNER_SHADOW_REPORT none` when nothing was recorded.
+
 Values are compared as short sha256 hashes. Guard verdicts compare level and reasons, never raw figures. If the
 hub can't open (an unsafe directory, a bad socket file) the supervisor logs `RUNNER_HUB_DISABLED` and keeps running.
 
@@ -235,7 +285,6 @@ must handle its absence. On disk, new hub columns are added with `ALTER TABLE` a
 
 Later phases add:
 
-- remote install of runners on worker machines (`dori runner install`, probe, health file)
 - lane control: supervisor commands with real effects and `authoritative` mode
 - guard samples and alerts from the runner
 - full liveness: `lost` and `revoked` states, restart counts and the restart circuit

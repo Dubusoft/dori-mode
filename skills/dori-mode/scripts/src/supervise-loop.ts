@@ -5,6 +5,7 @@ import { configPath, deliveryConfigError, runnerMode, saveLeadPane } from "./con
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { RunnerHub } from "./runner/hub.ts";
+import { recordDiffLines } from "./runner/shadow-store.ts";
 import {
   acceptRunners, drainRunnerAdmin, type HubHooks, LOCAL_RUNNER, loadIdentity, nextEpoch, openRunnerJournal, type RunnerAccept,
   type RunnerJournal, ShadowObserver,
@@ -205,12 +206,20 @@ export const openRunnerHub = (
   };
 };
 
-/** One runners-task pass: a shadow cycle per runner in shadow mode, each difference logged as RUNNER_SHADOW_DIFF. */
-export const runnersPass = async (handle: RunnerHubHandle, config: Parameters<typeof runnerMode>[0], open: () => Promise<Lane[]>, log: (line: string) => void): Promise<void> => {
+/**
+ * One runners-task pass: a shadow cycle per runner in shadow mode, each difference logged as RUNNER_SHADOW_DIFF and
+ * handed to `record` (the shadow report store) in one batch.
+ */
+export const runnersPass = async (
+  handle: RunnerHubHandle, config: Parameters<typeof runnerMode>[0], open: () => Promise<Lane[]>, log: (line: string) => void,
+  record: (lines: readonly string[]) => void = () => {},
+): Promise<void> => {
   const labels = handle.shadow.labels().filter((label) => runnerMode(config, label) === "shadow");
   if (!labels.length) return;
   const lanes = await open();
-  for (const label of labels) for (const line of handle.shadow.cycle(label, lanes)) log(line);
+  const lines = labels.flatMap((label) => handle.shadow.cycle(label, lanes));
+  for (const line of lines) log(line);
+  if (lines.length) record(lines);
 };
 
 /**
@@ -905,7 +914,10 @@ export const supervise = async (
         // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
         try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now())) console.log(line); }
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        try { await runnersPass(handle, deps.config, () => deps.registry.open(), (line) => { console.log(line); }); }
+        try {
+          await runnersPass(handle, deps.config, () => deps.registry.open(), (line) => { console.log(line); },
+            (lines) => { recordDiffLines(deps.config.stateDir, lines, deps.clock.now()); });
+        }
         catch (e) { console.error(`RUNNER_SHADOW_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
           lastJournalPrune = deps.clock.now();
