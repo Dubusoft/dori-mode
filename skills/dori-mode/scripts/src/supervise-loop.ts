@@ -1,7 +1,12 @@
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { configPath, deliveryConfigError, saveLeadPane } from "./config.ts";
+import { configPath, deliveryConfigError, runnerMode, saveLeadPane } from "./config.ts";
+import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } from "./runner/fs-safety.ts";
+import { RunnerHub } from "./runner/hub.ts";
+import { acceptRunners, type HubHooks, nextEpoch, openRunnerJournal, type RunnerJournal, ShadowObserver } from "./runner/serve.ts";
+import type { Listener } from "./runner/transport.ts";
+import { controlSocketPath, listenUnix } from "./runner/unix-transport.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -101,6 +106,61 @@ export const TASK_ALERT_MS = 5 * 60_000;
 /** The supervisor's independent tasks. */
 export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
+/** The fifth task, run only when the config has a `runners` section: the runner hub's shadow comparison. */
+export const RUNNERS_TASK = "runners";
+/** How often the runners task compares shadow observations; the hub itself answers frames as they arrive. */
+export const RUNNERS_PASS_MS = 5_000;
+/** How often the runners task drops old rows from the hub's runner event journal. */
+const RUNNER_JOURNAL_PRUNE_MS = 60 * 60_000;
+
+/** The open runner hub: its listener on the local control socket, the hub, its journal and the shadow observer. */
+export type RunnerHubHandle = {
+  readonly hub: RunnerHub;
+  readonly journal: RunnerJournal;
+  readonly listener: Listener;
+  readonly shadow: ShadowObserver;
+  close(): void;
+};
+
+/**
+ * Opens the runner hub on `<runnerDir>/sock/control` (P1: the local runner only, shadow-only and unauthenticated). The
+ * runner directory and its 0700 `sock/` are created or checked first; the supervisor epoch is committed before the
+ * hub is built. Runner events are committed to the hub's own journal table, never to the lead's events, and nothing
+ * here changes a lane.
+ */
+export const openRunnerHub = (
+  stateDir: string, runnerDir: string, now: () => number, monotonic: () => number, log: (line: string) => void,
+  hooks: Pick<HubHooks, "onHeartbeat"> = {},
+): RunnerHubHandle => {
+  ensureRunnerDir(runnerDir);
+  ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
+  const epoch = nextEpoch(stateDir);
+  const journal = openRunnerJournal(stateDir, now);
+  const hub = new RunnerHub({ stateDir, commit: journal.commit, now, monotonic, epoch });
+  let listener: Listener;
+  try { listener = listenUnix(controlSocketPath(runnerDir)); }
+  catch (e) { hub.close(); journal.close(); throw e; }
+  const shadow = new ShadowObserver();
+  const stop = acceptRunners(hub, listener, {
+    onHello: (label, body) => { shadow.hello(label, body.inventory); },
+    onEvent: (label, frame) => { shadow.event(label, frame); },
+    ...hooks,
+    log,
+  });
+  log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}`);
+  return {
+    hub, journal, listener, shadow,
+    close() { stop(); listener.close(); hub.close(); journal.close(); },
+  };
+};
+
+/** One runners-task pass: a shadow cycle per runner in shadow mode, each difference logged as RUNNER_SHADOW_DIFF. */
+export const runnersPass = async (handle: RunnerHubHandle, config: Parameters<typeof runnerMode>[0], open: () => Promise<Lane[]>, log: (line: string) => void): Promise<void> => {
+  const labels = handle.shadow.labels().filter((label) => runnerMode(config, label) === "shadow");
+  if (!labels.length) return;
+  const lanes = await open();
+  for (const label of labels) for (const line of handle.shadow.cycle(label, lanes)) log(line);
+};
 
 /**
  * Decides when systemd may be told WATCHDOG=1: only while the foreground loop has made progress (a finished pass, or a
@@ -553,6 +613,7 @@ export const supervise = async (
   let sources: EventSources | undefined;
   let scheduleOps: OperationStore | undefined;
   let reports: LaneReportStore | undefined;
+  let runnerHub: RunnerHubHandle | undefined;
   const watchdog = new Watchdog(deps.clock.now, notify);
   let petting: ReturnType<typeof setInterval> | undefined;
   const stop = new AbortController();
@@ -724,6 +785,15 @@ export const supervise = async (
       catch (e) { console.error(`CLOSE_BUTTON_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     };
     let lastGitHub = -Infinity;
+    // Only with a `runners` section; an unsafe runner directory or a busy socket costs the hub, never the supervisor.
+    if (deps.config.runners) {
+      try {
+        runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }));
+      } catch (e) {
+        console.error(`RUNNER_HUB_DISABLED ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    let lastJournalPrune = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
     await probe.step("ready", () => notify("READY=1"));
     ready = true;
@@ -732,7 +802,7 @@ export const supervise = async (
     // Each task is its own loop, so one stuck pass costs only that task. Every pass is tracked as task:<name>: the
     // loop below reports one running past TASK_ALERT_MS by name, and past WATCHDOG_STALL_MS it withholds the watchdog.
     const halted = AbortSignal.any([signal, stop.signal]);
-    const task = (name: SupervisorTask, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
+    const task = (name: SupervisorTask | typeof RUNNERS_TASK, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
       const span = name === "sweeps" ? undefined : probe.span();
       while (!halted.aborted) {
         // The pass starts only once task:<name> is tracked, so the watchdog names the task before any work it tracks inside.
@@ -778,6 +848,15 @@ export const supervise = async (
         polls.push(tickSources(), routeLaneReports());
         await Promise.all(polls);
       }),
+      ...(runnerHub ? [task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
+        const handle = runnerHub as RunnerHubHandle;
+        try { await runnersPass(handle, deps.config, () => deps.registry.open(), (line) => { console.log(line); }); }
+        catch (e) { console.error(`RUNNER_SHADOW_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
+          lastJournalPrune = deps.clock.now();
+          handle.journal.prune(lastJournalPrune);
+        }
+      })] : []),
     ]);
     probe.close();
     const stalled = new Set<string>();
@@ -823,6 +902,7 @@ export const supervise = async (
     await inbound?.close();
     if (inbound) writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, messageContent: false });
     reports?.close();
+    runnerHub?.close();
     sources?.close();
     scheduleOps?.close();
     ci?.close();

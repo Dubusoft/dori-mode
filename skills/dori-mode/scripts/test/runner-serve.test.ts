@@ -1,0 +1,114 @@
+import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { statSync } from "node:fs";
+import { join } from "node:path";
+
+import { RunnerClient } from "../src/runner/client.ts";
+import { runStartupCheck } from "../src/runner/fs-safety.ts";
+import { HUB_FILE, readRunnerRows } from "../src/runner/hub.ts";
+import { Outbox } from "../src/runner/outbox.ts";
+import { loadIdentity, type ObservedLane, serveRunner, trackedConnector } from "../src/runner/serve.ts";
+import { RunnerState } from "../src/runner/state.ts";
+import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
+import { collectStatus, renderStatus } from "../src/status.ts";
+import { openRunnerHub, runnersPass } from "../src/supervise-loop.ts";
+import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+
+const cleanups: (() => void)[] = [];
+afterEach(() => { for (const done of cleanups.splice(0).reverse()) done(); });
+
+/** A promise that resolves the first time `match` sees a value. */
+const waiter = <T>() => {
+  const waiting: { match: (value: T) => boolean; resolve: () => void }[] = [];
+  return {
+    see(value: T) { for (const w of waiting.splice(0)) if (w.match(value)) w.resolve(); else waiting.push(w); },
+    when: (match: (value: T) => boolean) => new Promise<void>((resolve) => { waiting.push({ match, resolve }); }),
+  };
+};
+
+test("a local runner over the real unix socket says hello, replays its outbox, heartbeats and shows as RUNNER local connected", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const stateDir = join(state.dir, "state");
+  const runnerDir = join(state.dir, "runner");
+  const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
+  const deps = depsFor(newWorld(), clock, stateDir, { runners: { mode: { local: "shadow" } } });
+
+  // Supervisor side: the hub on <runnerDir>/sock/control, as supervise() opens it.
+  const logs: string[] = [];
+  const logged = waiter<string>();
+  const heartbeats = waiter<string>();
+  const hub = openRunnerHub(stateDir, runnerDir, clock.now, clock.now, (line) => { logs.push(line); logged.see(line); }, {
+    onHeartbeat: (label) => { heartbeats.see(label); },
+  });
+  cleanups.push(() => hub.close());
+  expect(statSync(join(runnerDir, "sock")).mode & 0o777).toBe(0o700);
+  expect(statSync(controlSocketPath(runnerDir)).isSocket()).toBe(true);
+
+  // Runner side, wired as `dori runner serve` wires it, with a fake clock and a manual timer.
+  const exits: number[] = [];
+  expect(runStartupCheck(runnerDir, { stderr: () => {}, exit: (code) => { exits.push(code); } })).toBe(true);
+  expect(exits).toEqual([]);
+  const identity = loadIdentity(runnerDir, "local", "host-a");
+  const runnerState = new RunnerState(runnerDir, { now: clock.now });
+  expect(runnerState.boot()).toBe(1);
+  const outbox = new Outbox(runnerDir, { now: clock.now });
+  cleanups.push(() => { outbox.close(); runnerState.close(); });
+  const observed: ObservedLane[] = [{ key: "demo", pane: "w1:p2", tab: "w1:t1", status: "working" }];
+  const tracked = trackedConnector(connectUnix(controlSocketPath(runnerDir)));
+  const client = new RunnerClient({ label: identity.label, hostId: identity.hostId }, {
+    connect: tracked.connect, outbox, state: runnerState, clock, inventory: () => observed.map(({ status: _s, ...lane }) => lane),
+  });
+  const timers: { ms: number; tick: () => void }[] = [];
+  const controller = new AbortController();
+  const heartbeat = heartbeats.when((label) => label === "local");
+  const serving = serveRunner({
+    client, latest: tracked.latest, clock, heartbeatMs: 15_000, observe: async () => observed, log: () => {},
+    every: (ms, tick) => { const timer = { ms, tick }; timers.push(timer); return () => { timers.splice(timers.indexOf(timer), 1); }; },
+  }, controller.signal);
+
+  await heartbeat;
+  // The heartbeat timer is separate from the observation timer.
+  expect(timers.map((t) => t.ms).sort((a, b) => a - b)).toEqual([15_000, 30_000]);
+  expect(logs).toContain("RUNNER_CONNECTED runner=local gen=1 eventAck=0");
+
+  // The lane.state observed before the connection was appended to the outbox, replayed and committed to the hub's own journal.
+  expect(hub.hub.runner("local")?.eventAck).toBe(1);
+  const db = new Database(join(stateDir, HUB_FILE), { readonly: true });
+  expect((db.query("SELECT id FROM runner_events").all() as { id: string }[]).map((r) => r.id)).toEqual(["runner:local:1"]);
+  db.close();
+
+  // dori status reads the persisted row.
+  const status = await collectStatus(deps);
+  expect(renderStatus(status)).toContain("RUNNER local connected proto=1 version=- gen=1 hb=0 outbox=");
+  expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=- lanes=1$/m);
+
+  // Shadow: the registry has no lane "demo", so after one settling cycle each unit is reported missing-in-legacy.
+  const shadowLines: string[] = [];
+  await runnersPass(hub, deps.config, () => deps.registry.open(), (line) => { shadowLines.push(line); });
+  expect(shadowLines).toEqual([]);
+  await runnersPass(hub, deps.config, () => deps.registry.open(), (line) => { shadowLines.push(line); });
+  expect(shadowLines.map((line) => line.split(" ").slice(0, 6).join(" "))).toEqual([
+    "RUNNER_SHADOW_DIFF runner=local class=missing-in-legacy kind=inventory.pane lane=demo gen=0",
+    "RUNNER_SHADOW_DIFF runner=local class=missing-in-legacy kind=lane.state lane=demo gen=0",
+  ]);
+
+  // Past the stale threshold with no heartbeat the line reads stale; the runner stopping reads offline.
+  clock.at += 61_000;
+  expect(renderStatus(await collectStatus(deps))).toContain("RUNNER local stale ");
+  const gone = logged.when((line) => line === "RUNNER_DISCONNECTED runner=local");
+  controller.abort();
+  await serving;
+  await gone;
+  expect(readRunnerRows(stateDir)[0]?.disconnectedAt).toBe(clock.at);
+  expect(renderStatus(await collectStatus(deps))).toContain("RUNNER local offline ");
+});
+
+test("without a runners section dori status shows no runner lines", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
+  const status = await collectStatus(depsFor(newWorld(), clock, state.dir));
+  expect(status.runners).toEqual([]);
+  expect(renderStatus(status)).not.toContain("RUNNER ");
+});

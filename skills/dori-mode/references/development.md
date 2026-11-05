@@ -42,6 +42,7 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/pause.ts` | `pause` and `resume` |
 | `src/inbox.ts` | the lead's event inbox (`dori inbox take`) |
 | `src/supervise.ts` and `src/supervise-*.ts` | `dori supervise` and its loop, delivery and lead lifecycle |
+| `src/runner/` | the runner protocol, outbox, state, hub, shadow diff and transports behind `dori runner serve`; see [runner-protocol.md](runner-protocol.md) |
 | `src/cli.ts` | the `dori` command itself |
 
 Every module takes its HTTP, clock and timers as arguments. That's how the tests run without the network.

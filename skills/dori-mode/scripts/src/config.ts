@@ -111,6 +111,65 @@ export type PlacementConfig = {
   readonly fallback: readonly string[];
 };
 
+/** Per-machine runner rollout: "off" starts no new lanes on a runner, "shadow" only observes, "authoritative" owns new lanes. */
+export const RUNNER_MODES = ["off", "shadow", "authoritative"] as const;
+export type RunnerMode = (typeof RUNNER_MODES)[number];
+
+/** The optional `runners` section. Absent from the file: the runner hub is not opened and every machine is mode "off". */
+export type RunnersConfig = {
+  /** Address the runner hub listens on (private-network validation comes with the hub itself). */
+  readonly listen?: string;
+  /** Machine label -> rollout mode; a label that is not listed is "off". */
+  readonly mode?: Readonly<Record<string, RunnerMode>>;
+  /** Restart circuit-breaker settings, passed through as written. */
+  readonly restartCircuit?: Readonly<Record<string, unknown>>;
+};
+
+/** The rollout mode of `label`: "off" unless the `runners.mode` section names it. */
+export const runnerMode = (config: Pick<DoriConfig, "runners">, label: string): RunnerMode => config.runners?.mode?.[label] ?? "off";
+
+/** The `runners` section (absent: undefined); throws TypeError when its shape is wrong. */
+const runnersConfig = (raw: unknown): RunnersConfig | undefined => {
+  if (raw === undefined) return undefined;
+  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isObject(raw)) throw new TypeError("runners must be an object");
+  const { listen, mode, restartCircuit } = raw;
+  if (listen !== undefined && (typeof listen !== "string" || !listen.trim())) throw new TypeError("runners.listen must be a non-empty string");
+  if (mode !== undefined) {
+    if (!isObject(mode)) throw new TypeError("runners.mode must map machine labels to modes");
+    for (const [label, value] of Object.entries(mode)) {
+      if (!(RUNNER_MODES as readonly unknown[]).includes(value)) throw new TypeError(`runners.mode.${label} must be one of ${RUNNER_MODES.join(", ")}`);
+    }
+  }
+  if (restartCircuit !== undefined && !isObject(restartCircuit)) throw new TypeError("runners.restartCircuit must be an object");
+  return {
+    ...(listen !== undefined ? { listen: (listen as string).trim() } : {}),
+    ...(mode !== undefined ? { mode: { ...(mode as Record<string, RunnerMode>) } } : {}),
+    ...(restartCircuit !== undefined ? { restartCircuit: { ...restartCircuit } } : {}),
+  };
+};
+
+/** Top-level config keys that are obsolete: ignored on load, each named once per process as CONFIG_KEY_OBSOLETE. Later phases add keys here. */
+export const OBSOLETE_CONFIG_KEYS: readonly string[] = [];
+
+const warnedObsoleteKeys = new Set<string>();
+
+/**
+ * Warns CONFIG_KEY_OBSOLETE on stderr for each of `obsolete` present in `loaded`, once per key per process (per `warned`);
+ * returns the keys that were present.
+ */
+export const warnObsoleteKeys = (
+  loaded: Readonly<Record<string, unknown>>, path: string, obsolete: readonly string[] = OBSOLETE_CONFIG_KEYS, warned: Set<string> = warnedObsoleteKeys,
+): string[] => {
+  const present = obsolete.filter((key) => key in loaded);
+  for (const key of present) {
+    if (warned.has(key)) continue;
+    warned.add(key);
+    console.error(`CONFIG_KEY_OBSOLETE ${key} in ${path}: the key is ignored and can be deleted`);
+  }
+  return present;
+};
+
 export type DiscordConfig = {
   readonly applicationId: string;
   readonly guildId: string;
@@ -236,6 +295,8 @@ export type DoriConfig = {
   readonly delivery: DeliveryConfig;
   /** Which machine a launch runs on. */
   readonly placement: PlacementConfig;
+  /** Runner hub settings; absent means the hub is not opened and behavior is unchanged. */
+  readonly runners?: RunnersConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -490,7 +551,8 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     }
     loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
   }
-  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS, ...REMOVED_TOODO_KEYS];
+  const obsolete = warnObsoleteKeys(loaded, path);
+  const dropped: readonly string[] = [...obsolete, ...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS, ...REMOVED_TOODO_KEYS];
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
   const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
   const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);
@@ -523,6 +585,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
+    runners: runnersConfig(raw.runners),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),

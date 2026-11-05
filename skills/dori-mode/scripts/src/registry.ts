@@ -108,6 +108,14 @@ export type Lane = {
   /** The status a paused lane had before it was paused; `resume` restores it. */
   readonly pausedFrom?: LaneStatus;
   readonly receipt?: unknown;
+  /** The runner (machine label) that owns this lane; absent means the lane is not runner-owned and takes the direct path. */
+  readonly runner?: string;
+  /** When the lane was bound to its runner (ms since epoch). */
+  readonly runnerAdoptedAt?: number;
+  /** Since when the owning runner has been silent (ms since epoch); unset while it reports. */
+  readonly runnerStaleSince?: number;
+  /** When the owning runner last reported for this lane (ms since epoch). */
+  readonly lastRunnerReportAt?: number;
   /** Bumped by every registry write; a write carrying an older version than the stored one was made from stale state. */
   readonly version?: number;
 };
