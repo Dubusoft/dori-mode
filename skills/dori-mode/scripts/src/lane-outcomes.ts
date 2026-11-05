@@ -293,7 +293,9 @@ export class OutcomeTracking {
 
   /**
    * Posts the owner's close-thread button into each thread whose work is finished: a report into it was recorded after the
-   * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. Run
+   * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. A
+   * report for a lane that closed before that button is covered by it and re-arms nothing; one for a lane that closed
+   * later (or has not closed yet) is new work. Run
    * every pass, so it fires right after the last report or right after the last lane closes, whichever comes later. A
    * failed post is retried on the next pass; `post` gets a stable id per thread and report, so a retry is not doubled.
    */
@@ -304,6 +306,11 @@ export class OutcomeTracking {
     const latest = new Map<string, number>();
     for (const outcome of outcomes) {
       if (outcome.thread === undefined || outcome.lastReportAt === undefined) continue;
+      const button = buttons[outcome.thread];
+      if (button !== undefined && outcome.lastReportAt > button) {
+        const closedAt = (await registry.read(outcome.lane))?.closedAt;
+        if (closedAt && Date.parse(closedAt) < button) continue;
+      }
       latest.set(outcome.thread, Math.max(latest.get(outcome.thread) ?? -Infinity, outcome.lastReportAt));
     }
     const due = [...latest].filter(([thread, at]) => at > (buttons[thread] ?? -Infinity));
