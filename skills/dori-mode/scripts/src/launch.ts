@@ -393,7 +393,7 @@ export const powershellLaunch = (argv: readonly string[], brief: string, key: st
   // Typed non-ASCII is not reliable through a pane's line editor, so such text travels as base64 too: the line stays ASCII.
   const literal = (s: string) => (/^[\x20-\x7e]*$/.test(s) ? psQuote(s) : `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(s)}'))`);
   const arg = (a: string) => (a.includes(BRIEF_AT) ? `(${a.split(BRIEF_AT).map(literal).join(" + $doriBrief + ")})` : psQuote(a) === literal(a) ? literal(a) : `(${literal(a)})`);
-  return `$doriBrief = Join-Path ([IO.Path]::GetTempPath()) ${psQuote(`dori-brief-${key}.md`)}; [IO.File]::WriteAllBytes($doriBrief, [Convert]::FromBase64String('${b64(brief)}')); if ($?) { & ${argv.map(arg).join(" ")} }`;
+  return `$doriBrief = Join-Path ([IO.Path]::GetTempPath()) ${psQuote(`dori-brief-${key}.md`)}; [IO.File]::WriteAllBytes($doriBrief, [Convert]::FromBase64String('${b64(brief)}')); if ($?) { $env:DORI_LANE_KEY = ${psQuote(key)}; & ${argv.map(arg).join(" ")} }`;
 };
 
 /** The brief's home on a POSIX remote: a fixed path, valid on Linux and macOS, never the lead's own path. */
@@ -493,7 +493,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     } else {
       // The brief is owned by this launch. Copy it with its footer: the remote host does not share our filesystem.
       const at = posixRemoteBrief(input.key);
-      command = `printf %s ${quoteForPane(brief)} > ${quoteForPane(at)} && ${agentArgv(at).map(quoteForPane).join(" ")}`;
+      command = `printf %s ${quoteForPane(brief)} > ${quoteForPane(at)} && ${quoteForPane(`DORI_LANE_KEY=${input.key}`)} ${agentArgv(at).map(quoteForPane).join(" ")}`;
     }
     const lane: Lane = { ...draft, pane, ...(tab ? { tab } : {}) };
     if (token) await deps.registry.update(lane.key, (current) => {
