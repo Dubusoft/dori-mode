@@ -898,7 +898,6 @@ export const supervise = async (
           registry: deps.registry, reports: () => reports, now: deps.clock.now,
           emit: (id, line) => { enqueueSweep(id, line); },
           recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
-          shadow: (label) => runnerMode(deps.config, label) === "shadow",
         };
         const inOrder = (what: string, work: () => Promise<void>): void => {
           laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
