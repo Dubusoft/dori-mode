@@ -19,6 +19,7 @@ import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
+import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { launchesThroughRunner, launchThroughRunner } from "./runner/launch-via-runner.ts";
 import { syncRegistry } from "./sync.ts";
 import { readToodoStart } from "./toodo-start.ts";
@@ -265,13 +266,13 @@ if (process.argv[2] === "runner") {
       const lines = await evacuate({
         hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined, shadow: (l) => runnerMode(cfg, l) === "shadow" },
         exportOutbox: async () => {
-          const r = await run(sshArgv(sshTarget, 'PATH="$HOME/.bun/bin:$PATH" bun "$HOME/.dori/runner/bin/dori.js" runner export-outbox'), { timeoutMs: 30_000 });
+          const r = await run(sshArgv(sshTarget, remoteRunnerCli("runner export-outbox")), { timeoutMs: 30_000 });
           if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);
           return JSON.parse(r.out.trim().split("\n").at(-1) ?? "[]");
         },
         tellLane: async (lane, text) => (lane.pane ? (await sendVerified(laneRunner(run, lane), realClock, lane.pane, text)) !== "failed" : false),
         stopRunner: async () => {
-          const r = await run(sshArgv(sshTarget, "systemctl --user stop dori-runner.service"), { timeoutMs: 30_000 });
+          const r = await run(sshArgv(sshTarget, remoteRunnerService("stop")), { timeoutMs: 30_000 });
           return { ok: r.code === 0, detail: (r.err || r.out).trim().split("\n").at(-1) || `exit ${r.code}` };
         },
       }, label);

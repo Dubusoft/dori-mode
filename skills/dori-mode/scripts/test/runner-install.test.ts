@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { INSTALL_EXIT, bundleVersion, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
@@ -86,12 +86,31 @@ const fakeHost = () => {
     chmodSync(join(bin, name), 0o755);
   };
   tool("uname", "echo Linux");
-  tool("bun", `cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
+  tool("bun", `[ "$1" = --version ] && { echo 1.3.0; exit 0; }; cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
   tool("loginctl", "exit 0");
   tool("systemctl", "exit 0");
   tool("id", "echo dori");
-  return { home, bin, log };
+  return { home, bin, log, tool };
 };
+
+const PLIST = readFileSync(join(import.meta.dir, "..", "templates", "dori-runner-launchd.plist"), "utf8");
+const SYSTEM_TOOLS = ["mkdir", "chmod", "cat", "mv", "rm", "sed", "mktemp", "unzip", "dirname", "cp", "sleep"];
+/** A Darwin host whose PATH is only the fake bin, with the system tools the script needs linked into it. */
+const darwinHost = (launchctl = "exit 0") => {
+  const host = fakeHost();
+  host.tool("uname", `case "$1" in -m) echo arm64 ;; *) echo Darwin ;; esac`);
+  host.tool("id", `[ "$1" = -u ] && echo 501 || echo dori`);
+  host.tool("launchctl", launchctl);
+  for (const name of SYSTEM_TOOLS) symlinkSync(Bun.which(name) as string, join(host.bin, name));
+  return host;
+};
+const runDarwin = async (host: ReturnType<typeof fakeHost>, script: string) => {
+  const p = Bun.spawn(["/bin/sh", "-s"], { stdin: new TextEncoder().encode(script), stdout: "pipe", stderr: "pipe", env: { HOME: host.home, PATH: host.bin } });
+  return { code: await p.exited, err: await new Response(p.stderr).text() };
+};
+const darwinScript = () =>
+  installScript(BUNDLE, UNIT, "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, remoteUnit(PLIST, "worker-a", "ws://100.101.1.2:7411"));
+const ARGS = ["runner", "serve", "--label", "worker-a", "--connect", "ws://100.101.1.2:7411"];
 
 const runScript = async (host: ReturnType<typeof fakeHost>, script: string) => {
   const p = Bun.spawn(["/bin/sh", "-s"], {
@@ -138,4 +157,106 @@ test("run by sh without bun on PATH, the script exits with the no-bun code", asy
   const script = installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT });
   const p = Bun.spawn(["/bin/sh", "-s"], { stdin: new TextEncoder().encode(script), stdout: "pipe", stderr: "pipe", env: { HOME: host.home, PATH: host.bin } });
   expect(await p.exited).toBe(INSTALL_EXIT.noBun);
+});
+
+const programArguments = (plist: string): string[] =>
+  [...(plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1] ?? "").matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1] as string);
+const plistPath = (home: string) => join(home, "Library/LaunchAgents/com.dori.runner.plist");
+
+test("on Darwin with bun on PATH, the script writes the launchd agent, boots it into the gui domain, and enrolls through a pipe", async () => {
+  const host = darwinHost();
+  const result = await runDarwin(host, darwinScript());
+  expect(result).toEqual({ code: 0, err: "" });
+  const bun = join(host.bin, "bun");
+  const plist = readFileSync(plistPath(host.home), "utf8");
+  expect(plist).not.toMatch(/@[A-Z]+@/);
+  expect(programArguments(plist)).toEqual([bun, join(host.home, ".dori/runner/bin/dori.js"), ...ARGS]);
+  expect(plist).toContain(`<key>PATH</key>\n    <string>${host.bin}:${host.bin}</string>`);
+  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/runner.log")}</string>`);
+  expect(statSync(plistPath(host.home)).mode & 0o777).toBe(0o644);
+  const domain = join(host.home, ".dori/runner/launchd-domain");
+  expect(readFileSync(domain, "utf8")).toBe("gui/501\n");
+  expect(statSync(domain).mode & 0o777).toBe(0o600);
+  expect(readFileSync(join(host.home, ".dori/runner/bin/dori"), "utf8")).toBe(`#!/bin/sh\nexec "${bun}" "$HOME/.dori/runner/bin/dori.js" "$@"\n`);
+  const argvLog = readFileSync(host.log, "utf8");
+  expect(argvLog).toContain(`launchctl bootstrap gui/501 ${plistPath(host.home)}`);
+  expect(argvLog).toContain("launchctl enable gui/501/com.dori.runner");
+  expect(argvLog).toContain("launchctl kickstart -k gui/501/com.dori.runner");
+  expect(argvLog).not.toContain("systemctl");
+  expect(argvLog).not.toContain("loginctl");
+  expect(argvLog).not.toContain(CODE);
+  expect(argvLog).not.toContain(FINGERPRINT);
+  expect(argvLog).toContain("runner serve --enroll-only --label worker-a --connect ws://100.101.1.2:7411");
+  expect(readFileSync(join(host.home, "enroll-stdin"), "utf8")).toBe(`code=${CODE}\nfingerprint=${FINGERPRINT}\n`);
+  expect(existsSync(join(host.home, ".config"))).toBe(false);
+  expect(existsSync(join(host.home, ".dori/runner/com.dori.runner.plist.tmp"))).toBe(false);
+});
+
+const CANDIDATES = ["/opt/homebrew/bin/bun", "/usr/local/bin/bun"];
+test.skipIf(!Bun.which("zip") || CANDIDATES.some((p) => existsSync(p)))("on Darwin with no bun anywhere, the script downloads the release zip into ~/.dori/runner/bun", async () => {
+  const host = darwinHost();
+  const stage = join(host.home, "stage");
+  mkdirSync(join(stage, "bun-darwin-aarch64"), { recursive: true });
+  copyFileSync(join(host.bin, "bun"), join(stage, "bun-darwin-aarch64/bun"));
+  rmSync(join(host.bin, "bun"));
+  const zip = Bun.spawn(["zip", "-qr", join(host.home, "fixture.zip"), "bun-darwin-aarch64"], { cwd: stage });
+  expect(await zip.exited).toBe(0);
+  host.tool("curl", `while [ $# -gt 0 ]; do [ "$1" = -o ] && O=$2; shift; done; cp '${join(host.home, "fixture.zip")}' "$O"`);
+  const result = await runDarwin(host, darwinScript());
+  expect(result).toEqual({ code: 0, err: "" });
+  const bun = join(host.home, ".dori/runner/bun/bun");
+  expect(statSync(bun).mode & 0o777).toBe(0o700);
+  expect(readFileSync(host.log, "utf8")).toContain("curl -fsSL -o");
+  expect(readFileSync(host.log, "utf8")).toContain("https://github.com/oven-sh/bun/releases/latest/download/bun-darwin-aarch64.zip");
+  const plist = readFileSync(plistPath(host.home), "utf8");
+  expect(programArguments(plist)[0]).toBe(bun);
+  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/bun")}:${host.bin}</string>`);
+  expect(readFileSync(join(host.home, ".dori/runner/bin/dori"), "utf8")).toContain(`exec "${bun}"`);
+  const left = new Bun.Glob("bun-download.*").scanSync({ cwd: join(host.home, ".dori/runner"), onlyFiles: false });
+  expect([...left]).toEqual([]);
+});
+
+test("on Darwin a failing download exits with the no-bun code", async () => {
+  const host = darwinHost();
+  rmSync(join(host.bin, "bun"));
+  host.tool("curl", "exit 22");
+  const result = await runDarwin(host, darwinScript());
+  expect(result.code).toBe(INSTALL_EXIT.noBun);
+  expect(existsSync(plistPath(host.home))).toBe(false);
+});
+
+test("on Darwin without a gui domain, the script falls back to the user domain", async () => {
+  const host = darwinHost(`[ "$1" = print ] && exit 113; exit 0`);
+  const result = await runDarwin(host, darwinScript());
+  expect(result).toEqual({ code: 0, err: "" });
+  expect(readFileSync(join(host.home, ".dori/runner/launchd-domain"), "utf8")).toBe("user/501\n");
+  const argvLog = readFileSync(host.log, "utf8");
+  expect(argvLog).toContain(`launchctl bootstrap user/501 ${plistPath(host.home)}`);
+  expect(argvLog).toContain("launchctl kickstart -k user/501/com.dori.runner");
+});
+
+test("on Darwin the agent is enabled before bootstrap, and a gui domain that refuses bootstrap falls back to the user domain", async () => {
+  const host = darwinHost(`[ "$1" = bootstrap ] && [ "\${2%%/*}" = gui ] && exit 5; exit 0`);
+  const result = await runDarwin(host, darwinScript());
+  expect(result.code).toBe(0);
+  expect(readFileSync(join(host.home, ".dori/runner/launchd-domain"), "utf8")).toBe("user/501\n");
+  const lines = readFileSync(host.log, "utf8").split("\n").filter((l) => l.startsWith("launchctl "));
+  expect(lines.filter((l) => l.startsWith("launchctl bootstrap gui/501 "))).toHaveLength(5);
+  const enable = lines.indexOf("launchctl enable user/501/com.dori.runner");
+  const bootstrap = lines.indexOf(`launchctl bootstrap user/501 ${plistPath(host.home)}`);
+  expect(enable).toBeGreaterThanOrEqual(0);
+  expect(bootstrap).toBeGreaterThan(enable);
+  expect(lines.at(-1)).toBe("launchctl kickstart -k user/501/com.dori.runner");
+});
+
+test("on any other OS the script exits with the unsupported code before touching anything", async () => {
+  const host = fakeHost();
+  host.tool("uname", "echo FreeBSD");
+  const result = await runScript(host, darwinScript());
+  expect(result.code).toBe(INSTALL_EXIT.notLinux);
+  expect(existsSync(join(host.home, ".dori"))).toBe(false);
+});
+
+test("the launchd plist is checked against the heredoc delimiter too", () => {
+  expect(() => installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, "a\nDORI_RUNNER_EOF\n")).toThrow("heredoc delimiter");
 });
