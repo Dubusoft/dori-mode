@@ -14,6 +14,12 @@ import type { RecoveryLane } from "./recover.ts";
 import { Registry, statusOf } from "./registry.ts";
 import { type Clock, realClock, type Runner, run } from "./run.ts";
 import { LEGACY_PRESENCE, SERVICES, unitState } from "./status.ts";
+import { openOperations } from "./operations.ts";
+import { checkRunnerDir, defaultRunnerDir } from "./runner/fs-safety.ts";
+import { readRunnerRows } from "./runner/hub.ts";
+import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
+import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
+import { PROTO } from "./runner/protocol.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -254,8 +260,45 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
 };
 
 /** Read-only: every probe is a status query or a GET. */
+/**
+ * Runner checks, only with a `runners` section: the listen address, the local runner directory's permissions, and per
+ * known runner its protocol, outbox backlog and restart circuit. Read-only.
+ */
+export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
+  if (!d.config.runners) return [];
+  const checks: Check[] = [];
+  const listen = d.config.runners.listen;
+  checks.push(listen ? ok("runner listen", `${listen} (private)`) : warn("runner listen", "runners.listen is not set: only the local runner can connect", "set runners.listen to this host's private address, e.g. <tailnet-ip>:7411"));
+  const dir = defaultRunnerDir(d.home);
+  if (d.exists(dir)) {
+    try { checkRunnerDir(dir); checks.push(ok("runner dir", `${dir} 0700, files 0600, no symlinks`)); }
+    catch (e) { checks.push(fail("runner dir", e instanceof Error ? e.message : String(e), `chmod -R go-rwx ${dir} and remove any symlink in it`)); }
+  }
+  const now = d.clock.now();
+  let restarts: (label: string) => number = () => 0;
+  try {
+    const ops = openOperations(d.config);
+    const rows = ops.list().filter((op) => op.action === "restart" && op.lane.startsWith("runner:") && now - op.at < RESTART_CIRCUIT_WINDOW_MS);
+    ops.close();
+    restarts = (label) => rows.filter((op) => op.lane === `runner:${label}`).length;
+  } catch (e) {
+    checks.push(warn("runner restarts", `cannot read the operations store: ${e instanceof Error ? e.message : String(e)}`, "dori doctor again once the supervisor has started"));
+  }
+  for (const row of readRunnerRows(d.config.stateDir)) {
+    const id = `runner ${row.label}`;
+    const problems: string[] = [];
+    if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
+    if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
+    if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
+    checks.push(problems.length
+      ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
+      : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}`));
+  }
+  return checks;
+};
+
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d))])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

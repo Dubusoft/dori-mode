@@ -82,7 +82,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
   expect(renderStatus(status)).toContain("RUNNER local connected proto=1 version=- gen=1 hb=0 outbox=");
-  expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=- lanes=1$/m);
+  expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=1$/m);
 
   // Shadow: the registry has no lane "demo", so after one settling cycle each unit is reported missing-in-legacy.
   const shadowLines: string[] = [];

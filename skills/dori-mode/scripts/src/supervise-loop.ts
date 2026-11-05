@@ -4,7 +4,8 @@ import { resolveCredential } from "./credentials.ts";
 import { configPath, deliveryConfigError, runnerMode, saveLeadPane } from "./config.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
-import { RunnerHub } from "./runner/hub.ts";
+import { readRunnerRows, RunnerHub } from "./runner/hub.ts";
+import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
 import { recordDiffLines } from "./runner/shadow-store.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import {
@@ -861,10 +862,25 @@ export const supervise = async (
     };
     let lastGitHub = -Infinity;
     // Only with a `runners` section; an unsafe runner directory or a busy socket costs the hub, never the supervisor.
+    let liveness: LivenessMonitor | undefined;
     if (deps.config.runners) {
       try {
         const listen = deps.config.runners.listen;
-        runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }, listen ? { listen } : {}));
+        // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
+        let monitor: LivenessMonitor | undefined;
+        const hub = runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
+          ...(listen ? { listen } : {}),
+          onHeartbeat: (label) => { void monitor?.heartbeat(label); },
+          onHello: (label, body) => { void monitor?.hello(label, body.gen); },
+        }));
+        let livenessSeq = 0;
+        monitor = liveness = new LivenessMonitor({
+          monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
+          ...livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines)).machines),
+          ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
+          emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
+        });
+        for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
       } catch (e) {
         console.error(`RUNNER_HUB_DISABLED ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -926,6 +942,7 @@ export const supervise = async (
       }),
       ...(runnerHub ? [task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
         const handle = runnerHub as RunnerHubHandle;
+        try { await liveness?.tick(); } catch (e) { console.error(`RUNNER_LIVENESS_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
         try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now())) console.log(line); }
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
