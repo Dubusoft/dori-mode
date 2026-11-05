@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { freshnessTick } from "../src/freshness.ts";
-import { JsonLaneReports, type LaneReportStore, SqliteLaneReports, UNFENCED_GENERATION } from "../src/lane-reports.ts";
+import { JsonLaneReports, LANE_REPORTS_FILE, type LaneReport, type LaneReportStore, putReportRows, SqliteLaneReports, UNFENCED_GENERATION } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -13,10 +13,14 @@ const MIN = 60_000;
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0).reverse()) done(); });
 
-const STORES: readonly (readonly [string, (dir: string) => LaneReportStore])[] = [
-  ["json", (dir) => new JsonLaneReports(dir)],
-  ["sqlite", (dir) => {
-    new SqliteStore(join(dir, SQLITE_FILE), { create: true }).close();
+const STORES: readonly (readonly [string, (dir: string, rows: LaneReport[]) => LaneReportStore])[] = [
+  ["json", (dir, rows) => {
+    writeFileSync(join(dir, LANE_REPORTS_FILE), JSON.stringify({ reports: rows }));
+    return new JsonLaneReports(dir);
+  }],
+  ["sqlite", (dir, rows) => {
+    const store = new SqliteStore(join(dir, SQLITE_FILE), { create: true });
+    try { store.transaction("full", () => putReportRows(store.database, rows)); } finally { store.close(); }
     return new SqliteLaneReports(join(dir, SQLITE_FILE));
   }],
 ];
@@ -28,15 +32,19 @@ const lane = (key: string, pane: string): Lane => ({
 test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep no herdr call; once rows stop for nudgeAfterMin the pane is read again", async (_name, open) => {
   const state = withState();
   cleanups.push(state.done);
-  const store = open(state.dir);
-  cleanups.push(() => { store.close(); });
   const world = newWorld();
   const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
+  // Seed the existing state directly: this tests a 100-lane sweep, not 200 separately durable CLI writes.
+  // Keep the real registry and report stores for both ticks, including every registry patch the fallback makes.
+  mkdirSync(join(state.dir, "lanes"));
+  const rows: LaneReport[] = [];
   for (let i = 0; i < 100; i++) {
     const key = `lane-${i}`;
-    await deps(T0).registry.write(lane(key, `w:p${i}`));
-    store.append({ lane: key, generation: UNFENCED_GENERATION, kind: "progress", text: `step ${i}`, at: T0 + 10 * MIN });
+    writeFileSync(join(state.dir, "lanes", `${key}.json`), JSON.stringify({ ...lane(key, `w:p${i}`), version: 1 }));
+    rows.push({ id: `${key}:${UNFENCED_GENERATION}:1`, lane: key, generation: UNFENCED_GENERATION, seq: 1, kind: "progress", text: `step ${i}`, at: T0 + 10 * MIN });
   }
+  const store = open(state.dir, rows);
+  cleanups.push(() => { store.close(); });
   // Silent by replies past both nudgeAfterMin (15) and postAfterMin (20), but every lane wrote a row 11 min ago: nothing to read or post.
   expect(await freshnessTick(deps(T0 + 21 * MIN), "/home/test", undefined, store)).toEqual([]);
   expect(world.calls.filter((c) => c[0] === "herdr")).toEqual([]);
