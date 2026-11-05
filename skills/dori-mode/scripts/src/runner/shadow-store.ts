@@ -57,6 +57,11 @@ export const recordDiffLines = (stateDir: string, lines: readonly string[], at: 
   }
 };
 
+/** Whether the hub's `runners` table has `label` (the table is absent before the hub first opened). */
+const knownRunner = (db: Database, label: string): boolean =>
+  db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runners'").get() !== null
+  && db.query("SELECT 1 FROM runners WHERE label = ?").get(label) !== null;
+
 export type ShadowReportRow = { readonly runner: string; readonly failures: number; readonly counts: Readonly<Record<ShadowDiffClass, number>> };
 
 export const shadowReport = (stateDir: string, filter: { readonly runner?: string; readonly sinceMs?: number } = {}): ShadowReportRow[] => {
@@ -70,6 +75,10 @@ export const shadowReport = (stateDir: string, filter: { readonly runner?: strin
       const counts = byRunner.get(row.runner) ?? Object.fromEntries(SHADOW_CLASSES.map((c) => [c, 0])) as Record<ShadowDiffClass, number>;
       counts[row.class] = row.n;
       byRunner.set(row.runner, counts);
+    }
+    // A runner the hub knows that has no stored difference gets a row of zeros, so a clean count reads failures=0.
+    if (filter.runner !== undefined && !byRunner.has(filter.runner) && knownRunner(db, filter.runner)) {
+      byRunner.set(filter.runner, Object.fromEntries(SHADOW_CLASSES.map((c) => [c, 0])) as Record<ShadowDiffClass, number>);
     }
     return [...byRunner].map(([runner, counts]) => ({ runner, counts, failures: SHADOW_CLASSES.filter((c) => c !== "timing").reduce((sum, c) => sum + counts[c], 0) }));
   } finally {

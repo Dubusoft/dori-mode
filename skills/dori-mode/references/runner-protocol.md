@@ -316,7 +316,8 @@ RUNNER_SHADOW_DIFF runner=<label> class=<c> kind=<k> lane=<key> gen=<n> field=<f
 Every reported difference is also stored in `<stateDir>/runners.sqlite` (table `shadow_diffs`). `dori runner
 shadow-report [--runner <label>]` prints one line per runner,
 `RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`,
-where `failures` counts every class but `timing`, or `RUNNER_SHADOW_REPORT none` when nothing was recorded.
+where `failures` counts every class but `timing`, or `RUNNER_SHADOW_REPORT none` when nothing was recorded. With
+`--runner`, a runner the hub knows that has no stored difference prints its line with every count 0.
 
 The `gen` in a `RUNNER_SHADOW_DIFF` line is the lane generation (the lane's `lastRecoveryAt`, or 0 for a lane never
 recovered), not the runner's boot generation that `dori status` shows as `RUNNER <label> ... gen=<n>`.

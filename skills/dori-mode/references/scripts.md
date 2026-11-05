@@ -179,7 +179,7 @@ Installs or upgrades the runner on a Linux worker (a herdr saved machine or a `g
 
 ### `dori runner shadow-report [--runner LABEL]`
 
-One line per runner from the shadow differences the supervisor stored: `RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`; `failures` counts every class but `timing`. `RUNNER_SHADOW_REPORT none` when there is nothing yet.
+One line per runner from the shadow differences the supervisor stored: `RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`; `failures` counts every class but `timing`. `RUNNER_SHADOW_REPORT none` when there is nothing yet; with `--runner`, a runner the hub knows that has nothing stored prints its line with every count 0.
 
 ### `dori runner evacuate LABEL`
 
