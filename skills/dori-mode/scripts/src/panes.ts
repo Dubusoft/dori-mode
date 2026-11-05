@@ -19,8 +19,10 @@ export type Pane = {
   /** The title the program in the pane set for its terminal. */
   readonly terminal_title?: string;
   readonly cwd?: string;
-  /** Bumped by herdr whenever the pane's content changes. */
+  /** Bumped by herdr on prompt and command events; printed output alone does not bump it. */
   readonly revision?: number;
+  /** How far the pane can scroll back: grows as output scrolls off the screen, until the scrollback is full. */
+  readonly scroll?: { readonly max_offset_from_bottom?: number };
 };
 
 export class UnsafeTextError extends Error {}
