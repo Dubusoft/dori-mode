@@ -12,6 +12,7 @@ import { quotaMessage } from "../src/messenger/discord-commands.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { JsonLaneReports, type LaneReportStore, SqliteLaneReports } from "../src/lane-reports.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind, WAKES_FILE } from "../src/store.ts";
+import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { collectStatus, kst, lookupStatus, renderStatus, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
@@ -342,6 +343,24 @@ test("item 6: lanes pending or exhausted on recovery are a status problem and ma
   expect(text).toContain("- Lane recovery pending (not nudged): held");
   expect(text).toContain("\n- [recovery gave up] dead (");
   expect(text).toContain("\n- [recovery pending] held (");
+});
+
+test("RUNNER lanes= follows the registry's open lanes on each runner's machine, not the count of the last hello", async () => {
+  const f = await fixture();
+  new RunnerHub({ stateDir: f.dir, commit: () => true, now: () => NOW, monotonic: () => 0, epoch: 1 }).close();
+  const db = new Database(join(f.dir, HUB_FILE));
+  // Stale hello inventories: 7 and 3 lanes.
+  db.run("INSERT INTO runners (label, maxGen, lastHeartbeatAt, lanes) VALUES ('local', 1, ?, 7), ('macbook', 1, ?, 3)", [NOW, NOW]);
+  db.close();
+  await f.registry.write(lane("alpha"));
+  await f.registry.write(lane("beta", { machine: "macbook", runner: "macbook" }));
+  await f.registry.write(lane("delta", { machine: "macbook" }));
+  await f.registry.write(lane("gamma", { machine: "macbook", runner: "macbook", closedAt: OPENED }));
+  const counts = async () => Object.fromEntries((await collectStatus(f.deps)).runners?.map((r) => [r.label, r.lanes]) ?? []);
+  expect(await counts()).toEqual({ local: 1, macbook: 2 });
+  await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
+  expect(await counts()).toEqual({ local: 1, macbook: 1 });
+  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER macbook connected .* lanes=1$/m);
 });
 
 test("a claude-quota.json left by the removed quota gate is ignored", async () => {

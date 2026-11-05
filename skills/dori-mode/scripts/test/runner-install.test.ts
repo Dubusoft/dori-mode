@@ -2,8 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { INSTALL_EXIT, bundleVersion, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
-import type { Ran, RunOptions } from "../src/run.ts";
+import { INSTALL_EXIT, buildBundle, bundleVersion, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
+import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
+import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
@@ -276,3 +277,19 @@ test("the runner directory the script leaves passes the runner's own safety chec
 test("the launchd plist is checked against the heredoc delimiter too", () => {
   expect(() => installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, "a\nDORI_RUNNER_EOF\n")).toThrow("heredoc delimiter");
 });
+
+test("a bundle run outside any git checkout reports the git SHA it was built from", async () => {
+  const sha = await gitVersion(realRun, import.meta.dir);
+  expect(sha).toMatch(/^[0-9a-f]{7,}$/);
+  const dir = mkdtempSync(join(tmpdir(), "dori-runner-version-"));
+  dirs.push(dir);
+  expect(await gitVersion(realRun, dir)).toBeUndefined();
+  const entry = join(dir, "entry.ts");
+  writeFileSync(entry, `import { run } from ${JSON.stringify(join(import.meta.dir, "../src/run.ts"))};
+import { runnerVersion } from ${JSON.stringify(join(import.meta.dir, "../src/runner/version.ts"))};
+console.log((await runnerVersion(run, import.meta.dir)) ?? "-");\n`);
+  const out = join(dir, "dori.js");
+  writeFileSync(out, await buildBundle(realRun, entry)());
+  const ran = await realRun(["bun", out], { timeoutMs: 30_000, cwd: dir });
+  expect(ran.out.trim()).toBe(sha as string);
+}, 60_000);

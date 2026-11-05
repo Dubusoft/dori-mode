@@ -17,6 +17,7 @@ import type { Clock, Runner } from "./run.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { readStoreView, readWakes } from "./store.ts";
 import { readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_STALE_MS, type RunnerRow } from "./runner/hub.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { openOperations } from "./operations.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
@@ -88,6 +89,7 @@ export type RunnerView = {
   /** Commands issued and not yet acknowledged (cmdSeq - cmdAck). */
   readonly cmds: number;
   readonly restarts1h?: number;
+  /** Open registry lanes on the runner's machine (see runnerLaneCount). */
   readonly lanes?: number;
 };
 
@@ -105,7 +107,14 @@ const runnerRestarts = (config: Parameters<typeof openOperations>[0], label: str
   } catch { return undefined; }
 };
 
-export const runnerView = (row: RunnerRow, now: number, restarts1h?: number): RunnerView => {
+/**
+ * The open lanes on runner `label`'s machine, read from the registry so the count follows every launch and close: the
+ * lanes it owns, and the unowned lanes on its host (no machine for the local runner, else `machine` is the label).
+ */
+export const runnerLaneCount = (lanes: readonly Lane[], label: string): number =>
+  lanes.filter((l) => !l.closedAt && (l.runner ? l.runner === label : label === LOCAL_RUNNER ? !l.machine : l.machine === label)).length;
+
+export const runnerView = (row: RunnerRow, now: number, restarts1h?: number, lanes?: number): RunnerView => {
   const hb = row.lastHeartbeatAt;
   const age = hb === undefined ? undefined : Math.max(0, now - hb);
   const closed = hb === undefined || (row.disconnectedAt !== undefined && row.disconnectedAt >= hb);
@@ -116,7 +125,7 @@ export const runnerView = (row: RunnerRow, now: number, restarts1h?: number): Ru
     ...(row.version !== undefined ? { version: row.version } : {}),
     ...(age !== undefined ? { heartbeatAgeSec: Math.floor(age / 1000) } : {}),
     ...(row.outbox ? { outbox: { unacked: row.outbox.unacked, oldestAgeSec: Math.floor(row.outbox.oldestAgeMs / 1000) } } : {}),
-    ...(row.lanes !== undefined ? { lanes: row.lanes } : {}),
+    ...(lanes !== undefined ? { lanes } : {}),
     ...(restarts1h !== undefined ? { restarts1h } : {}),
   };
 };
@@ -318,7 +327,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     events: eventStats(d.config, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
-    runners: readRunnerRows(d.config.stateDir).map((row) => runnerView(row, now, d.config.runners ? runnerRestarts(d.config, row.label, now) : undefined)),
+    runners: readRunnerRows(d.config.stateDir).map((row) => runnerView(row, now, d.config.runners ? runnerRestarts(d.config, row.label, now) : undefined, runnerLaneCount(open, row.label))),
   };
 };
 
