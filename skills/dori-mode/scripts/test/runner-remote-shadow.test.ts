@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -95,6 +96,19 @@ test("matching legacy and runner views record no failures", async () => {
   const lines = [...observer.cycle("worker-a", lanes, 0, legacy), ...observer.cycle("worker-a", lanes, S, legacy)];
   expect(lines).toEqual([]);
   expect(recordDiffLines(dir, lines, 1)).toBe(0);
+  expect(shadowReport(dir)).toEqual([]);
+});
+
+test("a runner the hub knows with no stored difference reports a zero row; an unknown label still reports nothing", () => {
+  const dir = stateDir();
+  expect(shadowReport(dir, { runner: "worker-a" })).toEqual([]);
+  const db = new Database(join(dir, HUB_FILE), { create: true });
+  db.run("CREATE TABLE runners (label TEXT PRIMARY KEY)");
+  db.run("INSERT INTO runners (label) VALUES ('worker-a')");
+  db.close();
+  const rows = shadowReport(dir, { runner: "worker-a" });
+  expect(renderShadowReport(rows)).toBe("RUNNER_SHADOW_REPORT runner=worker-a failures=0 missing-in-runner=0 missing-in-legacy=0 value-differs=0 timing=0");
+  expect(shadowReport(dir, { runner: "worker-typo" })).toEqual([]);
   expect(shadowReport(dir)).toEqual([]);
 });
 
