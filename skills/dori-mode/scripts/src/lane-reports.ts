@@ -42,9 +42,11 @@ export type LaneReport = {
   readonly route?: ReportRoute;
   /** The journal event the routed row became: `lane-report:<id>`, `lane-report-late:<id>`, or the claim's `done-claim:<key>:<at>`. */
   readonly eventId?: string;
+  /** Where the row came from when it was not written here, e.g. a runner's event `runner:<label>:<seq>`; one row per source. */
+  readonly source?: string;
 };
 
-export type NewReport = Pick<LaneReport, "lane" | "generation" | "kind" | "text" | "evidence" | "at">;
+export type NewReport = Pick<LaneReport, "lane" | "generation" | "kind" | "text" | "evidence" | "at" | "source">;
 
 /** A row written without an ownership generation (older dori, or a writer that does not fence): never fenced. */
 export const UNFENCED_GENERATION = 0;
@@ -75,6 +77,7 @@ const order = (a: LaneReport, b: LaneReport): number => a.at - b.at || (a.lane <
 const withId = (report: NewReport, seq: number): LaneReport => ({
   id: `${report.lane}:${report.generation}:${seq}`, lane: report.lane, generation: report.generation, seq, kind: report.kind,
   text: redactSecrets(report.text), ...(report.evidence ? { evidence: redactSecrets(report.evidence) } : {}), at: report.at,
+  ...(report.source ? { source: report.source } : {}),
 });
 
 /** `lane-reports.json` beside supervisor.json, rewritten whole under a short state lock (lanes and the supervisor both write). */
@@ -91,6 +94,8 @@ export class JsonLaneReports implements LaneReportStore {
   append(report: NewReport): LaneReport {
     return withStateLockSync(this.lock, () => {
       const reports = this.read();
+      const known = report.source ? reports.find((r) => r.source === report.source) : undefined;
+      if (known) return known;
       const seq = reports.reduce((max, r) => (r.lane === report.lane ? Math.max(max, r.seq) : max), 0) + 1;
       const row = withId(report, seq);
       saveJsonFile(this.path, { reports: [...reports, row] });
@@ -112,22 +117,24 @@ export class JsonLaneReports implements LaneReportStore {
 /** Created on first use like the lane_messages table, not by a schema migration. */
 const DDL = `CREATE TABLE IF NOT EXISTS lane_reports (
   id TEXT PRIMARY KEY, lane TEXT NOT NULL, generation INTEGER NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
-  evidence TEXT, at INTEGER NOT NULL, consumed_at INTEGER, route TEXT, event_id TEXT, UNIQUE (lane, seq));
+  evidence TEXT, at INTEGER NOT NULL, consumed_at INTEGER, route TEXT, event_id TEXT, source TEXT, UNIQUE (lane, seq));
 CREATE INDEX IF NOT EXISTS lane_reports_pending ON lane_reports (consumed_at, at);`;
 
-/** Creates the table, and adds event_id to a table made before it existed (older rows read it as unset). */
+/** Creates the table, and adds event_id and source to a table made before they existed (older rows read them as unset). */
 const ensureSchema = (db: Database): void => {
   db.exec(DDL);
   const columns = db.query("PRAGMA table_info(lane_reports)").all() as { name: string }[];
   if (!columns.some((c) => c.name === "event_id")) db.exec("ALTER TABLE lane_reports ADD COLUMN event_id TEXT");
+  if (!columns.some((c) => c.name === "source")) db.exec("ALTER TABLE lane_reports ADD COLUMN source TEXT");
 };
 
-type Row = { id: string; lane: string; generation: number; seq: number; kind: string; text: string; evidence: string | null; at: number; consumed_at: number | null; route: string | null; event_id?: string | null };
+type Row = { id: string; lane: string; generation: number; seq: number; kind: string; text: string; evidence: string | null; at: number; consumed_at: number | null; route: string | null; event_id?: string | null; source?: string | null };
 const reportOf = (row: Row): LaneReport => ({
   id: row.id, lane: row.lane, generation: row.generation, seq: row.seq, kind: row.kind as ReportKind, text: row.text,
   ...(row.evidence !== null ? { evidence: row.evidence } : {}), at: row.at,
   ...(row.consumed_at !== null ? { consumedAt: row.consumed_at } : {}), ...(row.route !== null ? { route: row.route as ReportRoute } : {}),
   ...(row.event_id != null ? { eventId: row.event_id } : {}),
+  ...(row.source != null ? { source: row.source } : {}),
 });
 
 /** Every row of `db`'s lane_reports table, as stored and in list() order; no table reads as no rows (`dori store export`). */
@@ -139,8 +146,8 @@ export const readReportRows = (db: Database): LaneReport[] =>
 /** Inserts `rows` with every column kept (id, seq, consumed_at, route), for `dori store import`; an id already there throws. */
 export const putReportRows = (db: Database, rows: readonly LaneReport[]): void => {
   ensureSchema(db);
-  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null, r.eventId ?? null);
+  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null, r.eventId ?? null, r.source ?? null);
 };
 
 /** The `lane_reports` table of supervisor.sqlite, on its own connection (WAL: the supervisor's connection keeps writing). */
@@ -161,10 +168,14 @@ export class SqliteLaneReports implements LaneReportStore {
   append(report: NewReport): LaneReport {
     // IMMEDIATE: two lanes (or two reports of one lane) never read the same max seq.
     return this.db.transaction(() => {
+      if (report.source) {
+        const known = this.db.query("SELECT * FROM lane_reports WHERE source = ?").get(report.source) as Row | null;
+        if (known) return reportOf(known);
+      }
       const max = this.db.query("SELECT max(seq) AS seq FROM lane_reports WHERE lane = ?").get(report.lane) as { seq: number | null };
       const row = withId(report, (max.seq ?? 0) + 1);
-      this.db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .run(row.id, row.lane, row.generation, row.seq, row.kind, row.text, row.evidence ?? null, row.at);
+      this.db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(row.id, row.lane, row.generation, row.seq, row.kind, row.text, row.evidence ?? null, row.at, row.source ?? null);
       return row;
     }).immediate();
   }

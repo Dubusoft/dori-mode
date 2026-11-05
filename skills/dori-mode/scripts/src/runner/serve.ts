@@ -316,23 +316,25 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
 // Operator requests to the live hub (`dori runner revoke|rotate`)
 // ---------------------------------------------------------------------------------------------------------------
 
-export type RunnerAdminOp = "revoke" | "rotate";
+export type RunnerAdminOp = "revoke" | "rotate" | "lane.start";
 /** A queued request the supervisor has not taken within this long is answered `expired`. */
 export const RUNNER_ADMIN_TTL_MS = 2 * 60_000;
 
 const adminTable = (db: Database): void => {
-  db.run("CREATE TABLE IF NOT EXISTS runner_admin (id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, label TEXT NOT NULL, at INTEGER NOT NULL, doneAt INTEGER, result TEXT)");
+  db.run("CREATE TABLE IF NOT EXISTS runner_admin (id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, label TEXT NOT NULL, at INTEGER NOT NULL, doneAt INTEGER, result TEXT, body TEXT)");
+  const columns = db.query("PRAGMA table_info(runner_admin)").all() as { name: string }[];
+  if (!columns.some((c) => c.name === "body")) db.run("ALTER TABLE runner_admin ADD COLUMN body TEXT");
 };
 
 /**
  * Queues a request for the supervisor's live hub in `runner_admin` of `runners.sqlite` (the CLI runs in another
  * process than the hub). The runners task takes it on its next pass; `runnerAdminResult` reads the answer.
  */
-export const queueRunnerAdmin = (stateDir: string, op: RunnerAdminOp, label: string, now: number): number => {
+export const queueRunnerAdmin = (stateDir: string, op: RunnerAdminOp, label: string, now: number, body?: object): number => {
   const db = openHubDb(stateDir);
   try {
     adminTable(db);
-    return Number(db.query("INSERT INTO runner_admin (op, label, at) VALUES (?, ?, ?)").run(op, label, now).lastInsertRowid);
+    return Number(db.query("INSERT INTO runner_admin (op, label, at, body) VALUES (?, ?, ?, ?)").run(op, label, now, body ? JSON.stringify(body) : null).lastInsertRowid);
   } finally {
     db.close();
   }
@@ -354,11 +356,11 @@ export const runnerAdminResult = (stateDir: string, id: number): string | undefi
  * is closed either way); `rotate` -> `sent cmdId=<id>` / `not-connected`; older than `RUNNER_ADMIN_TTL_MS` ->
  * `expired`. Returns one log line per request.
  */
-export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "revoke" | "rotate">, now: number): string[] => {
+export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "revoke" | "rotate" | "command" | "connected">, now: number): string[] => {
   const db = openHubDb(stateDir);
   try {
     adminTable(db);
-    const open = db.query("SELECT id, op, label, at FROM runner_admin WHERE doneAt IS NULL ORDER BY id").all() as { id: number; op: string; label: string; at: number }[];
+    const open = db.query("SELECT id, op, label, at, body FROM runner_admin WHERE doneAt IS NULL ORDER BY id").all() as { id: number; op: string; label: string; at: number; body: string | null }[];
     return open.map((row) => {
       let result: string;
       if (now - row.at > RUNNER_ADMIN_TTL_MS) result = "expired";
@@ -366,6 +368,11 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
       else if (row.op === "rotate") {
         const cmdId = accept.rotate(row.label);
         result = cmdId ? `sent cmdId=${cmdId}` : "not-connected";
+      } else if (row.op === "lane.start" && row.body) {
+        // Not connected now: the request stays open and is tried again on the next pass until it expires.
+        if (!accept.connected(row.label)) return `RUNNER_ADMIN op=${row.op} runner=${row.label} waiting for the runner`;
+        const cmdSeq = accept.command(row.label, "lane.start", JSON.parse(row.body) as SupervisorCommandBodies["lane.start"]);
+        result = cmdSeq ? `sent cmdSeq=${cmdSeq}` : "not-connected";
       } else result = `unknown op ${row.op}`;
       db.query("UPDATE runner_admin SET doneAt = ?, result = ? WHERE id = ?").run(now, result, row.id);
       return `RUNNER_ADMIN op=${row.op} runner=${row.label} result=${result}`;

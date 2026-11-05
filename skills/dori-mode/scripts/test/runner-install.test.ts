@@ -115,6 +115,9 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   expect(argvLog).toContain("loginctl enable-linger dori");
   expect(readFileSync(join(host.home, "enroll-stdin"), "utf8")).toBe(`code=${CODE}\nfingerprint=${FINGERPRINT}\n`);
   expect(readFileSync(join(host.home, ".dori/runner/bin/dori.js"), "utf8")).toBe(BUNDLE);
+  const wrapper = join(host.home, ".dori/runner/bin/dori");
+  expect(readFileSync(wrapper, "utf8")).toBe(`#!/bin/sh\nexec "${join(host.bin, "bun")}" "$HOME/.dori/runner/bin/dori.js" "$@"\n`);
+  expect(statSync(wrapper).mode & 0o777).toBe(0o700);
   expect(statSync(join(host.home, ".dori/runner")).mode & 0o777).toBe(0o700);
   const unit = readFileSync(join(host.home, ".config/systemd/user/dori-runner.service"), "utf8");
   expect(unit).toContain(`ExecStart=${join(host.bin, "bun")} %h/.dori/runner/bin/dori.js runner serve --label worker-a --connect ws://100.101.1.2:7411`);

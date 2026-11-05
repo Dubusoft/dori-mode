@@ -189,10 +189,19 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
  * here so a brief need not repeat them; the owner's own policy lines (`laneRules`: merge policy, CI policy) follow them.
  * Nothing lane-specific (key, thread, pane, Done line) may appear here; that is the "### This lane" section.
  */
+/**
+ * The `dori` a lane runs: the runner's lane-mode CLI on a worker for a runner-owned remote lane (installed by
+ * `dori runner install`), else the `dori` on PATH.
+ */
+export const laneCli = (lane: Pick<Lane, "machine" | "runner">): string => (lane.machine && lane.runner ? RUNNER_LANE_CLI : "dori");
+export const RUNNER_LANE_CLI = "~/.dori/runner/bin/dori";
+
 export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = [], shell?: PaneShell): string => {
-  const remote = Boolean(lane.machine);
-  const claim = remote ? "print the done line below in your own output" : lane.reportVia === "cli" ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
-  const ask = remote ? "print a question report line below in your own output" : lane.reportVia === "cli" ? "run the dori report question command below" : "send a question report line below";
+  // A runner-owned remote lane reports through the runner like a local lane through the supervisor.
+  const remote = Boolean(lane.machine) && !lane.runner;
+  const cliLane = lane.reportVia === "cli" || Boolean(lane.runner);
+  const claim = remote ? "print the done line below in your own output" : cliLane ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
+  const ask = remote ? "print a question report line below in your own output" : cliLane ? "run the dori report question command below" : "send a question report line below";
   return [
     "- Set a goal first: restate the deliverable and the observable condition that ends this lane. The `Done =` signals below still decide when the lane closes; your restatement does not replace them.",
     "- Work until that condition holds. Do not stop to ask permission for reversible steps the brief already covers; only a decision the brief leaves open goes to the owner, as below.",
@@ -207,7 +216,7 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
     "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
     `- For any owner decision, ${ask} and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.`,
     ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
-    `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${remote ? (shell === "powershell" ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\\.dori\\guard-agent.ps1" heavy' : "sh ~/.dori/guard-agent.sh heavy") : "dori heavy"} <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
+    `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${remote ? (shell === "powershell" ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\\.dori\\guard-agent.ps1" heavy' : "sh ~/.dori/guard-agent.sh heavy") : `${laneCli(lane)} heavy`} <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
     ...laneRules.map((rule) => `- ${rule}`),
     ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
   ].join("\n");
@@ -223,7 +232,12 @@ export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, lan
   "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}`,
-  ...(lane.machine
+  ...(lane.machine && lane.runner
+    ? [
+      `- This lane runs on machine ${lane.machine} under its runner. Report to the lead with ${RUNNER_LANE_CLI} report, never by typing into any pane: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". question and blocked wake the lead, milestone reaches it with its next update, progress is posted to your work thread. That CLI takes only report, claim-done and heavy, and only for this lane's key.`,
+      `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
+    ]
+    : lane.machine
     ? [
       `- This lane runs on machine ${lane.machine}; the lead reads this pane from another host. Report at each milestone by printing this line in your own output (do not message any pane): [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>.`,
       `- When done: print [REPORT] ${lane.key} | done | <merge SHA, closed issue, version> and stay idle. The lead checks the Done signals and closes the lane; dori claim-done is not available on this machine. Each distinct report line is read once: after a [LEAD] not done, print a done line with updated evidence.`,

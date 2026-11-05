@@ -84,6 +84,9 @@ export const installScript = (bundle: string, unit: string, label: string, conne
     `cat > "$R/bin/dori.js.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(bundle)}${HEREDOC}`,
     'mv -f "$R/bin/dori.js.tmp" "$R/bin/dori.js" || exit 1',
+    // The `dori` a runner lane runs (its footer names this path): the bundle in lane mode.
+    `printf '#!/bin/sh\\nexec "%s" "$HOME/.dori/runner/bin/dori.js" "$@"\\n' "$BUN" > "$R/bin/dori" || exit 1`,
+    'chmod 700 "$R/bin/dori" || exit 1',
     `cat > "$R/dori-runner.service.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(unit)}${HEREDOC}`,
     `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$PATH|g" "$R/dori-runner.service.tmp" > "$HOME/.config/systemd/user/dori-runner.service" || exit 1`,

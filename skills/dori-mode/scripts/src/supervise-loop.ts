@@ -6,6 +6,7 @@ import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } f
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { readRunnerRows, RunnerHub } from "./runner/hub.ts";
 import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
+import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps, reconcileInventory } from "./runner/lanes-hub.ts";
 import { recordDiffLines } from "./runner/shadow-store.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import {
@@ -863,16 +864,40 @@ export const supervise = async (
     let lastGitHub = -Infinity;
     // Only with a `runners` section; an unsafe runner directory or a busy socket costs the hub, never the supervisor.
     let liveness: LivenessMonitor | undefined;
+    let takeLaneEvents: () => Promise<void> = async () => {};
     if (deps.config.runners) {
       try {
         const listen = deps.config.runners.listen;
         // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
         let monitor: LivenessMonitor | undefined;
+        // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
+        let laneWork: Promise<void> = Promise.resolve();
+        const laneDeps: LaneHubDeps = {
+          registry: deps.registry, reports: () => reports, now: deps.clock.now,
+          emit: (id, line) => { enqueueSweep(id, line); },
+          recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+        };
+        const inOrder = (what: string, work: () => Promise<void>): void => {
+          laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
+        };
         const hub = runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
           ...(listen ? { listen } : {}),
           onHeartbeat: (label) => { void monitor?.heartbeat(label); },
-          onHello: (label, body) => { void monitor?.hello(label, body.gen); },
+          onHello: (label, body) => {
+            void monitor?.hello(label, body.gen);
+            inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
+          },
         }));
+        // Lane events come from the hub's journal on every runners pass (from the start after a restart): the hub acks
+        // an event once it is journaled there, so nothing is lost if this process stops before storing a report.
+        let laneRowid = 0;
+        takeLaneEvents = () => {
+          for (const e of laneEventsAfter(deps.config.stateDir, laneRowid)) {
+            laneRowid = e.rowid;
+            inOrder(`${e.frame.type} ${e.label}`, () => acceptLaneEvent(laneDeps, e.label, e.frame));
+          }
+          return laneWork;
+        };
         let livenessSeq = 0;
         monitor = liveness = new LivenessMonitor({
           monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
@@ -943,6 +968,7 @@ export const supervise = async (
       ...(runnerHub ? [task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
         const handle = runnerHub as RunnerHubHandle;
         try { await liveness?.tick(); } catch (e) { console.error(`RUNNER_LIVENESS_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        try { await takeLaneEvents(); } catch (e) { console.error(`RUNNER_LANE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
         try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now())) console.log(line); }
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }

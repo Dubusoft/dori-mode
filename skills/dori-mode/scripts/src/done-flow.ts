@@ -543,7 +543,10 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: SweepVi
     return;
   }
   let lane = listed;
-  if (lane.machine && (status === "working" || status === "not-done")) lane = await remoteReport(deps, lane, push, view);
+  // A runner-owned lane whose runner has delivered its first report is heard through the runner; until then (a lane
+  // moving onto its runner) its [REPORT] lines are still read from the screen.
+  const heardViaRunner = Boolean(lane.runner && lane.lastRunnerReportAt);
+  if (lane.machine && !heardViaRunner && (status === "working" || status === "not-done")) lane = await remoteReport(deps, lane, push, view);
   let claim = lane.claim;
   if (statusOf(lane) !== "done-claimed" || !claim) return;
   const machine = machineClose(lane);
