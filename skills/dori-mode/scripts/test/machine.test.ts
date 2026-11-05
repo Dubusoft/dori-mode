@@ -122,6 +122,24 @@ test("POSIX remote launch copies the complete brief to a remote-valid path befor
   }
 });
 
+test("POSIX remote launch exposes the lane key to the agent environment", async () => {
+  const d = deps();
+  const input = lane({ key: `remote-posix-env-${process.pid}` });
+  await Bun.write(input.brief, "work\n");
+  await launchLane({ ...d, config: { ...d.config, agentCommand: ["sh", "-c", 'printf %s "$DORI_LANE_KEY"'] } }, input);
+  const command = calls.find((argv) => argv[4] === "run")?.[6];
+  if (!command) throw new Error("launch did not submit a command");
+  const remote = `/tmp/dori-brief-${input.key}.md`;
+  const remoteState = withState();
+  try {
+    const executed = await realRun(["sh", "-c", command.replaceAll(remote, join(remoteState.dir, `dori-brief-${input.key}.md`))], { timeoutMs: 5_000 });
+    expect(executed.code).toBe(0);
+    expect(executed.out).toBe(input.key);
+  } finally {
+    remoteState.done();
+  }
+});
+
 /** Reads a PowerShell line the way its parser treats single quotes: '' inside a literal is one quote, as are the typographic quotes. */
 const psTokens = (line: string): { readonly literals: string[]; readonly code: string } => {
   const literals: string[] = [];
@@ -189,9 +207,10 @@ test("PowerShell remote launch ships the brief as bytes and quotes every argumen
   // Pure printable ASCII: typed non-ASCII is not reliable through a pane's line editor.
   expect(command).toMatch(/^[\x20-\x7e]+$/);
   const { literals, code } = psTokens(command);
-  const head = /^\$doriBrief = Join-Path \(\[IO\.Path\]::GetTempPath\(\)\) <0>; \[IO\.File\]::WriteAllBytes\(\$doriBrief, \[Convert\]::FromBase64String\(<1>\)\); if \(\$\?\) \{ & (.*) \}$/.exec(code);
+  const head = /^\$doriBrief = Join-Path \(\[IO\.Path\]::GetTempPath\(\)\) <0>; \[IO\.File\]::WriteAllBytes\(\$doriBrief, \[Convert\]::FromBase64String\(<1>\)\); if \(\$\?\) \{ \$env:DORI_LANE_KEY = <2>; & (.*) \}$/.exec(code);
   if (!head?.[1]) throw new Error(`unexpected PowerShell line shape: ${code}`);
   expect(literals[0]).toBe("dori-brief-remote-lane.md");
+  expect(literals[2]).toBe(input.key);
   expect(Buffer.from(literals[1] ?? "", "base64").toString("utf8")).toBe(shipped);
   // Evaluate the argument list with $doriBrief bound to a Windows temp path; it must equal the agent argv.
   expect(psArgv(head[1], literals, "C:\\Temp\\x.md")).toEqual([

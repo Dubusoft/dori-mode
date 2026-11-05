@@ -8,7 +8,7 @@ import type { Proc } from "../src/lane-memory.ts";
 import type { Lane } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
 import { HUB_FILE } from "../src/runner/hub.ts";
-import { observeHost } from "../src/runner/observe.ts";
+import { briefLane, observeHost } from "../src/runner/observe.ts";
 import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
 import { RunnerClient, yieldTurn } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
@@ -80,6 +80,35 @@ test("observeHost finds lanes by DORI_LANE_KEY without a registry and hashes the
     { key: "lane-b", pane: "p2", tab: "t2", status: "idle", reportHash: valueHash(REPORT_B) },
   ]);
   expect(lastReportLine(screens.p2 as string, "lane-b")).toBe(REPORT_B);
+});
+
+const withInfo = (override: Record<string, object>) => async (argv: readonly string[]): Promise<Ran> => {
+  if (argv[1] === "pane" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: override[argv[4] as string] } }));
+  return fakeHerdr(argv);
+};
+const agentArgv = (path: string): string[] => ["omo", `Read and execute the lane brief at ${path} in full. You are the lane; report as usual.`];
+const argvInfo = (path: string): Record<string, object> => ({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, name: "omo", argv: agentArgv(path) }] } });
+
+test("observeHost attributes a pane from the brief path in the agent argv when no process environment is readable", async () => {
+  const observed = await observeHost({ run: withInfo(argvInfo("/tmp/dori-brief-mac-lane.md")), procs: async () => [] });
+  expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "p1"]]);
+});
+
+test("observeHost attributes a Windows-style brief path in the agent argv", async () => {
+  const observed = await observeHost({ run: withInfo(argvInfo(String.raw`C:\Users\x\AppData\Local\Temp\dori-brief-win-lane.md`)), procs: async () => [] });
+  expect(observed.map((l) => l.key)).toEqual(["win-lane"]);
+});
+
+test("observeHost does not observe a pane whose argv names no dori-brief path", async () => {
+  const run = withInfo({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: ["vim", "/tmp/notes.md", "/tmp/dori-brief-x.txt"] }] } });
+  expect(await observeHost({ run, procs: async () => [] })).toEqual([]);
+  expect(briefLane(undefined)).toBeUndefined();
+  expect(briefLane(["/tmp/dori-brief-Bad_Key.md"])).toBeUndefined();
+});
+
+test("observeHost prefers the environment attribution over a different key in the argv", async () => {
+  const observed = await observeHost({ run: withInfo(argvInfo("/tmp/dori-brief-other-lane.md")), procs: async () => procs });
+  expect(observed.map((l) => l.key)).toEqual(["lane-a"]);
 });
 
 test("observeHost reports a lane whose agent_status is not alive as dead", async () => {
