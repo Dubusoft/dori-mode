@@ -14,7 +14,14 @@ export type RunnerPolicy = {
   readonly allowedRoots: readonly string[];
   readonly sandbox: "required" | "optional";
   readonly jobs: "allow" | "deny";
+  /** Guard thresholds for this host; each one absent falls back to the runner's config defaults. */
+  readonly guard?: Readonly<Partial<Record<GuardKey, number>>>;
+  /** Command-line patterns killed under critical memory pressure; absent falls back to the config's `heavyKill`. */
+  readonly heavyKill?: readonly string[];
 };
+
+const GUARD_KEYS = ["loadAlert", "loadOk", "memFreeMinPct", "memFreeCritPct", "swapFreeCritPct", "diskFreeMinGb", "panesMax"] as const;
+type GuardKey = (typeof GUARD_KEYS)[number];
 
 export const DEFAULT_POLICY: RunnerPolicy = { agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow" };
 
@@ -32,7 +39,7 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 /** Reads a policy from parsed JSON; unknown keys or wrong types throw. */
 export function parsePolicy(value: unknown): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
-  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs"]);
+  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill"]);
   for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
   const agents: Record<string, readonly string[]> = {};
@@ -46,7 +53,20 @@ export function parsePolicy(value: unknown): RunnerPolicy {
   if (value.allowedRoots !== undefined && !strings(value.allowedRoots)) throw new Error("runner-config: allowedRoots must be a string array");
   if (value.sandbox !== undefined && value.sandbox !== "required" && value.sandbox !== "optional") throw new Error("runner-config: sandbox must be required|optional");
   if (value.jobs !== undefined && value.jobs !== "allow" && value.jobs !== "deny") throw new Error("runner-config: jobs must be allow|deny");
+  if (value.heavyKill !== undefined && !strings(value.heavyKill)) throw new Error("runner-config: heavyKill must be a string array");
+  let guard: Partial<Record<GuardKey, number>> | undefined;
+  if (value.guard !== undefined) {
+    if (!isRecord(value.guard)) throw new Error("runner-config: guard must be an object");
+    guard = {};
+    for (const [key, n] of Object.entries(value.guard)) {
+      if (!(GUARD_KEYS as readonly string[]).includes(key)) throw new Error(`runner-config: unknown key guard.${key}`);
+      if (typeof n !== "number" || !Number.isFinite(n)) throw new Error(`runner-config: guard.${key} must be a number`);
+      guard[key as GuardKey] = n;
+    }
+  }
   return {
+    ...(guard ? { guard } : {}),
+    ...(value.heavyKill !== undefined ? { heavyKill: value.heavyKill as string[] } : {}),
     agents,
     allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,

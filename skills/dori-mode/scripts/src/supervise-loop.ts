@@ -6,6 +6,7 @@ import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } f
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { RunnerHub } from "./runner/hub.ts";
 import { recordDiffLines } from "./runner/shadow-store.ts";
+import { RunnerGuardBoard } from "./runner/guard.ts";
 import {
   acceptRunners, drainRunnerAdmin, type HubHooks, LOCAL_RUNNER, loadIdentity, nextEpoch, openRunnerJournal, type RunnerAccept,
   type RunnerJournal, ShadowObserver,
@@ -32,7 +33,7 @@ import { describeKilled, heavyTargets, type KilledProc, killProcs } from "./pres
 import type { Lane } from "./registry.ts";
 import {
   type GuardMachine, guardAgentWants, killOnMachine, type KillResult, loadMachineGuardState,
-  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, readGuardMachines, sampleMachine, saveMachineGuardState,
+  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, readGuardMachines, sampleMachine, saveMachineGuardState, wantFor,
 } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -131,6 +132,8 @@ export type RunnerHubHandle = {
   /** Live connection operations (revoke, rotate, commands). */
   readonly accept: RunnerAccept;
   readonly shadow: ShadowObserver;
+  /** Each runner's latest guard sample and unreported kills, for the machine-guard sweep. */
+  readonly guard: RunnerGuardBoard;
   close(): void;
 };
 
@@ -191,17 +194,18 @@ export const openRunnerHub = (
     catch (e) { log(`RUNNER_LISTEN_FAILED listen=${options.listen} ${e instanceof Error ? e.message : String(e)}`); }
   }
   const shadow = new ShadowObserver();
+  const guard = new RunnerGuardBoard(monotonic);
   const accept = acceptRunners(hub, network ? [listener, network] : [listener], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
     onHello: (label, body) => { shadow.hello(label, body.inventory); options.onHello?.(label, body); },
-    onEvent: (label, frame) => { shadow.event(label, frame); options.onEvent?.(label, frame); },
+    onEvent: (label, frame) => { shadow.event(label, frame); guard.event(label, frame); options.onEvent?.(label, frame); },
     auth,
     log,
   });
   log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}${network ? ` listen=${network.host}:${network.port}` : ""}`);
   const keys = auth;
   return {
-    hub, journal, listener, auth: keys, accept, shadow, ...(network ? { network } : {}),
+    hub, journal, listener, auth: keys, accept, shadow, guard, ...(network ? { network } : {}),
     close() { accept(); listener.close(); network?.close(); keys.close(); hub.close(); journal.close(); },
   };
 };
@@ -493,6 +497,7 @@ export const supervisorSweeps = (
   deps: FlowDeps, home: string, enqueueRecovery?: RecoveryEnqueue,
   laneReports: () => LaneReportStore | undefined = () => undefined,
   io: PressureIo = pressureIo(deps),
+  runnerGuard: () => RunnerGuardBoard | undefined = () => undefined,
 ): readonly Sweep[] => {
   const guard: GuardState = { alerting: false };
   const critical = { critical: false };
@@ -559,8 +564,15 @@ export const supervisorSweeps = (
       }
       const due = guardMachines.list.filter((m) => machineDue(machineGuard, m.label, now));
       if (!due.length) return [];
-      const results = await Promise.all(due.map(async (machine) => ({ machine, result: await sampleMachine(deps.run, machine) })));
       const want = guardAgentWants(await readGuardAgentScripts());
+      // A machine whose runner sent a fresh sample is not sampled over ssh; without one (no runner, or it went quiet)
+      // the ssh path runs as before. The runner kills by itself, so its machine's critical stage takes the kills it
+      // reported instead of killing over ssh.
+      const board = runnerGuard();
+      const results = await Promise.all(due.map(async (machine) => {
+        const fromRunner = board?.sampleFor(machine.label, (os) => wantFor(want, os));
+        return { machine, result: fromRunner ?? await sampleMachine(deps.run, machine), viaRunner: fromRunner !== undefined };
+      }));
       const open = await deps.registry.open();
       // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
       // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.
@@ -585,8 +597,10 @@ export const supervisorSweeps = (
           await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
           clearLaunchHold(deps.config.stateDir, label);
         }
-        const criticalLines = await Promise.all(results.map(({ machine, result }) =>
-          result.ok ? machineCriticalTick(deps, machine, result.sample, open, machineCritical, io) : Promise.resolve(undefined)));
+        const criticalLines = await Promise.all(results.map(({ machine, result, viaRunner }) =>
+          result.ok
+            ? machineCriticalTick(deps, machine, result.sample, open, machineCritical, viaRunner && board ? { ...io, killRemote: async (m) => board.takeKills(m.label) } : io)
+            : Promise.resolve(undefined)));
         for (const line of criticalLines) if (line) await emit(line);
       } finally {
         saveMachineGuardState(machineGuardPath, machineGuard);
@@ -733,7 +747,8 @@ export const supervise = async (
     const sweepProbe = probe.span();
     // Each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog.
     // The watcher reads its claim announcements back from the journal.
-    const sweeps = supervisorSweeps({ ...deps, leadDelivered: (id) => supervisor.leadDelivered(id) }, home, async (line, id) => { enqueueSweep(id, line); }, () => reports).map(([name, step]): Sweep => [name, async (emit) =>
+    const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id) };
+    const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard).map(([name, step]): Sweep => [name, async (emit) =>
       watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
     const recentWarnings = new Map<string, number>();
     const boot = randomUUID();

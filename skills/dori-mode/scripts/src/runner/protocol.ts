@@ -52,9 +52,18 @@ export type RunnerEventBodies = {
   readonly "lane.progress": { readonly key: string; readonly reportHash?: string; readonly text?: string };
   readonly "wait.result": { readonly waitId: string; readonly outcome: WaitOutcome; readonly detail: string };
   readonly "job.result": { readonly opKey: string; readonly state: "verified" | "failed"; readonly exitCode: number; readonly output: string };
-  readonly "guard.sample": { readonly level: GuardLevel; readonly reasons: readonly string[]; readonly sampledAt: number };
+  /** The level with its reasons, plus the readings the supervisor's HOST_GUARD lines quote (-1 when unreadable). */
+  readonly "guard.sample": {
+    readonly level: GuardLevel; readonly reasons: readonly string[]; readonly sampledAt: number;
+    readonly load1?: number; readonly memFreePct?: number; readonly diskFreeGb?: number; readonly swapFreeGb?: number; readonly swapTotalGb?: number;
+    readonly os?: string;
+  };
   readonly "guard.alert": { readonly reasons: readonly string[] };
-  readonly "guard.critical": { readonly killed: readonly number[]; readonly paused: readonly string[] };
+  /** `rssKb[i]` and `cmds[i]` describe `killed[i]`, so the supervisor reports a runner's kills as it reports its own. */
+  readonly "guard.critical": {
+    readonly killed: readonly number[]; readonly paused: readonly string[]; readonly reasons?: readonly string[];
+    readonly rssKb?: readonly number[]; readonly cmds?: readonly string[];
+  };
   readonly "heavy.state": { readonly slots: number; readonly used: number; readonly holders: readonly string[] };
   readonly "cmd.result": { readonly cmdId: string; readonly cmdSeq: number; readonly state: CommandOutcome; readonly detail: string };
 };
@@ -208,9 +217,12 @@ const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
   "lane.progress": { key: req("string"), reportHash: opt("string"), text: opt("string") },
   "wait.result": { waitId: req("string"), outcome: req({ enum: ["WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED"] }), detail: req("string") },
   "job.result": { opKey: req("string"), state: req({ enum: ["verified", "failed"] }), exitCode: req("int"), output: req("string") },
-  "guard.sample": { level: req({ enum: ["ok", "alert", "critical"] }), reasons: req("string[]"), sampledAt: req("int") },
+  "guard.sample": {
+    level: req({ enum: ["ok", "alert", "critical"] }), reasons: req("string[]"), sampledAt: req("int"),
+    load1: opt("number"), memFreePct: opt("number"), diskFreeGb: opt("number"), swapFreeGb: opt("number"), swapTotalGb: opt("number"), os: opt("string"),
+  },
   "guard.alert": { reasons: req("string[]") },
-  "guard.critical": { killed: req("int[]"), paused: req("string[]") },
+  "guard.critical": { killed: req("int[]"), paused: req("string[]"), reasons: opt("string[]"), rssKb: opt("int[]"), cmds: opt("string[]") },
   "heavy.state": { slots: req("int"), used: req("int"), holders: req("string[]") },
   "cmd.result": { cmdId: req("string"), cmdSeq: req("int"), state: req({ enum: ["verified", "failed", "ambiguous"] }), detail: req("string") },
 };
