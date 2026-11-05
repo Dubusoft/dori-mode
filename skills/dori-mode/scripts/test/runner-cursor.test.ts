@@ -192,7 +192,7 @@ describe("hub commit-then-ack", () => {
       expect(hub.receive(runnerEvent(HEAD, 1, "lane.state", stateBody))).toMatchObject({ result: "duplicate", eventAck: 1 });
       expect(ids).toEqual([journalId(LABEL, 1)]);
       const reply = hello(hub);
-      expect(reply.ok && reply.reply.body).toEqual({ proto: 1, epoch: 1, eventAck: 1 });
+      expect(reply.ok && reply.reply.body).toEqual({ proto: 2, epoch: 1, eventAck: 1 });
     } finally {
       hub.close();
     }

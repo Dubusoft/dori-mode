@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { laneGeneration } from "../lane-reports.ts";
-import type { Pane } from "../panes.ts";
+import { paneAlive, type Pane } from "../panes.ts";
 import type { Lane } from "../registry.ts";
 import type { Clock } from "../run.ts";
 import { backoffMs, type RunnerClient, yieldTurn } from "./client.ts";
@@ -18,7 +18,7 @@ import {
   type RunnerEventBodies, type SupervisorCommandBodies, type SupervisorCommandType,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
-import { diffUnits, settleCycle, shadowDiffLine, shadowUnit, valueHash, type ShadowDiff, type ShadowUnit } from "./shadow.ts";
+import { diffUnits, settleCycle, shadowDiffLine, shadowUnit, valueHash, type PendingDiff, type ShadowDiff, type ShadowUnit } from "./shadow.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 
 /**
@@ -31,6 +31,11 @@ import type { Connector, Listener, Transport } from "./transport.ts";
 export const LOCAL_RUNNER = "local";
 /** How often a shadow runner reads its lanes. */
 export const SHADOW_OBSERVE_MS = 30_000;
+/**
+ * How long a shadow difference must persist before it is reported with its class: two observation periods plus
+ * margin, so a real transition the runner has not observed yet is not counted as a failure.
+ */
+export const SHADOW_SETTLE_MS = 2 * SHADOW_OBSERVE_MS + 5_000;
 /** Committed runner events are kept this long in the hub's journal table. */
 export const RUNNER_JOURNAL_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
@@ -393,18 +398,32 @@ export const lanesFor = (label: string, lanes: readonly Lane[]): Lane[] =>
 /** Lane statuses that mean the lane's agent is there. */
 const ALIVE: ReadonlySet<LaneStatus> = new Set(["working", "idle"]);
 
+/** What the supervisor's own paths hold for one shadow cycle. */
+export type ShadowLegacy = {
+  /** herdr's pane list for the runner's machine; undefined when it could not be read this pass. */
+  readonly panes: readonly Pane[] | undefined;
+  /** Keys of archived (closed) lanes. */
+  readonly archived: ReadonlySet<string>;
+};
+
 /**
  * Compares what each shadow runner reported with what the supervisor's own paths hold, with no effect on lane state.
- * Two cheap units per lane: `inventory.pane` (the registry's pane id against the runner's hello inventory) and
- * `lane.state` field `alive` (an open registry lane against the runner's latest `lane.state`: working or idle is
- * alive). A difference waits one cycle (`settleCycle`) before it is reported as a `RUNNER_SHADOW_DIFF` line.
+ * Two cheap units per lane: `inventory.pane` (the registry's pane id against the runner's pane for the lane, from the
+ * hello inventory overridden by the `pane` of later `lane.state` events) and `lane.state` field `alive` (panes.ts
+ * `paneAlive` on the supervisor's own pane list against the runner's latest `lane.state`: working or idle is alive).
+ * Without a readable legacy pane list no `lane.state` unit is compared that pass. A lane that is closed (archived and
+ * not open) is dropped from the runner's side. A difference is reported as a `RUNNER_SHADOW_DIFF` line once it has
+ * persisted `SHADOW_SETTLE_MS` (`settleCycle`).
  */
 export class ShadowObserver {
-  private readonly runners = new Map<string, { inventory?: readonly InventoryLane[]; states: Map<string, LaneStatus>; reports: Map<string, string>; pending: readonly ShadowDiff[] }>();
+  private readonly runners = new Map<string, {
+    inventory?: readonly InventoryLane[]; panes: Map<string, string>; states: Map<string, LaneStatus>; reports: Map<string, string>;
+    pending: readonly PendingDiff[];
+  }>();
 
   private entry(label: string) {
     let entry = this.runners.get(label);
-    if (!entry) this.runners.set(label, entry = { states: new Map(), reports: new Map(), pending: [] });
+    if (!entry) this.runners.set(label, entry = { panes: new Map(), states: new Map(), reports: new Map(), pending: [] });
     return entry;
   }
 
@@ -414,7 +433,11 @@ export class ShadowObserver {
   }
 
   event(label: string, frame: AnyRunnerEvent): void {
-    if (frame.type === "lane.state") this.entry(label).states.set(frame.body.key, frame.body.status);
+    if (frame.type === "lane.state") {
+      const entry = this.entry(label);
+      entry.states.set(frame.body.key, frame.body.status);
+      if (frame.body.pane !== undefined) entry.panes.set(frame.body.key, frame.body.pane);
+    }
     if (frame.type === "lane.progress" && frame.body.reportHash) this.entry(label).reports.set(frame.body.key, frame.body.reportHash);
   }
 
@@ -423,26 +446,36 @@ export class ShadowObserver {
     return [...this.runners.keys()].sort();
   }
 
-  /** One cycle for `label` against the registry's open lanes; returns the lines to log. */
-  cycle(label: string, open: readonly Lane[]): string[] {
+  /** One cycle for `label` at `now` against the registry's open lanes and the legacy pane list; returns the lines to log. */
+  cycle(label: string, open: readonly Lane[], now: number, legacySide: ShadowLegacy): string[] {
     const entry = this.entry(label);
+    const openKeys = new Set(open.map((l) => l.key));
+    const closed = (key: string): boolean => !openKeys.has(key) && legacySide.archived.has(key);
+    for (const map of [entry.panes, entry.states, entry.reports]) for (const key of [...map.keys()]) if (closed(key)) map.delete(key);
     const lanes = lanesFor(label, open);
     const generation = new Map(lanes.map((l) => [l.key, laneGeneration(l)]));
     const gen = (key: string): number => generation.get(key) ?? 0;
+    const byId = legacySide.panes && new Map(legacySide.panes.map((p) => [p.pane_id, p]));
     // A remote lane's newest [REPORT] line: the line the supervisor's screen scraping recorded, against the hash the
     // runner read from the same pane. Both sides hash with valueHash, so the runner never sends the line itself.
     const legacy: ShadowUnit[] = lanes.flatMap((l) => [
       shadowUnit("inventory.pane", l.key, gen(l.key), "pane", l.pane ?? ""),
-      shadowUnit("lane.state", l.key, gen(l.key), "alive", "yes"),
+      ...(byId ? [shadowUnit("lane.state", l.key, gen(l.key), "alive", paneAlive(byId.get(l.pane ?? "")) ? "yes" : "no")] : []),
       ...(l.machine && l.lastRemoteReport ? [shadowUnit("lane.report", l.key, gen(l.key), "latest", valueHash(l.lastRemoteReport))] : []),
     ]);
+    const panes = new Map((entry.inventory ?? []).map((lane) => [lane.key, lane.pane]));
+    for (const [key, pane] of entry.panes) panes.set(key, pane);
     const runner: ShadowUnit[] = [
-      ...(entry.inventory ?? []).map((lane) => shadowUnit("inventory.pane", lane.key, gen(lane.key), "pane", lane.pane)),
-      ...[...entry.states].map(([key, status]) => shadowUnit("lane.state", key, gen(key), "alive", ALIVE.has(status) ? "yes" : "no")),
+      ...[...panes].filter(([key]) => !closed(key)).map(([key, pane]) => shadowUnit("inventory.pane", key, gen(key), "pane", pane)),
+      ...(byId ? [...entry.states].map(([key, status]) => shadowUnit("lane.state", key, gen(key), "alive", ALIVE.has(status) ? "yes" : "no")) : []),
       ...[...entry.reports].map(([key, hash]) => shadowUnit("lane.report", key, gen(key), "latest", hash)),
     ];
-    const settled = settleCycle(entry.pending, diffUnits(legacy, runner));
-    entry.pending = settled.pending;
+    // Without a legacy pane list, lane.state differences already being watched are held as they are, neither settled
+    // nor reported as timing.
+    const held = (diff: ShadowDiff): boolean => !byId && diff.kind === "lane.state";
+    const watched = entry.pending.filter((diff) => !closed(diff.laneKey));
+    const settled = settleCycle(watched.filter((diff) => !held(diff)), diffUnits(legacy, runner), now, SHADOW_SETTLE_MS);
+    entry.pending = [...settled.pending, ...watched.filter(held)];
     return settled.report.map((diff) => shadowDiffLine(label, diff));
   }
 }
@@ -455,14 +488,18 @@ export class ShadowObserver {
 export type ObservedLane = InventoryLane & { readonly status: LaneStatus; readonly reportHash?: string };
 
 /**
- * What a runner sees of the lanes it covers: the registry's open lanes for the label, each matched against herdr's
- * pane list. No pane: `missing`; a pane with no agent: `dead`; an agent reported working: `working`; else `idle`.
+ * A lane's status from its herdr pane, by panes.ts `paneAlive`: no pane: `missing`; a pane whose agent is not alive:
+ * `dead`; alive and working: `working`; alive otherwise: `idle`.
  */
+export const laneStatus = (pane: Pane | undefined): LaneStatus =>
+  !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
+
+/** What a runner sees of the lanes it covers: the registry's open lanes for the label, each matched against herdr's pane list (`laneStatus`). */
 export const observeLanes = (label: string, open: readonly Lane[], panes: readonly Pane[]): ObservedLane[] => {
   const byId = new Map(panes.map((p) => [p.pane_id, p]));
   return lanesFor(label, open).flatMap((lane): ObservedLane[] => {
     const pane = byId.get(lane.pane ?? "");
-    const status: LaneStatus = !pane ? "missing" : !pane.agent ? "dead" : pane.agent_status === "working" ? "working" : "idle";
+    const status = laneStatus(pane);
     return [{ key: lane.key, pane: lane.pane ?? "", tab: pane?.tab_id ?? lane.tab ?? "", ...(lane.session ? { session: lane.session } : {}), status }];
   });
 };
@@ -493,19 +530,24 @@ export type ServeDeps = {
 /**
  * The runner's serve loop, as `RunnerClient.run` but with a heartbeat right after each hello and on a timer separate
  * from any work (heartbeats never go through the outbox). In shadow mode a second timer reads the lanes, keeps the
- * latest list as the hello inventory, and publishes `lane.state` for each lane whose status changed (published through
- * the outbox, so nothing is lost while disconnected). It changes nothing on the host.
+ * latest list as the hello inventory, and publishes `lane.state {key, status, pane}` for each lane whose status or pane
+ * changed (published through the outbox, so nothing is lost while disconnected). A lane no longer observed is
+ * forgotten, so it is published again if it comes back. It changes nothing on the host.
  */
 export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise<void> => {
-  const published = new Map<string, LaneStatus>();
+  const published = new Map<string, string>();
   const publishedReport = new Map<string, string>();
   const observeOnce = async (): Promise<void> => {
     if (!deps.observe) return;
     try {
-      for (const lane of await deps.observe()) {
-        if (published.get(lane.key) !== lane.status) {
-          published.set(lane.key, lane.status);
-          deps.client.publish("lane.state", { key: lane.key, status: lane.status });
+      const observed = await deps.observe();
+      const keys = new Set(observed.map((lane) => lane.key));
+      for (const map of [published, publishedReport]) for (const key of [...map.keys()]) if (!keys.has(key)) map.delete(key);
+      for (const lane of observed) {
+        const seen = JSON.stringify([lane.status, lane.pane]);
+        if (published.get(lane.key) !== seen) {
+          published.set(lane.key, seen);
+          deps.client.publish("lane.state", { key: lane.key, status: lane.status, pane: lane.pane });
         }
         if (lane.reportHash && publishedReport.get(lane.key) !== lane.reportHash) {
           publishedReport.set(lane.key, lane.reportHash);

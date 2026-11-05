@@ -8,7 +8,7 @@ import { RunnerClient } from "../src/runner/client.ts";
 import { runStartupCheck } from "../src/runner/fs-safety.ts";
 import { HUB_FILE, readRunnerRows } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { loadIdentity, type ObservedLane, serveRunner, trackedConnector } from "../src/runner/serve.ts";
+import { loadIdentity, type ObservedLane, SHADOW_SETTLE_MS, serveRunner, trackedConnector } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
@@ -81,14 +81,16 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(renderStatus(status)).toContain("RUNNER local connected proto=1 version=- gen=1 hb=0 outbox=");
+  expect(renderStatus(status)).toContain("RUNNER local connected proto=2 version=- gen=1 hb=0 outbox=");
   expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=1$/m);
 
-  // Shadow: the registry has no lane "demo", so after one settling cycle each unit is reported missing-in-legacy.
+  // Shadow: the registry has no lane "demo", so once a difference has persisted SHADOW_SETTLE_MS each unit is
+  // reported missing-in-legacy.
   const shadowLines: string[] = [];
-  await runnersPass(hub, deps.config, () => deps.registry.open(), (line) => { shadowLines.push(line); });
+  const side = (now: number) => ({ now, panes: async () => [], archived: () => deps.registry.archivedKeys(), error: (line: string) => { shadowLines.push(line); } });
+  await runnersPass(hub, deps.config, () => deps.registry.open(), side(clock.now()), (line) => { shadowLines.push(line); });
   expect(shadowLines).toEqual([]);
-  await runnersPass(hub, deps.config, () => deps.registry.open(), (line) => { shadowLines.push(line); });
+  await runnersPass(hub, deps.config, () => deps.registry.open(), side(clock.now() + SHADOW_SETTLE_MS), (line) => { shadowLines.push(line); });
   expect(shadowLines.map((line) => line.split(" ").slice(0, 6).join(" "))).toEqual([
     "RUNNER_SHADOW_DIFF runner=local class=missing-in-legacy kind=inventory.pane lane=demo gen=0",
     "RUNNER_SHADOW_DIFF runner=local class=missing-in-legacy kind=lane.state lane=demo gen=0",

@@ -35,6 +35,10 @@ export const readScreen = async (run: Runner, pane: string, lines?: number): Pro
 /** States herdr reports for a pane whose agent is running. A screen read never stands in for these. */
 export const ALIVE_STATUSES: ReadonlySet<string> = new Set(["idle", "working", "blocked", "done"]);
 
+/** A lane's agent is alive when its pane is in herdr's pane list and its agent_status is one of ALIVE_STATUSES. */
+export const paneAlive = (pane: Pane | undefined): boolean =>
+  pane?.agent_status !== undefined && ALIVE_STATUSES.has(pane.agent_status);
+
 export const agentStatus = async (run: Runner, pane: string): Promise<string | undefined> =>
   (await listPanes(run)).find((p) => p.pane_id === pane)?.agent_status;
 

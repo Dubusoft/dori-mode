@@ -2,8 +2,9 @@
  * Shadow comparison: a runner in shadow mode reports what it sees, the supervisor changes nothing and compares it with
  * what the current paths found. Both sides are normalized into units `{kind, laneKey, generation, field, valueHash}`
  * and compared per unit key `kind|laneKey|generation|field`. A difference is one of `missing-in-runner`,
- * `missing-in-legacy`, `value-differs`; a difference that is gone at the next cycle is reclassified `timing`. Only
- * non-timing differences count as failures. Each reported difference is logged as one `RUNNER_SHADOW_DIFF` line.
+ * `missing-in-legacy`, `value-differs`; a difference is reported with its class only once it has persisted for the
+ * settle window, and one that is gone before then is reported once as `timing`. Only non-timing differences count as
+ * failures. Each reported difference is logged as one `RUNNER_SHADOW_DIFF` line.
  */
 
 import { createHash } from "node:crypto";
@@ -33,8 +34,14 @@ export type ShadowDiff = {
   readonly legacyHash?: string;
 };
 
-/** The result of one cycle: `report` is logged now, `pending` waits one cycle to tell timing from a real difference. */
-export type ShadowCycle = { readonly report: readonly ShadowDiff[]; readonly pending: readonly ShadowDiff[] };
+/**
+ * A difference being watched: `since` is when it was first seen (or last reported), `reported` whether it was already
+ * reported with its class.
+ */
+export type PendingDiff = ShadowDiff & { readonly since: number; readonly reported: boolean };
+
+/** The result of one cycle: `report` is logged now, `pending` is watched until it settles or goes away. */
+export type ShadowCycle = { readonly report: readonly ShadowDiff[]; readonly pending: readonly PendingDiff[] };
 
 /** A stable short hash of a normalized value (sha256 hex, first 16 characters). */
 export const valueHash = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
@@ -74,22 +81,33 @@ export const diffUnits = (legacy: readonly ShadowUnit[], runner: readonly Shadow
   return diffs.sort(([x], [y]) => byKey(x, y)).map(([, d]) => d);
 };
 
+const strip = ({ since: _since, reported: _reported, ...diff }: PendingDiff): ShadowDiff => diff;
+
 /**
- * Settles a cycle against the previous cycle's pending differences: one pending before and still present is reported
- * with its class; one pending before and gone now is reported as `timing`; one new now becomes pending.
+ * Settles the differences seen at `now` against the ones watched before. A difference present for at least `settleMs`
+ * is reported with its class and re-armed (reported again only after another full `settleMs`); one that goes away
+ * before it was ever reported is reported once as `timing`; one that goes away after being reported is dropped; a new
+ * one starts being watched.
  */
-export const settleCycle = (previousPending: readonly ShadowDiff[], current: readonly ShadowDiff[]): ShadowCycle => {
-  const before = new Set(previousPending.map(unitKey));
-  const now = new Set(current.map(unitKey));
+export const settleCycle = (previous: readonly PendingDiff[], current: readonly ShadowDiff[], now: number, settleMs: number): ShadowCycle => {
+  const before = new Map(previous.map((d) => [unitKey(d), d]));
+  const present = new Set(current.map(unitKey));
   const report: [string, ShadowDiff][] = [];
-  const pending: [string, ShadowDiff][] = [];
-  for (const diff of previousPending) {
-    if (!now.has(unitKey(diff))) report.push([unitKey(diff), { ...diff, class: "timing" }]);
+  const pending: [string, PendingDiff][] = [];
+  for (const [key, diff] of before) {
+    if (!present.has(key) && !diff.reported) report.push([key, { ...strip(diff), class: "timing" }]);
   }
   for (const diff of current) {
-    (before.has(unitKey(diff)) ? report : pending).push([unitKey(diff), diff]);
+    const key = unitKey(diff);
+    const seen = before.get(key);
+    if (seen && now - seen.since >= settleMs) {
+      report.push([key, diff]);
+      pending.push([key, { ...diff, since: now, reported: true }]);
+    } else {
+      pending.push([key, { ...diff, since: seen?.since ?? now, reported: seen?.reported ?? false }]);
+    }
   }
-  const sorted = (list: [string, ShadowDiff][]): ShadowDiff[] => list.sort(([x], [y]) => byKey(x, y)).map(([, d]) => d);
+  const sorted = <T>(list: [string, T][]): T[] => list.sort(([x], [y]) => byKey(x, y)).map(([, d]) => d);
   return { report: sorted(report), pending: sorted(pending) };
 };
 

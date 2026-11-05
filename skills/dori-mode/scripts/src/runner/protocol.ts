@@ -14,7 +14,7 @@
  */
 
 /** The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. */
-export const PROTO = 1;
+export const PROTO = 2;
 /** The envelope layout version (`v`). */
 export const ENVELOPE_VERSION = 1;
 /** The longest line `decodeFrame` accepts; the outbox caps a single body at 256KB, so a frame stays well under this. */
@@ -43,7 +43,8 @@ export type InventoryLane = { readonly key: string; readonly pane: string; reado
 
 export type RunnerEventBodies = {
   readonly "lane.started": { readonly key: string; readonly pane: string; readonly tab: string; readonly session: string };
-  readonly "lane.state": { readonly key: string; readonly status: LaneStatus };
+  /** `pane` (since proto 2) is the lane's pane id as the runner sees it; a proto 1 runner never sends it. */
+  readonly "lane.state": { readonly key: string; readonly status: LaneStatus; readonly pane?: string };
   readonly "lane.report": {
     readonly key: string; readonly kind: ReportKind; readonly text: string; readonly evidence?: string; readonly bodyRef?: BodyRef;
   };
@@ -208,7 +209,7 @@ const INVENTORY: Shape = { key: req("string"), pane: req("string"), tab: req("st
 
 const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
   "lane.started": { key: req("string"), pane: req("string"), tab: req("string"), session: req("string") },
-  "lane.state": { key: req("string"), status: req({ enum: ["working", "idle", "dead", "missing"] }) },
+  "lane.state": { key: req("string"), status: req({ enum: ["working", "idle", "dead", "missing"] }), pane: opt("string") },
   "lane.report": {
     key: req("string"), kind: req({ enum: ["progress", "question", "blocked", "milestone", "done"] }), text: req("string"),
     evidence: opt("string"), bodyRef: opt({ object: BODY_REF }),
