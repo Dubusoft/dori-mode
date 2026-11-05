@@ -23,6 +23,8 @@ export type SweepView = {
 export const SWEEP_CONCURRENCY = 4;
 /** One screen read per pane serves every sweep: the largest any of them asks for (remote reports, freshness posts). */
 export const SWEEP_SCREEN_LINES = 200;
+/** A cached screen older than this is read again even when the pane's revision and scroll extent are unchanged. */
+export const SWEEP_SCREEN_MAX_AGE_MS = 5 * 60_000;
 
 const on = (run: Runner, machine?: string): Runner => laneRunner(run, machine ? { machine } : {});
 
@@ -62,9 +64,9 @@ export const boundedRunner = (run: Runner, limit: number, deadlineAt: number, no
   };
 };
 
-type Seen = { readonly token: string; readonly screen?: string; readonly lines?: number; readonly infoToken?: string; readonly info?: Ran };
+type Seen = { readonly token: string; readonly screenToken?: string; readonly readAt?: number; readonly screen?: string; readonly lines?: number; readonly infoToken?: string; readonly info?: Ran };
 
-/** Reads kept across rounds, keyed by machine and pane; valid while the pane's herdr `revision` is unchanged. */
+/** Reads kept across rounds, keyed by machine and pane; a screen is valid while the pane's revision and scroll extent are unchanged and it is younger than SWEEP_SCREEN_MAX_AGE_MS. */
 export type SweepCache = Map<string, Seen>;
 export const newSweepCache = (): SweepCache => new Map();
 
@@ -83,8 +85,9 @@ const cacheKey = (machine: string | undefined, pane: string): string => `${machi
 
 /**
  * One sweep round: one `herdr pane list` per machine, taken now and shared by every sweep. A screen or process-info
- * read is cached by the pane's `revision` (herdr bumps it when the pane's content changes), so a pane that did not
- * change costs no call at all; a row without a revision is cached for this round only. Reads of open lanes whose pane
+ * read is cached by the pane's `revision` (herdr bumps it on prompt and command events, not when a program prints), so
+ * a screen is also keyed by the pane's scrollback extent and re-read once it is older than SWEEP_SCREEN_MAX_AGE_MS;
+ * a pane that did not change costs no call at all; a row without a revision is cached for this round only. Reads of open lanes whose pane
  * changed are prefetched with at most `concurrency` calls per machine, each machine within its own deadline.
  * A pane missing from the snapshot (a lane launched meanwhile) is confirmed with one fresh list before it counts as gone.
  */
@@ -123,6 +126,7 @@ export const sweepRound = async (run: Runner, cache: SweepCache, lanes: readonly
     return fresh;
   };
   const token = (row: Pane): string => row.revision === undefined ? `round:${round}` : `revision:${row.revision}`;
+  const screenToken = (row: Pane): string => `${token(row)}|${row.scroll?.max_offset_from_bottom ?? ""}`;
   const screen = async (ref: PaneRef, lines: number): Promise<string> => {
     const pane = ref.pane ?? "";
     let row: Pane | undefined;
@@ -132,11 +136,11 @@ export const sweepRound = async (run: Runner, cache: SweepCache, lanes: readonly
     const key = cacheKey(ref.machine, pane);
     const seen = cache.get(key);
     const want = Math.max(lines, SWEEP_SCREEN_LINES);
-    if (seen?.token === token(row) && seen.screen !== undefined && (seen.lines ?? 0) >= lines) return seen.screen.split("\n").slice(-lines).join("\n");
+    if (seen?.screenToken === screenToken(row) && seen.screen !== undefined && (seen.lines ?? 0) >= lines && opts.now() - (seen.readAt ?? 0) < SWEEP_SCREEN_MAX_AGE_MS) return seen.screen.split("\n").slice(-lines).join("\n");
     const r = await runnerFor(ref.machine)(["herdr", "pane", "read", pane, "--source", "recent", "--lines", String(want)]);
     if (r.code === 0) {
       const current = cache.get(key);
-      cache.set(key, { ...(current?.token === token(row) ? current : {}), token: token(row), screen: r.out, lines: want });
+      cache.set(key, { ...(current?.token === token(row) ? current : {}), token: token(row), screenToken: screenToken(row), readAt: opts.now(), screen: r.out, lines: want });
     }
     return r.out.split("\n").slice(-lines).join("\n");
   };

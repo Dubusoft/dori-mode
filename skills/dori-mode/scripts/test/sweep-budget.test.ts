@@ -5,7 +5,7 @@ import type { FlowDeps } from "../src/done-flow.ts";
 import { Registry, type Lane } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { runSweeps, supervisorSweeps } from "../src/supervise-loop.ts";
-import { boundedRunner } from "../src/sweep-view.ts";
+import { boundedRunner, newSweepCache, SWEEP_SCREEN_MAX_AGE_MS, sweepRound } from "../src/sweep-view.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -88,6 +88,61 @@ test("with 100 open lanes a round makes at most machines + changed lanes x 2 her
     expect(h.peak.get(machine) ?? 0).toBeGreaterThan(1);
   }
   expect(lines.filter((line) => /^(LANE_RECOVER|NUDGED|DEAD_PANE|UNRECOGNISED_PANE)/.test(line))).toEqual([]);
+});
+
+/** One pane whose revision, scroll extent and screen the test changes by hand. */
+const screenFake = () => {
+  const state = { revision: 2, maxOffset: 43, screen: "old screen" };
+  const calls: string[][] = [];
+  const run: Runner = async (argv): Promise<Ran> => {
+    calls.push([...argv]);
+    if (argv[2] === "list") {
+      const row = { pane_id: "w1:p1", workspace_id: "w1", revision: state.revision, scroll: { max_offset_from_bottom: state.maxOffset } };
+      return { code: 0, out: JSON.stringify({ result: { panes: [row] } }), err: "" };
+    }
+    if (argv[2] === "read") return { code: 0, out: state.screen, err: "" };
+    return { code: 1, out: "", err: "unexpected" };
+  };
+  const reads = (): number => calls.filter((c) => c[2] === "read").length;
+  return { state, run, reads };
+};
+const PANE = { pane: "w1:p1" };
+
+test("a screen is read again when the scroll extent grows although the revision is unchanged", async () => {
+  const f = screenFake();
+  const cache = newSweepCache();
+  let now = T0;
+  const opts = { now: () => now, deadlineMs: 10_000 };
+  expect(await (await sweepRound(f.run, cache, [], opts)).screen(PANE, 50)).toBe("old screen");
+  f.state.screen = "old screen\n[REPORT] new";
+  f.state.maxOffset = 44;
+  now += 30_000;
+  expect(await (await sweepRound(f.run, cache, [], opts)).screen(PANE, 50)).toBe("old screen\n[REPORT] new");
+  expect(f.reads()).toBe(2);
+});
+
+test("a screen with the same revision and scroll extent is served from the cache while younger than the maximum age", async () => {
+  const f = screenFake();
+  const cache = newSweepCache();
+  let now = T0;
+  const opts = { now: () => now, deadlineMs: 10_000 };
+  await (await sweepRound(f.run, cache, [], opts)).screen(PANE, 50);
+  f.state.screen = "changed";
+  now += SWEEP_SCREEN_MAX_AGE_MS - 1;
+  expect(await (await sweepRound(f.run, cache, [], opts)).screen(PANE, 50)).toBe("old screen");
+  expect(f.reads()).toBe(1);
+});
+
+test("a screen with the same revision and scroll extent is read again once older than the maximum age", async () => {
+  const f = screenFake();
+  const cache = newSweepCache();
+  let now = T0;
+  const opts = { now: () => now, deadlineMs: 10_000 };
+  await (await sweepRound(f.run, cache, [], opts)).screen(PANE, 50);
+  f.state.screen = "changed";
+  now += SWEEP_SCREEN_MAX_AGE_MS + 1;
+  expect(await (await sweepRound(f.run, cache, [], opts)).screen(PANE, 50)).toBe("changed");
+  expect(f.reads()).toBe(2);
 });
 
 test("a bounded runner never runs more than its limit at once and starts nothing past its deadline", async () => {
