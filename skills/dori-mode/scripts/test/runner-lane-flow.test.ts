@@ -25,7 +25,7 @@ const setup = async () => {
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });
   const emitted: [string, string][] = [];
-  const hub: LaneHubDeps = { registry: deps.registry, reports: () => store, now: clock.now, emit: (id, line) => { emitted.push([id, line]); }, recover: () => undefined, shadow: () => false };
+  const hub: LaneHubDeps = { registry: deps.registry, reports: () => store, now: clock.now, emit: (id, line) => { emitted.push([id, line]); }, recover: () => undefined };
   let seq = 0;
   const event = (type: RunnerEventType, body: object): AnyRunnerEvent => ({ v: 1, runner: "worker-a", gen: 1, epoch: 1, seq: ++seq, type, body }) as unknown as AnyRunnerEvent;
   const journal: string[] = [];

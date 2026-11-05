@@ -20,7 +20,7 @@ const setup = async (mode: "authoritative" | "off") => {
   await deps.registry.write({ key: "lane-a", title: "a", thread: "none", brief: join(s.dir, "a.md"), done: "x", openedAt: new Date(T0).toISOString(), status: "working", machine: "worker-a", runner: "worker-a", pane: "pa" } as unknown as Lane);
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });
-  const hub: LaneHubDeps = { registry: deps.registry, reports: () => store, now: clock.now, emit: () => {}, recover: () => undefined, shadow: () => false };
+  const hub: LaneHubDeps = { registry: deps.registry, reports: () => store, now: clock.now, emit: () => {}, recover: () => undefined };
   return { deps, store, hub };
 };
 const report = (seq: number, kind: string, text: string, evidence?: string): AnyRunnerEvent =>

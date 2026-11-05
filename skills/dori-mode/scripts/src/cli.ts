@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
-import { configPath, loadConfig, runnerMode } from "./config.ts";
+import { configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
@@ -265,7 +265,7 @@ if (process.argv[2] === "runner") {
     const store = openLaneReports(cfg);
     try {
       const lines = await evacuate({
-        hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined, shadow: (l) => runnerMode(cfg, l) === "shadow" },
+        hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined },
         exportOutbox: async () => {
           const r = await run(sshArgv(sshTarget, remoteRunnerCli("runner export-outbox")), { timeoutMs: 30_000 });
           if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);
