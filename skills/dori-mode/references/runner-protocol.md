@@ -352,6 +352,27 @@ The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_FORGED_E
 `RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
 `RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
 
+## Command durability
+
+The runner commits a command's intent before the effect and its result after it. A runner that stops between the two
+never runs the command again on restart. It settles it from what herdr shows:
+
+- **`lane.start`:** a pane whose process carries `DORI_LANE_KEY=<key>` makes it `verified`, no such pane makes it
+  `failed`, and herdr not answering leaves it `ambiguous`.
+- **Other commands:** they are `ambiguous`.
+
+Each outcome goes out as `cmd.result` (`RUNNER_CMD_RECOVERED` in the runner's log).
+
+After its own restart the supervisor reads an attempted command back with `cmd.status`. A runner with no record of
+it (`unknown`, for example after its state was lost) is not sent the same command again. The supervisor asks
+`lane.observe` instead:
+
+- the lane present makes the command `verified`;
+- its absence proven allows one more attempt;
+- anything else is `OPERATION_AMBIGUOUS` for the lead, and nothing is resent.
+
+Command records are kept 30 days.
+
 ## Runner-owned lanes
 
 `runners.mode.<label>` decides how new lanes start on a worker. With `authoritative`, `dori launch --machine <label>`
