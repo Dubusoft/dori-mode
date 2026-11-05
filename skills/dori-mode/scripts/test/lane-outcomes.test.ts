@@ -522,6 +522,35 @@ test("receipts without a thread (written before this check) never post a button"
   f.supervisor.close();
 });
 
+test("a report of a lane that closed before the supervisor's button re-arms nothing; a lane closed after it does", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
+  f.report("alpha");
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  // beta closes; its report has not arrived yet, so nothing is left on the thread and the button goes on.
+  f.clock.at += 1_000;
+  await f.close("beta");
+  f.clock.at += 1_000;
+  await f.tick();
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0}` }]);
+  // beta's report arrives after the button: that button already covers it.
+  f.clock.at += 5_000;
+  f.report("beta");
+  await f.tick();
+  await f.tick();
+  expect(f.posts).toHaveLength(1);
+  // gamma starts after the button, closes and is reported: new work gets a button of its own.
+  await f.deps.registry.write(lane("gamma", { thread: "discord:100/200" }));
+  f.clock.at += 1_000;
+  await f.close("gamma");
+  f.report("gamma");
+  await f.tick();
+  expect(f.posts.map((post) => post.id)).toEqual([`close-button:200:${T0}`, `close-button:200:${f.clock.now()}`]);
+  f.supervisor.close();
+});
+
 test("a repeat report of a lane after its --final button does not post a second button", async () => {
   const f = closeButtons();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
