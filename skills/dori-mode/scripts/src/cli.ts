@@ -19,6 +19,7 @@ import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
+import { launchesThroughRunner, launchThroughRunner } from "./runner/launch-via-runner.ts";
 import { syncRegistry } from "./sync.ts";
 import { readToodoStart } from "./toodo-start.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
@@ -245,6 +246,38 @@ if (process.argv[2] === "runner") {
       console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""}`);
     } finally {
       auth.close();
+    }
+    process.exit(0);
+  }
+  if (sub === "evacuate") {
+    const label = labelArg(target);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    const { readGuardMachines, sshArgv } = await import("./remote-guard.ts");
+    const { laneRunner, sendVerified } = await import("./panes.ts");
+    const { openLaneReports } = await import("./lane-reports.ts");
+    const { evacuate } = await import("./runner/evacuate.ts");
+    const machine = (await readGuardMachines(run, cfg.guardMachines)).machines.find((m) => m.label === label);
+    if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}`);
+    const sshTarget = (machine as NonNullable<typeof machine>).target;
+    const store = openLaneReports(cfg);
+    try {
+      const lines = await evacuate({
+        hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined },
+        exportOutbox: async () => {
+          const r = await run(sshArgv(sshTarget, 'PATH="$HOME/.bun/bin:$PATH" bun "$HOME/.dori/runner/bin/dori.js" runner export-outbox'), { timeoutMs: 30_000 });
+          if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);
+          return JSON.parse(r.out.trim().split("\n").at(-1) ?? "[]");
+        },
+        tellLane: async (lane, text) => (lane.pane ? (await sendVerified(laneRunner(run, lane), realClock, lane.pane, text)) !== "failed" : false),
+        stopRunner: async () => {
+          const r = await run(sshArgv(sshTarget, "systemctl --user stop dori-runner.service"), { timeoutMs: 30_000 });
+          return { ok: r.code === 0, detail: (r.err || r.out).trim().split("\n").at(-1) || `exit ${r.code}` };
+        },
+      }, label);
+      for (const line of lines) console.log(line);
+    } finally {
+      store.close();
     }
     process.exit(0);
   }
@@ -671,6 +704,12 @@ try {
         console.log(verdictLine(target, plan.check.verdict));
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
+      }
+      if (launchesThroughRunner(config, machine)) {
+        const started = await launchThroughRunner(deps, { ...input, machine }).catch((e: unknown) => die(e instanceof Error ? e.message : String(e)));
+        dequeueLaunch(config.stateDir, input.key);
+        console.log(`LAUNCHED ${started.lane.key} runner=${machine} request=${started.request} (the runner starts it once it is connected; its pane follows in lane.started)`);
+        break;
       }
       const r = await launchLane(deps, { ...input, machine });
       dequeueLaunch(config.stateDir, input.key);

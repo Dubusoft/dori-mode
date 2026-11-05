@@ -2,10 +2,10 @@
 
 The runner is a small per-machine process (`dori runner serve`) that talks to the supervisor over one line-based
 connection: a unix socket on the lead host, or a WebSocket on a private address for other machines. Both sides
-authenticate every connection. In this release a runner reports what it sees on its machine and changes no lane. A
-worker's runner also guards its host (below): it samples memory, load and disk, and under critical memory kills its
-lanes' heavy processes. Every command but `guard.kill` and `runner.rotate` is answered with a refusal or
-`RUNNER_CMD_UNSUPPORTED`.
+authenticate every connection. A runner reports what it sees on its machine. On a worker whose `runners.mode` is
+`authoritative` it also starts, steers and closes the lanes launched there (below), and every worker's runner guards
+its host: it samples memory, load and disk, and under critical memory kills its lanes' heavy processes. Commands it
+does not carry out are answered with a refusal or `RUNNER_CMD_UNSUPPORTED`.
 The modules live in `scripts/src/runner/`; see [development.md](development.md) for the module table and
 [scripts.md](scripts.md) for the commands.
 
@@ -46,10 +46,12 @@ fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
 `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. Today
-a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`,
-`lane.resume`, `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`,
-`runner.rotate`) are part of the schema. A worker's runner carries out `guard.kill`; `runner.rotate` is handled by
-the connection itself. Every command the runner receives goes through the command policy (below): a refused one is
+a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, `lane.started`, `lane.report` and
+the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
+`lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `runner.rotate`)
+are part of the schema. A worker's runner carries out `lane.start`, `lane.stop`, `lane.close`, `lane.send`,
+`lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); `runner.rotate` is
+handled by the connection itself. Every command the runner receives goes through the command policy (below): a refused one is
 answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, a carried-out one `cmd.result verified <detail>`, and an
 accepted one that this release cannot carry out yet `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Both get an
 intent row and a final row, so `cmdAck` moves past them and they are not sent again. A command with an unknown type
@@ -350,8 +352,59 @@ The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_FORGED_E
 `RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
 `RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
 
-## Not yet
+## Runner-owned lanes
 
-Later phases add:
+`runners.mode.<label>` decides how new lanes start on a worker. With `authoritative`, `dori launch --machine <label>`
+starts the lane through that machine's runner; `shadow`, `off` and no entry keep the direct herdr path. `off` stops
+new runner launches only: a lane a runner already owns keeps reporting and being controlled through it until it
+closes, so nothing it sends is lost.
 
-- lane control: supervisor commands with real effects and `authoritative` mode
+**Launch.** `dori launch` registers the lane at once with `runner: <label>` and appends the runner footer to the
+brief. It then queues `lane.start` for the supervisor (`runner_admin` in `runners.sqlite`), which sends it once the
+runner is connected; a request waits at most 2 minutes. A runner launch needs `--cwd` and takes no `--pane`,
+`--workspace` or `--toodo-start`. On the worker, the runner:
+
+- checks the command against `runner-config.json` (the `cwd` must be under `allowedRoots`);
+- opens a herdr tab labelled with the key, writes the brief to `~/.dori/runner/briefs/<key>.md` and issues the lane a
+  fresh 32-byte token;
+- runs the agent of its own profile `default` (`agents.default`, with `{prompt}`, `{model}` and `{brief}` filled in),
+  with `DORI_LANE_KEY` and `DORI_LANE_TOKEN` in front of it. The lead never sends an argv.
+
+The runner keeps only the token's sha256, with the lane's pane, tab and cwd, in `~/.dori/runner/lanes.json`; that is
+its hello inventory. Its `lane.started` gives the supervisor the pane and tab. `lane.close` and `lane.stop` close the
+tab, delete the brief and forget the token. `lane.recover` starts the lane again from its brief when its pane or agent
+is gone, and leaves a live one alone. The agent runs in the herdr pane, not under the runner, so a runner restart
+does not end a lane.
+
+**Reporting.** A runner lane's footer has it report with `~/.dori/runner/bin/dori` (a wrapper the installer puts there
+for the bundle). In a lane that CLI takes only `report`, `claim-done` and `heavy`, and only for the lane's own key; any
+other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane`
+with the lane's token. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
+accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
+`guard-agent.sh heavy` uses, so old and new footers share one heavy count per machine.
+
+**Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
+authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not
+have) is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). A `lane.report` becomes a row of the lane
+report store whose `source` is the event's journal id (`runner:<label>:<seq>`), so the same event never makes two
+rows. From there it is routed exactly as a local `dori report`: a done report becomes the claim through `claimDone`
+(the same evidence again is `LANE_DONE_ALREADY_CLAIMED`); the rest is journaled or posted to the thread. The
+supervisor reads lane events back from the hub's own journal on every runners pass, from the start after a restart,
+so an event acked just before a crash is still stored. The first report from a runner lane also ends the screen
+scraping of its `[REPORT]` lines.
+
+**Inventory.** On each hello the supervisor compares the runner's inventory with the registry:
+
+- a lane the runner owns that the inventory lacks is marked `recoveryPending` and sent `lane.recover`;
+- a key with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry entry;
+- a lane in both whose pane, tab or session differs takes the runner's values for those three only.
+
+**Evacuate.** `dori runner evacuate <label>` is the forced rollback for a runner that cannot be used. In order:
+
+1. It fetches the runner's unacked events over ssh (`runner export-outbox`) and takes them as if they had arrived,
+   so a report already received is not stored twice.
+2. It types a footer update into each lane's pane: go back to printing `[REPORT]` lines.
+3. It clears `Lane.runner`, which puts the lane back on the screen-scraping path.
+4. It stops the runner's service.
+
+The lanes keep running. A step that fails is reported, and the later steps still run.

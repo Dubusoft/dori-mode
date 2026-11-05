@@ -1,5 +1,10 @@
 import { realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
+import { join } from "node:path";
+import { laneCliMain } from "./lane-cli.ts";
+import { LANE_SOCKET, RunnerLanes, serveLaneSocket } from "./lanes.ts";
+import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
+import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { sampleHost } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import { parseArgs } from "node:util";
@@ -81,7 +86,10 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       : undefined;
   const observe = observedLanes ? async () => {
     const lanes = await observedLanes();
-    inventory = lanes.map(({ status: _status, reportHash: _hash, ...lane }) => lane);
+    const observed = lanes.map(({ status: _status, reportHash: _hash, ...lane }) => lane);
+    // The lanes this runner started come first; the rest are lanes it only observes for the shadow comparison.
+    const owned = runnerLanes?.inventory() ?? [];
+    inventory = [...owned, ...observed.filter((l) => !owned.some((o) => o.key === l.key))];
     return lanes;
   } : undefined;
   const head = await run(["git", "-C", import.meta.dir, "rev-parse", "--short", "HEAD"], { timeoutMs: 5_000 }).catch(() => undefined);
@@ -89,6 +97,10 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const log = (line: string): void => { console.log(line); };
   const tracked = trackedConnector(connector);
   let client: RunnerClient | undefined;
+  const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => { client?.publish(type, body); };
+  // Lanes started through this runner exist only on a worker; the lead host's lanes keep their own launch path.
+  const runnerLanes = remote ? new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish }) : undefined;
+  if (runnerLanes) inventory = runnerLanes.inventory();
   // Only a worker's runner guards its host: on the lead host the supervisor's own guard sweep samples and kills, and
   // two killers there would race. Thresholds and heavyKill come from runner-config.json, else the config defaults.
   const guard = remote ? new RunnerGuard({
@@ -100,7 +112,17 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const dispatch = commandDispatcher({
     state, policy, realpath: realpathSync, log,
     publish: (body) => { client?.publish("cmd.result", body); },
-    ...(guard ? { effects: { "guard.kill": async (command) => `killed ${(await guard.killLanes(command.body.keys)).length}` } } : {}),
+    effects: {
+      ...(guard ? { "guard.kill": async (command) => `killed ${(await guard.killLanes(command.body.keys)).length}` } : {}),
+      ...(runnerLanes ? {
+        "lane.start": async (command) => runnerLanes.start(command.body),
+        "lane.stop": async (command) => runnerLanes.close(command.body.key),
+        "lane.close": async (command) => runnerLanes.close(command.body.key),
+        "lane.send": async (command) => runnerLanes.send(command.body.key, command.body.text, command.body.verify),
+        "lane.recover": async (command) => runnerLanes.recover(command.body.key),
+        "lane.observe": async (command) => runnerLanes.observe(command.body.key),
+      } : {}),
+    },
   });
   client = new RunnerClient(
     { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
@@ -119,12 +141,20 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   };
   guardTick();
   const stopGuard = guard ? realEvery(GUARD_SAMPLE_MS, guardTick) : () => {};
+  let stopLaneSocket = (): void => {};
+  if (runnerLanes) {
+    ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
+    const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
+    const stop = serveLaneSocket(laneListener, runnerLanes, publish, log);
+    stopLaneSocket = () => { stop(); laneListener.close(); };
+  }
   try {
     await serveRunner({
       client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
       ...(observe ? { observe } : {}), log,
     }, controller.signal);
   } finally {
+    stopLaneSocket();
     stopGuard();
     stopHealth();
     outbox.close();
@@ -135,6 +165,13 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
 
 /** Runs `serve` or `probe` from `args` (the words after `runner`). */
 export const runnerHostMain = async (args: readonly string[]): Promise<number> => {
+  // Inside a lane this bundle is the lane-mode `dori`: report, claim-done and heavy for the lane's own key, nothing else.
+  if (process.env.DORI_LANE_KEY) {
+    return laneCliMain(args, {
+      env: process.env, connect: connectLane(join(defaultRunnerDir(), RUNNER_PATHS.sock, LANE_SOCKET)),
+      out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
+    });
+  }
   try {
     const parsed = parseArgs({
       args: [...args], allowPositionals: true,
@@ -143,6 +180,19 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
     const [sub, ...extra] = parsed.positionals;
     if (extra.length) fail(RUNNER_HOST_USAGE, 2);
     if (sub === "probe") return probeMain(parsed.values.json === true);
+    if (sub === "export-outbox") {
+      // For `dori runner evacuate` over ssh: every event this runner has not had acked, as the frames it would send.
+      const runnerDir = defaultRunnerDir();
+      const identity = loadIdentity(runnerDir, parsed.values.label ?? LOCAL_RUNNER, hostname());
+      const outbox = new Outbox(runnerDir, { now: realClock.now });
+      try {
+        const frames = outbox.unacked(0).map((row) => ({ v: 1, runner: identity.label, gen: 0, epoch: 0, seq: row.seq, type: row.type, body: row.body }));
+        console.log(JSON.stringify(frames));
+      } finally {
+        outbox.close();
+      }
+      return 0;
+    }
     if (sub === "serve") return await serveMain(parsed.values);
     return fail(RUNNER_HOST_USAGE, 2);
   } catch (error) {
