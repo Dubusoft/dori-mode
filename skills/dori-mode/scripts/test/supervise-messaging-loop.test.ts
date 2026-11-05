@@ -85,7 +85,7 @@ const fixture = (kind: OwnerNoticeKind, reminded = true) => {
     }, { preconnect: fetch.preconnect }));
     try {
       await supervise(deps, controller.signal, {
-        token: `loop-test-${state.dir}`, http, lookup: async () => "", statusLookup: async () => "",
+        token: `loop-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
         open: () => {
           let closed = (_code: number) => {};
           return {

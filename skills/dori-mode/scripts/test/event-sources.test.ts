@@ -317,7 +317,7 @@ test("the real supervisor runs the built-ins and the user sources through the re
   };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `event-sources-test-${state.dir}`,
+    token: `event-sources-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"),
     http: async (request) => ({ status: 200, headers: {}, body: request.url.endsWith("/threads/active") ? JSON.stringify({ threads: [] }) : "[]" }),
     lookup: async () => "", statusLookup: async () => "",
     open: () => {
