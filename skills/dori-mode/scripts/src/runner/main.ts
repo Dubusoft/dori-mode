@@ -80,7 +80,13 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   // labels its own runners.mode marks shadow. The local runner observes only in shadow mode, from the registry.
   const remote = values.connect !== undefined;
   const mode = remote ? "shadow" : runnerMode(cfg, identity.label);
-  let inventory: { key: string; pane: string; tab: string; session?: string }[] = [];
+  type InventoryLane = { key: string; pane: string; tab: string; session?: string };
+  // The lanes only observed (not owned), as of the last observe pass; the owned part is read fresh in each hello.
+  let observedOnly: InventoryLane[] = [];
+  const currentInventory = (): InventoryLane[] => {
+    const owned = runnerLanes?.inventory() ?? [];
+    return [...owned, ...observedOnly.filter((l) => !owned.some((o) => o.key === l.key))];
+  };
   const observedLanes = remote
     ? () => observeHost({ run })
     : mode === "shadow"
@@ -90,8 +96,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const lanes = await observedLanes();
     const observed = lanes.map(({ status: _status, reportHash: _hash, ...lane }) => lane);
     // The lanes this runner started come first; the rest are lanes it only observes for the shadow comparison.
-    const owned = runnerLanes?.inventory() ?? [];
-    inventory = [...owned, ...observed.filter((l) => !owned.some((o) => o.key === l.key))];
+    observedOnly = observed;
+    // An owned lane waiting on an on-screen question goes out as one lane.asking per question.
+    if (runnerLanes) await runnerLanes.askTick().catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
     return lanes;
   } : undefined;
   const version = await runnerVersion(run, import.meta.dir);
@@ -101,7 +108,6 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => { client?.publish(type, body); };
   // Lanes started through this runner exist only on a worker; the lead host's lanes keep their own launch path.
   const runnerLanes = remote ? new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish }) : undefined;
-  if (runnerLanes) inventory = runnerLanes.inventory();
   // Only a worker's runner guards its host: on the lead host the supervisor's own guard sweep samples and kills, and
   // two killers there would race. Thresholds and heavyKill come from runner-config.json, else the config defaults.
   const guard = remote ? new RunnerGuard({
@@ -127,7 +133,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   });
   client = new RunnerClient(
     { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
-    { connect: tracked.connect, outbox, state, clock: realClock, inventory: () => inventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch },
+    { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch },
   );
   // A command a crash left between its intent and its result is settled by looking at herdr, never run again.
   const observeLane = async (key: string): Promise<Observation> => {

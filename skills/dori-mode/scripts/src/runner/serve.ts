@@ -74,7 +74,16 @@ const openHubDb = (stateDir: string): Database => {
   const db = new Database(path, { create: true });
   db.run("PRAGMA journal_mode = WAL");
   db.run("CREATE TABLE IF NOT EXISTS hub_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)");
-  db.run("CREATE TABLE IF NOT EXISTS runner_events (id TEXT PRIMARY KEY, line TEXT NOT NULL, at INTEGER NOT NULL)");
+  db.transaction(() => {
+    db.run("CREATE TABLE IF NOT EXISTS runner_events (position INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, line TEXT NOT NULL, at INTEGER NOT NULL)");
+    const columns = db.query("PRAGMA table_info(runner_events)").all() as { name: string }[];
+    if (!columns.some((column) => column.name === "position")) {
+      db.run("ALTER TABLE runner_events RENAME TO runner_events_legacy");
+      db.run("CREATE TABLE runner_events (position INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, line TEXT NOT NULL, at INTEGER NOT NULL)");
+      db.run("INSERT INTO runner_events (position, id, line, at) SELECT rowid, id, line, at FROM runner_events_legacy ORDER BY rowid");
+      db.run("DROP TABLE runner_events_legacy");
+    }
+  }).immediate();
   for (const suffix of ["", "-wal", "-shm"]) if (existsSync(path + suffix)) chmodSync(path + suffix, 0o600);
   return db;
 };

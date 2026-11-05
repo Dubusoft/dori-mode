@@ -1,12 +1,12 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { configPath, deliveryConfigError, runnerMode, saveLeadPane } from "./config.ts";
-import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS } from "./runner/fs-safety.ts";
+import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
-import { readRunnerRows, RunnerHub } from "./runner/hub.ts";
+import { HUB_FILE, readRunnerRows, RunnerHub } from "./runner/hub.ts";
 import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
-import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps, reconcileInventory } from "./runner/lanes-hub.ts";
+import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps, reconcileInventory, runnerJournalHead } from "./runner/lanes-hub.ts";
 import { recordDiffLines } from "./runner/shadow-store.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import {
@@ -66,6 +66,49 @@ const MACHINE_LIST_TTL_MS = 10 * 60_000;
 const MACHINE_LIST_RETRY_MS = 60_000;
 /** The machine guard's state file in the supervisor stateDir, so a restart does not re-report unchanged machines. */
 export const MACHINE_GUARD_STATE_FILE = "machine-guard.json";
+
+/** Supervisor-owned progress through the private runner journal, committed only after successful lane processing. */
+export const RUNNER_LANE_CURSOR_FILE = "runner-lane-cursor.json";
+
+/** Called in the lane work queue; a failed event stops the pass and is retried on the next call. */
+export const laneEventReader = (stateDir: string, deps: LaneHubDeps): (() => Promise<void>) => {
+  // The hello that marks a recovery must number the journal as this reader does; deps without a head get this journal's.
+  if (!deps.journalHead) (deps as { journalHead?: () => number }).journalHead = () => runnerJournalHead(stateDir);
+  const path = join(stateDir, RUNNER_LANE_CURSOR_FILE);
+  let position = 0;
+  let invalid: string | undefined;
+  if (existsSync(path)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed >= 0) position = parsed;
+      else invalid = "not a non-negative integer";
+    } catch (e) {
+      invalid = e instanceof Error ? e.message : String(e);
+    }
+  }
+  if (invalid !== undefined) {
+    // Stale lane.started events are ignored by the hub, so replaying the journal from the start is safe.
+    console.error(`RUNNER_CURSOR_INVALID ${path} ${invalid}; reading the runner journal from the start`);
+    writeRunnerFile(path, "0\n");
+  }
+  const db = new Database(join(stateDir, HUB_FILE), { readonly: true });
+  try {
+    const row = db.query("SELECT MAX(rowid) AS position FROM runner_events").get() as { position: number | null };
+    if (position > (row.position ?? 0)) {
+      position = 0;
+      writeRunnerFile(path, `${position}\n`);
+    }
+  } finally {
+    db.close();
+  }
+  return async () => {
+    for (const event of laneEventsAfter(stateDir, position)) {
+      await acceptLaneEvent(deps, event.label, event.frame, event.rowid);
+      writeRunnerFile(path, `${event.rowid}\n`);
+      position = event.rowid;
+    }
+  };
+};
 
 /** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
 export const SYSTEM_PREFIX = "[System] ";
@@ -898,6 +941,7 @@ export const supervise = async (
           registry: deps.registry, reports: () => reports, now: deps.clock.now,
           emit: (id, line) => { enqueueSweep(id, line); },
           recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+          journalHead: () => runnerJournalHead(deps.config.stateDir),
         };
         const inOrder = (what: string, work: () => Promise<void>): void => {
           laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
@@ -910,14 +954,10 @@ export const supervise = async (
             inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
           },
         }));
-        // Lane events come from the hub's journal on every runners pass (from the start after a restart): the hub acks
-        // an event once it is journaled there, so nothing is lost if this process stops before storing a report.
-        let laneRowid = 0;
+        // Resume after successfully processed events; an upgrade with no cursor reads the retained journal once.
+        const readLaneEvents = laneEventReader(deps.config.stateDir, laneDeps);
         takeLaneEvents = () => {
-          for (const e of laneEventsAfter(deps.config.stateDir, laneRowid)) {
-            laneRowid = e.rowid;
-            inOrder(`${e.frame.type} ${e.label}`, () => acceptLaneEvent(laneDeps, e.label, e.frame));
-          }
+          inOrder("journal", readLaneEvents);
           return laneWork;
         };
         let livenessSeq = 0;

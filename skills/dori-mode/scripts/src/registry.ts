@@ -54,6 +54,8 @@ export type Lane = {
   readonly ghIssue?: string;
   readonly recoveryPending?: boolean;
   readonly recoveryPreviousPane?: string;
+  /** A runner lane's recovery: the runner journal head at the hello that asked for it; a lane.started at or before it is stale. */
+  readonly recoveryAfter?: number;
   /** An admission reservation is paused until its agent is registered, so recovery never launches it too. */
   readonly launchReservation?: string;
   readonly worktrees?: readonly string[];

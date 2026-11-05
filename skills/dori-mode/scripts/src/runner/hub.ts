@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { redactSecrets } from "../redact.ts";
 import type { EventMeta } from "../supervise-journal.ts";
 import { decideHello, recordHello, resetGen, type StoredRunner } from "./fencing.ts";
 import {
@@ -307,9 +306,9 @@ export class RunnerHub {
   }
 }
 
-/** The journal line of a runner event: `RUNNER_EVENT runner=<label> seq=<n> type=<type>` followed by the redacted body JSON. */
+/** Private runner journal line with the original body JSON; report routing applies the same redaction as local reports. */
 export const eventLine = (frame: AnyRunnerEvent): string =>
-  `RUNNER_EVENT runner=${frame.runner} seq=${frame.seq} type=${frame.type} ${redactSecrets(JSON.stringify(frame.body))}`;
+  `RUNNER_EVENT runner=${frame.runner} seq=${frame.seq} type=${frame.type} ${JSON.stringify(frame.body)}`;
 
 /**
  * One `dori status` line:

@@ -51,7 +51,7 @@ test("lane.start on the runner, its lane.started, then a done report make exactl
   });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0 });
   const run = herdr.find((a) => a[2] === "run");
-  expect(run?.[4]).toStartWith("DORI_LANE_KEY=lane-a DORI_LANE_TOKEN=lane-token-1 omo --model m1 ");
+  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} omo --model m1 `);
   expect(lanes.tokenFor("lane-a", "lane-token-1")).toBe(true);
   expect(lanes.tokenFor("lane-a", "other")).toBe(false);
   const [type, started] = published[0] as [RunnerEventType, object];
