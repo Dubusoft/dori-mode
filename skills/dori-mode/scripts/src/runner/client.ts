@@ -1,9 +1,10 @@
 import type { Clock } from "../run.ts";
+import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import type { Outbox } from "./outbox.ts";
 import {
   PROTO, decodeFrame, encodeFrame, runnerControl, runnerEvent, ProtocolError,
   type AnyRunnerEvent, type AnySupervisorCommand, type InventoryLane, type RejectCode, type RunnerControlBodies, type RunnerEventBodies, type RunnerEventType,
-  type SupervisorFrame,
+  type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Transport } from "./transport.ts";
@@ -14,6 +15,13 @@ import type { Connector, Transport } from "./transport.ts";
  * Each `ack {eventAck}` frame marks rows up to it acked in the outbox; an ack never moves the cursor backwards.
  * `run` repeats `connectOnce` with the reconnect backoff until aborted. `gen` is the state's current gen: the
  * process bumps it with `RunnerState.boot()` once before the client starts.
+ *
+ * With `auth` set (auth.ts), the hello carries a nonce and an ephemeral key; the client checks the supervisor's
+ * `hello.challenge` signature against the pinned key and closes with `RUNNER_AUTH_FAILED` when it does not verify,
+ * answers `auth.proof`, and from then on seals every frame it sends with the session MAC and drops (logging
+ * `RUNNER_AUTH_FAILED`) every received frame whose MAC does not check. Before the handshake only `hello.challenge` and
+ * `hello.reject` are read. `runner.rotate` is handled here: the client answers `runner.rotated` with a new key and
+ * makes it current on `rotate.ok`, recording the command in the state so `cmdAck` moves past it.
  */
 
 export const RECONNECT_BASE_MS = 1_000;
@@ -41,6 +49,15 @@ export type ClientDeps = {
   readonly inventory?: () => readonly InventoryLane[];
   /** Receives commands; a shadow runner leaves it unset and commands are ignored. */
   readonly onCommand?: (command: AnySupervisorCommand) => void;
+  /**
+   * Receives a frame that carries a `cmdSeq` but fails the schema (unknown type or field, wrong type), as parsed JSON,
+   * so the runner can answer it `RUNNER_CMD_REJECTED <rule>`. With `auth` it is passed on only when its MAC checks.
+   */
+  readonly onInvalidCommand?: (raw: unknown) => void;
+  /** Enables the signed handshake and frame MACs. */
+  readonly auth?: RunnerAuth;
+  /** Receives `RUNNER_AUTH_FAILED ...` and `RUNNER_KEY_ROTATED ...` lines. */
+  readonly log?: (line: string) => void;
 };
 
 export type ConnectOutcome =
@@ -55,6 +72,9 @@ export class RunnerClient {
   private settle: ((outcome: ConnectOutcome) => void) | undefined;
   private replayed = 0;
   private closedWaiter: Promise<void> = Promise.resolve();
+  /** Set once the supervisor's challenge verified; every frame after that is sealed and checked with it. */
+  private session: Session | undefined;
+  private pendingHello: PendingRunnerHello | undefined;
 
   constructor(private readonly config: ClientConfig, private readonly deps: ClientDeps) {}
 
@@ -63,7 +83,11 @@ export class RunnerClient {
   }
 
   private sendFrame(frame: Parameters<typeof encodeFrame>[0]): void {
-    this.transport?.send(encodeFrame(frame));
+    this.transport?.send(encodeFrame(this.session ? this.session.seal(frame) : frame));
+  }
+
+  private log(line: string): void {
+    this.deps.log?.(line);
   }
 
   /** One connection attempt through to the end of the replay; the connection stays open afterwards. */
@@ -77,6 +101,8 @@ export class RunnerClient {
     this.transport = transport;
     this.ready = false;
     this.replayed = 0;
+    this.session = undefined;
+    this.pendingHello = this.deps.auth?.startHello();
     const outcome = new Promise<ConnectOutcome>((resolve) => { this.settle = resolve; });
     let markClosed: () => void = () => {};
     this.closedWaiter = new Promise<void>((resolve) => { markClosed = resolve; });
@@ -86,7 +112,9 @@ export class RunnerClient {
       if (this.transport === transport) {
         this.transport = undefined;
         this.ready = false;
-        this.finish({ ok: false, code: "RUNNER_CLOSED", detail: reason });
+        this.session = undefined;
+        this.pendingHello = undefined;
+        this.finish({ ok: false, code: isRejectCode(reason) ? reason : "RUNNER_CLOSED", detail: reason });
       }
       markClosed();
     });
@@ -98,6 +126,7 @@ export class RunnerClient {
       cmdAck: this.deps.state.cmdAck(),
       ...(this.config.version !== undefined ? { version: this.config.version } : {}),
       ...(this.deps.inventory ? { inventory: this.deps.inventory() } : {}),
+      ...(this.pendingHello ? { nonce: this.pendingHello.nonce, dh: this.pendingHello.dh } : {}),
     };
     transport.send(encodeFrame(runnerControl(this.head(), "hello", hello)));
     return outcome;
@@ -152,11 +181,28 @@ export class RunnerClient {
     try {
       frame = decodeFrame(line, "supervisor");
     } catch (error) {
-      if (error instanceof ProtocolError) return;
-      throw error;
+      if (!(error instanceof ProtocolError)) throw error;
+      this.invalidCommand(line);
+      return;
+    }
+    if (this.deps.auth) {
+      if (!this.session) {
+        if (frame.type === "hello.challenge" && this.pendingHello) {
+          this.answerChallenge(frame.body as SupervisorControlBodies["hello.challenge"]);
+          return;
+        }
+        if (frame.type !== "hello.reject") {
+          this.log(`RUNNER_AUTH_FAILED frame dropped: ${frame.type} before the handshake`);
+          return;
+        }
+      } else if (!this.session.check(frame)) {
+        this.log(`RUNNER_AUTH_FAILED frame dropped: bad mac type=${frame.type}`);
+        return;
+      }
     }
     if ("cmdSeq" in frame) {
-      this.deps.onCommand?.(frame);
+      if (frame.type === "runner.rotate" && this.deps.auth && this.session) this.rotate(frame as SupervisorCommand<"runner.rotate">);
+      else this.deps.onCommand?.(frame);
       return;
     }
     switch (frame.type) {
@@ -190,7 +236,54 @@ export class RunnerClient {
         }));
         return;
       }
+      case "rotate.ok": {
+        const record = this.deps.state.command(frame.body.cmdId);
+        if (!this.deps.auth || record?.type !== "runner.rotate" || record.state !== "intent") return;
+        this.deps.auth.confirmRotate();
+        this.deps.state.recordResult(frame.body.cmdId, "verified", "runner key rotated");
+        this.log(`RUNNER_KEY_ROTATED cmdId=${frame.body.cmdId}`);
+        return;
+      }
+      default:
+        // hello.challenge after the handshake and enroll.ok have no meaning on an open connection.
+        return;
     }
+  }
+
+  private invalidCommand(line: string): void {
+    if (!this.deps.onInvalidCommand) return;
+    let raw: unknown;
+    try { raw = JSON.parse(line); } catch { return; }
+    if (typeof raw !== "object" || raw === null || !("cmdSeq" in raw)) return;
+    if (this.deps.auth && !(this.session && this.session.check(raw as SupervisorFrame))) {
+      this.log(`RUNNER_AUTH_FAILED frame dropped: bad mac on an invalid command`);
+      return;
+    }
+    this.deps.onInvalidCommand(raw);
+  }
+
+  private answerChallenge(challenge: SupervisorControlBodies["hello.challenge"]): void {
+    const auth = this.deps.auth as RunnerAuth;
+    const pending = this.pendingHello as PendingRunnerHello;
+    this.pendingHello = undefined;
+    const answer = auth.answerChallenge(pending, { label: this.config.label, hostId: this.config.hostId, gen: this.deps.state.gen() }, challenge);
+    if (!answer.ok) {
+      this.log(`RUNNER_AUTH_FAILED ${answer.detail}`);
+      this.finish({ ok: false, code: "RUNNER_AUTH_FAILED", detail: answer.detail });
+      this.transport?.close("RUNNER_AUTH_FAILED");
+      return;
+    }
+    // The proof is the last unsealed frame; the session takes over right after it.
+    this.sendFrame(runnerControl(this.head(), "auth.proof", { sig: answer.sig }));
+    this.session = answer.session;
+  }
+
+  private rotate(command: SupervisorCommand<"runner.rotate">): void {
+    const auth = this.deps.auth as RunnerAuth;
+    const intent = this.deps.state.recordIntent({ cmdId: command.body.cmdId, cmdSeq: command.cmdSeq, type: "runner.rotate", epoch: command.epoch });
+    if (!intent.fresh && intent.existing.state !== "intent") return;
+    const answer = auth.rotateAnswer(this.session as Session, this.config.label, command.body.cmdId);
+    this.sendFrame(runnerControl(this.head(), "runner.rotated", answer));
   }
 
   /** The last eventAck the supervisor sent (0 before the first hello). */

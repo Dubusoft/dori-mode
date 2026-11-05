@@ -9,10 +9,15 @@ import type { Clock } from "../run.ts";
 import { backoffMs, type RunnerClient } from "./client.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { HUB_FILE, type CommitFn, type RunnerHub } from "./hub.ts";
+import { fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
+import { checkEffectEpoch } from "./fencing.ts";
+import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
-  decodeFrame, encodeFrame, LABEL_PATTERN, ProtocolError,
-  type AnyRunnerEvent, type InventoryLane, type LaneStatus, type RunnerControl,
+  decodeFrame, encodeFrame, LABEL_PATTERN, ProtocolError, supervisorCommand, supervisorControl,
+  type AnyRunnerEvent, type Frame, type InventoryLane, type LaneStatus, type RejectCode, type RunnerControl,
+  type RunnerEventBodies, type SupervisorCommandBodies, type SupervisorCommandType,
 } from "./protocol.ts";
+import type { RunnerState } from "./state.ts";
 import { diffUnits, settleCycle, shadowDiffLine, shadowUnit, type ShadowDiff, type ShadowUnit } from "./shadow.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 
@@ -107,24 +112,91 @@ export type HubHooks = {
   /** An event the hub committed just now. */
   readonly onEvent?: (label: string, frame: AnyRunnerEvent) => void;
   readonly onHeartbeat?: (label: string) => void;
+  /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
+  readonly auth?: SupervisorAuth;
   readonly log: (line: string) => void;
 };
 
+/** `acceptRunners`' stop function, with the operations on live connections. */
+export type RunnerAccept = (() => void) & {
+  /** Deletes the label's key, sends `hello.reject RUNNER_REVOKED` and closes its connection; false when it held no key. */
+  revoke(label: string): boolean;
+  /** Sends `runner.rotate` to the label's connection; returns the cmdId, or undefined when it is not connected. */
+  rotate(label: string): string | undefined;
+  /** Sends a command to the label's connection with the next cmdSeq; returns the cmdSeq, or undefined when it is not connected. */
+  command<T extends SupervisorCommandType>(label: string, type: T, body: SupervisorCommandBodies[T]): number | undefined;
+  /** Whether the label has an admitted connection now. */
+  connected(label: string): boolean;
+};
+
+type Connection = {
+  readonly transport: Transport;
+  readonly gen: number;
+  readonly send: (frame: Frame) => void;
+  /** The cmdId of the `runner.rotate` sent on this connection and not yet answered. */
+  rotating?: string;
+};
+
 /**
- * Serves runner connections from `listener` through `hub`. The first frame must be a hello; a rejected hello is
- * answered and the connection closed. After it, every frame must name the admitted label. A newer connection of the
- * same label replaces the older one. An invalid frame, or an event whose commit throws (no ack), closes the
- * connection; the runner reconnects and replays from its hello. Returns a function that stops accepting.
+ * Serves runner connections from `listeners` (the local socket and, when configured, the network listener) through
+ * `hub`, with one table of live connections across all of them. The first frame must be a hello (or, with
+ * `hooks.auth`, an `enroll`); a rejected hello is answered and the connection closed. After it, every frame must name
+ * the admitted label. The hub's hello rules (fencing.ts `decideHello`) see the gen of the label's live connection; an
+ * admitted hello closes that older connection. An invalid frame, or an event whose commit
+ * throws (no ack), closes the connection; the runner reconnects and replays from its hello. Returns a function that
+ * stops accepting.
+ *
+ * With `hooks.auth`:
+ * - `enroll` is checked by `SupervisorAuth.enroll`, answered `enroll.ok` (the runner closes) or refused with
+ *   `RUNNER_ENROLL_REFUSED` and closed; the label's hub row is bound to the enrolled hostId.
+ * - `hello` is answered with the signed `hello.challenge` (or refused: `RUNNER_AUTH_FAILED`, `RUNNER_REVOKED`); the
+ *   next frame must be `auth.proof`. A proof that does not verify is refused with `RUNNER_AUTH_FAILED` and closed;
+ *   one that verifies opens the session and only then runs the hub's hello rules.
+ * - Every later frame must carry the session MAC; one that does not is dropped and logged
+ *   `RUNNER_AUTH_FAILED runner=<label> frame dropped: bad mac type=<type>`, and the connection stays open.
+ * - `runner.rotated` answering the pending `runner.rotate` stores the new key and is acked with `rotate.ok`.
  */
-export const acceptRunners = (hub: RunnerHub, listener: Listener, hooks: HubHooks): (() => void) => {
-  const current = new Map<string, Transport>();
-  return listener.onConnection((transport) => {
+export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Listener[], hooks: HubHooks): RunnerAccept => {
+  const current = new Map<string, Connection>();
+  const auth = hooks.auth;
+  const head = (label: string, gen: number) => ({ runner: label, gen, epoch: hub.epoch });
+  const serve = (transport: Transport): void => {
     let label: string | undefined;
-    const reply = (frame: Parameters<typeof encodeFrame>[0] | undefined): void => {
-      if (frame && transport.open) transport.send(encodeFrame(frame));
+    let session: Session | undefined;
+    let phase: "start" | "proof" | "ready" | "done" = "start";
+    let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
+    const reply = (frame: Frame | undefined): void => {
+      if (frame && transport.open) transport.send(encodeFrame(session ? session.seal(frame) : frame));
+    };
+    const refuse = (code: RejectCode, detail: string, who: string, gen: number): void => {
+      reply(supervisorControl(head(who, gen), "hello.reject", { code, detail }));
+      hooks.log(`${code} runner=${who} ${detail}`);
+      phase = "done";
+      transport.close(code);
+    };
+    const admit = (hello: RunnerControl<"hello">): void => {
+      const live = current.get(hello.body.label);
+      const outcome = hub.hello(hello, live?.transport.open ? live.gen : undefined);
+      reply(outcome.reply);
+      if (!outcome.ok) {
+        hooks.log(`${outcome.reply.body.code} runner=${hello.body.label} ${outcome.reply.body.detail}`);
+        phase = "done";
+        transport.close(outcome.reply.body.code);
+        return;
+      }
+      label = hello.body.label;
+      phase = "ready";
+      const previous = current.get(label);
+      current.set(label, { transport, gen: hello.body.gen, send: reply });
+      if (previous) {
+        previous.transport.close("replaced by a newer connection");
+        hooks.log(`RUNNER_REPLACED runner=${label} gen=${previous.gen}->${hello.body.gen}`);
+      }
+      hooks.log(`RUNNER_CONNECTED runner=${label} gen=${hello.body.gen} eventAck=${outcome.row.eventAck}`);
+      hooks.onHello?.(label, hello.body);
     };
     transport.onClose(() => {
-      if (label !== undefined && current.get(label) === transport) {
+      if (label !== undefined && current.get(label)?.transport === transport) {
         current.delete(label);
         hub.disconnected(label);
         hooks.log(`RUNNER_DISCONNECTED runner=${label}`);
@@ -133,30 +205,71 @@ export const acceptRunners = (hub: RunnerHub, listener: Listener, hooks: HubHook
     transport.onLine((line) => {
       try {
         const frame = decodeFrame(line, "runner");
-        if (label === undefined) {
-          if (frame.type !== "hello" || "seq" in frame) throw new ProtocolError("sequence", `${frame.type} before hello`);
-          const hello = frame as RunnerControl<"hello">;
-          const outcome = hub.hello(hello);
-          reply(outcome.reply);
-          if (!outcome.ok) {
-            hooks.log(`${outcome.reply.body.code} runner=${hello.body.label} ${outcome.reply.body.detail}`);
-            transport.close(outcome.reply.body.code);
+        if (phase === "done") return;
+        if (phase === "start") {
+          if (frame.type === "enroll" && auth) {
+            const body = (frame as RunnerControl<"enroll">).body;
+            const enrolled = auth.enroll(body);
+            if (!enrolled.ok) { refuse(enrolled.code, enrolled.detail, body.label, frame.gen); return; }
+            hub.bindHost(body.label, body.hostId);
+            reply(supervisorControl(head(body.label, frame.gen), "enroll.ok", enrolled.reply));
+            hooks.log(`RUNNER_ENROLLED runner=${body.label} hostId=${body.hostId} key=${fingerprint(body.runnerPubKey)}`);
+            phase = "done";
             return;
           }
-          label = hello.body.label;
-          const previous = current.get(label);
-          current.set(label, transport);
-          previous?.close("replaced by a newer connection");
-          hooks.log(`RUNNER_CONNECTED runner=${label} gen=${hello.body.gen} eventAck=${outcome.row.eventAck}`);
-          hooks.onHello?.(label, hello.body);
+          if (frame.type !== "hello" || "seq" in frame) throw new ProtocolError("sequence", `${frame.type} before hello`);
+          const hello = frame as RunnerControl<"hello">;
+          if (!auth) { admit(hello); return; }
+          const begun = auth.beginHello(hello.body);
+          if (!begun.ok) { refuse(begun.code, begun.detail, hello.body.label, hello.body.gen); return; }
+          pending = { hello, handshake: begun.pending };
+          phase = "proof";
+          reply(supervisorControl(head(hello.body.label, hello.body.gen), "hello.challenge", begun.challenge));
           return;
         }
+        if (phase === "proof" && pending && auth) {
+          if (frame.type !== "auth.proof") throw new ProtocolError("sequence", `${frame.type} before auth.proof`);
+          const { hello, handshake } = pending;
+          pending = undefined;
+          // The session key is known to both ends now, so even a refusal goes out sealed.
+          session = handshake.session;
+          if (!auth.finishHello(handshake, (frame as RunnerControl<"auth.proof">).body.sig)) {
+            refuse("RUNNER_AUTH_FAILED", "hello proof is not signed by the enrolled runner key", hello.body.label, hello.body.gen);
+            return;
+          }
+          admit(hello);
+          return;
+        }
+        if (session && !session.check(frame)) {
+          hooks.log(`RUNNER_AUTH_FAILED runner=${label ?? "-"} frame dropped: bad mac type=${frame.type}`);
+          return;
+        }
+        if (label === undefined) throw new ProtocolError("sequence", `${frame.type} before hello`);
         if (frame.runner !== label) throw new ProtocolError("envelope-field", `frame for ${frame.runner} on the connection of ${label}`);
         if ("seq" in frame) {
           const outcome = hub.receive(frame);
           reply(outcome.reply);
           if (outcome.result === "committed") hooks.onEvent?.(label, frame);
           return;
+        }
+        if (frame.type === "runner.rotated") {
+          const body = (frame as RunnerControl<"runner.rotated">).body;
+          const connection = current.get(label);
+          if (!auth || !session || connection?.transport !== transport || connection.rotating !== body.cmdId) {
+            hooks.log(`RUNNER_ROTATE_REFUSED runner=${label} cmdId=${body.cmdId} no such rotation pending`);
+            return;
+          }
+          if (!auth.rotate(label, session, body)) {
+            hooks.log(`RUNNER_AUTH_FAILED runner=${label} rotation signature does not verify`);
+            return;
+          }
+          connection.rotating = undefined;
+          reply(supervisorControl(head(label, frame.gen), "rotate.ok", { cmdId: body.cmdId }));
+          hooks.log(`RUNNER_KEY_ROTATED runner=${label} key=${fingerprint(body.runnerPubKey)}`);
+          return;
+        }
+        if (frame.type === "enroll" || frame.type === "hello" || frame.type === "auth.proof") {
+          throw new ProtocolError("sequence", `${frame.type} on an admitted connection`);
         }
         reply(hub.handle(frame));
         if (frame.type === "heartbeat") hooks.onHeartbeat?.(label);
@@ -166,7 +279,100 @@ export const acceptRunners = (hub: RunnerHub, listener: Listener, hooks: HubHook
         transport.close(error instanceof ProtocolError ? error.code : "hub error");
       }
     });
+  };
+  const stops = (Array.isArray(listeners) ? listeners : [listeners as Listener]).map((listener) => listener.onConnection(serve));
+  return Object.assign(() => { for (const stop of stops) stop(); }, {
+    connected: (name: string): boolean => current.get(name)?.transport.open === true,
+    command<T extends SupervisorCommandType>(name: string, type: T, body: SupervisorCommandBodies[T]): number | undefined {
+      const connection = current.get(name);
+      if (!connection?.transport.open) return undefined;
+      const cmdSeq = hub.nextCmdSeq(name);
+      connection.send(supervisorCommand(head(name, connection.gen), cmdSeq, type, body) as Frame);
+      return cmdSeq;
+    },
+    revoke(name: string): boolean {
+      const had = auth?.revoke(name) ?? false;
+      const connection = current.get(name);
+      if (connection) {
+        connection.send(supervisorControl(head(name, connection.gen), "hello.reject", { code: "RUNNER_REVOKED", detail: `runner ${name} is revoked` }));
+        connection.transport.close("RUNNER_REVOKED");
+      }
+      hooks.log(`RUNNER_REVOKED runner=${name} key deleted`);
+      return had;
+    },
+    rotate(name: string): string | undefined {
+      const connection = current.get(name);
+      if (!auth || !connection?.transport.open) return undefined;
+      const cmdSeq = hub.nextCmdSeq(name);
+      const cmdId = `rotate:${name}:${cmdSeq}`;
+      connection.rotating = cmdId;
+      connection.send(supervisorCommand(head(name, connection.gen), cmdSeq, "runner.rotate", { cmdId }));
+      return cmdId;
+    },
   });
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Operator requests to the live hub (`dori runner revoke|rotate`)
+// ---------------------------------------------------------------------------------------------------------------
+
+export type RunnerAdminOp = "revoke" | "rotate";
+/** A queued request the supervisor has not taken within this long is answered `expired`. */
+export const RUNNER_ADMIN_TTL_MS = 2 * 60_000;
+
+const adminTable = (db: Database): void => {
+  db.run("CREATE TABLE IF NOT EXISTS runner_admin (id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, label TEXT NOT NULL, at INTEGER NOT NULL, doneAt INTEGER, result TEXT)");
+};
+
+/**
+ * Queues a request for the supervisor's live hub in `runner_admin` of `runners.sqlite` (the CLI runs in another
+ * process than the hub). The runners task takes it on its next pass; `runnerAdminResult` reads the answer.
+ */
+export const queueRunnerAdmin = (stateDir: string, op: RunnerAdminOp, label: string, now: number): number => {
+  const db = openHubDb(stateDir);
+  try {
+    adminTable(db);
+    return Number(db.query("INSERT INTO runner_admin (op, label, at) VALUES (?, ?, ?)").run(op, label, now).lastInsertRowid);
+  } finally {
+    db.close();
+  }
+};
+
+/** The answer to a queued request, or undefined while the supervisor has not taken it. */
+export const runnerAdminResult = (stateDir: string, id: number): string | undefined => {
+  const db = openHubDb(stateDir);
+  try {
+    adminTable(db);
+    return (db.query("SELECT result FROM runner_admin WHERE id = ? AND doneAt IS NOT NULL").get(id) as { result: string } | null)?.result;
+  } finally {
+    db.close();
+  }
+};
+
+/**
+ * Supervisor side: answers every open request through `accept`. `revoke` -> `revoked` / `not-enrolled` (the live link
+ * is closed either way); `rotate` -> `sent cmdId=<id>` / `not-connected`; older than `RUNNER_ADMIN_TTL_MS` ->
+ * `expired`. Returns one log line per request.
+ */
+export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "revoke" | "rotate">, now: number): string[] => {
+  const db = openHubDb(stateDir);
+  try {
+    adminTable(db);
+    const open = db.query("SELECT id, op, label, at FROM runner_admin WHERE doneAt IS NULL ORDER BY id").all() as { id: number; op: string; label: string; at: number }[];
+    return open.map((row) => {
+      let result: string;
+      if (now - row.at > RUNNER_ADMIN_TTL_MS) result = "expired";
+      else if (row.op === "revoke") result = accept.revoke(row.label) ? "revoked" : "not-enrolled";
+      else if (row.op === "rotate") {
+        const cmdId = accept.rotate(row.label);
+        result = cmdId ? `sent cmdId=${cmdId}` : "not-connected";
+      } else result = `unknown op ${row.op}`;
+      db.query("UPDATE runner_admin SET doneAt = ?, result = ? WHERE id = ?").run(now, result, row.id);
+      return `RUNNER_ADMIN op=${row.op} runner=${row.label} result=${result}`;
+    });
+  } finally {
+    db.close();
+  }
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -333,6 +539,71 @@ export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise
     stopHeartbeat();
     stopObserve();
   }
+};
+
+/**
+ * Reads the `dori runner enroll` output a runner gets on stdin: `code=<base64url>` and `fingerprint=sha256:<hex>` lines
+ * (other lines and surrounding blanks are ignored). Undefined when either is missing or malformed.
+ */
+export const parseEnrollInput = (text: string): { readonly code: string; readonly fingerprint: string } | undefined => {
+  const values = new Map<string, string>();
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^\s*(code|fingerprint)=(\S+)\s*$/.exec(line);
+    if (match) values.set(match[1] as string, match[2] as string);
+  }
+  const code = values.get("code");
+  const fp = values.get("fingerprint");
+  if (!code || !/^[A-Za-z0-9_-]{43}$/.test(code) || !fp || !/^sha256:[0-9a-f]{64}$/.test(fp)) return undefined;
+  return { code, fingerprint: fp };
+};
+
+export type DispatchDeps = {
+  readonly state: RunnerState;
+  readonly policy: RunnerPolicy;
+  /** `fs.realpathSync` in production: resolves symlinks and throws for a missing path. */
+  readonly realpath: (path: string) => string;
+  /** Publishes the `cmd.result` event (through the outbox). */
+  readonly publish: (body: RunnerEventBodies["cmd.result"]) => void;
+  readonly log: (line: string) => void;
+};
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * The runner's command dispatcher. For every command the supervisor sends (`runner.rotate` is handled by the client):
+ * 1. policy.ts `checkCommand` (schema and the runner's own allow lists); a refusal is recorded final and answered
+ *    `cmd.result failed "RUNNER_CMD_REJECTED <rule>"`.
+ * 2. The intent row is committed in the state; a cmdId already recorded is not run again.
+ * 3. Right before the effect, fencing.ts `checkEffectEpoch` against a fresh read of `maxEpoch`; a stale command is
+ *    recorded and answered `failed` with the `RUNNER_CMD_REJECTED stale-epoch ...` detail.
+ * 4. The effect. No command type has one yet, so each is answered `failed "RUNNER_CMD_UNSUPPORTED <type>"`.
+ * A frame without a usable cmdId and cmdSeq cannot be answered and is only logged.
+ */
+export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void => {
+  const body = isRecord(raw) && isRecord(raw.body) ? raw.body : undefined;
+  const cmdId = body?.cmdId;
+  const cmdSeq = isRecord(raw) ? raw.cmdSeq : undefined;
+  const type = isRecord(raw) && typeof raw.type === "string" ? raw.type : "?";
+  if (typeof cmdId !== "string" || !Number.isSafeInteger(cmdSeq) || (cmdSeq as number) < 1) {
+    deps.log(`RUNNER_CMD_DROPPED type=${type} no cmdId or cmdSeq to answer`);
+    return;
+  }
+  const seq = cmdSeq as number;
+  const epoch = isRecord(raw) && Number.isSafeInteger(raw.epoch) ? (raw.epoch as number) : 0;
+  const key = typeof body?.key === "string" ? body.key : undefined;
+  const finish = (detail: string): void => {
+    deps.state.recordResult(cmdId, "failed", detail);
+    deps.publish({ cmdId, cmdSeq: seq, state: "failed", detail });
+    deps.log(`RUNNER_CMD_FAILED cmdId=${cmdId} type=${type} ${detail}`);
+  };
+  const intent = { cmdId, cmdSeq: seq, type: type as SupervisorCommandType, epoch, ...(key !== undefined ? { key } : {}) };
+  const checked = checkCommand(deps.policy, raw, deps.realpath);
+  if (!deps.state.recordIntent(intent).fresh) return;
+  if (!checked.ok) { finish(rejectionText(checked.rule)); return; }
+  deps.state.observeEpoch(checked.command.epoch);
+  const fence = checkEffectEpoch(checked.command.epoch, deps.state.maxEpoch());
+  if (!fence.ok) { finish(fence.detail); return; }
+  finish(`RUNNER_CMD_UNSUPPORTED ${checked.command.type}`);
 };
 
 /** Wraps `connect` so `serveRunner` sees each connection; pass the result to both the client and `serveRunner`. */

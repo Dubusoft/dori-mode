@@ -117,7 +117,7 @@ export type RunnerMode = (typeof RUNNER_MODES)[number];
 
 /** The optional `runners` section. Absent from the file: the runner hub is not opened and every machine is mode "off". */
 export type RunnersConfig = {
-  /** Address the runner hub listens on (private-network validation comes with the hub itself). */
+  /** Private-network address the runner hub listens on. */
   readonly listen?: string;
   /** Machine label -> rollout mode; a label that is not listed is "off". */
   readonly mode?: Readonly<Record<string, RunnerMode>>;
@@ -134,7 +134,28 @@ const runnersConfig = (raw: unknown): RunnersConfig | undefined => {
   const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   if (!isObject(raw)) throw new TypeError("runners must be an object");
   const { listen, mode, restartCircuit } = raw;
-  if (listen !== undefined && (typeof listen !== "string" || !listen.trim())) throw new TypeError("runners.listen must be a non-empty string");
+  if (listen !== undefined) {
+    const value = typeof listen === "string" ? listen.trim() : String(listen);
+    const invalid = typeof listen !== "string" || !listen.trim()
+      ? true
+      : (() => {
+          const match = /^(\[[^\]]*\]|[^:]*):([0-9]+)$/.exec(value);
+          if (!match || !match[1] || Number(match[2]) < 1 || Number(match[2]) > 65535) return true;
+          const host = match[1].startsWith("[") ? match[1].slice(1, -1).toLowerCase() : match[1];
+          let privateHost = false;
+          if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+            const octets = host.split(".").map(Number);
+            const a = octets[0]!;
+            const b = octets[1]!;
+            privateHost = octets.every((n) => n >= 0 && n <= 255) &&
+              (a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) ||
+                (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127));
+          } else if (host === "::1" || host === "0:0:0:0:0:0:0:1") privateHost = true;
+          else if (/^f[cd][0-9a-f]{2}:/i.test(host)) privateHost = true;
+          return !privateHost;
+        })();
+    if (invalid) throw new TypeError(`CONFIG_RUNNER_LISTEN_INVALID ${value}`);
+  }
   if (mode !== undefined) {
     if (!isObject(mode)) throw new TypeError("runners.mode must map machine labels to modes");
     for (const [label, value] of Object.entries(mode)) {

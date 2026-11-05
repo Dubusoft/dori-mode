@@ -8,7 +8,9 @@
  *
  * Every frame is validated against a fixed per-type schema: an unknown type, a missing field, a field of the wrong
  * shape or a field the schema does not name is rejected with a `ProtocolError` naming the rule. `mac` is accepted as
- * an optional string; signing and checking it belong to the authentication layer.
+ * an optional string here; auth.ts computes and checks it, and the hub and client require it on every frame after the
+ * handshake (`enroll`, `hello`, `hello.challenge`, `auth.proof`, `enroll.ok` and a reject sent before the handshake
+ * are the only frames without one).
  */
 
 /** The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. */
@@ -83,16 +85,26 @@ export type SupervisorCommandBodies = {
 };
 
 export type RunnerControlBodies = {
+  /** `nonce` (32 random bytes) and `dh` (an ephemeral X25519 public key) open the signed handshake (base64 each). */
   readonly hello: {
     readonly proto: number; readonly gen: number; readonly label: string; readonly hostId: string; readonly cmdAck: number;
-    readonly version?: string; readonly inventory?: readonly InventoryLane[];
+    readonly version?: string; readonly inventory?: readonly InventoryLane[]; readonly nonce?: string; readonly dh?: string;
   };
+  /**
+   * First frame of an enrollment connection. `proof` is HMAC-SHA256 keyed with the enrollment code over the label,
+   * hostId and public key, so the code itself never crosses the network.
+   */
+  readonly enroll: { readonly label: string; readonly hostId: string; readonly runnerPubKey: string; readonly proof: string };
+  /** The runner's Ed25519 signature over the handshake transcript. */
+  readonly "auth.proof": { readonly sig: string };
+  /** Answer to `runner.rotate`: the new public key, and a signature with the new key binding it to this session. */
+  readonly "runner.rotated": { readonly cmdId: string; readonly runnerPubKey: string; readonly sig: string };
   /** `outbox` lets `dori status` show the runner's backlog without reading its files. */
   readonly heartbeat: { readonly outbox?: { readonly unacked: number; readonly oldestAgeMs: number } };
   readonly "cmd.status.result": { readonly cmdId: string; readonly state: CommandStatusState; readonly detail?: string };
 };
 
-export type RejectCode = "RUNNER_PROTO_MISMATCH" | "RUNNER_CONFLICT" | "RUNNER_REVOKED" | "RUNNER_AUTH_FAILED";
+export type RejectCode = "RUNNER_PROTO_MISMATCH" | "RUNNER_CONFLICT" | "RUNNER_REVOKED" | "RUNNER_AUTH_FAILED" | "RUNNER_ENROLL_REFUSED";
 
 export type SupervisorControlBodies = {
   /** `eventAck` tells the runner where to resume its outbox replay. */
@@ -100,6 +112,12 @@ export type SupervisorControlBodies = {
   readonly "hello.reject": { readonly code: RejectCode; readonly detail: string };
   readonly ack: { readonly eventAck: number };
   readonly "cmd.status": { readonly cmdId: string };
+  /** The supervisor's nonce, ephemeral X25519 key, transcript signature and the fingerprint of the runner key it holds. */
+  readonly "hello.challenge": { readonly nonce: string; readonly dh: string; readonly sig: string; readonly keyFp: string };
+  /** Enrollment accepted: the supervisor's public key, and an HMAC keyed with the code that proves the reply's origin. */
+  readonly "enroll.ok": { readonly supervisorPubKey: string; readonly proof: string };
+  /** The new runner key from `runner.rotated` is stored; the runner may drop its old key. */
+  readonly "rotate.ok": { readonly cmdId: string };
 };
 
 export type RunnerEventType = keyof RunnerEventBodies;
@@ -220,8 +238,11 @@ const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
 const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
   hello: {
     proto: req("int"), gen: req("int"), label: req("string"), hostId: req("string"), cmdAck: req("int"),
-    version: opt("string"), inventory: opt({ list: INVENTORY }),
+    version: opt("string"), inventory: opt({ list: INVENTORY }), nonce: opt("string"), dh: opt("string"),
   },
+  enroll: { label: req("string"), hostId: req("string"), runnerPubKey: req("string"), proof: req("string") },
+  "auth.proof": { sig: req("string") },
+  "runner.rotated": { cmdId: req("string"), runnerPubKey: req("string"), sig: req("string") },
   heartbeat: { outbox: opt({ object: { unacked: req("int"), oldestAgeMs: req("int") } }) },
   "cmd.status.result": {
     cmdId: req("string"), state: req({ enum: ["intent", "running", "verified", "failed", "ambiguous", "unknown"] }), detail: opt("string"),
@@ -231,10 +252,14 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
 const SUPERVISOR_CONTROL_SCHEMAS: { readonly [T in SupervisorControlType]: Shape } = {
   "hello.ok": { proto: req("int"), epoch: req("int"), eventAck: req("int") },
   "hello.reject": {
-    code: req({ enum: ["RUNNER_PROTO_MISMATCH", "RUNNER_CONFLICT", "RUNNER_REVOKED", "RUNNER_AUTH_FAILED"] }), detail: req("string"),
+    code: req({ enum: ["RUNNER_PROTO_MISMATCH", "RUNNER_CONFLICT", "RUNNER_REVOKED", "RUNNER_AUTH_FAILED", "RUNNER_ENROLL_REFUSED"] }),
+    detail: req("string"),
   },
   ack: { eventAck: req("int") },
   "cmd.status": { cmdId: req("string") },
+  "hello.challenge": { nonce: req("string"), dh: req("string"), sig: req("string"), keyFp: req("string") },
+  "enroll.ok": { supervisorPubKey: req("string"), proof: req("string") },
+  "rotate.ok": { cmdId: req("string") },
 };
 
 const has = <T extends object>(table: T, key: string): key is Extract<keyof T, string> => Object.hasOwn(table, key);
@@ -313,8 +338,8 @@ export function validateFrame(value: unknown, from: Sender): Frame {
   }
   if (value.body === undefined) throw new ProtocolError("missing-field", "body");
   checkShape("body", schema.shape, value.body);
-  if (value.type === "hello" && isRecord(value.body) && !LABEL_PATTERN.test(String(value.body.label))) {
-    throw new ProtocolError("label", `hello label ${JSON.stringify(value.body.label)} is not a valid label`);
+  if ((value.type === "hello" || value.type === "enroll") && isRecord(value.body) && !LABEL_PATTERN.test(String(value.body.label))) {
+    throw new ProtocolError("label", `${value.type} label ${JSON.stringify(value.body.label)} is not a valid label`);
   }
   return value as unknown as Frame;
 }

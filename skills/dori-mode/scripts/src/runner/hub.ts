@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { redactSecrets } from "../redact.ts";
 import type { EventMeta } from "../supervise-journal.ts";
+import { decideHello, recordHello, resetGen, type StoredRunner } from "./fencing.ts";
 import {
   PROTO, checkProto, journalId, supervisorControl,
   type AnyRunnerEvent, type RunnerControl, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
@@ -81,7 +82,8 @@ export type RunnerStatus = {
 };
 
 export type HelloOutcome =
-  | { readonly ok: true; readonly reply: SupervisorControl<"hello.ok">; readonly row: RunnerRow }
+  /** `replace`: the runner restarted (higher gen), so the connection held for the label must be closed. */
+  | { readonly ok: true; readonly reply: SupervisorControl<"hello.ok">; readonly row: RunnerRow; readonly replace: boolean }
   | { readonly ok: false; readonly reply: SupervisorControl<"hello.reject"> };
 
 export type ReceiveOutcome = {
@@ -155,12 +157,34 @@ export class RunnerHub {
     return { runner: label, gen, epoch: this.deps.epoch };
   }
 
+  /** The supervisor epoch this hub stamps on its frames. */
+  get epoch(): number {
+    return this.deps.epoch;
+  }
+
   /**
-   * Admits a hello: `checkProto` (`RUNNER_PROTO_MISMATCH`), the same label under another hostId or a gen below the
-   * stored maxGen (`RUNNER_CONFLICT`). On success it persists hostId, maxGen, cmdAck, proto, version and lastHelloAt
-   * and replies `hello.ok {proto, epoch, eventAck}`. A label seen for the first time gets a row with eventAck 0.
+   * Binds an existing runner row to the hostId of a fresh enrollment, so a runner enrolled again on another host is
+   * not refused as `RUNNER_CONFLICT`. A label without a row gets one at its first hello.
    */
-  hello(frame: RunnerControl<"hello">): HelloOutcome {
+  bindHost(label: string, hostId: string): void {
+    this.db.query("UPDATE runners SET hostId = ? WHERE label = ?").run(hostId, label);
+  }
+
+  /** Issues and persists the next cmdSeq for an admitted runner. */
+  nextCmdSeq(label: string): number {
+    const row = this.db.query("UPDATE runners SET cmdSeq = cmdSeq + 1 WHERE label = ? RETURNING cmdSeq").get(label) as { cmdSeq: number } | null;
+    if (!row) throw new Error(`RUNNER_UNKNOWN ${label}`);
+    return row.cmdSeq;
+  }
+
+  /**
+   * Admits a hello: `checkProto` (`RUNNER_PROTO_MISMATCH`), then fencing.ts `decideHello` against the stored hostId and
+   * maxGen (`RUNNER_CONFLICT`: another hostId, a lower gen, or the gen of the live connection `connectedGen` again).
+   * On success it persists hostId, the highest gen seen, cmdAck, proto, version and lastHelloAt and replies
+   * `hello.ok {proto, epoch, eventAck}`. A label seen for the first time gets a row with eventAck 0. A stored maxGen of
+   * 0 means none (a new row, or after `resetRunnerGen`).
+   */
+  hello(frame: RunnerControl<"hello">, connectedGen?: number): HelloOutcome {
     const body = frame.body;
     const supervisorProto = this.deps.proto ?? PROTO;
     const reject = (code: "RUNNER_PROTO_MISMATCH" | "RUNNER_CONFLICT", detail: string): HelloOutcome => ({
@@ -171,18 +195,19 @@ export class RunnerHub {
     if (!check.ok) return reject(check.code, check.detail);
     const label = body.label;
     const existing = this.get(label);
-    if (existing?.hostId !== undefined && existing.hostId !== body.hostId) {
-      return reject("RUNNER_CONFLICT", `label ${label} is bound to another host`);
-    }
-    if (existing && body.gen < existing.maxGen) {
-      return reject("RUNNER_CONFLICT", `gen ${body.gen} is below the recorded gen ${existing.maxGen}`);
-    }
+    const stored: StoredRunner | undefined = existing
+      ? { ...(existing.hostId !== undefined ? { hostId: existing.hostId } : {}), ...(existing.maxGen > 0 ? { maxGen: existing.maxGen } : {}) }
+      : undefined;
+    const identity = { label, hostId: body.hostId, gen: body.gen };
+    const decision = decideHello(stored, identity, connectedGen);
+    if (decision.action === "conflict") return reject(decision.code, decision.detail);
+    const maxGen = recordHello(stored, identity).maxGen;
     this.db.query(
       `INSERT INTO runners (label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt)
        VALUES (?, ?, 0, 0, ?, ?, ?, ?, ?)
        ON CONFLICT(label) DO UPDATE SET hostId = excluded.hostId, maxGen = excluded.maxGen, cmdAck = excluded.cmdAck,
          proto = excluded.proto, version = excluded.version, lastHelloAt = excluded.lastHelloAt`,
-    ).run(label, body.hostId, body.gen, body.cmdAck, body.proto, body.version ?? null, this.deps.now());
+    ).run(label, body.hostId, maxGen, body.cmdAck, body.proto, body.version ?? null, this.deps.now());
     this.db.query("UPDATE runners SET lanes = ? WHERE label = ?").run(body.inventory ? body.inventory.length : null, label);
     this.lockDown();
     this.live.set(label, { ...(this.live.get(label) ?? {}), lastSeen: this.deps.monotonic() });
@@ -190,6 +215,7 @@ export class RunnerHub {
     return {
       ok: true,
       row,
+      replace: decision.action === "replace",
       reply: supervisorControl(this.head(label, body.gen), "hello.ok", { proto: supervisorProto, epoch: this.deps.epoch, eventAck: row.eventAck }),
     };
   }
@@ -293,6 +319,25 @@ export const formatRunnerStatus = (status: RunnerStatus): string => {
   const or = (v: number | string | undefined): string => (v === undefined ? "-" : String(v));
   const outbox = status.outbox ? `${status.outbox.unacked}/${Math.floor(status.outbox.oldestAgeMs / 1000)}` : "-";
   return `RUNNER ${status.label} ${status.state} proto=${or(status.proto)} version=${or(status.version)} gen=${status.gen} hb=${or(status.heartbeatAgeSec)} outbox=${outbox}`;
+};
+
+/**
+ * `dori runner reset-gen <label>`: clears the label's stored maxGen (fencing.ts `resetGen`, hostId kept) so the next
+ * hello from the same host is admitted at any gen. Returns false when the label has no row.
+ */
+export const resetRunnerGen = (stateDir: string, label: string): boolean => {
+  const path = join(stateDir, HUB_FILE);
+  if (!existsSync(path)) return false;
+  const db = new Database(path);
+  try {
+    const row = db.query("SELECT hostId, maxGen FROM runners WHERE label = ?").get(label) as { hostId: string | null; maxGen: number } | null;
+    if (!row) return false;
+    const kept = resetGen({ ...(row.hostId !== null ? { hostId: row.hostId } : {}), maxGen: row.maxGen });
+    db.query("UPDATE runners SET hostId = ?, maxGen = ? WHERE label = ?").run(kept.hostId ?? null, kept.maxGen ?? 0, label);
+    return true;
+  } finally {
+    db.close();
+  }
 };
 
 /** Reads runner status rows from `<stateDir>/runners.sqlite` without a live hub (read-only; [] when absent). */

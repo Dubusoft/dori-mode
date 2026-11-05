@@ -1,0 +1,119 @@
+// Runner-side command validation: what the runner agrees to execute even for an authenticated supervisor.
+// Pure apart from the optional config read in `loadPolicy`; path resolution is injected into `checkCommand`.
+
+import { readFileSync } from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand } from "./protocol.ts";
+
+export const POLICY_FILE = "runner-config.json";
+
+export type RunnerPolicy = {
+  /** Profile name -> argv template. Only these profiles may be started. */
+  readonly agents: Readonly<Record<string, readonly string[]>>;
+  /** Directories under which every command cwd must resolve. */
+  readonly allowedRoots: readonly string[];
+  readonly sandbox: "required" | "optional";
+  readonly jobs: "allow" | "deny";
+};
+
+export const DEFAULT_POLICY: RunnerPolicy = { agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow" };
+
+/** Rules beyond the protocol schema rules (which pass through under their own names, e.g. `unknown-field`). */
+export type PolicyRule =
+  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "command-not-argv" | "jobs-denied";
+
+export type CheckResult = { readonly ok: true; readonly command: AnySupervisorCommand } | { readonly ok: false; readonly rule: string; readonly detail: string };
+
+/** The `detail` a rejected command reports in its `cmd.result`. */
+export const rejectionText = (rule: string): string => `RUNNER_CMD_REJECTED ${rule}`;
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Reads a policy from parsed JSON; unknown keys or wrong types throw. */
+export function parsePolicy(value: unknown): RunnerPolicy {
+  if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
+  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs"]);
+  for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
+  const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
+  const agents: Record<string, readonly string[]> = {};
+  if (value.agents !== undefined) {
+    if (!isRecord(value.agents)) throw new Error("runner-config: agents must be an object");
+    for (const [name, argv] of Object.entries(value.agents)) {
+      if (!strings(argv)) throw new Error(`runner-config: agents.${name} must be a string array`);
+      agents[name] = argv;
+    }
+  }
+  if (value.allowedRoots !== undefined && !strings(value.allowedRoots)) throw new Error("runner-config: allowedRoots must be a string array");
+  if (value.sandbox !== undefined && value.sandbox !== "required" && value.sandbox !== "optional") throw new Error("runner-config: sandbox must be required|optional");
+  if (value.jobs !== undefined && value.jobs !== "allow" && value.jobs !== "deny") throw new Error("runner-config: jobs must be allow|deny");
+  return {
+    agents,
+    allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
+    sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
+    jobs: (value.jobs as RunnerPolicy["jobs"] | undefined) ?? DEFAULT_POLICY.jobs,
+  };
+}
+
+/** Loads `<runnerDir>/runner-config.json`; an absent file yields the defaults (no agents, no roots). */
+export function loadPolicy(runnerDir: string): RunnerPolicy {
+  let text: string;
+  try {
+    text = readFileSync(join(runnerDir, POLICY_FILE), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return DEFAULT_POLICY;
+    throw error;
+  }
+  return parsePolicy(JSON.parse(text));
+}
+
+const underRoot = (root: string, path: string): boolean => {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+
+/**
+ * Checks a parsed supervisor command frame against the policy. `realpath` resolves symlinks and throws when the
+ * path does not exist (as `fs.realpathSync` does).
+ */
+export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (path: string) => string): CheckResult {
+  const reject = (rule: string, detail: string): CheckResult => ({ ok: false, rule, detail });
+  // A shell string is reported by its own rule rather than as a generic type error.
+  if (isRecord(command) && command.type === "job.run" && isRecord(command.body) && command.body.command !== undefined) {
+    const argv = command.body.command;
+    if (!Array.isArray(argv) || !argv.every((s) => typeof s === "string")) return reject("command-not-argv", "command must be an argv string array");
+  }
+  let frame: AnySupervisorCommand;
+  try {
+    const checked = validateFrame(command, "supervisor");
+    if (!(SUPERVISOR_COMMAND_TYPES as readonly string[]).includes(checked.type)) return reject("not-a-command", checked.type);
+    frame = checked as AnySupervisorCommand;
+  } catch (error) {
+    if (error instanceof ProtocolError) return reject(error.rule, error.detail);
+    throw error;
+  }
+
+  const body = frame.body as Record<string, unknown>;
+  if ((frame.type === "job.run" || frame.type === "wait.check") && policy.jobs === "deny") return reject("jobs-denied", frame.type);
+  if (frame.type === "lane.start") {
+    if (!Object.hasOwn(policy.agents, body.agentProfile as string)) return reject("agent-profile", String(body.agentProfile));
+    if (body.sandbox === false && policy.sandbox === "required") return reject("sandbox-required", "sandbox:false");
+  }
+  if (typeof body.cwd === "string") {
+    if (!isAbsolute(body.cwd)) return reject("cwd-missing", `${body.cwd} is not absolute`);
+    let resolved: string;
+    try {
+      resolved = realpath(body.cwd);
+    } catch {
+      return reject("cwd-missing", body.cwd);
+    }
+    const roots: string[] = [];
+    for (const root of policy.allowedRoots) {
+      try { roots.push(realpath(root)); } catch { /* a root that does not exist admits nothing */ }
+    }
+    if (!roots.some((root) => underRoot(root, resolved))) return reject("cwd-outside-roots", resolved);
+  }
+  return { ok: true, command: frame };
+}
+
+/** `RUNNER_CMD_REJECTED <rule>` for a failed check, else undefined. */
+export const rejection = (result: CheckResult): string | undefined => (result.ok ? undefined : rejectionText(result.rule));

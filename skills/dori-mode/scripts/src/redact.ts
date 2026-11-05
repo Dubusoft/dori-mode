@@ -58,6 +58,8 @@ const assignment = (match: string, prefix: string, raw: string): string => {
 // Order matters: block/prefixed forms first, generic assignments last.
 const RULES: readonly (readonly [RegExp, string | ((...m: string[]) => string)])[] = [
   [/-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?(?:-----END \1-----|$)/g, `[REDACTED PRIVATE KEY]`],
+  [/\b((?:enroll-code|enrollment-code|code)\s*[:=]\s*)[A-Za-z0-9_-]{8,}/gi, (_m, prefix) => `${prefix}${MASK}`],
+  [/(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g, MASK],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, MASK],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, MASK],
   [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}/g, MASK],

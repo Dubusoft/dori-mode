@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { statSync } from "node:fs";
 import { join } from "node:path";
 
+import { RunnerAuth } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { runStartupCheck } from "../src/runner/fs-safety.ts";
 import { HUB_FILE, readRunnerRows } from "../src/runner/hub.ts";
@@ -34,12 +35,12 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
   const deps = depsFor(newWorld(), clock, stateDir, { runners: { mode: { local: "shadow" } } });
 
-  // Supervisor side: the hub on <runnerDir>/sock/control, as supervise() opens it.
+  // Supervisor side: the hub on <runnerDir>/sock/control, as supervise() opens it; it enrolls the local runner in-process.
   const logs: string[] = [];
   const logged = waiter<string>();
   const heartbeats = waiter<string>();
   const hub = openRunnerHub(stateDir, runnerDir, clock.now, clock.now, (line) => { logs.push(line); logged.see(line); }, {
-    onHeartbeat: (label) => { heartbeats.see(label); },
+    onHeartbeat: (label) => { heartbeats.see(label); }, hostId: "host-a",
   });
   cleanups.push(() => hub.close());
   expect(statSync(join(runnerDir, "sock")).mode & 0o777).toBe(0o700);
@@ -57,7 +58,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const observed: ObservedLane[] = [{ key: "demo", pane: "w1:p2", tab: "w1:t1", status: "working" }];
   const tracked = trackedConnector(connectUnix(controlSocketPath(runnerDir)));
   const client = new RunnerClient({ label: identity.label, hostId: identity.hostId }, {
-    connect: tracked.connect, outbox, state: runnerState, clock, inventory: () => observed.map(({ status: _s, ...lane }) => lane),
+    connect: tracked.connect, outbox, state: runnerState, clock, auth: new RunnerAuth(runnerDir), inventory: () => observed.map(({ status: _s, ...lane }) => lane),
   });
   const timers: { ms: number; tick: () => void }[] = [];
   const controller = new AbortController();

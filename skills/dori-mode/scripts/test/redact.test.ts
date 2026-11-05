@@ -31,6 +31,15 @@ describe("redactSecrets patterns", () => {
     const out = redactSecrets(`https://api.telegram.org/bot${token}/sendMessage`);
     expect(out).toBe("https://api.telegram.org/bot[REDACTED]/sendMessage");
   });
+  test("runner enrollment codes, session tokens, and private keys", () => {
+    const code = "enroll-" + body(5);
+    const token = "a".repeat(43);
+    const pem = "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----";
+    const out = redactSecrets(`enroll-code=${code} session=${token}\n${pem}`);
+    expect(out).not.toContain(code);
+    expect(out).not.toContain(token);
+    expect(out).not.toContain("abc123");
+  });
   test("ordinary text is untouched", () => {
     for (const text of ["token=5", "MAX_TOKENS=100", "sort_key list", "see src/token.ts", "state: key=value"]) expect(redactSecrets(text)).toBe(text);
   });
