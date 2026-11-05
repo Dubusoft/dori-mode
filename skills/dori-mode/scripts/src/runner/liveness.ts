@@ -3,6 +3,7 @@ import { machineBackoffMs, sshArgv, type GuardMachine } from "../remote-guard.ts
 import { RUN_TIMEOUT_CODE, type Runner } from "../run.ts";
 import { plan, settleOperation, type OperationStore } from "../operations.ts";
 import { RUNNER_OFFLINE_MS, RUNNER_STALE_MS } from "./hub.ts";
+import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
 
 /**
  * Runner liveness and restart decisions (design 4.3), on the supervisor's monotonic clock only.
@@ -13,7 +14,7 @@ import { RUNNER_OFFLINE_MS, RUNNER_STALE_MS } from "./hub.ts";
  *   restart, retried on the guard's backoff (2 min doubling to 30 min). The process alive with a fresh health file is a
  *   partition: no restart, `RUNNER_UNREACHABLE machine=<label>` once per outage. The process gone or its health older
  *   than 120 s is "dead": a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>` and carried out
- *   (`systemctl --user restart dori-runner.service` on that host). A hello with a higher gen within 2 min verifies it
+ *   (`systemctl --user restart dori-runner.service`, or launchd on macOS, on that host). A hello with a higher gen within 2 min verifies it
  *   (`RUNNER_RESTARTED`); none fails it (`RUNNER_RESTART_FAILED`) and the next decision follows the backoff.
  * - The circuit breaker allows 3 restarts per runner per hour. A restart it refuses, or 30 min offline, makes the
  *   runner LOST: `LANE_RUNNER_LOST <key> runner=<label>` once for each open lane the runner owns. Nothing is moved to
@@ -67,7 +68,7 @@ const tag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
 export const PROBE_TIMEOUT_MS = 20_000;
 const RUNNER_UNIT = "dori-runner.service";
 // The bundle `dori runner install` puts on a worker, run with the bun the user's login would find.
-const REMOTE_PROBE = 'PATH="$HOME/.bun/bin:$PATH" bun "$HOME/.dori/runner/bin/dori.js" runner probe --json';
+const REMOTE_PROBE = remoteRunnerCli("runner probe --json");
 
 /**
  * The real probe and restart. `local` is the label of the runner on the supervisor's own host, probed and restarted
@@ -94,9 +95,9 @@ export const livenessIo = (run: Runner, local: string, machines: () => Promise<r
       return { kind: "unreachable", detail: `no probe answer (exit ${r.code})` };
     },
     restart: async (label) => {
-      const r = await on(label, ["systemctl", "--user", "restart", RUNNER_UNIT], `systemctl --user restart ${RUNNER_UNIT}`, PROBE_TIMEOUT_MS);
+      const r = await on(label, ["systemctl", "--user", "restart", RUNNER_UNIT], remoteRunnerService("restart"), PROBE_TIMEOUT_MS);
       if (!r) return { ok: false, detail: `no machine ${label}` };
-      return r.code === 0 ? { ok: true, detail: "systemctl restart" } : { ok: false, detail: (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}` };
+      return r.code === 0 ? { ok: true, detail: "service restart" } : { ok: false, detail: (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}` };
     },
   };
 };

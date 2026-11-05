@@ -210,25 +210,31 @@ from posing as the supervisor or the runner.
 
 ## Remote install
 
-`dori runner install --machine <label>` puts a runner on a Linux worker. The machine is looked up like the guard's
+`dori runner install --machine <label>` puts a runner on a Linux or macOS worker. The machine is looked up like the guard's
 machines (herdr's saved machines plus `guardMachines`), and `runners.listen` must be set; otherwise it stops with
 `RUNNER_INSTALL_NO_LISTEN`. The supervisor issues the enrollment code in its own process and runs
 `ssh <target> sh -s`. That command line never changes: everything else goes on ssh's stdin as one sh script.
 
 - The bundle is `bun build src/runner/bin.ts --target=bun`, a single file holding only the runner. It is written to
-  `~/.dori/runner/bin/dori.js` through a temporary file and `mv`. The worker needs `bun` on its PATH.
-- `~/.config/systemd/user/dori-runner.service` (from `templates/dori-runner-remote.service`) runs
+  `~/.dori/runner/bin/dori.js` through a temporary file and `mv`. A Linux worker needs `bun` on its PATH. A macOS
+  worker takes it from the PATH, `~/.dori/runner/bun/bun`, `/opt/homebrew/bin`, `/usr/local/bin` or `~/.bun/bin`, and
+  otherwise downloads the latest release into `~/.dori/runner/bun`.
+- On Linux, `~/.config/systemd/user/dori-runner.service` (from `templates/dori-runner-remote.service`) runs
   `bun ~/.dori/runner/bin/dori.js runner serve --label <label> --connect ws://<runners.listen>`. It has no
   `EnvironmentFile`: a worker holds no supervisor or Discord credentials.
 - The enrollment code and the supervisor fingerprint are shell variables in the script. They reach
   `runner serve --enroll-only` through a pipe from the `printf` builtin, so they appear in no process's argv on either
   machine. A worker that already has `~/.dori/runner/keys/supervisor.pub` skips enrollment: a reinstall or an upgrade
   keeps its keys.
-- Then linger is turned on and the unit is enabled and restarted, so a new bundle takes effect.
+- On macOS, the launchd user agent `~/Library/LaunchAgents/com.dori.runner.plist` (from
+  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials.
+- Then, on Linux, linger is turned on and the unit is enabled and restarted. On macOS the agent is loaded into
+  `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
+  `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.
 
 It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256>`, or exits 1 with
-`RUNNER_INSTALL_UNREACHABLE` (ssh failed or timed out), `RUNNER_INSTALL_UNSUPPORTED` (not Linux, or no POSIX shell),
-`RUNNER_INSTALL_NO_BUN`, `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd or linger step
+`RUNNER_INSTALL_UNREACHABLE` (ssh failed or timed out), `RUNNER_INSTALL_UNSUPPORTED` (neither Linux nor macOS, or no POSIX shell),
+`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd, linger or launchd step
 named when that failed).
 
 ## Guard
@@ -351,7 +357,8 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
 - **Alive** (`healthy` or `stalled`): the runner is fine and only its connection is down, so it is not restarted.
   `RUNNER_UNREACHABLE machine=<label>` (digest) is said once per outage.
 - **Dead**: a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>`, and then
-  `systemctl --user restart dori-runner.service` runs on that host. A hello with a higher gen within 2 minutes
+  the runner's service is restarted on that host (`systemctl --user restart dori-runner.service`, or
+  `launchctl kickstart -k` on the recorded launchd domain on macOS). A hello with a higher gen within 2 minutes
   verifies it: `RUNNER_RESTARTED`. Without one the row fails, `RUNNER_RESTART_FAILED` is said, and the next decision
   follows the backoff.
 
@@ -452,6 +459,6 @@ scraping of its `[REPORT]` lines.
    so a report already received is not stored twice.
 2. It types a footer update into each lane's pane: go back to printing `[REPORT]` lines.
 3. It clears `Lane.runner`, which puts the lane back on the screen-scraping path.
-4. It stops the runner's service.
+4. It stops the runner's service: the systemd unit on Linux, or on macOS the launchd agent (disabled and booted out).
 
 The lanes keep running. A step that fails is reported, and the later steps still run.
