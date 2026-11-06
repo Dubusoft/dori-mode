@@ -87,8 +87,8 @@ test("the runners section loads, with unlisted machines off, and a malformed one
   }
 });
 
-test("an obsolete key warns once per process and is dropped; the shipped list starts empty", async () => {
-  expect(OBSOLETE_CONFIG_KEYS).toEqual([]);
+test("an obsolete key warns once per process and is dropped; the shipped list names progressTemplate", async () => {
+  expect(OBSOLETE_CONFIG_KEYS).toEqual(["progressTemplate"]);
   const lines: string[] = [];
   const original = console.error;
   console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };

@@ -74,12 +74,14 @@ export type Lane = {
   /** When a nudge last could not be typed (input line busy, pane not live); it is retried each tick, reported once per silence. */
   readonly lastNudgeFailedAt?: number;
   readonly lastAutoReplyAt?: number;
-  /** The todo item the freshness sweep last posted from a working lane's pane, so an unchanged item is never posted twice. */
+  /** @deprecated No longer written (the sweep no longer relays pane todo items); old registries still load with it. */
   readonly lastProgressPost?: string;
-  /** When that todo item was last posted successfully, so an unchanged item is posted again after nudgeAfterMin. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastProgressAt?: number;
-  /** The last failed progress-post error, so a failing hook is reported once per distinct error, not every tick. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastProgressError?: string;
+  /** The id of the one `[System]` status message the supervisor keeps in the lane's thread and edits on each progress or milestone report. */
+  readonly statusMessageId?: string;
   /** A remote lane's last [REPORT] line the watcher acted on (claim, LANE_REPORT or nothing for a milestone). */
   readonly lastRemoteReport?: string;
   /** Every [REPORT] line the watcher has acted on, by line hash and first-seen time, newest last. */

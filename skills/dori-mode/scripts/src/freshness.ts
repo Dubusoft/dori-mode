@@ -4,7 +4,6 @@ import type { FlowDeps } from "./done-flow.ts";
 import type { LaneReportStore } from "./lane-reports.ts";
 import { checkPausedLane } from "./pause.ts";
 import { laneRunner, sendVerified } from "./panes.ts";
-import { extractProgress, progressLine } from "./progress.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
 
@@ -30,12 +29,12 @@ export const scrubForThread = (line: string, home: string): string =>
     .trim();
 
 /**
- * A thread post the supervisor makes for a lane (its todo item, its last [REPORT] line, a `dori report progress` row):
+ * A thread post the supervisor makes for a lane (its last [REPORT] line, a `dori report progress` row):
  * marked `[System]` and relayed, so the owner never reads it as the lane, or the lead, speaking.
  */
 export const relayedText = (key: string, text: string): string => `[System] relayed from lane ${key}: ${text}`;
 
-export type SweepAct = { readonly kind: "nudged" | "progress" | "progress-failed" | "no-progress" | "idle-escalate" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
+export type SweepAct = { readonly kind: "nudged" | "no-progress" | "idle-escalate" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
 
 /**
  * The nudge an idle silent lane gets: three ways out, each in the lane's own report form (its footer's): claim done,
@@ -62,7 +61,7 @@ const lastRowAt = (reports: LaneReportStore): Map<string, number> => {
 
 /**
  * With `reports`, a lane's report rows are its progress: the router already posts them, so a working
- * lane with a row newer than nudgeAfterMin costs no herdr call at all. Its pane is read (todo item, nudge, last
+ * lane with a row newer than nudgeAfterMin costs no herdr call at all. Its pane is read (nudge, last
  * [REPORT] line) only once no row arrived within nudgeAfterMin, counted from its newest row or reply.
  */
 export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepView = passthroughView(deps.run), reports?: LaneReportStore): Promise<SweepAct[]> => {
@@ -95,31 +94,12 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
     };
     const hook = deps.config.hooks.threadReply;
     if (silentMin >= deps.config.nudgeAfterMin) {
-      // herdr's own status decides. A working lane is never interrupted: its pane is read (no LLM turn) and the todo item is posted for it.
+      // herdr's own status decides. A working lane is never interrupted and nothing is posted for it: the lead hears
+      // once per silence and decides. No nudge was sent, so this silence never escalates.
       if ((await view.status(lane)).status === "working") {
-        const progress = extractProgress(await view.screen(lane, 60));
-        if (progress && hook && lane.thread !== "none") {
-          const line = progressLine(progress, (s) => scrubForThread(s, home), deps.config.progressTemplate);
-          // A new item posts at once; an unchanged one again every nudgeAfterMin, so a long step still shows life.
-          if (line.key !== current.lastProgressPost || now - (current.lastProgressAt ?? 0) >= deps.config.nudgeAfterMin * 60_000) {
-            const posted = await deps.run(fillHook(hook, { thread: lane.thread, text: relayedText(lane.key, line.text), key: lane.key }));
-            if (posted.code === 0) {
-              await save({ lastProgressPost: line.key, lastProgressAt: now, lastProgressError: undefined });
-              acts.push({ kind: "progress", lane: lane.key, detail: line.text });
-            } else {
-              // Nothing is saved as posted, so the next tick tries again; the same error is reported once.
-              const error = (posted.err || posted.out || `exit ${posted.code}`).replace(/\s+/g, " ").slice(0, 160);
-              if (error !== current.lastProgressError) {
-                await save({ lastProgressError: error });
-                acts.push({ kind: "progress-failed", lane: lane.key, detail: `thread hook failed: ${error}` });
-              }
-            }
-          }
-        } else if (lane.thread !== "none" && (current.lastNudgeAt ?? 0) < heard) {
-          // Nothing can be posted for it (no Todo item on its pane, or no thread hook), and a working lane is not
-          // interrupted: the lead hears once per silence and decides. No nudge was sent, so this silence never escalates.
+        if (lane.thread !== "none" && (current.lastNudgeAt ?? 0) < heard) {
           await save({ lastNudgeAt: now, idleEscalations: undefined, lastIdleEscalateAt: undefined });
-          acts.push({ kind: "no-progress", lane: lane.key, detail: `${silentMin} min without a thread update while working; ${progress ? "no threadReply hook to post its todo" : "its pane shows no Todo item to post"}` });
+          acts.push({ kind: "no-progress", lane: lane.key, detail: `${silentMin} min without a thread update while working` });
         }
       } else if ((current.lastNudgeAt ?? 0) < heard) {
         const delivery = await sendVerified(run, deps.clock, lane.pane, nudgeText(lane, silentMin, deps.config.ownerLanguage));

@@ -224,6 +224,11 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
 
 const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 
+/** What a milestone report is, shared by every footer. */
+const MILESTONE_KIND = 'milestone = a state change the owner would care about: what now works or landed, where the lane stands against its Done condition, and "scope unchanged" or what changed';
+/** The kinds of a `dori report` footer and where each goes. */
+const REPORT_KINDS_TEXT = `${MILESTONE_KIND}; it reaches the lead with its next update. progress = 1-2 sentences, done since last and next; it updates your work thread's status message. question and blocked wake the lead.`;
+
 export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, laneRules?: readonly string[], shell?: PaneShell): string => [
   "",
   FOOTER_HEADING.slice(1),
@@ -234,22 +239,22 @@ export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, lan
   `- Done = ${lane.done}`,
   ...(lane.machine && lane.runner
     ? [
-      `- This lane runs on machine ${lane.machine} under its runner. Report to the lead with ${RUNNER_LANE_CLI} report, never by typing into any pane: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". question and blocked wake the lead, milestone reaches it with its next update, progress is posted to your work thread. That CLI takes only report, claim-done and heavy, and only for this lane's key.`,
+      `- This lane runs on machine ${lane.machine} under its runner. Report to the lead with ${RUNNER_LANE_CLI} report, never by typing into any pane: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done and heavy, and only for this lane's key.`,
       `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
     ]
     : lane.machine
     ? [
-      `- This lane runs on machine ${lane.machine}; the lead reads this pane from another host. Report at each milestone by printing this line in your own output (do not message any pane): [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>.`,
+      `- This lane runs on machine ${lane.machine}; the lead reads this pane from another host. Report at each milestone by printing this line in your own output (do not message any pane): [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>. ${MILESTONE_KIND}.`,
       `- When done: print [REPORT] ${lane.key} | done | <merge SHA, closed issue, version> and stay idle. The lead checks the Done signals and closes the lane; dori claim-done is not available on this machine. Each distinct report line is read once: after a [LEAD] not done, print a done line with updated evidence.`,
     ]
     : lane.reportVia === "cli"
       ? [
-        `- Report to the lead with dori report, never by typing into the lead's pane: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". question and blocked wake the lead, milestone reaches it with its next update, progress is posted to your work thread.`,
+        `- Report to the lead with dori report, never by typing into the lead's pane: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT}`,
         `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>" (the same claim as dori claim-done). See references/done-protocol.md.`,
       ]
       // Only a lane record without reportVia reaches this; launchLane sets reportVia on every local launch and relaunch.
       : [
-        `- Report to the lead at each milestone: [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>, sent to pane ${leadPane || "(lead pane)"} as an argv array, never a shell string.`,
+        `- Report to the lead at each milestone: [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>, sent to pane ${leadPane || "(lead pane)"} as an argv array, never a shell string. ${MILESTONE_KIND}.`,
         `- When done: dori claim-done ${lane.key} --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
       ]),
   "",

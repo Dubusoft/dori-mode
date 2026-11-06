@@ -15,6 +15,7 @@ import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard
 import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
 import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
+import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
@@ -40,7 +41,7 @@ import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, recordHandled } from "./ack.ts";
-import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, unreadAfterAck } from "./inbox.ts";
+import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -57,7 +58,9 @@ const USAGE = `dori <command> [options]
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
   setup  [--yes] [--token-file F] [--channel ID] [--autostart]   interactive install: token, channels, herdr, autostart (dori setup --help)
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
-  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
+  launch <key> --title T (--brief FILE | --from-message CHANNEL MESSAGE_ID ... [--note TEXT ...]) --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
+                [--from-message CHANNEL MESSAGE_ID]   repeatable, instead of --brief: the brief is "# <title>", "## Owner request" with those owner messages (latest edit) in order,
+                                       then "## Lead notes" with each --note as a bullet; written to <stateDir>/briefs/<key>.md; a deleted, visitor or unknown message exits 1
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
                 [--sandbox]   every local lane's agent runs in laneSandbox.command (a --machine or --pane lane, or a missing command, passes through with SANDBOX_SKIPPED); --sandbox wraps a --pane lane too, refused for --machine
@@ -145,8 +148,11 @@ const USAGE = `dori <command> [options]
                                        hourglass off, eyes on; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
                                        link what handled an owner message
-  send discord --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON]
-                                       post or edit a Discord message (token from DORI_DISCORD_TOKEN)
+  send discord --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
+                                       post or edit a Discord message (token from DORI_DISCORD_TOKEN). A new post is refused with
+                                       SEND_STALE <n> (the unseen owner events follow, exit 3) when the destination got owner messages
+                                       you have not taken, acked or seen in an ack preview; merge them and resend. --force skips the
+                                       check; --edit is never checked
   thread discord --to CHANNEL [--message ID] --name NAME
                                        start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
                                        prints THREAD discord:<channel>/<thread>
@@ -688,8 +694,19 @@ try {
       const toodoArg = opt("toodo-start");
       if (toodoArg !== undefined && (opt("cwd") || opt("pane") || opt("workspace"))) die("--toodo-start takes the directory and pane from the start_task response; drop --cwd, --pane and --workspace");
       const toodo = toodoArg === undefined ? undefined : await readToodoStart(toodoArg).catch((error: unknown) => die(error instanceof Error ? error.message : String(error)));
-      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
+      const fromArgs = (() => { try { return launchBriefArgs(rest); } catch (e) { return die(e instanceof Error ? e.message : String(e)); } })();
+      const fromMessage = fromArgs.refs.length > 0;
+      if (fromMessage === (flags.values.brief !== undefined)) die("launch needs exactly one of --brief FILE or --from-message <channel> <messageId> (repeatable)");
+      if (!fromMessage && fromArgs.notes.length) die("--note goes with --from-message; with --brief put lead notes in the brief file");
+      const title = need("title");
+      const generated = fromMessage ? (() => {
+        try {
+          return { path: generatedBriefPath(config.stateDir, key ?? ""), text: assembleBrief(title, fromArgs.refs.map((ref) => ownerMessageText(config.stateDir, ref)), fromArgs.notes) };
+        } catch (e) { return die(e instanceof Error ? e.message : String(e)); }
+      })() : undefined;
+      const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
+      if (generated) writeGeneratedBrief(generated.path, generated.text);
       const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
@@ -1097,6 +1114,14 @@ try {
       let components: unknown[] | undefined;
       try { components = buttons === undefined ? undefined : buttonRow(buttons); } catch (e) { die(e instanceof Error ? e.message : String(e)); }
       if (!edit) {
+        if (flags.values.force !== true) {
+          const stale = staleOwnerEvents(config.stateDir, to);
+          if (stale.count) {
+            console.log(`SEND_STALE ${stale.count}`);
+            for (const line of stale.lines) console.log(line);
+            process.exit(3);
+          }
+        }
         const sent = await postMessage(to, text, components);
         console.log(`SENT ${sent}`);
       } else await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);

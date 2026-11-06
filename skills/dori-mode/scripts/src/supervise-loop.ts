@@ -51,7 +51,8 @@ import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
 import { OWNER_NOTICE_AFTER_MS, RetryingDelivery, SuperviseError, Supervisor } from "./supervise.ts";
 import { Waits } from "./waits.ts";
-import { GitHubEvents } from "./github-events.ts";
+import { GitHubEvents, type OpenPull } from "./github-events.ts";
+import { driftTick, pullOwners } from "./drift.ts";
 import { CiFollowUp } from "./ci-follow.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
@@ -564,6 +565,7 @@ export const supervisorSweeps = (
   laneReports: () => LaneReportStore | undefined = () => undefined,
   io: PressureIo = pressureIo(deps),
   runnerGuard: () => RunnerGuardBoard | undefined = () => undefined,
+  openPulls: () => readonly OpenPull[] = () => [],
 ): readonly Sweep[] => {
   const guard: GuardState = { alerting: false };
   const critical = { critical: false };
@@ -611,6 +613,13 @@ export const supervisorSweeps = (
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
     ["freshness", async () => (await freshnessTick(deps, home, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
+    // Urgent LANE_DRIFT for a working lane overdue on milestones or failing CI head after head; reads the last GitHub poll only.
+    ["drift", async (emit) => {
+      await driftTick({
+        stateDir: deps.config.stateDir, drift: deps.config.drift, now: deps.clock.now, openLanes: () => deps.registry.open(), owners: pullOwners(deps.run),
+      }, laneReports(), openPulls(), emit);
+      return [];
+    }],
     // A lane asking through its agent's on-screen question UI instead of dori report: one urgent LANE_ASKING per question.
     ["ask-user", async (emit) => { await askUserTick(deps, emit, view); return []; }],
     ["memory", async () => memorySweep(deps, home)],
@@ -815,7 +824,7 @@ export const supervise = async (
     // Each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog.
     // The watcher reads its claim announcements back from the journal.
     const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id) };
-    const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard).map(([name, step]): Sweep => [name, async (emit) =>
+    const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard, () => github.openPulls()).map(([name, step]): Sweep => [name, async (emit) =>
       watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
     const recentWarnings = new Map<string, number>();
     const boot = randomUUID();
@@ -865,7 +874,9 @@ export const supervise = async (
     // Lane reports are routed in the 5 s polling pass, so a question reaches the lead within one pass and one delivery
     // tick of being written.
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
-    const routeLaneReports = (): Promise<void> => watchdog.track("reports", routeReports(deps, reportStore, enqueueSweep, home))
+    // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
+    const statusTransport = { post: (channel: string, text: string, id: string) => discord.send(channel, text, id), edit: (channel: string, id: string, text: string) => discord.edit(channel, id, text) };
+    const routeLaneReports = (): Promise<void> => watchdog.track("reports", routeReports(deps, reportStore, enqueueSweep, home, statusTransport))
       .then((lines) => { for (const line of lines) console.log(line); })
       .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
     const tickSources = (): Promise<void> => watchdog.track("sources", registry.tick())

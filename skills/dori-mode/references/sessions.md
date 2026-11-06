@@ -6,7 +6,7 @@ A lane is one agent session doing one job in its own herdr tab. You launch it, t
 
 ```sh
 dori launch fix-login --title "Fix the login redirect loop" \
-  --brief ~/briefs/fix-login.md --done "merged acme/app#412; closed acme/app#398" \
+  --from-message <channel> <messageId> --note "worktree from origin/dev; leave the session store alone" --done "merged acme/app#412; closed acme/app#398" \
   --thread "discord:<channel>/<thread>" --mode ulw
 ```
 
@@ -20,7 +20,7 @@ For a Toodo task, start it from your own session with the Toodo `start_task` too
 
 To run a lane on another machine, add `--machine <label-or-id>` naming a saved herdr machine, either on its own (a new tab there) or with `--pane`/`--workspace`. The brief is read locally and written on the machine to its temp directory (`/tmp/dori-brief-<key>.md` for a POSIX shell, `<temp>\dori-brief-<key>.md` for PowerShell, sent as base64 so no quoting can break it); a `cmd.exe` pane is refused. `--cwd` names the directory on that machine and is kept as `remoteCwd`, apart from the local directory where `command` Done signals run (`defaultCwd`). A remote lane prints its `[REPORT]` lines in its own pane and does not run `dori claim-done`; the watcher turns its new `done` report into a claim with the usual 5-minute window, and its blocker or question into an urgent `LANE_REPORT`. Register a lane already running remotely with `dori adopt --machine`. The machine is saved in the registry entry, and every reader and sender uses it; older entries without one stay local. Remote lanes skip the local MCP optimization, and their worktree git checks and cleanup are skipped with an explicit detail rather than run against a local path that only looks the same.
 
-Write the brief like a careful prompt:
+When the work comes from the owner's messages, build the brief from them with `--from-message <channel> <messageId>` (repeatable) and add `--note` for what only you know: earlier decisions from memory, boundaries with other lanes, what not to touch, which repo or worktree. Don't restate the request. Write a `--brief FILE` by hand only for work that has no owner message:
 
 - leave the opening keywords out: `launch` puts the mode's keywords (`ulw ...` or `/mass-ulw ...`) in front of the prompt;
 - where the code is and what has been learned so far;

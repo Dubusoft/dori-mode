@@ -25,6 +25,8 @@ const URGENT_KINDS = [
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
   // An idle lane still silent idleEscalateMin after its freshness nudge (freshness.ts); the lane itself gets no more input.
   "IDLE-ESCALATE",
+  // A working lane that drifted: milestones overdue or its PR failing CI again and again (drift.ts). No periodic summaries.
+  "LANE_DRIFT",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "HOST_GUARD OUTDATED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   // The supervisor killed or paused something because memory ran critically low; the lead relays it to the owner.
   "HOST_GUARD CRITICAL",

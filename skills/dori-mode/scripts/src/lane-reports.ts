@@ -7,7 +7,11 @@ import { Database } from "bun:sqlite";
 import { fillHook } from "./config.ts";
 import { claimDone, type Emit, type FlowDeps, laneMeta, REMOTE_SEEN_MAX } from "./done-flow.ts";
 import { relayedText, scrubForThread } from "./freshness.ts";
+import { Discord } from "./messenger/discord.ts";
+import { fetchHttp } from "./messenger/http.ts";
+import { resolveTarget } from "./messenger/target.ts";
 import { readScreen } from "./panes.ts";
+import type { Clock } from "./run.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
@@ -271,11 +275,85 @@ const failures = new WeakMap<LaneReportStore, Map<string, number>>();
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
 export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
+/** Posts and edits a lane's status message in its thread; `post` returns the new message's id. */
+export type LaneStatusTransport = {
+  post(channel: string, text: string, stableId: string): Promise<string>;
+  edit(channel: string, messageId: string, text: string): Promise<void>;
+};
+
+/**
+ * The Discord status transport, on DORI_DISCORD_TOKEN from the process environment (the supervisor unit loads it from
+ * its EnvironmentFile); undefined without a token, so progress falls back to hooks.threadReply or the lead's journal.
+ */
+export const discordStatusTransport = (clock: Clock, env: Readonly<Record<string, string | undefined>> = process.env): LaneStatusTransport | undefined => {
+  const token = env.DORI_DISCORD_TOKEN?.trim();
+  if (!token) return undefined;
+  const discord = new Discord(fetchHttp, clock, token);
+  return { post: (channel, text, stableId) => discord.send(channel, text, stableId), edit: (channel, id, text) => discord.edit(channel, id, text) };
+};
+
+/** Longest report text a status message line carries. */
+export const STATUS_TEXT_MAX = 300;
+
+const elapsed = (ms: number): string => {
+  const min = Math.max(0, Math.floor(ms / 60_000));
+  const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+};
+const stamp = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e)).slice(0, 160);
+
+/**
+ * The text of a lane's status message as of `report`: its key, time since it opened, and its last milestone and last
+ * progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post.
+ */
+export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: LaneReport, now: number, home: string): string => {
+  const upTo = rows.filter((r) => r.seq <= report.seq && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
+  const last = (kind: ReportKind): LaneReport | undefined =>
+    [...upTo, ...(upTo.some((r) => r.id === report.id) ? [] : [report])].filter((r) => r.kind === kind).sort((a, b) => a.seq - b.seq).at(-1);
+  const line = (label: string, row: LaneReport | undefined): string => {
+    if (!row) return `${label}: none yet`;
+    const text = scrubForThread(oneLine(row.text), home);
+    return `${label} (${stamp(row.at)}): ${text.length <= STATUS_TEXT_MAX ? text : `${text.slice(0, STATUS_TEXT_MAX)}...`}`;
+  };
+  const opened = Date.parse(lane.openedAt);
+  return [
+    `[System] status of lane ${lane.key}, open ${Number.isNaN(opened) ? "(unknown)" : elapsed(now - opened)} (updated ${stamp(now)})`,
+    line("last milestone", last("milestone")),
+    line("last progress", last("progress")),
+  ].join("\n");
+};
+
+/** The Discord channel id of a lane's thread, or undefined for no thread or a non-Discord one. */
+const statusChannel = (lane: Lane): string | undefined =>
+  lane.thread !== "none" && lane.thread.startsWith("discord:") ? resolveTarget("discord", lane.thread).to : undefined;
+
+/**
+ * Edits the lane's status message to the text as of `report`, or posts it when there is none yet or the edit fails (a
+ * deleted message), and stores the new id on the lane (statusMessageId). A failed post throws.
+ */
+const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string): Promise<void> => {
+  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home);
+  if (lane.statusMessageId) {
+    try {
+      await transport.edit(channel, lane.statusMessageId, text);
+      return;
+    } catch (e) {
+      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${lane.statusMessageId} ${errorText(e)}; posting a new status message`);
+    }
+  }
+  const id = await transport.post(channel, text, `lane-status:${report.id}`);
+  await deps.registry.patch(lane.key, { statusMessageId: id });
+};
+
 /**
  * Routes every pending row once, oldest first, and marks it consumed after its effect. question, blocked and milestone
  * become a `LANE_REPORT` event under the id `lane-report:<row id>` (its class comes from eventPolicy: question and
- * blocked wake the lead, milestone is digest by default); progress is posted to the lane's thread through
- * hooks.threadReply (without a hook or thread, or when the post fails, it is a digest LANE_REPORT instead); done is the
+ * blocked wake the lead, milestone is digest by default). progress and milestone also update the lane's one `[System]`
+ * status message in its thread (laneStatusText), posted the first time and edited afterwards through `transport`
+ * (default: discordStatusTransport); its id lives on the lane (statusMessageId). Without a transport progress is posted
+ * through hooks.threadReply as before, and without either, or a thread, or when the post fails, it is a digest
+ * LANE_REPORT instead; a failed status update of a milestone is only logged (the lead has the row). done is the
  * lane's done claim, as `dori claim-done`. A row whose lane is closed or unregistered is not lost: it becomes a
  * `LANE_REPORT_LATE <key> <kind> <text>` event under `lane-report-late:<row id>` (route `late`). A crash between the
  * effect and the mark repeats the effect: the journal dedupes the event by id, and a thread post may show twice.
@@ -288,7 +366,10 @@ export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unkn
  * POISON_ALERT_AFTER failed passes in a row it raises one urgent `LANE_REPORT <key> blocked REPORT_STUCK ...` event
  * under `lane-report-stuck:<row id>`. Returns one log line per routed row.
  */
-export const routeReports = async (deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? ""): Promise<string[]> => {
+export const routeReports = async (
+  deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? "",
+  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null,
+): Promise<string[]> => {
   const out: string[] = [];
   const failed = failures.get(store) ?? new Map<string, number>();
   failures.set(store, failed);
@@ -309,6 +390,15 @@ export const routeReports = async (deps: FlowDeps, store: LaneReportStore, enque
         // done-flow.ts claimEventId's format, spelled here: test/cli-sync-watch.test.ts mocks done-flow with a fixed export list.
         if (claim) eventId = `done-claim:${report.lane}:${claim.at}`;
         route = "claim";
+      } else if (report.kind === "progress" && transport && statusChannel(lane)) {
+        try {
+          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home);
+          route = "thread";
+        } catch (e) {
+          eventId = `lane-report:${report.id}`;
+          await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report))} (status message failed: ${errorText(e)})`, laneMeta(lane));
+          route = "journal";
+        }
       } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none") {
         const posted = await deps.run(fillHook(deps.config.hooks.threadReply, { thread: lane.thread, text: relayedText(lane.key, scrubForThread(oneLine(report.text), home)), key: lane.key }));
         if (posted.code === 0) route = "thread";
@@ -322,6 +412,11 @@ export const routeReports = async (deps: FlowDeps, store: LaneReportStore, enque
         eventId = `lane-report:${report.id}`;
         await enqueue(eventId, reportLine(report, saveReportBody(deps.config.stateDir, report)), laneMeta(lane));
         route = "journal";
+        const channel = statusChannel(lane);
+        if (report.kind === "milestone" && transport && channel) {
+          try { await upsertStatus(deps, transport, channel, lane, store, report, home); }
+          catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errorText(e)}`); }
+        }
       }
       // A routed report is the lane being heard, like a thread reply: freshness neither nudges it nor raises NO-REPORT.
       if (route !== "late") await deps.registry.patch(report.lane, { lastReplyAt: deps.clock.now() });

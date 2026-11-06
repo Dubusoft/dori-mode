@@ -547,7 +547,7 @@ export class LeadLifecycle {
       "Supervised mode: do not start inbound pollers or sweeps.",
       "Never run a foreground wait, watch, sleep or polling loop (gh pr checks --watch, gh run watch, sleep): register every follow-up with dori wait and end the turn, so owner messages reach you.",
     ];
-    const replyFirst = "Owner messages come first, each step its own call: dori ack alone, dori inbox take once more, then one short reply that merges related follow-ups in that channel (an edit replaces, a delete withdraws); only then investigate or work and send the result as a follow-up.";
+    const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     return [
       ...head,

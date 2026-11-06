@@ -97,6 +97,31 @@ export const deliveryConfigError = (delivery: DeliveryConfig): string | undefine
   return undefined;
 };
 
+/** Lane drift signals (drift.ts): urgent LANE_DRIFT for a working lane that misses milestones or keeps failing CI. */
+export type DriftConfig = {
+  /** Off: no LANE_DRIFT line is raised. */
+  readonly enabled: boolean;
+  /** Minutes a working lane may go without a milestone report (since its last one, or its open) before milestone-overdue. */
+  readonly milestoneOverdueMin: number;
+  /** Failing head SHAs in a row (no green between) of a lane PR before ci-failing. */
+  readonly ciFailStreak: number;
+};
+
+export const DEFAULT_DRIFT: DriftConfig = { enabled: true, milestoneOverdueMin: 90, ciFailStreak: 3 };
+
+/** The config's `drift` (absent: the default), laid over the default; throws TypeError on a bad shape or value. */
+const driftConfig = (raw: unknown): DriftConfig => {
+  if (raw === undefined) return DEFAULT_DRIFT;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("drift must be an object");
+  const merged = { ...DEFAULT_DRIFT, ...(raw as Partial<DriftConfig>) };
+  if (typeof merged.enabled !== "boolean") throw new TypeError("drift.enabled must be true or false");
+  if (typeof merged.milestoneOverdueMin !== "number" || !Number.isFinite(merged.milestoneOverdueMin) || merged.milestoneOverdueMin <= 0) {
+    throw new TypeError("drift.milestoneOverdueMin must be positive");
+  }
+  if (!Number.isInteger(merged.ciFailStreak) || merged.ciFailStreak < 1) throw new TypeError("drift.ciFailStreak must be an integer of at least 1");
+  return { enabled: merged.enabled, milestoneOverdueMin: merged.milestoneOverdueMin, ciFailStreak: merged.ciFailStreak };
+};
+
 /** The shortest pointer (kinds cut to `+N more`) fits in MIN_POINTER_CHARS; omo kept 800 typed chars in one input. */
 export const MIN_POINTER_CHARS = 140;
 export const MAX_POINTER_CHARS = 800;
@@ -171,7 +196,7 @@ const runnersConfig = (raw: unknown): RunnersConfig | undefined => {
 };
 
 /** Top-level config keys that are obsolete: ignored on load, each named once per process as CONFIG_KEY_OBSOLETE. Later phases add keys here. */
-export const OBSOLETE_CONFIG_KEYS: readonly string[] = [];
+export const OBSOLETE_CONFIG_KEYS: readonly string[] = ["progressTemplate"];
 
 const warnedObsoleteKeys = new Set<string>();
 
@@ -254,8 +279,6 @@ export type DoriConfig = {
    * The lead is never wrapped.
    */
   readonly laneSandbox?: LaneSandbox;
-  /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
-  readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
@@ -318,6 +341,8 @@ export type DoriConfig = {
   readonly placement: PlacementConfig;
   /** Runner hub settings; absent means the hub is not opened and behavior is unchanged. */
   readonly runners?: RunnersConfig;
+  /** Lane drift signals (LANE_DRIFT). */
+  readonly drift: DriftConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -367,7 +392,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   idleEscalateMin: 30,
   closeAfterMin: 5,
   worktreeRoot: "/data/repos/worktrees",
-  progressTemplate: "{todo}",
   digestMaxDelayMin: 60,
   ownerDelayNotice: "Got your message. The lead session is not taking it yet; it stays queued and will be answered as soon as the lead is back.",
   ackTimeoutSec: 60,
@@ -401,6 +425,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
     push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
   },
   placement: { defaultMachine: "local", workspaces: {}, fallback: [] },
+  drift: DEFAULT_DRIFT,
 });
 
 /**
@@ -607,6 +632,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
     runners: runnersConfig(raw.runners),
+    drift: driftConfig(raw.drift),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
