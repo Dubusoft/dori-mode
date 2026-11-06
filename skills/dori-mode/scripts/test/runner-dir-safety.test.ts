@@ -3,8 +3,8 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  checkRunnerDir, defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, lockDownDatabase, RunnerDirUnsafe,
-  runStartupCheck, writeRunnerFile,
+  checkRunnerDir, defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, holdServeLock, lockDownDatabase, RunnerDirUnsafe,
+  runStartupCheck, SERVE_LOCK, writeRunnerFile,
 } from "../src/runner/fs-safety.ts";
 
 const roots: string[] = [];
@@ -141,6 +141,29 @@ describe("creation and atomic writes", () => {
     expect(mode(`${db}-wal`)).toBe(0o600);
     expect(() => lstatSync(`${db}-shm`)).toThrow();
     checkRunnerDir(d);
+  });
+});
+
+describe("serve lock", () => {
+  test("a second process cannot take the serve lock while the first holds it; the lock file keeps the dir safe", async () => {
+    const d = goodDir();
+    const script = `import { holdServeLock } from ${JSON.stringify(join(import.meta.dir, "../src/runner/fs-safety.ts"))};
+      const release = holdServeLock(${JSON.stringify(d)});
+      console.log(release ? "HELD" : "BUSY");
+      if (release) { await Bun.stdin.text(); release(); }`;
+    const holder = Bun.spawn([process.execPath, "-e", script], { stdin: "pipe", stdout: "pipe" });
+    const reader = holder.stdout.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value).trim()).toBe("HELD");
+
+    expect(holdServeLock(d)).toBeUndefined();
+    expect(mode(join(d, SERVE_LOCK))).toBe(0o600);
+    checkRunnerDir(d);
+
+    holder.stdin.end();
+    expect(await holder.exited).toBe(0);
+    const release = holdServeLock(d);
+    expect(release).toBeDefined();
+    release?.();
   });
 });
 

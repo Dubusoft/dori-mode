@@ -208,7 +208,10 @@ committed. When the hub receives `seq`:
 - `seq <= eventAck`: a duplicate. Nothing is committed and the current `eventAck` is acked again.
 - `seq == eventAck + 1`: the event is committed under the journal id `runner:<label>:<seq>`, then `eventAck` is
   persisted, then the ack goes out. An id already in the journal counts as committed.
-- `seq > eventAck + 1`: a gap. Nothing is committed and the unchanged `eventAck` is acked.
+- `seq > eventAck + 1`: a gap. Nothing is committed, the unchanged `eventAck` is acked, and the supervisor logs
+  `RUNNER_EVENT_GAP runner=<label> seq=<n> eventAck=<n>` and closes the connection. Only a hello replays from
+  `eventAck`, so a gap left open would hold back every later event, `cmd.result` included, for as long as the
+  connection lives; the runner reconnects with its backoff and the replay fills it.
 
 If the commit throws, `eventAck` doesn't move and no ack is sent. So `eventAck` never runs ahead of the journal,
 and the journal holds events in `seq` order. After a reconnect the runner replays every outbox row above the

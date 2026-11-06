@@ -1,7 +1,8 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, type Stats } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { writeFileAtomic } from "../setup.ts";
+import { tryStateLock } from "../state-lock.ts";
 
 /**
  * The runner directory and its safety rules. The directory (default `~/.dori/runner`) and every directory under it
@@ -28,6 +29,21 @@ export const RUNNER_PATHS = {
   bin: "bin",
   bun: "bun",
 } as const;
+
+/** The lock `runner serve` holds for its whole life (0600, inside the runner directory). */
+export const SERVE_LOCK = "serve.lock";
+
+/**
+ * Takes the runner directory's serve lock, or returns undefined while another live process holds it. Two serves on one
+ * directory share its outbox and state: each appends events under seqs the other never sends, so the supervisor sees a
+ * gap, and both hello with the same gen. The kernel drops the lock when the holder dies.
+ */
+export const holdServeLock = (dir: string): (() => void) | undefined => {
+  const path = join(dir, SERVE_LOCK);
+  writeFileSync(path, "", { flag: "a", mode: RUNNER_FILE_MODE });
+  chmodSync(path, RUNNER_FILE_MODE);
+  return tryStateLock(path);
+};
 
 /** `~/.dori/runner` under `home`; every runner module takes the directory as an argument and defaults to this. */
 export const defaultRunnerDir = (home: string = homedir()): string => join(home, ".dori", "runner");

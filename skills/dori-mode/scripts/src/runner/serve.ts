@@ -267,6 +267,13 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           const outcome = hub.receive(frame);
           reply(outcome.reply);
           if (outcome.result === "committed") hooks.onEvent?.(label, frame);
+          else if (outcome.result === "gap") {
+            // Only a hello replays from eventAck, so a gap left open would hold back every later event (and every
+            // cmd.result) for as long as this connection lives. Closing makes the runner reconnect and fill it.
+            hooks.log(`RUNNER_EVENT_GAP runner=${label} seq=${frame.seq} eventAck=${outcome.eventAck}: closing so the runner replays`);
+            phase = "done";
+            transport.close("RUNNER_EVENT_GAP");
+          }
           return;
         }
         if (frame.type === "runner.rotated") {
