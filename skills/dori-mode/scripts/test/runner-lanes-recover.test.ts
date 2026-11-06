@@ -209,6 +209,26 @@ test.each([true, false])("an unattributed legacy record never reuses its old pan
   expect(t.calls.slice(before).some((a) => a[1] === "tab" && a[2] === "list")).toBe(false);
 });
 
+test("a restored empty shell with the old pane id, label and cwd is not migrated", async () => {
+  const t = setup({ procs: async () => [{ pid: 20, ppid: 1, rssKb: 1, comm: "bash" }] });
+  await t.lanes.start(START);
+  const record = t.lanes.records()["lane-a"];
+  if (!record) throw new Error("missing lane");
+  const { herdrInstance: _old, ...legacy } = record;
+  writeRunnerFile(join(t.runnerDir, "lanes.json"), JSON.stringify({ "lane-a": legacy }));
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", cwd: "/repo", agent_status: "unknown" }];
+  t.world.tabs = [{ tab_id: "t1", label: "lane-a" }];
+  t.world.paneGet.p1 = { pane_id: "p1", workspace_id: "w", tab_id: "t1", cwd: "/repo" };
+  t.world.processInfo.p1 = { shell_pid: 20, foreground_process_group_id: 20, foreground_processes: [{ pid: 20, name: "bash", argv: ["/bin/bash"] }] };
+  t.world.screen = `Read and execute the lane brief at ${t.lanes.briefPath("lane-a")} in full.`;
+  const before = t.calls.length;
+  await expect(t.lanes.observe("lane-a")).rejects.toThrow("RUNNER_LANE_ABSENT");
+  expect(t.lanes.records()["lane-a"]?.herdrInstance).toBeUndefined();
+  expect(t.calls.slice(before)).toEqual([["herdr", "pane", "list"], ["herdr", "pane", "process-info", "--pane", "p1"]]);
+  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true });
+  expect(t.calls.slice(before).some((a) => a[2] === "close" || a[2] === "run" && a[3] === "p1")).toBe(false);
+});
+
 test("a stamped lane record never requests process-info during identity checks", async () => {
   const t = setup();
   await t.lanes.start(START);
