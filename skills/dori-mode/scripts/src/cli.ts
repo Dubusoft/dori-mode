@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { loadavg } from "node:os";
+import { homedir, loadavg } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -50,6 +50,7 @@ import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sour
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
 import { updateInstall } from "./update.ts";
+import { refreshLaneSandbox } from "./lane-sandbox-install.ts";
 import { laneOps, type LaneOps, LaneOpsError } from "./lane-ops.ts";
 import { type CliRunnerCall, cliRunnerCall, cliSocketPath } from "./runner/cli-relay.ts";
 import { RunnerUnavailable } from "./runner/call.ts";
@@ -602,6 +603,7 @@ try {
         run, sleep: realClock.sleep, log: (line) => console.log(line),
         refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readGuardAgentScripts(), (line) => console.log(line)),
         upgradeRunners: async () => upgradeRunnersNow(config),
+        refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
@@ -736,6 +738,9 @@ try {
       const stop = () => controller.abort();
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
+      // dori update runs the code it started with, so the supervisor it restarts installs the new checkout's sandbox.
+      try { const line = refreshLaneSandbox(homedir()); if (line) console.log(line); }
+      catch (e) { console.error(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
       try { await supervise(deps, controller.signal); }
       finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
       break;

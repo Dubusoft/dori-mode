@@ -94,6 +94,17 @@ test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or 
   expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
 });
 
+test("the lane sandbox is refreshed on UP_TO_DATE and on UPDATED, its line logged and a throw kept as a WARN", async () => {
+  const sandbox = (refreshLaneSandbox: () => string | undefined, branch: "main" | "dev") =>
+    updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), refreshLaneSandbox }, { packageDir: pkg, branch, force: false });
+  expect(await sandbox(() => "LANE_SANDBOX_UPDATED x", "dev")).toBe(0);
+  expect(lines).toContain("LANE_SANDBOX_UPDATED x");
+  await commit(origin, "notes.txt", "two\n");
+  expect(await sandbox(() => { throw new Error("EACCES"); }, "main")).toBe(0);
+  expect(lines).toContain("WARN lane sandbox: EACCES");
+  expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
+});
+
 test("guard agents are refreshed before the supervisor restarts", async () => {
   await commit(origin, "notes.txt", "two\n");
   expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);
