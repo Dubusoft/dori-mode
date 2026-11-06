@@ -8,7 +8,7 @@ import type { Ran } from "../src/run.ts";
 import { briefLane, observeHost, valueHash } from "../src/runner/observe.ts";
 import { RunnerClient, yieldTurn } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { serveRunner, type ObservedLane } from "../src/runner/serve.ts";
+import { serveRunner, STARTUP_GRACE_MS, type ObservedLane } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { fakeClock } from "./fakes.ts";
 
@@ -124,6 +124,44 @@ test("serveRunner publishes lane.state on a status change and lane.progress on a
     ["lane.state", { key: "lane-a", status: "working", pane: "p1" }],
     ["lane.progress", { key: "lane-a", reportHash: "h1" }],
     ["lane.progress", { key: "lane-a", reportHash: "h2" }],
+  ]);
+  outbox.close();
+  state.close();
+});
+
+test("serveRunner holds back dead for a starting lane until its agent was seen alive or the startup grace ends", async () => {
+  const dir = stateDir();
+  const clock = fakeClock(1_000);
+  const state = new RunnerState(dir, { now: clock.now });
+  state.boot();
+  const outbox = new Outbox(dir, { now: clock.now });
+  const client = new RunnerClient({ label: "worker-a", hostId: "h" }, { connect: async () => { throw new Error("offline"); }, outbox, state, clock });
+  // lane-a: herdr names its fresh agent unknown (dead), then working, then the agent really stops.
+  // lane-b: its agent never comes up.
+  const steps: { readonly at: number; readonly view: ObservedLane[] }[] = [
+    { at: 1_000, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
+    { at: 31_000, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "working" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
+    { at: 61_000, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
+    { at: 1_000 + STARTUP_GRACE_MS, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
+  ];
+  let step = 0;
+  let observeTick: (() => void) | undefined;
+  const abort = new AbortController();
+  const serving = serveRunner({
+    client, latest: () => undefined, clock, heartbeatMs: 15_000, observeMs: 30_000, log: () => {},
+    every: (ms, tick) => { if (ms === 30_000) observeTick = tick; return () => {}; },
+    observe: async () => steps[step]?.view ?? [],
+  }, abort.signal);
+  await yieldTurn();
+  const published = (): unknown[] => outbox.unacked(0).map((r) => r.body);
+  expect(published()).toEqual([]);
+  for (step = 1; step < steps.length; step++) { clock.at = steps[step]?.at ?? 0; observeTick?.(); await yieldTurn(); }
+  abort.abort();
+  await serving;
+  expect(published()).toEqual([
+    { key: "lane-a", status: "working", pane: "p1" },
+    { key: "lane-a", status: "dead", pane: "p1" },
+    { key: "lane-b", status: "dead", pane: "p2" },
   ]);
   outbox.close();
   state.close();
