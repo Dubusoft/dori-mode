@@ -15,6 +15,8 @@ export type UpdateDeps = {
    * count, which is logged by the callee and never changes the exit code.
    */
   readonly upgradeRunners?: () => Promise<number>;
+  /** Installs the template over an outdated lane sandbox (lane-sandbox-install.ts); returns the line to log, if any. */
+  readonly refreshLaneSandbox?: () => string | undefined;
 };
 export type UpdateOptions = {
   readonly packageDir: string;
@@ -40,6 +42,10 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
   const refreshAgents = async (): Promise<void> => {
     if (!d.refreshGuardAgents) return;
     try { await d.refreshGuardAgents(); } catch (e) { d.log(`WARN guard agents: ${e instanceof Error ? e.message : String(e)}`); }
+  };
+  const refreshSandbox = (): void => {
+    if (!d.refreshLaneSandbox) return;
+    try { const line = d.refreshLaneSandbox(); if (line) d.log(line); } catch (e) { d.log(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
   };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);
@@ -86,9 +92,11 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     else if (quotaMoved) d.log(`PI_QUOTA_UPDATED ${o.packageDir}`);
     if (now === old && !quotaMoved && !o.force) {
       d.log(`UP_TO_DATE ${o.branch} ${short(now)}`);
+      refreshSandbox();
       await refreshAgents();
       return 0;
     }
+    refreshSandbox();
     // Agents first: the restarted supervisor then samples the new agents instead of reporting the old ones OUTDATED.
     await refreshAgents();
     const restart = await d.run(["systemctl", "--user", "restart", SUPERVISOR_UNIT], { timeoutMs: 120_000 });

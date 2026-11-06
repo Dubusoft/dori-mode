@@ -21,8 +21,7 @@ import { readRunnerRows } from "./runner/hub.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { PROTO } from "./runner/protocol.ts";
-
-const SANDBOX_TEMPLATE = new URL("../templates/lane-sandbox.sh", import.meta.url);
+import { installedLaneSandbox, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -81,12 +80,12 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
 };
 
 const sandbox = (d: Pick<DoctorDeps, "home">): Check[] => {
-  const installed = join(d.home, ".local", "bin", "lane-sandbox");
+  const installed = installedLaneSandbox(d.home);
   if (!existsSync(installed)) return [];
-  const templatePath = SANDBOX_TEMPLATE.pathname;
+  const templatePath = LANE_SANDBOX_TEMPLATE;
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
   const templateHash = createHash("sha256").update(readFileSync(templatePath)).digest("hex");
-  return installedHash === templateHash ? [] : [warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "copy the template over it")];
+  return installedHash === templateHash ? [] : [warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
 };
 
 const herdr = async (d: DoctorDeps): Promise<Check[]> => {
