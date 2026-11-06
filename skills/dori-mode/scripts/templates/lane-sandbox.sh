@@ -57,7 +57,8 @@ opts+=(
 
 # ~/.dori gets its own tmpfs that is made read-only after the ro binds, so
 # rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env stays hidden.
-opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state")
+# Every rw mount point under it is created here: bwrap cannot mkdir one once it is read-only.
+opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state" --dir "$H/.dori/heavy")
 
 # Read-only re-binds (skipped when missing)
 for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \

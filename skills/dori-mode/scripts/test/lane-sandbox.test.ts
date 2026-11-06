@@ -47,6 +47,22 @@ test("a sandboxed lane gets its own token file, the runner socket and its brief,
   expect(argv.some((a) => a.startsWith(join(home, ".dori", "env")))).toBe(false);
 });
 
+test("every read-write mount under ~/.dori has its mount point created before ~/.dori turns read-only", async () => {
+  const home = join(tempDir(), "home");
+  const dori = join(home, ".dori");
+  mkdirSync(join(dori, "state"), { recursive: true });
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+
+  const doriRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === dori);
+  expect(doriRo).toBeGreaterThan(-1);
+  const rwInDori = argv.flatMap((a, i) => ((a === "--bind" || a === "--bind-try") && argv[i + 2]?.startsWith(`${dori}/`) ? [argv[i + 2]] : []));
+  expect(rwInDori).toContain(join(dori, "heavy"));
+  // bwrap cannot mkdir a missing mount point on the read-only tmpfs (EROFS), so each one is a --dir before the remount.
+  const createdBefore = argv.slice(0, doriRo).flatMap((a, i, before) => (a === "--dir" ? [before[i + 1]] : []));
+  expect(rwInDori.filter((p) => !createdBefore.includes(p))).toEqual([]);
+});
+
 test("refreshLaneSandbox replaces an outdated install, keeps the old copy, and leaves a current or missing one alone", () => {
   const home = tempDir();
   const installed = installedLaneSandbox(home);
