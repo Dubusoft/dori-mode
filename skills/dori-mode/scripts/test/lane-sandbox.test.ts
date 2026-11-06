@@ -63,6 +63,18 @@ test("every read-write mount under ~/.dori has its mount point created before ~/
   expect(rwInDori.filter((p) => !createdBefore.includes(p))).toEqual([]);
 });
 
+test("the top-level directory holding $HOME is the sandbox's own, not a read-only bind of the host's root-owned one", async () => {
+  // Under TMPDIR (/tmp, /dev/shm) the top-level entry is skipped anyway; next to this file it is one the script binds.
+  const home = mkdtempSync(join(import.meta.dir, ".sandbox-home-"));
+  dirs.push(home);
+  const top = `/${home.split("/")[1]}`;
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+
+  // A host bind shows root as the overflow uid inside the user namespace, and omo refuses that trust ancestor.
+  expect(argv.filter((a, i) => a.startsWith("--") && argv[i + 1] === top)).toEqual([]);
+});
+
 test("refreshLaneSandbox replaces an outdated install, keeps the old copy, and leaves a current or missing one alone", () => {
   const home = tempDir();
   const installed = installedLaneSandbox(home);
