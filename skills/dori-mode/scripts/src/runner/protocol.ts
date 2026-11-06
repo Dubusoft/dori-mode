@@ -348,6 +348,8 @@ export class ProtocolError extends Error {
 
 type Spec =
   | "string" | "int" | "number" | "bool" | "string[]" | "int[]"
+  /** A non-negative integer, or -1 for a reading that failed. */
+  | "count"
   /** Any JSON value (null, boolean, number, string, array, object); nested content is not walked. */
   | "json"
   | { readonly enum: readonly string[] }
@@ -382,7 +384,8 @@ const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
   "guard.sample": {
     level: req({ enum: ["ok", "alert", "critical"] }), reasons: req("string[]"), sampledAt: req("int"),
     load1: opt("number"), memFreePct: opt("number"), diskFreeGb: opt("number"), swapFreeGb: opt("number"), swapTotalGb: opt("number"), os: opt("string"),
-    panes: opt("int"),
+    // -1 when the runner could not read herdr's pane list (main.ts paneCount): the supervisor's herdr-down signal.
+    panes: opt("count"),
     lanes: opt({ list: { key: req("string"), rssKb: req("int"), top: req({ list: { comm: req("string"), rssKb: req("int"), count: req("int") } }) } }),
   },
   "guard.alert": { reasons: req("string[]") },
@@ -487,6 +490,7 @@ const checkValue = (path: string, spec: Spec, value: unknown): void => {
   const bad = (want: string): never => { throw new ProtocolError("field-type", `${path} must be ${want}`); };
   if (spec === "string") { if (typeof value !== "string") bad("a string"); return; }
   if (spec === "int") { if (!isInt(value)) bad("a non-negative integer"); return; }
+  if (spec === "count") { if (!isInt(value) && value !== -1) bad("a non-negative integer or -1"); return; }
   if (spec === "number") { if (typeof value !== "number" || !Number.isFinite(value)) bad("a finite number"); return; }
   if (spec === "bool") { if (typeof value !== "boolean") bad("a boolean"); return; }
   if (spec === "string[]") { if (!Array.isArray(value) || !value.every((v) => typeof v === "string")) bad("an array of strings"); return; }

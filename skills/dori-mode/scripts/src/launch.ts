@@ -8,6 +8,7 @@ import { LaneOpsError, machineRunner, type StartInput } from "./lane-ops.ts";
 import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
 import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
+import { herdrDownSince } from "./runner/herdr-down.ts";
 import { cmdRefused, paneShell } from "./runner/lane-control.ts";
 import type { StartupVerdict } from "./runner/protocol.ts";
 import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
@@ -60,6 +61,11 @@ export class LaunchError extends Error {}
 
 export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
   if (!LANE_KEY.test(input.key)) throw new LaunchError(`key must match ${LANE_KEY}`);
+  // Refused before any placement check or runner call: the runner could not open a tab there anyway.
+  const herdrDown = input.machine ? herdrDownSince(deps.config.stateDir).get(machineRunner(input.machine)) : undefined;
+  if (input.machine && herdrDown !== undefined) {
+    throw new LaunchError(`HERDR_DOWN machine=${input.machine.replace(/\s/g, "_")} herdr there has been unreadable since ${new Date(herdrDown).toISOString()}; launch there once it reads again (HERDR_UP), or pick another machine`);
+  }
   if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} is already registered`);
   const errors = doneSyntaxErrors(input.done);
   if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);

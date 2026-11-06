@@ -10,7 +10,8 @@ import {
 
 /**
  * The supervisor side of the runner protocol. Runner rows live in `<stateDir>/runners.sqlite` (0600, WAL), table
- * `runners {label, hostId, eventAck, cmdSeq, maxGen, proto, version, lastHelloAt, cmdAck}`. An event is committed to
+ * `runners {label, hostId, eventAck, cmdSeq, maxGen, proto, version, lastHelloAt, cmdAck}` plus the later columns
+ * (LATER_COLUMNS, among them `herdr` and `herdrSince` from herdr-down.ts). An event is committed to
  * the journal through the injected `commit` (`Supervisor.enqueue` in production) under id `runner:<label>:<seq>`, and
  * only after that returns is `eventAck` advanced and persisted. Only the next expected seq (`eventAck + 1`) is
  * committed: a frame past a gap is not committed and leaves `eventAck` where it is, so the runner's replay after its
@@ -63,6 +64,10 @@ export type RunnerRow = {
   readonly outbox?: { readonly unacked: number; readonly oldestAgeMs: number };
   /** How many lanes the last hello's inventory listed. */
   readonly lanes?: number;
+  /** The runner's machine's herdr as its guard samples showed it (herdr-down.ts); absent until a sample carried a pane count. */
+  readonly herdr?: "up" | "down";
+  /** Supervisor wall time `herdr` was entered. */
+  readonly herdrSince?: number;
 };
 
 export type RunnerLiveness = "connected" | "stale" | "offline" | "disconnected";
@@ -96,12 +101,15 @@ type DbRow = {
   label: string; hostId: string | null; eventAck: number; cmdSeq: number; maxGen: number; cmdAck: number;
   proto: number | null; version: string | null; lastHelloAt: number | null;
   lastHeartbeatAt: number | null; disconnectedAt: number | null; outboxUnacked: number | null; outboxOldestAgeMs: number | null;
-  lanes: number | null;
+  lanes: number | null; herdr: string | null; herdrSince: number | null;
 };
 
-const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes";
-/** Columns added after the first table layout; an older table gets them on open. */
-const LATER_COLUMNS = ["lastHeartbeatAt", "disconnectedAt", "outboxUnacked", "outboxOldestAgeMs", "lanes"] as const;
+const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, herdr, herdrSince";
+/** Columns added after the first table layout, with their types; an older table gets them on open. */
+const LATER_COLUMNS = {
+  lastHeartbeatAt: "INTEGER", disconnectedAt: "INTEGER", outboxUnacked: "INTEGER", outboxOldestAgeMs: "INTEGER", lanes: "INTEGER",
+  herdr: "TEXT", herdrSince: "INTEGER",
+} as const;
 
 const toRow = (r: DbRow): RunnerRow => ({
   label: r.label,
@@ -117,6 +125,8 @@ const toRow = (r: DbRow): RunnerRow => ({
   ...(r.disconnectedAt !== null ? { disconnectedAt: r.disconnectedAt } : {}),
   ...(r.outboxUnacked !== null && r.outboxOldestAgeMs !== null ? { outbox: { unacked: r.outboxUnacked, oldestAgeMs: r.outboxOldestAgeMs } } : {}),
   ...(r.lanes !== null ? { lanes: r.lanes } : {}),
+  ...(r.herdr === "up" || r.herdr === "down" ? { herdr: r.herdr } : {}),
+  ...(r.herdrSince !== null ? { herdrSince: r.herdrSince } : {}),
 });
 
 type Live = { lastSeen: number; heartbeatAt?: number; outbox?: { unacked: number; oldestAgeMs: number } };
@@ -139,7 +149,7 @@ export class RunnerHub {
       )`,
     );
     const have = new Set((this.db.query("PRAGMA table_info(runners)").all() as { name: string }[]).map((c) => c.name));
-    for (const column of LATER_COLUMNS) if (!have.has(column)) this.db.run(`ALTER TABLE runners ADD COLUMN ${column} INTEGER`);
+    for (const [column, type] of Object.entries(LATER_COLUMNS)) if (!have.has(column)) this.db.run(`ALTER TABLE runners ADD COLUMN ${column} ${type}`);
     this.lockDown();
   }
 
@@ -264,6 +274,11 @@ export class RunnerHub {
     return undefined;
   }
 
+  /** Saves the runner's machine's herdr state (herdr-down.ts) and when it was entered. */
+  setHerdr(label: string, state: "up" | "down", since: number): void {
+    this.db.query("UPDATE runners SET herdr = ?, herdrSince = ? WHERE label = ?").run(state, since, label);
+  }
+
   /** Marks a runner's connection closed (its row stays). */
   disconnected(label: string): void {
     this.live.delete(label);
@@ -345,7 +360,10 @@ export const readRunnerRows = (stateDir: string): RunnerRow[] => {
   if (!existsSync(path)) return [];
   const db = new Database(path, { readonly: true });
   try {
-    return (db.query(`SELECT ${COLUMNS} FROM runners ORDER BY label`).all() as DbRow[]).map(toRow);
+    // A table the supervisor has not opened since an upgrade lacks the later columns: they read as NULL.
+    const have = new Set((db.query("PRAGMA table_info(runners)").all() as { name: string }[]).map((c) => c.name));
+    const select = COLUMNS.split(", ").map((c) => (have.has(c) ? c : `NULL AS ${c}`)).join(", ");
+    return (db.query(`SELECT ${select} FROM runners ORDER BY label`).all() as DbRow[]).map(toRow);
   } catch {
     return [];
   } finally {

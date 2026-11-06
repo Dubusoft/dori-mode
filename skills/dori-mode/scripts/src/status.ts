@@ -93,6 +93,9 @@ export type RunnerView = {
   readonly restarts1h?: number;
   /** Open registry lanes on the runner's machine (see runnerLaneCount). */
   readonly lanes?: number;
+  /** The machine's herdr as the runner's guard samples showed it, and since when (wall ms); absent: unknown. */
+  readonly herdr?: "up" | "down";
+  readonly herdrSince?: number;
   /**
    * The local runner only: its process as the supervisor's child, from the health file it writes
    * (`<runnerDir>/health`, the same reading as `dori runner probe`).
@@ -158,14 +161,16 @@ export const runnerView = (row: RunnerRow, now: number, restarts1h?: number, lan
     ...(row.outbox ? { outbox: { unacked: row.outbox.unacked, oldestAgeSec: Math.floor(row.outbox.oldestAgeMs / 1000) } } : {}),
     ...(lanes !== undefined ? { lanes } : {}),
     ...(restarts1h !== undefined ? { restarts1h } : {}),
+    ...(row.herdr ? { herdr: row.herdr } : {}),
+    ...(row.herdrSince !== undefined ? { herdrSince: row.herdrSince } : {}),
   };
 };
 
-/** `RUNNER <label> <state> proto=<n> version=<sha> gen=<n> hb=<sec> outbox=<unacked>/<oldest sec> cmds=<n> restarts1h=<n> lanes=<n>` */
+/** `RUNNER <label> <state> proto=<n> version=<sha> gen=<n> hb=<sec> outbox=<unacked>/<oldest sec> cmds=<n> restarts1h=<n> lanes=<n> herdr=<up|down|unknown>` */
 export const runnerLine = (r: RunnerView): string => {
   const or = (v: number | string | undefined): string => (v === undefined ? "-" : String(v));
   return `RUNNER ${r.label} ${r.state} proto=${or(r.proto)} version=${or(r.version)} gen=${r.gen} hb=${or(r.heartbeatAgeSec)} `
-    + `outbox=${r.outbox ? `${r.outbox.unacked}/${r.outbox.oldestAgeSec}` : "-"} cmds=${r.cmds} restarts1h=${or(r.restarts1h)} lanes=${or(r.lanes)}`
+    + `outbox=${r.outbox ? `${r.outbox.unacked}/${r.outbox.oldestAgeSec}` : "-"} cmds=${r.cmds} restarts1h=${or(r.restarts1h)} lanes=${or(r.lanes)} herdr=${r.herdr ?? "unknown"}`
     + (r.child ? ` child=${r.child.verdict} pid=${or(r.child.pid)} health=${r.child.healthAgeSec === undefined ? "-" : `${r.child.healthAgeSec}s`}` : "");
 };
 

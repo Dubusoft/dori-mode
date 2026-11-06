@@ -9,6 +9,7 @@ import { HUB_FILE, readRunnerRows, RunnerHub } from "./runner/hub.ts";
 import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
 import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps, reconcileInventory, runnerJournalHead } from "./runner/lanes-hub.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
+import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
 import { type Delivery, laneOps, type LaneOps } from "./lane-ops.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
@@ -197,6 +198,8 @@ export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEve
   readonly hostId?: string;
   /** The call/query timeout timers (default real timers). */
   readonly timers?: Timers;
+  /** A runner machine's herdr went down or came back (`HERDR_DOWN` / `HERDR_UP`), already saved on its hub row. */
+  readonly onHerdr?: (id: string, line: string) => void;
 };
 
 /**
@@ -249,13 +252,26 @@ export const openRunnerHub = (
     catch (e) { log(`RUNNER_LISTEN_FAILED listen=${options.listen} ${e instanceof Error ? e.message : String(e)}`); }
   }
   const guard = new RunnerGuardBoard(monotonic);
+  const herdr = new HerdrDownInference({
+    read: (label) => {
+      const row = hub.runner(label);
+      return row?.herdr ? { state: row.herdr, since: row.herdrSince ?? 0 } : undefined;
+    },
+    save: (label, record) => { hub.setHerdr(label, record.state, record.since); },
+  }, now);
   // The proto each label said hello with on its current connection: RunnerCalls refuses newer types to a proto-2 runner.
   const protos = new Map<string, number>();
   let calls: RunnerCalls | undefined;
   const accept = acceptRunners(hub, network ? [listener, network] : [listener], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
     onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
-    onEvent: (label, frame) => { guard.event(label, frame); calls?.onEvent(label, frame); options.onEvent?.(label, frame); },
+    onEvent: (label, frame) => {
+      guard.event(label, frame);
+      const changed = herdr.event(label, frame);
+      if (changed) { log(changed.line); options.onHerdr?.(changed.id, changed.line); }
+      calls?.onEvent(label, frame);
+      options.onEvent?.(label, frame);
+    },
     onControl: (label, frame) => { calls?.onControl(label, frame); },
     onDisconnected: (label) => { protos.delete(label); calls?.disconnected(label); },
     auth,
@@ -973,6 +989,7 @@ export const supervise = async (
       const hub = runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
         ...(listen ? { listen } : {}),
         onHeartbeat: (label) => { void monitor?.heartbeat(label); },
+        onHerdr: (id, line) => { enqueueSweep(id, line); },
         onHello: (label, body) => {
           void monitor?.hello(label, body.gen);
           inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
