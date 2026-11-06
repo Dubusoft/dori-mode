@@ -58,13 +58,13 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 
 | 字段 | 含义 |
 |---|---|
-| `leadPane` | Dori 自己的 herdr pane(`herdr pane current`)。各条 lane 的汇报会发到这里。 |
-| `laneWorkspace` | 新 lane 标签页打开的 herdr workspace |
 | `defaultCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
 | `agentCommand` | 启动智能体的命令，写成含 `{model}` 和 `{prompt}` 的 argv 列表 |
 | `hooks.threadReply` | 你的消息 CLI,写成含 `{thread}` 和 `{text}` 的 argv 列表，用来发布 lane 进度 |
 
 其余项(时间、阈值、heavy 槽位数)用默认值就够了。完整表格见 [`references/scripts.md`](skills/dori-mode/references/scripts.md)。环境变量 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` 优先于配置文件。
+
+主控的 herdr pane 和新 lane 标签页打开的 workspace 不在配置里设置：由 supervisor 查找，缺失时创建(`Dori` workspace 里的 `dori-lead` 标签页，以及 `lanes` workspace),并记录在 `<stateDir>/herdr-panes.json`。旧配置里的 `leadPane`、`laneWorkspace`、`workspaces` 只会被迁移一次，之后忽略。
 
 ## 初次了解(Onboarding)
 

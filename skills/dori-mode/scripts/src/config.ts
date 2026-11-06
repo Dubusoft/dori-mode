@@ -1,9 +1,9 @@
-import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
+import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
 
@@ -215,9 +215,12 @@ export type DiscordConfig = {
 export type DoriConfig = {
   readonly discord?: DiscordConfig;
   readonly stateDir: string;
+  /** The herdr workspace new local lane tabs open in, from dori state (managed-panes.ts); never read from the config file after migration. */
   readonly laneWorkspace: string;
+  /** The workspaces the sweeps watch: the lanes workspace (empty: every workspace). Derived, not configured. */
   readonly workspaces: readonly string[];
   readonly ignorePanes: readonly string[];
+  /** The lead's herdr pane, from dori state (managed-panes.ts) or DORI_LEAD_PANE; the supervisor creates and records it. */
   readonly leadPane: string;
   readonly defaultCwd: string;
   readonly agentCommand: ArgvTemplate;
@@ -455,6 +458,7 @@ let warnedRemovedOwnerPostKeys = false;
 let warnedRemovedToodoKeys = false;
 let warnedRemovedHookKeys = false;
 let warnedSandboxDefault = false;
+let warnedPaneKeys = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -611,6 +615,15 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is left open for the owner to close, no hook marks it done; the keys are ignored and can be deleted`);
   }
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => !(REMOVED_HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
+  const stateDir = expandHome(process.env.DORI_STATE_DIR ?? raw.stateDir ?? base.stateDir, home);
+  const panes = resolveManagedPanes(stateDir, loaded);
+  const paneKeys = legacyPaneKeys(loaded);
+  if (paneKeys.length && !warnedPaneKeys) {
+    warnedPaneKeys = true;
+    console.error(panes.migrated?.saved
+      ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
+      : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
+  }
   const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...hooks }, delivery };
   return {
     ...merged,
@@ -625,32 +638,13 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     drift: driftConfig(raw.drift),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
-    stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
+    stateDir,
     defaultCwd: expandHome(merged.defaultCwd, home),
     sessionsDir: expandHome(merged.sessionsDir, home),
-    leadPane: process.env.DORI_LEAD_PANE ?? merged.leadPane,
+    leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
+    laneWorkspace: panes.laneWorkspace,
+    workspaces: panes.laneWorkspace ? [panes.laneWorkspace] : [],
   };
-};
-
-/**
- * Persist a recreated lead pane into the config file that was loaded. Every other key is kept as
- * written, the file mode is preserved, and the rename happens only after the new bytes are on disk.
- * A missing file is left alone: nothing was loaded from it.
- */
-export const saveLeadPane = (path: string, leadPane: string): boolean => {
-  let real: string;
-  try { real = realpathSync(path); } catch { return false; }
-  const raw: unknown = JSON.parse(readFileSync(real, "utf8"));
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError(`${path} is not a JSON object`);
-  const mode = statSync(real).mode & 0o777;
-  const tmp = `${real}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", mode);
-  try {
-    writeFileSync(fd, `${JSON.stringify({ ...raw, leadPane }, null, 2)}\n`);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  renameSync(tmp, real);
-  return true;
 };
 
 /** `fill` for the thread hooks: their `text` and `title` leave the host, so secrets are masked on the way out. */

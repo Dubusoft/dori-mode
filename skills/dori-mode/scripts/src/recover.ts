@@ -4,7 +4,7 @@ import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
-import { LaunchError, launchLane, startupLine } from "./launch.ts";
+import { LaunchError, laneTabWorkspace, launchLane, startupLine } from "./launch.ts";
 import { LaneOpsError } from "./lane-ops.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
@@ -145,7 +145,9 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
 const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined): Promise<Relaunched> => {
   let r;
   try {
-    r = await deps.ops.recover(stored, session !== undefined ? { session } : {});
+    // A local relaunch opens its new tab in the lanes workspace as it is now (herdr may have renumbered it since the start).
+    const tabWorkspace = lane.machine ? undefined : await laneTabWorkspace(deps, (line) => { console.error(line); });
+    r = await deps.ops.recover(stored, { ...(session !== undefined ? { session } : {}), ...(tabWorkspace ? { tabWorkspace } : {}) });
   } catch (error) {
     if (unknownToRunner(error)) return startAgain(deps, lane, stored, session);
     throw error;

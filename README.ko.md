@@ -58,13 +58,13 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 
 | 항목 | 뜻 |
 |---|---|
-| `leadPane` | Dori 자신의 herdr pane (`herdr pane current`). 레인 보고가 여기로 옵니다. |
-| `laneWorkspace` | 새 레인 탭이 열릴 herdr workspace |
 | `defaultCwd` | 레인이 시작하는 디렉터리이자, 레인이 worktree를 만드는 저장소 |
 | `agentCommand` | 에이전트 실행 명령. `{model}`, `{prompt}`가 들어간 argv 목록 |
 | `hooks.threadReply` | 메신저 CLI를 `{thread}`, `{text}`가 들어간 argv 목록으로. 레인 진행 상황을 올릴 때 씁니다. |
 
 나머지(시간, 임계값, heavy 슬롯 수)는 기본값으로 충분합니다. 전체 표는 [`references/scripts.md`](skills/dori-mode/references/scripts.md)에 있습니다. `DORI_CONFIG`, `DORI_STATE_DIR`, `DORI_LEAD_PANE` 환경변수를 주면 파일 값 대신 그 값을 씁니다.
+
+리드의 herdr pane과 새 레인 탭이 열리는 workspace는 설정하지 않습니다. 수퍼바이저가 찾아 쓰고, 없으면 만들어서(`Dori` workspace의 `dori-lead` 탭, `lanes` workspace) `<stateDir>/herdr-panes.json`에 기록합니다. 예전 설정의 `leadPane`, `laneWorkspace`, `workspaces`는 한 번 그곳으로 옮겨지고 그 뒤로는 무시됩니다.
 
 ## 온보딩
 

@@ -69,7 +69,7 @@ export const runnerEffects = (deps: { readonly lanes: RunnerLanes; readonly guar
   "lane.resume": async (command) => deps.lanes.resume(command.body.key),
   "lane.notify": async (command) => deps.lanes.notify(command.body),
   "lane.git": async (command) => laneGitEffect(deps.run, command.body),
-  "lane.recover": async (command) => deps.lanes.recover(command.body.key, command.body.session),
+  "lane.recover": async (command) => deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace),
   "lane.observe": async (command) => deps.lanes.observe(command.body.key),
 });
 

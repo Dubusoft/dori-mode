@@ -13,7 +13,7 @@ const SRC = join(import.meta.dir, "..", "src");
 /** Runner-side primitives and lead modules: herdr access there is not lane access through the supervisor. */
 const EXEMPT: ReadonlySet<string> = new Set([
   "panes.ts", "session-id.ts", "herdr-machines.ts",
-  "supervise-lead-lifecycle.ts", "supervise-push.ts", "supervise-delivery.ts", "status.ts", "doctor.ts", "setup.ts", "lane-reports.ts",
+  "supervise-lead-lifecycle.ts", "supervise-push.ts", "supervise-delivery.ts", "status.ts", "doctor.ts", "setup.ts", "lane-reports.ts", "managed-panes.ts",
 ]);
 
 type Offence = "herdr" | "panes";

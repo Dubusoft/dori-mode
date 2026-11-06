@@ -32,7 +32,7 @@ const happyRun: Record<string, Ran> = {
   "systemctl --user is-enabled dori-presence.service": no("disabled"),
   "systemctl --user is-active dori-presence.service": no("inactive", 3),
   "pgrep -f (dori|cli\\.ts) presence": no(),
-  "herdr workspace list": ok("{}"),
+  "herdr workspace list": ok(JSON.stringify({ result: { workspaces: [{ label: "lanes", workspace_id: "w1" }] } })),
   "pgrep -f herdr server": ok("101"),
   "systemctl --user show dori-supervisor.service --property=WorkingDirectory --value": ok("/work"),
   "herdr pane list": ok(pane),
@@ -192,13 +192,16 @@ test("missing WorkingDirectory, missing dirs, missing config keys and a missing 
   expect(find(c, "stateDir")).toMatchObject({ level: "FAIL" });
   expect(find(c, "defaultCwd").fix).toStartWith("mkdir -p ");
   const keys = fixture({ deps: { config: { ...fixture().deps.config, laneWorkspace: "", discordChannels: [], discord: { applicationId: "x", guildId: "200", ownerId: "300" } } } });
-  const k = find(await runDoctor(keys.deps), "config");
+  const kc = await runDoctor(keys.deps);
+  const k = find(kc, "config");
   expect(k.level).toBe("FAIL");
-  expect(k.detail).toContain("laneWorkspace");
+  expect(find(kc, "lanes workspace")).toMatchObject({ level: "WARN", fix: "systemctl --user restart dori-supervisor.service" });
   expect(k.detail).toContain("discordChannels");
   expect(k.detail).toContain("discord.applicationId");
   const lead = fixture({ run: { "herdr pane list": ok(JSON.stringify({ result: { panes: [] } })) } });
   expect(find(await runDoctor(lead.deps), "leadPane")).toMatchObject({ level: "FAIL", fix: "dori lead-restart" });
+  const gone = fixture({ run: { "herdr workspace list": ok(JSON.stringify({ result: { workspaces: [{ label: "lanes", workspace_id: "w9" }] } })) } });
+  expect(find(await runDoctor(gone.deps), "lanes workspace")).toMatchObject({ level: "WARN" });
   const bad = fixture({ deps: { configError: "Unexpected token" } });
   expect(find(await runDoctor(bad.deps), "config")).toMatchObject({ level: "FAIL" });
 });

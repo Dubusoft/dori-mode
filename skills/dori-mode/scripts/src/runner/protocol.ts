@@ -107,13 +107,14 @@ export type SupervisorCommandBodies = {
   /**
    * Since proto 3, all optional: `keywords` (the opening keywords; absent: the runner's default), `session` (resume
    * that agent session), `target` (run in this idle shell pane, or the one shell pane of this workspace, instead of a
-   * new tab), `heavySlots`/`heavyMaxLoad` (exported to the lane as DORI_HEAVY_SLOTS / DORI_HEAVY_MAX_LOAD).
+   * new tab), `heavySlots`/`heavyMaxLoad` (exported to the lane as DORI_HEAVY_SLOTS / DORI_HEAVY_MAX_LOAD), `tabWorkspace`
+   * (the herdr workspace a new tab opens in; absent: herdr's focused workspace).
    */
   readonly "lane.start": Cmd<{
     readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd: string;
     readonly agentProfile: string; readonly mode: string; readonly model: string; readonly sandbox: boolean; readonly expectedLaneGen: number;
     readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
-    readonly heavySlots?: number; readonly heavyMaxLoad?: number;
+    readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
   }>;
   /** Since proto 3: take the existing pane `pane` as lane `key`; issues a token file. */
   readonly "lane.adopt": Cmd<{ readonly key: string; readonly pane: string; readonly cwd?: string; readonly mode: string; readonly model: string }>;
@@ -121,8 +122,11 @@ export type SupervisorCommandBodies = {
   /** `step` (since proto 3) defaults to `both`. */
   readonly "lane.pause": Cmd<{ readonly key: string; readonly step?: PauseStep }>;
   readonly "lane.resume": Cmd<LaneKey>;
-  /** `session` (since proto 3): resume that agent session when relaunching. */
-  readonly "lane.recover": Cmd<{ readonly key: string; readonly session?: string }>;
+  /**
+   * `session` (since proto 3): resume that agent session when relaunching. `tabWorkspace`: the herdr workspace the
+   * relaunch's new tab opens in (absent: the one the lane was started in).
+   */
+  readonly "lane.recover": Cmd<{ readonly key: string; readonly session?: string; readonly tabWorkspace?: string }>;
   /** `mode` and `refuseWhileAsking` since proto 3. */
   readonly "lane.send": Cmd<{ readonly key: string; readonly text: string; readonly verify: boolean; readonly mode?: SendMode; readonly refuseWhileAsking?: boolean }>;
   /** Since proto 3: the lane's status as the supervisor holds it, answered to the lane's `dori lane status`. */
@@ -394,13 +398,13 @@ const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
     key: req("string"), briefText: req("string"), done: req("string"), thread: req("string"), cwd: req("string"),
     agentProfile: req("string"), mode: req("string"), model: req("string"), sandbox: req("bool"), expectedLaneGen: req("int"),
     keywords: opt("string"), session: opt("string"), target: opt({ object: { pane: opt("string"), workspace: opt("string") } }),
-    heavySlots: opt("int"), heavyMaxLoad: opt("number"),
+    heavySlots: opt("int"), heavyMaxLoad: opt("number"), tabWorkspace: opt("string"),
   }),
   "lane.adopt": cmd({ key: req("string"), pane: req("string"), cwd: opt("string"), mode: req("string"), model: req("string") }),
   "lane.stop": cmd(laneKey),
   "lane.pause": cmd({ key: req("string"), step: opt({ enum: ["goal", "stop", "both"] }) }),
   "lane.resume": cmd(laneKey),
-  "lane.recover": cmd({ key: req("string"), session: opt("string") }),
+  "lane.recover": cmd({ key: req("string"), session: opt("string"), tabWorkspace: opt("string") }),
   "lane.send": cmd({
     key: req("string"), text: req("string"), verify: req("bool"), mode: opt({ enum: ["verified", "guarded"] }), refuseWhileAsking: opt("bool"),
   }),

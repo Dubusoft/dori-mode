@@ -28,6 +28,8 @@ export type StartInput = {
   readonly key: string; readonly machine?: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd: string;
   readonly sandbox: boolean; readonly mode: string; readonly model: string; readonly keywords: string; readonly session?: string;
   readonly target?: { pane?: string; workspace?: string }; readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly cmdId?: string;
+  /** The herdr workspace a new tab opens in (the supervisor-managed lanes workspace of a local lane). */
+  readonly tabWorkspace?: string;
 };
 export type AdoptInput = { readonly key: string; readonly machine?: string; readonly pane: string; readonly cwd?: string; readonly mode: string; readonly model: string };
 export type GitOp =
@@ -76,7 +78,7 @@ export type LaneOps = {
   /** Throws LaneOpsError LANE_OP_FAILED with the runner's detail (RUNNER_CMD_REJECTED cwd-outside-roots, RUNNER_LANE_TARGET_BUSY, ...). */
   readonly start: (input: StartInput) => Promise<CommandResults["lane.start"]>;
   readonly adopt: (input: AdoptInput) => Promise<CommandResults["lane.adopt"]>;
-  readonly recover: (lane: LaneRef, opts?: { readonly session?: string }) => Promise<CommandResults["lane.recover"]>;
+  readonly recover: (lane: LaneRef, opts?: { readonly session?: string; readonly tabWorkspace?: string }) => Promise<CommandResults["lane.recover"]>;
   /** An ambiguous close throws LANE_OP_AMBIGUOUS (closeSequence maps it to its ambiguous step). */
   readonly close: (lane: LaneRef, opts?: { readonly cmdId?: string }) => Promise<CommandResults["lane.close"]>;
   /** failed → {code: 1, err: detail}; ambiguous → {code: 2, err: "ambiguous: ..."} (the operation's read-back decides). */
@@ -286,11 +288,14 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
       ...(input.target ? { target: input.target } : {}),
       ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}),
       ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
+      ...(input.tabWorkspace !== undefined ? { tabWorkspace: input.tabWorkspace } : {}),
     }, input.cmdId),
     adopt: (input) => effect(machineRunner(input.machine), "lane.adopt", {
       key: input.key, pane: input.pane, mode: input.mode, model: input.model, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     }),
-    recover: (lane, opts = {}) => effect(runnerOf(lane), "lane.recover", { key: lane.key, ...(opts.session !== undefined ? { session: opts.session } : {}) }),
+    recover: (lane, opts = {}) => effect(runnerOf(lane), "lane.recover", {
+      key: lane.key, ...(opts.session !== undefined ? { session: opts.session } : {}), ...(opts.tabWorkspace !== undefined ? { tabWorkspace: opts.tabWorkspace } : {}),
+    }),
     // Worktree checks are the supervisor's (q.lane.inspect before the close, D10), never the runner's.
     close: (lane, opts = {}) => effect(runnerOf(lane), "lane.close", { key: lane.key, worktreeChecks: false }, opts.cmdId),
     git: async (lane, op, opts = {}) => {

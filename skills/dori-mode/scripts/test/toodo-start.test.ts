@@ -70,7 +70,8 @@ test("no pane (runner plain) falls back to a new tab in the task's worktree and 
   expect(started()?.target).toBeUndefined();
   expect(started()?.cwd).toBe(state.dir);
   expect(r.lane).toMatchObject({ pane: "w1:p9", tab: "w1:t9" });
-  expect(r.notes).toEqual(["LAUNCH_FALLBACK toodo-lane new tab: start_task listed no shell pane (task 580 has no herdr workspace; start it first)"]);
+  expect(r.notes).toEqual(["LAUNCH_FALLBACK toodo-lane new tab: start_task listed no shell pane (task 580 has no herdr workspace; start it first)", "LANE_WORKSPACE_REGISTERED wL (found by label)"]);
+  expect(started()?.tabWorkspace).toBe("wL");
 });
 
 /**

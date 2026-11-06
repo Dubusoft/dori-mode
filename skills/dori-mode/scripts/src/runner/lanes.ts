@@ -57,6 +57,8 @@ export type LaneRecord = {
   readonly lastAsk?: string;
   /** Opening keywords of the start (absent: the mode's default), reused by a relaunch. */
   readonly keywords?: string;
+  /** The herdr workspace the lane's tab was opened in (absent: herdr's focused one), reused by a relaunch. */
+  readonly tabWorkspace?: string;
   readonly heavySlots?: number;
   readonly heavyMaxLoad?: number;
   /** The status the supervisor last pushed with `lane.notify`. */
@@ -120,7 +122,7 @@ export const agentArgv = (
 type LaunchInput = {
   readonly key: string; readonly cwd: string; readonly profile: string; readonly mode: string; readonly model: string;
   readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
-  readonly heavySlots?: number; readonly heavyMaxLoad?: number;
+  readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
 };
 type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict };
 
@@ -192,6 +194,7 @@ export class RunnerLanes {
       ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
       ...(body.target ? { target: body.target } : {}),
       ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
+      ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
     });
     return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup } };
   }
@@ -217,7 +220,8 @@ export class RunnerLanes {
       tab = target.tab ?? "";
       cwd = target.cwd ?? cwd;
     } else {
-      const created = await this.deps.run(["herdr", "tab", "create", "--cwd", input.cwd, "--label", key, "--no-focus"]);
+      const workspace = input.tabWorkspace ? ["--workspace", input.tabWorkspace] : [];
+      const created = await this.deps.run(["herdr", "tab", "create", ...workspace, "--cwd", input.cwd, "--label", key, "--no-focus"]);
       if (created.code !== 0) throw new Error(`herdr tab create failed: ${(created.err || created.out).trim()}`);
       const made = (JSON.parse(created.out) as { result: { root_pane: { pane_id: string; tab_id?: string }; tab_id?: string } }).result;
       pane = made.root_pane.pane_id;
@@ -255,6 +259,7 @@ export class RunnerLanes {
       [key]: {
         key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
         ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
+        ...(input.tabWorkspace !== undefined && !input.target ? { tabWorkspace: input.tabWorkspace } : {}),
         ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
       },
     });
@@ -380,7 +385,7 @@ export class RunnerLanes {
    * lane publishes `lane.started` for its current record, which completes the supervisor's pending recovery. `session`
    * resumes that agent session when the profile allows (`resumed` says whether it did).
    */
-  async recover(key: string, session?: string): Promise<Effect<"lane.recover">> {
+  async recover(key: string, session?: string, tabWorkspace?: string): Promise<Effect<"lane.recover">> {
     const record = this.record(key);
     const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
     if (paneAlive(pane)) {
@@ -392,6 +397,7 @@ export class RunnerLanes {
     const launched = await this.launch({
       key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,
       ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),
+      ...((tabWorkspace ?? record.tabWorkspace) !== undefined ? { tabWorkspace: tabWorkspace ?? record.tabWorkspace } : {}),
       ...(record.heavySlots !== undefined ? { heavySlots: record.heavySlots } : {}), ...(record.heavyMaxLoad !== undefined ? { heavyMaxLoad: record.heavyMaxLoad } : {}),
     });
     // The relaunch replaced the record; a notice the supervisor pushed stays with the lane.

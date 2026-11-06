@@ -182,7 +182,8 @@ test("handled CLI persists task count and reply coverage through the real comman
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner alpha beta");
   const config = join(f.state.dir, "config.json");
-  writeFileSync(config, JSON.stringify(f.deps.config));
+  const { leadPane: _lead, laneWorkspace: _lanes, workspaces: _watched, ...persisted } = f.deps.config;
+  writeFileSync(config, JSON.stringify(persisted));
   // When the lead declares two tasks and links one reply through the CLI.
   const child = Bun.spawn([process.execPath, "src/cli.ts", "handled", "11", "22", "--tasks", "2", "--reply"], {
     cwd: join(import.meta.dir, ".."), env: { ...process.env, DORI_CONFIG: config, DORI_STATE_DIR: f.state.dir },
