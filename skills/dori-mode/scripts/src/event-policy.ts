@@ -40,6 +40,8 @@ const URGENT_KINDS = [
   // stays digest (the default): held recovery resumes by itself.
   "HERDR_DOWN",
   "HERDR_HUNG",
+  // The supervisor's Discord gateway hit a close code it must not reconnect after (messenger/discord.ts DISCORD_FATAL_CLOSE).
+  "DISCORD_GATEWAY_FATAL",
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
   "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",

@@ -241,6 +241,39 @@ test("a repo timeout still lets a healthy repo emit its decision event", async (
   expect(f.events.some((e) => e.line.startsWith("HOST_GITHUB slow/repo poll_failed "))).toBe(true);
 });
 
+test("a repo poll cut short keeps what it read: the next tick resumes after the finished PRs instead of starting over", async () => {
+  const f = await fixture();
+  const LIST = "repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100";
+  const human = [{ id: 3, user: { login: "human", type: "User" } }];
+  const seven = pull({ updated_at: "2026-10-20T00:00:00Z" });
+  const eight = pull({ number: 8, head: { sha: "def", ref: "other", repo: { full_name: "Acme/App" } }, updated_at: "2026-10-20T00:00:00Z", html_url: "https://github.com/acme/app/pull/8" });
+  f.responses.set(LIST, ok([seven, eight], '"v2"'));
+  f.responses.set("repos/acme/app/pulls/7", ok(seven, '"v2"'));
+  f.responses.set("repos/acme/app/issues/7/comments?per_page=100", ok(human, '"v2"'));
+  f.responses.set("repos/acme/app/pulls/8", ok(eight));
+  f.responses.set("repos/acme/app/commits/def/check-runs?per_page=100", ok({ check_runs: [] }));
+  f.responses.set("repos/acme/app/commits/def/status?per_page=100", ok({ state: "pending", statuses: [] }));
+  f.responses.set("repos/acme/app/pulls/8/reviews?per_page=100", { code: 124, out: "", err: "timeout" });
+  f.responses.set("repos/acme/app/issues/8/comments?per_page=100", ok(human));
+  f.responses.set("repos/acme/app/pulls/8/comments?per_page=100", ok([]));
+  // The first tick finishes PR 7 (its comment goes out) and is cut short inside PR 8.
+  await f.github.tick(f.deps, f.emit);
+  expect(f.events.map((e) => e.line.split(" ").slice(0, 3).join(" "))).toEqual(["GH_PR acme/app#7 comment", "GH_PR acme/app#7 updated", "HOST_GITHUB acme/app poll_failed"]);
+  // The next tick reads the list conditionally from what the failed tick kept, and does not read PR 7 again.
+  f.responses.set("repos/acme/app/pulls/8/reviews?per_page=100", ok([]));
+  const before = f.calls.length;
+  await f.github.tick(f.deps, f.emit);
+  const resumed = f.calls.slice(before);
+  expect(resumed.find((c) => c.argv[5] === LIST)?.argv).toContain('If-None-Match: "v2"');
+  expect(resumed.some((c) => c.argv[5]?.includes("/7"))).toBe(false);
+  expect(f.events.filter((e) => e.line.startsWith("GH_PR acme/app#8 ")).map((e) => e.line.split(" ")[2])).toEqual(["comment", "opened"]);
+  // Once the repo finished, the snapshot is durable and a later tick reads every PR again without repeating an event.
+  const events = f.events.length;
+  await poller(f.state.dir).tick(f.deps, f.emit);
+  expect(f.events.length).toBe(events);
+  expect(githubSummary(f.state.dir).failures).toEqual({});
+});
+
 test("per-repo auth failure is bounded, isolated and rate-limited durably while repos hot reload", async () => {
   const f = await fixture();
   new Repos(f.state.dir).add("bad/repo");
