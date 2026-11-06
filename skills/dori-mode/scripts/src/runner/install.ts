@@ -15,7 +15,8 @@ import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
  * so they never appear in any process's argv on either machine.
  *
  * On both systems the script writes the bundle to `~/.dori/runner/bin/dori.js` through a temporary file and `mv`, the
- * `~/.dori/runner/bin/dori` wrapper that runs it with an absolute bun, and enrolls once (skipped when
+ * `~/.dori/runner/bin/dori` wrapper that runs it with an absolute bun, creates `~/.dori/runner/evidence` (or tightens an
+ * existing one) at 0700, and enrolls once (skipped when
  * `~/.dori/runner/keys/supervisor.pub` already exists, so a reinstall or upgrade keeps the runner's keys).
  *
  * Linux needs `bun` on the remote PATH; it writes `~/.config/systemd/user/dori-runner.service`, turns on linger, and
@@ -173,7 +174,10 @@ export const installScript = (
     `  "$BUN" --version </dev/null >/dev/null 2>&1 || exit ${INSTALL_EXIT.noBun}`,
     '  mkdir -p "$R/bin" "$HOME/Library/LaunchAgents" || exit 1',
     "fi",
-    'chmod 700 "$HOME/.dori" "$R" "$R/bin" || exit 1',
+    // `evidence/` holds lane QA artifacts on the host. It is created here, and an existing one (left 0755 by a tool that
+    // made it) is tightened, since the runner refuses to start on any runner directory that is not 0700.
+    'mkdir -p "$R/evidence" || exit 1',
+    'chmod 700 "$HOME/.dori" "$R" "$R/bin" "$R/evidence" || exit 1',
     // A starter command policy, only when the host has none: without an agent profile and a root every lane.start is
     // refused. An existing runner-config.json is the operator's and is never rewritten.
     ...(agentCommand.length ? [
