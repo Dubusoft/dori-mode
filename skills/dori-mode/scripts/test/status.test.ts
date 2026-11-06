@@ -362,21 +362,21 @@ test("RUNNER lanes= follows the registry's open lanes on each runner's machine, 
   expect(await counts()).toEqual({ local: 1, macbook: 2 });
   await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
   expect(await counts()).toEqual({ local: 1, macbook: 1 });
-  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER macbook connected .* lanes=1$/m);
+  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER macbook connected .* lanes=1 herdr=unknown$/m);
 });
 
 test("the local runner row is always shown, with its child's state from the health file, even before the hub ever opened", async () => {
   const f = await fixture();
   // No runners.sqlite and no runners section: still RUNNER local, offline, no child state without a runner dir.
   expect((await collectStatus(f.deps)).runners).toEqual([{ label: "local", state: "offline", gen: 0, cmds: 0, restarts1h: 0, lanes: 0 }]);
-  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0$/m);
+  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0 herdr=unknown$/m);
   const runnerDir = join(f.dir, "runner");
   expect((await collectStatus({ ...f.deps, runnerDir })).runners?.[0]?.child).toEqual({ verdict: "dead" });
   mkdirSync(runnerDir, { recursive: true });
   writeFileSync(healthPath(runnerDir), `${JSON.stringify({ pid: process.pid, gen: 3, monotonicMs: 1, wallAt: NOW })}\n`);
   utimesSync(healthPath(runnerDir), new Date(NOW - 5_000), new Date(NOW - 5_000));
   const text = renderStatus(await collectStatus({ ...f.deps, runnerDir }));
-  expect(text).toMatch(new RegExp(`^RUNNER local offline .* lanes=0 child=healthy pid=${process.pid} health=5s$`, "m"));
+  expect(text).toMatch(new RegExp(`^RUNNER local offline .* lanes=0 herdr=unknown child=healthy pid=${process.pid} health=5s$`, "m"));
 });
 
 test("a claude-quota.json left by the removed quota gate is ignored", async () => {

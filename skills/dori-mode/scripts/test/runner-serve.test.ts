@@ -85,7 +85,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const status = await collectStatus(deps);
   expect(renderStatus(status)).toContain("RUNNER local connected proto=3 version=- gen=1 hb=0 outbox=");
   // lanes= counts the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
-  expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=0$/m);
+  expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=0 herdr=unknown$/m);
 
   // The handle's RunnerCalls: a label with no connection fails closed at once; a query pending on the live connection
   // (this client has no query dispatcher, so it stays unanswered) is rejected when the connection closes.
@@ -113,5 +113,5 @@ test("without a runners section dori status still shows the local runner, offlin
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
   const status = await collectStatus(depsFor(newWorld(), clock, state.dir));
   expect(status.runners?.map((r) => [r.label, r.state])).toEqual([["local", "offline"]]);
-  expect(renderStatus(status).split("\n").filter((line) => line.startsWith("RUNNER "))).toEqual(["RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0"]);
+  expect(renderStatus(status).split("\n").filter((line) => line.startsWith("RUNNER "))).toEqual(["RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0 herdr=unknown"]);
 });

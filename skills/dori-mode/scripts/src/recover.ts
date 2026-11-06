@@ -5,7 +5,8 @@ import { Database, SQLiteError } from "bun:sqlite";
 import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, startupLine } from "./launch.ts";
-import { LaneOpsError } from "./lane-ops.ts";
+import { LaneOpsError, machineRunner } from "./lane-ops.ts";
+import { herdrDownSince } from "./runner/herdr-down.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 
@@ -238,10 +239,23 @@ const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue
     catch (error) { return [`LANE_RECOVERY_ERROR ${lane.key} ${message(error)}`]; }
   });
 
-/** Legacy callers receive lines; supervisors must pass enqueue to durably accept notices before their flags are saved. */
+/**
+ * Legacy callers receive lines; supervisors must pass enqueue to durably accept notices before their flags are saved.
+ * A lane whose runner's machine has herdr down (herdr-down.ts) is held: nothing is read, relaunched or counted against
+ * its recovery attempts until herdr reads again. The sweep holds it silently (HERDR_DOWN already told the lead); a
+ * recovery asked for by key says LANE_RECOVERY_HELD.
+ */
 export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: RecoveryEnqueue, view: SweepView = passthroughView(deps.ops)): Promise<string[]> => {
   const lanes = key ? [await deps.registry.read(key)].filter((lane): lane is Lane => lane !== null) : await deps.registry.open();
+  const down = herdrDownSince(deps.config.stateDir);
   const events: string[] = [];
-  for (const lane of lanes) events.push(...await relaunchLane(deps, lane, enqueue, view));
+  for (const lane of lanes) {
+    const runner = lane.runner ?? machineRunner(lane.machine);
+    if (down.has(runner)) {
+      if (key && statusOf(lane) === "working") events.push(`LANE_RECOVERY_HELD ${lane.key} herdr is down on machine=${runner.replace(/\s/g, "_")}; recovery resumes once it reads again`);
+      continue;
+    }
+    events.push(...await relaunchLane(deps, lane, enqueue, view));
+  }
   return events;
 };

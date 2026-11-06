@@ -7,6 +7,7 @@ import { type Lane, Registry } from "../src/registry.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { StartupVerdict } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
+import { markHerdr } from "./herdr-world.ts";
 
 let state: ReturnType<typeof withState>;
 beforeEach(() => { state = withState(); withSqliteStore(state.dir); });
@@ -126,6 +127,36 @@ test("a remote lane whose pane is unknown is recovered by its own runner, never 
   expect(await recoverLanes(deps, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
   expect(opsOf(world, "recover", "start").map((e) => [e.op, (e.args as { runner?: string }).runner])).toEqual([["recover", "worker-a"]]);
   expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
+});
+
+test("while a machine's herdr is down its lanes are held without spending attempts, and recovered once herdr is back", async () => {
+  const { deps, world, lane } = await fixture();
+  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app" });
+  // A local lane (no machine, the local runner) on a host whose herdr is fine is recovered as usual meanwhile.
+  await deps.registry.write({ ...lane, key: "local-lane" });
+  markHerdr(deps.config.stateDir, "worker-a", "down", 0);
+  for (let round = 0; round < RECOVERY_LIMIT + 1; round++) {
+    expect((await recoverLanes(deps)).filter((l) => l.includes(lane.key))).toEqual([]);
+  }
+  expect(opsOf(world, "recover", "start").map((e) => e.key)).toEqual(["local-lane"]);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
+  expect((await deps.registry.read(lane.key))?.recoveryPending).toBeUndefined();
+  // Asked for by key, the hold says so.
+  expect(await recoverLanes(deps, lane.key)).toEqual(["LANE_RECOVERY_HELD recover-lane herdr is down on machine=worker-a; recovery resumes once it reads again"]);
+
+  markHerdr(deps.config.stateDir, "worker-a", "up", 1);
+  expect(await recoverLanes(deps, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p2 missing-pane", "STARTUP_OK recover-lane new:p2"]);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
+});
+
+test("a held lane resumes its own session when herdr is back", async () => {
+  const { deps, world, lane } = await fixture();
+  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app", session: "ses_1" });
+  markHerdr(deps.config.stateDir, "worker-a", "down", 0);
+  expect(await recoverLanes(deps)).toEqual([]);
+  markHerdr(deps.config.stateDir, "worker-a", "up", 1);
+  expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
+  expect(opsOf(world, "recover").map((e) => (e.args as { opts?: { session?: string } }).opts?.session)).toEqual(["ses_1"]);
 });
 
 test("does not interpret list failure as a missing pane", async () => {

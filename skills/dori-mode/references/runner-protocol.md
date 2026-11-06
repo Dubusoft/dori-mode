@@ -64,7 +64,7 @@ Protocol 3 adds, all optional on existing frames:
 |---|---|
 | `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane |
 | `lane.ack {key, id}` | new event: the lane confirmed the supervisor's lane message `id` |
-| `guard.sample` | `panes` (herdr's pane count) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
+| `guard.sample` | `panes` (herdr's pane count, -1 when the runner could not read herdr) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
 | `cmd.result` | `result`: the effect's structured result (any JSON value; below) |
 | `lane.start` | `keywords`, `session`, `target {pane?, workspace?}`, `heavySlots`, `heavyMaxLoad` |
 | `lane.adopt {key, pane, cwd?, mode, model}` | new command: take an existing pane as lane `key` |
@@ -314,6 +314,28 @@ as `OUTDATED`, because it has no guard agent. Its critical stage reports the run
 machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane on entering critical with nothing
 killed, but it kills nothing over ssh. Without a fresh runner sample (no runner, or it went quiet) the machine is
 sampled over ssh again, as before.
+
+## herdr outages
+
+The supervisor reads a machine's herdr from its runner's `guard.sample.panes` (protocol 3, so every installed
+runner already sends it). It applies to every runner, the local one included.
+
+- Two committed samples in a row with `panes: -1` mark the machine's herdr `down`: `HERDR_DOWN machine=<label> ...`
+  (urgent), once. Protocol 3 cannot tell a stopped herdr from a hung one, and -1 also covers a pane list that timed
+  out or did not parse. One unreadable sample between readable ones changes nothing.
+- The next sample with a pane count marks it `up` again: `HERDR_UP machine=<label> ... after <n> s down` (digest), once.
+  A runner's first readable sample is saved as `up` and says nothing. A sample without `panes` (a protocol-2
+  runner) changes nothing.
+- The state and the time it was entered are saved on the runner's row in `runners.sqlite` (`herdr`, `herdrSince`),
+  so they survive a supervisor restart and other `dori` processes read them.
+- While a machine's herdr is down the recovery sweep leaves that machine's lanes alone: nothing is read or relaunched
+  and no recovery attempt is counted. `dori recover <key>` for such a lane prints `LANE_RECOVERY_HELD <key> ...`.
+  After `HERDR_UP` the next sweep recovers them as usual, on their recorded session when they have one.
+- `dori launch --machine <label>` is refused at once with `HERDR_DOWN machine=<label> ...`, before any placement
+  check or runner call.
+- `dori status` adds `herdr=<up|down|unknown>` to each runner line.
+
+The supervisor neither starts nor restarts herdr; bring it back on that machine by hand.
 
 ## Health and probe
 

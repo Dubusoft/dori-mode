@@ -284,6 +284,10 @@ describe("proto 3 frames", () => {
       .toThrow("RUNNER_FRAME_INVALID field-type body.reason");
     expect(() => decodeFrame(encodeFrame(runnerEvent(HEAD, 6, "guard.sample", { ...sample, lanes: [{ key: "a", rssKb: 1 } as never] })), "runner"))
       .toThrow("RUNNER_FRAME_INVALID missing-field body.lanes[0].top");
+    // A runner that could not read herdr sends panes -1 (the supervisor's herdr-down signal); nothing lower decodes.
+    expect(roundTrip(runnerEvent(HEAD, 7, "guard.sample", { ...sample, panes: -1 }), "runner").body).toEqual({ ...sample, panes: -1 });
+    expect(() => decodeFrame(encodeFrame(runnerEvent(HEAD, 8, "guard.sample", { ...sample, panes: -2 })), "runner"))
+      .toThrow("RUNNER_FRAME_INVALID field-type body.panes must be a non-negative integer or -1");
   });
 
   test("queries are supervisor control frames without cmdSeq, answered by the runner's q.result", () => {
