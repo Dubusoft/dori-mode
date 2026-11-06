@@ -1,11 +1,6 @@
 {
   "stateDir": "~/.dori/state",
-  "laneWorkspace": "lanes",
-  "workspaces": [
-    "lanes"
-  ],
   "ignorePanes": [],
-  "leadPane": "<your herdr pane id, from: herdr pane current>",
   "defaultCwd": "~/code/my-project",
   "agentCommand": [
     "omo",

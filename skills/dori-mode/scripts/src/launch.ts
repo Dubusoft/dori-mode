@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { languageInstruction } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { LaneOpsError, machineRunner, type StartInput } from "./lane-ops.ts";
+import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
 import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
 import { cmdRefused, paneShell } from "./runner/lane-control.ts";
@@ -336,6 +337,19 @@ const toodoTarget = async (deps: FlowDeps, input: LaunchInput, start: ToodoStart
   return { notes: [`LAUNCH_FALLBACK ${input.key} new tab: ${failed.join("; ")}`] };
 };
 
+/**
+ * The herdr workspace a local lane's new tab opens in: the supervisor-managed lanes workspace, found again or created and
+ * recorded when herdr lost it. A launch never falls back to herdr's focused workspace, so a herdr failure refuses it.
+ */
+export const laneTabWorkspace = async (deps: Pick<FlowDeps, "run" | "config">, log: (line: string) => void): Promise<string> => {
+  try {
+    return await ensureLaneWorkspace(deps.run, deps.config.stateDir, deps.config.defaultCwd, log);
+  } catch (error) {
+    if (error instanceof ManagedPanesError) throw new LaunchError(`no lanes workspace: ${error.message}`);
+    throw error;
+  }
+};
+
 /** The STARTUP_OK / STARTUP_ERROR / STARTUP_UNCONFIRMED line of a runner's startup verdict for `pane`. */
 export const startupLine = (key: string, pane: string, startup: StartupVerdict): string =>
   startup.verdict === "ok" ? `STARTUP_OK ${key} ${pane}` : `STARTUP_${startup.verdict === "error" ? "ERROR" : "UNCONFIRMED"} ${key} ${pane}: ${startup.detail}`;
@@ -373,6 +387,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const placed = input.toodo && !input.pane && !input.workspace ? await toodoTarget(deps, input, input.toodo) : undefined;
   const target = placed ? placed.target : input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
   const notes = [...(placed?.notes ?? []), ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
+  const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
   const dir = input.cwd ?? target?.cwd;
   // The runner starts every lane in a directory on its own host; the lead's defaultCwd means nothing on another machine.
   if (input.machine && !dir) throw new LaunchError(`a lane on machine ${input.machine} needs --cwd (a directory on that machine)`);
@@ -403,6 +418,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
       ...(input.session !== undefined ? { session: input.session } : {}),
       ...(target ? { target: { pane: target.pane } } : {}),
+      ...(tabWorkspace ? { tabWorkspace } : {}),
     };
     let result;
     try {

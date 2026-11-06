@@ -46,7 +46,8 @@ export type LeadState = {
 export type Status = {
   readonly at: string;
   readonly services: readonly UnitState[];
-  readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest };
+  /** `laneWorkspace`: the supervisor-managed herdr workspace new local lane tabs open in ("" when none is recorded yet). */
+  readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string };
   readonly lanes: readonly {
     readonly key: string; readonly model?: string; readonly ageMin: number; readonly progress?: string; readonly repo?: string; readonly pr?: number;
     /** recoveryPending: "exhausted" after every recovery attempt failed (LANE_RECOVERY_EXHAUSTED), else "pending". */
@@ -338,7 +339,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   return {
     at: new Date(now).toISOString(),
     services,
-    lead: { ...lead, cacheTtlMin: d.config.cacheTtlMin, capTokens: d.config.leadContextCapTokens, ...(pendingRestart ? { pendingRestart } : {}) },
+    lead: { ...lead, cacheTtlMin: d.config.cacheTtlMin, capTokens: d.config.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
     lanes: open.filter((l) => statusOf(l) === "working").map((l) => ({
       key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
       ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
@@ -517,7 +518,7 @@ const leadLine = (l: Status["lead"]): string => {
     `${state}${l.idleMin !== undefined ? ` (last turn ${l.idleMin < 1 ? "just now" : `${dur(l.idleMin)} ago`}, prompt cache ${l.state})` : ""}`,
     ...(l.tokens !== undefined ? [`context ${kilo(l.tokens)} of ${kilo(l.capTokens)} tokens`] : []),
   ];
-  return `- ${l.pane || "(no leadPane)"}: ${parts.join(", ")}${l.note ? ` - ${clip(l.note, 100)}` : ""}`;
+  return `- ${l.pane || "(no lead pane recorded)"}: ${parts.join(", ")}${l.note ? ` - ${clip(l.note, 100)}` : ""}`;
 };
 
 /** The line under page 1's lanes naming how many more there are (and, paged, where). */
@@ -541,6 +542,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const l = s.lead;
   section("Lead", [
     leadLine(l),
+    `- New lanes open in workspace ${l.laneWorkspace || "(none recorded; the supervisor creates one)"}`,
     ...(l.pendingRestart ? [clip(`- Restart ${l.pendingRestart.id} pending: ${l.pendingRestart.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}, at the next idle moment`, 300)] : []),
   ]);
 

@@ -173,7 +173,7 @@ export class Supervisor {
 
   /**
    * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at defaultCwd.
-   * The runtime leadPane changes and persistLeadPane writes it back to the loaded config. Returns the new
+   * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
    * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
    */
   repairLeadPane(): Promise<string | undefined> { return this.lead.repairLeadPane(); }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { readManagedPanes } from "../src/managed-panes.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { Repos, ReposError } from "../src/repos.ts";
@@ -160,7 +161,10 @@ test("non-interactive setup writes env 600, config with herdr ids and units, nev
   expect(mode(d.envPath)).toBe(0o600);
   expect(envGet(readFileSync(d.envPath, "utf8"), "DORI_DISCORD_TOKEN")).toBe(TOKEN);
   const cfg = readJson(d.configPath);
-  expect(cfg).toMatchObject({ custom: "keep me", hooks: { threadReply: ["notify", "{text}"] }, discordChannels: [CHANNEL], defaultCwd: "~/code", stateDir: "~/.dori/state", leadPane: "w1:p2", laneWorkspace: "w2", workspaces: ["w2"], ignorePanes: ["w2:p1"] });
+  expect(cfg).toMatchObject({ custom: "keep me", hooks: { threadReply: ["notify", "{text}"] }, discordChannels: [CHANNEL], defaultCwd: "~/code", stateDir: "~/.dori/state", ignorePanes: ["w2:p1"] });
+  expect(cfg).not.toHaveProperty("leadPane");
+  expect(cfg).not.toHaveProperty("laneWorkspace");
+  expect(readManagedPanes(join(d.home, ".dori", "state"))).toEqual({ leadPane: "w1:p2", laneWorkspace: "w2", migrated: true });
   expect(requests.map((r) => r.url)).toEqual([
     `https://discord.com/api/v10/channels/${CHANNEL}`,
     "https://discord.com/api/v10/oauth2/applications/@me",

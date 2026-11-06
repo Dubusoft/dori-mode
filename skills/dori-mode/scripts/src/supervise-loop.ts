@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { configPath, deliveryConfigError, saveLeadPane } from "./config.ts";
+import { deliveryConfigError } from "./config.ts";
+import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { HUB_FILE, readRunnerRows, RunnerHub } from "./runner/hub.ts";
@@ -679,6 +680,29 @@ const pause: Pause = (ms, signal) => new Promise<void>((resolve) => {
 });
 
 /**
+ * The supervisor owns the lead pane and the lanes workspace: before its tasks start it recreates a lead pane that is
+ * missing (none recorded, or herdr lost it) and finds or creates the lanes workspace, both recorded in dori state. A herdr
+ * failure here is logged and left to the lead-pane repair retries and to the next launch, which ensures the workspace again.
+ */
+const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promise<FlowDeps> => {
+  let config = deps.config;
+  try {
+    await supervisor.repairLeadPane();
+    config = { ...config, leadPane: supervisor.leadPane };
+  } catch (error) {
+    console.error(`LEAD_PANE_ENSURE_FAILED ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    const laneWorkspace = await ensureLaneWorkspace(deps.run, config.stateDir, config.defaultCwd, (line) => { console.log(line); });
+    config = { ...config, laneWorkspace, workspaces: [laneWorkspace] };
+  } catch (error) {
+    if (!(error instanceof ManagedPanesError)) throw error;
+    console.error(`LANE_WORKSPACE_ENSURE_FAILED ${error.message}`);
+  }
+  return { ...deps, config };
+};
+
+/**
  * Polling and sweeps enqueue independently of the single serialized lead delivery. There is no single loop: inbound,
  * delivery (with the owner notices and ack ticks), sweeps and GitHub/wait polling each run as their own task, so none
  * waits behind another; a stuck one is reported by name (TASK_STALLED) while the other three keep working, and each sweep
@@ -695,7 +719,6 @@ export const supervise = async (
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
   const { gatewayLockDir, spawnRunner, ...discordOptions } = options;
-  if (!deps.config.leadPane) throw new SuperviseError("supervise requires leadPane");
   if (!Number.isFinite(deps.config.cacheTtlMin) || deps.config.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
   if (!Number.isFinite(deps.config.leadContextCapTokens) || deps.config.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
   if (!Number.isFinite(deps.config.leadContextHardCapTokens) || deps.config.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
@@ -757,13 +780,13 @@ export const supervise = async (
     const ownerNotice = async (channel: string, text: string, id: string): Promise<void> => {
       await discord.send(channel, systemText(text), id);
     };
-    // Resolved once: the file this process loaded (DORI_CONFIG or ~/.dori/config.json).
-    const loadedConfig = configPath();
+    const stateDir = deps.config.stateDir;
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
-      persistLeadPane: (pane) => { saveLeadPane(loadedConfig, pane); },
+      persistLeadPane: (pane) => { saveLeadPane(stateDir, pane); },
       announce: async (text, id, thread) => { await postOwnerLine(discord, deps.config.discordChannels[0], thread, systemText(text), id); },
     }));
+    deps = await ensureManagedPanes(deps, supervisor);
     // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
     // run too, each run an operation row; a heavy job takes a heavy slot like `dori heavy`, without waiting for one.
     const ops = scheduleOps = probe.step("schedules", () => openOperations(deps.config));

@@ -8,6 +8,7 @@ import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
 import { readWakes } from "./store.ts";
+import { legacyPaneKeys, managedPanesPath } from "./managed-panes.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
 import { listPanes } from "./panes.ts";
@@ -110,6 +111,41 @@ const paths = async (d: DoctorDeps): Promise<Check[]> => {
   return checks;
 };
 
+/**
+ * The lead pane and lanes workspace the supervisor manages (dori state, not the config): each must exist in herdr. One
+ * that is missing is a WARN, since the supervisor creates it at start and a launch re-creates the lanes workspace.
+ * Legacy config keys naming them are reported as ignored.
+ */
+const managedPanes = async (d: DoctorDeps): Promise<Check[]> => {
+  const c = d.config;
+  const where = managedPanesPath(c.stateDir);
+  const checks: Check[] = [];
+  try {
+    const raw: unknown = JSON.parse(readFileSync(d.configPath, "utf8"));
+    const legacy = raw && typeof raw === "object" && !Array.isArray(raw) ? legacyPaneKeys(raw as Record<string, unknown>) : [];
+    if (legacy.length) checks.push(warn("config pane keys", `${legacy.join(", ")} in ${d.configPath} are ignored; the supervisor manages them in ${where}`, `delete ${legacy.join(", ")} from ${d.configPath}`));
+  } catch { /* the config check above already reports an unreadable config */ }
+  const restart = "systemctl --user restart dori-supervisor.service";
+  if (!c.leadPane) checks.push(warn("leadPane", `no lead pane recorded in ${where}`, restart));
+  if (!c.laneWorkspace) checks.push(warn("lanes workspace", `no lanes workspace recorded in ${where}`, restart));
+  if (!c.leadPane && !c.laneWorkspace) return checks;
+  try {
+    if (c.leadPane) {
+      const found = (await listPanes(d.run)).some((p) => p.pane_id === c.leadPane);
+      checks.push(found ? ok("leadPane", `${c.leadPane} exists in herdr`) : fail("leadPane", `${c.leadPane} is not a herdr pane`, "dori lead-restart"));
+    }
+    if (c.laneWorkspace) {
+      const listed = await d.run(["herdr", "workspace", "list"], T);
+      let found = false;
+      try { found = listed.code === 0 && (JSON.parse(listed.out) as { result?: { workspaces?: { workspace_id?: string }[] } }).result?.workspaces?.some((w) => w.workspace_id === c.laneWorkspace) === true; } catch { found = false; }
+      checks.push(found ? ok("lanes workspace", `${c.laneWorkspace} exists in herdr`) : warn("lanes workspace", `${c.laneWorkspace} is not a herdr workspace; the next launch or supervisor start finds or creates one`, restart));
+    }
+  } catch {
+    checks.push(fail("leadPane", "cannot list herdr panes", "systemctl --user start herdr-server.service"));
+  }
+  return checks;
+};
+
 const isDiscord = (d: DoctorDeps): boolean => Boolean(d.config.discord) || d.config.discordChannels.length > 0 || d.token !== undefined;
 
 const config = async (d: DoctorDeps): Promise<Check[]> => {
@@ -117,7 +153,7 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
   if (!d.exists(d.configPath)) return [fail("config", `${d.configPath} is missing`, "dori setup")];
   const c = d.config;
   const missing = [
-    ...(c.leadPane ? [] : ["leadPane"]), ...(c.laneWorkspace ? [] : ["laneWorkspace"]), ...(c.defaultModel ? [] : ["defaultModel"]),
+    ...(c.defaultModel ? [] : ["defaultModel"]),
     ...(c.discordChannels.length ? [] : ["discordChannels"]),
     ...(isDiscord(d) ? (["applicationId", "guildId", "ownerId"] as const).filter((k) => !/^\d+$/.test(c.discord?.[k] ?? "")).map((k) => `discord.${k}`) : []),
   ];
@@ -138,14 +174,7 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
   if (lane.length) checks.push(warn("lane command", lane.join("; "), `fix the keys in ${d.configPath}`));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
-  if (c.leadPane) {
-    try {
-      const found = (await listPanes(d.run)).some((p) => p.pane_id === c.leadPane);
-      checks.push(found ? ok("leadPane", `${c.leadPane} exists in herdr`) : fail("leadPane", `${c.leadPane} is not a herdr pane`, "dori lead-restart"));
-    } catch {
-      checks.push(fail("leadPane", "cannot list herdr panes", "systemctl --user start herdr-server.service"));
-    }
-  }
+  checks.push(...await managedPanes(d));
   return checks;
 };
 

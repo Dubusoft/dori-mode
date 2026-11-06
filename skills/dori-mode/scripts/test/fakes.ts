@@ -72,13 +72,15 @@ export type World = {
   startResult?: CommandResults["lane.start"];
   /** Every runner is down: reads and effects throw RUNNER_UNAVAILABLE, send answers "failed", status an error. */
   runnerDown?: boolean;
+  /** The herdr workspaces `herdr workspace list` answers; `workspace create` adds one (`w<n>`). */
+  workspaces: { label?: string; workspace_id: string }[];
 };
 
 export type OpsEntry = { readonly op: keyof LaneOps; readonly key?: string; readonly args: unknown };
 
 export const WT = "/repo/.wt/demo-lane";
 
-export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [], ops: [] });
+export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [], ops: [], workspaces: [{ label: "lanes", workspace_id: "wL" }] });
 
 export const fakeRunner = (w: World): Runner => async (argv) => {
   w.calls.push([...argv]);
@@ -98,6 +100,12 @@ export const fakeRunner = (w: World): Runner => async (argv) => {
     return ok();
   }
   if (cmd === "herdr" && a1 === "pane" && a2 === "list") return ok(JSON.stringify({ result: { panes: w.panes } }));
+  if (cmd === "herdr" && a1 === "workspace" && a2 === "list") return ok(JSON.stringify({ result: { workspaces: w.workspaces } }));
+  if (cmd === "herdr" && a1 === "workspace" && a2 === "create") {
+    const label = argv[argv.indexOf("--label") + 1];
+    w.workspaces.push({ ...(label ? { label } : {}), workspace_id: `w${w.workspaces.length + 1}` });
+    return ok();
+  }
   // A closed pane leaves the pane list, so a close's read-back sees it gone.
   if (cmd === "herdr" && a1 === "pane" && a2 === "close") w.panes = w.panes.filter((p) => p.pane_id !== argv[3]);
   if (cmd === "herdr") return ok();
