@@ -148,15 +148,14 @@ export class RunnerLanes {
     if (!instance || record.herdrInstance && record.herdrInstance !== instance) return undefined;
     const pane = (panes ?? await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
     if (!record.herdrInstance) {
-      if (!paneAlive(pane)) return undefined;
+      if (!pane) return undefined;
       const got = await this.deps.run(["herdr", "pane", "process-info", "--pane", record.pane]);
       if (got.code !== 0) return undefined;
       let info: ProcessInfo | undefined;
       try { info = (JSON.parse(got.out) as { result?: { process_info?: ProcessInfo } }).result?.process_info; } catch { return undefined; }
       const owner = procLanes(await (this.deps.procs ?? (() => sampleProcs(this.deps.run)))());
       const foreground = info?.foreground_processes ?? [];
-      const attributed = foreground.some((p) => p.pid !== undefined && owner.get(p.pid) === record.key)
-        || !record.adopted && foreground.some((p) => p.argv?.some((arg) => arg.includes(`Read and execute the lane brief at ${this.briefPath(record.key)} in full.`)));
+      const attributed = foreground.some((p) => p.pid !== undefined && owner.get(p.pid) === record.key);
       if (!attributed || instance !== await this.instance()) return undefined;
       this.update(record.key, (r) => ({ ...r, herdrInstance: instance, ...(pane?.terminal_id ? { terminalId: pane.terminal_id } : {}) }));
       return pane;
@@ -467,7 +466,7 @@ export class RunnerLanes {
       return { detail: `alive pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
     }
     if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
-    const restored = !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;
+    const restored = record.herdrInstance && !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;
     if (pane && record.tab) await this.deps.run(["herdr", "tab", "close", record.tab]);
     const launched = await this.launch({
       key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,

@@ -168,12 +168,16 @@ test("a legacy live lane acquires server identity only after its foreground proc
   writeRunnerFile(join(t.runnerDir, "lanes.json"), JSON.stringify({ "lane-a": legacy }));
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle", terminal_id: "term-current" }];
   t.world.processInfo.p1 = { foreground_processes: [{ pid: 20 }] };
+  const before = t.calls.length;
   expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p1", relaunched: false });
   expect(t.lanes.records()["lane-a"]).toMatchObject({ herdrInstance: "server-1", terminalId: "term-current" });
+  expect((await t.make().recover("lane-a")).result).toMatchObject({ pane: "p1", relaunched: false });
+  expect(t.calls.slice(before).filter((a) => a[2] === "process-info")).toHaveLength(1);
+  expect(t.calls.slice(before).every((a) => a[2] === "list" || a[2] === "process-info")).toBe(true);
   expect(t.calls.filter((a) => a[1] === "tab" && a[2] === "create")).toHaveLength(1);
 });
 
-test("legacy migration uses the exact launch prompt when process environments are unavailable", async () => {
+test("legacy migration refuses argv prompt text without process ownership attribution", async () => {
   const t = setup({ procs: async () => [] });
   await t.lanes.start(START);
   const record = t.lanes.records()["lane-a"];
@@ -182,21 +186,52 @@ test("legacy migration uses the exact launch prompt when process environments ar
   writeRunnerFile(join(t.runnerDir, "lanes.json"), JSON.stringify({ "lane-a": legacy }));
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle" }];
   t.world.processInfo.p1 = { foreground_processes: [{ pid: 20, argv: ["omo", `ulw. Read and execute the lane brief at ${t.lanes.briefPath("lane-a")} in full. You are the lane-a lane; report.`] }] };
-  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "idle" });
-  expect(t.lanes.records()["lane-a"]?.herdrInstance).toBe("server-1");
+  await expect(t.lanes.observe("lane-a")).rejects.toThrow("RUNNER_LANE_ABSENT");
+  expect(t.lanes.records()["lane-a"]?.herdrInstance).toBeUndefined();
 });
 
-test("a legacy record never trusts a reused live pane without positive lane attribution", async () => {
+test.each([true, false])("an unattributed legacy record never reuses its old pane or tab, agent=%s", async (agent) => {
   const t = setup({ procs: async () => [] });
   await t.lanes.start(START);
   const record = t.lanes.records()["lane-a"];
   if (!record) throw new Error("missing lane");
   const { herdrInstance: _old, ...legacy } = record;
   writeRunnerFile(join(t.runnerDir, "lanes.json"), JSON.stringify({ "lane-a": legacy }));
-  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle" }];
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", ...(agent ? { agent: "omo", agent_status: "idle" } : {}) }];
+  t.world.tabs = [{ tab_id: "t1", label: "lane-a" }];
+  t.world.paneGet.p1 = { pane_id: "p1", workspace_id: "w", tab_id: "t1", cwd: "/repo" };
   t.world.processInfo.p1 = { foreground_processes: [{ pid: 20, argv: ["omo", "another task"] }] };
+  const before = t.calls.length;
   await expect(t.lanes.send("lane-a", "unsafe", false)).rejects.toThrow("RUNNER_LANE_ABSENT");
   expect(t.lanes.records()["lane-a"]?.herdrInstance).toBeUndefined();
+  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true });
+  expect(t.calls.slice(before).some((a) => a[2] === "close" || a[2] === "run" && a[3] === "p1")).toBe(false);
+  expect(t.calls.slice(before).some((a) => a[1] === "tab" && a[2] === "list")).toBe(false);
+});
+
+test("a stamped lane record never requests process-info during identity checks", async () => {
+  const t = setup();
+  await t.lanes.start(START);
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle" }];
+  const before = t.calls.length;
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "idle" });
+  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ relaunched: false });
+  expect(t.calls.slice(before).some((a) => a[2] === "process-info")).toBe(false);
+});
+
+test("a legacy record whose pane is missing cannot acquire identity", async () => {
+  const t = setup({ procs: async () => [{ pid: 20, ppid: 1, rssKb: 1, comm: "omo", lane: "lane-a" }] });
+  await t.lanes.start(START);
+  const record = t.lanes.records()["lane-a"];
+  if (!record) throw new Error("missing lane");
+  const { herdrInstance: _old, ...legacy } = record;
+  writeRunnerFile(join(t.runnerDir, "lanes.json"), JSON.stringify({ "lane-a": legacy }));
+  t.world.panes = [];
+  t.world.processInfo.p1 = { foreground_processes: [{ pid: 20 }] };
+  const before = t.calls.length;
+  await expect(t.lanes.observe("lane-a")).rejects.toThrow("RUNNER_LANE_ABSENT");
+  expect(t.lanes.records()["lane-a"]?.herdrInstance).toBeUndefined();
+  expect(t.calls.slice(before).some((a) => a[2] === "process-info")).toBe(false);
 });
 
 test("P6: a recover whose relaunch fails keeps the lane's record, and a later recover relaunches it", async () => {

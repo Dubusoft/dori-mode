@@ -378,9 +378,11 @@ Lane records store `herdrInstance` from the current user's herdr server pids and
 `ps`). Multiple matching server processes contribute to one sorted identity, so any such process changing
 conservatively invalidates old records. `terminalId`, when herdr provides it, additionally fences replacement
 terminals within the same server. Unknown server identity refuses a new launch or adoption. A record from an older
-runner acquires identity only when a live foreground process is positively attributed to its key through
-`DORI_LANE_KEY` ancestry, or its argv contains the exact saved lane brief prompt. Otherwise it counts as absent;
-it is never trusted by pane id alone. An adopted legacy lane needs process attribution because it has no launch prompt.
+runner acquires identity only when its pane exists and a foreground process from that pane's `process-info`
+is positively attributed to its key through `DORI_LANE_KEY` ancestry. Persist the stamp once; records already
+carrying `herdrInstance` do not request `process-info` for migration. Migration only reads pane state and writes
+the lane record. An unproven legacy record counts as absent and recovery opens a new tab without reusing or
+mutating its old pane, even if that pane is now an idle shell. Prompt text in argv alone is not ownership proof.
 
 Observe, recover, send, pause, resume, close, asking-screen reads and lane inspection compare the saved identity
 before touching the recorded pane. A mismatch means missing (`RUNNER_LANE_ABSENT` for steering); close forgets
