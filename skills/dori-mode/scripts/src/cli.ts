@@ -148,16 +148,16 @@ const USAGE = `dori <command> [options]
                                        hourglass off, eyes on; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
                                        link what handled an owner message
-  send discord --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
-                                       post or edit a Discord message (token from DORI_DISCORD_TOKEN). A new post is refused with
+  send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
+                                       post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN). A new post is refused with
                                        SEND_STALE <n> (the unseen owner events follow, exit 3) when the destination got owner messages
                                        you have not taken, acked or seen in an ack preview; merge them and resend. --force skips the
                                        check; --edit is never checked
-  thread discord --to CHANNEL [--message ID] --name NAME
+  thread [discord] --to CHANNEL [--message ID] --name NAME
                                        start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
                                        prints THREAD discord:<channel>/<thread>
   typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
-  presence discord                     keep the bot shown as online until stopped
+  presence [discord]                   keep the bot shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text`;
 
 const die = (message: string, code = 1): never => {
@@ -1104,9 +1104,9 @@ try {
       break;
     }
     case "send": {
-      const platform = key ?? die("send needs discord");
-      const named = platform === "discord" ? platform : die(`unknown platform ${platform}`);
-      const { to } = resolveTarget(named, need("to"), opt("thread"));
+      const platform = key ?? "discord";
+      if (platform !== "discord") die(`unknown platform ${platform}`);
+      const { to } = resolveTarget("discord", need("to"), opt("thread"));
       const text = need("text");
       const edit = opt("edit");
       const buttons = opt("buttons");
@@ -1128,10 +1128,11 @@ try {
       break;
     }
     case "thread": {
-      // `dori thread discord --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
+      // `dori thread [discord] --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
       // make discord.ownerId a member. The thread ref is printed either way; a failed add prints THREAD_OWNER_FAILED and exits 1.
-      if (key !== "discord" || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
-        die("usage: dori thread discord --to CHANNEL [--message ID] --name NAME");
+      if ((key ?? "discord") !== "discord") die(`unknown platform ${key}`);
+      if (flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
+        die("usage: dori thread [discord] --to CHANNEL [--message ID] --name NAME");
       }
       const { to } = resolveTarget("discord", need("to"));
       const owner = config.discord?.ownerId;
@@ -1161,7 +1162,7 @@ try {
       break;
     }
     case "presence": {
-      if (key === "discord") {
+      if ((key ?? "discord") === "discord") {
         const token = resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`);
         const release = acquireDiscordGateway(token);
         let presence: ReturnType<typeof discordPresence> | undefined;
@@ -1180,7 +1181,7 @@ try {
           await presence?.settled();
           release();
         }
-      } else die("presence needs discord");
+      } else die(`unknown platform ${key}`);
       break;
     }
     case "transcribe":
