@@ -14,7 +14,7 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
 import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
 import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
-import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
+import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, validateLaunch } from "./launch.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -156,7 +156,7 @@ const USAGE = `dori <command> [options]
   thread [discord] --to CHANNEL [--message ID] --name NAME
                                        start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
                                        prints THREAD discord:<channel>/<thread>
-  typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
+  typing [discord] <channel>           show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
   presence [discord]                   keep the bot shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text`;
 
@@ -164,6 +164,21 @@ const die = (message: string, code = 1): never => {
   console.error(message);
   process.exit(code);
 };
+
+const helpCommand = process.argv[2] ?? "";
+if (helpCommand !== "setup" && process.argv.slice(3).some((arg) => arg === "--help" || arg === "-h")) {
+  const lines = USAGE.split("\n");
+  const start = lines.findIndex((line) => {
+    const prefix = `  ${helpCommand}`;
+    return helpCommand !== "" && line.startsWith(prefix) && /\s/.test(line[prefix.length] ?? "");
+  });
+  if (start >= 0) {
+    let end = start + 1;
+    while (end < lines.length && !/^  \S/.test(lines[end] ?? "")) end++;
+    console.log(lines.slice(start, end).join("\n").trimEnd());
+    process.exit(0);
+  }
+}
 
 if (process.argv[2] === "setup") {
   const { setupMain } = await import("./setup-cli.ts");
@@ -736,6 +751,7 @@ try {
       for (const note of r.notes) console.log(note);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
+      const next = launchNextLine(r.lane.key, r.startup); if (next) console.log(next);
       process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
     }
     case "hold": {
@@ -812,6 +828,9 @@ try {
     }
     case "close": {
       let cancelled: { reason: string } | undefined;
+      if (!flags.values.cancelled && flags.values.reason !== undefined) {
+        die("--reason goes with --cancelled: dori close <key> --cancelled --reason TEXT");
+      }
       if (flags.values.cancelled) {
         const caller = await callerLane(deps);
         if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run close --cancelled; it is lead-only`);
@@ -964,7 +983,7 @@ try {
         const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        const reminders = [...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
+        const reminders = [...takeCarriedReminders(config.stateDir, new Set(result.events.map((event) => event.id))), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
         // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
         const checklist = checklistLine([...result.events.map((event) => `${event.id}\t${event.line}`), ...reminders]);
         for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...sentinel]) console.log(line);
@@ -1149,16 +1168,16 @@ try {
     }
     case "typing": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { off: { type: "boolean" } } });
-      const typingUsage = "usage: dori typing discord <channel>";
       const [target, ...extra] = parsed.positionals;
       const on = parsed.values.off !== true;
-      if (target === "discord" && extra.length === 1 && on) {
-        const { to, thread } = resolveTarget("discord", extra[0]!);
+      const channel = target === "discord" ? extra[0] : target;
+      if (channel && extra.length === (target === "discord" ? 1 : 0) && on) {
+        const { to, thread } = resolveTarget("discord", channel);
         const id = thread ?? to;
         const dc = new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
         await dc.typing(id);
         console.log(`TYPING discord ${id} on`);
-      } else die(typingUsage);
+      } else die("usage: dori typing [discord] <channel>");
       break;
     }
     case "presence": {

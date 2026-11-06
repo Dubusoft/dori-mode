@@ -118,7 +118,12 @@ export const parseSignal = (raw: string): Signal => {
   const pub = /^published\s+(\S+)@(\S+)\s*$/i.exec(s);
   if (pub?.[1] && pub[2]) return { kind: "published", pkg: pub[1], version: pub[2] };
   const head = /^(command|file|url)\s+/i.exec(s);
-  if (!head?.[1]) throw new SignalSyntaxError(UNREADABLE);
+  if (!head?.[1]) {
+    const nearMiss = /^(merged|closed)\b/i.test(s);
+    throw new SignalSyntaxError(nearMiss
+      ? `${UNREADABLE} merged needs a PR number (merged <owner>/<repo>#N); if the PR does not exist yet, launch with the issue's closed <owner>/<repo>#M, or add the PR to Done later.`
+      : UNREADABLE);
+  }
   const kind = head[1].toLowerCase();
   const at = head[0].length;
   if (kind === "command") {

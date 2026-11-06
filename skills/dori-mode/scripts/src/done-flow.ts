@@ -277,7 +277,7 @@ const closeSequence = async (
     ...(cancelled ? [`SIGNAL SKIPPED ${lane.key}: cancelled by the lead: ${cancelled.reason}`] : []),
     ...checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`),
   ];
-  if (checks.some((c) => !c.ok)) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live`] };
+  if (checks.some((c) => !c.ok)) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live (to give the lane up: dori close ${lane.key} --cancelled --reason TEXT)`] };
   const discovered = opts.pre?.worktrees ?? await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
   if (!opts.force) {
     const unpushed = await unpushedWorkIn(deps, lane, discovered);

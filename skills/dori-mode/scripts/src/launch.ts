@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 
 import { languageInstruction, withThinking } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
@@ -11,6 +12,13 @@ import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
 import type { ToodoStart } from "./toodo-start.ts";
+
+/** Return the follow-up instruction when startup did not succeed. */
+export function launchNextLine(key: string, startup: string): string | undefined {
+  return startup.startsWith("STARTUP_OK")
+    ? undefined
+    : `LAUNCH_NEXT the lane is registered; cancel it with dori close ${key} --cancelled --reason TEXT before relaunching`;
+}
 
 export type LaunchInput = {
   readonly key: string;
@@ -104,8 +112,24 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
     const keywords: unknown = deps.config.massLaunchKeywords;
     if (typeof keywords !== "string" || !keywords.startsWith("/mass-ulw") || keywords.includes("?") || input.brief.includes("?")) throw new LaunchError("massLaunchKeywords must start with /mass-ulw and the prompt (keywords and brief path) must contain no '?'");
   }
+  const unbindable = sandboxedCwdInDoriHome(deps, input);
+  if (unbindable) throw new LaunchError(`--cwd ${input.cwd} is inside ${unbindable}, which the lane sandbox cannot bind; put the worktree outside it (e.g. under ${dirname(deps.config.defaultCwd)})`);
   const sharing = await threadSharers(deps, input);
   if (sharing.length && !input.shareThread) throw new LaunchError(`thread ${input.thread} already has open lane ${sharing.join(", ")}; one thread per lane, or pass --share-thread`);
+};
+
+const within = (dir: string, parent: string): boolean => { const r = relative(parent, dir); return r === "" || (!r.startsWith("..") && !r.startsWith("/")); };
+
+/**
+ * The dori home (~/.dori) when a sandboxed local launch's --cwd is inside it: lane-sandbox mounts a read-only tmpfs there and
+ * binds only <home>/.dori/state read-write, so any other directory under it cannot be bound as the lane's cwd.
+ */
+const sandboxedCwdInDoriHome = (deps: FlowDeps, input: LaunchInput): string | undefined => {
+  if (!input.cwd || !sandboxChoice(deps.config, input, deps.which ?? Bun.which).on) return undefined;
+  const state = resolve(deps.config.stateDir);
+  const home = basename(state) === "state" && basename(dirname(state)) === ".dori" ? dirname(state) : join(homedir(), ".dori"); // the sandbox always uses $HOME/.dori
+  const cwd = resolve(input.cwd);
+  return within(cwd, home) && !within(cwd, state) ? home : undefined;
 };
 
 /** Open lanes on the input's thread, by thread id: `discord:<thread>` and `discord:<channel>/<thread>` are the same thread. */

@@ -198,8 +198,16 @@ export const writeCarried = (stateDir: string, items: readonly Carried[]): void 
   else dropTake(join(stateDir, CARRIED_FILE));
 };
 
+/** Removes one carried entry (an owner message that is fully handled); no write when it is not there. */
+export const dropCarried = (stateDir: string, id: string): void => {
+  const carried = readCarried(stateDir);
+  const next = carried.filter((item) => item.id !== id);
+  if (next.length !== carried.length) writeCarried(stateDir, next);
+};
+
 /** `dori inbox take`'s reminder lines (id<TAB>line, like the events) for unfinished taken or carried work. */
-export const takeCarriedReminders = (stateDir: string): string[] => readCarried(stateDir).map((item) => item.kind === "owner"
+export const takeCarriedReminders = (stateDir: string, skipIds: ReadonlySet<string> = new Set()): string[] => readCarried(stateDir)
+  .filter((item) => !skipIds.has(item.id)).map((item) => item.kind === "owner"
   ? `unfinished:${item.id}\tUNFINISHED ${item.id} taken and not handled (dori ack it unless acked, then handle it): ${item.line}`
   : `${item.id}\t${item.line}`);
 

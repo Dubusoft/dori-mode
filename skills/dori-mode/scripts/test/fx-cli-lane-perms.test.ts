@@ -67,7 +67,7 @@ test("object-done is limited to the lane's own key; the lead may object on any l
 test("typing discord refuses --off with the usage text before any token lookup", async () => {
   const r = await cli(["typing", "discord", "123", "--off"]);
   expect(r.code).toBe(1);
-  expect(r.err).toContain("usage: dori typing discord <channel>");
+  expect(r.err).toContain("usage: dori typing [discord] <channel>");
   expect(r.err).not.toContain("DORI_DISCORD_TOKEN");
 });
 

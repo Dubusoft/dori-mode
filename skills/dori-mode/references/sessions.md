@@ -41,6 +41,8 @@ Leave out what the footer already says to every lane: how to report and claim do
 | `file <path> [sha256=<hex>] [json:.a.b=<json value>]` | the file exists, its sha256 matches, and the JSON field equals the value |
 | `url <http(s) url> [status=200] [body~"regex"]` | a GET returns that status, and the body matches if a regex is given |
 
+Worked examples: `Done = merged acme/app#12` for a lane that lands a PR, and `Done = merged acme/app#12; closed acme/app#7` when it also closes an issue. A `command [...] stdout~` signal that can only hold after the work is done is never live for a cancel, so a cancelled lane never passes it: cancel with `dori close <key> --cancelled --reason TEXT`.
+
 The last three are for work that never lands as a PR: a local setup, a QA pass, a running service. Write the check so that it can fail. `command ["bun","test"] stdout~" 0 fail"` is a real check, while `command ["true"]` checks nothing. The watcher runs commands itself, in the lane's directory, as a plain argv with no shell. They have a 2-minute limit. It never trusts the lane's own report that something passed. Relative file paths resolve from the lane's directory, and `~` is your home. JSON values compare as JSON, so `json:.n=3` and `json:.n="3"` are different checks.
 
 Example for a QA-only lane:

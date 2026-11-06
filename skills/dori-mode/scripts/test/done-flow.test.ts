@@ -214,7 +214,7 @@ test("closing directly refuses while a signal is not live and leaves the pane al
   world.prState = "OPEN";
   const r = await closeLane(at(T0), lane, "manual");
   expect(r.closed).toBe(false);
-  expect(r.lines.at(-1)).toStartWith("REFUSED demo-lane");
+  expect(r.lines.at(-1)).toBe("REFUSED demo-lane: a Done signal is not live (to give the lane up: dori close demo-lane --cancelled --reason TEXT)");
   expect(closedVia()).toHaveLength(0);
 });
 
