@@ -261,6 +261,11 @@ export type DoriConfig = {
    */
   readonly idleEscalateMin: number;
   readonly closeAfterMin: number;
+  /**
+   * Minutes after a claim's window starts that the claim keeps waiting for the supervisor's merge, when its only failing
+   * Done signals are `merged` PRs it bound at their still-current head with no failed check and no conflict.
+   */
+  readonly mergeWaitMaxMin: number;
   /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
@@ -384,6 +389,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   postAfterMin: 20,
   idleEscalateMin: 30,
   closeAfterMin: 5,
+  mergeWaitMaxMin: 60,
   worktreeRoot: "/data/repos/worktrees",
   digestMaxDelayMin: 60,
   ownerDelayNotice: "메시지를 받았습니다. 리드 세션이 아직 메시지를 받지 못하고 있어 대기열에 보관해 두었고, 리드가 돌아오는 대로 답변드립니다.",

@@ -39,6 +39,7 @@
   "idleEscalateMin": 30,
   "drift": { "enabled": true, "milestoneOverdueMin": 90, "ciFailStreak": 3 },
   "closeAfterMin": 5,
+  "mergeWaitMaxMin": 60,
   "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
   "ownerLanguage": "Korean",

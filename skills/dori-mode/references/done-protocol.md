@@ -4,6 +4,8 @@ The `dori launch` footer already carries these rules to every lane, so the Dori 
 
 When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
 
+A `merged <repo>#N` signal is the exception: the supervisor merges your PR only after your claim, so it cannot be live before you claim. Push everything, open the PR, and claim as soon as its CI is running or green; do not wait for the merge. The claim records the PR's head, and the supervisor merges exactly that head once its checks are green and GitHub calls it clean.
+
 If your footer says to report with `dori report`, claim done the same way:
 
 ```sh
@@ -28,7 +30,7 @@ A lane on another machine (`dori launch --machine`) has no `dori` there: it prin
 
 1. The supervisor records the claim (`LANE_DONE_CLAIMED` wakes the Dori, who checks your evidence and reports the lane to the owner at that point, not at the close), and you get a `[LEAD]` line saying when the lane closes.
 2. Stay idle and start no new work.
-3. If nobody objects within 5 minutes, the watcher re-checks everything live and closes the lane. A lane whose PR is confirmed merged (the supervisor merged it, or GitHub reports a PR merged into `dev` from your worktree branch at its HEAD) closes on the next pass instead, and its merged branch is deleted locally and on the remote. Before closing, it reads back every `Done =` signal live. It refuses to close if any of your worktrees still has uncommitted changes, untracked files (gitignored ones don't count), or commits that are on no remote.
+3. If nobody objects within 5 minutes, the watcher re-checks everything live and closes the lane. When the only signals not yet live are `merged` PRs your claim recorded, still at that head with checks pending or green and no conflict, the claim keeps waiting for the supervisor's merge, up to `mergeWaitMaxMin` (60) minutes after the window started; a failed check, a conflict, a draft, a push after the claim, or a wait past that bound becomes the objection, with that reason. A lane whose PR is confirmed merged (the supervisor merged it, or GitHub reports a PR merged into `dev` from your worktree branch at its HEAD) closes on the next pass instead, and its merged branch is deleted locally and on the remote. Before closing, it reads back every `Done =` signal live. It refuses to close if any of your worktrees still has uncommitted changes, untracked files (gitignored ones don't count), or commits that are on no remote.
 4. Closing removes your worktrees first, then marks your thread done (when a thread hook is configured, and only if no other open lane shares it), then closes your tab. A worktree that cannot be removed then (for example untracked files) is listed as kept in the close receipt; the watcher removes it later once it is clean, only under `worktreeRoot`, and reports `WORKTREE_CLEANED`. A lane that has not closed never loses a worktree to that sweep, even after its PR merged. A worktree that is already gone when the close runs (for example a Toodo task's worktree removed first) does not stop the close: the Done signals run in `defaultCwd` and the receipt lists it as already removed.
 
 ## If the Dori objects, or a check fails
