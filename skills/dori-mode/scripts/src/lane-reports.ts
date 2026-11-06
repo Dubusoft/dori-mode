@@ -295,7 +295,7 @@ export const STATUS_TEXT_MAX = 300;
 const elapsed = (ms: number): string => {
   const min = Math.max(0, Math.floor(ms / 60_000));
   const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+  return d ? `${d}일 ${h}시간` : h ? `${h}시간 ${m}분` : `${m}분`;
 };
 const stamp = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e)).slice(0, 160);
@@ -309,15 +309,15 @@ export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: 
   const last = (kind: ReportKind): LaneReport | undefined =>
     [...upTo, ...(upTo.some((r) => r.id === report.id) ? [] : [report])].filter((r) => r.kind === kind).sort((a, b) => a.seq - b.seq).at(-1);
   const line = (label: string, row: LaneReport | undefined): string => {
-    if (!row) return `${label}: none yet`;
+    if (!row) return `${label}: 아직 없음`;
     const text = scrubForThread(oneLine(row.text), home);
     return `${label} (${stamp(row.at)}): ${text.length <= STATUS_TEXT_MAX ? text : `${text.slice(0, STATUS_TEXT_MAX)}...`}`;
   };
   const opened = Date.parse(lane.openedAt);
   return [
-    `[System] status of lane ${lane.key}, open ${Number.isNaN(opened) ? "(unknown)" : elapsed(now - opened)} (updated ${stamp(now)})`,
-    line("last milestone", last("milestone")),
-    line("last progress", last("progress")),
+    `[System] 레인 ${lane.key} 상태, 진행 ${Number.isNaN(opened) ? "(알 수 없음)" : elapsed(now - opened)} (갱신 ${stamp(now)})`,
+    line("마지막 마일스톤", last("milestone")),
+    line("마지막 진행", last("progress")),
   ].join("\n");
 };
 

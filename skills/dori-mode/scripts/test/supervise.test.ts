@@ -2205,7 +2205,7 @@ test("a lead stuck blocked with owner messages unread is cold-restarted with the
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
   expect(f.prompt()).toContain("it was stuck blocked for 30 min with 1 owner message(s) unread");
   expect(handed(f)).toContain("discord:1:1\t");
-  expect(announced).toEqual(["The lead has been stuck (blocked) for 30 min without reading your messages, so it is being restarted; your unanswered messages go to the new lead."]);
+  expect(announced).toEqual(["리드가 30분째 멈춘 상태(blocked)로 메시지를 읽지 못하고 있어 재시작합니다. 답변받지 못한 메시지는 새 리드에게 넘어갑니다."]);
   expect(journal(f).restart).toBeUndefined();
 });
 

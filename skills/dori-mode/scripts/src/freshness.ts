@@ -31,7 +31,7 @@ export const scrubForThread = (line: string, home: string): string =>
  * A thread post the supervisor makes for a lane (its last [REPORT] line, a `dori report progress` row):
  * marked `[System]` and relayed, so the owner never reads it as the lane, or the lead, speaking.
  */
-export const relayedText = (key: string, text: string): string => `[System] relayed from lane ${key}: ${text}`;
+export const relayedText = (key: string, text: string): string => `[System] 레인 ${key} 전달: ${text}`;
 
 export type SweepAct = { readonly kind: "nudged" | "no-progress" | "idle-escalate" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
 
@@ -145,7 +145,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view?: SweepVi
         }
         continue;
       }
-      const text = relayedText(lane.key, `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`);
+      const text = relayedText(lane.key, `진행 상황(레인의 마지막 보고): ${scrubForThread(report ?? "", home)}`);
       await deps.run(fillHook(hook, { thread: lane.thread, text, key: lane.key }));
       await save({ lastSeenReport, lastAutoReplyAt: now, lastPostedReport: report ?? undefined, lastFreshnessNote: undefined });
       acts.push({ kind: "posted", lane: lane.key, detail: text });

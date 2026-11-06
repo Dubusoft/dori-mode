@@ -88,7 +88,7 @@ test("routing: progress posts to the lane's thread, done is the lane's claim, a 
     "LANE_REPORT_ROUTED local-lane:0:2 done claim",
   ]);
   // Posted as a [System] relay, never as the lane (or the lead) speaking to the owner.
-  expect(posts).toEqual([["notify", "discord:1/2", "[System] relayed from lane local-lane: tests green in ~/repo"]]);
+  expect(posts).toEqual([["notify", "discord:1/2", "[System] 레인 local-lane 전달: tests green in ~/repo"]]);
   expect(journal).toEqual([["lane-report-late:gone-lane:0:1", "LANE_REPORT_LATE gone-lane question still there?"]]);
   expect(store.list({ lane: "gone-lane" })[0]?.route).toBe("late");
   const claimed = await deps.registry.read("local-lane");
@@ -140,7 +140,7 @@ test("routing: progress with no thread hook, or a failing one, reaches the lead 
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   const journal: [string, string][] = [];
   await routeReports(deps, store, (id, line) => { journal.push([id, line]); });
-  expect(journal).toEqual([["lane-report:local-lane:0:1", "LANE_REPORT local-lane progress half way (thread post failed: unexpected false-hook [System] relayed from lane local-lane: half way)"]]);
+  expect(journal).toEqual([["lane-report:local-lane:0:1", "LANE_REPORT local-lane progress half way (thread post failed: unexpected false-hook [System] 레인 local-lane 전달: half way)"]]);
   expect(store.list()[0]?.route).toBe("journal");
 });
 
