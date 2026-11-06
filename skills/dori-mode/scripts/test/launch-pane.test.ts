@@ -293,6 +293,12 @@ test("footer puts the shared done rules first and every lane value after '### Th
   expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
 });
 
+test("only a lane whose Done names a merged PR is told to claim without waiting for the merge", () => {
+  const line = "claim done without waiting for the merge";
+  expect(footerDoneRules(footerLane({ done: "merged acme/app#1; closed acme/app#3" }))).toContain(line);
+  expect(footerDoneRules(footerLane())).not.toContain(line);
+});
+
 test("a mass-ulw launch refuses keywords or a brief path that omo would not bind", async () => {
   await writeBrief();
   const base = deps({});

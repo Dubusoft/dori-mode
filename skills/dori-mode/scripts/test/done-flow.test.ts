@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -223,6 +224,75 @@ test("a Done signal that does not read back live becomes the objection", async (
   expect(after && statusOf(after)).toBe("not-done");
   expect(after?.objection?.reasons).toEqual(["closed acme/app#2 -> OPEN"]);
   expect(closedVia()).toHaveLength(0);
+});
+
+/** A lane whose Done is one `merged` PR the claim binds at HEAD; its live view follows `pr` (checks, head, state). */
+const mergeOnly = (pr: { state: string; head?: string; checks: { status: string; conclusion?: string }[] }) => {
+  const HEAD = "a".repeat(40);
+  const bound: Lane = { ...lane, done: "merged acme/app#1" };
+  const deps = (ms: number): FlowDeps => {
+    const base = at(ms);
+    const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
+      const fields = argv[argv.indexOf("--json") + 1] ?? "";
+      if (argv[0] === "gh" && argv[2] === "view" && fields.includes("headRefOid") && !fields.includes("headRefName")) {
+        return { code: 0, out: JSON.stringify({ number: 1, state: pr.state, headRefOid: pr.head ?? HEAD, isCrossRepository: false, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED", statusCheckRollup: pr.checks.map((c) => ({ __typename: "CheckRun", ...c })) }), err: "" };
+      }
+      return base.run(argv, opts);
+    };
+    return { ...base, run };
+  };
+  return { bound, deps, HEAD };
+};
+
+test("a Done=merged claim whose CI outlasts the window stays claimed, stays mergeable for the supervisor, and closes once the PR merges", async () => {
+  livePane();
+  world.prState = "OPEN";
+  const pr: { state: string; checks: { status: string; conclusion?: string }[] } = { state: "OPEN", checks: [{ status: "IN_PROGRESS" }] };
+  const { bound, deps, HEAD } = mergeOnly(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "PR acme/app#1 pushed");
+  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 PR acme/app#1 pushed"]);
+  // The window ends with CI still running: no objection, the claim and its bound head stand.
+  expect(await watchTick(deps(T0 + 6 * MIN))).toEqual([]);
+  pr.checks = [{ status: "COMPLETED", conclusion: "SUCCESS" }];
+  expect(await watchTick(deps(T0 + 20 * MIN))).toEqual([]);
+  const waiting = (await at(T0).registry.read("demo-lane")) ?? bound;
+  expect(statusOf(waiting)).toBe("done-claimed");
+  expect(claimGate(waiting, { repo: "acme/app", number: 1, sha: HEAD })).toEqual({ ok: true, why: "claimed at this head" });
+  expect(closedVia()).toHaveLength(0);
+  // The supervisor merges it: the next pass reads the signal live and closes the lane.
+  world.prState = "MERGED";
+  pr.state = "MERGED";
+  const lines = await watchTick(deps(T0 + 21 * MIN));
+  expect(lines[0]).toStartWith("LANE_CLOSED demo-lane closed seen-claim");
+  expect(closedVia()).toEqual(["demo-lane"]);
+});
+
+test("a Done=merged claim objects with the reason once a check fails, the head moves, or the merge wait passes mergeWaitMaxMin", async () => {
+  world.prState = "OPEN";
+  const pr: { state: string; head?: string; checks: { status: string; conclusion?: string }[] } = { state: "OPEN", checks: [{ status: "COMPLETED", conclusion: "FAILURE" }] };
+  const { bound, deps } = mergeOnly(pr);
+  const objection = async () => ((await at(T0).registry.read("demo-lane")) ?? bound).objection?.reasons;
+  const claimAndSettle = async (ms: number, afterClaim = () => {}): Promise<string[]> => {
+    await deps(ms).registry.write(bound);
+    await claimDone(deps(ms), bound, `claim ${ms}`);
+    afterClaim();
+    await watchTick(deps(ms));
+    return watchTick(deps(ms + 6 * MIN));
+  };
+  expect((await claimAndSettle(T0))[0]).toStartWith("LANE_NOT_DONE demo-lane");
+  expect(await objection()).toEqual(["merged acme/app#1 -> OPEN", "acme/app#1 has 1 failed check(s)"]);
+  pr.checks = [{ status: "QUEUED" }];
+  // A push after the claim: the PR's head is no longer the one the claim recorded.
+  await claimAndSettle(T0 + 10 * MIN, () => { pr.head = "b".repeat(40); });
+  expect((await objection())?.[1]).toStartWith("acme/app#1 head moved to bbbbbbbbbb after the claim");
+  delete pr.head;
+  await claimAndSettle(T0 + 20 * MIN);
+  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? bound)).toBe("done-claimed");
+  // Handed over at T0+20: still waiting at T0+79, refused at T0+80 (mergeWaitMaxMin 60).
+  expect(await watchTick(deps(T0 + 79 * MIN))).toEqual([]);
+  expect((await watchTick(deps(T0 + 80 * MIN)))[0]).toStartWith("LANE_NOT_DONE demo-lane");
+  expect((await objection())?.[1]).toStartWith("not merged within 60 min of the claim");
 });
 
 test("a watcher restarted inside the window keeps the original deadline and announces the claim once", async () => {

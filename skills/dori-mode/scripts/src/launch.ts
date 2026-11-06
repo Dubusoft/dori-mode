@@ -179,12 +179,16 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
 export const laneCli = (lane: Pick<Lane, "machine">): string => (lane.machine ? RUNNER_LANE_CLI : "dori");
 export const RUNNER_LANE_CLI = "~/.dori/runner/bin/dori";
 
+/** Whether a `Done =` line names a `merged <repo>#N` signal (the PR the supervisor merges after the claim). */
+const hasMergedSignal = (done: string): boolean => splitDone(done).some((part) => /^merged\s/i.test(part.trim()));
+
 export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => [
   "- Set a goal first: restate the deliverable and the observable condition that ends this lane. The `Done =` signals below still decide when the lane closes; your restatement does not replace them.",
   "- Work until that condition holds. Do not stop to ask permission for reversible steps the brief already covers; only a decision the brief leaves open goes to the owner, as below.",
   "- Done rules: when every `Done =` signal below is live and all work is pushed, claim done with the dori report done command below yourself, then stay idle and start no new work.",
   "  The watcher re-reads every signal live and closes the lane 5 min after your claim unless the Dori objects. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits. The lane closes only when every signal reads back live.",
   "  On `[LEAD] not done: <reasons>`, fix every reason and claim again.",
+  ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: once the PR is pushed and its CI is running or green, claim done without waiting for the merge. The supervisor merges the PR at the head your claim recorded and the lane closes after it; push nothing after the claim, or claim again if you must."] : []),
   "- PR bodies, issues, commit messages, code comments and repo docs carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
   "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
   "- For any owner decision, run the dori report question command below and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.",

@@ -8,7 +8,7 @@ import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { reportLines } from "./freshness.ts";
 import { OPEN_STATES, openOperations, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
-import type { Check, SignalIo } from "./signals.ts";
+import { type Check, parseSignal, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings, type WorktreeFact } from "./branch-cleanup.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
@@ -450,13 +450,60 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
   }
 };
 
-const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
+const WAIT_FIELDS = "state,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup";
+const CHECK_FAILED = new Set(["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
+type WaitView = {
+  readonly state?: string; readonly headRefOid?: string; readonly isDraft?: boolean; readonly mergeable?: string; readonly mergeStateStatus?: string;
+  readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
+};
+
+/**
+ * Whether a settling claim is still waiting for the supervisor's merge instead of failing: every failing Done signal is a
+ * `merged` PR the claim bound, still OPEN at exactly the bound head, not a draft, not conflicting, with no failed check
+ * (pending is fine), and less than `mergeWaitMaxMin` has passed since the window started. Otherwise `why` says what
+ * stops the merge, for the objection. A PR that cannot be read this pass keeps the wait; the bound still ends it.
+ */
+const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], start: number): Promise<{ readonly waiting: boolean; readonly why: string[] }> => {
+  const signals = failing.map((c) => { try { return parseSignal(c.signal); } catch { return undefined; } });
+  if (!signals.length || signals.some((s) => s?.kind !== "merged")) return { waiting: false, why: [] };
+  const maxMin = deps.config.mergeWaitMaxMin;
+  const why: string[] = [];
+  for (const s of signals) {
+    if (s?.kind !== "merged") continue;
+    const ref = `${s.repo}#${s.n}`;
+    const bound = (lane.claim?.pulls ?? []).find((p) => p.repo.toLowerCase() === s.repo.toLowerCase() && String(p.number) === s.n);
+    if (!bound) { why.push(`${ref} was not open at a head the claim recorded, so it is not merged for this claim (push, then claim again)`); continue; }
+    const r = await deps.run(["gh", "pr", "view", s.n, "-R", s.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
+    let view: WaitView | undefined;
+    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
+    if (!view) continue;
+    const failed = (view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+    if (view.state !== "OPEN") why.push(`${ref} is ${view.state ?? "unknown"}`);
+    else if (view.headRefOid !== bound.sha) why.push(`${ref} head moved to ${(view.headRefOid ?? "unknown").slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
+    else if (view.isDraft) why.push(`${ref} is a draft, which the supervisor never merges`);
+    else if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") why.push(`${ref} conflicts with its base`);
+    else if (failed.length) why.push(`${ref} has ${failed.length} failed check(s)`);
+  }
+  if (why.length) return { waiting: false, why };
+  if (deps.clock.now() - start < maxMin * 60_000) return { waiting: true, why: [] };
+  return { waiting: false, why: [`not merged within ${maxMin} min of the claim (mergeWaitMaxMin): the supervisor could not merge it; check its checks, reviews and merge state`] };
+};
+
+/**
+ * Settles a claim whose window ended: closes the lane, or objects. A claim only waiting for the supervisor's merge of
+ * its bound PR (mergeWait) is kept: undefined, nothing to report, and the next pass settles it again.
+ */
+const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: number): Promise<string | undefined> => {
   const read = await readLane(deps, lane, { done: true });
   const blocked = unpushedIn(read.worktrees);
   if (blocked.length) return objectDone(deps, lane, blocked);
   const checks = read.checks ?? [];
-  const failing = checks.filter((c) => !c.ok).map((c) => `${c.signal} -> ${c.detail}`);
-  if (failing.length) return objectDone(deps, lane, failing);
+  const failing = checks.filter((c) => !c.ok);
+  if (failing.length) {
+    const wait = await mergeWait(deps, lane, failing, start);
+    if (wait.waiting) return undefined;
+    return objectDone(deps, lane, [...failing.map((c) => `${c.signal} -> ${c.detail}`), ...wait.why]);
+  }
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
   await withOperations(deps, async (store) => {
     const prior = store.get(closeId(lane.key));
@@ -647,7 +694,8 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: LaneRea
     if (!merged) return;
     evidence = `${claim.evidence} (closed at once: ${merged})`;
   }
-  const line = await settle(deps, lane, evidence);
+  const line = await settle(deps, lane, evidence, start ?? deps.clock.now());
+  if (line === undefined) return;
   // A close whose claim announcement already reached the lead is digest news (seen-claim); otherwise it wakes the lead.
   const event = claim.event;
   const seen = event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event));
