@@ -7,12 +7,12 @@ const fakeChild = () => {
   return { child, exit: (code: number) => exit(code) };
 };
 
-test("on darwin the runner holds an idle-sleep assertion tied to its pid until stopped, with nothing logged", async () => {
+test("on darwin the runner holds idle- and system-sleep assertions tied to its pid until stopped, with nothing logged", async () => {
   const spawned: (readonly string[])[] = [];
   const logs: string[] = [];
   const { child } = fakeChild();
   const stop = holdAwake({ os: "darwin", pid: 4242, spawn: (argv) => { spawned.push(argv); return child as AwakeChild; }, log: (l) => logs.push(l) });
-  expect(spawned).toEqual([[CAFFEINATE, "-i", "-w", "4242"]]);
+  expect(spawned).toEqual([[CAFFEINATE, "-i", "-s", "-w", "4242"]]);
   stop();
   await child.exited;
   await Bun.sleep(0);
