@@ -1,6 +1,9 @@
 [Unit]
 Description=Dori runner (reports lane observations on this machine to the supervisor)
-# Its own unit, separate from herdr's: a runner restart never touches herdr or the lanes running in it.
+# Its own unit, separate from herdr's: a runner restart never touches herdr or the lanes running in it. Wants= and
+# After= only (never Requires=/BindsTo=): at boot herdr comes up first, and a herdr failure leaves the runner up to report it.
+Wants=herdr-server.service
+After=herdr-server.service
 StartLimitIntervalSec=600
 StartLimitBurst=5
 

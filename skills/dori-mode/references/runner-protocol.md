@@ -286,9 +286,33 @@ machines (herdr's saved machines plus `guardMachines`), and `runners.listen` mus
   `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
   `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.
 
-It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256>`, or exits 1 with
+**herdr.** The worker's herdr gets a unit of its own, so it is up after a reboot and restarted after a crash:
+
+- `herdr` must be on the PATH of the user's login shell (`$SHELL -lc`), read before anything is written; without it
+  the install stops with `RUNNER_INSTALL_NO_HERDR`. That login PATH and `$SHELL` become the herdr unit's `PATH` and
+  `SHELL`, which every lane shell herdr opens inherits.
+- On Linux, `~/.config/systemd/user/herdr-server.service` (from `templates/herdr-runner-remote.service`) runs
+  `herdr server` with `Restart=on-failure`, like the lead host's unit but without its `OnFailure=` hook. The runner
+  unit has `Wants=herdr-server.service` and `After=herdr-server.service`, never `Requires=` or `BindsTo=`: herdr
+  starts first at boot, a herdr failure leaves the runner up, and a runner restart never restarts herdr. Both units are
+  enabled.
+- On macOS, the agent `~/Library/LaunchAgents/com.dori.herdr.plist` (from `templates/dori-herdr-launchd.plist`,
+  `KeepAlive`, `ThrottleInterval` 30, output to `~/.dori/runner/herdr.log`) goes into the runner's launchd domain. A
+  second `herdr server` on a socket another server holds prints `herdr server is already running` and exits 1 at once,
+  so the throttle spaces out KeepAlive's retries while another server holds the socket.
+- The install never stops or restarts a running herdr, because that ends every lane on the host. A herdr the unit
+  already runs is left alone: a reinstall or `dori update` only rewrites the unit file (`daemon-reload` on Linux; on
+  macOS launchd reads the plist at its next load). A herdr started by hand keeps running: the unit is enabled but not
+  started (on macOS the agent is loaded with `RunAtLoad` false), and the unit takes over once that herdr stops. On
+  Linux the runner is then restarted with `--job-mode=ignore-dependencies`, so its `Wants=` does not start the herdr
+  unit beside it. Only when no herdr answers is the unit started (`systemctl --user start`, after `reset-failed`; on
+  macOS by loading the agent).
+
+It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256> herdr=<started|managed|unmanaged> (...)`
+(`unmanaged`: a herdr not from the unit is running, and the unit takes over when it stops), or exits 1 with
 `RUNNER_INSTALL_UNREACHABLE` (ssh failed or timed out), `RUNNER_INSTALL_UNSUPPORTED` (neither Linux nor macOS, or no POSIX shell),
-`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd, linger or launchd step
+`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_NO_HERDR` (no `herdr` on the
+login PATH), `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd, linger or launchd step
 named when that failed).
 
 ## Guard
@@ -349,6 +373,11 @@ from the file's mtime, so it is measured on the host's own clock.
 | `stalled` | the pid is alive and the file is 60 to 120 s old | 1 |
 | `dead` | no file, no such process, or the file is older than 120 s | 1 |
 
+The probe also reads the host's herdr once and adds `herdr` (`herdr=` in the text line): `up` when
+`herdr workspace list` answers, otherwise `hung` when a `herdr server` process exists (`pgrep -f 'herdr server'`),
+`down` when none does, and `unknown` when pgrep cannot tell. It is one reading for diagnosis; the verdict and the exit
+code stay the runner's alone.
+
 ## Shadow mode (removed)
 
 Shadow mode is gone. The supervisor always opens the hub, `dori supervise` always spawns the local runner as its
@@ -398,8 +427,8 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
   follows the backoff.
 
 The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello ends an outage, with
-`HOST_GUARD ONLINE machine=<label>` when it had gone offline. The runner's unit is separate from herdr's, so a
-restart never touches a lane's pane.
+`HOST_GUARD ONLINE machine=<label>` when it had gone offline. The runner's unit is separate from herdr's (it only
+`Wants=` and is `After=` the herdr unit), so a restart never touches a lane's pane.
 
 `dori status` shows the restarts of the last hour (`restarts1h`). `dori doctor` checks the listen address, the local
 runner directory, and each runner's protocol, outbox backlog and restart circuit.

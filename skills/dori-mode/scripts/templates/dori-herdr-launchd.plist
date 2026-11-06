@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dori.herdr</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@HERDR_BIN@</string>
+    <string>server</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+    <key>SHELL</key>
+    <string>@SHELL@</string>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+    <key>TERM</key>
+    <string>xterm-256color</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <@RUN_AT_LOAD@/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>@HOME@/.dori/runner/herdr.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/.dori/runner/herdr.log</string>
+</dict>
+</plist>
