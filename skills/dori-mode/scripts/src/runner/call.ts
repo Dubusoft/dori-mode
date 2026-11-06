@@ -39,13 +39,14 @@ export const CALL_TIMEOUT_MS = 30_000;
 export const QUERY_TIMEOUT_MS = 15_000;
 /** Per-type call timeouts; a type not listed waits `CALL_TIMEOUT_MS`. */
 export const COMMAND_TIMEOUTS: Partial<Record<DurableCommandType, number>> = {
-  "lane.start": 90_000, "lane.recover": 90_000, "lane.close": 60_000, "lane.git": 60_000, "lane.pause": 30_000,
+  "lane.start": 90_000, "lane.recover": 90_000, "lane.close": 60_000, "lane.git": 60_000, "lane.pause": 30_000, "host.herdr": 90_000,
 };
 
 /** The lowest proto that carries each type; anything not listed is proto 2 (today's commands). */
 export const NEEDS_PROTO: Partial<Record<DurableCommandType | QueryType, number>> = {
   "lane.adopt": 3, "lane.pause": 3, "lane.resume": 3, "lane.notify": 3, "lane.git": 3,
   "q.panes": 3, "q.screen": 3, "q.process": 3, "q.stat": 3, "q.lane.inspect": 3, "q.machine.observe": 3,
+  "host.herdr": 4,
 };
 
 /**

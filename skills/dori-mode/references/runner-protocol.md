@@ -49,7 +49,7 @@ Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane
 `lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `herdr.state`, `herdr.start`, `heavy.state` and `cmd.result`. Today
 a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, `lane.started`, `lane.report` and
 the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
-`lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `runner.rotate`)
+`lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `host.herdr`, `runner.rotate`)
 are part of the schema. A worker's runner carries out `lane.start`, `lane.stop`, `lane.close`, `lane.send`,
 `lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); `runner.rotate` is
 handled by the connection itself. Every command the runner receives goes through the command policy (below): a refused one is
@@ -80,11 +80,16 @@ outcomes. `since` is the runner's wall time; the supervisor records its own rece
 The supervisor continues to infer outages from `panes: -1` for protocol 3 runners. Protocol 4 samples without
 `herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
+Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
+verified with `{action, state: up|down|hung, instance?, managed, paused}` as read after the action. A protocol 3
+runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
+
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
 `lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal}`,
 `lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
-`lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`. A runner effect that only returns a
+`lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
+managed, paused}`. A runner effect that only returns a
 detail sends no `result`. The supervisor never sends a protocol 3 command or any query to a runner that said hello
 with protocol 2: such a call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
 
@@ -355,7 +360,26 @@ than three sampling intervals resets the failure window and discards the first f
 The runner starts an installed `herdr-server.service` on Linux or kickstarts `com.dori.herdr` in its saved launchd
 domain on macOS only while `down`. Attempts wait one minute, doubling to a thirty minute cap; `up` resets the
 cooldown. Each attempt is durably reported as `HERDR_START machine=<label> ok|failed <detail>`. An absent unit
-is reported through the down state without starting anything. A hung server is reported and left running.
+is reported through the down state without starting anything. A hung server is reported and left running. While the
+pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a down herdr is reported but not started.
+
+`dori runner herdr <start|restart|stop|status> --machine <label> [--yes]` sends `host.herdr` to that machine's runner
+(`local` is the lead host) through the supervisor's CLI relay:
+
+- `status` only reads: `RUNNER_HERDR machine=<label> action=status state=<up|down|hung> managed=<bool> paused=<bool> ...`.
+- `start` removes the pause marker and starts the installed unit when herdr is down, then waits up to 15 s for the pane
+  list to read. It refuses a hung server (`HERDR_HUNG`, use restart) and a host without a herdr unit (`HERDR_UNMANAGED`).
+- `restart` ends the server and starts the unit again. It refuses at once, before ending anything, on a host without a
+  herdr unit. It stops the unit (Linux `systemctl --user stop`, macOS `launchctl bootout`), sends `SIGTERM` to any
+  `herdr server` process of the user still running, `SIGKILL` after 10 s, then starts the unit (on macOS the agent is
+  bootstrapped again before the kickstart).
+- `stop` writes the pause marker first, then ends the server the same way and starts nothing.
+- `restart` and `stop` end every pane herdr runs on that machine. The CLI first prints
+  `RUNNER_HERDR_LANES machine=<label> ...` with the machine's open lanes (and the lead pane for `local`), and sends the
+  command only with `--yes`; without it, it exits 2 with `RUNNER_HERDR_CONFIRM`. After a restart the recovery sweep
+  relaunches those lanes in new tabs on their sessions; after a stop their recovery is held until `start`.
+- A runner whose hub row shows protocol 3 is refused before anything is sent: `RUNNER_HERDR_UNSUPPORTED` names
+  `dori runner install --machine <label>` to upgrade it.
 
 The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
 with `HERDR_DOWN` / `HERDR_HUNG` (urgent) and `HERDR_UP ... server=<instance>` (digest). For protocol 3 runners:
@@ -373,6 +397,13 @@ with `HERDR_DOWN` / `HERDR_HUNG` (urgent) and `HERDR_UP ... server=<instance>` (
 - `dori launch --machine <label>` is refused at once with `HERDR_DOWN machine=<label> ...`, before any placement
   check or runner call.
 - `dori status` adds `herdr=<up|down|hung|unknown>` to each runner line.
+- `dori doctor`'s `runner <label>` check is FAIL while that machine's herdr is down (fix `dori runner herdr start
+  --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`); a protocol 3 runner's fix
+  starts with `dori runner install --machine <label>`. Its local `herdr` check points a worker machine (a runner
+  labelled other than `local` in `~/.dori/runner/runner.json`) at the lead host's `dori runner herdr start` or, without
+  a herdr unit, `dori runner install`; the lead host keeps `systemctl --user start herdr-server.service`.
+- On the lead host the local runner reports as `machine=local`. While that herdr is down or hung the supervisor does
+  not create the lead pane again (`LEAD_PANE_HELD`, once per outage); it does after `HERDR_UP`.
 
 Lane records store `herdrInstance` from the current user's herdr server pids and process start times (`pgrep` /
 `ps`). Multiple matching server processes contribute to one sorted identity, so any such process changing

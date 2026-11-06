@@ -184,6 +184,17 @@ test("herdr: unreachable and duplicate servers are FAIL", async () => {
   expect(find(await runDoctor(dup.deps), "herdr")).toMatchObject({ level: "FAIL", detail: "2 herdr server processes" });
 });
 
+test("herdr unreachable on a worker machine points at the lead host's runner herdr command, or at install without a herdr unit", async () => {
+  const f = fixture({ run: { "herdr workspace list": no("", 1) } });
+  writeFileSync(join(f.deps.home, ".dori", "runner", "runner.json"), JSON.stringify({ id: "i", label: "worker-a", hostId: "h" }));
+  expect(find(await runDoctor(f.deps), "herdr")).toMatchObject({ level: "FAIL", fix: "on the lead host: dori runner herdr start --machine worker-a" });
+  const bare = { ...f.deps, exists: (path: string) => !path.endsWith("herdr-server.service") && !path.endsWith("com.dori.herdr.plist") };
+  expect(find(await runDoctor(bare), "herdr")).toMatchObject({ level: "FAIL", fix: "on the lead host: dori runner install --machine worker-a (installs the herdr unit)" });
+  // The lead host's local runner is labelled local: its own unit stays the fix.
+  writeFileSync(join(f.deps.home, ".dori", "runner", "runner.json"), JSON.stringify({ id: "i", label: "local", hostId: "h" }));
+  expect(find(await runDoctor(f.deps), "herdr")).toMatchObject({ level: "FAIL", fix: "systemctl --user start herdr-server.service" });
+});
+
 test("missing WorkingDirectory, missing dirs, missing config keys and a missing lead pane are FAIL", async () => {
   const wd = fixture({ run: { "systemctl --user show dori-supervisor.service --property=WorkingDirectory --value": ok("") } });
   expect(find(await runDoctor(wd.deps), "supervisor WorkingDirectory").detail).toContain("200/CHDIR");

@@ -18,26 +18,53 @@ export const herdrProcess = async (run: Runner): Promise<{ running: boolean; ins
   return { running: true, ...(ps.code === 0 && rows.length === ids.length && rows.every((s) => /^\d+ .+/.test(s)) ? { instance: rows.join(";") } : {}) };
 };
 
-/** Only starts an installed unit. It never stops, restarts or spawns a herdr child. */
-export const startManagedHerdr = async (deps: {
-  run: Runner; os?: string; home?: string; exists?: (path: string) => boolean; read?: (path: string) => string;
-}): Promise<{ ok: boolean; detail: string } | undefined> => {
+export type HerdrUnitDeps = { run: Runner; os?: string; home?: string; exists?: (path: string) => boolean; read?: (path: string) => string };
+
+export const HERDR_SYSTEMD_UNIT = ".config/systemd/user/herdr-server.service";
+export const HERDR_LAUNCHD_PLIST = "Library/LaunchAgents/com.dori.herdr.plist";
+
+/** Whether a herdr unit (`dori setup` or `dori runner install`) is installed on this host. */
+export const herdrUnitInstalled = (deps: Omit<HerdrUnitDeps, "run">): boolean => {
+  const os = deps.os ?? process.platform;
+  const exists = deps.exists ?? existsSync;
+  const home = deps.home ?? homedir();
+  if (os === "linux") return exists(join(home, HERDR_SYSTEMD_UNIT));
+  if (os === "darwin") return exists(join(home, HERDR_LAUNCHD_PLIST));
+  return false;
+};
+
+/** The saved launchd domain of the runner (`gui/<uid>` or `user/<uid>`); undefined when absent, "" when invalid. */
+export const launchdDomain = (deps: Omit<HerdrUnitDeps, "run" | "os">): string | undefined => {
+  const home = deps.home ?? homedir();
+  const domainFile = join(home, ".dori/runner/launchd-domain");
+  if (!(deps.exists ?? existsSync)(domainFile)) return undefined;
+  const domain = (deps.read ?? ((p) => readFileSync(p, "utf8")))(domainFile).trim();
+  return /^(gui|user)\/\d+$/.test(domain) ? domain : "";
+};
+
+/**
+ * Only starts an installed unit. It never stops, restarts or spawns a herdr child. On macOS a unit that is not loaded
+ * (`dori runner herdr stop` boots it out) is bootstrapped again before the kickstart is retried.
+ */
+export const startManagedHerdr = async (deps: HerdrUnitDeps): Promise<{ ok: boolean; detail: string } | undefined> => {
   const os = deps.os ?? process.platform;
   const home = deps.home ?? homedir();
-  const exists = deps.exists ?? existsSync;
+  if (!herdrUnitInstalled(deps)) return undefined;
   let argv: string[];
+  let domain: string | undefined;
   if (os === "linux") {
-    if (!exists(join(home, ".config/systemd/user/herdr-server.service"))) return undefined;
     argv = ["systemctl", "--user", "start", "herdr-server.service"];
   } else if (os === "darwin") {
-    if (!exists(join(home, "Library/LaunchAgents/com.dori.herdr.plist"))) return undefined;
-    const domainFile = join(home, ".dori/runner/launchd-domain");
-    if (!exists(domainFile)) return undefined;
-    const domain = (deps.read ?? ((p) => readFileSync(p, "utf8")))(domainFile).trim();
-    if (!/^(gui|user)\/\d+$/.test(domain)) return { ok: false, detail: "invalid launchd domain" };
+    domain = launchdDomain(deps);
+    if (domain === undefined) return undefined;
+    if (!domain) return { ok: false, detail: "invalid launchd domain" };
     argv = ["launchctl", "kickstart", `${domain}/com.dori.herdr`];
   } else return undefined;
-  const r = await deps.run(argv);
+  let r = await deps.run(argv);
+  if (r.code !== 0 && domain) {
+    const loaded = await deps.run(["launchctl", "bootstrap", domain, join(home, HERDR_LAUNCHD_PLIST)]);
+    if (loaded.code === 0) r = await deps.run(argv);
+  }
   return { ok: r.code === 0, detail: (r.err || r.out).trim() || `exit=${r.code}` };
 };
 
@@ -48,6 +75,8 @@ export type HerdrWatchDeps = {
   readonly publish: <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
   readonly process?: () => Promise<{ running: boolean; instance?: string }>;
   readonly start?: () => ReturnType<typeof startManagedHerdr>;
+  /** The watch pause marker (`dori runner herdr stop`): while set, a down herdr is reported but not started. */
+  readonly paused?: () => boolean;
 };
 
 export class HerdrWatch {
@@ -83,8 +112,10 @@ export class HerdrWatch {
     if (++this.misses < 2 || at - this.failedAt < 30_000) return panes;
     const proc = await (this.deps.process ?? (() => herdrProcess(this.deps.run)))();
     const state = proc.running ? "hung" : "down";
-    this.transition(state, undefined, proc.running ? "pane list failed; server process may still be running" : "pane list failed; no server process");
-    if (state === "down" && at >= this.nextStart) {
+    const paused = !proc.running && (this.deps.paused?.() ?? false);
+    this.transition(state, undefined, proc.running ? "pane list failed; server process may still be running"
+      : paused ? "pane list failed; no server process; stopped by dori runner herdr stop, not started again" : "pane list failed; no server process");
+    if (state === "down" && !paused && at >= this.nextStart) {
       this.nextStart = at + this.backoff;
       const result = await (this.deps.start ?? (() => startManagedHerdr({ run: this.deps.run })))();
       if (result) {

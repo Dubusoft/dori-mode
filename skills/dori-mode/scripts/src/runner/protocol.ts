@@ -155,8 +155,16 @@ export type SupervisorCommandBodies = {
     readonly heavy: boolean;
   }>;
   readonly "guard.kill": Cmd<{ readonly keys: readonly string[] }>;
+  /**
+   * Since proto 4: the host's herdr server. `start` starts the installed unit and clears the watch pause; `restart`
+   * ends the running server (every lane pane on the host with it) and starts the unit; `stop` ends it and leaves the
+   * watch pause marker so HerdrWatch does not start it again; `status` only reads.
+   */
+  readonly "host.herdr": Cmd<{ readonly action: HerdrAction }>;
   readonly "runner.rotate": Cmd<Record<never, never>>;
 };
+
+export type HerdrAction = "start" | "restart" | "stop" | "status";
 
 export type RunnerControlBodies = {
   /** `nonce` (32 random bytes) and `dh` (an ephemeral X25519 public key) open the signed handshake (base64 each). */
@@ -242,6 +250,13 @@ export type CommandResults = {
   readonly "lane.git": { readonly code: number; readonly out: string; readonly err: string };
   readonly "lane.observe": { readonly status: LaneStatus };
   readonly "guard.kill": { readonly killed: readonly { readonly pid: number; readonly lane?: string; readonly comm: string; readonly rssKb: number }[] };
+  /**
+   * herdr as read after the action: `managed` when a herdr unit is installed on the host, `paused` when the watch
+   * pause marker is set (`dori runner herdr stop`).
+   */
+  readonly "host.herdr": {
+    readonly action: HerdrAction; readonly state: HerdrHealth["state"]; readonly instance?: string; readonly managed: boolean; readonly paused: boolean;
+  };
 };
 /** The commands a supervisor awaits a structured result for. */
 export type DurableCommandType = keyof CommandResults;
@@ -434,6 +449,7 @@ const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
     opKey: req("string"), name: req("string"), command: req("string[]"), cwd: req("string"), timeoutSec: req("int"), heavy: req("bool"),
   }),
   "guard.kill": cmd({ keys: req("string[]") }),
+  "host.herdr": cmd({ action: req({ enum: ["start", "restart", "stop", "status"] }) }),
   "runner.rotate": cmd({}),
 };
 

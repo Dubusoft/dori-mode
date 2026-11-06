@@ -17,11 +17,13 @@ import { Registry, statusOf } from "./registry.ts";
 import { type Clock, realClock, type Runner, run } from "./run.ts";
 import { LEGACY_PRESENCE, SERVICES, unitState } from "./status.ts";
 import { openOperations } from "./operations.ts";
-import { checkRunnerDir, defaultRunnerDir } from "./runner/fs-safety.ts";
+import { checkRunnerDir, defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
+import { herdrUnitInstalled } from "./runner/herdr-watch.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { readRunnerRows } from "./runner/hub.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
-import { PROTO } from "./runner/protocol.ts";
+import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { installedLaneSandbox, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
@@ -89,9 +91,31 @@ const sandbox = (d: Pick<DoctorDeps, "home">): Check[] => {
   return installedHash === templateHash ? [] : [warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
 };
 
+/** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */
+const workerLabel = (d: Pick<DoctorDeps, "home">): string | undefined => {
+  try {
+    const label = (JSON.parse(readFileSync(join(defaultRunnerDir(d.home), RUNNER_PATHS.identity), "utf8")) as { label?: unknown }).label;
+    return typeof label === "string" && LABEL_PATTERN.test(label) && label !== LOCAL_RUNNER ? label : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * The repair for an unreachable herdr on this host: the lead host's own unit (dori setup), or on a worker machine the
+ * lead host's `dori runner herdr start` (herdr unit installed) or `dori runner install` (none yet).
+ */
+export const herdrFix = (d: Pick<DoctorDeps, "home" | "exists">): string => {
+  const label = workerLabel(d);
+  if (!label) return "systemctl --user start herdr-server.service";
+  return herdrUnitInstalled({ home: d.home, exists: d.exists })
+    ? `on the lead host: dori runner herdr start --machine ${label}`
+    : `on the lead host: dori runner install --machine ${label} (installs the herdr unit)`;
+};
+
 const herdr = async (d: DoctorDeps): Promise<Check[]> => {
   const up = await d.run(["herdr", "workspace", "list"], T);
-  if (up.code !== 0) return [fail("herdr", "server not reachable", "systemctl --user start herdr-server.service")];
+  if (up.code !== 0) return [fail("herdr", "server not reachable", herdrFix(d))];
   const procs = await d.run(["pgrep", "-f", "herdr server"], T);
   const n = procs.code === 0 ? procs.out.split("\n").filter(Boolean).length : 0;
   return [n > 1
@@ -336,9 +360,20 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
+    if (row.herdr === "down" || row.herdr === "hung") {
+      // The runner saw its machine's herdr stop answering: its lanes cannot run there and their recovery is held.
+      const since = row.herdrSince ? ` since ${new Date(row.herdrSince).toISOString()}` : "";
+      const herdrProblem = row.herdr === "down" ? `herdr down${since} (no server process)` : `herdr hung${since} (the server process runs but does not answer)`;
+      const command = row.herdr === "down"
+        ? `dori runner herdr start --machine ${row.label}`
+        : `dori runner herdr restart --machine ${row.label} --yes (ends every lane pane there; without --yes it lists them)`;
+      const upgrade = row.proto !== undefined && row.proto < 4 ? `dori runner install --machine ${row.label} to upgrade (proto ${row.proto} has no host.herdr), then ` : "";
+      checks.push(fail(id, [herdrProblem, ...problems].join("; "), `${upgrade}${command}`));
+      continue;
+    }
     checks.push(problems.length
       ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
-      : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}`));
+      : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}${row.herdr ? `, herdr ${row.herdr}` : ""}`));
   }
   return checks;
 };
