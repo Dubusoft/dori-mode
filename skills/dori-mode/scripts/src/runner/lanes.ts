@@ -10,6 +10,7 @@ import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.t
 import { cmdRefused, inspectCreated, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
+import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
   CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, ProcessInfo, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
 } from "./protocol.ts";
@@ -446,7 +447,10 @@ export class RunnerLanes {
     // The same alive test as serve.ts laneStatus, so the runner and the supervisor call one pane the same.
     const status: LaneStatus = !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
     const reason: LaneDeadReason | undefined = !pane ? "pane-missing" : status === "dead" ? "agent-gone" : undefined;
-    this.deps.publish("lane.state", { key, status, ...(reason ? { reason } : {}) });
+    // herdr names a fresh pane's agent unknown until its integration first reports: a lane started less than
+    // STARTUP_GRACE_MS ago whose pane is there is still starting, so its dead is answered but not published.
+    const starting = reason === "agent-gone" && this.deps.clock.now() - record.startedAt < STARTUP_GRACE_MS;
+    if (!starting) this.deps.publish("lane.state", { key, status, ...(reason ? { reason } : {}) });
     if (!pane) throw new Error(`RUNNER_LANE_ABSENT ${key} pane ${record.pane} is gone`);
     return { detail: `observed ${status}`, result: { status } };
   }

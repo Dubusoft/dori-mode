@@ -8,6 +8,7 @@ import { laneCliMain } from "../src/runner/lane-cli.ts";
 import { RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { type RunnerEventType, runnerEvent } from "../src/runner/protocol.ts";
+import { STARTUP_GRACE_MS } from "../src/runner/serve.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { fakeClock } from "./fakes.ts";
 import { writeRunnerFile } from "../src/runner/fs-safety.ts";
@@ -292,10 +293,32 @@ test("lane.asking: an owned lane's on-screen question is published once, and aga
   expect(t.published).toHaveLength(2);
 });
 
-test("alive criteria: observe and recover use paneAlive (agent_status), not the agent field", async () => {
-  const t = setup();
+test("observe answers dead but publishes no lane.state dead for a lane still in its startup window", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
   await t.lanes.start(START);
   t.published.length = 0;
+  const started = t.lanes.records()["lane-a"]?.startedAt ?? 0;
+  // A just-launched lane: herdr names its agent unknown until the agent's integration first reports.
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
+  clock.at = started + STARTUP_GRACE_MS - 1;
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "dead" });
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "working" }];
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "working" });
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working" }]]);
+  // Once the window is over a dead agent is published as before.
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
+  clock.at = started + STARTUP_GRACE_MS;
+  await t.lanes.observe("lane-a");
+  expect(t.published.at(-1)).toEqual(["lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }]);
+});
+
+test("alive criteria: observe and recover use paneAlive (agent_status), not the agent field", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
+  await t.lanes.start(START);
+  t.published.length = 0;
+  clock.at = (t.lanes.records()["lane-a"]?.startedAt ?? 0) + STARTUP_GRACE_MS;
   // herdr still names the agent, but its status is not an alive one: the supervisor's laneStatus calls this dead.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
