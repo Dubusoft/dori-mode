@@ -21,7 +21,7 @@ import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
 import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./fs-safety.ts";
-import { pidAlive, probe, startHealth } from "./health.ts";
+import { pidAlive, probe, probeHerdr, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
 import { Outbox } from "./outbox.ts";
 import { DEFAULT_POLICY, loadPolicy, POLICY_FILE } from "./policy.ts";
@@ -43,9 +43,9 @@ class Exit extends Error {
 }
 const fail = (message: string, code = 1): never => { throw new Exit(code, message); };
 
-const probeMain = (json: boolean): number => {
-  const result = probe({ runnerDir: defaultRunnerDir(), now: realClock.now });
-  console.log(json ? JSON.stringify(result) : `RUNNER_PROBE ${result.verdict} process=${result.process} age=${result.healthAgeMs ?? "-"}ms gen=${result.gen ?? "-"}`);
+const probeMain = async (json: boolean): Promise<number> => {
+  const result = { ...probe({ runnerDir: defaultRunnerDir(), now: realClock.now }), herdr: await probeHerdr(run) };
+  console.log(json ? JSON.stringify(result) : `RUNNER_PROBE ${result.verdict} process=${result.process} age=${result.healthAgeMs ?? "-"}ms gen=${result.gen ?? "-"} herdr=${result.herdr}`);
   return result.verdict === "healthy" ? 0 : 1;
 };
 

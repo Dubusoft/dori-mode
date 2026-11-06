@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HEALTH_DEAD_MS, HEALTH_FRESH_MS, healthPath, probe, readHealth, startHealth, writeHealth } from "../src/runner/health.ts";
+import { HEALTH_DEAD_MS, HEALTH_FRESH_MS, healthPath, probe, probeHerdr, readHealth, startHealth, writeHealth } from "../src/runner/health.ts";
+import type { Ran } from "../src/run.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -58,4 +59,20 @@ test("probe verdicts at each boundary", () => {
 
 test("no health file means dead", () => {
   expect(probe({ runnerDir: runnerDir(), now: () => NOW, isAlive: () => true })).toEqual({ process: "dead", verdict: "dead" });
+});
+
+test("probeHerdr: herdr answering is up; otherwise a herdr server process means hung, none down, a failed pgrep unknown", async () => {
+  const reading = async (workspace: number, pgrep: number) => {
+    const calls: string[] = [];
+    const state = await probeHerdr(async (argv) => {
+      calls.push(argv.join(" "));
+      return { code: argv[0] === "herdr" ? workspace : pgrep, out: "", err: "" } as Ran;
+    });
+    return { state, calls };
+  };
+  expect(await reading(0, 1)).toEqual({ state: "up", calls: ["herdr workspace list"] });
+  expect((await reading(1, 1)).state).toBe("down");
+  expect(await reading(1, 0)).toEqual({ state: "hung", calls: ["herdr workspace list", "pgrep -f herdr server"] });
+  expect((await reading(124, 0)).state).toBe("hung");
+  expect((await reading(1, 127)).state).toBe("unknown");
 });

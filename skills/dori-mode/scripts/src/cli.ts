@@ -326,7 +326,7 @@ if (process.argv[2] === "runner") {
     const machine = machines.machines.find((m) => m.label === label);
     if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
     const { SupervisorAuth } = await import("./runner/auth.ts");
-    const { buildBundle, installRunner } = await import("./runner/install.ts");
+    const { buildBundle, herdrInstallNote, installRunner } = await import("./runner/install.ts");
     const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
     try {
       // The code is issued in this process and handed to the installer as data; it never enters an argv.
@@ -336,7 +336,7 @@ if (process.argv[2] === "runner") {
         issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
       });
       if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
-      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""}`);
+      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${herdrInstallNote(result.ok ? result.herdr : undefined)}`);
     } finally {
       auth.close();
     }

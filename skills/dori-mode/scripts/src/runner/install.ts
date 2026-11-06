@@ -27,14 +27,28 @@ import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
  * when no GUI session exists), kickstarts it, and records that domain in `~/.dori/runner/launchd-domain`. Nothing
  * outside `~/.dori` and that plist is touched.
  *
+ * Both systems also get a herdr unit (design: runner host herdr lifecycle, section 5.3): `herdr` must be found on the
+ * user's login-shell PATH, which together with the login shell becomes the unit's PATH and SHELL (every lane shell
+ * herdr opens inherits them). Linux writes `~/.config/systemd/user/herdr-server.service`, which the runner unit only
+ * Wants= and is After=; macOS writes the launchd agent `~/Library/LaunchAgents/com.dori.herdr.plist` (KeepAlive,
+ * ThrottleInterval 30: a second `herdr server` on a taken socket exits 1 at once, so the retries are spaced out). The
+ * script never stops or restarts a running herdr, since that ends every lane on the host: a herdr the unit already runs
+ * is left alone (a reinstall or upgrade only rewrites the unit file), a herdr started by hand gets the unit enabled but
+ * not started (macOS: `RunAtLoad` false), and only when no herdr answers is the unit started. It prints
+ * `DORI_HERDR started|managed|unmanaged` on success.
+ *
  * Script exit codes: 0 installed; 3 no usable `bun`; 4 unsupported OS; 5 enrollment refused or failed; 6 service
- * manager (systemd, linger or launchd) failed; anything else is a generic failure. ssh's own 255 or a timeout is
- * unreachable.
+ * manager (systemd, linger or launchd) failed; 7 no `herdr` on the login PATH; anything else is a generic failure.
+ * ssh's own 255 or a timeout is unreachable.
  */
 
 export const RUNNER_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-runner-remote.service");
 export const RUNNER_LAUNCHD_PLIST_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-runner-launchd.plist");
 export const RUNNER_LAUNCHD_LABEL = "com.dori.runner";
+export const HERDR_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "herdr-runner-remote.service");
+export const HERDR_LAUNCHD_PLIST_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-herdr-launchd.plist");
+export const HERDR_LAUNCHD_LABEL = "com.dori.herdr";
+export const HERDR_UNIT = "herdr-server.service";
 export const RUNNER_CLI_ENTRY = join(import.meta.dir, "bin.ts");
 export const INSTALL_TIMEOUT_MS = 180_000;
 const HEREDOC = "DORI_RUNNER_EOF";
@@ -42,15 +56,31 @@ const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const CONNECT = /^ws:\/\/[A-Za-z0-9.:[\]-]+:\d{1,5}$/;
 const ENROLL_VALUE = /^[A-Za-z0-9_:=+/.-]+$/;
 
-export const INSTALL_EXIT = { noBun: 3, notLinux: 4, enroll: 5, systemd: 6 } as const;
+export const INSTALL_EXIT = { noBun: 3, notLinux: 4, enroll: 5, systemd: 6, noHerdr: 7 } as const;
 
 export type InstallFailure =
   | "RUNNER_INSTALL_UNREACHABLE"
   | "RUNNER_INSTALL_UNSUPPORTED"
   | "RUNNER_INSTALL_NO_BUN"
+  | "RUNNER_INSTALL_NO_HERDR"
   | "RUNNER_INSTALL_ENROLL_FAILED"
   | "RUNNER_INSTALL_FAILED";
-export type InstallResult = { readonly ok: true; readonly version: string } | { readonly ok: false; readonly code: InstallFailure; readonly detail: string };
+/** What the install did with herdr: started its unit, found the unit already running it, or found a herdr started by hand. */
+export type HerdrInstall = "started" | "managed" | "unmanaged";
+export type InstallResult =
+  | { readonly ok: true; readonly version: string; readonly herdr?: HerdrInstall }
+  | { readonly ok: false; readonly code: InstallFailure; readonly detail: string };
+
+/** The herdr part of the `RUNNER_INSTALLED` line. */
+export const herdrInstallNote = (herdr: HerdrInstall | undefined): string =>
+  herdr === "started" ? "herdr=started (by its unit)"
+    : herdr === "managed" ? "herdr=managed (its unit was already running it; left alone)"
+      : herdr === "unmanaged" ? "herdr=unmanaged (running, not from its unit; the unit takes over when it stops)"
+        : "herdr=unknown";
+
+/** The herdr unit and launchd plist texts; their `@NAME@` markers are filled on the remote host. */
+export type HerdrTemplates = { readonly unit: string; readonly plist: string };
+const herdrTemplates = (): HerdrTemplates => ({ unit: readFileSync(HERDR_REMOTE_UNIT_TEMPLATE, "utf8"), plist: readFileSync(HERDR_LAUNCHD_PLIST_TEMPLATE, "utf8") });
 
 export type EnrollIssue = { readonly code: string; readonly fingerprint: string };
 
@@ -61,6 +91,8 @@ export type InstallDeps = {
   readonly unitTemplate?: string;
   /** The remote launchd plist template text; defaults to templates/dori-runner-launchd.plist. */
   readonly plistTemplate?: string;
+  /** The herdr unit and plist texts; default to templates/herdr-runner-remote.service and templates/dori-herdr-launchd.plist. */
+  readonly herdrTemplates?: HerdrTemplates;
 };
 
 export type InstallRequest = {
@@ -95,8 +127,9 @@ export const installScript = (
   issue: EnrollIssue,
   plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, connectUrl),
   agentCommand: readonly string[] = [],
+  herdr: HerdrTemplates = herdrTemplates(),
 ): string => {
-  for (const text of [bundle, unit, plist]) {
+  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
   }
   const body = (text: string): string => (text.endsWith("\n") ? text : `${text}\n`);
@@ -105,6 +138,18 @@ export const installScript = (
     "umask 077",
     "OS=$(uname -s)",
     `case "$OS" in Linux|Darwin) ;; *) exit ${INSTALL_EXIT.notLinux} ;; esac`,
+    // The login shell's PATH (an ssh command gets a non-login one, without what the user's profile adds), read past
+    // whatever the profile prints. herdr is looked up on it before anything is written, and it becomes the herdr
+    // unit's PATH, which the lane shells inherit.
+    'SH=${SHELL:-/bin/sh}',
+    String.raw`LP=$("$SH" -lc 'printf "\nDORI_LOGIN_PATH=%s\n" "$PATH"' </dev/null 2>/dev/null | sed -n 's/^DORI_LOGIN_PATH=//p' | tail -n 1)`,
+    '[ -n "$LP" ] || LP=$PATH',
+    `HERDR=$(PATH="$LP:$PATH"; command -v herdr) || exit ${INSTALL_EXIT.noHerdr}`,
+    // A herdr already answering is never stopped or restarted here: that would end every lane on the host.
+    'if "$HERDR" workspace list </dev/null >/dev/null 2>&1; then HUP=1; else HUP=0; fi',
+    String.raw`esc() { printf '%s' "$1" | sed -e 's/[\|&]/\\&/g'; }`,
+    // A plist value is XML text as well.
+    String.raw`xesc() { esc "$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"; }`,
     'R="$HOME/.dori/runner"',
     'if [ "$OS" = Linux ]; then',
     `  BUN=$(command -v bun) || exit ${INSTALL_EXIT.noBun}`,
@@ -152,6 +197,11 @@ export const installScript = (
     `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$PATH|g" "$R/dori-runner.service.tmp" > "$HOME/.config/systemd/user/dori-runner.service" || exit 1`,
     'rm -f "$R/dori-runner.service.tmp"',
     'chmod 644 "$HOME/.config/systemd/user/dori-runner.service"',
+    `cat > "$R/${HERDR_UNIT}.tmp" <<'${HEREDOC}' || exit 1`,
+    `${body(herdr.unit)}${HEREDOC}`,
+    `sed -e "s|@HERDR_BIN@|$(esc "$HERDR")|g" -e "s|@PATH@|$(esc "$LP")|g" -e "s|@SHELL@|$(esc "$SH")|g" "$R/${HERDR_UNIT}.tmp" > "$HOME/.config/systemd/user/${HERDR_UNIT}" || exit 1`,
+    `rm -f "$R/${HERDR_UNIT}.tmp"`,
+    `chmod 644 "$HOME/.config/systemd/user/${HERDR_UNIT}"`,
     "else",
     `PL="$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist"`,
     `cat > "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
@@ -171,8 +221,16 @@ export const installScript = (
     'if [ "$OS" = Linux ]; then',
     `loginctl enable-linger "$(id -un)" || exit ${INSTALL_EXIT.systemd}`,
     `systemctl --user daemon-reload || exit ${INSTALL_EXIT.systemd}`,
-    `systemctl --user enable dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
-    `systemctl --user restart dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
+    `systemctl --user enable ${HERDR_UNIT} dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
+    // The unit's own herdr is left running (a changed unit file waits for herdr's next start); a herdr started by
+    // hand keeps the socket, and the unit takes over once it stops; with none answering, the unit starts it.
+    `if systemctl --user is-active --quiet ${HERDR_UNIT}; then HS=managed`,
+    'elif [ "$HUP" = 1 ]; then HS=unmanaged',
+    `else systemctl --user reset-failed ${HERDR_UNIT} >/dev/null 2>&1 || :; systemctl --user start ${HERDR_UNIT} || exit ${INSTALL_EXIT.systemd}; HS=started`,
+    "fi",
+    // ignore-dependencies: the runner's Wants= would otherwise start the herdr unit beside a herdr started by hand.
+    `systemctl --user restart --job-mode=ignore-dependencies dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
+    `printf 'DORI_HERDR %s\\n' "$HS"`,
     "exit 0",
     "fi",
     // Enabled before bootstrap: an evacuated runner was disabled, and launchd refuses to bootstrap a disabled service.
@@ -189,9 +247,25 @@ export const installScript = (
     "}",
     'D="gui/$(id -u)"',
     `if ! { launchctl print "$D" >/dev/null 2>&1 && boot "$D"; }; then D="user/$(id -u)"; boot "$D" || exit ${INSTALL_EXIT.systemd}; fi`,
+    // herdr's agent goes into the runner's domain. Loaded already: only the plist file is rewritten (no bootout, which
+    // would stop herdr; launchd reads the file at the next load). A herdr started by hand: RunAtLoad false, and the
+    // KeepAlive retries of a second server (it exits 1 on the taken socket) are spaced by ThrottleInterval.
+    `HP="$HOME/Library/LaunchAgents/${HERDR_LAUNCHD_LABEL}.plist"`,
+    `if launchctl print "$D/${HERDR_LAUNCHD_LABEL}" >/dev/null 2>&1; then HS=managed; RAL=true`,
+    'elif [ "$HUP" = 1 ]; then HS=unmanaged; RAL=false',
+    "else HS=started; RAL=true",
+    "fi",
+    `cat > "$R/${HERDR_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
+    `${body(herdr.plist)}${HEREDOC}`,
+    `sed -e "s|@HERDR_BIN@|$(xesc "$HERDR")|g" -e "s|@PATH@|$(xesc "$LP")|g" -e "s|@SHELL@|$(xesc "$SH")|g" -e "s|@HOME@|$(xesc "$HOME")|g" -e "s|@RUN_AT_LOAD@|$RAL|g" "$R/${HERDR_LAUNCHD_LABEL}.plist.tmp" > "$HP" || exit 1`,
+    `rm -f "$R/${HERDR_LAUNCHD_LABEL}.plist.tmp"`,
+    'chmod 644 "$HP"',
+    ': >> "$R/herdr.log" && chmod 600 "$R/herdr.log" || exit 1',
+    `if [ "$HS" != managed ]; then launchctl enable "$D/${HERDR_LAUNCHD_LABEL}" || exit ${INSTALL_EXIT.systemd}; launchctl bootstrap "$D" "$HP" || exit ${INSTALL_EXIT.systemd}; fi`,
     `launchctl kickstart -k "$D/${RUNNER_LAUNCHD_LABEL}" || exit ${INSTALL_EXIT.systemd}`,
     `printf '%s\\n' "$D" > "$R/launchd-domain" || exit ${INSTALL_EXIT.systemd}`,
     `chmod 600 "$R/launchd-domain" || exit ${INSTALL_EXIT.systemd}`,
+    `printf 'DORI_HERDR %s\\n' "$HS"`,
     "exit 0",
     "",
   ].join("\n");
@@ -207,13 +281,17 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   const plist = remoteUnit(deps.plistTemplate ?? readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), req.label, req.connectUrl);
   const issue = req.issue();
   if (!ENROLL_VALUE.test(issue.code) || !ENROLL_VALUE.test(issue.fingerprint)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: "bad enrollment code or fingerprint" };
-  const script = installScript(bundle, unit, req.label, req.connectUrl, issue, plist, req.agentCommand);
+  const script = installScript(bundle, unit, req.label, req.connectUrl, issue, plist, req.agentCommand, deps.herdrTemplates);
   const r = await deps.run(sshArgv(req.machine.target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   const detail = (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}`;
-  if (r.code === 0) return { ok: true, version: bundleVersion(bundle) };
+  if (r.code === 0) {
+    const herdr = [...r.out.matchAll(/^DORI_HERDR (started|managed|unmanaged)$/gm)].at(-1)?.[1] as HerdrInstall | undefined;
+    return { ok: true, version: bundleVersion(bundle), ...(herdr ? { herdr } : {}) };
+  }
   if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, code: "RUNNER_INSTALL_UNREACHABLE", detail };
   if (r.code === INSTALL_EXIT.notLinux || NOT_POSIX.test(r.err)) return { ok: false, code: "RUNNER_INSTALL_UNSUPPORTED", detail: `unsupported OS: only Linux and macOS machines take a runner (${detail})` };
   if (r.code === INSTALL_EXIT.noBun) return { ok: false, code: "RUNNER_INSTALL_NO_BUN", detail: "no usable bun on the remote host (Linux needs it on PATH; on macOS it could not be found or downloaded)" };
+  if (r.code === INSTALL_EXIT.noHerdr) return { ok: false, code: "RUNNER_INSTALL_NO_HERDR", detail: "no herdr on the remote host's login PATH: install herdr (https://herdr.dev) there first" };
   if (r.code === INSTALL_EXIT.enroll) return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail };
   return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: r.code === INSTALL_EXIT.systemd ? `service manager: ${detail}` : detail };
 };
