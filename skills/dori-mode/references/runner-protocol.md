@@ -292,7 +292,11 @@ machines (herdr's saved machines plus `guardMachines`), and `runners.listen` mus
   machine. A worker that already has `~/.dori/runner/keys/supervisor.pub` skips enrollment: a reinstall or an upgrade
   keeps its keys.
 - On macOS, the launchd user agent `~/Library/LaunchAgents/com.dori.runner.plist` (from
-  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials.
+  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials. While it
+  serves, the runner holds `caffeinate -i -s -w <its pid>` so an idle Mac does not sleep: asleep, it runs the runner
+  only in short DarkWake windows, heartbeats stop and the supervisor drops the link every few minutes. `-s` is what
+  keeps a DarkWake from going back to sleep, and macOS honors it only on AC power; on battery, and with the lid closed,
+  the Mac still sleeps. When `caffeinate` cannot start or exits, the runner logs `RUNNER_AWAKE_FAILED` and keeps serving.
 - Then, on Linux, linger is turned on and the unit is enabled and restarted. On macOS the agent is loaded into
   `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
   `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.

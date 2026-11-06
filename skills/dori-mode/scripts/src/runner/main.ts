@@ -19,6 +19,7 @@ import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
+import { holdAwake, spawnQuiet } from "./awake.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
@@ -185,6 +186,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   process.on("SIGINT", () => controller.abort());
   process.on("SIGTERM", () => controller.abort());
   console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=owner endpoint=${endpoint}`);
+  const stopAwake = holdAwake({ os: process.platform, pid: process.pid, spawn: spawnQuiet, log });
   const stopHealth = startHealth({ runnerDir, pid: process.pid, gen, now: realClock.now, monotonic: () => Math.round(performance.now()), every: realEvery, log });
   let guarding = false;
   const guardTick = (): void => {
@@ -208,6 +210,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     stopGuard();
     stopPrune();
     stopHealth();
+    stopAwake();
     outbox.close();
     state.close();
     releaseServeLock?.();
