@@ -63,9 +63,9 @@ test("status message: the first progress posts it, later progress and milestones
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "parser done in /home/test/repo; next the CLI", at: T0 + 60 * MIN });
   expect(await routeReports(base, store, enqueue, "/home/test", transport)).toEqual(["LANE_REPORT_ROUTED local-lane:0:1 progress thread"]);
   expect(calls).toEqual([["post", "2", [
-    "[System] status of lane local-lane, open 1h 5m (updated 2026-01-01 13:05 UTC)",
-    "last milestone: none yet",
-    "last progress (2026-01-01 13:00 UTC): parser done in ~/repo; next the CLI",
+    "[System] 레인 local-lane 상태, 진행 1시간 5분 (갱신 2026-01-01 13:05 UTC)",
+    "마지막 마일스톤: 아직 없음",
+    "마지막 진행 (2026-01-01 13:00 UTC): parser done in ~/repo; next the CLI",
   ].join("\n")]]);
   expect((await base.registry.read("local-lane"))?.statusMessageId).toBe("m1");
 
@@ -77,9 +77,9 @@ test("status message: the first progress posts it, later progress and milestones
   expect(journal).toEqual([["lane-report:local-lane:0:2", "LANE_REPORT local-lane milestone CLI works end to end; Done needs the PR merged; scope unchanged"]]);
   expect(calls.slice(1).map((c) => c.slice(0, 3))).toEqual([["edit", "2", "m1"], ["edit", "2", "m1"]]);
   expect(calls.at(-1)?.[3]).toBe([
-    "[System] status of lane local-lane, open 1h 5m (updated 2026-01-01 13:05 UTC)",
-    "last milestone (2026-01-01 13:10 UTC): CLI works end to end; Done needs the PR merged; scope unchanged",
-    "last progress (2026-01-01 13:20 UTC): opened PR #9; next CI",
+    "[System] 레인 local-lane 상태, 진행 1시간 5분 (갱신 2026-01-01 13:05 UTC)",
+    "마지막 마일스톤 (2026-01-01 13:10 UTC): CLI works end to end; Done needs the PR merged; scope unchanged",
+    "마지막 진행 (2026-01-01 13:20 UTC): opened PR #9; next CI",
   ].join("\n"));
   // The thread hook is not used while the status message works: no new thread post per report.
   expect(world.calls.filter((c) => c[0] === "notify")).toEqual([]);

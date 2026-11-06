@@ -512,7 +512,7 @@ test("past restartMaxPerHour the ladder refuses, logs and tells the owner once, 
   await supervisor.reactionsSettled();
   expect(f.launches()).toEqual([]);
   expect(lines.filter((line) => line.startsWith("LEAD_RESTART_CAPPED"))).toHaveLength(1);
-  expect(announced.filter((text) => text.includes("not restarted again"))).toHaveLength(1);
+  expect(announced.filter((text) => text.includes("다시 재시작하지 않습니다"))).toHaveLength(1);
   expect(f.texts().length).toBeGreaterThan(3);
   // The lead hears why nobody restarts it: one urgent LEAD_UNRESPONSIVE per hour, named in its next pointer; it
   // reaches a stale idle lead in place, never as a cold start the cap would not allow.

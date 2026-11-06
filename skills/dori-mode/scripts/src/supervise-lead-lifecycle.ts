@@ -211,7 +211,7 @@ export class LeadLifecycle {
       this.journal = { ...this.journal, inbox: { ...inbox, capNotice: hour } };
       this.persist();
       this.enqueue(`lead-unresponsive:${hour}`, `LEAD_UNRESPONSIVE ${what}: you did not take pushed events or handle owner messages, and ${count} forced restarts in the last hour reached delivery.restartMaxPerHour ${delivery.restartMaxPerHour}, so you are not restarted; run dori inbox take now`);
-      this.owners.announce(`lead-restart-capped:${hour}`, `The lead is not taking new events, but it was already restarted ${count} times in the last hour, so it is not restarted again for now. The supervisor keeps notifying it.`);
+      this.owners.announce(`lead-restart-capped:${hour}`, `리드가 새 이벤트를 받지 않고 있지만, 지난 한 시간 동안 이미 ${count}번 재시작했기 때문에 당분간은 다시 재시작하지 않습니다. 수퍼바이저가 계속 리드에게 알립니다.`);
     }
     return true;
   }
@@ -271,7 +271,7 @@ export class LeadLifecycle {
       const session = randomUUID();
       console.log(`LEAD_STUCK_RESTART ${config.leadPane} ${status} ${minutes} min, ${count} owner message(s) unread`);
       await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.defaultCwd);
-      this.owners.announce(`lead-stuck:${session}`, `The lead has been stuck (${status}) for ${minutes} min without reading your messages, so it is being restarted; your unanswered messages go to the new lead.`);
+      this.owners.announce(`lead-stuck:${session}`, `리드가 ${minutes}분째 멈춘 상태(${status})로 메시지를 읽지 못하고 있어 재시작합니다. 답변받지 못한 메시지는 새 리드에게 넘어갑니다.`);
       this.setRestart({
         session, events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
         phase: "stopping", force: true,

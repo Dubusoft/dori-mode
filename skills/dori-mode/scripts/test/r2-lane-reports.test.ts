@@ -175,7 +175,7 @@ test("a freshness post of a lane's last [REPORT] line is marked [System] relayed
   await deps(T0).registry.write({ ...lane(dir), key: "quiet-lane", thread: "chat:team/9", lastReplyAt: T0, lastNudgeAt: T0 + 16 * MIN });
   await freshnessTick(deps(T0 + 21 * MIN), "/home/test");
   expect((await freshnessTick(deps(T0 + 26 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["posted"]);
-  expect(world.calls.find((c) => c[0] === "notify")?.[2]).toBe("[System] relayed from lane quiet-lane: Progress (from the lane's last report): tests green, PR open");
+  expect(world.calls.find((c) => c[0] === "notify")?.[2]).toBe("[System] 레인 quiet-lane 전달: 진행 상황(레인의 마지막 보고): tests green, PR open");
 });
 
 test("a lane registered on the old [REPORT] footer moves onto dori report when it is relaunched", async () => {
