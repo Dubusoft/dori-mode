@@ -290,6 +290,20 @@ test("the runner directory the script leaves passes the runner's own safety chec
   checkRunnerDir(join(darwin.home, ".dori/runner"));
 });
 
+test("the script creates ~/.dori/runner/evidence at 0700 and tightens an existing 0755 one, on Linux and on Darwin", async () => {
+  for (const [makeHost, runIt, script] of [[fakeHost, runScript, linuxScript], [darwinHost, runDarwin, darwinScript]] as const) {
+    const fresh = makeHost();
+    expect((await runIt(fresh, script())).code).toBe(0);
+    expect(statSync(join(fresh.home, ".dori/runner/evidence")).mode & 0o777).toBe(0o700);
+    const loose = makeHost();
+    mkdirSync(join(loose.home, ".dori/runner/evidence"), { recursive: true, mode: 0o700 });
+    chmodSync(join(loose.home, ".dori/runner/evidence"), 0o755);
+    expect((await runIt(loose, script())).code).toBe(0);
+    expect(statSync(join(loose.home, ".dori/runner/evidence")).mode & 0o777).toBe(0o700);
+    checkRunnerDir(join(loose.home, ".dori/runner"));
+  }
+});
+
 test("the launchd plist is checked against the heredoc delimiter too", () => {
   expect(() => installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, "a\nDORI_RUNNER_EOF\n")).toThrow("heredoc delimiter");
 });
