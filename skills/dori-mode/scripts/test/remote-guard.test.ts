@@ -12,7 +12,6 @@ import {
   type MachineSample,
   guardAgentVersion,
   installGuardAgent,
-  killOnMachine,
   listGuardMachines,
   loadMachineGuardState,
   machineBackoffMs,
@@ -120,33 +119,6 @@ test("sampleMachine runs the agent over ssh and maps failures", async () => {
   expect(await detail({ code: 127, out: "", err: "sh: not found" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
   expect(await detail({ code: 2, out: "", err: "sh: 0: Can't open /home/me/.dori/guard-agent.sh" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
   expect(await detail(ok("garbage"))).toBe("bad sample: garbage");
-});
-
-test("killOnMachine single-quotes patterns, parses killed lines, maps failures", async () => {
-  const out = "DORI_GUARD_KILLED pid=4242 rss_kb=4000000 cmd=qemu-system-x86\nDORI_GUARD_KILLED pid=7 rss_kb=10 cmd=emulator\nDORI_GUARD_KILL_DONE count=2\n";
-  const f = fake(() => ok(out));
-  expect(await killOnMachine(f.run, mac, ["qemu-system", "it's; rm -rf $HOME", "  "])).toEqual({
-    ok: true,
-    killed: [{ pid: 4242, rssKb: 4_000_000, cmd: "qemu-system-x86" }, { pid: 7, rssKb: 10, cmd: "emulator" }],
-  });
-  expect(f.calls[1]).toEqual({
-    argv: sshArgv("me@mac", `sh "$HOME/.dori/guard-agent.sh" kill 'qemu-system' 'it'\\''s; rm -rf $HOME'`),
-    opts: { timeoutMs: 30_000 },
-  });
-  expect(await killOnMachine(fake(() => ok("DORI_GUARD_KILL_DONE count=0")).run, mac, ["x"])).toEqual({ ok: true, killed: [] });
-  const none = fake(() => ok());
-  expect(await killOnMachine(none.run, mac, [" "])).toEqual({ ok: true, killed: [] });
-  expect(none.calls).toHaveLength(0);
-
-  const detail = async (r: Ran) => {
-    const res = await killOnMachine(fake(() => r).run, mac, ["x"]);
-    return res.ok ? "ok" : res.detail;
-  };
-  expect(await detail({ code: 255, out: "", err: "No route to host" })).toBe("unreachable: No route to host");
-  expect(await detail({ code: 124, out: "", err: "timed out", timedOut: true })).toBe("unreachable: timed out");
-  expect(await detail({ code: 127, out: "", err: "" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
-  expect(await detail({ code: 2, out: "", err: "usage: kill" })).toBe("kill failed (exit 2): usage: kill");
-  expect(await detail(ok("garbage"))).toBe("bad kill output: garbage");
 });
 
 test("installGuardAgent writes both files to temp files and moves them into place in one call, then checks the version", async () => {

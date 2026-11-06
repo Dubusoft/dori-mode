@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { COMMAND_RETENTION_MS, RunnerState, STATE_FILE, type CommandIntent } from "../src/runner/state.ts";
@@ -184,6 +185,57 @@ describe("retention", () => {
     expect(a.cmdAck()).toBe(3);
     a.close();
     expect(make().cmdAck()).toBe(3);
+  });
+});
+
+describe("structured results", () => {
+  test("a result value is stored with the final state and read back after reopen; a detail-only result has none", () => {
+    const a = make();
+    a.recordIntent(intent(1));
+    a.recordResult("op-1", "verified", "started p7", { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "working" } });
+    a.recordIntent(intent(2));
+    a.recordResult("op-2", "failed", "boom");
+    a.close();
+    const b = make();
+    expect(b.command("op-1")).toMatchObject({ state: "verified", result: "started p7", resultValue: { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "working" } } });
+    expect(b.command("op-2")).toMatchObject({ state: "failed", result: "boom" });
+    expect(b.command("op-2")?.resultValue).toBeUndefined();
+    expect(b.cmdAck()).toBe(2);
+  });
+
+  test("a state file from before result_json opens, keeps its rows, and gains the column", () => {
+    const legacy = new Database(join(sandbox.dir, STATE_FILE), { create: true });
+    legacy.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE commands (cmdId TEXT PRIMARY KEY, cmdSeq INTEGER NOT NULL UNIQUE, type TEXT NOT NULL, key TEXT, epoch INTEGER NOT NULL,
+        state TEXT NOT NULL, result TEXT, at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      INSERT INTO meta VALUES ('gen', 4);
+      INSERT INTO commands VALUES ('old-1', 1, 'lane.close', 'lane-a', 1, 'verified', 'closed', 10, 20);
+      INSERT INTO commands VALUES ('old-2', 2, 'lane.start', 'lane-b', 1, 'intent', NULL, 30, 30);
+    `);
+    legacy.close();
+    const a = make();
+    expect(a.gen()).toBe(4);
+    expect(a.command("old-1")).toEqual({ cmdId: "old-1", cmdSeq: 1, type: "lane.close", key: "lane-a", epoch: 1, state: "verified", result: "closed", at: 10, updatedAt: 20 });
+    expect(a.pendingIntents().map((r) => r.cmdId)).toEqual(["old-2"]);
+    a.recordResult("old-2", "verified", "started", { pane: "p1", tab: "t1", startup: { verdict: "unconfirmed", detail: "idle" } });
+    expect(a.command("old-2")?.resultValue).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "unconfirmed", detail: "idle" } });
+    a.close();
+    // Opening again does not try to add the column twice.
+    expect(make().cmdAck()).toBe(2);
+  });
+
+  test("a stored result that does not parse reads as absent instead of breaking the record", () => {
+    const a = make();
+    a.recordIntent(intent(1));
+    a.recordResult("op-1", "verified", "ok", { gone: true });
+    a.close();
+    const raw = new Database(join(sandbox.dir, STATE_FILE));
+    raw.query("UPDATE commands SET result_json = '{not json' WHERE cmdId = 'op-1'").run();
+    raw.close();
+    const b = make();
+    expect(b.command("op-1")).toMatchObject({ state: "verified", result: "ok" });
+    expect(b.command("op-1")?.resultValue).toBeUndefined();
   });
 });
 

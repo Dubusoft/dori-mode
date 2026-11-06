@@ -8,7 +8,7 @@ import { Repos } from "../src/repos.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE } from "../src/store.ts";
 import { Supervisor, eventPriority } from "../src/supervise.ts";
-import { depsFor, fakeClock, newWorld, readGithub, TEST_STORE, withState } from "./fakes.ts";
+import { depsFor, fakeClock, fakeLaneOps, newWorld, readGithub, TEST_STORE, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -263,11 +263,13 @@ test("per-repo auth failure is bounded, isolated and rate-limited durably while 
 
 test("lane targets include merged PRs, command head branches and git worktree branches", async () => {
   const lane = { key: "lane", title: "", thread: "none", brief: "", openedAt: "", cwd: "/worktree", done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","feature","--json","number"]' };
-  const run: Runner = async (argv) => ({ code: 0, out: argv.includes("get-url") ? "git@github.com:git/repo.git" : "working-branch", err: "" });
-  const targets = await githubTargets([lane], run);
+  const w = newWorld();
+  w.inspection = { git: { origin: "git@github.com:git/repo.git", branch: "working-branch", worktrees: [{ path: "/worktree", branch: "side-branch", exists: true }] } };
+  const targets = await githubTargets([lane], fakeLaneOps(w));
+  expect(w.ops.find((e) => e.op === "inspect")?.args).toMatchObject({ want: { git: true } });
   expect([...targets.get("acme/app")?.numbers ?? []]).toEqual([7]);
   expect([...targets.get("other/repo")?.branches ?? []]).toEqual(["feature"]);
-  expect([...targets.get("git/repo")?.branches ?? []]).toEqual(["working-branch"]);
+  expect([...targets.get("git/repo")?.branches ?? []]).toEqual(["working-branch", "side-branch"]);
 });
 
 test("closing a reopened PR produces a new stable event identity", async () => {

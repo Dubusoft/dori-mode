@@ -13,6 +13,14 @@ import { supervise } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, manualPause, newWorld, readJournal, withState } from "./fakes.ts";
 
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
+
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   mock.restore();
@@ -260,7 +268,7 @@ test("the real supervisor runs a due job through the registry", async () => {
   };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `schedule-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"),
+    token: `schedule-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"),
     http: async (request) => ({ status: 200, headers: {}, body: request.url.endsWith("/threads/active") ? JSON.stringify({ threads: [] }) : "[]" }),
     lookup: async () => "", statusLookup: async () => "",
     open: () => {

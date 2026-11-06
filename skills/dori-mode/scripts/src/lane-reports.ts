@@ -16,14 +16,13 @@ import { type Lane, statusOf } from "./registry.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
+import { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
+export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
  * Structured lane reports (design 3.3): `dori report <key> <kind> --text T [--evidence E]` writes one
  * row, and the supervisor routes each row once and marks it consumed. Nothing is typed into the lead's pane.
  */
-export const REPORT_KINDS = ["progress", "question", "blocked", "milestone", "done"] as const;
-export type ReportKind = (typeof REPORT_KINDS)[number];
-
 /**
  * Where a routed row went: the lead's journal, the lane's thread, a done claim, a late notice in the journal (its lane
  * was closed or gone), or nowhere (`dropped`: rows written before late notices existed).
@@ -74,8 +73,6 @@ export interface LaneReportStore {
 export const LANE_REPORTS_FILE = "lane-reports.json";
 /** Held while lane-reports.json is written; `dori store import` holds it so no row lands between its copy and the file's retirement. */
 export const LANE_REPORTS_LOCK = "lane-reports.lock.sqlite";
-
-export const isReportKind = (value: unknown): value is ReportKind => typeof value === "string" && (REPORT_KINDS as readonly string[]).includes(value);
 
 const order = (a: LaneReport, b: LaneReport): number => a.at - b.at || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0) || a.seq - b.seq;
 const withId = (report: NewReport, seq: number): LaneReport => ({

@@ -2,9 +2,7 @@ import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { laneGeneration } from "../lane-reports.ts";
 import { paneAlive, type Pane } from "../panes.ts";
-import type { Lane } from "../registry.ts";
 import type { Clock } from "../run.ts";
 import { backoffMs, type RunnerClient, yieldTurn } from "./client.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
@@ -14,28 +12,23 @@ import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
   decodeFrame, encodeFrame, LABEL_PATTERN, ProtocolError, supervisorCommand, supervisorControl,
-  type AnyRunnerEvent, type AnySupervisorCommand, type Frame, type InventoryLane, type LaneStatus, type RejectCode, type RunnerControl,
-  type RunnerEventBodies, type SupervisorCommandBodies, type SupervisorCommandType,
+  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type InventoryLane, type JsonValue, type LaneStatus,
+  type QueryBodies, type QueryType, type RejectCode, type RunnerControl, type RunnerEventBodies, type SupervisorCommandBodies,
+  type SupervisorCommandType,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
-import { diffUnits, settleCycle, shadowDiffLine, shadowUnit, valueHash, type PendingDiff, type ShadowDiff, type ShadowUnit } from "./shadow.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 
 /**
  * The P1 wiring between the runner modules and the product: the runner's identity file, the supervisor epoch, the hub's
- * connection handling over any `Listener`, the shadow comparison, and the runner's serve loop. Every function takes its
+ * connection handling over any `Listener`, and the runner's serve loop. Every function takes its
  * clock and IO as arguments; `dori runner serve` and `supervise` pass the real ones.
  */
 
 /** The local runner's default label. */
 export const LOCAL_RUNNER = "local";
-/** How often a shadow runner reads its lanes. */
-export const SHADOW_OBSERVE_MS = 30_000;
-/**
- * How long a shadow difference must persist before it is reported with its class: two observation periods plus
- * margin, so a real transition the runner has not observed yet is not counted as a failure.
- */
-export const SHADOW_SETTLE_MS = 2 * SHADOW_OBSERVE_MS + 5_000;
+/** How often a runner reads its host's lanes (serveRunner's default observe period). */
+export const OBSERVE_MS = 30_000;
 /** Committed runner events are kept this long in the hub's journal table. */
 export const RUNNER_JOURNAL_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
@@ -106,8 +99,8 @@ export const nextEpoch = (stateDir: string): number => {
 export type RunnerJournal = { readonly commit: CommitFn; prune(now: number): number; close(): void };
 
 /**
- * The shadow journal: the hub commits runner events into `runner_events` of `runners.sqlite` instead of the lead's
- * event journal, so a shadow runner's events are durable and acked but never wake the lead. `commit` returns false for
+ * The hub's own journal: the hub commits runner events into `runner_events` of `runners.sqlite` instead of the lead's
+ * event journal, so a runner's events are durable and acked; the supervisor turns them into lane state itself. `commit` returns false for
  * an id already there, as the contract asks.
  */
 export const openRunnerJournal = (stateDir: string, now: () => number): RunnerJournal => {
@@ -126,6 +119,10 @@ export type HubHooks = {
   /** An event the hub committed just now. */
   readonly onEvent?: (label: string, frame: AnyRunnerEvent) => void;
   readonly onHeartbeat?: (label: string) => void;
+  /** Every admitted, MAC-checked `q.result` (the answer to a query sent with `RunnerAccept.control`). Never journaled. */
+  readonly onControl?: (label: string, frame: RunnerControl<"q.result">) => void;
+  /** The label's admitted connection closed (not called for a connection a newer one replaced). */
+  readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
   readonly auth?: SupervisorAuth;
   readonly log: (line: string) => void;
@@ -139,6 +136,11 @@ export type RunnerAccept = (() => void) & {
   rotate(label: string): string | undefined;
   /** Sends a command to the label's connection with the next cmdSeq; returns the cmdSeq, or undefined when it is not connected. */
   command<T extends SupervisorCommandType>(label: string, type: T, body: SupervisorCommandBodies[T]): number | undefined;
+  /**
+   * Sends a query control frame (no cmdSeq, not recorded, not epoch-fenced) to the label's connection; false when it is
+   * not connected. The answer arrives as `HubHooks.onControl`.
+   */
+  control<T extends QueryType>(label: string, type: T, body: QueryBodies[T]): boolean;
   /** Whether the label has an admitted connection now. */
   connected(label: string): boolean;
 };
@@ -214,6 +216,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
         current.delete(label);
         hub.disconnected(label);
         hooks.log(`RUNNER_DISCONNECTED runner=${label}`);
+        hooks.onDisconnected?.(label);
       }
     });
     transport.onLine((line) => {
@@ -285,6 +288,10 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
         if (frame.type === "enroll" || frame.type === "hello" || frame.type === "auth.proof") {
           throw new ProtocolError("sequence", `${frame.type} on an admitted connection`);
         }
+        if (frame.type === "q.result") {
+          hooks.onControl?.(label, frame as RunnerControl<"q.result">);
+          return;
+        }
         reply(hub.handle(frame));
         if (frame.type === "heartbeat") hooks.onHeartbeat?.(label);
       } catch (error) {
@@ -303,6 +310,12 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       const cmdSeq = hub.nextCmdSeq(name);
       connection.send(supervisorCommand(head(name, connection.gen), cmdSeq, type, body) as Frame);
       return cmdSeq;
+    },
+    control<T extends QueryType>(name: string, type: T, body: QueryBodies[T]): boolean {
+      const connection = current.get(name);
+      if (!connection?.transport.open) return false;
+      connection.send(supervisorControl(head(name, connection.gen), type, body as never) as Frame);
+      return true;
     },
     revoke(name: string): boolean {
       const had = auth?.revoke(name) ?? false;
@@ -397,103 +410,10 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
 };
 
 // ---------------------------------------------------------------------------------------------------------------
-// Shadow comparison (supervisor side)
-// ---------------------------------------------------------------------------------------------------------------
-
-/** The open lanes a runner label covers: the local runner has every open lane without a machine. */
-export const lanesFor = (label: string, lanes: readonly Lane[]): Lane[] =>
-  lanes.filter((l) => !l.closedAt && l.pane && (label === LOCAL_RUNNER ? !l.machine : l.machine === label));
-
-/** Lane statuses that mean the lane's agent is there. */
-const ALIVE: ReadonlySet<LaneStatus> = new Set(["working", "idle"]);
-
-/** What the supervisor's own paths hold for one shadow cycle. */
-export type ShadowLegacy = {
-  /** herdr's pane list for the runner's machine; undefined when it could not be read this pass. */
-  readonly panes: readonly Pane[] | undefined;
-  /** Keys of archived (closed) lanes. */
-  readonly archived: ReadonlySet<string>;
-};
-
-/**
- * Compares what each shadow runner reported with what the supervisor's own paths hold, with no effect on lane state.
- * Two cheap units per lane: `inventory.pane` (the registry's pane id against the runner's pane for the lane, from the
- * hello inventory overridden by the `pane` of later `lane.state` events) and `lane.state` field `alive` (panes.ts
- * `paneAlive` on the supervisor's own pane list against the runner's latest `lane.state`: working or idle is alive).
- * Without a readable legacy pane list no `lane.state` unit is compared that pass. A lane that is closed (archived and
- * not open) is dropped from the runner's side. A difference is reported as a `RUNNER_SHADOW_DIFF` line once it has
- * persisted `SHADOW_SETTLE_MS` (`settleCycle`).
- */
-export class ShadowObserver {
-  private readonly runners = new Map<string, {
-    inventory?: readonly InventoryLane[]; panes: Map<string, string>; states: Map<string, LaneStatus>; reports: Map<string, string>;
-    pending: readonly PendingDiff[];
-  }>();
-
-  private entry(label: string) {
-    let entry = this.runners.get(label);
-    if (!entry) this.runners.set(label, entry = { panes: new Map(), states: new Map(), reports: new Map(), pending: [] });
-    return entry;
-  }
-
-  hello(label: string, inventory: readonly InventoryLane[] | undefined): void {
-    const entry = this.entry(label);
-    if (inventory) entry.inventory = inventory;
-  }
-
-  event(label: string, frame: AnyRunnerEvent): void {
-    if (frame.type === "lane.state") {
-      const entry = this.entry(label);
-      entry.states.set(frame.body.key, frame.body.status);
-      if (frame.body.pane !== undefined) entry.panes.set(frame.body.key, frame.body.pane);
-    }
-    if (frame.type === "lane.progress" && frame.body.reportHash) this.entry(label).reports.set(frame.body.key, frame.body.reportHash);
-  }
-
-  /** Labels that have said hello since this supervisor started. */
-  labels(): string[] {
-    return [...this.runners.keys()].sort();
-  }
-
-  /** One cycle for `label` at `now` against the registry's open lanes and the legacy pane list; returns the lines to log. */
-  cycle(label: string, open: readonly Lane[], now: number, legacySide: ShadowLegacy): string[] {
-    const entry = this.entry(label);
-    const openKeys = new Set(open.map((l) => l.key));
-    const closed = (key: string): boolean => !openKeys.has(key) && legacySide.archived.has(key);
-    for (const map of [entry.panes, entry.states, entry.reports]) for (const key of [...map.keys()]) if (closed(key)) map.delete(key);
-    const lanes = lanesFor(label, open);
-    const generation = new Map(lanes.map((l) => [l.key, laneGeneration(l)]));
-    const gen = (key: string): number => generation.get(key) ?? 0;
-    const byId = legacySide.panes && new Map(legacySide.panes.map((p) => [p.pane_id, p]));
-    // A remote lane's newest [REPORT] line: the line the supervisor's screen scraping recorded, against the hash the
-    // runner read from the same pane. Both sides hash with valueHash, so the runner never sends the line itself.
-    const legacy: ShadowUnit[] = lanes.flatMap((l) => [
-      shadowUnit("inventory.pane", l.key, gen(l.key), "pane", l.pane ?? ""),
-      ...(byId ? [shadowUnit("lane.state", l.key, gen(l.key), "alive", paneAlive(byId.get(l.pane ?? "")) ? "yes" : "no")] : []),
-      ...(l.machine && l.lastRemoteReport ? [shadowUnit("lane.report", l.key, gen(l.key), "latest", valueHash(l.lastRemoteReport))] : []),
-    ]);
-    const panes = new Map((entry.inventory ?? []).map((lane) => [lane.key, lane.pane]));
-    for (const [key, pane] of entry.panes) panes.set(key, pane);
-    const runner: ShadowUnit[] = [
-      ...[...panes].filter(([key]) => !closed(key)).map(([key, pane]) => shadowUnit("inventory.pane", key, gen(key), "pane", pane)),
-      ...(byId ? [...entry.states].map(([key, status]) => shadowUnit("lane.state", key, gen(key), "alive", ALIVE.has(status) ? "yes" : "no")) : []),
-      ...[...entry.reports].map(([key, hash]) => shadowUnit("lane.report", key, gen(key), "latest", hash)),
-    ];
-    // Without a legacy pane list, lane.state differences already being watched are held as they are, neither settled
-    // nor reported as timing.
-    const held = (diff: ShadowDiff): boolean => !byId && diff.kind === "lane.state";
-    const watched = entry.pending.filter((diff) => !closed(diff.laneKey));
-    const settled = settleCycle(watched.filter((diff) => !held(diff)), diffUnits(legacy, runner), now, SHADOW_SETTLE_MS);
-    entry.pending = [...settled.pending, ...watched.filter(held)];
-    return settled.report.map((diff) => shadowDiffLine(label, diff));
-  }
-}
-
-// ---------------------------------------------------------------------------------------------------------------
 // Runner side
 // ---------------------------------------------------------------------------------------------------------------
 
-/** One lane as a shadow runner sees it on its host. */
+/** One lane as a runner sees it on its host. */
 export type ObservedLane = InventoryLane & { readonly status: LaneStatus; readonly reportHash?: string };
 
 /**
@@ -502,16 +422,6 @@ export type ObservedLane = InventoryLane & { readonly status: LaneStatus; readon
  */
 export const laneStatus = (pane: Pane | undefined): LaneStatus =>
   !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
-
-/** What a runner sees of the lanes it covers: the registry's open lanes for the label, each matched against herdr's pane list (`laneStatus`). */
-export const observeLanes = (label: string, open: readonly Lane[], panes: readonly Pane[]): ObservedLane[] => {
-  const byId = new Map(panes.map((p) => [p.pane_id, p]));
-  return lanesFor(label, open).flatMap((lane): ObservedLane[] => {
-    const pane = byId.get(lane.pane ?? "");
-    const status = laneStatus(pane);
-    return [{ key: lane.key, pane: lane.pane ?? "", tab: pane?.tab_id ?? lane.tab ?? "", ...(lane.session ? { session: lane.session } : {}), status }];
-  });
-};
 
 export type Every = (ms: number, tick: () => void) => () => void;
 
@@ -529,7 +439,7 @@ export type ServeDeps = {
   /** Runs `tick` every `ms` until the returned stop is called; heartbeats and observations each get their own. */
   readonly every: Every;
   readonly heartbeatMs: number;
-  /** Shadow mode: reads the runner's lanes; absent when the runner only says hello and heartbeats. */
+  /** Reads the runner's lanes; absent when the runner only says hello and heartbeats. */
   readonly observe?: () => Promise<readonly ObservedLane[]>;
   readonly observeMs?: number;
   readonly random?: () => number;
@@ -538,7 +448,7 @@ export type ServeDeps = {
 
 /**
  * The runner's serve loop, as `RunnerClient.run` but with a heartbeat right after each hello and on a timer separate
- * from any work (heartbeats never go through the outbox). In shadow mode a second timer reads the lanes, keeps the
+ * from any work (heartbeats never go through the outbox). With `observe` a second timer reads the lanes, keeps the
  * latest list as the hello inventory, and publishes `lane.state {key, status, pane}` for each lane whose status or pane
  * changed (published through the outbox, so nothing is lost while disconnected). A lane no longer observed is
  * forgotten, so it is published again if it comes back. It changes nothing on the host.
@@ -570,7 +480,7 @@ export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise
   const stopHeartbeat = deps.every(deps.heartbeatMs, () => { deps.client.heartbeat(); });
   let observing = false;
   const stopObserve = deps.observe
-    ? deps.every(deps.observeMs ?? SHADOW_OBSERVE_MS, () => {
+    ? deps.every(deps.observeMs ?? OBSERVE_MS, () => {
         if (observing) return;
         observing = true;
         void observeOnce().finally(() => { observing = false; });
@@ -627,6 +537,14 @@ export const parseEnrollInput = (text: string): { readonly code: string; readonl
   return { code, fingerprint: fp };
 };
 
+/**
+ * What an effect resolves to: a detail string (the proto 2 shape, still accepted), or the detail with the command's
+ * structured result (`CommandResults[type]`), which goes out as `cmd.result.result` and is stored with the record.
+ */
+export type EffectOutput<T extends SupervisorCommandType = SupervisorCommandType> =
+  | string
+  | { readonly detail: string; readonly result?: T extends keyof CommandResults ? CommandResults[T] : JsonValue };
+
 export type DispatchDeps = {
   readonly state: RunnerState;
   readonly policy: RunnerPolicy;
@@ -635,8 +553,11 @@ export type DispatchDeps = {
   /** Publishes the `cmd.result` event (through the outbox). */
   readonly publish: (body: RunnerEventBodies["cmd.result"]) => void;
   readonly log: (line: string) => void;
-  /** The effect of each command type the runner carries out; it resolves to the result detail. Others are unsupported. */
-  readonly effects?: { readonly [T in SupervisorCommandType]?: (command: Extract<AnySupervisorCommand, { readonly type: T }>) => Promise<string> };
+  /**
+   * The effect of each command type the runner carries out; it resolves to the result detail, or to `{detail, result}`.
+   * Others are unsupported.
+   */
+  readonly effects?: { readonly [T in SupervisorCommandType]?: (command: Extract<AnySupervisorCommand, { readonly type: T }>) => Promise<EffectOutput<T>> };
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -645,10 +566,12 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
  * The runner's command dispatcher. For every command the supervisor sends (`runner.rotate` is handled by the client):
  * 1. policy.ts `checkCommand` (schema and the runner's own allow lists); a refusal is recorded final and answered
  *    `cmd.result failed "RUNNER_CMD_REJECTED <rule>"`.
- * 2. The intent row is committed in the state; a cmdId already recorded is not run again.
+ * 2. The intent row is committed in the state; a cmdId already recorded is not run again. A cmdId whose record is
+ *    final is answered again with that record's `cmd.result` (state, detail, stored result), so a resent operation
+ *    gets its answer; one still at `intent` is left alone (its effect is running, or a restart settles it).
  * 3. Right before the effect, fencing.ts `checkEffectEpoch` against a fresh read of `maxEpoch`; a stale command is
  *    recorded and answered `failed` with the `RUNNER_CMD_REJECTED stale-epoch ...` detail.
- * 4. The effect from `effects`: its detail is recorded `verified`, a throw `failed`. A type without one is answered
+ * 4. The effect from `effects`: its detail (and structured result) is recorded `verified`, a throw `failed`. A type without one is answered
  *    `failed "RUNNER_CMD_UNSUPPORTED <type>"`.
  * A frame without a usable cmdId and cmdSeq cannot be answered and is only logged.
  */
@@ -664,22 +587,35 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
   const seq = cmdSeq as number;
   const epoch = isRecord(raw) && Number.isSafeInteger(raw.epoch) ? (raw.epoch as number) : 0;
   const key = typeof body?.key === "string" ? body.key : undefined;
-  const finish = (detail: string, outcome: "verified" | "failed" = "failed"): void => {
-    deps.state.recordResult(cmdId, outcome, detail);
-    deps.publish({ cmdId, cmdSeq: seq, state: outcome, detail });
+  const finish = (detail: string, outcome: "verified" | "failed" = "failed", result?: JsonValue): void => {
+    deps.state.recordResult(cmdId, outcome, detail, result);
+    deps.publish({ cmdId, cmdSeq: seq, state: outcome, detail, ...(result !== undefined ? { result } : {}) });
     deps.log(`${outcome === "verified" ? "RUNNER_CMD_DONE" : "RUNNER_CMD_FAILED"} cmdId=${cmdId} type=${type} ${detail}`);
   };
   const intent = { cmdId, cmdSeq: seq, type: type as SupervisorCommandType, epoch, ...(key !== undefined ? { key } : {}) };
   const checked = checkCommand(deps.policy, raw, deps.realpath);
-  if (!deps.state.recordIntent(intent).fresh) return;
+  const recorded = deps.state.recordIntent(intent);
+  if (!recorded.fresh) {
+    const record = recorded.existing;
+    if (record.state === "intent") return;
+    const detail = record.result ?? "";
+    deps.publish({
+      cmdId, cmdSeq: record.cmdSeq, state: record.state, detail, ...(record.resultValue !== undefined ? { result: record.resultValue } : {}),
+    });
+    deps.log(`RUNNER_CMD_REPLAYED cmdId=${cmdId} type=${record.type} state=${record.state}`);
+    return;
+  }
   if (!checked.ok) { finish(rejectionText(checked.rule)); return; }
   deps.state.observeEpoch(checked.command.epoch);
   const fence = checkEffectEpoch(checked.command.epoch, deps.state.maxEpoch());
   if (!fence.ok) { finish(fence.detail); return; }
-  const effect = deps.effects?.[checked.command.type] as ((command: AnySupervisorCommand) => Promise<string>) | undefined;
+  const effect = deps.effects?.[checked.command.type] as ((command: AnySupervisorCommand) => Promise<EffectOutput>) | undefined;
   if (!effect) { finish(`RUNNER_CMD_UNSUPPORTED ${checked.command.type}`); return; }
   void effect(checked.command).then(
-    (detail) => { finish(detail, "verified"); },
+    (output) => {
+      if (typeof output === "string") finish(output, "verified");
+      else finish(output.detail, "verified", output.result as JsonValue | undefined);
+    },
     (error: unknown) => { finish(`RUNNER_CMD_FAILED ${error instanceof Error ? error.message : String(error)}`); },
   );
 };

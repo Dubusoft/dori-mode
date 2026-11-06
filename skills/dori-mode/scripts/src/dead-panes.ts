@@ -1,9 +1,9 @@
 import type { DoriConfig } from "./config.ts";
+import type { LaneReads } from "./done-flow.ts";
+import type { LaneOps } from "./lane-ops.ts";
 import { appendDeadPaneReport } from "./lane-reports.ts";
-import { ALIVE_STATUSES } from "./panes.ts";
+import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Lane } from "./registry.ts";
-import type { Runner } from "./run.ts";
-import { passthroughView, type SweepView } from "./sweep-view.ts";
 
 /** Unrecognised ticks in a row before one alert names the pane. */
 export const UNRECOGNISED_ALERT_AFTER = 3;
@@ -22,8 +22,9 @@ export const newDeadPaneState = (): DeadPaneState => ({ unknown: new Map(), last
  * else is unrecognised, counted per pane, with one alert after UNRECOGNISED_ALERT_AFTER ticks in a row.
  * A DAG viewer pane in the same tab as a registered lane's pane belongs to that lane and is never counted.
  * A dead pane that is a registered lane's pane also leaves a synthetic `blocked` report row under that lane's key (lane-reports.ts appendDeadPaneReport), so the lane's result is not lost.
+ * Pane lists and tails come from each machine's runner: `view` (the supervisor round's cached reads), else `ops`.
  */
-export const deadPaneTick = async (run: Runner, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState = newDeadPaneState(), lanes: readonly Lane[] = [], view: SweepView = passthroughView(run), now: () => number = Date.now): Promise<string[]> => {
+export const deadPaneTick = async (ops: LaneOps, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState = newDeadPaneState(), lanes: readonly Lane[] = [], view: LaneReads = ops, now: () => number = Date.now): Promise<string[]> => {
   const out: string[] = [];
   const byPane = new Map(lanes.flatMap((lane) => lane.pane ? [[lane.machine ? `${lane.machine}/${lane.pane}` : lane.pane, lane] as const] : []));
   const ctx: Ctx = { byPane, now };
@@ -43,7 +44,7 @@ export const deadPaneTick = async (run: Runner, config: DoriConfig, seen: Set<st
 
 type Ctx = { readonly byPane: ReadonlyMap<string, Lane>; readonly now: () => number };
 
-const inspect = async (view: SweepView, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState, ctx: Ctx, machine?: string, owned?: ReadonlySet<string>): Promise<string[]> => {
+const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState, ctx: Ctx, machine?: string, owned?: ReadonlySet<string>): Promise<string[]> => {
   const out: string[] = [];
   const watch = new Set(config.workspaces);
   const skip = new Set([config.leadPane, ...config.ignorePanes].filter(Boolean));

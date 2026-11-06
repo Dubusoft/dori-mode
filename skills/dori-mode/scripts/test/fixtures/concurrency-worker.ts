@@ -86,16 +86,14 @@ if (mode === "registry-holder" || mode === "registry-publication-holder" || mode
   const { depsFor, fakeClock, newWorld } = await import("../fakes.ts");
   const base = depsFor(newWorld(), fakeClock(1), stateDir);
   const pane = mode === "launch-first" ? "w:p1" : "w:p2";
-  const run: typeof base.run = async (argv, opts) => {
-    if (argv[1] === "tab" && argv[2] === "create") {
-      signal("creating");
-      barrier();
-      return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: pane } } }), err: "" };
-    }
-    return base.run(argv, opts);
+  // The runner's lane.start is the first external write: the tab and the agent.
+  const start: typeof base.ops.start = async () => {
+    signal("creating");
+    barrier();
+    return { pane, tab: "w:t1", startup: { verdict: "ok", detail: "" } };
   };
   try {
-    await launchLane({ ...base, run }, {
+    await launchLane({ ...base, ops: { ...base.ops, start } }, {
       key: "double-lane", title: "race", brief: join(stateDir, `${mode}.md`), done: "merged acme/app#1",
     });
   } catch (error) {

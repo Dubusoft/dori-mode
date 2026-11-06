@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
@@ -15,6 +15,9 @@ const NOW = 1_800_000_000_000;
 const setup = (runners: object | undefined) => {
   const stateDir = mkdtempSync(join(tmpdir(), "runner-doctor-"));
   dirs.push(stateDir);
+  mkdirSync(join(stateDir, ".dori", "runner"), { recursive: true, mode: 0o700 });
+  chmodSync(join(stateDir, ".dori"), 0o700);
+  chmodSync(join(stateDir, ".dori", "runner"), 0o700);
   const config = { ...defaultConfig(), stateDir, store: "json" as const, ...(runners ? { runners } : {}) };
   return { config, stateDir, deps: { config, clock: { now: () => NOW, sleep: async () => {} }, home: stateDir, exists: existsSync } };
 };
@@ -26,16 +29,17 @@ const addRunner = (stateDir: string, label: string, proto: number): void => {
   db.close();
 };
 
-test("without a runners section doctor has no runner checks", () => {
-  expect(runnerChecks(setup(undefined).deps)).toEqual([]);
+test("without a runners section doctor still checks local runner basics", () => {
+  const checks = runnerChecks(setup(undefined).deps);
+  expect(checks.find((c) => c.id === "runner listen")).toMatchObject({ level: "WARN" });
 });
 
 test("a missing listen address warns; a healthy runner is OK", () => {
-  const s = setup({ mode: { "worker-a": "shadow" } });
-  addRunner(s.stateDir, "worker-a", 1);
+  const s = setup({});
+  addRunner(s.stateDir, "worker-a", 2);
   const checks = runnerChecks(s.deps);
   expect(checks.find((c) => c.id === "runner listen")?.level).toBe("WARN");
-  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 1, gen 4, restarts1h 0" });
+  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 2, gen 4, restarts1h 0" });
 });
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
@@ -49,5 +53,5 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   expect(checks.find((c) => c.id === "runner listen")).toMatchObject({ level: "OK", detail: "100.101.1.2:7411 (private)" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
-  expect(row?.detail).toBe("proto 4 is not 2 or 1; restart circuit open (3 restarts in the last hour)");
+  expect(row?.detail).toBe("proto 4 is not 3 or 2; restart circuit open (3 restarts in the last hour)");
 });

@@ -4,9 +4,13 @@ import { join } from "node:path";
 
 import { callerLane, claimDone, closeLane, laneActRefusal, laneSendRefusal, unpushedWork, watchTick } from "../src/done-flow.ts";
 import { lastReportLine } from "../src/freshness.ts";
-import { launchLane } from "../src/launch.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
-import { run } from "../src/run.ts";
+import { run, type Runner } from "../src/run.ts";
+import { laneOps, type LaneOps } from "../src/lane-ops.ts";
+import type { RunnerCall } from "../src/runner/call.ts";
+import { laneGitEffect } from "../src/runner/lane-git.ts";
+import type { AnySupervisorControl, SupervisorCommandBodies } from "../src/runner/protocol.ts";
+import { answerQuery } from "../src/runner/queries.ts";
 import { depsFor, fakeClock, newWorld, withState, type World, WT, withSqliteStore } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -16,8 +20,32 @@ const lane: Lane = { key: "demo-lane", title: "demo", thread: "discord:111/222",
 let state: ReturnType<typeof withState>;
 let world: World;
 const at = (ms: number) => depsFor(world, fakeClock(ms), state.dir);
-const closes = () => world.calls.filter((c) => c[0] === "herdr" && (c[1] === "pane" || c[1] === "tab") && c[2] === "close");
-const removes = () => world.calls.filter((c) => c[0] === "git" && c.includes("worktree") && c.includes("remove"));
+/** The lanes whose runner was asked to close them (`lane.close`). */
+const closes = () => world.ops.filter((e) => e.op === "close").map((e) => e.key);
+const removes = () => world.ops.filter((e) => e.op === "git" && (e.args as { op: string }).op === "worktree-remove");
+
+/**
+ * The lane facade over the runner's own code on this host: `q.lane.inspect`/`q.stat` answered by runner/queries.ts and
+ * `lane.git` by runner/lane-git.ts, both running `run`, so git facts and cleanup are real; every other operation is
+ * `base` (the fake World's). Each `lane.git` is recorded in `w.ops`.
+ */
+const runnerGitOps = (run: Runner, base: LaneOps, w: World): LaneOps => {
+  const call: RunnerCall = {
+    query: async (_label, type, body) =>
+      (await answerQuery({ run, clock: fakeClock(T0), lane: () => undefined }, { type, body: { qid: "q", ...body } } as unknown as AnySupervisorControl)) as never,
+    call: async (_label, type, body, opts) => {
+      if (type !== "lane.git") throw new Error(`unexpected runner command ${type}`);
+      const r = await laneGitEffect(run, body as Omit<SupervisorCommandBodies["lane.git"], "cmdId">);
+      return { cmdId: opts?.cmdId ?? "-", state: "verified", detail: r.detail, result: r.result } as never;
+    },
+    connected: () => true,
+  };
+  const real = laneOps(call, { now: () => T0 });
+  return {
+    ...base, inspect: real.inspect, exists: real.exists,
+    git: async (lane, op, opts) => { w.ops.push({ op: "git", key: lane.key, args: { ...op, ...(opts ? { opts } : {}) } }); return real.git(lane, op, opts); },
+  };
+};
 
 beforeEach(async () => {
   state = withState();
@@ -30,14 +58,11 @@ beforeEach(async () => {
 afterEach(() => state.done());
 
 // Item 1: untracked files count as dirty work.
-test("the dirty check lists untracked files, and an untracked file blocks the automatic close", async () => {
+test("a worktree the runner reads dirty (untracked files count) blocks the automatic close", async () => {
   world.dirty = "?? notes/new-file.ts";
   await claimDone(at(T0), lane, "merged acme/app#1");
   await watchTick(at(T0));
   await watchTick(at(T0 + 6 * MIN));
-  const status = world.calls.find((c) => c[0] === "git" && c.includes("status"));
-  expect(status).toContain("--untracked-files=normal");
-  expect(status).not.toContain("--untracked-files=no");
   expect((await at(T0).registry.read("demo-lane"))?.objection?.reasons).toEqual([`unpushed work in ${WT}`]);
   expect(closes()).toHaveLength(0);
 });
@@ -57,7 +82,8 @@ test("in a real worktree an untracked file is unpushed work and a gitignored fil
   await git("-C", repo, "push", "-q", "origin", "HEAD");
   mkdirSync(join(repo, "build"));
   writeFileSync(join(repo, "build", "out.js"), "ignored");
-  const d = { ...depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo }), run, exists: undefined };
+  const base = depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo });
+  const d = { ...base, run, exists: undefined, ops: runnerGitOps(run, base.ops, world) };
   const real: Lane = { ...lane, cwd: repo, worktrees: [repo] };
   expect(await unpushedWork(d, real)).toEqual([]);
   writeFileSync(join(repo, "draft.md"), "not committed");
@@ -75,13 +101,13 @@ test("dori close refuses unpushed work unless forced, and leaves pane, worktree 
   expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("working");
   const forced = await closeLane(at(T0), lane, "manual", { force: true });
   expect(forced.closed).toBe(true);
-  expect(closes()).toEqual([["herdr", "pane", "close", "w:p1"]]);
+  expect(closes()).toEqual(["demo-lane"]);
 });
 
 test("the worktree is removed before the pane closes, and a failed removal keeps the pane and the lane open", async () => {
   const ok = await closeLane(at(T0), lane, "manual");
   expect(ok.closed).toBe(true);
-  const order = world.calls.map((c) => (c.includes("remove") ? "remove" : c[2] === "close" ? "close" : "")).filter(Boolean);
+  const order = world.ops.map((e) => (e.op === "git" ? "remove" : e.op === "close" ? "close" : "")).filter(Boolean);
   expect(order).toEqual(["remove", "close"]);
 });
 
@@ -99,14 +125,14 @@ test("a lane whose worktree was removed before the close (Toodo got there first)
 
 test("a failed worktree removal refuses the close and keeps the pane, the thread and the lane open", async () => {
   const base = at(T0);
-  const failing = { ...base, run: async (argv: readonly string[]) => (argv.includes("remove") ? { code: 128, out: "", err: "fatal: locked" } : base.run(argv)) };
+  const failing = { ...base, ops: { ...base.ops, git: async () => ({ code: 128, out: "", err: "fatal: locked" }) } };
   const r = await closeLane(failing, lane, "manual");
   expect(r.closed).toBe(false);
   expect(r.lines.at(-1)).toStartWith(`REFUSED demo-lane: worktree ${WT} not removed: fatal: locked`);
   expect(closes()).toHaveLength(0);
   expect(statusOf((await base.registry.read("demo-lane")) ?? lane)).toBe("working");
   expect((await closeLane(failing, lane, "manual", { force: true })).closed).toBe(true);
-  expect(closes()).toEqual([["herdr", "pane", "close", "w:p1"]]);
+  expect(closes()).toEqual(["demo-lane"]);
 });
 
 // Item 3: a close never touches the lane's thread, shared or not; the owner closes it.
@@ -151,59 +177,19 @@ const cli = async (args: string[], env: Record<string, string>) => {
   return { out, err, code };
 };
 
-test("the dori CLI inside a lane refuses close/pause/claim-done on another lane and sends outside its thread", async () => {
+test("the dori CLI inside a lane may not close, pause, resume or send at all, and claims only its own key; the registry is untouched", async () => {
   const d = at(T0);
   await d.registry.write({ ...lane, key: "other-lane", pane: undefined, thread: "discord:111/333" });
-  const inLane = { DORI_LANE_KEY: "demo-lane" };
-  for (const args of [["close", "other-lane"], ["pause", "other-lane"], ["resume", "other-lane"], ["claim-done", "other-lane", "--evidence", "x"]]) {
+  const inLane = { DORI_LANE_KEY: "demo-lane", DORI_LANE_TOKEN: "tok" };
+  for (const args of [["close", "other-lane"], ["pause", "other-lane"], ["resume", "demo-lane"], ["send", "discord", "--to", "discord:111/222", "--text", "hi from Dori"]]) {
     const r = await cli(args, inLane);
-    expect(r.code).toBe(1);
-    expect(r.err).toContain(`LANE_PERMISSION_DENIED lane demo-lane may not ${args[0]} lane other-lane`);
+    expect(r.code).toBe(2);
+    expect(r.err).toStartWith(`DORI_CLI_LANE_ONLY ${args[0]}:`);
   }
-  for (const to of ["discord:111/333", "discord:111/222"]) {
-    const send = await cli(["send", "discord", "--to", to, "--text", "hi from Dori"], inLane);
-    expect(send.code).toBe(1);
-    expect(send.err).toContain("LANE_PERMISSION_DENIED lane demo-lane may not run send; it is lead-only. Ask the lead instead: dori report demo-lane question");
-  }
+  const claim = await cli(["claim-done", "other-lane", "--evidence", "x"], inLane);
+  expect(claim.code).toBe(1);
+  expect(claim.err).toContain("LANE_PERMISSION_DENIED lane demo-lane may report only for itself, not other-lane");
   expect(statusOf((await d.registry.read("other-lane")) ?? lane)).toBe("working");
-});
-
-test("the dori CLI inside a lane claims its own lane when no key is given", async () => {
-  await at(T0).registry.write({ ...lane, pane: undefined });
-  const r = await cli(["claim-done", "--evidence", "merged acme/app#1"], { DORI_LANE_KEY: "demo-lane" });
-  expect(r.code).toBe(0);
-  expect(r.out).toStartWith("LANE_DONE_CLAIMED demo-lane - merged acme/app#1");
-  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("done-claimed");
-});
-
-test("the dori CLI refuses claim-done and report from a replaced session's old pane, and accepts them from the lane's pane", async () => {
-  await at(T0).registry.write({ ...lane, pane: "w:p2" });
-  const old = { DORI_LANE_KEY: "demo-lane", HERDR_PANE_ID: "w:p1" };
-  for (const args of [["claim-done", "--evidence", "merged acme/app#1"], ["report", "demo-lane", "done", "--text", "done", "--evidence", "merged acme/app#1"]]) {
-    const r = await cli(args, old);
-    expect(r.code).toBe(1);
-    expect(r.err).toContain("LANE_STALE_SESSION lane demo-lane is now owned by pane w:p2; this session (pane w:p1) was replaced");
-  }
-  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("working");
-  const report = await cli(["report", "demo-lane", "question", "--text", "which base?"], { DORI_LANE_KEY: "demo-lane", HERDR_PANE_ID: "w:p2" });
-  expect(report.code).toBe(0);
-  expect(report.out).toStartWith("LANE_REPORTED demo-lane:0:");
-});
-
-test("a local lane is launched with DORI_LANE_KEY in its command", async () => {
-  const brief = join(state.dir, "brief.md");
-  writeFileSync(brief, "do the thing\n");
-  const base = at(T0);
-  const d = {
-    ...base,
-    run: async (argv: readonly string[]) =>
-      argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create"
-        ? { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }), err: "" }
-        : base.run(argv),
-  };
-  await launchLane(d, { key: "env-lane", title: "t", brief, done: "merged acme/app#1", cwd: join(state.dir, "nogit") });
-  const command = world.calls.find((c) => c[0] === "herdr" && c[1] === "pane" && c[2] === "run")?.[4] ?? "";
-  expect(command).toStartWith("DORI_LANE_KEY=env-lane ");
 });
 
 // Item 5: the remote [REPORT] matcher is anchored to a whole line.
@@ -225,8 +211,7 @@ test("lastReportLine reads only a whole [REPORT] line, never one inside command 
 test("a remote lane whose screen shows a [REPORT] shape inside command output is not claimed", async () => {
   const remote: Lane = { ...lane, key: "remote-lane", machine: "box", cwd: undefined };
   await at(T0).registry.write(remote);
-  const local = at(T0);
-  const d = { ...local, run: (argv: readonly string[]) => local.run(argv[1] === "--machine" ? [argv[0] ?? "", ...argv.slice(3)] : argv) };
+  const d = at(T0);
   world.screen = "$ grep -rn REPORT docs\ndocs/a.md:3:[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
   expect(await watchTick(d)).toEqual([]);
   expect(statusOf((await at(T0).registry.read("remote-lane")) ?? remote)).toBe("working");

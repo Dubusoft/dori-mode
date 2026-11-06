@@ -47,10 +47,10 @@ test("a stopped agent pane is reported once per hour and the lead pane is never 
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const seen = new Set<string>();
   const st = newDeadPaneState();
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual(["DEAD_PANE w:p1"]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T13", st)).toEqual(["DEAD_PANE w:p1"]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual(["DEAD_PANE w:p1"]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T13", st)).toEqual(["DEAD_PANE w:p1"]);
 });
 
 test("a reworded stop message is not dead: with no alive status it is unrecognised, and repeated reads raise one alert", async () => {
@@ -59,10 +59,10 @@ test("a reworded stop message is not dead: with no alive status it is unrecognis
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const seen = new Set<string>();
   const st = newDeadPaneState();
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual(["UNRECOGNISED_PANE w:p1 dead-panes: no alive status and no dead marker for 3 ticks"]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual(["UNRECOGNISED_PANE w:p1 dead-panes: no alive status and no dead marker for 3 ticks"]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
 });
 
 test("a DAG viewer pane in a registered lane's tab is part of that lane and never raises UNRECOGNISED_PANE", async () => {
@@ -73,7 +73,7 @@ test("a DAG viewer pane in a registered lane's tab is part of that lane and neve
   world.screen = "wave 2/3 running\n";
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const st = newDeadPaneState();
-  for (let i = 0; i < 5; i++) expect(await deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st, [working])).toEqual([]);
+  for (let i = 0; i < 5; i++) expect(await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st, [working])).toEqual([]);
 });
 
 test("a DAG viewer pane outside every lane's tab, and any other unknown pane in a lane's tab, still raise UNRECOGNISED_PANE", async () => {
@@ -85,7 +85,7 @@ test("a DAG viewer pane outside every lane's tab, and any other unknown pane in 
   world.screen = "wave 2/3 running\n";
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const st = newDeadPaneState();
-  const tick = () => deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st, [working]);
+  const tick = () => deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st, [working]);
   expect(await tick()).toEqual([]);
   expect(await tick()).toEqual([]);
   expect(await tick()).toEqual([
@@ -99,8 +99,8 @@ test("a pane whose agent status says it is alive is never reported dead, whateve
   world.screen = "grep output: has stopped\n❯ ";
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const st = newDeadPaneState();
-  expect(await deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st)).toEqual([]);
-  expect(await deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st)).toEqual([]);
 });
 
 test("a dead marker that does not hold to the next tick is never dead", async () => {
@@ -108,7 +108,7 @@ test("a dead marker that does not hold to the next tick is never dead", async ()
   world.screens = ["omo has stopped\n$ ", "redrawing\n", "omo has stopped\n$ ", "redrawing\n"];
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const st = newDeadPaneState();
-  for (let i = 0; i < 4; i++) expect(await deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st)).toEqual([]);
+  for (let i = 0; i < 4; i++) expect(await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st)).toEqual([]);
 });
 
 test("an alive status resets the unrecognised count, so two unknown ticks on each side of it raise no alert", async () => {
@@ -116,7 +116,7 @@ test("an alive status resets the unrecognised count, so two unknown ticks on eac
   world.screen = "something else\n$ ";
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const st = newDeadPaneState();
-  const tick = () => deadPaneTick(deps.run, deps.config, new Set(), "2026-01-01T12", st);
+  const tick = () => deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st);
   expect(await tick()).toEqual([]);
   expect(await tick()).toEqual([]);
   world.panes[0] = { pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" };
@@ -152,31 +152,21 @@ test("a quiet remote lane with no [REPORT] line logs NO-REPORT once, not on ever
   expect((await freshnessTick(deps(T0 + 36 * MIN), "/home/test")).filter((a) => a.lane === "local-lane")).toEqual([]);
 });
 
-test("launch reports STARTUP_OK only on a ready agent status after the screen scan; a blank pane is unconfirmed, a known failure is an error", async () => {
+test("launch reports the runner's startup verdict for the lane's pane: STARTUP_OK, STARTUP_ERROR or STARTUP_UNCONFIRMED with its detail", async () => {
+  // The screen scan and status polls run in the runner (lane.start, runner/lane-control.ts); launch formats its verdict.
   const brief = join(state.dir, "brief.md");
-  const run = async (status: string | undefined, screen: string, key: string) => {
+  const run = async (verdict: "ok" | "error" | "unconfirmed", detail: string, key: string) => {
     writeFileSync(brief, "# brief\n");
     world = newWorld();
-    world.screen = screen;
-    const base = depsFor(world, fakeClock(T0), state.dir);
-    const inner = base.run;
-    const deps = { ...base, run: async (argv: readonly string[]) => {
-      if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }), err: "" };
-      if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "w:p9", workspace_id: "w", ...(status ? { agent: "pi", agent_status: status } : {}) }] } }), err: "" };
-      return inner(argv);
-    } };
-    return (await launchLane(deps, { key, title: "t", brief, done: "closed acme/app#3", cwd: state.dir })).startup;
+    world.startResult = { pane: "w:p9", tab: "w:t9", startup: { verdict, detail } };
+    // Each launch in its own registry: the fake runner reports every cwd as one checkout, which a second open lane may not share.
+    const own = withState();
+    try { return (await launchLane(depsFor(world, fakeClock(T0), own.dir), { key, title: "t", brief, done: "closed acme/app#3", cwd: state.dir })).startup; }
+    finally { own.done(); }
   };
-  expect(await run("idle", "❯ ", "ok-lane")).toBe("STARTUP_OK ok-lane w:p9");
-  expect(await run(undefined, "", "blank-lane")).toStartWith("STARTUP_UNCONFIRMED blank-lane w:p9");
-  expect(await run(undefined, "Error: provider refused the key\n$ ", "worded-lane")).toStartWith("STARTUP_UNCONFIRMED worded-lane w:p9");
-  expect(await run("blocked", "No API key found\n❯ ", "err-lane")).toBe("STARTUP_ERROR err-lane w:p9: No API key");
-  // An idle agent that printed a failure and stopped at its prompt never started the work.
-  expect(await run("idle", "No API key found\n❯ ", "idle-err-lane")).toBe("STARTUP_ERROR idle-err-lane w:p9: No API key");
-  // A working agent has started its task, whatever older screen text says.
-  expect(await run("working", "No API key found\n❯ ", "live-lane")).toBe("STARTUP_OK live-lane w:p9");
-  expect(await run("blocked", "❯ ", "blocked-lane")).toStartWith("STARTUP_UNCONFIRMED blocked-lane w:p9");
-  expect(await run("done", "❯ ", "done-lane")).toStartWith("STARTUP_UNCONFIRMED done-lane w:p9");
+  expect(await run("ok", "", "ok-lane")).toBe("STARTUP_OK ok-lane w:p9");
+  expect(await run("error", "No API key", "err-lane")).toBe("STARTUP_ERROR err-lane w:p9: No API key");
+  expect(await run("unconfirmed", "no ready agent status (idle)", "blank-lane")).toBe("STARTUP_UNCONFIRMED blank-lane w:p9: no ready agent status (idle)");
 });
 
 test("the host guard alerts on low disk, clears when it recovers, and flips compute readiness on load", () => {

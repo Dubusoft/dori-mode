@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src/launch.ts";
+import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { Lane } from "../src/registry.ts";
 import {
   clearLaunchHold, dequeueLaunch, enqueueLaunch, launchGate, launchHeld, launchQueue, launchQueueText,
@@ -82,27 +83,23 @@ test("panesMax 0 means unlimited panes, with a warning on every launch", () => {
 });
 
 // Items 3 and 4: placement and threads
-/** deps whose git knows checkouts: dir -> [toplevel, remote url]; a new tab is created for each launch. */
+/** deps whose local runner knows git checkouts: dir -> [toplevel, origin url]; every start opens a new pane. */
 const deps = (repos: Record<string, readonly [string, string]> = {}) => {
   const base = depsFor(world, fakeClock(T0), state.dir);
-  return {
-    ...base,
-    run: async (argv: readonly string[]) => {
-      if (argv[0] === "git" && argv[1] === "-C") {
-        world.calls.push([...argv]);
-        const dir = argv[2] ?? "";
-        const repo = repos[dir] ?? Object.values(repos).find(([top]) => top === dir);
-        if (argv[3] === "rev-parse") return repo ? { code: 0, out: `${repo[0]}\n`, err: "" } : { code: 128, out: "", err: "not a git repository" };
-        if (argv[3] === "remote") return { code: 0, out: repo ? `origin\t${repo[1]} (fetch)\norigin\t${repo[1]} (push)\n` : "", err: "" };
-      }
-      if (argv[1] === "tab" && argv[2] === "create") { world.calls.push([...argv]); return { code: 0, out: JSON.stringify({ result: { tab_id: "w:t9", root_pane: { pane_id: `w:p${world.calls.length}` } } }), err: "" }; }
-      return base.run(argv);
+  const ops: LaneOps = {
+    ...base.ops,
+    inspect: async (lane, want) => {
+      world.ops.push({ op: "inspect", key: lane.key, args: { lane, want } });
+      const dir = want.cwd ?? lane.cwd ?? "";
+      const repo = repos[dir] ?? Object.values(repos).find(([top]) => top === dir);
+      return { status: "missing", cwd: dir, cwdExists: true, ...(want.git ? { git: { worktrees: [], ...(repo ? { toplevel: repo[0], origin: repo[1] } : {}) } } : {}) };
     },
   };
+  return { ...base, ops };
 };
 const brief = () => { const b = join(state.dir, `brief-${Math.random()}.md`); writeFileSync(b, "goal\n"); return b; };
 const input = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, brief: brief(), done: "merged acme/app#1", ...extra });
-const tabs = () => world.calls.filter((c) => c[1] === "tab" && c[2] === "create");
+const tabs = () => world.ops.filter((e) => e.op === "start");
 
 test("git remote URLs of every common form name their owner/repo", () => {
   expect(remoteRepo("git@github.com:Acme/App.git")).toBe("acme/app");
@@ -161,13 +158,13 @@ for (const conflict of ["key", "thread", "checkout"] as const) {
     const entered = Promise.withResolvers<void>();
     const proceed = Promise.withResolvers<void>();
     let creates = 0;
-    const d = { ...base, run: async (argv: readonly string[]) => {
-      if (argv[1] === "tab" && argv[2] === "create" && ++creates === 1) {
+    const d = { ...base, ops: { ...base.ops, start: async (start: Parameters<LaneOps["start"]>[0]) => {
+      if (++creates === 1) {
         entered.resolve();
         await proceed.promise;
       }
-      return base.run(argv);
-    } };
+      return base.ops.start(start);
+    } } };
     const placement = conflict === "checkout" ? { cwd: "/repos/app" } : { cwd: "/scratch" };
     const first = launchLane(d, input("first-lane", { ...placement, thread: "discord:one" }));
     let error: unknown;
@@ -188,14 +185,13 @@ for (const conflict of ["key", "thread", "checkout"] as const) {
 test("a failed launch releases only its reservation and allows retrying the key", async () => {
   const base = deps();
   const entry = input("retry-lane", { cwd: "/scratch" });
-  const d = { ...base, run: async (argv: readonly string[]) => argv[1] === "tab" && argv[2] === "create"
-    ? { code: 1, out: "", err: "create failed" } : base.run(argv) };
+  const d = { ...base, ops: { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.start herdr tab create failed: create failed"); } } };
   await expect(launchLane(d, entry)).rejects.toThrow("create failed");
   expect(await d.registry.read(entry.key)).toBeNull();
   await expect(launchLane(base, entry)).resolves.toMatchObject({ lane: { key: entry.key } });
 });
 
-test("a registration failure after agent admission keeps its paused reservation and pane visible", async () => {
+test("a registration failure after the runner started the agent keeps its paused reservation visible", async () => {
   const base = deps();
   let admitted = false;
   const update = base.registry.update.bind(base.registry);
@@ -203,13 +199,15 @@ test("a registration failure after agent admission keeps its paused reservation 
     if (admitted) return Promise.reject(new Error("registration disk error"));
     return update(key, mutate);
   });
-  const d = { ...base, run: async (argv: readonly string[]) => {
-    if (argv[1] === "pane" && argv[2] === "run") admitted = true;
-    return base.run(argv);
-  } };
+  const d = { ...base, ops: { ...base.ops, start: async (start: Parameters<LaneOps["start"]>[0]) => {
+    const started = await base.ops.start(start);
+    admitted = true;
+    return started;
+  } } };
   try {
     await expect(launchLane(d, input("visible-lane", { cwd: "/scratch" }))).rejects.toThrow("registration disk error");
-    expect(await d.registry.read("visible-lane")).toMatchObject({ status: "paused", pane: expect.any(String), launchReservation: expect.any(String) });
+    // The reservation is not released: the runner owns a live agent for this key, and its lane.started fills the pane in.
+    expect(await d.registry.read("visible-lane")).toMatchObject({ status: "paused", runner: "local", launchReservation: expect.any(String) });
   } finally { spy.mockRestore(); }
 });
 

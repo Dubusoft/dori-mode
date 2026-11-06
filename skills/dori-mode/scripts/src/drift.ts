@@ -6,7 +6,7 @@ import type { Emit } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import type { LaneReport, LaneReportStore } from "./lane-reports.ts";
 import { type Lane, statusOf } from "./registry.ts";
-import type { Runner } from "./run.ts";
+import type { LaneOps } from "./lane-ops.ts";
 
 /**
  * Lane drift (urgent LANE_DRIFT): machine-detectable deviations of a working lane, raised by the supervisor itself. The
@@ -84,11 +84,11 @@ export type PullOwners = (lanes: readonly Lane[], pulls: readonly OpenPull[]) =>
 const pullKey = (pull: Pick<OpenPull, "repo" | "number">): string => `${pull.repo.toLowerCase()}#${pull.number}`;
 
 /** The same ownership rule as CI follow-up: oldest open lane whose Done signal or local worktree branch names the same-repo PR. */
-export const pullOwners = (run: Runner): PullOwners => async (lanes, pulls) => {
+export const pullOwners = (ops: Pick<LaneOps, "inspect">): PullOwners => async (lanes, pulls) => {
   const owner = new Map<string, string>();
   const sorted = [...lanes].sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.key.localeCompare(b.key));
   for (const lane of sorted) {
-    for (const [repo, targets] of await githubTargets([lane], run)) {
+    for (const [repo, targets] of await githubTargets([lane], ops)) {
       for (const pull of pulls) {
         if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || targets.branches.has(pull.branch))) continue;
         if (!owner.has(pullKey(pull))) owner.set(pullKey(pull), lane.key);

@@ -8,11 +8,11 @@ import { RunnerClient } from "../src/runner/client.ts";
 import { runStartupCheck } from "../src/runner/fs-safety.ts";
 import { HUB_FILE, readRunnerRows } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { loadIdentity, type ObservedLane, SHADOW_SETTLE_MS, serveRunner, trackedConnector } from "../src/runner/serve.ts";
+import { loadIdentity, type ObservedLane, serveRunner, trackedConnector } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
-import { openRunnerHub, runnersPass } from "../src/supervise-loop.ts";
+import { openRunnerHub } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -33,7 +33,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const stateDir = join(state.dir, "state");
   const runnerDir = join(state.dir, "runner");
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
-  const deps = depsFor(newWorld(), clock, stateDir, { runners: { mode: { local: "shadow" } } });
+  const deps = depsFor(newWorld(), clock, stateDir, { runners: {} });
 
   // Supervisor side: the hub on <runnerDir>/sock/control, as supervise() opens it; it enrolls the local runner in-process.
   const logs: string[] = [];
@@ -41,6 +41,8 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const heartbeats = waiter<string>();
   const hub = openRunnerHub(stateDir, runnerDir, clock.now, clock.now, (line) => { logs.push(line); logged.see(line); }, {
     onHeartbeat: (label) => { heartbeats.see(label); }, hostId: "host-a",
+    // RunnerCalls timeouts never fire here: the test settles every pending query itself.
+    timers: { set: () => 0, clear: () => {} },
   });
   cleanups.push(() => hub.close());
   expect(statSync(join(runnerDir, "sock")).mode & 0o777).toBe(0o700);
@@ -81,21 +83,16 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(renderStatus(status)).toContain("RUNNER local connected proto=2 version=- gen=1 hb=0 outbox=");
+  expect(renderStatus(status)).toContain("RUNNER local connected proto=3 version=- gen=1 hb=0 outbox=");
   // lanes= counts the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
   expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=0$/m);
 
-  // Shadow: the registry has no lane "demo", so once a difference has persisted SHADOW_SETTLE_MS each unit is
-  // reported missing-in-legacy.
-  const shadowLines: string[] = [];
-  const side = (now: number) => ({ now, panes: async () => [], archived: () => deps.registry.archivedKeys(), error: (line: string) => { shadowLines.push(line); } });
-  await runnersPass(hub, deps.config, () => deps.registry.open(), side(clock.now()), (line) => { shadowLines.push(line); });
-  expect(shadowLines).toEqual([]);
-  await runnersPass(hub, deps.config, () => deps.registry.open(), side(clock.now() + SHADOW_SETTLE_MS), (line) => { shadowLines.push(line); });
-  expect(shadowLines.map((line) => line.split(" ").slice(0, 6).join(" "))).toEqual([
-    "RUNNER_SHADOW_DIFF runner=local class=missing-in-legacy kind=inventory.pane lane=demo gen=0",
-    "RUNNER_SHADOW_DIFF runner=local class=missing-in-legacy kind=lane.state lane=demo gen=0",
-  ]);
+  // The handle's RunnerCalls: a label with no connection fails closed at once; a query pending on the live connection
+  // (this client has no query dispatcher, so it stays unanswered) is rejected when the connection closes.
+  expect(hub.calls.connected("local")).toBe(true);
+  await expect(hub.calls.query("box", "q.panes", {})).rejects.toMatchObject({ code: "RUNNER_UNAVAILABLE", why: "disconnected" });
+  const pendingQuery = hub.calls.query("local", "q.panes", {}).then(() => undefined, (e: unknown) => e);
+  expect(hub.calls.pending()).toBe(1);
 
   // Past the stale threshold with no heartbeat the line reads stale; the runner stopping reads offline.
   clock.at += 61_000;
@@ -104,15 +101,17 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   controller.abort();
   await serving;
   await gone;
+  expect(await pendingQuery).toMatchObject({ code: "RUNNER_UNAVAILABLE", why: "disconnected" });
+  expect(hub.calls.pending()).toBe(0);
   expect(readRunnerRows(stateDir)[0]?.disconnectedAt).toBe(clock.at);
   expect(renderStatus(await collectStatus(deps))).toContain("RUNNER local offline ");
 });
 
-test("without a runners section dori status shows no runner lines", async () => {
+test("without a runners section dori status still shows the local runner, offline until it says hello", async () => {
   const state = withState();
   cleanups.push(state.done);
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
   const status = await collectStatus(depsFor(newWorld(), clock, state.dir));
-  expect(status.runners).toEqual([]);
-  expect(renderStatus(status)).not.toContain("RUNNER ");
+  expect(status.runners?.map((r) => [r.label, r.state])).toEqual([["local", "offline"]]);
+  expect(renderStatus(status).split("\n").filter((line) => line.startsWith("RUNNER "))).toEqual(["RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0"]);
 });

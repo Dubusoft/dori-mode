@@ -1,15 +1,16 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, closeSync, openSync } from "node:fs";
 import { join } from "node:path";
-import type { CommandOutcome, SupervisorCommandType } from "./protocol.ts";
+import type { CommandOutcome, JsonValue, SupervisorCommandType } from "./protocol.ts";
 
 /**
  * The runner's own durable state (`<runnerDir>/state.sqlite`, 0600 with its WAL):
  * - `gen`: bumped by `boot()` in one committed transaction before the first hello of a process;
  * - `maxEpoch`: the highest supervisor epoch seen; a command whose epoch is lower is stale and is refused right
  *   before its effect;
- * - `commands`: `{cmdId, cmdSeq, type, key, epoch, state, result}`; the intent row is committed before the effect,
- *   the result after it;
+ * - `commands`: `{cmdId, cmdSeq, type, key, epoch, state, result, result_json}`; the intent row is committed before
+ *   the effect, the result after it. `result` is the detail text, `result_json` (added in proto 3 with `ALTER TABLE`,
+ *   nullable) the effect's structured result, so a resent cmdId can be answered again in full;
  * - `cmdAck`: the highest `cmdSeq` such that every `cmdSeq` up to it has a final (non-intent) row.
  */
 
@@ -28,6 +29,8 @@ export type CommandRecord = {
   readonly epoch: number;
   readonly state: CommandRowState;
   readonly result?: string;
+  /** The structured result stored with the final state (`result_json`); absent on old rows and detail-only results. */
+  readonly resultValue?: JsonValue;
   readonly at: number;
   readonly updatedAt: number;
 };
@@ -44,23 +47,34 @@ type CommandRow = {
   epoch: number;
   state: string;
   result: string | null;
+  result_json: string | null;
   at: number;
   updated_at: number;
 };
 
-const COLUMNS = "cmdId, cmdSeq, type, key, epoch, state, result, at, updated_at";
+const COLUMNS = "cmdId, cmdSeq, type, key, epoch, state, result, result_json, at, updated_at";
 
-const toRecord = (row: CommandRow): CommandRecord => ({
-  cmdId: row.cmdId,
-  cmdSeq: row.cmdSeq,
-  type: row.type as SupervisorCommandType,
-  ...(row.key === null ? {} : { key: row.key }),
-  epoch: row.epoch,
-  state: row.state as CommandRowState,
-  ...(row.result === null ? {} : { result: row.result }),
-  at: row.at,
-  updatedAt: row.updated_at,
-});
+/** A stored structured result; a value that does not parse reads as absent rather than breaking the record. */
+const parseResult = (text: string | null): JsonValue | undefined => {
+  if (text === null) return undefined;
+  try { return JSON.parse(text) as JsonValue; } catch { return undefined; }
+};
+
+const toRecord = (row: CommandRow): CommandRecord => {
+  const resultValue = parseResult(row.result_json);
+  return {
+    cmdId: row.cmdId,
+    cmdSeq: row.cmdSeq,
+    type: row.type as SupervisorCommandType,
+    ...(row.key === null ? {} : { key: row.key }),
+    epoch: row.epoch,
+    state: row.state as CommandRowState,
+    ...(row.result === null ? {} : { result: row.result }),
+    ...(resultValue === undefined ? {} : { resultValue }),
+    at: row.at,
+    updatedAt: row.updated_at,
+  };
+};
 
 export class RunnerState {
   private readonly db: Database;
@@ -92,6 +106,9 @@ export class RunnerState {
         updated_at INTEGER NOT NULL
       );
     `);
+    // A state file from before proto 3 has no result_json; add it nullable so its rows keep loading.
+    const columns = this.db.query("PRAGMA table_info(commands)").all() as { name: string }[];
+    if (!columns.some((c) => c.name === "result_json")) this.db.exec("ALTER TABLE commands ADD COLUMN result_json TEXT");
   }
 
   private meta(name: string): number {
@@ -145,11 +162,11 @@ export class RunnerState {
     }).immediate();
   }
 
-  /** Commits the final state and result of a recorded command. */
-  recordResult(cmdId: string, state: CommandOutcome, result: string): void {
+  /** Commits the final state, the detail and (optionally) the structured result of a recorded command. */
+  recordResult(cmdId: string, state: CommandOutcome, result: string, value?: JsonValue): void {
     const changes = this.db
-      .query("UPDATE commands SET state = ?, result = ?, updated_at = ? WHERE cmdId = ?")
-      .run(state, result, this.now(), cmdId).changes;
+      .query("UPDATE commands SET state = ?, result = ?, result_json = ?, updated_at = ? WHERE cmdId = ?")
+      .run(state, result, value === undefined ? null : JSON.stringify(value), this.now(), cmdId).changes;
     if (changes === 0) throw new Error(`RUNNER_STATE no intent recorded for ${cmdId}`);
   }
 

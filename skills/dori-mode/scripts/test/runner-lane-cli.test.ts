@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GUARD_AGENT_TEMPLATE } from "../src/remote-guard.ts";
@@ -76,19 +76,94 @@ test("over a real unix socket the lane socket answers a report and refuses a for
   }
 });
 
-test("any other command exits 2 with DORI_CLI_UNSUPPORTED_ON_RUNNER", async () => {
-  for (const sub of ["send", "launch", "serve", "close"]) {
+test("any other command exits 2 with DORI_CLI_LANE_ONLY", async () => {
+  for (const sub of ["send", "launch", "serve", "close", "wait"]) {
     const r = io();
     expect(await laneCliMain([sub, "lane-a", "hi"], { env, connect: laneSocket().connect, ...r.deps })).toBe(2);
-    expect(r.err[0]).toStartWith(`DORI_CLI_UNSUPPORTED_ON_RUNNER ${sub}`);
+    expect(r.err[0]).toStartWith(`DORI_CLI_LANE_ONLY ${sub}:`);
   }
+  const other = io();
+  expect(await laneCliMain(["lane", "list"], { env, connect: laneSocket().connect, ...other.deps })).toBe(2);
+  expect(other.err[0]).toStartWith("DORI_CLI_LANE_ONLY lane list:");
+});
+
+/** A connector over a scripted reply: records each request body the lane CLI sends. */
+const scripted = (reply: object, requests: object[]): Connector => async () => {
+  const lines = new Set<(l: string) => void>();
+  return {
+    send: (line) => { requests.push(JSON.parse(line)); queueMicrotask(() => { for (const h of lines) h(JSON.stringify(reply)); }); },
+    onLine: (h) => { lines.add(h); return () => { lines.delete(h); }; },
+    onClose: () => () => {}, close: () => {}, open: true,
+  } satisfies Transport;
+};
+
+test("lane status sends {kind:status} and prints the reply; report ack sends {kind:ack}", async () => {
+  const requests: object[] = [];
+  const status = { ok: true, status: "done-claimed", objection: null, claim: { at: "t", evidence: "abc" } };
+  const s = io();
+  expect(await laneCliMain(["lane", "status"], { env, connect: scripted(status, requests), ...s.deps })).toBe(0);
+  expect(requests).toEqual([{ kind: "status", key: "lane-a", token: "tok-a" }]);
+  expect(JSON.parse(s.out[0] as string)).toEqual({ status: "done-claimed", objection: null, claim: { at: "t", evidence: "abc" } });
+
+  const wrong = io();
+  expect(await laneCliMain(["lane", "status", "lane-b"], { env, connect: scripted(status, requests), ...wrong.deps })).toBe(1);
+  expect(wrong.err[0]).toStartWith("LANE_PERMISSION_DENIED");
+
+  const a = io();
+  expect(await laneCliMain(["report", "ack", "m-1"], { env, connect: scripted({ ok: true }, requests), ...a.deps })).toBe(0);
+  expect(requests.at(-1)).toEqual({ kind: "ack", id: "m-1", key: "lane-a", token: "tok-a" });
+  expect(a.out[0]).toContain("m-1");
+});
+
+test("the token falls back to briefs/<key>.token under the runner dir", async () => {
+  const requests: object[] = [];
+  const r = io();
+  const code = await laneCliMain(["lane", "status"], {
+    env: { DORI_LANE_KEY: "lane-a" }, connect: scripted({ ok: true, status: "working" }, requests), ...r.deps,
+    runnerDir: "/r", readFile: (p) => { if (p === "/r/briefs/lane-a.token") return "file-tok\n"; throw new Error("ENOENT"); },
+  });
+  expect(code).toBe(0);
+  expect(requests).toEqual([{ kind: "status", key: "lane-a", token: "file-tok" }]);
+});
+
+test("the socket client retries ENOENT/ECONNREFUSED every second for 60 s on the injected clock", async () => {
+  let now = 0;
+  const sleeps: number[] = [];
+  const clock = { now: () => now, sleep: async (ms: number) => { sleeps.push(ms); now += ms; } };
+  const requests: object[] = [];
+  let calls = 0;
+  const inner = scripted({ ok: true, status: "working" }, requests);
+  const flaky: Connector = async () => {
+    calls += 1;
+    if (calls <= 3) throw Object.assign(new Error("connect failed"), { code: calls === 1 ? "ENOENT" : "ECONNREFUSED" });
+    return inner();
+  };
+  const ok = io();
+  expect(await laneCliMain(["lane", "status"], { env, connect: flaky, clock, ...ok.deps })).toBe(0);
+  expect(sleeps).toEqual([1000, 1000, 1000]);
+
+  now = 0; sleeps.length = 0;
+  const never: Connector = async () => { throw Object.assign(new Error("connect ENOENT /x"), { code: "ENOENT" }); };
+  const bad = io();
+  expect(await laneCliMain(["lane", "status"], { env, connect: never, clock, ...bad.deps })).toBe(1);
+  expect(bad.err[0]).toStartWith("RUNNER_LANE_SOCKET_UNAVAILABLE");
+  expect(sleeps).toHaveLength(60);
+  expect(now).toBe(60_000);
+
+  const other: Connector = async () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); };
+  const eacces = io();
+  expect(await laneCliMain(["lane", "status"], { env, connect: other, clock, ...eacces.deps })).toBe(1);
+  expect(sleeps).toHaveLength(60);
 });
 
 test("dori heavy waits for ~/.dori/heavy/slot.1 that guard-agent.sh heavy holds, then takes it", async () => {
   const home = mkdtempSync(join(tmpdir(), "runner-lane-heavy-"));
   dirs.push(home);
-  const agent = Bun.spawn(["sh", GUARD_AGENT_TEMPLATE, "heavy", "old-footer", "--", "sh", "-c", "echo HOLDING; cat"], {
-    env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  // The old footer's job holds the slot until the test writes to this fifo: no stdin pipe whose early close would free it.
+  const release = join(home, "release.fifo");
+  expect(Bun.spawnSync(["mkfifo", release]).exitCode).toBe(0);
+  const agent = Bun.spawn(["sh", GUARD_AGENT_TEMPLATE, "heavy", "old-footer", "--", "sh", "-c", 'echo HOLDING; cat "$0" >/dev/null', release], {
+    env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
   const reader = agent.stdout.getReader();
   const first = new TextDecoder().decode((await reader.read()).value);
@@ -104,7 +179,7 @@ test("dori heavy waits for ~/.dori/heavy/slot.1 that guard-agent.sh heavy holds,
     clock: {
       now: () => 0,
       // The first wait is where the old footer's job ends and frees the slot.
-      sleep: async () => { waited += 1; if (waited === 1) { agent.stdin.end(); await agent.exited; } },
+      sleep: async () => { waited += 1; if (waited === 1) { writeFileSync(release, ""); await agent.exited; } },
     },
     spawn: async () => { ownerWhileRunning = readFileSync(join(slot, "owner"), "utf8"); return 0; },
   });

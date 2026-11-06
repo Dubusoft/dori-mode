@@ -29,7 +29,7 @@ const lane = (key: string, pane: string): Lane => ({
   key, title: key, thread: "chat:team/9", pane, brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0,
 });
 
-test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep no herdr call; once rows stop for nudgeAfterMin the pane is read again", async (_name, open) => {
+test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep no pane read; once rows stop for nudgeAfterMin the pane is read again", async (_name, open) => {
   const state = withState();
   cleanups.push(state.done);
   const world = newWorld();
@@ -47,10 +47,12 @@ test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep n
   cleanups.push(() => { store.close(); });
   // Silent by replies past both nudgeAfterMin (15) and postAfterMin (20), but every lane wrote a row 11 min ago: nothing to read or post.
   expect(await freshnessTick(deps(T0 + 21 * MIN), "/home/test", undefined, store)).toEqual([]);
+  expect(world.ops).toEqual([]);
   expect(world.calls.filter((c) => c[0] === "herdr")).toEqual([]);
   // Without the store the same tick nudges every lane and reads every pane for its last [REPORT] line, as before.
   expect((await freshnessTick(deps(T0 + 21 * MIN), "/home/test")).filter((a) => a.kind === "nudged")).toHaveLength(100);
-  expect(world.calls.filter((c) => c[0] === "herdr" && c[2] === "read")).toHaveLength(100);
+  expect(world.ops.filter((e) => e.op === "screen")).toHaveLength(100);
+  expect(world.ops.filter((e) => e.op === "send")).toHaveLength(100);
 });
 
 test("a lane with no row, or whose last row is older than nudgeAfterMin, keeps the screen-based nudge counted from that row", async () => {

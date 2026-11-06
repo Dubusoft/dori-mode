@@ -1,13 +1,7 @@
 import type { Clock, Runner } from "./run.ts";
-import type { Lane } from "./registry.ts";
+import { agentRefusal, ALIVE_STATUSES } from "./pane-state.ts";
 
-/** Herdr IDs belong to a server, not to the host running Dori. */
-export const herdrArgv = (lane: Pick<Lane, "machine">, args: readonly string[]): string[] =>
-  ["herdr", ...(lane.machine ? ["--machine", lane.machine] : []), ...args];
-
-/** Scope existing pane helpers to a lane; nested lifecycle calls must not add the selector twice. */
-export const laneRunner = (run: Runner, lane: Pick<Lane, "machine">): Runner =>
-  lane.machine ? (argv, opts) => run(argv[0] === "herdr" && argv[1] !== "--machine" ? herdrArgv(lane, argv.slice(1)) : argv, opts) : run;
+export { agentRefusal, ALIVE_STATUSES };
 
 export type Pane = {
   readonly pane_id: string;
@@ -35,9 +29,6 @@ export const listPanes = async (run: Runner): Promise<Pane[]> => {
 
 export const readScreen = async (run: Runner, pane: string, lines?: number): Promise<string> =>
   (await run(["herdr", "pane", "read", pane, "--source", lines ? "recent" : "visible", ...(lines ? ["--lines", String(lines)] : [])])).out;
-
-/** States herdr reports for a pane whose agent is running. A screen read never stands in for these. */
-export const ALIVE_STATUSES: ReadonlySet<string> = new Set(["idle", "working", "blocked", "done"]);
 
 /** A lane's agent is alive when its pane is in herdr's pane list and its agent_status is one of ALIVE_STATUSES. */
 export const paneAlive = (pane: Pane | undefined): boolean =>
@@ -113,14 +104,6 @@ export const leftInInput = async (run: Runner, clock: Clock, pane: string, text:
   if (!(await stuck())) return false;
   console.error(`sendVerified ${pane}: text still in the input line after a second Enter`);
   return true;
-};
-
-/** Why `pane` cannot take typed text as an agent prompt: missing from the list, or no agent runs in it (only a shell). */
-export const agentRefusal = (panes: readonly Pane[], pane: string): string | undefined => {
-  const found = panes.find((p) => p.pane_id === pane);
-  if (!found) return `pane ${pane} missing`;
-  if (!found.agent) return `pane ${pane} runs no agent`;
-  return undefined;
 };
 
 /** Sleeps between successive status lookups after Enter; the first lookup is immediate. */

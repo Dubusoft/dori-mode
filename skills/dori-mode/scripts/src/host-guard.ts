@@ -35,16 +35,14 @@ const parseMemInfo = (text: string): Pick<HostSample, "memFreePct" | "swapFreeGb
 /** The filesystem the disk guard checks: `diskGuardPath`, else the one holding the state directory. */
 export const diskGuardPath = (config: Pick<DoriConfig, "diskGuardPath" | "stateDir">): string => config.diskGuardPath?.trim() || config.stateDir;
 
-const listedPanes = async (run: Runner): Promise<number> => {
-  const pl = await run(["herdr", "pane", "list"]);
-  return pl.code === 0 ? (JSON.parse(pl.out) as { result: { panes: unknown[] } }).result.panes.length : -1;
-};
-
-/** `paneCount` (-1 when unreadable) defaults to its own `herdr pane list`; the supervisor passes its round's snapshot. */
+/**
+ * One host sample. `paneCount` (-1 when unreadable) is the caller's: a runner counts its own herdr panes, the
+ * supervisor (which reaches no pane) passes `async () => -1` when it needs only the load.
+ */
 export const sampleHost = async (
   run: Runner,
-  dataPath = "/",
-  paneCount: () => Promise<number> = () => listedPanes(run),
+  dataPath: string,
+  paneCount: () => Promise<number>,
   readMemInfo: MemInfoReader = (path) => readFile(path, "utf8"),
 ): Promise<HostSample> => {
   const linux = process.platform === "linux";

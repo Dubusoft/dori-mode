@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
@@ -14,9 +14,10 @@ import type { Ran } from "../src/run.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const TOKEN = "secret-token-xyz";
+const PATH = process.env.PATH;
 const NOW = 1_800_000_000_000;
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const done of cleanups.splice(0)) done(); });
+afterEach(() => { for (const done of cleanups.splice(0)) done(); process.env.PATH = PATH; });
 
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
 const no = (out = "", code = 1): Ran => ({ code, out, err: "" });
@@ -26,6 +27,8 @@ const happyRun: Record<string, Ran> = {
   "systemctl --user is-active herdr-server.service": ok("active"),
   "systemctl --user is-enabled dori-supervisor.service": ok("enabled"),
   "systemctl --user is-active dori-supervisor.service": ok("active"),
+  "systemctl --user is-enabled dori-runner.service": no("disabled"),
+  "systemctl --user is-active dori-runner.service": no("inactive", 3),
   "systemctl --user is-enabled dori-presence.service": no("disabled"),
   "systemctl --user is-active dori-presence.service": no("inactive", 3),
   "pgrep -f (dori|cli\\.ts) presence": no(),
@@ -48,6 +51,9 @@ type Patch = { run?: Record<string, Ran>; http?: Record<string, ReturnType<typeo
 const fixture = (patch: Patch = {}) => {
   const state = withState();
   cleanups.push(state.done);
+  mkdirSync(join(state.dir, ".dori", "runner"), { recursive: true });
+  chmodSync(join(state.dir, ".dori", "runner"), 0o700);
+  chmodSync(join(state.dir, ".dori"), 0o700);
   const table = { ...happyRun, ...patch.run };
   const routes = { ...happyHttp, ...patch.http };
   const calls: string[] = [];
@@ -76,6 +82,7 @@ const fixture = (patch: Patch = {}) => {
     run, http, clock, configPath: "/home/test/config.json", envPath: "/home/test/.dori/env", token: TOKEN, tokenSource: "file", exists: () => true, home: state.dir,
     config: {
       ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
+      runners: { listen: "100.101.1.2:7411", restartCircuit: { max: 3, windowMs: 3_600_000 } },
       memoryCheck: { ...defaultConfig("/home/test").memoryCheck, repo: join(state.dir, "memory") },
       discordChannels: ["500"], discord: { applicationId: "100", guildId: "200", ownerId: "300" },
     },
@@ -103,6 +110,27 @@ test("doctor only reads: no unit changes and Discord is GET only", async () => {
   expect(f.calls.filter((c) => /^systemctl --user (enable|disable|start|stop|restart|daemon-reload)/.test(c) || /^kill /.test(c))).toEqual([]);
   expect(f.requests.length).toBeGreaterThan(0);
   expect(f.requests.every((r) => r.method === "GET")).toBe(true);
+});
+
+test("doctor warns when the installed lane sandbox differs from the template", async () => {
+  const f = fixture();
+  const installed = join(f.deps.home, ".local", "bin", "lane-sandbox");
+  mkdirSync(join(f.deps.home, ".local", "bin"), { recursive: true });
+  mkdirSync(join(f.deps.home, ".dori", "runner"), { recursive: true });
+  chmodSync(join(f.deps.home, ".dori", "runner"), 0o700);
+  chmodSync(join(f.deps.home, ".dori"), 0o700);
+  writeFileSync(installed, "old sandbox");
+  const path = process.env.PATH;
+  process.env.PATH = `${join(f.deps.home, ".local", "bin")}:${path ?? ""}`;
+  const check = find(await runDoctor(f.deps), "lane sandbox");
+  expect(check).toMatchObject({ level: "WARN" });
+  expect(check.detail).toContain("LANE_SANDBOX_OUTDATED");
+  process.env.PATH = path;
+});
+
+test("doctor warns when the obsolete local runner unit is enabled", async () => {
+  const f = fixture({ run: { "systemctl --user is-enabled dori-runner.service": ok("enabled") } });
+  expect(find(await runDoctor(f.deps), "runner unit")).toMatchObject({ level: "WARN", detail: expect.stringContaining("supervisor runs the local runner itself") });
 });
 
 test("doctor warns when a lead restart is pending without consuming it or touching the warm lead", async () => {

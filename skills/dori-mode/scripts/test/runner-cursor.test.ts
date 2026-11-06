@@ -8,7 +8,9 @@ import { RunnerClient, backoffMs } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { memoryNetwork } from "../src/runner/transport.ts";
-import { journalId, runnerControl, runnerEvent } from "../src/runner/protocol.ts";
+import {
+  decodeFrame, encodeFrame, isQueryType, journalId, PROTO, QUERY_TYPES, runnerControl, runnerEvent, SUPERVISOR_CONTROL_TYPES, supervisorControl,
+} from "../src/runner/protocol.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const LABEL = "r1";
@@ -154,7 +156,7 @@ describe("event cursor over a lossy in-memory link", () => {
 });
 
 describe("hub commit-then-ack", () => {
-  const hello = (hub: RunnerHub) => hub.hello(runnerControl(HEAD, "hello", { proto: 1, gen: 1, label: LABEL, hostId: "h", cmdAck: 0, version: "v" }));
+  const hello = (hub: RunnerHub) => hub.hello(runnerControl(HEAD, "hello", { proto: 2, gen: 1, label: LABEL, hostId: "h", cmdAck: 0, version: "v" }));
 
   test("a throwing commit leaves eventAck unchanged and sends no ack; a retry commits", () => {
     let fail = true;
@@ -192,7 +194,7 @@ describe("hub commit-then-ack", () => {
       expect(hub.receive(runnerEvent(HEAD, 1, "lane.state", stateBody))).toMatchObject({ result: "duplicate", eventAck: 1 });
       expect(ids).toEqual([journalId(LABEL, 1)]);
       const reply = hello(hub);
-      expect(reply.ok && reply.reply.body).toEqual({ proto: 2, epoch: 1, eventAck: 1 });
+      expect(reply.ok && reply.reply.body).toEqual({ proto: 3, epoch: 1, eventAck: 1 });
     } finally {
       hub.close();
     }
@@ -202,16 +204,18 @@ describe("hub commit-then-ack", () => {
     let mono = 0;
     const hub = new RunnerHub({ stateDir: join(tmp.dir, "sup"), now: () => 5, monotonic: () => mono, epoch: 1, commit: () => true });
     try {
-      const body = { proto: 1, gen: 2, label: LABEL, hostId: "h", cmdAck: 0 };
+      // The supervisor speaks proto 3 and accepts 3 and 2 (N and N-1).
+      const body = { proto: 2, gen: 2, label: LABEL, hostId: "h", cmdAck: 0 };
       const rejectCode = (b: typeof body) => {
         const out = hub.hello(runnerControl(HEAD, "hello", b));
         return out.ok ? "ok" : out.reply.body.code;
       };
       expect(rejectCode({ ...body, proto: 9 })).toBe("RUNNER_PROTO_MISMATCH");
+      expect(rejectCode({ ...body, proto: 1 })).toBe("RUNNER_PROTO_MISMATCH");
       expect(rejectCode(body)).toBe("ok");
       expect(rejectCode({ ...body, hostId: "other" })).toBe("RUNNER_CONFLICT");
       expect(rejectCode({ ...body, gen: 1 })).toBe("RUNNER_CONFLICT");
-      expect(formatRunnerStatus(hub.status()[0] as never)).toBe("RUNNER r1 connected proto=1 version=- gen=2 hb=- outbox=-");
+      expect(formatRunnerStatus(hub.status()[0] as never)).toBe("RUNNER r1 connected proto=2 version=- gen=2 hb=- outbox=-");
       mono = 61_000;
       expect(hub.status()[0]?.state).toBe("stale");
       hub.disconnected(LABEL);
@@ -229,5 +233,44 @@ describe("backoffMs", () => {
     expect(backoffMs(20, () => 0.5)).toBe(60_000);
     expect(backoffMs(0, () => 0)).toBe(800);
     expect(backoffMs(20, () => 0.999999)).toBeLessThanOrEqual(72_000);
+  });
+});
+
+describe("proto 3 frames", () => {
+  const roundTrip = (frame: Parameters<typeof encodeFrame>[0], from: "runner" | "supervisor") => decodeFrame(encodeFrame(frame), from);
+
+  test("the new event fields and lane.ack validate; cmd.result.result takes any JSON value", () => {
+    expect(PROTO).toBe(3);
+    expect(roundTrip(runnerEvent(HEAD, 1, "lane.ack", { key: "lane-a", id: "m-1" }), "runner").type).toBe("lane.ack");
+    expect(roundTrip(runnerEvent(HEAD, 2, "lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }), "runner").body)
+      .toEqual({ key: "lane-a", status: "dead", reason: "agent-gone" });
+    const sample = {
+      level: "ok", reasons: [], sampledAt: 5, panes: 3, lanes: [{ key: "lane-a", rssKb: 900, top: [{ comm: "bun", rssKb: 800, count: 2 }] }],
+    } as const;
+    expect(roundTrip(runnerEvent(HEAD, 3, "guard.sample", sample), "runner").body).toEqual(sample);
+    for (const result of [null, true, 3.5, "x", [1, "a", null], { pane: "p7", startup: { verdict: "ok", detail: "" } }]) {
+      const body = { cmdId: "c", cmdSeq: 1, state: "verified" as const, detail: "d", result };
+      expect(roundTrip(runnerEvent(HEAD, 4, "cmd.result", body), "runner").body).toEqual(body);
+    }
+    expect(() => decodeFrame(encodeFrame(runnerEvent(HEAD, 5, "lane.state", { key: "a", status: "dead", reason: "boom" as never })), "runner"))
+      .toThrow("RUNNER_FRAME_INVALID field-type body.reason");
+    expect(() => decodeFrame(encodeFrame(runnerEvent(HEAD, 6, "guard.sample", { ...sample, lanes: [{ key: "a", rssKb: 1 } as never] })), "runner"))
+      .toThrow("RUNNER_FRAME_INVALID missing-field body.lanes[0].top");
+  });
+
+  test("queries are supervisor control frames without cmdSeq, answered by the runner's q.result", () => {
+    expect(QUERY_TYPES).toEqual(["q.panes", "q.screen", "q.process", "q.stat", "q.lane.inspect", "q.machine.observe"]);
+    for (const type of QUERY_TYPES) expect(SUPERVISOR_CONTROL_TYPES).toContain(type);
+    expect(isQueryType("q.panes")).toBe(true);
+    expect(isQueryType("ack")).toBe(false);
+    const query = roundTrip(supervisorControl(HEAD, "q.screen", { qid: "q1", pane: "w1:p2", lines: 200, source: "recent" }), "supervisor");
+    expect("cmdSeq" in query).toBe(false);
+    expect(() => decodeFrame(encodeFrame(supervisorControl(HEAD, "q.panes", { qid: "q1" })), "runner")).toThrow("wrong-direction");
+    expect(() => decodeFrame(JSON.stringify({ ...supervisorControl(HEAD, "q.panes", { qid: "q1" }), cmdSeq: 1 }), "supervisor")).toThrow("sequence");
+    expect(() => decodeFrame(encodeFrame(supervisorControl(HEAD, "q.panes", {} as never)), "supervisor")).toThrow("missing-field body.qid");
+    const answer = { qid: "q1", ok: true, detail: "ok", result: { panes: [{ pane_id: "w1:p2" }] } };
+    expect(roundTrip(runnerControl(HEAD, "q.result", answer), "runner").body).toEqual(answer);
+    expect(roundTrip(runnerControl(HEAD, "q.result", { qid: "q2", ok: false, detail: "herdr down" }), "runner").body).toEqual({ qid: "q2", ok: false, detail: "herdr down" });
+    expect(() => decodeFrame(encodeFrame(runnerControl(HEAD, "q.result", answer)), "supervisor")).toThrow("wrong-direction");
   });
 });

@@ -3,7 +3,6 @@ import { join } from "node:path";
 
 import type { Runner } from "./run.ts";
 import type { Lane } from "./registry.ts";
-import { laneRunner } from "./panes.ts";
 
 export type Proc = { readonly pid: number; readonly ppid: number; readonly cmd: string };
 export type SessionHit = { readonly id: string; readonly via: "argv" | "child-env" | "start-time" | "none"; readonly pid?: number };
@@ -51,7 +50,6 @@ export const sessionDirFor = (sessionsDir: string, cwd: string): string => join(
 export type SessionDeps = { readonly run: Runner; readonly sessionsDir: string; readonly listDir?: (dir: string) => readonly string[] };
 
 export const resolveSession = async (pane: string, cwd: string, table: readonly Proc[], deps: SessionDeps, lane: Pick<Lane, "machine"> = {}): Promise<SessionHit> => {
-  deps = { ...deps, run: laneRunner(deps.run, lane) };
   const info = await deps.run(["herdr", "pane", "process-info", "--pane", pane]);
   if (lane.machine) {
     // Remote PIDs and session files must never be resolved against the lead host.

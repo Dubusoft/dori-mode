@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
@@ -20,6 +21,8 @@ import { readRunnerRows } from "./runner/hub.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { PROTO } from "./runner/protocol.ts";
+
+const SANDBOX_TEMPLATE = new URL("../templates/lane-sandbox.sh", import.meta.url);
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -67,12 +70,23 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
     else if (u.enabled === "not-found" || u.active === "unknown") checks.push(fail(id, `not installed (${u.enabled}/${u.active})`, "dori setup --autostart"));
     else checks.push(fail(id, `${u.enabled}, ${u.active}`, `systemctl --user enable --now ${u.name}`));
   }
+  const runnerUnit = await unitState(d.run, "dori-runner.service");
+  if (runnerUnit.enabled === "enabled") checks.push(warn("runner unit", "dori-runner.service is enabled; the supervisor runs the local runner itself", "systemctl --user disable --now dori-runner.service"));
   const pids = procs.code === 0 ? procs.out.split("\n").filter(Boolean) : [];
   const unitOn = legacy.enabled === "enabled" || ["active", "activating"].includes(legacy.active);
   if (unitOn) checks.push(warn("legacy presence", `${LEGACY_PRESENCE} is ${legacy.enabled}/${legacy.active}; two gateways risk double replies`, `systemctl --user disable --now ${LEGACY_PRESENCE}`));
   else if (pids.length) checks.push(warn("legacy presence", `stray 'dori presence' process (pid ${pids.join(", ")})`, `kill ${pids.join(" ")}`));
   else checks.push(ok("legacy presence", "none running"));
   return checks;
+};
+
+const sandbox = (d: Pick<DoctorDeps, "home">): Check[] => {
+  const installed = join(d.home, ".local", "bin", "lane-sandbox");
+  if (!existsSync(installed)) return [];
+  const templatePath = SANDBOX_TEMPLATE.pathname;
+  const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
+  const templateHash = createHash("sha256").update(readFileSync(templatePath)).digest("hex");
+  return installedHash === templateHash ? [] : [warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "copy the template over it")];
 };
 
 const herdr = async (d: DoctorDeps): Promise<Check[]> => {
@@ -261,15 +275,19 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
 
 /** Read-only: every probe is a status query or a GET. */
 /**
- * Runner checks, only with a `runners` section: the listen address, the local runner directory's permissions, and per
- * known runner its protocol, outbox backlog and restart circuit. Read-only.
+ * Read-only runner checks: the local runner directory's permissions and per known runner protocol,
+ * outbox backlog and restart circuit.
  */
 export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
-  if (!d.config.runners) return [];
   const checks: Check[] = [];
-  const listen = d.config.runners.listen;
+  const listen = d.config.runners?.listen;
   checks.push(listen ? ok("runner listen", `${listen} (private)`) : warn("runner listen", "runners.listen is not set: only the local runner can connect", "set runners.listen to this host's private address, e.g. <tailnet-ip>:7411"));
   const dir = defaultRunnerDir(d.home);
+  const rootsFile = join(dir, "runner-config.json");
+  const roots = d.exists(rootsFile)
+    ? "runner-config.json"
+    : [d.home, tmpdir(), dirname(d.config.defaultCwd), d.config.worktreeRoot].join(", ");
+  checks.push(ok("runner policy", `effective allowedRoots: ${roots}`));
   if (d.exists(dir)) {
     try { checkRunnerDir(dir); checks.push(ok("runner dir", `${dir} 0700, files 0600, no symlinks`)); }
     catch (e) { checks.push(fail("runner dir", e instanceof Error ? e.message : String(e), `chmod -R go-rwx ${dir} and remove any symlink in it`)); }
@@ -298,7 +316,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
 };
 
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d))])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), Promise.resolve(sandbox(d))])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

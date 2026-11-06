@@ -1,9 +1,8 @@
 import type { DoriConfig, GuardThresholds, PlacementConfig } from "./config.ts";
-import { diskGuardPath, type HostSample, sampleHost } from "./host-guard.ts";
 import { doneRepos } from "./launch.ts";
-import { type GuardMachine, listGuardMachines, type SampleResult, sampleMachine, UNSUPPORTED_SHELL } from "./remote-guard.ts";
+import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
+import { type SampleResult, UNSUPPORTED_SHELL } from "./remote-guard.ts";
 import { canLaunch, type LaunchVerdict } from "./routing.ts";
-import type { Runner } from "./run.ts";
 
 /** The reserved machine name for this host. */
 export const LOCAL_MACHINE = "local";
@@ -70,37 +69,37 @@ export const machineVerdict = (result: SampleResult, panes: number, t: GuardThre
 export const summaryOf = (memFreePct: number, diskFreeGb: number, panes: number): string =>
   `memory free ${memFreePct === -1 ? "?" : `${memFreePct}%`}, disk free ${diskFreeGb === -1 ? "?" : `${diskFreeGb.toFixed(0)} GB`}, panes ${panes < 0 ? "?" : panes}`;
 
-/** `herdr --machine <label> pane list` counted; -1 when it fails or its JSON is not the pane list shape. */
-const remotePanes = async (run: Runner, label: string): Promise<number> => {
-  const r = await run(["herdr", "--machine", label, "pane", "list"]);
-  if (r.code !== 0) return -1;
-  try {
-    const panes = (JSON.parse(r.out) as { result?: { panes?: unknown } }).result?.panes;
-    return Array.isArray(panes) ? panes.length : -1;
-  } catch { return -1; }
-};
-
-export type CheckMachineDeps = {
-  readonly sampleHost?: (run: Runner, dataPath: string) => Promise<HostSample>;
-  readonly listMachines?: (run: Runner, overrides: Readonly<Record<string, string>>) => Promise<GuardMachine[]>;
-  readonly sampleMachine?: (run: Runner, m: GuardMachine) => Promise<SampleResult>;
-};
-
-/** Whether `machine` ("local" or a label) has room for one more lane, with a short metrics summary ("" on failure). */
-export const checkMachine = async (run: Runner, config: DoriConfig, machine: string, deps: CheckMachineDeps = {}): Promise<MachineCheck> => {
-  if (machine === LOCAL_MACHINE) {
-    const s = await (deps.sampleHost ?? ((r, path) => sampleHost(r, path)))(run, diskGuardPath(config));
-    return { machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes) };
+/** Why a machine cannot be observed: no connected runner names the install command, anything else is the runner's error. */
+const unobservable = (machine: string, error: unknown): string => {
+  if (error instanceof LaneOpsError && error.code === "RUNNER_UNAVAILABLE") {
+    return machine === LOCAL_MACHINE
+      ? "no runner (the supervisor runs the local runner: systemctl --user start dori-supervisor.service)"
+      : `no runner (dori runner install --machine ${machine})`;
   }
-  const listed = await (deps.listMachines ?? listGuardMachines)(run, config.guardMachines);
-  const m = listed.find((x) => x.label === machine);
-  if (!m) return { machine, verdict: { ok: false, reasons: [`unknown machine ${machine}; see dori guard machines`] }, summary: "" };
-  const [result, panes] = await Promise.all([(deps.sampleMachine ?? sampleMachine)(run, m), remotePanes(run, machine)]);
-  return {
-    machine,
-    verdict: machineVerdict(result, panes, config.guard, machine),
-    summary: result.ok ? summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes) : "",
+  const detail = error instanceof Error ? error.message : String(error);
+  return machine === LOCAL_MACHINE ? `host unobservable: ${detail}` : `machine ${machine} unreachable: ${detail}`;
+};
+
+/**
+ * Whether `machine` ("local" or a label) has room for one more lane, with a short metrics summary ("" on failure). The
+ * machine's runner observes it (`q.machine.observe`: its guard sample and pane list); a machine without a connected runner
+ * cannot host a lane, so it holds.
+ */
+export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: string): Promise<MachineCheck> => {
+  let seen;
+  try {
+    seen = await ops.observeMachine(machine === LOCAL_MACHINE ? undefined : machine);
+  } catch (error) {
+    return { machine, verdict: { ok: false, reasons: [unobservable(machine, error)] }, summary: "" };
+  }
+  const s = seen.sample;
+  if (machine === LOCAL_MACHINE) return { machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes) };
+  const panes = s.panes >= 0 ? seen.panes.length : -1;
+  const result: SampleResult = {
+    ok: true,
+    sample: { version: "runner", os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
   };
+  return { machine, verdict: machineVerdict(result, panes, config.guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes) };
 };
 
 /** Local keeps the legacy `CAN_LAUNCH` / `HOLD <reasons>`; a remote line names its machine. */

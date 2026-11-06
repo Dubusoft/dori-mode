@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { loadavg } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -8,20 +9,18 @@ import { configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
-import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
+import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
-import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
-import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
+import { guardTick } from "./host-guard.ts";
 import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, validateLaunch } from "./launch.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
-import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
+import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
-import { launchesThroughRunner, launchThroughRunner } from "./runner/launch-via-runner.ts";
 import { syncRegistry } from "./sync.ts";
 import { readToodoStart } from "./toodo-start.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
@@ -45,12 +44,90 @@ import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, stal
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
-import { ackLaneMessage, LaneMessageError, openLaneMessages } from "./lane-messages.ts";
-import { isReportKind, laneGeneration, oneLine, openLaneReports, REPORT_KINDS, type ReportKind } from "./lane-reports.ts";
+import { LaneMessageError } from "./lane-messages.ts";
+import { oneLine, openLaneReports } from "./lane-reports.ts";
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
 import { updateInstall } from "./update.ts";
+import { laneOps, type LaneOps, LaneOpsError } from "./lane-ops.ts";
+import { type CliRunnerCall, cliRunnerCall, cliSocketPath } from "./runner/cli-relay.ts";
+import { RunnerUnavailable } from "./runner/call.ts";
+import { defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
+import { heavyDirOf, laneCliMain } from "./runner/lane-cli.ts";
+import { LANE_SOCKET } from "./runner/lane-socket.ts";
+import { readLaneIdentity } from "./runner/lane-identity.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
+import type { Connector, Transport } from "./runner/transport.ts";
+import { connectUnix } from "./runner/unix-transport.ts";
+
+/** How long the lane-mode check waits for the lane socket's whoami answer before it falls back to the runner's lane record. */
+const WHOAMI_TIMEOUT_MS = 500;
+
+/** The lane socket's whoami for `pane`; `answered` only when the runner replied ok (with or without a key). */
+const whoami = async (pane: string, socketPath: string, connect: Connector): Promise<{ answered: boolean; key: string | undefined }> => {
+  if (!existsSync(socketPath)) return { answered: false, key: undefined };
+  let link: Transport | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const reply = await new Promise<string | undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), WHOAMI_TIMEOUT_MS);
+      connect().then((opened) => {
+        link = opened;
+        opened.onLine(resolve);
+        opened.onClose(() => resolve(undefined));
+        opened.send(`${JSON.stringify({ kind: "whoami", pane })}\n`);
+      }, () => resolve(undefined));
+    });
+    const parsed = reply === undefined ? undefined : JSON.parse(reply) as { ok?: unknown; key?: unknown };
+    if (parsed?.ok !== true) return { answered: false, key: undefined };
+    return { answered: true, key: typeof parsed.key === "string" && parsed.key ? parsed.key : undefined };
+  } catch {
+    return { answered: false, key: undefined };
+  } finally {
+    clearTimeout(timer);
+    link?.close("whoami");
+  }
+};
+
+/**
+ * Lane mode (design 5, D11; gate B1): `DORI_LANE_KEY` names the lane; else the runner's lane socket is asked which lane
+ * holds `HERDR_PANE_ID` (`{kind:"whoami", pane}`), and when it names none (no socket, no answer within
+ * WHOAMI_TIMEOUT_MS, a failed reply, no key) the runner's own record `<runnerDir>/lanes.json` is read, so an adopted
+ * lane (no DORI_LANE_KEY) stays a lane while its runner is down. Lead mode only when neither maps the pane. A record
+ * that cannot be read while the socket did not answer exits 2 LANE_IDENTITY_UNKNOWN: a transport failure never grants
+ * lead authority. Reads nothing but the environment, the socket and lanes.json.
+ */
+const laneContext = async (env: Readonly<Record<string, string | undefined>>, runnerDir: string, socketPath: string, connect: Connector): Promise<string | undefined> => {
+  const named = env.DORI_LANE_KEY?.trim();
+  if (named) return named;
+  const pane = env.HERDR_PANE_ID?.trim();
+  if (!pane) return undefined;
+  const asked = await whoami(pane, socketPath, connect);
+  if (asked.key) return asked.key;
+  const recorded = readLaneIdentity(runnerDir, pane);
+  if (recorded.kind === "lane") return recorded.key;
+  if (recorded.kind === "unreadable" && !asked.answered) {
+    console.error(`LANE_IDENTITY_UNKNOWN pane ${pane}: the runner's lane socket did not answer and its lane record cannot be read (${recorded.detail}); dori will not run as the lead from a pane that may be a lane. Bring the runner back (its lane socket answers whoami) or repair the lane record.`);
+    process.exit(2);
+  }
+  return undefined;
+};
+
+// The lane-mode gate runs before anything else (help, setup, runner *, loadConfig): inside a lane dori takes only
+// report, claim-done, report ack, lane status and heavy, all over the runner's lane socket, and opens no registry,
+// store, journal, inbox or state-dir file.
+{
+  const laneRunnerDir = defaultRunnerDir();
+  const laneSocket = join(laneRunnerDir, RUNNER_PATHS.sock, LANE_SOCKET);
+  const laneKey = await laneContext(process.env, laneRunnerDir, laneSocket, connectUnix(laneSocket));
+  if (laneKey !== undefined) {
+    process.exit(await laneCliMain(process.argv.slice(2), {
+      env: process.env, laneKey, connect: connectUnix(laneSocket),
+      out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
+    }));
+  }
+}
 
 const USAGE = `dori <command> [options]
 
@@ -72,15 +149,17 @@ const USAGE = `dori <command> [options]
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
-  claim-done [<key>] --evidence TEXT  key defaults to the lane registered for $HERDR_PANE_ID
+  claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
   object-done <key> --reason TEXT [--reason TEXT ...]
-  lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); key defaults as for claim-done
+  lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); inside a lane its own (from its runner), the lead names the lane
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
   close  <key> --cancelled --reason TEXT [--force]   lead-only: close a lane whose work was cancelled or whose Done can never hold;
                                        Done signals are not checked, the lane is recorded closed as cancelled with the reason
-                                       inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, send is lead-only (a lane asks with report <key> question), and a session replaced by recovery may not claim-done or report
+                                       inside a lane (DORI_LANE_KEY, or a pane its runner knows) dori takes only report, claim-done, report ack,
+                                       lane status and heavy (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
+                                       supervisor (RUNNER_UNAVAILABLE, exit 2, while it is down)
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
@@ -93,7 +172,6 @@ const USAGE = `dori <command> [options]
   runner install --machine LABEL       install or upgrade the runner on a Linux worker over ssh (bundle, unit, linger, enrollment
                                        through ssh stdin); needs runners.listen and bun on the worker
   runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
-  runner shadow-report [--runner L]    per runner: shadow differences by class and the failure count (every class but timing)
   runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
   runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
   runner rotate LABEL                  have the connected runner switch to a new key; prints the new key fingerprint
@@ -132,7 +210,7 @@ const USAGE = `dori <command> [options]
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
-                                       a lane's structured report (own key only): one row the supervisor routes
+                                       inside a lane: its structured report (own key only), sent through its runner to the supervisor
   report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up)
   inbox take [--max-bytes N] [--peek]  the lead's read path: delivered events past the take cursor as id<TAB>line, whole lines
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
@@ -195,7 +273,7 @@ if (process.argv[2] === "status") {
   const { collectStatus, statusPage } = await import("./status.ts");
   const cfg = await loadConfig();
   setDefaultRunTimeout(cfg.runTimeoutMs);
-  const status = await collectStatus({ run, clock: realClock, config: cfg, registry: new Registry(cfg.stateDir) });
+  const status = await collectStatus({ run, clock: realClock, config: cfg, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
   console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
   process.exit(0);
 }
@@ -206,11 +284,11 @@ if (process.argv[2] === "runner") {
     const { runnerHostMain } = await import("./runner/main.ts");
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
-  // enroll, install, shadow-report, revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | shadow-report [--runner LABEL] | revoke LABEL | rotate LABEL | reset-gen LABEL";
+  // enroll, install, revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
-    options: { machine: { type: "string" }, runner: { type: "string" } },
+    options: { machine: { type: "string" } },
   });
   const [sub = "", target, ...extra] = parsed.positionals;
   if (extra.length) die(usage);
@@ -233,15 +311,6 @@ if (process.argv[2] === "runner") {
     } finally {
       auth.close();
     }
-    process.exit(0);
-  }
-  if (sub === "shadow-report") {
-    if (target !== undefined) die(usage);
-    const runner = parsed.values.runner === undefined ? undefined : labelArg(parsed.values.runner);
-    const cfg = await loadConfig();
-    const { renderShadowReport, shadowReport } = await import("./runner/shadow-store.ts");
-    const rows = shadowReport(cfg.stateDir, runner ? { runner } : {});
-    console.log(rows.length ? renderShadowReport(rows) : `RUNNER_SHADOW_REPORT none${runner ? ` runner=${runner}` : ""}`);
     process.exit(0);
   }
   if (sub === "install") {
@@ -277,13 +346,14 @@ if (process.argv[2] === "runner") {
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
     const { readGuardMachines, sshArgv } = await import("./remote-guard.ts");
-    const { laneRunner, sendVerified } = await import("./panes.ts");
     const { openLaneReports } = await import("./lane-reports.ts");
     const { evacuate } = await import("./runner/evacuate.ts");
     const machine = (await readGuardMachines(run, cfg.guardMachines)).machines.find((m) => m.label === label);
     if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     const sshTarget = (machine as NonNullable<typeof machine>).target;
     const store = openLaneReports(cfg);
+    // The notice goes through the runner being evacuated (D9), so it is sent before the runner is stopped.
+    const ops = laneOps(cliRunnerCall(cliSocketPath(defaultRunnerDir())), { now: realClock.now, log: (line) => { console.error(line); } });
     try {
       const lines = await evacuate({
         hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined },
@@ -292,7 +362,7 @@ if (process.argv[2] === "runner") {
           if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);
           return JSON.parse(r.out.trim().split("\n").at(-1) ?? "[]");
         },
-        tellLane: async (lane, text) => (lane.pane ? (await sendVerified(laneRunner(run, lane), realClock, lane.pane, text)) !== "failed" : false),
+        tellLane: async (lane, text) => (await ops.send(lane, text)) !== "failed",
         stopRunner: async () => {
           const r = await run(sshArgv(sshTarget, remoteRunnerService("stop")), { timeoutMs: 30_000 });
           return { ok: r.code === 0, detail: (r.err || r.out).trim().split("\n").at(-1) || `exit ${r.code}` };
@@ -355,16 +425,16 @@ if (process.argv[2] === "runner") {
 }
 
 /**
- * `dori update`'s runner rollout: the local runner restarts on the updated checkout, then each other known runner gets
- * the new bundle through `dori runner install`'s path, one at a time, each confirmed by a hello with a higher gen
- * within 2 minutes. Returns 1 when one failed (the rest were not touched), else 0.
+ * `dori update`'s runner rollout: each worker runner gets the new bundle through `dori runner install`'s path, one at
+ * a time, each confirmed by a hello with a higher gen within 2 minutes. The local runner is the supervisor's child, so
+ * the supervisor restart that `dori update` already did restarted it on the updated checkout. Returns 1 when one
+ * failed (the rest were not touched), else 0.
  */
 const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
   const { readRunnerRows } = await import("./runner/hub.ts");
   const { upgradeRunners } = await import("./runner/upgrade.ts");
   const { buildBundle, installRunner } = await import("./runner/install.ts");
   const { SupervisorAuth } = await import("./runner/auth.ts");
-  const { LOCAL_RUNNER } = await import("./runner/serve.ts");
   const rows = readRunnerRows(cfg.stateDir);
   const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
   const machines = await listGuardMachines(run, cfg.guardMachines);
@@ -373,12 +443,8 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
   const before = new Map(rows.map((r) => [r.label, r.maxGen]));
   try {
     const result = await upgradeRunners({
-      labels: [...rows.filter((r) => r.label === LOCAL_RUNNER), ...rows.filter((r) => r.label !== LOCAL_RUNNER)].map((r) => r.label),
+      labels: rows.filter((r) => r.label !== LOCAL_RUNNER).map((r) => r.label),
       install: async (label) => {
-        if (label === LOCAL_RUNNER) {
-          const r = await run(["systemctl", "--user", "restart", "dori-runner.service"], { timeoutMs: 60_000 });
-          return r.code === 0 ? { ok: true } : { ok: false, detail: (r.err || r.out).split("\n")[0] || `exit ${r.code}` };
-        }
         const machine = machines.find((m) => m.label === label);
         if (!machine) return { ok: false, detail: `no machine ${label}` };
         if (!cfg.runners?.listen) return { ok: false, detail: "runners.listen is not set" };
@@ -406,7 +472,20 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
 
 const config = await loadConfig();
 setDefaultRunTimeout(config.runTimeoutMs);
-const deps: FlowDeps = { run, clock: realClock, registry: new Registry(config.stateDir), config };
+// Lane operations go through the supervisor's CLI relay; built on first use, so commands that touch no lane never connect.
+let cliCall: CliRunnerCall | undefined;
+const relay = (): CliRunnerCall => (cliCall ??= cliRunnerCall(cliSocketPath(defaultRunnerDir())));
+let cliOps: LaneOps | undefined;
+const deps: FlowDeps = {
+  run, clock: realClock, registry: new Registry(config.stateDir), config,
+  get ops(): LaneOps { return cliOps ??= laneOps(relay(), { now: realClock.now, log: (line) => { console.error(line); } }); },
+};
+
+/** RUNNER_UNAVAILABLE (exit 2) at once when the supervisor's CLI relay does not answer: every lane operation needs it (D7). */
+const needSupervisor = async (): Promise<void> => {
+  try { await relay().refresh(LOCAL_RUNNER); }
+  catch (e) { if (e instanceof RunnerUnavailable) die(e.message, 2); throw e; }
+};
 const [command = "", ...rest] = process.argv.slice(2);
 
 const flags = parseArgs({
@@ -442,46 +521,12 @@ const commandArgv = (command: string | undefined): unknown => {
   try { return JSON.parse(command) as unknown; } catch { return die("--command starting with [ must be a JSON argv array"); }
 };
 
-/** Lane permission isolation: inside a lane, a lane command may name only that lane (and defaults to it); the lead may name any. */
-const ownKey = async (command: string, k: string | undefined): Promise<string | undefined> => {
-  const caller = await callerLane(deps);
-  const refusal = k === undefined ? undefined : laneActRefusal(caller, command, k);
-  return refusal ? die(refusal) : (k ?? caller);
-};
+// Lead mode from here on: lane mode (DORI_LANE_KEY, or a pane its runner knows) was handled before loadConfig, so every
+// command below runs for the lead and may name any lane.
 
-/** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule", "send", "thread"]);
-if (LEAD_ONLY.has(command)) {
-  const caller = await callerLane(deps);
-  if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
-}
-if (command === "guard" && flags.positionals[0] === "install") {
-  const caller = await callerLane(deps);
-  if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run guard install; it is lead-only`);
-}
-
-/**
- * Why the calling process may not report as lane `lane` (claim-done, report), or undefined when it may. Ownership
- * fencing on the CLI side: a lane's active session is the one in its registered pane, so a session replaced by
- * recovery (still alive in the old pane, DORI_LANE_KEY unchanged) cannot claim or report for the lane that replaced it.
- * The lead (no caller lane) and a process with no pane id are not fenced.
- */
-const staleLaneRefusal = (caller: string | undefined, lane: Lane, env: Readonly<Record<string, string | undefined>> = process.env): string | undefined => {
-  const pane = env.HERDR_PANE_ID?.trim();
-  if (caller === undefined || caller !== lane.key || !pane || !lane.pane || pane === lane.pane) return undefined;
-  return `LANE_STALE_SESSION lane ${lane.key} is now owned by pane ${lane.pane}; this session (pane ${pane}) was replaced and may not report for it`;
-};
-
-/** `lane(k)` for a command that reports as the lane (claim-done, report): a session replaced by recovery is refused. */
-const activeLane = async (command: string, k: string | undefined) => {
-  const found = await lane(await ownKey(command, k));
-  const stale = staleLaneRefusal(await callerLane(deps), found);
-  return stale ? die(stale) : found;
-};
-
-const lane = async (k: string | undefined) => {
-  const found = k ? await deps.registry.read(k) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? "", opt("machine"));
-  if (!found) return die(k ? `no registered lane "${k}"` : "no open lane is registered for this pane");
+const lane = async (k: string) => {
+  const found = await deps.registry.read(k);
+  if (!found) return die(`no registered lane "${k}"`);
   if (statusOf(found) === "closed") return die(`lane ${found.key} is already closed`);
   return found;
 };
@@ -520,6 +565,7 @@ try {
     case "recover": {
       if (flags.positionals.length > 1 || Object.keys(flags.values).length) die("usage: dori recover [key]");
       if (key && !(await deps.registry.read(key))) die(`no registered lane "${key}"`);
+      await needSupervisor();
       for (const line of await recoverLanes(deps, key)) console.log(line);
       break;
     }
@@ -555,7 +601,7 @@ try {
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
         refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readGuardAgentScripts(), (line) => console.log(line)),
-        ...(config.runners ? { upgradeRunners: async () => upgradeRunnersNow(config) } : {}),
+        upgradeRunners: async () => upgradeRunnersNow(config),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
@@ -722,11 +768,16 @@ try {
       const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
-      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
+      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine));
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
       const machine = target === LOCAL_MACHINE ? undefined : target;
-      if (!machine && toodo?.worktreePath && !existsSync(toodo.worktreePath)) die(`start_task's worktree ${toodo.worktreePath} is not on this host; for a task on a remote workspace pass --machine <its herdr machine>`);
+      // The worktree is the lane's checkout: its owning runner (the selected machine's, else the local one) says whether it exists (gate B2).
+      if (toodo?.worktreePath && !(await deps.ops.exists(machine, [toodo.worktreePath]))[0]) {
+        die(machine
+          ? `start_task's worktree ${toodo.worktreePath} is not on machine ${machine}; pass --machine <the herdr machine of the task's workspace>`
+          : `start_task's worktree ${toodo.worktreePath} is not on this host; for a task on a remote workspace pass --machine <its herdr machine>`);
+      }
       if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
       if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
@@ -739,12 +790,6 @@ try {
         console.log(verdictLine(target, plan.check.verdict));
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
-      }
-      if (launchesThroughRunner(config, machine)) {
-        const started = await launchThroughRunner(deps, { ...input, machine }).catch((e: unknown) => die(e instanceof Error ? e.message : String(e)));
-        dequeueLaunch(config.stateDir, input.key);
-        console.log(`LAUNCHED ${started.lane.key} runner=${machine} request=${started.request} (the runner starts it once it is connected; its pane follows in lane.started)`);
-        break;
       }
       const r = await launchLane(deps, { ...input, machine });
       dequeueLaunch(config.stateDir, input.key);
@@ -764,11 +809,14 @@ try {
     }
     case "adopt": {
       if (opt("mode") !== undefined) die("--mode applies to launch only");
-      const l = await adoptLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) });
+      const adoptInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
+      await needSupervisor();
+      const l = await adoptLane(deps, { ...adoptInput, thread: await laneThreadRef(opt("thread"), config.discordChannels) });
       console.log(`ADOPTED ${l.key} pane=${l.pane} thread=${l.thread}`);
       break;
     }
     case "sync": {
+      await needSupervisor();
       const r = await syncRegistry(deps, Boolean(flags.values.write));
       if (flags.values.full) {
         console.log("key | thread | pane | session | status");
@@ -784,22 +832,27 @@ try {
       console.log(flags.values.write ? "WROTE session ids" : "READ_ONLY");
       break;
     }
-    case "claim-done":
-      console.log(await claimDone(deps, await activeLane("claim-done", key), need("evidence")));
+    case "claim-done": {
+      // Inside a lane claim-done is lane mode's (a done report over the lane socket); the lead names the lane.
+      const target = await lane(key ?? die("claim-done needs a lane key"));
+      const evidence = need("evidence");
+      await needSupervisor();
+      console.log(await claimDone(deps, target, evidence));
       break;
+    }
     case "lane": {
       const [action, laneKey, ...extra] = flags.positionals;
-      if (action !== "status" || extra.length || Object.keys(flags.values).length) die("usage: dori lane status [<key>]");
-      const own = await ownKey("read the status of", laneKey);
-      const found = (own ? await deps.registry.read(own) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? ""))
-        ?? die(own ? `no registered lane "${own}"` : "no open lane is registered for this pane");
+      if (action !== "status" || !laneKey || extra.length || Object.keys(flags.values).length) die("usage: dori lane status <key> (inside a lane: dori lane status)");
+      const found = (await deps.registry.read(laneKey ?? "")) ?? die(`no registered lane "${laneKey}"`);
       console.log(JSON.stringify({ key: found.key, status: statusOf(found), objection: found.objection ?? null, claim: found.claim ?? null }, null, 2));
       break;
     }
     case "object-done": {
       const reasons = (flags.values.reason as string[] | undefined)?.map((r) => r.trim()).filter(Boolean) ?? [];
       if (!reasons.length) die("--reason is required");
-      console.log(await objectDone(deps, await lane(await ownKey("object-done", key ?? die("object-done needs a lane key"))), reasons));
+      const target = await lane(key ?? die("object-done needs a lane key"));
+      await needSupervisor();
+      console.log(await objectDone(deps, target, reasons));
       break;
     }
     case "ops": {
@@ -832,21 +885,23 @@ try {
         die("--reason goes with --cancelled: dori close <key> --cancelled --reason TEXT");
       }
       if (flags.values.cancelled) {
-        const caller = await callerLane(deps);
-        if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run close --cancelled; it is lead-only`);
         const reasons = (Array.isArray(flags.values.reason) ? flags.values.reason : []).filter((r): r is string => typeof r === "string" && r.trim() !== "");
         if (!reasons.length) die("usage: dori close <key> --cancelled --reason TEXT [--force]");
         cancelled = { reason: reasons.map((r) => r.trim()).join("; ") };
       }
       const note = opt("note") ?? (cancelled ? `cancelled: ${cancelled.reason}` : "closed by the lead");
-      const r = await closeLane(deps, await lane(await ownKey("close", key ?? die("close needs a lane key"))), note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
+      const target = await lane(key ?? die("close needs a lane key"));
+      await needSupervisor();
+      const r = await closeLane(deps, target, note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
       for (const line of r.lines) console.log(line);
       process.exit(r.closed ? 0 : 2);
     }
     case "pause":
     case "resume": {
       const act = command === "pause" ? pauseLane : resumeLane;
-      const r = await act(deps, await lane(await ownKey(command, key ?? die(`${command} needs a lane key`))), opt("note") ?? `${command}d by the lead`);
+      const target = await lane(key ?? die(`${command} needs a lane key`));
+      await needSupervisor();
+      const r = await act(deps, target, opt("note") ?? `${command}d by the lead`);
       for (const line of r.lines) console.log(line);
       process.exit(r.code);
     }
@@ -864,6 +919,8 @@ try {
       }
     }
     case "freshness":
+      // A one-shot run fails closed with the supervisor down; a loop warns per pass and retries (D7).
+      if (loopMin <= 0) await needSupervisor();
       await every(loopMin, async () => {
         const reports = openLaneReports(deps.config);
         try {
@@ -874,8 +931,9 @@ try {
     case "dead-panes": {
       const seen = new Set<string>();
       const paneState = newDeadPaneState();
+      if (loopMin <= 0) await needSupervisor();
       await every(loopMin, async () => {
-        for (const line of await deadPaneTick(run, config, seen, new Date().toISOString().slice(0, 13), paneState, await deps.registry.open())) console.log(line);
+        for (const line of await deadPaneTick(deps.ops, config, seen, new Date().toISOString().slice(0, 13), paneState, await deps.registry.open())) console.log(line);
       });
       break;
     }
@@ -908,12 +966,14 @@ try {
         if (outcomes.includes(false)) process.exitCode = 1;
         break;
       }
+      // The lead host's load, memory, disk and pane count as the local runner samples them (q.machine.observe); the
+      // lanes-by-memory detail is the supervisor's (from guard.sample), not this loop's.
       const state = { alerting: false };
+      if (loopMin <= 0) await needSupervisor();
       console.log("HOST_GUARD_READY");
       await every(loopMin, async () => {
-        const sample = await sampleHost(run, diskGuardPath(config));
-        const detail = !state.alerting && alertReasons(sample, config.guard).length ? laneMemoryDetail(laneMemory(await sampleProcs(run))) : undefined;
-        for (const line of guardTick(sample, config.guard, state, detail)) console.log(line);
+        const observed = await deps.ops.observeMachine();
+        for (const line of guardTick(observed.sample, config.guard, state)) console.log(line);
       });
       break;
     }
@@ -922,8 +982,9 @@ try {
       const label = rest[0];
       const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
       if (!label || label === "--" || !cmd.length) die("usage: dori heavy <label> -- <command ...>");
-      const load = async () => (await sampleHost(run, diskGuardPath(config))).load1;
-      const slot = await acquireSlot({ dir: `${config.stateDir}/heavy`, slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
+      // One slot directory per host (D17), shared with the lanes' `dori heavy` and the supervisor's scheduled heavy jobs.
+      const load = async () => loadavg()[0] ?? 0;
+      const slot = await acquireSlot({ dir: heavyDirOf(), slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
       try {
         const child = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit", stdin: "inherit" });
         process.exitCode = await child.exited;
@@ -937,7 +998,7 @@ try {
       const machines = flags.values.all
         ? [LOCAL_MACHINE, ...listed.map((m) => m.label)]
         : [resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement).machine];
-      const checks = await Promise.all(machines.map((m) => checkMachine(run, config, m, flags.values.all ? { listMachines: async () => listed } : {})));
+      const checks = await Promise.all(machines.map((m) => checkMachine(deps.ops, config, m)));
       const at = Date.now();
       for (const c of checks) {
         recordLaunchVerdict(config.stateDir, c.verdict, at, c.machine);
@@ -1014,35 +1075,11 @@ try {
       for (const line of unreadAfterAck(config.stateDir, acked)) console.log(line);
       break;
     }
-    case "report": {
-      const [action, id, ...extra] = flags.positionals;
-      if (action !== "ack" || Object.keys(flags.values).length) {
-        // `dori report <key> <kind> --text T [--evidence E]`: one row the supervisor routes.
-        const kind = id;
-        if (!action || !isReportKind(kind) || extra.length || Object.keys(flags.values).some((name) => name !== "text" && name !== "evidence")) {
-          die(`usage: dori report <key> <${REPORT_KINDS.join("|")}> --text T [--evidence E] | dori report ack <id>`);
-        }
-        // Newlines stay: the store redacts, and routeReports saves a multi-line body to a file for the lead.
-        const text = need("text").trim();
-        const evidence = opt("evidence")?.trim();
-        const target = await activeLane("report", action);
-        const reports = openLaneReports(config);
-        try {
-          const row = reports.append({ lane: target.key, generation: laneGeneration(target), kind: kind as ReportKind, text, ...(evidence ? { evidence } : {}), at: realClock.now() });
-          console.log(`LANE_REPORTED ${row.id} ${row.kind}`);
-        } finally { reports.close(); }
-        break;
-      }
-      if (!id || extra.length) die("usage: dori report ack <id>");
-      const me = await callerLane(deps);
-      if (!me) die("dori report ack runs inside a lane (DORI_LANE_KEY or its pane): it confirms a message to that lane");
-      const messages = openLaneMessages(config);
-      try {
-        const acked = ackLaneMessage(messages, me ?? "", id ?? "", realClock.now());
-        console.log(`LANE_MESSAGE_ACKED ${acked.lane} ${acked.id}`);
-      } finally { messages.close(); }
+    case "report":
+      // A report is the lane's own voice, sent by its runner over the lane socket (lane mode); the lead has no lane to
+      // report as.
+      die(`DORI_CLI_LANE_COMMAND dori report${flags.positionals[0] === "ack" ? " ack" : ""} runs only inside a lane (DORI_LANE_KEY, or a pane its runner knows)`, 2);
       break;
-    }
     case "reported": {
       // `dori reported <key> --text T`: post lane <key>'s outcome to the owner (the lane's thread unless --to/--thread),
       // then record the receipt. A failed post records nothing, so the obligation stays open.
@@ -1187,7 +1224,7 @@ try {
         let presence: ReturnType<typeof discordPresence> | undefined;
         try {
           if (!config.discord) console.warn("PRESENCE_WARNING discord slash commands skipped: config.discord is missing; run dori setup");
-          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults()), undefined, config.discordChannels, lookupStatus(deps)) : undefined;
+          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults()), undefined, config.discordChannels, lookupStatus({ ...deps, runnerDir: defaultRunnerDir() })) : undefined;
           await commands?.register();
           presence = discordPresence(openDiscordGateway, token, realTimers, commands ? (data) => commands.handle(data) : undefined);
           console.log("PRESENCE_READY discord");
@@ -1211,6 +1248,8 @@ try {
       process.exit(command ? 1 : 0);
   }
 } catch (e) {
+  // The supervisor (and with it every runner) is unreachable, or a runner answered RUNNER_UNAVAILABLE: fail closed (D7).
+  if (e instanceof RunnerUnavailable || (e instanceof LaneOpsError && e.code === "RUNNER_UNAVAILABLE")) die(e.message, 2);
   if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof ReposError || e instanceof DiscordGatewayOwnedError || e instanceof AckError || e instanceof LeadRestartError || e instanceof StoreError || e instanceof LaneMessageError || e instanceof SourceError) die(e.message);
   throw e;
 }

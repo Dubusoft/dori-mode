@@ -1,26 +1,20 @@
 import { afterEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lastReportLine } from "../src/freshness.ts";
 import type { Proc } from "../src/lane-memory.ts";
-import type { Lane } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
-import { HUB_FILE } from "../src/runner/hub.ts";
-import { briefLane, observeHost } from "../src/runner/observe.ts";
-import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
+import { briefLane, observeHost, valueHash } from "../src/runner/observe.ts";
 import { RunnerClient, yieldTurn } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { SHADOW_SETTLE_MS, ShadowObserver, serveRunner, type ObservedLane } from "../src/runner/serve.ts";
+import { serveRunner, type ObservedLane } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { fakeClock } from "./fakes.ts";
-import { valueHash } from "../src/runner/shadow.ts";
-import { recordDiffLines, renderShadowReport, shadowReport } from "../src/runner/shadow-store.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-const stateDir = (): string => { const d = mkdtempSync(join(tmpdir(), "runner-remote-shadow-")); dirs.push(d); return d; };
+const stateDir = (): string => { const d = mkdtempSync(join(tmpdir(), "runner-observe-")); dirs.push(d); return d; };
 
 const REPORT_A = "[REPORT] lane-a | milestone | PR #12 open, CI green";
 const REPORT_B_OLD = "[REPORT] lane-b | question | which base branch?";
@@ -58,20 +52,6 @@ const herdrWith = (list: readonly object[]) => async (argv: readonly string[]): 
   return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` } as Ran;
 };
 const fakeHerdr = herdrWith(panes);
-const S = SHADOW_SETTLE_MS;
-const legacy = { panes, archived: new Set<string>() };
-
-const lane = (key: string, pane: string, lastRemoteReport?: string): Lane =>
-  ({ key, title: key, thread: "none", brief: "b", done: [], openedAt: "2026-11-05T00:00:00Z", machine: "worker-a", pane, ...(lastRemoteReport ? { lastRemoteReport } : {}) }) as unknown as Lane;
-const event = (type: string, body: object): AnyRunnerEvent => ({ v: 1, runner: "worker-a", gen: 1, epoch: 1, seq: 1, type, body }) as unknown as AnyRunnerEvent;
-
-const feed = (observer: ShadowObserver, observed: Awaited<ReturnType<typeof observeHost>>): void => {
-  observer.hello("worker-a", observed.map(({ key, pane, tab }) => ({ key, pane, tab })));
-  for (const l of observed) {
-    observer.event("worker-a", event("lane.state", { key: l.key, status: l.status, pane: l.pane }));
-    if (l.reportHash) observer.event("worker-a", event("lane.progress", { key: l.key, reportHash: l.reportHash }));
-  }
-};
 
 test("observeHost finds lanes by DORI_LANE_KEY without a registry and hashes the newest [REPORT] line", async () => {
   const observed = await observeHost({ run: fakeHerdr, procs: async () => procs });
@@ -115,57 +95,6 @@ test("observeHost reports a lane whose agent_status is not alive as dead", async
   const unknown = panes.map((p) => (p.pane_id === "p1" ? { ...p, agent_status: "unknown" } : p));
   const observed = await observeHost({ run: herdrWith(unknown), procs: async () => procs });
   expect(observed.map((l) => [l.key, l.status])).toEqual([["lane-a", "dead"], ["lane-b", "idle"]]);
-});
-
-test("matching legacy and runner views record no failures", async () => {
-  const dir = stateDir();
-  const observer = new ShadowObserver();
-  feed(observer, await observeHost({ run: fakeHerdr, procs: async () => procs }));
-  const lanes = [lane("lane-a", "p1", REPORT_A), lane("lane-b", "p2", REPORT_B)];
-  const lines = [...observer.cycle("worker-a", lanes, 0, legacy), ...observer.cycle("worker-a", lanes, S, legacy)];
-  expect(lines).toEqual([]);
-  expect(recordDiffLines(dir, lines, 1)).toBe(0);
-  expect(shadowReport(dir)).toEqual([]);
-});
-
-test("a runner the hub knows with no stored difference reports a zero row; an unknown label still reports nothing", () => {
-  const dir = stateDir();
-  expect(shadowReport(dir, { runner: "worker-a" })).toEqual([]);
-  const db = new Database(join(dir, HUB_FILE), { create: true });
-  db.run("CREATE TABLE runners (label TEXT PRIMARY KEY)");
-  db.run("INSERT INTO runners (label) VALUES ('worker-a')");
-  db.close();
-  const rows = shadowReport(dir, { runner: "worker-a" });
-  expect(renderShadowReport(rows)).toBe("RUNNER_SHADOW_REPORT runner=worker-a failures=0 missing-in-runner=0 missing-in-legacy=0 value-differs=0 timing=0");
-  expect(shadowReport(dir, { runner: "worker-typo" })).toEqual([]);
-  expect(shadowReport(dir)).toEqual([]);
-});
-
-test("a lane the runner does not see, and a different newest report, count as failures; a passing gap is timing", async () => {
-  const dir = stateDir();
-  const observer = new ShadowObserver();
-  const observed = await observeHost({ run: fakeHerdr, procs: async () => procs.filter((p) => p.lane !== "lane-b") });
-  feed(observer, observed);
-  const lanes = [lane("lane-a", "p1", REPORT_A), lane("lane-b", "p2", REPORT_B), lane("lane-c", "p9", REPORT_A)];
-  const cycle = (now: number): string[] => { const lines = observer.cycle("worker-a", lanes, now, legacy); recordDiffLines(dir, lines, now + 1); return lines; };
-  expect(cycle(0)).toEqual([]);
-  const settled = cycle(S);
-  expect(settled.every((l) => l.includes("class=missing-in-runner"))).toBe(true);
-  expect(settled.some((l) => l.includes("lane=lane-b kind=") || l.includes("kind=inventory.pane lane=lane-b"))).toBe(true);
-
-  // lane-a's legacy view moves on to a report the runner has not read yet; the runner catches up within the settle window.
-  lanes[0] = lane("lane-a", "p1", "[REPORT] lane-a | done | merged");
-  expect(cycle(S + 5_000)).toEqual([]);
-  observer.event("worker-a", event("lane.progress", { key: "lane-a", reportHash: valueHash("[REPORT] lane-a | done | merged") }));
-  const caughtUp = cycle(S + 30_000);
-  expect(caughtUp.some((l) => l.includes("class=timing") && l.includes("lane=lane-a"))).toBe(true);
-
-  const [row] = shadowReport(dir, { runner: "worker-a" });
-  expect(row?.counts.timing).toBeGreaterThanOrEqual(1);
-  expect(row?.counts["missing-in-runner"]).toBeGreaterThanOrEqual(2);
-  expect(row?.failures).toBe((row?.counts["missing-in-runner"] ?? 0) + (row?.counts["missing-in-legacy"] ?? 0) + (row?.counts["value-differs"] ?? 0));
-  expect(renderShadowReport(shadowReport(dir))).toMatch(/^RUNNER_SHADOW_REPORT runner=worker-a failures=\d+ missing-in-runner=\d+ missing-in-legacy=\d+ value-differs=\d+ timing=\d+$/);
-  expect(statSync(join(dir, HUB_FILE)).mode & 0o777).toBe(0o600);
 });
 
 test("serveRunner publishes lane.state on a status change and lane.progress on a new report hash, once each", async () => {
@@ -232,17 +161,4 @@ test("serveRunner republishes lane.state on a pane change and after a lane was g
   ]);
   outbox.close();
   state.close();
-});
-
-test("a newest report that stays different is value-differs", async () => {
-  const dir = stateDir();
-  const observer = new ShadowObserver();
-  feed(observer, await observeHost({ run: fakeHerdr, procs: async () => procs }));
-  const lanes = [lane("lane-a", "p1", REPORT_A), lane("lane-b", "p2", REPORT_B_OLD)];
-  observer.cycle("worker-a", lanes, 0, legacy);
-  const lines = observer.cycle("worker-a", lanes, S, legacy);
-  expect(lines).toHaveLength(1);
-  expect(lines[0]).toContain("class=value-differs kind=lane.report lane=lane-b");
-  recordDiffLines(dir, lines, 1);
-  expect(shadowReport(dir)[0]?.failures).toBe(1);
 });

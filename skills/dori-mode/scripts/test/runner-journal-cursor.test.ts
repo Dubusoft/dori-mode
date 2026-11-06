@@ -6,7 +6,7 @@ import { openLaneReports, type NewReport } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { eventLine, HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { laneEventsAfter, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
-import { runnerControl, runnerEvent } from "../src/runner/protocol.ts";
+import { PROTO, runnerControl, runnerEvent } from "../src/runner/protocol.ts";
 import { openRunnerJournal, RUNNER_JOURNAL_RETENTION_MS } from "../src/runner/serve.ts";
 import { laneEventReader, RUNNER_LANE_CURSOR_FILE } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -137,7 +137,7 @@ test("P5 hub report text and evidence survive the private journal round trip unr
   const f = await fixture();
   const hub = new RunnerHub({ stateDir: f.state.dir, commit: f.journal.commit, now: f.clock.now, monotonic: f.clock.now, epoch: 1 });
   try {
-    expect(hub.hello(runnerControl(head, "hello", { proto: 1, gen: 1, label: head.runner, hostId: "host-a", cmdAck: 0 })).ok).toBe(true);
+    expect(hub.hello(runnerControl(head, "hello", { proto: PROTO, gen: 1, label: head.runner, hostId: "host-a", cmdAck: 0 })).ok).toBe(true);
     const body = { key: "lane-a", kind: "milestone", text: "api_key=staging12\nexact report", evidence: "a".repeat(43) } as const;
     hub.receive(runnerEvent(head, 1, "lane.report", body));
     expect(laneEventsAfter(f.state.dir, 0)[0]!.frame.body).toEqual(body);

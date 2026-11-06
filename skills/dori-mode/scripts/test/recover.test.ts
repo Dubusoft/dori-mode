@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, resumeCommand, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { type Lane, Registry } from "../src/registry.ts";
-import { depsFor, fakeClock, fakeRunner, newWorld, withState, withSqliteStore } from "./fakes.ts";
+import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
+import type { StartupVerdict } from "../src/runner/protocol.ts";
+import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
 
 let state: ReturnType<typeof withState>;
 beforeEach(() => { state = withState(); withSqliteStore(state.dir); });
@@ -18,41 +20,69 @@ const fixture = async () => {
   const brief = join(state.dir, "brief.md");
   await Bun.write(brief, "Execute the task.");
   const lane: Lane = { key: "recover-lane", title: "lane", thread: "chat:1", brief, cwd: state.dir, model: "provider/expected", pane: "old:p1", tab: "old:t1", done: "merged a/b#1", openedAt: new Date(-STARTUP_GRACE_MS).toISOString() };
-  const control = { live: false, argv: ["omo", "--model", "provider/expected"], createCode: 0, listCode: 0, next: 0, attempted: 0, duringCreate: undefined as undefined | (() => Promise<void>) };
-  const base = fakeRunner(world);
-  const deps: typeof d = { ...d, run: async (argv, opts) => {
-    if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "list") {
-      world.calls.push([...argv]);
-      const panes = [
-        ...(control.live ? [{ pane_id: "old:p1", tab_id: "old:t1", workspace_id: "w", agent_status: "working" }] : []),
-        ...(control.next ? [{ pane_id: `new:p${control.next}`, tab_id: `new:t${control.next}`, workspace_id: "w", agent_status: "working" }] : []),
-      ];
-      return { code: control.listCode, out: JSON.stringify({ result: { panes } }), err: "" };
-    }
-    if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") {
-      world.calls.push([...argv]);
-      return { code: 0, out: JSON.stringify({ result: { process_info: { foreground_processes: [{ pid: 42, argv: control.argv }] } } }), err: "" };
-    }
-    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") {
-      world.calls.push([...argv]);
-      control.attempted = (await d.registry.read(lane.key))?.recoveryAttempts ?? 0;
-      await control.duringCreate?.();
-      control.next++;
-      return { code: control.createCode, out: JSON.stringify({ result: { root_pane: { pane_id: `new:p${control.next}` }, tab_id: `new:t${control.next}` } }), err: "" };
-    }
-    return base(argv, opts);
-  } };
+  const control = {
+    argv: ["omo", "--model", "provider/expected"], fail: false, listFails: false, next: 0, attempted: 0,
+    startup: { verdict: "ok", detail: "ready" } as StartupVerdict,
+    duringCreate: undefined as undefined | (() => Promise<void>), onProcessInfo: undefined as undefined | (() => Promise<void>),
+    live: (on: boolean) => { world.panes = on ? [{ pane_id: "old:p1", tab_id: "old:t1", workspace_id: "w", agent: "omo", agent_status: "working" }] : []; },
+  };
+  /** The runner's relaunch (lane.recover or lane.start): a new working pane new:p<n>, or a failure when control.fail. */
+  const relaunch = async (): Promise<{ pane: string; tab: string }> => {
+    control.attempted = (await d.registry.read(lane.key))?.recoveryAttempts ?? 0;
+    await control.duringCreate?.();
+    control.next++;
+    if (control.fail) throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover herdr tab create failed");
+    const pane = `new:p${control.next}`;
+    world.panes.push({ pane_id: pane, tab_id: `new:t${control.next}`, workspace_id: "w", agent: "omo", agent_status: "working" });
+    return { pane, tab: `new:t${control.next}` };
+  };
+  const ops: LaneOps = {
+    ...d.ops,
+    panes: async (machine) => {
+      if (control.listFails) { world.ops.push({ op: "panes", args: { machine } }); throw new LaneOpsError("LANE_OP_FAILED", "local", "herdr pane list failed"); }
+      return d.ops.panes(machine);
+    },
+    processInfo: async (ref) => {
+      world.ops.push({ op: "processInfo", args: { ...ref } });
+      const out = { code: 0, out: JSON.stringify({ result: { process_info: { foreground_processes: [{ pid: 42, argv: control.argv }] } } }), err: "" };
+      await control.onProcessInfo?.();
+      return out;
+    },
+    recover: async (l, opts) => {
+      world.ops.push({ op: "recover", key: l.key, args: { runner: l.runner, ...(opts ? { opts } : {}) } });
+      const made = await relaunch();
+      return { ...made, relaunched: true, resumed: opts?.session !== undefined, startup: control.startup };
+    },
+    start: async (input) => {
+      world.ops.push({ op: "start", key: input.key, args: input });
+      return { ...(await relaunch()), startup: control.startup };
+    },
+  };
+  const deps: typeof d = { ...d, ops };
   await deps.registry.write(lane);
   return { deps, world, lane, control, clock };
 };
 
-test("recovers a missing pane with persisted attempt and original launch metadata", async () => {
+const opsOf = (world: World, ...names: string[]) => world.ops.filter((e) => names.includes(e.op));
+
+test("recovers a missing pane through its runner with persisted attempt and original launch metadata", async () => {
   const { deps, world, lane, control } = await fixture();
   const events = await recoverLanes(deps, lane.key);
   expect(events).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
   expect(control.attempted).toBe(1);
-  expect(await deps.registry.read(lane.key)).toMatchObject({ pane: "new:p1", model: lane.model, brief: lane.brief, cwd: lane.cwd, openedAt: lane.openedAt, recoveryAttempts: 1, lastRecoveryAt: 0 });
+  expect(opsOf(world, "recover", "start", "close").map((e) => e.op)).toEqual(["recover"]);
+  expect(await deps.registry.read(lane.key)).toMatchObject({ pane: "new:p1", tab: "new:t1", model: lane.model, brief: lane.brief, cwd: lane.cwd, openedAt: lane.openedAt, recoveryAttempts: 1, lastRecoveryAt: 0 });
   expect(world.calls.filter((call) => call[0] === "notify")).toHaveLength(1);
+});
+
+test("a lane its runner does not know is started again from its brief", async () => {
+  const { deps, world, lane } = await fixture();
+  const ops: LaneOps = { ...deps.ops, recover: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover RUNNER_LANE_UNKNOWN recover-lane"); } };
+  expect(await recoverLanes({ ...deps, ops }, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
+  const start = opsOf(world, "start")[0]?.args as { briefText: string } | undefined;
+  expect(start).toMatchObject({ key: "recover-lane", cwd: lane.cwd, model: lane.model });
+  // A lane on the old footer moves onto the dori report one when it is started again.
+  expect(start?.briefText).toStartWith("Execute the task.\n\n## Lane footer (written by dori launch)");
 });
 
 test.each([
@@ -60,26 +90,27 @@ test.each([
   { argv: ["bun", "/bin/omo", "--model", "provider/wrong"], reason: "model-mismatch" },
   { argv: ["omo", "--model=provider/wrong"], reason: "model-mismatch" },
   { argv: ["bun", "/agent/senpi/dist/bundle/cli.js"], reason: "missing-model" },
-])("recovers restored argv $argv using registry model", async ({ argv, reason }) => {
+])("replaces a live pane on argv $argv using the registry model: the runner closes the lane, then starts it again", async ({ argv, reason }) => {
   const { deps, world, control } = await fixture();
-  control.live = true;
+  control.live(true);
   control.argv = [...argv];
   const events = await recoverLanes(deps);
   expect(events[0]).toBe(`LANE_RECOVERED recover-lane new:p1 ${reason}`);
   expect((await deps.registry.read("recover-lane"))?.model).toBe("provider/expected");
-  expect(world.calls.findIndex((call) => call[2] === "run")).toBeLessThan(world.calls.findIndex((call) => call[2] === "close"));
-  expect(world.calls.filter((call) => call[2] === "close")).toEqual([["herdr", "pane", "close", "old:p1"]]);
+  expect(opsOf(world, "recover", "start", "close").map((e) => e.op)).toEqual(["close", "start"]);
+  expect(opsOf(world, "start")[0]?.args).toMatchObject({ model: "provider/expected" });
+  expect(world.panes.some((p) => p.pane_id === "old:p1")).toBe(false);
   expect(world.calls.filter((call) => call[0] === "notify")).toHaveLength(1);
 });
 
 test.each(["working", "paused", "closed", "done-claimed"] as const)("leaves %s live lanes untouched when matching or inactive", async (status) => {
   const { deps, world, lane, control } = await fixture();
-  control.live = true;
+  control.live(true);
   if (status !== "working") control.argv = ["omo"];
   await deps.registry.write({ ...lane, status });
   const events = await recoverLanes(deps);
   expect(events).toEqual([]);
-  expect(world.calls.some((call) => call[2] === "create" || call[2] === "close")).toBe(false);
+  expect(opsOf(world, "recover", "start", "close")).toEqual([]);
 });
 
 test.each(["paused", "closed", "done-claimed"] as const)("does not recover a missing %s lane", async (status) => {
@@ -89,17 +120,17 @@ test.each(["paused", "closed", "done-claimed"] as const)("does not recover a mis
   expect(events).toEqual([]);
 });
 
-test("a runner-owned lane whose pane is unknown is left to its runner, never relaunched here", async () => {
+test("a remote lane whose pane is unknown is recovered by its own runner, never started here", async () => {
   const { deps, world, lane } = await fixture();
-  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a" });
-  expect(await recoverLanes(deps, lane.key)).toEqual([]);
-  expect(world.calls.some((call) => call[1] === "tab" && call[2] === "create")).toBe(false);
-  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
+  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app" });
+  expect(await recoverLanes(deps, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
+  expect(opsOf(world, "recover", "start").map((e) => [e.op, (e.args as { runner?: string }).runner])).toEqual([["recover", "worker-a"]]);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
 });
 
 test("does not interpret list failure as a missing pane", async () => {
   const { deps, control } = await fixture();
-  control.listCode = 1;
+  control.listFails = true;
   const events = await recoverLanes(deps);
   expect(events[0]?.startsWith("LANE_RECOVERY_ERROR recover-lane ")).toBe(true);
   expect(control.next).toBe(0);
@@ -108,7 +139,7 @@ test("does not interpret list failure as a missing pane", async () => {
 
 test("failed attempts exhaust the persisted recovery budget", async () => {
   const { deps, control, lane } = await fixture();
-  control.createCode = 1;
+  control.fail = true;
   await deps.registry.write({ ...lane, recoveryAttempts: RECOVERY_LIMIT - 1 });
   const first = await recoverLanes(deps);
   const second = await recoverLanes(deps);
@@ -174,53 +205,39 @@ test("a concurrent recovery owner excludes another registry instance", async () 
 
 test("a pause during process inspection prevents recovery admission", async () => {
   const { deps, lane, control, world } = await fixture();
-  control.live = true;
+  control.live(true);
   control.argv = ["omo"];
-  const run: typeof deps.run = async (argv, opts) => {
-    const result = await deps.run(argv, opts);
-    if (argv[2] === "process-info") await deps.registry.write({ ...lane, status: "paused" });
-    return result;
-  };
-  expect(await recoverLanes({ ...deps, run })).toEqual([]);
+  control.onProcessInfo = async () => { await deps.registry.write({ ...lane, status: "paused" }); };
+  expect(await recoverLanes(deps)).toEqual([]);
   expect((await deps.registry.read(lane.key))?.status).toBe("paused");
-  expect(world.calls.some((call) => call[2] === "create" || call[2] === "close")).toBe(false);
+  expect(opsOf(world, "recover", "start", "close")).toEqual([]);
 });
 
 test("a capped wrong-model pane is never fed a freshness nudge", async () => {
   const { deps, lane, control, world } = await fixture();
-  control.live = true;
+  control.live(true);
   control.argv = ["omo"];
   await deps.registry.write({ ...lane, recoveryAttempts: RECOVERY_LIMIT });
   await recoverLanes(deps);
   expect((await deps.registry.read(lane.key))?.recoveryPending).toBe(true);
   expect(await freshnessTick({ ...deps, clock: fakeClock(30 * 60_000) }, "/home/test")).toEqual([]);
-  expect(world.calls.some((call) => call[2] === "send-text" || call[2] === "create")).toBe(false);
+  expect(sent(world)).toEqual([]);
+  expect(opsOf(world, "recover", "start")).toEqual([]);
 });
 
 test("failed process inspection never turns a live lane into a missing lane", async () => {
   const { deps, control } = await fixture();
-  control.live = true;
-  const run: typeof deps.run = async (argv, opts) => argv[2] === "process-info"
-    ? { code: 1, out: "", err: "unavailable" } : deps.run(argv, opts);
-  const events = await recoverLanes({ ...deps, run });
+  control.live(true);
+  const ops: LaneOps = { ...deps.ops, processInfo: async () => ({ code: 1, out: "", err: "unavailable" }) };
+  const events = await recoverLanes({ ...deps, ops });
   expect(events[0]?.startsWith("LANE_RECOVERY_ERROR recover-lane ")).toBe(true);
   expect(control.next).toBe(0);
   expect((await deps.registry.read("recover-lane"))?.recoveryAttempts).toBeUndefined();
 });
 
-test("recovery closes only its registered pane even when the saved tab changed", async () => {
-  const { deps, lane, control, world } = await fixture();
-  control.live = true;
-  control.argv = ["omo"];
-  await deps.registry.write({ ...lane, tab: "someone-else:t1" });
-  const events = await recoverLanes(deps);
-  expect(events[0]).toBe("LANE_RECOVERED recover-lane new:p1 missing-model");
-  expect(world.calls.filter((call) => call[2] === "close")).toEqual([["herdr", "pane", "close", "old:p1"]]);
-});
-
 test("a recovered agent that later confirms clears the freshness hold", async () => {
   const { deps, lane, control } = await fixture();
-  control.live = true;
+  control.live(true);
   await deps.registry.write({ ...lane, recoveryPending: true });
   expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane old:p1 startup-confirmed"]);
   expect((await deps.registry.read(lane.key))?.recoveryPending).toBeUndefined();
@@ -237,41 +254,38 @@ test("item 7: a recovered lane resumes its registered session instead of restart
   const { deps, world, lane } = await fixture();
   await deps.registry.write({ ...lane, session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", sessionVia: "argv" });
   expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
-  const ran = world.calls.find((c) => c[0] === "herdr" && c[2] === "run")?.[4] ?? "";
-  expect(ran).toStartWith("DORI_LANE_KEY=recover-lane omo --model provider/expected --thinking medium --session 0b1c2d3e-aaaa-bbbb-cccc-123456789abc ");
+  expect(opsOf(world, "recover")[0]?.args).toMatchObject({ opts: { session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc" } });
   expect(await deps.registry.read(lane.key)).toMatchObject({ session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", pane: "new:p1" });
 });
 
-test("a sandboxed lane is relaunched behind laneSandbox.command, resumed session included", async () => {
-  const { deps, world, lane } = await fixture();
+test("a sandboxed lane replaced on the wrong model is started sandboxed again, resumed session included", async () => {
+  const { deps, world, lane, control, clock } = await fixture();
+  clock.at = STARTUP_GRACE_MS;
+  control.live(true);
+  control.argv = ["omo"];
   await deps.registry.write({ ...lane, sandbox: true, session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc", sessionVia: "argv" });
   const wrapped = { ...deps, config: { ...deps.config, laneSandbox: { command: ["lane-sandbox"] } } };
-  expect(await recoverLanes(wrapped)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
-  const ran = world.calls.find((c) => c[0] === "herdr" && c[2] === "run")?.[4] ?? "";
-  expect(ran).toStartWith("DORI_LANE_KEY=recover-lane lane-sandbox omo --model provider/expected --thinking medium --session 0b1c2d3e-aaaa-bbbb-cccc-123456789abc ");
+  expect(await recoverLanes(wrapped)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-model session-resumed", "STARTUP_OK recover-lane new:p1"]);
+  expect(opsOf(world, "start")[0]?.args).toMatchObject({ sandbox: true, session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc" });
   expect((await deps.registry.read(lane.key))?.sandbox).toBe(true);
 });
 
 test("item 7: a resume that does not start falls back to the brief on the next attempt", async () => {
   const { deps, world, lane, control, clock } = await fixture();
   await deps.registry.write({ ...lane, session: "gone-session" });
-  world.screen = "Error: Session crashed\n";
-  const idle: typeof deps = { ...deps, run: async (argv, opts) => {
-    const r = await deps.run(argv, opts);
-    return argv[0] === "herdr" && argv[2] === "list" ? { ...r, out: r.out.replaceAll('"working"', '"idle"') } : r;
-  } };
-  const first = await recoverLanes(idle);
+  control.startup = { verdict: "error", detail: "Session crashed" };
+  const first = await recoverLanes(deps);
   expect(first).toEqual(["STARTUP_ERROR recover-lane new:p1: Session crashed", "LANE_RECOVERY_ERROR recover-lane replacement-unconfirmed; session gone-session not resumed, the next attempt starts from the brief"]);
   expect(await deps.registry.read(lane.key)).toMatchObject({ recoveryResumeFailed: "gone-session" });
   expect((await deps.registry.read(lane.key))?.session).toBeUndefined();
   control.argv = ["omo"];
-  world.screen = "❯ ";
+  control.startup = { verdict: "ok", detail: "ready" };
   clock.at = STARTUP_GRACE_MS;
   await recoverLanes(deps);
-  const runs = world.calls.filter((c) => c[0] === "herdr" && c[2] === "run").map((c) => c[4] ?? "");
-  expect(runs).toHaveLength(2);
-  expect(runs[0]).toContain("--session gone-session");
-  expect(runs[1]).not.toContain("--session");
+  const relaunches = opsOf(world, "recover", "start");
+  expect(relaunches).toHaveLength(2);
+  expect(relaunches[0]?.args).toMatchObject({ opts: { session: "gone-session" } });
+  expect((relaunches[1]?.args as { session?: string }).session).toBeUndefined();
 });
 
 test("item 7: resumeCommand puts --session before the prompt, and declines when it cannot resume", () => {
@@ -286,13 +300,13 @@ test("item 7: resumeCommand puts --session before the prompt, and declines when 
 test.each([{ live: false, reason: "missing-pane" }, { live: true, reason: "missing-model" }])("never relaunches a lane whose PR is merged ($reason); the lane is closed instead", async ({ live, reason }) => {
   const { deps, world, lane, control } = await fixture();
   world.prState = "MERGED";
-  if (live) { control.live = true; control.argv = ["omo"]; }
+  if (live) { control.live(true); control.argv = ["omo"]; }
   const events = await recoverLanes(deps, lane.key);
   expect(events).toHaveLength(1);
   expect(events[0]).toStartWith(`LANE_RECOVERY_SKIPPED recover-lane old:p1 ${reason}: every Done signal holds`);
   expect(control.next).toBe(0);
   expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
-  expect(world.calls.some((call) => call[2] === "create")).toBe(false);
+  expect(opsOf(world, "recover", "start")).toEqual([]);
   expect(events[0]).toContain("lane closed");
   expect((await deps.registry.read(lane.key))?.status).toBe("closed");
 });
@@ -314,23 +328,21 @@ test.each([
 ])("a sonnet lane running its model is left alone: $name", async ({ procs, screen }) => {
   const { deps, world, lane, control } = await fixture();
   await deps.registry.write({ ...lane, model: SONNET });
-  control.live = true;
+  control.live(true);
   world.screen = screen;
-  const run: typeof deps.run = async (argv, opts) => argv[2] === "process-info"
-    ? { code: 0, out: JSON.stringify({ result: { process_info: { foreground_processes: procs.map((p, i) => ({ pid: 40 + i, argv: p })) } } }), err: "" }
-    : deps.run(argv, opts);
-  expect(await recoverLanes({ ...deps, run })).toEqual([]);
-  expect(world.calls.some((call) => call[2] === "create" || call[2] === "close")).toBe(false);
+  const ops: LaneOps = { ...deps.ops, processInfo: async () => ({ code: 0, out: JSON.stringify({ result: { process_info: { foreground_processes: procs.map((p, i) => ({ pid: 40 + i, argv: p })) } } }), err: "" }) };
+  expect(await recoverLanes({ ...deps, ops })).toEqual([]);
+  expect(opsOf(world, "recover", "start", "close")).toEqual([]);
 });
 
 test("a pane whose model is not readable yet is not judged missing-model until the startup grace ends", async () => {
   const { deps, world, lane, control, clock } = await fixture();
   clock.at = 1_000_000;
   await deps.registry.write({ ...lane, openedAt: new Date(clock.at - 15_000).toISOString() });
-  control.live = true;
+  control.live(true);
   control.argv = ["omo"];
   expect(await recoverLanes(deps)).toEqual([]);
-  expect(world.calls.some((call) => call[2] === "create")).toBe(false);
+  expect(opsOf(world, "recover", "start")).toEqual([]);
   clock.at += STARTUP_GRACE_MS;
   expect((await recoverLanes(deps))[0]).toBe("LANE_RECOVERED recover-lane new:p1 missing-model");
 });
@@ -344,9 +356,9 @@ test.each([
   const { deps, world, lane, control, clock } = await fixture();
   clock.at = 1_000_000;
   await deps.registry.write({ ...lane, model: SONNET, ...(fresh ? { openedAt: new Date(clock.at - 5_000).toISOString() } : {}) });
-  control.live = true;
+  control.live(true);
   control.argv = [...argv];
   world.screen = screen;
   expect((await recoverLanes(deps))[0]).toBe(`LANE_RECOVERED recover-lane new:p1 ${reason}`);
-  expect(world.calls.filter((call) => call[2] === "close")).toEqual([["herdr", "pane", "close", "old:p1"]]);
+  expect(opsOf(world, "close", "start").map((e) => [e.op, e.key])).toEqual([["close", "recover-lane"], ["start", "recover-lane"]]);
 });

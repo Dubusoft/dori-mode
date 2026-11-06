@@ -9,6 +9,11 @@ import type { Clock, Ran, Runner } from "../src/run.ts";
 import { Database } from "bun:sqlite";
 
 import { GITHUB_FILE, loadGithub } from "../src/github-events.ts";
+import { LaneOpsError, type Delivery, type LaneOps, type LaneRef, runnerOf, machineRunner } from "../src/lane-ops.ts";
+import type { Pane } from "../src/panes.ts";
+import type { CommandResults, LaneInspection } from "../src/runner/protocol.ts";
+import { laneStatus } from "../src/runner/serve.ts";
+import { checkDone } from "../src/signals.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
 import type { Journal } from "../src/supervise.ts";
 
@@ -57,11 +62,23 @@ export type World = {
   /** Worktrees a successful `git worktree remove` took away: no longer listed, and `exists` reads them gone. */
   removed: string[];
   calls: string[][];
+  /** Every LaneOps call fakeLaneOps(w) took, in order. */
+  ops: OpsEntry[];
+  /** What a send answers (default "delivered"). */
+  sendDelivery?: Delivery;
+  pauseResult?: CommandResults["lane.pause"];
+  /** Merged over the inspection fakeLaneOps derives from the World. */
+  inspection?: Partial<LaneInspection>;
+  startResult?: CommandResults["lane.start"];
+  /** Every runner is down: reads and effects throw RUNNER_UNAVAILABLE, send answers "failed", status an error. */
+  runnerDown?: boolean;
 };
+
+export type OpsEntry = { readonly op: keyof LaneOps; readonly key?: string; readonly args: unknown };
 
 export const WT = "/repo/.wt/demo-lane";
 
-export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [] });
+export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [], ops: [] });
 
 export const fakeRunner = (w: World): Runner => async (argv) => {
   w.calls.push([...argv]);
@@ -137,9 +154,121 @@ export const withState = (root = tmpdir()): { dir: string; done: () => void } =>
   return { dir, done: () => rmSync(dir, { recursive: true, force: true }) };
 };
 
-export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps => {
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, ...patch };
-  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path) };
+/**
+ * A LaneOps over the World: panes from w.panes, screens from w.screens/w.screen, send applies w.onEnterStatus and logs,
+ * close drops the pane, git worktree-remove pushes w.removed, inspect derives git facts from w.dirty/w.aheadCount/w.removed
+ * and runs Done checks through fakeRunner(w); w.runnerDown makes every call throw LaneOpsError RUNNER_UNAVAILABLE (send
+ * answers "failed", notify and status never throw, as the real facade). Every call is recorded in w.ops.
+ */
+export const fakeLaneOps = (w: World): LaneOps => {
+  const record = (op: keyof LaneOps, key: string | undefined, args: unknown): void => { w.ops.push({ op, ...(key !== undefined ? { key } : {}), args }); };
+  const down = (label: string): void => { if (w.runnerDown) throw new LaneOpsError("RUNNER_UNAVAILABLE", label, "disconnected: the fake World's runner is down"); };
+  const paneOf = (id: string | undefined): World["panes"][number] | undefined => w.panes.find((p) => p.pane_id === id);
+  const setStatus = (id: string | undefined, status: string | undefined): void => {
+    const p = paneOf(id);
+    if (p && status) p.agent_status = status;
+  };
+  const statusOf = (lane: LaneRef) => laneStatus(paneOf(lane.pane) as Pane | undefined);
+  return {
+    panes: async (machine) => { record("panes", undefined, { machine }); down(machineRunner(machine)); return w.panes.map((p) => ({ ...p })); },
+    screen: async (ref, lines) => {
+      record("screen", undefined, { ...ref, lines }); down(machineRunner(ref.machine));
+      return w.screens?.length ? (w.screens.shift() ?? w.screen) : w.screen;
+    },
+    processInfo: async (ref) => {
+      record("processInfo", undefined, { ...ref }); down(machineRunner(ref.machine));
+      const info = w.inspection?.process;
+      return info ? { code: 0, out: JSON.stringify({ result: { process_info: info } }), err: "" } : { code: 1, out: "", err: "no process info in the fake World" };
+    },
+    status: async (ref) => {
+      record("status", undefined, { ...ref });
+      if (w.runnerDown) return { error: `RUNNER_UNAVAILABLE runner=${machineRunner(ref.machine)} disconnected` };
+      return { status: paneOf(ref.pane)?.agent_status };
+    },
+    exists: async (machine, paths) => { record("exists", undefined, { machine, paths }); down(machineRunner(machine)); return paths.map((p) => !w.removed.includes(p)); },
+    inspect: async (lane, want) => {
+      record("inspect", lane.key, { lane, want }); down(runnerOf(lane));
+      const cwd = want.cwd ?? (lane.machine ? lane.remoteCwd : lane.cwd) ?? "/repo";
+      const dirty = w.dirty !== "";
+      const ahead = Number(w.aheadCount) || 0;
+      const worktrees = [
+        { path: "/repo", branch: "main", dirty, ahead, exists: true },
+        ...(w.removed.includes(WT) ? [] : [{ path: WT, branch: "demo-lane", dirty, ahead, exists: true }]),
+      ];
+      const pane = paneOf(lane.pane) as Pane | undefined;
+      const done = want.done !== undefined
+        ? { cwd: lane.machine ? (want.doneCwd ?? "/repo") : cwd, fallback: false, checks: await checkDone(want.done, fakeRunner(w), { cwd }) }
+        : undefined;
+      const derived: LaneInspection = {
+        status: statusOf(lane), ...(pane ? { pane } : {}), cwd, cwdExists: !w.removed.includes(cwd),
+        ...(want.git ? {
+          git: {
+            toplevel: "/repo", branch: "main", worktrees,
+            ...(want.branches ? { branches: Object.fromEntries(want.branches.map((b) => [b, { local: true, remote: false }])) } : {}),
+          },
+        } : {}),
+        ...(done ? { done } : {}),
+      };
+      return { ...derived, ...w.inspection };
+    },
+    observeMachine: async (machine) => {
+      record("observeMachine", undefined, { machine }); down(machineRunner(machine));
+      const panes = w.panes.map((p) => ({ ...p }));
+      return { os: "linux", sampledAt: 0, sample: { load1: 0, memFreePct: 100, diskFreeGb: 100, swapFreeGb: 0, swapTotalGb: 0, panes: panes.length }, panes };
+    },
+    send: async (lane, text, opts) => {
+      record("send", lane.key, { text, ...(opts ? { opts } : {}) });
+      if (w.runnerDown) return "failed";
+      setStatus(lane.pane, w.onEnterStatus);
+      return w.sendDelivery ?? "delivered";
+    },
+    pause: async (lane, step) => {
+      record("pause", lane.key, { step }); down(runnerOf(lane));
+      if (step !== "goal") setStatus(lane.pane, w.onEscapeStatus);
+      return w.pauseResult ?? { goal: "confirmed", working: false, stopped: true };
+    },
+    resume: async (lane) => { record("resume", lane.key, {}); down(runnerOf(lane)); return { goal: "confirmed" }; },
+    start: async (input) => {
+      record("start", input.key, input); down(machineRunner(input.machine));
+      if (w.startResult) return w.startResult;
+      const pane = `w-${input.key}:p1`;
+      w.panes.push({ pane_id: pane, workspace_id: `w-${input.key}`, tab_id: `w-${input.key}:t1`, agent: "omo", agent_status: "working", cwd: input.cwd });
+      return { pane, tab: `w-${input.key}:t1`, startup: { verdict: "ok", detail: "" } };
+    },
+    adopt: async (input) => {
+      record("adopt", input.key, input); down(machineRunner(input.machine));
+      return { pane: input.pane, tab: paneOf(input.pane)?.tab_id ?? "", tokenFile: `/home/test/.dori/runner/briefs/${input.key}.token` };
+    },
+    recover: async (lane, opts) => {
+      record("recover", lane.key, { ...(opts ? { opts } : {}) }); down(runnerOf(lane));
+      return { pane: lane.pane ?? "", tab: lane.tab ?? "", relaunched: true, resumed: opts?.session !== undefined };
+    },
+    close: async (lane, opts) => {
+      record("close", lane.key, { ...(opts ? { opts } : {}) }); down(runnerOf(lane));
+      const had = paneOf(lane.pane) !== undefined;
+      w.panes = w.panes.filter((p) => p.pane_id !== lane.pane);
+      return { closed: lane.tab ? "tab" : had ? "pane" : "none", gone: true };
+    },
+    git: async (lane, op, opts) => {
+      record("git", lane.key, { ...op, ...(opts ? { opts } : {}) }); down(runnerOf(lane));
+      if (op.op === "worktree-remove" && !w.removed.includes(op.path)) w.removed.push(op.path);
+      return { code: 0, out: "", err: "" };
+    },
+    notify: async (lane, notice) => { record("notify", lane.key, notice); },
+    kill: async (machine, keys) => { record("kill", undefined, { machine, keys }); down(machineRunner(machine)); return []; },
+    observe: async (lane) => { record("observe", lane.key, {}); down(runnerOf(lane)); return statusOf(lane); },
+    connected: () => !w.runnerDown,
+  };
 };
 
-export const sent = (w: World): string[] => w.calls.filter((c) => c[0] === "herdr" && c[2] === "send-text").map((c) => c[4] ?? "");
+/** FlowDeps over the World, plus `ops` (a fakeLaneOps over the same World) for modules that reach lanes through the facade. */
+export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps & { readonly ops: LaneOps } => {
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, ...patch };
+  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w) };
+};
+
+/** The texts sent to lanes: through the facade (`w.ops` sends), and through herdr `send-text` by modules not yet moved onto it. */
+export const sent = (w: World): string[] => [
+  ...w.calls.filter((c) => c[0] === "herdr" && c[2] === "send-text").map((c) => c[4] ?? ""),
+  ...w.ops.filter((e) => e.op === "send").map((e) => (e.args as { text: string }).text),
+];

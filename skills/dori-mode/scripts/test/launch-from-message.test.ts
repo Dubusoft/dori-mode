@@ -104,12 +104,12 @@ test("a generated brief launches in mass-ulw mode: its path has no '?' and the f
   expect(path).toBe(join(state.dir, "briefs", "mass-lane.md"));
   writeGeneratedBrief(path, assembleBrief("Upload", [ownerMessageText(state.dir, { channel: "111", message: "501" })], []));
   world.panes = [];
-  const base = depsFor(world, fakeClock(T0), state.dir);
-  const d = { ...base, run: async (argv: readonly string[]) => (argv[1] === "tab" ? { code: 0, out: JSON.stringify({ result: { tab_id: "w:t9", root_pane: { pane_id: "w:p9" } } }), err: "" } : base.run(argv)) };
+  const d = depsFor(world, fakeClock(T0), state.dir);
   const r = await launchLane(d, { key: "mass-lane", title: "Upload", brief: path, done: "closed acme/app#3", mode: "mass-ulw", cwd: state.dir });
   expect(r.lane.mode).toBe("mass-ulw");
-  const command = world.calls.find((c) => c[0] === "herdr" && c[1] === "pane" && c[2] === "run")?.[4] ?? "";
-  expect(command).toContain(`/mass-ulw set goal and work. Read and execute the lane brief at ${path}`);
+  const start = world.ops.find((e) => e.op === "start")?.args as { keywords: string; mode: string; briefText: string } | undefined;
+  expect(start).toMatchObject({ keywords: "/mass-ulw set goal and work", mode: "mass-ulw" });
+  expect(start?.briefText).toContain("## Lane footer (written by dori launch)");
   expect(r.lane.brief).toBe(path);
   const text = await Bun.file(path).text();
   expect(text).toStartWith("# Upload\n\n## Owner request\n\ninvestigate the flaky upload\n");

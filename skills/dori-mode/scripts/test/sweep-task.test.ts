@@ -7,6 +7,14 @@ import type { Http } from "../src/messenger/http.ts";
 import { supervise, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, manualPause, newWorld, withState } from "./fakes.ts";
 
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
+
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   mock.restore();
@@ -15,7 +23,6 @@ afterEach(() => {
 
 const T0 = 1_800_000_000_000;
 const STALL_MS = 120_000;
-const DF = "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200";
 const OWNER = "123456789012345";
 const MESSAGE = "1900000000000000001";
 
@@ -54,17 +61,17 @@ const setup = () => {
   const base = depsFor(world, clock, state.dir, {
     discord: { applicationId: "100", guildId: "200", ownerId: OWNER }, discordChannels: ["11"], defaultModel: "test/model",
   });
-  // The guard sweep's disk sample (only that sweep runs df) hangs for STALL_MS: the injected sweep stall.
+  // The machine-guard sweep's `herdr machine list` (only that sweep reads it) hangs for STALL_MS: the injected sweep stall.
   const stall: { at?: number; release: () => void } = { release: () => {} };
   const stallListeners = new Set<() => void>();
   let ownerPosted = false;
   const deps = {
     ...base,
     run: async (argv: readonly string[]) => {
-      if (argv[0] !== "df") return base.run(argv);
+      if (argv.join(" ") !== "herdr machine list --json") return base.run(argv);
       return new Promise<{ code: number; out: string; err: string }>((resolve) => {
         const timer = setTimeout(() => { stall.release(); }, STALL_MS);
-        stall.release = () => { clearTimeout(timer); resolve({ code: 0, out: DF, err: "" }); };
+        stall.release = () => { clearTimeout(timer); resolve({ code: 0, out: "[]", err: "" }); };
         stall.at = performance.now();
         // The owner writes while the sweep is stuck; the REST catch-up is due again on the next pass.
         ownerPosted = true;
@@ -88,7 +95,7 @@ const setup = () => {
   const pause = (ms: number, signal: AbortSignal) => { const parked = pauses.pause(ms, signal); for (const listener of parkListeners) listener(); return parked; };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `sweep-task-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
+    token: `sweep-task-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
     open: () => {
       let closed = (_code: number) => {};
       return {
@@ -104,9 +111,9 @@ const setup = () => {
   const onError = (signal: () => void) => { errorListeners.add(signal); return () => { errorListeners.delete(signal); }; };
   const onStall = (signal: () => void) => { stallListeners.add(signal); return () => { stallListeners.delete(signal); }; };
   const onPark = (signal: () => void) => { parkListeners.add(signal); return () => { parkListeners.delete(signal); }; };
-  // Once the three working tasks and the stall check are parked (the sweeps task is stuck), each takes its next pass.
+  // Once the three working tasks, the runners task (the hub always opens) and the stall check are parked (the sweeps task is stuck), each takes its next pass.
   const next = async () => {
-    await until(onPark, () => pauses.parked() === 4, 10_000, "the three working tasks and the stall check parked");
+    await until(onPark, () => pauses.parked() === 5, 10_000, "the three working tasks, the runners task and the stall check parked");
     pauses.tick();
   };
   const stop = async () => { controller.abort(); stall.release(); await running; };
@@ -114,7 +121,7 @@ const setup = () => {
 };
 
 test("an injected 120 s sweep stall still delivers an owner INBOUND to the lead in under 10 s, and the stuck sweep withholds the watchdog", async () => {
-  // Given the real supervise() whose guard sweep hangs for 120 s, and an owner message posted once it hangs.
+  // Given the real supervise() whose machine-guard sweep hangs for 120 s, and an owner message posted once it hangs.
   const s = setup();
   try {
     await until(s.onStall, () => s.stall.at !== undefined, 10_000, "the sweep stall");

@@ -18,6 +18,7 @@ import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { readStoreView, readWakes } from "./store.ts";
 import { readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_STALE_MS, type RunnerRow } from "./runner/hub.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
+import { probe as probeRunner, type Verdict } from "./runner/health.ts";
 import { openOperations } from "./operations.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
@@ -72,7 +73,7 @@ export type Status = {
   readonly sources?: { readonly sources: readonly SourceView[]; readonly error?: string };
   /** Every scheduled job with its next run, its last run and how that ended. */
   readonly schedules?: readonly ScheduleRow[];
-  /** Every runner in the hub's table (`runners.sqlite`); none while the hub was never opened. */
+  /** Every runner in the hub's table (`runners.sqlite`), and always the local runner (offline until it first says hello). */
   readonly runners?: readonly RunnerView[];
 };
 
@@ -91,6 +92,35 @@ export type RunnerView = {
   readonly restarts1h?: number;
   /** Open registry lanes on the runner's machine (see runnerLaneCount). */
   readonly lanes?: number;
+  /**
+   * The local runner only: its process as the supervisor's child, from the health file it writes
+   * (`<runnerDir>/health`, the same reading as `dori runner probe`).
+   */
+  readonly child?: { readonly verdict: Verdict; readonly pid?: number; readonly healthAgeSec?: number };
+};
+
+/** The local runner child's state from its health file in `runnerDir`. */
+export const localChildState = (runnerDir: string, now: number): NonNullable<RunnerView["child"]> => {
+  const p = probeRunner({ runnerDir, now: () => now });
+  return {
+    verdict: p.verdict,
+    ...(p.pid !== undefined ? { pid: p.pid } : {}),
+    ...(p.healthAgeMs !== undefined ? { healthAgeSec: Math.floor(p.healthAgeMs / 1000) } : {}),
+  };
+};
+
+/**
+ * Every runner row, the local runner always first: an install whose supervisor never opened the hub (or whose local
+ * runner never said hello) still shows `RUNNER local offline`, and `child` adds the local child's own state.
+ */
+export const runnerViews = (rows: readonly RunnerRow[], now: number, opts: {
+  readonly restarts?: (label: string) => number | undefined; readonly lanes?: (label: string) => number; readonly child?: RunnerView["child"];
+} = {}): RunnerView[] => {
+  const local = rows.find((r) => r.label === LOCAL_RUNNER) ?? { label: LOCAL_RUNNER, eventAck: 0, maxGen: 0, cmdSeq: 0, cmdAck: 0 };
+  return [local, ...rows.filter((r) => r.label !== LOCAL_RUNNER)].map((row) => {
+    const view = runnerView(row, now, opts.restarts?.(row.label), opts.lanes?.(row.label));
+    return row.label === LOCAL_RUNNER && opts.child ? { ...view, child: opts.child } : view;
+  });
 };
 
 /**
@@ -134,7 +164,8 @@ export const runnerView = (row: RunnerRow, now: number, restarts1h?: number, lan
 export const runnerLine = (r: RunnerView): string => {
   const or = (v: number | string | undefined): string => (v === undefined ? "-" : String(v));
   return `RUNNER ${r.label} ${r.state} proto=${or(r.proto)} version=${or(r.version)} gen=${r.gen} hb=${or(r.heartbeatAgeSec)} `
-    + `outbox=${r.outbox ? `${r.outbox.unacked}/${r.outbox.oldestAgeSec}` : "-"} cmds=${r.cmds} restarts1h=${or(r.restarts1h)} lanes=${or(r.lanes)}`;
+    + `outbox=${r.outbox ? `${r.outbox.unacked}/${r.outbox.oldestAgeSec}` : "-"} cmds=${r.cmds} restarts1h=${or(r.restarts1h)} lanes=${or(r.lanes)}`
+    + (r.child ? ` child=${r.child.verdict} pid=${or(r.child.pid)} health=${r.child.healthAgeSec === undefined ? "-" : `${r.child.healthAgeSec}s`}` : "");
 };
 
 /** The scheduled jobs in sources.json with their next run; none when it does not read (dori status shows that error). */
@@ -207,6 +238,8 @@ export type StatusDeps = {
   readonly clock: Clock;
   readonly config: DoriConfig;
   readonly registry: Registry;
+  /** The runner directory whose health file tells the local runner child's state; without it no child state is shown. */
+  readonly runnerDir?: string;
 };
 
 const lastTokens = (file: string): number => {
@@ -327,7 +360,10 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     events: eventStats(d.config, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
-    runners: readRunnerRows(d.config.stateDir).map((row) => runnerView(row, now, d.config.runners ? runnerRestarts(d.config, row.label, now) : undefined, runnerLaneCount(open, row.label))),
+    runners: runnerViews(readRunnerRows(d.config.stateDir), now, {
+      restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
+      ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
+    }),
   };
 };
 

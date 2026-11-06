@@ -1,9 +1,9 @@
 import type { GuardThresholds } from "../config.ts";
 import { alertReasons, criticalReasons, type HostSample } from "../host-guard.ts";
-import { procLanes, type Proc } from "../lane-memory.ts";
+import { laneMemory, procLanes, type Proc } from "../lane-memory.ts";
 import { heavyTargets, killProcs, type KillDeps, type KilledProc } from "../pressure.ts";
 import type { KillResult, MachineSample, SampleResult } from "../remote-guard.ts";
-import type { AnyRunnerEvent, GuardLevel, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
+import type { AnyRunnerEvent, GuardLevel, LaneMemoryBody, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
 
 /**
  * The machine guard moved onto the runner (design 3.5). The runner samples its host every 30 s with the same
@@ -23,6 +23,16 @@ export const GUARD_SAMPLE_MS = 30_000;
 export const GUARD_SEND_MS = 60_000;
 /** A runner's sample stands in for an ssh sample while it is at most this old. */
 export const GUARD_SAMPLE_FRESH_MS = 3 * GUARD_SAMPLE_MS;
+/** At most this many lanes, each with at most GUARD_LANE_TOP commands, go out in one `guard.sample.lanes`. */
+export const GUARD_LANES_MAX = 20;
+export const GUARD_LANE_TOP = 5;
+
+/** Per-lane memory of `procs` as `guard.sample.lanes` carries it: heaviest lanes first, each with its heaviest commands. */
+export const laneMemoryBodies = (procs: readonly Proc[]): LaneMemoryBody[] =>
+  laneMemory(procs).slice(0, GUARD_LANES_MAX).map((l) => ({ key: l.lane, rssKb: l.rssKb, top: l.top.slice(0, GUARD_LANE_TOP).map((c) => ({ ...c })) }));
+
+/** A runner's fresh sample as the machine-guard sweep takes it, with the pane count and per-lane memory it carried. */
+export type RunnerSampleResult = Extract<SampleResult, { ok: true }> & { readonly panes?: number; readonly lanes?: readonly LaneMemoryBody[] };
 
 type Publish = <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
 
@@ -60,9 +70,12 @@ export class RunnerGuard {
     const now = this.deps.now();
     const changed = level !== this.level;
     if (changed || now - this.sentAt >= GUARD_SEND_MS) {
+      // Per-lane memory is read only when a sample goes out; an unreadable process table sends no lanes.
+      const lanes = await this.deps.procs().then(laneMemoryBodies, () => undefined);
       this.deps.publish("guard.sample", {
         level, reasons, sampledAt: Math.round(now), load1: round(s.load1), memFreePct: s.memFreePct, diskFreeGb: round(s.diskFreeGb),
         swapFreeGb: round(s.swapFreeGb), swapTotalGb: round(s.swapTotalGb), os: this.deps.os,
+        ...(Number.isSafeInteger(s.panes) ? { panes: s.panes } : {}), ...(lanes ? { lanes } : {}),
       });
       this.sentAt = now;
     }
@@ -92,7 +105,7 @@ export class RunnerGuard {
 }
 
 export class RunnerGuardBoard {
-  private readonly samples = new Map<string, { readonly sample: MachineSample; readonly at: number }>();
+  private readonly samples = new Map<string, { readonly sample: MachineSample; readonly at: number; readonly panes?: number; readonly lanes?: readonly LaneMemoryBody[] }>();
   private readonly kills = new Map<string, { pid: number; rssKb: number; cmd: string }[]>();
 
   constructor(private readonly now: () => number) {}
@@ -104,6 +117,7 @@ export class RunnerGuardBoard {
       this.samples.set(label, {
         at: this.now(),
         sample: { version: "", os: b.os ?? "linux", load1: b.load1, memFreePct: b.memFreePct, diskFreeGb: b.diskFreeGb, swapFreeGb: b.swapFreeGb ?? -1, swapTotalGb: b.swapTotalGb ?? -1 },
+        ...(b.panes !== undefined ? { panes: b.panes } : {}), ...(b.lanes !== undefined ? { lanes: b.lanes } : {}),
       });
     }
     if (frame.type === "guard.critical") {
@@ -116,12 +130,16 @@ export class RunnerGuardBoard {
 
   /**
    * The runner's sample as a successful sample result while it is fresh. A runner has no guard agent, so its version
-   * is `versionFor(os)`, the one the sweep wants, and a runner machine never reads as OUTDATED.
+   * is `versionFor(os)`, the one the sweep wants, and a runner machine never reads as OUTDATED. The pane count and the
+   * per-lane memory come along when the runner sent them (proto 3).
    */
-  sampleFor(label: string, versionFor: (os: string) => string): SampleResult | undefined {
+  sampleFor(label: string, versionFor: (os: string) => string): RunnerSampleResult | undefined {
     const entry = this.samples.get(label);
     if (!entry || this.now() - entry.at > GUARD_SAMPLE_FRESH_MS) return undefined;
-    return { ok: true, sample: { ...entry.sample, version: versionFor(entry.sample.os) } };
+    return {
+      ok: true, sample: { ...entry.sample, version: versionFor(entry.sample.os) },
+      ...(entry.panes !== undefined ? { panes: entry.panes } : {}), ...(entry.lanes !== undefined ? { lanes: entry.lanes } : {}),
+    };
   }
 
   /** The kills reported since the last call, as the ssh kill path returns them; taking them clears them. */

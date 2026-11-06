@@ -2,8 +2,10 @@
 // Pure apart from the optional config read in `loadPolicy`; path resolution is injected into `checkCommand`.
 
 import { readFileSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
-import { ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand } from "./protocol.ts";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import {
+  isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
+} from "./protocol.ts";
 
 export const POLICY_FILE = "runner-config.json";
 
@@ -13,6 +15,7 @@ export type RunnerPolicy = {
   /** Directories under which every command cwd must resolve. */
   readonly allowedRoots: readonly string[];
   readonly sandbox: "required" | "optional";
+  /** `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with a `done` section. */
   readonly jobs: "allow" | "deny";
   /** Guard thresholds for this host; each one absent falls back to the runner's config defaults. */
   readonly guard?: Readonly<Partial<Record<GuardKey, number>>>;
@@ -91,9 +94,45 @@ const underRoot = (root: string, path: string): boolean => {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 };
 
+/** `cwd-missing` / `cwd-outside-roots` for `path` (absolute, resolving, under an allowed root), else undefined. */
+const checkRootedPath = (policy: RunnerPolicy, path: string, realpath: (path: string) => string, missingOk = false): { readonly rule: string; readonly detail: string } | undefined => {
+  if (!isAbsolute(path)) return { rule: "cwd-missing", detail: `${path} is not absolute` };
+  let resolved: string;
+  try {
+    resolved = realpath(path);
+  } catch {
+    if (!missingOk) return { rule: "cwd-missing", detail: path };
+    // A path to be created (git worktree add): resolve its nearest existing ancestor and re-append the normalized rest.
+    let head = resolvePath(path);
+    const tail: string[] = [];
+    for (;;) {
+      try { resolved = join(realpath(head), ...tail); break; } catch {
+        const parent = dirname(head);
+        if (parent === head) return { rule: "cwd-missing", detail: path };
+        tail.unshift(basename(head));
+        head = parent;
+      }
+    }
+  }
+  const roots: string[] = [];
+  for (const root of policy.allowedRoots) {
+    try { roots.push(realpath(root)); } catch { /* a root that does not exist admits nothing */ }
+  }
+  if (!roots.some((root) => underRoot(root, resolved))) return { rule: "cwd-outside-roots", detail: resolved };
+  return undefined;
+};
+
+/**
+ * The same root check for a directory the runner learns only on its host, such as an adopted or target pane's
+ * `foreground_cwd`/`cwd`: `cwd-missing` / `cwd-outside-roots` (symlinks resolved, path segments compared), else undefined.
+ */
+export const checkCwd = (policy: RunnerPolicy, path: string, realpath: (path: string) => string): { readonly rule: string; readonly detail: string } | undefined =>
+  checkRootedPath(policy, path, realpath);
+
 /**
  * Checks a parsed supervisor command frame against the policy. `realpath` resolves symlinks and throws when the
- * path does not exist (as `fs.realpathSync` does).
+ * path does not exist (as `fs.realpathSync` does). Every `cwd` (`lane.start`, `lane.adopt`, `job.run`,
+ * `wait.check`) and `lane.git.root` must be absolute, resolve and lie under `allowedRoots`.
  */
 export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (path: string) => string): CheckResult {
   const reject = (rule: string, detail: string): CheckResult => ({ ok: false, rule, detail });
@@ -113,26 +152,44 @@ export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (
   }
 
   const body = frame.body as Record<string, unknown>;
-  if ((frame.type === "job.run" || frame.type === "wait.check") && policy.jobs === "deny") return reject("jobs-denied", frame.type);
+  if ((frame.type === "job.run" || frame.type === "wait.check" || frame.type === "lane.git") && policy.jobs === "deny") return reject("jobs-denied", frame.type);
   if (frame.type === "lane.start") {
     if (!Object.hasOwn(policy.agents, body.agentProfile as string)) return reject("agent-profile", String(body.agentProfile));
     if (body.sandbox === false && policy.sandbox === "required") return reject("sandbox-required", "sandbox:false");
   }
-  if (typeof body.cwd === "string") {
-    if (!isAbsolute(body.cwd)) return reject("cwd-missing", `${body.cwd} is not absolute`);
-    let resolved: string;
-    try {
-      resolved = realpath(body.cwd);
-    } catch {
-      return reject("cwd-missing", body.cwd);
-    }
-    const roots: string[] = [];
-    for (const root of policy.allowedRoots) {
-      try { roots.push(realpath(root)); } catch { /* a root that does not exist admits nothing */ }
-    }
-    if (!roots.some((root) => underRoot(root, resolved))) return reject("cwd-outside-roots", resolved);
+  const paths = [body.cwd, frame.type === "lane.git" ? body.root : undefined].filter((p): p is string => typeof p === "string");
+  for (const path of paths) {
+    const refused = checkRootedPath(policy, path, realpath);
+    if (refused) return reject(refused.rule, refused.detail);
+  }
+  // A lane.git path is under the allowed roots too; worktree-add's does not exist yet.
+  if (frame.type === "lane.git" && typeof body.path === "string") {
+    const refused = checkRootedPath(policy, body.path, realpath, body.op === "worktree-add");
+    if (refused) return reject(refused.rule, refused.detail);
   }
   return { ok: true, command: frame };
+}
+
+export type QueryCheckResult = { readonly ok: true; readonly query: AnySupervisorControl } | { readonly ok: false; readonly rule: string; readonly detail: string };
+
+/**
+ * Checks a parsed `q.*` query frame: the protocol schema, and under `jobs: "deny"` a `q.lane.inspect` with a `done`
+ * section (its Done signal commands would run on the host) is refused `jobs-denied`. Queries are read-only otherwise,
+ * so no path is checked against `allowedRoots`.
+ */
+export function checkQuery(policy: RunnerPolicy, query: unknown): QueryCheckResult {
+  const reject = (rule: string, detail: string): QueryCheckResult => ({ ok: false, rule, detail });
+  let frame: AnySupervisorControl;
+  try {
+    const checked = validateFrame(query, "supervisor");
+    if (!isQueryType(checked.type)) return reject("not-a-command", checked.type);
+    frame = checked as AnySupervisorControl;
+  } catch (error) {
+    if (error instanceof ProtocolError) return reject(error.rule, error.detail);
+    throw error;
+  }
+  if (frame.type === "q.lane.inspect" && frame.body.done !== undefined && policy.jobs === "deny") return reject("jobs-denied", "q.lane.inspect done");
+  return { ok: true, query: frame };
 }
 
 /** `RUNNER_CMD_REJECTED <rule>` for a failed check, else undefined. */

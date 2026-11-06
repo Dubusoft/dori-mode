@@ -2,16 +2,21 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
-import { languageInstruction, withThinking } from "./config.ts";
+import { languageInstruction } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { laneRunner, readScreen, statusLookup } from "./panes.ts";
-import { LANE_KEY, type Lane, type LaneMode, statusOf } from "./registry.ts";
+import { LaneOpsError, machineRunner, type StartInput } from "./lane-ops.ts";
+import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
+import { cmdRefused, paneShell } from "./runner/lane-control.ts";
+import type { StartupVerdict } from "./runner/protocol.ts";
 import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
 import type { ToodoStart } from "./toodo-start.ts";
+
+// The startup check and the pane-shell reader run inside the runner's lane.start now; re-exported for their callers.
+export { paneShell, type PaneShell, screenLines, startupFailure, STARTUP_POLL_MS, STARTUP_POLLS, STARTUP_READY_READS } from "./runner/lane-control.ts";
 
 /** Return the follow-up instruction when startup did not succeed. */
 export function launchNextLine(key: string, startup: string): string | undefined {
@@ -43,64 +48,14 @@ export type LaunchInput = {
   readonly allowRepoMismatch?: boolean;
   /** Wrap the agent in `laneSandbox.command` even where the sandbox would pass the lane through (`--sandbox`, or a relaunch of a lane recorded as sandboxed). */
   readonly sandbox?: true;
+  /** Resume this agent session (recovery): the runner inserts `--session <id>` when its profile allows. */
+  readonly session?: string;
 };
 
 /** A lane launched with --share-thread: the keys of the other open lanes on its thread at launch time. */
 export type SharedThreadLane = Lane & { readonly threadSharedWith?: readonly string[] };
 
 export class LaunchError extends Error {}
-
-const FAILURE_WORDS = /Cannot find module|All fallback models failed|No API key|model_not_available|usage limit|rate limit|quota|Session crashed|unknown provider/i;
-/** Without an "Error:" prefix a failure must be the start of the line, never a word inside prose. */
-const FAILURE_LINE = /^(?:Cannot find module|All fallback models failed|No API key|model_not_available|unknown provider|Session crashed|(?:you(?:'ve| have) (?:hit|reached|exceeded) (?:your |the )?)?(?:(?:usage|rate) limit|quota)\s+(?:reached|exceeded|hit|exhausted|error))/i;
-const LEAD_IN = /^[\s│|>•*✗✖×!⚠❌-]*/;
-
-/**
- * The first real startup failure on a pane screen, or undefined. Tips, recalled-memory/Kibitzer
- * blocks and echoes of the launch prompt are skipped, and bare words only count after "Error:".
- */
-export const startupFailure = (screen: string): string | undefined => {
-  for (const line of screenLines(screen)) {
-    const error = /^(?:error|fatal)\b[:\s-]*/i.exec(line);
-    const hit = error ? FAILURE_WORDS.exec(line.slice(error[0].length)) : FAILURE_LINE.exec(line);
-    if (hit) return hit[0];
-  }
-  return undefined;
-};
-
-/**
- * The screen lines that can carry an agent's own message, with their box/bullet lead-in removed. Tips, recalled-memory
- * and Kibitzer blocks (until a blank line or the closing tag) and echoes of a lane brief are left out.
- */
-export function* screenLines(screen: string): Generator<string> {
-  let skipping: "tip" | "memory" | undefined;
-  for (const raw of screen.split("\n")) {
-    const line = raw.replace(LEAD_IN, "");
-    if (!line.trim()) { skipping = undefined; continue; }
-    if (/^Tip:|^Want the full story on any tip/i.test(line)) { skipping = "tip"; continue; }
-    if (/<recalled-memory|Kibitzer/i.test(raw)) skipping = "memory";
-    if (/<\/recalled-memory>/i.test(raw)) { skipping = undefined; continue; }
-    if (skipping) continue;
-    if (/lane brief at /i.test(raw)) continue;
-    yield line;
-  }
-}
-
-/** The figma-off project config older launches wrote into lane cwds; kept only to recognise and remove it. */
-export const LEGACY_LANE_MCP = `${JSON.stringify({ mcpServers: { figma: { enabled: false, url: "https://mcp.figma.com/mcp" } } }, null, 2)}\n`;
-
-/**
- * Remove a .omo/mcp.json that is byte-for-byte the old lane file, so an old worktree stops keeping
- * figma off. A user's own file is never touched. Returns whether a file was removed.
- */
-export const removeLegacyLaneMcp = async (cwd: string): Promise<boolean> => {
-  const file = Bun.file(join(cwd, ".omo", "mcp.json"));
-  try {
-    if (!(await file.exists()) || (await file.text()) !== LEGACY_LANE_MCP) return false;
-    await file.delete();
-    return true;
-  } catch { return false; } // unremovable: the lane still launches as before
-};
 
 export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
   if (!LANE_KEY.test(input.key)) throw new LaunchError(`key must match ${LANE_KEY}`);
@@ -145,30 +100,30 @@ export const doneRepos = (done: string): string[] => [...new Set(splitDone(done)
 export const remoteRepo = (url: string): string | undefined =>
   /[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(url.trim())?.[1]?.toLowerCase();
 
-const gitTop = async (deps: FlowDeps, dir: string): Promise<string | undefined> => {
-  const r = await deps.run(["git", "-C", dir, "rev-parse", "--show-toplevel"]);
-  return r.code === 0 && r.out.trim() ? r.out.trim() : undefined;
+/** The git toplevel and origin URL of `dir` on the lane's host, read by its runner (`q.lane.inspect`); none outside git. */
+const gitOf = async (deps: FlowDeps, key: string, dir: string): Promise<{ readonly top?: string; readonly origin?: string }> => {
+  const git = (await deps.ops.inspect({ key, cwd: dir }, { git: true, cwd: dir })).git;
+  return { ...(git?.toplevel ? { top: git.toplevel } : {}), ...(git?.origin ? { origin: git.origin } : {}) };
 };
 
 /**
  * A local lane's directory: refused when it is the git checkout (worktree) another open local lane works in, and when
- * its git remotes name none of the Done line's repos (unless allowRepoMismatch). A directory outside git is not checked.
- * Remote lanes are not checked: their directory is not on this host.
+ * its origin remote names none of the Done line's repos (unless allowRepoMismatch). A directory outside git is not
+ * checked. Remote lanes are not checked: their directory is not on this host. The git facts come from the local runner.
  */
 export const validatePlacement = async (deps: FlowDeps, input: LaunchInput, cwd: string): Promise<void> => {
   if (input.machine) return;
-  const top = await gitTop(deps, cwd);
+  const { top, origin } = await gitOf(deps, input.key, cwd);
   if (!top) return;
   for (const other of await deps.registry.open()) {
     if (other.key === input.key || other.machine) continue;
     const dir = other.cwd ?? deps.config.defaultCwd;
-    if (dir === cwd || (await gitTop(deps, dir)) === top) throw new LaunchError(`${cwd} is the checkout open lane ${other.key} works in (${top}); give this lane its own worktree with --cwd`);
+    if (dir === cwd || (await gitOf(deps, other.key, dir)).top === top) throw new LaunchError(`${cwd} is the checkout open lane ${other.key} works in (${top}); give this lane its own worktree with --cwd`);
   }
   const want = doneRepos(input.done);
   if (!want.length || input.allowRepoMismatch) return;
-  const remotes = await deps.run(["git", "-C", top, "remote", "-v"]);
-  const have = [...new Set(remotes.out.split("\n").map((l) => remoteRepo(l.split(/\s+/)[1] ?? "")).filter((r): r is string => Boolean(r)))];
-  if (have.length && !have.some((r) => want.includes(r))) throw new LaunchError(`${cwd} is a checkout of ${have.join(", ")}, but the Done line names ${want.join(", ")}; launch from that repo's worktree or pass --allow-repo-mismatch`);
+  const have = origin ? remoteRepo(origin) : undefined;
+  if (have && !want.includes(have)) throw new LaunchError(`${cwd} is a checkout of ${have}, but the Done line names ${want.join(", ")}; launch from that repo's worktree or pass --allow-repo-mismatch`);
 };
 
 /**
@@ -208,79 +163,53 @@ const autoCloseOf = async (path: string): Promise<Pick<Lane, "autoClose" | "ghIs
 
 /**
  * The done rules every footer carries, ahead of the lane's own values: how to claim, what the watcher checks, what happens
- * on a refusal. Only the claim step and the close wording differ for a remote lane, a `dori report` lane and a pane-report lane.
+ * on a refusal. Every lane reports through its runner, so only the `dori` path differs between a local and a remote lane.
  * The rules every lane shares (no quotes, ids or usage numbers; no decision records in the repo; how to ask the owner) sit
  * here so a brief need not repeat them; the owner's own policy lines (`laneRules`: merge policy, CI policy) follow them.
  * Nothing lane-specific (key, thread, pane, Done line) may appear here; that is the "### This lane" section.
  */
-/**
- * The `dori` a lane runs: the runner's lane-mode CLI on a worker for a runner-owned remote lane (installed by
- * `dori runner install`), else the `dori` on PATH.
- */
-export const laneCli = (lane: Pick<Lane, "machine" | "runner">): string => (lane.machine && lane.runner ? RUNNER_LANE_CLI : "dori");
+/** The `dori` a lane runs: the runner's lane-mode CLI on a worker (installed by `dori runner install`), else the `dori` on PATH. */
+export const laneCli = (lane: Pick<Lane, "machine">): string => (lane.machine ? RUNNER_LANE_CLI : "dori");
 export const RUNNER_LANE_CLI = "~/.dori/runner/bin/dori";
 
-export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = [], shell?: PaneShell): string => {
-  // A runner-owned remote lane reports through the runner like a local lane through the supervisor.
-  const remote = Boolean(lane.machine) && !lane.runner;
-  const cliLane = lane.reportVia === "cli" || Boolean(lane.runner);
-  const claim = remote ? "print the done line below in your own output" : cliLane ? "claim done with the dori report done command below yourself" : "run the claim-done command below yourself";
-  const ask = remote ? "print a question report line below in your own output" : cliLane ? "run the dori report question command below" : "send a question report line below";
-  return [
-    "- Set a goal first: restate the deliverable and the observable condition that ends this lane. The `Done =` signals below still decide when the lane closes; your restatement does not replace them.",
-    "- Work until that condition holds. Do not stop to ask permission for reversible steps the brief already covers; only a decision the brief leaves open goes to the owner, as below.",
-    `- Done rules: when every \`Done =\` signal below is live and all work is pushed, ${claim}, then stay idle and start no new work.`,
-    remote
-      ? "  The lead re-reads every signal live and closes the lane only when every signal reads back live. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits."
-      : "  The watcher re-reads every signal live and closes the lane 5 min after your claim unless the Dori objects. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits. The lane closes only when every signal reads back live.",
-    remote
-      ? "  On `[LEAD] not done: <reasons>`, fix every reason and print a done line again."
-      : "  On `[LEAD] not done: <reasons>`, fix every reason and claim again.",
-    "- PR bodies, issues, commit messages, code comments and repo docs carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
-    "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
-    `- For any owner decision, ${ask} and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.`,
-    ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
-    `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${remote ? (shell === "powershell" ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\\.dori\\guard-agent.ps1" heavy' : "sh ~/.dori/guard-agent.sh heavy") : `${laneCli(lane)} heavy`} <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
-    ...laneRules.map((rule) => `- ${rule}`),
-    ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
-  ].join("\n");
-};
+export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => [
+  "- Set a goal first: restate the deliverable and the observable condition that ends this lane. The `Done =` signals below still decide when the lane closes; your restatement does not replace them.",
+  "- Work until that condition holds. Do not stop to ask permission for reversible steps the brief already covers; only a decision the brief leaves open goes to the owner, as below.",
+  "- Done rules: when every `Done =` signal below is live and all work is pushed, claim done with the dori report done command below yourself, then stay idle and start no new work.",
+  "  The watcher re-reads every signal live and closes the lane 5 min after your claim unless the Dori objects. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits. The lane closes only when every signal reads back live.",
+  "  On `[LEAD] not done: <reasons>`, fix every reason and claim again.",
+  "- PR bodies, issues, commit messages, code comments and repo docs carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
+  "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
+  "- For any owner decision, run the dori report question command below and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.",
+  ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
+  `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${laneCli(lane)} heavy <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
+  ...laneRules.map((rule) => `- ${rule}`),
+  ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
+].join("\n");
 
 const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 
-/** What a milestone report is, shared by every footer. */
-const MILESTONE_KIND = 'milestone = a state change the owner would care about: what now works or landed, where the lane stands against its Done condition, and "scope unchanged" or what changed';
 /** The kinds of a `dori report` footer and where each goes. */
-const REPORT_KINDS_TEXT = `${MILESTONE_KIND}; it reaches the lead with its next update. progress = 1-2 sentences, done since last and next; it updates your work thread's status message. question and blocked wake the lead.`;
+const REPORT_KINDS_TEXT = 'milestone = a state change the owner would care about: what now works or landed, where the lane stands against its Done condition, and "scope unchanged" or what changed; it reaches the lead with its next update. progress = 1-2 sentences, done since last and next; it updates your work thread\'s status message. question and blocked wake the lead.';
 
-export const footer = (lane: Lane, leadPane: string, ownerLanguage?: string, laneRules?: readonly string[], shell?: PaneShell): string => [
+/** The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner. */
+export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly string[]): string => [
   "",
   FOOTER_HEADING.slice(1),
-  footerDoneRules(lane, ownerLanguage, laneRules, shell),
+  footerDoneRules(lane, ownerLanguage, laneRules),
   "",
   "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}`,
-  ...(lane.machine && lane.runner
+  ...(lane.machine
     ? [
-      `- This lane runs on machine ${lane.machine} under its runner. Report to the lead with ${RUNNER_LANE_CLI} report, never by typing into any pane: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done and heavy, and only for this lane's key.`,
+      `- This lane runs on machine ${lane.machine} under its runner. Report to the lead with ${RUNNER_LANE_CLI} report, never by typing into any pane: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
       `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
     ]
-    : lane.machine
-    ? [
-      `- This lane runs on machine ${lane.machine}; the lead reads this pane from another host. Report at each milestone by printing this line in your own output (do not message any pane): [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>. ${MILESTONE_KIND}.`,
-      `- When done: print [REPORT] ${lane.key} | done | <merge SHA, closed issue, version> and stay idle. The lead checks the Done signals and closes the lane; dori claim-done is not available on this machine. Each distinct report line is read once: after a [LEAD] not done, print a done line with updated evidence.`,
-    ]
-    : lane.reportVia === "cli"
-      ? [
-        `- Report to the lead with dori report, never by typing into the lead's pane: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT}`,
-        `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>" (the same claim as dori claim-done). See references/done-protocol.md.`,
-      ]
-      // Only a lane record without reportVia reaches this; launchLane sets reportVia on every local launch and relaunch.
-      : [
-        `- Report to the lead at each milestone: [REPORT] ${lane.key} | <milestone|blocker|question|done> | <what, with links>, sent to pane ${leadPane || "(lead pane)"} as an argv array, never a shell string. ${MILESTONE_KIND}.`,
-        `- When done: dori claim-done ${lane.key} --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
-      ]),
+    : [
+      `- Report to the lead with dori report, never by typing into the lead's pane: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT}`,
+      `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>" (the same claim as dori claim-done). See references/done-protocol.md.`,
+    ]),
   "",
 ].join("\n");
 
@@ -291,15 +220,42 @@ const laneDirs = (machine: string | undefined, dir: string | undefined, defaultC
 /** The hint for a pane id this host's herdr does not list: lanes without --machine are local lanes. */
 const REMOTE_PANE_HINT = "a pane on another machine needs --machine LABEL";
 
+/** A runner failure that leaves nothing started (refused, failed, or a runner that was never reached): the reservation can go. */
+const nothingStarted = (e: unknown): boolean =>
+  e instanceof LaneOpsError && (e.code === "LANE_OP_FAILED" || e.code === "RUNNER_OUTDATED" || (e.code === "RUNNER_UNAVAILABLE" && e.detail.startsWith("disconnected")));
+
+/**
+ * Registers an existing pane as a lane: the lane's runner takes the pane over (`lane.adopt`, which checks the pane is on
+ * its host and issues the lane token). Without --machine the lane is local, so the local runner must see the pane.
+ */
 export const adoptLane = async (deps: FlowDeps, input: LaunchInput & { readonly pane: string }): Promise<Lane> => {
-  // Without --machine the lane is local: the local runner, the sweeps and recovery look its pane up on this host, so a
-  // remote pane id registered here would read as gone and be relaunched locally.
-  if (!input.machine) {
-    const got = await deps.run(["herdr", "pane", "get", input.pane]);
-    if (got.code !== 0) throw new LaunchError(`pane ${input.pane} is not on this host (${(got.err || got.out).trim() || `exit ${got.code}`}); ${REMOTE_PANE_HINT}`);
+  const draft: Lane = {
+    key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), pane: input.pane, ...(input.machine ? { machine: input.machine } : {}),
+    runner: machineRunner(input.machine), runnerAdoptedAt: deps.clock.now(), brief: input.brief, done: input.done, ...(await autoCloseOf(input.brief)),
+    ...laneDirs(input.machine, input.cwd, deps.config.defaultCwd), openedAt: iso(deps.clock),
+  };
+  const token = randomUUID();
+  const reserved = await reserveLane(deps, input, draft, token);
+  let adopted;
+  try {
+    adopted = await deps.ops.adopt({
+      key: input.key, pane: input.pane, mode: input.mode ?? "ulw", model: input.model ?? deps.config.defaultModel,
+      ...(input.machine ? { machine: input.machine } : {}), ...(input.cwd ? { cwd: input.cwd } : {}),
+    });
+  } catch (error) {
+    if (nothingStarted(error)) {
+      await deps.registry.releaseReservation(input.key, token);
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new LaunchError(`pane ${input.pane} cannot be adopted on ${input.machine ?? "this host"} (${detail})${input.machine ? "" : `; ${REMOTE_PANE_HINT}`}`);
+    }
+    throw error;
   }
-  const lane: Lane = { key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), pane: input.pane, ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(await autoCloseOf(input.brief)), ...laneDirs(input.machine, input.cwd, deps.config.defaultCwd), openedAt: iso(deps.clock) };
-  return reserveLane(deps, input, lane);
+  const lane: SharedThreadLane = { ...reserved, pane: adopted.pane, ...(adopted.tab ? { tab: adopted.tab } : {}) };
+  await deps.registry.update(input.key, (current) => {
+    if (current?.launchReservation !== token) throw new LaunchError(`lane ${input.key} lost its launch reservation`);
+    return { ...current, ...lane, status: current.status === "paused" ? lane.status : current.status, launchReservation: undefined };
+  });
+  return lane;
 };
 
 /** Serialize admissions across keys: thread and checkout checks and the key reservation are one transaction. */
@@ -319,64 +275,43 @@ const reserveLane = async (deps: FlowDeps, input: LaunchInput, lane: Lane, token
   } finally { release(); }
 };
 
-type TargetPane = { readonly pane: string; readonly tab?: string; readonly cwd?: string; readonly shell: PaneShell };
+type TargetPane = { readonly pane: string; readonly tab?: string; readonly cwd?: string };
 
-type ProcessInfo = {
-  readonly shell_pid?: number;
-  readonly foreground_process_group_id?: number;
-  readonly foreground_processes?: readonly { readonly pid?: number; readonly name?: string; readonly argv?: readonly string[] }[];
-};
-
-export type PaneShell = "posix" | "powershell" | "cmd";
-
-/**
- * The shell an idle pane runs, from herdr process-info: the foreground process that is the shell (or the only one).
- * Without a readable name, a drive-letter cwd (D:\...) means a Windows pane, whose default shell is PowerShell.
- */
-export const paneShell = (info: ProcessInfo | undefined, cwd?: string): PaneShell => {
-  const procs = info?.foreground_processes ?? [];
-  const proc = procs.find((p) => p.pid !== undefined && p.pid === info?.shell_pid) ?? (procs.length === 1 ? procs[0] : undefined);
-  const name = (proc?.name || proc?.argv?.[0] || "").replace(/\\/g, "/").split("/").pop()?.toLowerCase().replace(/^-/, "").replace(/\.exe$/, "") ?? "";
-  if (name === "pwsh" || name === "powershell") return "powershell";
-  if (name === "cmd") return "cmd";
-  if (name) return "posix";
-  return cwd && /^[A-Za-z]:[\\/]/.test(cwd) ? "powershell" : "posix";
-};
-
-type PaneInfo = { readonly pane_id: string; readonly workspace_id: string; readonly tab_id?: string; readonly agent?: string; readonly cwd?: string; readonly foreground_cwd?: string };
+type ProcessInfo = { readonly shell_pid?: number; readonly foreground_process_group_id?: number };
 
 const parse = <T>(text: string, what: string): T => {
-  try { return JSON.parse(text) as T; } catch { throw new LaunchError(`${what}: unreadable herdr output`); }
+  try { return JSON.parse(text) as T; } catch { throw new LaunchError(`${what}: unreadable process info`); }
 };
 
-/** The existing pane a lane may start in: it exists, is an idle shell (no agent, no other foreground process) and no lane owns it. Throws before anything is written. */
+/**
+ * The existing pane a lane may start in, checked before anything is written: it exists on the lane's host, is an idle
+ * shell (no agent, no other foreground process) and no lane owns it. The pane list and process info come from the
+ * lane's runner, which checks the pane again when it starts the lane (`lane.start` target).
+ */
 const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<TargetPane> => {
+  const panes = await deps.ops.panes(input.machine);
   let id = input.pane;
   if (!id) {
-    const list = await deps.run(["herdr", "pane", "list"]);
-    if (list.code !== 0) throw new LaunchError(`herdr pane list failed: ${list.err || list.out}`);
-    const inWs = parse<{ result: { panes: PaneInfo[] } }>(list.out, "herdr pane list").result.panes.filter((p) => p.workspace_id === input.workspace);
+    const inWs = panes.filter((p) => p.workspace_id === input.workspace);
     if (!inWs.length) throw new LaunchError(`workspace ${input.workspace} has no panes (or does not exist)`);
     const shells = inWs.filter((p) => !p.agent);
     if (shells.length !== 1) throw new LaunchError(`workspace ${input.workspace} has ${shells.length} shell panes; pass --pane to pick one`);
     id = shells[0]?.pane_id;
   }
   if (!id) throw new LaunchError("no target pane");
-  const got = await deps.run(["herdr", "pane", "get", id]);
-  if (got.code !== 0) throw new LaunchError(`pane ${id} does not exist: ${got.err || got.out}${input.machine ? "" : `; ${REMOTE_PANE_HINT}`}`);
-  const info = parse<{ result: { pane: PaneInfo } }>(got.out, `herdr pane get ${id}`).result.pane;
+  const info = panes.find((p) => p.pane_id === id);
+  if (!info) throw new LaunchError(`pane ${id} does not exist on ${input.machine ?? "this host"}${input.machine ? "" : `; ${REMOTE_PANE_HINT}`}`);
   if (input.workspace && info.workspace_id !== input.workspace) throw new LaunchError(`pane ${id} is in workspace ${info.workspace_id}, not ${input.workspace}`);
   if (info.agent) throw new LaunchError(`pane ${id} runs an agent (${info.agent}); a lane needs an idle shell`);
-  const proc = await deps.run(["herdr", "pane", "process-info", "--pane", id]);
+  const proc = await deps.ops.processInfo({ ...(input.machine ? { machine: input.machine } : {}), pane: id });
   if (proc.code !== 0) throw new LaunchError(`cannot read the processes of pane ${id}: ${proc.err || proc.out}`);
-  const p = parse<{ result: { process_info: ProcessInfo } }>(proc.out, `herdr pane process-info ${id}`).result.process_info;
+  const p = parse<{ result: { process_info: ProcessInfo } }>(proc.out, `process info of pane ${id}`).result.process_info;
   if (p.foreground_process_group_id && p.foreground_process_group_id !== p.shell_pid) throw new LaunchError(`pane ${id} has a foreground process running; a lane needs an idle shell`);
   const owner = (await deps.registry.open()).find((l) => l.pane === id && l.machine === input.machine);
   if (owner) throw new LaunchError(`pane ${id} is already registered to lane ${owner.key}`);
-  const cwd = info.foreground_cwd ?? info.cwd;
-  const shell = paneShell(p, cwd);
-  if (input.machine && shell === "cmd") throw new LaunchError(CMD_REFUSED(id));
-  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(cwd ? { cwd } : {}), shell };
+  // The runner refuses a cmd.exe pane (no launch line exists for it); say so before anything is written.
+  if (paneShell(p, info.cwd) === "cmd") throw new LaunchError(cmdRefused(id));
+  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(info.cwd ? { cwd: info.cwd } : {}) };
 };
 
 /**
@@ -401,46 +336,9 @@ const toodoTarget = async (deps: FlowDeps, input: LaunchInput, start: ToodoStart
   return { notes: [`LAUNCH_FALLBACK ${input.key} new tab: ${failed.join("; ")}`] };
 };
 
-const CMD_REFUSED = (pane: string) => `pane ${pane} runs cmd.exe; start pwsh or powershell in it (or a POSIX shell) and launch again`;
-
-/** A freshly created remote pane: its shell and directory, read leniently (an unreadable answer means POSIX, as before). */
-const inspectCreated = async (deps: FlowDeps, pane: string): Promise<{ readonly shell: PaneShell; readonly cwd?: string }> => {
-  const got = await deps.run(["herdr", "pane", "get", pane]);
-  const proc = await deps.run(["herdr", "pane", "process-info", "--pane", pane]);
-  const read = <T>(text: string): T | undefined => { try { return JSON.parse(text) as T; } catch { return undefined; } };
-  const info = got.code === 0 ? read<{ result?: { pane?: PaneInfo } }>(got.out)?.result?.pane : undefined;
-  const p = proc.code === 0 ? read<{ result?: { process_info?: ProcessInfo } }>(proc.out)?.result?.process_info : undefined;
-  const cwd = info?.foreground_cwd ?? info?.cwd;
-  return { shell: paneShell(p, cwd), ...(cwd ? { cwd } : {}) };
-};
-
-/** Marks where the brief path goes in the agent prompt when the shell computes that path. */
-const BRIEF_AT = "\u0000brief\u0000";
-
-/** A PowerShell single-quoted literal: nothing inside expands; a quote (including the typographic ones PowerShell also accepts) is doubled. */
-export const psQuote = (arg: string): string => `'${arg.replace(/['\u2018\u2019\u201A\u201B]/g, "$&$&")}'`;
-
-/**
- * One PowerShell line that writes the brief to the remote temp directory and then starts the agent.
- * The brief travels as base64 bytes, so no brief character is ever parsed by the shell, and no lead-local path appears.
- * Works in Windows PowerShell 5.1 and PowerShell 7 (no `&&`).
- */
-export const powershellLaunch = (argv: readonly string[], brief: string, key: string): string => {
-  if (argv.some((a) => /[\r\n]/.test(a))) throw new LaunchError("the agent command must be single-line to run in a PowerShell pane");
-  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
-  // Typed non-ASCII is not reliable through a pane's line editor, so such text travels as base64 too: the line stays ASCII.
-  const literal = (s: string) => (/^[\x20-\x7e]*$/.test(s) ? psQuote(s) : `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(s)}'))`);
-  const arg = (a: string) => (a.includes(BRIEF_AT) ? `(${a.split(BRIEF_AT).map(literal).join(" + $doriBrief + ")})` : psQuote(a) === literal(a) ? literal(a) : `(${literal(a)})`);
-  return `$doriBrief = Join-Path ([IO.Path]::GetTempPath()) ${psQuote(`dori-brief-${key}.md`)}; [IO.File]::WriteAllBytes($doriBrief, [Convert]::FromBase64String('${b64(brief)}')); if ($?) { $env:DORI_LANE_KEY = ${psQuote(key)}; & ${argv.map(arg).join(" ")} }`;
-};
-
-/** The brief's home on a POSIX remote: a fixed path, valid on Linux and macOS, never the lead's own path. */
-export const posixRemoteBrief = (key: string): string => `/tmp/dori-brief-${key}.md`;
-
-/** Startup confirmation: a check every 2 s, at most 10 times, and 2 consecutive ready reads. */
-export const STARTUP_POLL_MS = 2_000;
-export const STARTUP_POLLS = 10;
-export const STARTUP_READY_READS = 2;
+/** The STARTUP_OK / STARTUP_ERROR / STARTUP_UNCONFIRMED line of a runner's startup verdict for `pane`. */
+export const startupLine = (key: string, pane: string, startup: StartupVerdict): string =>
+  startup.verdict === "ok" ? `STARTUP_OK ${key} ${pane}` : `STARTUP_${startup.verdict === "error" ? "ERROR" : "UNCONFIRMED"} ${key} ${pane}: ${startup.detail}`;
 
 /**
  * Whether this launch wraps its agent in laneSandbox.command. Every local lane is wrapped; there is no opt-out. `--sandbox` (and a
@@ -458,6 +356,12 @@ export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, wh
   return { on: true };
 };
 
+/**
+ * Starts a lane through its runner (`lane.start`): the lane is reserved (paused, with a token), its brief gets the
+ * footer, and the runner opens the pane (a new tab, or the checked target pane), runs the agent from its own profile
+ * (`sandboxed` for a sandboxed local lane), and confirms the startup. The returned pane is recorded on the lane.
+ * `existing` relaunches a registered lane (recovery) without a reservation.
+ */
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string; readonly notes: readonly string[] }> => {
   const model = input.model ?? deps.config.defaultModel;
   const mode = input.mode ?? "ulw";
@@ -466,81 +370,50 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const sandbox = choice.on;
   if (sandbox && !deps.config.laneSandbox) throw new LaunchError("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
   if (sandbox && input.machine) throw new LaunchError(`--sandbox wraps local lanes only; machine ${input.machine} cannot run it, drop --sandbox`);
-  deps = { ...deps, run: laneRunner(deps.run, input) };
   const placed = input.toodo && !input.pane && !input.workspace ? await toodoTarget(deps, input, input.toodo) : undefined;
   const target = placed ? placed.target : input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
   const notes = [...(placed?.notes ?? []), ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const dir = input.cwd ?? target?.cwd;
+  // The runner starts every lane in a directory on its own host; the lead's defaultCwd means nothing on another machine.
+  if (input.machine && !dir) throw new LaunchError(`a lane on machine ${input.machine} needs --cwd (a directory on that machine)`);
   const cwd = dir ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
-  let draft: SharedThreadLane = { ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), ...(input.machine ? { machine: input.machine } : {}), brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)), ...(!input.machine ? { reportVia: "cli" as const } /* an old-footer lane moves onto dori report when recovery relaunches it */ : {}), ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock) };
+  let draft: SharedThreadLane = {
+    ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), ...(input.machine ? { machine: input.machine } : {}),
+    runner: machineRunner(input.machine), runnerAdoptedAt: existing?.runnerAdoptedAt ?? deps.clock.now(),
+    brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)),
+    reportVia: "cli" as const, // every lane reports through its runner; an old-footer lane moves onto dori report when recovery relaunches it
+    ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
+  };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
-  let agentAdmitted = false;
+  let started = false;
   try {
-    let pane: string;
-    let tab: string | undefined;
-    let shell: PaneShell = "posix";
-    if (target) {
-      ({ pane, tab, shell } = target);
-    } else {
-      // A remote tab gets only a remote directory; the lead's defaultCwd means nothing on that machine.
-      const where = input.machine ? (dir ? ["--cwd", dir] : []) : ["--cwd", cwd];
-      const created = await deps.run(["herdr", "tab", "create", ...(!input.machine && deps.config.laneWorkspace ? ["--workspace", deps.config.laneWorkspace] : []), ...where, "--label", input.key, "--no-focus"]);
-      if (created.code !== 0) throw new LaunchError(`herdr tab create failed: ${created.err || created.out}`);
-      const made = (JSON.parse(created.out) as { result: { root_pane: { pane_id: string; tab_id?: string }; tab_id?: string } }).result;
-      pane = made.root_pane.pane_id;
-      tab = made.tab_id ?? made.root_pane.tab_id;
-      if (input.machine) {
-        const fresh = await inspectCreated(deps, pane);
-        shell = fresh.shell;
-        if (!dir && fresh.cwd) draft = { ...draft, remoteCwd: fresh.cwd };
-        if (shell === "cmd") {
-          if (tab) await deps.run(["herdr", "tab", "close", tab]);
-          throw new LaunchError(CMD_REFUSED(pane));
-        }
-      }
-    }
-    // The footer is written once the pane's shell is known: a PowerShell pane gets the PowerShell guard agent form.
-    // A relaunched local lane still on the old [REPORT] footer gets its footer replaced by the dori report one.
-    const migrate = Boolean(existing && !existing.reportVia && !input.machine);
+    // A relaunched lane still on an old footer ([REPORT] lines, or a remote lane printing them) gets the dori report one.
+    const migrate = Boolean(existing && (!existing.reportVia || (existing.machine && !existing.runner)));
     const text = await briefFile.text();
     const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;
-    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.leadPane, deps.config.ownerLanguage, deps.config.laneRules, shell)}`;
+    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.ownerLanguage, deps.config.laneRules)}`;
+    // The lead-side brief keeps the footer for reference; the runner writes its own copy on the lane's host.
     if (!existing || migrate) await Bun.write(input.brief, brief);
-    const agentArgv = (briefPath: string): string[] => {
-      const keywords = mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords;
-      const prompt = `${keywords}. Read and execute the lane brief at ${briefPath} in full. You are the ${input.key} lane; report as the brief's footer says.`;
-      // laneThinking only touches an omo-style command (one with a --model or --thinking flag); anything else runs as written.
-      const template = deps.config.agentCommand;
-      const takesThinking = template.some((part) => /^--(model|thinking)(=|$)/.test(part));
-      const [exe, ...args] = withThinking(template, { model, prompt }, takesThinking ? (typeof deps.config.laneThinking === "string" ? deps.config.laneThinking.trim() : "") || undefined : undefined);
-      return exe ? [exe, ...args] : [];
+    const start: StartInput = {
+      key: input.key, briefText: brief, done: input.done, thread: draft.thread, cwd, sandbox, mode, model,
+      keywords: mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords,
+      ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
+      ...(input.session !== undefined ? { session: input.session } : {}),
+      ...(target ? { target: { pane: target.pane } } : {}),
     };
-    let command: string;
-    if (!input.machine) {
-      const [exe, ...args] = agentArgv(input.brief);
-      await removeLegacyLaneMcp(cwd);
-      // DORI_LANE_KEY tells the dori CLI it runs inside this lane, which limits it to the lane's own key and thread.
-      // A sandboxed lane runs its agent behind laneSandbox.command; the lead's command never gets this prefix.
-      const prefix = sandbox ? deps.config.laneSandbox?.command ?? [] : [];
-      command = (exe ? [`DORI_LANE_KEY=${input.key}`, ...prefix, exe, ...args] : []).map(quoteForPane).join(" ");
-    } else if (shell === "powershell") {
-      command = powershellLaunch(agentArgv(BRIEF_AT), brief, input.key);
-    } else {
-      // The brief is owned by this launch. Copy it with its footer: the remote host does not share our filesystem.
-      const at = posixRemoteBrief(input.key);
-      command = `printf %s ${quoteForPane(brief)} > ${quoteForPane(at)} && ${quoteForPane(`DORI_LANE_KEY=${input.key}`)} ${agentArgv(at).map(quoteForPane).join(" ")}`;
+    let result;
+    try {
+      result = await deps.ops.start(start);
+    } catch (error) {
+      if (nothingStarted(error)) throw new LaunchError(`${input.key}: ${error instanceof Error ? error.message : String(error)}`);
+      started = true; // a timeout or an ambiguous answer: the runner may have started the agent, so the reservation stays visible
+      throw new LaunchError(`${input.key}: the start may have happened (${error instanceof Error ? error.message : String(error)}); the lane stays reserved and paused: check dori status, or cancel it with dori close ${input.key} --cancelled --reason TEXT`);
     }
-    const lane: Lane = { ...draft, pane, ...(tab ? { tab } : {}) };
-    if (token) await deps.registry.update(lane.key, (current) => {
-      if (current?.launchReservation !== token) throw new LaunchError(`lane ${lane.key} lost its launch reservation`);
-      return { ...current, ...lane, status: "paused", launchReservation: token };
-    });
-    const admitted = await deps.run(["herdr", "pane", "run", pane, command]);
-    if (admitted.code !== 0) throw new LaunchError(`herdr pane run failed: ${admitted.err || admitted.out}`);
-    agentAdmitted = true;
+    started = true;
+    const lane: Lane = { ...draft, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
     // A relaunch writes only what this launch changed, so a pause or objection that landed meanwhile survives.
     const launched = (current: Lane): Lane => existing
       ? { ...current, ...Object.fromEntries(Object.entries(lane).filter(([k, v]) => (existing as Record<string, unknown>)[k] !== v)), key: lane.key } as Lane
@@ -549,34 +422,11 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       if (token && current?.launchReservation !== token) throw new LaunchError(`lane ${lane.key} lost its launch reservation`);
       return current ? launched(current) : lane;
     });
-    // Poll for the agent: STARTUP_OK needs STARTUP_READY_READS ready reads in a row, so one early idle blip is not a start.
-    let screen = "";
-    let status: string | undefined;
-    let error: string | undefined;
-    let ready = 0;
-    for (let poll = 0; poll < STARTUP_POLLS; poll++) {
-      await deps.clock.sleep(STARTUP_POLL_MS);
-      ({ status, error } = await statusLookup(deps.run, pane));
-      // A working agent has started its task. Anything else, idle included, is scanned first: an agent that printed
-      // "No API key" or a usage-limit error and stopped at its prompt reads idle but never started the work.
-      if (status === "working") { ready++; } else {
-        screen = await readScreen(deps.run, pane, 40);
-        const bad = startupFailure(screen);
-        if (bad) return { lane, notes, startup: `STARTUP_ERROR ${input.key} ${pane}: ${bad}` };
-        ready = status === "idle" ? ready + 1 : 0;
-      }
-      if (ready >= STARTUP_READY_READS) return { lane, notes, startup: `STARTUP_OK ${input.key} ${pane}` };
-    }
-    if (!screen) screen = await readScreen(deps.run, pane, 40);
-    const why = error ? `status lookup failed: ${error}` : `no ready agent status (${status ?? "none"})`;
-    return { lane, notes, startup: `STARTUP_UNCONFIRMED ${input.key} ${pane}: ${why}; last lines: ${lastLines(screen)}` };
+    return { lane, notes, startup: startupLine(input.key, result.pane, result.startup) };
   } catch (error) {
-    if (token && !agentAdmitted) await deps.registry.releaseReservation(input.key, token);
+    if (token && !started) await deps.registry.releaseReservation(input.key, token);
     throw error;
   }
 };
-
-const lastLines = (screen: string): string =>
-  screen.split("\n").map((s) => s.trim()).filter(Boolean).slice(-3).join(" / ").replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)").slice(0, 240) || "(blank)";
 
 export const quoteForPane = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);

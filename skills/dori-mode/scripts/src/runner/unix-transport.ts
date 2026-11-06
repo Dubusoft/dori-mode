@@ -9,7 +9,7 @@ import type { Connector, Listener, Transport } from "./transport.ts";
  * The local runner link: frame lines over a unix socket at `<runnerDir>/sock/control`. The supervisor's hub listens
  * there and the local runner connects to it, the same direction as a remote runner over the network.
  *
- * In P1 this socket is shadow-only and unauthenticated: mutual authentication arrives with P2. Bun's socket API does
+ * In P1 this socket was unauthenticated: mutual authentication arrived with P2. Bun's socket API does
  * not expose the peer's uid (no SO_PEERCRED), so the only boundary is the 0700 `sock/` directory (and the 0700 runner
  * directory above it) owned by the user both processes run as. Nothing that arrives here may change lane state.
  */

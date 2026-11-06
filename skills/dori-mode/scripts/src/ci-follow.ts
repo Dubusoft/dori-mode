@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
@@ -11,7 +11,8 @@ import {
 import {
   FINAL_STATES, type Observed, type Operation, operationId, type OperationSpec, type OperationStore, openOperations, perform, plan, type ReadBack, reconcile, settleOperation,
 } from "./operations.ts";
-import { agentRefusal, holds, inputState, laneRunner, leftInInput, listPanes, type Pane, readScreen } from "./panes.ts";
+import { agentRefusal } from "./pane-state.ts";
+import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
 
@@ -119,7 +120,7 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
     const machine = lane.machine ?? "";
     let hit = panes.get(machine);
     if (!hit) {
-      hit = listPanes(laneRunner(deps.run, lane)).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e))));
+      hit = deps.ops.panes(lane.machine).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e))));
       panes.set(machine, hit);
     }
     return hit;
@@ -144,37 +145,24 @@ const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessag
   const now = deps.clock.now();
   const refusal = paneRefusal(lane, panes);
   if (refusal) return refusal === message.blocked ? message : updateLaneMessage(messages, message, { blocked: refusal }, now);
-  const run = laneRunner(deps.run, lane);
-  const pane = lane.pane ?? "";
-  // Text in the lane's input box may be the owner's: ours would be appended and submitted with it, so the message waits
-  // (and reaches the lead as LANE_MESSAGE_UNCONFIRMED if it keeps waiting). Our own text left there unsubmitted by an
-  // earlier attempt only gets Enter.
-  const input = inputState(await readScreen(run, pane), holds(message.text));
-  if (input === "busy") {
-    const why = `pane ${pane} input line holds other text (or shows no prompt)`;
-    return why === message.blocked ? message : updateLaneMessage(messages, message, { blocked: why }, now);
-  }
-  // The lane's ack proves the text arrived. Short of it, only this attempt's own herdr exits can tell: a refused
-  // send-text typed nothing (not done), text plus enter both accepted is done. An interrupted attempt (a new process,
-  // no exits seen) or text typed without its enter stays unknown, so it is ambiguous and never retyped.
+  // The runner's send refuses while the lane's input box holds the owner's text and presses Enter at most once; its
+  // verdict is the only evidence of this attempt. A failed send typed nothing (not done), delivered or unconfirmed is
+  // done. An interrupted attempt (a new process, no verdict seen) stays unknown, so it is ambiguous and never retyped.
+  // The lane's ack proves the text arrived and wins over everything.
   let typedHere: Observed = "unknown";
   const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
-  const { op } = await perform(ops, deps.clock.now, { lane: lane.key, action: "lane-message", target: message.id }, async () => {
-    const typed = input === "ours" ? undefined : await run(["herdr", "pane", "send-text", pane, message.text]);
-    if (typed && typed.code !== 0) {
+  const spec: OperationSpec = { lane: lane.key, action: "lane-message", target: message.id };
+  const { op } = await perform(ops, deps.clock.now, spec, async () => {
+    // The runner answers a repeated cmdId with its first result, so each attempt has its own id (done-flow.ts act):
+    // a retry after a definitive failure reaches the effect again, while a replay of one attempt keeps its id.
+    const id = operationId(spec);
+    const delivery = await deps.ops.send(lane, message.text, { mode: "verified", inputCheck: true, cmdId: `op:${id}:${ops.get(id)?.attempts ?? 0}` });
+    if (delivery === "failed") {
       typedHere = "not-done";
-      return { ok: false, detail: typed.err || typed.out || "send-text failed" };
-    }
-    const entered = await run(["herdr", "pane", "send-keys", pane, "enter"]);
-    if (entered.code !== 0) return { ok: false, detail: entered.err || "send-keys failed" };
-    // Enter accepted is not the text submitted: still in the input box after a second Enter, it did not reach the
-    // agent, so this attempt fails and the next pass only presses Enter.
-    if (await leftInInput(run, deps.clock, pane, message.text)) {
-      typedHere = "not-done";
-      return { ok: false, detail: "text stayed in the input line" };
+      return { ok: false, detail: "the runner could not deliver the text (input line busy, refused, or runner unavailable)" };
     }
     typedHere = "done";
-    return { ok: true, detail: "" };
+    return { ok: true, detail: delivery === "unconfirmed" ? "typed, not confirmed in the pane" : "" };
   }, readBack);
   const current = messages.get(message.id) ?? message;
   if (current.state === "acked") return current;
@@ -278,7 +266,7 @@ export class CiFollowUp {
     // Oldest lane first: the lane that opened the PR keeps its operations even after a merge lane joins it.
     const lanes = (await this.deps.registry.open()).filter((l) => statusOf(l) !== "closed").sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.key.localeCompare(b.key));
     for (const lane of lanes) {
-      for (const [repo, targets] of await githubTargets([lane], this.deps.run)) {
+      for (const [repo, targets] of await githubTargets([lane], this.deps.ops)) {
         for (const pull of pulls) {
           if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || (pull.branch !== undefined && targets.branches.has(pull.branch)))) continue;
           const key = `${repo}#${pull.number}`;
@@ -479,7 +467,7 @@ export class CiFollowUp {
       if (merging && statusOf(merging) !== "closed") down = "merge lane already open";
       else {
         const fresh = (await deps.registry.read(lane.key)) ?? lane;
-        const panes = fresh.pane ? await listPanes(laneRunner(deps.run, fresh)).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e)))) : [];
+        const panes = fresh.pane ? await deps.ops.panes(fresh.machine).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e)))) : [];
         down = laneDown(fresh, panes);
         if (down === undefined) {
           const id = rebaseMessageId(pull);
@@ -534,13 +522,14 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
   if (!deps.config.worktreeRoot) return { ok: false, detail: "worktreeRoot is not set" };
-  const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config)), deps.config.guard);
+  const paneCount = async (): Promise<number> => deps.ops.panes().then((panes) => panes.length, () => -1); // the local runner's panes; -1 when unreadable
+  const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config), paneCount), deps.config.guard);
   if (!host.ok) return { ok: false, detail: `HOLD ${host.reasons.join(" | ")}` };
   const worktree = join(deps.config.worktreeRoot, repoName(pull.repo), key);
-  if (existsSync(worktree)) return { ok: false, detail: `worktree ${worktree} already exists` };
-  const fetched = await deps.run(["git", "-C", source.cwd, "fetch", "--end-of-options", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  if ((await deps.ops.exists(undefined, [worktree]))[0]) return { ok: false, detail: `worktree ${worktree} already exists` };
+  const fetched = await deps.ops.git(source, { op: "fetch-branch", root: source.cwd, remote: "origin", branch });
   if (fetched.code !== 0) return { ok: false, detail: `git fetch failed: ${(fetched.err || fetched.out).trim()}` };
-  const added = await deps.run(["git", "-C", source.cwd, "worktree", "add", "--detach", worktree, `refs/remotes/origin/${branch}`]);
+  const added = await deps.ops.git(source, { op: "worktree-add", root: source.cwd, path: worktree, ref: `refs/remotes/origin/${branch}` });
   if (added.code !== 0) return { ok: false, detail: `git worktree add failed: ${(added.err || added.out).trim()}` };
   const briefs = join(deps.config.stateDir, "briefs");
   mkdirSync(briefs, { recursive: true });

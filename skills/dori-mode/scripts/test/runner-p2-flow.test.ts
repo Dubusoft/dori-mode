@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { enrollRunner, RunnerAuth } from "../src/runner/auth.ts";
+import { CALL_TIMEOUT_MS, COMMAND_TIMEOUTS, NEEDS_PROTO, newCmdId, QUERY_TIMEOUT_MS, RunnerUnavailable } from "../src/runner/call.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { readRunnerRows, resetRunnerGen } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
@@ -162,7 +163,7 @@ test("a runner over WebSocket on 127.0.0.1 enrolls, connects and shows in readRu
   expect(readRunnerRows(stateDir).find((row) => row.label === "remote")).toMatchObject({ hostId: "host-r", maxGen: 1 });
 });
 
-test("the dispatcher answers a schema failure and a stale epoch, and runs nothing twice", () => {
+test("the dispatcher answers a schema failure and a stale epoch, runs nothing twice, and answers a resent final cmdId again", () => {
   const tmp = withState();
   cleanups.push(tmp.done);
   const clock = fakeClock(1_000);
@@ -181,10 +182,28 @@ test("the dispatcher answers a schema failure and a stale epoch, and runs nothin
   dispatch({ ...head, epoch: 4, cmdSeq: 2, type: "lane.observe", body: { cmdId: "b", key: "k" } });
   dispatch({ ...head, epoch: 4, type: "lane.observe", body: { key: "k" } });
 
-  expect(published.map((p) => [p.cmdId, p.state, p.detail.split(" ").slice(0, 2).join(" ")])).toEqual([
-    ["a", "failed", "RUNNER_CMD_REJECTED unknown-field"],
-    ["b", "failed", "RUNNER_CMD_REJECTED stale-epoch"],
+  // The second "b" is not judged or run again; its stored final record is answered once more.
+  expect(published.map((p) => [p.cmdId, p.cmdSeq, p.state, p.detail.split(" ").slice(0, 2).join(" ")])).toEqual([
+    ["a", 1, "failed", "RUNNER_CMD_REJECTED unknown-field"],
+    ["b", 2, "failed", "RUNNER_CMD_REJECTED stale-epoch"],
+    ["b", 2, "failed", "RUNNER_CMD_REJECTED stale-epoch"],
   ]);
+  expect(logs).toContain("RUNNER_CMD_REPLAYED cmdId=b type=lane.observe state=failed");
   expect(state.cmdAck()).toBe(2);
   expect(logs).toContain("RUNNER_CMD_DROPPED type=lane.observe no cmdId or cmdSeq to answer");
+});
+
+test("call.ts: cmdId shapes lanes-hub parses, the fail-closed error, and the proto each new type needs", () => {
+  expect(newCmdId("lane.start", "lane-a", 1_700, 0)).toBe("lane-start:lane-a:1700");
+  expect(newCmdId("lane.recover", "lane-a", 1_700, 4)).toBe("recover:lane-a:1700");
+  expect(newCmdId("lane.close", "lane-a", 1_700, 2)).toBe("lane.close:lane-a:1700:2");
+  expect(newCmdId("guard.kill", undefined, 1_700, 0)).toBe("guard.kill:-:1700:0");
+  const error = new RunnerUnavailable("lab", "outdated", "proto 2 has no lane.pause");
+  expect(error).toBeInstanceOf(Error);
+  expect(error).toMatchObject({ code: "RUNNER_UNAVAILABLE", label: "lab", why: "outdated" });
+  expect(error.message).toBe("RUNNER_UNAVAILABLE runner=lab outdated: proto 2 has no lane.pause");
+  expect([CALL_TIMEOUT_MS, QUERY_TIMEOUT_MS, COMMAND_TIMEOUTS["lane.start"], COMMAND_TIMEOUTS["lane.send"]]).toEqual([30_000, 15_000, 90_000, undefined]);
+  expect(NEEDS_PROTO["q.panes"]).toBe(3);
+  expect(NEEDS_PROTO["lane.pause"]).toBe(3);
+  expect(NEEDS_PROTO["lane.close"]).toBeUndefined();
 });

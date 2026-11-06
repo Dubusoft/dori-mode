@@ -53,3 +53,12 @@ test("a healthy sample kills nothing and is sent once a minute and on a level ch
   expect(signals).toEqual([]);
   expect(published.map(([type]) => type)).toEqual(["guard.sample"]);
 });
+
+test("guard.sample carries the pane count and per-lane memory, heaviest commands first", async () => {
+  const { guard, published } = guardWith({ ...critical, memFreePct: 50, swapFreeGb: 6 });
+  await guard.tick();
+  expect(published[0]?.[1]).toMatchObject({
+    level: "ok", panes: 3,
+    lanes: [{ key: "lane-a", rssKb: 4_170_000, top: [{ comm: "qemu-system-x86", rssKb: 4_000_000, count: 1 }, { comm: "omo", rssKb: 100_000, count: 1 }, { comm: "bun", rssKb: 60_000, count: 1 }, { comm: "sh", rssKb: 10_000, count: 1 }] }],
+  });
+});

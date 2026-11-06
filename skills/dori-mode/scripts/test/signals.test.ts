@@ -88,9 +88,18 @@ test("a QA-only lane's claim is re-checked at close time: the lane says done, bu
   const world = newWorld();
   const clock = fakeClock(Date.parse("2026-01-01T00:00:00Z"));
   const flag = join(state.dir, "qa-passed");
-  const fake = depsFor(world, clock, state.dir);
-  const deps = { ...fake, run, signalIo: { cwd: state.dir } };
-  // Adoption looks the pane up in herdr: the fake world answers, so the test never reaches the host's herdr.
+  const own = withState();
+  const fake = depsFor(world, clock, own.dir);
+  // The Done checks run where the lane's runner runs them; here on this host, for real, in the lane's cwd.
+  const ops: typeof fake.ops = {
+    ...fake.ops,
+    inspect: async (lane, want) => ({
+      ...(await fake.ops.inspect(lane, { ...want, done: undefined })),
+      ...(want.done !== undefined ? { done: { cwd: state.dir, fallback: false, checks: await checkDone(want.done, run, { cwd: state.dir }) } } : {}),
+    }),
+  };
+  const deps = { ...fake, run, ops };
+  // Adoption goes to the lane's runner (the fake facade), so the test never reaches the host's herdr.
   const lane = await adoptLane(fake, { key: "local-setup", title: "setup", brief: "/b.md", done: `command ["test","-f","${flag}"]`, pane: "w:p3", cwd: state.dir });
   await claimDone(deps, lane, "I ran the setup and it works");
   // The first pass hands the claim over; its window runs from there.
@@ -100,6 +109,7 @@ test("a QA-only lane's claim is re-checked at close time: the lane says done, bu
   const after = await deps.registry.read("local-setup");
   expect(after && statusOf(after)).toBe("not-done");
   expect(after?.objection?.reasons[0]).toContain("exit 1");
+  own.done();
 });
 
 test("checkDone reports every signal, so one passing signal never hides a failing one", async () => {

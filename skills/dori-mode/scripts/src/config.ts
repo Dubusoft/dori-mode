@@ -136,25 +136,18 @@ export type PlacementConfig = {
   readonly fallback: readonly string[];
 };
 
-/** Per-machine runner rollout: "off" starts no new lanes on a runner, "shadow" only observes, "authoritative" owns new lanes. */
-export const RUNNER_MODES = ["off", "shadow", "authoritative"] as const;
-export type RunnerMode = (typeof RUNNER_MODES)[number];
-
-/** The optional `runners` section. Absent from the file: the runner hub is not opened and every machine is mode "off". */
+/** The optional `runners` section. */
 export type RunnersConfig = {
   /** Private-network address the runner hub listens on. */
   readonly listen?: string;
-  /** Machine label -> rollout mode; a label that is not listed is "off". */
-  readonly mode?: Readonly<Record<string, RunnerMode>>;
   /** Restart circuit-breaker settings, passed through as written. */
   readonly restartCircuit?: Readonly<Record<string, unknown>>;
 };
 
-/** The rollout mode of `label`: "off" unless the `runners.mode` section names it. */
-export const runnerMode = (config: Pick<DoriConfig, "runners">, label: string): RunnerMode => config.runners?.mode?.[label] ?? "off";
+let warnedRunnersMode = false;
 
 /** The `runners` section (absent: undefined); throws TypeError when its shape is wrong. */
-const runnersConfig = (raw: unknown): RunnersConfig | undefined => {
+const runnersConfig = (raw: unknown, path: string): RunnersConfig | undefined => {
   if (raw === undefined) return undefined;
   const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   if (!isObject(raw)) throw new TypeError("runners must be an object");
@@ -181,16 +174,13 @@ const runnersConfig = (raw: unknown): RunnersConfig | undefined => {
         })();
     if (invalid) throw new TypeError(`CONFIG_RUNNER_LISTEN_INVALID ${value}`);
   }
-  if (mode !== undefined) {
-    if (!isObject(mode)) throw new TypeError("runners.mode must map machine labels to modes");
-    for (const [label, value] of Object.entries(mode)) {
-      if (!(RUNNER_MODES as readonly unknown[]).includes(value)) throw new TypeError(`runners.mode.${label} must be one of ${RUNNER_MODES.join(", ")}`);
-    }
+  if (mode !== undefined && !warnedRunnersMode) {
+    warnedRunnersMode = true;
+    console.error(`CONFIG_RUNNERS_MODE_REMOVED runners.mode in ${path}: every lane is owned by its runner, the key is ignored and can be deleted`);
   }
   if (restartCircuit !== undefined && !isObject(restartCircuit)) throw new TypeError("runners.restartCircuit must be an object");
   return {
     ...(listen !== undefined ? { listen: (listen as string).trim() } : {}),
-    ...(mode !== undefined ? { mode: { ...(mode as Record<string, RunnerMode>) } } : {}),
     ...(restartCircuit !== undefined ? { restartCircuit: { ...restartCircuit } } : {}),
   };
 };
@@ -631,7 +621,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
-    runners: runnersConfig(raw.runners),
+    runners: runnersConfig(raw.runners, path),
     drift: driftConfig(raw.drift),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },

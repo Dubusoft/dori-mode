@@ -69,6 +69,10 @@ export const describeLane = (l: LaneMemory, commands = 3): string =>
 export const laneMemoryDetail = (lanes: readonly LaneMemory[], count = 3): string | undefined =>
   lanes.length ? `lanes by memory: ${lanes.slice(0, count).map((l) => describeLane(l)).join(", ")}` : undefined;
 
+/*
+ * `sampleProcs` is a runner-side primitive (runner/guard.ts, runner/observe.ts): the supervisor reads per-lane memory
+ * from the runners' `guard.sample.lanes` and never walks a lane host's process table itself.
+ */
 const LANE_ENV = /(?:^|\0)DORI_LANE_KEY=([^\0]*)/;
 
 /**

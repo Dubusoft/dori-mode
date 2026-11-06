@@ -2,6 +2,8 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 
 import { claimDone, closeLane, objectDone, watchTick } from "../src/done-flow.ts";
 import { freshnessTick } from "../src/freshness.ts";
+import type { LaneOps } from "../src/lane-ops.ts";
+import { passthroughView } from "../src/sweep-view.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import { type Lane, Registry, statusOf } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
@@ -54,6 +56,17 @@ const racing = (when: (argv: readonly string[]) => boolean, during: () => Promis
     return answer?.(argv) ?? base(argv, opts);
   };
 };
+/** Deps whose facade runs `during` once, before the first `op` call whose arguments match `when` is answered. */
+const racingOps = <K extends keyof LaneOps>(ms: number, op: K, when: (...args: Parameters<LaneOps[K]>) => boolean, during: () => Promise<unknown>) => {
+  const d = deps(ms);
+  const inner = d.ops[op] as unknown as (...args: Parameters<LaneOps[K]>) => ReturnType<LaneOps[K]>;
+  let fired = false;
+  const raced = (async (...args: Parameters<LaneOps[K]>) => {
+    if (!fired && when(...args)) { fired = true; await during(); }
+    return inner(...args);
+  }) as unknown as LaneOps[K];
+  return { ...d, ops: { ...d.ops, [op]: raced } };
+};
 const staleWrites = () => errors.filter((e) => e.includes("REGISTRY_STALE_WRITE"));
 
 test("done-flow: claim, objection and close from a stale lane keep the fields written since it was loaded", async () => {
@@ -79,11 +92,12 @@ test("done-flow: an objection written while the claim is being settled stands an
   await deps(T0).registry.write(lane);
   await claimDone(deps(T0), lane, "merged acme/app#1");
   await watchTick(deps(T0 + MIN));
-  const run = racing((argv) => argv[0] === "gh", async () => objectDone(deps(T0 + 6 * MIN), await stored(), ["lead objected"]));
-  const lines = await watchTick(deps(T0 + 6 * MIN, run));
+  // The objection lands while the runner reads the Done signals back.
+  const d = racingOps(T0 + 6 * MIN, "inspect", (_lane, want) => want.done !== undefined, async () => objectDone(deps(T0 + 6 * MIN), await stored(), ["lead objected"]));
+  const lines = await watchTick(d);
   expect(lines).toEqual(["LANE_SETTLE_SKIPPED race-lane is now not-done; the done claim being settled was superseded, not closed"]);
   expect(await stored()).toMatchObject({ status: "not-done", objection: { reasons: ["lead objected"] } });
-  expect(world.calls.some((c) => c[0] === "herdr" && c[2] === "close")).toBe(false);
+  expect(world.ops.some((e) => e.op === "close" || e.op === "git")).toBe(false);
   expect(staleWrites()).toEqual([]);
 });
 
@@ -91,13 +105,11 @@ test("pause: pause and resume from a stale lane keep an objection and progress p
   await deps(T0).registry.write(lane);
   const stale = await stored();
   await elsewhere({ objection, lastProgressPost: "todo 3" });
-  world.screens = ["❯ ", "❯ ", "Goal paused\n❯ "];
   expect((await pauseLane(deps(T0 + MIN), stale, "owner said wait")).code).toBe(0);
   expect(await stored()).toMatchObject({ status: "paused", pausedFrom: "working", objection, lastProgressPost: "todo 3" });
 
   const stalePaused = await stored();
   await elsewhere({ lastProgressPost: "todo 4" });
-  world.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
   expect((await resumeLane(deps(T0 + 2 * MIN), stalePaused, "go")).code).toBe(0);
   expect(await stored()).toMatchObject({ status: "working", objection, lastProgressPost: "todo 4", lastReplyAt: T0 + 2 * MIN });
   expect(staleWrites()).toEqual([]);
@@ -105,8 +117,8 @@ test("pause: pause and resume from a stale lane keep an objection and progress p
 
 test("freshness: a pause written while the sweep nudges the lane stands; only the nudge time is saved", async () => {
   await deps(T0).registry.write(lane);
-  const run = racing((argv) => argv[2] === "send-text" && String(argv[4]).startsWith("[LEAD] your work thread"), () => elsewhere({ status: "paused", pausedFrom: "working" }));
-  const acts = await freshnessTick(deps(T0 + 20 * MIN, run), "/home/test");
+  const d = racingOps(T0 + 20 * MIN, "send", (_lane, text) => text.startsWith("[LEAD] your work thread"), () => elsewhere({ status: "paused", pausedFrom: "working" }));
+  const acts = await freshnessTick(d, "/home/test", passthroughView(d.ops));
   expect(acts.map((a) => a.kind)).toContain("nudged");
   expect(await stored()).toMatchObject({ status: "paused", pausedFrom: "working", lastNudgeAt: T0 + 20 * MIN });
   expect(staleWrites()).toEqual([]);

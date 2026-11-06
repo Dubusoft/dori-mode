@@ -65,6 +65,11 @@ for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
   .npmrc .dori/config.json .dori/src .dori/bin; do
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
+opts+=(--ro-bind-try "$H/.dori/runner/sock" "$H/.dori/runner/sock")
+opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
+if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then
+  opts+=(--ro-bind-try "$DORI_LANE_TOKEN_FILE" "$DORI_LANE_TOKEN_FILE")
+fi
 opts+=(--remount-ro "$H/.dori")
 
 # ssh rejects root-owned include files inside the user namespace (root shows as
@@ -81,6 +86,8 @@ for p in "$H/.omo" "$H/.dori/state" "$H/.cache" "$H/.npm" "$H/.bun/install/cache
   "$H/.cargo/registry" "$H/.cargo/git"; do
   opts+=(--bind-try "$p" "$p")
 done
+mkdir -p "$H/.dori/heavy"
+opts+=(--bind-try "$H/.dori/heavy" "$H/.dori/heavy")
 
 if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   IFS=: read -r -a extra <<<"$LANE_SANDBOX_RW"

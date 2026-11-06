@@ -14,7 +14,7 @@ import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
  *   restart, retried on the guard's backoff (2 min doubling to 30 min). The process alive with a fresh health file is a
  *   partition: no restart, `RUNNER_UNREACHABLE machine=<label>` once per outage. The process gone or its health older
  *   than 120 s is "dead": a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>` and carried out
- *   (`systemctl --user restart dori-runner.service`, or launchd on macOS, on that host). A hello with a higher gen within 2 min verifies it
+ *   (a worker's service over ssh; the local runner as the supervisor's child process). A hello with a higher gen within 2 min verifies it
  *   (`RUNNER_RESTARTED`); none fails it (`RUNNER_RESTART_FAILED`) and the next decision follows the backoff.
  * - The circuit breaker allows 3 restarts per runner per hour. A restart it refuses, or 30 min offline, makes the
  *   runner LOST: `LANE_RUNNER_LOST <key> runner=<label>` once for each open lane the runner owns. Nothing is moved to
@@ -66,17 +66,17 @@ type Watched = {
 const tag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
 
 export const PROBE_TIMEOUT_MS = 20_000;
-const RUNNER_UNIT = "dori-runner.service";
 // The bundle `dori runner install` puts on a worker, run with the bun the user's login would find.
 const REMOTE_PROBE = remoteRunnerCli("runner probe --json");
 
 /**
- * The real probe and restart. `local` is the label of the runner on the supervisor's own host, probed and restarted
- * without ssh; any other label is looked up in `machines` and reached over ssh. ssh failing or timing out, a machine
- * that cannot be found, or output that is not a probe answer is "unreachable"; a stalled health file still counts as
- * alive (the restart is kept for a runner the probe calls dead).
+ * The real probe and restart. `local` is the label of the runner on the supervisor's own host, probed without ssh and
+ * restarted through `restartLocal` (the supervisor's `LocalChild.restart`: the local runner is its child process, never
+ * a systemd unit); without it a local restart fails. Any other label is looked up in `machines` and reached over ssh.
+ * ssh failing or timing out, a machine that cannot be found, or output that is not a probe answer is "unreachable"; a
+ * stalled health file still counts as alive (the restart is kept for a runner the probe calls dead).
  */
-export const livenessIo = (run: Runner, local: string, machines: () => Promise<readonly GuardMachine[]>): Pick<LivenessDeps, "probe" | "restart"> => {
+export const livenessIo = (run: Runner, local: string, machines: () => Promise<readonly GuardMachine[]>, restartLocal?: () => Promise<void>): Pick<LivenessDeps, "probe" | "restart"> => {
   const on = async (label: string, command: readonly string[], remote: string, timeoutMs: number) => {
     if (label === local) return run(command, { timeoutMs });
     const machine = (await machines()).find((m) => m.label === label);
@@ -95,7 +95,12 @@ export const livenessIo = (run: Runner, local: string, machines: () => Promise<r
       return { kind: "unreachable", detail: `no probe answer (exit ${r.code})` };
     },
     restart: async (label) => {
-      const r = await on(label, ["systemctl", "--user", "restart", RUNNER_UNIT], remoteRunnerService("restart"), PROBE_TIMEOUT_MS);
+      if (label === local) {
+        if (!restartLocal) return { ok: false, detail: "the local runner is the supervisor's child; restart dori-supervisor.service" };
+        await restartLocal();
+        return { ok: true, detail: "child restart" };
+      }
+      const r = await on(label, [], remoteRunnerService("restart"), PROBE_TIMEOUT_MS);
       if (!r) return { ok: false, detail: `no machine ${label}` };
       return r.code === 0 ? { ok: true, detail: "service restart" } : { ok: false, detail: (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}` };
     },

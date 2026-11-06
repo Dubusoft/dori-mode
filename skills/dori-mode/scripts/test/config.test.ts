@@ -131,6 +131,21 @@ test("an old config's quotaGate loads fine: the key is dropped and named in one 
   expect(warnings).toEqual([`CONFIG_QUOTA_GATE_KEYS_REMOVED quotaGate in ${path}: launches are no longer gated on Claude quota; the keys are ignored and can be deleted`]);
 });
 
+test("an old config's runners.mode loads fine: the key is dropped and named in one CONFIG_RUNNERS_MODE_REMOVED line per process", async () => {
+  const path = join(state.dir, "old-runners-mode.json");
+  await Bun.write(path, JSON.stringify({ runners: { listen: "100.64.0.1:7411", mode: { mini: "shadow" }, restartCircuit: { max: 3 } } }));
+  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
+    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
+    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
+    console.log(JSON.stringify({ runners: a.runners, mode: ["mode" in (a.runners ?? {}), "mode" in (b.runners ?? {})] }));`;
+  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
+  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  expect(code).toBe(0);
+  expect(JSON.parse(out)).toEqual({ runners: { listen: "100.64.0.1:7411", restartCircuit: { max: 3 } }, mode: [false, false] });
+  const warnings = err.split("\n").filter((line) => line.startsWith("CONFIG_RUNNERS_MODE_REMOVED "));
+  expect(warnings).toEqual([`CONFIG_RUNNERS_MODE_REMOVED runners.mode in ${path}: every lane is owned by its runner, the key is ignored and can be deleted`]);
+});
+
 test("an old config's delivery.mode loads fine: the key is dropped and named in one warning per process", async () => {
   const path = join(state.dir, "old-delivery-mode.json");
   await Bun.write(path, JSON.stringify({ delivery: { mode: "push", tailMonitor: false } }));

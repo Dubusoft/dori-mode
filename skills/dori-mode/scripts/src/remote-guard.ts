@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
 import { alertReasons } from "./host-guard.ts";
+import { herdrMachineList } from "./herdr-machines.ts";
 import { type Ran, RUN_TIMEOUT_CODE, type Runner } from "./run.ts";
 
 /** The agent script the server installs on each worker machine as `$HOME/.dori/guard-agent.sh`. */
@@ -31,7 +32,6 @@ const REMOTE_VERSION_TMP = '"$HOME/.dori/guard-agent.version.tmp.$$"';
 const HEREDOC = "DORI_GUARD_EOF";
 const INSTALL_TIMEOUT_MS = 30_000;
 const SAMPLE_TIMEOUT_MS = 20_000;
-const KILL_TIMEOUT_MS = 30_000;
 
 /** First 12 hex chars of the script's sha256: what `guard-agent.version` holds once installed. */
 export const guardAgentVersion = (script: string): string => createHash("sha256").update(script).digest("hex").slice(0, 12);
@@ -81,7 +81,7 @@ const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Reco
 
 /** herdr's saved machines with `overrides` (label -> ssh target) replacing or adding by label; a herdr failure or invalid JSON is not ok. */
 export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<MachineListResult> => {
-  const r = await run(["herdr", "machine", "list", "--json"]);
+  const r = await herdrMachineList(run);
   if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides) };
   try {
     return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides) };
@@ -161,7 +161,6 @@ const NO_SHELL = `${UNSUPPORTED_SHELL} (no POSIX sh or PowerShell)`;
 export const encodedPowerShell = (snippet: string): string =>
   `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(snippet, "utf16le").toString("base64")}`;
 
-const psQuote = (s: string): string => `'${s.replace(/'/g, "''")}'`;
 const psAgent = (args: string): string => encodedPowerShell(`& (Join-Path $env:USERPROFILE '.dori\\guard-agent.ps1') ${args}; exit $LASTEXITCODE`);
 const PS_VERSION = encodedPowerShell(
   "$f = Join-Path $env:USERPROFILE '.dori\\guard-agent.version'; if (Test-Path -LiteralPath $f) { Get-Content -LiteralPath $f -TotalCount 1; exit 0 } else { exit 1 }",
@@ -240,44 +239,10 @@ const sampleWith = async (run: Runner, m: GuardMachine, timeoutMs: number): Prom
 /** Runs the installed agent's `sample` over ssh. */
 export const sampleMachine = (run: Runner, m: GuardMachine): Promise<SampleResult> => sampleWith(run, m, SAMPLE_TIMEOUT_MS);
 
+/** A runner's kills on its machine (`RunnerGuardBoard.takeKills`, from `guard.critical`), as the critical stage reads them. */
 export type KillResult =
   | { ok: true; killed: { pid: number; rssKb: number; cmd: string }[] }
   | { ok: false; detail: string };
-
-const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-
-/** Parses the agent's `DORI_GUARD_KILLED` lines; undefined without the closing `DORI_GUARD_KILL_DONE` line. */
-const parseKillOutput = (out: string): { pid: number; rssKb: number; cmd: string }[] | undefined => {
-  const killed: { pid: number; rssKb: number; cmd: string }[] = [];
-  let done = false;
-  for (const line of out.split("\n").map((l) => l.trim())) {
-    if (line.startsWith("DORI_GUARD_KILL_DONE")) done = true;
-    const m = /^DORI_GUARD_KILLED pid=(\d+) rss_kb=(\d+) cmd=(\S*)$/.exec(line);
-    if (m) killed.push({ pid: Number(m[1]), rssKb: Number(m[2]), cmd: m[3]! });
-  }
-  return done ? killed : undefined;
-};
-
-/** Runs the installed agent's `kill` over ssh: ends that machine's processes whose command line contains any of `patterns`. */
-export const killOnMachine = async (run: Runner, m: GuardMachine, patterns: readonly string[]): Promise<KillResult> => {
-  const pats = patterns.filter((p) => p.trim());
-  if (pats.length === 0) return { ok: true, killed: [] };
-  const p = await runOn(run, m, (kind) => ({
-    command: kind === "windows" ? psAgent(`kill ${pats.map(psQuote).join(" ")}`) : `sh ${REMOTE_SCRIPT} kill ${pats.map(shellQuote).join(" ")}`,
-  }), KILL_TIMEOUT_MS);
-  if (!p.ok) return { ok: false, detail: p.detail };
-  const r = p.r;
-  if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, detail: `unreachable: ${sshError(r)}` };
-  if (p.kind === "windows" && psAgentMissing(r)) return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
-  const unsupported = unsupportedShell(r);
-  if (unsupported) return { ok: false, detail: unsupported };
-  if (r.code === 127 || (r.code !== 0 && /No such file|Can't open|cannot open/i.test(r.err))) {
-    return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
-  }
-  if (r.code !== 0) return { ok: false, detail: `kill failed (exit ${r.code}): ${sshError(r)}` };
-  const killed = parseKillOutput(r.out);
-  return killed ? { ok: true, killed } : { ok: false, detail: `bad kill output: ${firstLine(r.out).slice(0, 200) || "(empty)"}` };
-};
 
 /** `unsupported` marks a worker with neither POSIX sh nor PowerShell: the agent is skipped there, not failed. */
 export type InstallResult =

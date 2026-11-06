@@ -1,36 +1,47 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { isReportKind } from "../lane-reports.ts";
 import { ASK_SCREEN_LINES, askingLine, screenQuestion, type ScreenQuestion } from "../ask-user.ts";
-import { listPanes, paneAlive, readScreen, sendVerified } from "../panes.ts";
+import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import type { RunnerPolicy } from "./policy.ts";
-import type { InventoryLane, RunnerEventBodies, RunnerEventType, SupervisorCommandBodies } from "./protocol.ts";
-import type { Listener, Transport } from "./transport.ts";
+import { cmdRefused, inspectCreated, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
+import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
+import type {
+  CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
+} from "./protocol.ts";
+
+export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
 
 /**
- * The lanes a runner starts and owns on its host (design 3.3, 3.4, 9.1 P3b).
+ * The lanes a runner starts and owns on its host (design 3.3, 3.4, 9.1 P3b; runner-audit design 2.3, 4).
  *
- * `lane.start` opens a herdr tab labelled with the lane key, writes the brief to `~/.dori/runner/briefs/<key>.md` (not
- * /tmp), issues the lane a fresh 32-byte token, writes it to `briefs/<key>.token` (0600) and runs the agent of the
- * requested profile from `runner-config.json` with `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` in front of it, so the
- * token itself is never on a command line (shell history, process listings). Only the token's sha256 is kept, in
- * `lanes.json` (0600) with the lane's pane, tab and cwd; that file is the hello inventory. The agent runs inside the herdr pane, not as a
- * child of the runner, so a runner restart does not end it.
+ * `lane.start` opens a herdr tab labelled with the lane key (or takes the idle shell pane `target` names), writes the
+ * brief to `~/.dori/runner/briefs/<key>.md` (not /tmp), issues the lane a fresh 32-byte token, writes it to
+ * `briefs/<key>.<gen>.token` (0600, one file per launch generation) and runs the agent of the requested profile from the runner's policy with
+ * `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given) in front of it,
+ * so the token itself is never on a command line (shell history, process listings). Only the token's sha256 is kept,
+ * in `lanes.json` (0600) with the lane's pane, tab and cwd; that file is the hello inventory. The agent runs inside
+ * the herdr pane, not as a child of the runner, so a runner restart does not end it. After the agent is admitted the
+ * startup poll (lane-control.ts) judges whether it came up.
  *
- * The lane socket `sock/lane` takes one JSON request per line from the lane-mode CLI: `{key, token, kind, text,
- * evidence?}`. A token that is not the key's own is refused (`RUNNER_LANE_AUTH_FAILED`); an accepted report goes to the
- * outbox as `lane.report`, so it survives a disconnect. `lane.close` and `lane.stop` close the tab, delete the brief and
- * the token file and forget the token. `askTick` reads each owned lane's pane for an on-screen question (the same
- * `screenQuestion` the supervisor's ask-user sweep uses) and publishes one `lane.asking` per distinct question.
+ * `lane.adopt` takes an existing pane as a lane and issues it a token file; `lane.notify` stores the status the
+ * supervisor holds for the lane (`notice`), which the lane reads with `dori lane status` over the lane socket
+ * (lane-socket.ts). `lane.close` and `lane.stop` close the tab (else the pane), delete the brief and the token file and
+ * forget the token. `askTick` reads each owned lane's pane for an on-screen question (the same `screenQuestion` the
+ * supervisor's ask-user sweep uses) and publishes one `lane.asking` per distinct question.
  */
 
 export const LANES_FILE = "lanes.json";
-export const LANE_SOCKET = "lane";
 
 type Publish = <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
+
+/** The lane's status as the supervisor last pushed it (`lane.notify`), answered to the lane's `dori lane status`. */
+export type LaneNotice = {
+  readonly status: string;
+  readonly objection?: { readonly at: string; readonly reasons: readonly string[] };
+  readonly claim?: { readonly at: string; readonly evidence: string };
+};
 
 export type LaneRecord = {
   readonly key: string;
@@ -44,6 +55,16 @@ export type LaneRecord = {
   readonly startedAt: number;
   /** The on-screen question last published as `lane.asking` (see `questionKey`), absent when none is showing. */
   readonly lastAsk?: string;
+  /** Opening keywords of the start (absent: the mode's default), reused by a relaunch. */
+  readonly keywords?: string;
+  readonly heavySlots?: number;
+  readonly heavyMaxLoad?: number;
+  /** The status the supervisor last pushed with `lane.notify`. */
+  readonly notice?: LaneNotice;
+  /** A pane the runner took over with `lane.adopt` rather than started; it has no brief or profile to relaunch from. */
+  readonly adopted?: true;
+  /** The launch generation: its token is in `briefs/<key>.<gen>.token`. Absent (adopted, or an older runner's record): `briefs/<key>.token`. */
+  readonly gen?: number;
 };
 
 export type RunnerLanesDeps = {
@@ -53,7 +74,15 @@ export type RunnerLanesDeps = {
   readonly policy: RunnerPolicy;
   readonly publish: Publish;
   readonly token?: () => string;
+  /** The startup verdict of a just-admitted agent (default: lane-control.ts `startupPoll`). */
+  readonly startup?: (pane: string) => Promise<StartupVerdict>;
+  /** Removes a stale lane `.omo/mcp.json` in the lane's cwd before the agent starts (default: `removeLegacyLaneMcp`). */
+  readonly legacyMcp?: (cwd: string) => Promise<boolean>;
+  /** Resolves a pane's directory for the allowedRoots check (default `fs.realpathSync`). */
+  readonly realpath?: (path: string) => string;
 };
+
+export type Effect<T extends keyof CommandResults> = { readonly detail: string; readonly result: CommandResults[T] };
 
 const hash = (token: string): string => createHash("sha256").update(token).digest("hex");
 /** One question across ticks, like ask-user's own key: header, text and options, not the pending count. */
@@ -61,12 +90,39 @@ const questionKey = (q: ScreenQuestion): string =>
   createHash("sha256").update(JSON.stringify(q.tabs && q.tabs.length > 1 ? [q.tabs] : [q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
 const quote = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);
 
-/** The agent argv of `profile`, each `{prompt}`, `{model}` and `{brief}` filled in. */
-export const agentArgv = (policy: RunnerPolicy, profile: string, values: { readonly prompt: string; readonly model: string; readonly brief: string }): string[] => {
+/** The old lane `.omo/mcp.json` (figma disabled) that launch.ts used to write; the same bytes as `LEGACY_LANE_MCP` there. */
+export const LEGACY_LANE_MCP = `${JSON.stringify({ mcpServers: { figma: { enabled: false, url: "https://mcp.figma.com/mcp" } } }, null, 2)}\n`;
+
+/**
+ * Removes a `.omo/mcp.json` in `cwd` that is byte-for-byte the old lane file, so an old worktree stops keeping figma
+ * off; a user's own file is never touched. Runs on the lane's host before the agent starts (moved from launch.ts).
+ */
+export const removeLegacyLaneMcp = async (cwd: string): Promise<boolean> => {
+  const file = Bun.file(join(cwd, ".omo", "mcp.json"));
+  try {
+    if (!(await file.exists()) || (await file.text()) !== LEGACY_LANE_MCP) return false;
+    await file.delete();
+    return true;
+  } catch { return false; } // unremovable: the lane still launches as before
+};
+
+/** The agent argv of `profile`, each `{prompt}`, `{model}` and `{brief}` filled in; `session` resumes it when the profile allows (`resumeArgv`). */
+export const agentArgv = (
+  policy: RunnerPolicy, profile: string, values: { readonly prompt: string; readonly model: string; readonly brief: string }, session?: string,
+): string[] => {
   const template = policy.agents[profile];
   if (!template?.length) throw new Error(`RUNNER_LANE_PROFILE_UNKNOWN ${profile}`);
-  return template.map((part) => part.replaceAll("{prompt}", values.prompt).replaceAll("{model}", values.model).replaceAll("{brief}", values.brief));
+  const parts = resumeArgv(template, session) ?? template;
+  return parts.map((part) => part.replaceAll("{prompt}", values.prompt).replaceAll("{model}", values.model).replaceAll("{brief}", values.brief));
 };
+
+/** What a launch needs; a relaunch takes it from the record. */
+type LaunchInput = {
+  readonly key: string; readonly cwd: string; readonly profile: string; readonly mode: string; readonly model: string;
+  readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
+  readonly heavySlots?: number; readonly heavyMaxLoad?: number;
+};
+type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict };
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
@@ -85,9 +141,23 @@ export class RunnerLanes {
     return join(this.deps.runnerDir, RUNNER_PATHS.briefs, `${key}.md`);
   }
 
-  /** The lane's token file, next to its brief in the owner-only briefs directory. */
+  /**
+   * The lane's current token file, next to its brief in the owner-only briefs directory: each launch generation has its
+   * own (`<key>.<gen>.token`), so a session from before a relaunch, which keeps re-reading its old DORI_LANE_TOKEN_FILE,
+   * finds no token once that file is deleted. An adopted lane (never relaunched) keeps the stable `<key>.token`.
+   */
   tokenPath(key: string): string {
-    return join(this.deps.runnerDir, RUNNER_PATHS.briefs, `${key}.token`);
+    return this.tokenFileOf(key, this.records()[key]?.gen);
+  }
+
+  private tokenFileOf(key: string, gen: number | undefined): string {
+    return join(this.deps.runnerDir, RUNNER_PATHS.briefs, gen === undefined ? `${key}.token` : `${key}.${gen}.token`);
+  }
+
+  /** Throws `RUNNER_CMD_REJECTED <rule>` when a pane directory found on this host is not under the policy's allowedRoots. */
+  private checkPaneCwd(cwd: string): void {
+    const refused = checkCwd(this.deps.policy, cwd, this.deps.realpath ?? realpathSync);
+    if (refused) throw new Error(`${rejectionText(refused.rule)} ${refused.detail}`);
   }
 
   inventory(): InventoryLane[] {
@@ -103,37 +173,96 @@ export class RunnerLanes {
     return want.length === got.length && timingSafeEqual(want, got);
   }
 
-  async start(body: SupervisorCommandBodies["lane.start"]): Promise<string> {
+  /** The status the supervisor last pushed for lane `key` (`lane.notify`), if any. */
+  notice(key: string): LaneNotice | undefined {
+    return this.records()[key]?.notice;
+  }
+
+  /** The key of the lane whose record holds `pane` (the lane socket's `whoami`). */
+  keyForPane(pane: string): string | undefined {
+    return Object.values(this.records()).find((r) => r.pane === pane)?.key;
+  }
+
+  async start(body: SupervisorCommandBodies["lane.start"]): Promise<Effect<"lane.start">> {
     if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
     writeRunnerFile(this.briefPath(body.key), body.briefText);
-    return this.launch(body.key, body.cwd, body.agentProfile, body.mode, body.model);
+    const launched = await this.launch({
+      key: body.key, cwd: body.cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
+      ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
+      ...(body.target ? { target: body.target } : {}),
+      ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
+    });
+    return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup } };
   }
 
-  private async launch(key: string, cwd: string, profile: string, mode: string, model: string): Promise<string> {
+  /** Opens the lane's pane (a new tab, or the checked `target` pane) and runs its agent there; publishes `lane.started`. */
+  private async launch(input: LaunchInput): Promise<Launched> {
+    const { key } = input;
     const brief = this.briefPath(key);
-    const prompt = `${mode === "mass-ulw" ? "mass-ulw" : "ulw"}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
-    const argv = agentArgv(this.deps.policy, profile, { prompt, model, brief });
-    const created = await this.deps.run(["herdr", "tab", "create", "--cwd", cwd, "--label", key, "--no-focus"]);
-    if (created.code !== 0) throw new Error(`herdr tab create failed: ${(created.err || created.out).trim()}`);
-    const made = (JSON.parse(created.out) as { result: { root_pane: { pane_id: string; tab_id?: string }; tab_id?: string } }).result;
-    const pane = made.root_pane.pane_id;
-    const tab = made.tab_id ?? made.root_pane.tab_id ?? "";
+    const keywords = input.keywords ?? (input.mode === "mass-ulw" ? "mass-ulw" : "ulw");
+    const prompt = `${keywords}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
+    const argv = agentArgv(this.deps.policy, input.profile, { prompt, model: input.model, brief }, input.session);
+    const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
+    let pane: string;
+    let tab: string;
+    let cwd = input.cwd;
+    /** Closes what this launch opened; a target pane is the owner's and is left open. */
+    let rollback = async (): Promise<void> => {};
+    if (input.target) {
+      const target = await resolveTargetPane(this.deps.run, input.target, { ownerOf: (p) => this.keyForPane(p), refuseCmd: true });
+      // The checked input cwd is replaced by the pane's own directory, so that is what must lie under allowedRoots.
+      if (target.cwd !== undefined) this.checkPaneCwd(target.cwd);
+      pane = target.pane;
+      tab = target.tab ?? "";
+      cwd = target.cwd ?? cwd;
+    } else {
+      const created = await this.deps.run(["herdr", "tab", "create", "--cwd", input.cwd, "--label", key, "--no-focus"]);
+      if (created.code !== 0) throw new Error(`herdr tab create failed: ${(created.err || created.out).trim()}`);
+      const made = (JSON.parse(created.out) as { result: { root_pane: { pane_id: string; tab_id?: string }; tab_id?: string } }).result;
+      pane = made.root_pane.pane_id;
+      tab = made.tab_id ?? made.root_pane.tab_id ?? "";
+      const openedTab = tab;
+      rollback = async () => { await this.deps.run(["herdr", "tab", "close", openedTab]); };
+      // A cmd.exe pane cannot run the POSIX launch line: the tab is closed before anything is typed.
+      if ((await inspectCreated(this.deps.run, pane)).shell === "cmd") {
+        await rollback();
+        throw new TargetError("RUNNER_LANE_TARGET_INVALID", cmdRefused(pane));
+      }
+    }
+    await (this.deps.legacyMcp ?? removeLegacyLaneMcp)(cwd);
     const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
-    const tokenFile = this.tokenPath(key);
+    const previous = this.records()[key];
+    const gen = (previous?.gen ?? 0) + 1;
+    const tokenFile = this.tokenFileOf(key, gen);
     writeRunnerFile(tokenFile, token);
+    const env = [
+      `DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`,
+      ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
+      ...(input.heavyMaxLoad !== undefined ? [`DORI_HEAVY_MAX_LOAD=${input.heavyMaxLoad}`] : []),
+    ];
     // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
-    const command = [`DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`, ...argv.map(quote)].join(" ");
+    const command = [...env, ...argv.map(quote)].join(" ");
     const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
     if (ran.code !== 0) {
       rmSync(tokenFile, { force: true });
-      await this.deps.run(["herdr", "tab", "close", tab]);
+      await rollback();
       throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
     }
-    this.save({ ...this.records(), [key]: { key, pane, tab, cwd, tokenHash: hash(token), profile, mode, model, startedAt: this.deps.clock.now() } });
+    this.save({
+      ...this.records(),
+      [key]: {
+        key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
+        ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
+        ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
+      },
+    });
+    // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
+    if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
     this.deps.publish("lane.started", { key, pane, tab, session: "" });
-    return `started pane=${pane} tab=${tab}`;
+    const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
+    return { pane, tab, resumed, startup };
   }
 
   private record(key: string): LaneRecord {
@@ -142,48 +271,135 @@ export class RunnerLanes {
     return record;
   }
 
-  /** Closes the lane's tab, deletes its brief and token file and forgets its token. */
-  async close(key: string): Promise<string> {
+  private update(key: string, change: (record: LaneRecord) => LaneRecord): void {
+    const records = this.records();
+    const current = records[key];
+    if (current) this.save({ ...records, [key]: change(current) });
+  }
+
+  /**
+   * Takes the existing pane `pane` of this host as lane `key`: the pane must exist (`RUNNER_LANE_PANE_MISSING`) and
+   * belong to no other lane. Issues a token into `briefs/<key>.token`; the lane has no token variable, so the lane CLI
+   * reads that file by key.
+   */
+  async adopt(body: SupervisorCommandBodies["lane.adopt"]): Promise<Effect<"lane.adopt">> {
+    if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
+    const owner = this.keyForPane(body.pane);
+    if (owner) throw new Error(`RUNNER_LANE_TARGET_BUSY pane ${body.pane} is already lane ${owner}`);
+    const got = await this.deps.run(["herdr", "pane", "get", body.pane]);
+    if (got.code !== 0) throw new Error(`RUNNER_LANE_PANE_MISSING pane ${body.pane} is not on this host: ${(got.err || got.out).trim()}`);
+    let info: { tab_id?: string; cwd?: string; foreground_cwd?: string } | undefined;
+    try { info = (JSON.parse(got.out) as { result?: { pane?: { tab_id?: string; cwd?: string; foreground_cwd?: string } } }).result?.pane; } catch { info = undefined; }
+    const tab = info?.tab_id ?? "";
+    // The pane's own directory is where the lane works, whatever body.cwd (already checked at dispatch) says.
+    const paneCwd = info?.foreground_cwd ?? info?.cwd;
+    if (paneCwd === undefined && body.cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} pane ${body.pane} reports no directory`);
+    for (const dir of [body.cwd, paneCwd]) if (dir !== undefined) this.checkPaneCwd(dir);
+    const cwd = body.cwd ?? paneCwd ?? "";
+    const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
+    ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
+    const tokenFile = this.tokenPath(body.key);
+    writeRunnerFile(tokenFile, token);
+    this.save({
+      ...this.records(),
+      [body.key]: { key: body.key, pane: body.pane, tab, cwd, tokenHash: hash(token), profile: "", mode: body.mode, model: body.model, startedAt: this.deps.clock.now(), adopted: true },
+    });
+    this.deps.publish("lane.started", { key: body.key, pane: body.pane, tab, session: "" });
+    return { detail: `adopted pane=${body.pane} tab=${tab}`, result: { pane: body.pane, tab, tokenFile } };
+  }
+
+  /** Stores the status the supervisor holds for the lane, answered to the lane's `dori lane status`. */
+  async notify(body: SupervisorCommandBodies["lane.notify"]): Promise<Effect<"lane.notify">> {
+    this.record(body.key);
+    const notice: LaneNotice = { status: body.status, ...(body.objection ? { objection: body.objection } : {}), ...(body.claim ? { claim: body.claim } : {}) };
+    this.update(body.key, (r) => ({ ...r, notice }));
+    return { detail: `noted ${body.status}`, result: {} };
+  }
+
+  /** Closes the lane's tab (else its pane), deletes its brief and token file and forgets its token; `gone` is read back from the pane list. */
+  async close(key: string): Promise<Effect<"lane.close">> {
     const record = this.record(key);
-    await this.deps.run(["herdr", "tab", "close", record.tab]);
+    const closed: "tab" | "pane" | "none" = record.tab ? "tab" : record.pane ? "pane" : "none";
+    if (closed === "tab") await this.deps.run(["herdr", "tab", "close", record.tab]);
+    else if (closed === "pane") await this.deps.run(["herdr", "pane", "close", record.pane]);
     rmSync(this.briefPath(key), { force: true });
-    rmSync(this.tokenPath(key), { force: true });
+    rmSync(this.tokenFileOf(key, record.gen), { force: true });
+    rmSync(this.tokenFileOf(key, undefined), { force: true });
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
-    return `closed tab=${record.tab}`;
+    let gone = false;
+    try { gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
+    catch { gone = false; }
+    return { detail: closed === "tab" ? `closed tab=${record.tab}` : closed === "pane" ? `closed pane=${record.pane}` : "closed none", result: { closed, gone } };
   }
 
-  async send(key: string, text: string, verify: boolean): Promise<string> {
+  /**
+   * Types `text` into the lane. `verified` (the default) confirms delivery from the pane (`sendVerified`); `guarded`
+   * types through the same guard without waiting (`sendGuarded`, delivery `sent`). With `refuseWhileAsking` a lane
+   * showing a question prompt (`lastAsk`) gets nothing: `{delivery: "failed", refusal}`. A send the pane did not take
+   * throws `RUNNER_LANE_SEND_FAILED`, as before.
+   */
+  async send(key: string, text: string, verify: boolean, opts: { readonly mode?: "verified" | "guarded"; readonly refuseWhileAsking?: boolean } = {}): Promise<Effect<"lane.send">> {
     const record = this.record(key);
-    const delivery = await sendVerified(this.deps.run, this.deps.clock, record.pane, text, verify);
+    if (opts.refuseWhileAsking && record.lastAsk) {
+      return { detail: `refused asking`, result: { delivery: "failed", refusal: `RUNNER_LANE_ASKING ${key} shows a question prompt; not typed` } };
+    }
+    const delivery = opts.mode === "guarded"
+      ? await sendGuarded(this.deps.run, record.pane, text)
+      : await sendVerified(this.deps.run, this.deps.clock, record.pane, text, verify);
     if (delivery === "failed") throw new Error(`RUNNER_LANE_SEND_FAILED ${key}`);
-    return `sent ${delivery}`;
+    return { detail: `sent ${delivery}`, result: { delivery } };
   }
 
-  async observe(key: string): Promise<string> {
+  /** `lane.pause` on the lane's pane (lane-control.ts `pause`). */
+  async pause(key: string, step: PauseStep = "both"): Promise<Effect<"lane.pause">> {
+    const result = await pause({ run: this.deps.run, clock: this.deps.clock }, this.record(key).pane, step);
+    return { detail: `paused ${step} goal=${result.goal ?? "-"} working=${result.working ?? "-"} stopped=${result.stopped ?? "-"}`, result };
+  }
+
+  /** `lane.resume` on the lane's pane (lane-control.ts `resume`). */
+  async resume(key: string): Promise<Effect<"lane.resume">> {
+    const result = await resume({ run: this.deps.run, clock: this.deps.clock }, this.record(key).pane);
+    return { detail: `resumed goal=${result.goal}`, result };
+  }
+
+  async observe(key: string): Promise<Effect<"lane.observe">> {
     const record = this.record(key);
     const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
     // The same alive test as serve.ts laneStatus, so the runner and the supervisor call one pane the same.
-    const status = !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
-    this.deps.publish("lane.state", { key, status });
+    const status: LaneStatus = !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
+    const reason: LaneDeadReason | undefined = !pane ? "pane-missing" : status === "dead" ? "agent-gone" : undefined;
+    this.deps.publish("lane.state", { key, status, ...(reason ? { reason } : {}) });
     if (!pane) throw new Error(`RUNNER_LANE_ABSENT ${key} pane ${record.pane} is gone`);
-    return `observed ${status}`;
+    return { detail: `observed ${status}`, result: { status } };
   }
 
   /**
    * Starts the lane again from its brief when its pane or agent is gone (`paneAlive`); a live lane is left alone. The old
    * record stays until the relaunch has a new pane, so a failed relaunch throws and a later recover can retry it. A live
-   * lane publishes `lane.started` for its current record, which completes the supervisor's pending recovery.
+   * lane publishes `lane.started` for its current record, which completes the supervisor's pending recovery. `session`
+   * resumes that agent session when the profile allows (`resumed` says whether it did).
    */
-  async recover(key: string): Promise<string> {
+  async recover(key: string, session?: string): Promise<Effect<"lane.recover">> {
     const record = this.record(key);
     const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
     if (paneAlive(pane)) {
       this.deps.publish("lane.started", { key, pane: record.pane, tab: record.tab, session: "" });
-      return `alive pane=${record.pane}`;
+      return { detail: `alive pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
     }
-    if (pane) await this.deps.run(["herdr", "tab", "close", record.tab]);
-    return this.launch(key, record.cwd, record.profile, record.mode, record.model);
+    if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
+    if (pane && record.tab) await this.deps.run(["herdr", "tab", "close", record.tab]);
+    const launched = await this.launch({
+      key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,
+      ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),
+      ...(record.heavySlots !== undefined ? { heavySlots: record.heavySlots } : {}), ...(record.heavyMaxLoad !== undefined ? { heavyMaxLoad: record.heavyMaxLoad } : {}),
+    });
+    // The relaunch replaced the record; a notice the supervisor pushed stays with the lane.
+    if (record.notice) this.update(key, (r) => ({ ...r, notice: record.notice as LaneNotice }));
+    return {
+      detail: `started pane=${launched.pane} tab=${launched.tab}`,
+      result: { pane: launched.pane, tab: launched.tab, relaunched: true, resumed: launched.resumed, startup: launched.startup },
+    };
   }
 
   /**
@@ -209,29 +425,3 @@ export class RunnerLanes {
     return asked;
   }
 }
-
-export type LaneRequest = { readonly key: string; readonly token: string; readonly kind: string; readonly text: string; readonly evidence?: string };
-
-/** Serves the lane socket on `listener`: each request line gets one reply line `{ok}` or `{ok:false, code, detail}`. */
-export const serveLaneSocket = (listener: Listener, lanes: Pick<RunnerLanes, "tokenFor">, publish: Publish, log: (line: string) => void): (() => void) =>
-  listener.onConnection((link: Transport) => {
-    link.onLine((line) => {
-      const reply = (body: object): void => {
-        try { link.send(`${JSON.stringify(body)}\n`); }
-        catch (e) { log(`RUNNER_LANE_REPLY_FAILED ${e instanceof Error ? e.message : String(e)}`); }
-      };
-      let req: LaneRequest;
-      try { req = JSON.parse(line) as LaneRequest; } catch { reply({ ok: false, code: "RUNNER_LANE_BAD_REQUEST", detail: "not JSON" }); return; }
-      if (typeof req.key !== "string" || typeof req.token !== "string" || typeof req.text !== "string" || !isReportKind(req.kind)) {
-        reply({ ok: false, code: "RUNNER_LANE_BAD_REQUEST", detail: "needs key, token, a report kind and text" });
-        return;
-      }
-      if (!lanes.tokenFor(req.key, req.token)) {
-        log(`RUNNER_LANE_AUTH_FAILED key=${req.key}`);
-        reply({ ok: false, code: "RUNNER_LANE_AUTH_FAILED", detail: `not ${req.key}'s lane token` });
-        return;
-      }
-      publish("lane.report", { key: req.key, kind: req.kind, text: req.text, ...(typeof req.evidence === "string" && req.evidence ? { evidence: req.evidence } : {}) });
-      reply({ ok: true });
-    });
-  });

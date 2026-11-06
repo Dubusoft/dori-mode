@@ -1,17 +1,23 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { configPath, deliveryConfigError, runnerMode, saveLeadPane } from "./config.ts";
+import { configPath, deliveryConfigError, saveLeadPane } from "./config.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { HUB_FILE, readRunnerRows, RunnerHub } from "./runner/hub.ts";
 import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
 import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps, reconcileInventory, runnerJournalHead } from "./runner/lanes-hub.ts";
-import { recordDiffLines } from "./runner/shadow-store.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
+import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
+import { type Delivery, laneOps, type LaneOps } from "./lane-ops.ts";
+import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
+import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
+import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
+import type { LaneMemoryBody } from "./runner/protocol.ts";
+import { type LaneMessageStore, openLaneMessages } from "./lane-messages.ts";
 import {
   acceptRunners, drainRunnerAdmin, type HubHooks, LOCAL_RUNNER, loadIdentity, nextEpoch, openRunnerJournal, type RunnerAccept,
-  type RunnerJournal, ShadowObserver,
+  type RunnerJournal,
 } from "./runner/serve.ts";
 import type { Listener } from "./runner/transport.ts";
 import { controlSocketPath, listenUnix } from "./runner/unix-transport.ts";
@@ -20,7 +26,6 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 
-import { askUserTick } from "./ask-user.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
 import { freshnessTick, scrubForThread } from "./freshness.ts";
@@ -28,14 +33,12 @@ import { lookupQuotaResults, quotaReport } from "./claude-quota.ts";
 import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
 import { memorySweep } from "./memory-check.ts";
 import { alertReasons, criticalReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
-import { describeLane, formatKb, type LaneMemory, laneMemory, laneMemoryDetail, type Proc, procLanes, sampleProcs } from "./lane-memory.ts";
-import { laneRunner, type Pane, sendGuarded } from "./panes.ts";
+import { describeLane, formatKb, type LaneMemory, laneMemoryDetail } from "./lane-memory.ts";
 import { pauseLane, type PauseResult } from "./pause.ts";
-import { describeKilled, heavyTargets, type KilledProc, killProcs } from "./pressure.ts";
 import type { Lane } from "./registry.ts";
 import {
-  type GuardMachine, guardAgentWants, killOnMachine, type KillResult, loadMachineGuardState,
-  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, readGuardMachines, sampleMachine, saveMachineGuardState, wantFor,
+  type GuardMachine, guardAgentWants, type KillResult, loadMachineGuardState,
+  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, type SampleResult, readGuardMachines, sampleMachine, saveMachineGuardState, wantFor,
 } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -159,14 +162,16 @@ export const TASK_ALERT_MS = 5 * 60_000;
 /** The supervisor's independent tasks. */
 export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
-/** The fifth task, run only when the config has a `runners` section: the runner hub's shadow comparison. */
+/** The fifth task, run while the runner hub is open: liveness, lane events, runner admin, legacy adoption, journal pruning. */
 export const RUNNERS_TASK = "runners";
-/** How often the runners task compares shadow observations; the hub itself answers frames as they arrive. */
+/** How often the runners task tries to adopt open lanes that have no runner yet. */
+export const LEGACY_ADOPT_MS = 60_000;
+/** How often the runners task runs; the hub itself answers frames as they arrive. */
 export const RUNNERS_PASS_MS = 5_000;
 /** How often the runners task drops old rows from the hub's runner event journal. */
 const RUNNER_JOURNAL_PRUNE_MS = 60 * 60_000;
 
-/** The open runner hub: its listeners, the hub, its journal, the key store, the live connections and the shadow observer. */
+/** The open runner hub: its listeners, the hub, its journal, the key store, the live connections, the guard board and the calls. */
 export type RunnerHubHandle = {
   readonly hub: RunnerHub;
   readonly journal: RunnerJournal;
@@ -177,9 +182,10 @@ export type RunnerHubHandle = {
   readonly auth: SupervisorAuth;
   /** Live connection operations (revoke, rotate, commands). */
   readonly accept: RunnerAccept;
-  readonly shadow: ShadowObserver;
   /** Each runner's latest guard sample and unreported kills, for the machine-guard sweep. */
   readonly guard: RunnerGuardBoard;
+  /** Awaitable commands and queries over the live connections (the facade's RunnerCall). */
+  readonly calls: RunnerCalls;
   close(): void;
 };
 
@@ -188,6 +194,8 @@ export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEve
   readonly listen?: string;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
   readonly hostId?: string;
+  /** The call/query timeout timers (default real timers). */
+  readonly timers?: Timers;
 };
 
 /**
@@ -239,58 +247,26 @@ export const openRunnerHub = (
     try { network = listenWs(options.listen); }
     catch (e) { log(`RUNNER_LISTEN_FAILED listen=${options.listen} ${e instanceof Error ? e.message : String(e)}`); }
   }
-  const shadow = new ShadowObserver();
   const guard = new RunnerGuardBoard(monotonic);
+  // The proto each label said hello with on its current connection: RunnerCalls refuses newer types to a proto-2 runner.
+  const protos = new Map<string, number>();
+  let calls: RunnerCalls | undefined;
   const accept = acceptRunners(hub, network ? [listener, network] : [listener], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
-    onHello: (label, body) => { shadow.hello(label, body.inventory); options.onHello?.(label, body); },
-    onEvent: (label, frame) => { shadow.event(label, frame); guard.event(label, frame); options.onEvent?.(label, frame); },
+    onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
+    onEvent: (label, frame) => { guard.event(label, frame); calls?.onEvent(label, frame); options.onEvent?.(label, frame); },
+    onControl: (label, frame) => { calls?.onControl(label, frame); },
+    onDisconnected: (label) => { protos.delete(label); calls?.disconnected(label); },
     auth,
     log,
   });
+  calls = new RunnerCalls({ accept, proto: (label) => protos.get(label), now, timers: options.timers ?? realTimers, log });
   log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}${network ? ` listen=${network.host}:${network.port}` : ""}`);
   const keys = auth;
   return {
-    hub, journal, listener, auth: keys, accept, shadow, guard, ...(network ? { network } : {}),
+    hub, journal, listener, auth: keys, accept, guard, calls, ...(network ? { network } : {}),
     close() { accept(); listener.close(); network?.close(); keys.close(); hub.close(); journal.close(); },
   };
-};
-
-/** The supervisor's own side of a shadow pass. */
-export type ShadowPassDeps = {
-  /** The supervisor clock's now. */
-  readonly now: number;
-  /** herdr's pane list on a machine (undefined: this host), e.g. `passthroughView(run).panes`. */
-  readonly panes: (machine?: string) => Promise<Pane[]>;
-  /** Keys of archived (closed) lanes. */
-  readonly archived: () => readonly string[];
-  /** Where a pane list that could not be read is reported. */
-  readonly error: (line: string) => void;
-};
-
-/**
- * One runners-task pass: a shadow cycle per runner in shadow mode, each difference logged as RUNNER_SHADOW_DIFF and
- * handed to `record` (the shadow report store) in one batch. Each runner's lanes are judged alive from the supervisor's
- * own pane list for that runner's machine; when it cannot be read the error is reported and that runner's lane states
- * are not compared this pass.
- */
-export const runnersPass = async (
-  handle: RunnerHubHandle, config: Parameters<typeof runnerMode>[0], open: () => Promise<Lane[]>, side: ShadowPassDeps,
-  log: (line: string) => void, record: (lines: readonly string[]) => void = () => {},
-): Promise<void> => {
-  const labels = handle.shadow.labels().filter((label) => runnerMode(config, label) === "shadow");
-  if (!labels.length) return;
-  const lanes = await open();
-  const archived = new Set(side.archived());
-  const lines: string[] = [];
-  for (const label of labels) {
-    let panes: Pane[] | undefined;
-    try { panes = await side.panes(label === LOCAL_RUNNER ? undefined : label); }
-    catch (e) { side.error(`RUNNER_SHADOW_ERROR runner=${label} legacy pane list unreadable: ${e instanceof Error ? e.message : String(e)}`); }
-    lines.push(...handle.shadow.cycle(label, lanes, side.now, { panes, archived }));
-  }
-  for (const line of lines) log(line);
-  if (lines.length) record(lines);
 };
 
 /**
@@ -348,12 +324,20 @@ export const LANE_WARN_MIN_KB = 1_048_576;
 export const WARN_COOLDOWN_MS = 30 * 60_000;
 
 /**
+ * A guard message for a lane, through the lane's runner: a guarded send (nothing pressed when the input line holds
+ * someone's text) that the runner refuses while the lane shows a question prompt, whose dialog reads digits, space and
+ * 'c' as keys. A refusal, a failed send and an unreachable runner all come back as "failed".
+ */
+const guardSend = (ops: LaneOps, lane: Lane, text: string): Promise<Delivery> =>
+  ops.send(lane, systemText(text), { mode: "guarded", refuseWhileAsking: true });
+
+/**
  * Types a memory warning into the pane of the heaviest lane overall, when that lane is an open local one (remote lanes
  * run on another host's memory) of at least LANE_WARN_MIN_KB and was not warned within WARN_COOLDOWN_MS, so the lane
  * stops what it does not need without the lead relaying it. Returns what happened, for the lead's ALERT line.
  */
 export const warnHeaviestLane = async (
-  run: Runner, lanes: readonly LaneMemory[], open: readonly Lane[], reason: string,
+  ops: LaneOps, lanes: readonly LaneMemory[], open: readonly Lane[], reason: string,
   warnedAt: Map<string, number> = new Map(), now: () => number = Date.now,
 ): Promise<string> => {
   const target = lanes[0];
@@ -361,54 +345,49 @@ export const warnHeaviestLane = async (
   const lane = open.find((l) => l.key === target.lane && l.pane && !l.machine);
   if (!lane?.pane) return `not typed: heaviest lane ${target.lane} is not open here`;
   if (target.rssKb < LANE_WARN_MIN_KB) return `not typed: heaviest lane ${target.lane} is below ${(LANE_WARN_MIN_KB / 1_048_576).toFixed(1)} GB`;
-  // The question dialog reads digits, space and 'c' as keys, so typing there could submit an answer nobody chose.
-  if (lane.lastAskPrompt) return `not typed: ${target.lane} is on a question prompt`;
   const last = warnedAt.get(target.lane);
   if (last !== undefined && now() - last < WARN_COOLDOWN_MS) return `not typed: ${target.lane} was warned ${Math.floor((now() - last) / 60_000)} min ago`;
-  const text = systemText(`HOST_GUARD memory warning: ${reason} on this host, and this lane (${target.lane}) uses the most memory: ${describeLane(target)}. `
-    + "Stop what you are not using now (an emulator, an expo or dev server, a watcher or test runner), then go on with your task. The lead has been told.");
-  if (await sendGuarded(run, lane.pane, text) !== "sent") return `could not warn ${target.lane} in its pane ${lane.pane}`;
+  const text = `HOST_GUARD memory warning: ${reason} on this host, and this lane (${target.lane}) uses the most memory: ${describeLane(target)}. `
+    + "Stop what you are not using now (an emulator, an expo or dev server, a watcher or test runner), then go on with your task. The lead has been told.";
+  if (await guardSend(ops, lane, text) === "failed") return `could not warn ${target.lane} in its pane ${lane.pane}`;
   warnedAt.set(target.lane, now());
   return `warned ${target.lane} in its pane ${lane.pane}`;
 };
 
+/** A runner's `guard.sample.lanes` as the lane-memory helpers read it (heaviest first, as the runner sent it). */
+export const laneMemoryOf = (lanes: readonly LaneMemoryBody[]): LaneMemory[] =>
+  lanes.map((l) => ({ lane: l.key, rssKb: l.rssKb, top: l.top.map((c) => ({ ...c })) }));
+
 /**
- * The detail of a new HOST_GUARD ALERT: the heaviest lanes by memory and, when free memory is below its threshold, the
- * warning sent to the heaviest lane. A failure here never costs the ALERT itself.
+ * The detail of a new HOST_GUARD ALERT: the heaviest lanes by memory (from the local runner's sample; undefined when
+ * the runner sent none) and, when free memory is below its threshold, the warning sent to the heaviest lane. A failure
+ * here never costs the ALERT itself.
  */
 export const guardAlertDetail = async (
-  deps: Pick<FlowDeps, "run" | "config" | "registry">, sample: HostSample, procs: () => Promise<Proc[]> = () => sampleProcs(deps.run),
+  deps: Pick<FlowDeps, "ops" | "config" | "registry">, sample: HostSample, lanes: readonly LaneMemory[] | undefined,
   warnedAt: Map<string, number> = new Map(), now: () => number = Date.now,
 ): Promise<string | undefined> => {
+  if (!lanes) return undefined;
   try {
-    const lanes = laneMemory(await procs());
     const detail = laneMemoryDetail(lanes);
     const min = deps.config.guard.memFreeMinPct;
     if (sample.memFreePct >= min) return detail;
-    const warned = await warnHeaviestLane(deps.run, lanes, await deps.registry.open(), `memory free ${sample.memFreePct}% < ${min}%`, warnedAt, now);
+    const warned = await warnHeaviestLane(deps.ops, lanes, await deps.registry.open(), `memory free ${sample.memFreePct}% < ${min}%`, warnedAt, now);
     return [detail, warned].filter(Boolean).join("; ");
   } catch (e) {
     return `lane memory unreadable: ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 120)}`;
   }
 };
 
-/** What the critical-pressure stage reads and does; tests replace these, production uses `pressureIo`. */
+/**
+ * What the critical-pressure stage does itself; tests replace it, production uses `pressureIo`. Killing is the
+ * runners' (their guard kills under critical memory and reports it in `guard.critical`), so only the pause is left.
+ */
 export type PressureIo = {
-  readonly procs: () => Promise<Proc[]>;
-  readonly signal: (pid: number, sig: "SIGTERM" | "SIGKILL") => void;
-  readonly alive: (pid: number) => boolean;
-  /** The supervisor's own pid: it and its ancestors are never killed. */
-  readonly self: number;
-  readonly killRemote: (machine: GuardMachine, patterns: readonly string[]) => Promise<KillResult>;
   readonly pause: (lane: Lane, note: string) => Promise<PauseResult>;
 };
 
 export const pressureIo = (deps: FlowDeps): PressureIo => ({
-  procs: () => sampleProcs(deps.run),
-  signal: (pid, sig) => { process.kill(pid, sig); },
-  alive: pidAlive,
-  self: process.pid,
-  killRemote: (machine, patterns) => killOnMachine(deps.run, machine, patterns),
   pause: (lane, note) => pauseLane(deps, lane, note),
 });
 
@@ -427,121 +406,84 @@ const pauseForCritical = async (io: PressureIo, lane: Lane | undefined, reasons:
   }
 };
 
-/** Types the kill notice into each pane; returns the lanes it could not reach. */
-const notifyKilled = async (run: Runner, lanes: readonly Lane[], text: (lane: Lane) => string): Promise<string[]> => {
+/** Sends the guard notice to each lane through its runner; returns the lanes it could not reach. */
+const notifyLanes = async (ops: LaneOps, lanes: readonly Lane[], text: (lane: Lane) => string): Promise<string[]> => {
   const failed: string[] = [];
   for (const lane of lanes) {
-    // As in warnHeaviestLane: typing into a question dialog could submit an answer nobody chose.
-    if (lane.lastAskPrompt) { failed.push(lane.key); continue; }
-    const sent = lane.pane ? await sendGuarded(laneRunner(run, lane), lane.pane, systemText(text(lane))).catch(() => "failed" as const) : "failed";
-    if (sent !== "sent") failed.push(lane.key);
+    const sent = lane.pane ? await guardSend(ops, lane, text(lane)).catch(() => "failed" as const) : "failed";
+    if (sent === "failed") failed.push(lane.key);
   }
   return failed;
 };
 
 const notReached = (failed: readonly string[]): string => failed.length ? `; could not notify ${failed.join(", ")}` : "";
 
-/**
- * The local critical stage, once per guard sweep. While free memory or swap is critically low it kills the open local
- * lanes' processes matching `config.heavyKill` and tells each affected lane in its pane; on entering critical with
- * nothing killed it pauses the heaviest open local lane. Returns the HOST_GUARD CRITICAL line, or undefined when there
- * is nothing new to say (not critical, or still critical with nothing new to kill).
- */
-export const localCriticalTick = async (
-  deps: Pick<FlowDeps, "run" | "config" | "registry" | "clock">, sample: HostSample, state: { critical: boolean }, io: PressureIo,
-): Promise<string | undefined> => {
-  const reasons = criticalReasons(sample, deps.config.guard);
-  if (!reasons.length) {
-    state.critical = false;
-    return undefined;
-  }
-  const entering = !state.critical;
-  state.critical = true;
-  const head = `HOST_GUARD CRITICAL ${reasons.join(" | ")}`;
-  let local: Lane[] = [];
-  let procs: Proc[] = [];
-  let failure = "";
-  let attempted = false;
-  try {
-    local = (await deps.registry.open()).filter((l) => l.pane && !l.machine);
-    procs = await io.procs();
-    const targets = heavyTargets(procs, deps.config.heavyKill, new Set(local.map((l) => l.key)), io.self);
-    if (targets.length) {
-      attempted = true;
-      const killed = await killProcs(targets, { clock: deps.clock, alive: io.alive, signal: io.signal }, procLanes(procs));
-      if (killed.length) {
-        const byLane = new Map<string, KilledProc[]>();
-        for (const k of killed) if (k.lane) byLane.set(k.lane, [...byLane.get(k.lane) ?? [], k]);
-        const failed = await notifyKilled(deps.run, local.filter((l) => byLane.has(l.key)), (lane) =>
-          `HOST_GUARD memory critical: ${reasons.join(" | ")} on this host, so the supervisor killed ${describeKilled(byLane.get(lane.key) ?? [])} in this lane. `
-          + "Do not start it again directly: once memory has recovered, restart it only through dori heavy (dori heavy <label> -- <command>), which waits for a free heavy slot.");
-        return `${head}; killed ${describeKilled(killed)}${notReached(failed)}${OWNER}`;
-      }
-    }
-  } catch (e) {
-    failure = `kill failed: ${errText(e)}`;
-  }
-  if (!entering) return failure && attempted ? `${head}; ${failure}${OWNER}` : undefined;
-  const open = new Map(local.map((l) => [l.key, l]));
-  const heaviest = laneMemory(procs).find((m) => open.has(m.lane));
-  const paused = await pauseForCritical(io, heaviest && open.get(heaviest.lane), reasons);
-  return `${head}; ${failure ? `${failure}; ` : ""}${paused}${OWNER}`;
-};
-
 const machineTag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
 
+/** Whose critical stage: this host (its local runner) or one worker machine. */
+export type CriticalScope = { readonly kind: "local" } | { readonly kind: "machine"; readonly machine: GuardMachine };
+
+/** The open lanes with a pane in `scope`: local lanes, or lanes naming the machine by label or herdr id. */
+const lanesIn = (scope: CriticalScope, open: readonly Lane[]): Lane[] => open.filter((l) => l.pane && (scope.kind === "local"
+  ? !l.machine
+  : l.machine !== undefined && (l.machine === scope.machine.label || l.machine === scope.machine.id)));
+
 /**
- * The critical stage for one worker machine: kills its processes matching `config.heavyKill` through the guard agent
- * and tells every open lane there; on entering critical with nothing killed it pauses the most recently opened lane
- * there. `state` holds each machine's critical flag. Returns the HOST_GUARD CRITICAL line, or undefined.
+ * The critical stage of one host, once per guard sweep: this host (`scope.kind` "local", the local runner's sample) or
+ * a worker machine. The supervisor kills nothing: `kills` are what that host's runner killed by itself under critical
+ * memory (`RunnerGuardBoard.takeKills`, from `guard.critical`); each open lane there is told through its runner. On
+ * entering critical with nothing killed it pauses the heaviest open lane there by the runner's per-lane memory
+ * (`memory`), else the most recently opened one. `state` holds each scope's critical flag (keyed by runner label).
+ * Returns the HOST_GUARD CRITICAL line, or undefined when there is nothing new to say.
  */
-export const machineCriticalTick = async (
-  deps: Pick<FlowDeps, "run" | "config">, machine: GuardMachine, sample: MachineSample, open: readonly Lane[],
-  state: Map<string, boolean>, io: PressureIo,
+export const criticalTick = async (
+  deps: Pick<FlowDeps, "ops" | "config">, scope: CriticalScope,
+  sample: Pick<MachineSample, "os" | "memFreePct" | "swapFreeGb" | "swapTotalGb">, open: readonly Lane[],
+  state: Map<string, boolean>, kills: KillResult, io: PressureIo, memory: readonly LaneMemory[] = [],
 ): Promise<string | undefined> => {
+  const label = scope.kind === "local" ? LOCAL_RUNNER : scope.machine.label;
   // macOS swap files and a system-managed Windows page file grow on demand, so a nearly full swap there is normal;
   // the memory reading decides.
   const reasons = criticalReasons(sample.os === "darwin" || sample.os === "windows" ? { ...sample, swapTotalGb: -1 } : sample, deps.config.guard);
   if (!reasons.length) {
-    state.delete(machine.label);
+    state.delete(label);
     return undefined;
   }
-  const entering = !state.get(machine.label);
-  state.set(machine.label, true);
-  const head = `HOST_GUARD CRITICAL ${machineTag(machine.label)} ${reasons.join(" | ")}`;
-  const lanes = open.filter((l) => l.pane && l.machine !== undefined && (l.machine === machine.label || l.machine === machine.id));
+  const entering = !state.get(label);
+  state.set(label, true);
+  const where = scope.kind === "local" ? "on this host," : `on machine ${scope.machine.label}, where this lane runs,`;
+  const heavy = scope.kind === "local" ? "dori heavy <label> -- <command>" : "~/.dori/runner/bin/dori heavy <label> -- <command>";
+  const head = `HOST_GUARD CRITICAL ${scope.kind === "local" ? "" : `${machineTag(label)} `}${reasons.join(" | ")}`;
+  const lanes = lanesIn(scope, open);
   let failure = "";
-  try {
-    const res = await io.killRemote(machine, deps.config.heavyKill);
-    if (!res.ok) failure = `kill failed: ${res.detail.replace(/\s+/g, " ")}`;
-    else if (res.killed.length) {
-      const what = res.killed.map((k) => `${k.cmd} ${formatKb(k.rssKb)} (pid ${k.pid})`).join(", ");
-      const failed = await notifyKilled(deps.run, lanes, () =>
-        `HOST_GUARD memory critical: ${reasons.join(" | ")} on machine ${machine.label}, where this lane runs, so the supervisor killed ${what} there. `
-        + `Do not start it again directly: once memory has recovered, restart it only through sh ~/.dori/guard-agent.sh heavy <label> -- <command>, which waits for a free heavy slot.`);
-      return `${head}; killed ${what}${notReached(failed)}${OWNER}`;
-    }
-  } catch (e) {
-    failure = `kill failed: ${errText(e)}`;
+  if (!kills.ok) failure = `kill failed: ${kills.detail.replace(/\s+/g, " ")}`;
+  else if (kills.killed.length) {
+    const what = kills.killed.map((k) => `${k.cmd} ${formatKb(k.rssKb)} (pid ${k.pid})`).join(", ");
+    const failed = await notifyLanes(deps.ops, lanes, () =>
+      `HOST_GUARD memory critical: ${reasons.join(" | ")} ${where} so its runner killed ${what} there. `
+      + `Do not start it again directly: once memory has recovered, restart it only through ${heavy}, which waits for a free heavy slot.`);
+    return `${head}; killed ${what}${notReached(failed)}${OWNER}`;
   }
   if (!entering) return undefined;
+  const byKey = new Map(lanes.map((l) => [l.key, l]));
+  const heaviest = memory.find((m) => byKey.has(m.lane));
   const newest = [...lanes].sort((a, b) => (a.openedAt < b.openedAt ? 1 : a.openedAt > b.openedAt ? -1 : 0))[0];
-  const paused = await pauseForCritical(io, newest, reasons);
+  const paused = await pauseForCritical(io, heaviest ? byKey.get(heaviest.lane) : newest, reasons);
   return `${head}; ${failure ? `${failure}; ` : ""}${paused}${OWNER}`;
 };
 
 /**
  * The warn stage on a worker machine: when it newly enters ALERT with free memory below `guard.memFreeMinPct`, every
- * open lane there gets the memory warning in its pane. Returns the ALERT detail (`warned <keys>`), or undefined.
+ * open lane there gets the memory warning through its runner. Returns the ALERT detail (`warned <keys>`), or undefined.
  */
 export const warnMachineLanes = async (
-  run: Runner, machine: GuardMachine, sample: MachineSample, open: readonly Lane[], minPct: number,
+  ops: LaneOps, machine: GuardMachine, sample: MachineSample, open: readonly Lane[], minPct: number,
 ): Promise<string | undefined> => {
   if (sample.memFreePct < 0 || sample.memFreePct >= minPct) return undefined;
-  const lanes = open.filter((l) => l.pane && l.machine !== undefined && (l.machine === machine.label || l.machine === machine.id));
+  const lanes = lanesIn({ kind: "machine", machine }, open);
   if (!lanes.length) return undefined;
   const reason = `memory free ${sample.memFreePct}% < ${minPct}%`;
-  const failed = await notifyKilled(run, lanes, (lane) => `HOST_GUARD memory warning: ${reason} on machine ${machine.label}, where this lane (${lane.key}) runs. `
+  const failed = await notifyLanes(ops, lanes, (lane) => `HOST_GUARD memory warning: ${reason} on machine ${machine.label}, where this lane (${lane.key}) runs. `
     + "Stop what you are not using now (an emulator, an expo or dev server, a watcher or test runner), then go on with your task. The lead has been told.");
   const warned = lanes.map((l) => l.key).filter((k) => !failed.includes(k));
   return [warned.length ? `warned ${warned.join(", ")}` : "", failed.length ? `could not warn ${failed.join(", ")}` : ""].filter(Boolean).join("; ");
@@ -568,7 +510,7 @@ export const supervisorSweeps = (
   openPulls: () => readonly OpenPull[] = () => [],
 ): readonly Sweep[] => {
   const guard: GuardState = { alerting: false };
-  const critical = { critical: false };
+  const critical = new Map<string, boolean>();
   const machineCritical = new Map<string, boolean>();
   const warnedAt = new Map<string, number>();
   const machineGuardPath = join(deps.config.stateDir, MACHINE_GUARD_STATE_FILE);
@@ -578,14 +520,14 @@ export const supervisorSweeps = (
   const seen = new Set<string>();
   const dead = newDeadPaneState();
   const cache = newSweepCache();
-  let view: SweepView = passthroughView(deps.run);
+  let view: SweepView = passthroughView(deps.ops);
   let lastArchive = -Infinity;
   return [
     ["snapshot", async () => {
-      view = passthroughView(deps.run);
+      view = passthroughView(deps.ops);
       // A bad deadline warns every round and the sweeps read per lane.
       if (!Number.isFinite(deps.config.sweepMachineDeadlineMs) || deps.config.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
-      view = await sweepRound(deps.run, cache, await deps.registry.open(), { now: deps.clock.now, deadlineMs: deps.config.sweepMachineDeadlineMs });
+      view = await sweepRound(deps.ops, cache, await deps.registry.open(), { now: deps.clock.now, deadlineMs: deps.config.sweepMachineDeadlineMs });
       return [];
     }],
     ["watch", async (emit) => {
@@ -594,12 +536,21 @@ export const supervisorSweeps = (
       if (archived) lastArchive = deps.clock.now();
       return [];
     }],
+    // This host's numbers are the local runner's guard sample (it samples and kills on its host); without a fresh one
+    // the sweep says nothing, and the liveness monitor reports the runner.
     ["guard", async (emit) => {
-      const sample = await sampleHost(deps.run, diskGuardPath(deps.config), () => view.panes().then((panes) => panes.length, () => -1));
+      const board = runnerGuard();
+      const fromRunner = board?.sampleFor(LOCAL_RUNNER, () => "");
+      if (!board || !fromRunner) return [];
+      const s = fromRunner.sample;
+      const sample: HostSample = {
+        load1: s.load1, memFreePct: s.memFreePct, diskFreeGb: s.diskFreeGb, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, panes: fromRunner.panes ?? -1,
+      };
+      const memory = fromRunner.lanes ? laneMemoryOf(fromRunner.lanes) : undefined;
       const memJustLow = memIsLow(sample, deps.config.guard, guard.memLow) && !guard.memLow;
-      const detail = (memJustLow || (!guard.alerting && alertReasons(sample, deps.config.guard).length)) ? await guardAlertDetail(deps, sample, undefined, warnedAt, deps.clock.now) : undefined;
+      const detail = (memJustLow || (!guard.alerting && alertReasons(sample, deps.config.guard).length)) ? await guardAlertDetail(deps, sample, memory, warnedAt, deps.clock.now) : undefined;
       for (const line of guardTick(sample, deps.config.guard, guard, detail)) await emit(line);
-      const criticalLine = await localCriticalTick(deps, sample, critical, io);
+      const criticalLine = await criticalTick(deps, { kind: "local" }, s, await deps.registry.open(), critical, board.takeKills(LOCAL_RUNNER), io, memory);
       if (criticalLine) await emit(criticalLine);
       // Work queued on a HOLD from `dori can-launch` resumes on this, whichever host threshold kept it held. An
       // unreadable pane count (-1) proves no room.
@@ -609,19 +560,17 @@ export const supervisorSweeps = (
       }
       return [];
     }],
-    ["dead-panes", async () => deadPaneTick(deps.run, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now)],
+    ["dead-panes", async () => deadPaneTick(deps.ops, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now)],
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
     ["freshness", async () => (await freshnessTick(deps, home, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
     // Urgent LANE_DRIFT for a working lane overdue on milestones or failing CI head after head; reads the last GitHub poll only.
     ["drift", async (emit) => {
       await driftTick({
-        stateDir: deps.config.stateDir, drift: deps.config.drift, now: deps.clock.now, openLanes: () => deps.registry.open(), owners: pullOwners(deps.run),
+        stateDir: deps.config.stateDir, drift: deps.config.drift, now: deps.clock.now, openLanes: () => deps.registry.open(), owners: pullOwners(deps.ops),
       }, laneReports(), openPulls(), emit);
       return [];
     }],
-    // A lane asking through its agent's on-screen question UI instead of dori report: one urgent LANE_ASKING per question.
-    ["ask-user", async (emit) => { await askUserTick(deps, emit, view); return []; }],
     ["memory", async () => memorySweep(deps, home)],
     // Counts [REPORT] lines of `dori report` lanes found in the lead's pane; reads nothing while no such lane is open.
     ["lead-pane", async (emit) => { await leadPaneViolationTick(deps, emit); return []; }],
@@ -640,21 +589,26 @@ export const supervisorSweeps = (
       const due = guardMachines.list.filter((m) => machineDue(machineGuard, m.label, now));
       if (!due.length) return [];
       const want = guardAgentWants(await readGuardAgentScripts());
-      // A machine whose runner sent a fresh sample is not sampled over ssh; without one (no runner, or it went quiet)
-      // the ssh path runs as before. The runner kills by itself, so its machine's critical stage takes the kills it
-      // reported instead of killing over ssh.
+      // A machine whose runner sent a fresh sample is judged from it. A machine with an enrolled runner is never sampled
+      // over ssh: while its runner is quiet it is skipped (the liveness monitor reports it). Only a machine without a
+      // runner, which cannot host lanes, is sampled through the ssh guard agent. The runner kills by itself, so a
+      // machine's critical stage reports the kills it sent.
       const board = runnerGuard();
-      const results = await Promise.all(due.map(async (machine) => {
+      const enrolled = new Set(readRunnerRows(deps.config.stateDir).map((row) => row.label));
+      const sampled = await Promise.all(due.map(async (machine) => {
         const fromRunner = board?.sampleFor(machine.label, (os) => wantFor(want, os));
-        return { machine, result: fromRunner ?? await sampleMachine(deps.run, machine), viaRunner: fromRunner !== undefined };
+        if (fromRunner) return { machine, result: fromRunner as SampleResult, fromRunner };
+        if (enrolled.has(machine.label)) return undefined;
+        return { machine, result: await sampleMachine(deps.run, machine), fromRunner: undefined };
       }));
+      const results = sampled.filter((r) => r !== undefined);
       const open = await deps.registry.open();
       // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
       // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.
       const warned = new Map<string, string>();
       await Promise.all(results.map(async ({ machine, result }) => {
         if (!result.ok || machineGuard.get(machine.label)?.alerting) return;
-        const note = await warnMachineLanes(deps.run, machine, result.sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
+        const note = await warnMachineLanes(deps.ops, machine, result.sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
         if (note) warned.set(machine.label, note);
       }));
       const lanesOn = (m: GuardMachine): string | undefined => {
@@ -665,16 +619,17 @@ export const supervisorSweeps = (
       try {
         for (const line of lines) await emit(line);
         // A machine held by `dori can-launch --machine` or a queued launch resumes the same way, from this round's pane list.
-        for (const { machine: { label }, result } of results) {
+        for (const { machine: { label }, result, fromRunner } of results) {
           if (!result.ok || !launchHeld(deps.config.stateDir, label)) continue;
-          const panes = await view.panes(label).then((p) => p.length, () => -1);
+          const panes = fromRunner?.panes ?? await view.panes(label).then((p) => p.length, () => -1);
           if (!machineVerdict(result, panes, deps.config.guard, label).ok) continue;
           await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
           clearLaunchHold(deps.config.stateDir, label);
         }
-        const criticalLines = await Promise.all(results.map(({ machine, result, viaRunner }) =>
+        const criticalLines = await Promise.all(results.map(({ machine, result, fromRunner }) =>
           result.ok
-            ? machineCriticalTick(deps, machine, result.sample, open, machineCritical, viaRunner && board ? { ...io, killRemote: async (m) => board.takeKills(m.label) } : io)
+            ? criticalTick(deps, { kind: "machine", machine }, result.sample, open, machineCritical,
+              fromRunner && board ? board.takeKills(machine.label) : { ok: true, killed: [] }, io, fromRunner?.lanes ? laneMemoryOf(fromRunner.lanes) : [])
             : Promise.resolve(undefined)));
         for (const line of criticalLines) if (line) await emit(line);
       } finally {
@@ -731,10 +686,15 @@ const pause: Pause = (ms, signal) => new Promise<void>((resolve) => {
  * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
  */
 export const supervise = async (
-  deps: FlowDeps, signal: AbortSignal, options: Partial<Omit<SupervisorDiscordOptions, "emit">> & { readonly gatewayLockDir?: string } = {},
+  deps: FlowDeps, signal: AbortSignal,
+  options: Partial<Omit<SupervisorDiscordOptions, "emit">> & {
+    readonly gatewayLockDir?: string;
+    /** Starts the local runner child (default Bun.spawn); tests inject one that starts nothing. */
+    readonly spawnRunner?: LocalChildDeps["spawn"];
+  } = {},
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
-  const { gatewayLockDir, ...discordOptions } = options;
+  const { gatewayLockDir, spawnRunner, ...discordOptions } = options;
   if (!deps.config.leadPane) throw new SuperviseError("supervise requires leadPane");
   if (!Number.isFinite(deps.config.cacheTtlMin) || deps.config.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
   if (!Number.isFinite(deps.config.leadContextCapTokens) || deps.config.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
@@ -764,6 +724,24 @@ export const supervise = async (
   let scheduleOps: OperationStore | undefined;
   let reports: LaneReportStore | undefined;
   let runnerHub: RunnerHubHandle | undefined;
+  let localRunner: LocalChild | undefined;
+  let stopRelay: (() => void) | undefined;
+  let relayListener: Listener | undefined;
+  let laneMessages: LaneMessageStore | undefined;
+  // Lane operations go through the hub's RunnerCalls; until the hub is open every call fails closed.
+  const hubCall: RunnerCall = {
+    call: (label, type, body, opts) => {
+      if (!runnerHub) return Promise.reject(new RunnerUnavailable(label, "disconnected", "the runner hub is not open"));
+      return runnerHub.calls.call(label, type, body, opts);
+    },
+    query: (label, type, body, opts) => {
+      if (!runnerHub) return Promise.reject(new RunnerUnavailable(label, "disconnected", "the runner hub is not open"));
+      return runnerHub.calls.query(label, type, body, opts);
+    },
+    connected: (label) => runnerHub?.calls.connected(label) ?? false,
+  };
+  // The caller's ops (cli.ts: the CLI relay, which this process serves) are replaced by the hub's own.
+  deps = { ...deps, ops: laneOps(hubCall, { now: deps.clock.now, log: (line) => { console.error(line); } }) };
   const watchdog = new Watchdog(deps.clock.now, notify);
   let petting: ReturnType<typeof setInterval> | undefined;
   const stop = new AbortController();
@@ -789,7 +767,9 @@ export const supervise = async (
     // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
     // run too, each run an operation row; a heavy job takes a heavy slot like `dori heavy`, without waiting for one.
     const ops = scheduleOps = probe.step("schedules", () => openOperations(deps.config));
-    const heavyLoad = async (): Promise<number> => (await sampleHost(deps.run, diskGuardPath(deps.config))).load1;
+    // The host's load only (no pane count): a scheduled heavy job's maxLoad.
+    const heavyLoad = async (): Promise<number> => (await sampleHost(deps.run, diskGuardPath(deps.config), async () => -1)).load1;
+    const home = process.env.HOME ?? "";
     const registry = sources = new EventSources({
       stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
       policy: deps.config.eventPolicy, log: (line) => { console.error(line); },
@@ -797,7 +777,8 @@ export const supervise = async (
         operations: ops, journaled: (id: string) => supervisor.journaled(id),
         heavy: {
           take: async (label: string) => (await trySlot({
-            dir: join(deps.config.stateDir, "heavy"), slots: deps.config.heavySlots, maxLoad: deps.config.heavyMaxLoad, clock: deps.clock,
+            // One heavy-slot directory per host, shared with the lanes' `dori heavy`.
+            dir: join(home || homedir(), ".dori", "heavy"), slots: deps.config.heavySlots, maxLoad: deps.config.heavyMaxLoad, clock: deps.clock,
             load: heavyLoad, alive: pidAlive, pid: process.pid,
           }, label)) ?? undefined,
           release: releaseSlot,
@@ -818,7 +799,6 @@ export const supervise = async (
       await github.tick(deps, enqueueGitHub);
       await follow.tick(github.openPulls(), enqueueGitHub, github.mergedPulls());
     };
-    const home = process.env.HOME ?? "";
     // The sweep task gets its own span, so its timings never mix into the startup report.
     const sweepProbe = probe.span();
     // Each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog.
@@ -938,52 +918,78 @@ export const supervise = async (
       catch (e) { console.error(`CLOSE_BUTTON_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     };
     let lastGitHub = -Infinity;
-    // Only with a `runners` section; an unsafe runner directory or a busy socket costs the hub, never the supervisor.
+    // The hub always opens: every lane is runner-owned, and the local runner is this process's child. An unsafe runner
+    // directory or a busy socket costs the hub (RUNNER_HUB_DISABLED, and every lane operation fails closed), never the
+    // supervisor.
     let liveness: LivenessMonitor | undefined;
     let takeLaneEvents: () => Promise<void> = async () => {};
-    if (deps.config.runners) {
-      try {
-        const listen = deps.config.runners.listen;
-        // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
-        let monitor: LivenessMonitor | undefined;
-        // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
-        let laneWork: Promise<void> = Promise.resolve();
-        const laneDeps: LaneHubDeps = {
-          registry: deps.registry, reports: () => reports, now: deps.clock.now,
-          emit: (id, line) => { enqueueSweep(id, line); },
-          recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
-          journalHead: () => runnerJournalHead(deps.config.stateDir),
-        };
-        const inOrder = (what: string, work: () => Promise<void>): void => {
-          laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
-        };
-        const hub = runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, defaultRunnerDir(home || undefined), deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
-          ...(listen ? { listen } : {}),
-          onHeartbeat: (label) => { void monitor?.heartbeat(label); },
-          onHello: (label, body) => {
-            void monitor?.hello(label, body.gen);
-            inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
-          },
-        }));
-        // Resume after successfully processed events; an upgrade with no cursor reads the retained journal once.
-        const readLaneEvents = laneEventReader(deps.config.stateDir, laneDeps);
-        takeLaneEvents = () => {
-          inOrder("journal", readLaneEvents);
-          return laneWork;
-        };
-        let livenessSeq = 0;
-        monitor = liveness = new LivenessMonitor({
-          monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
-          ...livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines)).machines),
-          ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
-          emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
-        });
-        for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
-      } catch (e) {
-        console.error(`RUNNER_HUB_DISABLED ${e instanceof Error ? e.message : String(e)}`);
-      }
+    try {
+      const listen = deps.config.runners?.listen;
+      const runnerDir = defaultRunnerDir(home || undefined);
+      // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
+      let monitor: LivenessMonitor | undefined;
+      // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
+      let laneWork: Promise<void> = Promise.resolve();
+      const laneDeps: LaneHubDeps = {
+        registry: deps.registry, reports: () => reports, now: deps.clock.now,
+        emit: (id, line) => { enqueueSweep(id, line); },
+        recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+        journalHead: () => runnerJournalHead(deps.config.stateDir),
+        // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
+        messages: () => (laneMessages ??= openLaneMessages(deps.config)),
+        // At each hello the runner gets every owned lane's notice back, for `dori lane status` inside the lane.
+        notify: (_label, lane) => deps.ops.notify(lane, {
+          status: lane.status ?? "working",
+          ...(lane.objection ? { objection: lane.objection } : {}),
+          ...(lane.claim ? { claim: { at: lane.claim.at, evidence: lane.claim.evidence } } : {}),
+        }),
+      };
+      const inOrder = (what: string, work: () => Promise<void>): void => {
+        laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
+      };
+      const hub = runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
+        ...(listen ? { listen } : {}),
+        onHeartbeat: (label) => { void monitor?.heartbeat(label); },
+        onHello: (label, body) => {
+          void monitor?.hello(label, body.gen);
+          inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
+        },
+      }));
+      // The lead's `dori` CLI reaches the runners through this process: <runnerDir>/sock/cli next to the control socket.
+      relayListener = listenUnix(cliSocketPath(runnerDir));
+      stopRelay = serveCliRelay(relayListener, hub.calls, (line) => { console.error(line); });
+      // The local runner: `dori runner serve` as this process's child, restarted with backoff, stopped with it.
+      const child = localRunner = startLocalRunner({
+        spawn: spawnRunner ?? spawnProcess, argv: localRunnerArgv(join(import.meta.dir, "cli.ts")),
+        env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)),
+        clock: deps.clock, log: (line) => { console.log(line); },
+      }, AbortSignal.any([signal, stop.signal]));
+      // Resume after successfully processed events; an upgrade with no cursor reads the retained journal once.
+      const readLaneEvents = laneEventReader(deps.config.stateDir, laneDeps);
+      takeLaneEvents = () => {
+        inOrder("journal", readLaneEvents);
+        return laneWork;
+      };
+      let livenessSeq = 0;
+      const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines)).machines);
+      monitor = liveness = new LivenessMonitor({
+        monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
+        probe: io.probe,
+        // The local runner is restarted as this process's child, a worker's over ssh.
+        restart: async (label) => {
+          if (label !== LOCAL_RUNNER) return io.restart(label);
+          await child.restart();
+          return { ok: true, detail: "child restart" };
+        },
+        ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
+        emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
+      });
+      for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
+    } catch (e) {
+      console.error(`RUNNER_HUB_DISABLED ${e instanceof Error ? e.message : String(e)}`);
     }
     let lastJournalPrune = -Infinity;
+    let lastAdoption = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
     await probe.step("ready", () => notify("READY=1"));
     ready = true;
@@ -1042,16 +1048,17 @@ export const supervise = async (
         const handle = runnerHub as RunnerHubHandle;
         try { await liveness?.tick(); } catch (e) { console.error(`RUNNER_LIVENESS_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         try { await takeLaneEvents(); } catch (e) { console.error(`RUNNER_LANE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        // Open lanes from before every lane was runner-owned are adopted once the local runner is up (D18).
+        if (deps.clock.now() - lastAdoption >= LEGACY_ADOPT_MS && handle.calls.connected(LOCAL_RUNNER)) {
+          lastAdoption = deps.clock.now();
+          try {
+            const adopted = await adoptLegacyLanes({ registry: deps.registry, ops: deps.ops, emit: (id, line) => { enqueueSweep(id, line); }, log: (line) => { console.error(line); } });
+            for (const key of adopted) console.log(`LANE_RUNNER_ADOPTED ${key}`);
+          } catch (e) { console.error(`LANE_ADOPT_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        }
         // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
         try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now())) console.log(line); }
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        try {
-          await runnersPass(handle, deps.config, () => deps.registry.open(), {
-            now: deps.clock.now(), panes: passthroughView(deps.run).panes, archived: () => deps.registry.archivedKeys(),
-            error: (line) => { console.error(line); },
-          }, (line) => { console.log(line); }, (lines) => { recordDiffLines(deps.config.stateDir, lines, deps.clock.now()); });
-        }
-        catch (e) { console.error(`RUNNER_SHADOW_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
           lastJournalPrune = deps.clock.now();
           handle.journal.prune(lastJournalPrune);
@@ -1102,7 +1109,11 @@ export const supervise = async (
     await inbound?.close();
     if (inbound) writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, messageContent: false });
     reports?.close();
+    stopRelay?.();
+    relayListener?.close();
+    await localRunner?.stop();
     runnerHub?.close();
+    laneMessages?.close();
     sources?.close();
     scheduleOps?.close();
     ci?.close();

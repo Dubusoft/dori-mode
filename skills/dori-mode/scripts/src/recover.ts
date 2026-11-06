@@ -4,8 +4,8 @@ import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
-import { LaunchError, launchLane } from "./launch.ts";
-import { laneRunner, listPanes } from "./panes.ts";
+import { LaunchError, launchLane, startupLine } from "./launch.ts";
+import { LaneOpsError } from "./lane-ops.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 
@@ -105,27 +105,61 @@ const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promi
   const current = await deps.registry.read(lane.key);
   if (!current || statusOf(current) !== "working" || current.pane !== lane.pane || current.model !== lane.model) return [];
   lane = current;
-  const run = laneRunner(deps.run, lane);
+  // The runner closed the replaced pane's tab itself (lane.recover / lane.close); this only confirms it is gone.
   const previous = lane.recoveryPreviousPane;
-  if (previous && (await listPanes(run)).some((pane) => pane.pane_id === previous)) {
-    const closed = await run(["herdr", "pane", "close", previous]);
-    if (closed.code !== 0) throw new LaunchError(`cannot retire recovered pane ${previous}: ${closed.err || closed.out}`);
-  }
+  const left = previous && previous !== lane.pane && (await deps.ops.panes(lane.machine)).some((pane) => pane.pane_id === previous)
+    ? [`LANE_RECOVERY_WARN ${lane.key} the replaced pane ${previous} is still open; close it by hand`] : [];
   await deps.registry.patch<RecoveryLane>(lane.key, { recoveryPending: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined });
   const event = `LANE_RECOVERED ${lane.key} ${lane.pane} ${reason}`;
   const hook = deps.config.hooks.threadReply;
   if (hook && lane.thread !== "none") {
     const notice = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, title: lane.title, text: event }));
-    if (notice.code !== 0) return [event, `LANE_RECOVERY_NOTICE_ERROR ${lane.key}`];
+    if (notice.code !== 0) return [event, ...left, `LANE_RECOVERY_NOTICE_ERROR ${lane.key}`];
   }
-  return [event];
+  return [event, ...left];
+};
+
+type Relaunched = { readonly lane: Lane; readonly startup?: string; readonly ok: boolean; readonly resumed: boolean };
+
+/** The runner knows no lane `key` (a lane it never started, or one closed for a replacement that did not start). */
+const unknownToRunner = (error: unknown): boolean => error instanceof LaneOpsError && error.code === "LANE_OP_FAILED" && error.detail.includes("RUNNER_LANE_UNKNOWN");
+
+/** Starts the lane again from its brief through its runner (`lane.start`, launchLane with the stored record). */
+const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined): Promise<Relaunched> => {
+  const cwd = lane.machine ? lane.remoteCwd : lane.cwd;
+  const launched = await launchLane(deps, {
+    key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, thread: lane.thread,
+    model: lane.model ?? deps.config.defaultModel,
+    ...(lane.mode ? { mode: lane.mode } : {}),
+    ...(cwd ? { cwd } : {}), ...(lane.machine ? { machine: lane.machine } : {}),
+    ...(lane.sandbox ? { sandbox: true as const } : {}),
+    ...(session !== undefined ? { session } : {}),
+  }, stored);
+  return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined };
+};
+
+/**
+ * A lane whose pane or agent is gone: its runner relaunches it from its own record (`lane.recover`, which closes the
+ * dead pane's tab and keeps the lane token's brief and profile). A runner that has no record of the lane starts it anew.
+ */
+const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined): Promise<Relaunched> => {
+  let r;
+  try {
+    r = await deps.ops.recover(stored, session !== undefined ? { session } : {});
+  } catch (error) {
+    if (unknownToRunner(error)) return startAgain(deps, lane, stored, session);
+    throw error;
+  }
+  const moved = await deps.registry.patch<RecoveryLane>(lane.key, { pane: r.pane, ...(r.tab ? { tab: r.tab } : {}) });
+  const next: Lane = moved ?? { ...stored, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}) };
+  // A live lane the runner left alone: its record had the pane the registry lost.
+  if (!r.relaunched) return { lane: next, ok: true, resumed: false };
+  const startup = r.startup ? startupLine(lane.key, r.pane, r.startup) : `STARTUP_UNCONFIRMED ${lane.key} ${r.pane}: the runner gave no startup verdict`;
+  return { lane: next, startup, ok: r.startup?.verdict === "ok", resumed: r.resumed };
 };
 
 const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue | undefined, view: SweepView): Promise<string[]> => {
   if (statusOf(lane) !== "working") return [];
-  // A runner-owned lane is recovered by its runner (lane.recover, lanes-hub.ts reconcileInventory). Relaunched here it
-  // would run outside the runner, without the lane token its reports need.
-  if (lane.runner) return [];
   const old = lane.pane ? await view.find(lane) : undefined;
   let reason = "missing-pane";
   if (old) {
@@ -169,28 +203,29 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   }
   const now = deps.clock.now();
   // Resume the lane's own session when the registry has one, so it continues its work instead of restarting from the brief.
-  const resumeArgv = current.recoveryResumeFailed === current.session ? undefined : resumeCommand(deps.config.agentCommand, current.session);
+  const session = current.recoveryResumeFailed !== current.session && resumeCommand(deps.config.agentCommand, current.session) ? current.session : undefined;
   const pending = (fresh: RecoveryLane): Partial<RecoveryLane> => ({
-    ...(resumeArgv ? {} : { session: undefined, sessionVia: undefined }),
+    ...(session ? {} : { session: undefined, sessionVia: undefined }),
     recoveryAttempts: (fresh.recoveryAttempts ?? 0) + 1, lastRecoveryAt: now, recoveryPending: true,
     ...(old ? { recoveryPreviousPane: old.pane_id } : {}),
   });
   const stored = (await deps.registry.patch<RecoveryLane>(lane.key, pending)) ?? { ...current, ...pending(current) };
-  const cwd = lane.machine ? lane.remoteCwd : lane.cwd;
-  const launched = await launchLane(resumeArgv ? { ...deps, config: { ...deps.config, agentCommand: resumeArgv } } : deps, {
-    key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, thread: lane.thread,
-    model: lane.model ?? deps.config.defaultModel,
-    ...(lane.mode ? { mode: lane.mode } : {}),
-    ...(cwd ? { cwd } : {}), ...(lane.machine ? { machine: lane.machine } : {}),
-    ...(lane.sandbox ? { sandbox: true as const } : {}),
-  }, stored);
-  if (!launched.startup.startsWith("STARTUP_OK ")) {
-    if (!resumeArgv) return [launched.startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed`];
-    await deps.registry.patch<RecoveryLane>(lane.key, { session: undefined, sessionVia: undefined, recoveryResumeFailed: current.session });
-    return [launched.startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed; session ${current.session} not resumed, the next attempt starts from the brief`];
+  let relaunched: Relaunched;
+  if (old) {
+    // A live agent on the wrong model: the runner leaves a live lane alone, so the lane is closed and started again.
+    await deps.ops.close(stored);
+    relaunched = await startAgain(deps, lane, stored, session);
+  } else {
+    relaunched = await runnerRecover(deps, lane, stored, session);
   }
-  // Create first: closing the last old pane would also remove the lane workspace.
-  return [...await finishRecovery(deps, launched.lane, resumeArgv ? `${reason} session-resumed` : reason), launched.startup];
+  if (!relaunched.ok) {
+    const startup = relaunched.startup ?? `STARTUP_UNCONFIRMED ${lane.key} -`;
+    if (!session) return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed`];
+    await deps.registry.patch<RecoveryLane>(lane.key, { session: undefined, sessionVia: undefined, recoveryResumeFailed: current.session });
+    return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed; session ${current.session} not resumed, the next attempt starts from the brief`];
+  }
+  const why = relaunched.startup ? (relaunched.resumed ? `${reason} session-resumed` : reason) : `${reason} runner-alive`;
+  return [...await finishRecovery(deps, relaunched.lane, why), ...(relaunched.startup ? [relaunched.startup] : [])];
 };
 
 const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue | undefined, view: SweepView): Promise<string[]> =>
@@ -202,7 +237,7 @@ const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue
   });
 
 /** Legacy callers receive lines; supervisors must pass enqueue to durably accept notices before their flags are saved. */
-export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: RecoveryEnqueue, view: SweepView = passthroughView(deps.run)): Promise<string[]> => {
+export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: RecoveryEnqueue, view: SweepView = passthroughView(deps.ops)): Promise<string[]> => {
   const lanes = key ? [await deps.registry.read(key)].filter((lane): lane is Lane => lane !== null) : await deps.registry.open();
   const events: string[] = [];
   for (const lane of lanes) events.push(...await relaunchLane(deps, lane, enqueue, view));

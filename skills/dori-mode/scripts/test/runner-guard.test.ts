@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
+import { RunnerGuardBoard } from "../src/runner/guard.ts";
+import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
 import { agentLine, guardWorld as world, type Reading, runnerSample } from "./runner-guard-world.ts";
 
 const cleanups: (() => void)[] = [];
@@ -69,4 +71,19 @@ test("OFFLINE and ONLINE read the same when the runner goes quiet and comes back
     "HOST_GUARD OFFLINE machine=mac unreachable: ssh: connect to host mac port 22: No route to host",
     "HOST_GUARD ONLINE machine=mac",
   ]);
+});
+
+test("the board hands out a runner sample's pane count and per-lane memory with the sample", () => {
+  let now = 1_000;
+  const board = new RunnerGuardBoard(() => now);
+  const lanes = [{ key: "lane-a", rssKb: 900, top: [{ comm: "node", rssKb: 900, count: 2 }] }];
+  board.event("local", {
+    v: 1, runner: "local", gen: 1, epoch: 1, seq: 1, type: "guard.sample",
+    body: { level: "ok", reasons: [], sampledAt: now, load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2, os: "linux", panes: 4, lanes },
+  } as unknown as AnyRunnerEvent);
+  expect(board.sampleFor("local", () => "v1")).toEqual({
+    ok: true, sample: { version: "v1", os: "linux", load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2 }, panes: 4, lanes,
+  });
+  now += 100_000;
+  expect(board.sampleFor("local", () => "v1")).toBeUndefined();
 });

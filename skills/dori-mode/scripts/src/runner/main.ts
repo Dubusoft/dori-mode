@@ -1,18 +1,21 @@
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
-import { LANE_SOCKET, RunnerLanes, serveLaneSocket } from "./lanes.ts";
+import { RunnerLanes } from "./lanes.ts";
+import { LANE_SOCKET, serveLaneSocket } from "./lane-socket.ts";
+import { laneGitEffect } from "./lane-git.ts";
+import { localPolicy } from "./local-policy.ts";
+import { queryDispatcher } from "./queries.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
-import { sampleHost } from "../host-guard.ts";
+import { diskGuardPath, sampleHost } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import { parseArgs } from "node:util";
-import { loadConfig, runnerMode } from "../config.ts";
+import { loadConfig } from "../config.ts";
 import { listPanes } from "../panes.ts";
-import { Registry } from "../registry.ts";
-import { realClock, run, setDefaultRunTimeout } from "../run.ts";
+import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
@@ -21,8 +24,8 @@ import { defaultRunnerDir, runStartupCheck } from "./fs-safety.ts";
 import { pidAlive, probe, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
 import { Outbox } from "./outbox.ts";
-import { loadPolicy } from "./policy.ts";
-import { commandDispatcher, LOCAL_RUNNER, loadIdentity, observeLanes, parseEnrollInput, realEvery, serveRunner, trackedConnector } from "./serve.ts";
+import { DEFAULT_POLICY, loadPolicy, POLICY_FILE } from "./policy.ts";
+import { commandDispatcher, type DispatchDeps, LOCAL_RUNNER, loadIdentity, parseEnrollInput, realEvery, serveRunner, trackedConnector } from "./serve.ts";
 import { RunnerState } from "./state.ts";
 import { connectUnix, controlSocketPath } from "./unix-transport.ts";
 import { connectWs } from "./ws-transport.ts";
@@ -45,6 +48,30 @@ const probeMain = (json: boolean): number => {
   console.log(json ? JSON.stringify(result) : `RUNNER_PROBE ${result.verdict} process=${result.process} age=${result.healthAgeMs ?? "-"}ms gen=${result.gen ?? "-"}`);
   return result.verdict === "healthy" ? 0 : 1;
 };
+
+/**
+ * The effect of every durable command a runner carries out (design 2.3, section 4): the lane verbs on its own lanes,
+ * `lane.git` in the given root, and `guard.kill` limited to the named lanes. Each resolves to `{detail, result}`.
+ */
+export const runnerEffects = (deps: { readonly lanes: RunnerLanes; readonly guard: Pick<RunnerGuard, "killLanes">; readonly run: Runner }): DispatchDeps["effects"] => ({
+  "guard.kill": async (command) => {
+    const killed = await deps.guard.killLanes(command.body.keys);
+    return { detail: `killed ${killed.length}`, result: { killed: killed.map((k) => ({ pid: k.pid, comm: k.comm, rssKb: k.rssKb, ...(k.lane ? { lane: k.lane } : {}) })) } };
+  },
+  "lane.start": async (command) => deps.lanes.start(command.body),
+  "lane.adopt": async (command) => deps.lanes.adopt(command.body),
+  "lane.stop": async (command) => deps.lanes.close(command.body.key),
+  "lane.close": async (command) => deps.lanes.close(command.body.key),
+  "lane.send": async (command) => deps.lanes.send(command.body.key, command.body.text, command.body.verify, {
+    ...(command.body.mode ? { mode: command.body.mode } : {}), ...(command.body.refuseWhileAsking !== undefined ? { refuseWhileAsking: command.body.refuseWhileAsking } : {}),
+  }),
+  "lane.pause": async (command) => deps.lanes.pause(command.body.key, command.body.step),
+  "lane.resume": async (command) => deps.lanes.resume(command.body.key),
+  "lane.notify": async (command) => deps.lanes.notify(command.body),
+  "lane.git": async (command) => laneGitEffect(deps.run, command.body),
+  "lane.recover": async (command) => deps.lanes.recover(command.body.key, command.body.session),
+  "lane.observe": async (command) => deps.lanes.observe(command.body.key),
+});
 
 const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-only"?: boolean; connect?: string }): Promise<number> => {
   const runnerDir = defaultRunnerDir();
@@ -71,15 +98,14 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     if (enrollOnly) return 0;
   }
   if (!auth.enrolled) fail(`RUNNER_NOT_ENROLLED runner=${identity.label}: start once with --enroll (the local runner is enrolled by the supervisor)`);
-  const policy = loadPolicy(runnerDir);
+  const remote = values.connect !== undefined;
+  // runner-config.json wins when present; without it the local runner derives its policy from config.json (D20) and
+  // a worker keeps the empty default (no profiles, no roots).
+  const policy = existsSync(join(runnerDir, POLICY_FILE)) ? loadPolicy(runnerDir) : remote ? DEFAULT_POLICY : localPolicy(cfg);
   const state = new RunnerState(runnerDir, { now: realClock.now });
   const gen = state.boot();
   const outbox = new Outbox(runnerDir, { now: realClock.now });
-  // A runner started with --connect runs on a worker machine: it has no dori config or registry there, so it always
-  // observes its host's lanes from herdr and /proc. Observing changes nothing; the supervisor compares only the
-  // labels its own runners.mode marks shadow. The local runner observes only in shadow mode, from the registry.
-  const remote = values.connect !== undefined;
-  const mode = remote ? "shadow" : runnerMode(cfg, identity.label);
+  // Every runner owns the lanes it starts and observes its host's lanes from herdr and /proc.
   type InventoryLane = { key: string; pane: string; tab: string; session?: string };
   // The lanes only observed (not owned), as of the last observe pass; the owned part is read fresh in each hello.
   let observedOnly: InventoryLane[] = [];
@@ -87,53 +113,47 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const owned = runnerLanes?.inventory() ?? [];
     return [...owned, ...observedOnly.filter((l) => !owned.some((o) => o.key === l.key))];
   };
-  const observedLanes = remote
-    ? () => observeHost({ run })
-    : mode === "shadow"
-      ? (() => { const registry = new Registry(cfg.stateDir); return async () => observeLanes(identity.label, await registry.open(), await listPanes(run)); })()
-      : undefined;
-  const observe = observedLanes ? async () => {
+  const observedLanes = () => observeHost({ run });
+  const observe = async () => {
     const lanes = await observedLanes();
     const observed = lanes.map(({ status: _status, reportHash: _hash, ...lane }) => lane);
-    // The lanes this runner started come first; the rest are lanes it only observes for the shadow comparison.
+    // The lanes this runner started come first; the rest are lanes it only observes on its host.
     observedOnly = observed;
     // An owned lane waiting on an on-screen question goes out as one lane.asking per question.
-    if (runnerLanes) await runnerLanes.askTick().catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
+    await runnerLanes.askTick().catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
     return lanes;
-  } : undefined;
+  };
   const version = await runnerVersion(run, import.meta.dir);
   const log = (line: string): void => { console.log(line); };
   const tracked = trackedConnector(connector);
   let client: RunnerClient | undefined;
   const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => { client?.publish(type, body); };
-  // Lanes started through this runner exist only on a worker; the lead host's lanes keep their own launch path.
-  const runnerLanes = remote ? new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish }) : undefined;
-  // Only a worker's runner guards its host: on the lead host the supervisor's own guard sweep samples and kills, and
-  // two killers there would race. Thresholds and heavyKill come from runner-config.json, else the config defaults.
-  const guard = remote ? new RunnerGuard({
-    sample: () => sampleHost(run, homedir()), thresholds: { ...cfg.guard, ...policy.guard }, heavyKill: policy.heavyKill ?? cfg.heavyKill,
+  // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
+  const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish });
+  // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
+  // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
+  const paneCount = async (): Promise<number> => { try { return (await listPanes(run)).length; } catch { return -1; } };
+  const dataPath = remote ? homedir() : diskGuardPath(cfg);
+  const guard = new RunnerGuard({
+    sample: () => sampleHost(run, dataPath, paneCount), thresholds: { ...cfg.guard, ...policy.guard }, heavyKill: policy.heavyKill ?? cfg.heavyKill,
     procs: () => sampleProcs(run), self: process.pid, now: realClock.now, os: process.platform,
     kill: { clock: realClock, alive: pidAlive, signal: (pid, sig) => { process.kill(pid, sig); } },
     publish: (type, body) => { client?.publish(type, body); },
-  }) : undefined;
+  });
   const dispatch = commandDispatcher({
     state, policy, realpath: realpathSync, log,
     publish: (body) => { client?.publish("cmd.result", body); },
-    effects: {
-      ...(guard ? { "guard.kill": async (command) => `killed ${(await guard.killLanes(command.body.keys)).length}` } : {}),
-      ...(runnerLanes ? {
-        "lane.start": async (command) => runnerLanes.start(command.body),
-        "lane.stop": async (command) => runnerLanes.close(command.body.key),
-        "lane.close": async (command) => runnerLanes.close(command.body.key),
-        "lane.send": async (command) => runnerLanes.send(command.body.key, command.body.text, command.body.verify),
-        "lane.recover": async (command) => runnerLanes.recover(command.body.key),
-        "lane.observe": async (command) => runnerLanes.observe(command.body.key),
-      } : {}),
-    },
+    effects: runnerEffects({ lanes: runnerLanes, guard, run }),
+  });
+  // Read-only q.* control frames: answered on this host, never queued or recorded.
+  const onQuery = queryDispatcher({
+    run, clock: realClock, policy, log, dataPath, os: process.platform,
+    lane: (key) => { const r = runnerLanes.records()[key]; return r ? { pane: r.pane, cwd: r.cwd } : undefined; },
+    reply: (body) => { client?.control("q.result", body); },
   });
   client = new RunnerClient(
     { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
-    { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch },
+    { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch, onQuery },
   );
   // A command a crash left between its intent and its result is settled by looking at herdr, never run again.
   const observeLane = async (key: string): Promise<Observation> => {
@@ -149,27 +169,24 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const controller = new AbortController();
   process.on("SIGINT", () => controller.abort());
   process.on("SIGTERM", () => controller.abort());
-  console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=${mode} endpoint=${endpoint}`);
+  console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=owner endpoint=${endpoint}`);
   const stopHealth = startHealth({ runnerDir, pid: process.pid, gen, now: realClock.now, monotonic: () => Math.round(performance.now()), every: realEvery, log });
   let guarding = false;
   const guardTick = (): void => {
-    if (!guard || guarding) return;
+    if (guarding) return;
     guarding = true;
     void guard.tick().catch((e: unknown) => { log(`RUNNER_GUARD_FAILED ${e instanceof Error ? e.message : String(e)}`); }).finally(() => { guarding = false; });
   };
   guardTick();
-  const stopGuard = guard ? realEvery(GUARD_SAMPLE_MS, guardTick) : () => {};
-  let stopLaneSocket = (): void => {};
-  if (runnerLanes) {
-    ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
-    const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
-    const stop = serveLaneSocket(laneListener, runnerLanes, publish, log);
-    stopLaneSocket = () => { stop(); laneListener.close(); };
-  }
+  const stopGuard = realEvery(GUARD_SAMPLE_MS, guardTick);
+  ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
+  const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
+  const stopLaneServe = serveLaneSocket(laneListener, runnerLanes, publish, log);
+  const stopLaneSocket = (): void => { stopLaneServe(); laneListener.close(); };
   try {
     await serveRunner({
       client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
-      ...(observe ? { observe } : {}), log,
+      observe, log,
     }, controller.signal);
   } finally {
     stopLaneSocket();

@@ -9,6 +9,7 @@ import { watchTick } from "../src/done-flow.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, withSqliteStore, withState } from "./fakes.ts";
+import { fakeLaneSocket } from "./fake-lane-socket.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; a loaded full run on a small host needs more than bun's default 5 s per test.
 setDefaultTimeout(30_000);
@@ -170,45 +171,39 @@ const cli = async (dir: string, args: string[], env: Record<string, string> = {}
   return { out, err, code };
 };
 
-test("dori report: a lane writes a row for its own key only", async () => {
+test("dori report: a lane sends a report for its own key only, through its runner, and writes no row itself", async () => {
   const dir = stateDir();
-  const deps = depsFor(newWorld(), fakeClock(T0), dir);
-  await deps.registry.write(lane(dir));
-  await deps.registry.write(lane(dir, { key: "other-lane", pane: "w:p8" }));
-  const inLane = { DORI_LANE_KEY: "local-lane" };
+  const sock = fakeLaneSocket(dir);
+  cleanups.push(sock.close);
+  const inLane = { DORI_LANE_KEY: "local-lane", DORI_LANE_TOKEN: "tok" };
 
   const ok = await cli(dir, ["local-lane", "question", "--text", "which base\nbranch?", "--evidence", "PR #4"], inLane);
-  expect(ok).toMatchObject({ code: 0, out: "LANE_REPORTED local-lane:0:1 question\n" });
-  expect(new JsonLaneReports(dir).list()).toMatchObject([{ lane: "local-lane", seq: 1, kind: "question", text: "which base\nbranch?", evidence: "PR #4" }]);
+  expect(ok).toMatchObject({ code: 0, out: "LANE_REPORTED local-lane question (through the runner)\n" });
+  expect(sock.requests).toEqual([{ kind: "question", text: "which base\nbranch?", evidence: "PR #4", key: "local-lane", token: "tok" }]);
 
   const denied = await cli(dir, ["other-lane", "blocked", "--text", "x"], inLane);
   expect(denied.code).toBe(1);
-  expect(denied.err).toContain("LANE_PERMISSION_DENIED lane local-lane may not report lane other-lane");
+  expect(denied.err).toContain("LANE_PERMISSION_DENIED lane local-lane may report only for itself, not other-lane");
 
   const badKind = await cli(dir, ["local-lane", "finished", "--text", "x"], inLane);
-  expect(badKind.code).toBe(1);
+  expect(badKind.code).toBe(2);
   expect(badKind.err).toContain("usage: dori report <key> <progress|question|blocked|milestone|done>");
 
-  expect(new JsonLaneReports(dir).list()).toHaveLength(1);
+  expect(sock.requests).toHaveLength(1);
+  expect(new JsonLaneReports(dir).list()).toHaveLength(0);
 });
 
 /** Launches a local lane through the fakes (herdr tab create answers with pane w:p9). */
 const launchLocal = async (dir: string, key = "cli-lane") => {
   const world = newWorld();
-  const base = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });
-  const deps = {
-    ...base,
-    run: async (argv: readonly string[]) => argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create"
-      ? { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }), err: "" }
-      : base.run(argv),
-  };
+  const deps = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });
   const brief = join(dir, `${key}.md`);
   await Bun.write(brief, "do the thing\n");
   const { lane: launched } = await launchLane(deps, { key, title: "t", brief, done: "merged acme/app#1", thread: `discord:1/${key}`, cwd: join(dir, "nogit") });
   return { lane: launched, brief: await Bun.file(brief).text() };
 };
 
-test("footer: a new local lane is told to use dori report and never the lead's pane; a lane without reportVia keeps the [REPORT] footer", async () => {
+test("footer: every lane is told to use dori report and never a pane; a remote lane uses its runner's dori", async () => {
   const dir = stateDir();
   const on = await launchLocal(dir);
   expect(on.lane.reportVia).toBe("cli");
@@ -216,13 +211,14 @@ test("footer: a new local lane is told to use dori report and never the lead's p
   expect(on.brief).toContain('When done: dori report cli-lane done --text "<one line>" --evidence "<merge SHA, closed issue, version>"');
   expect(on.brief).not.toContain("w:lead");
   expect(on.brief).not.toContain("[REPORT] cli-lane |");
-  // A lane registered by an older dori (no reportVia) keeps the [REPORT] footer it was launched on.
-  const old = footer({ ...on.lane, key: "old-lane", reportVia: undefined }, "w:lead");
-  expect(old).toContain("[REPORT] old-lane | <milestone|blocker|question|done> | <what, with links>, sent to pane w:lead as an argv array");
-  expect(old).toContain('When done: dori claim-done old-lane --evidence');
-  // A remote lane has no dori on its machine: it keeps printing [REPORT] lines in its own pane.
-  const remote = footer({ ...on.lane, machine: "m1", reportVia: undefined }, "w:lead");
-  expect(remote).toContain("[REPORT] cli-lane | done |");
+  // A lane registered by an older dori (no reportVia) is told the same: no footer types into the lead's pane (D4).
+  const old = footer({ ...on.lane, key: "old-lane", reportVia: undefined });
+  expect(old).toContain('dori report old-lane <milestone|progress|question|blocked> --text "<what, with links>"');
+  expect(old).not.toContain("[REPORT] old-lane |");
+  // A remote lane reports through its runner's own dori.
+  const remote = footer({ ...on.lane, machine: "m1", reportVia: undefined });
+  expect(remote).toContain('~/.dori/runner/bin/dori report cli-lane done --text "<one line>"');
+  expect(remote).not.toContain("[REPORT] cli-lane |");
 });
 
 test("lead-pane violations: each distinct [REPORT] line of a dori-report lane in the lead's pane is counted once; old-footer lanes are not counted", async () => {
@@ -268,14 +264,13 @@ test("a dori-report lane's row is routed and counts as hearing from it, and an o
   const dir = stateDir();
   const world = newWorld();
   const base = depsFor(world, fakeClock(T0), dir);
-  // The remote lane's herdr calls carry --machine; the fake herdr answers them like local ones.
-  const deps = { ...base, run: (argv: readonly string[]) => base.run(argv[1] === "--machine" ? [argv[0] ?? "", ...argv.slice(3)] : argv) };
+  const deps = base;
   await deps.registry.write(lane(dir, { key: "cli-lane", reportVia: "cli" }));
   await deps.registry.write(lane(dir, { key: "old-lane", pane: "w:p8" }));
   await deps.registry.write(lane(dir, { key: "remote-lane", pane: "w:p5", machine: "m1" }));
 
-  const ok = await cli(dir, ["cli-lane", "question", "--text", "which base?"], { DORI_LANE_KEY: "cli-lane" });
-  expect(ok).toMatchObject({ code: 0, out: "LANE_REPORTED cli-lane:0:1 question\n" });
+  // The lane's `dori report` arrives through its runner, and the hub appends it to the store (lanes-hub.ts).
+  expect(new JsonLaneReports(dir).append({ lane: "cli-lane", generation: 0, kind: "question", text: "which base?", at: T0 }).id).toBe("cli-lane:0:1");
 
   // The supervisor routes the row, and the question wakes the lead.
   const journal: [string, string][] = [];

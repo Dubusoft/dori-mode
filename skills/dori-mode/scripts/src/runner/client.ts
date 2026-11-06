@@ -2,9 +2,9 @@ import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import type { Outbox } from "./outbox.ts";
 import {
-  PROTO, decodeFrame, encodeFrame, runnerControl, runnerEvent, ProtocolError,
-  type AnyRunnerEvent, type AnySupervisorCommand, type InventoryLane, type RejectCode, type RunnerControlBodies, type RunnerEventBodies, type RunnerEventType,
-  type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
+  PROTO, decodeFrame, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies,
+  type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Transport } from "./transport.ts";
@@ -52,15 +52,20 @@ export type ClientDeps = {
   readonly clock: Clock;
   /** Jitter source in [0, 1); default Math.random. */
   readonly random?: () => number;
-  /** The lanes the runner sees, sent with each hello (shadow inventory). */
+  /** The lanes the runner sees, sent with each hello (its inventory). */
   readonly inventory?: () => readonly InventoryLane[];
-  /** Receives commands; a shadow runner leaves it unset and commands are ignored. */
+  /** Receives commands; when unset, commands are ignored. */
   readonly onCommand?: (command: AnySupervisorCommand) => void;
   /**
    * Receives a frame that carries a `cmdSeq` but fails the schema (unknown type or field, wrong type), as parsed JSON,
    * so the runner can answer it `RUNNER_CMD_REJECTED <rule>`. With `auth` it is passed on only when its MAC checks.
    */
   readonly onInvalidCommand?: (raw: unknown) => void;
+  /**
+   * Receives the supervisor's read-only `q.*` queries (control frames: never recorded, never in the outbox). The runner
+   * answers each with `control("q.result", ...)`; without it a query is ignored and the supervisor times out.
+   */
+  readonly onQuery?: (frame: AnySupervisorControl) => void;
   /** Enables the signed handshake and frame MACs. */
   readonly auth?: RunnerAuth;
   /** Receives `RUNNER_AUTH_FAILED ...` and `RUNNER_KEY_ROTATED ...` lines. */
@@ -175,6 +180,16 @@ export class RunnerClient {
     return row.seq;
   }
 
+  /**
+   * Sends a runner control frame (a `q.result`) on the live connection, sealed like every frame; never through the
+   * outbox. Returns false, sending nothing, when not connected: a query answer has no use on a later connection.
+   */
+  control<T extends RunnerControlType>(type: T, body: RunnerControlBodies[T]): boolean {
+    if (!this.connected) return false;
+    this.sendFrame(runnerControl(this.head(), type, body) as AnyRunnerControl);
+    return true;
+  }
+
   /** Sends a heartbeat with the outbox figures when connected (the serve loop calls it every `HEARTBEAT_MS`). */
   heartbeat(): void {
     if (!this.connected) return;
@@ -253,6 +268,11 @@ export class RunnerClient {
         return;
       }
       default:
+        if (isQueryType(frame.type)) {
+          // A query is answered only on an admitted connection.
+          if (this.ready) this.deps.onQuery?.(frame);
+          return;
+        }
         // hello.challenge after the handshake and enroll.ok have no meaning on an open connection.
         return;
     }

@@ -92,7 +92,11 @@ test("failing CI on a lane PR is one lane message with an ID, typed once into th
   await ci.tick([pull()], emit);
   expect(sent(world)).toHaveLength(1);
   expect(sent(world)[0]).toContain(`dori report ack ${id}`);
-  expect(world.calls.filter((c) => c[0] === "herdr" && c[2] === "send-keys")).toHaveLength(1);
+  // One facade send, as the recorded operation's effect: verified, input-checked, keyed by the operation's cmdId.
+  expect(world.ops.filter((e) => e.op === "send")).toHaveLength(1);
+  expect(world.ops.find((e) => e.op === "send")?.args).toMatchObject({
+    opts: { mode: "verified", inputCheck: true, cmdId: `op:demo-lane/lane-message/${id}:1` },
+  });
   expect(ci.messages.get(id)).toMatchObject({ lane: "demo-lane", state: "delivered" });
 
   expect(() => ackLaneMessage(ci.messages, "other-lane", id, clock.now())).toThrow(LaneMessageError);
@@ -121,7 +125,6 @@ for (const [name, setup, reason] of [
   ["busy", () => { world.panes = [{ ...idle, agent_status: "working" }]; }, "busy (working)"],
   ["paused", async () => { await deps.registry.update(lane.key, () => ({ ...lane, status: "paused" })); }, "lane paused"],
   ["missing", () => { world.panes = []; }, "pane w:p1 missing"],
-  ["owner-draft", () => { world.screen = "❯ half a sentence"; }, "input line holds other text"],
 ] as const) {
   test(`a ${name} pane keeps the message queued, untyped, and wakes the lead once after the deadline`, async () => {
     await setup();
@@ -138,6 +141,28 @@ for (const [name, setup, reason] of [
     expect(sent(world)).toEqual([]);
   });
 }
+
+test("a send the runner refuses (owner's text in the input line, runner down) keeps the message queued and wakes the lead once after the deadline", async () => {
+  world.sendDelivery = "failed";
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)).toMatchObject({ state: "queued", blocked: expect.stringContaining("send failed") });
+  clock.at += 21 * MIN;
+  await ci.tick([pull()], emit);
+  expect(events.filter(([, l]) => l.startsWith("LANE_MESSAGE_UNCONFIRMED"))).toHaveLength(1);
+  expect(lines("LANE_MESSAGE_UNCONFIRMED")[0]).toContain(`demo-lane ${id} not delivered: `);
+});
+
+test("an unconfirmed send counts as delivered and is never retyped", async () => {
+  world.sendDelivery = "unconfirmed";
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)).toMatchObject({ state: "delivered" });
+  expect(sent(world)).toHaveLength(1);
+});
 
 test("a new head SHA supersedes the queued message for the old one", async () => {
   world.panes = [{ ...idle, agent_status: "working" }];
@@ -243,6 +268,29 @@ test("a merge lane refuses a fork head and an option-shaped or invalid branch be
   }
   const bad = await launchMergeLane({ ...deps, run: async (argv, opts) => (argv[1] === "check-ref-format" ? { code: 1, out: "", err: "" } : deps.run(argv, opts)) }, { key: mergeLaneKey(pull()), source, pull: pull({ branch: "a..b" }), base: "dev" });
   expect(bad).toEqual({ ok: false, detail: 'branch name "a..b" of acme/app#7 is not a valid branch' });
+  expect(world.calls.filter((c) => c[0] === "git" && c[1] !== "check-ref-format")).toEqual([]);
+});
+
+test("a merge lane asks the runner, in order, whether the worktree exists, then to fetch and to add it; each refusal keeps its detail", async () => {
+  const request = { key: mergeLaneKey(pull()), source: { ...claimedLane }, pull: pull(), base: "dev" };
+  const roomy = (argv: readonly string[], opts?: Parameters<typeof deps.run>[1]) =>
+    argv[0] === "df" ? Promise.resolve({ code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200", err: "" }) : deps.run(argv, opts);
+  const exists = async () => [false];
+  const failing = (fail: string) => ({ ...deps.ops, exists, git: async (lane: Parameters<typeof deps.ops.git>[0], op: Parameters<typeof deps.ops.git>[1]) => {
+    await deps.ops.git(lane, op);
+    return op.op === fail ? { code: 128, out: "", err: `${fail} boom\n` } : { code: 0, out: "", err: "" };
+  } });
+  const fetchFail = await launchMergeLane({ ...deps, run: roomy, ops: failing("fetch-branch") }, request);
+  expect(fetchFail).toEqual({ ok: false, detail: "git fetch failed: fetch-branch boom" });
+  world.ops.length = 0;
+  const addFail = await launchMergeLane({ ...deps, run: roomy, ops: failing("worktree-add") }, request);
+  expect(addFail).toEqual({ ok: false, detail: "git worktree add failed: worktree-add boom" });
+  const git = world.ops.filter((o) => o.op === "git");
+  expect(git.map((o) => (o.args as { op: string }).op)).toEqual(["fetch-branch", "worktree-add"]);
+  expect(git[0]!.args).toMatchObject({ root: claimedLane.cwd, remote: "origin", branch: "feat" });
+  expect(git[1]!.args).toMatchObject({ root: claimedLane.cwd, ref: "refs/remotes/origin/feat" });
+  const present = await launchMergeLane({ ...deps, run: roomy, ops: { ...deps.ops, exists: async () => [true] } }, request);
+  expect(present.detail).toMatch(/^worktree .* already exists$/);
   expect(world.calls.filter((c) => c[0] === "git" && c[1] !== "check-ref-format")).toEqual([]);
 });
 

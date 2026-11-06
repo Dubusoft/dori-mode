@@ -380,8 +380,8 @@ test("dori reported is lead-only, needs a registered lane, and needs --text", as
   const f = fixture();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200" }));
   const denied = await cli(f.state.dir, ["reported", "alpha", "--text", "merged"], { DORI_LANE_KEY: "alpha" });
-  expect(denied.code).toBe(1);
-  expect(denied.err).toContain("LANE_PERMISSION_DENIED lane alpha may not run reported; it is lead-only");
+  expect(denied.code).toBe(2);
+  expect(denied.err).toStartWith("DORI_CLI_LANE_ONLY reported:");
   const unknown = await cli(f.state.dir, ["reported", "nope", "--text", "merged"]);
   expect(unknown.code).toBe(1);
   expect(unknown.err).toContain('no registered lane "nope"');

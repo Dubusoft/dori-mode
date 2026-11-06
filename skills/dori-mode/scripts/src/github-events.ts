@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 
 import type { FlowDeps } from "./done-flow.ts";
+import type { LaneOps } from "./lane-ops.ts";
 import type { Lane } from "./registry.ts";
 import { Repos } from "./repos.ts";
 import type { Runner } from "./run.ts";
@@ -86,7 +87,7 @@ const repoFromRemote = (remote: string): string | undefined =>
   /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
 
 /** Registry signals carry PR identity; a lane worktree carries its branch identity. */
-export const githubTargets = async (lanes: readonly Lane[], run: Runner): Promise<Map<string, Targets>> => {
+export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "inspect">): Promise<Map<string, Targets>> => {
   const targets = new Map<string, Targets>();
   const target = (repo: string): Targets => {
     const key = repo.toLowerCase();
@@ -111,13 +112,11 @@ export const githubTargets = async (lanes: readonly Lane[], run: Runner): Promis
       }
     }
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
-    for (const cwd of new Set([lane.cwd, ...(lane.worktrees ?? [])].filter((p): p is string => Boolean(p)))) {
-      const remote = await run(["git", "-C", cwd, "remote", "get-url", "origin"], { timeoutMs: 2_000 });
-      const repo = remote.code === 0 ? repoFromRemote(remote.out) : undefined;
-      if (!repo) continue;
-      const branch = await run(["git", "-C", cwd, "branch", "--show-current"], { timeoutMs: 2_000 });
-      if (branch.code === 0 && branch.out) target(repo).branches.add(branch.out);
-    }
+    // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
+    const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => undefined))?.git;
+    const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
+    if (!git || !repo) continue;
+    for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) if (branch) target(repo).branches.add(branch);
   }
   return targets;
 };
@@ -259,7 +258,7 @@ export class GitHubEvents {
   }
 
   async tick(deps: FlowDeps, emit: Emit): Promise<void> {
-    const targets = await githubTargets(await deps.registry.open(), deps.run);
+    const targets = await githubTargets(await deps.registry.open(), deps.ops);
     // Re-read on every tick: machine repos can change without restarting supervise.
     for (const repo of new Repos(this.stateDir).list()) if (!targets.has(repo)) targets.set(repo, { numbers: new Set(), branches: new Set() });
     await Promise.all([...targets].map(async ([repo, lanes]) => {

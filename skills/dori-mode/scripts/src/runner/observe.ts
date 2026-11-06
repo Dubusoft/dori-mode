@@ -1,10 +1,10 @@
+import { createHash } from "node:crypto";
 import { lastReportLine } from "../freshness.ts";
 import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { listPanes, readScreen } from "../panes.ts";
 import { LANE_KEY } from "../registry.ts";
 import type { Runner } from "../run.ts";
 import { laneStatus, type ObservedLane } from "./serve.ts";
-import { valueHash } from "./shadow.ts";
 
 /**
  * What a runner on a worker machine sees of the lanes on its host, without the supervisor's registry. A pane is a
@@ -14,11 +14,14 @@ import { valueHash } from "./shadow.ts";
  * argv: the launch prompt names the lane brief `dori-brief-<key>.md`, and a foreground process whose argv carries that
  * path belongs to `<key>`. The environment attribution wins when both name a lane. For each such
  * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle), and `reportHash` is the
- * shadow hash of the newest `[REPORT]` line in the pane's last 200 lines, so the supervisor can compare it with the
+ * `valueHash` of the newest `[REPORT]` line in the pane's last 200 lines, so the supervisor can compare it with the
  * line its own screen scraping recorded (`Lane.lastRemoteReport`).
  */
 
 export const SCREEN_LINES = 200;
+
+/** A short stable hash of a value (the first 16 hex digits of its SHA-256), as `lane.progress` carries a report line. */
+export const valueHash = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
 
 type ProcessInfo = {
   readonly shell_pid?: number;

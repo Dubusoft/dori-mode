@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultConfig, loadConfig, OBSOLETE_CONFIG_KEYS, runnerMode, warnObsoleteKeys } from "../src/config.ts";
+import { defaultConfig, loadConfig, OBSOLETE_CONFIG_KEYS, warnObsoleteKeys } from "../src/config.ts";
 import { Registry } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
 import { withState } from "./fakes.ts";
@@ -60,28 +60,25 @@ for (const kind of ["json", "sqlite"] as const) {
   });
 }
 
-test("a config without runners loads with the hub unconfigured and every machine off", async () => {
+test("a config without runners loads with the hub unconfigured", async () => {
   const state = withState();
   cleanups.push(state.done);
   const path = join(state.dir, "config.json");
   await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
   const config = await loadConfig(path, "/home/ana");
   expect(config.runners).toBeUndefined();
-  expect(runnerMode(config, "mini")).toBe("off");
   expect(defaultConfig("/home/ana").runners).toBeUndefined();
 });
 
-test("the runners section loads, with unlisted machines off, and a malformed one is refused", async () => {
+test("the runners section loads, a runners.mode in it is ignored, and a malformed one is refused", async () => {
   const state = withState();
   cleanups.push(state.done);
   const path = join(state.dir, "config.json");
   await Bun.write(path, JSON.stringify({ runners: { listen: "100.64.0.1:7411", mode: { mini: "shadow", box: "authoritative" }, restartCircuit: { max: 3 } } }));
   const config = await loadConfig(path, "/home/ana");
   expect(config.runners?.listen).toBe("100.64.0.1:7411");
-  expect(runnerMode(config, "mini")).toBe("shadow");
-  expect(runnerMode(config, "box")).toBe("authoritative");
-  expect(runnerMode(config, "other")).toBe("off");
-  for (const bad of [[], { mode: { mini: "on" } }, { listen: 5 }, { mode: [] }, { restartCircuit: "x" }]) {
+  expect(config.runners).toEqual({ listen: "100.64.0.1:7411", restartCircuit: { max: 3 } });
+  for (const bad of [[], { listen: 5 }, { restartCircuit: "x" }]) {
     await Bun.write(path, JSON.stringify({ runners: bad }));
     await expect(loadConfig(path, "/home/ana")).rejects.toThrow(TypeError);
   }

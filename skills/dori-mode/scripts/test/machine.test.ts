@@ -2,25 +2,25 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
-import { claimDone, closeLane, closedWorktreeSweep, discoverWorktrees, objectDone, unpushedWork, watchTick } from "../src/done-flow.ts";
+import { claimDone, closeLane, closedWorktreeSweep, objectDone, unpushedWork, watchTick } from "../src/done-flow.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { githubTargets } from "../src/github-events.ts";
+import { type LaneOps, LaneOpsError, machineRunner, runnerOf } from "../src/lane-ops.ts";
 import { adoptLane, footer, launchLane, paneShell } from "../src/launch.ts";
-import { herdrArgv, laneRunner } from "../src/panes.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";
-import { run as realRun } from "../src/run.ts";
 import { resolveSession } from "../src/session-id.ts";
 import { syncRegistry } from "../src/sync.ts";
-import { depsFor, fakeClock, newWorld, withState, type World, withSqliteStore } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, type OpsEntry, sent, withState, type World, withSqliteStore } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00Z");
 const MACHINE = "build host";
 let state: ReturnType<typeof withState>;
 let world: World;
-let calls: string[][];
-beforeEach(() => { state = withState(); withSqliteStore(state.dir); world = newWorld(); calls = []; });
+/** The runner label of every facade call, in order: the lane's runner for lane calls, the machine's for pane and host reads. */
+let routed: string[];
+beforeEach(() => { state = withState(); withSqliteStore(state.dir); world = newWorld(); routed = []; });
 afterEach(() => state.done());
 
 const lane = (patch: Partial<Lane> = {}): Lane => ({
@@ -29,205 +29,118 @@ const lane = (patch: Partial<Lane> = {}): Lane => ({
   openedAt: new Date(T0).toISOString(), ...patch,
 });
 
-const deps = (remote = true) => {
+const labelOf = (op: string, first: unknown): string => {
+  if (op === "start" || op === "adopt") return machineRunner((first as { machine?: string }).machine);
+  if (first && typeof first === "object" && "key" in first) return runnerOf(first as Pick<Lane, "runner" | "machine">);
+  if (first && typeof first === "object") return machineRunner((first as { machine?: string }).machine);
+  return machineRunner(first as string | undefined);
+};
+
+/** Records the runner label of every call; `connected` is a probe, not a call. */
+const routing = (ops: LaneOps): LaneOps => Object.fromEntries(Object.entries(ops).map(([name, fn]) => [name, (...args: unknown[]) => {
+  if (name !== "connected") routed.push(labelOf(name, args[0]));
+  return (fn as (...a: unknown[]) => unknown)(...args);
+}])) as LaneOps;
+
+/**
+ * Deps over the World whose facade lists the World's panes on the machine only (`remote`), or on this host only, the way
+ * two hosts with the same pane ids look; `patch` replaces facade methods.
+ */
+const deps = (remote = true, patch: Partial<LaneOps> = {}) => {
   const base = depsFor(world, fakeClock(T0), state.dir);
-  const run: Runner = async (argv, opts) => {
-    calls.push([...argv]);
-    const selected = argv[0] === "herdr" && argv[1] === "--machine";
-    const args = selected ? ["herdr", ...argv.slice(3)] : argv;
-    if (args[0] === "ps") return { code: 0, out: "", err: "" };
-    if (args[0] === "herdr") {
-      if (args[1] === "tab" && args[2] === "create") return { code: 0, err: "", out: JSON.stringify({ result: { root_pane: { pane_id: "w:p3" }, tab_id: "w:t3" } }) };
-      if (args[1] === "pane" && args[2] === "get") return { code: 0, err: "", out: JSON.stringify({ result: { pane: { pane_id: "w:p3", workspace_id: "w", cwd: "/remote-only/repo" } } }) };
-      if (args[1] === "pane" && args[2] === "process-info") return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { shell_pid: 100, foreground_process_group_id: 100, foreground_processes: [{ pid: 200, argv: ["omo", "--session-id", "remote-session"] }] } } }) };
-      if (args[1] === "pane" && args[2] === "list" && selected !== remote) return { code: 0, err: "", out: JSON.stringify({ result: { panes: [] } }) };
-    }
-    return base.run(args, opts);
+  const panes: LaneOps["panes"] = async (machine) => {
+    const all = await base.ops.panes(machine);
+    return (machine === MACHINE) === remote ? all : [];
   };
   world.panes = [{ pane_id: "w:p3", workspace_id: "w", agent: "pi", agent_status: "idle" }];
-  return { ...base, run };
+  return { ...base, ops: routing({ ...base.ops, panes, ...patch }) };
 };
 
-const remoteCalls = () => calls.filter((argv) => argv[0] === "herdr");
+/** An idle shell pane: launch may start a lane in it. */
+const shellPane = (cwd?: string) => {
+  world.panes = [{ pane_id: "w:p3", workspace_id: "w", ...(cwd ? { cwd } : {}) }];
+  world.inspection = { process: { shell_pid: 100, foreground_process_group_id: 100, foreground_processes: [] } as never };
+  world.startResult = { pane: "w:p3", tab: "w:t3", startup: { verdict: "ok", detail: "" } };
+};
+
+const opsOf = (op: OpsEntry["op"]) => world.ops.filter((e) => e.op === op);
+const startInput = () => opsOf("start")[0]?.args as Record<string, unknown> | undefined;
 const expectRemote = () => {
-  expect(remoteCalls().length).toBeGreaterThan(0);
-  for (const argv of remoteCalls()) expect(argv.slice(0, 3)).toEqual(["herdr", "--machine", MACHINE]);
+  expect(routed.length).toBeGreaterThan(0);
+  for (const label of routed) expect(label).toBe(MACHINE);
 };
 
-test("remote --pane launch routes checks, run and startup and persists machine", async () => {
-  // Given a local brief and a shell on a saved machine.
+test("remote --pane launch checks the pane and starts the lane through the machine's runner and persists machine", async () => {
   const d = deps();
+  shellPane();
   const input = lane();
   await Bun.write(input.brief, "execute the requested work\n");
-  // When launched, an identical local pane ID must not make the remote pane owned.
+  // An identical local pane ID must not make the remote pane owned.
   await d.registry.write(lane({ key: "local-owner", machine: undefined }));
   const result = await launchLane(d, { ...input, pane: "w:p3" });
-  // Then every herdr operation, including startup status, targets the machine.
   expectRemote();
-  expect(result.startup).toStartWith("STARTUP_OK");
-  expect((await d.registry.read(input.key))?.machine).toBe(MACHINE);
-  const command = calls.find((argv) => argv[4] === "run")?.[6] ?? "";
-  expect(command).toContain("/tmp/dori-brief-remote-lane.md");
-  expect(command).not.toContain(state.dir);
-  expect(calls.some((argv) => argv[0] === "git")).toBe(false);
+  expect(result.startup).toStartWith("STARTUP_OK remote-lane w:p3");
+  expect(await d.registry.read(input.key)).toMatchObject({ machine: MACHINE, runner: MACHINE, pane: "w:p3", tab: "w:t3", remoteCwd: "/remote-only/repo" });
+  expect(startInput()).toMatchObject({ machine: MACHINE, cwd: "/remote-only/repo", target: { pane: "w:p3" } });
+  // Heavy slots are the lead host's; a remote lane's runner keeps its own.
+  expect(startInput()).not.toHaveProperty("heavySlots");
+  expect(opsOf("processInfo").map((e) => e.args)).toEqual([{ machine: MACHINE, pane: "w:p3" }]);
+  // A remote directory is never checked as a local checkout.
+  expect(opsOf("inspect")).toEqual([]);
+  expect(world.calls).toEqual([]);
 });
 
-test("remote --workspace launch resolves inventory on that machine", async () => {
+test("remote --workspace launch resolves the shell pane from that machine's inventory", async () => {
   const d = deps();
-  world.panes = [{ pane_id: "w:p3", workspace_id: "w", agent_status: "idle" }];
+  shellPane();
   const input = lane({ pane: undefined });
   await Bun.write(input.brief, "work\n");
   const result = await launchLane(d, { ...input, workspace: "w" });
   expect(result.lane.pane).toBe("w:p3");
   expectRemote();
-  expect(remoteCalls()).toContainEqual(["herdr", "--machine", MACHINE, "pane", "list"]);
+  expect(opsOf("panes").map((e) => e.args)).toContainEqual({ machine: MACHINE });
+  expect(startInput()).toMatchObject({ target: { pane: "w:p3" } });
 });
 
-test("plain remote launch creates its tab through the saved machine API", async () => {
+test("plain remote launch needs a directory on the machine and never sends the lead's workspace or defaultCwd", async () => {
   const d = deps();
-  const input = lane({ pane: undefined, cwd: undefined });
-  await Bun.write(input.brief, "work\n");
-  expect((await launchLane({ ...d, config: { ...d.config, laneWorkspace: "local-only-workspace" } }, input)).lane.tab).toBe("w:t3");
+  const config = { ...d.config, laneWorkspace: "local-only-workspace" };
+  await Bun.write(lane().brief, "work\n");
+  // The lead's defaultCwd means nothing on the machine.
+  await expect(launchLane({ ...d, config }, lane({ pane: undefined, cwd: undefined }))).rejects.toThrow(`a lane on machine ${MACHINE} needs --cwd`);
+  expect(opsOf("start")).toEqual([]);
+  expect(await d.registry.read("remote-lane")).toBeNull();
+  world.startResult = { pane: "w:p8", tab: "w:t8", startup: { verdict: "ok", detail: "" } };
+  expect((await launchLane({ ...d, config }, lane({ pane: undefined }))).lane.tab).toBe("w:t8");
   expectRemote();
-  expect(calls.some((argv) => argv.slice(3, 5).join(" ") === "tab create")).toBe(true);
-  expect(calls.some((argv) => argv.includes("local-only-workspace"))).toBe(false);
-  // The lead's defaultCwd means nothing on the machine, so the remote tab gets no --cwd; the pane's own path is kept apart.
-  expect(calls.find((argv) => argv.slice(3, 5).join(" ") === "tab create")).not.toContain("--cwd");
-  expect(await d.registry.read(input.key)).toMatchObject({ remoteCwd: "/remote-only/repo" });
-  expect((await d.registry.read(input.key))?.cwd).toBeUndefined();
+  expect(startInput()).toMatchObject({ machine: MACHINE, cwd: "/remote-only/repo" });
+  expect(startInput()).not.toHaveProperty("target");
+  expect(JSON.stringify(startInput())).not.toContain("local-only-workspace");
+  expect(await d.registry.read("remote-lane")).toMatchObject({ remoteCwd: "/remote-only/repo" });
+  expect((await d.registry.read("remote-lane"))?.cwd).toBeUndefined();
 });
 
-test("POSIX remote launch copies the complete brief to a remote-valid path before executing the agent", async () => {
+test("a remote launch hands the complete brief text to the machine's runner, never a lead-local path", async () => {
   const d = deps();
+  shellPane();
   const input = lane({ key: `remote-posix-${process.pid}`, brief: join(state.dir, "quoted ' brief.md") });
-  const remote = `/tmp/dori-brief-${input.key}.md`;
   await Bun.write(input.brief, "literal ' quote and $(printf INJECTED) and `printf INJECTED`\n");
-  await launchLane({ ...d, config: { ...d.config, agentCommand: ["printf", "%s", "{prompt}"] } }, input);
+  await launchLane(d, input);
   const shipped = await Bun.file(input.brief).text();
-  const command = calls.find((argv) => argv[4] === "run")?.[6];
-  if (!command) throw new Error("launch did not submit a command");
-  expect(command).not.toContain(state.dir);
-  expect(command).toContain(remote);
-  // Emulate the remote host's /tmp in a separate TMPDIR-backed filesystem fixture.
-  // The submitted path remains checked above; the lead's /tmp need not be writable.
-  const remoteState = withState();
-  const remoteBrief = join(remoteState.dir, `dori-brief-${input.key}.md`);
-  try {
-    const executed = await realRun(["sh", "-c", command.replaceAll(remote, remoteBrief)], { timeoutMs: 5_000 });
-    expect(executed.code).toBe(0);
-    expect(executed.out).toContain(`lane brief at ${remoteBrief} in full`);
-    expect(await Bun.file(remoteBrief).text()).toBe(shipped);
-  } finally {
-    remoteState.done();
-  }
-});
-
-test("POSIX remote launch exposes the lane key to the agent environment", async () => {
-  const d = deps();
-  const input = lane({ key: `remote-posix-env-${process.pid}` });
-  await Bun.write(input.brief, "work\n");
-  await launchLane({ ...d, config: { ...d.config, agentCommand: ["sh", "-c", 'printf %s "$DORI_LANE_KEY"'] } }, input);
-  const command = calls.find((argv) => argv[4] === "run")?.[6];
-  if (!command) throw new Error("launch did not submit a command");
-  const remote = `/tmp/dori-brief-${input.key}.md`;
-  const remoteState = withState();
-  try {
-    const executed = await realRun(["sh", "-c", command.replaceAll(remote, join(remoteState.dir, `dori-brief-${input.key}.md`))], { timeoutMs: 5_000 });
-    expect(executed.code).toBe(0);
-    expect(executed.out).toBe(input.key);
-  } finally {
-    remoteState.done();
-  }
-});
-
-/** Reads a PowerShell line the way its parser treats single quotes: '' inside a literal is one quote, as are the typographic quotes. */
-const psTokens = (line: string): { readonly literals: string[]; readonly code: string } => {
-  const literals: string[] = [];
-  let code = "";
-  const quote = /['\u2018\u2019\u201A\u201B]/;
-  for (let i = 0; i < line.length; i++) {
-    if (!quote.test(line[i] ?? "")) { code += line[i]; continue; }
-    let text = "";
-    for (i++; ; i++) {
-      if (i >= line.length) throw new Error("unterminated PowerShell string");
-      if (quote.test(line[i] ?? "")) {
-        if (quote.test(line[i + 1] ?? "")) { text += line[i + 1]; i++; continue; }
-        break;
-      }
-      text += line[i];
-    }
-    code += `<${literals.length}>`;
-    literals.push(text);
-  }
-  return { literals, code };
-};
-
-/** Evaluates the subset launch emits: <k> literals, base64-decoded literals, and ( a + $doriBrief + b ) concatenations. */
-const psArgv = (args: string, literals: readonly string[], briefPath: string): string[] => {
-  const term = (s: string): string => {
-    if (s === "$doriBrief") return briefPath;
-    const lit = /^<(\d+)>$/.exec(s);
-    if (lit) return literals[Number(lit[1])] ?? "";
-    const b64 = /^\[Text\.Encoding\]::UTF8\.GetString\(\[Convert\]::FromBase64String\(<(\d+)>\)\)$/.exec(s);
-    if (b64) return Buffer.from(literals[Number(b64[1])] ?? "", "base64").toString("utf8");
-    throw new Error(`unexpected PowerShell term: ${s}`);
-  };
-  const out: string[] = [];
-  for (let i = 0; i < args.length;) {
-    if (args[i] === " ") { i++; continue; }
-    if (args[i] !== "(") { const j = args.indexOf(" ", i); const tok = args.slice(i, j < 0 ? args.length : j); out.push(term(tok)); i += tok.length; continue; }
-    let depth = 0, j = i;
-    for (; j < args.length; j++) { if (args[j] === "(") depth++; else if (args[j] === ")" && --depth === 0) break; }
-    out.push(args.slice(i + 1, j).split(" + ").map(term).join(""));
-    i = j + 1;
-  }
-  return out;
-};
-
-const windowsPane = (d: ReturnType<typeof deps>, shellName: string): Runner => async (argv, opts) => {
-  const args = argv[1] === "--machine" ? ["herdr", ...argv.slice(3)] : [...argv];
-  if (args[1] === "pane" && args[2] === "process-info") return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { shell_pid: 4100, foreground_processes: [{ pid: 4100, name: shellName, argv: [`C:\\Program Files\\PowerShell\\7\\${shellName}`] }] } } }) };
-  if (args[1] === "pane" && args[2] === "get") return { code: 0, err: "", out: JSON.stringify({ result: { pane: { pane_id: "w:p3", workspace_id: "w", cwd: "D:\\dev\\worktrees\\app" } } }) };
-  return d.run(argv, opts);
-};
-
-test("PowerShell remote launch ships the brief as bytes and quotes every argument as a PowerShell literal", async () => {
-  const d = deps();
-  const input = lane({ cwd: undefined });
-  const body = "it's \"quoted\" $env:PATH $(Get-Date) `backtick` \u2018smart\u2019 \u201Alow\u201B\nsecond line\r\nthird\n";
-  await Bun.write(input.brief, body);
-  const result = await launchLane({ ...d, run: windowsPane(d, "pwsh.exe"), config: { ...d.config, launchKeywords: "ulw it's $go \u2018x\u2019" } }, { ...input, pane: "w:p3" });
-  const shipped = await Bun.file(input.brief).text();
-  expect(shipped.startsWith(body.replace(/\s*$/, ""))).toBe(true);
-  const command = calls.find((argv) => argv[4] === "run")?.[6] ?? "";
-  // One line, no lead-local path, and nothing from the brief is typed into the shell.
-  expect(command).not.toMatch(/[\r\n]/);
-  expect(command).not.toContain(state.dir);
-  expect(command).not.toContain("backtick");
-  // Pure printable ASCII: typed non-ASCII is not reliable through a pane's line editor.
-  expect(command).toMatch(/^[\x20-\x7e]+$/);
-  const { literals, code } = psTokens(command);
-  const head = /^\$doriBrief = Join-Path \(\[IO\.Path\]::GetTempPath\(\)\) <0>; \[IO\.File\]::WriteAllBytes\(\$doriBrief, \[Convert\]::FromBase64String\(<1>\)\); if \(\$\?\) \{ \$env:DORI_LANE_KEY = <2>; & (.*) \}$/.exec(code);
-  if (!head?.[1]) throw new Error(`unexpected PowerShell line shape: ${code}`);
-  expect(literals[0]).toBe("dori-brief-remote-lane.md");
-  expect(literals[2]).toBe(input.key);
-  expect(Buffer.from(literals[1] ?? "", "base64").toString("utf8")).toBe(shipped);
-  // Evaluate the argument list with $doriBrief bound to a Windows temp path; it must equal the agent argv.
-  expect(psArgv(head[1], literals, "C:\\Temp\\x.md")).toEqual([
-    ...d.config.agentCommand.slice(0, -1).map((a) => a.replace("{model}", d.config.defaultModel)),
-    "--thinking", "medium",
-    "ulw it's $go \u2018x\u2019. Read and execute the lane brief at C:\\Temp\\x.md in full. You are the remote-lane lane; report as the brief's footer says.",
-  ]);
-  expect(result.lane).toMatchObject({ machine: MACHINE, remoteCwd: "D:\\dev\\worktrees\\app" });
-  expect(result.lane.cwd).toBeUndefined();
+  const start = startInput();
+  expect(start?.briefText).toBe(shipped);
+  expect(String(start?.briefText)).toContain(`~/.dori/runner/bin/dori report ${input.key} done`);
+  expect(JSON.stringify(start)).not.toContain(state.dir);
 });
 
 test("a cmd.exe pane is refused before anything runs or registers", async () => {
   const d = deps();
+  world.panes = [{ pane_id: "w:p3", workspace_id: "w", cwd: "D:\\dev\\worktrees\\app" }];
+  world.inspection = { process: { shell_pid: 4100, foreground_processes: [{ pid: 4100, name: "cmd.exe", argv: ["C:\\Windows\\System32\\cmd.exe"] }] } as never };
   const input = lane();
   await Bun.write(input.brief, "work\n");
-  await expect(launchLane({ ...d, run: windowsPane(d, "cmd.exe") }, { ...input, pane: "w:p3" })).rejects.toThrow("runs cmd.exe");
-  expect(calls.some((argv) => argv[4] === "run")).toBe(false);
+  await expect(launchLane(d, { ...input, pane: "w:p3" })).rejects.toThrow("runs cmd.exe");
+  expect(opsOf("start")).toEqual([]);
   expect(await d.registry.read(input.key)).toBeNull();
 });
 
@@ -241,93 +154,94 @@ test("pane shell detection reads the shell process, then a Windows drive cwd", (
   expect(paneShell(undefined, "/home/u")).toBe("posix");
 });
 
-test("remote footer asks only for steps a lane on another machine can take; local footer is unchanged", () => {
-  const remote = footer(lane(), "lead:p1");
-  expect(remote).not.toContain("claim-done --evidence");
+test("remote footer reports through the runner's lane CLI; local footer through dori report; neither types into a pane", () => {
+  const remote = footer(lane());
+  expect(remote).toContain('~/.dori/runner/bin/dori report remote-lane done --text "<one line>"');
   expect(remote).not.toContain("dori claim-done remote-lane");
+  expect(remote).not.toContain("[REPORT]");
   expect(remote).not.toContain("lead:p1");
-  expect(remote).toContain("[REPORT] remote-lane | done |");
-  const local = footer(lane({ machine: undefined }), "lead:p1");
-  expect(local).toContain("sent to pane lead:p1 as an argv array");
-  expect(local).toContain('When done: dori claim-done remote-lane --evidence "<merge SHA, closed issue, version>"');
+  const local = footer(lane({ machine: undefined }));
+  expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<merge SHA, closed issue, version>"');
+  expect(local).not.toContain("~/.dori/runner/bin/dori");
+  expect(local).not.toContain("[REPORT]");
 });
 
 test("close runs a remote lane's command signals in the local defaultCwd, also for entries that stored the remote path", async () => {
   for (const entry of [lane({ cwd: undefined, remoteCwd: "D:\\dev\\app" }), lane({ cwd: "D:\\dev\\app" })]) {
+    world.ops = [];
     const d = deps();
     await d.registry.write(entry);
-    const dirs: (string | undefined)[] = [];
-    const run: Runner = (argv, opts) => {
-      if (argv[0] === "gh") { dirs.push(opts?.cwd); return Promise.resolve({ code: 0, err: "", out: '[{"number":7}]' }); }
-      return d.run(argv, opts);
-    };
-    const result = await closeLane({ ...d, run }, { ...entry, done: 'command ["gh","pr","list"] stdout~"number"' }, "verified");
+    const result = await closeLane(d, { ...entry, done: 'command ["gh","pr","list"] stdout~"MERGED"' }, "verified");
     expect(result.closed).toBe(true);
-    expect(dirs).toEqual([d.config.defaultCwd]);
+    const asked = opsOf("inspect").map((e) => (e.args as { want: Record<string, unknown> }).want).filter((want) => want.done !== undefined);
+    expect(asked).toEqual([{ done: 'command ["gh","pr","list"] stdout~"MERGED"', doneCwd: d.config.defaultCwd }]);
   }
 });
 
 test("adopt --machine keeps the given directory as the remote path, never as a local cwd", async () => {
   const d = deps();
   const adopted = await adoptLane(d, { ...lane({ cwd: "D:\\dev\\app" }), pane: "w:p3" });
-  expect(adopted).toMatchObject({ remoteCwd: "D:\\dev\\app" });
+  expect(adopted).toMatchObject({ remoteCwd: "D:\\dev\\app", runner: MACHINE });
   expect(adopted.cwd).toBeUndefined();
+  expect(opsOf("adopt")[0]?.args).toMatchObject({ key: "remote-lane", machine: MACHINE, pane: "w:p3", cwd: "D:\\dev\\app" });
   expect((await adoptLane(d, { ...lane({ key: "local-adopted", machine: undefined, cwd: "/repo/x" }), pane: "w:p4" })).cwd).toBe("/repo/x");
 });
 
-test("adopt without --machine refuses a pane id this host's herdr does not list; with --machine the same id is adopted", async () => {
-  const d = deps();
-  const run: Runner = (argv, opts) => argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "get"
-    ? Promise.resolve({ code: 1, out: "", err: "pane w:p3 not found" })
-    : d.run(argv, opts);
-  await expect(adoptLane({ ...d, run }, { ...lane({ machine: undefined }), pane: "w:p3" })).rejects.toThrow("needs --machine");
+test("adopt without --machine refuses a pane id the local runner does not list; with --machine the same id is adopted", async () => {
+  let d = deps();
+  const adopt = d.ops.adopt;
+  d = deps(true, {
+    adopt: async (input) => {
+      if (!input.machine) throw new LaneOpsError("LANE_OP_FAILED", "local", "RUNNER_LANE_PANE_MISSING pane w:p3 not found");
+      return adopt(input);
+    },
+  });
+  await expect(adoptLane(d, { ...lane({ machine: undefined }), pane: "w:p3" })).rejects.toThrow("needs --machine");
   expect(await d.registry.read("remote-lane")).toBeNull();
-  expect((await adoptLane({ ...d, run }, { ...lane(), pane: "w:p3" })).machine).toBe(MACHINE);
+  expect((await adoptLane(d, { ...lane(), pane: "w:p3" })).machine).toBe(MACHINE);
 });
 
-test("a failed remote pane run is not registered as a launched lane", async () => {
-  const d = deps();
-  const input = lane();
+test("a remote start the runner refuses is not registered as a launched lane", async () => {
+  const d = deps(true, { start: async () => { throw new LaneOpsError("LANE_OP_FAILED", MACHINE, "RUNNER_LANE_START_FAILED machine disconnected"); } });
+  const input = lane({ pane: undefined });
   await Bun.write(input.brief, "work\n");
-  const run: Runner = (argv, opts) => argv[4] === "run"
-    ? Promise.resolve({ code: 1, out: "", err: "machine disconnected" })
-    : d.run(argv, opts);
-  await expect(launchLane({ ...d, run }, input)).rejects.toThrow("herdr pane run failed");
+  await expect(launchLane(d, input)).rejects.toThrow("machine disconnected");
   expect(await d.registry.read(input.key)).toBeNull();
 });
 
-test("remote startup failure screen reads stay on the selected machine", async () => {
+test("a remote startup failure the runner reports becomes the STARTUP_ERROR line", async () => {
   const d = deps();
-  world.panes = [];
-  world.screen = "Error: No API key";
-  const input = lane();
+  world.startResult = { pane: "w:p3", tab: "w:t3", startup: { verdict: "error", detail: "Error: No API key" } };
+  const input = lane({ pane: undefined });
   await Bun.write(input.brief, "work\n");
-  expect((await launchLane(d, input)).startup).toStartWith("STARTUP_ERROR");
+  expect((await launchLane(d, input)).startup).toBe("STARTUP_ERROR remote-lane w:p3: Error: No API key");
   expectRemote();
-  expect(calls.some((argv) => argv[4] === "read")).toBe(true);
 });
 
-test("adopt records machine and sync reads its inventory and remote session argv", async () => {
+test("adopt records machine and sync reads its inventory and session through the machine's runner", async () => {
   const d = deps();
   await adoptLane(d, { ...lane(), pane: "w:p3" });
   expect((await d.registry.read("remote-lane"))?.machine).toBe(MACHINE);
+  world.inspection = { session: { id: "remote-session", via: "argv" } };
   const result = await syncRegistry(d, true);
   expect(result.drift).toEqual([]);
   expect(result.rows[0]?.session).toBe("remote-session (argv)");
   expect((await d.registry.read("remote-lane"))?.session).toBe("remote-session");
-  expect(calls).toContainEqual(["herdr", "--machine", MACHINE, "pane", "list"]);
-  expect(calls).toContainEqual(["herdr", "--machine", MACHINE, "pane", "process-info", "--pane", "w:p3"]);
+  expect(opsOf("panes").map((e) => e.args)).toContainEqual({ machine: MACHINE });
+  const asked = opsOf("inspect").at(-1)?.args as { lane: Lane; want: Record<string, unknown> };
+  expect(asked.lane).toMatchObject({ key: "remote-lane", machine: MACHINE, pane: "w:p3" });
+  expect(asked.want).toMatchObject({ session: true });
 });
 
-test("local entries and argv stay unchanged without machine", async () => {
+test("local entries stay local without machine: every call goes to the local runner", async () => {
   const d = deps(false);
   const input = lane({ machine: undefined });
   await adoptLane(d, { ...input, pane: "w:p3" });
   await syncRegistry(d, false);
   expect((await d.registry.read(input.key))?.machine).toBeUndefined();
-  expect(remoteCalls().every((argv) => argv[1] !== "--machine")).toBe(true);
-  expect(herdrArgv({}, ["pane", "list"])).toEqual(["herdr", "pane", "list"]);
-  expect(laneRunner(d.run, {})).toBe(d.run);
+  expect(routed.length).toBeGreaterThan(0);
+  // sync lists every machine a lane is on; with no remote lane that is only this host.
+  expect(routed.every((label) => label === "local")).toBe(true);
 });
 
 test("byPane distinguishes a local pane from the same ID on a saved machine", async () => {
@@ -338,35 +252,33 @@ test("byPane distinguishes a local pane from the same ID on a saved machine", as
   expect((await d.registry.byPane("w:p3", MACHINE))?.key).toBe("remote-lane");
 });
 
-test("remote pause reads back the goal and interrupts only the remote turn", async () => {
+test("remote pause pauses the goal and interrupts only the remote turn, through the machine's runner", async () => {
   const d = deps();
   const input = lane();
   for (const pane of world.panes) pane.agent_status = "working";
   world.onEscapeStatus = "idle";
-  world.screens = ["", "❯ ", "Goal paused\n"];
   const result = await pauseLane(d, input, "wait");
   expect(result.code).toBe(0);
   expect(result.lane.status).toBe("paused");
   expectRemote();
-  expect(calls).toContainEqual(["herdr", "--machine", MACHINE, "pane", "send-text", "w:p3", "/goal pause"]);
-  expect(calls).toContainEqual(["herdr", "--machine", MACHINE, "pane", "send-keys", "w:p3", "escape"]);
+  expect(opsOf("pause").map((e) => (e.args as { step?: string }).step)).toEqual(["goal", "stop"]);
 });
 
 test("remote resume reads back the remote goal before restoring lane state", async () => {
   const d = deps();
-  world.screens = ["Goal paused\n", "❯ ", "Goal active\n"];
   const result = await resumeLane(d, lane({ status: "paused" }), "go");
   expect(result.code).toBe(0);
   expect(result.lane.status).toBe("working");
+  expect(opsOf("resume")).toHaveLength(1);
   expectRemote();
 });
 
-test("claim and objection messages route to the remote pane", async () => {
+test("claim and objection messages route to the remote lane's runner", async () => {
   const d = deps();
   await claimDone(d, lane(), "verified");
   await objectDone(d, lane(), ["not yet"]);
   expectRemote();
-  expect(remoteCalls().filter((argv) => argv[4] === "send-text")).toHaveLength(2);
+  expect(opsOf("send")).toHaveLength(2);
 });
 
 test("after an objection a remote lane's stale done line is not re-claimed, and a new done line claims again", async () => {
@@ -377,20 +289,22 @@ test("after an objection a remote lane's stale done line is not re-claimed, and 
   await objectDone(d, (await d.registry.read("remote-lane")) ?? lane(), ["changelog missing"]);
   expect(await watchTick(d)).toEqual([]);
   // The objection itself lands on the lane's screen; it must never read as a new claim.
-  const objection = remoteCalls().filter((argv) => argv[4] === "send-text").at(-1)?.[6] ?? "";
+  const objection = sent(world).at(-1) ?? "";
   expect(objection).toStartWith("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons.");
   expect(objection).not.toContain("changelog missing");
   world.screen = `[REPORT] remote-lane | done | closed acme/app#3\n❯ ${objection}\n`;
   expect(await watchTick(d)).toEqual([]);
   world.screen = "[REPORT] remote-lane | done | closed acme/app#3, changelog added\n❯ ";
   expect(await watchTick(d)).toEqual(["LANE_DONE_CLAIMED remote-lane w:p3 closed acme/app#3, changelog added"]);
+  expectRemote();
 });
 
-test("freshness nudges a quiet remote lane without touching the local namesake", async () => {
+test("freshness nudges a quiet remote lane through its runner without touching the local namesake", async () => {
   const d = deps();
   await d.registry.write(lane({ openedAt: new Date(T0 - 16 * 60_000).toISOString() }));
   expect((await freshnessTick(d, "/home/test")).map((act) => act.kind)).toEqual(["nudged"]);
   expectRemote();
+  expect(opsOf("send")[0]?.args).toMatchObject({ text: expect.stringContaining("~/.dori/runner/bin/dori report remote-lane"), opts: { refuseWhileAsking: true } });
 });
 
 test("dead-panes scopes remote reads and state independently from local IDs", async () => {
@@ -399,24 +313,26 @@ test("dead-panes scopes remote reads and state independently from local IDs", as
   world.screen = "agent has stopped";
   const seen = new Set<string>();
   const memory = newDeadPaneState();
-  expect(await deadPaneTick(d.run, d.config, seen, "hour", memory, [lane()])).toEqual([]);
-  const result = await deadPaneTick(d.run, d.config, seen, "hour", memory, [lane()]);
+  expect(await deadPaneTick(d.ops, d.config, seen, "hour", memory, [lane()])).toEqual([]);
+  const result = await deadPaneTick(d.ops, d.config, seen, "hour", memory, [lane()]);
   expect(result).toEqual([`DEAD_PANE w:p3 machine=${MACHINE}`]);
-  expect(calls).toContainEqual(["herdr", "--machine", MACHINE, "pane", "read", "w:p3", "--source", "recent", "--lines", "6"]);
-  expect(calls.some((argv) => argv[1] === "--machine" && argv.includes("w:p9"))).toBe(false);
+  const reads = opsOf("screen").map((e) => e.args as { machine?: string; pane?: string; lines?: number });
+  expect(reads).toContainEqual({ machine: MACHINE, pane: "w:p3", lines: 6 });
+  expect(reads.some((r) => r.pane === "w:p9")).toBe(false);
 });
 
-test("remote worktree checks and cleanup skip explicitly and never run local git", async () => {
+test("remote worktree checks and cleanup skip explicitly and never ask for git", async () => {
   const d = deps();
   const input = lane({ worktrees: ["/remote-only/repo"] });
-  expect(await discoverWorktrees(input, d.run)).toEqual([]);
   expect(await unpushedWork(d, input)).toEqual([]);
   expect(await closedWorktreeSweep(d, { ...input, closedAt: new Date(T0).toISOString(), receipt: { cleanup: ["worktree /data/repos/worktrees/x kept: dirty"] } })).toEqual([]);
   const result = await closeLane(d, input, "verified");
   expect(result.closed).toBe(true);
   expect(result.lines.some((line) => line.startsWith("WORKTREE_CHECK SKIPPED"))).toBe(true);
   expect((await d.registry.read(input.key))?.receipt).toMatchObject({ worktreeCheck: { status: "skipped" } });
-  expect(calls.some((argv) => argv[0] === "git")).toBe(false);
+  expect(opsOf("git")).toEqual([]);
+  expect(opsOf("inspect").some((e) => (e.args as { want: { git?: boolean } }).want.git)).toBe(false);
+  expect(world.calls.some((argv) => argv[0] === "git")).toBe(false);
   expectRemote();
 });
 
@@ -425,6 +341,7 @@ test("watch settles a remote claim using remote close and records skipped worktr
   await d.registry.write(lane({ status: "done-claimed", claim: { at: new Date(T0 - 6 * 60_000).toISOString(), evidence: "verified", emitted: true } }));
   expect((await watchTick(d))[0]).toStartWith("LANE_CLOSED");
   expect((await d.registry.read("remote-lane"))?.receipt).toMatchObject({ worktreeCheck: { status: "skipped" } });
+  expect(opsOf("close")).toHaveLength(1);
   expectRemote();
 });
 
@@ -440,11 +357,19 @@ test("a remote lane's [REPORT] done becomes a claim in the same window; a questi
   expect(await watchTick(d)).toEqual(["LANE_DONE_CLAIMED remote-lane w:p3 closed acme/app#3 by abc123"]);
   const claimed = await d.registry.read("remote-lane");
   expect(claimed && statusOf(claimed)).toBe("done-claimed");
-  expect(remoteCalls().some((argv) => argv[4] === "send-text" && argv[6]?.startsWith("[LEAD] done claim recorded"))).toBe(true);
+  expect(sent(world).some((text) => text.startsWith("[LEAD] done claim recorded"))).toBe(true);
   expect(await watchTick(d)).toEqual([]);
   (d.clock as ReturnType<typeof fakeClock>).at += 5 * 60_000 + 1;
   expect((await watchTick(d))[0]).toStartWith("LANE_CLOSED remote-lane");
   expectRemote();
+});
+
+test("a remote lane on its runner (dori report) is never read from its screen", async () => {
+  const d = deps();
+  await d.registry.write(lane({ reportVia: "cli", runner: MACHINE }));
+  world.screen = "[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
+  expect(await watchTick(d)).toEqual([]);
+  expect(opsOf("screen")).toEqual([]);
 });
 
 test("two remote reports printed between two polls both arrive, in order", async () => {
@@ -479,29 +404,33 @@ test("remote session lookup cannot mistake a local matching PID for its session"
     run, sessionsDir: "/local/sessions", listDir: () => { throw new Error("must not read local sessions"); },
   }, { machine: MACHINE });
   expect(result).toEqual({ id: "", via: "none" });
-  expect(calls).toEqual([["herdr", "--machine", MACHINE, "pane", "process-info", "--pane", "w:p3"]]);
+  expect(calls).toEqual([["herdr", "pane", "process-info", "--pane", "w:p3"]]);
 });
 
-test("GitHub supervision keeps remote signal targets without reading remote paths locally", async () => {
+test("GitHub supervision keeps remote signal targets without asking any runner for remote paths", async () => {
   const d = deps();
-  const targets = await githubTargets([lane({ done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","remote-branch"]' })], d.run);
+  const targets = await githubTargets([lane({ done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","remote-branch"]' })], d.ops);
   expect([...targets.get("acme/app")?.numbers ?? []]).toEqual([7]);
   expect([...targets.get("other/repo")?.branches ?? []]).toEqual(["remote-branch"]);
-  expect(calls).toEqual([]);
+  expect(world.ops).toEqual([]);
+  expect(world.calls).toEqual([]);
 });
 
 test("sync's session update re-reads the lane, so an objection written while sync ran survives", async () => {
-  const d = deps();
-  await adoptLane(d, { ...lane(), pane: "w:p3" });
   const objection = { at: new Date(T0).toISOString(), reasons: ["unpushed work"] };
-  const run: Runner = async (argv, opts) => {
-    if (argv.includes("process-info")) {
-      const current = await d.registry.read("remote-lane");
-      if (current && !current.objection) await d.registry.write({ ...current, status: "not-done", objection });
-    }
-    return d.run(argv, opts);
-  };
-  await syncRegistry({ ...d, run }, true);
+  let d = deps();
+  const inspect = d.ops.inspect;
+  const registry = d.registry;
+  d = deps(true, {
+    inspect: async (l, want) => {
+      const current = await registry.read("remote-lane");
+      if (want.session && current && !current.objection) await registry.write({ ...current, status: "not-done", objection });
+      return inspect(l, want);
+    },
+  });
+  await adoptLane(d, { ...lane(), pane: "w:p3" });
+  world.inspection = { session: { id: "remote-session", via: "argv" } };
+  await syncRegistry(d, true);
   const after = await d.registry.read("remote-lane");
   expect(after?.session).toBe("remote-session");
   expect(after?.objection).toEqual(objection);

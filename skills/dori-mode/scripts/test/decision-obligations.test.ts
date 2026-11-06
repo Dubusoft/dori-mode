@@ -207,8 +207,8 @@ test("dori resolved is lead-only, takes several ids, names unmatched ones, and w
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");
   supervisor.resolveTick();
   const denied = await cli(f.state.dir, ["resolved", "wait:1"], { DORI_LANE_KEY: "alpha" });
-  expect(denied.code).toBe(1);
-  expect(denied.err).toContain("LANE_PERMISSION_DENIED lane alpha may not run resolved; it is lead-only");
+  expect(denied.code).toBe(2);
+  expect(denied.err).toStartWith("DORI_CLI_LANE_ONLY resolved:");
   const usage = await cli(f.state.dir, ["resolved"]);
   expect(usage.code).toBe(1);
   expect(existsSync(join(f.state.dir, RESOLVED_DIR))).toBe(false);

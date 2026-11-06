@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Pane } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
-import { RunnerLanes, serveLaneSocket } from "../src/runner/lanes.ts";
+import { RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { type RunnerEventType, runnerEvent } from "../src/runner/protocol.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
@@ -19,19 +19,20 @@ const QUESTION = ["work output", "? Question pending (1 unanswered) · 30m", "  
 const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0 };
 
 /** A RunnerLanes over a scripted herdr: `world` decides each herdr answer, every call is recorded. */
-const setup = () => {
+const setup = (over: Partial<RunnerLanesDeps> = {}) => {
   const runnerDir = join(mkdtempSync(join(tmpdir(), "runner-lanes-recover-")), "runner");
   dirs.push(join(runnerDir, ".."));
   mkdirSync(runnerDir, { mode: 0o700 });
-  const world = { panes: [] as Pane[], screen: "", tabCreateFails: 0, nextPane: 1 };
+  const world = { panes: [] as Pane[], screen: "", tabCreateFails: 0, nextPane: 1, paneGet: {} as Record<string, object>, processInfo: {} as Record<string, object> };
   const calls: string[][] = [];
   const published: [RunnerEventType, unknown][] = [];
   let tokens = 0;
   const ok = (out = ""): Ran => ({ code: 0, out, err: "" }) as Ran;
   const make = () => new RunnerLanes({
-    runnerDir, clock: fakeClock(T0), token: () => `tok-${++tokens}`,
+    runnerDir, clock: fakeClock(T0), token: () => `tok-${++tokens}`, realpath: (p: string) => p,
     policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
     publish: (type, body) => { published.push([type, body]); },
+    ...over,
     run: async (argv) => {
       calls.push([...argv]);
       const verb = argv.slice(0, 3).join(" ");
@@ -42,6 +43,14 @@ const setup = () => {
       }
       if (verb === "herdr pane list") return ok(JSON.stringify({ result: { panes: world.panes } }));
       if (verb === "herdr pane read") return ok(world.screen);
+      if (verb === "herdr pane get") {
+        const pane = world.paneGet[argv[3] ?? ""];
+        return pane ? ok(JSON.stringify({ result: { pane } })) : ({ code: 1, out: "", err: "pane not found" } as Ran);
+      }
+      if (verb === "herdr pane process-info") {
+        const info = world.processInfo[argv[4] ?? ""];
+        return info ? ok(JSON.stringify({ result: { process_info: info } })) : ok();
+      }
       return ok();
     },
   });
@@ -59,7 +68,7 @@ test("P6: a recover whose relaunch fails keeps the lane's record, and a later re
   expect(t.lanes.records()["lane-a"]).toEqual(before as NonNullable<typeof before>);
   expect(t.lanes.tokenFor("lane-a", "tok-1")).toBe(true);
 
-  expect(await t.lanes.recover("lane-a")).toBe("started pane=p2 tab=t2");
+  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
   expect(t.lanes.records()["lane-a"]?.pane).toBe("p2");
   expect(t.lanes.tokenFor("lane-a", "tok-2")).toBe(true);
   expect(t.lanes.tokenFor("lane-a", "tok-1")).toBe(false);
@@ -91,13 +100,13 @@ test("alive criteria: observe and recover use paneAlive (agent_status), not the 
   t.published.length = 0;
   // herdr still names the agent, but its status is not an alive one: the supervisor's laneStatus calls this dead.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
-  expect(await t.lanes.observe("lane-a")).toBe("observed dead");
-  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead" }]]);
-  expect(await t.lanes.recover("lane-a")).toBe("started pane=p2 tab=t2");
+  expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }]]);
+  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
   // An alive status without an agent field is alive, as paneAlive says.
   t.world.panes = [{ pane_id: "p2", workspace_id: "w", tab_id: "t2", agent_status: "blocked" }];
-  expect(await t.lanes.observe("lane-a")).toBe("observed idle");
-  expect(await t.lanes.recover("lane-a")).toBe("alive pane=p2");
+  expect((await t.lanes.observe("lane-a")).detail).toBe("observed idle");
+  expect((await t.lanes.recover("lane-a")).detail).toBe("alive pane=p2");
 });
 
 test("the lane token is never on the herdr command line; the lane CLI authenticates through DORI_LANE_TOKEN_FILE", async () => {
@@ -150,7 +159,7 @@ test("B2: recovering a lane whose pane is alive publishes lane.started, which cl
   await reconcileInventory(deps, "worker-a", []); // a stale hello from before the launch
   expect(lane.recoveryPending).toBe(true);
   t.published.length = 0;
-  expect(await t.lanes.recover("lane-a")).toBe("alive pane=p1");
+  expect((await t.lanes.recover("lane-a")).detail).toBe("alive pane=p1");
   expect(t.published).toEqual([["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "" }]]);
   for (const [type, body] of t.published) await acceptLaneEvent(deps, "worker-a", runnerEvent(head, ++seq, type, body as never) as Parameters<typeof acceptLaneEvent>[2]);
   expect(lane.recoveryPending).toBeFalsy();
@@ -175,7 +184,130 @@ test("B3: the launch command runs under /bin/sh when the runner directory has a 
   const proc = Bun.spawn(["/bin/sh", "-c", command], { env: { PATH: process.env.PATH ?? "" }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   expect({ code, err }).toEqual({ code: 0, err: "" });
-  expect(out).toContain(`DORI_LANE_TOKEN_FILE=${join(runnerDir, "briefs", "lane-a.token")}`);
+  expect(out).toContain(`DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")}`);
+  expect(lanes.tokenPath("lane-a")).toStartWith(join(runnerDir, "briefs", "lane-a."));
   expect(out).toContain("DORI_LANE_KEY=lane-a");
   expect(out).not.toContain("secret-not-on-argv");
+});
+
+test("lane.start carries keywords and heavy env into the launch line, and a recover with a session resumes it", async () => {
+  const t = setup();
+  const started = await t.lanes.start({ ...START, keywords: "ulw set goal and work", heavySlots: 2, heavyMaxLoad: 40 });
+  expect(started.detail).toBe("started pane=p1 tab=t1");
+  expect(started.result.startup.verdict).toBe("unconfirmed");
+  const first = t.calls.find((a) => a[2] === "run")?.[4] ?? "";
+  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 'ulw set goal and work. Read and execute`);
+  t.world.panes = [];
+  const recovered = await t.lanes.recover("lane-a", "ses_123");
+  expect(recovered.result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true, resumed: true });
+  const second = t.calls.filter((a) => a[2] === "run").at(-1)?.[4] ?? "";
+  expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --session ses_123 'ulw set goal and work.");
+});
+
+test("lane.start with a target runs in that idle shell pane, leaves it open on a failed run, and refuses a pane another lane holds", async () => {
+  const t = setup();
+  t.world.paneGet.p9 = { pane_id: "p9", workspace_id: "w1", tab_id: "t9", cwd: "/repo/wt" };
+  t.world.processInfo.p9 = { shell_pid: 50, foreground_process_group_id: 50, foreground_processes: [{ pid: 50, name: "bash" }] };
+  const started = await t.lanes.start({ ...START, target: { pane: "p9" } });
+  expect(started.result).toMatchObject({ pane: "p9", tab: "t9" });
+  expect(t.calls.some((a) => a[1] === "tab" && a[2] === "create")).toBe(false);
+  expect(t.lanes.records()["lane-a"]).toMatchObject({ pane: "p9", tab: "t9", cwd: "/repo/wt" });
+  await expect(t.lanes.start({ ...START, key: "lane-b", target: { pane: "p9" } })).rejects.toThrow("RUNNER_LANE_TARGET_BUSY");
+});
+
+test("a new tab running cmd.exe is closed and refused before anything is typed", async () => {
+  const t = setup();
+  t.world.processInfo.p1 = { shell_pid: 7, foreground_processes: [{ pid: 7, name: "cmd.exe" }] };
+  await expect(t.lanes.start(START)).rejects.toThrow("RUNNER_LANE_TARGET_INVALID");
+  expect(t.calls.some((a) => a[2] === "run")).toBe(false);
+  expect(t.calls.some((a) => a.join(" ") === "herdr tab close t1")).toBe(true);
+  expect(t.lanes.records()).toEqual({});
+});
+
+test("lane.adopt takes an existing pane with a token file; whoami maps it; recover refuses to relaunch it", async () => {
+  const t = setup();
+  await expect(t.lanes.adopt({ cmdId: "a0", key: "lane-z", pane: "p5", mode: "ulw", model: "m1" })).rejects.toThrow("RUNNER_LANE_PANE_MISSING");
+  t.world.paneGet.p5 = { pane_id: "p5", workspace_id: "w1", tab_id: "t5", cwd: "/repo/z" };
+  const adopted = await t.lanes.adopt({ cmdId: "a1", key: "lane-z", pane: "p5", mode: "ulw", model: "m1" });
+  expect(adopted.result).toEqual({ pane: "p5", tab: "t5", tokenFile: t.lanes.tokenPath("lane-z") });
+  expect(readFileSync(t.lanes.tokenPath("lane-z"), "utf8")).toBe("tok-1");
+  expect(t.lanes.tokenFor("lane-z", "tok-1")).toBe(true);
+  expect(t.lanes.records()["lane-z"]).toMatchObject({ cwd: "/repo/z", adopted: true });
+  expect(t.lanes.keyForPane("p5")).toBe("lane-z");
+  expect(t.published.at(-1)).toEqual(["lane.started", { key: "lane-z", pane: "p5", tab: "t5", session: "" }]);
+  await expect(t.lanes.adopt({ cmdId: "a2", key: "lane-y", pane: "p5", mode: "ulw", model: "m1" })).rejects.toThrow("RUNNER_LANE_TARGET_BUSY");
+  await expect(t.lanes.recover("lane-z")).rejects.toThrow("RUNNER_LANE_ADOPTED");
+});
+
+test("B7: adopt and target start check the pane's effective cwd against allowedRoots (real paths, symlink escape)", async () => {
+  const base = mkdtempSync(join(tmpdir(), "runner-lanes-cwd-"));
+  dirs.push(base);
+  const allowed = join(base, "allowed");
+  const outside = join(base, "outside");
+  mkdirSync(join(allowed, "wt"), { recursive: true });
+  mkdirSync(outside);
+  symlinkSync(outside, join(allowed, "escape"));
+  // The real realpathSync (the runner's default), not the identity the other tests use.
+  const t = setup({ realpath: undefined, policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: [allowed], sandbox: "optional", jobs: "allow" } });
+  const briefs = join(t.runnerDir, "briefs");
+  const tokenFiles = () => (existsSync(briefs) ? readdirSync(briefs).filter((f) => f.endsWith(".token")) : []);
+  const adopt = (key: string, pane: string, cwd?: string) => t.lanes.adopt({ cmdId: key, key, pane, mode: "ulw", model: "m1", ...(cwd ? { cwd } : {}) });
+
+  t.world.paneGet.p1 = { pane_id: "p1", tab_id: "t1", cwd: outside };
+  await expect(adopt("lane-1", "p1")).rejects.toThrow("RUNNER_CMD_REJECTED cwd-outside-roots");
+  t.world.paneGet.p2 = { pane_id: "p2", tab_id: "t2", foreground_cwd: join(allowed, "escape") };
+  await expect(adopt("lane-2", "p2")).rejects.toThrow("RUNNER_CMD_REJECTED cwd-outside-roots");
+  // A permitted body.cwd does not cover the pane's own directory.
+  t.world.paneGet.p3 = { pane_id: "p3", tab_id: "t3", cwd: join(allowed, "wt"), foreground_cwd: outside };
+  await expect(adopt("lane-3", "p3", join(allowed, "wt"))).rejects.toThrow("RUNNER_CMD_REJECTED cwd-outside-roots");
+  expect(t.lanes.records()).toEqual({});
+  expect(tokenFiles()).toEqual([]);
+
+  const shell = { shell_pid: 50, foreground_process_group_id: 50, foreground_processes: [{ pid: 50, name: "bash" }] };
+  for (const [pane, cwd] of [["p8", outside], ["p9", join(allowed, "escape")]] as const) {
+    t.world.paneGet[pane] = { pane_id: pane, workspace_id: "w1", tab_id: `t-${pane}`, cwd };
+    t.world.processInfo[pane] = shell;
+    await expect(t.lanes.start({ ...START, key: `lane-${pane}`, cwd: allowed, target: { pane } })).rejects.toThrow("RUNNER_CMD_REJECTED cwd-outside-roots");
+  }
+  expect(t.calls.some((a) => a[2] === "run")).toBe(false);
+  expect(t.lanes.records()).toEqual({});
+  expect(tokenFiles()).toEqual([]);
+
+  t.world.paneGet.p4 = { pane_id: "p4", tab_id: "t4", cwd: join(allowed, "wt") };
+  expect((await adopt("lane-4", "p4")).result.pane).toBe("p4");
+});
+
+test("send refuses while a question shows when asked to, guarded mode answers sent, and close reads the pane back", async () => {
+  const t = setup();
+  await t.lanes.start(START);
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle" }];
+  t.world.screen = QUESTION;
+  await t.lanes.askTick();
+  const before = t.calls.length;
+  expect((await t.lanes.send("lane-a", "hello", true, { refuseWhileAsking: true })).result).toEqual({ delivery: "failed", refusal: "RUNNER_LANE_ASKING lane-a shows a question prompt; not typed" });
+  expect(t.calls.length).toBe(before);
+  t.world.screen = "❯ \n";
+  expect((await t.lanes.send("lane-a", "hello", false, { mode: "guarded" })).result).toEqual({ delivery: "sent" });
+  expect(t.calls.some((a) => a.join(" ") === "herdr pane send-text p1 hello")).toBe(true);
+  const closedWhileListed = await t.lanes.close("lane-a");
+  expect(closedWhileListed.result).toEqual({ closed: "tab", gone: false });
+  await t.lanes.start({ ...START, key: "lane-b" });
+  t.world.panes = [];
+  expect((await t.lanes.close("lane-b")).result).toEqual({ closed: "tab", gone: true });
+});
+
+test("pause and resume run the lane-control sequences on the lane's pane; a recover keeps the lane's notice", async () => {
+  const t = setup();
+  await t.lanes.start(START);
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle" }];
+  t.world.screen = "❯ \n";
+  const paused = await t.lanes.pause("lane-a", "stop");
+  expect(paused.result).toEqual({ working: false, stopped: true });
+  const resumed = await t.lanes.resume("lane-a");
+  expect(resumed.result.goal).toBe("unconfirmed");
+  await t.lanes.notify({ cmdId: "n", key: "lane-a", status: "paused" });
+  t.world.panes = [];
+  await t.lanes.recover("lane-a");
+  expect(t.lanes.notice("lane-a")).toEqual({ status: "paused" });
+  await expect(t.lanes.notify({ cmdId: "n2", key: "nope", status: "x" })).rejects.toThrow("RUNNER_LANE_UNKNOWN");
 });

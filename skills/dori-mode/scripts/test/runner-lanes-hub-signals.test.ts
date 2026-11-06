@@ -5,6 +5,7 @@ import { eventClass } from "../src/event-policy.ts";
 import { openLaneReports } from "../src/lane-reports.ts";
 import type { RecoveryLane } from "../src/recover.ts";
 import type { Lane } from "../src/registry.ts";
+import { queueLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import type { AnyRunnerEvent, RunnerEventType } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
@@ -66,6 +67,37 @@ test("P2: the owner's lane.state dead raises one urgent RUNNER_LANE_DEAD; workin
   await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "dead", pane: "p1" }));
   expect(t.emitted).toEqual([["runner-lane-dead:worker-a:3", expect.stringMatching(/^RUNNER_LANE_DEAD lane-a runner=worker-a pane=p1 .*dori close lane-a/)]]);
   expect(eventClass(t.emitted[0]?.[1] ?? "")).toBe("lead-urgent");
+});
+
+test("the owner's lane.state dead carries the runner's reason into RUNNER_LANE_DEAD", async () => {
+  const t = await setup();
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "pane-missing" }));
+  expect(t.emitted[0]?.[1]).toStartWith("RUNNER_LANE_DEAD lane-a runner=worker-a pane=p1 reason=pane-missing ");
+});
+
+test("the owner's lane.ack acks the addressed lane message; a wrong lane's or unknown id is LANE_ACK_FAILED; a forged ack changes nothing", async () => {
+  const t = await setup();
+  const messages = openLaneMessages(t.deps.config);
+  cleanups.push(() => { messages.close(); });
+  queueLaneMessage(messages, T0, { id: "m1", lane: "lane-a", subject: "s", text: "t" });
+  queueLaneMessage(messages, T0, { id: "m2", lane: "lane-b", subject: "s", text: "t" });
+  const hub = { ...t.hub, messages: () => messages };
+  await acceptLaneEvent(hub, "worker-a", t.event("lane.ack", { key: "lane-a", id: "m1" }));
+  expect(messages.get("m1")?.state).toBe("acked");
+  await acceptLaneEvent(hub, "worker-a", t.event("lane.ack", { key: "lane-a", id: "m2" }));
+  await acceptLaneEvent(hub, "worker-a", t.event("lane.ack", { key: "lane-a", id: "nope" }));
+  expect(messages.get("m2")?.state).toBe("queued");
+  expect(t.emitted.map(([id]) => id)).toEqual(["lane-ack-failed:worker-a:2", "lane-ack-failed:worker-a:3"]);
+  expect(t.emitted[0]?.[1]).toStartWith("LANE_ACK_FAILED lane-a m2 ");
+  await acceptLaneEvent(hub, "worker-b", t.event("lane.ack", { key: "lane-a", id: "m1" }));
+  expect(t.emitted[2]?.[1]).toStartWith("RUNNER_FORGED_EVENT runner=worker-b key=lane-a type=lane.ack");
+});
+
+test("the hello calls LaneHubDeps.notify for every lane the runner owns, and only those", async () => {
+  const t = await setup();
+  const notified: [string, string][] = [];
+  await reconcileInventory({ ...t.hub, notify: (label, lane) => { notified.push([label, lane.key]); } }, "worker-a", [{ key: "lane-a", pane: "pa", tab: "ta" }]);
+  expect(notified).toEqual([["worker-a", "lane-a"]]);
 });
 
 test("P2: the owner's lane.asking raises urgent LANE_ASKING, as a local lane's question does", async () => {

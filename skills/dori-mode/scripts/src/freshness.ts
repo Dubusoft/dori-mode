@@ -1,11 +1,10 @@
 import { fillHook, languageInstruction } from "./config.ts";
 import { redactSecrets } from "./redact.ts";
-import type { FlowDeps } from "./done-flow.ts";
+import type { FlowDeps, LaneReads } from "./done-flow.ts";
 import type { LaneReportStore } from "./lane-reports.ts";
 import { checkPausedLane } from "./pause.ts";
-import { laneRunner, sendVerified } from "./panes.ts";
 import { type Lane, statusOf } from "./registry.ts";
-import { passthroughView, type SweepView } from "./sweep-view.ts";
+import type { SweepView } from "./sweep-view.ts";
 
 /** Every [REPORT] line of `key` on `screen`, top to bottom. */
 export const reportLines = (screen: string, key: string): string[] => {
@@ -37,15 +36,14 @@ export const relayedText = (key: string, text: string): string => `[System] rela
 export type SweepAct = { readonly kind: "nudged" | "no-progress" | "idle-escalate" | "posted" | "no-report" | "pending-report" | "stale-report" | "working-while-paused"; readonly lane: string; readonly detail: string };
 
 /**
- * The nudge an idle silent lane gets: three ways out, each in the lane's own report form (its footer's): claim done,
- * report a blocker outside the lane, or post a progress line and keep working. One line, since it is typed into the pane.
+ * The nudge an idle silent lane gets: three ways out, each through `dori report` (the lane's runner carries it): claim
+ * done, report a blocker outside the lane, or post a progress line and keep working. One line, since it is typed into
+ * the pane. A remote lane runs the runner's own `dori` (`~/.dori/runner/bin/dori`).
  */
 export const nudgeText = (lane: Lane, silentMin: number, ownerLanguage?: string): string => {
-  const [done, blocked] = lane.machine
-    ? [`print [REPORT] ${lane.key} | done | <merge SHA, closed issue, version> in your own output`, `print [REPORT] ${lane.key} | blocker | <what blocks you> in your own output`]
-    : lane.reportVia === "cli"
-      ? [`claim it: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>"`, `report it: dori report ${lane.key} blocked --text "<what blocks you>"`]
-      : [`claim it: dori claim-done ${lane.key} --evidence "<merge SHA, closed issue, version>"`, `send the lead a [REPORT] ${lane.key} | blocker | <what blocks you> line as your footer says`];
+  const dori = lane.machine ? "~/.dori/runner/bin/dori" : "dori";
+  const done = `claim it: ${dori} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>"`;
+  const blocked = `report it: ${dori} report ${lane.key} blocked --text "<what blocks you>"`;
   const language = languageInstruction(ownerLanguage);
   return `[LEAD] your work thread has had no update for ${silentMin} min. If the deliverable is done and every Done signal is live, ${done}. If you are blocked on something outside this lane, ${blocked}. Otherwise post a 1-2 sentence progress line (done since last, next), keep its status true, and continue the work now.${language ? ` ${language}` : ""}`;
 };
@@ -61,17 +59,18 @@ const lastRowAt = (reports: LaneReportStore): Map<string, number> => {
 
 /**
  * With `reports`, a lane's report rows are its progress: the router already posts them, so a working
- * lane with a row newer than nudgeAfterMin costs no herdr call at all. Its pane is read (nudge, last
+ * lane with a row newer than nudgeAfterMin costs no pane read at all. Its pane is read (nudge, last
  * [REPORT] line) only once no row arrived within nudgeAfterMin, counted from its newest row or reply.
+ * Every read and the nudge go through the lane's runner: `view` (the supervisor round's cached reads), else `deps.ops`.
  */
-export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepView = passthroughView(deps.run), reports?: LaneReportStore): Promise<SweepAct[]> => {
+export const freshnessTick = async (deps: FlowDeps, home: string, view?: SweepView, reports?: LaneReportStore): Promise<SweepAct[]> => {
   const acts: SweepAct[] = [];
   const now = deps.clock.now();
+  const reads: LaneReads = view ?? deps.ops;
   let rows: Map<string, number> | undefined;
   for (const lane of await deps.registry.open()) {
-    const run = laneRunner(deps.run, lane);
     if (statusOf(lane) === "paused") {
-      const checked = await checkPausedLane(deps, lane, view);
+      const checked = view ? await checkPausedLane(deps, lane, view) : await checkPausedLane(deps, lane);
       if (checked && checked.lane.lastFreshnessNote !== "working-while-paused") {
         // Reported once per working stretch (the note clears when the lane goes idle), so the lead can ask; it stays paused.
         await deps.registry.patch(lane.key, (fresh) => (statusOf(fresh) === "paused" ? { lastFreshnessNote: "working-while-paused" } : undefined));
@@ -94,15 +93,16 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
     };
     const hook = deps.config.hooks.threadReply;
     if (silentMin >= deps.config.nudgeAfterMin) {
-      // herdr's own status decides. A working lane is never interrupted and nothing is posted for it: the lead hears
+      // The pane's agent status (read by the lane's runner) decides. A working lane is never interrupted and nothing is posted for it: the lead hears
       // once per silence and decides. No nudge was sent, so this silence never escalates.
-      if ((await view.status(lane)).status === "working") {
+      if ((await reads.status(lane)).status === "working") {
         if (lane.thread !== "none" && (current.lastNudgeAt ?? 0) < heard) {
           await save({ lastNudgeAt: now, idleEscalations: undefined, lastIdleEscalateAt: undefined });
           acts.push({ kind: "no-progress", lane: lane.key, detail: `${silentMin} min without a thread update while working` });
         }
       } else if ((current.lastNudgeAt ?? 0) < heard) {
-        const delivery = await sendVerified(run, deps.clock, lane.pane, nudgeText(lane, silentMin, deps.config.ownerLanguage));
+        // A question prompt on the lane's screen is the owner's to answer: the runner refuses to type over it.
+        const delivery = await deps.ops.send(lane, nudgeText(lane, silentMin, deps.config.ownerLanguage), { refuseWhileAsking: true });
         if (delivery !== "failed") {
           await save({ lastNudgeAt: now, idleEscalations: 0, lastIdleEscalateAt: undefined });
           acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
@@ -125,7 +125,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string, view: SweepVie
       }
     }
     if (silentMin >= deps.config.postAfterMin && hook && lane.thread !== "none" && (current.lastAutoReplyAt ?? 0) < heard) {
-      const report = lastReportLine(await view.screen(lane, 200), lane.key);
+      const report = lastReportLine(await reads.screen(lane, 200), lane.key);
       // The two reads are a full loop interval apart: a line counts only once it is still there on the next tick.
       const seenBefore = current.lastSeenReport;
       const lastSeenReport = report ?? undefined;

@@ -3,7 +3,8 @@ import { expect, test } from "bun:test";
 import type { Runner } from "../src/run.ts";
 import { criticalReasons, guardTick, sampleHost } from "../src/host-guard.ts";
 import { laneMemory, type Proc, procLanes, sampleProcs } from "../src/lane-memory.ts";
-import { guardAlertDetail, WARN_COOLDOWN_MS, warnHeaviestLane } from "../src/supervise-loop.ts";
+import { guardAlertDetail, laneMemoryOf, WARN_COOLDOWN_MS, warnHeaviestLane } from "../src/supervise-loop.ts";
+import { fakeLaneOps, newWorld, sent } from "./fakes.ts";
 import type { DoriConfig } from "../src/config.ts";
 import type { Lane } from "../src/registry.ts";
 
@@ -41,78 +42,87 @@ test("sampleProcs reads the lane from each environment and skips unreadable ones
 
 const openLane = (key: string, extra: Partial<Lane> = {}): Lane => ({ key, title: key, thread: "t", brief: "b", done: "d", openedAt: "x", pane: `w:${key}`, ...extra });
 
-const herdr = (agentPanes: string[]) => {
-  const sent: string[][] = [];
-  const run: Runner = async (argv) => {
-    if (argv[1] === "pane" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { panes: agentPanes.map((p) => ({ pane_id: p, workspace_id: "w", agent: "omo", agent_status: "working" })) } }), err: "" };
-    if (argv[1] === "pane" && argv[2] === "read") return { code: 0, out: "❯ ", err: "" };
-    sent.push([...argv]);
-    return { code: 0, out: "", err: "" };
-  };
-  return { run, sent };
+/** A World with these agent panes; its facade records every send. */
+const lanesWorld = (agentPanes: string[]) => {
+  const w = newWorld();
+  w.panes = agentPanes.map((p) => ({ pane_id: p, workspace_id: "w", agent: "omo", agent_status: "working" }));
+  return { w, ops: fakeLaneOps(w) };
 };
 
-test("on a memory alert the heaviest open local lane is warned in its pane and the ALERT says so", async () => {
-  const { run, sent } = herdr(["w:emu-lane", "w:small-lane"]);
-  const deps = { run, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane"), openLane("small-lane")] } };
+test("on a memory alert the heaviest open local lane is warned through its runner and the ALERT says so", async () => {
+  const { w, ops } = lanesWorld(["w:emu-lane", "w:small-lane"]);
+  const deps = { ops, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane"), openLane("small-lane")] } };
   const sample = { load1: 1, memFreePct: 4, diskFreeGb: 200, swapFreeGb: 0.1, swapTotalGb: 4, panes: 3 };
-  const detail = await guardAlertDetail(deps as never, sample, async () => procs);
+  const detail = await guardAlertDetail(deps as never, sample, laneMemory(procs));
   const t = { loadAlert: 150, loadOk: 80, memFreeMinPct: 10, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 0 };
   const [alert] = guardTick(sample, t, { alerting: false }, detail);
   expect(alert).toBe("HOST_GUARD ALERT memory free 4% < 10%; lanes by memory: emu-lane 4.4 GB (qemu-system-x86 3.8 GB, node x2 488 MB, omo 98 MB), "
     + "small-lane 264 MB (omo 146 MB, adb 68 MB, tsserver 49 MB); warned emu-lane in its pane w:emu-lane");
-  expect(sent[0]?.slice(0, 4)).toEqual(["herdr", "pane", "send-text", "w:emu-lane"]);
-  expect(sent[0]?.[4]).toStartWith("[System] HOST_GUARD memory warning: memory free 4% < 10% on this host, and this lane (emu-lane) uses the most memory: emu-lane 4.4 GB");
-  expect(sent[1]).toEqual(["herdr", "pane", "send-keys", "w:emu-lane", "enter"]);
+  const sends = w.ops.filter((e) => e.op === "send");
+  expect(sends.map((e) => e.key)).toEqual(["emu-lane"]);
+  expect(sends[0]?.args).toMatchObject({ opts: { mode: "guarded", refuseWhileAsking: true } });
+  expect(sent(w)[0]).toStartWith("[System] HOST_GUARD memory warning: memory free 4% < 10% on this host, and this lane (emu-lane) uses the most memory: emu-lane 4.4 GB");
+});
+
+test("the lanes by memory come from the runner's sample; without them the ALERT carries no detail", async () => {
+  const { w, ops } = lanesWorld(["w:emu-lane"]);
+  const deps = { ops, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane")] } };
+  const sample = { load1: 1, memFreePct: 4, diskFreeGb: 200, swapFreeGb: 0.1, swapTotalGb: 4, panes: 3 };
+  expect(await guardAlertDetail(deps as never, sample, undefined)).toBeUndefined();
+  const body = [{ key: "emu-lane", rssKb: 4_600_000, top: [{ comm: "qemu-system-x86", rssKb: 4_000_000, count: 1 }] }];
+  expect(laneMemoryOf(body)).toEqual([{ lane: "emu-lane", rssKb: 4_600_000, top: [{ comm: "qemu-system-x86", rssKb: 4_000_000, count: 1 }] }]);
+  expect(await guardAlertDetail(deps as never, { ...sample, memFreePct: 50 }, laneMemoryOf(body))).toBe("lanes by memory: emu-lane 4.4 GB (qemu-system-x86 3.8 GB)");
+  expect(w.ops).toEqual([]);
 });
 
 test("a disk-only alert lists the lanes but warns nobody", async () => {
-  const { run, sent } = herdr(["w:emu-lane"]);
-  const deps = { run, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane")] } };
-  const detail = await guardAlertDetail(deps as never, { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, swapTotalGb: 8, panes: 3 }, async () => procs);
+  const { w, ops } = lanesWorld(["w:emu-lane"]);
+  const deps = { ops, config: { guard: { memFreeMinPct: 10 } } as DoriConfig, registry: { open: async () => [openLane("emu-lane")] } };
+  const detail = await guardAlertDetail(deps as never, { load1: 1, memFreePct: 50, diskFreeGb: 5, swapFreeGb: 4, swapTotalGb: 8, panes: 3 }, laneMemory(procs));
   expect(detail).toStartWith("lanes by memory: emu-lane 4.4 GB");
   expect(detail).not.toContain("warned");
-  expect(sent).toEqual([]);
+  expect(sent(w)).toEqual([]);
 });
 
 test("a heaviest lane that is remote or closed is not swapped for a lighter one", async () => {
-  const { run, sent } = herdr(["w:small-lane"]);
+  const { w, ops } = lanesWorld(["w:small-lane"]);
   const lanes = laneMemory(procs);
-  expect(await warnHeaviestLane(run, lanes, [openLane("emu-lane", { machine: "mac" }), openLane("small-lane")], "memory free 4% < 10%")).toBe("not typed: heaviest lane emu-lane is not open here");
-  expect(await warnHeaviestLane(run, lanes, [openLane("small-lane")], "memory free 4% < 10%")).toBe("not typed: heaviest lane emu-lane is not open here");
-  expect(await warnHeaviestLane(run, [], [openLane("small-lane")], "memory free 4% < 10%")).toBe("no open local lane to warn");
-  expect(sent).toEqual([]);
+  expect(await warnHeaviestLane(ops, lanes, [openLane("emu-lane", { machine: "mac" }), openLane("small-lane")], "memory free 4% < 10%")).toBe("not typed: heaviest lane emu-lane is not open here");
+  expect(await warnHeaviestLane(ops, lanes, [openLane("small-lane")], "memory free 4% < 10%")).toBe("not typed: heaviest lane emu-lane is not open here");
+  expect(await warnHeaviestLane(ops, [], [openLane("small-lane")], "memory free 4% < 10%")).toBe("no open local lane to warn");
+  expect(sent(w)).toEqual([]);
 });
 
 test("a heaviest lane under 1 GB is not typed into", async () => {
-  const { run, sent } = herdr(["w:small-lane"]);
+  const { w, ops } = lanesWorld(["w:small-lane"]);
   const lanes = laneMemory(procs.filter((p) => p.lane !== "emu-lane" && p.pid < 10 || p.pid >= 20));
   expect(lanes[0]?.lane).toBe("small-lane");
-  expect(await warnHeaviestLane(run, lanes, [openLane("small-lane")], "memory free 4% < 10%")).toBe("not typed: heaviest lane small-lane is below 1.0 GB");
-  expect(sent).toEqual([]);
+  expect(await warnHeaviestLane(ops, lanes, [openLane("small-lane")], "memory free 4% < 10%")).toBe("not typed: heaviest lane small-lane is below 1.0 GB");
+  expect(sent(w)).toEqual([]);
 });
 
 test("a lane warned in its pane is not warned again for 30 minutes", async () => {
-  const { run, sent } = herdr(["w:emu-lane"]);
+  const { w, ops } = lanesWorld(["w:emu-lane"]);
   const lanes = laneMemory(procs);
   const open = [openLane("emu-lane")];
   const warnedAt = new Map<string, number>();
   let t = 1_000_000;
   const now = () => t;
-  expect(await warnHeaviestLane(run, lanes, open, "r", warnedAt, now)).toBe("warned emu-lane in its pane w:emu-lane");
+  expect(await warnHeaviestLane(ops, lanes, open, "r", warnedAt, now)).toBe("warned emu-lane in its pane w:emu-lane");
   t += 5 * 60_000;
-  expect(await warnHeaviestLane(run, lanes, open, "r", warnedAt, now)).toBe("not typed: emu-lane was warned 5 min ago");
-  expect(sent.length).toBe(2);
+  expect(await warnHeaviestLane(ops, lanes, open, "r", warnedAt, now)).toBe("not typed: emu-lane was warned 5 min ago");
+  expect(sent(w).length).toBe(1);
   t += WARN_COOLDOWN_MS;
-  expect(await warnHeaviestLane(run, lanes, open, "r", warnedAt, now)).toBe("warned emu-lane in its pane w:emu-lane");
-  expect(sent.length).toBe(4);
+  expect(await warnHeaviestLane(ops, lanes, open, "r", warnedAt, now)).toBe("warned emu-lane in its pane w:emu-lane");
+  expect(sent(w).length).toBe(2);
 });
 
-test("a lane on a question prompt is not typed into", async () => {
-  const { run, sent } = herdr(["w:emu-lane"]);
-  const lanes = laneMemory(procs);
-  expect(await warnHeaviestLane(run, lanes, [openLane("emu-lane", { lastAskPrompt: "Which one?" } as Partial<Lane>)], "memory free 4% < 10%")).toBe("not typed: emu-lane is on a question prompt");
-  expect(sent).toEqual([]);
+test("a warning the runner refuses (the lane shows a question prompt) is reported as not typed", async () => {
+  const { w, ops } = lanesWorld(["w:emu-lane"]);
+  w.sendDelivery = "failed";
+  const warnedAt = new Map<string, number>();
+  expect(await warnHeaviestLane(ops, laneMemory(procs), [openLane("emu-lane")], "memory free 4% < 10%", warnedAt)).toBe("could not warn emu-lane in its pane w:emu-lane");
+  expect(warnedAt.size).toBe(0);
 });
 
 test("memory turning low while already alerting for disk emits one more ALERT line", () => {

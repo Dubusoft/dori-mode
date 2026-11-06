@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openOperations, plan, type OperationStore } from "../src/operations.ts";
-import { LivenessMonitor, type ProbeOutcome } from "../src/runner/liveness.ts";
+import { LivenessMonitor, livenessIo, type ProbeOutcome } from "../src/runner/liveness.ts";
+import type { Runner } from "../src/run.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -98,6 +99,22 @@ test("a hello that arrives while the restart command is still running verifies t
   expect(r.restarts).toEqual([180_000]);
   expect(r.lines).toContain("RUNNER_RESTARTED machine=worker-a gen=2");
   expect(r.operations.get("runner:worker-a/restart/7-1")?.state).toBe("verified");
+});
+
+test("the local runner is restarted through the supervisor's child, never a systemd unit; a worker over ssh", async () => {
+  const argv: string[][] = [];
+  const run: Runner = async (a) => { argv.push([...a]); return { code: 0, out: "", err: "" }; };
+  let childRestarts = 0;
+  const io = livenessIo(run, "local", async () => [{ label: "worker-a", target: "u@a" } as never], async () => { childRestarts += 1; });
+  expect(await io.restart("local")).toEqual({ ok: true, detail: "child restart" });
+  expect(childRestarts).toBe(1);
+  expect(argv).toEqual([]);
+  expect((await io.restart("worker-a")).ok).toBe(true);
+  expect(argv).toHaveLength(1);
+  expect(argv[0]?.[0]).toBe("ssh");
+  // Without the child hook a local restart fails instead of touching systemd.
+  expect((await livenessIo(run, "local", async () => []).restart("local")).ok).toBe(false);
+  expect(argv).toHaveLength(1);
 });
 
 test("restarts from before a supervisor restart still count toward the circuit", async () => {

@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
@@ -13,6 +13,7 @@ import { resolveEventPolicy } from "../src/event-policy.ts";
 import { JsonLaneReports, type LaneReportStore, SqliteLaneReports } from "../src/lane-reports.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind, WAKES_FILE } from "../src/store.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
+import { healthPath } from "../src/runner/health.ts";
 import { collectStatus, kst, lookupStatus, renderStatus, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
@@ -361,6 +362,20 @@ test("RUNNER lanes= follows the registry's open lanes on each runner's machine, 
   await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
   expect(await counts()).toEqual({ local: 1, macbook: 1 });
   expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER macbook connected .* lanes=1$/m);
+});
+
+test("the local runner row is always shown, with its child's state from the health file, even before the hub ever opened", async () => {
+  const f = await fixture();
+  // No runners.sqlite and no runners section: still RUNNER local, offline, no child state without a runner dir.
+  expect((await collectStatus(f.deps)).runners).toEqual([{ label: "local", state: "offline", gen: 0, cmds: 0, restarts1h: 0, lanes: 0 }]);
+  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0$/m);
+  const runnerDir = join(f.dir, "runner");
+  expect((await collectStatus({ ...f.deps, runnerDir })).runners?.[0]?.child).toEqual({ verdict: "dead" });
+  mkdirSync(runnerDir, { recursive: true });
+  writeFileSync(healthPath(runnerDir), `${JSON.stringify({ pid: process.pid, gen: 3, monotonicMs: 1, wallAt: NOW })}\n`);
+  utimesSync(healthPath(runnerDir), new Date(NOW - 5_000), new Date(NOW - 5_000));
+  const text = renderStatus(await collectStatus({ ...f.deps, runnerDir }));
+  expect(text).toMatch(new RegExp(`^RUNNER local offline .* lanes=0 child=healthy pid=${process.pid} health=5s$`, "m"));
 });
 
 test("a claude-quota.json left by the removed quota gate is ignored", async () => {

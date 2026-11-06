@@ -2,8 +2,8 @@
 
 The runner is a small per-machine process (`dori runner serve`) that talks to the supervisor over one line-based
 connection: a unix socket on the lead host, or a WebSocket on a private address for other machines. Both sides
-authenticate every connection. A runner reports what it sees on its machine. On a worker whose `runners.mode` is
-`authoritative` it also starts, steers and closes the lanes launched there (below), and every worker's runner guards
+authenticate every connection. A runner reports what it sees on its machine and owns every lane there: it starts,
+steers and closes them (below), local lanes included. Each runner also guards
 its host: it samples memory, load and disk, and under critical memory kills its lanes' heavy processes. Commands it
 does not carry out are answered with a refusal or `RUNNER_CMD_UNSUPPORTED`.
 The modules live in `scripts/src/runner/`; see [development.md](development.md) for the module table and
@@ -36,16 +36,17 @@ Control frames, used in this release:
 
 - Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
-  `cmd.status.result {cmdId, state, detail?}`.
+  `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
-  `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`.
+  `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`, and the queries `q.panes`,
+  `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3).
 
 `hello` must be the first frame on a connection (after an `enroll` connection has closed). After the handshake
 (below) the hub applies its hello rules: `RUNNER_PROTO_MISMATCH` when the protocol version isn't accepted, then the
 fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
-`wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. Today
+`lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. Today
 a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, `lane.started`, `lane.report` and
 the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
 `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `runner.rotate`)
@@ -56,6 +57,49 @@ answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, a carried-out one `cmd.
 accepted one that this release cannot carry out yet `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Both get an
 intent row and a final row, so `cmdAck` moves past them and they are not sent again. A command with an unknown type
 or field still gets an answer instead of being dropped.
+
+Protocol 3 adds, all optional on existing frames:
+
+| Frame | Addition |
+|---|---|
+| `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane |
+| `lane.ack {key, id}` | new event: the lane confirmed the supervisor's lane message `id` |
+| `guard.sample` | `panes` (herdr's pane count) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
+| `cmd.result` | `result`: the effect's structured result (any JSON value; below) |
+| `lane.start` | `keywords`, `session`, `target {pane?, workspace?}`, `heavySlots`, `heavyMaxLoad` |
+| `lane.adopt {key, pane, cwd?, mode, model}` | new command: take an existing pane as lane `key` |
+| `lane.pause` | `step` (`goal`, `stop` or `both`, default `both`) |
+| `lane.recover` | `session` (resume that agent session when relaunching) |
+| `lane.send` | `mode` (`verified` or `guarded`), `refuseWhileAsking` |
+| `lane.notify {key, status, objection?: {at, reasons}, claim?: {at, evidence}}` | new command: the lane's status as the supervisor holds it |
+| `lane.git {key, op, root, path?, branch?, remote?}` | new command: `worktree-remove`, `branch-delete` or `remote-branch-delete` in `root` |
+
+A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
+{verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
+`lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal}`,
+`lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
+`lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`. A runner effect that only returns a
+detail sends no `result`. The supervisor never sends a protocol 3 command or any query to a runner that said hello
+with protocol 2: such a call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
+
+## Queries
+
+Reads (screens, pane lists, process info, path existence, lane and machine facts) are control frames, not commands:
+they carry no `seq` or `cmdSeq`, go through no outbox and no journal, get no intent or result row, and are not
+epoch-fenced (they change nothing). Each `q.*` body has a `qid`; the runner answers it with one `q.result {qid, ok,
+detail, result?}` on the same connection, sealed like every frame. A query sent while the link is down is not sent at
+all, and an answer whose connection has closed is dropped: the caller times out and asks again on its next pass.
+
+| Query | Body | `result` when `ok` |
+|---|---|---|
+| `q.panes` | `{qid}` | `{panes}`: herdr's pane list of the runner's host |
+| `q.screen` | `{qid, pane, lines, source: visible\|recent}` | `{text}` (at most 400 lines; `lines` ignored for `visible`) |
+| `q.process` | `{qid, pane}` | `{info?, error?}`: herdr's process-info |
+| `q.stat` | `{qid, paths}` | `{exists}`, one boolean per path |
+| `q.lane.inspect` | `{qid, key, cwd?, git?, roots?, branches?, done?, doneCwd?, session?, sessionsDir?}` | `{status, pane?, process?, cwd, cwdExists, git?, done?, session?}` |
+| `q.machine.observe` | `{qid}` | `{os, sampledAt, sample, panes}` |
+
+A `q.result` must fit one frame (1 MiB). `ok: false` carries the reason in `detail`.
 
 ## Authentication
 
@@ -122,7 +166,7 @@ refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAIL
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
 | `allowedRoots` | directories every `cwd` must be under | none |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
-| `jobs` | `deny` refuses `job.run` and `wait.check` | `allow` |
+| `jobs` | `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with `done` | `allow` |
 | `guard` | this host's guard thresholds (`loadAlert`, `loadOk`, `memFreeMinPct`, `memFreeCritPct`, `swapFreeCritPct`, `diskFreeMinGb`, `panesMax`), each optional | the config's `guard` |
 | `heavyKill` | command-line patterns killed under critical memory | the config's `heavyKill` |
 
@@ -130,7 +174,8 @@ A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule
 `unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
 (compared by path segment after resolving symlinks on both sides, so `/data/repos-evil` is not under `/data/repos`),
 `sandbox-required`, `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
-`guard.kill` accepts only lane keys.
+`guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
+`lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
 
 ## Fencing
 
@@ -193,7 +238,7 @@ Everything lives under `~/.dori/runner`:
 | Path | What |
 |---|---|
 | `runner.json` | identity `{id, label, hostId}` |
-| `state.sqlite` (+ `-wal`, `-shm`) | `gen`, highest seen epoch, command rows (kept 30 days) |
+| `state.sqlite` (+ `-wal`, `-shm`) | `gen`, highest seen epoch, command rows with their detail and structured result (kept 30 days) |
 | `outbox.sqlite` (+ `-wal`, `-shm`) | the outbox |
 | `bodies/<seq>.body` | moved report and job bodies |
 | `keys/runner.key`, `keys/supervisor.pub` | the runner's private key and the pinned supervisor key (`keys/runner.next.key` during a rotation) |
@@ -279,63 +324,19 @@ from the file's mtime, so it is measured on the host's own clock.
 | `stalled` | the pid is alive and the file is 60 to 120 s old | 1 |
 | `dead` | no file, no such process, or the file is older than 120 s | 1 |
 
-## Shadow mode
+## Shadow mode (removed)
 
-A runner is in shadow mode when the config's `runners.mode` maps its label to `"shadow"`; unnamed labels are
-`"off"`. Without a `runners` section the supervisor opens no hub and nothing changes. In shadow mode the local
-runner reads the registry's open local lanes and herdr's pane list every 30 seconds, publishes
-`lane.state {key, status, pane}` when a lane's status or pane changes, and sends the latest list as the hello
-inventory. A lane it no longer sees is forgotten, so it is published again if it comes back. `pane` was added in
-protocol 2; a protocol 1 runner leaves it out, and the supervisor then relies on the hello inventory alone. It never
-starts, stops or edits a lane.
+Shadow mode is gone. The supervisor always opens the hub, `dori supervise` always spawns the local runner as its
+child (label `local`), and every lane is runner-owned. A leftover `runners.mode` in the config is ignored, with one
+`CONFIG_RUNNERS_MODE_REMOVED` warning per process. `dori runner shadow-report` was removed with it, nothing is
+compared against a legacy path any more, and a `shadow_diffs` table left in `runners.sqlite` is ignored.
+
+## Liveness rule
 
 A lane's agent is alive when its pane is in herdr's pane list and its `agent_status` is `idle`, `working`, `blocked`
 or `done` (`paneAlive` in `panes.ts`). Both sides use that rule: the runner reports no pane as `missing`, a pane
 whose agent is not alive as `dead`, and an alive one as `working` or `idle`; the supervisor applies it to its own
 pane list for the runner's machine. A paused lane whose pane is gone is therefore not alive on either side.
-
-A runner started with `--connect` is a worker's runner. It has no registry, so it always observes its host on the
-same 30-second timer. A pane belongs to a lane when one of its foreground processes (from `herdr pane
-process-info`) has `DORI_LANE_KEY` in its environment or inherits it from an ancestor. For each such pane it also
-hashes the newest `[REPORT]` line in the pane's last 200 lines and publishes `lane.progress {key, reportHash}` when
-that hash changes. The line itself never leaves the host. The supervisor compares only the labels its own
-`runners.mode` marks `shadow`. For a remote lane it also compares the runner's hash with the hash of the line its
-own screen scraping recorded (`Lane.lastRemoteReport`), as `kind=lane.report field=latest`.
-
-On the supervisor, the `runners` task (every 5 seconds, under the usual watchdog) compares what the runner reported
-with what the legacy path sees. Per lane it compares the pane id (the registry's against the runner's, taken from
-the hello inventory and replaced by the `pane` of each later `lane.state`) and whether the agent is alive. If the
-supervisor can't read the pane list for a runner's machine in a pass, it logs the error and compares no lane states
-for that runner in that pass. A lane that is closed (archived and no longer open) is dropped from the runner's side
-and never reported; a key that is neither open nor archived is still `missing-in-legacy`.
-
-The runner observes every 30 seconds while the supervisor compares every 5, so a difference is reported with its
-class only once it has lasted the settle window of 65 seconds (two observation periods plus 5 seconds). One that goes
-away sooner is logged once as `timing`. A reported difference that persists is reported again only after another
-full settle window:
-
-```
-RUNNER_SHADOW_DIFF runner=<label> class=<c> kind=<k> lane=<key> gen=<n> field=<f> runnerHash=<h|-> legacyHash=<h|->
-```
-
-| Class | Meaning |
-|---|---|
-| `missing-in-runner` | the legacy path has the value, the runner doesn't |
-| `missing-in-legacy` | the runner has the value, the legacy path doesn't |
-| `value-differs` | both have it, with different values |
-| `timing` | a difference that went away within the settle window; not a failure |
-
-Every reported difference is also stored in `<stateDir>/runners.sqlite` (table `shadow_diffs`). `dori runner
-shadow-report [--runner <label>]` prints one line per runner,
-`RUNNER_SHADOW_REPORT runner=<label> failures=<n> missing-in-runner=<n> missing-in-legacy=<n> value-differs=<n> timing=<n>`,
-where `failures` counts every class but `timing`, or `RUNNER_SHADOW_REPORT none` when nothing was recorded. With
-`--runner`, a runner the hub knows that has no stored difference prints its line with every count 0.
-
-The `gen` in a `RUNNER_SHADOW_DIFF` line is the lane generation (the lane's `lastRecoveryAt`, or 0 for a lane never
-recovered), not the runner's boot generation that `dori status` shows as `RUNNER <label> ... gen=<n>`.
-
-Values are compared as short sha256 hashes. Guard verdicts compare level and reasons, never raw figures. If the
-hub can't open (an unsafe directory, a bad socket file) the supervisor logs `RUNNER_HUB_DISABLED` and keeps running.
 
 ## Compatibility
 
@@ -343,6 +344,9 @@ Because validation rejects unknown fields, a new field, optional or not, is a pr
 in the schema and bump `PROTO`. The hub accepts runners at its own protocol version and one below (N and N-1),
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
+
+The current protocol is 3, so a supervisor accepts runners at 3 and 2. The runner's `state.sqlite` gained the
+nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
 
 ## Liveness and restarts
 
@@ -396,6 +400,11 @@ never runs the command again on restart. It settles it from what herdr shows:
 
 Each outcome goes out as `cmd.result` (`RUNNER_CMD_RECOVERED` in the runner's log).
 
+A command whose `cmdId` already has a final record is not checked or run again: the runner answers it once more with
+that record's `cmd.result` (state, detail and stored `result`, with the record's `cmdSeq`) and logs
+`RUNNER_CMD_REPLAYED`, so a supervisor that resends an operation gets its answer. A `cmdId` still at `intent` (its
+effect is running, or a restart will settle it as above) is left alone.
+
 After its own restart the supervisor reads an attempted command back with `cmd.status`. A runner with no record of
 it (`unknown`, for example after its state was lost) is not sent the same command again. The supervisor asks
 `lane.observe` instead:
@@ -408,10 +417,10 @@ Command records are kept 30 days.
 
 ## Runner-owned lanes
 
-`runners.mode.<label>` decides how new lanes start on a worker. With `authoritative`, `dori launch --machine <label>`
-starts the lane through that machine's runner; `shadow`, `off` and no entry keep the direct herdr path. `off` stops
-new runner launches only: a lane a runner already owns keeps reporting and being controlled through it until it
-closes, so nothing it sends is lost.
+Every lane is runner-owned. `dori launch` starts a local lane through the local runner, the supervisor's child, and
+`dori launch --machine <label>` starts it through that machine's runner. There's no direct herdr path and no mode
+that picks one: `runners.mode` is ignored (`CONFIG_RUNNERS_MODE_REMOVED`). A lane whose runner is down waits for it,
+and losing a runner never hands the lane back to the supervisor.
 
 **Launch.** `dori launch` registers the lane at once with `runner: <label>` and appends the runner footer to the
 brief. It then queues `lane.start` for the supervisor (`runner_admin` in `runners.sqlite`), which sends it once the
@@ -439,13 +448,7 @@ accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dor
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not
-have) is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). The one exception is a shadow runner's
-observation: a `lane.state` or `lane.progress` from a runner whose `runners.mode` is `shadow`, about an open lane that
-no runner owns on that runner's own machine (no `machine` for the local runner, `machine` equal to the label for a
-worker's), goes only to the shadow comparison and is not journaled. These two types only report what the runner sees.
-The same runner's `lane.started`, `lane.report` or `lane.asking` about such a lane would act on it, so they are still
-forged, as is an observation about a closed lane, another machine's lane, another runner's lane, or from a runner
-not in shadow mode. A `lane.report` becomes a row of the lane
+have) is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). A `lane.report` becomes a row of the lane
 report store whose `source` is the event's journal id (`runner:<label>:<seq>`), so the same event never makes two
 rows. From there it is routed exactly as a local `dori report`: a done report becomes the claim through `claimDone`
 (the same evidence again is `LANE_DONE_ALREADY_CLAIMED`); the rest is journaled or posted to the thread. The

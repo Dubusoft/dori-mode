@@ -12,6 +12,14 @@ import { Supervisor } from "../src/supervise.ts";
 import { Waits } from "../src/waits.ts";
 import { depsFor, fakeClock, manualPause, newWorld, withState } from "./fakes.ts";
 
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
+
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   mock.restore();
@@ -19,7 +27,6 @@ afterEach(() => {
 });
 
 const T0 = 1_800_000_000_000;
-const DF = "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200";
 const OWNER = "123456789012345";
 const MESSAGE = "1900000000000000001";
 const REPORT = "LANE_REPORT demo-lane journaled before the supervisor started";
@@ -36,7 +43,8 @@ const until = (subscribe: (signal: () => void) => () => void, check: () => boole
 
 /**
  * The real supervise(), where the work of `stalled` hangs until the test ends: the inbound Discord
- * catch-up, the delivery task's owner delay notice, the guard sweep's df, or the GitHub poll's gh api call (a wait check
+ * catch-up, the delivery task's owner delay notice, the machine-guard sweep's `herdr machine list` (the host guard reads the
+ * local runner's sample and runs nothing), or the GitHub poll's gh api call (a wait check
  * has its own 10 s budget, so it cannot hold the polling task).
  */
 const setup = (stalled: SupervisorTask) => {
@@ -84,14 +92,14 @@ const setup = (stalled: SupervisorTask) => {
     const ok = new Response(JSON.stringify({ id: "33" }), { status: 200 });
     return stalled === "delivery" && body.includes(base.config.ownerDelayNotice) ? hang(ok) : ok;
   }, { preconnect: fetch.preconnect }));
-  const done = { df: 0, gh: 0 };
+  const done = { machines: 0, gh: 0 };
   const deps = {
     ...base,
     run: async (argv: readonly string[]): Promise<Ran> => {
-      if (argv[0] === "df") {
-        const ran = { code: 0, out: DF, err: "" };
+      if (argv.join(" ") === "herdr machine list --json") {
+        const ran = { code: 0, out: "[]", err: "" };
         if (stalled === "sweeps") return hang(ran);
-        done.df++;
+        done.machines++;
         changed();
         return ran;
       }
@@ -126,7 +134,7 @@ const setup = (stalled: SupervisorTask) => {
   const pause = (ms: number, signal: AbortSignal) => { const parked = pauses.pause(ms, signal); changed(); return parked; };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `supervise-tasks-test-${state.dir}`, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
+    token: `supervise-tasks-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
     open: () => {
       let closed = (_code: number) => {};
       return {
@@ -141,7 +149,7 @@ const setup = (stalled: SupervisorTask) => {
     // The inbound pass ends with the gateway heartbeat.
     inbound: () => existsSync(gatewayStatusPath(state.dir)),
     delivery: () => existsSync(log) && readFileSync(log, "utf8").includes(REPORT),
-    sweeps: () => done.df > 0,
+    sweeps: () => done.machines > 0,
     polling: () => done.gh > 0,
   };
   const subscribe = (signal: () => void) => {
@@ -150,9 +158,9 @@ const setup = (stalled: SupervisorTask) => {
     return () => { listeners.delete(signal); watcher.close(); };
   };
   const stop = async () => { controller.abort(); release(); await running; };
-  // Once the three working tasks and the stall check are parked, each takes its next pass.
+  // Once the three working tasks, the runners task (the hub always opens) and the stall check are parked, each takes its next pass.
   const next = async () => {
-    await until(subscribe, () => pauses.parked() === 4, 10_000, "the three working tasks and the stall check parked");
+    await until(subscribe, () => pauses.parked() === 5, 10_000, "the three working tasks, the runners task and the stall check parked");
     pauses.tick();
   };
   return { clock, errors, posts, hung, working, subscribe, stop, next };

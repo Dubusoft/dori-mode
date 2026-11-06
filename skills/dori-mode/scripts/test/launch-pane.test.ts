@@ -2,8 +2,11 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { footer, footerDoneRules, LaunchError, launchLane, LEGACY_LANE_MCP, STARTUP_POLL_MS, STARTUP_POLLS, validateLaunch } from "../src/launch.ts";
+import { footer, footerDoneRules, LaunchError, launchLane, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
+import { LaneOpsError, laneOps, type StartInput } from "../src/lane-ops.ts";
 import type { Lane } from "../src/registry.ts";
+import type { RunnerCall } from "../src/runner/call.ts";
+import type { LaneInspection } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -20,32 +23,19 @@ afterEach(() => state.done());
 
 type PaneSpec = { agent?: string; fgPgid?: number; workspace?: string };
 
-/** deps whose herdr answers pane get / process-info for `w:p3` (a shell pane in `wt`), plus whatever `world.panes` lists. */
+/** deps whose runner lists `w:p3` (a shell pane in `wt`, tab `w:t7`), answers its process info, and starts lanes in it. */
 const deps = (spec: PaneSpec | null = {}) => {
   const base = depsFor(world, fakeClock(T0), state.dir);
-  world.panes = [{ pane_id: "w:p3", workspace_id: spec?.workspace ?? "w", ...(spec?.agent ? { agent: spec.agent, agent_status: "idle" } : {}) }];
-  return {
-    ...base,
-    run: async (argv: readonly string[]) => {
-      const [cmd, a1, a2, a3] = argv;
-      if (cmd === "herdr" && a1 === "pane" && a2 === "get") {
-        if (!spec || a3 !== "w:p3") { world.calls.push([...argv]); return { code: 1, out: "", err: "pane not found" }; }
-        world.calls.push([...argv]);
-        const pane = { pane_id: "w:p3", workspace_id: spec.workspace ?? "w", tab_id: "w:t7", cwd: wt, foreground_cwd: wt, ...(spec.agent ? { agent: spec.agent } : {}) };
-        return { code: 0, out: JSON.stringify({ result: { pane } }), err: "" };
-      }
-      if (cmd === "herdr" && a1 === "pane" && a2 === "process-info") {
-        world.calls.push([...argv]);
-        return { code: 0, out: JSON.stringify({ result: { process_info: { shell_pid: 100, foreground_process_group_id: spec?.fgPgid ?? 100 } } }), err: "" };
-      }
-      return base.run(argv);
-    },
-  };
+  world.panes = spec ? [{ pane_id: "w:p3", workspace_id: spec.workspace ?? "w", tab_id: "w:t7", cwd: wt, ...(spec.agent ? { agent: spec.agent, agent_status: "idle" } : {}) }] : [];
+  // The directories here are outside git: the placement check has nothing to compare.
+  world.inspection = { process: { shell_pid: 100, foreground_process_group_id: spec?.fgPgid ?? 100 }, git: undefined } as Partial<LaneInspection>;
+  world.startResult = { pane: "w:p3", tab: "w:t7", startup: { verdict: "ok", detail: "ready" } };
+  return base;
 };
 
 const input = (extra: Record<string, string> = {}) => ({ key: "pane-lane", title: "t", brief: join(state.dir, "brief.md"), done: "closed acme/app#3", ...extra });
 const writeBrief = () => Bun.write(join(state.dir, "brief.md"), "goal: do it\n");
-const herdr = (sub: string, action: string) => world.calls.filter((c) => c[0] === "herdr" && c[1] === sub && c[2] === action);
+const starts = (): StartInput[] => world.ops.filter((e) => e.op === "start").map((e) => e.args as StartInput);
 
 const expectRefused = async (d: ReturnType<typeof deps>, extra: Record<string, string>, message: RegExp) => {
   await writeBrief();
@@ -54,140 +44,152 @@ const expectRefused = async (d: ReturnType<typeof deps>, extra: Record<string, s
   await expect(attempt).rejects.toBeInstanceOf(LaunchError);
   await expect(attempt).rejects.toThrow(message);
   expect(await d.registry.read("pane-lane")).toBeNull();
-  expect(herdr("pane", "run")).toEqual([]);
-  expect(herdr("tab", "create")).toEqual([]);
+  expect(starts()).toEqual([]);
   expect(await Bun.file(join(state.dir, "brief.md")).text()).toBe(brief);
 };
 
-test("--pane runs the lane command in that pane, creates no tab, and registers pane and tab", async () => {
+test("--pane starts the lane through its runner in that pane and registers the pane and tab it returns", async () => {
   await writeBrief();
-  world.panes = [];
   const d = deps({});
   const r = await launchLane(d, input({ pane: "w:p3" }));
-  expect(herdr("tab", "create")).toEqual([]);
-  const run = herdr("pane", "run");
-  expect(run).toHaveLength(1);
-  expect(run[0]?.[3]).toBe("w:p3");
-  expect(run[0]?.[4]).toContain("ulw set goal and work");
-  expect(run[0]?.[4]).toContain(join(state.dir, "brief.md"));
-  expect(r.lane.pane).toBe("w:p3");
-  expect(r.lane.tab).toBe("w:t7");
-  expect((await d.registry.read("pane-lane"))?.pane).toBe("w:p3");
+  expect(starts()).toHaveLength(1);
+  const start = starts()[0]!;
+  expect(start).toMatchObject({ key: "pane-lane", target: { pane: "w:p3" }, keywords: "ulw set goal and work", sandbox: false, cwd: wt, done: "closed acme/app#3" });
+  expect(start.machine).toBeUndefined();
+  expect(start.briefText).toContain("## Lane footer (written by dori launch)");
+  expect(r.lane).toMatchObject({ pane: "w:p3", tab: "w:t7", runner: "local", reportVia: "cli" });
+  expect(await d.registry.read("pane-lane")).toMatchObject({ pane: "w:p3", tab: "w:t7", runner: "local" });
+  expect((await d.registry.read("pane-lane"))?.launchReservation).toBeUndefined();
   expect(await Bun.file(join(state.dir, "brief.md")).text()).toContain("## Lane footer (written by dori launch)");
-  expect(r.startup).toStartWith("STARTUP_");
+  expect(r.startup).toBe("STARTUP_OK pane-lane w:p3");
 });
 
-test("leadModel and leadThinking leave a lane on defaultModel and agentCommand's --thinking", async () => {
+test("a sandboxed local lane reaches the runner as lane.start with agentProfile sandboxed, and the returned pane is recorded", async () => {
   await writeBrief();
-  world.panes = [];
   const base = deps({});
-  const config = {
-    ...base.config, agentCommand: ["omo", "--model", "{model}", "--thinking", "medium", "{prompt}"],
-    defaultModel: "test/lane-default", leadModel: "test/lead", leadThinking: "high",
+  const calls: { label: string; type: string; body: Record<string, unknown> }[] = [];
+  const call: RunnerCall = {
+    call: async (label, type, body) => {
+      calls.push({ label, type, body: body as Record<string, unknown> });
+      return { cmdId: "c1", state: "verified", detail: "started", result: { pane: "w:p9", tab: "w:t9", startup: { verdict: "ok", detail: "ready" } } } as never;
+    },
+    query: async (_label, type, body) => {
+      if (type !== "q.lane.inspect") throw new Error(`no ${type} expected`);
+      return { status: "missing", cwd: (body as { cwd?: string }).cwd ?? "", cwdExists: true } as never;
+    },
+    connected: () => true,
   };
-  await launchLane({ ...base, config }, input({ pane: "w:p3" }));
-  const command = herdr("pane", "run")[0]?.[4] ?? "";
-  expect(command).toContain("--model test/lane-default --thinking medium ");
-  expect(command).not.toContain("test/lead");
-  expect(command).not.toContain("--thinking high");
+  const ops = laneOps(call, { now: () => T0 });
+  const config = { ...base.config, laneSandbox: { command: ["lane-sandbox"] } };
+  const r = await launchLane({ ...base, ops, config, which: () => "/usr/local/bin/lane-sandbox" }, input({ cwd: wt }));
+  expect(calls.map((c) => [c.label, c.type])).toEqual([["local", "lane.start"]]);
+  expect(calls[0]?.body).toMatchObject({ key: "pane-lane", agentProfile: "sandboxed", sandbox: true, cwd: wt, mode: "ulw", heavySlots: config.heavySlots, heavyMaxLoad: config.heavyMaxLoad });
+  expect(r.lane).toMatchObject({ pane: "w:p9", tab: "w:t9", sandbox: true });
+  const stored = await base.registry.read("pane-lane");
+  expect(stored).toMatchObject({ pane: "w:p9", tab: "w:t9" });
+  expect(stored?.status).toBeUndefined();
+  expect(stored?.launchReservation).toBeUndefined();
 });
 
-test("--mode mass-ulw opens the prompt with massLaunchKeywords and records the mode; the default is ulw", async () => {
+test("--mode mass-ulw opens with massLaunchKeywords and records the mode; the default is ulw", async () => {
   await writeBrief();
-  world.panes = [];
   const d = deps({});
   const mass = await launchLane(d, { ...input({ pane: "w:p3" }), mode: "mass-ulw" });
-  const command = herdr("pane", "run")[0]?.[4] ?? "";
-  expect(command).toContain("'/mass-ulw set goal and work. Read and execute the lane brief");
+  expect(starts()[0]).toMatchObject({ keywords: "/mass-ulw set goal and work", mode: "mass-ulw" });
   expect(mass.lane.mode).toBe("mass-ulw");
   expect((await d.registry.read("pane-lane"))?.mode).toBe("mass-ulw");
   await d.registry.write({ ...mass.lane, closedAt: new Date(T0).toISOString() });
   const plain = await launchLane(deps({}), input({ key: "pane-lane-2", pane: "w:p3" }));
-  expect(herdr("pane", "run")[1]?.[4]).toContain("'ulw set goal and work. Read and execute the lane brief");
+  expect(starts()[1]).toMatchObject({ keywords: "ulw set goal and work", mode: "ulw" });
   expect(plain.lane.mode).toBe("ulw");
 });
 
-test("laneThinking is inserted after the --model pair, replaces agentCommand's --thinking, and blank keeps the template", async () => {
-  let n = 0;
-  const command = async (laneThinking: string, agentCommand: string[]) => {
-    await writeBrief();
-    world.calls.length = 0;
-    const base = deps({});
-    const r = await launchLane({ ...base, config: { ...base.config, agentCommand, defaultModel: "test/lane", laneThinking } }, input({ key: `pane-lane-${++n}`, pane: "w:p3" }));
-    await base.registry.write({ ...r.lane, closedAt: new Date(T0).toISOString() });
-    return herdr("pane", "run")[0]?.[4] ?? "";
-  };
-  expect(await command("medium", ["omo", "--model", "{model}", "{prompt}"])).toContain("omo --model test/lane --thinking medium 'ulw set goal and work.");
-  expect(await command("high", ["omo", "--model", "{model}", "--thinking", "low", "{prompt}"])).toContain("--model test/lane --thinking high '");
-  expect(await command(" ", ["omo", "--model", "{model}", "{prompt}"])).toContain("omo --model test/lane 'ulw");
-  expect(await command("medium", ["run-agent", "{prompt}"])).toContain("run-agent 'ulw");
+test("the lane's model reaches the runner: defaultModel unless the launch names one; leadModel never does", async () => {
+  await writeBrief();
+  const base = deps({});
+  await launchLane({ ...base, config: { ...base.config, defaultModel: "test/lane-default", leadModel: "test/lead" } }, input({ pane: "w:p3" }));
+  expect(starts()[0]?.model).toBe("test/lane-default");
+  await launchLane(base, input({ key: "pane-lane-2", cwd: wt, model: "test/picked" }));
+  expect(starts()[1]?.model).toBe("test/picked");
 });
 
-test("laneSandbox wraps every local lane's agent after DORI_LANE_KEY, passes a --pane lane through unless --sandbox, and records it", async () => {
+test("laneSandbox wraps every local lane, passes a --pane lane through unless --sandbox, and records it", async () => {
   const base = deps({});
   const laneSandbox = { command: ["lane-sandbox"] };
   let n = 0;
   const launch = async (config: typeof base.config, target: Record<string, string>, sandbox?: true, which: (cmd: string) => string | null = () => null) => {
     await writeBrief();
-    world.panes = target.workspace ? [{ pane_id: "w:p3", workspace_id: target.workspace }] : [];
-    world.calls.length = 0;
+    world.panes = [{ pane_id: "w:p3", workspace_id: target.workspace ?? "w", tab_id: "w:t7", cwd: wt }];
     const key = `sandbox-lane-${++n}`;
     const r = await launchLane({ ...base, config, which }, { ...input({ key, ...target }), ...(sandbox ? { sandbox } : {}) });
     await base.registry.update(key, (lane) => ({ ...lane!, status: "closed", pane: undefined }));
-    return { command: herdr("pane", "run")[0]?.[4] ?? "", lane: r.lane, notes: r.notes };
+    return { start: starts().at(-1)!, lane: r.lane, notes: r.notes };
   };
   const onPath = (cmd: string) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null);
-  // No flag and no setting: a lane in a new tab is wrapped.
+  // No flag and no setting: a lane in a workspace pane is wrapped.
   const always = await launch({ ...base.config, laneSandbox }, { workspace: "w" }, undefined, onPath);
-  expect(always.command).toStartWith("DORI_LANE_KEY=sandbox-lane-1 lane-sandbox omo ");
+  expect(always.start.sandbox).toBe(true);
   expect(always.lane.sandbox).toBe(true);
   expect(always.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
   const forced = await launch({ ...base.config, laneSandbox }, { pane: "w:p3" }, true);
-  expect(forced.command).toStartWith("DORI_LANE_KEY=sandbox-lane-2 lane-sandbox omo ");
+  expect(forced.start.sandbox).toBe(true);
   expect(forced.lane.sandbox).toBe(true);
-  // A --pane lane runs as before and says why.
+  // A --pane lane runs unwrapped and says why.
   const reused = await launch({ ...base.config, laneSandbox }, { pane: "w:p3" }, undefined, onPath);
-  expect(reused.command).toStartWith("DORI_LANE_KEY=sandbox-lane-3 omo ");
+  expect(reused.start.sandbox).toBe(false);
   expect(reused.lane.sandbox).toBeUndefined();
   expect(reused.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-3: --pane w:p3 /));
   // A wrapper missing from PATH passes through and says why.
   const missing = await launch({ ...base.config, laneSandbox }, { workspace: "w" });
-  expect(missing.command).toStartWith("DORI_LANE_KEY=sandbox-lane-4 omo ");
+  expect(missing.start.sandbox).toBe(false);
   expect(missing.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-4: lane-sandbox is not on PATH/));
-  expect((await launch(base.config, { pane: "w:p3" })).command).toStartWith("DORI_LANE_KEY=sandbox-lane-5 omo ");
+  expect((await launch(base.config, { pane: "w:p3" })).start.sandbox).toBe(false);
 });
 
 test("--sandbox is refused without laneSandbox and for a remote lane, before anything is written", async () => {
   await writeBrief();
-  world.panes = [];
   const base = deps({});
   await expect(launchLane(base, { ...input({ pane: "w:p3" }), sandbox: true })).rejects.toThrow(/needs laneSandbox/);
   const remote = launchLane({ ...base, config: { ...base.config, laneSandbox: { command: ["lane-sandbox"] } } }, { ...input({ machine: "m1" }), sandbox: true });
   await expect(remote).rejects.toThrow(/local lanes only/);
   expect(await base.registry.read("pane-lane")).toBeNull();
-  expect(herdr("pane", "run")).toEqual([]);
+  expect(starts()).toEqual([]);
+});
+
+test("a remote lane goes to its machine's runner with its remote directory and no heavy-slot settings; without a directory it is refused", async () => {
+  await writeBrief();
+  const d = deps({});
+  await expect(launchLane(d, input({ machine: "m1" }))).rejects.toThrow("a lane on machine m1 needs --cwd");
+  expect(starts()).toEqual([]);
+  expect(await d.registry.read("pane-lane")).toBeNull();
+  const r = await launchLane(d, input({ machine: "m1", cwd: "/home/u/app" }));
+  const start = starts()[0]!;
+  expect(start).toMatchObject({ machine: "m1", cwd: "/home/u/app", sandbox: false });
+  expect(start.heavySlots).toBeUndefined();
+  expect(start.briefText).toContain("~/.dori/runner/bin/dori report pane-lane done");
+  expect(r.lane).toMatchObject({ machine: "m1", runner: "m1", remoteCwd: "/home/u/app", reportVia: "cli" });
+  expect(r.lane.cwd).toBeUndefined();
 });
 
 test("cwd comes from the pane unless --cwd is given", async () => {
   await writeBrief();
   const d = deps({});
-  await Bun.write(join(wt, ".omo", "mcp.json"), LEGACY_LANE_MCP);
   const r = await launchLane(d, input({ pane: "w:p3" }));
   expect(r.lane.cwd).toBe(wt);
+  expect(starts()[0]?.cwd).toBe(wt);
   await d.registry.write({ ...r.lane, closedAt: new Date(T0).toISOString() });
-  expect(await Bun.file(join(wt, ".omo", "mcp.json")).exists()).toBe(false);
-  expect(herdr("pane", "run").flat().join(" ")).not.toContain("--approve");
   const other = join(state.dir, "other");
   mkdirSync(other);
   const r2 = await launchLane(deps({}), input({ key: "pane-lane-2", pane: "w:p3", cwd: other }));
   expect(r2.lane.cwd).toBe(other);
+  expect(starts()[1]?.cwd).toBe(other);
 });
 
 test("--workspace resolves to that workspace's shell pane", async () => {
   await writeBrief();
   const r = await launchLane(deps({}), input({ workspace: "w" }));
   expect(r.lane.pane).toBe("w:p3");
-  expect(herdr("tab", "create")).toEqual([]);
+  expect(starts()[0]?.target).toEqual({ pane: "w:p3" });
 });
 
 test("a missing pane is refused and writes nothing", async () => {
@@ -213,81 +215,59 @@ test("--pane and --workspace that disagree are refused and write nothing", async
   await expectRefused(deps({ workspace: "w" }), { pane: "w:p3", workspace: "x" }, /not x/);
 });
 
-test("without --pane the lane still gets a new tab", async () => {
+test("without --pane the runner opens a new tab and the lane records the pane it returns", async () => {
   await writeBrief();
-  const base = depsFor(world, fakeClock(T0), state.dir);
-  const d = { ...base, run: async (argv: readonly string[]) => (argv[1] === "tab" ? (world.calls.push([...argv]), { code: 0, out: JSON.stringify({ result: { tab_id: "w:t9", root_pane: { pane_id: "w:p9" } } }), err: "" }) : base.run(argv)) };
+  const d = deps({});
+  world.startResult = undefined;
   const r = await launchLane(d, input({ cwd: wt }));
-  expect(herdr("tab", "create")).toHaveLength(1);
-  expect(r.lane.pane).toBe("w:p9");
-  expect(r.lane.tab).toBe("w:t9");
-  expect(herdr("pane", "get")).toEqual([]);
+  expect(starts()[0]?.target).toBeUndefined();
+  expect(r.lane.pane).toBe("w-pane-lane:p1");
+  expect(r.lane.tab).toBe("w-pane-lane:t1");
+  expect(world.ops.some((e) => e.op === "processInfo")).toBe(false);
 });
 
-/** Launch into a new tab whose pane reports `statuses` on successive status lookups (the last repeats); every sleep is recorded, none waits. */
-const startup = async (statuses: (string | undefined)[], screen: string) => {
-  const key = "poll-lane";
-  state.done();
-  state = withState();
-  wt = join(state.dir, "worktree");
-  mkdirSync(wt);
-  await writeBrief();
-  world = newWorld();
-  world.screen = screen;
-  const waited: number[] = [];
-  const clock = { ...fakeClock(T0), sleep: async (ms: number) => { waited.push(ms); } };
-  const base = depsFor(world, clock, state.dir);
-  let reads = 0;
-  const d = { ...base, run: async (argv: readonly string[]) => {
-    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") return { code: 0, out: JSON.stringify({ result: { tab_id: "w:t9", root_pane: { pane_id: "w:p9" } } }), err: "" };
-    if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "list") {
-      const status = statuses[Math.min(reads++, statuses.length - 1)];
-      return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "w:p9", workspace_id: "w", ...(status ? { agent: "pi", agent_status: status } : {}) }] } }), err: "" };
-    }
-    return base.run(argv);
-  } };
-  const r = await launchLane(d, input({ key, cwd: wt }));
-  return { startup: r.startup, waited };
-};
-
-test("startup needs two consecutive ready reads, polled every 2 s", async () => {
+test("the runner's startup verdict becomes the STARTUP line; the poll constants stay exported", async () => {
   expect(STARTUP_POLL_MS).toBe(2_000);
-  expect(await startup(["idle", "idle"], "❯ ")).toEqual({ startup: "STARTUP_OK poll-lane w:p9", waited: [2_000, 2_000] });
-  // A blip in between restarts the count.
-  expect((await startup(["idle", "blocked", "idle", "working"], "❯ ")).waited).toEqual([2_000, 2_000, 2_000, 2_000]);
-  expect((await startup(["working", "working"], "❯ ")).startup).toBe("STARTUP_OK poll-lane w:p9");
-});
-
-test("a lane never ready is unconfirmed after exactly 10 polls", async () => {
-  const r = await startup(["idle", "blocked"], "❯ ");
   expect(STARTUP_POLLS).toBe(10);
-  expect(r.startup).toStartWith("STARTUP_UNCONFIRMED poll-lane w:p9");
-  expect(r.waited).toHaveLength(10);
+  expect(startupLine("k", "w:p9", { verdict: "ok", detail: "ready" })).toBe("STARTUP_OK k w:p9");
+  expect(startupLine("k", "w:p9", { verdict: "error", detail: "No API key" })).toBe("STARTUP_ERROR k w:p9: No API key");
+  expect(startupLine("k", "w:p9", { verdict: "unconfirmed", detail: "no ready agent status (idle); last lines: ❯" })).toBe("STARTUP_UNCONFIRMED k w:p9: no ready agent status (idle); last lines: ❯");
+  await writeBrief();
+  const d = deps({});
+  world.startResult = { pane: "w:p3", tab: "w:t7", startup: { verdict: "error", detail: "No API key" } };
+  expect((await launchLane(d, input({ pane: "w:p3" }))).startup).toBe("STARTUP_ERROR pane-lane w:p3: No API key");
 });
 
-test("startup keeps the scan-before-idle rule: an idle prompt over a known failure is an error on the first poll", async () => {
-  const r = await startup(["idle"], "No API key found\n❯ ");
-  expect(r).toEqual({ startup: "STARTUP_ERROR poll-lane w:p9: No API key", waited: [2_000] });
-  // A working agent is not scanned.
-  expect((await startup(["working", "working"], "No API key found\n❯ ")).startup).toBe("STARTUP_OK poll-lane w:p9");
+test("a start the runner refuses releases the reservation; one that may have happened keeps it reserved and paused", async () => {
+  await writeBrief();
+  const base = deps({});
+  const refusing = { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.start RUNNER_CMD_REJECTED cwd-outside-roots"); } };
+  await expect(launchLane({ ...base, ops: refusing }, input({ cwd: wt }))).rejects.toThrow("cwd-outside-roots");
+  expect(await base.registry.read("pane-lane")).toBeNull();
+  const down = { ...base.ops, start: async () => { throw new LaneOpsError("RUNNER_UNAVAILABLE", "local", "disconnected: no admitted connection"); } };
+  await expect(launchLane({ ...base, ops: down }, input({ cwd: wt }))).rejects.toThrow("RUNNER_UNAVAILABLE");
+  expect(await base.registry.read("pane-lane")).toBeNull();
+  const unsure = { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_AMBIGUOUS", "local", "lane.start lost"); } };
+  await expect(launchLane({ ...base, ops: unsure }, input({ cwd: wt }))).rejects.toThrow("the start may have happened");
+  expect(await base.registry.read("pane-lane")).toMatchObject({ status: "paused", launchReservation: expect.any(String) });
 });
 
 const footerLane = (patch: Partial<Lane> = {}): Lane => ({ key: "k-1", title: "t", thread: "th-9", brief: "/b.md", done: "closed acme/app#3", openedAt: "x", ...patch });
 
-test("footer puts the shared done rules first and every lane value after '### This lane'", () => {
+test("footer puts the shared done rules first and every lane value after '### This lane'; no lane types into the lead pane", () => {
   const variants: [string, Lane][] = [
-    ["pane report", footerLane()],
+    ["local", footerLane()],
     ["cli", footerLane({ reportVia: "cli" })],
-    ["remote", footerLane({ machine: "m1" })],
+    ["remote", footerLane({ machine: "m1", runner: "m1" })],
     ["autoClose", footerLane({ reportVia: "cli", autoClose: "machine" })],
   ];
   for (const [name, lane] of variants) {
-    const text = footer(lane, "w:lead", "Korean");
+    const text = footer(lane, "Korean");
     const rules = footerDoneRules(lane, "Korean");
     const at = text.indexOf("### This lane");
     expect(at, name).toBeGreaterThan(text.indexOf(rules));
     expect(text.indexOf(rules), name).toBeGreaterThanOrEqual(0);
-    for (const v of ["k-1", "th-9", "closed acme/app#3", ...(name === "pane report" ? ["w:lead"] : [])]) {
+    for (const v of ["k-1", "th-9", "closed acme/app#3"]) {
       expect(rules, `${name} ${v}`).not.toContain(v);
       expect(text.indexOf(v), `${name} ${v}`).toBeGreaterThan(at);
     }
@@ -295,24 +275,25 @@ test("footer puts the shared done rules first and every lane value after '### Th
     expect(rules, name).toContain("not done");
     expect(rules, name).toContain("Keep decisions and conversations out of the repo");
     expect(rules, name).toContain("never ask only through an on-screen ask-user prompt");
+    expect(rules, name).toContain("run the dori report question command below");
+    expect(text, name).not.toContain("[REPORT]");
+    expect(text, name).not.toContain("sent to pane");
   }
-  expect(footerDoneRules(footerLane({ reportVia: "cli" }))).toContain("run the dori report question command below");
-  expect(footerDoneRules(footerLane({ machine: "m1" }))).toContain("print a question report line below");
   expect(footerDoneRules(footerLane())).toContain("only through `dori heavy <label> -- <command>`");
-  expect(footerDoneRules(footerLane({ machine: "m1" }))).toContain("only through `sh ~/.dori/guard-agent.sh heavy <label> -- <command>`");
-  // laneRules lines follow the shared rules, in config order, for every report mode; none adds nothing.
+  expect(footerDoneRules(footerLane({ machine: "m1", runner: "m1" }))).toContain("only through `~/.dori/runner/bin/dori heavy <label> -- <command>`");
+  // laneRules lines follow the shared rules, in config order, for every lane; none adds nothing.
   for (const [, lane] of variants) {
     const rules = footerDoneRules(lane, "Korean", ["Stop at an open PR with CI green; do not merge.", "CI runs the typecheck only."]);
     expect(rules).toContain("- Stop at an open PR with CI green; do not merge.\n- CI runs the typecheck only.");
     expect(footerDoneRules(lane, "Korean", [])).toBe(footerDoneRules(lane, "Korean"));
   }
-  expect(footer(footerLane(), "w:lead")).toContain('dori claim-done k-1 --evidence "<merge SHA, closed issue, version>"');
-  expect(footer(footerLane({ reportVia: "cli" }), "w:lead")).toContain('dori report k-1 done --text "<one line>"');
-  expect(footer(footerLane({ machine: "m1" }), "w:lead")).not.toContain("claim-done k-1");
+  expect(footer(footerLane())).toContain('dori report k-1 done --text "<one line>"');
+  expect(footer(footerLane({ machine: "m1", runner: "m1" }))).toContain('~/.dori/runner/bin/dori report k-1 done --text "<one line>"');
+  expect(footer(footerLane({ machine: "m1", runner: "m1" }))).not.toContain("claim-done k-1");
   expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
 });
 
-test("a mass-ulw launch refuses keywords or a brief path that omo would not bind, and a non-string laneThinking keeps the template", async () => {
+test("a mass-ulw launch refuses keywords or a brief path that omo would not bind", async () => {
   await writeBrief();
   const base = deps({});
   const mass = (massLaunchKeywords: string, extra: Record<string, string> = {}) =>
@@ -321,6 +302,4 @@ test("a mass-ulw launch refuses keywords or a brief path that omo would not bind
   await expect(mass("/mass-ulw set goal and work?")).rejects.toThrow(LaunchError);
   await expect(mass("/mass-ulw set goal and work", { brief: join(state.dir, "what?.md") })).rejects.toThrow(LaunchError);
   await mass("/mass-ulw set goal and work");
-  const odd = await launchLane({ ...base, config: { ...base.config, agentCommand: ["omo", "--model", "{model}", "{prompt}"], laneThinking: 5 as unknown as string } }, input({ pane: "w:p3" }));
-  expect(odd.lane.mode).toBe("ulw");
 });
