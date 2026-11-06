@@ -145,6 +145,8 @@ const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boole
   "lane.git": (v) => isObj(v) && isNum(v.code) && isStr(v.out) && isStr(v.err),
   "lane.observe": (v) => isObj(v) && LANE_STATUSES(v.status),
   "guard.kill": (v) => isObj(v) && listOf(v.killed, (k) => isObj(k) && isNum(k.pid) && isStr(k.comm) && isNum(k.rssKb) && optStr(k.lane)),
+  "host.herdr": (v) => isObj(v) && oneOf(["start", "restart", "stop", "status"])(v.action) && oneOf(["up", "down", "hung"])(v.state)
+    && optStr(v.instance) && isBool(v.managed) && isBool(v.paused),
 };
 
 /** A RunnerUnavailable from call.ts (or rebuilt by the CLI relay): matched by shape, not class identity. */

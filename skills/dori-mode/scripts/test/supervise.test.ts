@@ -14,6 +14,7 @@ import { sessionDirFor } from "../src/session-id.ts";
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
 import { clearLaunchHold, dequeueLaunch, enqueueLaunch } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, writeJournal } from "./fakes.ts";
+import { markHerdr } from "./herdr-world.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
@@ -1617,6 +1618,27 @@ const recreating = (f: ReturnType<typeof fixture>, next: Runner): Runner => asyn
   }
   return next(argv, options);
 };
+
+test("while the lead host's herdr is down the lead pane is not created again; after HERDR_UP it is", async () => {
+  const f = fixture();
+  f.world.panes.splice(f.world.panes.indexOf(f.pane), 1);
+  markHerdr(f.deps.config.stateDir, "local", "down", 1_000);
+  const persisted: string[] = [];
+  const supervisor = new Supervisor({ ...f.deps, run: recreating(f, f.deps.run), config: { ...f.deps.config } }, { persistLeadPane: (pane) => { persisted.push(pane); } });
+  const held = await quiet(async () => {
+    expect(await supervisor.repairLeadPane()).toBeUndefined();
+    expect(await supervisor.repairLeadPane()).toBeUndefined();
+  });
+  expect(held.filter((line) => line.startsWith("LEAD_PANE_HELD"))).toEqual([
+    `LEAD_PANE_HELD herdr on machine=local has been unreadable since ${new Date(1_000).toISOString()}; the lead pane is created again after HERDR_UP`,
+  ]);
+  expect(f.calls.filter((call) => call[0] === "herdr" && (call[1] === "tab" || call[1] === "workspace"))).toEqual([]);
+  expect(persisted).toEqual([]);
+  markHerdr(f.deps.config.stateDir, "local", "up", 2_000);
+  const lines = await quiet(async () => { expect(await supervisor.repairLeadPane()).toBe("w7:p9"); });
+  expect(lines).toContain("LEAD_PANE_RECREATED lead:p1 -> w7:p9");
+  expect(persisted).toEqual(["w7:p9"]);
+});
 
 test("a lead pane closed by hand together with its Dori workspace is recreated in a new Dori workspace and cold-started with the pending events", async () => {
   const f = fixture();

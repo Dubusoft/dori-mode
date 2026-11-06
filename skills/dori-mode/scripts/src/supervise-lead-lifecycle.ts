@@ -12,6 +12,8 @@ import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { completeLeadRestart } from "./lead-restart.ts";
+import { herdrDownSince } from "./runner/herdr-down.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
 import type { Durability } from "./store.ts";
@@ -340,6 +342,7 @@ export class LeadLifecycle {
    */
   async repairLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
+    if (this.herdrHeld()) return undefined;
     if ((await listPanes(run)).some((p) => p.pane_id === config.leadPane)) return undefined;
     const pane = await this.createLeadPane();
     if (!pane) return undefined;
@@ -365,8 +368,24 @@ export class LeadLifecycle {
    * created again, as dori-boot-prep.sh does, and its root pane becomes the lead. Undefined, with herdr's reason logged,
    * when herdr refuses.
    */
+  /**
+   * While the local runner reports this host's herdr down or hung (HERDR_DOWN / HERDR_HUNG machine=local, saved on its
+   * hub row) the lead pane is not created again: herdr cannot hold it, and each refused attempt would only add a
+   * failure. Re-creation resumes once the runner reads herdr again (HERDR_UP). Logged once per held state.
+   */
+  private heldSince: number | undefined;
+  private herdrHeld(): boolean {
+    const since = herdrDownSince(this.deps.config.stateDir).get(LOCAL_RUNNER);
+    if (since !== undefined && since !== this.heldSince) {
+      console.log(`LEAD_PANE_HELD herdr on machine=${LOCAL_RUNNER} has been unreadable since ${new Date(since).toISOString()}; the lead pane is created again after HERDR_UP`);
+    }
+    this.heldSince = since;
+    return since !== undefined;
+  }
+
   private async createLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
+    if (this.herdrHeld()) return undefined;
     const refused = (what: string, result: { readonly out: string; readonly err: string }): undefined => {
       console.error(`LEAD_PANE_CREATE_FAILED ${what}: ${result.err || result.out}`);
       return undefined;

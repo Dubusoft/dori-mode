@@ -19,6 +19,8 @@ import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
+import { herdrPaused, hostHerdr } from "./herdr-control.ts";
+import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
 import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./fs-safety.ts";
 import { pidAlive, probe, probeHerdr, startHealth } from "./health.ts";
@@ -53,7 +55,11 @@ const probeMain = async (json: boolean): Promise<number> => {
  * The effect of every durable command a runner carries out (design 2.3, section 4): the lane verbs on its own lanes,
  * `lane.git` in the given root, and `guard.kill` limited to the named lanes. Each resolves to `{detail, result}`.
  */
-export const runnerEffects = (deps: { readonly lanes: RunnerLanes; readonly guard: Pick<RunnerGuard, "killLanes">; readonly run: Runner }): DispatchDeps["effects"] => ({
+export const runnerEffects = (deps: {
+  readonly lanes: RunnerLanes; readonly guard: Pick<RunnerGuard, "killLanes">; readonly run: Runner;
+  readonly herdr?: ReturnType<typeof hostHerdr>;
+}): DispatchDeps["effects"] => ({
+  ...(deps.herdr ? { "host.herdr": async (command: { readonly body: { readonly action: HerdrAction } }) => (deps.herdr as ReturnType<typeof hostHerdr>)(command.body.action) } : {}),
   "guard.kill": async (command) => {
     const killed = await deps.guard.killLanes(command.body.keys);
     return { detail: `killed ${killed.length}`, result: { killed: killed.map((k) => ({ pid: k.pid, comm: k.comm, rssKb: k.rssKb, ...(k.lane ? { lane: k.lane } : {}) })) } };
@@ -135,7 +141,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote });
   // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
   // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
-  const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish });
+  const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir) });
   const paneCount = () => herdr.sample();
   const dataPath = remote ? homedir() : diskGuardPath(cfg);
   const guard = new RunnerGuard({
@@ -148,7 +154,10 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const dispatch = commandDispatcher({
     state, policy, realpath: realpathSync, log,
     publish: (body) => { client?.publish("cmd.result", body); },
-    effects: runnerEffects({ lanes: runnerLanes, guard, run }),
+    effects: runnerEffects({
+      lanes: runnerLanes, guard, run,
+      herdr: hostHerdr({ run, runnerDir, now: realClock.now, sleep: realClock.sleep, signal: (pid, sig) => { process.kill(pid, sig); } }),
+    }),
   });
   // Read-only q.* control frames: answered on this host, never queued or recorded.
   const onQuery = queryDispatcher({

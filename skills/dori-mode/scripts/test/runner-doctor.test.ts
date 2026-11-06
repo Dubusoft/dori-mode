@@ -7,6 +7,7 @@ import { defaultConfig } from "../src/config.ts";
 import { runnerChecks } from "../src/doctor.ts";
 import { openOperations, plan } from "../src/operations.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
+import { markHerdr } from "./herdr-world.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -54,4 +55,27 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
   expect(row?.detail).toBe("proto 6 is not 4 or 3; restart circuit open (3 restarts in the last hour)");
+});
+
+test("a runner whose machine's herdr is down or hung is FAIL with the herdr command for that machine; up is OK", () => {
+  const s = setup({ listen: "100.101.1.2:7411" });
+  addRunner(s.stateDir, "worker-a", 4);
+  addRunner(s.stateDir, "worker-b", 4);
+  addRunner(s.stateDir, "worker-c", 3);
+  addRunner(s.stateDir, "worker-d", 4);
+  markHerdr(s.stateDir, "worker-a", "down", NOW - 60_000);
+  markHerdr(s.stateDir, "worker-b", "hung", NOW - 60_000);
+  markHerdr(s.stateDir, "worker-c", "down", NOW - 60_000);
+  markHerdr(s.stateDir, "worker-d", "up", NOW - 60_000);
+  const checks = runnerChecks(s.deps);
+  const since = new Date(NOW - 60_000).toISOString();
+  expect(checks.find((c) => c.id === "runner worker-a")).toEqual({
+    id: "runner worker-a", level: "FAIL", detail: `herdr down since ${since} (no server process)`, fix: "dori runner herdr start --machine worker-a",
+  });
+  expect(checks.find((c) => c.id === "runner worker-b")).toMatchObject({
+    level: "FAIL", detail: `herdr hung since ${since} (the server process runs but does not answer)`,
+    fix: "dori runner herdr restart --machine worker-b --yes (ends every lane pane there; without --yes it lists them)",
+  });
+  expect(checks.find((c) => c.id === "runner worker-c")?.fix).toBe("dori runner install --machine worker-c to upgrade (proto 3 has no host.herdr), then dori runner herdr start --machine worker-c");
+  expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 4, gen 4, restarts1h 0, herdr up" });
 });

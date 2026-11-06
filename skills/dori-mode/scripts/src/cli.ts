@@ -177,6 +177,10 @@ const USAGE = `dori <command> [options]
   runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
   runner rotate LABEL                  have the connected runner switch to a new key; prints the new key fingerprint
   runner reset-gen LABEL               forget the runner's highest gen (after restoring its state from a backup)
+  runner herdr start|restart|stop|status --machine LABEL [--yes]
+                                       the machine's herdr through its runner (proto 4; LABEL local is the lead host);
+                                       restart and stop end every lane pane there: they list the open lanes and need --yes;
+                                       stop keeps herdr down (the runner does not start it again) until start
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
@@ -286,10 +290,10 @@ if (process.argv[2] === "runner") {
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
   // enroll, install, revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL";
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | herdr start|restart|stop|status --machine LABEL [--yes]";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
-    options: { machine: { type: "string" } },
+    options: { machine: { type: "string" }, yes: { type: "boolean" } },
   });
   const [sub = "", target, ...extra] = parsed.positionals;
   if (extra.length) die(usage);
@@ -298,6 +302,19 @@ if (process.argv[2] === "runner") {
     if (!value || !LABEL_PATTERN.test(value)) die(usage);
     return value as string;
   };
+  if (parsed.values.yes && sub !== "herdr") die(usage);
+  if (sub === "herdr") {
+    const label = labelArg(parsed.values.machine);
+    const cfg = await loadConfig();
+    const { readRunnerRows } = await import("./runner/hub.ts");
+    const { runnerHerdrMain } = await import("./runner/herdr-cli.ts");
+    process.exit(await runnerHerdrMain({ action: target, machine: label, yes: parsed.values.yes === true }, {
+      calls: cliRunnerCall(cliSocketPath(defaultRunnerDir())),
+      rows: () => readRunnerRows(cfg.stateDir),
+      lanes: async () => (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed"),
+      out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
+    }));
+  }
   if (sub === "enroll") {
     // The code and fingerprint go to stdout only: the installer pipes them into the runner's stdin over ssh.
     const label = labelArg(parsed.values.machine);
