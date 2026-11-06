@@ -14,6 +14,7 @@ let pkg = "";
 let calls: string[] = [];
 let lines: string[] = [];
 let unitState = "active";
+let quotaBump = false;
 
 const sh = async (cwd: string, ...argv: string[]) => {
   const r = await run(argv, { cwd });
@@ -29,6 +30,7 @@ const commit = async (cwd: string, file: string, text: string) => {
 const runner: Runner = async (argv, opts) => {
   if (argv[0] === "systemctl" || argv[0] === "bun") {
     calls.push(argv.join(" "));
+    if (argv[1] === "update" && quotaBump) writeFileSync(join(pkg, "bun.lock"), "pi-quota newer\n");
     return { code: 0, out: argv[2] === "is-active" ? unitState : "", err: "" };
   }
   return run(argv, opts);
@@ -41,7 +43,7 @@ const updateWith = (refreshGuardAgents: () => Promise<number>, branch: "main" | 
 
 beforeEach(async () => {
   dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "dori-update-"));
-  calls = []; lines = []; unitState = "active";
+  calls = []; lines = []; unitState = "active"; quotaBump = false;
   origin = join(dir, "origin");
   mkdirSync(join(origin, "pkg"), { recursive: true });
   await sh(origin, "git", "init", "-q", "-b", "main");
@@ -61,7 +63,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 test("nothing new: UP_TO_DATE, no restart; --force restarts anyway", async () => {
   expect(await update("dev")).toBe(0);
   expect(lines.at(-1)).toMatch(/^UP_TO_DATE dev [0-9a-f]{7}$/);
-  expect(calls).toEqual([]);
+  expect(calls).toEqual(["bun update pi-quota"]);
   expect(await update("dev", true)).toBe(0);
   expect(calls).toContain("systemctl --user restart dori-supervisor.service");
 });
@@ -78,7 +80,7 @@ test("switches dev -> main, keeps local changes, installs on a lockfile change, 
   expect(lines.at(-1)).toBe(`UPDATED main ${old}..${now} supervisor=active`);
   expect(readFileSync(join(install, "local.txt"), "utf8")).toBe("untracked\n");
   expect(await sh(install, "git", "stash", "list")).toBe("");
-  expect(calls).toEqual(["bun install --frozen-lockfile", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+  expect(calls).toEqual(["bun install --frozen-lockfile", "bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
 });
 
 test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or exception keeps the exit code", async () => {
@@ -95,7 +97,7 @@ test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or 
 test("guard agents are refreshed before the supervisor restarts", async () => {
   await commit(origin, "notes.txt", "two\n");
   expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);
-  expect(calls).toEqual(["refresh", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+  expect(calls).toEqual(["bun update pi-quota", "refresh", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
 });
 
 test("guard agents are not refreshed when the update fails", async () => {
@@ -106,6 +108,16 @@ test("guard agents are not refreshed when the update fails", async () => {
   expect(await updateWith(async () => { n++; return 0; }, "main")).toBe(1);
   expect(lines.at(-1)).toMatch(/^UPDATE_NOT_FAST_FORWARD /);
   expect(n).toBe(0);
+});
+
+test("a newer pi-quota restarts the supervisor without a new commit and leaves the lockfile clean", async () => {
+  quotaBump = true;
+  const head = (await sh(install, "git", "rev-parse", "HEAD")).slice(0, 7);
+  expect(await update("dev")).toBe(0);
+  expect(lines).toContain(`PI_QUOTA_UPDATED ${pkg}`);
+  expect(lines.at(-1)).toBe(`UPDATED dev ${head}..${head} supervisor=active`);
+  expect(calls).toEqual(["bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+  expect(await sh(install, "git", "status", "--porcelain")).toBe("");
 });
 
 test("a supervisor that is not active afterwards exits 1", async () => {

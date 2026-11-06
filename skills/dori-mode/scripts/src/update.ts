@@ -26,8 +26,9 @@ class UpdateStop extends Error {}
 
 /**
  * Updates the install checkout that holds `packageDir` to `origin/<branch>` (fast-forward only), keeping local changes
- * through a stash, runs `bun install` when the package manifest or lockfile changed, and restarts the supervisor when
- * HEAD moved (or `force`). Returns the exit code; every outcome is logged as one line.
+ * through a stash, runs `bun install` when the package manifest or lockfile changed, re-resolves the unpinned pi-quota
+ * dependency to its newest commit, and restarts the supervisor when HEAD or pi-quota moved (or `force`). Returns the exit
+ * code; every outcome is logged as one line.
  */
 export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<number> => {
   const git = async (args: readonly string[], cwd = root): Promise<string> => {
@@ -73,7 +74,17 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       if (install.code !== 0) throw new UpdateStop(`UPDATE_FAILED bun install: ${(install.err || install.out).split("\n").at(-1)}; supervisor not restarted`);
       d.log(`DEPENDENCIES_INSTALLED ${o.packageDir}`);
     }
-    if (now === old && !o.force) {
+    // pi-quota is not pinned: re-resolve it on every run so its newest commit installs even when this checkout did not
+    // move. A lockfile that was clean is put back afterwards, so later fast-forwards never carry it through a stash.
+    const lockHash = () => git(["hash-object", "bun.lock"], o.packageDir);
+    const lockClean = (await git(["status", "--porcelain", "--", "bun.lock"], o.packageDir)) === "";
+    const lockBefore = await lockHash();
+    const refresh = await d.run(["bun", "update", "pi-quota"], { cwd: o.packageDir, timeoutMs: 600_000 });
+    const quotaMoved = refresh.code === 0 && (await lockHash()) !== lockBefore;
+    if (lockClean) await git(["checkout", "-q", "--", "bun.lock"], o.packageDir);
+    if (refresh.code !== 0) d.log(`WARN bun update pi-quota: ${(refresh.err || refresh.out).split("\n").at(-1)}`);
+    else if (quotaMoved) d.log(`PI_QUOTA_UPDATED ${o.packageDir}`);
+    if (now === old && !quotaMoved && !o.force) {
       d.log(`UP_TO_DATE ${o.branch} ${short(now)}`);
       await refreshAgents();
       return 0;
