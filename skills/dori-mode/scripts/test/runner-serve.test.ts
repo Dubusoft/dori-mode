@@ -83,9 +83,9 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(renderStatus(status)).toContain("RUNNER local connected proto=4 version=- gen=1 hb=0 outbox=");
-  // lanes= counts the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
-  expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=0 herdr=unknown$/m);
+  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 4, gen: 1, heartbeatAgeSec: 0 });
+  // The lane count is the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
+  expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · herdr 미확인 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
 
   // The handle's RunnerCalls: a label with no connection fails closed at once; a query pending on the live connection
   // (this client has no query dispatcher, so it stays unanswered) is rejected when the connection closes.
@@ -96,7 +96,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // Past the stale threshold with no heartbeat the line reads stale; the runner stopping reads offline.
   clock.at += 61_000;
-  expect(renderStatus(await collectStatus(deps))).toContain("RUNNER local stale ");
+  expect(renderStatus(await collectStatus(deps))).toMatch(/^- local: 응답 늦음 · 마지막 응답 1분 전 · /m);
   const gone = logged.when((line) => line === "RUNNER_DISCONNECTED runner=local");
   controller.abort();
   await serving;
@@ -104,7 +104,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   expect(await pendingQuery).toMatchObject({ code: "RUNNER_UNAVAILABLE", why: "disconnected" });
   expect(hub.calls.pending()).toBe(0);
   expect(readRunnerRows(stateDir)[0]?.disconnectedAt).toBe(clock.at);
-  expect(renderStatus(await collectStatus(deps))).toContain("RUNNER local offline ");
+  expect(renderStatus(await collectStatus(deps))).toMatch(/^- local: 오프라인 · /m);
 });
 
 test("without a runners section dori status still shows the local runner, offline until it says hello", async () => {
@@ -113,5 +113,5 @@ test("without a runners section dori status still shows the local runner, offlin
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
   const status = await collectStatus(depsFor(newWorld(), clock, state.dir));
   expect(status.runners?.map((r) => [r.label, r.state])).toEqual([["local", "offline"]]);
-  expect(renderStatus(status).split("\n").filter((line) => line.startsWith("RUNNER "))).toEqual(["RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0 herdr=unknown"]);
+  expect(renderStatus(status)).toContain("\n■ 머신 (1)\n- local: 오프라인 · 레인 0개 · herdr 미확인\n  머신 샘플 없음\n");
 });

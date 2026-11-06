@@ -13,7 +13,7 @@ import { Outbox } from "../src/runner/outbox.ts";
 import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
-import { runnerLine, runnerViews } from "../src/status.ts";
+import { machineLines, runnerViews } from "../src/status.ts";
 import { openRunnerHub } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
@@ -124,8 +124,11 @@ test("over the runner hub: a runner's guard samples save herdr on its row, enque
   expect(row()).toMatchObject({ herdr: "down", herdrSince: downAt });
   expect(herdrDownSince(stateDir)).toEqual(new Map([["lab", downAt]]));
   expect(herdrLines.map(([id, line]) => [id, line.split(" ").slice(0, 2).join(" ")])).toEqual([[`herdr:lab:down:${downAt}`, "HERDR_DOWN machine=lab"]]);
-  const labLine = runnerViews(readRunnerRows(stateDir), clock.now()).map(runnerLine).find((l) => l.startsWith("RUNNER lab "));
-  expect(labLine).toEndWith(" herdr=down");
+  const lab = runnerViews(readRunnerRows(stateDir), clock.now()).find((r) => r.label === "lab")!;
+  expect(machineLines(lab)[0]).toContain(" · herdr 다운");
+  // The sample's readings are saved on the row for dori status, stamped with the supervisor's clock.
+  expect(row()?.machine).toEqual({ at: downAt, level: "ok", reasons: [], os: "linux", load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 2, swapTotalGb: 2, panes: -1 });
+  expect(machineLines(lab)[1]).toBe("  CPU 부하 1.0 · 메모리 여유 50% · 디스크 여유 100GB · 스왑 여유 2.0/2.0GB (0초 전 측정)");
 
   clock.at += 60_000;
   await publish(3);
@@ -133,7 +136,7 @@ test("over the runner hub: a runner's guard samples save herdr on its row, enque
   expect(herdrDownSince(stateDir).size).toBe(0);
   expect(herdrLines.map(([, line]) => line.split(" ")[0])).toEqual(["HERDR_DOWN", "HERDR_UP"]);
   // The local runner has never sent a sample: its herdr is unknown.
-  expect(runnerViews(readRunnerRows(stateDir), clock.now()).map(runnerLine)[0]).toEndWith(" herdr=unknown");
+  expect(machineLines(runnerViews(readRunnerRows(stateDir), clock.now())[0]!)).toEqual(["- local: 오프라인 · herdr 미확인", "  머신 샘플 없음"]);
 });
 
 test("readRunnerRows reads a table from before the herdr columns (the supervisor not restarted yet since an upgrade)", () => {

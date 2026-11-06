@@ -341,10 +341,10 @@ test("dori status names unreported lanes as a problem", () => {
     gateway: { state: "live", text: "" },
     events: { hours: 24, wakes: 0, measured: 0, calls: 0, kinds: [] },
   } as unknown as Status;
-  expect(renderStatus(base)).not.toContain("unreported");
+  expect(renderStatus(base)).not.toContain("미보고");
   const text = renderStatus({ ...base, unreported: [{ lane: "alpha", since: new Date(T0 - 12 * MIN).toISOString() }] });
-  expect(text.split("\n")[1]).toContain("unreported 1");
-  expect(text).toContain("- Finished lanes not reported to the owner yet (dori reported <key> --text TEXT): alpha 12m ago");
+  expect(text.split("\n")[1]).toContain("미보고 레인 1");
+  expect(text).toContain("- 끝났지만 오너에게 아직 보고 안 한 레인 (dori reported <key> --text TEXT): alpha 12분 전");
 });
 
 // A preload replacing fetch: each request is appended to $FAKE_LOG as JSON; $FAKE_STATUS (default 200) is the reply status.
