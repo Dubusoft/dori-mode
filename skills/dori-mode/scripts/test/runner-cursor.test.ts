@@ -113,11 +113,13 @@ describe("event cursor over a lossy in-memory link", () => {
       for (let n = 1; n <= 100; n += 1) expect(r.client.publish("lane.state", stateBody)).toBe(n);
       r.net.pairs[0]?.pump();
 
-      // 1..40 committed; 61..100 arrived past the gap and were not committed; the cursor sits at 40.
+      // 1..40 committed; 61 arrived past the gap, was not committed and closed the link; the cursor sits at 40.
       expect(r.committed).toEqual(Array.from({ length: 40 }, (_, i) => journalId(LABEL, i + 1)));
       expect(r.hub.runner(LABEL)?.eventAck).toBe(40);
-      expect(r.client.eventAck).toBe(40);
-      expect(r.outbox.stats().unacked).toBe(60);
+      // The close dropped the acks still queued for the runner; the next hello.ok carries eventAck 40.
+      expect(r.client.eventAck).toBe(0);
+      expect(r.client.connected).toBe(false);
+      expect(r.outbox.stats().unacked).toBe(100);
 
       // Link breaks; the next hello's eventAck drives the replay.
       r.net.pairs[0]?.sever("link down");
@@ -135,6 +137,32 @@ describe("event cursor over a lossy in-memory link", () => {
       expect(readRunnerRows(join(tmp.dir, "sup")).find((row) => row.label === LABEL)?.eventAck).toBe(100);
       expect(seenAck).toEqual(Array.from({ length: 100 }, (_, i) => i));
     } finally {
+      r.close();
+    }
+  });
+
+  test("a row another process appends to the shared outbox closes the link at the gap, and the reconnect delivers every later event", async () => {
+    const r = rig();
+    const other = new Outbox(join(tmp.dir, "runner"), { now: () => 1_000 });
+    try {
+      expect((await r.reconnect()).ok).toBe(true);
+      r.net.pairs[0]?.pump();
+      expect(r.client.publish("lane.state", stateBody)).toBe(1);
+      // Seq 2 is written by a second runner process on the same directory and never sent on this connection.
+      expect(other.append("lane.state", stateBody).seq).toBe(2);
+      expect(r.client.publish("cmd.result", { cmdId: "c-1", cmdSeq: 1, state: "verified", detail: "started" })).toBe(3);
+      r.net.pairs[0]?.pump();
+
+      // Seq 3 is past the gap: not committed, and the supervisor drops the link instead of stalling on it.
+      expect(r.committed).toEqual([journalId(LABEL, 1)]);
+      expect(r.client.connected).toBe(false);
+
+      expect(await r.reconnect()).toEqual({ ok: true, eventAck: 1, replayed: 2 });
+      r.net.pairs[1]?.pump();
+      expect(r.committed).toEqual([1, 2, 3].map((seq) => journalId(LABEL, seq)));
+      expect(r.outbox.stats().unacked).toBe(0);
+    } finally {
+      other.close();
       r.close();
     }
   });
