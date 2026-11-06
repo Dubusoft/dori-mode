@@ -30,8 +30,8 @@ chmod 700 "$LT"
 # Root is a namespace-owned tmpfs (uid = us, 0755) instead of --ro-bind / /, so
 # / and the parent of $HOME do not show up as nobody-owned. Host top-level
 # entries are re-bound read-only and top-level symlinks recreated.
-top=/${H#/}
-top=${top%%/*}
+top=${H#/}
+top=/${top%%/*}
 opts=(--perms 0755 --tmpfs /)
 shopt -s nullglob dotglob
 for e in /*; do
