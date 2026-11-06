@@ -20,7 +20,7 @@ import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
-import { defaultRunnerDir, runStartupCheck } from "./fs-safety.ts";
+import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./fs-safety.ts";
 import { pidAlive, probe, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
 import { Outbox } from "./outbox.ts";
@@ -102,6 +102,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   // runner-config.json wins when present; without it the local runner derives its policy from config.json (D20) and
   // a worker keeps the empty default (no profiles, no roots).
   const policy = existsSync(join(runnerDir, POLICY_FILE)) ? loadPolicy(runnerDir) : remote ? DEFAULT_POLICY : localPolicy(cfg);
+  // Before the gen bump: a second serve on this directory exits here and leaves the running one's gen alone.
+  const releaseServeLock = holdServeLock(runnerDir);
+  if (!releaseServeLock) fail(`RUNNER_ALREADY_SERVING another runner serve holds ${join(runnerDir, SERVE_LOCK)}; stop it (e.g. a leftover dori-runner.service next to dori supervise) before starting this one`);
   const state = new RunnerState(runnerDir, { now: realClock.now });
   const gen = state.boot();
   const outbox = new Outbox(runnerDir, { now: realClock.now });
@@ -195,6 +198,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     stopHealth();
     outbox.close();
     state.close();
+    releaseServeLock?.();
   }
   return 0;
 };
