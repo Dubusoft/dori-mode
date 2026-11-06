@@ -55,6 +55,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   mkdirSync(runnerDir, { recursive: true, mode: 0o700 });
   const calls: string[][] = [];
   const lanes = new RunnerLanes({
+    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), policy, token: () => "tok", publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     run: async (argv) => {
       calls.push([...argv]);

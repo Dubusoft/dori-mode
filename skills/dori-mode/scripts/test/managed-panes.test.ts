@@ -108,6 +108,7 @@ test("the runner opens a lane tab in tabWorkspace and a relaunch uses the worksp
   let panes: { pane_id: string; workspace_id: string; tab_id: string }[] = [];
   let n = 0;
   const lanes = new RunnerLanes({
+    instance: async () => "server-1",
     runnerDir, clock: fakeClock(T0), token: () => "tok",
     policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
     publish: () => {},

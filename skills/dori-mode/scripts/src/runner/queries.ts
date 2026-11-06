@@ -27,6 +27,7 @@ export const SCREEN_MAX_LINES = 400;
 export type QueryLane = { readonly pane?: string; readonly cwd?: string };
 
 export type QueryDeps = {
+  readonly currentPane?: (key: string, panes: readonly Pane[]) => Promise<Pane | undefined>;
   readonly run: Runner;
   readonly clock: Clock;
   /** The runner's own record of lane `key`, if it owns one. */
@@ -90,7 +91,10 @@ export const laneInspect = async (deps: QueryDeps, body: Body<"q.lane.inspect">)
   const record = deps.lane(body.key);
   const paneId = record?.pane;
   let pane: Pane | undefined;
-  if (paneId) pane = (await listPanes(deps.run)).find((p) => p.pane_id === paneId);
+  if (paneId) {
+    const panes = await listPanes(deps.run);
+    pane = deps.currentPane ? await deps.currentPane(body.key, panes) : panes.find((p) => p.pane_id === paneId);
+  }
   const process = pane ? (await queryProcess(deps, { pane: pane.pane_id })).info : undefined;
   const cwd = body.cwd ?? record?.cwd ?? "";
   const cwdExists = cwd !== "" && exists(cwd);
@@ -105,9 +109,9 @@ export const laneInspect = async (deps: QueryDeps, body: Body<"q.lane.inspect">)
   }
   let session: LaneInspection["session"];
   if (body.session) {
-    if (!paneId) session = { id: "", via: "none" };
+    if (!pane) session = { id: "", via: "none" };
     else {
-      const hit = await resolveSession(paneId, cwd, await procTable(deps.run), { run: deps.run, sessionsDir: body.sessionsDir ?? deps.sessionsDir ?? defaultSessionsDir() });
+      const hit = await resolveSession(pane.pane_id, cwd, await procTable(deps.run), { run: deps.run, sessionsDir: body.sessionsDir ?? deps.sessionsDir ?? defaultSessionsDir() });
       session = { id: hit.id, via: hit.via };
     }
   }

@@ -1,14 +1,17 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { ensureLaneWorkspace } from "../managed-panes.ts";
+import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { ASK_SCREEN_LINES, askingLine, screenQuestion, type ScreenQuestion } from "../ask-user.ts";
-import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified } from "../panes.ts";
+import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
+import { herdrProcess } from "./herdr-watch.ts";
 import type {
-  CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
+  CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, ProcessInfo, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
 } from "./protocol.ts";
 
 export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
@@ -53,6 +56,8 @@ export type LaneRecord = {
   readonly mode: string;
   readonly model: string;
   readonly startedAt: number;
+  readonly herdrInstance?: string;
+  readonly terminalId?: string;
   /** The on-screen question last published as `lane.asking` (see `questionKey`), absent when none is showing. */
   readonly lastAsk?: string;
   /** Opening keywords of the start (absent: the mode's default), reused by a relaunch. */
@@ -70,6 +75,9 @@ export type LaneRecord = {
 };
 
 export type RunnerLanesDeps = {
+  readonly instance?: () => Promise<string | undefined>;
+  readonly remote?: boolean;
+  readonly procs?: () => Promise<readonly Proc[]>;
   readonly runnerDir: string;
   readonly run: Runner;
   readonly clock: Clock;
@@ -123,11 +131,58 @@ type LaunchInput = {
   readonly key: string; readonly cwd: string; readonly profile: string; readonly mode: string; readonly model: string;
   readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
   readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
+  readonly restored?: boolean;
 };
 type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict };
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
+
+  private instance(): Promise<string | undefined> {
+    return this.deps.instance ? this.deps.instance() : herdrProcess(this.deps.run).then((p) => p.instance);
+  }
+
+  /** Pre-proto-4 records acquire identity only from a live foreground process positively attributed to their key. */
+  async currentPane(record: LaneRecord, panes?: readonly Pane[]): Promise<Pane | undefined> {
+    const instance = await this.instance();
+    if (!instance || record.herdrInstance && record.herdrInstance !== instance) return undefined;
+    const pane = (panes ?? await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
+    if (!record.herdrInstance) {
+      if (!pane) return undefined;
+      const got = await this.deps.run(["herdr", "pane", "process-info", "--pane", record.pane]);
+      if (got.code !== 0) return undefined;
+      let info: ProcessInfo | undefined;
+      try { info = (JSON.parse(got.out) as { result?: { process_info?: ProcessInfo } }).result?.process_info; } catch { return undefined; }
+      const owner = procLanes(await (this.deps.procs ?? (() => sampleProcs(this.deps.run)))());
+      const foreground = info?.foreground_processes ?? [];
+      const attributed = foreground.some((p) => p.pid !== undefined && owner.get(p.pid) === record.key);
+      if (!attributed || instance !== await this.instance()) return undefined;
+      this.update(record.key, (r) => ({ ...r, herdrInstance: instance, ...(pane?.terminal_id ? { terminalId: pane.terminal_id } : {}) }));
+      return pane;
+    }
+    return pane && (!record.terminalId || record.terminalId === pane.terminal_id) ? pane : undefined;
+  }
+
+  private async requirePane(record: LaneRecord): Promise<void> {
+    if (!await this.currentPane(record)) throw new Error(`RUNNER_LANE_ABSENT ${record.key} pane ${record.pane} is gone`);
+  }
+
+  /** Reuse only a single idle shell in a tab still labelled with this lane key; leave other restored tabs alone. */
+  private async restoredShell(record: LaneRecord): Promise<string | undefined> {
+    if (!record.tab) return undefined;
+    const panes = (await listPanes(this.deps.run)).filter((p) => p.tab_id === record.tab);
+    if (panes.length !== 1 || panes[0]?.agent) return undefined;
+    const listed = await this.deps.run(["herdr", "tab", "list", "--workspace", panes[0]?.workspace_id ?? ""]);
+    if (listed.code !== 0) throw new Error(`herdr tab list failed: ${listed.err || listed.out}`);
+    const tabs = (JSON.parse(listed.out) as { result: { tabs: { tab_id: string; label?: string }[] } }).result.tabs;
+    if (!tabs.some((t) => t.tab_id === record.tab && t.label === record.key)) return undefined;
+    try {
+      return (await resolveTargetPane(this.deps.run, { pane: panes[0]?.pane_id }, { ownerOf: () => undefined, refuseCmd: true, requireIdleProof: true })).pane;
+    } catch (e) {
+      if (e instanceof TargetError) return undefined;
+      throw e;
+    }
+  }
 
   private get file(): string { return join(this.deps.runnerDir, LANES_FILE); }
 
@@ -202,6 +257,8 @@ export class RunnerLanes {
   /** Opens the lane's pane (a new tab, or the checked `target` pane) and runs its agent there; publishes `lane.started`. */
   private async launch(input: LaunchInput): Promise<Launched> {
     const { key } = input;
+    const herdrInstance = await this.instance();
+    if (!herdrInstance) throw new Error("RUNNER_HERDR_INSTANCE_UNKNOWN cannot identify the herdr server");
     const brief = this.briefPath(key);
     const keywords = input.keywords ?? (input.mode === "mass-ulw" ? "mass-ulw" : "ulw");
     const prompt = `${keywords}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
@@ -209,18 +266,24 @@ export class RunnerLanes {
     const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
     let pane: string;
     let tab: string;
+    let terminalId: string | undefined;
     let cwd = input.cwd;
     /** Closes what this launch opened; a target pane is the owner's and is left open. */
     let rollback = async (): Promise<void> => {};
     if (input.target) {
-      const target = await resolveTargetPane(this.deps.run, input.target, { ownerOf: (p) => this.keyForPane(p), refuseCmd: true });
+      const target = await resolveTargetPane(this.deps.run, input.target, { ownerOf: (p) => {
+        const owner = this.keyForPane(p);
+        return input.restored && owner === key ? undefined : owner;
+      }, refuseCmd: true, ...(input.restored ? { requireIdleProof: true } : {}) });
       // The checked input cwd is replaced by the pane's own directory, so that is what must lie under allowedRoots.
       if (target.cwd !== undefined) this.checkPaneCwd(target.cwd);
       pane = target.pane;
+      terminalId = target.terminalId;
       tab = target.tab ?? "";
       cwd = target.cwd ?? cwd;
     } else {
-      const workspace = input.tabWorkspace ? ["--workspace", input.tabWorkspace] : [];
+      const tabWorkspace = input.tabWorkspace ?? (this.deps.remote ? await ensureLaneWorkspace(this.deps.run, this.deps.runnerDir, input.cwd, () => {}) : undefined);
+      const workspace = tabWorkspace ? ["--workspace", tabWorkspace] : [];
       const created = await this.deps.run(["herdr", "tab", "create", ...workspace, "--cwd", input.cwd, "--label", key, "--no-focus"]);
       if (created.code !== 0) throw new Error(`herdr tab create failed: ${(created.err || created.out).trim()}`);
       const made = (JSON.parse(created.out) as { result: { root_pane: { pane_id: string; tab_id?: string }; tab_id?: string } }).result;
@@ -229,7 +292,9 @@ export class RunnerLanes {
       const openedTab = tab;
       rollback = async () => { await this.deps.run(["herdr", "tab", "close", openedTab]); };
       // A cmd.exe pane cannot run the POSIX launch line: the tab is closed before anything is typed.
-      if ((await inspectCreated(this.deps.run, pane)).shell === "cmd") {
+      const inspected = await inspectCreated(this.deps.run, pane);
+      terminalId = inspected.terminalId;
+      if (inspected.shell === "cmd") {
         await rollback();
         throw new TargetError("RUNNER_LANE_TARGET_INVALID", cmdRefused(pane));
       }
@@ -258,8 +323,9 @@ export class RunnerLanes {
       ...this.records(),
       [key]: {
         key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
+        herdrInstance, ...(terminalId ? { terminalId } : {}),
         ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
-        ...(input.tabWorkspace !== undefined && !input.target ? { tabWorkspace: input.tabWorkspace } : {}),
+        ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),
         ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
       },
     });
@@ -291,10 +357,12 @@ export class RunnerLanes {
     if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
     const owner = this.keyForPane(body.pane);
     if (owner) throw new Error(`RUNNER_LANE_TARGET_BUSY pane ${body.pane} is already lane ${owner}`);
+    const herdrInstance = await this.instance();
+    if (!herdrInstance) throw new Error("RUNNER_HERDR_INSTANCE_UNKNOWN cannot identify the herdr server");
     const got = await this.deps.run(["herdr", "pane", "get", body.pane]);
     if (got.code !== 0) throw new Error(`RUNNER_LANE_PANE_MISSING pane ${body.pane} is not on this host: ${(got.err || got.out).trim()}`);
-    let info: { tab_id?: string; cwd?: string; foreground_cwd?: string } | undefined;
-    try { info = (JSON.parse(got.out) as { result?: { pane?: { tab_id?: string; cwd?: string; foreground_cwd?: string } } }).result?.pane; } catch { info = undefined; }
+    let info: { tab_id?: string; cwd?: string; foreground_cwd?: string; terminal_id?: string } | undefined;
+    try { info = (JSON.parse(got.out) as { result?: { pane?: typeof info } }).result?.pane; } catch { info = undefined; }
     const tab = info?.tab_id ?? "";
     // The pane's own directory is where the lane works, whatever body.cwd (already checked at dispatch) says.
     const paneCwd = info?.foreground_cwd ?? info?.cwd;
@@ -307,7 +375,7 @@ export class RunnerLanes {
     writeRunnerFile(tokenFile, token);
     this.save({
       ...this.records(),
-      [body.key]: { key: body.key, pane: body.pane, tab, cwd, tokenHash: hash(token), profile: "", mode: body.mode, model: body.model, startedAt: this.deps.clock.now(), adopted: true },
+      [body.key]: { key: body.key, pane: body.pane, tab, cwd, tokenHash: hash(token), profile: "", mode: body.mode, model: body.model, startedAt: this.deps.clock.now(), adopted: true, herdrInstance, ...(info?.terminal_id ? { terminalId: info.terminal_id } : {}) },
     });
     this.deps.publish("lane.started", { key: body.key, pane: body.pane, tab, session: "" });
     return { detail: `adopted pane=${body.pane} tab=${tab}`, result: { pane: body.pane, tab, tokenFile } };
@@ -324,7 +392,8 @@ export class RunnerLanes {
   /** Closes the lane's tab (else its pane), deletes its brief and token file and forgets its token; `gone` is read back from the pane list. */
   async close(key: string): Promise<Effect<"lane.close">> {
     const record = this.record(key);
-    const closed: "tab" | "pane" | "none" = record.tab ? "tab" : record.pane ? "pane" : "none";
+    const current = await this.currentPane(record);
+    const closed: "tab" | "pane" | "none" = !current ? "none" : record.tab ? "tab" : record.pane ? "pane" : "none";
     if (closed === "tab") await this.deps.run(["herdr", "tab", "close", record.tab]);
     else if (closed === "pane") await this.deps.run(["herdr", "pane", "close", record.pane]);
     rmSync(this.briefPath(key), { force: true });
@@ -332,8 +401,8 @@ export class RunnerLanes {
     rmSync(this.tokenFileOf(key, undefined), { force: true });
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
-    let gone = false;
-    try { gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
+    let gone = !current;
+    try { if (current) gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
     catch { gone = false; }
     return { detail: closed === "tab" ? `closed tab=${record.tab}` : closed === "pane" ? `closed pane=${record.pane}` : "closed none", result: { closed, gone } };
   }
@@ -349,6 +418,7 @@ export class RunnerLanes {
     if (opts.refuseWhileAsking && record.lastAsk) {
       return { detail: `refused asking`, result: { delivery: "failed", refusal: `RUNNER_LANE_ASKING ${key} shows a question prompt; not typed` } };
     }
+    await this.requirePane(record);
     const delivery = opts.mode === "guarded"
       ? await sendGuarded(this.deps.run, record.pane, text)
       : await sendVerified(this.deps.run, this.deps.clock, record.pane, text, verify);
@@ -358,19 +428,21 @@ export class RunnerLanes {
 
   /** `lane.pause` on the lane's pane (lane-control.ts `pause`). */
   async pause(key: string, step: PauseStep = "both"): Promise<Effect<"lane.pause">> {
+    await this.requirePane(this.record(key));
     const result = await pause({ run: this.deps.run, clock: this.deps.clock }, this.record(key).pane, step);
     return { detail: `paused ${step} goal=${result.goal ?? "-"} working=${result.working ?? "-"} stopped=${result.stopped ?? "-"}`, result };
   }
 
   /** `lane.resume` on the lane's pane (lane-control.ts `resume`). */
   async resume(key: string): Promise<Effect<"lane.resume">> {
+    await this.requirePane(this.record(key));
     const result = await resume({ run: this.deps.run, clock: this.deps.clock }, this.record(key).pane);
     return { detail: `resumed goal=${result.goal}`, result };
   }
 
   async observe(key: string): Promise<Effect<"lane.observe">> {
     const record = this.record(key);
-    const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
+    const pane = await this.currentPane(record);
     // The same alive test as serve.ts laneStatus, so the runner and the supervisor call one pane the same.
     const status: LaneStatus = !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
     const reason: LaneDeadReason | undefined = !pane ? "pane-missing" : status === "dead" ? "agent-gone" : undefined;
@@ -387,15 +459,18 @@ export class RunnerLanes {
    */
   async recover(key: string, session?: string, tabWorkspace?: string): Promise<Effect<"lane.recover">> {
     const record = this.record(key);
-    const pane = (await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
+    const panes = await listPanes(this.deps.run);
+    const pane = await this.currentPane(record, panes);
     if (paneAlive(pane)) {
       this.deps.publish("lane.started", { key, pane: record.pane, tab: record.tab, session: "" });
       return { detail: `alive pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
     }
     if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
+    const restored = record.herdrInstance && !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;
     if (pane && record.tab) await this.deps.run(["herdr", "tab", "close", record.tab]);
     const launched = await this.launch({
       key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,
+      ...(restored ? { target: { pane: restored }, restored: true } : {}),
       ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),
       ...((tabWorkspace ?? record.tabWorkspace) !== undefined ? { tabWorkspace: tabWorkspace ?? record.tabWorkspace } : {}),
       ...(record.heavySlots !== undefined ? { heavySlots: record.heavySlots } : {}), ...(record.heavyMaxLoad !== undefined ? { heavyMaxLoad: record.heavyMaxLoad } : {}),
@@ -416,6 +491,7 @@ export class RunnerLanes {
   async askTick(): Promise<string[]> {
     const asked: string[] = [];
     for (const record of Object.values(this.records())) {
+      if (!await this.currentPane(record)) continue;
       const screen = await readScreen(this.deps.run, record.pane, ASK_SCREEN_LINES).catch(() => "");
       if (!screen.trim()) continue;
       const q = screenQuestion(screen);

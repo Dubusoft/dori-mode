@@ -14,11 +14,11 @@ import { diskGuardPath, sampleHost } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import { parseArgs } from "node:util";
 import { loadConfig } from "../config.ts";
-import { listPanes } from "../panes.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
+import { HerdrWatch } from "./herdr-watch.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
 import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./fs-safety.ts";
 import { pidAlive, probe, probeHerdr, startHealth } from "./health.ts";
@@ -132,12 +132,14 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   let client: RunnerClient | undefined;
   const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => { client?.publish(type, body); };
   // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
-  const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish });
+  const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote });
   // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
   // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
-  const paneCount = async (): Promise<number> => { try { return (await listPanes(run)).length; } catch { return -1; } };
+  const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish });
+  const paneCount = () => herdr.sample();
   const dataPath = remote ? homedir() : diskGuardPath(cfg);
   const guard = new RunnerGuard({
+    herdr: () => herdr.snapshot(),
     sample: () => sampleHost(run, dataPath, paneCount), thresholds: { ...cfg.guard, ...policy.guard }, heavyKill: policy.heavyKill ?? cfg.heavyKill,
     procs: () => sampleProcs(run), self: process.pid, now: realClock.now, os: process.platform,
     kill: { clock: realClock, alive: pidAlive, signal: (pid, sig) => { process.kill(pid, sig); } },
@@ -152,6 +154,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const onQuery = queryDispatcher({
     run, clock: realClock, policy, log, dataPath, os: process.platform,
     lane: (key) => { const r = runnerLanes.records()[key]; return r ? { pane: r.pane, cwd: r.cwd } : undefined; },
+    currentPane: async (key, panes) => { const r = runnerLanes.records()[key]; return r ? runnerLanes.currentPane(r, panes) : undefined; },
     reply: (body) => { client?.control("q.result", body); },
   });
   client = new RunnerClient(

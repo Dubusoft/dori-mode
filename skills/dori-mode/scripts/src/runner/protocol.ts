@@ -20,7 +20,7 @@ import type { Check } from "../signals.ts";
 import type { ReportKind } from "./report-kinds.ts";
 
 /** The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. */
-export const PROTO = 3;
+export const PROTO = 4;
 /** The envelope layout version (`v`). */
 export const ENVELOPE_VERSION = 1;
 /** The longest line `decodeFrame` accepts; the outbox caps a single body at 256KB, so a frame stays well under this. */
@@ -36,6 +36,7 @@ export const LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export type LaneStatus = "working" | "idle" | "dead" | "missing";
 export type WaitOutcome = "WAIT_DONE" | "WAIT_TIMEOUT" | "WAIT_FAILED";
 export type GuardLevel = "ok" | "alert" | "critical";
+export type HerdrHealth = { readonly state: "up" | "down" | "hung"; readonly instance?: string; readonly since: number };
 export type CommandOutcome = "verified" | "failed" | "ambiguous";
 /** What a runner knows of a command when asked (`cmd.status`): `unknown` means it holds no record of it. */
 export type CommandStatusState = "intent" | "running" | "verified" | "failed" | "ambiguous" | "unknown";
@@ -58,6 +59,8 @@ export type LaneMemoryBody = {
 };
 
 export type RunnerEventBodies = {
+  readonly "herdr.state": { readonly state: HerdrHealth["state"]; readonly instance?: string; readonly detail: string };
+  readonly "herdr.start": { readonly ok: boolean; readonly detail: string };
   readonly "lane.started": { readonly key: string; readonly pane: string; readonly tab: string; readonly session: string };
   /**
    * `pane` (since proto 2) is the lane's pane id as the runner sees it; a proto 1 runner never sends it. `reason`
@@ -81,6 +84,7 @@ export type RunnerEventBodies = {
     readonly os?: string;
     /** Since proto 3: herdr's pane count on the host, and per-lane memory. */
     readonly panes?: number; readonly lanes?: readonly LaneMemoryBody[];
+    readonly herdr?: HerdrHealth;
   };
   readonly "guard.alert": { readonly reasons: readonly string[] };
   /** `rssKb[i]` and `cmds[i]` describe `killed[i]`, so the supervisor reports a runner's kills as it reports its own. */
@@ -108,7 +112,7 @@ export type SupervisorCommandBodies = {
    * Since proto 3, all optional: `keywords` (the opening keywords; absent: the runner's default), `session` (resume
    * that agent session), `target` (run in this idle shell pane, or the one shell pane of this workspace, instead of a
    * new tab), `heavySlots`/`heavyMaxLoad` (exported to the lane as DORI_HEAVY_SLOTS / DORI_HEAVY_MAX_LOAD), `tabWorkspace`
-   * (the herdr workspace a new tab opens in; absent: herdr's focused workspace).
+   * (the herdr workspace a new tab opens in; absent on remote runners: find or create `lanes`).
    */
   readonly "lane.start": Cmd<{
     readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd: string;
@@ -365,8 +369,11 @@ const laneKey: Shape = { key: req("string") };
 
 const BODY_REF: Shape = { sha256: req("string"), bytes: req("int"), truncated: req("bool") };
 const INVENTORY: Shape = { key: req("string"), pane: req("string"), tab: req("string"), session: opt("string") };
+const HERDR: Shape = { state: req({ enum: ["up", "down", "hung"] }), instance: opt("string") };
 
 const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
+  "herdr.state": { ...HERDR, detail: req("string") },
+  "herdr.start": { ok: req("bool"), detail: req("string") },
   "lane.started": { key: req("string"), pane: req("string"), tab: req("string"), session: req("string") },
   "lane.state": {
     key: req("string"), status: req({ enum: ["working", "idle", "dead", "missing"] }), pane: opt("string"),
@@ -386,6 +393,7 @@ const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
     load1: opt("number"), memFreePct: opt("number"), diskFreeGb: opt("number"), swapFreeGb: opt("number"), swapTotalGb: opt("number"), os: opt("string"),
     // -1 when the runner could not read herdr's pane list (main.ts paneCount): the supervisor's herdr-down signal.
     panes: opt("count"),
+    herdr: opt({ object: { ...HERDR, since: req("int") } }),
     lanes: opt({ list: { key: req("string"), rssKb: req("int"), top: req({ list: { comm: req("string"), rssKb: req("int"), count: req("int") } }) } }),
   },
   "guard.alert": { reasons: req("string[]") },

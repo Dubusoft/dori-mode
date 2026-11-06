@@ -267,7 +267,7 @@ export const openRunnerHub = (
     onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
     onEvent: (label, frame) => {
       guard.event(label, frame);
-      const changed = herdr.event(label, frame);
+      const changed = herdr.event(label, frame, protos.get(label) ?? hub.runner(label)?.proto);
       if (changed) { log(changed.line); options.onHerdr?.(changed.id, changed.line); }
       calls?.onEvent(label, frame);
       options.onEvent?.(label, frame);

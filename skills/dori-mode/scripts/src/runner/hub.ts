@@ -65,7 +65,7 @@ export type RunnerRow = {
   /** How many lanes the last hello's inventory listed. */
   readonly lanes?: number;
   /** The runner's machine's herdr as its guard samples showed it (herdr-down.ts); absent until a sample carried a pane count. */
-  readonly herdr?: "up" | "down";
+  readonly herdr?: "up" | "down" | "hung";
   /** Supervisor wall time `herdr` was entered. */
   readonly herdrSince?: number;
 };
@@ -125,7 +125,7 @@ const toRow = (r: DbRow): RunnerRow => ({
   ...(r.disconnectedAt !== null ? { disconnectedAt: r.disconnectedAt } : {}),
   ...(r.outboxUnacked !== null && r.outboxOldestAgeMs !== null ? { outbox: { unacked: r.outboxUnacked, oldestAgeMs: r.outboxOldestAgeMs } } : {}),
   ...(r.lanes !== null ? { lanes: r.lanes } : {}),
-  ...(r.herdr === "up" || r.herdr === "down" ? { herdr: r.herdr } : {}),
+  ...(r.herdr === "up" || r.herdr === "down" || r.herdr === "hung" ? { herdr: r.herdr } : {}),
   ...(r.herdrSince !== null ? { herdrSince: r.herdrSince } : {}),
 });
 
@@ -275,7 +275,7 @@ export class RunnerHub {
   }
 
   /** Saves the runner's machine's herdr state (herdr-down.ts) and when it was entered. */
-  setHerdr(label: string, state: "up" | "down", since: number): void {
+  setHerdr(label: string, state: "up" | "down" | "hung", since: number): void {
     this.db.query("UPDATE runners SET herdr = ?, herdrSince = ? WHERE label = ?").run(state, since, label);
   }
 

@@ -129,12 +129,12 @@ test("a remote lane whose pane is unknown is recovered by its own runner, never 
   expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
 });
 
-test("while a machine's herdr is down its lanes are held without spending attempts, and recovered once herdr is back", async () => {
+test.each(["down", "hung"] as const)("while a machine's herdr is %s its lanes are held without spending attempts, and recovered once herdr is back", async (state) => {
   const { deps, world, lane } = await fixture();
   await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app" });
   // A local lane (no machine, the local runner) on a host whose herdr is fine is recovered as usual meanwhile.
   await deps.registry.write({ ...lane, key: "local-lane" });
-  markHerdr(deps.config.stateDir, "worker-a", "down", 0);
+  markHerdr(deps.config.stateDir, "worker-a", state, 0);
   for (let round = 0; round < RECOVERY_LIMIT + 1; round++) {
     expect((await recoverLanes(deps)).filter((l) => l.includes(lane.key))).toEqual([]);
   }

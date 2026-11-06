@@ -3,7 +3,7 @@ import { alertReasons, criticalReasons, type HostSample } from "../host-guard.ts
 import { laneMemory, procLanes, type Proc } from "../lane-memory.ts";
 import { heavyTargets, killProcs, type KillDeps, type KilledProc } from "../pressure.ts";
 import type { KillResult, MachineSample, SampleResult } from "../remote-guard.ts";
-import type { AnyRunnerEvent, GuardLevel, LaneMemoryBody, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
+import type { AnyRunnerEvent, GuardLevel, HerdrHealth, LaneMemoryBody, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
 
 /**
  * The machine guard moved onto the runner (design 3.5). The runner samples its host every 30 s with the same
@@ -37,6 +37,7 @@ export type RunnerSampleResult = Extract<SampleResult, { ok: true }> & { readonl
 type Publish = <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
 
 export type RunnerGuardDeps = {
+  readonly herdr?: () => HerdrHealth | undefined;
   readonly sample: () => Promise<HostSample>;
   readonly thresholds: GuardThresholds;
   readonly heavyKill: readonly string[];
@@ -76,6 +77,7 @@ export class RunnerGuard {
         level, reasons, sampledAt: Math.round(now), load1: round(s.load1), memFreePct: s.memFreePct, diskFreeGb: round(s.diskFreeGb),
         swapFreeGb: round(s.swapFreeGb), swapTotalGb: round(s.swapTotalGb), os: this.deps.os,
         ...(Number.isSafeInteger(s.panes) ? { panes: s.panes } : {}), ...(lanes ? { lanes } : {}),
+        ...(this.deps.herdr?.() ? { herdr: this.deps.herdr() } : {}),
       });
       this.sentAt = now;
     }

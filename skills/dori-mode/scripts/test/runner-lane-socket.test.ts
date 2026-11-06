@@ -21,6 +21,7 @@ const setup = async () => {
   const runnerDir = join(root, "runner");
   mkdirSync(runnerDir, { mode: 0o700 });
   const lanes = new RunnerLanes({
+    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), token: () => "tok-a", publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
     run: async (argv) => (argv.slice(0, 3).join(" ") === "herdr tab create"

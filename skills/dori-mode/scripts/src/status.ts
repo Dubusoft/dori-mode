@@ -94,7 +94,7 @@ export type RunnerView = {
   /** Open registry lanes on the runner's machine (see runnerLaneCount). */
   readonly lanes?: number;
   /** The machine's herdr as the runner's guard samples showed it, and since when (wall ms); absent: unknown. */
-  readonly herdr?: "up" | "down";
+  readonly herdr?: "up" | "down" | "hung";
   readonly herdrSince?: number;
   /**
    * The local runner only: its process as the supervisor's child, from the health file it writes

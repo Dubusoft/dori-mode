@@ -21,6 +21,16 @@ const depsOf = (run: Runner, over: Partial<QueryDeps> = {}): QueryDeps => ({
   run, clock: fakeClock(T0), lane: (key) => (key === "demo-lane" ? { pane: "p1", cwd: "/repo" } : undefined), exists: () => true, ...over,
 });
 
+test("laneInspect uses the lane identity guard before reading processes or resolving sessions", async () => {
+  const w = inspectWorld();
+  const got = await laneInspect(depsOf(fakeRunner(w), { currentPane: async () => undefined }), { key: "demo-lane", session: true });
+  expect(got.status).toBe("missing");
+  expect(got.pane).toBeUndefined();
+  expect(got.process).toBeUndefined();
+  expect(got.session).toEqual({ id: "", via: "none" });
+  expect(w.calls.some((a) => a[2] === "process-info" || a[0] === "ps")).toBe(false);
+});
+
 test("laneInspect({git:true, done}) returns the worktrees with dirty/ahead and the Done checks", async () => {
   const w = inspectWorld();
   const got = await laneInspect(depsOf(fakeRunner(w)), { key: "demo-lane", git: true, roots: ["/repo"], done: "merged o/r#1; closed o/r#2" });
