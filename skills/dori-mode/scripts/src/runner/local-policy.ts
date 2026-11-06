@@ -1,5 +1,5 @@
 import { homedir, tmpdir } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { DEFAULT_LANE_SANDBOX, type DoriConfig, withThinking } from "../config.ts";
 import type { RunnerPolicy } from "./policy.ts";
 
@@ -9,7 +9,9 @@ import type { RunnerPolicy } from "./policy.ts";
  *
  * - `agents.default`: `agentCommand` with `laneThinking` applied the way launch.ts applies it (only to a template with a
  *   `--model` or `--thinking` flag), its `{model}` and `{prompt}` slots left for the runner to fill.
- * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that.
+ * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that, run with
+ *   `LANE_SANDBOX_VERIFY=<defaultCwd>/state/verify` so the lane can write its result files there (the lane's pane gets
+ *   no environment from the runner beyond its own DORI_* variables).
  * - `allowedRoots`: `$HOME`, the temp directory, `dirname(defaultCwd)` and `worktreeRoot` when set, without repeats.
  * Guard thresholds and `heavyKill` stay unset, so the runner reads them from the same config as the supervisor.
  */
@@ -26,7 +28,7 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
   const roots = [env.home ?? homedir(), env.tmp ?? tmpdir(), dirname(cfg.defaultCwd), cfg.worktreeRoot?.trim() || undefined]
     .filter((r): r is string => typeof r === "string" && r !== "");
   return {
-    agents: { default: lane, sandboxed: [...sandbox, ...lane] },
+    agents: { default: lane, sandboxed: ["env", `LANE_SANDBOX_VERIFY=${join(cfg.defaultCwd, "state", "verify")}`, ...sandbox, ...lane] },
     allowedRoots: [...new Set(roots)],
     sandbox: "optional",
     jobs: "allow",

@@ -21,7 +21,7 @@ test("localPolicy derives default and sandboxed profiles from agentCommand, lane
   const cfg = { ...defaultConfig("/home/u"), defaultCwd: "/data/repos/app", worktreeRoot: "/data/repos/worktrees", laneThinking: "high", laneSandbox: { command: ["lane-sandbox", "--strict"] } };
   const policy = localPolicy(cfg, { home: "/home/u", tmp: "/tmp" });
   expect(policy.agents.default).toEqual(["omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
-  expect(policy.agents.sandboxed).toEqual(["lane-sandbox", "--strict", "omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
+  expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/data/repos/app/state/verify", "lane-sandbox", "--strict", "omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
   expect(policy.allowedRoots).toEqual(["/home/u", "/tmp", "/data/repos", "/data/repos/worktrees"]);
   expect(policy).toMatchObject({ sandbox: "optional", jobs: "allow" });
   expect(policy.guard).toBeUndefined();
@@ -32,7 +32,7 @@ test("localPolicy: no laneSandbox uses lane-sandbox; a template without --model/
   const cfg = { ...defaultConfig("/home/u"), agentCommand: ["claude", "{prompt}"], defaultCwd: "/home/u/repo", worktreeRoot: "", laneSandbox: undefined };
   const policy = localPolicy(cfg, { home: "/home/u", tmp: "/home/u" });
   expect(policy.agents.default).toEqual(["claude", "{prompt}"]);
-  expect(policy.agents.sandboxed).toEqual(["lane-sandbox", "claude", "{prompt}"]);
+  expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/home/u/repo/state/verify", "lane-sandbox", "claude", "{prompt}"]);
   expect(policy.allowedRoots).toEqual(["/home/u"]);
 });
 
@@ -65,6 +65,6 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const started = await lanes.start(start);
   expect(started.result).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "ok", detail: "ready" } });
   const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
-  expect(command).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} lane-sandbox omo --model m1 --thinking medium 'ulw set goal and work. Read and execute the lane brief at `);
+  expect(command).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} env LANE_SANDBOX_VERIFY=${repo}/state/verify lane-sandbox omo --model m1 --thinking medium 'ulw set goal and work. Read and execute the lane brief at `);
   expect(lanes.records()["lane-a"]?.profile).toBe("sandboxed");
 });
