@@ -50,8 +50,8 @@ test("status lists working lanes with model, age and last progress; paused and c
   const s = await collectStatus(f.deps);
   expect(s.lanes).toEqual([{ key: "alpha", model: "m/one", ageMin: 90, progress: "Write the tests" }]);
   const text = renderStatus(s);
-  expect(text).toContain("1 lane working");
-  expect(text).toContain("\nLanes (1)\n- alpha (90m, one): Write the tests");
+  expect(text).toContain("작업 중 레인 1개");
+  expect(text).toContain("\n■ 레인 (1)\n- alpha (90분 · one): Write the tests");
   expect(text).not.toContain("beta");
 });
 
@@ -63,18 +63,18 @@ test("status shows services, pending waits, watched repos with poll time and fai
   writeGatewayStatus(f.dir, { pid: 1, at: NOW - 4_000, connected: true, messageContent: true });
   const s = await collectStatus(f.deps);
   const text = renderStatus(s);
-  expect(text).toContain("\nServices\n- herdr-server: running\n- dori-supervisor: running\n");
-  expect(text).toContain("\n- Discord gateway: connected\n- GitHub: 1 repo watched, last poll 2m ago, 1 repo failing\n");
-  expect(text).toContain("\nWaits (1)\n- ci-pr-7: on signal, times out 10-19 10:30 KST (in 0m) - n");
-  expect(text).toContain("\nProblems\n- GitHub poll failing: o/r 20m ago\n");
-  expect(text).toContain("- No trusted issue authors (githubIssueAuthors)");
-  expect(text.startsWith("Dori status - 10-19 10:30 KST\nNeeds attention: github poll failing, no trusted issue authors. 0 lanes working, 1 wait.\n")).toBe(true);
+  expect(text).toContain("\n■ 서비스\n- herdr-server: 실행 중\n- dori-supervisor: 실행 중\n");
+  expect(text).toContain("\n- Discord 게이트웨이: 연결됨\n- GitHub: 저장소 1개 감시, 마지막 폴링 2분 전, 1개 실패\n");
+  expect(text).toContain("\n■ 대기 (1)\n- ci-pr-7: 신호 대기, 10-19 10:30 KST 시한 (0분 후) - n");
+  expect(text).toContain("\n■ 문제\n- GitHub 폴링 실패: o/r 20분 전\n");
+  expect(text).toContain("- 신뢰하는 이슈 작성자 없음 (githubIssueAuthors)");
+  expect(text.startsWith("도리 상태 · 10-19 10:30 KST\n⚠️ 확인 필요: GitHub 폴링 실패, 신뢰 이슈 작성자 없음 · 작업 중 레인 0개 · 대기 1개\n")).toBe(true);
   expect(s.gateway.state).toBe("live");
   expect(s.waits[0]).toMatchObject({ note: "n" });
   const trusted = renderStatus(await collectStatus({ ...f.deps, config: { ...f.deps.config, githubIssueAuthors: ["octo-owner", "octo-alt"] } }));
-  expect(trusted).toContain("- GitHub poll failing: o/r 20m ago");
-  expect(trusted).not.toContain("trusted");
-  expect(trusted).toContain("- Issues: watching 1 repo");
+  expect(trusted).toContain("- GitHub 폴링 실패: o/r 20분 전");
+  expect(trusted).not.toContain("신뢰");
+  expect(trusted).toContain("- 이슈: 저장소 1개 감시");
 });
 
 test("lead state: missing pane, and a pane with no agent is cold; cap and ttl come from config", async () => {
@@ -83,7 +83,7 @@ test("lead state: missing pane, and a pane with no agent is cold; cap and ttl co
   const bare = await fixture();
   const s = await collectStatus(bare.deps);
   expect(s.lead.state).toBe("cold");
-  expect(renderStatus(s)).toContain("\nLead\n- lead:p1: stopped - no agent running in the lead pane\n");
+  expect(renderStatus(s)).toContain("\n■ 리드\n- lead:p1: 멈춤 - 리드 패널에 실행 중인 에이전트 없음\n");
 });
 
 test("status --json shape round-trips and an empty state dir needs no files and creates none", async () => {
@@ -113,7 +113,7 @@ test("the /status text stays far under Discord's limit even with many lanes", as
   mkdirSync(f.registry.dir, { recursive: true });
   for (let i = 0; i < 30; i++) await f.registry.write(lane(`lane-${i}`, { model: "provider/very-long-model-name-for-testing", lastProgressPost: "x".repeat(300) }));
   const text = await lookupStatus(f.deps)();
-  expect(text).toMatch(/\+\d+ more/);
+  expect(text).toMatch(/- 외 \d+개/);
   expect(text.length).toBeLessThanOrEqual(STATUS_MAX_CHARS);
   expect(quotaMessage(text, "No status available.").length).toBeLessThan(2000);
 });
@@ -131,13 +131,13 @@ test("/status pages through 100 lanes: every page fits Discord, every lane is li
   }
   const listed = pages.flatMap((page) => page.split("\n").filter((line) => line.startsWith("- scale-lane-")).map((line) => line.slice(2).split(" ")[0]));
   expect(listed.sort()).toEqual([...keys].sort());
-  expect(pages[0]).toContain(`more on pages 2-${pages.length}`);
-  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`Dori lanes - page 2 of ${pages.length} - ${kst(NOW)} KST`, "", "Lanes (100), continued"]);
-  expect(pages[1]).toEndWith("\n\nNext: page 3");
-  expect(pages.at(-1)).not.toContain("Next: page");
+  expect(pages[0]).toContain(`개 (2-${pages.length}쪽)`);
+  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`도리 레인 · 2/${pages.length}쪽 · ${kst(NOW)} KST`, "", "■ 레인 (100) 이어서"]);
+  expect(pages[1]).toEndWith("\n\n다음: /status page:3");
+  expect(pages.at(-1)).not.toContain("다음: /status");
   // The slash command's page option picks the page; past the end it says how many there are.
   expect(await lookupStatus(f.deps)(AbortSignal.timeout(5_000), 2)).toBe(pages[1]!);
-  expect(await lookupStatus(f.deps)(AbortSignal.timeout(5_000), 999)).toBe(`Dori status has ${pages.length} pages; there is no page 999.`);
+  expect(await lookupStatus(f.deps)(AbortSignal.timeout(5_000), 999)).toBe(`도리 상태는 ${pages.length}쪽까지 있습니다. 999쪽은 없습니다.`);
 });
 
 test("few lanes stay one page, the same text as renderStatus", async () => {
@@ -211,8 +211,8 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
     { kind: "NUDGED", cls: "lead-digest", events: 3, wakes: 0, measured: 0, calls: 0 },
   ]);
   const text = renderStatus(s);
-  expect(text).toContain("\nActivity (last 24h)\n- Lead woke 3 times, 6.5 model calls per wake\n");
-  expect(text).toContain("\n- Busiest: INBOUND 2 events, 2 wakes; GH_PR * merged 1 event, 1 wake; (restart) 0 events, 1 wake; NUDGED 3 events");
+  expect(text).toContain("\n■ 활동 (최근 24시간)\n- 리드 깨움 3회, 깨울 때마다 모델 호출 6.5회\n");
+  expect(text).toContain("\n- 많은 순: INBOUND 이벤트 2 · 깨움 2; GH_PR * merged 이벤트 1 · 깨움 1; (restart) 이벤트 0 · 깨움 1; NUDGED 이벤트 3");
   // A kind moved by config is counted and classed under the config's table, with no code change.
   const moved = await collectStatus({ ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
   expect(moved.events.kinds.find((k) => k.kind === "NUDGED lane")).toEqual({ kind: "NUDGED lane", cls: "engine-only", events: 3, wakes: 0, measured: 0, calls: 0 });
@@ -236,52 +236,52 @@ const base: Status = {
 
 test("owner messages still unacked after the ack window make the status a problem", () => {
   const text = renderStatus({ ...base, unacked: 2 });
-  expect(text.split("\n")[1]).toBe("Needs attention: unacked 2. 0 lanes working, no waits.");
-  expect(text).toContain("\nProblems\n- 2 owner messages handed to the lead and still not acked (dori ack) after the ack window\n");
+  expect(text.split("\n")[1]).toBe("⚠️ 확인 필요: 미확인 메시지 2 · 작업 중 레인 0개 · 대기 없음");
+  expect(text).toContain("\n■ 문제\n- 리드에 넘긴 오너 메시지 2개가 확인 시간이 지나도 ack 안 됨 (dori ack)\n");
 });
 
 test("healthy status reads as titled sections with one line per item, in KST", () => {
   const text = renderStatus({ ...base, lanes: [{ key: "ops", model: "anthropic-subscription/claude-opus-5-5", ageMin: 27, repo: "dori-mode", pr: 55, progress: "Full run\nthen  the docs" }] });
   expect(text).toBe([
-    "Dori status - 10-21 09:53 KST",
-    "All good. 1 lane working, no waits.",
+    "도리 상태 · 10-21 09:53 KST",
+    "✅ 모두 정상 · 작업 중 레인 1개 · 대기 없음",
     "",
-    "Services",
-    "- herdr-server: running",
-    "- dori-supervisor: running",
+    "■ 서비스",
+    "- herdr-server: 실행 중",
+    "- dori-supervisor: 실행 중",
     "",
-    "Lead",
-    "- wL1:p4: active (last turn just now, prompt cache warm), context 52k of 150k tokens",
-    "- New lanes open in workspace wS",
+    "■ 리드",
+    "- wL1:p4: 활동 중 (마지막 턴 방금, 프롬프트 캐시 유지) · 컨텍스트 52k/150k 토큰",
+    "- 새 레인 워크스페이스: wS",
     "",
-    "Lanes (1)",
-    "- ops (27m, opus-5-5, dori-mode #55): Full run then the docs",
+    "■ 레인 (1)",
+    "- ops (27분 · opus-5-5 · dori-mode #55): Full run then the docs",
     "",
-    "Waits (0)",
-    "- none",
+    "■ 대기 (0)",
+    "- 없음",
     "",
-    "Gateway and repos",
-    "- Discord gateway: connected",
-    "- GitHub: 3 repos watched, last poll 1m ago",
-    "- Issues: watching 1 repo",
+    "■ 연결",
+    "- Discord 게이트웨이: 연결됨",
+    "- GitHub: 저장소 3개 감시, 마지막 폴링 1분 전",
+    "- 이슈: 저장소 1개 감시",
   ].join("\n"));
 });
 
 test("long progress is cut at a word with ..., never mid-word", () => {
   const text = renderStatus({ ...base, lanes: [{ key: "ops", ageMin: 3, progress: `${"word ".repeat(60)}tail` }] });
-  const line = text.split("\n").find((l) => l.startsWith("- ops (3m): "))!;
+  const line = text.split("\n").find((l) => l.startsWith("- ops (3분): "))!;
   expect(line).toEndWith("word...");
-  expect(line.length).toBeLessThanOrEqual("- ops (3m): ".length + 200);
+  expect(line.length).toBeLessThanOrEqual("- ops (3분): ".length + 200);
 });
 
 test("a failing service expands on its own line and the legacy unit counts only when it is active", () => {
   const down = renderStatus({ ...base, services: [{ name: "herdr-server.service", enabled: "enabled", active: "active" }, { name: "dori-supervisor.service", enabled: "enabled", active: "failed" }, base.services[2]!] });
-  expect(down.split("\n")[1]).toBe("Needs attention: dori-supervisor failed. 0 lanes working, no waits.");
-  expect(down).toContain("\nProblems\n- Service dori-supervisor: failed\n");
-  expect(down).toContain("\nServices\n- herdr-server: running\n- dori-supervisor: failed\n");
+  expect(down.split("\n")[1]).toBe("⚠️ 확인 필요: dori-supervisor 실패 · 작업 중 레인 0개 · 대기 없음");
+  expect(down).toContain("\n■ 문제\n- 서비스 dori-supervisor: 실패\n");
+  expect(down).toContain("\n■ 서비스\n- herdr-server: 실행 중\n- dori-supervisor: 실패\n");
   expect(down).not.toContain("dori-presence");
   const legacy = renderStatus({ ...base, services: [base.services[0]!, base.services[1]!, { name: "dori-presence.service", enabled: "enabled", active: "active" }] });
-  expect(legacy).toContain("- Service dori-presence: running (legacy, should be off)");
+  expect(legacy).toContain("- 서비스 dori-presence: 실행 중 (예전 유닛, 꺼야 함)");
 });
 
 test("wait time: a date-epoch signal is the fire time; the deadline field is only a labelled timeout; else the clipped signal", () => {
@@ -296,9 +296,9 @@ test("wait time: a date-epoch signal is the fire time; the deadline field is onl
     w({ key: "t", until: "merged o/r#8", deadline: timeout }),
     w({ key: "m", until: "merged o/r#7" }),
   ] });
-  expect(text).toContain("\nWaits (3)\n- k: fires 10-22 07:00 KST (in 21h) - token refresh\n");
-  expect(text).toContain("\n- t: on signal, times out 10-22 14:00 KST (in 28h)\n");
-  expect(text).toContain("\n- m: until merged o/r#7\n");
+  expect(text).toContain("\n■ 대기 (3)\n- k: 10-22 07:00 KST에 실행 (21시간 후) - token refresh\n");
+  expect(text).toContain("\n- t: 신호 대기, 10-22 14:00 KST 시한 (28시간 후)\n");
+  expect(text).toContain("\n- m: 조건: merged o/r#7\n");
 });
 
 test("a (#N) in the lane title is never shown as a PR", async () => {
@@ -339,12 +339,12 @@ test("item 6: lanes pending or exhausted on recovery are a status problem and ma
   const s = await collectStatus(f.deps);
   expect(s.lanes.map((l) => [l.key, l.recovery])).toEqual(expect.arrayContaining([["dead", "exhausted"], ["held", "pending"], ["fine", undefined]]));
   const text = renderStatus(s);
-  expect(text.split("\n")[1]).toStartWith("Needs attention: ");
-  expect(text).toContain("recovery exhausted 1");
-  expect(text).toContain("- Lane recovery gave up (not relaunched or nudged): dead");
-  expect(text).toContain("- Lane recovery pending (not nudged): held");
-  expect(text).toContain("\n- [recovery gave up] dead (");
-  expect(text).toContain("\n- [recovery pending] held (");
+  expect(text.split("\n")[1]).toStartWith("⚠️ 확인 필요: ");
+  expect(text).toContain("복구 포기 1");
+  expect(text).toContain("- 레인 복구 포기 (재실행·넛지 안 함): dead");
+  expect(text).toContain("- 레인 복구 대기 (넛지 안 함): held");
+  expect(text).toContain("\n- [복구 포기] dead (");
+  expect(text).toContain("\n- [복구 대기] held (");
 });
 
 test("RUNNER lanes= follows the registry's open lanes on each runner's machine, not the count of the last hello", async () => {
@@ -362,21 +362,24 @@ test("RUNNER lanes= follows the registry's open lanes on each runner's machine, 
   expect(await counts()).toEqual({ local: 1, macbook: 2 });
   await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
   expect(await counts()).toEqual({ local: 1, macbook: 1 });
-  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER macbook connected .* lanes=1 herdr=unknown$/m);
+  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^- macbook: 연결됨 · 레인 1개 · herdr 미확인$/m);
 });
 
 test("the local runner row is always shown, with its child's state from the health file, even before the hub ever opened", async () => {
   const f = await fixture();
   // No runners.sqlite and no runners section: still RUNNER local, offline, no child state without a runner dir.
   expect((await collectStatus(f.deps)).runners).toEqual([{ label: "local", state: "offline", gen: 0, cmds: 0, restarts1h: 0, lanes: 0 }]);
-  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^RUNNER local offline proto=- version=- gen=0 hb=- outbox=- cmds=0 restarts1h=0 lanes=0 herdr=unknown$/m);
+  expect(renderStatus(await collectStatus(f.deps))).toContain("\n■ 머신 (1)\n- local: 오프라인 · 레인 0개 · herdr 미확인\n  머신 샘플 없음\n");
   const runnerDir = join(f.dir, "runner");
   expect((await collectStatus({ ...f.deps, runnerDir })).runners?.[0]?.child).toEqual({ verdict: "dead" });
   mkdirSync(runnerDir, { recursive: true });
   writeFileSync(healthPath(runnerDir), `${JSON.stringify({ pid: process.pid, gen: 3, monotonicMs: 1, wallAt: NOW })}\n`);
   utimesSync(healthPath(runnerDir), new Date(NOW - 5_000), new Date(NOW - 5_000));
   const text = renderStatus(await collectStatus({ ...f.deps, runnerDir }));
-  expect(text).toMatch(new RegExp(`^RUNNER local offline .* lanes=0 herdr=unknown child=healthy pid=${process.pid} health=5s$`, "m"));
+  expect(text).toMatch(/^- local: 오프라인 · 레인 0개 · herdr 미확인$/m);
+  // A local runner child that is not healthy is named on its line.
+  const dead = renderStatus(await collectStatus({ ...f.deps, runnerDir: join(f.dir, "no-runner") }));
+  expect(dead).toMatch(/^- local: 오프라인 · 레인 0개 · herdr 미확인 · 러너 프로세스 없음$/m);
 });
 
 test("a claude-quota.json left by the removed quota gate is ignored", async () => {
@@ -385,4 +388,32 @@ test("a claude-quota.json left by the removed quota gate is ignored", async () =
   const text = renderStatus(await collectStatus(f.deps));
   expect(text).not.toContain("claude");
   expect(text).not.toContain("brief");
+});
+
+test("each runner's machine shows CPU load, free memory, disk and swap from its last guard sample; an alert is a problem", async () => {
+  const f = await fixture();
+  new RunnerHub({ stateDir: f.dir, commit: () => true, now: () => NOW, monotonic: () => 0, epoch: 1 }).close();
+  const db = new Database(join(f.dir, HUB_FILE));
+  const sample = (extra: object) => JSON.stringify({ at: NOW - 40_000, level: "ok", reasons: [], os: "linux", load1: 1.23, memFreePct: 35, diskFreeGb: 120.4, swapFreeGb: 2, swapTotalGb: 4, panes: 5, lanesRssKb: 3 * 1_048_576, ...extra });
+  db.run("INSERT INTO runners (label, maxGen, lastHeartbeatAt, machine) VALUES ('local', 1, ?, ?), ('macbook', 1, ?, ?), ('pi', 1, ?, ?)", [
+    NOW, sample({}), NOW, sample({ os: "darwin", level: "alert", reasons: ["memory free 8% < 10%"], memFreePct: 8, diskFreeGb: 7.25, swapTotalGb: 0, swapFreeGb: 0 }),
+    // A machine column that does not read as a sample is ignored: the runner reads as having none.
+    NOW, "{not json",
+  ]);
+  db.close();
+  const s = await collectStatus(f.deps);
+  expect(s.runners?.[0]?.machine).toEqual({ sampledAt: new Date(NOW - 40_000).toISOString(), ageSec: 40, level: "ok", reasons: [], os: "linux", load1: 1.23, memFreePct: 35, diskFreeGb: 120.4, swapFreeGb: 2, swapTotalGb: 4, panes: 5, lanesRssKb: 3 * 1_048_576 });
+  expect(s.runners?.find((r) => r.label === "pi")).not.toHaveProperty("machine");
+  expect(JSON.parse(JSON.stringify(s))).toEqual(s);
+  const text = renderStatus(s);
+  expect(text).toContain([
+    "\n■ 머신 (3)",
+    "- local (linux): 연결됨 · 레인 0개 · herdr 미확인",
+    "  CPU 부하 1.2 · 메모리 여유 35% · 디스크 여유 120GB · 스왑 여유 2.0/4.0GB · 레인 메모리 3.0GB (40초 전 측정)",
+    "- [경고] macbook (darwin): 연결됨 · 레인 0개 · herdr 미확인",
+    "  CPU 부하 1.2 · 메모리 여유 8% · 디스크 여유 7.3GB · 스왑 없음 · 레인 메모리 3.0GB (40초 전 측정)",
+    "- pi: 연결됨 · 레인 0개 · herdr 미확인",
+    "  머신 샘플 없음\n",
+  ].join("\n"));
+  expect(text).toContain("\n- 머신 macbook 경고: memory free 8% < 10%\n");
 });

@@ -333,7 +333,8 @@ supervisor takes of its own host, judged against `runner-config.json`'s `guard` 
 
 - `guard.sample {level, reasons, sampledAt, load1, memFreePct, diskFreeGb, swapFreeGb, swapTotalGb, os}` goes out once
   a minute and on every level change (`ok`, `alert`, `critical`); `guard.alert {reasons}` on entering alert or
-  critical.
+  critical. The supervisor saves each sample's readings on the runner's row in `runners.sqlite` (`machine`), which
+  `dori status` shows as that machine's CPU load, free memory, disk and swap.
 - Under critical memory the runner kills by itself. It targets only processes whose command line matches a
   `heavyKill` pattern and that belong to a lane on the host (`DORI_LANE_KEY` in their own or an ancestor's
   environment). The runner and its ancestors are never targets. Each gets SIGTERM, then SIGKILL after 5 seconds. The
@@ -396,7 +397,7 @@ with `HERDR_DOWN` / `HERDR_HUNG` (urgent) and `HERDR_UP ... server=<instance>` (
   After `HERDR_UP` the next sweep recovers them as usual, on their recorded session when they have one.
 - `dori launch --machine <label>` is refused at once with `HERDR_DOWN machine=<label> ...`, before any placement
   check or runner call.
-- `dori status` adds `herdr=<up|down|hung|unknown>` to each runner line.
+- `dori status` shows `herdr <정상|다운|멈춤|미확인>` on each machine line.
 - `dori doctor`'s `runner <label>` check is FAIL while that machine's herdr is down (fix `dori runner herdr start
   --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`); a protocol 3 runner's fix
   starts with `dori runner install --machine <label>`. Its local `herdr` check points a worker machine (a runner
@@ -491,7 +492,7 @@ The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello 
 `HOST_GUARD ONLINE machine=<label>` when it had gone offline. The runner's unit is separate from herdr's (it only
 `Wants=` and is `After=` the herdr unit), so a restart never touches a lane's pane.
 
-`dori status` shows the restarts of the last hour (`restarts1h`). `dori doctor` checks the listen address, the local
+`dori status` shows the restarts of the last hour on the runner's machine line (`restarts1h` in `--json`). `dori doctor` checks the listen address, the local
 runner directory, and each runner's protocol, outbox backlog and restart circuit.
 
 `dori update` restarts the supervisor first. Only once it is active again does it move the runners, one at a time.

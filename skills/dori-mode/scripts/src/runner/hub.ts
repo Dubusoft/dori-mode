@@ -5,7 +5,7 @@ import type { EventMeta } from "../supervise-journal.ts";
 import { decideHello, recordHello, resetGen, type StoredRunner } from "./fencing.ts";
 import {
   PROTO, checkProto, journalId, supervisorControl,
-  type AnyRunnerEvent, type RunnerControl, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
+  type AnyRunnerEvent, type RunnerControl, type RunnerEventBodies, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
 } from "./protocol.ts";
 
 /**
@@ -68,6 +68,43 @@ export type RunnerRow = {
   readonly herdr?: "up" | "down" | "hung";
   /** Supervisor wall time `herdr` was entered. */
   readonly herdrSince?: number;
+  /** The machine readings of the runner's last `guard.sample` (absent until one arrived). */
+  readonly machine?: RunnerMachine;
+};
+
+/** One runner's last `guard.sample` as the hub saves it: `at` is the supervisor wall time it arrived, -1 a reading the runner could not take. */
+export type RunnerMachine = {
+  readonly at: number;
+  readonly level: "ok" | "alert" | "critical";
+  readonly reasons: readonly string[];
+  readonly os?: string;
+  readonly load1?: number;
+  readonly memFreePct?: number;
+  readonly diskFreeGb?: number;
+  readonly swapFreeGb?: number;
+  readonly swapTotalGb?: number;
+  readonly panes?: number;
+  /** Resident memory of the runner's lanes together, from `guard.sample.lanes`. */
+  readonly lanesRssKb?: number;
+};
+
+const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** The saved `machine` column, or undefined when it is missing or does not read as one. */
+const parseMachine = (text: string | null): RunnerMachine | undefined => {
+  if (text === null) return undefined;
+  let v: unknown;
+  try { v = JSON.parse(text); } catch { return undefined; }
+  if (typeof v !== "object" || v === null) return undefined;
+  const m = v as Record<string, unknown>;
+  if (!isNum(m.at) || (m.level !== "ok" && m.level !== "alert" && m.level !== "critical")) return undefined;
+  const nums = ["load1", "memFreePct", "diskFreeGb", "swapFreeGb", "swapTotalGb", "panes", "lanesRssKb"] as const;
+  return {
+    at: m.at, level: m.level,
+    reasons: Array.isArray(m.reasons) ? m.reasons.filter((r): r is string => typeof r === "string") : [],
+    ...(typeof m.os === "string" ? { os: m.os } : {}),
+    ...Object.fromEntries(nums.filter((k) => isNum(m[k])).map((k) => [k, m[k]])),
+  };
 };
 
 export type RunnerLiveness = "connected" | "stale" | "offline" | "disconnected";
@@ -101,14 +138,14 @@ type DbRow = {
   label: string; hostId: string | null; eventAck: number; cmdSeq: number; maxGen: number; cmdAck: number;
   proto: number | null; version: string | null; lastHelloAt: number | null;
   lastHeartbeatAt: number | null; disconnectedAt: number | null; outboxUnacked: number | null; outboxOldestAgeMs: number | null;
-  lanes: number | null; herdr: string | null; herdrSince: number | null;
+  lanes: number | null; herdr: string | null; herdrSince: number | null; machine: string | null;
 };
 
-const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, herdr, herdrSince";
+const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, herdr, herdrSince, machine";
 /** Columns added after the first table layout, with their types; an older table gets them on open. */
 const LATER_COLUMNS = {
   lastHeartbeatAt: "INTEGER", disconnectedAt: "INTEGER", outboxUnacked: "INTEGER", outboxOldestAgeMs: "INTEGER", lanes: "INTEGER",
-  herdr: "TEXT", herdrSince: "INTEGER",
+  herdr: "TEXT", herdrSince: "INTEGER", machine: "TEXT",
 } as const;
 
 const toRow = (r: DbRow): RunnerRow => ({
@@ -127,6 +164,7 @@ const toRow = (r: DbRow): RunnerRow => ({
   ...(r.lanes !== null ? { lanes: r.lanes } : {}),
   ...(r.herdr === "up" || r.herdr === "down" || r.herdr === "hung" ? { herdr: r.herdr } : {}),
   ...(r.herdrSince !== null ? { herdrSince: r.herdrSince } : {}),
+  ...(() => { const machine = parseMachine(r.machine); return machine ? { machine } : {}; })(),
 });
 
 type Live = { lastSeen: number; heartbeatAt?: number; outbox?: { unacked: number; oldestAgeMs: number } };
@@ -277,6 +315,22 @@ export class RunnerHub {
   /** Saves the runner's machine's herdr state (herdr-down.ts) and when it was entered. */
   setHerdr(label: string, state: "up" | "down" | "hung", since: number): void {
     this.db.query("UPDATE runners SET herdr = ?, herdrSince = ? WHERE label = ?").run(state, since, label);
+  }
+
+  /** Saves the readings of a runner's `guard.sample`, stamped with the supervisor's wall clock, for `dori status`. */
+  setMachine(label: string, b: RunnerEventBodies["guard.sample"]): void {
+    const machine: RunnerMachine = {
+      at: this.deps.now(), level: b.level, reasons: [...b.reasons],
+      ...(b.os !== undefined ? { os: b.os } : {}),
+      ...(b.load1 !== undefined ? { load1: b.load1 } : {}),
+      ...(b.memFreePct !== undefined ? { memFreePct: b.memFreePct } : {}),
+      ...(b.diskFreeGb !== undefined ? { diskFreeGb: b.diskFreeGb } : {}),
+      ...(b.swapFreeGb !== undefined ? { swapFreeGb: b.swapFreeGb } : {}),
+      ...(b.swapTotalGb !== undefined ? { swapTotalGb: b.swapTotalGb } : {}),
+      ...(b.panes !== undefined ? { panes: b.panes } : {}),
+      ...(b.lanes ? { lanesRssKb: b.lanes.reduce((sum, lane) => sum + lane.rssKb, 0) } : {}),
+    };
+    this.db.query("UPDATE runners SET machine = ? WHERE label = ?").run(JSON.stringify(machine), label);
   }
 
   /** Marks a runner's connection closed (its row stays). */
