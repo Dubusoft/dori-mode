@@ -199,9 +199,18 @@ const retainHistory = (pulls: Record<string, Pull>, cache: Readonly<Record<strin
   return kept;
 };
 
+/**
+ * A repo poll cut short (its time budget spent or a request failed): the responses read so far, the snapshot it built,
+ * and the PRs it finished (their events already emitted). The next tick resumes from it, so a repo too slow for one
+ * budget still converges instead of repeating the same requests every tick. Kept in memory only: after a restart the
+ * poll starts over from the durable snapshot, and a re-emitted event carries the same id.
+ */
+type RepoProgress = { readonly cache: Readonly<Record<string, Cached>>; readonly pulls: Readonly<Record<string, Pull>>; readonly done: ReadonlySet<number> };
+
 export class GitHubEvents {
   private readonly path: string;
   private state: State;
+  private readonly partial = new Map<string, RepoProgress>();
   /** The store holding the poll state once the journal is on sqlite; github-events.json otherwise. */
   private readonly store?: SqliteStore;
 
@@ -262,17 +271,21 @@ export class GitHubEvents {
     // Re-read on every tick: machine repos can change without restarting supervise.
     for (const repo of new Repos(this.stateDir).list()) if (!targets.has(repo)) targets.set(repo, { numbers: new Set(), branches: new Set() });
     await Promise.all([...targets].map(async ([repo, lanes]) => {
+      const old = this.state.repos[repo];
+      const carried = this.partial.get(repo);
+      const api = new Api(deps.run, carried?.cache ?? old?.cache ?? {}, deps.config.githubTimeoutMs, deps.clock.now());
+      const pulls: Record<string, Pull> = { ...old?.pulls, ...carried?.pulls };
+      const done = new Set(carried?.done);
       try {
-        const old = this.state.repos[repo];
-        const api = new Api(deps.run, old?.cache ?? {}, deps.config.githubTimeoutMs, deps.clock.now());
         const self = text(object((await api.get("user")).body).login).toLowerCase();
         const owner = repo.split("/")[0];
-        const pulls: Record<string, Pull> = { ...old?.pulls };
         const rows = await api.pages(`repos/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`);
         for (const row of rows) {
           const summary = object(row);
           const number = summary.number;
           if (typeof number !== "number" || !Number.isInteger(number)) throw new GitHubError("invalid PR number");
+          // Finished by an earlier, cut-short tick and unchanged since: its events are out, so it is not read again.
+          if (done.has(number) && pulls[number]?.updated === text(summary.updated_at)) continue;
           const prior = old?.pulls[number];
           // Closed history is baselined cheaply; continue following previously open PRs through closure.
           const inspect = summary.state === "open" || prior?.state === "open" || Boolean(old && (!prior || prior.updated !== summary.updated_at));
@@ -334,6 +347,7 @@ export class GitHubEvents {
           }
           for (const event of events) emit(`github:${repo}#${number}:${event.identity}`, `GH_PR ${repo}#${number} ${event.kind} ${event.detail} ${current.url}`);
           pulls[number] = current;
+          done.add(number);
         }
         const issues = await this.issues(api, repo, old?.issues, deps.config.githubIssueAuthors, emit);
         // Only commit source progress after every durable enqueue has succeeded.
@@ -341,13 +355,22 @@ export class GitHubEvents {
         const { [repo]: _recovered, ...failures } = this.state.failures;
         const cache = retainHistory(pulls, api.cache, deps.clock.now());
         this.commit({ ...this.state, failures: repo in this.state.failures ? failures : this.state.failures, repos: { ...this.state.repos, [repo]: { cache, pulls, issues } } });
+        this.partial.delete(repo);
       } catch (e) {
         if (!(e instanceof Error)) throw e;
+        // Keep what this tick read (conditional responses and finished PRs) for the next one instead of discarding it.
+        this.partial.set(repo, { cache: { ...api.cache }, pulls, done });
         const now = deps.clock.now();
         const last = this.state.failures[repo];
         if (last === undefined || now - last >= 15 * 60_000) {
-          emit(`github-error:${repo}:${now}`, `HOST_GITHUB ${repo} poll_failed ${e instanceof GitHubError ? e.message : e.name}`);
-          this.commit({ ...this.state, failures: { ...this.state.failures, [repo]: now } });
+          try {
+            emit(`github-error:${repo}:${now}`, `HOST_GITHUB ${repo} poll_failed ${e instanceof GitHubError ? e.message : e.name}`);
+            this.commit({ ...this.state, failures: { ...this.state.failures, [repo]: now } });
+          } catch (failed) {
+            // One repo's failure line that cannot be queued must not fail the other repos' poll; it is retried next tick.
+            if (!(failed instanceof Error)) throw failed;
+            console.error(`GITHUB_ERROR ${repo} cannot queue its poll failure: ${failed.message}`);
+          }
         }
       }
     }));

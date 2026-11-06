@@ -212,6 +212,21 @@ type GatewayOptions = {
   readonly onDispatch?: (type: string, data: unknown) => void;
   readonly log?: (line: string) => void;
   readonly random?: () => number;
+  /** A close code no reconnect can fix (see DISCORD_FATAL_CLOSE): the gateway stops reconnecting and calls this once. */
+  readonly onFatal?: (code: number, reason: string) => void;
+};
+
+/**
+ * Close codes Discord documents as not to be reconnected after: retrying only burns the daily IDENTIFY budget until
+ * someone fixes the token, sharding or intents. 4014 is fatal only once Message Content is no longer requested.
+ */
+export const DISCORD_FATAL_CLOSE: Readonly<Record<number, string>> = {
+  4004: "authentication-failed",
+  4010: "invalid-shard",
+  4011: "sharding-required",
+  4012: "invalid-api-version",
+  4013: "invalid-intents",
+  4014: "disallowed-intents",
 };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -234,6 +249,7 @@ export const discordPresence = (
   let handshake: unknown;
   let failures = 0;
   let stopped = false;
+  let fatal: number | undefined;
   let healthy = false;
   let acknowledged = true;
   let content = options.messageContent === true;
@@ -256,7 +272,7 @@ export const discordPresence = (
   };
   const resetSession = () => { session = undefined; seq = null; resumeUrl = undefined; };
   const reconnect = (socket?: GatewaySocket) => {
-    if (stopped || (socket && socket !== ws)) return;
+    if (stopped || fatal !== undefined || (socket && socket !== ws)) return;
     clearConnection();
     const previous = ws;
     ws = undefined;
@@ -279,6 +295,16 @@ export const discordPresence = (
       acknowledged = true;
       socket.onClose?.((code) => {
         if (stopped || socket !== ws) return;
+        const reason = DISCORD_FATAL_CLOSE[code];
+        if (reason && !(code === 4014 && content)) {
+          fatal = code;
+          clearConnection();
+          ws = undefined;
+          log(`DISCORD_GATEWAY_FATAL close=${code} ${reason}; not reconnecting`);
+          try { options.onFatal?.(code, reason); }
+          catch { log("DISCORD_GATEWAY_ERROR fatal close handler failed"); }
+          return;
+        }
         if (code === 4014 && content) {
           content = false;
           resetSession();
@@ -375,6 +401,8 @@ export const discordPresence = (
     /** Raw socket state for the status file: connected, and whether Message Content is still requested. */
     get connected() { return healthy; },
     get messageContent() { return content; },
+    /** The fatal close code that stopped reconnecting, if any. */
+    get fatal() { return fatal; },
     async settled() { await Promise.all(handlers); },
     close() {
       stopped = true;

@@ -9,6 +9,7 @@ import { discordPresence, type GatewaySocket } from "../src/messenger/discord.ts
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Supervisor } from "../src/supervise.ts";
 import type { DoriConfig } from "../src/config.ts";
+import { eventClass } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal } from "./fakes.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -170,6 +171,25 @@ test("4014 warns once, drops the privileged intent and retains quota handling wi
   s.socket().disconnect(4014);
   t.fire(1_000);
   expect(logs.filter((line) => line.includes("Message Content Intent"))).toHaveLength(1);
+});
+
+test("a fatal close code stops reconnecting and reports once; 4014 is fatal once Message Content is already dropped", () => {
+  for (const [codes, fatal] of [[[4013], 4013], [[4014, 4014], 4014]] as const) {
+    const t = timerFixture();
+    const s = socketsFixture();
+    const fatals: number[] = [];
+    const gateway = discordPresence(s.open, "test-token", t.timers, undefined, { messageContent: true, log: () => {}, onFatal: (code) => { fatals.push(code); } });
+    cleanups.push(() => gateway.close());
+    for (const code of codes) {
+      s.socket().receive(hello);
+      s.socket().disconnect(code);
+      t.fire(1_000);
+    }
+    expect(fatals).toEqual([fatal]);
+    expect(gateway.fatal).toBe(fatal);
+    expect(s.sockets).toHaveLength(codes.length);
+    expect(t.live.size).toBe(0);
+  }
 });
 
 const inboundFixture = (patch: Partial<DoriConfig> = {}) => {
@@ -525,4 +545,21 @@ test("item 6: first-seen REST catch-up uses discordFirstSeenLimit", async () => 
   await g.inbound.tick();
   await g.inbound.close();
   expect(g.listed.filter((url) => url.includes("/channels/100/messages")).map((url) => new URL(url).searchParams.get("limit"))).toEqual(["100"]);
+});
+
+test("a fatal gateway close reaches the lead as one urgent DISCORD_GATEWAY_FATAL line and REST catch-up keeps polling", async () => {
+  const f = inboundFixture();
+  f.socket().receive(hello);
+  f.socket().disconnect(4004);
+  await f.waitFor("discord-gateway-fatal:4004:0");
+  const line = f.emitted.get("discord-gateway-fatal:4004:0") ?? "";
+  expect(line).toStartWith("DISCORD_GATEWAY_FATAL close=4004 authentication-failed ");
+  expect(eventClass(line)).toBe("lead-urgent");
+  f.t.fire(1_000);
+  f.t.fire(30_000);
+  expect(f.sockets).toHaveLength(1);
+  expect([...f.emitted.keys()].filter((id) => id.startsWith("discord-gateway-fatal:"))).toHaveLength(1);
+  expect(f.inbound.state().connected).toBe(false);
+  await f.inbound.tick();
+  expect(f.listed.length).toBeGreaterThan(0);
 });

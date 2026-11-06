@@ -139,6 +139,11 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       messageContent: true,
       log,
       onReady: catchup,
+      // The gateway has stopped for good (bad token, intents or sharding): the lead hears it once; REST catch-up keeps polling.
+      onFatal: (code, reason) => {
+        void options.emit(`discord-gateway-fatal:${code}:${deps.clock.now()}`, `DISCORD_GATEWAY_FATAL close=${code} ${reason} reconnect stopped; fix the bot token or intents, then restart the supervisor`)
+          .catch(() => { log(`DISCORD_GATEWAY_ERROR cannot queue DISCORD_GATEWAY_FATAL close=${code}`); });
+      },
       onDispatch: (type, data) => {
         if (type === "READY" && typeof data === "object" && data !== null && "user" in data) {
           const user: unknown = data.user;
