@@ -95,9 +95,9 @@ export const paneShell = (info: ProcessInfo | undefined, cwd?: string): PaneShel
   return cwd && /^[A-Za-z]:[\\/]/.test(cwd) ? "powershell" : "posix";
 };
 
-type PaneInfo = { readonly pane_id: string; readonly workspace_id: string; readonly tab_id?: string; readonly agent?: string; readonly cwd?: string; readonly foreground_cwd?: string };
+type PaneInfo = { readonly pane_id: string; readonly workspace_id: string; readonly tab_id?: string; readonly terminal_id?: string; readonly agent?: string; readonly cwd?: string; readonly foreground_cwd?: string };
 
-export type TargetPane = { readonly pane: string; readonly tab?: string; readonly cwd?: string; readonly shell: PaneShell };
+export type TargetPane = { readonly pane: string; readonly tab?: string; readonly terminalId?: string; readonly cwd?: string; readonly shell: PaneShell };
 
 /** A target pane that cannot take the lane. `code`: `RUNNER_LANE_TARGET_BUSY` (an agent, a foreground process or another lane holds it) or `RUNNER_LANE_TARGET_INVALID`. */
 export class TargetError extends Error {
@@ -121,6 +121,8 @@ export type TargetOptions = {
   readonly ownerOf: (pane: string) => string | undefined;
   /** Refuse a cmd.exe pane (no lane footer form exists for it). */
   readonly refuseCmd: boolean;
+  /** Restored tabs need positive proof that the shell owns the foreground process group. */
+  readonly requireIdleProof?: boolean;
 };
 
 /**
@@ -149,24 +151,26 @@ export const resolveTargetPane = async (run: Runner, target: { readonly pane?: s
   const proc = await run(["herdr", "pane", "process-info", "--pane", id]);
   if (proc.code !== 0) throw invalid(`cannot read the processes of pane ${id}: ${proc.err || proc.out}`);
   const p = parse<{ result: { process_info: ProcessInfo } }>(proc.out, `herdr pane process-info ${id}`).result.process_info;
+  if (opts.requireIdleProof && (!p.shell_pid || p.foreground_process_group_id !== p.shell_pid
+    || p.foreground_processes?.some((proc) => proc.pid !== p.shell_pid))) throw busy(`pane ${id} is not a proven idle shell`);
   if (p.foreground_process_group_id && p.foreground_process_group_id !== p.shell_pid) throw busy(`pane ${id} has a foreground process running; a lane needs an idle shell`);
   const owner = opts.ownerOf(id);
   if (owner) throw busy(`pane ${id} is already registered to lane ${owner}`);
   const cwd = info.foreground_cwd ?? info.cwd;
   const shell = paneShell(p, cwd);
   if (opts.refuseCmd && shell === "cmd") throw invalid(cmdRefused(id));
-  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(cwd ? { cwd } : {}), shell };
+  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(info.terminal_id ? { terminalId: info.terminal_id } : {}), ...(cwd ? { cwd } : {}), shell };
 };
 
 /** A freshly created pane: its shell and directory, read leniently (an unreadable answer means POSIX). */
-export const inspectCreated = async (run: Runner, pane: string): Promise<{ readonly shell: PaneShell; readonly cwd?: string }> => {
+export const inspectCreated = async (run: Runner, pane: string): Promise<{ readonly shell: PaneShell; readonly cwd?: string; readonly terminalId?: string }> => {
   const got = await run(["herdr", "pane", "get", pane]);
   const proc = await run(["herdr", "pane", "process-info", "--pane", pane]);
   const read = <T>(text: string): T | undefined => { try { return JSON.parse(text) as T; } catch { return undefined; } };
   const info = got.code === 0 ? read<{ result?: { pane?: PaneInfo } }>(got.out)?.result?.pane : undefined;
   const p = proc.code === 0 ? read<{ result?: { process_info?: ProcessInfo } }>(proc.out)?.result?.process_info : undefined;
   const cwd = info?.foreground_cwd ?? info?.cwd;
-  return { shell: paneShell(p, cwd), ...(cwd ? { cwd } : {}) };
+  return { shell: paneShell(p, cwd), ...(cwd ? { cwd } : {}), ...(info?.terminal_id ? { terminalId: info.terminal_id } : {}) };
 };
 
 // ---------------------------------------------------------------------------------------------------------------

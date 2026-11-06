@@ -184,7 +184,7 @@ describe("event cursor over a lossy in-memory link", () => {
 });
 
 describe("hub commit-then-ack", () => {
-  const hello = (hub: RunnerHub) => hub.hello(runnerControl(HEAD, "hello", { proto: 2, gen: 1, label: LABEL, hostId: "h", cmdAck: 0, version: "v" }));
+  const hello = (hub: RunnerHub) => hub.hello(runnerControl(HEAD, "hello", { proto: 3, gen: 1, label: LABEL, hostId: "h", cmdAck: 0, version: "v" }));
 
   test("a throwing commit leaves eventAck unchanged and sends no ack; a retry commits", () => {
     let fail = true;
@@ -222,7 +222,7 @@ describe("hub commit-then-ack", () => {
       expect(hub.receive(runnerEvent(HEAD, 1, "lane.state", stateBody))).toMatchObject({ result: "duplicate", eventAck: 1 });
       expect(ids).toEqual([journalId(LABEL, 1)]);
       const reply = hello(hub);
-      expect(reply.ok && reply.reply.body).toEqual({ proto: 3, epoch: 1, eventAck: 1 });
+      expect(reply.ok && reply.reply.body).toEqual({ proto: 4, epoch: 1, eventAck: 1 });
     } finally {
       hub.close();
     }
@@ -232,8 +232,8 @@ describe("hub commit-then-ack", () => {
     let mono = 0;
     const hub = new RunnerHub({ stateDir: join(tmp.dir, "sup"), now: () => 5, monotonic: () => mono, epoch: 1, commit: () => true });
     try {
-      // The supervisor speaks proto 3 and accepts 3 and 2 (N and N-1).
-      const body = { proto: 2, gen: 2, label: LABEL, hostId: "h", cmdAck: 0 };
+      // The supervisor speaks proto 4 and accepts 4 and 3 (N and N-1).
+      const body = { proto: 3, gen: 2, label: LABEL, hostId: "h", cmdAck: 0 };
       const rejectCode = (b: typeof body) => {
         const out = hub.hello(runnerControl(HEAD, "hello", b));
         return out.ok ? "ok" : out.reply.body.code;
@@ -243,7 +243,7 @@ describe("hub commit-then-ack", () => {
       expect(rejectCode(body)).toBe("ok");
       expect(rejectCode({ ...body, hostId: "other" })).toBe("RUNNER_CONFLICT");
       expect(rejectCode({ ...body, gen: 1 })).toBe("RUNNER_CONFLICT");
-      expect(formatRunnerStatus(hub.status()[0] as never)).toBe("RUNNER r1 connected proto=2 version=- gen=2 hb=- outbox=-");
+      expect(formatRunnerStatus(hub.status()[0] as never)).toBe("RUNNER r1 connected proto=3 version=- gen=2 hb=- outbox=-");
       mono = 61_000;
       expect(hub.status()[0]?.state).toBe("stale");
       hub.disconnected(LABEL);
@@ -268,7 +268,7 @@ describe("proto 3 frames", () => {
   const roundTrip = (frame: Parameters<typeof encodeFrame>[0], from: "runner" | "supervisor") => decodeFrame(encodeFrame(frame), from);
 
   test("the new event fields and lane.ack validate; cmd.result.result takes any JSON value", () => {
-    expect(PROTO).toBe(3);
+    expect(PROTO).toBe(4);
     expect(roundTrip(runnerEvent(HEAD, 1, "lane.ack", { key: "lane-a", id: "m-1" }), "runner").type).toBe("lane.ack");
     expect(roundTrip(runnerEvent(HEAD, 2, "lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }), "runner").body)
       .toEqual({ key: "lane-a", status: "dead", reason: "agent-gone" });

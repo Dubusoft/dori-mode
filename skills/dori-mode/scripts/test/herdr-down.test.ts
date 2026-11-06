@@ -103,7 +103,7 @@ test("over the runner hub: a runner's guard samples save herdr on its row, enque
   cleanups.push(() => { outbox.close(); state.close(); });
   const { code } = handle.auth.issueCode("lab");
   expect(await enrollRunner({ auth, connect, code, label: "lab", hostId: "host-b", expectedFingerprint: handle.auth.fingerprint })).toMatchObject({ ok: true });
-  const client = new RunnerClient({ label: "lab", hostId: "host-b" }, { connect, outbox, state, clock, auth });
+  const client = new RunnerClient({ label: "lab", hostId: "host-b", proto: 3 }, { connect, outbox, state, clock, auth });
   expect(await client.connectOnce()).toMatchObject({ ok: true });
   /** Publishes one guard sample and waits until the hub committed it. */
   const publish = async (panes: number): Promise<void> => {

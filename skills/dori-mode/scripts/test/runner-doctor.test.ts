@@ -36,15 +36,15 @@ test("without a runners section doctor still checks local runner basics", () => 
 
 test("a missing listen address warns; a healthy runner is OK", () => {
   const s = setup({});
-  addRunner(s.stateDir, "worker-a", 2);
+  addRunner(s.stateDir, "worker-a", 3);
   const checks = runnerChecks(s.deps);
   expect(checks.find((c) => c.id === "runner listen")?.level).toBe("WARN");
-  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 2, gen 4, restarts1h 0" });
+  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 3, gen 4, restarts1h 0" });
 });
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
   const s = setup({ listen: "100.101.1.2:7411" });
-  addRunner(s.stateDir, "worker-a", 4);
+  addRunner(s.stateDir, "worker-a", 6);
   const ops = openOperations(s.config);
   for (const n of [1, 2, 3]) plan(ops, NOW - n * 60_000, { lane: "runner:worker-a", action: "restart", target: `1-${n}` });
   plan(ops, NOW - 2 * 60 * 60_000, { lane: "runner:worker-a", action: "restart", target: "0-9" });
@@ -53,5 +53,5 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   expect(checks.find((c) => c.id === "runner listen")).toMatchObject({ level: "OK", detail: "100.101.1.2:7411 (private)" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
-  expect(row?.detail).toBe("proto 4 is not 3 or 2; restart circuit open (3 restarts in the last hour)");
+  expect(row?.detail).toBe("proto 6 is not 4 or 3; restart circuit open (3 restarts in the last hour)");
 });

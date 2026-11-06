@@ -44,6 +44,7 @@ test("lane.start on the runner, its lane.started, then a done report make exactl
   const published: [string, unknown][] = [];
   const herdr: [string, ...string[]][] = [];
   const lanes = new RunnerLanes({
+    instance: async () => "server-1",
     runnerDir, clock: fakeClock(T0), token: () => "lane-token-1",
     policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
     publish: (type, body) => { published.push([type, body]); },
@@ -160,7 +161,7 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe a
     if (argv.slice(0, 3).join(" ") === "herdr pane list") return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "p7", workspace_id: "w", tab_id: "t7", agent: "omo", agent_status: "working" }] } }), err: "" } as Ran;
     return { code: 0, out: "", err: "" } as Ran;
   };
-  const lanes = new RunnerLanes({ runnerDir, run: herdr, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
+  const lanes = new RunnerLanes({ instance: async () => "server-1", runnerDir, run: herdr, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
   const published: RunnerEventBodies["cmd.result"][] = [];
   let waiting: { n: number; resolve: () => void } | undefined;
   const dispatch = commandDispatcher({

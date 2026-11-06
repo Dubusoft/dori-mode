@@ -46,7 +46,7 @@ Control frames, used in this release:
 fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
-`lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. Today
+`lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `herdr.state`, `herdr.start`, `heavy.state` and `cmd.result`. Today
 a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, `lane.started`, `lane.report` and
 the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
 `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `runner.rotate`)
@@ -73,6 +73,12 @@ Protocol 3 adds, all optional on existing frames:
 | `lane.send` | `mode` (`verified` or `guarded`), `refuseWhileAsking` |
 | `lane.notify {key, status, objection?: {at, reasons}, claim?: {at, evidence}}` | new command: the lane's status as the supervisor holds it |
 | `lane.git {key, op, root, path?, branch?, remote?}` | new command: `worktree-remove`, `branch-delete` or `remote-branch-delete` in `root` |
+
+Protocol 4 adds `guard.sample.herdr?: {state: up|down|hung, instance?: string, since: number}`,
+`herdr.state {state, instance?, detail}` on transitions, and `herdr.start {ok, detail}` for managed-unit start
+outcomes. `since` is the runner's wall time; the supervisor records its own receipt time for shared state.
+The supervisor continues to infer outages from `panes: -1` for protocol 3 runners. Protocol 4 samples without
+`herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
@@ -341,25 +347,47 @@ sampled over ssh again, as before.
 
 ## herdr outages
 
-The supervisor reads a machine's herdr from its runner's `guard.sample.panes` (protocol 3, so every installed
-runner already sends it). It applies to every runner, the local one included.
+Each runner, including the local runner, watches herdr on the existing 30 s guard sampling timer. A readable pane
+list means `up`; a failed list and no server process means `down`; a failed list with a server process (or an
+unreadable process table) means `hung`. Two consecutive failures spanning at least 30 s are required. A gap longer
+than three sampling intervals resets the failure window and discards the first failed sample after waking.
+
+The runner starts an installed `herdr-server.service` on Linux or kickstarts `com.dori.herdr` in its saved launchd
+domain on macOS only while `down`. Attempts wait one minute, doubling to a thirty minute cap; `up` resets the
+cooldown. Each attempt is durably reported as `HERDR_START machine=<label> ok|failed <detail>`. An absent unit
+is reported through the down state without starting anything. A hung server is reported and left running.
+
+The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
+with `HERDR_DOWN` / `HERDR_HUNG` (urgent) and `HERDR_UP ... server=<instance>` (digest). For protocol 3 runners:
 
 - Two committed samples in a row with `panes: -1` mark the machine's herdr `down`: `HERDR_DOWN machine=<label> ...`
   (urgent), once. Protocol 3 cannot tell a stopped herdr from a hung one, and -1 also covers a pane list that timed
   out or did not parse. One unreadable sample between readable ones changes nothing.
 - The next sample with a pane count marks it `up` again: `HERDR_UP machine=<label> ... after <n> s down` (digest), once.
-  A runner's first readable sample is saved as `up` and says nothing. A sample without `panes` (a protocol-2
-  runner) changes nothing.
+  A runner's first readable sample is saved as `up` and says nothing. A sample without `panes` changes nothing.
 - The state and the time it was entered are saved on the runner's row in `runners.sqlite` (`herdr`, `herdrSince`),
   so they survive a supervisor restart and other `dori` processes read them.
-- While a machine's herdr is down the recovery sweep leaves that machine's lanes alone: nothing is read or relaunched
+- While a machine's herdr is down or hung the recovery sweep leaves that machine's lanes alone: nothing is read or relaunched
   and no recovery attempt is counted. `dori recover <key>` for such a lane prints `LANE_RECOVERY_HELD <key> ...`.
   After `HERDR_UP` the next sweep recovers them as usual, on their recorded session when they have one.
 - `dori launch --machine <label>` is refused at once with `HERDR_DOWN machine=<label> ...`, before any placement
   check or runner call.
-- `dori status` adds `herdr=<up|down|unknown>` to each runner line.
+- `dori status` adds `herdr=<up|down|hung|unknown>` to each runner line.
 
-The supervisor neither starts nor restarts herdr; bring it back on that machine by hand.
+Lane records store `herdrInstance` from the current user's herdr server pids and process start times (`pgrep` /
+`ps`). Multiple matching server processes contribute to one sorted identity, so any such process changing
+conservatively invalidates old records. `terminalId`, when herdr provides it, additionally fences replacement
+terminals within the same server. Unknown server identity refuses a new launch or adoption. A record from an older
+runner acquires identity only when a live foreground process is positively attributed to its key through
+`DORI_LANE_KEY` ancestry, or its argv contains the exact saved lane brief prompt. Otherwise it counts as absent;
+it is never trusted by pane id alone. An adopted legacy lane needs process attribution because it has no launch prompt.
+
+Observe, recover, send, pause, resume, close, asking-screen reads and lane inspection compare the saved identity
+before touching the recorded pane. A mismatch means missing (`RUNNER_LANE_ABSENT` for steering); close forgets
+the lane without closing a reused pane. Recover resumes the saved session in a new tab, or reuses the restored
+tab only if its label still equals the lane key and it contains exactly one idle shell without an agent or
+foreground job. Other tabs are left alone. Remote launches without `tabWorkspace` find or create the workspace
+labelled `lanes`, so a fresh headless server needs no focused workspace.
 
 ## Health and probe
 
@@ -399,7 +427,7 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 3, so a supervisor accepts runners at 3 and 2. The runner's `state.sqlite` gained the
+The current protocol is 4, so a supervisor accepts runners at 4 and 3. The runner's `state.sqlite` gained the
 nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
 
 ## Liveness and restarts

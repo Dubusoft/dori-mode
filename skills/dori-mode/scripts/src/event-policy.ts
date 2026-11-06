@@ -39,6 +39,7 @@ const URGENT_KINDS = [
   // A machine's herdr is unreadable: its lanes cannot run or be recovered until someone brings herdr back. HERDR_UP
   // stays digest (the default): held recovery resumes by itself.
   "HERDR_DOWN",
+  "HERDR_HUNG",
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
   "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",

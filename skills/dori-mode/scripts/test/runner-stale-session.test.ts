@@ -30,6 +30,7 @@ const setup = () => {
   let tokens = 0;
   const ok = (out = ""): Ran => ({ code: 0, out, err: "" }) as Ran;
   const lanes = new RunnerLanes({
+    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), token: () => `tok-${++tokens}`, publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     realpath: (p) => p,
     policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },

@@ -3,7 +3,7 @@ import type { AnyRunnerEvent } from "./protocol.ts";
 import { LOCAL_RUNNER } from "./serve.ts";
 
 /**
- * herdr outages read from the runners' guard samples, on the supervisor (protocol 3, no runner change). A runner's
+ * Explicit protocol-4 herdr transitions and snapshots, with protocol-3 pane-count inference on the supervisor. A runner's
  * `guard.sample.panes` is -1 when it could not read herdr's pane list. That many samples in a row
  * (HERDR_DOWN_SAMPLES; the runner sends one a minute) mark the runner's machine's herdr `down`: `HERDR_DOWN
  * machine=<label>` once, and the state is saved on the runner's hub row. The next sample with a pane count marks it
@@ -16,7 +16,7 @@ import { LOCAL_RUNNER } from "./serve.ts";
  * read the saved state through `herdrDownSince`, so a `dori` command in another process sees it too.
  */
 
-export type HerdrState = "up" | "down";
+export type HerdrState = "up" | "down" | "hung";
 
 /** Unreadable samples in a row before a machine's herdr counts as down. */
 export const HERDR_DOWN_SAMPLES = 2;
@@ -36,12 +36,33 @@ const tag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
 
 export class HerdrDownInference {
   private readonly misses = new Map<string, number>();
+  private readonly instances = new Map<string, string>();
 
   /** `now` is the supervisor's wall clock: the saved time is read by other processes. */
   constructor(private readonly store: HerdrStore, private readonly now: () => number) {}
 
   /** The transition a committed runner event shows, if any; it is saved before it is returned. */
-  event(label: string, frame: AnyRunnerEvent): HerdrTransition | undefined {
+  event(label: string, frame: AnyRunnerEvent, proto = 3): HerdrTransition | undefined {
+    if (frame.type === "herdr.start") return {
+      id: `herdr:${label}:start:${frame.seq}`,
+      line: `HERDR_START ${tag(label)} ${frame.body.ok ? "ok" : "failed"} ${frame.body.detail}`,
+    };
+    const health = frame.type === "herdr.state" ? frame.body : frame.type === "guard.sample" ? frame.body.herdr : undefined;
+    if (health) {
+      this.misses.delete(label);
+      const known = this.store.read(label);
+      const instance = this.instances.get(label);
+      if (health.instance) this.instances.set(label, health.instance);
+      if (known?.state === health.state && !(health.state === "up" && instance && health.instance && instance !== health.instance)) return undefined;
+      const since = this.now();
+      this.store.save(label, { state: health.state, since });
+      if (!known && health.state === "up") return undefined;
+      return {
+        id: `herdr:${label}:${health.state}:${frame.seq}`,
+        line: `HERDR_${health.state.toUpperCase()} ${tag(label)}${health.instance ? ` server=${health.instance.replace(/\s/g, "_")}` : ""} ${health.state === "up" ? "held lane recovery resumes at the next recovery sweep" : "lane recovery on this machine is held until herdr reads again"}`,
+      };
+    }
+    if (proto >= 4) return undefined;
     if (frame.type !== "guard.sample") return undefined;
     const panes = frame.body.panes;
     if (panes === undefined) return undefined;
@@ -72,4 +93,4 @@ export class HerdrDownInference {
 
 /** The runners whose machine's herdr is saved as down, with the time it went down (read-only; empty without a hub). */
 export const herdrDownSince = (stateDir: string): ReadonlyMap<string, number> =>
-  new Map(readRunnerRows(stateDir).flatMap((row) => (row.herdr === "down" ? [[row.label, row.herdrSince ?? 0] as const] : [])));
+  new Map(readRunnerRows(stateDir).flatMap((row) => (row.herdr === "down" || row.herdr === "hung" ? [[row.label, row.herdrSince ?? 0] as const] : [])));

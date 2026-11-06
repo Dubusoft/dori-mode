@@ -42,7 +42,7 @@ test("a runner that crashed after lane.start's effect and before its result sett
   const before = new RunnerState(dir, { now: clock.now });
   before.boot();
   expect(before.recordIntent({ cmdId: START.cmdId, cmdSeq: 1, type: "lane.start", epoch: 1, key: "lane-a" }).fresh).toBe(true);
-  const lanes = new RunnerLanes({ runnerDir: dir, run: herdr.run, clock, publish: () => {}, policy: { agents: { default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" } });
+  const lanes = new RunnerLanes({ instance: async () => "server-1", runnerDir: dir, run: herdr.run, clock, publish: () => {}, policy: { agents: { default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" } });
   await lanes.start(START);
   before.close();
 

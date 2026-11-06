@@ -83,7 +83,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(renderStatus(status)).toContain("RUNNER local connected proto=3 version=- gen=1 hb=0 outbox=");
+  expect(renderStatus(status)).toContain("RUNNER local connected proto=4 version=- gen=1 hb=0 outbox=");
   // lanes= counts the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
   expect(renderStatus(status)).toMatch(/RUNNER local connected .* cmds=0 restarts1h=0 lanes=0 herdr=unknown$/m);
 
