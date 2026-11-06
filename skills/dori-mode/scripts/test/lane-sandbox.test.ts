@@ -75,6 +75,21 @@ test("the top-level directory holding $HOME is the sandbox's own, not a read-onl
   expect(argv.filter((a, i) => a.startsWith("--") && argv[i + 1] === top)).toEqual([]);
 });
 
+test("LANE_SANDBOX_VERIFY is bound read-write on its own, leaving its parent directories unbound", async () => {
+  const home = join(tempDir(), "home");
+  const state = join(home, "..", "ws", "state");
+  const verify = join(state, "verify");
+  mkdirSync(verify, { recursive: true });
+
+  const rw = (argv: string[]) => argv.flatMap((a, i) => (a === "--bind" || a === "--bind-try" ? [argv[i + 2] ?? ""] : []));
+  const bound = rw(await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_VERIFY: verify }));
+  expect(bound).toContain(verify);
+  expect(bound).not.toContain(state);
+  expect(bound).not.toContain(join(state, ".."));
+
+  expect(rw(await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" }))).not.toContain(verify);
+});
+
 test("refreshLaneSandbox replaces an outdated install, keeps the old copy, and leaves a current or missing one alone", () => {
   const home = tempDir();
   const installed = installedLaneSandbox(home);

@@ -5,6 +5,7 @@
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
+#   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <defaultCwd>/state/verify)
 set -eu
 
 if [ "$#" -eq 0 ]; then
@@ -95,6 +96,10 @@ if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   for p in "${extra[@]}"; do
     [ -n "$p" ] && opts+=(--bind-try "$p" "$p")
   done
+fi
+# Only the verify directory itself: the rest of its parent stays read-only.
+if [ -n "${LANE_SANDBOX_VERIFY:-}" ]; then
+  opts+=(--bind-try "$LANE_SANDBOX_VERIFY" "$LANE_SANDBOX_VERIFY")
 fi
 
 # Private key only when the ssh agent has no identities
