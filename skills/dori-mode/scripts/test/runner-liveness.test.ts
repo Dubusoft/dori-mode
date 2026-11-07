@@ -22,22 +22,25 @@ const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOu
   let at = 0;
   const lines: string[] = [];
   const restarts: number[] = [];
+  let owned = lanes;
   const operations = openOperations({ stateDir: dir, store: "json" });
   options.seed?.(operations, 1_800_000_000_000);
   const monitor: LivenessMonitor = new LivenessMonitor({
     monotonic: () => at, now: () => 1_800_000_000_000 + at, epoch: 7,
     probe: async () => probe(monitor),
     restart: async () => { restarts.push(at); await options.duringRestart?.(monitor); return { ok: true, detail: "restarted" }; },
-    ownedLanes: async () => lanes, operations, emit: (line) => { lines.push(line); },
+    ownedLanes: async () => owned, operations, emit: (line) => { lines.push(line); },
   });
   monitor.track("worker-a", 1);
   /** Ticks every 5 s (the runners task period) until `untilMs`. */
   const runTo = async (untilMs: number): Promise<void> => { while (at < untilMs) { at = Math.min(untilMs, at + 5_000); await monitor.tick(); } };
-  return { monitor, lines, restarts, operations, runTo, at: () => at };
+  return { monitor, lines, restarts, operations, runTo, at: () => at, own: (next: readonly string[]) => { owned = next; } };
 };
 const kinds = (lines: readonly string[]): string[] => lines.map((l) => l.split(" ").slice(0, l.startsWith("HOST_GUARD") ? 2 : 1).join(" "));
 
-test("heartbeats stop: RUNNER_STALE at 60 s, HOST_GUARD OFFLINE at 180 s, once each", async () => {
+const urgent = (lines: readonly string[]): string[] => lines.filter((l) => l.startsWith("HOST_GUARD OFFLINE") || l.startsWith("LANE_RUNNER_LOST"));
+
+test("heartbeats stop: RUNNER_STALE at 60 s, digest RUNNER_OFFLINE at 180 s, HOST_GUARD OFFLINE only once 10 min offline", async () => {
   const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }));
   await r.runTo(55_000);
   expect(r.lines).toEqual([]);
@@ -46,15 +49,79 @@ test("heartbeats stop: RUNNER_STALE at 60 s, HOST_GUARD OFFLINE at 180 s, once e
   await r.runTo(175_000);
   expect(r.lines).toHaveLength(1);
   await r.runTo(180_000);
-  expect(r.lines.at(-1)).toBe("HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 180 s");
-  await r.runTo(600_000);
-  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "HOST_GUARD OFFLINE"]);
+  expect(r.lines.at(-1)).toBe("RUNNER_OFFLINE machine=worker-a runner heartbeat missing for 180 s");
+  await r.runTo(775_000);
+  expect(urgent(r.lines)).toEqual([]);
+  await r.runTo(780_000);
+  expect(r.lines.at(-1)).toBe("HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 780 s");
+  await r.runTo(1_500_000);
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE", "HOST_GUARD OFFLINE"]);
   expect(r.restarts).toEqual([]);
+});
+
+test("alive but unreachable: a short disconnect stays digest and its reconnect wakes nobody", async () => {
+  const r = rig(() => ({ kind: "alive" }));
+  await r.runTo(180_000 + 5 * 60_000);
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE", "RUNNER_UNREACHABLE"]);
+  await r.monitor.heartbeat("worker-a");
+  expect(urgent(r.lines)).toEqual([]);
+  expect(r.lines.some((l) => l.startsWith("HOST_GUARD ONLINE"))).toBe(false);
+  expect(r.restarts).toEqual([]);
+});
+
+test("a dead host escalates at once, before its restart", async () => {
+  const r = rig(() => ({ kind: "dead", detail: "no process" }));
+  await r.runTo(180_000);
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE", "HOST_GUARD OFFLINE"]);
+  expect(r.lines.at(-1)).toBe("HOST_GUARD OFFLINE machine=worker-a runner dead on its host: no process");
+  expect(r.restarts).toEqual([180_000]);
+});
+
+test("a runner that owns open lanes escalates on its first disconnect", async () => {
+  const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }), ["lane-a"]);
+  await r.runTo(180_000);
+  expect(r.lines.at(-1)).toBe("HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 180 s; it owns open lanes lane-a");
+  await r.monitor.heartbeat("worker-a");
+  expect(r.lines.at(-1)).toBe("HOST_GUARD ONLINE machine=worker-a");
+});
+
+test("reconnects within the hysteresis fold into one outage per machine: one RUNNER_OFFLINE, one RUNNER_ONLINE, no wake", async () => {
+  const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }));
+  // Four flaps: 3.5 min down, 2 min up, each well inside the 10 min hold.
+  for (let i = 0; i < 4; i++) {
+    await r.runTo(r.at() + 210_000);
+    await r.monitor.heartbeat("worker-a");
+    await r.runTo(r.at() + 120_000);
+    await r.monitor.heartbeat("worker-a");
+  }
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE"]);
+  // Steady from here: the outage ends 10 min after the last reconnect, said once with the folded count.
+  const steadyUntil = r.at() + 11 * 60_000;
+  while (r.at() < steadyUntil) { await r.runTo(r.at() + 30_000); await r.monitor.heartbeat("worker-a"); }
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE", "RUNNER_ONLINE"]);
+  expect(r.lines.at(-1)).toEndWith("; 4 disconnects folded into this outage");
+  expect(urgent(r.lines)).toEqual([]);
+  // A disconnect after the outage ended is a new first disconnect.
+  await r.runTo(r.at() + 180_000);
+  expect(kinds(r.lines).slice(-2)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE"]);
+});
+
+test("a folded disconnect that stays down 10 min still wakes the lead; owned lanes wake it once per outage", async () => {
+  const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }), ["lane-a"]);
+  await r.runTo(180_000);
+  await r.monitor.heartbeat("worker-a");
+  await r.runTo(r.at() + 180_000);
+  expect(urgent(r.lines)).toHaveLength(1);
+  r.own([]);
+  await r.runTo(r.at() + 10 * 60_000);
+  expect(urgent(r.lines)).toHaveLength(2);
+  expect(urgent(r.lines)[1]).toStartWith("HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 780 s");
 });
 
 test("a partition (process alive, health fresh) for 10 min restarts nothing and says RUNNER_UNREACHABLE once", async () => {
   const r = rig(() => ({ kind: "alive" }));
   await r.runTo(180_000 + 10 * 60_000);
+  expect(urgent(r.lines)).toHaveLength(1);
   expect(r.restarts).toEqual([]);
   expect(r.lines.filter((l) => l.startsWith("RUNNER_UNREACHABLE"))).toHaveLength(1);
   await r.monitor.heartbeat("worker-a");
@@ -90,7 +157,8 @@ test("a runner that reconnects while it is being probed is not restarted", async
   const r = rig(async (monitor) => { await monitor.heartbeat("worker-a"); return { kind: "dead", detail: "health read before the reconnect" }; });
   await r.runTo(180_000);
   expect(r.restarts).toEqual([]);
-  expect(r.lines.at(-1)).toBe("HOST_GUARD ONLINE machine=worker-a");
+  expect(r.lines.at(-1)).toBe("RUNNER_OFFLINE machine=worker-a runner heartbeat missing for 180 s");
+  expect(urgent(r.lines)).toEqual([]);
 });
 
 test("a hello that arrives while the restart command is still running verifies the restart", async () => {
