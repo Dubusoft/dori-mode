@@ -82,7 +82,8 @@ export class Delivery {
       const now = this.deps.clock.now();
       // A sweep warning waits for real traffic: a failure that persists must not restart an idle lead every hour.
       const overdue = (event: Event) => event.at !== undefined && now - event.at >= this.deps.config.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line);
-      const urgent = pending.filter((event) => eventPriority(event.line, policy) === "urgent");
+      // A finish event that joined its lane's record with nothing new (a merge after the claim) waits like digest.
+      const urgent = pending.filter((event) => eventPriority(event.line, policy) === "urgent" && !this.outcomes.quiet(event.id));
       const due = urgent.length > 0 || pending.some(overdue);
       await this.lead.resumePaused(readPane);
       if (await this.lead.stuckRestart(pending, readPane)) continue;

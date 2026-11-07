@@ -139,7 +139,7 @@ test("CI_MERGED and LANE_CLOSED of one lane are one obligation: UNREPORTED after
   f.clock.at += MIN;
   supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha {\"checks\":[]}");
   expect(readJournal(f.state.dir).outcomes).toEqual([
-    { lane: "alpha", since: T0, line: "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x", events: ["ci-merged:acme/app#7", "lane-closed:alpha"] },
+    { lane: "alpha", since: T0, line: "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x", events: ["ci-merged:acme/app#7", "lane-closed:alpha"], heads: ["abc"] },
   ]);
   f.clock.at = T0 + 5 * MIN - 1;
   await supervisor.reportTick();
@@ -212,7 +212,7 @@ test("a done claim opens the lane's obligation: listed for inbox take, UNREPORTE
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("done-claim:alpha:1", CLAIM);
-  expect(readJournal(f.state.dir).outcomes).toEqual([{ lane: "alpha", since: T0, line: CLAIM, events: ["done-claim:alpha:1"], claim: true }]);
+  expect(readJournal(f.state.dir).outcomes).toEqual([{ lane: "alpha", since: T0, line: CLAIM, events: ["done-claim:alpha:1"], claim: true, claimed: true }]);
   await supervisor.reportTick();
   expect(takeReminders(f.state.dir)).toEqual([
     `unreported:alpha\tUNREPORTED alpha since ${new Date(T0).toISOString()}: run dori reported alpha --text TEXT to post the outcome to the owner in its thread`,
@@ -235,7 +235,7 @@ test("the seen-claim close joins the claim's obligation: a reported claim is not
   await supervisor.reportTick();
   expect(f.unreported()).toEqual([]);
   expect(readJournal(f.state.dir).outcomes).toEqual([
-    { lane: "alpha", since: T0, line: CLAIM, events: ["done-claim:alpha:1", "lane-closed:alpha"], reportedAt: T0 },
+    { lane: "alpha", since: T0, line: CLAIM, events: ["done-claim:alpha:1", "lane-closed:alpha"], reportedAt: T0, claimed: true },
   ]);
   // Joined by a real outcome, the row is no longer the claim's: a later rejection leaves it.
   supervisor.enqueue("not-done:alpha", "LANE_NOT_DONE alpha dirty tree");
@@ -278,7 +278,7 @@ test("LANE_NOT_DONE drops a reported claim's row, so the next claim is owed afre
   f.clock.at += 30 * MIN;
   const again = f.clock.now();
   supervisor.enqueue("done-claim:alpha:2", `${CLAIM} fixed`);
-  expect(readJournal(f.state.dir).outcomes).toEqual([{ lane: "alpha", since: again, line: `${CLAIM} fixed`, events: ["done-claim:alpha:2"], claim: true }]);
+  expect(readJournal(f.state.dir).outcomes).toEqual([{ lane: "alpha", since: again, line: `${CLAIM} fixed`, events: ["done-claim:alpha:2"], claim: true, claimed: true }]);
   f.clock.at += 5 * MIN;
   await supervisor.reportTick();
   expect(f.unreported().map((event) => event.line.split(" ").slice(0, 3).join(" "))).toEqual(["UNREPORTED alpha claimed"]);

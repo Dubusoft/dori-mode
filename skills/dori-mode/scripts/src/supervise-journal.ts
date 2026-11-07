@@ -90,6 +90,12 @@ export type LaneOutcome = {
   readonly pushedAt?: number;
   /** Opened by a done claim and no LANE_CLOSED/CI_MERGED joined yet: a rejected claim drops the row. */
   readonly claim?: true;
+  /** A done claim joined the row (kept when a real outcome joins it, unlike `claim`). */
+  readonly claimed?: true;
+  /** The PR heads its CI_MERGED events named. */
+  readonly heads?: readonly string[];
+  /** Events that joined with nothing new for the lead: they wake no one (lane-outcomes.ts). */
+  readonly quiet?: readonly string[];
   /** The lane's thread id and its latest report there, from `dori reported` receipts: the close-button check reads them. */
   readonly thread?: string;
   readonly lastReportAt?: number;
