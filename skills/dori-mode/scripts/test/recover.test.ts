@@ -392,6 +392,24 @@ test.each([{ live: false, reason: "missing-pane" }, { live: true, reason: "missi
   expect((await deps.registry.read(lane.key))?.status).toBe("closed");
 });
 
+test("the supervisor journals a skipped recovery under one id per lane, generation and reason", async () => {
+  const { deps, world, lane } = await fixture();
+  world.prState = "MERGED";
+  const enqueued: [string, string][] = [];
+  const enqueue = async (line: string, id: string): Promise<void> => { enqueued.push([id, line]); };
+  // The lane is still open on the next sweep (as when its close was refused): the same observation, the same id.
+  expect(await recoverLanes(deps, undefined, enqueue)).toEqual([]);
+  await deps.registry.write(lane);
+  expect(await recoverLanes(deps, undefined, enqueue)).toEqual([]);
+  expect(enqueued).toHaveLength(2);
+  expect(enqueued[0]?.[1]).toStartWith("LANE_RECOVERY_SKIPPED recover-lane old:p1 missing-pane: every Done signal holds");
+  expect(enqueued[1]?.[0]).toBe(enqueued[0]?.[0]);
+  // Another generation of the lane is a new observation.
+  await deps.registry.write({ ...lane, lastRecoveryAt: 5 } as RecoveryLane);
+  await recoverLanes(deps, undefined, enqueue);
+  expect(new Set(enqueued.map(([id]) => id)).size).toBe(2);
+});
+
 // Captured 10-23 from live omo 5.1.44 panes (herdr process-info argv and the status bar's last lines).
 const SONNET = "anthropic-subscription/claude-sonnet-5-5";
 const OMO = "/home/dev/.omo/binary-runtime/5.1.44/omo";

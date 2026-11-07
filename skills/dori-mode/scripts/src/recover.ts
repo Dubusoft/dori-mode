@@ -238,7 +238,11 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   const finished = await finishedReason(deps, current);
   if (finished) {
     const closed = await closeLane(deps, current, `recovery: ${finished}; not relaunched`);
-    return [`LANE_RECOVERY_SKIPPED ${lane.key} ${lane.pane ?? "-"} ${reason}: ${finished}; ${closed.closed ? "lane closed" : `not relaunched, left for dori close (${closed.lines.at(-1) ?? "refused"})`}`];
+    const event = `LANE_RECOVERY_SKIPPED ${lane.key} ${lane.pane ?? "-"} ${reason}: ${finished}; ${closed.closed ? "lane closed" : `not relaunched, left for dori close (${closed.lines.at(-1) ?? "refused"})`}`;
+    if (!enqueue) return [event];
+    // A refused close leaves the lane for the next sweep: the same lane, generation and reason is said once.
+    await enqueue(event, `recovery-skipped:${JSON.stringify([lane.key, lane.openedAt, current.lastRecoveryAt ?? null, reason, finished, closed.closed])}`);
+    return [];
   }
   const noticeId = (kind: string, detail = ""): string =>
     `recovery:${JSON.stringify([lane.key, lane.openedAt, lane.pane, lane.model, current.recoveryAttempts ?? 0, current.lastRecoveryAt, kind, detail])}`;

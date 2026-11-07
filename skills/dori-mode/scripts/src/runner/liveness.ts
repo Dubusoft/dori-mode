@@ -17,7 +17,7 @@ import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
  *   as `RUNNER_ONLINE machine=<label>` (digest) with the number of disconnects folded into it.
  * - Each decision runs `dori runner probe --json` on the runner's host over ssh. ssh failing is "unreachable": no
  *   restart, retried on the guard's backoff (2 min doubling to 30 min). The process alive with a fresh health file is a
- *   partition: no restart, `RUNNER_UNREACHABLE machine=<label>` once per outage. The process gone or its health older
+ *   partition: no restart, `RUNNER_UNREACHABLE machine=<label>` once per outage, disconnects folded into it included. The process gone or its health older
  *   than 120 s is "dead": a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>` and carried out
  *   (a worker's service over ssh; the local runner as the supervisor's child process). A hello with a higher gen within 2 min verifies it
  *   (`RUNNER_RESTARTED`); none fails it (`RUNNER_RESTART_FAILED`) and the next decision follows the backoff.
@@ -67,8 +67,7 @@ type Watched = {
   /** This disconnect woke the lead with HOST_GUARD OFFLINE. */
   escalated: boolean;
   /** From the first disconnect until FLAP_HOLD_MS connected after the last one. */
-  outage?: { readonly since: number; disconnects: number; recoveredAt?: number; woke: boolean };
-  unreachableSaid: boolean;
+  outage?: { readonly since: number; disconnects: number; recoveredAt?: number; woke: boolean; unreachableSaid?: boolean };
   lost: boolean;
   failures: number;
   nextDecisionAt: number;
@@ -147,7 +146,7 @@ export class LivenessMonitor {
       const restarts = this.deps.operations.list({ lane: `runner:${label}` })
         .filter((op) => op.action === "restart" && wall - op.at < RESTART_CIRCUIT_WINDOW_MS)
         .map((op) => mono - (wall - op.at));
-      this.runners.set(label, { lastSeen: mono, gen, stale: false, offline: false, escalated: false, unreachableSaid: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0 });
+      this.runners.set(label, { lastSeen: mono, gen, stale: false, offline: false, escalated: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0 });
     }
   }
 
@@ -178,7 +177,7 @@ export class LivenessMonitor {
     r.lastSeen = this.deps.monotonic();
     if (r.offline && r.outage) r.outage.recoveredAt = r.lastSeen;
     if (r.offline && r.escalated) await this.deps.emit(`HOST_GUARD ONLINE ${tag(label)}`);
-    Object.assign(r, { stale: false, offline: false, offlineSince: undefined, escalated: false, unreachableSaid: false, lost: false, failures: 0, nextDecisionAt: 0 });
+    Object.assign(r, { stale: false, offline: false, offlineSince: undefined, escalated: false, lost: false, failures: 0, nextDecisionAt: 0 });
   }
 
   private async escalate(label: string, r: Watched, why: string): Promise<void> {
@@ -239,8 +238,9 @@ export class LivenessMonitor {
     // A heartbeat or hello during the probe ended the outage; the probe's answer is older than that.
     if (!r.offline) return;
     if (outcome.kind !== "dead") {
-      if (outcome.kind === "alive" && !r.unreachableSaid) {
-        r.unreachableSaid = true;
+      // A partition is a state of the machine, not of one disconnect: a folded flap does not say it again.
+      if (outcome.kind === "alive" && r.outage && !r.outage.unreachableSaid) {
+        r.outage.unreachableSaid = true;
         await this.deps.emit(`RUNNER_UNREACHABLE ${tag(label)} the runner is alive and healthy on its host but its connection is down; not restarting`);
       }
       r.failures += 1;

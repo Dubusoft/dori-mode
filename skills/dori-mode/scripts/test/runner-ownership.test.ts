@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
+import { eventClass } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
@@ -45,8 +46,20 @@ test("runner B reporting done for runner A's lane makes no claim and one RUNNER_
   await routeReports(t.deps, t.store, () => {});
   expect(t.store.list()).toEqual([]);
   expect((await t.deps.registry.read("lane-a"))?.status).toBe("working");
-  expect(new Set(t.emitted.map(([id]) => id))).toEqual(new Set(["runner-forged:worker-b:9"]));
+  expect(new Set(t.emitted.map(([id]) => id)).size).toBe(1);
   expect(t.emitted[0]?.[1]).toBe("RUNNER_FORGED_EVENT runner=worker-b key=lane-a type=lane.report owner=worker-a");
+});
+
+test("the same forgery in new frames keeps one id; a new forged identity gets its own id and stays urgent", async () => {
+  const t = await setup();
+  for (const seq of [9, 10, 11]) await acceptLaneEvent(t.hub, "worker-b", done("worker-b", seq, "lane-a"));
+  expect(new Set(t.emitted.map(([id]) => id)).size).toBe(1);
+  await acceptLaneEvent(t.hub, "worker-c", done("worker-c", 12, "lane-a"));
+  await acceptLaneEvent(t.hub, "worker-b", done("worker-b", 13, "ghost"));
+  await acceptLaneEvent(t.hub, "worker-b", event("worker-b", 14, "lane.state", { key: "lane-a", status: "dead" }));
+  const ids = t.emitted.map(([id]) => id);
+  expect(new Set(ids).size).toBe(4);
+  for (const [, line] of t.emitted.slice(3)) expect(eventClass(line)).toBe("lead-urgent");
 });
 
 test("a lane no runner owns and a key the registry does not have are not taken from a runner", async () => {
