@@ -55,7 +55,9 @@ const URGENT_KINDS = [
   "MERGE_UNVERIFIED", "MERGE_STALLED",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
   "LANE_DONE_CLAIMED",
-  // A lane that ended is news the lead acts on: report to the owner, free the slot.
+  // A lane that ended is news the lead acts on: report to the owner, free the slot, finish its Toodo task. That holds for
+  // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
+  // waits on the close itself, so it must not sit in the digest.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
@@ -68,13 +70,11 @@ const URGENT_KINDS = [
  * or opens a merge lane), and a lane's milestone and progress reports wait for the next urgent delivery. The supervisor
  * settles the rest itself: a done claim (urgent LANE_DONE_CLAIMED) is re-checked live (then closed, or objected to,
  * LANE_NOT_DONE, which is urgent), and a merged lane PR has its merge read back (MERGE_VERIFIED, or urgent MERGE_UNVERIFIED).
- * A close whose LANE_DONE_CLAIMED the lead already received (`LANE_CLOSED <key> closed seen-claim`) is digest: the lead
- * heard of the claim, and the close only confirms it. A close of an undelivered claim stays urgent.
  */
 const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
-  "MERGE_VERIFIED", "LANE_CLOSED * closed seen-claim",
+  "MERGE_VERIFIED",
   // A worker machine without the guard agent, one whose shell cannot run it, or one whose agent is current again,
   // needs no action now.
   "HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT",

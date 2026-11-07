@@ -134,7 +134,7 @@ const machineClose = (lane: Lane): boolean => lane.autoClose === "machine";
 
 /**
  * Whether the claim's window waits for the lead to receive it: when the policy makes LANE_DONE_CLAIMED wake the lead
- * (the default), so the later close finds the claim delivered and is digest (seen-claim). A policy that makes the claim
+ * (the default), so the later close finds the claim delivered and is marked seen-claim. A policy that makes the claim
  * digest leaves it to the supervisor (live re-check, then close or LANE_NOT_DONE), so the window runs from the hand-over.
  */
 const claimWaitsForLead = (deps: FlowDeps, lane: Lane): boolean =>
@@ -634,7 +634,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   }
   const line = await settle(deps, lane, evidence, start ?? deps.clock.now());
   if (line === undefined) return;
-  // A close whose claim announcement already reached the lead is digest news (seen-claim); otherwise it wakes the lead.
+  // A close whose claim announcement already reached the lead is marked seen-claim; either way it wakes the lead.
   const event = claim.event;
   const seen = event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event));
   const closed = seen ? line.replace(/^(LANE_CLOSED \S+ closed)(?= |$)/, "$1 seen-claim") : line;

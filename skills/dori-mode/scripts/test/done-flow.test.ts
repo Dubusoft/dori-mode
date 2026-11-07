@@ -450,7 +450,7 @@ test("with claims made digest, a claim is the supervisor's to settle: its window
   expect(closedVia()).toEqual(["demo-lane"]);
 });
 
-test("by default a claim the lead receives 40 minutes late still gets the full window from that delivery, and its close is digest", async () => {
+test("by default a claim the lead receives 40 minutes late still gets the full window from that delivery, and its close wakes the lead", async () => {
   livePane();
   let received = false;
   const claimAt = new Date(T0).toISOString();
@@ -469,7 +469,7 @@ test("by default a claim the lead receives 40 minutes late still gets the full w
   expect(closedVia()).toHaveLength(0);
   const lines = await watchTick(onDelivery(T0 + 45 * MIN + 1, lead));
   expect(lines[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
-  expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
+  expect(eventClass(lines[0] ?? "")).toBe("lead-urgent");
   expect(closedVia()).toEqual(["demo-lane"]);
 });
 
@@ -480,13 +480,13 @@ test("with no supervisor (dori watch) the window starts when the claim is handed
   expect((await watchTick(onDelivery(T0 + 25 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
 });
 
-test("a close whose claim the lead already received is digest (seen-claim); a merge that closes the lane before the lead received its claim wakes the lead", async () => {
+test("a close whose claim the lead already received is marked seen-claim and wakes the lead; so does a merge that closes the lane before the lead received its claim", async () => {
   livePane();
   await claimDone(onDelivery(T0), lane, "merged acme/app#1");
   await watchTick(onDelivery(T0, () => true));
   const seen = (await watchTick(onDelivery(T0 + 5 * MIN + 1, () => true)))[0] ?? "";
   expect(seen).toStartWith("LANE_CLOSED demo-lane closed seen-claim");
-  expect(eventClass(seen)).toBe("lead-digest");
+  expect(eventClass(seen)).toBe("lead-urgent");
 
   await at(T0).registry.write(lane);
   livePane();

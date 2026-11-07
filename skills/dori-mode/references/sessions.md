@@ -22,7 +22,7 @@ A Toodo task is tracked by you, not by the lane. Toodo holds the task graph (tas
 2. Right after `LAUNCHED`, `start_task` the task and `add_progress_note` with the lane key, its thread and why it starts now (an owner go, an urgent fix). `start_task` may still open a worktree or pane of its own for workspaces with a herdr runner; the lane never uses them, so leave them alone.
 3. While the lane works, record each decision worth remembering (the choice and the reason) with `add_progress_note` when it is made, and a blocker the lane cannot clear with `report_blocker`.
 4. When the lane opens its PR, add a note with the PR URL.
-5. After the PR merges and `LANE_CLOSED`, finish the task with `complete_task` and a note linking the PR (a task whose criteria Toodo already saw met may be done on its own), or `conclude_task` with the reason when the work did not ship. Read it back with `get_task`.
+5. After the PR merges and `LANE_CLOSED`, finish the task. That close is urgent even when you already took the lane's claim (`LANE_CLOSED <key> closed seen-claim`), so it wakes you for this step at once; you need no wait of your own for it. Finish the task with `complete_task` and a note linking the PR (a task whose criteria Toodo already saw met may be done on its own), or `conclude_task` with the reason when the work did not ship. Read it back with `get_task`.
 
 A lane never calls Toodo and its brief never asks it to; you relay what it reports into the task.
 

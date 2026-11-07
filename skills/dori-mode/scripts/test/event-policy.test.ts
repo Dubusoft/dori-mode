@@ -45,11 +45,11 @@ test("the default table classifies every line as the hard-coded list did, except
   expect(corpus.filter((line) => eventPriority(line) === "urgent").length).toBeGreaterThan(LEGACY_URGENT.length);
 });
 
-test("the done claim and lane-ending events are lead-urgent; a close after a received claim and the merge readback stay lead-digest", () => {
-  for (const line of ["LANE_DONE_CLAIMED alpha w:p1 proof", "LANE_CLOSED alpha closed", "LANE_AUTO_CLOSED alpha {}", "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x"]) {
+test("the done claim and lane-ending events, a close after a received claim too, are lead-urgent; the merge readback stays lead-digest", () => {
+  for (const line of ["LANE_DONE_CLAIMED alpha w:p1 proof", "LANE_CLOSED alpha closed", "LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "LANE_AUTO_CLOSED alpha {}", "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x"]) {
     expect(eventClass(line)).toBe("lead-urgent");
   }
-  for (const line of ["LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
+  for (const line of ["MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
     expect(eventClass(line)).toBe("lead-digest");
   }
 });
