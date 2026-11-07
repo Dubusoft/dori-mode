@@ -628,6 +628,55 @@ test("digest traffic is pushed only once overdue, and a _WARN line never", async
   expect(f.texts()[0]).toContain("(digest: NUDGED)");
 });
 
+test("a noise-only batch keeps one pointer at its take cursor: never typed again, idle or working, until a take", async () => {
+  const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  f.clock.at += 61 * 60_000;
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  for (const status of ["idle", "working", "idle", "working"]) {
+    f.pane.agent_status = status;
+    f.clock.at += 11 * 60_000;
+    utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+    supervisor.enqueue(`nudge:${f.clock.now()}`, "NUDGED lane silent");
+    await flush(supervisor);
+  }
+  expect(f.texts()).toHaveLength(1);
+  expect(f.launches()).toHaveLength(0);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  supervisor.enqueue("nudge:after", "NUDGED lane silent");
+  f.clock.at += 61 * 60_000;
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  f.pane.agent_status = "idle";
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+});
+
+test("an actionable event joining a pointed noise-only batch still retries after ackSec and escalates an idle lead", async () => {
+  const f = fixture({ delivery: delivery({ tailMonitor: false }), digestMaxDelayMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  f.clock.at += 61 * 60_000;
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  f.clock.at += 60_000;
+  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+  expect(f.texts()[1]).toContain("urgent: WAIT_DONE");
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(3);
+  for (let i = 0; i < 10 && !f.launches().length; i++) {
+    f.clock.at += 60_000;
+    await flush(supervisor);
+  }
+  expect(f.launches()).toHaveLength(1);
+});
+
 test("push mode enqueues no ACK_MISSING but the owner still gets the ack notice", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }), ackTimeoutSec: 60 });
   const supervisor = new Supervisor(f.deps);
