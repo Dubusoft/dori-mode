@@ -125,6 +125,29 @@ test("a failing sweep never ends the supervisor or loses a done claim: the claim
   expect(w.queue.filter((line) => line.startsWith("SWEEP_WARN dead-panes"))).toHaveLength(2);
 });
 
+test("a runner without an admitted connection is one RUNNER_UNAVAILABLE per outage, never a warning per lane and sweep", async () => {
+  const w = sweepWorld(false);
+  const at = new Date(T0).toISOString();
+  const lane = { title: "l", thread: "none", brief: "/b.md", done: "merged acme/app#1", openedAt: at };
+  w.world.panes = ["w:p1", "w:p2"].map((pane_id) => ({ pane_id, workspace_id: "w", agent: "omo", agent_status: "idle" }));
+  await w.deps.registry.write({ ...lane, key: "claimed", pane: "w:p1", status: "done-claimed", claim: { at, evidence: "merged acme/app#1 abc", emitted: true } });
+  await w.deps.registry.write({ ...lane, key: "silent", pane: "w:p2", status: "working", lastReplyAt: T0 - 3 * 3_600_000 });
+  await w.deps.registry.write({ ...lane, key: "kept", pane: "w:p3", closedAt: at, receipt: { cleanup: ["worktree /data/repos/worktrees/kept kept: dirty"] } } as Parameters<typeof w.deps.registry.write>[0]);
+  w.world.runnerDown = true; // a supervisor restart: the local runner has not said hello yet
+  for (let i = 0; i < 3; i++) { await w.tick(); w.clock.at += 30_000; }
+  const down = "RUNNER_UNAVAILABLE runner=local no admitted connection: watch, dead-panes and freshness skip its lanes until it says hello";
+  // The host guard, memory and machine-guard sweeps read no lane through the runner and say what they say regardless.
+  const runnerLines = (lines: string[]) => lines.filter((line) => !/^(HOST_GUARD |MEMORY_CHECK|SWEEP_WARN machine-guard )/.test(line));
+  expect(runnerLines(w.queue)).toEqual([down]);
+  w.world.runnerDown = false;
+  await w.tick();
+  const back = w.queue.length;
+  w.world.runnerDown = true; // the next outage is its own transition
+  await w.tick();
+  await w.tick();
+  expect(runnerLines(w.queue.slice(back))).toEqual([down]);
+});
+
 test("a launch held by dori can-launch wakes the lead with LAUNCH_READY once the host has room, once", async () => {
   const w = sweepWorld(false);
   w.world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "working" }];

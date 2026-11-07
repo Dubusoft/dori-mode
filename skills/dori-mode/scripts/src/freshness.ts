@@ -49,13 +49,15 @@ const lastRowAt = (reports: LaneReportStore): Map<string, number> => {
  * lane with a row newer than nudgeAfterMin costs no pane read at all. Its pane status is read (for the nudge) only once
  * no row arrived within nudgeAfterMin, counted from its newest row or reply. A pane's text is never read for a report.
  * Every read and the nudge go through the lane's runner: `view` (the supervisor round's cached reads), else `deps.ops`.
+ * A lane whose machine is not `admitted` (its runner has no admitted connection) is skipped.
  */
-export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: LaneReportStore): Promise<SweepAct[]> => {
+export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: LaneReportStore, admitted: (machine?: string) => boolean = () => true): Promise<SweepAct[]> => {
   const acts: SweepAct[] = [];
   const now = deps.clock.now();
   const reads: LaneReads = view ?? deps.ops;
   let rows: Map<string, number> | undefined;
   for (const lane of await deps.registry.open()) {
+    if (!admitted(lane.machine)) continue;
     if (statusOf(lane) === "paused") {
       const checked = view ? await checkPausedLane(deps, lane, view) : await checkPausedLane(deps, lane);
       if (checked && checked.lane.lastFreshnessNote !== "working-while-paused") {

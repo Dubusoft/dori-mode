@@ -707,8 +707,9 @@ const windowStart = async (deps: FlowDeps, lane: Lane, claim: NonNullable<Lane["
  * One pass over every lane. With `emit`, each line is handed over the moment it exists (the supervisor enqueues it
  * durably); the lines are also returned. One lane's failure is a LANE_WATCH_WARN line and never stops the others.
  * `archived: false` skips the closed lanes in the archive (their worktree cleanup), so a pass reads open lanes only.
+ * A lane whose machine is not `admitted` (its runner has no admitted connection) is skipped without a line.
  */
-export const watchTick = async (deps: FlowDeps, emit?: Emit, archived = true): Promise<string[]> => {
+export const watchTick = async (deps: FlowDeps, emit?: Emit, archived = true, admitted: (machine?: string) => boolean = () => true): Promise<string[]> => {
   const out: string[] = [];
   const push: Emit = async (line, id, meta) => {
     if (emit) await (meta ? emit(line, id, meta) : emit(line, id));
@@ -720,6 +721,7 @@ export const watchTick = async (deps: FlowDeps, emit?: Emit, archived = true): P
     await push(`LANE_WATCH_WARN operations ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200)}`);
   }
   for (const listed of archived ? await deps.registry.list() : await deps.registry.open()) {
+    if (!admitted(listed.machine)) continue;
     try {
       await watchLane(deps, listed, push);
     } catch (e) {

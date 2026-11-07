@@ -656,8 +656,14 @@ so an event acked just before a crash is still stored.
 **Inventory.** On each hello the supervisor compares the runner's inventory with the registry:
 
 - a lane the runner owns that the inventory lacks is marked `recoveryPending` and sent `lane.recover`;
-- a key with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry entry;
+- a key with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry entry, unless the archive holds
+  that key closed, owned by the same runner, in the same pane (a closed lane the runner still lists is no unknown agent);
 - a lane in both whose pane, tab or session differs takes the runner's values for those three only.
+
+**Sweeps without a runner.** The supervisor's watch, dead-panes and freshness sweeps read a machine only through an
+admitted connection. While a runner has none (after a supervisor restart, before its hello, or while it is gone) its
+lanes are skipped without a line per lane, and the sweeps say `RUNNER_UNAVAILABLE runner=<label>` (digest) once per
+outage; the archive's worktree cleanup runs right after the local runner's hello.
 
 **Evacuate.** `dori runner evacuate <label>` is the forced rollback for a runner that cannot be used. In order:
 

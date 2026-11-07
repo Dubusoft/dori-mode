@@ -14,7 +14,7 @@ import { COMMAND_RETENTION_MS } from "./runner/durability.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
-import { type Delivery, laneOps, type LaneOps } from "./lane-ops.ts";
+import { type Delivery, laneOps, type LaneOps, machineRunner } from "./lane-ops.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
 import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
@@ -584,17 +584,34 @@ export const supervisorSweeps = (
   const cache = newSweepCache();
   let view: SweepView = passthroughView(deps.ops);
   let lastArchive = -Infinity;
+  // The watch, dead-panes and freshness sweeps read a machine only through an admitted runner connection. A runner
+  // without one (right after a restart, before its hello, or gone) is one RUNNER_UNAVAILABLE line per outage, by
+  // runner label (the machine it serves as value), instead of one warning per lane and sweep every round.
+  const admitted = (machine?: string): boolean => deps.ops.connected(machine);
+  const unavailable = new Map<string, string | undefined>();
   return [
-    ["snapshot", async () => {
+    ["snapshot", async (emit) => {
       view = passthroughView(deps.ops);
       // A bad deadline warns every round and the sweeps read per lane.
       if (!Number.isFinite(deps.config.sweepMachineDeadlineMs) || deps.config.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
-      view = await sweepRound(deps.ops, cache, await deps.registry.open(), { now: deps.clock.now, deadlineMs: deps.config.sweepMachineDeadlineMs });
+      const open = await deps.registry.open();
+      const machines = new Map<string, string | undefined>([
+        [machineRunner(undefined), undefined], ...open.flatMap((l) => l.machine ? [[machineRunner(l.machine), l.machine] as const] : []), ...unavailable,
+      ]);
+      for (const [label, machine] of machines) {
+        if (admitted(machine)) unavailable.delete(label);
+        else if (!unavailable.has(label)) {
+          unavailable.set(label, machine);
+          await emit(`RUNNER_UNAVAILABLE runner=${label} no admitted connection: watch, dead-panes and freshness skip its lanes until it says hello`);
+        }
+      }
+      view = await sweepRound(deps.ops, cache, open, { now: deps.clock.now, deadlineMs: deps.config.sweepMachineDeadlineMs });
       return [];
     }],
     ["watch", async (emit) => {
-      const archived = deps.clock.now() - lastArchive >= ARCHIVE_SWEEP_MS;
-      await watchTick(deps, emit, archived);
+      // The archive's lanes are local: their pass waits for the local runner, so it runs right after its hello.
+      const archived = deps.clock.now() - lastArchive >= ARCHIVE_SWEEP_MS && admitted(undefined);
+      await watchTick(deps, emit, archived, admitted);
       if (archived) lastArchive = deps.clock.now();
       return [];
     }],
@@ -622,10 +639,10 @@ export const supervisorSweeps = (
       }
       return [];
     }],
-    ["dead-panes", async () => deadPaneTick(deps.ops, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now)],
+    ["dead-panes", async () => deadPaneTick(deps.ops, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now, admitted)],
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
-    ["freshness", async () => (await freshnessTick(deps, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
+    ["freshness", async () => (await freshnessTick(deps, view, laneReports(), admitted)).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
     // Urgent LANE_DRIFT for a working lane overdue on milestones or failing CI head after head; reads the last GitHub poll only.
     ["drift", async (emit) => {
       await driftTick({

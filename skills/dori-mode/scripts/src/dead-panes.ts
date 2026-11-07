@@ -23,13 +23,15 @@ export const newDeadPaneState = (): DeadPaneState => ({ unknown: new Map(), last
  * A DAG viewer pane in the same tab as a registered lane's pane belongs to that lane and is never counted.
  * A dead pane that is a registered lane's pane also leaves a synthetic `blocked` report row under that lane's key (lane-reports.ts appendDeadPaneReport), so the lane's result is not lost.
  * Pane lists and tails come from each machine's runner: `view` (the supervisor round's cached reads), else `ops`.
+ * A machine that is not `admitted` (its runner has no admitted connection) is skipped without a line.
  */
-export const deadPaneTick = async (ops: LaneOps, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState = newDeadPaneState(), lanes: readonly Lane[] = [], view: LaneReads = ops, now: () => number = Date.now): Promise<string[]> => {
+export const deadPaneTick = async (ops: LaneOps, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState = newDeadPaneState(), lanes: readonly Lane[] = [], view: LaneReads = ops, now: () => number = Date.now, admitted: (machine?: string) => boolean = () => true): Promise<string[]> => {
   const out: string[] = [];
   const byPane = new Map(lanes.flatMap((lane) => lane.pane ? [[lane.machine ? `${lane.machine}/${lane.pane}` : lane.pane, lane] as const] : []));
   const ctx: Ctx = { byPane, now };
   const machines = new Set(lanes.flatMap((lane) => lane.machine ? [lane.machine] : []));
   for (const machine of machines) {
+    if (!admitted(machine)) continue;
     // Remote inventories contain other people's panes too: inspect only registered lane panes.
     const owned = new Set(lanes.flatMap((lane) => lane.machine === machine && lane.pane ? [lane.pane] : []));
     try {
@@ -38,7 +40,7 @@ export const deadPaneTick = async (ops: LaneOps, config: DoriConfig, seen: Set<s
       out.push(`DEAD_PANES_WARN machine=${machine} ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  out.push(...await inspect(view, config, seen, hourKey, state, ctx));
+  if (admitted(undefined)) out.push(...await inspect(view, config, seen, hourKey, state, ctx));
   return out;
 };
 

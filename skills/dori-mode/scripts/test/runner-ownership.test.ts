@@ -123,3 +123,11 @@ test("the hello inventory: an unknown key is LANE_ORPHAN with no registry entry;
   expect([moved?.pane, moved?.tab, moved?.status]).toEqual(["pa2", "ta2", "working"]);
   expect((await t.deps.registry.read("lane-b"))?.pane).toBe("pb");
 });
+
+test("the hello inventory: a closed archived lane of that runner in its own pane is no orphan; the same key in another pane still is", async () => {
+  const t = await setup();
+  await reconcileInventory(t.hub, "local", [{ key: "closed-e", pane: "pe", tab: "te" }]);
+  await reconcileInventory(t.hub, "worker-a", [{ key: "closed-e", pane: "pe", tab: "te" }]);
+  await reconcileInventory(t.hub, "local", [{ key: "closed-e", pane: "p7", tab: "t7" }, { key: "ghost", pane: "p8", tab: "t8" }]);
+  expect(t.emitted.map(([id]) => id)).toEqual(["lane-orphan:worker-a:closed-e", "lane-orphan:local:closed-e", "lane-orphan:local:ghost"]);
+});
