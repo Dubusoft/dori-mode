@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
+import { deadPaneTick, newDeadPaneState, UNRECOGNISED_ALERT_AFTER } from "../src/dead-panes.ts";
 import { claimDone, closeLane, closedWorktreeSweep, objectDone, unpushedWork, watchTick } from "../src/done-flow.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { githubTargets } from "../src/github-events.ts";
@@ -319,6 +319,25 @@ test("dead-panes scopes remote reads and state independently from local IDs", as
   const reads = opsOf("screen").map((e) => e.args as { machine?: string; pane?: string; lines?: number });
   expect(reads).toContainEqual({ machine: MACHINE, pane: "w:p3", lines: 6 });
   expect(reads.some((r) => r.pane === "w:p9")).toBe(false);
+});
+
+test("dead-panes never alerts on a remote host's own panes over several sweeps", async () => {
+  const d = deps();
+  // The machine's herdr lists the lane's working pane plus panes no lane owns: a plain shell and another workspace's pane.
+  world.panes = [
+    { pane_id: "w:p3", workspace_id: "w", agent: "pi", agent_status: "working" },
+    { pane_id: "w:p9", workspace_id: "w" },
+    { pane_id: "x:p1", workspace_id: "x" },
+  ];
+  world.screen = "user@build:~$ ";
+  const seen = new Set<string>();
+  const memory = newDeadPaneState();
+  for (let tick = 0; tick <= UNRECOGNISED_ALERT_AFTER; tick++) expect(await deadPaneTick(d.ops, d.config, seen, "hour", memory, [lane()])).toEqual([]);
+  expect(opsOf("screen")).toEqual([]);
+  // With no lane registered on the machine, the sweep does not ask its runner at all.
+  routed = [];
+  for (let tick = 0; tick <= UNRECOGNISED_ALERT_AFTER; tick++) expect(await deadPaneTick(d.ops, d.config, seen, "hour", memory, [])).toEqual([]);
+  expect(routed).not.toContain(MACHINE);
 });
 
 test("remote worktree checks and cleanup skip explicitly and never ask for git", async () => {
