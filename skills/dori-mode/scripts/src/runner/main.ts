@@ -12,6 +12,7 @@ import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { diskGuardPath, sampleHost } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
+import type { Pane } from "../panes.ts";
 import { parseArgs } from "node:util";
 import { loadConfig } from "../config.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
@@ -123,7 +124,16 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const owned = runnerLanes?.inventory() ?? [];
     return [...owned, ...observedOnly.filter((l) => !owned.some((o) => o.key === l.key))];
   };
-  const observedLanes = () => observeHost({ run });
+  // The lanes this runner started are attributed from its own records, whatever runs in their panes now.
+  const ownedPanes = async (panes: readonly Pane[]): Promise<Map<string, string>> => {
+    const owned = new Map<string, string>();
+    for (const record of Object.values(runnerLanes.records())) {
+      const pane = await runnerLanes.currentPane(record, panes);
+      if (pane) owned.set(pane.pane_id, record.key);
+    }
+    return owned;
+  };
+  const observedLanes = () => observeHost({ run, owned: ownedPanes });
   const observe = async () => {
     const lanes = await observedLanes();
     const observed = lanes.map(({ status: _status, reportHash: _hash, ...lane }) => lane);

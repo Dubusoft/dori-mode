@@ -74,6 +74,19 @@ test("observeHost attributes a pane from the brief path in the agent argv when n
   expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "p1"]]);
 });
 
+test("observeHost attributes a pane from the runner's own briefs/<key>.md path in the agent argv", async () => {
+  const observed = await observeHost({ run: withInfo(argvInfo("/Users/x/.dori/runner/briefs/mac-lane.md")), procs: async () => [] });
+  expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "p1"]]);
+});
+
+test("observeHost observes the runner's owned panes with no process environment, a shell-only one as dead", async () => {
+  // macOS: no environment is readable and no argv names a brief; p3's agent exited and left only its shell.
+  const run = withInfo({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: ["omo"] }] }, p3: { shell_pid: 300, foreground_processes: [] } });
+  const owned = async () => new Map([["p1", "own-a"], ["p3", "own-b"]]);
+  const observed = await observeHost({ run, procs: async () => [], owned });
+  expect(observed.map((l) => [l.key, l.pane, l.status])).toEqual([["own-a", "p1", "working"], ["own-b", "p3", "dead"]]);
+});
+
 test("observeHost attributes a Windows-style brief path in the agent argv", async () => {
   const observed = await observeHost({ run: withInfo(argvInfo(String.raw`C:\Users\x\AppData\Local\Temp\dori-brief-win-lane.md`)), procs: async () => [] });
   expect(observed.map((l) => l.key)).toEqual(["win-lane"]);

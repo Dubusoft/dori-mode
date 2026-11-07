@@ -455,7 +455,7 @@ export class RunnerLanes {
     // herdr names a fresh pane's agent unknown until its integration first reports: a lane started less than
     // STARTUP_GRACE_MS ago whose pane is there is still starting, so its dead is answered but not published.
     const starting = reason === "agent-gone" && this.starting(record);
-    if (!starting) this.deps.publish("lane.state", { key, status, ...(reason ? { reason } : {}) });
+    if (!starting) this.deps.publish("lane.state", { key, status, pane: record.pane, ...(reason ? { reason } : {}) });
     if (!pane) throw new Error(`RUNNER_LANE_ABSENT ${key} pane ${record.pane} is gone`);
     return { detail: `observed ${status}`, result: { status } };
   }

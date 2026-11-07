@@ -1,18 +1,21 @@
 import { createHash } from "node:crypto";
 import { lastReportLine } from "../freshness.ts";
 import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
-import { listPanes, readScreen } from "../panes.ts";
+import { listPanes, readScreen, type Pane } from "../panes.ts";
 import { LANE_KEY } from "../registry.ts";
 import type { Runner } from "../run.ts";
 import { laneStatus, type ObservedLane } from "./serve.ts";
 
 /**
- * What a runner on a worker machine sees of the lanes on its host, without the supervisor's registry. A pane is a
- * lane's when one of its foreground processes (from `herdr pane process-info`) carries `DORI_LANE_KEY` in its own
+ * What a runner on a worker machine sees of the lanes on its host, without the supervisor's registry. A pane the runner
+ * started a lane on (`owned`: its lane records, each pane checked by `RunnerLanes.currentPane`) is that lane's whatever
+ * runs in it, so a lane whose agent exited and left only its shell is still observed (as dead), and a host with no
+ * readable process environment (macOS) still sees every lane it owns. Any other pane is a lane's when one of its foreground processes (from `herdr pane process-info`) carries `DORI_LANE_KEY` in its own
  * environment or inherits it from an ancestor, the same attribution `lane-memory.ts` uses for memory (Linux, where
  * `/proc` is readable). When no process environment is readable (macOS) the attribution falls back to the agent's
- * argv: the launch prompt names the lane brief `dori-brief-<key>.md`, and a foreground process whose argv carries that
- * path belongs to `<key>`. The environment attribution wins when both name a lane. For each such
+ * argv: the launch prompt names the lane brief (`briefs/<key>.md` in the runner directory, or an older launch's
+ * `dori-brief-<key>.md`), and a foreground process whose argv carries that path belongs to `<key>`. The owned record
+ * wins, then the environment attribution, then the argv. For each such
  * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle), and `reportHash` is the
  * `valueHash` of the newest `[REPORT]` line in the pane's last 200 lines, so the supervisor can compare it with the
  * line its own screen scraping recorded (`Lane.lastRemoteReport`).
@@ -28,9 +31,9 @@ type ProcessInfo = {
   readonly foreground_processes?: readonly { readonly pid?: number; readonly argv?: readonly string[] }[];
 };
 
-const BRIEF_TOKEN = /[/\\]dori-brief-([a-z0-9._-]+)\.md(?=\s|$)/g;
+const BRIEF_TOKEN = /[/\\](?:dori-brief-|briefs[/\\])([a-z0-9._-]+)\.md(?=\s|$)/g;
 
-/** The lane key named by a `dori-brief-<key>.md` path (either separator style) in an argv, if any. */
+/** The lane key named by a `briefs/<key>.md` or `dori-brief-<key>.md` path (either separator style) in an argv, if any. */
 export const briefLane = (argv: readonly string[] | undefined): string | undefined => {
   for (const arg of argv ?? []) {
     for (const m of arg.matchAll(BRIEF_TOKEN)) {
@@ -44,6 +47,8 @@ export const briefLane = (argv: readonly string[] | undefined): string | undefin
 export type ObserveHostDeps = {
   readonly run: Runner;
   readonly procs?: () => Promise<readonly Proc[]>;
+  /** The lanes this runner owns, as pane id to lane key, for the panes listed (only panes whose identity checked out). */
+  readonly owned?: (panes: readonly Pane[]) => Promise<ReadonlyMap<string, string>>;
 };
 
 const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | undefined> => {
@@ -56,12 +61,15 @@ const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | und
 export const observeHost = async (deps: ObserveHostDeps): Promise<ObservedLane[]> => {
   const [panes, procs] = await Promise.all([listPanes(deps.run), (deps.procs ?? (() => sampleProcs(deps.run)))()]);
   const owner = procLanes(procs);
+  const owned = (await deps.owned?.(panes)) ?? new Map<string, string>();
   const seen = new Set<string>();
   const out: ObservedLane[] = [];
   for (const pane of panes) {
-    const info = await processInfo(deps.run, pane.pane_id);
+    const ownedKey = owned.get(pane.pane_id);
+    const info = ownedKey ? undefined : await processInfo(deps.run, pane.pane_id);
     const pids = [...(info?.foreground_processes ?? []).map((p) => p.pid), info?.shell_pid].filter((pid): pid is number => typeof pid === "number");
-    const key = pids.map((pid) => owner.get(pid)).find((k): k is string => typeof k === "string")
+    const key = ownedKey
+      ?? pids.map((pid) => owner.get(pid)).find((k): k is string => typeof k === "string")
       ?? (info?.foreground_processes ?? []).map((p) => briefLane(p.argv)).find((k): k is string => k !== undefined);
     if (!key || seen.has(key)) continue;
     seen.add(key);
