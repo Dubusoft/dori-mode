@@ -3,7 +3,7 @@ import { redactSecrets } from "./redact.ts";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
+import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
 import { withStateLockSync } from "./state-lock.ts";
 
 /**
@@ -70,6 +70,8 @@ export interface OperationStore {
   put(op: Operation): void;
   /** Rows of one lane and/or in the given states, oldest first. */
   list(filter?: { readonly lane?: string; readonly states?: readonly OperationState[] }): Operation[];
+  /** Removes verified history older than statusHistoryMs; unresolved effects stay available for reconciliation. */
+  prune(now: number): void;
   close(): void;
 }
 
@@ -99,6 +101,18 @@ export class JsonOperations implements OperationStore {
   }
   list(filter: { readonly lane?: string; readonly states?: readonly OperationState[] } = {}): Operation[] {
     return Object.values(this.read()).filter((op) => matches(op, filter)).sort(byAt);
+  }
+  prune(now: number): void {
+    withStateLockSync(this.lock, () => {
+      const ops = this.read();
+      let changed = false;
+      for (const [id, op] of Object.entries(ops)) {
+        if (op.state !== "verified" || op.updatedAt >= now - RETENTION.statusHistoryMs) continue;
+        delete ops[id];
+        changed = true;
+      }
+      if (changed) saveJsonFile(this.path, { ops });
+    });
   }
   close(): void {}
 }
@@ -157,6 +171,9 @@ export class SqliteOperations implements OperationStore {
   put(op: Operation): void { this.db.transaction(() => putRows(this.db, [op]))(); }
   list(filter: { readonly lane?: string; readonly states?: readonly OperationState[] } = {}): Operation[] {
     return readRows(this.db).filter((op) => matches(op, filter));
+  }
+  prune(now: number): void {
+    this.db.query("DELETE FROM operations WHERE state = 'verified' AND updated_at < ?").run(now - RETENTION.statusHistoryMs);
   }
   close(): void { this.db.close(); }
 }

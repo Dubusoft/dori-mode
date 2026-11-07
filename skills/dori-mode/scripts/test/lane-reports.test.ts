@@ -58,6 +58,27 @@ test.each(STORES)("%s store: seq counts up per lane, ids carry (lane, generation
   expect(store.list({ lane: "lane-b" })[0]?.evidence).toBe("PR #4");
 });
 
+test.each(STORES)("%s report retention removes old consumed rows while keeping pending, recent, and latest rows and sequence continuity", (_name, open) => {
+  const store = open(stateDir());
+  cleanups.push(() => { store.close(); });
+  const cutoff = T0 - 30 * 24 * 60 * 60_000;
+  const append = (lane: string) => store.append({ lane, generation: 0, kind: "progress", text: "progress", at: cutoff - 2 });
+  const old = append("lane-a");
+  const pending = append("lane-a");
+  const recent = append("lane-a");
+  const latest = append("lane-a");
+  const single = append("lane-b");
+  store.consume(old.id, cutoff - 1, "journal");
+  store.consume(recent.id, cutoff, "journal");
+  store.consume(latest.id, cutoff - 1, "journal");
+  store.consume(single.id, cutoff - 1, "journal");
+  store.prune(T0);
+  expect(store.list().map((row) => row.id).sort()).toEqual([pending.id, recent.id, latest.id, single.id].sort());
+  expect(store.pending().map((row) => row.id)).toEqual([pending.id]);
+  expect(append("lane-a").seq).toBe(5);
+  expect(append("lane-b").seq).toBe(2);
+});
+
 test.each(STORES)("%s store: rows written by another connection (a lane's CLI) are read by the supervisor's", (_name, open) => {
   const dir = stateDir();
   const supervisor = open(dir);

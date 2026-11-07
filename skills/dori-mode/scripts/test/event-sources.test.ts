@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as quota from "../src/claude-quota.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import {
-  EMIT_DIR, EventSources, publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews, validateSpec,
+  EMIT_DIR, EventSources, publicSpec, queueEmit, readSourceStatus, SOURCE_STATUS_FILE, SourceError, SourceSpecs, sourceViews, validateSpec,
 } from "../src/event-sources.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
@@ -68,7 +68,25 @@ test("dori emit: spooled events are journaled once per --id and delivered by the
   queueEmit(f.dir, "DEPLOY", "replayed", T0 + 3, "deploy-42");
   await f.sources.tick();
   expect(f.events().filter((event) => event.line.startsWith("DEPLOY "))).toHaveLength(2);
-  expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ type: "builtin", events: 2, duplicates: 2, lastKind: "DEPLOY", lastEventAt: T0 });
+  expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ type: "builtin", events: 2, duplicates: 1, lastKind: "DEPLOY", lastEventAt: T0 });
+});
+
+test("duplicate-only source events leave the status file untouched and their counters persist with the next new event", async () => {
+  const f = fixture({ DEPLOY: "lead-digest" });
+  const enqueue = f.sources.enqueueFor("github");
+  expect(enqueue("one", "DEPLOY one")).toBe(true);
+  await f.sources.tick();
+  const path = join(f.dir, SOURCE_STATUS_FILE);
+  const before = statSync(path);
+  const bytes = readFileSync(path, "utf8");
+  f.clock.at++;
+  expect(enqueue("one", "DEPLOY duplicate")).toBe(false);
+  await f.sources.tick();
+  expect(statSync(path).ino).toBe(before.ino);
+  expect(readFileSync(path, "utf8")).toBe(bytes);
+  expect(enqueue("two", "DEPLOY two")).toBe(true);
+  await f.sources.tick();
+  expect(readSourceStatus(f.dir)?.sources.github).toMatchObject({ events: 2, duplicates: 1 });
 });
 
 test("emit retains its spool after a failed save and retries without a false duplicate", async () => {

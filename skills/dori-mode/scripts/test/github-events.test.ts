@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -432,6 +432,47 @@ test("a successful poll clears the repo's failure marker while the failure throt
 
 const DAY = 24 * 60 * 60_000;
 const LIST = "repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100";
+
+test("a multi-repo tick commits successful snapshots and failure markers exactly once", async () => {
+  const f = await fixture();
+  new Repos(f.state.dir).add("acme/other");
+  new Repos(f.state.dir).add("bad/repo");
+  const run: Runner = async (argv, opts) => {
+    if (argv[5]?.startsWith("repos/acme/other/")) return ok([]);
+    if (argv[5]?.startsWith("repos/bad/repo/")) throw new Error("unavailable");
+    return f.deps.run(argv, opts);
+  };
+  const commit = spyOn(f.github as unknown as { commit: (next: unknown) => void }, "commit");
+  try {
+    await f.github.tick({ ...f.deps, run }, f.emit);
+    expect(commit).toHaveBeenCalledTimes(1);
+    const saved = readGithub(f.state.dir);
+    expect(Object.keys(saved.repos).sort()).toEqual(["acme/app", "acme/other"]);
+    expect(saved.failures).toEqual({ "bad/repo": f.clock.now() });
+    expect(saved.polledAt).toBe(f.clock.now());
+  } finally { commit.mockRestore(); }
+});
+
+test("closing PRs immediately drops their response caches and drops a SHA only after its last open PR closes", async () => {
+  const f = await fixture();
+  const closed = pull({ state: "closed" });
+  const other = pull({ number: 8 });
+  f.responses.set(LIST, ok([closed, other]));
+  f.responses.set("repos/acme/app/pulls/7", ok(closed));
+  f.responses.set("repos/acme/app/pulls/8", ok(other));
+  for (const path of ["pulls/8/reviews", "issues/8/comments", "pulls/8/comments"]) f.responses.set(`repos/acme/app/${path}?per_page=100`, ok([]));
+  await f.github.tick(f.deps, f.emit);
+  const cache = readGithub(f.state.dir).repos["acme/app"].cache;
+  expect(Object.keys(cache).filter((path) => /\/(?:pulls|issues)\/7(?:\/|\?|$)/.test(path))).toEqual([]);
+  expect(cache["repos/acme/app/commits/abc/check-runs?per_page=100"]).toBeDefined();
+  const merged = pull({ number: 8, state: "closed", merged_at: "2026-11-07T00:00:00Z" });
+  f.responses.set(LIST, ok([closed, merged]));
+  f.responses.set("repos/acme/app/pulls/8", ok(merged));
+  await f.github.tick(f.deps, f.emit);
+  const saved = readGithub(f.state.dir).repos["acme/app"];
+  expect(Object.keys(saved.cache).filter((path) => path.includes("/commits/") || /\/(?:pulls|issues)\/8(?:\/|\?|$)/.test(path))).toEqual([]);
+  expect(saved.pulls["8"].state).toBe("merged");
+});
 
 test("closed PR history keeps its baseline but drops activity and unused cached responses after 30 days, replaying nothing", async () => {
   const f = await fixture();

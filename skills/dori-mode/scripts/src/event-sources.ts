@@ -322,9 +322,9 @@ export class EventSources {
     return (id, line, meta) => {
       const added = this.deps.enqueue(id, line, meta);
       const entry = this.entry(name, this.typeOf(name));
-      this.set(name, added
-        ? { ...entry, events: entry.events + 1, lastEventAt: this.deps.now(), lastKind: eventKind(line, this.deps.policy ?? DEFAULT_EVENT_POLICY) }
-        : { ...entry, duplicates: entry.duplicates + 1 });
+      if (added) this.set(name, { ...entry, events: entry.events + 1, lastEventAt: this.deps.now(), lastKind: eventKind(line, this.deps.policy ?? DEFAULT_EVENT_POLICY) });
+      // Duplicate counts ride along with the next status change instead of causing a file rewrite on every poll.
+      else this.status.set(name, { ...entry, duplicates: entry.duplicates + 1 });
       return added;
     };
   }

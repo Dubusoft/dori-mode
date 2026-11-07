@@ -22,7 +22,7 @@ const lane = (key: string, patch: Partial<Lane> = {}): Lane =>
 const milestone = (laneKey: string, at: number, seq = 1): LaneReport =>
   ({ id: `${laneKey}:0:${seq}`, lane: laneKey, generation: 0, seq, kind: "milestone", text: "step", at });
 const store = (rows: LaneReport[]): LaneReportStore =>
-  ({ append: () => { throw new Error("unused"); }, pending: () => [], list: () => rows, consume: () => {}, close: () => {} });
+  ({ append: () => { throw new Error("unused"); }, pending: () => [], list: () => rows, consume: () => {}, prune: () => {}, close: () => {} });
 const pull = (sha: string, checks: OpenPull["checks"], number = 7): OpenPull =>
   ({ repo: "acme/app", number, sha, branch: "lane-b", headRepo: "acme/app", url: `https://github.com/acme/app/pull/${number}`, conflicting: false, checks });
 

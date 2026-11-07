@@ -42,6 +42,23 @@ test("a verified operation never runs its effect again", async () => {
   expect({ state: again.op.state, ran: again.ran, effects: ran }).toEqual({ state: "verified", ran: false, effects: 1 });
 });
 
+test.each(["json", "sqlite"] as const)("%s operation retention removes only verified rows older than 30 days", (kind) => {
+  const dir = withState();
+  if (kind === "sqlite") new SqliteStore(join(dir.dir, SQLITE_FILE), { create: true }).close();
+  const history = openOperations({ stateDir: dir.dir, store: kind });
+  try {
+    const cutoff = T0 - 30 * 24 * 60 * 60_000;
+    for (const state of ["verified", "planned", "attempted", "failed", "ambiguous"] as const) {
+      history.put({ id: state, ...spec, state, detail: state, attempts: 1, at: cutoff - 1, updatedAt: cutoff - 1 });
+    }
+    history.put({ id: "recent", ...spec, state: "verified", detail: "", attempts: 1, at: cutoff, updatedAt: cutoff });
+    history.prune(T0);
+    expect(history.list().map((op) => op.id).sort()).toEqual(["ambiguous", "attempted", "failed", "planned", "recent"]);
+    history.prune(T0);
+    expect(history.get("recent")?.state).toBe("verified");
+  } finally { history.close(); dir.done(); }
+});
+
 test("an attempted row left by a crash is reconciled by read-back: done verifies, not done retries once, unknown is ambiguous", async () => {
   const attempted = { id: "demo-lane/pane-close/w:p1", ...spec, state: "attempted" as const, detail: "attempted", attempts: 1, at: T0, updatedAt: T0 };
   store.put(attempted);

@@ -898,7 +898,16 @@ export const supervise = async (
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
     // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
     const statusTransport = { post: (channel: string, text: string, id: string) => discord.send(channel, text, id), edit: (channel: string, id: string, text: string) => discord.edit(channel, id, text) };
-    const routeLaneReports = (): Promise<void> => watchdog.track("reports", routeReports(deps, reportStore, enqueueSweep, home, statusTransport))
+    let nextHistoryPrune = 0;
+    const routeLaneReports = (): Promise<void> => watchdog.track("reports", (async () => {
+      const now = deps.clock.now();
+      if (now >= nextHistoryPrune) {
+        ops.prune(now);
+        reportStore.prune(now);
+        nextHistoryPrune = now + 60 * 60_000;
+      }
+      return routeReports(deps, reportStore, enqueueSweep, home, statusTransport);
+    })())
       .then((lines) => { for (const line of lines) console.log(line); })
       .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
     const tickSources = (): Promise<void> => watchdog.track("sources", registry.tick())
