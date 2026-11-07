@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { type GoalOutcome } from "./runner/protocol.ts";
+import { type CommandResults, type GoalOutcome } from "./runner/protocol.ts";
 import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
 import { type Lane, type LaneStatus, statusOf, withStatus } from "./registry.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
@@ -12,8 +12,13 @@ import { passthroughView, type SweepView } from "./sweep-view.ts";
  * paused only once the pane shows the goal paused: a silenced lane whose goal still runs is the bug itself.
  */
 export type PauseResult = { readonly lane: Lane; readonly lines: readonly string[]; readonly code: 0 | 2 | 3 };
-/** `resuming`: the claim of a resume whose goal command is in flight; a pause in the meantime removes it. */
-type ResumingLane = Lane & { readonly resuming?: string };
+/**
+ * `resuming`: the claim of a resume whose goal command is in flight; a pause in the meantime removes it. `resumingAt`:
+ * when it was claimed, so the paused-lane sweep leaves the turn the resume starts alone while the claim is fresh.
+ */
+type ResumingLane = Lane & { readonly resuming?: string; readonly resumingAt?: number };
+/** How long a resume claim keeps the paused-lane sweep off the lane; a resumer that died leaves it stale. */
+const RESUME_CLAIM_MS = 2 * 60_000;
 
 const PAUSABLE: ReadonlySet<LaneStatus> = new Set(["working", "not-done"]);
 /** The pause/resume steps run on the lane's runner (`ops.pause` / `ops.resume`); a runner that cannot be reached confirms nothing. */
@@ -23,9 +28,9 @@ const goalPause = async (ops: LaneOps, lane: Lane): Promise<GoalOutcome> => {
   try { return (await ops.pause(lane, "goal")).goal ?? "unconfirmed"; }
   catch (e) { if (e instanceof LaneOpsError) return "failed"; throw e; }
 };
-const goalResume = async (ops: LaneOps, lane: Lane): Promise<GoalOutcome> => {
-  try { return (await ops.resume(lane)).goal; }
-  catch (e) { if (e instanceof LaneOpsError) return "failed"; throw e; }
+const goalResume = async (ops: LaneOps, lane: Lane): Promise<CommandResults["lane.resume"]> => {
+  try { return await ops.resume(lane); }
+  catch (e) { if (e instanceof LaneOpsError) return { goal: "failed" }; throw e; }
 };
 /** Escape, read back by the runner until the turn has stopped; an unreachable runner stops nothing. */
 const stopTurn = async (ops: LaneOps, lane: Lane): Promise<boolean> => {
@@ -43,7 +48,7 @@ const beforePause = (lane: Lane): LaneStatus => (lane.pausedFrom && PAUSABLE.has
 export const pauseLane = async (deps: FlowDeps & Ops, lane: Lane, note: string): Promise<PauseResult> => {
   const status = statusOf(lane);
   if (status === "paused") {
-    const fields: Pick<ResumingLane, "resuming"> = { resuming: undefined };
+    const fields: Pick<ResumingLane, "resuming" | "resumingAt"> = { resuming: undefined, resumingAt: undefined };
     let interrupted = false;
     lane = await deps.registry.update(lane.key, (current) => {
       if (!current || statusOf(current) !== "paused") return undefined;
@@ -104,15 +109,24 @@ export const resumeLane = async (deps: FlowDeps & Ops, lane: Lane, note: string,
       result = { lane: fresh, lines: [`RESUME_UNVERIFIED ${lane.key} has no pane, so its goal cannot be resumed`], code: 3 };
       return undefined;
     }
-    const claim: ResumingLane = { ...fresh, resuming: token };
+    const claim: ResumingLane = { ...fresh, resuming: token, resumingAt: deps.clock.now() };
     return claim;
   });
   if (!claimed?.pane || claimed.resuming !== token) return result;
   const ours = (current: Lane | null): current is ResumingLane => !!current && (current as ResumingLane).resuming === token;
-  const goal = await goalResume(deps.ops, claimed);
+  const unclaim = (): Promise<unknown> =>
+    deps.registry.update(lane.key, (current) => (ours(current) ? { ...current, resuming: undefined, resumingAt: undefined } as ResumingLane : undefined));
+  const { goal, execution } = await goalResume(deps.ops, claimed);
   if (goal !== "confirmed") {
-    await deps.registry.update(lane.key, (current) => (ours(current) ? { ...current, resuming: undefined } as ResumingLane : undefined));
+    await unclaim();
     return { lane: claimed, lines: [`RESUME_UNVERIFIED ${lane.key} /goal resume ${goal}; lane left paused`], code: 3 };
+  }
+  // An active goal is not a running lane: a held session stays idle after it. A runner that does not read the turn
+  // back (older than `execution`) is read here once.
+  if ((execution ?? ((await isWorking(deps.ops, claimed)) ? "running" : "held")) !== "running") {
+    await unclaim();
+    const again = await goalPause(deps.ops, claimed);
+    return { lane: (await deps.registry.read(lane.key)) ?? claimed, lines: [`RESUME_UNVERIFIED ${lane.key} goal resumed, but no turn ran after it (session held); /goal pause ${again}; lane left paused`], code: 3 };
   }
   let repause = false;
   await deps.registry.update(lane.key, (current) => {
@@ -124,12 +138,12 @@ export const resumeLane = async (deps: FlowDeps & Ops, lane: Lane, note: string,
     if (!ours(current) || (owns && !owns(current))) {
       // Paused again meanwhile (the claim is gone or ownership moved): that pause stands. A newer resume owns the goal.
       repause = other === undefined || other === token;
-      return other === token ? { ...current, resuming: undefined } as ResumingLane : undefined;
+      return other === token ? { ...current, resuming: undefined, resumingAt: undefined } as ResumingLane : undefined;
     }
     const now = deps.clock.now();
     // Quiet time starts again at the resume: a long pause must not turn into an instant nudge.
-    const resumed = withStatus({ ...current, resuming: undefined } as ResumingLane, beforePause(current), note, new Date(now).toISOString(), { lastReplyAt: now, pausedFrom: undefined, pausedSeenWorking: undefined, lastFreshnessNote: undefined });
-    result = { lane: resumed, lines: [`RESUMED ${lane.key} as ${statusOf(resumed)}, goal resumed`], code: 0 };
+    const resumed = withStatus({ ...current, resuming: undefined, resumingAt: undefined } as ResumingLane, beforePause(current), note, new Date(now).toISOString(), { lastReplyAt: now, pausedFrom: undefined, pausedSeenWorking: undefined, lastFreshnessNote: undefined });
+    result = { lane: resumed, lines: [`RESUMED ${lane.key} as ${statusOf(resumed)}, goal resumed, turn running`], code: 0 };
     return resumed;
   });
   if (result.code === 0) await notifyStatus(deps.ops, result.lane);
@@ -150,6 +164,9 @@ export type PausedCheck = { readonly lane: Lane; readonly outcome: "working-whil
  */
 export const checkPausedLane = async (deps: FlowDeps & Ops, lane: Lane, view: SweepView = passthroughView(deps.ops)): Promise<PausedCheck> => {
   if (statusOf(lane) !== "paused" || !lane.pane) return null;
+  // A resume in flight starts this turn on purpose; interrupting it would make the resume read the lane held.
+  const { resuming, resumingAt } = lane as ResumingLane;
+  if (resuming && resumingAt !== undefined && deps.clock.now() - resumingAt < RESUME_CLAIM_MS) return null;
   const working = (await view.status(lane)).status === "working";
   if (!working) {
     // Idle again: the next working stretch is new information and is reported again.
