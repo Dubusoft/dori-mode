@@ -677,6 +677,22 @@ test("an actionable event joining a pointed noise-only batch still retries after
   expect(f.launches()).toHaveLength(1);
 });
 
+test("a first runner disconnect waits in the digest batch; an owner message arriving meanwhile is pushed at once and carries it", async () => {
+  const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("runner:offline:1", "RUNNER_OFFLINE machine=mac runner heartbeat missing for 180 s");
+  await flush(supervisor);
+  expect(f.texts()).toEqual([]);
+  f.clock.at += 5 * 60_000;
+  // Keep the lead warm so the push is appended, not a cold start.
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  supervisor.enqueue("discord:1:1", "INBOUND 1 1 is the build done?");
+  await flush(supervisor);
+  // One pointer for both: the owner message and the batched disconnect the same take prints.
+  expect(f.texts()).toHaveLength(1);
+  expect(f.texts()[0]).toContain("2 new events (urgent: INBOUND)");
+});
+
 test("push mode enqueues no ACK_MISSING but the owner still gets the ack notice", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }), ackTimeoutSec: 60 });
   const supervisor = new Supervisor(f.deps);

@@ -540,7 +540,8 @@ never used. A supervisor start counts as the last time it saw each runner it kno
 | Silent for | What happens |
 |---|---|
 | 60 s | `RUNNER_STALE machine=<label>` (digest), once |
-| 180 s | `HOST_GUARD OFFLINE machine=<label> runner heartbeat missing ...`, once, and restart decisions start |
+| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (digest), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes |
+| 10 min offline, or the probe finds it dead | `HOST_GUARD OFFLINE machine=<label> ...` (urgent), once per disconnect |
 | 30 min offline, or the restart circuit open | the runner is lost: `LANE_RUNNER_LOST <key> runner=<label>` (urgent) once for each open lane it owns; nothing is moved |
 
 Each decision runs `dori runner probe --json` on the runner's host: over ssh for a worker, using
@@ -556,8 +557,13 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
   verifies it: `RUNNER_RESTARTED`. Without one the row fails, `RUNNER_RESTART_FAILED` is said, and the next decision
   follows the backoff.
 
-The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello ends an outage, with
-`HOST_GUARD ONLINE machine=<label>` when it had gone offline. The runner's unit is separate from herdr's (it only
+The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello ends a disconnect, with
+`HOST_GUARD ONLINE machine=<label>` when it had woken the lead with `HOST_GUARD OFFLINE`.
+
+Outages have hysteresis per machine: an outage ends only once the runner has stayed connected for 10 minutes. A
+disconnect before then folds into the same outage: no new `RUNNER_STALE` or `RUNNER_OFFLINE`, and owned lanes do not
+wake the lead a second time (staying down 10 minutes or a dead probe still does). The end of the outage is said once as
+`RUNNER_ONLINE machine=<label>` (digest), with the number of disconnects folded into it. The runner's unit is separate from herdr's (it only
 `Wants=` and is `After=` the herdr unit), so a restart never touches a lane's pane.
 
 `dori status` shows the restarts of the last hour on the runner's machine line (`restarts1h` in `--json`). `dori doctor` checks the listen address, the local
@@ -570,7 +576,7 @@ runner that fails stops the rollout with `RUNNER_UPGRADE_FAILED runner=<label> .
 it keep their version.
 
 The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_FAILED`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
-`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
+`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_ONLINE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
 `RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
 
 ## Command durability
