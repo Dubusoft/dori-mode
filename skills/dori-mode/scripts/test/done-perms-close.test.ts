@@ -111,7 +111,7 @@ test("the worktree is removed before the pane closes, and a failed removal keeps
   expect(order).toEqual(["remove", "close"]);
 });
 
-test("a lane whose worktree was removed before the close (Toodo got there first) closes and records it as already removed", async () => {
+test("a lane whose worktree was removed before the close (someone got there first) closes and records it as already removed", async () => {
   world.removed = [WT];
   const toodoLane: Lane = { ...lane, cwd: WT };
   await at(T0).registry.write(toodoLane);

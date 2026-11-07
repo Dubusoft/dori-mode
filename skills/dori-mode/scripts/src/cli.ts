@@ -22,7 +22,6 @@ import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { syncRegistry } from "./sync.ts";
-import { readToodoStart } from "./toodo-start.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
@@ -144,8 +143,6 @@ const USAGE = `dori <command> [options]
                 [--sandbox]   every local lane's agent runs in laneSandbox.command (a --machine or --pane lane, or a missing command, passes through with SANDBOX_SKIPPED); --sandbox wraps a --pane lane too, refused for --machine
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
-                [--toodo-start FILE-OR-JSON]   a Toodo task the lead started: run in the worktree and first shell pane of its start_task response
-                                       (no pane, or a stale one not found again in its herdr workspace: a new tab there, LAUNCH_FALLBACK <reason>)
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
@@ -512,7 +509,7 @@ const flags = parseArgs({
   strict: false,
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, "toodo-start": { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
+    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
@@ -774,9 +771,7 @@ try {
       if (flags.values["no-sandbox"]) console.error("LAUNCH_NO_SANDBOX_REMOVED --no-sandbox was removed and is ignored: every local lane runs in the sandbox");
       if (flags.values.sandbox && !config.laneSandbox) die("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
       const sandbox = flags.values.sandbox ? (true as const) : undefined;
-      const toodoArg = opt("toodo-start");
-      if (toodoArg !== undefined && (opt("cwd") || opt("pane") || opt("workspace"))) die("--toodo-start takes the directory and pane from the start_task response; drop --cwd, --pane and --workspace");
-      const toodo = toodoArg === undefined ? undefined : await readToodoStart(toodoArg).catch((error: unknown) => die(error instanceof Error ? error.message : String(error)));
+      if (flags.values["toodo-start"] !== undefined) die("LAUNCH_TOODO_START_REMOVED --toodo-start was removed: launch the lane with --cwd like any other and record the task in Toodo yourself over MCP");
       const fromArgs = (() => { try { return launchBriefArgs(rest); } catch (e) { return die(e instanceof Error ? e.message : String(e)); } })();
       const fromMessage = fromArgs.refs.length > 0;
       if (fromMessage === (flags.values.brief !== undefined)) die("launch needs exactly one of --brief FILE or --from-message <channel> <messageId> (repeatable)");
@@ -787,19 +782,13 @@ try {
           return { path: generatedBriefPath(config.stateDir, key ?? ""), text: assembleBrief(title, fromArgs.refs.map((ref) => ownerMessageText(config.stateDir, ref)), fromArgs.notes) };
         } catch (e) { return die(e instanceof Error ? e.message : String(e)); }
       })() : undefined;
-      const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
+      const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
       const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine));
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
       const machine = target === LOCAL_MACHINE ? undefined : target;
-      // The worktree is the lane's checkout: its owning runner (the selected machine's, else the local one) says whether it exists (gate B2).
-      if (toodo?.worktreePath && !(await deps.ops.exists(machine, [toodo.worktreePath]))[0]) {
-        die(machine
-          ? `start_task's worktree ${toodo.worktreePath} is not on machine ${machine}; pass --machine <the herdr machine of the task's workspace>`
-          : `start_task's worktree ${toodo.worktreePath} is not on this host; for a task on a remote workspace pass --machine <its herdr machine>`);
-      }
       if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
       if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
