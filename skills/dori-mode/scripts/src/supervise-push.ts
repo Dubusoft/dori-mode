@@ -196,6 +196,12 @@ export class PushDelivery {
       if (this.working?.offset !== inbox.takenOffset) this.working = { offset: inbox.takenOffset, since: now };
       if (now - this.working.since < delivery.push.ackSec * 1000) return false;
     }
+    // A noise-only batch (overdue digest events, nothing urgent or owed) keeps the one pointer it got at this take cursor
+    // and lead session (a take or a new session clears the push): it is never typed again, idle or working.
+    if (push && push.attempts > 0 && !urgent.length && !due.length && !decisions.length && !owners.length) {
+      this.once("noise", `LEAD_PUSH_NOISE_HELD ${batch} ${untaken.length} digest event(s): one pointer already sent, not re-pushing`);
+      return false;
+    }
     // A take permits the next urgent batch immediately, without erasing an unfinished owner's escalation clock.
     if (push && now - push.at < this.interval(push.attempts) && !(inbox.takenOffset >= push.upto && urgent.length)) return false;
     if (push && push.attempts > delivery.push.retries && !push.untakenLogged) {
