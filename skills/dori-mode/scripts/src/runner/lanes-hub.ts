@@ -44,7 +44,7 @@ import { journalId, type AnyRunnerEvent, type CommandStatusState, type Inventory
  * is never applied: one closed with no pane (a launch cancelled before its start landed) gets `lane.close` and one
  * `LANE_STARTED_AFTER_CLOSE` line; one closed with its pane is a replay. A start for a reservation its launch stopped
  * waiting for (`launchUnconfirmed`) releases it: `LAUNCH_CONFIRMED_LATE`. A key in the inventory with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry
- * entry (an open lane that no runner owns is left to adopt-legacy.ts);
+ * entry, unless the archive holds that key closed, owned by the same runner, in the same pane (an open lane that no runner owns is left to adopt-legacy.ts);
  * a lane in both whose pane, tab or session differs takes the runner's values for those three only.
  *
  * Lane events are read back from the hub's own journal (`runner_events`), not taken from the connection: the hub
@@ -250,8 +250,12 @@ export const reconcileInventory = async (deps: LaneHubDeps, label: string, inven
       await patch(deps, lane.key, { pane: there.pane, tab: there.tab, ...(there.session !== undefined ? { session: there.session } : {}) });
     }
   }
-  for (const key of seen.keys()) {
-    if (!openKeys.has(key)) deps.emit(`lane-orphan:${label}:${key}`, `LANE_ORPHAN ${key} runner=${label} runs on that runner but the registry has no open lane ${key}; adopt it or stop it`);
+  for (const [key, there] of seen) {
+    if (openKeys.has(key)) continue;
+    // A closed lane of this runner still listed in its pane is the archived lane, not an unknown agent.
+    const known = await deps.registry.read(key);
+    if (known?.closedAt && (known.runner ?? known.machine ?? LOCAL_RUNNER) === label && known.pane === there.pane) continue;
+    deps.emit(`lane-orphan:${label}:${key}`, `LANE_ORPHAN ${key} runner=${label} runs on that runner but the registry has no open lane ${key}; adopt it or stop it`);
   }
 };
 
