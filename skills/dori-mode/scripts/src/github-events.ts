@@ -86,8 +86,11 @@ const text = (value: unknown): string => typeof value === "string" ? value : "";
 const repoFromRemote = (remote: string): string | undefined =>
   /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
 
-/** Registry signals carry PR identity; a lane worktree carries its branch identity. */
-export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "inspect">): Promise<Map<string, Targets>> => {
+/**
+ * Registry signals carry PR identity; a lane worktree carries its branch identity. A lane whose runner could not answer
+ * is added to `unresolved`: its targets may be incomplete this time, which is not evidence that it owns no PR.
+ */
+export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "inspect">, unresolved?: Set<string>): Promise<Map<string, Targets>> => {
   const targets = new Map<string, Targets>();
   const target = (repo: string): Targets => {
     const key = repo.toLowerCase();
@@ -113,7 +116,7 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     }
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
     // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
-    const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => undefined))?.git;
+    const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; }))?.git;
     const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
     if (!git || !repo) continue;
     for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) if (branch) target(repo).branches.add(branch);
