@@ -29,7 +29,8 @@ import { journalId, type AnyRunnerEvent, type InventoryLane } from "./protocol.t
  * Acks: the owner's `lane.ack` (the lane ran `dori report ack <id>`) applies `ackLaneMessage` to the message store; a
  * `LaneMessageError` is the digest line `LANE_ACK_FAILED <key> <id> <reason>`.
  *
- * Signals: the owner's `lane.state` dead is urgent `RUNNER_LANE_DEAD` (with the runner's `reason=` when it gave one), its `lane.asking` is urgent `LANE_ASKING` (the line
+ * Signals: the owner's `lane.state` dead is urgent `RUNNER_LANE_DEAD` (with the runner's `reason=` when it gave one;
+ * dropped for a closed lane, one with a launch reservation or a pending recovery, and one about another pane), its `lane.asking` is urgent `LANE_ASKING` (the line
  * ask-user.ts raises for a local lane's on-screen question), and a failed `lane.start` or `lane.recover` result is urgent
  * `RUNNER_LAUNCH_FAILED` or `RUNNER_RECOVER_FAILED`; each under a stable id from the runner label and the event's seq.
  *
@@ -174,6 +175,11 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
   }
   if (frame.type === "lane.state") {
     if (frame.body.status !== "dead") return;
+    // A dead replayed from the journal can predate what the lane is now: a closed lane, a launch still being
+    // reserved, a recovery already under way, or another pane than the lane's own say nothing about its agent.
+    const lr = lane as RecoveryLane;
+    if (lr.closedAt || lr.launchReservation || lr.recoveryPending) return;
+    if (frame.body.pane && lr.pane && frame.body.pane !== lr.pane) return;
     deps.emit(`runner-lane-dead:${label}:${frame.seq}`, `RUNNER_LANE_DEAD ${key} runner=${label}${frame.body.pane ? ` pane=${frame.body.pane}` : ""}${frame.body.reason ? ` reason=${frame.body.reason}` : ""} the lane's agent stopped on its runner: read its last report, then dori close ${key} or launch it again`);
     return;
   }

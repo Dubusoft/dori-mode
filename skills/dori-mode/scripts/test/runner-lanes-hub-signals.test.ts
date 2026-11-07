@@ -69,6 +69,17 @@ test("P2: the owner's lane.state dead raises one urgent RUNNER_LANE_DEAD; workin
   expect(eventClass(t.emitted[0]?.[1] ?? "")).toBe("lead-urgent");
 });
 
+test.each([
+  { name: "a closed lane", extra: { closedAt: new Date(T0).toISOString() }, pane: "p1" },
+  { name: "a lane with a launch reservation", extra: { launchReservation: "tok" }, pane: "p1" },
+  { name: "a lane with a recovery under way", extra: { recoveryPending: true }, pane: "p1" },
+  { name: "a pane the lane has left", extra: {}, pane: "p0" },
+])("a replayed lane.state dead about $name raises nothing", async ({ extra, pane }) => {
+  const t = await setup(extra as Partial<Lane>);
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "dead", pane, reason: "agent-gone" }));
+  expect(t.emitted).toEqual([]);
+});
+
 test("the owner's lane.state dead carries the runner's reason into RUNNER_LANE_DEAD", async () => {
   const t = await setup();
   await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "pane-missing" }));

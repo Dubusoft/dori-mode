@@ -81,7 +81,7 @@ test("a reused pane id after a server restart cannot be observed, steered or clo
   expect(await t.lanes.askTick()).toEqual([]);
   expect((await t.lanes.close("lane-a")).result).toEqual({ closed: "none", gone: true });
   expect(t.calls.slice(before).filter((a) => ["run", "send-text", "send-keys", "close", "read"].includes(a[2] ?? ""))).toEqual([]);
-  expect(t.published).toContainEqual(["lane.state", { key: "lane-a", status: "missing", reason: "pane-missing" }]);
+  expect(t.published).toContainEqual(["lane.state", { key: "lane-a", status: "missing", pane: "p1", reason: "pane-missing" }]);
 });
 
 test("recovery relaunches a lane whose old pane id now belongs to another live agent without closing that agent", async () => {
@@ -305,12 +305,12 @@ test("observe answers dead but publishes no lane.state dead for a lane still in 
   expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "dead" });
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "working" }];
   expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "working" });
-  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working" }]]);
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working", pane: "p1" }]]);
   // Once the window is over a dead agent is published as before.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   clock.at = started + STARTUP_GRACE_MS;
   await t.lanes.observe("lane-a");
-  expect(t.published.at(-1)).toEqual(["lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }]);
+  expect(t.published.at(-1)).toEqual(["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]);
 });
 
 test("recover leaves a lane still in its startup window alone instead of closing its tab and starting it again", async () => {
@@ -339,7 +339,7 @@ test("alive criteria: observe and recover use paneAlive (agent_status), not the 
   // herdr still names the agent, but its status is not an alive one: the supervisor's laneStatus calls this dead.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
-  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }]]);
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]]);
   expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
   // An alive status without an agent field is alive, as paneAlive says.
   t.world.panes = [{ pane_id: "p2", workspace_id: "w", tab_id: "t2", agent_status: "blocked" }];
