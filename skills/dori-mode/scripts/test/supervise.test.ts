@@ -308,6 +308,48 @@ test.each([false, true])("a close after a taken and reported claim wakes the lea
   expect(taken(f)).toEqual(["lane-closed:alpha\tLANE_CLOSED alpha closed seen-claim https://x"]);
 });
 
+const MERGED_7 = "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x/7";
+
+/** Enqueues each step's events, flushes, and returns how many pointers that flush sent and what the lead then takes. */
+const finishSteps = async (steps: readonly (readonly (readonly [string, string])[])[], restartAt = -1) => {
+  const f = fixture();
+  const pointers = () => f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text" && (call[4] ?? "").startsWith(POINTER_PREFIX)).length;
+  let supervisor = new Supervisor(f.deps);
+  const seen: { pointers: number; taken: string[] }[] = [];
+  for (const [i, step] of steps.entries()) {
+    if (i === restartAt) supervisor = new Supervisor(f.deps);
+    f.clock.at += 60_000;
+    const before = pointers();
+    for (const [id, line] of step) supervisor.enqueue(id, line);
+    await supervisor.flush();
+    seen.push({ pointers: pointers() - before, taken: taken(f).map((row) => row.split("\t")[0] ?? "") });
+  }
+  return seen;
+};
+
+test.each([-1, 1, 2])("one lane's claim, merge and close: the claim and the close wake the lead, the merge rides with the close (restart before step %i)", async (restartAt) => {
+  expect(await finishSteps([
+    [["done-claim:alpha:1", "LANE_DONE_CLAIMED alpha w:p1 proof"]],
+    [["ci-merged:acme/app#7", MERGED_7]],
+    [["lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim https://x/7"]],
+  ], restartAt)).toEqual([
+    { pointers: 1, taken: ["done-claim:alpha:1"] },
+    { pointers: 0, taken: ["INBOX_EMPTY"] },
+    { pointers: 1, taken: ["ci-merged:acme/app#7", "lane-closed:alpha"] },
+  ]);
+});
+
+test("a merge that brings something new still wakes the lead: before the claim, after an objection, at another PR head", async () => {
+  const claim = ["done-claim:alpha:1", "LANE_DONE_CLAIMED alpha w:p1 proof"] as const;
+  // Merge first: the merge is the lane's first finish news, and the later claim is one the lead may object to.
+  expect((await finishSteps([[["ci-merged:acme/app#7", MERGED_7]], [claim]])).map((step) => step.pointers)).toEqual([1, 1]);
+  // An objection drops the claim's record: a merge after it is news again.
+  expect((await finishSteps([[claim], [["not-done:alpha", "LANE_NOT_DONE alpha checks red"]], [["ci-merged:acme/app#7", MERGED_7]]])).map((step) => step.pointers)).toEqual([1, 1, 1]);
+  // A second PR merged at a head the record has not seen.
+  expect((await finishSteps([[claim], [["ci-merged:acme/app#7", MERGED_7]],
+    [["ci-merged:acme/app#8", "CI_MERGED acme/app#8 into dev lane=alpha head=fed merge=cba https://x/8"]]])).map((step) => step.pointers)).toEqual([1, 0, 1]);
+});
+
 test("an unseen newly idle agent reported as done is positive startup evidence", async () => {
   const f = fixture();
   f.cold();
