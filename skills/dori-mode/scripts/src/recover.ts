@@ -8,6 +8,7 @@ import { LaunchError, laneTabWorkspace, launchLane, startupLine } from "./launch
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
+import type { Pane } from "./panes.ts";
 import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
@@ -26,6 +27,42 @@ export type RecoveryLane = Lane & {
   readonly recoveryExhausted?: boolean;
   /** A session a recovery tried to resume and could not; the next attempt starts from the brief. */
   readonly recoveryResumeFailed?: string;
+  /** The live lane's pane was seen working since `turnStopRead`: its next stop is read from the runner once. */
+  readonly turnRan?: true;
+  /** The runner's last stopped turn of the lane read by recovery, as `gen:stop` (`-`: the runner gave none). */
+  readonly turnStopRead?: string;
+};
+
+/** Holds that already say why a lane waits: an explicit goal pause, a finished goal, a question (LANE_ASKING). */
+const EXPLAINED_HOLDS: ReadonlySet<string> = new Set(["goal-paused", "goal-complete", "question"]);
+
+/**
+ * A working lane whose agent is alive on the expected model: nothing is relaunched or retried. Once per stopped stretch
+ * (after its pane was seen working, or never read yet) its runner's record of the last stopped turn is read
+ * (`lane.observe`); a turn that was aborted (by the user, the system or a failed provider call) with no continuation
+ * pending and no hold that explains it is `LANE_TURN_INTERRUPTED`, once per stop, so the lead sees it before any
+ * recovery. A finished turn, a goal continuation or watch on duty, and a runner that records no turns say nothing.
+ */
+const turnInterrupted = async (deps: FlowDeps, lane: RecoveryLane, pane: Pane, enqueue: RecoveryEnqueue | undefined): Promise<string[]> => {
+  if (pane.agent_status === "working") {
+    if (!lane.turnRan) await deps.registry.patch<RecoveryLane>(lane.key, { turnRan: true });
+    return [];
+  }
+  if (lane.turnStopRead !== undefined && !lane.turnRan) return [];
+  let turn;
+  try { turn = await deps.ops.turn(lane); }
+  catch (error) {
+    // A runner that is down is the caller's (held silently); a lane the runner cannot observe has no turn to read.
+    if (!(error instanceof LaneOpsError) || runnerDown(error)) throw error;
+  }
+  const id = turn ? `${turn.gen}:${turn.stop}` : "-";
+  const event = turn && turn.cause !== "finished" && !turn.continuation && !EXPLAINED_HOLDS.has(turn.hold) && id !== lane.turnStopRead
+    ? `LANE_TURN_INTERRUPTED ${lane.key} ${pane.pane_id} gen=${turn.gen} stop=${turn.stop} cause=${turn.cause} hold=${turn.hold} its agent is alive but its last turn stopped with nothing pending to continue it; not relaunched or retried: read its pane, then send it a message to continue, or dori pause and dori resume ${lane.key} (resume confirms a turn runs)`
+    : undefined;
+  // Enqueued before the read is saved: a crash retries the same durable journal id.
+  if (event && enqueue) await enqueue(event, `turn:${JSON.stringify([lane.key, lane.openedAt, id])}`);
+  await deps.registry.patch<RecoveryLane>(lane.key, { turnRan: undefined, turnStopRead: id });
+  return event && !enqueue ? [event] : [];
 };
 
 /** omo's flag that continues an existing session file or id (`omo --session <path|id>`). */
@@ -186,7 +223,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
       if (lane.recoveryPending && (old.agent_status === "working" || old.agent_status === "idle" || old.agent_status === "done")) {
         return finishRecovery(deps, lane, "startup-confirmed");
       }
-      return [];
+      return lane.recoveryPending ? [] : turnInterrupted(deps, lane, old, enqueue);
     }
     // The pane in the registry was started by the last recovery, or else by the launch.
     const launchedAt = lane.lastRecoveryAt ?? Date.parse(lane.openedAt);

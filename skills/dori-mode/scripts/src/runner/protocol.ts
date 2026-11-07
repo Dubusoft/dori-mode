@@ -237,6 +237,22 @@ export type GoalOutcome = "confirmed" | "unconfirmed" | "failed";
  * `held` when it stayed idle (a held session or human wait the goal command did not release, or no goal to continue).
  */
 export type ExecutionOutcome = "running" | "held";
+/** How a lane's last turn ended, from the labels senpi prints under an aborted turn (runner/observe.ts `turnStop`). */
+export type TurnStopCause = "finished" | "aborted" | "system-aborted" | "provider-failed";
+/**
+ * What holds a stopped lane, from omo's footer and the question prompt: `none` is an active goal, `session-paused` omo's
+ * own pause after a stopped run (type to continue), `no-goal` a footer that names no goal.
+ */
+export type TurnHold = "none" | "goal-paused" | "session-paused" | "goal-stopped" | "goal-blocked" | "goal-complete" | "no-goal" | "question";
+/**
+ * A lane's last stopped turn as its runner recorded it (`lane.observe`): `gen` the launch generation, `stop` its
+ * number within that generation (one per running-to-stopped change the runner saw), `at` when it was recorded.
+ * `continuation`: the footer showed a goal continuation countdown or a live watch, so the lane wakes by itself.
+ */
+export type TurnEvidence = {
+  readonly gen: number; readonly stop: number; readonly at: number;
+  readonly cause: TurnStopCause; readonly hold: TurnHold; readonly continuation: boolean;
+};
 /** `detail`: the failure word, or e.g. "no ready agent status (idle)"; the last lines are inside it when unconfirmed. */
 export type StartupVerdict = { readonly verdict: "ok" | "error" | "unconfirmed"; readonly detail: string };
 
@@ -254,7 +270,8 @@ export type CommandResults = {
   readonly "lane.notify": Record<never, never>;
   /** `out` and `err` are capped at 4 KiB each. */
   readonly "lane.git": { readonly code: number; readonly out: string; readonly err: string };
-  readonly "lane.observe": { readonly status: LaneStatus };
+  /** `turn` (an idle lane's last stopped turn) comes only from a runner that records it. */
+  readonly "lane.observe": { readonly status: LaneStatus; readonly turn?: TurnEvidence };
   readonly "guard.kill": { readonly killed: readonly { readonly pid: number; readonly lane?: string; readonly comm: string; readonly rssKb: number }[] };
   /**
    * herdr as read after the action: `managed` when a herdr unit is installed on the host, `paused` when the watch

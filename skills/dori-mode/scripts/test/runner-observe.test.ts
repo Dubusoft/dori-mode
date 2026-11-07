@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Proc } from "../src/lane-memory.ts";
 import type { Ran } from "../src/run.ts";
-import { briefLane, observeHost } from "../src/runner/observe.ts";
+import { briefLane, observeHost, turnStop } from "../src/runner/observe.ts";
 import { RunnerClient, yieldTurn } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { serveRunner, STARTUP_GRACE_MS, type ObservedLane } from "../src/runner/serve.ts";
@@ -212,4 +212,36 @@ test("serveRunner republishes lane.state on a pane change and after a lane was g
   ]);
   outbox.close();
   state.close();
+});
+
+/** An omo screen: the chat's last lines, the input box, then the footer (`status`, the goal/monitor line). */
+const omoScreen = (chat: readonly string[], status: string): string =>
+  [...chat, "", "─".repeat(40), "", "─".repeat(40), "~/repo • main • 74K/1M (7.4%)          (anthropic@login) claude-opus-5-5", `(😺 OmO) ${status}`, ""].join("\n");
+
+test("turnStop names how the last turn ended, what holds the lane, and whether a continuation is pending", () => {
+  const work = ["● Editing src/a.ts", "  applied 2 edits"];
+  expect(turnStop(omoScreen([...work, "", "Operation aborted"], "Pursuing goal (4m)"), false)).toEqual({ cause: "aborted", hold: "none", continuation: false });
+  expect(turnStop(omoScreen([...work, "System operation aborted"], "Pursuing goal (4m)"), false)).toMatchObject({ cause: "system-aborted" });
+  expect(turnStop(omoScreen([...work, "Provider retry failed after 3 attempts"], "Goal stopped: no progress (send a message or /goal resume)"), false))
+    .toEqual({ cause: "provider-failed", hold: "goal-stopped", continuation: false });
+  // A user abort the goal resumes by itself, and a finished turn waiting on a watch, both continue on their own.
+  expect(turnStop(omoScreen([...work, "Operation aborted"], "Pursuing goal (4m) ▰▰▱▱ goal resumes in 30s"), false)).toEqual({ cause: "aborted", hold: "none", continuation: true });
+  expect(turnStop(omoScreen([...work, "Waiting on CI."], "Pursuing goal (4m) ◉ watching ci checks (3m)"), false)).toEqual({ cause: "finished", hold: "none", continuation: true });
+  // omo marks a watch with either glyph (the lead pane's footer: `mem:… just now (+3) ◎ watching dori lead events (1m)`).
+  expect(turnStop(omoScreen(["Idle."], "mem:dori-b116e8a6 just now (+3) ◎ watching dori lead events (1m)"), false)).toEqual({ cause: "finished", hold: "no-goal", continuation: true });
+  expect(turnStop(omoScreen(["Paused."], "Goal paused (/goal resume)"), false)).toMatchObject({ hold: "goal-paused" });
+  expect(turnStop(omoScreen(["Done."], "ship it · Goal achieved (9m)"), false)).toMatchObject({ cause: "finished", hold: "goal-complete" });
+  expect(turnStop(omoScreen(["Done."], "mem:src-1 1m ago"), true)).toMatchObject({ hold: "question" });
+  expect(turnStop(omoScreen(["Done."], "mem:src-1 1m ago"), false)).toMatchObject({ hold: "no-goal" });
+});
+
+test("turnStop reads only the last turn's end: an older abort further up, or one quoted in output, is a finished turn", () => {
+  const older = ["Operation aborted", "> continue", ...Array.from({ length: 8 }, (_, i) => `● step ${i}`), "All checks pass."];
+  expect(turnStop(omoScreen(older, "Pursuing goal (9m)"), false)).toMatchObject({ cause: "finished" });
+  expect(turnStop(omoScreen(["the log says: Operation aborted"], "Pursuing goal (9m)"), false)).toMatchObject({ cause: "finished" });
+});
+
+test("turnStop reads a real omo pane whose tool call the user stopped: the footer names the abort and omo's session pause", () => {
+  const screen = readFileSync(join(import.meta.dir, "fixtures", "omo-aborted-turn.txt"), "utf8");
+  expect(turnStop(screen, false)).toEqual({ cause: "aborted", hold: "session-paused", continuation: false });
 });

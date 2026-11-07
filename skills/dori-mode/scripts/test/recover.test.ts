@@ -5,7 +5,7 @@ import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, resumeCommand, STARTUP
 import { freshnessTick } from "../src/freshness.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
-import type { StartupVerdict } from "../src/runner/protocol.ts";
+import type { StartupVerdict, TurnEvidence } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
 
@@ -442,4 +442,84 @@ test.each([
   world.screen = screen;
   expect((await recoverLanes(deps))[0]).toBe(`LANE_RECOVERED recover-lane new:p1 ${reason}`);
   expect(opsOf(world, "close", "start").map((e) => [e.op, e.key])).toEqual([["close", "recover-lane"], ["start", "recover-lane"]]);
+});
+
+const stopped = (world: World, status = "idle"): void => {
+  world.panes = [{ pane_id: "old:p1", tab_id: "old:t1", workspace_id: "w", agent: "omo", agent_status: status }];
+};
+const turn = (over: Partial<TurnEvidence> = {}): TurnEvidence => ({ gen: 1, stop: 1, at: 0, cause: "aborted", hold: "none", continuation: false, ...over });
+
+test("a live agent whose turn was aborted is reported once per stop and never relaunched or retried", async () => {
+  const { deps, world, lane } = await fixture();
+  stopped(world);
+  world.turn = turn();
+  const events = await recoverLanes(deps);
+  expect(events).toEqual([expect.stringMatching(/^LANE_TURN_INTERRUPTED recover-lane old:p1 gen=1 stop=1 cause=aborted hold=none /)]);
+  // The same stopped stretch is not read again; the next turn's stop is, and the same stop is never reported twice.
+  expect(await recoverLanes(deps)).toEqual([]);
+  stopped(world, "working");
+  expect(await recoverLanes(deps)).toEqual([]);
+  stopped(world);
+  expect(await recoverLanes(deps)).toEqual([]);
+  stopped(world, "working");
+  await recoverLanes(deps);
+  stopped(world);
+  world.turn = turn({ stop: 2, cause: "provider-failed", hold: "goal-stopped" });
+  expect(await recoverLanes(deps)).toEqual([expect.stringMatching(/^LANE_TURN_INTERRUPTED recover-lane old:p1 gen=1 stop=2 cause=provider-failed hold=goal-stopped /)]);
+  expect(opsOf(world, "turn")).toHaveLength(3);
+  expect(opsOf(world, "recover", "start", "close", "send", "resume", "pause")).toEqual([]);
+  expect(await deps.registry.read(lane.key)).toMatchObject({ pane: "old:p1", turnStopRead: "1:2" });
+});
+
+test("a supervisor with enqueue journals the interrupted turn under a stable id before saving the read", async () => {
+  const { deps, world } = await fixture();
+  stopped(world);
+  world.turn = turn();
+  const queued: [string, string][] = [];
+  expect(await recoverLanes(deps, undefined, async (line, id) => { queued.push([line, id]); })).toEqual([]);
+  expect(queued).toEqual([[expect.stringMatching(/^LANE_TURN_INTERRUPTED recover-lane /), expect.stringMatching(/^turn:.*"1:1"/)]]);
+});
+
+test.each([
+  ["a finished turn", turn({ cause: "finished" })],
+  ["an abort the goal resumes by itself", turn({ continuation: true })],
+  ["an explicit goal pause", turn({ hold: "goal-paused" })],
+  ["a question prompt", turn({ hold: "question" })],
+  ["a runner that records no turns", undefined],
+])("normal idle says nothing: %s", async (_name, evidence) => {
+  const { deps, world } = await fixture();
+  stopped(world);
+  world.turn = evidence;
+  expect(await recoverLanes(deps)).toEqual([]);
+  expect(await recoverLanes(deps)).toEqual([]);
+  expect(opsOf(world, "turn")).toHaveLength(1);
+  expect(opsOf(world, "recover", "start", "close", "send", "resume")).toEqual([]);
+});
+
+test("an owner-paused lane with an aborted turn is neither read, reported nor resumed", async () => {
+  const { deps, world, lane } = await fixture();
+  await deps.registry.write({ ...lane, status: "paused" });
+  stopped(world);
+  world.turn = turn();
+  expect(await recoverLanes(deps)).toEqual([]);
+  expect(opsOf(world, "turn", "resume", "send", "recover", "start")).toEqual([]);
+});
+
+test("a dead agent is still relaunched through its runner without reading a turn", async () => {
+  const { deps, world, lane, control } = await fixture();
+  await deps.registry.write({ ...lane, openedAt: new Date(-3 * STARTUP_GRACE_MS).toISOString() });
+  shellOnly(world, control);
+  world.turn = turn();
+  control.duringCreate = async () => { world.panes = world.panes.filter((p) => p.pane_id !== "old:p1"); };
+  expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane new:p1 agent-gone", "STARTUP_OK recover-lane new:p1"]);
+  expect(opsOf(world, "turn")).toEqual([]);
+});
+
+test("a lane the runner cannot observe has no turn to read and gets no recovery error", async () => {
+  const { deps, world } = await fixture();
+  stopped(world);
+  const ops: LaneOps = { ...deps.ops, turn: async () => { world.ops.push({ op: "turn", args: {} }); throw new LaneOpsError("LANE_OP_FAILED", "local", "RUNNER_LANE_UNKNOWN recover-lane"); } };
+  expect(await recoverLanes({ ...deps, ops })).toEqual([]);
+  expect(await recoverLanes({ ...deps, ops })).toEqual([]);
+  expect(opsOf(world, "turn")).toHaveLength(1);
 });

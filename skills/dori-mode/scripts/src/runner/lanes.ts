@@ -10,9 +10,11 @@ import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.t
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
+import { turnStop } from "./observe.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
   CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, ProcessInfo, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
+  TurnEvidence,
 } from "./protocol.ts";
 
 export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
@@ -34,6 +36,13 @@ export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } 
  * (lane-socket.ts). `lane.close` and `lane.stop` close the tab (else the pane), delete the brief and the token file and
  * forget the token. `askTick` reads each owned lane's pane for an on-screen question (the same `screenQuestion` the
  * supervisor's ask-user sweep uses) and publishes one `lane.asking` per distinct question.
+ *
+ * Turn evidence (read-only): each pass and each `lane.observe` notes whether an owned lane's turn runs. A live lane
+ * seen stopped after a running turn (or stopped for the first time after its startup window) gets one new
+ * `turnStop` record for its generation: how the turn ended, what holds the lane, and whether a continuation is
+ * pending (observe.ts `turnStop`). The same stop is never recorded twice, across runner restarts too (lanes.json);
+ * `lane.observe` answers an idle lane's last stop, so the supervisor can tell an aborted turn from an owner pause or
+ * an intended end before it recovers anything. Nothing is typed into the pane for it.
  */
 
 export const LANES_FILE = "lanes.json";
@@ -75,6 +84,10 @@ export type LaneRecord = {
   readonly adopted?: true;
   /** The launch generation: its token is in `briefs/<key>.<gen>.token`. Absent (adopted, or an older runner's record): `briefs/<key>.token`. */
   readonly gen?: number;
+  /** A turn was seen running since `turnStop` was recorded. */
+  readonly turnRunning?: true;
+  /** The last stopped turn of this generation; a launch starts a record without it. */
+  readonly turnStop?: TurnEvidence;
 };
 
 export type RunnerLanesDeps = {
@@ -501,7 +514,29 @@ export class RunnerLanes {
     const starting = reason === "agent-gone" && this.starting(record);
     if (!starting) this.deps.publish("lane.state", { key, status, pane: record.pane, ...(reason ? { reason } : {}) });
     if (!pane) throw new Error(`RUNNER_LANE_ABSENT ${key} pane ${record.pane} is gone`);
-    return { detail: `observed ${status}`, result: { status } };
+    await this.noteTurn(record, pane);
+    const turn = status === "idle" ? this.records()[key]?.turnStop : undefined;
+    return { detail: `observed ${status}`, result: { status, ...(turn ? { turn } : {}) } };
+  }
+
+  /**
+   * Notes the lane's turn: a working pane marks a turn running; a stopped live pane after a running turn (or with no
+   * stop recorded yet, once past its startup window) records the next stop from its screen (`screen`, else read here).
+   * An unreadable or empty screen records nothing, so the next pass tries again.
+   */
+  private async noteTurn(record: LaneRecord, pane: Pane, screen?: string): Promise<void> {
+    if (!paneAlive(pane)) return;
+    if (pane.agent_status === "working") {
+      if (!record.turnRunning) this.update(record.key, (r) => ({ ...r, turnRunning: true }));
+      return;
+    }
+    if ((record.turnStop && !record.turnRunning) || this.starting(record)) return;
+    const text = screen ?? await readScreen(this.deps.run, record.pane, ASK_SCREEN_LINES).catch(() => "");
+    if (!text.trim()) return;
+    const evidence: TurnEvidence = {
+      gen: record.gen ?? 0, stop: (record.turnStop?.stop ?? 0) + 1, at: this.deps.clock.now(), ...turnStop(text, screenQuestion(text) !== null),
+    };
+    this.update(record.key, ({ turnRunning: _ran, ...rest }) => ({ ...rest, turnStop: evidence }));
   }
 
   /**
@@ -546,8 +581,10 @@ export class RunnerLanes {
   async askTick(): Promise<string[]> {
     const asked: string[] = [];
     for (const record of Object.values(this.records())) {
-      if (!await this.currentPane(record)) continue;
+      const pane = await this.currentPane(record);
+      if (!pane) continue;
       const screen = await readScreen(this.deps.run, record.pane, ASK_SCREEN_LINES).catch(() => "");
+      await this.noteTurn(record, pane, screen);
       if (!screen.trim()) continue;
       const q = screenQuestion(screen);
       const seen = q ? questionKey(q) : undefined;

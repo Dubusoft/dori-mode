@@ -116,6 +116,8 @@ describe("laneOps: one runner call per method", () => {
     ["kill", (o) => o.kill(undefined, ["demo"]), { fn: "call", label: LOCAL_RUNNER, type: "guard.kill", body: { keys: ["demo"] } },
       [{ pid: 42, lane: "demo", comm: "node", rssKb: 100 }]],
     ["observe", (o) => o.observe(remote), { fn: "call", label: "box", type: "lane.observe", body: { key: "far" } }, "idle"],
+    // A runner that records no turn answers none.
+    ["turn", (o) => o.turn(remote), { fn: "call", label: "box", type: "lane.observe", body: { key: "far" } }, undefined],
   ];
 
   for (const [name, run, expected, value] of cases) {
