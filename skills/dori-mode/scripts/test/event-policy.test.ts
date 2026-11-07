@@ -13,7 +13,7 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 /** The hard-coded classifier this table replaced (supervise-delivery.ts before 1.7), kept verbatim as the reference. */
 const LEGACY_URGENT = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_DONE_CLAIMED", "LANE_NOT_DONE", "LANE_CLOSED", "LANE_REPORT",
-  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
+  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "ACK_MISSING", "UNHANDLED",
   "LANE_RECOVERY_EXHAUSTED",

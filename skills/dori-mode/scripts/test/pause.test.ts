@@ -35,7 +35,7 @@ const pauseSteps = () => world.ops.filter((e) => e.op === "pause").map((e) => (e
 const escapes = () => pauseSteps().filter((s) => s === "stop");
 const goalOps = () => world.ops.filter((e) => e.op === "pause" || e.op === "resume").map((e) => (e.op === "resume" ? "resume" : `pause:${(e.args as { step?: string }).step}`));
 /** One freshness sweep at `ms`, over the World's runner. */
-const tick = (ms: number) => { const d = deps(ms); return freshnessTick(d, "/home/test", passthroughView(d.ops)); };
+const tick = (ms: number) => { const d = deps(ms); return freshnessTick(d, passthroughView(d.ops)); };
 /** A sweep tick that finds the paused lane woken (a monitor event, a background result) and working. */
 const wokenTick = async (at: number) => {
   paneStatus("working");

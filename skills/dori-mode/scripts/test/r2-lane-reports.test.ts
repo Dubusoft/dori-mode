@@ -5,7 +5,6 @@ import { Database } from "bun:sqlite";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { freshnessTick } from "../src/freshness.ts";
 import { INLINE_REPORT_MAX, JsonLaneReports, type LaneReportStore, openLaneReports, POISON_ALERT_AFTER, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { launchLane } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
@@ -164,18 +163,6 @@ test("a dead lane pane leaves one synthetic blocked row under the lane's key; a 
   expect(rows.map((r) => [r.lane, r.kind, r.at])).toEqual([["local-lane", "blocked", T0]]);
   expect(rows[0]?.text).toContain("pane w:p7 stopped");
   expect(eventClass(`LANE_REPORT local-lane blocked ${rows[0]?.text}`, deps.config.eventPolicy)).toBe("lead-urgent");
-});
-
-test("a freshness post of a lane's last [REPORT] line is marked [System] relayed, not the lane speaking", async () => {
-  const dir = stateDir();
-  const world = newWorld();
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
-  world.screen = "noise\n[REPORT] quiet-lane | milestone | tests green, PR open\n❯ ";
-  const deps = (ms: number) => depsFor(world, fakeClock(ms), dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
-  await deps(T0).registry.write({ ...lane(dir), key: "quiet-lane", thread: "chat:team/9", lastReplyAt: T0, lastNudgeAt: T0 + 16 * MIN });
-  await freshnessTick(deps(T0 + 21 * MIN), "/home/test");
-  expect((await freshnessTick(deps(T0 + 26 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["posted"]);
-  expect(world.calls.find((c) => c[0] === "notify")?.[2]).toBe("[System] 레인 quiet-lane 전달: 진행 상황(레인의 마지막 보고): tests green, PR open");
 });
 
 test("a lane registered on the old [REPORT] footer moves onto dori report when it is relaunched", async () => {

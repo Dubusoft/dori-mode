@@ -118,7 +118,7 @@ test("pause: pause and resume from a stale lane keep an objection and progress p
 test("freshness: a pause written while the sweep nudges the lane stands; only the nudge time is saved", async () => {
   await deps(T0).registry.write(lane);
   const d = racingOps(T0 + 20 * MIN, "send", (_lane, text) => text.startsWith("[LEAD] your work thread"), () => elsewhere({ status: "paused", pausedFrom: "working" }));
-  const acts = await freshnessTick(d, "/home/test", passthroughView(d.ops));
+  const acts = await freshnessTick(d, passthroughView(d.ops));
   expect(acts.map((a) => a.kind)).toContain("nudged");
   expect(await stored()).toMatchObject({ status: "paused", pausedFrom: "working", lastNudgeAt: T0 + 20 * MIN });
   expect(staleWrites()).toEqual([]);

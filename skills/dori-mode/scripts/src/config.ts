@@ -254,7 +254,6 @@ export type DoriConfig = {
   readonly laneThinking?: string;
   readonly sessionsDir: string;
   readonly nudgeAfterMin: number;
-  readonly postAfterMin: number;
   /**
    * Minutes an idle lane may stay silent after its freshness nudge before the lead hears urgent IDLE-ESCALATE; each
    * further one for the same silence waits twice as long. Must be positive.
@@ -391,7 +390,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   laneThinking: "medium",
   sessionsDir: join(home, ".omo", "agent", "sessions"),
   nudgeAfterMin: 15,
-  postAfterMin: 20,
   idleEscalateMin: 30,
   closeAfterMin: 5,
   mergeWaitMaxMin: 60,

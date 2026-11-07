@@ -3,12 +3,12 @@ import { join } from "node:path";
 
 import { loadConfig } from "../src/config.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { JsonLaneReports, type LaneReportStore, leadPaneViolationTick, openLaneReports, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { JsonLaneReports, type LaneReportStore, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { footer, launchLane } from "../src/launch.ts";
 import { watchTick } from "../src/done-flow.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, newWorld, withSqliteStore, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { fakeLaneSocket } from "./fake-lane-socket.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; a loaded full run on a small host needs more than bun's default 5 s per test.
@@ -242,46 +242,7 @@ test("footer: every lane is told to use dori report and never a pane; a remote l
   expect(remote).not.toContain("[REPORT] cli-lane |");
 });
 
-test("lead-pane violations: each distinct [REPORT] line of a dori-report lane in the lead's pane is counted once; old-footer lanes are not counted", async () => {
-  const dir = stateDir();
-  const world = newWorld();
-  const deps = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });
-  withSqliteStore(dir);
-  await deps.registry.write(lane(dir, { key: "cli-lane", reportVia: "cli" }));
-  await deps.registry.write(lane(dir, { key: "old-lane", pane: "w:p8" }));
-  const emitted: string[] = [];
-  const emit = async (line: string) => { emitted.push(line); };
-  world.screen = [
-    "> [REPORT] cli-lane | milestone | tests green, PR #9",
-    "> [REPORT] old-lane | milestone | typed here by design",
-    "  [REPORT] cli-lane | <milestone|progress> | <what, with links>",
-  ].join("\n");
-  await leadPaneViolationTick(deps, emit);
-  // The same screen on the next round is the same line: not counted again.
-  await leadPaneViolationTick(deps, emit);
-  expect(emitted).toEqual(["LANE_PANE_VIOLATION cli-lane 1 [REPORT] cli-lane | milestone | tests green, PR #9 (rerouted as report cli-lane:0:1)"]);
-  world.screen += "\n> [REPORT] cli-lane | question | which base?";
-  await leadPaneViolationTick(deps, emit);
-  expect(emitted.at(-1)).toBe("LANE_PANE_VIOLATION cli-lane 2 [REPORT] cli-lane | question | which base? (rerouted as report cli-lane:0:2)");
-  // Each counted line became one pending row of that lane, which routeReports acts on like a dori report.
-  const rerouted = openLaneReports(deps.config);
-  cleanups.push(() => { rerouted.close(); });
-  expect(rerouted.pending().map((r) => [r.lane, r.kind, r.text])).toEqual([
-    ["cli-lane", "milestone", "tests green, PR #9"], ["cli-lane", "question", "which base?"],
-  ]);
-  expect((await deps.registry.read("cli-lane"))?.leadPaneViolations).toBe(2);
-  expect((await deps.registry.read("old-lane"))?.leadPaneViolations).toBeUndefined();
-  expect(eventClass("LANE_PANE_VIOLATION cli-lane 2 x", deps.config.eventPolicy)).toBe("lead-digest");
-
-  // No dori-report lane open: the lead's pane is not read at all.
-  const quiet = depsFor(newWorld(), fakeClock(T0), stateDir(), { leadPane: "w:lead" });
-  await quiet.registry.write(lane(dir, { key: "old-lane" }));
-  const before = world.calls.length;
-  await leadPaneViolationTick(quiet, emit);
-  expect(world.calls.length).toBe(before);
-});
-
-test("a dori-report lane's row is routed and counts as hearing from it, and an old-footer remote lane's [REPORT] line is still read", async () => {
+test("a dori-report lane's row is routed and counts as hearing from it, and an old-footer remote lane's [REPORT] line is never read", async () => {
   const dir = stateDir();
   const world = newWorld();
   const base = depsFor(world, fakeClock(T0), dir);
@@ -301,11 +262,11 @@ test("a dori-report lane's row is routed and counts as hearing from it, and an o
   // Being routed is being heard: freshness counts from it.
   expect((await deps.registry.read("cli-lane"))?.lastReplyAt).toBe(T0);
 
-  // Pane [REPORT] lines are still parsed: a remote lane's question on its own screen reaches the lead.
+  // A pane is never parsed for a report: a remote lane's question printed on its own screen reaches no one.
   world.screen = "[REPORT] remote-lane | question | need the deploy key\n❯ ";
   const pushed: string[] = [];
   await watchTick(deps, async (line) => { pushed.push(line); });
-  expect(pushed).toContain("LANE_REPORT remote-lane question need the deploy key");
+  expect(pushed.filter((line) => line.startsWith("LANE_REPORT"))).toEqual([]);
 });
 
 test("routing: journal and late events carry the lane's meta (lane, thread, cwd), an unregistered lane only its key", async () => {

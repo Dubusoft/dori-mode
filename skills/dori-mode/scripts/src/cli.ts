@@ -935,7 +935,7 @@ try {
       await every(loopMin, async () => {
         const reports = openLaneReports(deps.config);
         try {
-          for (const a of await freshnessTick(deps, process.env.HOME ?? "", undefined, reports)) console.log(`${a.kind.toUpperCase()} ${a.lane} ${a.detail}`);
+          for (const a of await freshnessTick(deps, undefined, reports)) console.log(`${a.kind.toUpperCase()} ${a.lane} ${a.detail}`);
         } finally { reports.close(); }
       });
       break;

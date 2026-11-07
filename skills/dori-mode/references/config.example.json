@@ -35,7 +35,6 @@
   },
   "sessionsDir": "~/.omo/agent/sessions",
   "nudgeAfterMin": 15,
-  "postAfterMin": 20,
   "idleEscalateMin": 30,
   "drift": { "enabled": true, "milestoneOverdueMin": 90, "ciFailStreak": 3 },
   "closeAfterMin": 5,

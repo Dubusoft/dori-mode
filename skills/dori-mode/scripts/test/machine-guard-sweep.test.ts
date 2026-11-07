@@ -64,7 +64,6 @@ test("remote sampling is its own last sweep; the host guard sweep reaches no wor
   const w = world();
   const names = w.sweeps().map(([name]) => name);
   expect(names.at(-1)).toBe("machine-guard");
-  expect(names.at(-2)).toBe("lead-pane");
   expect(names.filter((n) => n === "guard")).toHaveLength(1);
   await w.sweeps().find(([name]) => name === "guard")?.[1](async () => {}).catch(() => []);
   expect(w.sshCalls()).toBe(0);

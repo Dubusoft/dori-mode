@@ -30,10 +30,10 @@ for (const [name, screen, hooks] of [
     await deps(T0).registry.write(lane);
     world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "working" }];
     world.screen = screen;
-    expect(await freshnessTick(deps(T0 + 10 * MIN, hooks), "/home/test")).toEqual([]);
-    expect((await freshnessTick(deps(T0 + 16 * MIN, hooks), "/home/test")).map((a) => a.kind)).toEqual(["no-progress"]);
-    expect(await freshnessTick(deps(T0 + 17 * MIN, hooks), "/home/test")).toEqual([]);
-    expect(await freshnessTick(deps(T0 + 40 * MIN, hooks), "/home/test")).toEqual([]);
+    expect(await freshnessTick(deps(T0 + 10 * MIN, hooks))).toEqual([]);
+    expect((await freshnessTick(deps(T0 + 16 * MIN, hooks))).map((a) => a.kind)).toEqual(["no-progress"]);
+    expect(await freshnessTick(deps(T0 + 17 * MIN, hooks))).toEqual([]);
+    expect(await freshnessTick(deps(T0 + 40 * MIN, hooks))).toEqual([]);
     expect(posts()).toEqual([]);
     expect(sent(world)).toEqual([]);
   });
@@ -43,7 +43,7 @@ test("an idle silent lane is still nudged, and nothing is posted from its pane",
   await deps(T0).registry.write(lane);
   world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "idle" }];
   world.screen = WITH_TODO;
-  expect((await freshnessTick(deps(T0 + 16 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["nudged"]);
+  expect((await freshnessTick(deps(T0 + 16 * MIN))).map((a) => a.kind)).toEqual(["nudged"]);
   expect(sent(world)).toHaveLength(1);
   expect(posts()).toEqual([]);
 });
@@ -52,6 +52,6 @@ test("a registry row with the removed progress fields still loads and does not c
   await deps(T0).registry.write({ ...lane, lastProgressPost: "old todo", lastProgressAt: T0, lastProgressError: "HTTP 503" });
   world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "working" }];
   world.screen = WITH_TODO;
-  expect((await freshnessTick(deps(T0 + 16 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["no-progress"]);
+  expect((await freshnessTick(deps(T0 + 16 * MIN))).map((a) => a.kind)).toEqual(["no-progress"]);
   expect(posts()).toEqual([]);
 });

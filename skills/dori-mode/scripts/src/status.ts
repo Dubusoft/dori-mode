@@ -351,7 +351,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     lanes: open.filter((l) => statusOf(l) === "working").map((l) => ({
       key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
       ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
-      ...(l.lastProgressPost ?? l.lastPostedReport ? { progress: l.lastProgressPost ?? l.lastPostedReport } : {}),
+      ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
       ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
       ...(reports.has(l.key) ? { report: reports.get(l.key) } : {}),
     })),

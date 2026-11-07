@@ -389,7 +389,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   if (token) draft = await reserveLane(deps, input, draft, token);
   let started = false;
   try {
-    // A relaunched lane still on an old footer ([REPORT] lines, or a remote lane printing them) gets the dori report one.
+    // A relaunched lane still on a footer an older dori wrote (pane report lines) gets the dori report one.
     const migrate = Boolean(existing && (!existing.reportVia || (existing.machine && !existing.runner)));
     const text = await briefFile.text();
     const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;

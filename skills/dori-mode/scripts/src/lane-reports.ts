@@ -1,22 +1,20 @@
-import { createHash } from "node:crypto";
 import { redactSecrets } from "./redact.ts";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { fillHook } from "./config.ts";
-import { claimDone, type Emit, type FlowDeps, laneMeta, REMOTE_SEEN_MAX } from "./done-flow.ts";
+import { claimDone, type Emit, type FlowDeps, laneMeta } from "./done-flow.ts";
 import { relayedText, scrubForThread } from "./freshness.ts";
 import { Discord } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
-import { readScreen } from "./panes.ts";
 import type { Clock } from "./run.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
-import { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
+import { REPORT_KINDS, type ReportKind } from "./runner/report-kinds.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -431,7 +429,7 @@ export const routeReports = async (
           catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errorText(e)}`); }
         }
       }
-      // A routed report is the lane being heard, like a thread reply: freshness neither nudges it nor raises NO-REPORT.
+      // A routed report is the lane being heard, like a thread reply: freshness neither nudges it nor raises NO-PROGRESS.
       if (route !== "late") await deps.registry.patch(report.lane, { lastReplyAt: deps.clock.now() });
       store.consume(report.id, deps.clock.now(), route, eventId);
       failed.delete(report.id);
@@ -452,68 +450,4 @@ export const routeReports = async (
     }
   }
   return out;
-};
-
-/** How many lead-pane lines the violation sweep reads: more than one screen, so a line is seen before it scrolls away. */
-export const LEAD_PANE_LINES = 200;
-
-/** Every `[REPORT] <key> | <kind> | <text>` line of `key` in the lead's pane, wherever it sits on the line (input box, quote). */
-export const leadPaneReportLines = (screen: string, key: string): string[] => {
-  const shape = new RegExp(`\\[REPORT\\] ${key.replace(/[.]/g, "\\.")} \\| \\w+ \\| (?!<)\\S.*$`);
-  return screen.split("\n").flatMap((l) => { const m = shape.exec(l); return m ? [m[0].trimEnd()] : []; });
-};
-
-const lineHash = (line: string): string => createHash("sha256").update(line).digest("hex").slice(0, 16);
-
-/** The report row a lead-pane `[REPORT] <key> | <kind> | <text>` line stands for: `blocker` is blocked, an unknown kind a milestone. */
-const rowOfPaneLine = (lane: Lane, line: string, at: number): NewReport => {
-  const m = /\[REPORT\] \S+ \| (\w+) \| (.*)$/.exec(line);
-  const word = m?.[1] ?? "milestone";
-  const kind: ReportKind = word === "blocker" ? "blocked" : isReportKind(word) ? word : "milestone";
-  const text = (m?.[2] ?? line).trim();
-  return { lane: lane.key, generation: laneGeneration(lane), kind, text, ...(kind === "done" ? { evidence: text } : {}), at };
-};
-
-/**
- * The lead-pane ban is a brief rule, not a technical one (design 3.3): a lane can still type into the lead's pane. Each
- * distinct [REPORT] line of an open `reportVia: cli` lane (every local launch and relaunch) found in the lead's pane is counted once on that lane (`leadPaneViolations`), rerouted as a
- * report row (routeReports then acts on it as the lane's report: a question wakes the lead, a done line is the claim),
- * and announced as a digest `LANE_PANE_VIOLATION <key> <count> <line> (rerouted as report <id>)`. `reports` defaults to
- * the configured store, opened only when a new line is found. A lane still on the old footer (launched by an older dori,
- * not relaunched since) reports there by design and is not counted. No such lane open, or no leadPane: nothing is read.
- */
-export const leadPaneViolationTick = async (deps: FlowDeps, emit: Emit, reports?: LaneReportStore): Promise<void> => {
-  if (!deps.config.leadPane) return;
-  const lanes = (await deps.registry.open()).filter((lane) => lane.reportVia === "cli" && statusOf(lane) !== "closed");
-  if (!lanes.length) return;
-  const screen = await readScreen(deps.run, deps.config.leadPane, LEAD_PANE_LINES);
-  let opened: LaneReportStore | undefined;
-  const reroute = (lane: Lane, line: string): string => {
-    try {
-      const store = reports ?? (opened ??= openLaneReports(deps.config));
-      return ` (rerouted as report ${store.append(rowOfPaneLine(lane, line, deps.clock.now())).id})`;
-    } catch (e) {
-      return ` (not rerouted: ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 160)})`;
-    }
-  };
-  try {
-    for (const lane of lanes) await violationsOf(deps, emit, lane, screen, reroute);
-  } finally { opened?.close(); }
-};
-
-const violationsOf = async (deps: FlowDeps, emit: Emit, lane: Lane, screen: string, reroute: (lane: Lane, line: string) => string): Promise<void> => {
-  let seen = lane.leadPaneSeen ?? [];
-  let count = lane.leadPaneViolations ?? 0;
-  const found: [number, string][] = [];
-  for (const line of leadPaneReportLines(screen, lane.key)) {
-    const hash = lineHash(line);
-    if (seen.some((s) => s.hash === hash)) continue;
-    seen = [...seen, { hash, at: new Date(deps.clock.now()).toISOString() }].slice(-REMOTE_SEEN_MAX);
-    count++;
-    found.push([count, line]);
-  }
-  if (!found.length) return;
-  // Saved before the rows and events: a crash in between loses a reroute and an announcement, never repeats a count or a row.
-  await deps.registry.patch(lane.key, { leadPaneSeen: seen, leadPaneViolations: count });
-  for (const [n, line] of found) await emit(`LANE_PANE_VIOLATION ${lane.key} ${n} ${oneLine(line)}${reroute(lane, line)}`);
 };
