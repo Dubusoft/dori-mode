@@ -201,6 +201,16 @@ test("adopt without --machine refuses a pane id the local runner does not list; 
   expect((await adoptLane(d, { ...lane(), pane: "w:p3" })).machine).toBe(MACHINE);
 });
 
+test("launch --pane without --machine refuses a pane id only the machine lists; nothing starts or registers", async () => {
+  const d = deps();
+  shellPane();
+  const input = lane({ machine: undefined, cwd: undefined });
+  await Bun.write(input.brief, "work\n");
+  await expect(launchLane(d, { ...input, pane: "w:p3" })).rejects.toThrow("pane w:p3 does not exist on this host; a pane on another machine needs --machine LABEL");
+  expect(opsOf("start")).toEqual([]);
+  expect(await d.registry.read(input.key)).toBeNull();
+});
+
 test("a remote start the runner refuses is not registered as a launched lane", async () => {
   const d = deps(true, { start: async () => { throw new LaneOpsError("LANE_OP_FAILED", MACHINE, "RUNNER_LANE_START_FAILED machine disconnected"); } });
   const input = lane({ pane: undefined });
