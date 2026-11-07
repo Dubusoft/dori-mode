@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import type { Ran, Runner } from "../src/run.ts";
 import {
-  goalCommand, lastLines, PAUSED_SHOWN, pause, paneShell, resolveTargetPane, resume, resumeArgv, startupFailure, startupPoll, stopTurn,
+  goalCommand, lastLines, PAUSED_SHOWN, pause, paneShell, resolveTargetPane, resume, RESUME_TEXT, resumeArgv, startupFailure, startupPoll, stopTurn,
   STARTUP_POLLS, TargetError,
 } from "../src/runner/lane-control.ts";
 import { fakeClock, fakeRunner, newWorld, type World } from "./fakes.ts";
@@ -75,11 +75,39 @@ test("goalCommand counts only new whole lines: an old 'Goal paused' line does no
   expect(await goalCommand(deps(w), "p1", "/goal pause", PAUSED_SHOWN)).toBe("unconfirmed");
 });
 
-test("resume confirms 'Goal active'", async () => {
+test("resume confirms 'Goal active' and a running turn, typing nothing more", async () => {
   const w = world("idle");
   w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
-  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed" });
+  w.onEnterStatus = "working";
+  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "running" });
   expect(sentText(w)).toEqual(["/goal resume"]);
+});
+
+test("resume: a goal active but a session left held is held, after one message to release it", async () => {
+  const w = world("idle");
+  w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
+  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "held" });
+  expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
+});
+
+test("resume: a held session the message releases is running", async () => {
+  const w = world("idle");
+  w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
+  let enters = 0;
+  const run: Runner = async (argv) => {
+    // The /goal resume Enter leaves the session idle; the release message's Enter starts a turn.
+    if (argv[2] === "send-keys" && argv[4] !== "escape" && ++enters === 2) w.onEnterStatus = "working";
+    return fakeRunner(w)(argv);
+  };
+  expect(await resume({ run, clock: fakeClock(T0) }, "p1")).toEqual({ goal: "confirmed", execution: "running" });
+  expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
+});
+
+test("resume: a session with no goal that stays held is held", async () => {
+  const w = world("idle");
+  w.screens = ["❯ ", "❯ ", "Error: cannot update goal: no goal exists\n❯ "];
+  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "held" });
+  expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
 });
 
 // ---------------------------------------------------------------------------------------------------------------

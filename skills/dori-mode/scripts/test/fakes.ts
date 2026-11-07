@@ -67,6 +67,8 @@ export type World = {
   /** What a send answers (default "delivered"). */
   sendDelivery?: Delivery;
   pauseResult?: CommandResults["lane.pause"];
+  /** What a resume answers (default: goal confirmed, turn running). */
+  resumeResult?: CommandResults["lane.resume"];
   /** Merged over the inspection fakeLaneOps derives from the World. */
   inspection?: Partial<LaneInspection>;
   startResult?: CommandResults["lane.start"];
@@ -235,7 +237,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
       if (step !== "goal") setStatus(lane.pane, w.onEscapeStatus);
       return w.pauseResult ?? { goal: "confirmed", working: false, stopped: true };
     },
-    resume: async (lane) => { record("resume", lane.key, {}); down(runnerOf(lane)); return { goal: "confirmed" }; },
+    resume: async (lane) => { record("resume", lane.key, {}); down(runnerOf(lane)); return w.resumeResult ?? { goal: "confirmed", execution: "running" }; },
     start: async (input) => {
       record("start", input.key, input); down(machineRunner(input.machine));
       if (w.startResult) return w.startResult;

@@ -232,6 +232,11 @@ export type QueryType = keyof QueryBodies;
 // ---------------------------------------------------------------------------------------------------------------
 
 export type GoalOutcome = "confirmed" | "unconfirmed" | "failed";
+/**
+ * Whether a lane's agent runs a turn again after `/goal resume` (`lane.resume`): `running` once its pane reads working,
+ * `held` when it stayed idle (a held session or human wait the goal command did not release, or no goal to continue).
+ */
+export type ExecutionOutcome = "running" | "held";
 /** `detail`: the failure word, or e.g. "no ready agent status (idle)"; the last lines are inside it when unconfirmed. */
 export type StartupVerdict = { readonly verdict: "ok" | "error" | "unconfirmed"; readonly detail: string };
 
@@ -242,7 +247,8 @@ export type CommandResults = {
   readonly "lane.stop": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
   readonly "lane.close": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
   readonly "lane.pause": { readonly goal?: GoalOutcome; readonly working?: boolean; readonly stopped?: boolean };
-  readonly "lane.resume": { readonly goal: GoalOutcome };
+  /** `execution` is read only after a confirmed goal; a runner older than it never sends it. */
+  readonly "lane.resume": { readonly goal: GoalOutcome; readonly execution?: ExecutionOutcome };
   readonly "lane.recover": { readonly pane: string; readonly tab: string; readonly relaunched: boolean; readonly resumed: boolean; readonly startup?: StartupVerdict };
   readonly "lane.send": { readonly delivery: "delivered" | "unconfirmed" | "failed" | "sent"; readonly refusal?: string };
   readonly "lane.notify": Record<never, never>;

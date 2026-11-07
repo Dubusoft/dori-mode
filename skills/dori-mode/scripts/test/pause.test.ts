@@ -110,6 +110,41 @@ test("a resume the runner cannot confirm leaves the lane paused, and an unreacha
   expect(await pauseLane(deps(T0 + 4 * MIN), fresh, "wait")).toMatchObject({ code: 3, lines: ["PAUSE_UNVERIFIED other-lane /goal pause failed; lane left working"] });
 });
 
+test("a goal resumed while the session stays held is RESUME_UNVERIFIED: the lane stays paused and its goal is paused again", async () => {
+  await deps(T0).registry.write(working);
+  const paused = (await pauseLane(deps(T0 + MIN), working, "wait")).lane;
+  world.resumeResult = { goal: "confirmed", execution: "held" };
+
+  const r = await resumeLane(deps(T0 + 2 * MIN), paused, "go");
+
+  expect(r).toMatchObject({ code: 3, lines: ["RESUME_UNVERIFIED waiting-lane goal resumed, but no turn ran after it (session held); /goal pause confirmed; lane left paused"] });
+  const lane = (await stored()) as Lane & { resuming?: string };
+  expect(statusOf(lane)).toBe("paused");
+  expect(lane.resuming).toBeUndefined();
+  expect(goalOps()).toEqual(["pause:goal", "resume", "pause:goal"]);
+  expect(world.ops.filter((e) => e.op === "notify").map((e) => (e.args as { status: string }).status)).toEqual(["paused"]);
+});
+
+test("a runner that does not read the turn back is checked once from the supervisor: an idle lane stays paused", async () => {
+  await deps(T0).registry.write(working);
+  const paused = (await pauseLane(deps(T0 + MIN), working, "wait")).lane;
+  world.resumeResult = { goal: "confirmed" };
+  expect((await resumeLane(deps(T0 + 2 * MIN), paused, "go")).code).toBe(3);
+  expect(statusOf((await stored()) as Lane)).toBe("paused");
+
+  paneStatus("working");
+  expect(await resumeLane(deps(T0 + 3 * MIN), (await stored()) as Lane, "go")).toMatchObject({ code: 0, lines: ["RESUMED waiting-lane as working, goal resumed, turn running"] });
+});
+
+test("the paused-lane sweep leaves the turn of a resume in flight alone, but not a stale claim", async () => {
+  await deps(T0).registry.write({ ...working, status: "paused", resuming: "in-flight", resumingAt: T0 } as Lane);
+  paneStatus("working");
+  expect(await tick(T0 + MIN)).toEqual([]);
+  expect(escapes()).toEqual([]);
+  await tick(T0 + 5 * MIN);
+  expect(escapes()).toEqual(["stop"]);
+});
+
 test("a not-done lane can be paused, and resume restores not-done and restarts the quiet clock", async () => {
   const notDone: Lane = { ...working, status: "not-done" };
   await deps(T0).registry.write(notDone);
@@ -118,7 +153,7 @@ test("a not-done lane can be paused, and resume restores not-done and restarts t
 
   const r = await resumeLane(deps(T0 + 90 * MIN), paused, "owner said go");
 
-  expect(r).toMatchObject({ code: 0, lines: ["RESUMED waiting-lane as not-done, goal resumed"] });
+  expect(r).toMatchObject({ code: 0, lines: ["RESUMED waiting-lane as not-done, goal resumed, turn running"] });
   const lane = await stored();
   expect(lane && statusOf(lane)).toBe("not-done");
   expect(lane?.lastReplyAt).toBe(T0 + 90 * MIN);
