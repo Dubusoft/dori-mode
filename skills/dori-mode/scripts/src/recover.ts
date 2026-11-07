@@ -7,6 +7,8 @@ import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, startupLine } from "./launch.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
+import { ALIVE_STATUSES } from "./pane-state.ts";
+import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 
@@ -169,7 +171,14 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     const got = await view.processInfo({ ...lane, pane: old.pane_id });
     if (got.code !== 0) throw new LaunchError(`process-info failed: ${got.err || got.out}`);
     const live = liveModel(JSON.parse(got.out));
-    if (!live.omo) return [];
+    // The pane is there but its agent is gone (its shell is all that runs): the runner relaunches it like a missing pane.
+    // A pane with another live agent, or one still in the runner's startup window (where its lane.recover leaves the
+    // pane alone), is left alone.
+    if (!live.omo) {
+      const launchedAt = lane.lastRecoveryAt ?? Date.parse(lane.openedAt);
+      if (ALIVE_STATUSES.has(old.agent_status ?? "") || deps.clock.now() - launchedAt < RUNNER_STARTUP_GRACE_MS) return [];
+      reason = "agent-gone";
+    } else {
     const expected = lane.model ?? deps.config.defaultModel;
     // argv without a model (a restored session) still runs the expected model when its status bar shows it.
     const model = live.model ?? (barShowsModel(await view.screen({ ...lane, pane: old.pane_id }, SWEEP_SCREEN_LINES), expected) ? expected : undefined);
@@ -183,6 +192,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     const launchedAt = lane.lastRecoveryAt ?? Date.parse(lane.openedAt);
     if (!model && deps.clock.now() - launchedAt < STARTUP_GRACE_MS) return [];
     reason = model ? "model-mismatch" : "missing-model";
+    }
   }
   const read = await deps.registry.read(lane.key);
   if (!read || statusOf(read) !== "working" || read.pane !== lane.pane || read.model !== lane.model) return [];
@@ -214,7 +224,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   });
   const stored = (await deps.registry.patch<RecoveryLane>(lane.key, pending)) ?? { ...current, ...pending(current) };
   let relaunched: Relaunched;
-  if (old) {
+  if (old && reason !== "agent-gone") {
     // A live agent on the wrong model: the runner leaves a live lane alone, so the lane is closed and started again.
     await deps.ops.close(stored);
     relaunched = await startAgain(deps, lane, stored, session);

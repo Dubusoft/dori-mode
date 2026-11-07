@@ -104,6 +104,33 @@ test.each([
   expect(world.calls.filter((call) => call[0] === "notify")).toHaveLength(1);
 });
 
+/** The lane's pane with only its shell left: herdr names no agent, process-info shows no omo. */
+const shellOnly = (world: World, control: { argv: string[] }): void => {
+  world.panes = [{ pane_id: "old:p1", tab_id: "old:t1", workspace_id: "w" }];
+  control.argv = ["bash"];
+};
+
+test("a lane whose agent is gone and left only its shell is recovered through its runner", async () => {
+  const { deps, world, lane, control } = await fixture();
+  await deps.registry.write({ ...lane, openedAt: new Date(-3 * STARTUP_GRACE_MS).toISOString() });
+  shellOnly(world, control);
+  // The runner's lane.recover closes the dead pane's tab before it opens the new one.
+  control.duringCreate = async () => { world.panes = world.panes.filter((p) => p.pane_id !== "old:p1"); };
+  expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane new:p1 agent-gone", "STARTUP_OK recover-lane new:p1"]);
+  expect(opsOf(world, "recover", "start", "close").map((e) => e.op)).toEqual(["recover"]);
+  expect(await deps.registry.read(lane.key)).toMatchObject({ pane: "new:p1", recoveryAttempts: 1 });
+});
+
+test("a shell-only pane still in the runner's startup window, or one running another agent, is left alone", async () => {
+  const { deps, world, lane, control } = await fixture();
+  shellOnly(world, control);
+  expect(await recoverLanes(deps)).toEqual([]);
+  await deps.registry.write({ ...lane, openedAt: new Date(-3 * STARTUP_GRACE_MS).toISOString() });
+  world.panes = [{ pane_id: "old:p1", tab_id: "old:t1", workspace_id: "w", agent: "claude", agent_status: "working" }];
+  expect(await recoverLanes(deps)).toEqual([]);
+  expect(opsOf(world, "recover", "start", "close")).toEqual([]);
+});
+
 test.each(["working", "paused", "closed", "done-claimed"] as const)("leaves %s live lanes untouched when matching or inactive", async (status) => {
   const { deps, world, lane, control } = await fixture();
   control.live(true);
