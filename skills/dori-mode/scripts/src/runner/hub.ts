@@ -43,6 +43,9 @@ export type HubDeps = {
   readonly proto?: number;
 };
 
+/** A command an earlier supervisor run sent and never saw the result of (`runner_attempts`). */
+export type AttemptRow = { readonly cmdId: string; readonly type: string; readonly key?: string; readonly body: Record<string, unknown> };
+
 export type RunnerRow = {
   readonly label: string;
   readonly hostId?: string;
@@ -188,6 +191,11 @@ export class RunnerHub {
     );
     const have = new Set((this.db.query("PRAGMA table_info(runners)").all() as { name: string }[]).map((c) => c.name));
     for (const [column, type] of Object.entries(LATER_COLUMNS)) if (!have.has(column)) this.db.run(`ALTER TABLE runners ADD COLUMN ${column} ${type}`);
+    this.db.run(
+      `CREATE TABLE IF NOT EXISTS runner_attempts (
+        cmdId TEXT PRIMARY KEY, label TEXT NOT NULL, type TEXT NOT NULL, key TEXT, body TEXT NOT NULL, epoch INTEGER NOT NULL, at INTEGER NOT NULL
+      )`,
+    );
     this.lockDown();
   }
 
@@ -215,6 +223,31 @@ export class RunnerHub {
    */
   bindHost(label: string, hostId: string): void {
     this.db.query("UPDATE runners SET hostId = ? WHERE label = ?").run(hostId, label);
+  }
+
+  /**
+   * Records a command as attempted before it is sent, under this hub's epoch: a command sent again under the same
+   * cmdId takes the current epoch. `settleAttempt` drops it when its `cmd.result` is committed.
+   */
+  recordAttempt(label: string, type: string, cmdId: string, key: string | undefined, body: object): void {
+    this.db.query("INSERT OR REPLACE INTO runner_attempts (cmdId, label, type, key, body, epoch, at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(cmdId, label, type, key ?? null, JSON.stringify(body), this.deps.epoch, this.deps.now());
+  }
+
+  /** Forgets an attempted command of `label` (its result arrived, or its read-back settled it). */
+  settleAttempt(label: string, cmdId: string): void {
+    this.db.query("DELETE FROM runner_attempts WHERE cmdId = ? AND label = ?").run(cmdId, label);
+  }
+
+  /**
+   * The commands an earlier supervisor run attempted on `label` with no `cmd.result` yet, oldest first. A record older
+   * than `retentionMs` is deleted instead: the runner keeps its command records no longer than that.
+   */
+  staleAttempts(label: string, retentionMs: number): AttemptRow[] {
+    this.db.query("DELETE FROM runner_attempts WHERE label = ? AND at < ?").run(label, this.deps.now() - retentionMs);
+    const rows = this.db.query("SELECT cmdId, type, key, body FROM runner_attempts WHERE label = ? AND epoch < ? ORDER BY at, cmdId")
+      .all(label, this.deps.epoch) as { cmdId: string; type: string; key: string | null; body: string }[];
+    return rows.map((r) => ({ cmdId: r.cmdId, type: r.type, ...(r.key !== null ? { key: r.key } : {}), body: JSON.parse(r.body) as Record<string, unknown> }));
   }
 
   /** Issues and persists the next cmdSeq for an admitted runner. */

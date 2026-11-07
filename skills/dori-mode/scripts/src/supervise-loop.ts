@@ -7,7 +7,10 @@ import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, wr
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { HUB_FILE, readRunnerRows, RunnerHub } from "./runner/hub.ts";
 import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
-import { acceptLaneEvent, laneEventsAfter, type LaneHubDeps, reconcileInventory, runnerJournalHead } from "./runner/lanes-hub.ts";
+import {
+  acceptLaneEvent, laneEventsAfter, type LaneHubDeps, type LaneStartReadbackDeps, readBackLaneStarts, reconcileInventory, runnerJournalHead,
+} from "./runner/lanes-hub.ts";
+import { COMMAND_RETENTION_MS } from "./runner/durability.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
@@ -15,7 +18,7 @@ import { type Delivery, laneOps, type LaneOps } from "./lane-ops.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
 import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
-import type { LaneMemoryBody } from "./runner/protocol.ts";
+import type { InventoryLane, LaneMemoryBody, SupervisorCommandBodies } from "./runner/protocol.ts";
 import { type LaneMessageStore, openLaneMessages } from "./lane-messages.ts";
 import {
   acceptRunners, drainRunnerAdmin, type HubHooks, LOCAL_RUNNER, loadIdentity, nextEpoch, openRunnerJournal, type RunnerAccept,
@@ -276,17 +279,54 @@ export const openRunnerHub = (
       options.onEvent?.(label, frame);
     },
     onControl: (label, frame) => { calls?.onControl(label, frame); },
+    onStatus: (label, frame) => { calls?.onStatus(label, frame); },
     onDisconnected: (label) => { protos.delete(label); calls?.disconnected(label); },
     auth,
     log,
   });
-  calls = new RunnerCalls({ accept, proto: (label) => protos.get(label), now, timers: options.timers ?? realTimers, log });
+  calls = new RunnerCalls({
+    accept, proto: (label) => protos.get(label), now, timers: options.timers ?? realTimers, log,
+    attempts: {
+      record: (label, type, cmdId, key, body) => { hub.recordAttempt(label, type, cmdId, key, body); },
+      settle: (label, cmdId) => { hub.settleAttempt(label, cmdId); },
+    },
+  });
   log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}${network ? ` listen=${network.host}:${network.port}` : ""}`);
   const keys = auth;
   return {
     hub, journal, listener, auth: keys, accept, guard, calls, ...(network ? { network } : {}),
     close() { accept(); listener.close(); network?.close(); keys.close(); hub.close(); journal.close(); },
   };
+};
+
+/**
+ * At a runner's hello: reads back each `lane.start` an earlier supervisor run sent to it and never saw answered
+ * (lanes-hub.ts `readBackLaneStarts`) over the hub's own attempt records and calls. A start proven never run is sent
+ * again; when that send cannot go out the lead hears `RUNNER_LAUNCH_FAILED`. Logs `RUNNER_READBACK` per attempt.
+ */
+export const readBackRunnerStarts = async (
+  handle: Pick<RunnerHubHandle, "hub" | "calls">, registry: LaneStartReadbackDeps["registry"], label: string, inventory: readonly InventoryLane[],
+  emit: (id: string, line: string) => void, log: (line: string) => void,
+): Promise<void> => {
+  const outcomes = await readBackLaneStarts({
+    registry,
+    attempts: (l) => handle.hub.staleAttempts(l, COMMAND_RETENTION_MS),
+    settle: (l, cmdId) => { handle.hub.settleAttempt(l, cmdId); },
+    status: (l, cmdId) => handle.calls.status(l, cmdId),
+    observe: (l, key) => handle.calls.call(l, "lane.observe", { key }),
+    resend: (l, attempt) => {
+      const body = attempt.body as Omit<SupervisorCommandBodies["lane.start"], "cmdId">;
+      handle.calls.call(l, "lane.start", body, { cmdId: attempt.cmdId }).catch((e: unknown) => {
+        const why = e instanceof Error ? e.message : String(e);
+        log(`RUNNER_READBACK_RESEND_FAILED runner=${l} cmdId=${attempt.cmdId} ${why}`);
+        if (e instanceof RunnerUnavailable && e.why === "disconnected") {
+          emit(`runner-readback-resend:${l}:${attempt.cmdId}`, `RUNNER_LAUNCH_FAILED ${attempt.key} runner=${l} the start read back as never run, and sending it again failed (${why}); the lane has no agent: dori close ${attempt.key} --cancelled and launch again`);
+        }
+      });
+    },
+    emit,
+  }, label, inventory);
+  for (const [cmdId, outcome] of outcomes) log(`RUNNER_READBACK runner=${label} cmdId=${cmdId} ${outcome}`);
 };
 
 /**
@@ -995,6 +1035,10 @@ export const supervise = async (
             ...(lane.claim ? { claim: { at: lane.claim.at, evidence: lane.claim.evidence } } : {}),
           }),
         };
+        // After a supervisor restart, a lane.start an earlier run sent and never saw answered is read back (design 5.6).
+        const readBackStarts = async (label: string, inventory: readonly InventoryLane[]): Promise<void> => {
+          if (runnerHub) await readBackRunnerStarts(runnerHub, deps.registry, label, inventory, enqueueSweep, (line) => { console.log(line); });
+        };
         const inOrder = (what: string, work: () => Promise<void>): void => {
           laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
         };
@@ -1004,7 +1048,13 @@ export const supervise = async (
           onHerdr: (id, line) => { enqueueSweep(id, line); },
           onHello: (label, body) => {
             void monitor?.hello(label, body.gen);
-            inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
+            inOrder(`hello ${label}`, async () => {
+              await reconcileInventory(laneDeps, label, body.inventory ?? []);
+              // Off the lane-event queue: the read-back awaits the runner's answers, which arrive as lane events too.
+              void readBackStarts(label, body.inventory ?? []).catch((e: unknown) => {
+                console.error(`RUNNER_READBACK_ERROR runner=${label} ${e instanceof Error ? e.message : String(e)}`);
+              });
+            });
           },
         }));
         // The lead's `dori` CLI reaches the runners through this process: <runnerDir>/sock/cli next to the control socket.

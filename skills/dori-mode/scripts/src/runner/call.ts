@@ -1,4 +1,6 @@
-import type { AnyRunnerEvent, CommandResults, DurableCommandType, QueryBodies, QueryResults, QueryType, RunnerControl, SupervisorCommandBodies } from "./protocol.ts";
+import type {
+  AnyRunnerEvent, CommandResults, CommandStatusState, DurableCommandType, QueryBodies, QueryResults, QueryType, RunnerControl, SupervisorCommandBodies,
+} from "./protocol.ts";
 import type { RunnerAccept } from "./serve.ts";
 
 /**
@@ -79,8 +81,23 @@ export const realTimers: Timers = {
   clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+/**
+ * The durable record of commands sent and not yet answered (hub.ts `runner_attempts`), so a supervisor back from a
+ * restart can read them back (durability.ts `settleAttempted`). Only the types in `ATTEMPT_TYPES` are recorded.
+ */
+export type AttemptLog = {
+  readonly record: (label: string, type: DurableCommandType, cmdId: string, key: string | undefined, body: object) => void;
+  readonly settle: (label: string, cmdId: string) => void;
+};
+
+/** The commands whose loss a restart has to read back: a `lane.start` with no answer leaves a lane with no pane. */
+export const ATTEMPT_TYPES: ReadonlySet<DurableCommandType> = new Set(["lane.start"]);
+
+export const STATUS_TIMEOUT_MS = QUERY_TIMEOUT_MS;
+
 export type RunnerCallsDeps = {
-  readonly accept: Pick<RunnerAccept, "command" | "control" | "connected">;
+  readonly accept: Pick<RunnerAccept, "command" | "control" | "connected"> & Partial<Pick<RunnerAccept, "status">>;
+  readonly attempts?: AttemptLog;
   /** The proto the label said hello with (hub row), undefined when unknown. */
   readonly proto: (label: string) => number | undefined;
   readonly now: () => number;
@@ -97,6 +114,8 @@ const LATE_REMEMBERED = 1000;
 export class RunnerCalls implements RunnerCall {
   private readonly cmdWaiters = new Map<string, Set<Waiter<CmdResultBody>>>();
   private readonly queryWaiters = new Map<string, Waiter<QueryAnswer>>();
+  /** `cmd.status` waiters by `<label> <cmdId>`. */
+  private readonly statusWaiters = new Map<string, Set<Waiter<CommandStatusState>>>();
   private readonly late = new Set<string>();
   private n = 0;
 
@@ -132,8 +151,12 @@ export class RunnerCalls implements RunnerCall {
         reject(new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
       }, timeoutMs);
     });
+    const key = (body as { key?: string }).key;
+    const recorded = ATTEMPT_TYPES.has(type) && this.deps.attempts !== undefined;
+    if (recorded) this.deps.attempts?.record(label, type, cmdId, key, body);
     const sent = this.deps.accept.command(label, type, { ...body, cmdId } as SupervisorCommandBodies[T]);
     if (sent === undefined) {
+      if (recorded) this.deps.attempts?.settle(label, cmdId);
       this.rejectCmd(cmdId, label, new RunnerUnavailable(label, "disconnected", `${type} was not sent`));
       return answer.then(() => { throw new RunnerUnavailable(label, "disconnected", `${type} was not sent`); });
     }
@@ -167,10 +190,50 @@ export class RunnerCalls implements RunnerCall {
     return result.result as unknown as QueryResults[T];
   }
 
-  /** Hub hook: resolves the waiters of a committed `cmd.result`; a result nobody waits for is logged `RUNNER_CALL_LATE cmdId=` once. */
+  /**
+   * Asks `label` what it knows of `cmdId` (`cmd.status`). Throws RunnerUnavailable when it is not connected, its
+   * connection drops before the answer, or it does not answer within `timeoutMs`.
+   */
+  async status(label: string, cmdId: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<CommandStatusState> {
+    if (!this.deps.accept.connected(label) || !this.deps.accept.status) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for cmd.status ${cmdId}`);
+    const id = `${label} ${cmdId}`;
+    const answer = new Promise<CommandStatusState>((resolve, reject) => {
+      const waiter: Waiter<CommandStatusState> = { label, resolve, reject, timer: undefined };
+      const set = this.statusWaiters.get(id) ?? new Set<Waiter<CommandStatusState>>();
+      set.add(waiter);
+      this.statusWaiters.set(id, set);
+      waiter.timer = this.deps.timers.set(() => {
+        this.dropStatusWaiter(id, waiter);
+        reject(new RunnerUnavailable(label, "timeout", `no cmd.status.result for ${cmdId} within ${timeoutMs} ms`));
+      }, timeoutMs);
+    });
+    if (!this.deps.accept.status(label, cmdId)) {
+      for (const waiter of [...(this.statusWaiters.get(id) ?? [])]) this.dropStatusWaiter(id, waiter);
+      answer.catch(() => undefined);
+      throw new RunnerUnavailable(label, "disconnected", `cmd.status ${cmdId} was not sent`);
+    }
+    return answer;
+  }
+
+  /** Hub hook: a received `cmd.status.result`. */
+  onStatus(label: string, frame: RunnerControl<"cmd.status.result">): void {
+    const id = `${label} ${frame.body.cmdId}`;
+    const waiters = [...(this.statusWaiters.get(id) ?? [])];
+    if (!waiters.length) return this.noteLate(`status=${frame.body.cmdId}`, label);
+    for (const waiter of waiters) {
+      this.dropStatusWaiter(id, waiter);
+      waiter.resolve(frame.body.state);
+    }
+  }
+
+  /**
+   * Hub hook: resolves the waiters of a committed `cmd.result` and settles its attempt record; a result nobody waits
+   * for is logged `RUNNER_CALL_LATE cmdId=` once.
+   */
   onEvent(label: string, frame: AnyRunnerEvent): void {
     if (frame.type !== "cmd.result") return;
     const body = frame.body as CmdResultBody;
+    this.deps.attempts?.settle(label, body.cmdId);
     const waiters = [...(this.cmdWaiters.get(body.cmdId) ?? [])].filter((w) => w.label === label);
     if (!waiters.length) return this.noteLate(`cmdId=${body.cmdId}`, label);
     for (const waiter of waiters) {
@@ -196,11 +259,19 @@ export class RunnerCalls implements RunnerCall {
       this.deps.timers.clear(waiter.timer);
       waiter.reject(new RunnerUnavailable(label, "disconnected", "connection lost before q.result"));
     }
+    for (const [id, set] of [...this.statusWaiters]) {
+      for (const waiter of [...set]) {
+        if (waiter.label !== label) continue;
+        this.dropStatusWaiter(id, waiter);
+        waiter.reject(new RunnerUnavailable(label, "disconnected", "connection lost before cmd.status.result"));
+      }
+    }
   }
 
   pending(): number {
     let n = this.queryWaiters.size;
     for (const set of this.cmdWaiters.values()) n += set.size;
+    for (const set of this.statusWaiters.values()) n += set.size;
     return n;
   }
 
@@ -210,6 +281,14 @@ export class RunnerCalls implements RunnerCall {
     if (!set) return;
     set.delete(waiter);
     if (!set.size) this.cmdWaiters.delete(cmdId);
+  }
+
+  private dropStatusWaiter(id: string, waiter: Waiter<CommandStatusState>): void {
+    this.deps.timers.clear(waiter.timer);
+    const set = this.statusWaiters.get(id);
+    if (!set) return;
+    set.delete(waiter);
+    if (!set.size) this.statusWaiters.delete(id);
   }
 
   private rejectCmd(cmdId: string, label: string, error: Error): void {

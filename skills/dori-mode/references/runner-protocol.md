@@ -533,6 +533,14 @@ it (`unknown`, for example after its state was lost) is not sent the same comman
 - its absence proven allows one more attempt;
 - anything else is `OPERATION_AMBIGUOUS` for the lead, and nothing is resent.
 
+The supervisor records each `lane.start` it sends in `runner_attempts` of `runners.sqlite` (with its body and the
+supervisor epoch) and drops the record when the command's `cmd.result` arrives. At each hello it reads back the
+records an earlier supervisor run left for that runner, for lanes still open, owned by that runner and without a
+pane; any other record is dropped unasked. A lane in the hello inventory counts as present, `lane.observe` answering
+`RUNNER_LANE_UNKNOWN` as absent. A proven absence sends the same `lane.start` again under its cmdId; a command the
+runner still runs (`intent` or `running`) is read back at the next hello. Each record logs
+`RUNNER_READBACK runner=<label> cmdId=<id> verified|retry|ambiguous|pending|settled`.
+
 Command records are kept 30 days.
 
 ## Runner-owned lanes
