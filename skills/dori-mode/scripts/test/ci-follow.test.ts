@@ -186,6 +186,38 @@ test("a delivered message whose PR went green is superseded and never reaches th
   expect(lines("LANE_MESSAGE_UNCONFIRMED")).toEqual([]);
 });
 
+test("a lane whose runner cannot answer keeps its failing-CI message open, and it is typed once the runner is back", async () => {
+  // The PR belongs to the lane only through its worktree branch, which the lane's runner reports.
+  await deps.registry.update(lane.key, () => ({ ...lane, done: "merged acme/other#99" }));
+  world.inspection = { git: { toplevel: "/repo", branch: "feat", origin: "git@github.com:acme/app.git", worktrees: [] } };
+  world.panes = [{ ...idle, agent_status: "working" }];
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)?.state).toBe("queued");
+  world.runnerDown = true;
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)?.state).toBe("queued");
+  world.runnerDown = false;
+  world.panes = [{ ...idle }];
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)?.state).toBe("delivered");
+  expect(sent(world)).toHaveLength(1);
+});
+
+test("a superseded failing-CI message is queued again when the same head fails again", async () => {
+  world.panes = [{ ...idle, agent_status: "working" }];
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  await ci.tick([pull({ checks: "pending" })], emit);
+  expect(ci.messages.get(id)?.state).toBe("superseded");
+  world.panes = [{ ...idle }];
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)).toMatchObject({ state: "delivered" });
+  expect(sent(world)).toHaveLength(1);
+});
+
 test("a green, clean lane PR into dev is merged once with --match-head-commit and no --admin; a second poll and a restart merge nothing", async () => {
   await follow().tick([pull({ checks: "green" })], emit);
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);

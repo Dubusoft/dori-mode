@@ -58,6 +58,12 @@ export const MERGE_ATTEMPTS = 3;
 const short = (sha: string): string => sha.slice(0, 7);
 const repoName = (repo: string): string => (repo.split("/")[1] ?? repo).toLowerCase().replace(/[^a-z0-9.-]/g, "-");
 const subjectOf = (pull: OpenPull): string => `${pull.repo}#${pull.number}@${pull.sha}`;
+/** Queues the message; one superseded earlier whose reason is back at the same head is queued again, with a fresh deadline. */
+const requeueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text">): LaneMessage => {
+  const stored = queueLaneMessage(store, now, message);
+  return stored.state === "superseded" ? updateLaneMessage(store, stored, { state: "queued", at: now, blocked: undefined, escalatedAt: undefined }, now) : stored;
+};
+
 export const ciMessageId = (pull: OpenPull): string => `ci-${repoName(pull.repo)}-${pull.number}-${short(pull.sha)}`;
 
 /** The merge lane's key: `merge-<repo>-<n>`, shortened to fit LANE_KEY. */
@@ -287,13 +293,13 @@ export class CiFollowUp {
    * The open lane of each same-repo PR (`repo#n`, repo lowercased): its Done signal names it, or a lane worktree has its
    * branch. A fork PR (sameRepoHead false) has no lane, so it gets no CI message, merge, merge lane or issue close.
    */
-  private async owners(pulls: readonly (Pick<OpenPull, "repo" | "number" | "headRepo"> & { readonly branch?: string })[]): Promise<Map<string, Lane>> {
+  private async owners(pulls: readonly (Pick<OpenPull, "repo" | "number" | "headRepo"> & { readonly branch?: string })[], unresolved?: Set<string>): Promise<Map<string, Lane>> {
     const owner = new Map<string, Lane>();
     if (!pulls.length) return owner;
     // Oldest lane first: the lane that opened the PR keeps its operations even after a merge lane joins it.
     const lanes = (await this.deps.registry.open()).filter((l) => statusOf(l) !== "closed").sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.key.localeCompare(b.key));
     for (const lane of lanes) {
-      for (const [repo, targets] of await githubTargets([lane], this.deps.ops)) {
+      for (const [repo, targets] of await githubTargets([lane], this.deps.ops, unresolved)) {
         for (const pull of pulls) {
           if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || (pull.branch !== undefined && targets.branches.has(pull.branch)))) continue;
           const key = `${repo}#${pull.number}`;
@@ -306,7 +312,9 @@ export class CiFollowUp {
 
   private async follow(pulls: readonly OpenPull[], emit: CiEmit): Promise<void> {
     const deps = this.deps;
-    const owner = await this.owners(pulls);
+    // Lanes whose runner could not answer this poll: their PRs may be missing from `owner`, so their messages stay open.
+    const unresolved = new Set<string>();
+    const owner = await this.owners(pulls, unresolved);
     const failing = new Set<string>();
     this.rebasing = new Set();
     this.stalledNow = new Set();
@@ -319,7 +327,7 @@ export class CiFollowUp {
         if (issue) plan(this.ops, deps.clock.now(), { lane: lane.key, action: "close-issue", target: `${issue.repo}#${issue.number}@${pull.repo}#${pull.number}` });
         if (pull.checks === "failing") {
           failing.add(subjectOf(pull));
-          queueLaneMessage(this.messages, deps.clock.now(), { id: ciMessageId(pull), lane: lane.key, subject: subjectOf(pull), text: ciFailingText(pull, ciMessageId(pull)) });
+          requeueLaneMessage(this.messages, deps.clock.now(), { id: ciMessageId(pull), lane: lane.key, subject: subjectOf(pull), text: ciFailingText(pull, ciMessageId(pull)) });
         }
         if (pull.conflicting) await this.conflict(lane, pull, emit);
         else if (pull.checks === "green") await this.merge(lane, pull, emit);
@@ -334,6 +342,8 @@ export class CiFollowUp {
     for (const subject of this.stalls.keys()) if (!this.stalledNow.has(subject)) this.stalls.delete(subject);
     // A failing message whose PR moved on (new head, checks no longer failing, merged or closed) is no longer true.
     for (const message of this.messages.list({ states: OPEN_MESSAGE_STATES })) {
+      // Supersede only on a positive observation: a lane the poll could not resolve proves nothing about its PR.
+      if (unresolved.has(message.lane)) continue;
       if (message.id.startsWith("ci-") && !failing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "CI no longer failing at this head" }, deps.clock.now());
       // A rebase request whose PR moved on, stopped conflicting, or went to a merge lane (its lane went down) is stale.
       if (message.id.startsWith("rebase-") && !this.rebasing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "no longer a conflict for this live lane at this head" }, deps.clock.now());
@@ -526,7 +536,7 @@ export class CiFollowUp {
         if (down === undefined) {
           const id = rebaseMessageId(pull);
           this.rebasing.add(target);
-          queueLaneMessage(this.messages, deps.clock.now(), { id, lane: lane.key, subject: target, text: rebaseText(pull, deps.config.ciMergeBase, id) });
+          requeueLaneMessage(this.messages, deps.clock.now(), { id, lane: lane.key, subject: target, text: rebaseText(pull, deps.config.ciMergeBase, id) });
           return;
         }
       }
