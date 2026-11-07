@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, readFileSync, watch } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, watch } from "node:fs";
 import { join } from "node:path";
 
 import * as quota from "../src/claude-quota.ts";
@@ -7,7 +7,8 @@ import { gatewayStatusPath } from "../src/gateway-status.ts";
 import type { Http } from "../src/messenger/http.ts";
 import { Repos } from "../src/repos.ts";
 import type { Ran } from "../src/run.ts";
-import { supervise, SUPERVISOR_TASKS, type SupervisorTask, TASK_ALERT_MS, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
+import { defaultRunnerDir } from "../src/runner/fs-safety.ts";
+import { RUNNER_HUB_RETRY_MS, supervise, SUPERVISOR_TASKS, type SupervisorTask, TASK_ALERT_MS, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { Waits } from "../src/waits.ts";
 import { depsFor, fakeClock, manualPause, newWorld, withState } from "./fakes.ts";
@@ -47,9 +48,10 @@ const until = (subscribe: (signal: () => void) => () => void, check: () => boole
  * local runner's sample and runs nothing), or the GitHub poll's gh api call (a wait check
  * has its own 10 s budget, so it cannot hold the polling task).
  */
-const setup = (stalled: SupervisorTask) => {
+const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
   const state = withState();
   cleanups.push(state.done);
+  before?.(state.dir);
   const home = process.env.HOME;
   const socket = process.env.NOTIFY_SOCKET;
   process.env.HOME = state.dir;
@@ -191,6 +193,35 @@ const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>)
       await s.stop();
     }
   }, 60_000);
+
+test("a runner hub that cannot open at startup wakes the lead, and the runners task opens it once the cause is gone", async () => {
+  // Given a runner directory the hub refuses (not 0700), as a busy socket or a bad directory would at a restart.
+  let runnerDir = "";
+  const s = setup("polling", (home) => {
+    runnerDir = defaultRunnerDir(home);
+    mkdirSync(runnerDir, { recursive: true });
+    chmodSync(runnerDir, 0o755);
+  });
+  const logs: string[] = [];
+  const log = console.log;
+  console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+  cleanups.push(() => { console.log = log; });
+  try {
+    // When the supervisor starts, the failure is not swallowed: it reaches the lead's events, not only stderr.
+    const leadLog = join(process.env.HOME ?? "", "lead-events.log");
+    const leadSaw = (text: string) => existsSync(leadLog) && readFileSync(leadLog, "utf8").includes(text);
+    await until(s.subscribe, () => leadSaw("RUNNER_HUB_DISABLED "), 10_000, "RUNNER_HUB_DISABLED delivered to the lead");
+    expect(s.errors.some((line) => line.startsWith("RUNNER_HUB_DISABLED "))).toBe(true);
+    // Then once the directory is fixed and the retry interval has passed, the next runners pass opens the hub.
+    chmodSync(runnerDir, 0o700);
+    s.clock.at += RUNNER_HUB_RETRY_MS;
+    await s.next();
+    await until(s.subscribe, () => logs.includes("RUNNER_HUB_OPENED"), 10_000, "RUNNER_HUB_OPENED");
+    expect(existsSync(join(runnerDir, "sock"))).toBe(true);
+  } finally {
+    await s.stop();
+  }
+}, 60_000);
 
 stallTest("inbound");
 // A stalled delivery task cannot hand TASK_STALLED to the lead, so the owner is told in the main channel.

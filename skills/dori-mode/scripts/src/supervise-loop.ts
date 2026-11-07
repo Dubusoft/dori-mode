@@ -164,12 +164,14 @@ export const TASK_ALERT_MS = 5 * 60_000;
 /** The supervisor's independent tasks. */
 export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
-/** The fifth task, run while the runner hub is open: liveness, lane events, runner admin, legacy adoption, journal pruning. */
+/** The fifth task: liveness, lane events, runner admin, legacy adoption, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
 /** How often the runners task tries to adopt open lanes that have no runner yet. */
 export const LEGACY_ADOPT_MS = 60_000;
 /** How often the runners task runs; the hub itself answers frames as they arrive. */
 export const RUNNERS_PASS_MS = 5_000;
+/** How often the runners task tries to open a runner hub that failed to open. */
+export const RUNNER_HUB_RETRY_MS = 30_000;
 /** How often the runners task drops old rows from the hub's runner event journal. */
 const RUNNER_JOURNAL_PRUNE_MS = 60 * 60_000;
 
@@ -959,76 +961,111 @@ export const supervise = async (
     };
     let lastGitHub = -Infinity;
     // The hub always opens: every lane is runner-owned, and the local runner is this process's child. An unsafe runner
-    // directory or a busy socket costs the hub (RUNNER_HUB_DISABLED, and every lane operation fails closed), never the
-    // supervisor.
+    // directory or a busy socket costs the hub, never the supervisor: the lead gets RUNNER_HUB_DISABLED, every lane
+    // operation fails closed, and the runners task tries again every RUNNER_HUB_RETRY_MS until it opens.
     let liveness: LivenessMonitor | undefined;
     let takeLaneEvents: () => Promise<void> = async () => {};
-    try {
-      const listen = deps.config.runners?.listen;
-      const runnerDir = defaultRunnerDir(home || undefined);
-      // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
-      let monitor: LivenessMonitor | undefined;
-      // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
-      let laneWork: Promise<void> = Promise.resolve();
-      const laneDeps: LaneHubDeps = {
-        registry: deps.registry, reports: () => reports, now: deps.clock.now,
-        emit: (id, line) => { enqueueSweep(id, line); },
-        recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
-        journalHead: () => runnerJournalHead(deps.config.stateDir),
-        // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
-        messages: () => (laneMessages ??= openLaneMessages(deps.config)),
-        // At each hello the runner gets every owned lane's notice back, for `dori lane status` inside the lane.
-        notify: (_label, lane) => deps.ops.notify(lane, {
-          status: lane.status ?? "working",
-          ...(lane.objection ? { objection: lane.objection } : {}),
-          ...(lane.claim ? { claim: { at: lane.claim.at, evidence: lane.claim.evidence } } : {}),
-        }),
-      };
-      const inOrder = (what: string, work: () => Promise<void>): void => {
-        laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
-      };
-      const hub = runnerHub = probe.step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
-        ...(listen ? { listen } : {}),
-        onHeartbeat: (label) => { void monitor?.heartbeat(label); },
-        onHerdr: (id, line) => { enqueueSweep(id, line); },
-        onHello: (label, body) => {
-          void monitor?.hello(label, body.gen);
-          inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
-        },
-      }));
-      // The lead's `dori` CLI reaches the runners through this process: <runnerDir>/sock/cli next to the control socket.
-      relayListener = listenUnix(cliSocketPath(runnerDir));
-      stopRelay = serveCliRelay(relayListener, hub.calls, (line) => { console.error(line); });
-      // The local runner: `dori runner serve` as this process's child, restarted with backoff, stopped with it.
-      const child = localRunner = startLocalRunner({
-        spawn: spawnRunner ?? spawnProcess, argv: localRunnerArgv(join(import.meta.dir, "cli.ts")),
-        env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)),
-        clock: deps.clock, log: (line) => { console.log(line); },
-      }, AbortSignal.any([signal, stop.signal]));
-      // Resume after successfully processed events; an upgrade with no cursor reads the retained journal once.
-      const readLaneEvents = laneEventReader(deps.config.stateDir, laneDeps);
-      takeLaneEvents = () => {
-        inOrder("journal", readLaneEvents);
-        return laneWork;
-      };
-      let livenessSeq = 0;
-      const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines)).machines);
-      monitor = liveness = new LivenessMonitor({
-        monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
-        probe: io.probe,
-        // The local runner is restarted as this process's child, a worker's over ssh.
-        restart: async (label) => {
-          if (label !== LOCAL_RUNNER) return io.restart(label);
-          await child.restart();
-          return { ok: true, detail: "child restart" };
-        },
-        ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
-        emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
-      });
-      for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
-    } catch (e) {
-      console.error(`RUNNER_HUB_DISABLED ${e instanceof Error ? e.message : String(e)}`);
-    }
+    const openRunners = async (step: <T>(name: string, work: () => T) => T): Promise<void> => {
+      try {
+        const listen = deps.config.runners?.listen;
+        const runnerDir = defaultRunnerDir(home || undefined);
+        // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
+        let monitor: LivenessMonitor | undefined;
+        // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
+        let laneWork: Promise<void> = Promise.resolve();
+        const laneDeps: LaneHubDeps = {
+          registry: deps.registry, reports: () => reports, now: deps.clock.now,
+          emit: (id, line) => { enqueueSweep(id, line); },
+          recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+          journalHead: () => runnerJournalHead(deps.config.stateDir),
+          // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
+          messages: () => (laneMessages ??= openLaneMessages(deps.config)),
+          // At each hello the runner gets every owned lane's notice back, for `dori lane status` inside the lane.
+          notify: (_label, lane) => deps.ops.notify(lane, {
+            status: lane.status ?? "working",
+            ...(lane.objection ? { objection: lane.objection } : {}),
+            ...(lane.claim ? { claim: { at: lane.claim.at, evidence: lane.claim.evidence } } : {}),
+          }),
+        };
+        const inOrder = (what: string, work: () => Promise<void>): void => {
+          laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
+        };
+        const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
+          ...(listen ? { listen } : {}),
+          onHeartbeat: (label) => { void monitor?.heartbeat(label); },
+          onHerdr: (id, line) => { enqueueSweep(id, line); },
+          onHello: (label, body) => {
+            void monitor?.hello(label, body.gen);
+            inOrder(`hello ${label}`, () => reconcileInventory(laneDeps, label, body.inventory ?? []));
+          },
+        }));
+        // The lead's `dori` CLI reaches the runners through this process: <runnerDir>/sock/cli next to the control socket.
+        relayListener = listenUnix(cliSocketPath(runnerDir));
+        stopRelay = serveCliRelay(relayListener, hub.calls, (line) => { console.error(line); });
+        // The local runner: `dori runner serve` as this process's child, restarted with backoff, stopped with it.
+        const child = localRunner = startLocalRunner({
+          spawn: spawnRunner ?? spawnProcess, argv: localRunnerArgv(join(import.meta.dir, "cli.ts")),
+          env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)),
+          clock: deps.clock, log: (line) => { console.log(line); },
+        }, AbortSignal.any([signal, stop.signal]));
+        // Resume after successfully processed events; an upgrade with no cursor reads the retained journal once.
+        const readLaneEvents = laneEventReader(deps.config.stateDir, laneDeps);
+        takeLaneEvents = () => {
+          inOrder("journal", readLaneEvents);
+          return laneWork;
+        };
+        let livenessSeq = 0;
+        const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines)).machines);
+        monitor = liveness = new LivenessMonitor({
+          monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
+          probe: io.probe,
+          // The local runner is restarted as this process's child, a worker's over ssh.
+          restart: async (label) => {
+            if (label !== LOCAL_RUNNER) return io.restart(label);
+            await child.restart();
+            return { ok: true, detail: "child restart" };
+          },
+          ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
+          emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
+        });
+        for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
+      } catch (e) {
+        // Whatever opened before the failure is closed, so a retry starts clean and nothing half-open answers calls.
+        stopRelay?.();
+        stopRelay = undefined;
+        relayListener?.close();
+        relayListener = undefined;
+        await localRunner?.stop();
+        localRunner = undefined;
+        runnerHub?.close();
+        runnerHub = undefined;
+        liveness = undefined;
+        takeLaneEvents = async () => {};
+        throw e;
+      }
+    };
+    // Why the hub is not open, while it is not; the lead hears of the outage once and of its end once.
+    let hubDown: string | undefined;
+    let lastHubAttempt = deps.clock.now();
+    const tryOpenRunners = async (step: <T>(name: string, work: () => T) => T): Promise<void> => {
+      lastHubAttempt = deps.clock.now();
+      try { await openRunners(step); }
+      catch (e) {
+        const why = e instanceof Error ? e.message : String(e);
+        console.error(`RUNNER_HUB_DISABLED ${why}`);
+        if (hubDown === undefined) {
+          enqueueSweep(`runner-hub-disabled:${boot}:${lastHubAttempt}`, `RUNNER_HUB_DISABLED ${why}; every lane operation fails until the runner hub opens, the supervisor tries again every ${RUNNER_HUB_RETRY_MS / 1_000} s`);
+        }
+        hubDown = why;
+        return;
+      }
+      if (hubDown !== undefined) {
+        console.log("RUNNER_HUB_OPENED");
+        enqueueSweep(`runner-hub-opened:${boot}:${lastHubAttempt}`, `RUNNER_HUB_OPENED the runner hub is open again (it had failed: ${hubDown})`);
+        hubDown = undefined;
+      }
+    };
+    await tryOpenRunners((name, work) => probe.step(name, work));
     let lastJournalPrune = -Infinity;
     let lastAdoption = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
@@ -1085,8 +1122,10 @@ export const supervise = async (
         polls.push(tickSources(), routeLaneReports());
         await Promise.all(polls);
       }),
-      ...(runnerHub ? [task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
-        const handle = runnerHub as RunnerHubHandle;
+      task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
+        if (!runnerHub && deps.clock.now() - lastHubAttempt >= RUNNER_HUB_RETRY_MS) await tryOpenRunners((_name, work) => work());
+        const handle = runnerHub;
+        if (!handle) return;
         try { await liveness?.tick(); } catch (e) { console.error(`RUNNER_LIVENESS_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         try { await takeLaneEvents(); } catch (e) { console.error(`RUNNER_LANE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         // Open lanes from before every lane was runner-owned are adopted once the local runner is up (D18).
@@ -1104,7 +1143,7 @@ export const supervise = async (
           lastJournalPrune = deps.clock.now();
           handle.journal.prune(lastJournalPrune);
         }
-      })] : []),
+      }),
     ]);
     probe.close();
     const stalled = new Set<string>();
