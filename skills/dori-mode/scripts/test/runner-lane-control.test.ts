@@ -99,7 +99,7 @@ const idleShell = {
 
 test("resolveTargetPane accepts an idle shell pane no lane owns", async () => {
   const got = await resolveTargetPane(scripted(idleShell), { pane: "p9" }, { ownerOf: () => undefined, refuseCmd: true });
-  expect(got).toEqual({ pane: "p9", tab: "t9", cwd: "/repo", shell: "posix" });
+  expect(got).toEqual({ pane: "p9", tab: "t9", cwd: "/repo", shell: "posix", shellPid: 10 });
 });
 
 test("resolveTargetPane picks the one shell pane of a workspace", async () => {
@@ -124,7 +124,8 @@ test("resolveTargetPane refuses a missing pane and a cmd.exe pane when asked", a
 });
 
 test("paneShell reads pwsh and a drive-letter cwd as PowerShell", () => {
-  expect(paneShell({ shell_pid: 1, foreground_processes: [{ pid: 1, name: "pwsh.exe" }] })).toBe("powershell");
+  expect(paneShell({ shell_pid: 1, foreground_processes: [{ pid: 1, name: "pwsh.exe" }] })).toBe("pwsh");
+  expect(paneShell({ shell_pid: 1, foreground_processes: [{ pid: 1, name: "powershell.exe" }] })).toBe("powershell");
   expect(paneShell(undefined, "D:\\work")).toBe("powershell");
   expect(paneShell(undefined, "/home/x")).toBe("posix");
 });

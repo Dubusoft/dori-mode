@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Runner } from "../run.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
+import { winHerdrServers } from "./herdr-watch.ts";
 
 /**
  * The runner's health file and the probe that reads it. The runner rewrites `<runnerDir>/health` every 15 s with
@@ -103,8 +104,12 @@ export const HERDR_PROBE_TIMEOUT_MS = 5_000;
  * One reading of the host's herdr, as `dori doctor` reads it: `herdr workspace list` answering is up; otherwise a
  * `herdr server` process (pgrep) means hung and none means down. A single reading, with no retry or debounce.
  */
-export const probeHerdr = async (run: Runner): Promise<HerdrProbe> => {
+export const probeHerdr = async (run: Runner, opts: { platform?: string; user?: string } = {}): Promise<HerdrProbe> => {
   if ((await run(["herdr", "workspace", "list"], { timeoutMs: HERDR_PROBE_TIMEOUT_MS })).code === 0) return "up";
+  if ((opts.platform ?? process.platform) === "win32") {
+    const ids = await winHerdrServers(run, opts.user);
+    return ids ? (ids.length ? "hung" : "down") : "unknown";
+  }
   const procs = await run(["pgrep", "-f", "herdr server"], { timeoutMs: HERDR_PROBE_TIMEOUT_MS });
   return procs.code === 0 ? "hung" : procs.code === 1 ? "down" : "unknown";
 };

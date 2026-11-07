@@ -1,0 +1,7 @@
+#!/bin/sh
+# dori for Git Bash, MSYS and Cygwin callers on Windows: the bundle run by the bun the installer pinned. Path
+# conversion is off so arguments that look like /paths reach dori unchanged; the bundle path is given in Windows form.
+D=$(dirname "$0")
+V=$(cat "$D/bun.txt")
+W=$(cygpath -m "$D" 2>/dev/null) || W=$D
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' exec "$D/../bun/$V/bun.exe" "$W/dori.js" "$@"

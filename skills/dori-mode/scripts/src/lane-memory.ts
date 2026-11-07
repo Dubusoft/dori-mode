@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { WinProc, WinSampleLoader } from "./host-guard.ts";
 import type { Runner } from "./run.ts";
 import { LANE_KEY } from "./registry.ts";
 
@@ -75,16 +76,46 @@ export const laneMemoryDetail = (lanes: readonly LaneMemory[], count = 3): strin
  */
 const LANE_ENV = /(?:^|\0)DORI_LANE_KEY=([^\0]*)/;
 
+const safeComm = (comm: string): string => comm.replace(/[^\w.:+-]/g, "_");
+
+/**
+ * The Windows sampler's rows as processes. No environment is readable from outside a Windows process, so a lane is
+ * seeded on its shell pid (`seeds`: pid to lane key) and reaches the shell's descendants through `procLanes`. Windows
+ * does not re-parent orphans, so a parent link is kept only when the parent was created before the child; any other
+ * ppid becomes 0.
+ */
+export const winProcs = (rows: readonly WinProc[], seeds: ReadonlyMap<number, string>): Proc[] => {
+  const created = new Map(rows.map((r) => [r.pid, r.created]));
+  return rows.map((r) => {
+    const parentCreated = created.get(r.ppid);
+    const linked = r.ppid !== r.pid && parentCreated !== undefined && parentCreated > 0 && r.created > 0 && parentCreated < r.created;
+    const lane = seeds.get(r.pid);
+    return {
+      pid: r.pid, ppid: linked ? r.ppid : 0, rssKb: r.rss, comm: safeComm(r.name),
+      ...(lane && LANE_KEY.test(lane) ? { lane } : {}), ...(r.cmd ? { args: r.cmd } : {}),
+    };
+  });
+};
+
+/** Where `sampleProcs` reads a Windows process table: the sampler run and the lane shell pids. */
+export type WinProcSource = { readonly sample: WinSampleLoader; readonly seeds: () => ReadonlyMap<number, string> };
+
 /**
  * Reads every process on this host with its lane. Linux only for now (the lane comes from /proc/<pid>/environ); on
  * another platform, or when `ps` fails, it returns no processes. An environment that cannot be read (another user's
- * process, or one that just exited) counts as no lane of its own.
+ * process, or one that just exited) counts as no lane of its own. With `win` (a Windows host) the processes come from
+ * the sampler instead (see `winProcs`); a failed sampler run returns no processes.
  */
 export const sampleProcs = async (
   run: Runner,
   readEnviron: (pid: number) => Promise<string> = (pid) => readFile(`/proc/${pid}/environ`, "utf8"),
   linux = process.platform === "linux",
+  win?: WinProcSource,
 ): Promise<Proc[]> => {
+  if (!linux && win) {
+    const sample = await win.sample();
+    return sample ? winProcs(sample.procs, win.seeds()) : [];
+  }
   if (!linux) return [];
   const ps = await run(["ps", "-eo", "pid=,ppid=,rss=,comm="]);
   if (ps.code !== 0) return [];
@@ -105,6 +136,6 @@ export const sampleProcs = async (
       return key && LANE_KEY.test(key) ? key : undefined;
     }, () => undefined);
     // A command name lands in event lines and pane text, which must not carry shell syntax.
-    return { pid, ppid: Number(m[2]), rssKb: Number(m[3]), comm: m[4]!.replace(/[^\w.:+-]/g, "_"), ...(lane ? { lane } : {}), ...(argsByPid.has(pid) ? { args: argsByPid.get(pid)! } : {}) };
+    return { pid, ppid: Number(m[2]), rssKb: Number(m[3]), comm: safeComm(m[4]!), ...(lane ? { lane } : {}), ...(argsByPid.has(pid) ? { args: argsByPid.get(pid)! } : {}) };
   }));
 };

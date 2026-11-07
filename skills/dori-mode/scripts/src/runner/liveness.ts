@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { machineBackoffMs, sshArgv, type GuardMachine } from "../remote-guard.ts";
+import { machineBackoffMs, machineKind, sshArgv, type GuardMachine, type KindResult, type MachineKind } from "../remote-guard.ts";
 import { RUN_TIMEOUT_CODE, type Runner } from "../run.ts";
 import { plan, settleOperation, type OperationStore } from "../operations.ts";
 import { RUNNER_OFFLINE_MS, RUNNER_STALE_MS } from "./hub.ts";
@@ -67,26 +67,35 @@ const tag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
 
 export const PROBE_TIMEOUT_MS = 20_000;
 // The bundle `dori runner install` puts on a worker, run with the bun the user's login would find.
-const REMOTE_PROBE = remoteRunnerCli("runner probe --json");
+const REMOTE_PROBE = (kind: MachineKind): string => remoteRunnerCli("runner probe --json", kind);
 
 /**
  * The real probe and restart. `local` is the label of the runner on the supervisor's own host, probed without ssh and
  * restarted through `restartLocal` (the supervisor's `LocalChild.restart`: the local runner is its child process, never
  * a systemd unit); without it a local restart fails. Any other label is looked up in `machines` and reached over ssh.
  * ssh failing or timing out, a machine that cannot be found, or output that is not a probe answer is "unreachable"; a
- * stalled health file still counts as alive (the restart is kept for a runner the probe calls dead).
+ * stalled health file still counts as alive (the restart is kept for a runner the probe calls dead). A worker's
+ * commands take the form of its kind (`kindOf`, by default `machineKind`); a kind that cannot be found is unreachable.
  */
-export const livenessIo = (run: Runner, local: string, machines: () => Promise<readonly GuardMachine[]>, restartLocal?: () => Promise<void>): Pick<LivenessDeps, "probe" | "restart"> => {
-  const on = async (label: string, command: readonly string[], remote: string, timeoutMs: number) => {
+export const livenessIo = (
+  run: Runner,
+  local: string,
+  machines: () => Promise<readonly GuardMachine[]>,
+  restartLocal?: () => Promise<void>,
+  kindOf: (m: GuardMachine) => Promise<KindResult> = (m) => machineKind(run, m, PROBE_TIMEOUT_MS),
+): Pick<LivenessDeps, "probe" | "restart"> => {
+  const on = async (label: string, command: readonly string[], remote: (kind: MachineKind) => string, timeoutMs: number) => {
     if (label === local) return run(command, { timeoutMs });
     const machine = (await machines()).find((m) => m.label === label);
-    if (!machine) return undefined;
-    return run(sshArgv(machine.target, remote), { timeoutMs });
+    if (!machine) return `no machine ${label}`;
+    const k = await kindOf(machine);
+    if (!k.ok) return k.detail;
+    return run(sshArgv(machine.target, remote(k.kind)), { timeoutMs });
   };
   return {
     probe: async (label) => {
       const r = await on(label, [process.execPath, join(import.meta.dir, "..", "cli.ts"), "runner", "probe", "--json"], REMOTE_PROBE, PROBE_TIMEOUT_MS);
-      if (!r) return { kind: "unreachable", detail: `no machine ${label}` };
+      if (typeof r === "string") return { kind: "unreachable", detail: r };
       if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { kind: "unreachable", detail: (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}` };
       let verdict: unknown;
       try { verdict = (JSON.parse(r.out.trim().split("\n").at(-1) ?? "") as { verdict?: unknown }).verdict; } catch { verdict = undefined; }
@@ -100,8 +109,8 @@ export const livenessIo = (run: Runner, local: string, machines: () => Promise<r
         await restartLocal();
         return { ok: true, detail: "child restart" };
       }
-      const r = await on(label, [], remoteRunnerService("restart"), PROBE_TIMEOUT_MS);
-      if (!r) return { ok: false, detail: `no machine ${label}` };
+      const r = await on(label, [], (kind) => remoteRunnerService("restart", kind), PROBE_TIMEOUT_MS);
+      if (typeof r === "string") return { ok: false, detail: r };
       return r.code === 0 ? { ok: true, detail: "service restart" } : { ok: false, detail: (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}` };
     },
   };

@@ -1,5 +1,6 @@
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { Buffer } from "node:buffer";
+import { basename, dirname, join } from "node:path";
 import type { Socket } from "bun";
 import { RUNNER_PATHS } from "./fs-safety.ts";
 import { LineSplitter } from "./protocol.ts";
@@ -117,11 +118,22 @@ const handlers = {
  * leftover socket file from an earlier process is replaced; any other kind of file at `path` is refused. The socket
  * file is chmod 0600. `close` stops listening, ends every open connection and removes the socket file.
  */
-export const listenUnix = (path: string): Listener => {
+const assertSocketPathLength = (path: string, platform: NodeJS.Platform): void => {
+  if (platform === "win32" && Buffer.byteLength(path, "utf8") > 107) {
+    const error = new Error(`RUNNER_SOCKET_PATH_TOO_LONG ${path}`);
+    error.name = "RUNNER_SOCKET_PATH_TOO_LONG";
+    Object.assign(error, { code: "RUNNER_SOCKET_PATH_TOO_LONG" });
+    throw error;
+  }
+};
+
+export const listenUnix = (path: string, platform: NodeJS.Platform = process.platform): Listener => {
+  assertSocketPathLength(path, platform);
   let stale: ReturnType<typeof lstatSync> | undefined;
   try { stale = lstatSync(path); } catch { stale = undefined; }
   if (stale) {
-    if (!stale.isSocket()) throw new Error(`RUNNER_SOCKET_INVALID ${path} exists and is not a socket`);
+    const winSockEntry = platform === "win32" && basename(dirname(path)) === RUNNER_PATHS.sock;
+    if (!stale.isSocket() && !winSockEntry) throw new Error(`RUNNER_SOCKET_INVALID ${path} exists and is not a socket`);
     unlinkSync(path);
   }
   const subscribers = new Set<(transport: Transport) => void>();
@@ -139,7 +151,7 @@ export const listenUnix = (path: string): Listener => {
       },
     },
   });
-  chmodSync(path, 0o600);
+  if (platform !== "win32") chmodSync(path, 0o600);
   return {
     onConnection(handler) {
       subscribers.add(handler);
@@ -155,9 +167,12 @@ export const listenUnix = (path: string): Listener => {
 };
 
 /** Connects to the hub's socket at `path`; rejects when nothing listens there. */
-export const connectUnix = (path: string): Connector => async () => {
-  const socket = await Bun.connect<Data>({ unix: path, data: {}, socket: handlers });
-  const transport = new SocketTransport(socket);
-  socket.data.transport = transport;
-  return transport;
+export const connectUnix = (path: string, platform: NodeJS.Platform = process.platform): Connector => {
+  assertSocketPathLength(path, platform);
+  return async () => {
+    const socket = await Bun.connect<Data>({ unix: path, data: {}, socket: handlers });
+    const transport = new SocketTransport(socket);
+    socket.data.transport = transport;
+    return transport;
+  };
 };

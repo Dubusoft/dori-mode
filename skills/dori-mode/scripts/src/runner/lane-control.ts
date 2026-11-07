@@ -79,7 +79,7 @@ export const resume = async (deps: ControlDeps, pane: string): Promise<CommandRe
 // Target panes (lane.start.target) and freshly created panes
 // ---------------------------------------------------------------------------------------------------------------
 
-export type PaneShell = "posix" | "powershell" | "cmd";
+export type PaneShell = "posix" | "pwsh" | "powershell" | "cmd";
 
 /**
  * The shell an idle pane runs, from herdr process-info: the foreground process that is the shell (or the only one).
@@ -89,7 +89,7 @@ export const paneShell = (info: ProcessInfo | undefined, cwd?: string): PaneShel
   const procs = info?.foreground_processes ?? [];
   const proc = procs.find((p) => p.pid !== undefined && p.pid === info?.shell_pid) ?? (procs.length === 1 ? procs[0] : undefined);
   const name = (proc?.name || proc?.argv?.[0] || "").replace(/\\/g, "/").split("/").pop()?.toLowerCase().replace(/^-/, "").replace(/\.exe$/, "") ?? "";
-  if (name === "pwsh" || name === "powershell") return "powershell";
+  if (name === "pwsh" || name === "powershell") return name;
   if (name === "cmd") return "cmd";
   if (name) return "posix";
   return cwd && /^[A-Za-z]:[\\/]/.test(cwd) ? "powershell" : "posix";
@@ -97,7 +97,7 @@ export const paneShell = (info: ProcessInfo | undefined, cwd?: string): PaneShel
 
 type PaneInfo = { readonly pane_id: string; readonly workspace_id: string; readonly tab_id?: string; readonly terminal_id?: string; readonly agent?: string; readonly cwd?: string; readonly foreground_cwd?: string };
 
-export type TargetPane = { readonly pane: string; readonly tab?: string; readonly terminalId?: string; readonly cwd?: string; readonly shell: PaneShell };
+export type TargetPane = { readonly pane: string; readonly tab?: string; readonly terminalId?: string; readonly cwd?: string; readonly shell: PaneShell; readonly shellPid?: number };
 
 /** A target pane that cannot take the lane. `code`: `RUNNER_LANE_TARGET_BUSY` (an agent, a foreground process or another lane holds it) or `RUNNER_LANE_TARGET_INVALID`. */
 export class TargetError extends Error {
@@ -159,18 +159,18 @@ export const resolveTargetPane = async (run: Runner, target: { readonly pane?: s
   const cwd = info.foreground_cwd ?? info.cwd;
   const shell = paneShell(p, cwd);
   if (opts.refuseCmd && shell === "cmd") throw invalid(cmdRefused(id));
-  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(info.terminal_id ? { terminalId: info.terminal_id } : {}), ...(cwd ? { cwd } : {}), shell };
+  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(info.terminal_id ? { terminalId: info.terminal_id } : {}), ...(cwd ? { cwd } : {}), shell, ...(p.shell_pid ? { shellPid: p.shell_pid } : {}) };
 };
 
 /** A freshly created pane: its shell and directory, read leniently (an unreadable answer means POSIX). */
-export const inspectCreated = async (run: Runner, pane: string): Promise<{ readonly shell: PaneShell; readonly cwd?: string; readonly terminalId?: string }> => {
+export const inspectCreated = async (run: Runner, pane: string): Promise<{ readonly shell: PaneShell; readonly cwd?: string; readonly terminalId?: string; readonly shellPid?: number }> => {
   const got = await run(["herdr", "pane", "get", pane]);
   const proc = await run(["herdr", "pane", "process-info", "--pane", pane]);
   const read = <T>(text: string): T | undefined => { try { return JSON.parse(text) as T; } catch { return undefined; } };
   const info = got.code === 0 ? read<{ result?: { pane?: PaneInfo } }>(got.out)?.result?.pane : undefined;
   const p = proc.code === 0 ? read<{ result?: { process_info?: ProcessInfo } }>(proc.out)?.result?.process_info : undefined;
   const cwd = info?.foreground_cwd ?? info?.cwd;
-  return { shell: paneShell(p, cwd), ...(cwd ? { cwd } : {}), ...(info?.terminal_id ? { terminalId: info.terminal_id } : {}) };
+  return { shell: paneShell(p, cwd), ...(cwd ? { cwd } : {}), ...(info?.terminal_id ? { terminalId: info.terminal_id } : {}), ...(p?.shell_pid ? { shellPid: p.shell_pid } : {}) };
 };
 
 // ---------------------------------------------------------------------------------------------------------------

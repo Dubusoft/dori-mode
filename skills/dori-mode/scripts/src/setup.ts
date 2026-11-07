@@ -56,13 +56,48 @@ export type SetupInput = {
 
 type Json = Record<string, unknown>;
 
-export const writeFileAtomic = (path: string, content: string, mode: number): void => {
+/** Seams for `renameWithRetry`: the platform (default `process.platform`), the rename itself, and the pause between tries. */
+export type RenameDeps = {
+  readonly platform?: NodeJS.Platform;
+  readonly rename?: (from: string, to: string) => void;
+  readonly sleep?: (ms: number) => void;
+};
+
+/** Retries after the first failed rename on Windows, where antivirus and the indexer briefly hold files open. */
+export const RENAME_RETRIES = 5;
+export const RENAME_RETRY_MS = 50;
+const RENAME_BUSY: ReadonlySet<string> = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * `renameSync(from, to)`. On win32 an `EPERM`, `EACCES` or `EBUSY` failure is retried up to `RENAME_RETRIES` times,
+ * `RENAME_RETRY_MS` apart; any other error, or the last one, is thrown. Elsewhere it is a plain rename.
+ */
+export const renameWithRetry = (from: string, to: string, deps: RenameDeps = {}): void => {
+  const rename = deps.rename ?? renameSync;
+  if ((deps.platform ?? process.platform) !== "win32") {
+    rename(from, to);
+    return;
+  }
+  const sleep = deps.sleep ?? Bun.sleepSync;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rename(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (attempt >= RENAME_RETRIES || !code || !RENAME_BUSY.has(code)) throw error;
+      sleep(RENAME_RETRY_MS);
+    }
+  }
+};
+
+export const writeFileAtomic = (path: string, content: string, mode: number, deps: RenameDeps = {}): void => {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   const fd = openSync(tmp, "w", mode);
   try { writeFileSync(fd, content); fsyncSync(fd); } finally { closeSync(fd); }
   chmodSync(tmp, mode);
-  renameSync(tmp, path);
+  renameWithRetry(tmp, path, deps);
 };
 
 export const readConfigObject = (path: string): Json => {

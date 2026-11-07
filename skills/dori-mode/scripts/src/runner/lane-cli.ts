@@ -3,8 +3,9 @@ import { homedir, loadavg } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
+import { sampleLoad1 } from "../host-guard.ts";
 import { isReportKind } from "./report-kinds.ts";
-import { realClock, type Clock } from "../run.ts";
+import { realClock, run as realRun, type Clock, type Runner } from "../run.ts";
 import type { Connector, Transport } from "./transport.ts";
 
 /**
@@ -35,6 +36,10 @@ export type LaneCliDeps = {
   readonly runnerDir?: string;
   /** The lane's own key when it is not in `DORI_LANE_KEY` (a lane found through the socket's whoami). */
   readonly laneKey?: string;
+  /** Defaults to `process.platform`. */
+  readonly platform?: string;
+  /** Runs the Windows load sampler; default the real runner. */
+  readonly run?: Runner;
 };
 
 /**
@@ -59,10 +64,14 @@ export const heavyDirOf = (home: string = homedir()): string => join(home, ".dor
 
 type Reply = { ok: boolean; code?: string; detail?: string; [k: string]: unknown };
 
-const retryable = (error: unknown): boolean => {
+/** The heavy admission load: the sampler's load1 on win32 (`loadavg()` is all zeros there), else the 1-minute load average. */
+export const heavyLoad = (platform: string, run: Runner, runnerDir?: string): (() => Promise<number>) =>
+  platform === "win32" ? () => sampleLoad1(platform, run, runnerDir) : async () => loadavg()[0] ?? 0;
+
+export const retryable = (error: unknown): boolean => {
   const code = (error as { code?: unknown } | null)?.code;
   const text = `${typeof code === "string" ? code : ""} ${error instanceof Error ? error.message : String(error)}`;
-  return /ENOENT|ECONNREFUSED/.test(text);
+  return /ENOENT|ECONNREFUSED|EPIPE|ECONNRESET/.test(text);
 };
 
 /** Connects, retrying a missing or refusing socket every second for up to 60 s on the injected clock. */
@@ -128,7 +137,8 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     const slots = Number(deps.env.DORI_HEAVY_SLOTS ?? "1");
     const slot = await acquireSlot({
       dir: deps.heavyDir ?? heavyDirOf(), slots: Number.isSafeInteger(slots) && slots > 0 ? slots : 1, maxLoad: heavyMaxLoad(deps.env.DORI_HEAVY_MAX_LOAD),
-      clock, load: async () => loadavg()[0] ?? 0, alive: pidAlive, pid: process.pid,
+      clock, load: heavyLoad(deps.platform ?? process.platform, deps.run ?? realRun, deps.runnerDir), alive: pidAlive, pid: process.pid,
+      ...(deps.platform ? { platform: deps.platform } : {}),
     }, `${own}:${label}`);
     try {
       return await (deps.spawn ?? (async (argv) => Bun.spawn([...argv], { stdout: "inherit", stderr: "inherit", stdin: "inherit" }).exited))(cmd);

@@ -3,8 +3,9 @@ import {
   createHash, createHmac, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, sign,
   timingSafeEqual, verify, type KeyObject,
 } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { renameWithRetry } from "../setup.ts";
 import { ensureRunnerSubdir, lockDownDatabase, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { HUB_FILE } from "./hub.ts";
 import {
@@ -483,7 +484,7 @@ export class RunnerAuth {
 
   /** Makes the rotated-in key current; the old private key is gone once the rename lands. No-op without one. */
   confirmRotate(): void {
-    if (existsSync(this.path("next"))) renameSync(this.path("next"), this.path("key"));
+    if (existsSync(this.path("next"))) renameWithRetry(this.path("next"), this.path("key"));
   }
 }
 

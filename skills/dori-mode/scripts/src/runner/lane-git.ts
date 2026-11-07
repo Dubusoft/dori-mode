@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { basename } from "node:path";
 
 import type { Runner } from "../run.ts";
 import type { CommandResults, LaneInspection, SupervisorCommandBodies } from "./protocol.ts";
@@ -51,7 +52,7 @@ export const discoverWorktrees = async (run: Runner, key: string, roots: readonl
   for (const root of new Set(roots.filter(Boolean))) {
     for (const wt of (await listWorktrees(run, root)) ?? []) {
       if (wt.path === root || !wt.branch) continue;
-      if ((ours(wt.branch.split("/").pop() ?? "") || ours(wt.path.split("/").pop() ?? "")) && !found.has(wt.path)) found.set(wt.path, wt);
+      if ((ours(wt.branch.split("/").pop() ?? "") || ours(basename(wt.path))) && !found.has(wt.path)) found.set(wt.path, wt);
     }
   }
   return [...found.values()];
