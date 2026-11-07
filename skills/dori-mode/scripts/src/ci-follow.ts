@@ -15,6 +15,7 @@ import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
+import { parseSignal, splitDone } from "./signals.ts";
 
 /**
  * CI follow-up for lane PRs (design 4.5, item 1.4). After each GitHub poll, for every open PR that
@@ -30,6 +31,9 @@ import { canLaunch } from "./routing.ts";
  * - a merged PR of an open lane that the supervisor did not merge itself: its merge is read back once (a `merge-verify`
  *   operation) as digest MERGE_VERIFIED with the merge SHA, or urgent MERGE_UNVERIFIED when it cannot be confirmed.
  *   The watcher then closes a done-claimed lane at once (done-flow.ts mergeConfirmed), with its worktree and branch.
+ * - an open lane PR the supervisor cannot merge for a reason only a person fixes (claimed at its head but no checks, a
+ *   required review, a draft; or green and clean while its lane never claimed at that head) for `mergeStallMin`: urgent
+ *   MERGE_STALLED once per head. Pending CI is no stall: the claim's own merge wait (done-flow.ts mergeWait) bounds it.
  * Each merge and launch is an operation (operations.ts), keyed by PR and head SHA, so a restart never repeats it. The
  * lanes keep waiting on their own CI; nothing here replaces that wait.
  */
@@ -193,6 +197,26 @@ const viewPull = async (deps: FlowDeps, pull: Pick<OpenPull, "repo" | "number">,
 
 const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
 
+/** mergeGate `wait` reasons that no further CI run clears at the same head: a person has to act. */
+const stuckWait = (why: string): boolean => why === "no checks" || why === "draft" || why === "every check skipped or neutral" || why.startsWith("mergeable ");
+
+/**
+ * Whether a lane that has not claimed this PR at its head is stuck on its merge rather than still working: a lane told
+ * not done, or claimed at another head, waits for a merge that will not come; a working lane only when its Done names
+ * this PR as merged (it may be waiting for that merge instead of claiming). A paused lane is left alone.
+ */
+const waitsOnMerge = (lane: Lane, pull: Pick<OpenPull, "repo" | "number">): boolean => {
+  const status = statusOf(lane);
+  if (status === "paused") return false;
+  if (status !== "working") return true;
+  return splitDone(lane.done).some((part) => {
+    try {
+      const s = parseSignal(part);
+      return s.kind === "merged" && s.repo.toLowerCase() === pull.repo.toLowerCase() && s.n === String(pull.number);
+    } catch { return false; }
+  });
+};
+
 /**
  * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
  * branch of its own repo (never a fork), not a draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
@@ -238,6 +262,9 @@ export class CiFollowUp {
   private readonly settled = new Set<string>();
   /** Subjects of this poll's conflicting PRs whose live lane was asked to rebase; any other rebase message is stale. */
   private rebasing = new Set<string>();
+  /** Subjects (PR at a head) this process saw stalled, with when it first saw it; dropped once a poll finds it moving. */
+  private readonly stalls = new Map<string, { readonly since: number; alerted: boolean }>();
+  private stalledNow = new Set<string>();
 
   constructor(private readonly deps: FlowDeps, private readonly io: CiIo = defaultCiIo, stores?: { readonly ops: OperationStore; readonly messages: LaneMessageStore }) {
     this.ops = stores?.ops ?? deps.operations ?? openOperations(deps.config);
@@ -282,6 +309,7 @@ export class CiFollowUp {
     const owner = await this.owners(pulls);
     const failing = new Set<string>();
     this.rebasing = new Set();
+    this.stalledNow = new Set();
     for (const pull of pulls) {
       const lane = owner.get(`${pull.repo.toLowerCase()}#${pull.number}`);
       if (!lane) continue;
@@ -295,10 +323,15 @@ export class CiFollowUp {
         }
         if (pull.conflicting) await this.conflict(lane, pull, emit);
         else if (pull.checks === "green") await this.merge(lane, pull, emit);
+        else if (pull.checks === "none") {
+          const fresh = (await deps.registry.read(lane.key)) ?? lane;
+          if (claimGate(fresh, pull).ok) this.stall(fresh, pull, "no checks", "the supervisor merges only after a green check: add or run its checks, or merge it by hand", emit);
+        }
       } catch (e) {
         console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    for (const subject of this.stalls.keys()) if (!this.stalledNow.has(subject)) this.stalls.delete(subject);
     // A failing message whose PR moved on (new head, checks no longer failing, merged or closed) is no longer true.
     for (const message of this.messages.list({ states: OPEN_MESSAGE_STATES })) {
       if (message.id.startsWith("ci-") && !failing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "CI no longer failing at this head" }, deps.clock.now());
@@ -427,13 +460,18 @@ export class CiFollowUp {
       const view = await viewPull(deps, pull);
       const gate = mergeGate(view, pull.sha, base);
       if (gate.verdict === "conflict") return this.conflict(lane, pull, emit);
-      if (gate.verdict === "wait") {
-        if (gate.why.startsWith("base ")) this.settled.add(target);
-        return;
-      }
       // Merged only once the lane says it is done with this head; read fresh so a claim made since the poll counts.
       const fresh = (await deps.registry.read(lane.key)) ?? lane;
-      if (!claimGate(fresh, pull).ok) return;
+      const claim = claimGate(fresh, pull);
+      if (gate.verdict === "wait") {
+        if (gate.why.startsWith("base ")) this.settled.add(target);
+        else if (claim.ok && stuckWait(gate.why)) this.stall(fresh, pull, gate.why, "claimed at this head, but the supervisor cannot merge it as it stands: fix its checks, review or draft state, or merge it by hand", emit);
+        return;
+      }
+      if (!claim.ok) {
+        if (waitsOnMerge(fresh, pull)) this.stall(fresh, pull, claim.why, "green and clean, but the supervisor merges only a lane that claimed done at this head: have the lane claim again, or merge it by hand", emit);
+        return;
+      }
       // pull.sha is the head the claim recorded (claimGate) and the fresh read saw (mergeGate): GitHub merges no other.
       ({ op } = await perform(this.ops, deps.clock.now, spec, async () => {
         const r = await deps.run(["gh", "pr", "merge", String(pull.number), "-R", pull.repo, "--merge", "--match-head-commit", pull.sha], { timeoutMs: 60_000 });
@@ -443,6 +481,22 @@ export class CiFollowUp {
     }
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
+  }
+
+  /**
+   * Records this poll's stall of `pull`; once it has lasted `mergeStallMin` the lead hears MERGE_STALLED, once per PR head
+   * in this process (the journal dedupes the same id after a restart).
+   */
+  private stall(lane: Lane, pull: OpenPull, why: string, hint: string, emit: CiEmit): void {
+    const subject = subjectOf(pull);
+    this.stalledNow.add(subject);
+    const now = this.deps.clock.now();
+    const seen = this.stalls.get(subject) ?? { since: now, alerted: false };
+    this.stalls.set(subject, seen);
+    const min = this.deps.config.mergeStallMin;
+    if (seen.alerted || now - seen.since < min * 60_000) return;
+    seen.alerted = true;
+    emit(`merge-stalled:${subject}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} ${why} for ${min}+ min: ${hint} ${pull.url}`);
   }
 
   private async conflict(lane: Lane, pull: OpenPull, emit: CiEmit): Promise<void> {

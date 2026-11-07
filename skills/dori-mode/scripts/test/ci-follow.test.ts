@@ -220,6 +220,57 @@ test("a green lane PR is merged only at the head its done claim recorded: no cla
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
 });
 
+test("a claimed PR the supervisor cannot merge (review BLOCKED, no checks) wakes the lead once as urgent MERGE_STALLED after mergeStallMin; pending CI never does", async () => {
+  gh.view = greenView({ mergeStateStatus: "BLOCKED" });
+  const ci = follow();
+  await ci.tick([pull({ checks: "green" })], emit);
+  clock.at += 14 * MIN;
+  await ci.tick([pull({ checks: "green" })], emit);
+  expect(lines("MERGE_STALLED")).toEqual([]);
+  clock.at += 2 * MIN;
+  await ci.tick([pull({ checks: "green" })], emit);
+  await ci.tick([pull({ checks: "green" })], emit);
+  expect(events.filter(([, l]) => l.startsWith("MERGE_STALLED"))).toHaveLength(1);
+  expect(lines("MERGE_STALLED")[0]).toStartWith("MERGE_STALLED acme/app#7 lane=demo-lane head=abcdef1 mergeable MERGEABLE state BLOCKED for 15+ min");
+  expect(eventClass(lines("MERGE_STALLED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(gh.merges).toEqual([]);
+
+  events = [];
+  const none = follow();
+  await none.tick([pull({ checks: "none" })], emit);
+  clock.at += 16 * MIN;
+  await none.tick([pull({ checks: "none" })], emit);
+  expect(lines("MERGE_STALLED")[0]).toContain(" no checks for 15+ min");
+
+  // Long CI is the claim's own merge wait, never a stall; a poll that sees it moving resets the clock.
+  events = [];
+  const pending = follow();
+  await pending.tick([pull({ checks: "none" })], emit);
+  for (let i = 0; i < 4; i++) {
+    clock.at += 20 * MIN;
+    await pending.tick([pull({ checks: "pending" })], emit);
+  }
+  expect(lines("MERGE_STALLED")).toEqual([]);
+});
+
+test("a green, clean PR left unmerged for want of a claim is MERGE_STALLED only while its lane waits on that merge", async () => {
+  const stalledFor = async (patch: Partial<Lane>): Promise<string[]> => {
+    events = [];
+    await deps.registry.update(lane.key, () => ({ ...lane, ...patch }));
+    const ci = follow();
+    await ci.tick([pull({ checks: "green" })], emit);
+    clock.at += 16 * MIN;
+    await ci.tick([pull({ checks: "green" })], emit);
+    return lines("MERGE_STALLED");
+  };
+  // Told not done after its claim (the settle re-check or the lead objected): the supervisor never merges it.
+  expect((await stalledFor({ status: "not-done" }))[0]).toContain("lane is not-done, no done claim for 15+ min: green and clean");
+  // Still working with Done naming this PR as merged: it may be waiting for the merge instead of claiming.
+  expect((await stalledFor({}))[0]).toContain("lane is working, no done claim");
+  expect(await stalledFor({ status: "paused" })).toEqual([]);
+  expect(gh.merges).toEqual([]);
+});
+
 test("a fork PR named like the lane's PR or branch gets no merge, CI message, merge lane or issue close", async () => {
   // The lane owns its branch "feat" (a gh pr --head Done signal) and claimed PR #7; the outsider opens #999 from a fork.
   await deps.registry.update(lane.key, () => ({ ...claimedLane, ghIssue: "acme/app#3", done: 'merged acme/app#7; command ["gh","pr","list","-R","acme/app","--head","feat","--json","number"]', claim: { ...claimedLane.claim!, pulls: [{ repo: "acme/app", number: 999, sha: SHA }] } }));
