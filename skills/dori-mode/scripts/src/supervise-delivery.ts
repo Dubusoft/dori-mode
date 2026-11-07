@@ -46,6 +46,8 @@ export class Delivery {
     // Reuse this pass's pane observation for reporting, delivery, and push. A restart invalidates it.
     let paneSample: Promise<Pane | undefined> | undefined;
     const readPane = () => paneSample ??= listPanes(this.deps.run).then((panes) => panes.find((p) => p.pane_id === this.deps.config.leadPane));
+    // One pass starts at most one lead turn: a later batch or pointer in it joins the turn the first one started.
+    let woke = false;
     this.outcomes.markDelivered();
     await this.outcomes.tick(this.deps.registry, async () => {
       const pane = await readPane();
@@ -54,6 +56,7 @@ export class Delivery {
     for (;;) {
       if (this.journal.restart) {
         await this.lead.restart(this.journal.restart);
+        woke = true;
         paneSample = undefined;
         this.outcomes.markDelivered();
         continue;
@@ -95,7 +98,7 @@ export class Delivery {
           if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) this.owners.markReadable();
         }
         // Everything due is in the log now: the push step makes sure the lead takes it.
-        if (await this.push.tick(pending, readPane)) continue;
+        if (await this.push.tick(pending, readPane, woke)) continue;
         return;
       }
       const pane = await readPane();
@@ -114,7 +117,8 @@ export class Delivery {
       if (!cold || (pane.agent && await this.lead.deferForChildren(cwd, cold.kind, cold.detail))) {
         this.owners.record(pending, true);
         this.outcomes.markDelivered();
-        this.core.wakes.record(this.lead.warmSession, pending, urgent.length ? urgent : pending.filter(overdue));
+        if (!woke) this.core.wakes.record(this.lead.warmSession, pending, urgent.length ? urgent : pending.filter(overdue));
+        woke = true;
         continue;
       }
       if (cold.kind === "hard-cap") console.log(`LEAD_HARD_CAP ${cold.tokens}`);

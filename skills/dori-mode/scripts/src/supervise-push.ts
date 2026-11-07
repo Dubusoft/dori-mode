@@ -123,10 +123,11 @@ export class PushDelivery {
 
   /**
    * The push step of one delivery pass. Returns true when it set a restart (the caller's loop carries it out). Makes no
-   * herdr call while nothing untaken is due.
+   * herdr call while nothing untaken is due. A pointer that starts an idle lead's turn is a lead wake, unless this pass
+   * already `woke` the lead (the pointer then belongs to that turn).
    */
   async tick(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
-    (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane)): Promise<boolean> {
+    (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane), woke = false): Promise<boolean> {
     const { config, clock, run } = this.core.deps;
     const { delivery } = config;
     if (this.journal.restart) return false;
@@ -239,6 +240,7 @@ export class PushDelivery {
     const sent = await sendVerified(run, clock, config.leadPane, pointer, false);
     console.log(`LEAD_PUSH ${batch} ${total} ${kinds.join(",")} ${sent} attempt=${next.attempts}`);
     if (sent === "delivered") {
+      if (idle && !woke) this.core.wakes.recordKinds(this.lead.warmSession, kinds);
       // sendVerified already observed the post-handoff transition to working; do not poll the pane again.
       await this.outcomes.tick(this.core.deps.registry, async () => "working");
       return false;

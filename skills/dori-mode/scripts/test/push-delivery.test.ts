@@ -11,6 +11,7 @@ import { recordAck, recordHandled } from "../src/ack.ts";
 import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { recordReported, takeReminders } from "../src/lane-outcomes.ts";
+import { readWakes } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -171,6 +172,22 @@ test("an untaken event is pushed again after ackSec though nothing is pending, a
   await flush(supervisor);
   expect(f.texts()).toHaveLength(2);
   expect(readJournal(f.state.dir).inbox.push).toBeUndefined();
+});
+
+test("a re-push that starts an idle lead's turn is a wake; the pointer right after a warm append is not a second one", async () => {
+  const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }) });
+  f.onEnter("working");
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  expect(readWakes(f.state.dir, 0)).toMatchObject([{ trigger: ["WAIT_DONE"], kinds: { WAIT_DONE: 1 } }]);
+  // The lead ended that turn without taking: the re-push starts another one.
+  f.pane.agent_status = "idle";
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+  expect(readWakes(f.state.dir, 0)).toMatchObject([{ trigger: ["WAIT_DONE"] }, { trigger: ["WAIT_DONE"], kinds: { WAIT_DONE: 1 } }]);
 });
 
 test("a burst within one tick and more within ackSec become a single push", async () => {

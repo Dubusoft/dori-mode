@@ -147,13 +147,17 @@ test("doctor warns when a lead restart is pending without consuming it or touchi
   expect(f.calls.filter((c) => c.startsWith("herdr ") && c !== "herdr pane list" && c !== "herdr workspace list")).toEqual([]);
 });
 
-test("doctor warns when lead wakes exceed the 24-hour threshold", async () => {
+test("doctor warns when lead wakes not from owner messages exceed the 24-hour threshold, naming their top trigger", async () => {
   const f = fixture();
-  writeFileSync(join(f.deps.config.stateDir, WAKES_FILE), Array.from({ length: 21 }, (_, i) => JSON.stringify({
-    at: NOW - i, session: "lead", trigger: ["INBOUND"], kinds: { INBOUND: 1 },
-  })).join("\n"));
+  const wakes = (trigger: string[], n: number, from: number) => Array.from({ length: n }, (_, i) => JSON.stringify({ at: NOW - from - i, session: "lead", trigger, kinds: {} }));
+  const path = join(f.deps.config.stateDir, WAKES_FILE);
+  writeFileSync(path, wakes(["INBOUND"], 25, 0).join("\n"));
+  expect((await runDoctor(f.deps)).some((check) => check.id === "lead wakes")).toBe(false);
+  writeFileSync(path, [...wakes(["INBOUND"], 25, 0), ...wakes(["HOST_GUARD OFFLINE"], 15, 100), ...wakes(["LANE_REPORT"], 6, 200)].join("\n"));
   const check = find(await runDoctor(f.deps), "lead wakes");
-  expect(check).toMatchObject({ level: "WARN", detail: "21 lead wakes in the last 24 hours (threshold 20)" });
+  expect(check).toMatchObject({
+    level: "WARN", detail: "21 lead wakes not from owner messages in the last 24 hours (threshold 20; lane 6, noise 15); most from HOST_GUARD OFFLINE (15)",
+  });
   expect(doctorExit([check])).toBe(0);
 });
 

@@ -9,6 +9,7 @@ import { githubSummary } from "./github-events.ts";
 import { gatewayView, readGatewayStatus, type GatewayView } from "./gateway-status.ts";
 import { type LaneReport, latestLaneReports } from "./lane-reports.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
+import { WAKE_SOURCES, wakeSource, type WakeSource } from "./lead-wakes.ts";
 import { listPanes } from "./panes.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { type Lane, type Registry, statusOf } from "./registry.ts";
@@ -194,6 +195,8 @@ export type KindStats = {
 export type EventStats = {
   readonly hours: number;
   readonly wakes: number;
+  /** The wakes by who they were for (lead-wakes.ts wakeSource); they add up to `wakes`. */
+  readonly sources: Readonly<Record<WakeSource, number>>;
   readonly measured: number;
   readonly calls: number;
   /** Most wakes first, then most events. A wake triggered by several kinds counts once for each. */
@@ -223,7 +226,9 @@ const eventStats = (config: DoriConfig, now: number): EventStats => {
   const wakes = readWakes(config.stateDir, since);
   let measured = 0;
   let calls = 0;
+  const sources = Object.fromEntries(WAKE_SOURCES.map((source) => [source, 0])) as Record<WakeSource, number>;
   for (const wake of wakes) {
+    sources[wakeSource(wake.trigger)]++;
     if (wake.calls !== undefined) { measured++; calls += wake.calls; }
     for (const kind of wake.trigger) {
       const entry = of(kind);
@@ -232,7 +237,7 @@ const eventStats = (config: DoriConfig, now: number): EventStats => {
     }
   }
   return {
-    hours: STATS_HOURS, wakes: wakes.length, measured, calls,
+    hours: STATS_HOURS, wakes: wakes.length, sources, measured, calls,
     kinds: [...kinds].map(([kind, s]) => ({ kind, ...s })).sort((a, b) => b.wakes - a.wakes || b.events - a.events || a.kind.localeCompare(b.kind)),
   };
 };
@@ -570,10 +575,13 @@ const scheduleLines = (s: Status, now: number): string[] => (s.schedules ?? []).
 
 const perWake = (calls: number, measured: number): string => (measured ? (calls / measured).toFixed(1) : "?");
 
-/** "- 리드 깨움 12회, 깨울 때마다 모델 호출 8.3회" and "- 많은 순: INBOUND 이벤트 20 · 깨움 5; ..." (깨움 only for kinds that woke the lead). */
+const SOURCE_WORDS: Readonly<Record<WakeSource, string>> = { owner: "소유자", lane: "레인", noise: "노이즈" };
+
+/** "- 리드 깨움 12회 (소유자 5 · 레인 4 · 노이즈 3), 깨울 때마다 모델 호출 8.3회" and "- 많은 순: INBOUND 이벤트 20 · 깨움 5; ..." (깨움 only for kinds that woke the lead). */
 const eventLines = (e: EventStats, max: number): string[] => {
   if (!e.kinds.length) return [];
-  const head = `- 리드 깨움 ${e.wakes}회${e.wakes ? `, 깨울 때마다 모델 호출 ${perWake(e.calls, e.measured)}회` : ""}`;
+  const split = e.wakes ? ` (${WAKE_SOURCES.map((source) => `${SOURCE_WORDS[source]} ${e.sources[source]}`).join(" · ")})` : "";
+  const head = `- 리드 깨움 ${e.wakes}회${split}${e.wakes ? `, 깨울 때마다 모델 호출 ${perWake(e.calls, e.measured)}회` : ""}`;
   const shown = e.kinds.map((k) => `${k.kind} 이벤트 ${k.events}${k.wakes ? ` · 깨움 ${k.wakes}` : ""}`);
   return [head, `- 많은 순: ${list(shown, Math.min(max, 5), 220, "; ")}`];
 };

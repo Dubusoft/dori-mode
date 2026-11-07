@@ -202,7 +202,7 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
     { at: at + 2, session: "s2", trigger: ["(restart)"], kinds: {} },
   ].map((row) => JSON.stringify(row)).join("\n"));
   const s = await collectStatus(f.deps);
-  expect(s.events).toMatchObject({ hours: 24, wakes: 3, measured: 2, calls: 13 });
+  expect(s.events).toMatchObject({ hours: 24, wakes: 3, sources: { owner: 3, lane: 0, noise: 0 }, measured: 2, calls: 13 });
   expect(s.events.kinds).toEqual([
     { kind: "INBOUND", cls: "lead-urgent", events: 2, wakes: 2, measured: 2, calls: 13 },
     // The class is the current policy's: a merged PR is digest now, though it woke the lead when this wake was recorded.
@@ -211,11 +211,25 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
     { kind: "NUDGED", cls: "lead-digest", events: 3, wakes: 0, measured: 0, calls: 0 },
   ]);
   const text = renderStatus(s);
-  expect(text).toContain("\n■ 활동 (최근 24시간)\n- 리드 깨움 3회, 깨울 때마다 모델 호출 6.5회\n");
+  expect(text).toContain("\n■ 활동 (최근 24시간)\n- 리드 깨움 3회 (소유자 3 · 레인 0 · 노이즈 0), 깨울 때마다 모델 호출 6.5회\n");
   expect(text).toContain("\n- 많은 순: INBOUND 이벤트 2 · 깨움 2; GH_PR * merged 이벤트 1 · 깨움 1; (restart) 이벤트 0 · 깨움 1; NUDGED 이벤트 3");
   // A kind moved by config is counted and classed under the config's table, with no code change.
   const moved = await collectStatus({ ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
   expect(moved.events.kinds.find((k) => k.kind === "NUDGED lane")).toEqual({ kind: "NUDGED lane", cls: "engine-only", events: 3, wakes: 0, measured: 0, calls: 0 });
+});
+
+test("status splits wakes into owner, lane and noise by their triggers; a wake an owner message triggered is the owner's", async () => {
+  const f = await fixture();
+  const at = NOW - 60 * 60_000;
+  writeFileSync(join(f.dir, JOURNAL_FILE), JSON.stringify({ events: [{ id: "a", line: "HOST_GUARD OFFLINE mac", at }] }));
+  writeFileSync(join(f.dir, WAKES_FILE), [
+    ["INBOUND", "HOST_GUARD OFFLINE"], ["UNHANDLED"], ["LANE_REPORT", "HOST_GUARD OFFLINE"], ["GH_PR * closed"], ["UNREPORTED"],
+    ["HOST_GUARD OFFLINE"], ["HOST_GUARD OFFLINE"], ["RUNNER_FORGED_EVENT"],
+  ].map((trigger, i) => JSON.stringify({ at: at + i, session: "s", trigger, kinds: {} })).join("\n"));
+  const s = await collectStatus(f.deps);
+  expect(s.events).toMatchObject({ wakes: 8, sources: { owner: 2, lane: 3, noise: 3 } });
+  expect(s.events.kinds[0]).toMatchObject({ kind: "HOST_GUARD OFFLINE", wakes: 4 });
+  expect(renderStatus(s)).toContain("\n- 리드 깨움 8회 (소유자 2 · 레인 3 · 노이즈 3), ");
 });
 
 const base: Status = {
@@ -231,7 +245,7 @@ const base: Status = {
   github: { repos: ["a/b", "c/d", "e/f"], lastPollAt: "2026-10-21T00:52:36.000Z", failures: [], issueAuthors: ["octo-owner"], issueRepos: ["a/b"] },
   gateway: { state: "live", text: "live, Message Content on (heartbeat 1s ago)" },
   unacked: 0,
-  events: { hours: 24, wakes: 0, measured: 0, calls: 0, kinds: [] },
+  events: { hours: 24, wakes: 0, sources: { owner: 0, lane: 0, noise: 0 }, measured: 0, calls: 0, kinds: [] },
 };
 
 test("owner messages still unacked after the ack window make the status a problem", () => {
