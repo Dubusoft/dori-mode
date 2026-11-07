@@ -126,6 +126,8 @@ export type HubHooks = {
   readonly onHeartbeat?: (label: string) => void;
   /** Every admitted, MAC-checked `q.result` (the answer to a query sent with `RunnerAccept.control`). Never journaled. */
   readonly onControl?: (label: string, frame: RunnerControl<"q.result">) => void;
+  /** Every admitted, MAC-checked `cmd.status.result` (the answer to `RunnerAccept.status`). Never journaled. */
+  readonly onStatus?: (label: string, frame: RunnerControl<"cmd.status.result">) => void;
   /** The label's admitted connection closed (not called for a connection a newer one replaced). */
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
@@ -146,6 +148,8 @@ export type RunnerAccept = (() => void) & {
    * not connected. The answer arrives as `HubHooks.onControl`.
    */
   control<T extends QueryType>(label: string, type: T, body: QueryBodies[T]): boolean;
+  /** Asks the label's connection what it knows of `cmdId` (`cmd.status`); false when it is not connected. The answer arrives as `HubHooks.onStatus`. */
+  status(label: string, cmdId: string): boolean;
   /** Whether the label has an admitted connection now. */
   connected(label: string): boolean;
 };
@@ -304,6 +308,10 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           hooks.onControl?.(label, frame as RunnerControl<"q.result">);
           return;
         }
+        if (frame.type === "cmd.status.result") {
+          hooks.onStatus?.(label, frame as RunnerControl<"cmd.status.result">);
+          return;
+        }
         reply(hub.handle(frame));
         if (frame.type === "heartbeat") hooks.onHeartbeat?.(label);
       } catch (error) {
@@ -327,6 +335,12 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       const connection = current.get(name);
       if (!connection?.transport.open) return false;
       connection.send(supervisorControl(head(name, connection.gen), type, body as never) as Frame);
+      return true;
+    },
+    status(name: string, cmdId: string): boolean {
+      const connection = current.get(name);
+      if (!connection?.transport.open) return false;
+      connection.send(supervisorControl(head(name, connection.gen), "cmd.status", { cmdId }) as Frame);
       return true;
     },
     revoke(name: string): boolean {

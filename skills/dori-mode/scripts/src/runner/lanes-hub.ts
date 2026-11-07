@@ -5,10 +5,11 @@ import { askingLine } from "../ask-user.ts";
 import { ackLaneMessage, LaneMessageError, type LaneMessageStore } from "../lane-messages.ts";
 import { laneGeneration, type LaneReportStore } from "../lane-reports.ts";
 import type { RecoveryLane } from "../recover.ts";
-import { HUB_FILE } from "./hub.ts";
+import { type Observation, settleAttempted, type SupervisorReadback } from "./durability.ts";
+import { type AttemptRow, HUB_FILE } from "./hub.ts";
 import { LOCAL_RUNNER } from "./serve.ts";
 import type { Lane, Registry } from "../registry.ts";
-import { journalId, type AnyRunnerEvent, type InventoryLane } from "./protocol.ts";
+import { journalId, type AnyRunnerEvent, type CommandStatusState, type InventoryLane } from "./protocol.ts";
 
 /**
  * The supervisor side of runner-owned lanes (design 4.4, 4.5, 5.7).
@@ -251,4 +252,61 @@ export const reconcileInventory = async (deps: LaneHubDeps, label: string, inven
   for (const key of seen.keys()) {
     if (!openKeys.has(key)) deps.emit(`lane-orphan:${label}:${key}`, `LANE_ORPHAN ${key} runner=${label} runs on that runner but the registry has no open lane ${key}; adopt it or stop it`);
   }
+};
+
+export type LaneStartReadbackDeps = {
+  readonly registry: Pick<Registry, "read">;
+  /** The `lane.start` commands an earlier supervisor run sent to `label` and never saw answered (hub.ts `staleAttempts`). */
+  readonly attempts: (label: string) => readonly AttemptRow[];
+  /** Forgets an attempt the read-back settled. */
+  readonly settle: (label: string, cmdId: string) => void;
+  /** `cmd.status` on the runner's connection. */
+  readonly status: (label: string, cmdId: string) => Promise<CommandStatusState>;
+  /** `lane.observe` on the runner: its state and detail. */
+  readonly observe: (label: string, key: string) => Promise<{ readonly state: "verified" | "failed" | "ambiguous"; readonly detail: string }>;
+  /** Sends the recorded command again under its own cmdId; its answer comes back as any lane.start's does. */
+  readonly resend: (label: string, attempt: AttemptRow) => void;
+  readonly emit: (id: string, line: string) => void;
+};
+
+/**
+ * What a `lane.observe` answer says of a lane whose start nobody knows the fate of: a lane the runner reports in any
+ * state is `present`; `RUNNER_LANE_UNKNOWN` (the runner holds no lane of that key) is `absent`, so the start never
+ * happened there; anything else, a known lane whose pane is gone among them, is `unknown`.
+ */
+export const observationOf = (answer: { readonly state: string; readonly detail: string }): Observation =>
+  answer.state === "verified" ? "present" : answer.state === "failed" && /\bRUNNER_LANE_UNKNOWN\b/.test(answer.detail) ? "absent" : "unknown";
+
+/**
+ * After a supervisor restart, at a runner's hello: reads back each `lane.start` an earlier run sent to it and never saw
+ * answered (design 5.6, durability.ts `settleAttempted`). Only a lane still open, owned by that runner and without a
+ * pane is read back; any other attempt is settled without asking. The runner's own answer (`cmd.status`) decides first;
+ * a runner with no record of it is asked `lane.observe`, and a lane in its hello inventory counts as present. A proven
+ * absence sends the same `lane.start` again under its cmdId, `ambiguous` is `OPERATION_AMBIGUOUS` once, and a command
+ * the runner still runs stays recorded for the next hello. Returns each attempt's outcome by cmdId.
+ */
+export const readBackLaneStarts = async (
+  deps: LaneStartReadbackDeps, label: string, inventory: readonly InventoryLane[],
+): Promise<Map<string, SupervisorReadback | "settled">> => {
+  const outcomes = new Map<string, SupervisorReadback | "settled">();
+  const there = new Set(inventory.map((l) => l.key));
+  for (const attempt of deps.attempts(label)) {
+    const key = attempt.key;
+    const lane = attempt.type === "lane.start" && key ? await deps.registry.read(key) : undefined;
+    if (!key || !lane || lane.closedAt || lane.runner !== label || lane.pane) {
+      deps.settle(label, attempt.cmdId);
+      outcomes.set(attempt.cmdId, "settled");
+      continue;
+    }
+    const outcome = await settleAttempted({
+      status: (cmdId) => deps.status(label, cmdId),
+      observe: async (k) => (there.has(k) ? "present" : observationOf(await deps.observe(label, k))),
+      resend: () => { deps.resend(label, attempt); },
+      emit: (line) => { deps.emit(`operation-ambiguous:${label}:${attempt.cmdId}`, `${line}; the lane has no pane: check the runner's host, then dori close ${key} --cancelled and launch again`); },
+    }, { cmdId: attempt.cmdId, key, type: attempt.type });
+    // A resend records the attempt again under this run's epoch; a pending command is read back at the next hello.
+    if (outcome === "verified" || outcome === "ambiguous") deps.settle(label, attempt.cmdId);
+    outcomes.set(attempt.cmdId, outcome);
+  }
+  return outcomes;
 };
