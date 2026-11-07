@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { Outbox, OUTBOX_ACKED_RETENTION_MS, OUTBOX_BODY_CAP, OUTBOX_FILE, OUTBOX_INLINE_MAX, TRUNCATION_MARKER, bodyRefFor, outboxLargeLine } from "../src/runner/outbox.ts";
+import {
+  Outbox, OUTBOX_ACKED_RETENTION_MS, OUTBOX_BODY_CAP, OUTBOX_EVENT_MAX, OUTBOX_FILE, OUTBOX_INLINE_MAX, OutboxEventTooLarge, TRUNCATION_MARKER,
+  bodyRefFor, outboxLargeLine, outboxMaintenance,
+} from "../src/runner/outbox.ts";
 import { withState } from "./fakes.ts";
 
 const mode = (path: string) => statSync(path).mode & 0o777;
@@ -110,6 +113,37 @@ describe("runner outbox", () => {
     box.append("lane.asking", { key: "a", text: "q" });
     expect(box.large(at + 5_000)).toBeUndefined();
     expect(box.large(at + 5_001)).toEqual({ unacked: 1, oldestAgeMs: 5_001 });
+  });
+
+  test("an event over the frame budget is cut at append, longest string first, and still gets its seq", () => {
+    const row = box.append("lane.report", { ...report("short"), evidence: "\u0001".repeat(300_000) });
+    expect(row.seq).toBe(1);
+    expect(row.body.text).toBe("short");
+    expect(row.body.evidence?.endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(row.body))).toBeLessThanOrEqual(OUTBOX_EVENT_MAX);
+    expect(box.unacked(0)[0]!.body).toEqual(row.body);
+  });
+
+  test("an event that cannot be cut to fit is refused without taking a seq", () => {
+    const keys = Array.from({ length: 200_000 }, (_, i) => i);
+    expect(() => box.append("lane.state", { key: "a", status: "idle", keys } as never)).toThrow(OutboxEventTooLarge);
+    expect(box.append("lane.state", { key: "a", status: "idle" }).seq).toBe(1);
+  });
+
+  test("maintenance prunes acked rows and logs RUNNER_OUTBOX_LARGE once per transition", () => {
+    const lines: string[] = [];
+    const tick = outboxMaintenance(box, () => at, (line) => lines.push(line));
+    box.append("lane.asking", { key: "a", text: "q" });
+    box.ack(1);
+    at += OUTBOX_ACKED_RETENTION_MS + 1;
+    for (let i = 0; i < 4; i++) box.append("lane.asking", { key: "a", text: "q" });
+    tick();
+    tick();
+    expect(lines).toEqual(["RUNNER_OUTBOX_PRUNED 1 acked rows past retention", "RUNNER_OUTBOX_LARGE unacked=4 oldestAgeMs=0"]);
+    box.ack(5);
+    tick();
+    tick();
+    expect(lines.slice(2)).toEqual(["RUNNER_OUTBOX_OK unacked=0"]);
   });
 
   test("stats", () => {
