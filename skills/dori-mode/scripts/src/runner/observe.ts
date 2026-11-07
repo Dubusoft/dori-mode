@@ -2,6 +2,7 @@ import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { listPanes, type Pane } from "../panes.ts";
 import { LANE_KEY } from "../registry.ts";
 import type { Runner } from "../run.ts";
+import type { TurnEvidence, TurnHold, TurnStopCause } from "./protocol.ts";
 import { laneStatus, type ObservedLane } from "./serve.ts";
 
 /**
@@ -34,6 +35,48 @@ export const briefLane = (argv: readonly string[] | undefined): string | undefin
     }
   }
   return undefined;
+};
+
+export type TurnStop = Pick<TurnEvidence, "cause" | "hold" | "continuation">;
+
+const STOP_LABELS: readonly (readonly [RegExp, TurnStopCause])[] = [
+  [/^Operation aborted$|^Interrupted by the user's Stop before it finished\./, "aborted"],
+  [/^System operation aborted$/, "system-aborted"],
+  [/^Provider (?:request failed(?::.*)?|retry failed after \d+ attempts?)$/, "provider-failed"],
+];
+/** The last turn's end sits right above the input box and the footer: an older turn's label is further up. */
+const TURN_END_LINES = 10;
+/** omo's lifecycle segment in the footer names the last run's stop (`paused · stalled · aborted: user`); it wins. */
+const FOOTER_STOP = /(?:^|\s)aborted: (user|system|provider)\b/;
+const FOOTER_CAUSE: Readonly<Record<string, TurnStopCause>> = { user: "aborted", system: "system-aborted", provider: "provider-failed" };
+const FOOTER_LINES = 3;
+
+/**
+ * Reads a stopped lane's screen (the caller reads the pane; nothing here does): the label of an aborted turn among
+ * the last non-empty lines (whole lines only, so output that quotes one does not count) or omo's footer lifecycle
+ * segment; the goal or session pause and any pending continuation (goal wait countdown, monitor watch) from the
+ * footer; and `asking` from the question prompt.
+ */
+export const turnStop = (screen: string, asking: boolean): TurnStop => {
+  const lines = screen.split("\n").map((line) => line.trim()).filter(Boolean);
+  let cause: TurnStopCause = "finished";
+  for (const line of lines.slice(-TURN_END_LINES)) {
+    const hit = STOP_LABELS.find(([label]) => label.test(line));
+    if (hit) cause = hit[1];
+  }
+  const footer = lines.slice(-FOOTER_LINES).join("\n");
+  const source = FOOTER_STOP.exec(footer)?.[1];
+  if (source) cause = FOOTER_CAUSE[source] ?? cause;
+  const continuation = /goal (?:continues|retries|resumes) in |[◉◎] watching /.test(footer);
+  const hold: TurnHold = asking ? "question"
+    : /Goal paused \(\/goal resume\)/.test(footer) ? "goal-paused"
+    // omo's own session pause after a stopped run: `Paused · 0 updates held · type to continue`.
+    : /(?:^|\s)(?:Paused|Run paused|Interrupted) · /.test(footer) ? "session-paused"
+    : /Goal stopped: no progress/.test(footer) ? "goal-stopped"
+    : /Goal blocked/.test(footer) ? "goal-blocked"
+    : /Goal achieved/.test(footer) ? "goal-complete"
+    : /Pursuing goal/.test(footer) ? "none" : "no-goal";
+  return { cause, hold, continuation };
 };
 
 export type ObserveHostDeps = {

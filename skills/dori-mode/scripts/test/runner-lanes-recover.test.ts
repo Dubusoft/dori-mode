@@ -7,7 +7,7 @@ import type { Ran } from "../src/run.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
 import { RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
-import { type RunnerEventType, runnerEvent } from "../src/runner/protocol.ts";
+import { type RunnerEventType, runnerEvent, type TurnEvidence } from "../src/runner/protocol.ts";
 import { STARTUP_GRACE_MS } from "../src/runner/serve.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { fakeClock } from "./fakes.ts";
@@ -549,4 +549,54 @@ test("pause and resume run the lane-control sequences on the lane's pane; a reco
   await t.lanes.recover("lane-a");
   expect(t.lanes.notice("lane-a")).toEqual({ status: "paused" });
   await expect(t.lanes.notify({ cmdId: "n2", key: "nope", status: "x" })).rejects.toThrow("RUNNER_LANE_UNKNOWN");
+});
+
+const ABORTED = ["● Editing src/a.ts", "Operation aborted", "", "─".repeat(30), "(😺 OmO) Pursuing goal (4m)", ""].join("\n");
+const FINISHED = ["● Editing src/a.ts", "All checks pass.", "", "─".repeat(30), "(😺 OmO) Pursuing goal (6m)", ""].join("\n");
+const lanePane = (status: string): Pane => ({ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: status });
+
+test("a lane's stopped turn is recorded once per stop for its generation, kept across a runner restart, and answered by observe", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
+  await t.lanes.start(START);
+  clock.at = T0 + STARTUP_GRACE_MS + 1;
+  t.world.panes = [lanePane("working")];
+  t.world.screen = "● Editing src/a.ts\n";
+  await t.lanes.askTick();
+  expect(t.lanes.records()["lane-a"]?.turnStop).toBeUndefined();
+  t.world.panes = [lanePane("idle")];
+  t.world.screen = ABORTED;
+  await t.lanes.askTick();
+  const first: TurnEvidence = { gen: 1, stop: 1, at: T0 + STARTUP_GRACE_MS + 1, cause: "aborted", hold: "none", continuation: false };
+  expect(t.lanes.records()["lane-a"]?.turnStop).toEqual(first);
+  // The same stop again, or after a runner restart, is not a new one.
+  clock.at += 60_000;
+  await t.lanes.askTick();
+  await t.make().askTick();
+  expect((await t.make().observe("lane-a")).result).toEqual({ status: "idle", turn: first });
+  // The next turn runs and ends normally: stop 2, and a working lane answers no turn.
+  t.world.panes = [lanePane("working")];
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "working" });
+  t.world.panes = [lanePane("idle")];
+  t.world.screen = FINISHED;
+  expect((await t.lanes.observe("lane-a")).result).toMatchObject({ turn: { gen: 1, stop: 2, cause: "finished" } });
+  expect(t.calls.filter((a) => ["send-text", "send-keys"].includes(a[2] ?? ""))).toEqual([]);
+});
+
+test("a lane still in its startup window records no stopped turn", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
+  await t.lanes.start(START);
+  t.world.panes = [lanePane("idle")];
+  t.world.screen = ABORTED;
+  clock.at = T0 + STARTUP_GRACE_MS - 1;
+  await t.lanes.askTick();
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "idle" });
+  expect(t.lanes.records()["lane-a"]?.turnStop).toBeUndefined();
+  // Past the window the first stop is recorded; an empty read records nothing.
+  clock.at = T0 + STARTUP_GRACE_MS + 1;
+  t.world.screen = "";
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "idle" });
+  t.world.screen = ABORTED;
+  expect((await t.lanes.observe("lane-a")).result).toMatchObject({ turn: { stop: 1, cause: "aborted" } });
 });

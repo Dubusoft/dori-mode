@@ -11,7 +11,7 @@ import { Database } from "bun:sqlite";
 import { GITHUB_FILE, loadGithub } from "../src/github-events.ts";
 import { LaneOpsError, type Delivery, type LaneOps, type LaneRef, runnerOf, machineRunner } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
-import type { CommandResults, LaneInspection } from "../src/runner/protocol.ts";
+import type { CommandResults, LaneInspection, TurnEvidence } from "../src/runner/protocol.ts";
 import { laneStatus } from "../src/runner/serve.ts";
 import { checkDone } from "../src/signals.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
@@ -69,6 +69,8 @@ export type World = {
   pauseResult?: CommandResults["lane.pause"];
   /** What a resume answers (default: goal confirmed, turn running). */
   resumeResult?: CommandResults["lane.resume"];
+  /** What `ops.turn` answers (the runner's last stopped turn of an idle lane). */
+  turn?: TurnEvidence;
   /** Merged over the inspection fakeLaneOps derives from the World. */
   inspection?: Partial<LaneInspection>;
   startResult?: CommandResults["lane.start"];
@@ -267,6 +269,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
     notify: async (lane, notice) => { record("notify", lane.key, notice); },
     kill: async (machine, keys) => { record("kill", undefined, { machine, keys }); down(machineRunner(machine)); return []; },
     observe: async (lane) => { record("observe", lane.key, {}); down(runnerOf(lane)); return statusOf(lane); },
+    turn: async (lane) => { record("turn", lane.key, {}); down(runnerOf(lane)); return w.turn; },
     connected: () => !w.runnerDown,
   };
 };

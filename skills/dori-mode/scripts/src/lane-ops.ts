@@ -5,7 +5,7 @@ import type { Ran } from "./run.ts";
 import type { RunnerCall } from "./runner/call.ts";
 import type {
   CommandResults, DurableCommandType, JsonValue, LaneInspection, LaneStatus, MachineObservation, QueryBodies, QueryResults, QueryType,
-  SupervisorCommandBodies,
+  SupervisorCommandBodies, TurnEvidence,
 } from "./runner/protocol.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 
@@ -91,6 +91,8 @@ export type LaneOps = {
   readonly notify: (lane: LaneRef, notice: LaneNotice) => Promise<void>;
   readonly kill: (machine: string | undefined, keys: readonly string[]) => Promise<KilledProc[]>;
   readonly observe: (lane: LaneRef) => Promise<LaneStatus>;
+  /** An idle lane's last stopped turn as its runner recorded it (`lane.observe`); undefined when it has none to give. */
+  readonly turn: (lane: LaneRef) => Promise<TurnEvidence | undefined>;
   readonly connected: (machine?: string) => boolean;
 };
 
@@ -122,6 +124,9 @@ const isPane = (v: unknown): boolean => isObj(v) && isStr(v.pane_id) && isStr(v.
 const isStartup = (v: unknown): boolean => isObj(v) && oneOf(["ok", "error", "unconfirmed"])(v.verdict) && isStr(v.detail);
 const isCheck = (v: unknown): boolean => isObj(v) && isStr(v.signal) && isBool(v.ok) && isStr(v.detail);
 const isWorktree = (v: unknown): boolean => isObj(v) && isStr(v.path) && isBool(v.exists);
+const isTurn = (v: unknown): boolean => isObj(v) && isNum(v.gen) && isNum(v.stop) && isNum(v.at) && isBool(v.continuation)
+  && oneOf(["finished", "aborted", "system-aborted", "provider-failed"])(v.cause)
+  && oneOf(["none", "goal-paused", "session-paused", "goal-stopped", "goal-blocked", "goal-complete", "no-goal", "question"])(v.hold);
 
 const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
   "q.panes": (v) => isObj(v) && listOf(v.panes, isPane),
@@ -147,7 +152,7 @@ const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boole
   "lane.send": (v) => isObj(v) && DELIVERIES(v.delivery) && optStr(v.refusal),
   "lane.notify": (v) => v === undefined || isObj(v),
   "lane.git": (v) => isObj(v) && isNum(v.code) && isStr(v.out) && isStr(v.err),
-  "lane.observe": (v) => isObj(v) && LANE_STATUSES(v.status),
+  "lane.observe": (v) => isObj(v) && LANE_STATUSES(v.status) && (v.turn === undefined || isTurn(v.turn)),
   "guard.kill": (v) => isObj(v) && listOf(v.killed, (k) => isObj(k) && isNum(k.pid) && isStr(k.comm) && isNum(k.rssKb) && optStr(k.lane)),
   "host.herdr": (v) => isObj(v) && oneOf(["start", "restart", "stop", "status"])(v.action) && oneOf(["up", "down", "hung"])(v.state)
     && optStr(v.instance) && isBool(v.managed) && isBool(v.paused),
@@ -334,6 +339,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
     },
     kill: async (machine, keys) => [...(await effect(machineRunner(machine), "guard.kill", { keys: [...keys] })).killed],
     observe: async (lane) => (await effect(runnerOf(lane), "lane.observe", { key: lane.key })).status,
+    turn: async (lane) => (await effect(runnerOf(lane), "lane.observe", { key: lane.key })).turn,
     connected: (machine) => call.connected(machineRunner(machine)),
   };
 };
