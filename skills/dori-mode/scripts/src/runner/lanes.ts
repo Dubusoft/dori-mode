@@ -441,6 +441,11 @@ export class RunnerLanes {
     return { detail: `resumed goal=${result.goal}`, result };
   }
 
+  /** herdr names a fresh pane's agent unknown until its integration first reports: a lane this young is still starting. */
+  private starting(record: { readonly startedAt: number }): boolean {
+    return this.deps.clock.now() - record.startedAt < STARTUP_GRACE_MS;
+  }
+
   async observe(key: string): Promise<Effect<"lane.observe">> {
     const record = this.record(key);
     const pane = await this.currentPane(record);
@@ -449,7 +454,7 @@ export class RunnerLanes {
     const reason: LaneDeadReason | undefined = !pane ? "pane-missing" : status === "dead" ? "agent-gone" : undefined;
     // herdr names a fresh pane's agent unknown until its integration first reports: a lane started less than
     // STARTUP_GRACE_MS ago whose pane is there is still starting, so its dead is answered but not published.
-    const starting = reason === "agent-gone" && this.deps.clock.now() - record.startedAt < STARTUP_GRACE_MS;
+    const starting = reason === "agent-gone" && this.starting(record);
     if (!starting) this.deps.publish("lane.state", { key, status, ...(reason ? { reason } : {}) });
     if (!pane) throw new Error(`RUNNER_LANE_ABSENT ${key} pane ${record.pane} is gone`);
     return { detail: `observed ${status}`, result: { status } };
@@ -465,9 +470,11 @@ export class RunnerLanes {
     const record = this.record(key);
     const panes = await listPanes(this.deps.run);
     const pane = await this.currentPane(record, panes);
-    if (paneAlive(pane)) {
+    // A pane still in its startup window whose agent has not reported yet is starting, not dead: closing its tab would
+    // kill the launch in progress, so it is left alone like a live one.
+    if (paneAlive(pane) || (pane && this.starting(record))) {
       this.deps.publish("lane.started", { key, pane: record.pane, tab: record.tab, session: "" });
-      return { detail: `alive pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
+      return { detail: `${paneAlive(pane) ? "alive" : "starting"} pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
     }
     if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
     const restored = record.herdrInstance && !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;

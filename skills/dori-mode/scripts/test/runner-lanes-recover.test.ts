@@ -313,6 +313,23 @@ test("observe answers dead but publishes no lane.state dead for a lane still in 
   expect(t.published.at(-1)).toEqual(["lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }]);
 });
 
+test("recover leaves a lane still in its startup window alone instead of closing its tab and starting it again", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
+  await t.lanes.start(START);
+  t.published.length = 0;
+  const started = t.lanes.records()["lane-a"]?.startedAt ?? 0;
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
+  clock.at = started + STARTUP_GRACE_MS - 1;
+  const calls = t.calls.length;
+  expect(await t.lanes.recover("lane-a")).toEqual({ detail: "starting pane=p1", result: { pane: "p1", tab: "t1", relaunched: false, resumed: false } });
+  expect(t.calls.slice(calls).filter((c) => c[1] === "tab" && (c[2] === "close" || c[2] === "create"))).toEqual([]);
+  expect(t.published).toEqual([["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "" }]]);
+  // A pane that is gone is not starting: it is started again at once.
+  t.world.panes = [];
+  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
+});
+
 test("alive criteria: observe and recover use paneAlive (agent_status), not the agent field", async () => {
   const clock = fakeClock(T0);
   const t = setup({ clock });
