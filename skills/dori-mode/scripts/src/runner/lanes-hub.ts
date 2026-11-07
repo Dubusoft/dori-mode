@@ -17,7 +17,8 @@ import { journalId, type AnyRunnerEvent, type CommandStatusState, type Inventory
  * Ownership: `Lane.runner` names the runner that owns a lane. An event about a lane is taken only from the runner whose
  * authenticated connection carried it and that `Lane.runner` names; anything else - another runner's lane, a lane
  * the registry does not have - is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). The hub still
- * acks it, so the runner does not resend it forever. One exception: an observation (`lane.state`, `lane.progress`)
+ * acks it, so the runner does not resend it forever. The line's id is the forged identity (runner, key, event type, the
+ * lane's owner and generation), not the frame: the same forgery repeated is journaled once, a new one is a new alert. One exception: an observation (`lane.state`, `lane.progress`)
  * from a runner about an open lane on its own machine that no runner owns yet (a legacy lane before adopt-legacy.ts has
  * adopted it) is dropped here without a line: a runner observes every lane on its host. That runner's `lane.started`, `lane.report` or `lane.asking` about such a lane
  * is still forged: it controls no lane it does not own.
@@ -162,7 +163,7 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
   const lane = await deps.registry.read(key);
   if (lane && ownMachineObservation(label, frame, lane)) return;
   if (!lane || lane.runner !== label) {
-    deps.emit(`runner-forged:${label}:${frame.seq}`, `RUNNER_FORGED_EVENT runner=${label} key=${key} type=${frame.type}${lane?.runner ? ` owner=${lane.runner}` : " (no such runner lane)"}`);
+    deps.emit(`runner-forged:${JSON.stringify([label, key, frame.type, lane?.runner ?? null, lane ? laneGeneration(lane) : null])}`, `RUNNER_FORGED_EVENT runner=${label} key=${key} type=${frame.type}${lane?.runner ? ` owner=${lane.runner}` : " (no such runner lane)"}`);
     return;
   }
   if (frame.type === "lane.started") {

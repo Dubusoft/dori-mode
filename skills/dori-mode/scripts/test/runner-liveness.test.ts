@@ -118,6 +118,21 @@ test("a folded disconnect that stays down 10 min still wakes the lead; owned lan
   expect(urgent(r.lines)[1]).toStartWith("HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 780 s");
 });
 
+test("a partition that flaps inside the hysteresis says RUNNER_UNREACHABLE once per outage, and again after it ends", async () => {
+  const r = rig(() => ({ kind: "alive" }));
+  for (let i = 0; i < 4; i++) {
+    await r.runTo(r.at() + 210_000);
+    await r.monitor.heartbeat("worker-a");
+    await r.runTo(r.at() + 120_000);
+    await r.monitor.heartbeat("worker-a");
+  }
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE", "RUNNER_UNREACHABLE"]);
+  const steadyUntil = r.at() + 11 * 60_000;
+  while (r.at() < steadyUntil) { await r.runTo(r.at() + 30_000); await r.monitor.heartbeat("worker-a"); }
+  await r.runTo(r.at() + 180_000);
+  expect(kinds(r.lines).slice(3)).toEqual(["RUNNER_ONLINE", "RUNNER_STALE", "RUNNER_OFFLINE", "RUNNER_UNREACHABLE"]);
+});
+
 test("a partition (process alive, health fresh) for 10 min restarts nothing and says RUNNER_UNREACHABLE once", async () => {
   const r = rig(() => ({ kind: "alive" }));
   await r.runTo(180_000 + 10 * 60_000);

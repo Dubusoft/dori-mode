@@ -140,6 +140,16 @@ test("the sweep sends one MEMORY_CHECK per distinct finding: daily, and 15 minut
   expect(await memorySweep(at(t1 + MEMORY_CHECK_AFTER_CLOSE_MS + MIN), "/home/test")).toEqual([]);
 });
 
+test("a finding that comes back after a clean check is sent again", async () => {
+  const { deps, memory } = await setup();
+  const at = (ms: number): FlowDeps => ({ ...deps, clock: fakeClock(ms) });
+  expect(await memorySweep(at(T0), "/home/test")).toHaveLength(1);
+  writeFileSync(join(memory, "system", "human.md"), "## Open\n");
+  expect(await memorySweep(at(T0 + MEMORY_CHECK_EVERY_MS), "/home/test")).toEqual([]);
+  writeFileSync(join(memory, "system", "human.md"), HUMAN);
+  expect(await memorySweep(at(T0 + 2 * MEMORY_CHECK_EVERY_MS), "/home/test")).toHaveLength(1);
+});
+
 test("a missing memory file is one MEMORY_CHECK_WARN, retried only on the next daily turn", async () => {
   const { deps } = await setup();
   const gone = { ...deps, config: { ...deps.config, memoryCheck: { ...deps.config.memoryCheck, repo: join(state.dir, "nowhere") } } };
