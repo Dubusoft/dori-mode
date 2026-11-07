@@ -280,14 +280,60 @@ if (process.argv[2] === "status") {
   process.exit(0);
 }
 
+/**
+ * `dori update`'s runner rollout: each worker runner gets the new bundle through `dori runner install`'s path, one at
+ * a time, each confirmed by a hello with a higher gen within 2 minutes. The local runner is the supervisor's child, so
+ * the supervisor restart that `dori update` already did restarted it on the updated checkout. Returns 1 when one
+ * failed (the rest were not touched), else 0.
+ */
+const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
+  const { readRunnerRows } = await import("./runner/hub.ts");
+  const { upgradeRunners } = await import("./runner/upgrade.ts");
+  const { buildBundle, installRunner } = await import("./runner/install.ts");
+  const { SupervisorAuth } = await import("./runner/auth.ts");
+  const rows = readRunnerRows(cfg.stateDir);
+  const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
+  const machines = await listGuardMachines(run, cfg.guardMachines);
+  let bundle: string | undefined;
+  const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+  const before = new Map(rows.map((r) => [r.label, r.maxGen]));
+  try {
+    const result = await upgradeRunners({
+      labels: rows.filter((r) => r.label !== LOCAL_RUNNER).map((r) => r.label),
+      install: async (label) => {
+        const machine = machines.find((m) => m.label === label);
+        if (!machine) return { ok: false, detail: `no machine ${label}` };
+        if (!cfg.runners?.listen) return { ok: false, detail: "runners.listen is not set" };
+        bundle ??= await buildBundle(run)();
+        const done = await installRunner({ run, bundle: async () => bundle as string }, {
+          machine, label, connectUrl: `ws://${cfg.runners.listen}`,
+          agentCommand: cfg.agentCommand,
+          issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
+        });
+        return done.ok ? { ok: true, version: done.version } : { ok: false, detail: `${done.code} ${done.detail}` };
+      },
+      confirm: async (label) => {
+        for (const until = realClock.now() + 120_000; realClock.now() < until; await realClock.sleep(2_000)) {
+          if (genOf(label) > (before.get(label) ?? 0)) return true;
+        }
+        return false;
+      },
+      log: (line) => console.log(line),
+    });
+    return result.failed ? 1 : 0;
+  } finally {
+    auth.close();
+  }
+};
+
 if (process.argv[2] === "runner") {
   // serve and probe run on runner hosts and live in runner/main.ts, which the worker bundle (runner/bin.ts) also runs.
   if (process.argv[3] === "serve" || process.argv[3] === "probe") {
     const { runnerHostMain } = await import("./runner/main.ts");
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
-  // enroll, install, revoke, rotate and reset-gen run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | herdr start|restart|stop|status --machine LABEL [--yes]";
+  // enroll, install, revoke, rotate, reset-gen and upgrade run on the supervisor host against <stateDir>.
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
     options: { machine: { type: "string" }, yes: { type: "boolean" } },
@@ -311,6 +357,12 @@ if (process.argv[2] === "runner") {
       lanes: async () => (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed"),
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     }));
+  }
+  if (sub === "upgrade") {
+    if (target !== undefined || parsed.values.machine !== undefined) die(usage);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    process.exit(await upgradeRunnersNow(cfg));
   }
   if (sub === "enroll") {
     // The code and fingerprint go to stdout only: the installer pipes them into the runner's stdin over ssh.
@@ -445,52 +497,6 @@ if (process.argv[2] === "runner") {
   die(usage);
 }
 
-/**
- * `dori update`'s runner rollout: each worker runner gets the new bundle through `dori runner install`'s path, one at
- * a time, each confirmed by a hello with a higher gen within 2 minutes. The local runner is the supervisor's child, so
- * the supervisor restart that `dori update` already did restarted it on the updated checkout. Returns 1 when one
- * failed (the rest were not touched), else 0.
- */
-const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
-  const { readRunnerRows } = await import("./runner/hub.ts");
-  const { upgradeRunners } = await import("./runner/upgrade.ts");
-  const { buildBundle, installRunner } = await import("./runner/install.ts");
-  const { SupervisorAuth } = await import("./runner/auth.ts");
-  const rows = readRunnerRows(cfg.stateDir);
-  const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
-  const machines = await listGuardMachines(run, cfg.guardMachines);
-  let bundle: string | undefined;
-  const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
-  const before = new Map(rows.map((r) => [r.label, r.maxGen]));
-  try {
-    const result = await upgradeRunners({
-      labels: rows.filter((r) => r.label !== LOCAL_RUNNER).map((r) => r.label),
-      install: async (label) => {
-        const machine = machines.find((m) => m.label === label);
-        if (!machine) return { ok: false, detail: `no machine ${label}` };
-        if (!cfg.runners?.listen) return { ok: false, detail: "runners.listen is not set" };
-        bundle ??= await buildBundle(run)();
-        const done = await installRunner({ run, bundle: async () => bundle as string }, {
-          machine, label, connectUrl: `ws://${cfg.runners.listen}`,
-          agentCommand: cfg.agentCommand,
-          issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
-        });
-        return done.ok ? { ok: true, version: done.version } : { ok: false, detail: `${done.code} ${done.detail}` };
-      },
-      confirm: async (label) => {
-        for (const until = realClock.now() + 120_000; realClock.now() < until; await realClock.sleep(2_000)) {
-          if (genOf(label) > (before.get(label) ?? 0)) return true;
-        }
-        return false;
-      },
-      log: (line) => console.log(line),
-    });
-    return result.failed ? 1 : 0;
-  } finally {
-    auth.close();
-  }
-};
-
 const config = await loadConfig();
 setDefaultRunTimeout(config.runTimeoutMs);
 // Lane operations go through the supervisor's CLI relay; built on first use, so commands that touch no lane never connect.
@@ -622,7 +628,9 @@ try {
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
         refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readGuardAgentScripts(), (line) => console.log(line)),
-        upgradeRunners: async () => upgradeRunnersNow(config),
+        // A fresh process: this one still holds the modules it loaded before the pull, which the pulled runner code may not
+        // be able to import from (a missing export throws).
+        upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
         refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
