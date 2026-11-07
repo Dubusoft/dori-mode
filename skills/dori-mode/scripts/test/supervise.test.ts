@@ -1224,7 +1224,6 @@ test.each([
   ["WAIT_DONE release tell owner", "urgent"],
   ["WAIT_TIMEOUT release check manually", "urgent"],
   ["UNRECOGNISED_PANE scratch:p1 dead-panes: no alive status", "urgent"],
-  ["NO-REPORT lane pane has no [REPORT] line", "urgent"],
   ["NO-PROGRESS lane 16 min without a thread update while working", "urgent"],
   ["HOST_GUARD CLEAR load 40, memory free 50%", "urgent"],
   ["LAUNCH_READY the host has room again", "urgent"],

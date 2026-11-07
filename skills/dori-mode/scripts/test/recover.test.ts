@@ -301,7 +301,7 @@ test("a capped wrong-model pane is never fed a freshness nudge", async () => {
   await deps.registry.write({ ...lane, recoveryAttempts: RECOVERY_LIMIT });
   await recoverLanes(deps);
   expect((await deps.registry.read(lane.key))?.recoveryPending).toBe(true);
-  expect(await freshnessTick({ ...deps, clock: fakeClock(30 * 60_000) }, "/home/test")).toEqual([]);
+  expect(await freshnessTick({ ...deps, clock: fakeClock(30 * 60_000) })).toEqual([]);
   expect(sent(world)).toEqual([]);
   expect(opsOf(world, "recover", "start")).toEqual([]);
 });

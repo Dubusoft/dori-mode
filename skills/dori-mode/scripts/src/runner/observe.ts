@@ -1,7 +1,5 @@
-import { createHash } from "node:crypto";
-import { lastReportLine } from "../freshness.ts";
 import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
-import { listPanes, readScreen, type Pane } from "../panes.ts";
+import { listPanes, type Pane } from "../panes.ts";
 import { LANE_KEY } from "../registry.ts";
 import type { Runner } from "../run.ts";
 import { laneStatus, type ObservedLane } from "./serve.ts";
@@ -16,15 +14,9 @@ import { laneStatus, type ObservedLane } from "./serve.ts";
  * argv: the launch prompt names the lane brief (`briefs/<key>.md` in the runner directory, or an older launch's
  * `dori-brief-<key>.md`), and a foreground process whose argv carries that path belongs to `<key>`. The owned record
  * wins, then the environment attribution, then the argv. For each such
- * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle), and `reportHash` is the
- * `valueHash` of the newest `[REPORT]` line in the pane's last 200 lines, so the supervisor can compare it with the
- * line its own screen scraping recorded (`Lane.lastRemoteReport`).
+ * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle). A pane's text is
+ * never read here: a lane's reports reach the supervisor only as `lane.report` events.
  */
-
-export const SCREEN_LINES = 200;
-
-/** A short stable hash of a value (the first 16 hex digits of its SHA-256), as `lane.progress` carries a report line. */
-export const valueHash = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 16);
 
 type ProcessInfo = {
   readonly shell_pid?: number;
@@ -73,8 +65,7 @@ export const observeHost = async (deps: ObserveHostDeps): Promise<ObservedLane[]
       ?? (info?.foreground_processes ?? []).map((p) => briefLane(p.argv)).find((k): k is string => k !== undefined);
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    const line = lastReportLine(await readScreen(deps.run, pane.pane_id, SCREEN_LINES).catch(() => ""), key);
-    out.push({ key, pane: pane.pane_id, tab: pane.tab_id ?? "", status: laneStatus(pane), ...(line ? { reportHash: valueHash(line) } : {}) });
+    out.push({ key, pane: pane.pane_id, tab: pane.tab_id ?? "", status: laneStatus(pane) });
   }
   return out.sort((a, b) => a.key.localeCompare(b.key));
 };

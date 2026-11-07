@@ -71,7 +71,7 @@ export type RunnerEventBodies = {
     readonly key: string; readonly kind: ReportKind; readonly text: string; readonly evidence?: string; readonly bodyRef?: BodyRef;
   };
   readonly "lane.asking": { readonly key: string; readonly text: string };
-  /** A screen read: `reportHash` is the hash of the latest `[REPORT]` line seen, when there is one. */
+  /** No runner sends `reportHash` any more (a pane is never read for a report); kept so an older runner's frame still validates. */
   readonly "lane.progress": { readonly key: string; readonly reportHash?: string; readonly text?: string };
   /** The lane confirmed the supervisor's lane message `id` (`dori report ack <id>`, since proto 3). */
   readonly "lane.ack": { readonly key: string; readonly id: string };

@@ -3,7 +3,6 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { callerLane, claimDone, closeLane, laneActRefusal, laneSendRefusal, unpushedWork, watchTick } from "../src/done-flow.ts";
-import { lastReportLine } from "../src/freshness.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { run, type Runner } from "../src/run.ts";
 import { laneOps, type LaneOps } from "../src/lane-ops.ts";
@@ -192,30 +191,11 @@ test("the dori CLI inside a lane may not close, pause, resume or send at all, an
   expect(statusOf((await d.registry.read("other-lane")) ?? lane)).toBe("working");
 });
 
-// Item 5: the remote [REPORT] matcher is anchored to a whole line.
-test("lastReportLine reads only a whole [REPORT] line, never one inside command output or prose", () => {
-  const key = "remote-lane";
-  expect(lastReportLine("[REPORT] remote-lane | done | closed acme/app#3\n❯ ", key)).toBe("[REPORT] remote-lane | done | closed acme/app#3");
-  expect(lastReportLine("  ● [REPORT] remote-lane | done | closed acme/app#3", key)).toBe("[REPORT] remote-lane | done | closed acme/app#3");
-  for (const screen of [
-    "docs/notes.md:12: [REPORT] remote-lane | done | closed acme/app#3",
-    "INFO watcher saw [REPORT] remote-lane | done | closed acme/app#3",
-    "│ [REPORT] remote-lane | done | closed acme/app#3 │",
-    "  ⎿  [REPORT] remote-lane | done | closed acme/app#3",
-    "echo '[REPORT] remote-lane | done | closed acme/app#3'",
-    "[REPORT] remote-lane-2 | done | closed acme/app#3",
-    "[REPORT] remote-lane | finished | closed acme/app#3",
-  ]) expect(lastReportLine(screen, key)).toBeNull();
-});
-
-test("a remote lane whose screen shows a [REPORT] shape inside command output is not claimed", async () => {
+test("a remote lane whose screen shows a [REPORT] done line is not claimed: only its runner's report claims", async () => {
   const remote: Lane = { ...lane, key: "remote-lane", machine: "box", cwd: undefined };
   await at(T0).registry.write(remote);
   const d = at(T0);
-  world.screen = "$ grep -rn REPORT docs\ndocs/a.md:3:[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
+  world.screen = "[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
   expect(await watchTick(d)).toEqual([]);
   expect(statusOf((await at(T0).registry.read("remote-lane")) ?? remote)).toBe("working");
-  world.screen = "[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
-  await watchTick(d);
-  expect(statusOf((await at(T0).registry.read("remote-lane")) ?? remote)).toBe("done-claimed");
 });

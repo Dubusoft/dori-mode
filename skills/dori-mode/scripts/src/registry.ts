@@ -84,24 +84,24 @@ export type Lane = {
   readonly lastProgressError?: string;
   /** The id of the one `[System]` status message the supervisor keeps in the lane's thread and edits on each progress or milestone report. */
   readonly statusMessageId?: string;
-  /** A remote lane's last [REPORT] line the watcher acted on (claim, LANE_REPORT or nothing for a milestone). */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastRemoteReport?: string;
-  /** Every [REPORT] line the watcher has acted on, by line hash and first-seen time, newest last. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly remoteReportsSeen?: readonly { readonly hash: string; readonly at: string }[];
   /**
-   * `cli`: every local launch and relaunch sets this for the `dori report` footer, so it reports with `dori report` and never types into the lead's pane;
-   * its [REPORT] lines found there are counted as violations. Absent: an older lane on the [REPORT] footer, or a remote one.
+   * `cli`: every launch and relaunch sets this for the `dori report` footer, so it reports with `dori report` (its runner's, on
+   * another machine) and never types into a pane. Absent: a lane registered by an older dori; its next relaunch moves it onto that footer.
    */
   readonly reportVia?: "cli";
   /** Launched behind `laneSandbox.command` (every local `dori launch` that the sandbox fits, or `--sandbox`); recovery relaunches it the same way. */
   readonly sandbox?: true;
-  /** [REPORT] lines of a `reportVia: cli` lane found in the lead's pane, by line hash and first-seen time, newest last. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly leadPaneSeen?: readonly { readonly hash: string; readonly at: string }[];
-  /** How many distinct such lines were found: the lane's lead-pane violations. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly leadPaneViolations?: number;
-  /** The [REPORT] line the freshness sweep last posted, so a stale screen is never posted twice. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastPostedReport?: string;
-  /** The [REPORT] line seen on the previous freshness tick (a line is posted only once it holds across two ticks). */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastSeenReport?: string;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
   readonly lastFreshnessNote?: string;

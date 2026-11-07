@@ -1,11 +1,9 @@
-import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 import type { DoriConfig } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
-import { reportLines } from "./freshness.ts";
 import { OPEN_STATES, openOperations, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
 import { type Check, parseSignal, type SignalIo } from "./signals.ts";
@@ -113,12 +111,6 @@ const cwdFallbackLine = (deps: FlowDeps, lane: Lane, read: LaneRead): string | u
     ? `SIGNAL_CWD ${lane.key}: lane cwd ${lane.cwd} no longer exists; Done signals and git ran in defaultCwd ${deps.config.defaultCwd}`
     : undefined;
 
-/**
- * A remote lane still on the legacy footer (it prints `[REPORT]` lines in its own pane): one the upgrade moved onto a
- * runner before its runner delivered a report, launched without `dori report` (design A22, D7).
- */
-const reportsOnScreen = (lane: Lane): boolean => Boolean(lane.machine) && !lane.lastRunnerReportAt && !lane.reportVia;
-
 const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
 
 /** Free text in an event line (evidence, reasons) is capped; the registry keeps it whole. */
@@ -211,12 +203,8 @@ export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly s
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } }));
   // The reasons reach the lane through its runner (`dori lane status`, D16), before the lane is told to read them.
   await deps.ops.notify(lane, { status: "not-done", objection: { at, reasons } });
-  // A legacy remote lane claims by printing a [REPORT] line, and the watcher acts on each distinct line once. The payload
-  // stays a <placeholder>: this text lands on the lane's own screen, where a real-looking line would read as a claim.
   // The reasons are never typed: they carry command output and paths, and a pane is a shell line. The lane reads them.
-  const text = reportsOnScreen(lane)
-    ? `[LEAD] not done: the Done check of ${lane.key} did not pass; the lead has the reasons. Keep working, and print a new [REPORT] ${lane.key} | done | <updated evidence> line when fixed`
-    : lane.machine
+  const text = lane.machine
       ? `[LEAD] not done: the Done check of ${lane.key} did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status ${lane.key}, keep working, and claim again when fixed`
       : `[LEAD] not done: the Done check of ${lane.key} did not pass. Read the reasons with dori lane status ${lane.key}, keep working, and claim again when fixed`;
   if (lane.pane) await deps.ops.send(lane, text);
@@ -614,69 +602,14 @@ export const laneMeta = (lane: Lane): EventMeta => ({
   ...(lane.cwd ? { cwd: lane.cwd } : {}),
 });
 
-/**
- * A remote lane can neither run `dori claim-done` nor message the lead pane: its newest `[REPORT]` line, read from
- * its own pane, stands in for both. A new `done` report becomes the same claim a local lane makes (same window, same
- * live re-check before close); a new blocker or question is pushed as an urgent LANE_REPORT.
- */
-const remoteReport = async (deps: FlowDeps, lane: Lane, push: Emit, view: LaneReads): Promise<Lane> => {
-  if (!lane.pane) return lane;
-  return remoteReportSequence(deps, lane, push, await view.screen(lane, 200));
-};
-
-/** The most line hashes a lane keeps: more than one 200-line screen can show, so a line still on screen is never forgotten. */
-export const REMOTE_SEEN_MAX = 200;
-
-const lineHash = (line: string): string => createHash("sha256").update(line).digest("hex").slice(0, 16);
-
-/**
- * Every [REPORT] line on the screen not seen before is acted on, top to bottom, so a question and a milestone printed
- * between two polls both arrive, in order. Lines are told apart by (lane, line hash, first-seen): the same line printed
- * again is the same report. A lane watched by an older dori (newest line only) has no hashes yet: the lines up to its
- * `lastRemoteReport` count as seen, so the upgrade replays nothing.
- */
-const remoteReportSequence = async (deps: FlowDeps, lane: Lane, push: Emit, screen: string): Promise<Lane> => {
-  const lines = reportLines(screen, lane.key);
-  let seen = lane.remoteReportsSeen;
-  if (!seen) {
-    const upTo = lane.lastRemoteReport === undefined ? -1 : lines.lastIndexOf(lane.lastRemoteReport);
-    const at = iso(deps.clock);
-    seen = [...new Set(lines.slice(0, upTo + 1).map(lineHash))].map((hash) => ({ hash, at }));
-  }
-  let current = lane;
-  for (const line of lines) {
-    const hash = lineHash(line);
-    if (seen.some((s) => s.hash === hash)) continue;
-    seen = [...seen, { hash, at: iso(deps.clock) }].slice(-REMOTE_SEEN_MAX);
-    current = await actOnRemoteReport(deps, current, push, line, { lastRemoteReport: line, remoteReportsSeen: seen });
-  }
-  return current;
-};
-
-/** Acts on one remote [REPORT] line, then records `fields` so the line is not acted on again. */
-const actOnRemoteReport = async (deps: FlowDeps, lane: Lane, push: Emit, line: string, fields: Partial<Lane>): Promise<Lane> => {
-  const seen: Lane = { ...lane, ...fields };
-  const [, kind = "", what = ""] = /^\[REPORT\] \S+ \| (\w+) \| (.*)$/.exec(line) ?? [];
-  if (kind === "done") {
-    // Claim first: a crash before the line is recorded repeats the claim instead of losing it.
-    await claimDone(deps, seen, what);
-    return (await deps.registry.patch(lane.key, fields)) ?? seen;
-  }
-  if (kind === "blocker" || kind === "question") await push(`LANE_REPORT ${lane.key} ${kind} ${what}`, undefined, laneMeta(lane));
-  await deps.registry.patch(lane.key, fields);
-  return seen;
-};
-
-const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit, view: LaneReads): Promise<void> => {
+const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void> => {
   const status = statusOf(listed);
   if (status === "closed") {
     for (const line of await closedWorktreeSweep(deps, listed)) await push(line, undefined, laneMeta(listed));
     return;
   }
+  // A lane is heard only through its reports (`dori report` or its runner's `lane.report`); its screen is never read for one.
   let lane = listed;
-  // A lane is heard through its runner. Only a remote lane still on the legacy [REPORT] footer, until its runner delivers
-  // its first report, is read from its screen (through the runner, q.screen).
-  if (reportsOnScreen(lane) && (status === "working" || status === "not-done")) lane = await remoteReport(deps, lane, push, view);
   let claim = lane.claim;
   if (statusOf(lane) !== "done-claimed" || !claim) return;
   const machine = machineClose(lane);
@@ -754,7 +687,7 @@ const windowStart = async (deps: FlowDeps, lane: Lane, claim: NonNullable<Lane["
  * durably); the lines are also returned. One lane's failure is a LANE_WATCH_WARN line and never stops the others.
  * `archived: false` skips the closed lanes in the archive (their worktree cleanup), so a pass reads open lanes only.
  */
-export const watchTick = async (deps: FlowDeps, emit?: Emit, view: LaneReads = deps.ops, archived = true): Promise<string[]> => {
+export const watchTick = async (deps: FlowDeps, emit?: Emit, archived = true): Promise<string[]> => {
   const out: string[] = [];
   const push: Emit = async (line, id, meta) => {
     if (emit) await (meta ? emit(line, id, meta) : emit(line, id));
@@ -767,7 +700,7 @@ export const watchTick = async (deps: FlowDeps, emit?: Emit, view: LaneReads = d
   }
   for (const listed of archived ? await deps.registry.list() : await deps.registry.open()) {
     try {
-      await watchLane(deps, listed, push, view);
+      await watchLane(deps, listed, push);
     } catch (e) {
       await push(`LANE_WATCH_WARN ${listed.key} ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200)}`);
     }

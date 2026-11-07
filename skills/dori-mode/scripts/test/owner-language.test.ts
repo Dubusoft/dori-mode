@@ -39,7 +39,7 @@ const nudgeText = async (ownerLanguage: string | undefined): Promise<string> => 
   world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   const deps = depsFor(world, fakeClock(T0 + 16 * MIN), state.dir, ownerLanguage ? { ownerLanguage } : {});
   await deps.registry.write(lane());
-  expect((await freshnessTick(deps, "/home/test")).map((a) => a.kind)).toEqual(["nudged"]);
+  expect((await freshnessTick(deps)).map((a) => a.kind)).toEqual(["nudged"]);
   const sent = sentTexts(world).find((c) => c.includes("[LEAD] your work thread has had no update"));
   expect(sent).toBeDefined();
   return sent ?? "";

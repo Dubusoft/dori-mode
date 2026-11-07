@@ -23,21 +23,17 @@ afterEach(() => state.done());
 
 const working: Lane = { key: "quiet-lane", title: "quiet", thread: "chat:team/9", pane: "w:p7", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0 };
 
-test("a lane silent past the nudge time is nudged once, then its last report is posted for it", async () => {
+test("a lane silent past the nudge time is nudged once, and a [REPORT] line on its screen is never posted for it", async () => {
   world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
   await deps(T0).registry.write(working);
   world.screen = "noise\n[REPORT] quiet-lane | milestone | tests green on /home/test/repo, PR open\n❯ ";
-  expect(await freshnessTick(deps(T0 + 10 * MIN), "/home/test")).toEqual([]);
-  expect((await freshnessTick(deps(T0 + 16 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["nudged"]);
-  expect((await freshnessTick(deps(T0 + 17 * MIN), "/home/test")).map((a) => a.kind)).toEqual([]);
-  expect((await freshnessTick(deps(T0 + 21 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["pending-report"]);
+  expect(await freshnessTick(deps(T0 + 10 * MIN))).toEqual([]);
+  expect((await freshnessTick(deps(T0 + 16 * MIN))).map((a) => a.kind)).toEqual(["nudged"]);
+  expect((await freshnessTick(deps(T0 + 17 * MIN))).map((a) => a.kind)).toEqual([]);
+  expect(await freshnessTick(deps(T0 + 21 * MIN))).toEqual([]);
+  expect(await freshnessTick(deps(T0 + 26 * MIN))).toEqual([]);
   expect(world.calls.find((c) => c[0] === "notify")).toBeUndefined();
-  const posted = await freshnessTick(deps(T0 + 26 * MIN), "/home/test");
-  expect(posted.map((a) => a.kind)).toEqual(["posted"]);
-  const call = world.calls.find((c) => c[0] === "notify");
-  expect(call?.[1]).toBe("chat:team/9");
-  expect(call?.[2]).toContain("tests green on ~/repo, PR open");
   expect(sent(world)).toHaveLength(1);
 });
 
@@ -124,32 +120,6 @@ test("an alive status resets the unrecognised count, so two unknown ticks on eac
   world.panes[0] = { pane_id: "w:p1", workspace_id: "w" };
   expect(await tick()).toEqual([]);
   expect(await tick()).toEqual([]);
-});
-
-test("a posted [REPORT] line is saved: the same line on later ticks is stale, logged once, and never posted again", async () => {
-  const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
-  await deps(T0).registry.write({ ...working, lastNudgeAt: T0 + MIN });
-  world.screen = "[REPORT] quiet-lane | milestone | tests green\n❯ ";
-  expect((await freshnessTick(deps(T0 + 21 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["pending-report"]);
-  expect((await freshnessTick(deps(T0 + 26 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["posted"]);
-  const lane = await deps(T0).registry.read("quiet-lane");
-  await deps(T0).registry.write({ ...lane!, lastReplyAt: T0 + 30 * MIN, lastNudgeAt: T0 + 31 * MIN });
-  expect((await freshnessTick(deps(T0 + 55 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["stale-report"]);
-  expect(await freshnessTick(deps(T0 + 60 * MIN), "/home/test")).toEqual([]);
-  expect(await freshnessTick(deps(T0 + 65 * MIN), "/home/test")).toEqual([]);
-  expect(world.calls.filter((c) => c[0] === "notify")).toHaveLength(1);
-});
-
-test("a quiet remote lane with no [REPORT] line logs NO-REPORT once, not on every tick; a local lane never does", async () => {
-  const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
-  await deps(T0).registry.write({ ...working, machine: "m1", lastNudgeAt: T0 + MIN });
-  world.screen = "just thinking\n❯ ";
-  expect((await freshnessTick(deps(T0 + 21 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["no-report"]);
-  expect(await freshnessTick(deps(T0 + 26 * MIN), "/home/test")).toEqual([]);
-  expect(await freshnessTick(deps(T0 + 31 * MIN), "/home/test")).toEqual([]);
-  // A local lane reports with dori report or into the lead's pane: its own pane having none is expected.
-  await deps(T0).registry.write({ ...working, key: "local-lane", pane: "w:p8", lastNudgeAt: T0 + MIN });
-  expect((await freshnessTick(deps(T0 + 36 * MIN), "/home/test")).filter((a) => a.lane === "local-lane")).toEqual([]);
 });
 
 test("launch reports the runner's startup verdict for the lane's pane: STARTUP_OK, STARTUP_ERROR or STARTUP_UNCONFIRMED with its detail", async () => {

@@ -136,7 +136,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   const observedLanes = () => observeHost({ run, owned: ownedPanes });
   const observe = async () => {
     const lanes = await observedLanes();
-    const observed = lanes.map(({ status: _status, reportHash: _hash, ...lane }) => lane);
+    const observed = lanes.map(({ status: _status, ...lane }) => lane);
     // The lanes this runner started come first; the rest are lanes it only observes on its host.
     observedOnly = observed;
     // An owned lane waiting on an on-screen question goes out as one lane.asking per question.

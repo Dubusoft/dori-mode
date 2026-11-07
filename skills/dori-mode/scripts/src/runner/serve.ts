@@ -426,7 +426,7 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
 // ---------------------------------------------------------------------------------------------------------------
 
 /** One lane as a runner sees it on its host. */
-export type ObservedLane = InventoryLane & { readonly status: LaneStatus; readonly reportHash?: string };
+export type ObservedLane = InventoryLane & { readonly status: LaneStatus };
 
 /**
  * A lane's status from its herdr pane, by panes.ts `paneAlive`: no pane: `missing`; a pane whose agent is not alive:
@@ -469,7 +469,6 @@ export type ServeDeps = {
  */
 export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise<void> => {
   const published = new Map<string, string>();
-  const publishedReport = new Map<string, string>();
   // Per lane: the pane it is on, when that pane was first observed, and whether its agent was seen alive there since.
   const tracked = new Map<string, { pane: string; since: number; alive: boolean }>();
   const observeOnce = async (): Promise<void> => {
@@ -477,7 +476,7 @@ export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise
     try {
       const observed = await deps.observe();
       const keys = new Set(observed.map((lane) => lane.key));
-      for (const map of [published, publishedReport, tracked]) for (const key of [...map.keys()]) if (!keys.has(key)) map.delete(key);
+      for (const map of [published, tracked]) for (const key of [...map.keys()]) if (!keys.has(key)) map.delete(key);
       for (const lane of observed) {
         let track = tracked.get(lane.key);
         if (!track || track.pane !== lane.pane) tracked.set(lane.key, track = { pane: lane.pane, since: deps.clock.now(), alive: false });
@@ -488,10 +487,6 @@ export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise
         if (!starting && published.get(lane.key) !== seen) {
           published.set(lane.key, seen);
           deps.client.publish("lane.state", { key: lane.key, status: lane.status, pane: lane.pane });
-        }
-        if (lane.reportHash && publishedReport.get(lane.key) !== lane.reportHash) {
-          publishedReport.set(lane.key, lane.reportHash);
-          deps.client.publish("lane.progress", { key: lane.key, reportHash: lane.reportHash });
         }
       }
     } catch (error) {

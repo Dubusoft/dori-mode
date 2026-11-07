@@ -64,7 +64,7 @@ import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue } from "./event-sources.ts";
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
-import { type LaneReportStore, leadPaneViolationTick, openLaneReports, routeReports } from "./lane-reports.ts";
+import { type LaneReportStore, openLaneReports, routeReports } from "./lane-reports.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -552,7 +552,7 @@ export const supervisorSweeps = (
     }],
     ["watch", async (emit) => {
       const archived = deps.clock.now() - lastArchive >= ARCHIVE_SWEEP_MS;
-      await watchTick(deps, emit, view, archived);
+      await watchTick(deps, emit, archived);
       if (archived) lastArchive = deps.clock.now();
       return [];
     }],
@@ -583,7 +583,7 @@ export const supervisorSweeps = (
     ["dead-panes", async () => deadPaneTick(deps.ops, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now)],
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
-    ["freshness", async () => (await freshnessTick(deps, home, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
+    ["freshness", async () => (await freshnessTick(deps, view, laneReports())).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
     // Urgent LANE_DRIFT for a working lane overdue on milestones or failing CI head after head; reads the last GitHub poll only.
     ["drift", async (emit) => {
       await driftTick({
@@ -592,8 +592,6 @@ export const supervisorSweeps = (
       return [];
     }],
     ["memory", async () => memorySweep(deps, home)],
-    // Counts [REPORT] lines of `dori report` lanes found in the lead's pane; reads nothing while no such lane is open.
-    ["lead-pane", async (emit) => { await leadPaneViolationTick(deps, emit); return []; }],
     // Last, so a slow or unreachable worker machine never delays the pane reads of the sweeps before it. A machine
     // whose sample failed waits out its backoff instead of costing an ssh timeout every round.
     ["machine-guard", async (emit) => {

@@ -2,10 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { lastReportLine } from "../src/freshness.ts";
 import type { Proc } from "../src/lane-memory.ts";
 import type { Ran } from "../src/run.ts";
-import { briefLane, observeHost, valueHash } from "../src/runner/observe.ts";
+import { briefLane, observeHost } from "../src/runner/observe.ts";
 import { RunnerClient, yieldTurn } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { serveRunner, STARTUP_GRACE_MS, type ObservedLane } from "../src/runner/serve.ts";
@@ -44,7 +43,9 @@ const procs: Proc[] = [
   { pid: 300, ppid: 1, rssKb: 1, comm: "sh" },
 ];
 const ok = (out: string): Ran => ({ code: 0, out, err: "" } as Ran);
+const herdrCalls: string[][] = [];
 const herdrWith = (list: readonly object[]) => async (argv: readonly string[]): Promise<Ran> => {
+  herdrCalls.push([...argv]);
   const [, noun, verb, ...rest] = argv;
   if (noun === "pane" && verb === "list") return ok(JSON.stringify({ result: { panes: list } }));
   if (noun === "pane" && verb === "process-info") return ok(JSON.stringify({ result: { process_info: info[rest[1] as string] } }));
@@ -53,13 +54,14 @@ const herdrWith = (list: readonly object[]) => async (argv: readonly string[]): 
 };
 const fakeHerdr = herdrWith(panes);
 
-test("observeHost finds lanes by DORI_LANE_KEY without a registry and hashes the newest [REPORT] line", async () => {
+test("observeHost finds lanes by DORI_LANE_KEY without a registry and never reads a pane's screen for a report", async () => {
+  herdrCalls.length = 0;
   const observed = await observeHost({ run: fakeHerdr, procs: async () => procs });
   expect(observed).toEqual([
-    { key: "lane-a", pane: "p1", tab: "t1", status: "working", reportHash: valueHash(REPORT_A) },
-    { key: "lane-b", pane: "p2", tab: "t2", status: "idle", reportHash: valueHash(REPORT_B) },
+    { key: "lane-a", pane: "p1", tab: "t1", status: "working" },
+    { key: "lane-b", pane: "p2", tab: "t2", status: "idle" },
   ]);
-  expect(lastReportLine(screens.p2 as string, "lane-b")).toBe(REPORT_B);
+  expect(herdrCalls.filter((argv) => argv[1] === "pane" && argv[2] === "read")).toEqual([]);
 });
 
 const withInfo = (override: Record<string, object>) => async (argv: readonly string[]): Promise<Ran> => {
@@ -110,14 +112,14 @@ test("observeHost reports a lane whose agent_status is not alive as dead", async
   expect(observed.map((l) => [l.key, l.status])).toEqual([["lane-a", "dead"], ["lane-b", "idle"]]);
 });
 
-test("serveRunner publishes lane.state on a status change and lane.progress on a new report hash, once each", async () => {
+test("serveRunner publishes lane.state on a status change once, and no lane.progress", async () => {
   const dir = stateDir();
   const clock = fakeClock(1_000);
   const state = new RunnerState(dir, { now: clock.now });
   state.boot();
   const outbox = new Outbox(dir, { now: clock.now });
   const client = new RunnerClient({ label: "worker-a", hostId: "h" }, { connect: async () => { throw new Error("offline"); }, outbox, state, clock });
-  let view: ObservedLane[] = [{ key: "lane-a", pane: "p1", tab: "t1", status: "working", reportHash: "h1" }];
+  let view: ObservedLane[] = [{ key: "lane-a", pane: "p1", tab: "t1", status: "working" }];
   let observeTick: (() => void) | undefined;
   const abort = new AbortController();
   const serving = serveRunner({
@@ -128,15 +130,13 @@ test("serveRunner publishes lane.state on a status change and lane.progress on a
   await yieldTurn();
   observeTick?.();
   await yieldTurn();
-  view = [{ key: "lane-a", pane: "p1", tab: "t1", status: "working", reportHash: "h2" }];
+  view = [{ key: "lane-a", pane: "p1", tab: "t1", status: "working" }];
   observeTick?.();
   await yieldTurn();
   abort.abort();
   await serving;
   expect(outbox.unacked(0).map((r) => [r.type, r.body])).toEqual([
     ["lane.state", { key: "lane-a", status: "working", pane: "p1" }],
-    ["lane.progress", { key: "lane-a", reportHash: "h1" }],
-    ["lane.progress", { key: "lane-a", reportHash: "h2" }],
   ]);
   outbox.close();
   state.close();

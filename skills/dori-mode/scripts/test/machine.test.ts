@@ -281,28 +281,20 @@ test("claim and objection messages route to the remote lane's runner", async () 
   expect(opsOf("send")).toHaveLength(2);
 });
 
-test("after an objection a remote lane's stale done line is not re-claimed, and a new done line claims again", async () => {
+test("an objection tells a remote lane to read the reasons with its runner's dori, and never types them", async () => {
   const d = deps();
   await d.registry.write(lane());
-  world.screen = "[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
-  expect(await watchTick(d)).toEqual(["LANE_DONE_CLAIMED remote-lane w:p3 closed acme/app#3"]);
+  await claimDone(d, lane(), "closed acme/app#3");
   await objectDone(d, (await d.registry.read("remote-lane")) ?? lane(), ["changelog missing"]);
-  expect(await watchTick(d)).toEqual([]);
-  // The objection itself lands on the lane's screen; it must never read as a new claim.
   const objection = sent(world).at(-1) ?? "";
-  expect(objection).toStartWith("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons.");
-  expect(objection).not.toContain("changelog missing");
-  world.screen = `[REPORT] remote-lane | done | closed acme/app#3\n❯ ${objection}\n`;
-  expect(await watchTick(d)).toEqual([]);
-  world.screen = "[REPORT] remote-lane | done | closed acme/app#3, changelog added\n❯ ";
-  expect(await watchTick(d)).toEqual(["LANE_DONE_CLAIMED remote-lane w:p3 closed acme/app#3, changelog added"]);
+  expect(objection).toBe("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status remote-lane, keep working, and claim again when fixed");
   expectRemote();
 });
 
 test("freshness nudges a quiet remote lane through its runner without touching the local namesake", async () => {
   const d = deps();
   await d.registry.write(lane({ openedAt: new Date(T0 - 16 * 60_000).toISOString() }));
-  expect((await freshnessTick(d, "/home/test")).map((act) => act.kind)).toEqual(["nudged"]);
+  expect((await freshnessTick(d)).map((act) => act.kind)).toEqual(["nudged"]);
   expectRemote();
   expect(opsOf("send")[0]?.args).toMatchObject({ text: expect.stringContaining("~/.dori/runner/bin/dori report remote-lane"), opts: { refuseWhileAsking: true } });
 });
@@ -345,53 +337,17 @@ test("watch settles a remote claim using remote close and records skipped worktr
   expectRemote();
 });
 
-test("a remote lane's [REPORT] done becomes a claim in the same window; a question wakes the lead once; footer placeholders are ignored", async () => {
-  const d = deps();
-  await d.registry.write(lane());
-  world.screen = "- When done: print [REPORT] remote-lane | done | <merge SHA, closed issue, version> and stay idle.\n❯ ";
-  expect(await watchTick(d)).toEqual([]);
-  world.screen = "[REPORT] remote-lane | question | which base branch?\n❯ ";
-  expect(await watchTick(d)).toEqual(["LANE_REPORT remote-lane question which base branch?"]);
-  expect(await watchTick(d)).toEqual([]);
-  world.screen = "[REPORT] remote-lane | done | closed acme/app#3 by abc123\n❯ ";
-  expect(await watchTick(d)).toEqual(["LANE_DONE_CLAIMED remote-lane w:p3 closed acme/app#3 by abc123"]);
-  const claimed = await d.registry.read("remote-lane");
-  expect(claimed && statusOf(claimed)).toBe("done-claimed");
-  expect(sent(world).some((text) => text.startsWith("[LEAD] done claim recorded"))).toBe(true);
-  expect(await watchTick(d)).toEqual([]);
-  (d.clock as ReturnType<typeof fakeClock>).at += 5 * 60_000 + 1;
-  expect((await watchTick(d))[0]).toStartWith("LANE_CLOSED remote-lane");
-  expectRemote();
-});
-
-test("a remote lane on its runner (dori report) is never read from its screen", async () => {
-  const d = deps();
-  await d.registry.write(lane({ reportVia: "cli", runner: MACHINE }));
-  world.screen = "[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
-  expect(await watchTick(d)).toEqual([]);
-  expect(opsOf("screen")).toEqual([]);
-});
-
-test("two remote reports printed between two polls both arrive, in order", async () => {
-  const screen = "[REPORT] remote-lane | question | which base branch?\nworking...\n[REPORT] remote-lane | blocker | CI runner down\n❯ ";
-  const on = deps();
-  await on.registry.write(lane());
-  world.screen = screen;
-  expect(await watchTick(on)).toEqual(["LANE_REPORT remote-lane question which base branch?", "LANE_REPORT remote-lane blocker CI runner down"]);
-  // Each line once: the same screen again adds nothing; a new line after them is the only new report.
-  expect(await watchTick(on)).toEqual([]);
-  world.screen = `${screen}\n[REPORT] remote-lane | milestone | PR open\n[REPORT] remote-lane | question | merge now?\n❯ `;
-  expect(await watchTick(on)).toEqual(["LANE_REPORT remote-lane question merge now?"]);
-  const seen = (await on.registry.read("remote-lane"))?.remoteReportsSeen ?? [];
-  expect(seen).toHaveLength(4);
-  expect((await on.registry.read("remote-lane"))?.lastRemoteReport).toBe("[REPORT] remote-lane | question | merge now?");
-});
-
-test("a lane an older dori already read (newest line only) replays none of its earlier lines", async () => {
-  const d = deps();
-  await d.registry.write(lane({ lastRemoteReport: "[REPORT] remote-lane | blocker | CI runner down" }));
-  world.screen = "[REPORT] remote-lane | question | which base branch?\n[REPORT] remote-lane | blocker | CI runner down\n[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
-  expect(await watchTick(d)).toEqual(["LANE_DONE_CLAIMED remote-lane w:p3 closed acme/app#3"]);
+test("no remote lane is read from its screen for a report, whatever footer it was launched with", async () => {
+  for (const registered of [lane({ reportVia: "cli", runner: MACHINE }), lane()]) {
+    const d = deps();
+    await d.registry.write(registered);
+    world.screen = "[REPORT] remote-lane | question | which base branch?\n[REPORT] remote-lane | done | closed acme/app#3\n❯ ";
+    expect(await watchTick(d)).toEqual([]);
+    expect(opsOf("screen")).toEqual([]);
+    const after = await d.registry.read("remote-lane");
+    expect(after && statusOf(after)).toBe("working");
+    expect(after?.remoteReportsSeen).toBeUndefined();
+  }
 });
 
 test("remote session lookup cannot mistake a local matching PID for its session", async () => {

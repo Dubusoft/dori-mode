@@ -22,7 +22,7 @@ const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
   // A lane waiting on its agent's on-screen question instead of dori report (ask-user.ts).
   "LANE_ASKING",
-  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
+  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-PROGRESS",
   // An idle lane still silent idleEscalateMin after its freshness nudge (freshness.ts); the lane itself gets no more input.
   "IDLE-ESCALATE",
   // A working lane that drifted: milestones overdue or its PR failing CI again and again (drift.ts). No periodic summaries.
