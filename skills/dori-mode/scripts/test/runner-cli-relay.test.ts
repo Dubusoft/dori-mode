@@ -107,6 +107,19 @@ describe("CLI relay over an in-memory listener/connector", () => {
     expect(err.message).toContain("systemctl --user start dori-supervisor.service");
   });
 
+  test("a relay that closes after the request was sent is lost, not disconnected", async () => {
+    let closed: (() => void) | undefined;
+    const transport = {
+      send: () => { queueMicrotask(() => closed?.()); },
+      onLine: () => {}, onClose: (h: () => void) => { closed = h; }, close: () => {},
+      get open() { return true; },
+    } as unknown as Transport;
+    const client = cliRunnerCall("unused", { connect: async () => transport });
+    const err = await client.call("local", "lane.close", { key: "a", worktreeChecks: false }).catch((e) => e);
+    expect(err).toBeInstanceOf(RunnerUnavailable);
+    expect(err.why).toBe("lost");
+  });
+
   test("a relay that never answers times out on the injected timer", async () => {
     const net = memoryNetwork();
     const fired: (() => void)[] = [];

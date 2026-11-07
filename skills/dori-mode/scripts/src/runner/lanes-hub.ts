@@ -37,7 +37,10 @@ import { journalId, type AnyRunnerEvent, type InventoryLane } from "./protocol.t
  * `lane.recover` (a lane with no pane yet is skipped: it still waits for its queued `lane.start`); the owner's next
  * `lane.started` for it clears `recoveryPending` with its new pane (a `lane.started` is applied only for a lane with no pane yet, a `recoveryPending` lane, or the lane's current pane; any other is a stale replay and is ignored). The hello also
  * records the journal head as `recoveryAfter`: a start journaled at or before it predates the recovery and is ignored too;
- * a lane without `recoveryAfter` (an older registry entry) takes any start of its owner. A key in the inventory with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry
+ * a lane without `recoveryAfter` (an older registry entry) takes any start of its owner. A `lane.started` for a closed lane
+ * is never applied: one closed with no pane (a launch cancelled before its start landed) gets `lane.close` and one
+ * `LANE_STARTED_AFTER_CLOSE` line; one closed with its pane is a replay. A start for a reservation its launch stopped
+ * waiting for (`launchUnconfirmed`) releases it: `LAUNCH_CONFIRMED_LATE`. A key in the inventory with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry
  * entry (an open lane that no runner owns is left to adopt-legacy.ts);
  * a lane in both whose pane, tab or session differs takes the runner's values for those three only.
  *
@@ -54,6 +57,8 @@ export type LaneHubDeps = {
   readonly now: () => number;
   /** Sends a command to the runner; undefined when it is not connected. */
   readonly recover: (label: string, key: string) => number | undefined;
+  /** Sends `lane.close` for `key` to the runner under `cmdId`; undefined when it is not connected. */
+  readonly close?: (label: string, key: string, cmdId: string) => number | undefined;
   /** The runner journal's newest position (0 when empty); a recovery records it so older journaled starts stay stale. */
   readonly journalHead?: () => number;
   /** The lane message store a `lane.ack` is applied to; without it an ack is a failed event (retried from the journal). */
@@ -160,16 +165,28 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
   }
   if (frame.type === "lane.started") {
     const b = frame.body;
+    if (lane.closedAt) {
+      // A lane closed with a pane was started and its close took that pane: this is a replay. A lane closed with no pane
+      // was cancelled while its start was still out: that start landed late, and its agent is stopped, not recorded.
+      if (lane.pane) return;
+      const sent = deps.close?.(label, key, `late-start-close:${key}:${frame.seq}`);
+      deps.emit(`lane-started-after-close:${label}:${frame.seq}`, `LANE_STARTED_AFTER_CLOSE ${key} runner=${label} pane=${b.pane} started after the lane was closed; ${sent === undefined ? "the runner is not connected, so lane.close was not sent: the agent may still run in that pane" : "lane.close sent to stop it"}`);
+      return;
+    }
     // A replayed journal can hold an old start: only a first launch, an outstanding recovery or the current pane applies.
     const lr = lane as RecoveryLane;
     if (lr.pane && !lr.recoveryPending && lr.pane !== b.pane) return;
     // A start journaled before the hello that asked for the recovery is not the recovery's.
     if (lr.recoveryPending && position !== undefined && lr.recoveryAfter !== undefined && position <= lr.recoveryAfter) return;
     // A start or a recovery: either way the lane runs again, so a pending recovery (reconcileInventory) is over.
+    // A launch that gave up waiting (launchUnconfirmed) left its reservation paused: this start confirms it.
+    const late = Boolean(lane.launchReservation && lane.launchUnconfirmed);
     await patch(deps, key, {
       pane: b.pane, tab: b.tab, ...(b.session ? { session: b.session } : {}),
       recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined,
+      ...(late ? { status: undefined, launchReservation: undefined, launchUnconfirmed: undefined } : {}),
     });
+    if (late) deps.emit(`launch-confirmed-late:${label}:${frame.seq}`, `LAUNCH_CONFIRMED_LATE ${key} runner=${label} pane=${b.pane} the runner started the lane after its launch stopped waiting; the reservation is released and the lane is working`);
     return;
   }
   if (frame.type === "lane.state") {

@@ -184,6 +184,15 @@ test("a close runs through the lane's runner: inspect, then the recorded worktre
   expect(world.ops.find((e) => e.op === "close")?.args).toEqual({ opts: { cmdId: "op:demo-lane/pane-close/w:p1:1" } });
 });
 
+test("cancelling a runner lane whose start never reported a pane still sends lane.close for its key", async () => {
+  const reserved: Lane = { ...lane, key: "reserved-lane", pane: undefined, runner: "local", status: "paused", launchReservation: "tok" };
+  await at(T0).registry.write(reserved);
+  const r = await closeLane(at(T0), reserved, "cancelled", { cancelled: { reason: "launch timed out" } });
+  expect(r.closed).toBe(true);
+  expect(closedVia()).toEqual(["reserved-lane"]);
+  expect((await at(T0).registry.read("reserved-lane"))?.receipt).toMatchObject({ cleanup: expect.arrayContaining(["runner lane reserved-lane closed none"]) });
+});
+
 test("with the lane's runner down a close is refused RUNNER_UNAVAILABLE and the lane stays open, its worktree and pane untouched", async () => {
   livePane();
   world.runnerDown = true;

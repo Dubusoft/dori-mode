@@ -977,6 +977,7 @@ export const supervise = async (
           registry: deps.registry, reports: () => reports, now: deps.clock.now,
           emit: (id, line) => { enqueueSweep(id, line); },
           recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+          close: (label, key, cmdId) => runnerHub?.accept.command(label, "lane.close", { cmdId, key, worktreeChecks: false }),
           journalHead: () => runnerJournalHead(deps.config.stateDir),
           // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
           messages: () => (laneMessages ??= openLaneMessages(deps.config)),

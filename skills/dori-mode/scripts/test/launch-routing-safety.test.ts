@@ -4,7 +4,8 @@ import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src/launch.ts";
-import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
+import { type LaneOps, LaneOpsError, laneOps } from "../src/lane-ops.ts";
+import { type RunnerCall, RunnerUnavailable } from "../src/runner/call.ts";
 import type { Lane } from "../src/registry.ts";
 import {
   clearLaunchHold, dequeueLaunch, enqueueLaunch, launchGate, launchHeld, launchQueue, launchQueueText,
@@ -209,6 +210,18 @@ test("a registration failure after the runner started the agent keeps its paused
     // The reservation is not released: the runner owns a live agent for this key, and its lane.started fills the pane in.
     expect(await d.registry.read("visible-lane")).toMatchObject({ status: "paused", runner: "local", launchReservation: expect.any(String) });
   } finally { spy.mockRestore(); }
+});
+
+test("a lane.start whose relay closed after sending keeps its reservation, marked unconfirmed", async () => {
+  const base = deps();
+  const lost: RunnerCall = {
+    connected: () => true,
+    call: async () => { throw new RunnerUnavailable("local", "lost", "relay connection closed after call was sent; it may have reached the runner"); },
+    query: async () => { throw new Error("no query expected"); },
+  };
+  const d = { ...base, ops: { ...base.ops, start: laneOps(lost, { now: () => T0 }).start } };
+  await expect(launchLane(d, input("lost-lane", { cwd: "/scratch" }))).rejects.toThrow("the start may have happened");
+  expect(await d.registry.read("lost-lane")).toMatchObject({ status: "paused", launchReservation: expect.any(String), launchUnconfirmed: true });
 });
 
 // The CLI paths that need no host or network

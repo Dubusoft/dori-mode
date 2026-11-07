@@ -8,8 +8,11 @@ import type { RunnerAccept } from "./serve.ts";
  * timeouts and id shapes; the `RunnerCalls` implementation over the hub lives next to them.
  */
 
-/** `outdated`: the label's hello proto is below what the command or query needs (`NEEDS_PROTO`). */
-export type CallWhy = "disconnected" | "timeout" | "outdated";
+/**
+ * `outdated`: the label's hello proto is below what the command or query needs (`NEEDS_PROTO`). `lost`: the CLI relay
+ * closed after the request was sent, so the command may have reached the runner.
+ */
+export type CallWhy = "disconnected" | "timeout" | "outdated" | "lost";
 
 export class RunnerUnavailable extends Error {
   readonly code = "RUNNER_UNAVAILABLE";

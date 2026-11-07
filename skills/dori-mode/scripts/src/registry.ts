@@ -58,6 +58,8 @@ export type Lane = {
   readonly recoveryAfter?: number;
   /** An admission reservation is paused until its agent is registered, so recovery never launches it too. */
   readonly launchReservation?: string;
+  /** The launch stopped waiting for the runner's answer (a timeout); the runner's lane.started confirms the reservation. */
+  readonly launchUnconfirmed?: boolean;
   readonly worktrees?: readonly string[];
   readonly status?: LaneStatus;
   readonly claim?: Claim;
