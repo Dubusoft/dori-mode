@@ -544,8 +544,8 @@ and losing a runner never hands the lane back to the supervisor.
 
 **Launch.** `dori launch` registers the lane at once with `runner: <label>` and appends the runner footer to the
 brief. It then queues `lane.start` for the supervisor (`runner_admin` in `runners.sqlite`), which sends it once the
-runner is connected; a request waits at most 2 minutes. A runner launch needs `--cwd` and takes no `--pane`,
-`--workspace` or `--toodo-start`. On the worker, the runner:
+runner is connected; a request waits at most 2 minutes. A runner launch needs `--cwd` and takes no `--pane` or
+`--workspace`. On the worker, the runner:
 
 - checks the command against `runner-config.json` (the `cwd` must be under `allowedRoots`);
 - opens a herdr tab labelled with the key, writes the brief to `~/.dori/runner/briefs/<key>.md` and issues the lane a

@@ -365,7 +365,7 @@ const closeSequence = async (
   const pending = store.list({ lane: lane.key }).filter((op) => op.action === "worktree-remove" && op.state !== "verified").map((op) => op.target);
   const present = read.worktrees.filter((wt) => wt.exists);
   const worktrees = [...new Set([...present.map((wt) => wt.path), ...pending])];
-  // A lane worktree removed before the close (Toodo removes a finished task's worktree) is already cleaned, never a refusal.
+  // A lane worktree removed before the close (removed by hand or by another tool) is already cleaned, never a refusal.
   const gone = lane.machine ? [] : [...new Set([...(read.cwdGone && lane.cwd ? [lane.cwd] : []), ...read.worktrees.filter((wt) => !wt.exists).map((wt) => wt.path)])].filter((wt) => !pending.includes(wt));
   cleanup.push(...gone.map((wt) => `worktree ${wt} already removed`));
   // Bound before any worktree goes: a worktree whose branch moved past the merged head stays with its branch.

@@ -15,7 +15,6 @@ import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
-import type { ToodoStart } from "./toodo-start.ts";
 
 // The startup check and the pane-shell reader run inside the runner's lane.start now; re-exported for their callers.
 export { paneShell, type PaneShell, screenLines, startupFailure, STARTUP_POLL_MS, STARTUP_POLLS, STARTUP_READY_READS } from "./runner/lane-control.ts";
@@ -42,8 +41,6 @@ export type LaunchInput = {
   /** Run the lane in this workspace's idle shell pane (the only one without an agent). */
   readonly workspace?: string;
   readonly machine?: string;
-  /** A Toodo start_task response: run in its first shell pane, found again through its herdr workspace, else a new tab. */
-  readonly toodo?: ToodoStart;
   /** Allow a second open lane on the same messenger thread (`--share-thread`); the lanes are recorded in `threadSharedWith`. */
   readonly shareThread?: boolean;
   /** Allow a cwd whose git remotes name none of the Done line's repos (`--allow-repo-mismatch`). */
@@ -326,28 +323,6 @@ const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<Ta
 };
 
 /**
- * Where a Toodo task's lane runs: the first shell pane start_task listed, else the one shell pane of the task's herdr
- * workspace (a listed id goes stale when herdr restarts), else a new tab, with the reason in a LAUNCH_FALLBACK line.
- */
-const toodoTarget = async (deps: FlowDeps, input: LaunchInput, start: ToodoStart): Promise<{ readonly target?: TargetPane; readonly notes: readonly string[] }> => {
-  const attempts = [
-    ...start.shellPanes.slice(0, 1).map((pane) => ({ pane, workspace: undefined })),
-    ...(start.herdrWorkspaceId ? [{ pane: undefined, workspace: start.herdrWorkspaceId }] : []),
-  ];
-  const failed: string[] = start.shellPanes.length ? [] : [`start_task listed no shell pane (${start.paneError ?? "panes is empty"})`];
-  for (const at of attempts) {
-    try {
-      const target = await resolveTargetPane(deps, { ...input, ...at });
-      return { target, notes: failed.length ? [`LAUNCH_PANE_REFOUND ${input.key} pane=${target.pane}: ${failed.join("; ")}`] : [] };
-    } catch (error) {
-      if (!(error instanceof LaunchError)) throw error;
-      failed.push(error.message);
-    }
-  }
-  return { notes: [`LAUNCH_FALLBACK ${input.key} new tab: ${failed.join("; ")}`] };
-};
-
-/**
  * The herdr workspace a local lane's new tab opens in: the supervisor-managed lanes workspace, found again or created and
  * recorded when herdr lost it. A launch never falls back to herdr's focused workspace, so a herdr failure refuses it.
  */
@@ -394,9 +369,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const sandbox = choice.on;
   if (sandbox && !deps.config.laneSandbox) throw new LaunchError("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
   if (sandbox && input.machine) throw new LaunchError(`--sandbox wraps local lanes only; machine ${input.machine} cannot run it, drop --sandbox`);
-  const placed = input.toodo && !input.pane && !input.workspace ? await toodoTarget(deps, input, input.toodo) : undefined;
-  const target = placed ? placed.target : input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
-  const notes = [...(placed?.notes ?? []), ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
+  const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
+  const notes = [...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
   const dir = input.cwd ?? target?.cwd;
   // The runner starts every lane in a directory on its own host; the lead's defaultCwd means nothing on another machine.
