@@ -1,13 +1,54 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { listPanes } from "../panes.ts";
 import type { Runner } from "../run.ts";
 import { GUARD_SAMPLE_MS } from "./guard.ts";
 import type { HerdrHealth, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
 
+export type WinHerdrOptions = { platform?: string; user?: string };
+
+export const WIN_HERDR_SCRIPT = [
+  "Get-CimInstance Win32_Process -Filter \"Name='herdr.exe'\" | ForEach-Object {",
+  "$o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner;",
+  "[pscustomobject]@{ ProcessId = $_.ProcessId; CommandLine = $_.CommandLine; CreationDate = $_.CreationDate.ToString('o'); Owner = $o.User; Domain = $o.Domain }",
+  "} | ConvertTo-Json -Compress",
+].join(" ");
+
+/**
+ * The current user's `herdr server` processes on Windows as `<pid>@<CreationDate>`, or undefined when the CIM query
+ * failed or its output could not be read.
+ */
+export const winHerdrServers = async (run: Runner, user: string = userInfo().username): Promise<string[] | undefined> => {
+  const r = await run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WIN_HERDR_SCRIPT]);
+  if (r.code !== 0) return undefined;
+  const text = r.out.trim();
+  if (!text) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return undefined; }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const me = user.toLowerCase();
+  const ids: string[] = [];
+  for (const row of rows) {
+    if (typeof row !== "object" || row === null) return undefined;
+    const v = row as Record<string, unknown>;
+    if (!Number.isSafeInteger(v.ProcessId) || typeof v.CreationDate !== "string") return undefined;
+    if (typeof v.CommandLine !== "string" || !/\bserver\b/.test(v.CommandLine)) continue;
+    const owner = typeof v.Owner === "string" ? v.Owner.toLowerCase() : "";
+    const domain = typeof v.Domain === "string" ? v.Domain.toLowerCase() : "";
+    if (owner !== me && `${domain}\\${owner}` !== me) continue;
+    ids.push(`${v.ProcessId}@${v.CreationDate}`);
+  }
+  return ids.sort();
+};
+
 /** Process inspection failure is treated as possibly running: it must never authorize a start. */
-export const herdrProcess = async (run: Runner): Promise<{ running: boolean; instance?: string }> => {
+export const herdrProcess = async (run: Runner, opts: WinHerdrOptions = {}): Promise<{ running: boolean; instance?: string }> => {
+  if ((opts.platform ?? process.platform) === "win32") {
+    const ids = await winHerdrServers(run, opts.user);
+    if (!ids) return { running: true };
+    return ids.length ? { running: true, instance: ids.join(";") } : { running: false };
+  }
   const pids = await run(["pgrep", "-u", String(process.getuid?.() ?? 0), "-f", "(^|/)herdr server($| )"]);
   if (pids.code === 1) return { running: false };
   if (pids.code !== 0 || !pids.out.trim()) return { running: true };

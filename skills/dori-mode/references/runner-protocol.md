@@ -273,9 +273,18 @@ There's no peer credential check on the socket. Bun's unix sockets don't expose 
 The 0700 `sock/` directory keeps other users out, and the signed handshake keeps another process of the same user
 from posing as the supervisor or the runner.
 
+On Windows the runner dir is `%USERPROFILE%\.dori\runner` and the same walk checks DACLs instead of modes. Each
+entry's owner must be the runner user's SID. Allow ACEs may name only that user, SYSTEM, Administrators, and
+CREATOR OWNER when it's inherit-only; anything else gives `RUNNER_DIR_UNSAFE <path> acl allow=<sid>`. A wrong owner
+gives `owner owner=<sid>`. The runner dir itself must be protected (inheritance off), or it fails with
+`acl dacl=unprotected`, and a missing or null DACL fails too. Reparse points count as symlinks (junctions included),
+except an AF_UNIX socket directly under `sock\`. UNC paths fail as `remote unc` before anything is read. There's no
+chmod and the database lock-down is skipped. Socket paths over 107 UTF-8 bytes fail with
+`RUNNER_SOCKET_PATH_TOO_LONG`. Mapped network drives aren't detected yet.
+
 ## Remote install
 
-`dori runner install --machine <label>` puts a runner on a Linux or macOS worker. The machine is looked up like the guard's
+`dori runner install --machine <label>` puts a runner on a Linux, macOS or Windows worker (Windows is covered at the end of this section). The machine is looked up like the guard's
 machines (herdr's saved machines plus `guardMachines`), and `runners.listen` must be set; otherwise it stops with
 `RUNNER_INSTALL_NO_LISTEN`. The supervisor issues the enrollment code in its own process and runs
 `ssh <target> sh -s`. That command line never changes: everything else goes on ssh's stdin as one sh script.
@@ -329,6 +338,61 @@ It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's
 `RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_NO_HERDR` (no `herdr` on the
 login PATH), `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd, linger or launchd step
 named when that failed).
+
+
+### Windows workers
+
+The install first asks the machine what it is. A PowerShell host, or Git Bash/MSYS/Cygwin (`uname -s` gives
+`MINGW*`, `MSYS*` or `CYGWIN*`), counts as Windows; a POSIX script that hits one of those exits 8 and the Windows path
+runs instead. A machine with no usable shell fails as unsupported before any enrollment code is issued.
+
+Prerequisites:
+
+- Windows 10 1809 or Server 2019 (build 17763) or later, x64. Otherwise the script exits 4. ARM64 isn't supported.
+- OpenSSH server, reachable the same way as for the guard.
+- `herdr` on the PATH (exit 7). The install can't read its version, so the note says `herdr=unknown`.
+- The runner runs as a scheduled task at logon, so the user has to be logged on. An always-on worker needs
+  auto-logon.
+
+The bootstrap goes over ssh as `powershell -EncodedCommand` and the script comes on stdin; the enrollment code
+and fingerprint reach `runner serve --enroll-only` through stdin, never an argv. It then:
+
+1. Locks `%USERPROFILE%\.dori\runner` with `icacls` (inheritance removed, full control for the user, SYSTEM and
+   Administrators, owner set to the user) and creates `bin`, `bun`, `logs` and `evidence`.
+2. Installs a pinned Bun (1.4.4) into `bun\<version>\bun.exe`, checked by SHA-256, trying the x64 build first and
+   the baseline build second. `bin\bun.txt` names the one in use. If neither runs, it exits 3.
+3. Writes `dori.js` (hash checked), the shims, `runner-task.ps1`, `runner-sample.ps1`, `uninstall.ps1` and the task
+   XML, stops a running runner and moves the files into place, retrying while files are locked.
+4. Writes a starter `runner-config.json` (roots `%USERPROFILE%` and `%TEMP%`) only if none exists, and enrolls unless
+   `keys\supervisor.pub` exists (failure exits 5).
+5. Registers and starts the Task Scheduler task `\dori\dori-runner` (failure exits 6): at logon, interactive token,
+   least privilege, runs on battery, restarts every minute on failure. Its action runs `runner-task.ps1`, which loops
+   `bun dori.js runner serve`, logs to `logs\runner.log` (rotated at 10 MB between starts) and restarts after 5 s.
+
+Shims in `bin\`, all finding Bun through `bun.txt` next to them:
+
+| Shell | Shim |
+| --- | --- |
+| PowerShell (pwsh or 5.1) | `dori.ps1` |
+| cmd.exe | `dori.cmd` |
+| Git Bash / MSYS | `dori` (sh, turns off MSYS path conversion) |
+
+The supervisor drives the task with PowerShell: restart stops the task, kills the tree and starts it; stop disables
+the task first so the wrapper can't bring Bun back. `uninstall.ps1` removes the task and the install, and
+`-Purge` removes the whole runner dir.
+
+On Windows the runner:
+
+- stops processes with `taskkill /T` (graceful) and `taskkill /T /F`, so a stop is in practice a hard kill;
+- keeps the machine awake with `SetThreadExecutionState`;
+- samples memory, swap, disk, load and processes through `runner-sample.ps1`, and attributes processes to lanes from
+  the lane shell pid recorded at launch (adopted lanes aren't attributed);
+- types lane launch lines as `-EncodedCommand` into pwsh or PowerShell 5.1 panes. `cmd.exe` panes are refused. On 5.1,
+  an argv with a double quote is refused with `RUNNER_LANE_ARGV_UNSAFE`;
+- only watches herdr (through CIM); it never installs or starts a herdr service.
+
+WSL and UNC runner dirs aren't supported. A Windows machine without a runner keeps working the old way: the
+PowerShell guard agent (`guard-agent.ps1`) and lane reports.
 
 ## Guard
 

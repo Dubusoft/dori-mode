@@ -526,7 +526,7 @@ const resolveKinds = (raw: unknown): readonly string[] => {
 
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
-export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
+export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") || path.startsWith("~\\") ? join(home, path.slice(2)) : path);
 
 /** An object's string-valued entries; anything else is no entries. */
 const stringRecord = (v: unknown): Record<string, string> =>

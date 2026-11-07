@@ -13,7 +13,7 @@ import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./do
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
-import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
+import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, type MachineKind, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, validateLaunch } from "./launch.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
@@ -360,12 +360,18 @@ if (process.argv[2] === "runner") {
     const label = labelArg(target);
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
-    const { readGuardMachines, sshArgv } = await import("./remote-guard.ts");
+    const { machineKind, readGuardMachines, sshArgv } = await import("./remote-guard.ts");
     const { openLaneReports } = await import("./lane-reports.ts");
     const { evacuate } = await import("./runner/evacuate.ts");
     const machine = (await readGuardMachines(run, cfg.guardMachines)).machines.find((m) => m.label === label);
     if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     const sshTarget = (machine as NonNullable<typeof machine>).target;
+    // The worker's commands take the form of its kind (POSIX sh or Windows PowerShell); found once, on first use.
+    let kind: Promise<MachineKind> | undefined;
+    const kindOf = (): Promise<MachineKind> => (kind ??= machineKind(run, machine as NonNullable<typeof machine>).then((k) => {
+      if (!k.ok) throw new Error(`machine kind: ${k.detail}`);
+      return k.kind;
+    }));
     const store = openLaneReports(cfg);
     // The notice goes through the runner being evacuated (D9), so it is sent before the runner is stopped.
     const ops = laneOps(cliRunnerCall(cliSocketPath(defaultRunnerDir())), { now: realClock.now, log: (line) => { console.error(line); } });
@@ -373,13 +379,13 @@ if (process.argv[2] === "runner") {
       const lines = await evacuate({
         hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined },
         exportOutbox: async () => {
-          const r = await run(sshArgv(sshTarget, remoteRunnerCli("runner export-outbox")), { timeoutMs: 30_000 });
+          const r = await run(sshArgv(sshTarget, remoteRunnerCli("runner export-outbox", await kindOf())), { timeoutMs: 30_000 });
           if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);
           return JSON.parse(r.out.trim().split("\n").at(-1) ?? "[]");
         },
         tellLane: async (lane, text) => (await ops.send(lane, text)) !== "failed",
         stopRunner: async () => {
-          const r = await run(sshArgv(sshTarget, remoteRunnerService("stop")), { timeoutMs: 30_000 });
+          const r = await run(sshArgv(sshTarget, remoteRunnerService("stop", await kindOf())), { timeoutMs: 30_000 });
           return { ok: r.code === 0, detail: (r.err || r.out).trim().split("\n").at(-1) || `exit ${r.code}` };
         },
       }, label);

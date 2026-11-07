@@ -147,7 +147,7 @@ test("a cmd.exe pane is refused before anything runs or registers", async () => 
 test("pane shell detection reads the shell process, then a Windows drive cwd", () => {
   const info = (name: string) => ({ shell_pid: 1, foreground_processes: [{ pid: 1, name }] });
   expect(paneShell(info("powershell.exe"))).toBe("powershell");
-  expect(paneShell(info("pwsh"))).toBe("powershell");
+  expect(paneShell(info("pwsh"))).toBe("pwsh");
   expect(paneShell(info("CMD.EXE"))).toBe("cmd");
   expect(paneShell(info("-zsh"))).toBe("posix");
   expect(paneShell(undefined, "D:\\dev")).toBe("powershell");

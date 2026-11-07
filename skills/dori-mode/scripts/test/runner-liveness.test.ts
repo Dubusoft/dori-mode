@@ -105,7 +105,7 @@ test("the local runner is restarted through the supervisor's child, never a syst
   const argv: string[][] = [];
   const run: Runner = async (a) => { argv.push([...a]); return { code: 0, out: "", err: "" }; };
   let childRestarts = 0;
-  const io = livenessIo(run, "local", async () => [{ label: "worker-a", target: "u@a" } as never], async () => { childRestarts += 1; });
+  const io = livenessIo(run, "local", async () => [{ label: "worker-a", target: "u@a" } as never], async () => { childRestarts += 1; }, async () => ({ ok: true, kind: "posix" }));
   expect(await io.restart("local")).toEqual({ ok: true, detail: "child restart" });
   expect(childRestarts).toBe(1);
   expect(argv).toEqual([]);

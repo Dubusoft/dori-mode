@@ -10,7 +10,7 @@ import { localPolicy } from "./local-policy.ts";
 import { queryDispatcher } from "./queries.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
-import { diskGuardPath, sampleHost } from "../host-guard.ts";
+import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSource } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
 import { parseArgs } from "node:util";
@@ -20,12 +20,12 @@ import { runnerVersion } from "./version.ts";
 import { enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
-import { holdAwake, spawnQuiet } from "./awake.ts";
+import { selectPlatform } from "./platform.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
 import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./fs-safety.ts";
-import { pidAlive, probe, probeHerdr, startHealth } from "./health.ts";
+import { probe, probeHerdr, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
 import { Outbox, OUTBOX_MAINTENANCE_MS, outboxMaintenance } from "./outbox.ts";
 import { DEFAULT_POLICY, loadPolicy, POLICY_FILE } from "./policy.ts";
@@ -133,7 +133,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     }
     return owned;
   };
-  const observedLanes = () => observeHost({ run, owned: ownedPanes });
+  const observedLanes = () => observeHost({ run, owned: ownedPanes, ...(winSample ? { procs: hostProcs } : {}) });
   const observe = async () => {
     const lanes = await observedLanes();
     const observed = lanes.map(({ status: _status, ...lane }) => lane);
@@ -145,21 +145,29 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   };
   const version = await runnerVersion(run, import.meta.dir);
   const log = (line: string): void => { console.log(line); };
+  const platform = selectPlatform(process.platform, { log });
+  const dataPath = remote ? homedir() : diskGuardPath(cfg);
+  // On Windows one sampler run per guard tick feeds the host sample and the process table; lanes are seeded on the
+  // shell pids their records carry.
+  const winSample = platform.os === "win32" ? winSampleSource(() => readWinSample(run, runnerSampleArgv(runnerDir, dataPath)), realClock.now) : undefined;
+  const laneShells = (): Map<number, string> =>
+    new Map(Object.values(runnerLanes.records()).flatMap((r) => (r.shellPid ? [[r.shellPid, r.key] as const] : [])));
+  const hostProcs = winSample ? () => sampleProcs(run, undefined, false, { sample: winSample.procs, seeds: laneShells }) : () => sampleProcs(run);
   const tracked = trackedConnector(connector);
   let client: RunnerClient | undefined;
   const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => { client?.publish(type, body); };
   // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
-  const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote });
+  const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}) });
   // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
   // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
   const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir) });
   const paneCount = () => herdr.sample();
-  const dataPath = remote ? homedir() : diskGuardPath(cfg);
   const guard = new RunnerGuard({
     herdr: () => herdr.snapshot(),
-    sample: () => sampleHost(run, dataPath, paneCount), thresholds: { ...cfg.guard, ...policy.guard }, heavyKill: policy.heavyKill ?? cfg.heavyKill,
-    procs: () => sampleProcs(run), self: process.pid, now: realClock.now, os: process.platform,
-    kill: { clock: realClock, alive: pidAlive, signal: (pid, sig) => { process.kill(pid, sig); } },
+    sample: winSample ? () => sampleHost(run, dataPath, paneCount, undefined, "win32", winSample.host) : () => sampleHost(run, dataPath, paneCount),
+    thresholds: { ...cfg.guard, ...policy.guard }, heavyKill: policy.heavyKill ?? cfg.heavyKill,
+    procs: hostProcs, self: process.pid, now: realClock.now, os: process.platform,
+    kill: { clock: realClock, alive: platform.pidAlive, signal: platform.signal },
     publish: (type, body) => { client?.publish(type, body); },
   });
   const dispatch = commandDispatcher({
@@ -167,7 +175,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     publish: (body) => { client?.publish("cmd.result", body); },
     effects: runnerEffects({
       lanes: runnerLanes, guard, run,
-      herdr: hostHerdr({ run, runnerDir, now: realClock.now, sleep: realClock.sleep, signal: (pid, sig) => { process.kill(pid, sig); } }),
+      herdr: hostHerdr({ run, runnerDir, now: realClock.now, sleep: realClock.sleep, signal: platform.signal }),
     }),
   });
   // Read-only q.* control frames: answered on this host, never queued or recorded.
@@ -199,7 +207,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   process.on("SIGINT", () => controller.abort());
   process.on("SIGTERM", () => controller.abort());
   console.log(`RUNNER_SERVE label=${identity.label} gen=${gen} mode=owner endpoint=${endpoint}`);
-  const stopAwake = holdAwake({ os: process.platform, pid: process.pid, spawn: spawnQuiet, log });
+  const stopAwake = platform.holdAwake({ pid: process.pid, log });
   const stopHealth = startHealth({ runnerDir, pid: process.pid, gen, now: realClock.now, monotonic: () => Math.round(performance.now()), every: realEvery, log });
   let guarding = false;
   const guardTick = (): void => {

@@ -26,6 +26,7 @@ const fakeRun = (result: Partial<Ran> = {}) => {
   };
   return { run, calls };
 };
+const posixKind = async () => ({ ok: true as const, kind: "posix" as const });
 const request = (issued: { count: number }) => ({
   machine, label: "worker-a", connectUrl: "ws://100.101.1.2:7411", agentCommand: AGENT,
   issue: () => { issued.count += 1; return { code: CODE, fingerprint: FINGERPRINT }; },
@@ -34,7 +35,7 @@ const request = (issued: { count: number }) => ({
 test("the enrollment code and fingerprint go only on stdin, never in an argv element", async () => {
   const { run, calls } = fakeRun();
   const issued = { count: 0 };
-  const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT }, request(issued));
+  const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, request(issued));
   expect(result).toEqual({ ok: true, version: bundleVersion(BUNDLE) });
   expect(calls).toHaveLength(1);
   const call = calls[0] as Call;
@@ -65,7 +66,7 @@ test("each script exit maps to its result code", async () => {
   ];
   for (const [ran, code] of cases) {
     const { run } = fakeRun(ran);
-    const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT }, request({ count: 0 }));
+    const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, request({ count: 0 }));
     expect(result.ok ? "ok" : result.code).toBe(code);
   }
 });
@@ -73,7 +74,7 @@ test("each script exit maps to its result code", async () => {
 test("bad inputs are refused before a code is issued or ssh runs", async () => {
   const { run, calls } = fakeRun();
   const issued = { count: 0 };
-  const bad = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT }, { ...request(issued), connectUrl: "ws://h:1; rm -rf ~" });
+  const bad = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, { ...request(issued), connectUrl: "ws://h:1; rm -rf ~" });
   expect(bad.ok).toBe(false);
   expect(calls).toHaveLength(0);
   expect(issued.count).toBe(0);
@@ -465,7 +466,7 @@ test("on Darwin a reinstall or upgrade with the herdr agent loaded only rewrites
 
 test("the script's DORI_HERDR line is the install result's herdr, named on the RUNNER_INSTALLED line", async () => {
   const { run } = fakeRun({ out: "enrolled\nDORI_HERDR unmanaged\n" });
-  const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT }, request({ count: 0 }));
+  const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, request({ count: 0 }));
   expect(result).toEqual({ ok: true, version: bundleVersion(BUNDLE), herdr: "unmanaged" });
   expect(herdrInstallNote("unmanaged")).toBe("herdr=unmanaged (running, not from its unit; the unit takes over when it stops)");
   expect(herdrInstallNote(undefined)).toBe("herdr=unknown");

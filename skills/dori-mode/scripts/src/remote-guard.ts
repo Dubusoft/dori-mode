@@ -173,7 +173,10 @@ export type MachineKind = "posix" | "windows";
 const machineKinds = new Map<string, MachineKind>();
 
 /** Forgets every machine's resolved kind. */
-export const clearShellModes = (): void => machineKinds.clear();
+export const clearShellModes = (): void => {
+  machineKinds.clear();
+  runnerKinds.clear();
+};
 
 /** The ssh command (and its stdin) for one kind of machine. */
 type KindCommand = (kind: MachineKind) => { readonly command: string; readonly stdin?: string };
@@ -196,6 +199,32 @@ const resolveKind = async (run: Runner, target: string, timeoutMs: number): Prom
     why ||= stderrLine(r.err);
   }
   return { ok: false, unsupported: true, detail: `${NO_SHELL}: ${why || "no probe output"}` };
+};
+
+/** A machine's kind, or why it could not be found. */
+export type KindResult = { readonly ok: true; readonly kind: MachineKind } | ShellFailure;
+const runnerKinds = new Map<string, MachineKind>();
+const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
+
+/**
+ * The kind of commands `m`'s runner takes: the cached or probed kind, except that a POSIX shell on Windows (Git Bash,
+ * MSYS or Cygwin as the ssh shell, whose `uname -s` says so) counts as `windows`, since that runner is installed and
+ * controlled through PowerShell. Cached per target; `clearShellModes` forgets it.
+ */
+export const machineKind = async (run: Runner, m: GuardMachine, timeoutMs: number = SAMPLE_TIMEOUT_MS): Promise<KindResult> => {
+  const known = runnerKinds.get(m.target);
+  if (known) return { ok: true, kind: known };
+  const cached = machineKinds.get(m.target);
+  const k = cached ? { ok: true as const, kind: cached } : await resolveKind(run, m.target, timeoutMs);
+  if (!k.ok) return k;
+  let kind = k.kind;
+  if (kind === "posix") {
+    const r = await runIn(run, m.target, { command: "uname -s" }, timeoutMs);
+    if (unreachable(r)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(r)}` };
+    if (r.code === 0 && WINDOWS_UNAME.test(r.out.trim())) kind = "windows";
+  }
+  runnerKinds.set(m.target, kind);
+  return { ok: true, kind };
 };
 
 /** A result showing the cached kind is wrong: cmd's/PowerShell's unknown-command error under posix; exit 127 or an unknown command other than the agent under windows. */

@@ -7,7 +7,7 @@ import { ASK_SCREEN_LINES, askingLine, screenQuestion, type ScreenQuestion } fro
 import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import { cmdRefused, inspectCreated, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
+import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
@@ -59,6 +59,8 @@ export type LaneRecord = {
   readonly startedAt: number;
   readonly herdrInstance?: string;
   readonly terminalId?: string;
+  /** The pid of the pane's shell (herdr process-info `shell_pid`) at launch; seeds the memory sampler's lane attribution. Absent when herdr did not report it. */
+  readonly shellPid?: number;
   /** The on-screen question last published as `lane.asking` (see `questionKey`), absent when none is showing. */
   readonly lastAsk?: string;
   /** Opening keywords of the start (absent: the mode's default), reused by a relaunch. */
@@ -100,6 +102,26 @@ const hash = (token: string): string => createHash("sha256").update(token).diges
 const questionKey = (q: ScreenQuestion): string =>
   createHash("sha256").update(JSON.stringify(q.tabs && q.tabs.length > 1 ? [q.tabs] : [q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
 const quote = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);
+const psQuote = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+
+/**
+ * The line typed into a PowerShell pane: a nested `<shell> -NoLogo -EncodedCommand <base64(utf16le(script))>`, so the
+ * variables live only in the nested process and the typed text is plain base64. Windows PowerShell 5.1 mangles native
+ * arguments containing a double quote, so it is refused there (`RUNNER_LANE_ARGV_UNSAFE`); pwsh passes them intact.
+ */
+export const powershellLaunchLine = (shell: "pwsh" | "powershell", env: readonly (readonly [string, string])[], argv: readonly string[]): string => {
+  if (shell === "powershell" && argv.some((arg) => arg.includes('"'))) {
+    throw new Error("RUNNER_LANE_ARGV_UNSAFE Windows PowerShell 5.1 cannot pass an argument containing a double quote; use pwsh");
+  }
+  const [program, ...args] = argv;
+  const script = [
+    ...env.map(([name, value]) => `$env:${name}=${psQuote(value)}`),
+    "$env:PSExecutionPolicyPreference='Bypass'",
+    `& ${[program ?? "", ...args].map(psQuote).join(" ")}`,
+    "exit $LASTEXITCODE",
+  ].join("; ");
+  return `${shell} -NoLogo -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+};
 
 /** The old lane `.omo/mcp.json` (figma disabled) that launch.ts used to write; the same bytes as `LEGACY_LANE_MCP` there. */
 export const LEGACY_LANE_MCP = `${JSON.stringify({ mcpServers: { figma: { enabled: false, url: "https://mcp.figma.com/mcp" } } }, null, 2)}\n`;
@@ -268,6 +290,8 @@ export class RunnerLanes {
     let pane: string;
     let tab: string;
     let terminalId: string | undefined;
+    let shell: PaneShell = "posix";
+    let shellPid: number | undefined;
     let cwd = input.cwd;
     /** Closes what this launch opened; a target pane is the owner's and is left open. */
     let rollback = async (): Promise<void> => {};
@@ -280,6 +304,8 @@ export class RunnerLanes {
       if (target.cwd !== undefined) this.checkPaneCwd(target.cwd);
       pane = target.pane;
       terminalId = target.terminalId;
+      shell = target.shell;
+      shellPid = target.shellPid;
       tab = target.tab ?? "";
       cwd = target.cwd ?? cwd;
     } else {
@@ -295,6 +321,8 @@ export class RunnerLanes {
       // A cmd.exe pane cannot run the POSIX launch line: the tab is closed before anything is typed.
       const inspected = await inspectCreated(this.deps.run, pane);
       terminalId = inspected.terminalId;
+      shell = inspected.shell;
+      shellPid = inspected.shellPid;
       if (inspected.shell === "cmd") {
         await rollback();
         throw new TargetError("RUNNER_LANE_TARGET_INVALID", cmdRefused(pane));
@@ -307,13 +335,28 @@ export class RunnerLanes {
     const gen = (previous?.gen ?? 0) + 1;
     const tokenFile = this.tokenFileOf(key, gen);
     writeRunnerFile(tokenFile, token);
-    const env = [
-      `DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`,
-      ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
-      ...(input.heavyMaxLoad !== undefined ? [`DORI_HEAVY_MAX_LOAD=${input.heavyMaxLoad}`] : []),
-    ];
-    // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
-    const command = [...env, ...argv.map(quote)].join(" ");
+    let command: string;
+    if (shell === "pwsh" || shell === "powershell") {
+      try {
+        command = powershellLaunchLine(shell, [
+          ["DORI_LANE_KEY", key], ["DORI_LANE_TOKEN_FILE", tokenFile],
+          ...(input.heavySlots !== undefined ? [["DORI_HEAVY_SLOTS", String(input.heavySlots)] as const] : []),
+          ...(input.heavyMaxLoad !== undefined ? [["DORI_HEAVY_MAX_LOAD", String(input.heavyMaxLoad)] as const] : []),
+        ], argv);
+      } catch (e) {
+        rmSync(tokenFile, { force: true });
+        await rollback();
+        throw e;
+      }
+    } else {
+      const env = [
+        `DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`,
+        ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
+        ...(input.heavyMaxLoad !== undefined ? [`DORI_HEAVY_MAX_LOAD=${input.heavyMaxLoad}`] : []),
+      ];
+      // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
+      command = [...env, ...argv.map(quote)].join(" ");
+    }
     const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
     if (ran.code !== 0) {
       rmSync(tokenFile, { force: true });
@@ -324,7 +367,7 @@ export class RunnerLanes {
       ...this.records(),
       [key]: {
         key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
-        herdrInstance, ...(terminalId ? { terminalId } : {}),
+        herdrInstance, ...(terminalId ? { terminalId } : {}), ...(shellPid ? { shellPid } : {}),
         ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
         ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),
         ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),

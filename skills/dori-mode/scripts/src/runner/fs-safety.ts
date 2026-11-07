@@ -1,8 +1,9 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { writeFileAtomic } from "../setup.ts";
 import { tryStateLock } from "../state-lock.ts";
+import { currentUserSid, evaluateSddl, IO_REPARSE_TAG_AF_UNIX, readSddl, type AclInfo } from "./win-acl.ts";
 
 /**
  * The runner directory and its safety rules. The directory (default `~/.dori/runner`) and every directory under it
@@ -10,6 +11,11 @@ import { tryStateLock } from "../state-lock.ts";
  * wrapper and bun), nothing in it is a symlink, and everything is owned by the runner's user. A runner
  * that finds otherwise at start writes `RUNNER_DIR_UNSAFE <path> <reason>` to stderr and exits 1. Files are replaced
  * atomically (temporary file, fsync, rename) through `writeFileAtomic` from setup.ts.
+ *
+ * On Windows the modes and uids give way to the owner and DACL (see win-acl.ts): every entry is owned by the runner
+ * user's SID, allow ACEs name only that user, SYSTEM and Administrators (CREATOR OWNER inherit-only), the root's DACL is
+ * protected, nothing is a reparse point except the AF_UNIX socket directly under `sock\`, and the directory is not on
+ * a UNC path.
  */
 
 export const RUNNER_DIR_MODE = 0o700;
@@ -48,7 +54,7 @@ export const holdServeLock = (dir: string): (() => void) | undefined => {
 /** `~/.dori/runner` under `home`; every runner module takes the directory as an argument and defaults to this. */
 export const defaultRunnerDir = (home: string = homedir()): string => join(home, ".dori", "runner");
 
-export type UnsafeReason = "symlink" | "mode" | "owner" | "not-directory" | "not-file";
+export type UnsafeReason = "symlink" | "mode" | "owner" | "not-directory" | "not-file" | "acl" | "remote";
 
 /** The first unsafe entry found. Message: `RUNNER_DIR_UNSAFE <path> <reason>`. */
 export class RunnerDirUnsafe extends Error {
@@ -59,11 +65,28 @@ export class RunnerDirUnsafe extends Error {
   }
 }
 
-/** The owner the check expects; tests pass their own uid. Defaults to `process.getuid()`. */
-export type FsSafetyOptions = { readonly uid?: number };
+/**
+ * The owner the check expects; tests pass their own uid. Defaults to `process.getuid()`. `platform` (default
+ * `process.platform`) selects the Windows rules, where `acl` reads an entry's owner and SDDL (default `readSddl`) and
+ * `userSid` is the expected owner (default `currentUserSid()`).
+ */
+export type FsSafetyOptions = {
+  readonly uid?: number;
+  readonly platform?: NodeJS.Platform;
+  readonly acl?: (path: string) => AclInfo;
+  readonly userSid?: string;
+};
 
 const expectedOwner = (options: FsSafetyOptions): number | undefined =>
   options.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
+
+const isWindows = (options: FsSafetyOptions): boolean => (options.platform ?? process.platform) === "win32";
+
+/** What the Windows walk checks against: the root (for `D:P` and `sock\`), the user SID and the ACL reader. */
+type WinCheck = { readonly root: string; readonly userSid: string; readonly acl: (path: string) => AclInfo };
+
+/** `\\server\share\...`, `//server/share/...` or `\\?\UNC\...`; a `\\?\C:\` long local path is not one. */
+const isUncPath = (path: string): boolean => /^[\\/]{2}(?![?.][\\/][A-Za-z]:)/.test(path);
 
 const DIRECTORY_ENTRIES: ReadonlySet<string> = new Set([
   RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs, RUNNER_PATHS.bin, RUNNER_PATHS.bun,
@@ -87,16 +110,33 @@ const inspect = (path: string, uid: number | undefined, kind: "dir" | "file", ex
   return st;
 };
 
-const walk = (dir: string, uid: number | undefined, top: boolean, executable = false): void => {
-  inspect(dir, uid, "dir");
+/**
+ * The Windows form of `inspect`: reparse points (symlinks, junctions) are refused except an AF_UNIX socket directly
+ * under `sock\`, the type is checked as on POSIX, and the owner and DACL go through `evaluateSddl` instead of uid and mode.
+ */
+const inspectWindows = (path: string, win: WinCheck, kind: "dir" | "file"): void => {
+  const st = lstatSync(path);
+  const info = win.acl(path);
+  const socket = info.reparseTag === IO_REPARSE_TAG_AF_UNIX && kind === "file" && dirname(path) === join(win.root, RUNNER_PATHS.sock);
+  if (!socket && (st.isSymbolicLink() || info.reparseTag !== undefined)) throw new RunnerDirUnsafe(path, "symlink", info.reparseTag !== undefined ? `tag=0x${info.reparseTag.toString(16)}` : "");
+  if (kind === "dir" && !st.isDirectory()) throw new RunnerDirUnsafe(path, "not-directory");
+  if (kind === "file" && !socket && !st.isFile() && !st.isSocket()) throw new RunnerDirUnsafe(path, "not-file");
+  const verdict = evaluateSddl(info.sddl, win.userSid, { root: path === win.root });
+  if (verdict) throw new RunnerDirUnsafe(path, verdict.reason, verdict.detail);
+};
+
+const walk = (dir: string, uid: number | undefined, top: boolean, executable = false, win?: WinCheck): void => {
+  if (win) inspectWindows(dir, win, "dir");
+  else inspect(dir, uid, "dir");
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
     const st = lstatSync(path);
     // Only the entries the runner itself defines have a fixed type; anything else is checked by what it is.
     const isTopDir = top && DIRECTORY_ENTRIES.has(name);
     const isTopFile = top && (FILE_ENTRIES.has(name) || /^(state|outbox)\.sqlite-(wal|shm)$/.test(name));
-    if (st.isSymbolicLink()) throw new RunnerDirUnsafe(path, "symlink");
-    if (isTopDir || (st.isDirectory() && !isTopFile)) walk(path, uid, false, top ? EXECUTABLE_DIRS.has(name) : executable);
+    if (st.isSymbolicLink() && !win) throw new RunnerDirUnsafe(path, "symlink");
+    if (isTopDir || (st.isDirectory() && !st.isSymbolicLink() && !isTopFile)) walk(path, uid, false, top ? EXECUTABLE_DIRS.has(name) : executable, win);
+    else if (win) inspectWindows(path, win, "file");
     else inspect(path, uid, "file", executable);
   }
 };
@@ -105,22 +145,30 @@ const walk = (dir: string, uid: number | undefined, top: boolean, executable = f
  * Checks `dir` and everything under it (lstat, never following links). Throws `RunnerDirUnsafe` for the first entry
  * that is a symlink, is not mode 0700 (directories) or 0600 (files; 0700 also under `bin/` and `bun/`), is owned by another user, or is a file where a
  * directory belongs (or the reverse) for a known `RUNNER_PATHS` entry. A missing `dir` is unsafe as `not-directory`.
+ * On Windows the uid and mode checks are replaced by the owner/DACL policy (`owner`, `acl`), reparse points fail as
+ * `symlink` (the socket under `sock\` excepted), and a UNC path fails as `remote` before anything is read.
  */
 export const checkRunnerDir = (dir: string, options: FsSafetyOptions = {}): void => {
-  const uid = expectedOwner(options);
+  const windows = isWindows(options);
+  if (windows && isUncPath(dir)) throw new RunnerDirUnsafe(dir, "remote", "unc");
+  const uid = windows ? undefined : expectedOwner(options);
   try {
     lstatSync(dir);
   } catch {
     throw new RunnerDirUnsafe(dir, "not-directory", "missing");
   }
-  walk(dir, uid, true);
+  const win = windows ? { root: dir, userSid: options.userSid ?? currentUserSid(), acl: options.acl ?? readSddl } : undefined;
+  walk(dir, uid, true, false, win);
 };
 
-/** Creates `dir` (0700, parents included) when absent, then runs `checkRunnerDir`; it never loosens or repairs modes. */
+/**
+ * Creates `dir` (0700, parents included) when absent, then runs `checkRunnerDir`; it never loosens or repairs modes.
+ * On Windows there is no chmod: the installer sets the protected DACL, which new entries inherit.
+ */
 export const ensureRunnerDir = (dir: string, options: FsSafetyOptions = {}): void => {
-  if (!existsSync(dir) && !isDanglingLink(dir)) {
+  if (!(isWindows(options) && isUncPath(dir)) && !existsSync(dir) && !isDanglingLink(dir)) {
     mkdirSync(dir, { recursive: true, mode: RUNNER_DIR_MODE });
-    chmodSync(dir, RUNNER_DIR_MODE);
+    if (!isWindows(options)) chmodSync(dir, RUNNER_DIR_MODE);
   }
   checkRunnerDir(dir, options);
 };
@@ -130,13 +178,13 @@ const isDanglingLink = (path: string): boolean => {
 };
 
 /** Creates a subdirectory of the runner directory with 0700, refusing an existing symlink in its place. */
-export const ensureRunnerSubdir = (dir: string, name: string): string => {
+export const ensureRunnerSubdir = (dir: string, name: string, options: Pick<FsSafetyOptions, "platform"> = {}): string => {
   const path = join(dir, name);
   let st: Stats | undefined;
   try { st = lstatSync(path); } catch { st = undefined; }
   if (!st) {
     mkdirSync(path, { mode: RUNNER_DIR_MODE });
-    chmodSync(path, RUNNER_DIR_MODE);
+    if (!isWindows(options)) chmodSync(path, RUNNER_DIR_MODE);
     return path;
   }
   if (st.isSymbolicLink()) throw new RunnerDirUnsafe(path, "symlink");
@@ -149,8 +197,12 @@ export const writeRunnerFile = (path: string, content: string): void => {
   writeFileAtomic(path, content, RUNNER_FILE_MODE);
 };
 
-/** Sets 0600 on a SQLite database and its `-wal`/`-shm` companions that exist (called after open and after checkpoints). */
-export const lockDownDatabase = (path: string): void => {
+/**
+ * Sets 0600 on a SQLite database and its `-wal`/`-shm` companions that exist (called after open and after checkpoints).
+ * A no-op on Windows, where the files inherit the runner directory's DACL.
+ */
+export const lockDownDatabase = (path: string, options: Pick<FsSafetyOptions, "platform"> = {}): void => {
+  if (isWindows(options)) return;
   for (const file of [path, `${path}-wal`, `${path}-shm`]) {
     if (existsSync(file) && !lstatSync(file).isSymbolicLink()) chmodSync(file, RUNNER_FILE_MODE);
   }
