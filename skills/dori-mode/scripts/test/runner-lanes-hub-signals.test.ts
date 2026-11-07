@@ -151,3 +151,44 @@ test("B1: the hello records the journal head; a start at or before it is stale, 
   expect(lane?.recoveryPending).toBeUndefined();
   expect(lane?.recoveryAfter).toBeUndefined();
 });
+
+test("S-04: a lane.started for a lane closed with no pane is refused, gets lane.close and one LANE_STARTED_AFTER_CLOSE", async () => {
+  const closedAt = new Date(T0 + 1_000).toISOString();
+  const t = await setup({ pane: undefined, tab: undefined, status: "paused", launchReservation: "tok", closedAt } as Partial<Lane>);
+  const closes: string[] = [];
+  const hub: LaneHubDeps = { ...t.hub, close: (label, key, cmdId) => { closes.push(`${label}/${key}/${cmdId}`); return 1; } };
+  const before = await t.read();
+  await acceptLaneEvent(hub, "worker-a", t.event("lane.started", { key: "lane-a", pane: "p9", tab: "t9", session: "" }));
+  const after = await t.read();
+  expect(after?.pane).toBeUndefined();
+  expect(after?.version).toBe(before?.version);
+  expect(closes).toEqual(["worker-a/lane-a/late-start-close:lane-a:1"]);
+  expect(t.emitted).toHaveLength(1);
+  expect(t.emitted[0]?.[1]).toStartWith("LANE_STARTED_AFTER_CLOSE lane-a runner=worker-a pane=p9 ");
+});
+
+test("S-04: a replayed lane.started for a lane closed with its pane is ignored, nothing sent", async () => {
+  const t = await setup({ closedAt: new Date(T0 + 1_000).toISOString() } as Partial<Lane>);
+  const closes: string[] = [];
+  const hub: LaneHubDeps = { ...t.hub, close: (_l, key) => { closes.push(key); return 1; } };
+  await acceptLaneEvent(hub, "worker-a", t.event("lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "" }));
+  expect(closes).toEqual([]);
+  expect(t.emitted).toEqual([]);
+});
+
+test("S-04: a lane.started for an unconfirmed launch reservation releases it and the lane works; a confirmed-in-flight one is left to its launch", async () => {
+  const t = await setup({ pane: undefined, tab: undefined, status: "paused", launchReservation: "tok", launchUnconfirmed: true } as Partial<Lane>);
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.started", { key: "lane-a", pane: "p2", tab: "t2", session: "" }));
+  const lane = await t.read();
+  expect(lane).toMatchObject({ pane: "p2", tab: "t2" });
+  expect(lane?.status).toBeUndefined();
+  expect(lane?.launchReservation).toBeUndefined();
+  expect(lane?.launchUnconfirmed).toBeUndefined();
+  expect(t.emitted.map(([, line]) => line.split(" ")[0])).toEqual(["LAUNCH_CONFIRMED_LATE"]);
+  expect(eventClass(t.emitted[0]?.[1] ?? "")).toBe("lead-digest");
+
+  const u = await setup({ pane: undefined, tab: undefined, status: "paused", launchReservation: "tok" } as Partial<Lane>);
+  await acceptLaneEvent(u.hub, "worker-a", u.event("lane.started", { key: "lane-a", pane: "p2", tab: "t2", session: "" }));
+  expect(await u.read()).toMatchObject({ pane: "p2", status: "paused", launchReservation: "tok" });
+  expect(u.emitted).toEqual([]);
+});

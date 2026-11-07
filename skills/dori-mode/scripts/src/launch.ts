@@ -436,6 +436,15 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     } catch (error) {
       if (nothingStarted(error)) throw new LaunchError(`${input.key}: ${error instanceof Error ? error.message : String(error)}`);
       started = true; // a timeout or an ambiguous answer: the runner may have started the agent, so the reservation stays visible
+      if (token) {
+        // Marked unconfirmed, the runner's late lane.started confirms the reservation (lanes-hub.ts); one already in confirms it now.
+        await deps.registry.update(input.key, (current) => {
+          if (!current || current.launchReservation !== token) return undefined;
+          return current.pane
+            ? { ...current, status: current.status === "paused" ? draft.status : current.status, launchReservation: undefined }
+            : { ...current, launchUnconfirmed: true };
+        });
+      }
       throw new LaunchError(`${input.key}: the start may have happened (${error instanceof Error ? error.message : String(error)}); the lane stays reserved and paused: check dori status, or cancel it with dori close ${input.key} --cancelled --reason TEXT`);
     }
     started = true;

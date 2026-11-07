@@ -414,6 +414,11 @@ const closeSequence = async (
     const step = await act("pane-close", pane, closeEffect(deps, lane), paneGone(deps, lane, (p) => p.pane_id === pane));
     if (step.state === "ambiguous") return ambiguous(step);
     cleanup.push(step.state === "verified" ? `pane ${pane} closed` : `pane ${pane} not closed`);
+  } else if (lane.runner) {
+    // No pane yet: a start may still be out (a cancelled reservation). lane.close by key stops a lane the runner
+    // already recorded; a start that lands after the close is stopped by the supervisor (LANE_STARTED_AFTER_CLOSE).
+    const r = await closeEffect(deps, lane)(`close-by-key:${lane.key}:${deps.clock.now()}`);
+    cleanup.push(r.code === 0 ? `runner lane ${lane.key} ${r.out}` : `runner lane ${lane.key} not closed: ${r.err.slice(0, 120)}`);
   }
   const at = iso(deps.clock);
   const operations = store.list({ lane: lane.key }).filter((op) => op.action !== CLOSE_ACTION).map((op) => ({ id: op.id, state: op.state }));

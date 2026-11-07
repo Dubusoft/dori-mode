@@ -125,9 +125,14 @@ export const cliRunnerCall = (socketPath: string, deps: { readonly connect?: Con
           try { parsed = JSON.parse(line) as RelayReply; } catch { return; }
           if (parsed.id === id) settle(() => resolve(parsed));
         });
-        transport.onClose(() => settle(() => reject(new RunnerUnavailable(label, "disconnected", `relay connection closed: ${SUPERVISOR_DOWN}`))));
+        let sent = false;
+        // Closed after the request went out, the supervisor may have passed it on: `lost`, never "nothing was sent".
+        transport.onClose(() => settle(() => reject(sent
+          ? new RunnerUnavailable(label, "lost", `relay connection closed after ${req.op} was sent; it may have reached the runner`)
+          : new RunnerUnavailable(label, "disconnected", `relay connection closed: ${SUPERVISOR_DOWN}`))));
         try {
           transport.send(`${JSON.stringify({ id, label, ...req })}\n`);
+          sent = true;
         } catch (error) {
           settle(() => reject(new RunnerUnavailable(label, "disconnected", `${SUPERVISOR_DOWN}: ${error instanceof Error ? error.message : String(error)}`)));
         }
