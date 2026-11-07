@@ -21,6 +21,7 @@ import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
 import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
+import { recordReported } from "../src/lane-outcomes.ts";
 import { TransientSuperviseError } from "../src/supervise-journal.ts";
 
 const cleanups: (() => void)[] = [];
@@ -287,6 +288,24 @@ test.each([false, true])("a durable wait wakes a cold=%s lead through normal del
   await supervisor.flush();
   expect(f.log().map((event) => event.line)).toEqual(["WAIT_DONE release tell owner"]);
   expect(restartStarts(f)).toHaveLength(cold ? 1 : 0);
+});
+
+test.each([false, true])("a close after a taken and reported claim wakes the lead at once, restart=%s between them", async (restart) => {
+  const f = fixture();
+  const pointers = () => f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text" && (call[4] ?? "").startsWith(POINTER_PREFIX)).length;
+  let supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", "LANE_DONE_CLAIMED alpha w:p1 proof");
+  await supervisor.flush();
+  expect(taken(f)).toEqual(["done-claim:alpha:1\tLANE_DONE_CLAIMED alpha w:p1 proof"]);
+  recordReported(f.state.dir, "alpha", f.clock.now());
+  const before = pointers();
+  if (restart) supervisor = new Supervisor(f.deps);
+  // No other traffic: only the close can wake the lead (the lead's Toodo cleanup waits on it).
+  f.clock.at += 5 * 60_000;
+  supervisor.enqueue("lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim https://x");
+  await supervisor.flush();
+  expect(pointers()).toBe(before + 1);
+  expect(taken(f)).toEqual(["lane-closed:alpha\tLANE_CLOSED alpha closed seen-claim https://x"]);
 });
 
 test("an unseen newly idle agent reported as done is positive startup evidence", async () => {
@@ -1211,9 +1230,9 @@ test("a large multibyte event reaches the new lead through take without exceedin
 
 test.each([
   ["INBOUND 123 1 Owner hello", "urgent"],
-  // A claim wakes the lead; the close after the lead received it is digest (seen-claim), any other close urgent.
+  // A claim wakes the lead, and so does every close, the one after the lead received the claim (seen-claim) included.
   ["LANE_DONE_CLAIMED lane proof", "urgent"],
-  ["LANE_CLOSED lane closed seen-claim", "digest"],
+  ["LANE_CLOSED lane closed seen-claim", "urgent"],
   ["LANE_NOT_DONE lane reason", "urgent"],
   ["LANE_CLOSED lane", "urgent"],
   ["LANE_AUTO_CLOSED lane {}", "urgent"],
