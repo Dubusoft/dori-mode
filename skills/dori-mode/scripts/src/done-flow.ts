@@ -11,6 +11,8 @@ import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBi
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { LaneOpsError, type LaneOps, type PaneRef } from "./lane-ops.ts";
+import { deliverLaneMessage, queueSteering } from "./ci-follow.ts";
+import { openLaneMessages } from "./lane-messages.ts";
 
 export type FlowDeps = {
   readonly run: Runner;
@@ -193,9 +195,28 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): P
     const when = claimWaitsForLead(deps, lane)
       ? `${deps.config.closeAfterMin} minutes after the lead receives this claim`
       : `at ${closesAt}Z (${deps.config.closeAfterMin} minutes) once its Done signals read back live`;
-    await deps.ops.send(lane, `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons. Stay idle until then; an objection arrives here as [LEAD] not done.`);
+    await steerLane(deps, lane, "claim", `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons. Stay idle until then; an objection arrives here as [LEAD] not done.`);
   }
   return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${eventText(evidence)}`;
+};
+
+/**
+ * The lead's word on a done claim (its notice, an objection) as a lane message: queued durably with an ID the lane acks,
+ * replacing the lane's earlier one still open, then typed once now. A pane that does not take it now (other text in
+ * its input line, no prompt, runner away) keeps it queued for the supervisor's delivery pass and, unconfirmed after
+ * ciConfirmMin, one LANE_MESSAGE_UNCONFIRMED.
+ */
+const steerLane = async (deps: FlowDeps, lane: Lane, kind: "claim" | "not-done", text: string): Promise<void> => {
+  const messages = openLaneMessages(deps.config);
+  const ops = deps.operations ?? openOperations(deps.config);
+  try {
+    const now = deps.clock.now();
+    const message = queueSteering(messages, now, lane, { id: `${kind}-${lane.key}-${now}`, subject: `${lane.key} done status`, text });
+    await deliverLaneMessage(deps, ops, messages, lane, message);
+  } finally {
+    if (!deps.operations) ops.close();
+    messages.close();
+  }
 };
 
 export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly string[]): Promise<string> => {
@@ -207,7 +228,7 @@ export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly s
   const text = lane.machine
       ? `[LEAD] not done: the Done check of ${lane.key} did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status ${lane.key}, keep working, and claim again when fixed`
       : `[LEAD] not done: the Done check of ${lane.key} did not pass. Read the reasons with dori lane status ${lane.key}, keep working, and claim again when fixed`;
-  if (lane.pane) await deps.ops.send(lane, text);
+  if (lane.pane) await steerLane(deps, lane, "not-done", text);
   return `LANE_NOT_DONE ${lane.key} ${eventText(reasons.join("; "))}`;
 };
 

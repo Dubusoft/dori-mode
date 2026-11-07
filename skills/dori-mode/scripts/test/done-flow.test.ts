@@ -38,7 +38,7 @@ test("an objection inside the window keeps the lane open; the lane hears a fixed
   expect(after && statusOf(after)).toBe("not-done");
   expect(after?.objection?.reasons).toEqual(["changelog entry missing; touch /tmp/x"]);
   expect(closedVia()).toHaveLength(0);
-  expect(sent(world).at(-1)).toBe("[LEAD] not done: the Done check of demo-lane did not pass. Read the reasons with dori lane status demo-lane, keep working, and claim again when fixed");
+  expect(sent(world).at(-1)).toBe("[LEAD] not done: the Done check of demo-lane did not pass. Read the reasons with dori lane status demo-lane, keep working, and claim again when fixed. Confirm you got this message: dori report ack not-done-demo-lane-1767268860000");
   expect(sent(world).some((t) => t.includes("touch"))).toBe(false);
   // The reasons reach the lane's runner, where `dori lane status` reads them.
   expect(world.ops.filter((e) => e.op === "notify").map((e) => e.args)).toEqual([
@@ -60,7 +60,7 @@ test("a remote lane on its runner is told where to read the reasons with the run
   const remote: Lane = { ...lane, key: "remote-lane", machine: "box", runner: "box", reportVia: "cli" };
   await at(T0).registry.write(remote);
   await objectDone(at(T0), remote, ["tests red"]);
-  expect(sent(world).at(-1)).toBe("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status remote-lane, keep working, and claim again when fixed");
+  expect(sent(world).at(-1)).toBe("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status remote-lane, keep working, and claim again when fixed. Confirm you got this message: ~/.dori/runner/bin/dori report ack not-done-remote-lane-1767268800000");
 });
 
 test("a done claim records the lane's open same-repo PRs at their live head SHA, never a fork PR, and nothing for a failed read", async () => {

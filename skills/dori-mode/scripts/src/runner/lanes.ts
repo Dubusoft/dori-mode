@@ -455,7 +455,7 @@ export class RunnerLanes {
    * Types `text` into the lane. `verified` (the default) confirms delivery from the pane (`sendVerified`); `guarded`
    * types through the same guard without waiting (`sendGuarded`, delivery `sent`). With `refuseWhileAsking` a lane
    * showing a question prompt (`lastAsk`) gets nothing: `{delivery: "failed", refusal}`. A send the pane did not take
-   * throws `RUNNER_LANE_SEND_FAILED`, as before.
+   * throws `RUNNER_LANE_SEND_FAILED` with the reason the pane gave (other text in its input line, no prompt, ...).
    */
   async send(key: string, text: string, verify: boolean, opts: { readonly mode?: "verified" | "guarded"; readonly refuseWhileAsking?: boolean } = {}): Promise<Effect<"lane.send">> {
     const record = this.record(key);
@@ -463,10 +463,11 @@ export class RunnerLanes {
       return { detail: `refused asking`, result: { delivery: "failed", refusal: `RUNNER_LANE_ASKING ${key} shows a question prompt; not typed` } };
     }
     await this.requirePane(record);
+    let refusal: string | undefined;
     const delivery = opts.mode === "guarded"
       ? await sendGuarded(this.deps.run, record.pane, text)
-      : await sendVerified(this.deps.run, this.deps.clock, record.pane, text, verify);
-    if (delivery === "failed") throw new Error(`RUNNER_LANE_SEND_FAILED ${key}`);
+      : await sendVerified(this.deps.run, this.deps.clock, record.pane, text, verify, (why) => { refusal = why; });
+    if (delivery === "failed") throw new Error(`RUNNER_LANE_SEND_FAILED ${key}${refusal ? `: ${refusal}` : ""}`);
     return { detail: `sent ${delivery}`, result: { delivery } };
   }
 

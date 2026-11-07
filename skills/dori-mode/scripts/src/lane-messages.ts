@@ -28,6 +28,11 @@ export type LaneMessage = {
   readonly escalatedAt?: number;
   /** Why the last delivery attempt did not send (busy, paused, missing pane, ...). */
   readonly blocked?: string;
+  /**
+   * A lead steering message (a done-claim notice, an objection): sent whatever the pane shows, and the lane's runner
+   * alone decides whether its pane takes it (never over other text or without a prompt). CI messages wait for an idle pane.
+   */
+  readonly whileWorking?: boolean;
   readonly updatedAt: number;
 };
 
@@ -122,7 +127,7 @@ export const openLaneMessages = (config: { readonly stateDir: string; readonly s
   config.store === "sqlite" ? new SqliteLaneMessages(join(config.stateDir, SQLITE_FILE)) : new JsonLaneMessages(config.stateDir);
 
 /** Queues `message` unless a message with its ID exists (the same subject is the same message); returns the stored one. */
-export const queueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text">): LaneMessage => {
+export const queueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text" | "whileWorking">): LaneMessage => {
   if (!LANE_MESSAGE_ID.test(message.id)) throw new LaneMessageError(`lane message id must match ${LANE_MESSAGE_ID}`);
   const existing = store.get(message.id);
   if (existing) return existing;

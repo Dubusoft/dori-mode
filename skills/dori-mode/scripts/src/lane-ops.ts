@@ -19,7 +19,11 @@ import { LOCAL_RUNNER } from "./runner/serve.ts";
 export type PaneRef = { readonly machine?: string; readonly pane?: string };
 export type LaneRef = Pick<Lane, "key" | "machine" | "runner" | "pane" | "tab" | "cwd" | "remoteCwd" | "mode" | "model">;
 export type Delivery = "delivered" | "unconfirmed" | "failed" | "sent";
-export type SendOptions = { readonly mode?: "verified" | "guarded"; readonly inputCheck?: boolean; readonly refuseWhileAsking?: boolean; readonly cmdId?: string };
+export type SendOptions = {
+  readonly mode?: "verified" | "guarded"; readonly inputCheck?: boolean; readonly refuseWhileAsking?: boolean; readonly cmdId?: string;
+  /** Hears why a "failed" send failed: the runner's refusal (input line busy, no prompt, ...) or why the runner could not be reached. */
+  readonly onFailed?: (detail: string) => void;
+};
 export type InspectWant = {
   readonly git?: boolean; readonly roots?: readonly string[]; readonly branches?: readonly string[]; readonly done?: string; readonly doneCwd?: string;
   readonly process?: boolean; readonly session?: boolean; readonly sessionsDir?: string; readonly cwd?: string;
@@ -199,7 +203,8 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
     return (r.result ?? {}) as CommandResults[T];
   };
 
-  const sendFailed = (key: string, label: string, detail: string): Delivery => {
+  const sendFailed = (key: string, label: string, detail: string, onFailed?: (detail: string) => void): Delivery => {
+    onFailed?.(detail);
     const now = deps.now();
     const last = sendLoggedAt.get(key);
     if (last === undefined || now - last >= SEND_LOG_EVERY_MS) {
@@ -266,18 +271,18 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
           ...(opts.mode ? { mode: opts.mode } : {}),
           ...(opts.refuseWhileAsking !== undefined ? { refuseWhileAsking: opts.refuseWhileAsking } : {}),
         }, opts.cmdId ? { cmdId: opts.cmdId } : undefined);
-        if (r.state === "failed") return sendFailed(lane.key, label, r.detail);
+        if (r.state === "failed") return sendFailed(lane.key, label, r.detail, opts.onFailed);
         // The runner cannot tell whether the text was typed: like a send whose read-back did not confirm it.
         if (r.state === "ambiguous") return "unconfirmed";
-        if (!RESULT_GUARDS["lane.send"](r.result)) return sendFailed(lane.key, label, "malformed cmd.result lane.send");
+        if (!RESULT_GUARDS["lane.send"](r.result)) return sendFailed(lane.key, label, "malformed cmd.result lane.send", opts.onFailed);
         const sentResult = r.result as CommandResults["lane.send"];
-        if (sentResult.delivery === "failed") return sendFailed(lane.key, label, sentResult.refusal ?? "not delivered");
+        if (sentResult.delivery === "failed") return sendFailed(lane.key, label, sentResult.refusal ?? "not delivered", opts.onFailed);
         return sentResult.delivery;
       } catch (e) {
         // A timeout means the command reached the runner and its result never came back: it may have typed the text,
         // so it is uncertain like an ambiguous result, never a definite failure that would authorize a retry.
         if (asUnavailable(e)?.why === "timeout") return "unconfirmed";
-        return sendFailed(lane.key, label, toOpsError(e, label).message);
+        return sendFailed(lane.key, label, toOpsError(e, label).message, opts.onFailed);
       }
     },
     pause: (lane, step) => effect(runnerOf(lane), "lane.pause", { key: lane.key, ...(step ? { step } : {}) }),

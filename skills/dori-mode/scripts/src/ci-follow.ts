@@ -120,13 +120,15 @@ export const laneDown = (lane: Lane, panes: readonly Pane[] | Error): string | u
 };
 
 /**
- * Delivers queued lane messages and tells the lead about unconfirmed ones. A message is typed (send-text, then one
- * Enter) only when paneRefusal allows it, as its own operation: an interrupted delivery is never retyped. Anything
- * still queued, or delivered without an ack, `ciConfirmMin` after it was queued is one LANE_MESSAGE_UNCONFIRMED.
+ * A delivery attempt of the same message this recent, still `attempted`, is taken to be running in another process (the
+ * CLI's first attempt, the supervisor's pass): left alone, not reconciled to ambiguous under it. One older than this was
+ * interrupted, and its read-back decides as for any crash.
  */
-export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, emit: CiEmit): Promise<void> => {
+export const ATTEMPT_IN_FLIGHT_MS = 2 * 60_000;
+
+const panesReader = (deps: FlowDeps): ((lane: Lane) => Promise<Pane[] | Error>) => {
   const panes = new Map<string, Promise<Pane[] | Error>>();
-  const panesOf = (lane: Lane): Promise<Pane[] | Error> => {
+  return (lane) => {
     const machine = lane.machine ?? "";
     let hit = panes.get(machine);
     if (!hit) {
@@ -135,13 +137,53 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
     }
     return hit;
   };
+};
+
+/**
+ * Queues a lead steering message to `lane` (`whileWorking`) with its intent `id` and the line the lane confirms it with
+ * (`<dori> report ack <id>`), superseding any open message of the same lane and `subject` it replaces (a newer claim
+ * notice or objection). Returns the stored message; a known id is the same intent and stays as it is.
+ */
+export const queueSteering = (
+  store: LaneMessageStore, now: number, lane: Pick<Lane, "key" | "machine">, message: Pick<LaneMessage, "id" | "subject" | "text">,
+): LaneMessage => {
+  const dori = lane.machine ? "~/.dori/runner/bin/dori" : "dori";
+  const queued = queueLaneMessage(store, now, {
+    id: message.id, lane: lane.key, subject: message.subject, whileWorking: true,
+    text: `${message.text.replace(/\.$/, "")}. Confirm you got this message: ${dori} report ack ${message.id}`,
+  });
+  for (const old of store.list({ lane: lane.key, states: OPEN_MESSAGE_STATES })) {
+    if (old.subject === message.subject && old.id !== queued.id) updateLaneMessage(store, old, { state: "superseded", blocked: `replaced by ${queued.id}` }, now);
+  }
+  return queued;
+};
+
+/** One delivery attempt of a queued message now (its sender's first try); a refusal leaves it queued for deliverLaneMessages. */
+export const deliverLaneMessage = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, lane: Lane, message: LaneMessage): Promise<LaneMessage> =>
+  message.state === "queued" ? deliver(deps, ops, messages, lane, message, panesReader(deps)) : message;
+
+/**
+ * Why a lead steering message waits without being sent: the lane is paused or has no pane. Anything about the pane
+ * itself (no live agent, other text in its input line, no prompt) is the runner's to decide when it is sent.
+ */
+const steeringRefusal = (lane: Lane): string | undefined =>
+  statusOf(lane) === "paused" ? "lane paused" : lane.pane ? undefined : "lane has no pane";
+
+/**
+ * Delivers queued lane messages and tells the lead about unconfirmed ones. A message is typed (send-text, then one
+ * Enter) only when paneRefusal allows it, as its own operation: an interrupted delivery is never retyped. Anything
+ * still queued, or delivered without an ack, `ciConfirmMin` after it was queued is one LANE_MESSAGE_UNCONFIRMED, naming
+ * the message and why it was not delivered (the pane's state and the runner's refusal); the message stays queued.
+ */
+export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, emit: CiEmit): Promise<void> => {
+  const panesOf = panesReader(deps);
   for (let message of messages.list({ states: OPEN_MESSAGE_STATES })) {
     const lane = await deps.registry.read(message.lane);
     if (!lane || statusOf(lane) === "closed") {
       updateLaneMessage(messages, message, { state: "superseded", blocked: "lane closed" }, deps.clock.now());
       continue;
     }
-    if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, await panesOf(lane));
+    if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, panesOf);
     if (message.state === "acked" || message.escalatedAt !== undefined) continue;
     if (deps.clock.now() - message.at < deps.config.ciConfirmMin * 60_000) continue;
     const why = message.state === "delivered" ? "delivered but not confirmed" : `not delivered: ${message.blocked ?? "waiting"}`;
@@ -151,25 +193,32 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
   }
 };
 
-const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, lane: Lane, message: LaneMessage, panes: readonly Pane[] | Error): Promise<LaneMessage> => {
+const deliver = async (
+  deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, lane: Lane, message: LaneMessage, panesOf: (lane: Lane) => Promise<Pane[] | Error>,
+): Promise<LaneMessage> => {
   const now = deps.clock.now();
-  const refusal = paneRefusal(lane, panes);
+  const refusal = message.whileWorking ? steeringRefusal(lane) : paneRefusal(lane, await panesOf(lane));
   if (refusal) return refusal === message.blocked ? message : updateLaneMessage(messages, message, { blocked: refusal }, now);
+  const spec: OperationSpec = { lane: lane.key, action: "lane-message", target: message.id };
+  const inFlight = ops.get(operationId(spec));
+  if (inFlight?.state === "attempted" && now - inFlight.updatedAt < ATTEMPT_IN_FLIGHT_MS) return message;
   // The runner's send refuses while the lane's input box holds the owner's text and presses Enter at most once; its
   // verdict is the only evidence of this attempt. A failed send typed nothing (not done), delivered or unconfirmed is
   // done. An interrupted attempt (a new process, no verdict seen) stays unknown, so it is ambiguous and never retyped.
   // The lane's ack proves the text arrived and wins over everything.
   let typedHere: Observed = "unknown";
   const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
-  const spec: OperationSpec = { lane: lane.key, action: "lane-message", target: message.id };
+  let refused: string | undefined;
   const { op } = await perform(ops, deps.clock.now, spec, async () => {
     // The runner answers a repeated cmdId with its first result, so each attempt has its own id (done-flow.ts act):
     // a retry after a definitive failure reaches the effect again, while a replay of one attempt keeps its id.
     const id = operationId(spec);
-    const delivery = await deps.ops.send(lane, message.text, { mode: "verified", inputCheck: true, cmdId: `op:${id}:${ops.get(id)?.attempts ?? 0}` });
+    const delivery = await deps.ops.send(lane, message.text, {
+      mode: "verified", inputCheck: true, cmdId: `op:${id}:${ops.get(id)?.attempts ?? 0}`, onFailed: (detail) => { refused = detail; },
+    });
     if (delivery === "failed") {
       typedHere = "not-done";
-      return { ok: false, detail: "the runner could not deliver the text (input line busy, refused, or runner unavailable)" };
+      return { ok: false, detail: refused ?? "the runner could not deliver the text (input line busy, refused, or runner unavailable)" };
     }
     typedHere = "done";
     return { ok: true, detail: delivery === "unconfirmed" ? "typed, not confirmed in the pane" : "" };
@@ -177,7 +226,12 @@ const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessag
   const current = messages.get(message.id) ?? message;
   if (current.state === "acked") return current;
   if (op.state === "verified") return updateLaneMessage(messages, current, { state: "delivered", deliveredAt: deps.clock.now(), blocked: undefined }, deps.clock.now());
-  const blocked = op.state === "ambiguous" ? "an interrupted delivery may or may not have been typed; not retyped" : `send failed: ${op.detail}`;
+  const panes = await panesOf(lane);
+  const status = panes instanceof Error ? "status unreadable" : (panes.find((p) => p.pane_id === lane.pane)?.agent_status ?? "not listed");
+  const where = `pane ${lane.pane ?? "-"} ${status}`;
+  const blocked = op.state === "ambiguous"
+    ? "an interrupted delivery may or may not have been typed; not retyped"
+    : `send failed (${where}): ${(refused ?? op.detail).replace(/\s+/g, " ").slice(0, 240)}`;
   return updateLaneMessage(messages, current, { blocked }, deps.clock.now());
 };
 
@@ -271,6 +325,8 @@ export class CiFollowUp {
   /** Subjects (PR at a head) this process saw stalled, with when it first saw it; dropped once a poll finds it moving. */
   private readonly stalls = new Map<string, { readonly since: number; alerted: boolean }>();
   private stalledNow = new Set<string>();
+  /** The delivery pass in progress: the GitHub poll's and the supervisor's own pass never run at once. */
+  private delivering: Promise<void> = Promise.resolve();
 
   constructor(private readonly deps: FlowDeps, private readonly io: CiIo = defaultCiIo, stores?: { readonly ops: OperationStore; readonly messages: LaneMessageStore }) {
     this.ops = stores?.ops ?? deps.operations ?? openOperations(deps.config);
@@ -286,7 +342,14 @@ export class CiFollowUp {
     await this.follow(pulls, emit);
     await this.closeIssues(merged, emit);
     await this.verifyMerges(merged, emit);
-    await deliverLaneMessages(this.deps, this.ops, this.messages, emit);
+    await this.deliver(emit);
+  }
+
+  /** Delivers the queued lane messages (CI, rebase and lead steering) once, after any pass still running. */
+  deliver(emit: CiEmit): Promise<void> {
+    const pass = this.delivering.then(() => deliverLaneMessages(this.deps, this.ops, this.messages, emit));
+    this.delivering = pass.catch(() => {});
+    return pass;
   }
 
   /**

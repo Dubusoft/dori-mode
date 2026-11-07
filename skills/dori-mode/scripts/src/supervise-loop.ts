@@ -173,6 +173,8 @@ export const RUNNERS_TASK = "runners";
 export const LEGACY_ADOPT_MS = 60_000;
 /** How often the runners task runs; the hub itself answers frames as they arrive. */
 export const RUNNERS_PASS_MS = 5_000;
+/** How often the polling task delivers queued lane messages (lead steering, CI, rebase), apart from the GitHub poll. */
+export const LANE_MESSAGES_PASS_MS = 30_000;
 /** How often the runners task tries to open a runner hub that failed to open. */
 export const RUNNER_HUB_RETRY_MS = 30_000;
 /** How often the runners task drops old rows from the hub's runner event journal. */
@@ -1007,6 +1009,7 @@ export const supervise = async (
       catch (e) { console.error(`CLOSE_BUTTON_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     };
     let lastGitHub = -Infinity;
+    let lastLaneMessages = -Infinity;
     // The hub always opens: every lane is runner-owned, and the local runner is this process's child. An unsafe runner
     // directory or a busy socket costs the hub, never the supervisor: the lead gets RUNNER_HUB_DISABLED, every lane
     // operation fails closed, and the runners task tries again every RUNNER_HUB_RETRY_MS until it opens.
@@ -1176,6 +1179,11 @@ export const supervise = async (
           lastGitHub = deps.clock.now();
           polls.push(watchdog.track("github", guarded("github", pollGithub()))
             .catch((e: unknown) => { console.error(`GITHUB_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
+        }
+        if (deps.clock.now() - lastLaneMessages >= LANE_MESSAGES_PASS_MS) {
+          lastLaneMessages = deps.clock.now();
+          polls.push(watchdog.track("lane-messages", follow.deliver(enqueueSweep))
+            .catch((e: unknown) => { console.error(`LANE_MESSAGE_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
         }
         polls.push(tickSources(), routeLaneReports());
         await Promise.all(polls);
