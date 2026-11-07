@@ -231,19 +231,32 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   return [...await finishRecovery(deps, relaunched.lane, why), ...(relaunched.startup ? [relaunched.startup] : [])];
 };
 
-const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue | undefined, view: SweepView): Promise<string[]> =>
+/** The lane's runner has no admitted connection (not said hello yet, gone, or too old for the call): nothing to recover through. */
+const runnerDown = (error: unknown): error is LaneOpsError =>
+  error instanceof LaneOpsError && (error.code === "RUNNER_UNAVAILABLE" || error.code === "RUNNER_OUTDATED");
+
+const runnerHeld = (lane: Lane, runner: string): string =>
+  `LANE_RECOVERY_HELD ${lane.key} runner=${runner.replace(/\s/g, "_")} is not connected; recovery resumes once it says hello`;
+
+const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue | undefined, view: SweepView, byKey: boolean): Promise<string[]> =>
   withRecoveryLock(deps, lane.key, async () => {
     const current = await deps.registry.read(lane.key);
     if (!current || current.pane !== lane.pane || current.model !== lane.model) return [];
     try { return await recoverOne(deps, current, enqueue, view); }
-    catch (error) { return [`LANE_RECOVERY_ERROR ${lane.key} ${message(error)}`]; }
+    catch (error) {
+      // A runner that dropped mid-recovery is the liveness monitor's to report; the lane is tried again once it is back.
+      if (runnerDown(error)) return byKey ? [runnerHeld(lane, error.label)] : [];
+      return [`LANE_RECOVERY_ERROR ${lane.key} ${message(error)}`];
+    }
   });
 
 /**
  * Legacy callers receive lines; supervisors must pass enqueue to durably accept notices before their flags are saved.
  * A lane whose runner's machine has herdr down (herdr-down.ts) is held: nothing is read, relaunched or counted against
  * its recovery attempts until herdr reads again. The sweep holds it silently (HERDR_DOWN already told the lead); a
- * recovery asked for by key says LANE_RECOVERY_HELD.
+ * recovery asked for by key says LANE_RECOVERY_HELD. A lane whose runner has no admitted connection (right after a
+ * supervisor restart, before the runner's hello) is held the same way: the runner's own liveness reports a runner that
+ * stays away, and the first sweep after its hello recovers what is still missing.
  */
 export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: RecoveryEnqueue, view: SweepView = passthroughView(deps.ops)): Promise<string[]> => {
   const lanes = key ? [await deps.registry.read(key)].filter((lane): lane is Lane => lane !== null) : await deps.registry.open();
@@ -255,7 +268,11 @@ export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: Recov
       if (key && statusOf(lane) === "working") events.push(`LANE_RECOVERY_HELD ${lane.key} herdr is down on machine=${runner.replace(/\s/g, "_")}; recovery resumes once it reads again`);
       continue;
     }
-    events.push(...await relaunchLane(deps, lane, enqueue, view));
+    if (!deps.ops.connected(lane.machine)) {
+      if (key && statusOf(lane) === "working") events.push(runnerHeld(lane, runner));
+      continue;
+    }
+    events.push(...await relaunchLane(deps, lane, enqueue, view, key !== undefined));
   }
   return events;
 };

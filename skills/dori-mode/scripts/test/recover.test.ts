@@ -149,6 +149,29 @@ test.each(["down", "hung"] as const)("while a machine's herdr is %s its lanes ar
   expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
 });
 
+test("before its runner's hello a lane is held without an error or a spent attempt, and recovered after it", async () => {
+  const { deps, world, lane } = await fixture();
+  // Right after a supervisor restart: the local runner has not said hello yet (the sweep's pane view may still answer).
+  let hello = false;
+  const restarted = { ...deps, ops: { ...deps.ops, connected: () => hello } };
+  for (let round = 0; round < RECOVERY_LIMIT + 1; round++) expect(await recoverLanes(restarted)).toEqual([]);
+  expect(opsOf(world, "recover", "start")).toEqual([]);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
+  expect(await recoverLanes(restarted, lane.key)).toEqual(["LANE_RECOVERY_HELD recover-lane runner=local is not connected; recovery resumes once it says hello"]);
+  hello = true;
+  expect(await recoverLanes(restarted)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
+});
+
+test("a runner that drops in the middle of a recovery holds the lane instead of raising LANE_RECOVERY_ERROR", async () => {
+  const { deps, lane } = await fixture();
+  const dropping = { ...deps, ops: { ...deps.ops, recover: async () => { throw new LaneOpsError("RUNNER_UNAVAILABLE", "local", "disconnected: connection lost before cmd.result"); } } };
+  expect(await recoverLanes(dropping)).toEqual([]);
+  expect(await recoverLanes(dropping, lane.key)).toEqual(["LANE_RECOVERY_HELD recover-lane runner=local is not connected; recovery resumes once it says hello"]);
+  // Any other failure is still reported.
+  const failing = { ...deps, ops: { ...deps.ops, recover: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "herdr tab create failed"); } } };
+  expect((await recoverLanes(failing))[0]).toStartWith("LANE_RECOVERY_ERROR recover-lane ");
+});
+
 test("a held lane resumes its own session when herdr is back", async () => {
   const { deps, world, lane } = await fixture();
   await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app", session: "ses_1" });
