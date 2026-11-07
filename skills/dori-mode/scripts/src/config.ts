@@ -266,6 +266,11 @@ export type DoriConfig = {
    * Done signals are `merged` PRs it bound at their still-current head with no failed check and no conflict.
    */
   readonly mergeWaitMaxMin: number;
+  /**
+   * Minutes an open lane PR may stay unmergeable for a reason only a person fixes (claimed but no checks, review or
+   * draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
+   */
+  readonly mergeStallMin: number;
   /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
@@ -390,6 +395,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   idleEscalateMin: 30,
   closeAfterMin: 5,
   mergeWaitMaxMin: 60,
+  mergeStallMin: 15,
   worktreeRoot: "/data/repos/worktrees",
   digestMaxDelayMin: 60,
   ownerDelayNotice: "메시지를 받았습니다. 리드 세션이 아직 메시지를 받지 못하고 있어 대기열에 보관해 두었고, 리드가 돌아오는 대로 답변드립니다.",

@@ -40,6 +40,7 @@
   "drift": { "enabled": true, "milestoneOverdueMin": 90, "ciFailStreak": 3 },
   "closeAfterMin": 5,
   "mergeWaitMaxMin": 60,
+  "mergeStallMin": 15,
   "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
   "ownerLanguage": "Korean",
