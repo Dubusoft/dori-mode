@@ -7,6 +7,7 @@ import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
+import { wakeSource } from "./lead-wakes.ts";
 import { readWakes } from "./store.ts";
 import { legacyPaneKeys, managedPanesPath } from "./managed-panes.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
@@ -267,10 +268,16 @@ const issues = (d: DoctorDeps): Check[] => {
 };
 
 const leadWakes = (d: DoctorDeps): Check[] => {
-  const wakes = readWakes(d.config.stateDir, d.clock.now() - 24 * 60 * 60_000);
-  return wakes.length > LEAD_WAKE_WARNING_THRESHOLD
-    ? [warn("lead wakes", `${wakes.length} lead wakes in the last 24 hours (threshold ${LEAD_WAKE_WARNING_THRESHOLD})`, "review dori status --stats for wake triggers and model calls")]
-    : [];
+  // Owner messages are wanted wakes: only the rest count toward the threshold, and the warning names their top trigger.
+  const wakes = readWakes(d.config.stateDir, d.clock.now() - 24 * 60 * 60_000).filter((wake) => wakeSource(wake.trigger) !== "owner");
+  if (wakes.length <= LEAD_WAKE_WARNING_THRESHOLD) return [];
+  const lane = wakes.filter((wake) => wakeSource(wake.trigger) === "lane").length;
+  const triggers = new Map<string, number>();
+  for (const wake of wakes) for (const kind of wake.trigger) triggers.set(kind, (triggers.get(kind) ?? 0) + 1);
+  const [top, count] = [...triggers].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0] ?? ["?", 0];
+  return [warn("lead wakes",
+    `${wakes.length} lead wakes not from owner messages in the last 24 hours (threshold ${LEAD_WAKE_WARNING_THRESHOLD}; lane ${lane}, noise ${wakes.length - lane}); most from ${top} (${count})`,
+    "review dori status --stats for wake triggers and model calls")];
 };
 
 /** memoryCheck: the lead's human.md is found and within maxKb. */
