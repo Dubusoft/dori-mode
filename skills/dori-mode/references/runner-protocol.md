@@ -573,8 +573,7 @@ report store whose `source` is the event's journal id (`runner:<label>:<seq>`), 
 rows. From there it is routed exactly as a local `dori report`: a done report becomes the claim through `claimDone`
 (the same evidence again is `LANE_DONE_ALREADY_CLAIMED`); the rest is journaled or posted to the thread. The
 supervisor reads lane events back from the hub's own journal on every runners pass, from the start after a restart,
-so an event acked just before a crash is still stored. The first report from a runner lane also ends the screen
-scraping of its `[REPORT]` lines.
+so an event acked just before a crash is still stored.
 
 **Inventory.** On each hello the supervisor compares the runner's inventory with the registry:
 
@@ -586,8 +585,8 @@ scraping of its `[REPORT]` lines.
 
 1. It fetches the runner's unacked events over ssh (`runner export-outbox`) and takes them as if they had arrived,
    so a report already received is not stored twice.
-2. It types a footer update into each lane's pane: go back to printing `[REPORT]` lines.
-3. It clears `Lane.runner`, which puts the lane back on the screen-scraping path.
-4. It stops the runner's service: the systemd unit on Linux, or on macOS the launchd agent (disabled and booted out).
+2. It tells each lane the runner owns, through that runner while it still runs, that its reports fail until the runner
+   is back. `Lane.runner` is kept: the runner is the only path to its lanes.
+3. It stops the runner's service: the systemd unit on Linux, or on macOS the launchd agent (disabled and booted out).
 
 The lanes keep running. A step that fails is reported, and the later steps still run.

@@ -73,7 +73,7 @@ Arm these as persistent monitors in your own session. Each filter matches only l
 | freshness | `dori freshness --loop 5 \| tee -a ~/.dori/freshness.log` | `^WORKING-WHILE-PAUSED` |
 | presence (optional) | `dori presence discord` | `^PRESENCE_READY` |
 
-The done-flow filter keeps every `LANE_` line except the ready line. `LANE_WATCH_WARN` matters most there: it's the only sign that `dori watch` is failing and lanes aren't being closed. Freshness acts on its own (it nudges the lane and posts the report to the thread), so only `WORKING-WHILE-PAUSED` needs you. The other freshness lines (`NUDGED`, `POSTED`, `NO-REPORT`, `PENDING-REPORT`, `STALE-REPORT`) go only to `~/.dori/freshness.log`. Run `tail ~/.dori/freshness.log` when you want recent nudges and posts.
+The done-flow filter keeps every `LANE_` line except the ready line. `LANE_WATCH_WARN` matters most there: it's the only sign that `dori watch` is failing and lanes aren't being closed. Freshness acts on its own (it nudges the lane), so only `WORKING-WHILE-PAUSED` needs you. The other freshness lines (`NUDGED`) go only to `~/.dori/freshness.log`. Run `tail ~/.dori/freshness.log` when you want recent nudges.
 
 ### Supervised mode instead
 
