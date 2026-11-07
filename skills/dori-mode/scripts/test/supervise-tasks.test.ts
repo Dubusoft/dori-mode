@@ -8,10 +8,12 @@ import type { Http } from "../src/messenger/http.ts";
 import { Repos } from "../src/repos.ts";
 import type { Ran } from "../src/run.ts";
 import { defaultRunnerDir } from "../src/runner/fs-safety.ts";
+import { JsonOperations, SqliteOperations } from "../src/operations.ts";
+import { JsonLaneReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { RUNNER_HUB_RETRY_MS, supervise, SUPERVISOR_TASKS, type SupervisorTask, TASK_ALERT_MS, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { Waits } from "../src/waits.ts";
-import { depsFor, fakeClock, manualPause, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, manualPause, newWorld, TEST_STORE, withState } from "./fakes.ts";
 
 /** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
 const idleRunner = () => {
@@ -169,6 +171,21 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
 };
 
 const others = (stalled: SupervisorTask): SupervisorTask[] => SUPERVISOR_TASKS.filter((task) => task !== stalled);
+
+test("the report polling path prunes operation and report history at startup and once per hour", async () => {
+  const operations = spyOn(TEST_STORE === "json" ? JsonOperations.prototype : SqliteOperations.prototype, "prune");
+  const reports = spyOn(TEST_STORE === "json" ? JsonLaneReports.prototype : SqliteLaneReports.prototype, "prune");
+  const s = setup("inbound");
+  try {
+    await until(s.subscribe, () => operations.mock.calls.length === 1 && reports.mock.calls.length === 1, 10_000, "initial history pruning");
+    await s.next();
+    expect(operations).toHaveBeenCalledTimes(1);
+    expect(reports).toHaveBeenCalledTimes(1);
+    s.clock.at += 60 * 60_000;
+    await s.next();
+    await until(s.subscribe, () => operations.mock.calls.length === 2 && reports.mock.calls.length === 2, 10_000, "hourly history pruning");
+  } finally { await s.stop(); }
+}, 30_000);
 
 const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>) => void) =>
   test(`a stalled ${stalled} task leaves the other three working and is reported by name, then withholds the watchdog`, async () => {

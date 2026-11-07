@@ -15,7 +15,7 @@ import type { Clock } from "./run.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
-import { saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
+import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
 import { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
@@ -67,6 +67,8 @@ export interface LaneReportStore {
   pending(): LaneReport[];
   list(filter?: { readonly lane?: string }): LaneReport[];
   consume(id: string, at: number, route: ReportRoute, eventId?: string): void;
+  /** Removes old consumed history, keeping each lane's latest row for status and its next sequence number. */
+  prune(now: number): void;
   close(): void;
 }
 
@@ -110,6 +112,15 @@ export class JsonLaneReports implements LaneReportStore {
   consume(id: string, at: number, route: ReportRoute, eventId?: string): void {
     withStateLockSync(this.lock, () => {
       saveJsonFile(this.path, { reports: this.read().map((r) => (r.id === id && r.consumedAt === undefined ? { ...r, consumedAt: at, route, ...(eventId ? { eventId } : {}) } : r)) });
+    });
+  }
+  prune(now: number): void {
+    withStateLockSync(this.lock, () => {
+      const reports = this.read();
+      const latest = new Map<string, number>();
+      for (const row of reports) latest.set(row.lane, Math.max(latest.get(row.lane) ?? 0, row.seq));
+      const kept = reports.filter((row) => row.consumedAt === undefined || row.consumedAt >= now - RETENTION.statusHistoryMs || row.seq === latest.get(row.lane));
+      if (kept.length !== reports.length) saveJsonFile(this.path, { reports: kept });
     });
   }
   close(): void {}
@@ -191,6 +202,11 @@ export class SqliteLaneReports implements LaneReportStore {
   }
   consume(id: string, at: number, route: ReportRoute, eventId?: string): void {
     this.db.query("UPDATE lane_reports SET consumed_at = ?, route = ?, event_id = ? WHERE id = ? AND consumed_at IS NULL").run(at, route, eventId ?? null, id);
+  }
+  prune(now: number): void {
+    this.db.query(`DELETE FROM lane_reports WHERE consumed_at < ?
+      AND seq < (SELECT max(latest.seq) FROM lane_reports latest WHERE latest.lane = lane_reports.lane)`)
+      .run(now - RETENTION.statusHistoryMs);
   }
   close(): void { this.db.close(); }
 }

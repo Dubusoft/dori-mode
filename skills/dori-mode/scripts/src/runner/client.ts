@@ -1,8 +1,8 @@
 import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
-import type { Outbox } from "./outbox.ts";
+import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
-  PROTO, decodeFrame, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  MAX_FRAME_BYTES, PROTO, decodeFrame, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
   type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
@@ -22,6 +22,10 @@ import type { Connector, Transport } from "./transport.ts";
  * `RUNNER_AUTH_FAILED`) every received frame whose MAC does not check. Before the handshake only `hello.challenge` and
  * `hello.reject` are read. `runner.rotate` is handled here: the client answers `runner.rotated` with a new key and
  * makes it current on `rotate.ok`, recording the command in the state so `cmdAck` moves past it.
+ *
+ * A frame over `MAX_FRAME_BYTES` is never sent. When the replay cannot send a row, the attempt ends as
+ * `RUNNER_CLOSED` with `RUNNER_REPLAY_FAILED seq=<n> ...` logged and the connection closed, so the reconnect loop
+ * backs off instead of holding a connection that never becomes ready.
  */
 
 export const RECONNECT_BASE_MS = 1_000;
@@ -95,7 +99,10 @@ export class RunnerClient {
   }
 
   private sendFrame(frame: Parameters<typeof encodeFrame>[0]): void {
-    this.transport?.send(encodeFrame(this.session ? this.session.seal(frame) : frame));
+    const line = encodeFrame(this.session ? this.session.seal(frame) : frame);
+    const bytes = Buffer.byteLength(line, "utf8");
+    if (bytes > MAX_FRAME_BYTES) throw new Error(`${frame.type} frame is ${bytes} bytes, over ${MAX_FRAME_BYTES}`);
+    this.transport?.send(line);
   }
 
   private log(line: string): void {
@@ -173,10 +180,27 @@ export class RunnerClient {
     }
   }
 
-  /** Appends an event to the outbox and sends it at once when connected; returns its seq. */
-  publish<T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]): number {
-    const row = this.deps.outbox.append(type, body);
-    if (this.ready && this.transport?.open) this.sendFrame(runnerEvent(this.head(), row.seq, type, body) as AnyRunnerEvent);
+  /**
+   * Appends an event to the outbox and sends the stored row at once when connected; returns its seq. An event the
+   * outbox refuses as too large is logged `RUNNER_EVENT_DROPPED` and returns undefined. A failed live send leaves the
+   * row for the replay after the next hello.
+   */
+  publish<T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]): number | undefined {
+    let row;
+    try {
+      row = this.deps.outbox.append(type, body);
+    } catch (error) {
+      if (!(error instanceof OutboxEventTooLarge)) throw error;
+      this.log(`RUNNER_EVENT_DROPPED type=${type} ${error.message}`);
+      return undefined;
+    }
+    if (this.ready && this.transport?.open) {
+      try {
+        this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
+      } catch (error) {
+        this.log(`RUNNER_SEND_FAILED seq=${row.seq} ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     return row.seq;
   }
 
@@ -233,9 +257,19 @@ export class RunnerClient {
         this.deps.state.observeEpoch(frame.body.epoch);
         this.cursor = frame.body.eventAck;
         this.deps.outbox.ack(this.cursor);
-        for (const row of this.deps.outbox.unacked(this.cursor)) {
-          this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
-          this.replayed += 1;
+        let seq = this.cursor;
+        try {
+          for (const row of this.deps.outbox.unacked(this.cursor)) {
+            seq = row.seq;
+            this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
+            this.replayed += 1;
+          }
+        } catch (error) {
+          const detail = `RUNNER_REPLAY_FAILED seq=${seq} ${error instanceof Error ? error.message : String(error)}`;
+          this.log(detail);
+          this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
+          this.transport?.close("RUNNER_REPLAY_FAILED");
+          return;
         }
         this.ready = true;
         this.finish({ ok: true, eventAck: this.cursor, replayed: this.replayed });

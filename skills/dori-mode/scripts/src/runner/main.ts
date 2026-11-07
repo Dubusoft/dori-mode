@@ -27,7 +27,7 @@ import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
 import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./fs-safety.ts";
 import { pidAlive, probe, probeHerdr, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
-import { Outbox } from "./outbox.ts";
+import { Outbox, OUTBOX_MAINTENANCE_MS, outboxMaintenance } from "./outbox.ts";
 import { DEFAULT_POLICY, loadPolicy, POLICY_FILE } from "./policy.ts";
 import { commandDispatcher, type DispatchDeps, LOCAL_RUNNER, loadIdentity, parseEnrollInput, realEvery, serveRunner, trackedConnector } from "./serve.ts";
 import { RunnerState } from "./state.ts";
@@ -192,6 +192,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
   };
   pruneCommands();
   const stopPrune = realEvery(24 * 60 * 60_000, pruneCommands);
+  const outboxTick = outboxMaintenance(outbox, realClock.now, log);
+  outboxTick();
+  const stopOutboxTick = realEvery(OUTBOX_MAINTENANCE_MS, outboxTick);
   const controller = new AbortController();
   process.on("SIGINT", () => controller.abort());
   process.on("SIGTERM", () => controller.abort());
@@ -219,6 +222,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     stopLaneSocket();
     stopGuard();
     stopPrune();
+    stopOutboxTick();
     stopHealth();
     stopAwake();
     outbox.close();

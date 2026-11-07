@@ -187,7 +187,8 @@ const checkState = (runs: readonly unknown[], statuses: Json): Pull["checks"] =>
 /**
  * GitHub status history (RETENTION.statusHistoryMs): a closed or merged PR quiet that long keeps its baseline but not its
  * activity ids (a later reply is still new: the poll's closed-history rule never replays older ones), and a cached
- * response no poll used that long is dropped (the next request is simply unconditional).
+ * response no poll used that long is dropped (the next request is simply unconditional). Closed PR detail and
+ * activity responses are discarded immediately, as are commit responses not used by an open PR.
  */
 const retainHistory = (pulls: Record<string, Pull>, cache: Readonly<Record<string, Cached>>, now: number): Record<string, Cached> => {
   const cutoff = now - RETENTION.statusHistoryMs;
@@ -195,7 +196,12 @@ const retainHistory = (pulls: Record<string, Pull>, cache: Readonly<Record<strin
     if (pull.state !== "open" && pull.activity.length && Date.parse(pull.updated) < cutoff) pulls[number] = { ...pull, activity: [] };
   }
   const kept: Record<string, Cached> = {};
+  const openShas = new Set(Object.values(pulls).filter((pull) => pull.state === "open").map((pull) => pull.sha));
   for (const [path, entry] of Object.entries(cache)) {
+    const number = /\/(?:pulls|issues)\/(\d+)(?:\/|\?|$)/.exec(path)?.[1];
+    if (number && pulls[number] && pulls[number].state !== "open") continue;
+    const sha = /\/commits\/([^/]+)\//.exec(path)?.[1];
+    if (sha && !openShas.has(sha)) continue;
     if (entry.usedAt === undefined) kept[path] = { ...entry, usedAt: now };
     else if (entry.usedAt >= cutoff) kept[path] = entry;
   }
@@ -273,6 +279,7 @@ export class GitHubEvents {
     const targets = await githubTargets(await deps.registry.open(), deps.ops);
     // Re-read on every tick: machine repos can change without restarting supervise.
     for (const repo of new Repos(this.stateDir).list()) if (!targets.has(repo)) targets.set(repo, { numbers: new Set(), branches: new Set() });
+    let next = this.state;
     await Promise.all([...targets].map(async ([repo, lanes]) => {
       const old = this.state.repos[repo];
       const carried = this.partial.get(repo);
@@ -355,9 +362,9 @@ export class GitHubEvents {
         const issues = await this.issues(api, repo, old?.issues, deps.config.githubIssueAuthors, emit);
         // Only commit source progress after every durable enqueue has succeeded.
         // A successful poll also clears this repo's earlier failure marker in the same commit.
-        const { [repo]: _recovered, ...failures } = this.state.failures;
+        const { [repo]: _recovered, ...failures } = next.failures;
         const cache = retainHistory(pulls, api.cache, deps.clock.now());
-        this.commit({ ...this.state, failures: repo in this.state.failures ? failures : this.state.failures, repos: { ...this.state.repos, [repo]: { cache, pulls, issues } } });
+        next = { ...next, failures, repos: { ...next.repos, [repo]: { cache, pulls, issues } } };
         this.partial.delete(repo);
       } catch (e) {
         if (!(e instanceof Error)) throw e;
@@ -368,7 +375,7 @@ export class GitHubEvents {
         if (last === undefined || now - last >= 15 * 60_000) {
           try {
             emit(`github-error:${repo}:${now}`, `HOST_GITHUB ${repo} poll_failed ${e instanceof GitHubError ? e.message : e.name}`);
-            this.commit({ ...this.state, failures: { ...this.state.failures, [repo]: now } });
+            next = { ...next, failures: { ...next.failures, [repo]: now } };
           } catch (failed) {
             // One repo's failure line that cannot be queued must not fail the other repos' poll; it is retried next tick.
             if (!(failed instanceof Error)) throw failed;
@@ -377,7 +384,7 @@ export class GitHubEvents {
         }
       }
     }));
-    this.commit({ ...this.state, polledAt: deps.clock.now() });
+    this.commit({ ...next, polledAt: deps.clock.now() });
   }
 
   /**

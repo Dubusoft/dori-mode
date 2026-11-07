@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { RunnerHub, formatRunnerStatus, readRunnerRows, type CommitFn } from "../src/runner/hub.ts";
 import { acceptRunners } from "../src/runner/serve.ts";
 import { RunnerClient, backoffMs } from "../src/runner/client.ts";
-import { Outbox } from "../src/runner/outbox.ts";
+import { Outbox, OUTBOX_FILE, TRUNCATION_MARKER } from "../src/runner/outbox.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { memoryNetwork } from "../src/runner/transport.ts";
 import {
@@ -163,6 +164,30 @@ describe("event cursor over a lossy in-memory link", () => {
       expect(r.outbox.stats().unacked).toBe(0);
     } finally {
       other.close();
+      r.close();
+    }
+  });
+
+  test("oversized events between normal ones are cut to fit, and the replay delivers every event after them", async () => {
+    const r = rig();
+    try {
+      expect(r.outbox.append("lane.state", stateBody).seq).toBe(1);
+      const big = r.outbox.append("lane.report", { key: "lane-a", kind: "progress", text: "t".repeat(600_000), evidence: "e".repeat(2 * 1024 * 1024) });
+      expect(big.body.evidence?.endsWith(TRUNCATION_MARKER)).toBe(true);
+      // A row stored before append fitted bodies, written straight into the database: its JSON is about 2.4 MB.
+      const db = new Database(join(tmp.dir, "runner", OUTBOX_FILE));
+      db.query("INSERT INTO events (seq, type, body, at) VALUES (3, 'lane.report', ?, 1000)")
+        .run(JSON.stringify({ key: "lane-a", kind: "progress", text: "x", evidence: "\u0001".repeat(400_000) }));
+      db.run("UPDATE meta SET v = 4 WHERE k = 'next_seq'");
+      db.close();
+      expect(r.outbox.append("lane.state", { key: "lane-a", status: "idle" }).seq).toBe(4);
+
+      expect(await r.reconnect()).toEqual({ ok: true, eventAck: 0, replayed: 4 });
+      r.net.pairs[0]?.pump();
+      expect(r.committed).toEqual([1, 2, 3, 4].map((seq) => journalId(LABEL, seq)));
+      expect(r.client.connected).toBe(true);
+      expect(r.outbox.stats().unacked).toBe(0);
+    } finally {
       r.close();
     }
   });
