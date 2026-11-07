@@ -213,7 +213,7 @@ const USAGE = `dori <command> [options]
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
                                        inside a lane: its structured report (own key only), sent through its runner to the supervisor
-  report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up)
+  report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up, done-claim notice, objection)
   inbox take [--max-bytes N] [--peek]  the lead's read path: delivered events past the take cursor as id<TAB>line, whole lines
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
   reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT]

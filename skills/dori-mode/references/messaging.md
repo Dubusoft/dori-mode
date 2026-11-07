@@ -9,6 +9,6 @@ Never send to a shell, a stopped agent or an approval prompt. Before you type in
 3. send once, as one argument;
 4. confirm delivery from a state change: the pane's `agent_status` moving to working, or the message showing up in the session record. Short of that, read the input line back: only when your own text is still sitting there unsubmitted, press Enter once more; still there after that, the send failed. If the line is empty but no change shows up, treat the send as unconfirmed.
 
-The scripts' pane sends (`sendVerified`, `sendGuarded`, CI messages to lanes) do all of this: they type nothing into an input line that holds other text or shows no prompt and retry on a later pass, and our own text left there unsubmitted only gets Enter, never a second copy.
+The scripts' pane sends (`sendVerified`, `sendGuarded`, the queued lane messages: CI, rebase, done-claim notice, objection) do all of this: they type nothing into an input line that holds other text or shows no prompt and retry on a later pass, and our own text left there unsubmitted only gets Enter, never a second copy.
 
 Exit code 0 and echoed input aren't proof the agent got the message. A reply from the session, or its record of handling the message, is.

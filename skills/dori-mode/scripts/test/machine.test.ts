@@ -297,7 +297,7 @@ test("an objection tells a remote lane to read the reasons with its runner's dor
   await claimDone(d, lane(), "closed acme/app#3");
   await objectDone(d, (await d.registry.read("remote-lane")) ?? lane(), ["changelog missing"]);
   const objection = sent(world).at(-1) ?? "";
-  expect(objection).toBe("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status remote-lane, keep working, and claim again when fixed");
+  expect(objection).toBe("[LEAD] not done: the Done check of remote-lane did not pass; the lead has the reasons. Read them with ~/.dori/runner/bin/dori lane status remote-lane, keep working, and claim again when fixed. Confirm you got this message: ~/.dori/runner/bin/dori report ack not-done-remote-lane-1767268800000");
   expectRemote();
 });
 

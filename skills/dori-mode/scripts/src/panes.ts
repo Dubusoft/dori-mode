@@ -123,7 +123,7 @@ const typeAndEnter = async (run: Runner, pane: string, text: string): Promise<"s
  * as a command, and only into an empty input box, since text there may be the owner's and ours would be appended to it
  * and submitted with it. The same text already sitting there unsubmitted (an earlier send) only gets Enter.
  */
-const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ readonly sent: "sent" | "failed"; readonly status?: string }> => {
+const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ readonly sent: "sent" | "failed"; readonly status?: string; readonly refusal?: string }> => {
   if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
   let refusal: string | undefined;
   let status: string | undefined;
@@ -141,7 +141,7 @@ const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ r
   }
   if (refusal) {
     console.error(`sendVerified ${pane}: not typed: ${refusal}`);
-    return { sent: "failed", status };
+    return { sent: "failed", status, refusal };
   }
   return { sent: await typeAndEnter(run, pane, text), status };
 };
@@ -155,11 +155,17 @@ export const sendGuarded = async (run: Runner, pane: string, text: string): Prom
  * only by a state change: the pane's agent_status moving to "working" from something else. A pane that was already
  * working cannot show that change. Short of it, the input box is read back (leftInInput): text still there after a
  * second Enter is "failed" (not submitted), otherwise the send is "unconfirmed" and the caller decides. A caller that
- * reads the input box back itself passes `inputCheck` false.
+ * reads the input box back itself passes `inputCheck` false. `refused` hears why a "failed" send was not typed or not
+ * submitted.
  */
-export const sendVerified = async (run: Runner, clock: Clock, pane: string, text: string, inputCheck = true): Promise<Delivery> => {
-  const { sent, status } = await guardedSend(run, pane, text);
-  if (sent === "failed") return "failed";
+export const sendVerified = async (
+  run: Runner, clock: Clock, pane: string, text: string, inputCheck = true, refused: (why: string) => void = () => {},
+): Promise<Delivery> => {
+  const { sent, status, refusal } = await guardedSend(run, pane, text);
+  if (sent === "failed") {
+    refused(refusal ?? `herdr send-text to pane ${pane} failed`);
+    return "failed";
+  }
   if (status !== "working") {
     for (let attempt = 0; attempt <= CONFIRM_BACKOFF_MS.length; attempt++) {
       if (attempt > 0) await clock.sleep(CONFIRM_BACKOFF_MS[attempt - 1] ?? 1000);
@@ -169,7 +175,10 @@ export const sendVerified = async (run: Runner, clock: Clock, pane: string, text
     }
   }
   if (!inputCheck) return "unconfirmed";
-  if (await leftInInput(run, clock, pane, text, status !== "working")) return "failed";
+  if (await leftInInput(run, clock, pane, text, status !== "working")) {
+    refused(`pane ${pane} kept the text in its input line after a second Enter`);
+    return "failed";
+  }
   if (status !== "working" && (await statusLookup(run, pane)).status === "working") return "delivered";
   return "unconfirmed";
 };
