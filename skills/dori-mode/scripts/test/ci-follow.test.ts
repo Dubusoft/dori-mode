@@ -579,17 +579,12 @@ test("a merged lane PR that cannot be read back wakes the lead once as MERGE_UNV
   expect(eventClass(lines("MERGE_UNVERIFIED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
 });
 
-test("GH_PR checks_failing and conflicting are digest by default, unless eventPolicy names them", async () => {
+test("GH_PR checks_failing and conflicting are digest; an eventPolicy in the config file is ignored", async () => {
   const file = join(state.dir, "config.json");
-  writeFileSync(file, JSON.stringify({}));
+  writeFileSync(file, JSON.stringify({ eventPolicy: { kinds: { "GH_PR * conflicting": "lead-urgent" } } }));
   const plain = await loadConfig(file, "/home/test");
   expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", plain.eventPolicy)).toBe("lead-digest");
   expect(eventClass("GH_PR acme/app#7 conflicting sha=x u", plain.eventPolicy)).toBe("lead-digest");
-
-  writeFileSync(file, JSON.stringify({ eventPolicy: { kinds: { "GH_PR * conflicting": "lead-urgent" } } }));
-  const on = await loadConfig(file, "/home/test");
-  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", on.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("GH_PR acme/app#7 conflicting sha=x u", on.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", on.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("CI_CONFLICT acme/app#7 x", on.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", plain.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("CI_CONFLICT acme/app#7 x", plain.eventPolicy)).toBe("lead-urgent");
 });

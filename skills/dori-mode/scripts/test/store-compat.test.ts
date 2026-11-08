@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultConfig, loadConfig, OBSOLETE_CONFIG_KEYS, warnObsoleteKeys } from "../src/config.ts";
+import { defaultConfig, loadConfig } from "../src/config.ts";
 import { Registry } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
 import { withState } from "./fakes.ts";
@@ -60,39 +60,16 @@ for (const kind of ["json", "sqlite"] as const) {
   });
 }
 
-test("a config without runners loads with the hub unconfigured", async () => {
+test("a config with a runners section or progressTemplate loads with both ignored, valid or malformed", async () => {
   const state = withState();
   cleanups.push(state.done);
   const path = join(state.dir, "config.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
-  const config = await loadConfig(path, "/home/ana");
-  expect(config.runners).toBeUndefined();
-  expect(defaultConfig("/home/ana").runners).toBeUndefined();
-});
-
-test("the runners section loads, a runners.mode in it is ignored, and a malformed one is refused", async () => {
-  const state = withState();
-  cleanups.push(state.done);
-  const path = join(state.dir, "config.json");
-  await Bun.write(path, JSON.stringify({ runners: { listen: "100.64.0.1:7411", mode: { mini: "shadow", box: "authoritative" }, restartCircuit: { max: 3 } } }));
-  const config = await loadConfig(path, "/home/ana");
-  expect(config.runners?.listen).toBe("100.64.0.1:7411");
-  expect(config.runners).toEqual({ listen: "100.64.0.1:7411", restartCircuit: { max: 3 } });
-  for (const bad of [[], { listen: 5 }, { restartCircuit: "x" }]) {
-    await Bun.write(path, JSON.stringify({ runners: bad }));
-    await expect(loadConfig(path, "/home/ana")).rejects.toThrow(TypeError);
+  for (const runners of [{ listen: "100.64.0.1:7411", mode: { mini: "shadow" }, restartCircuit: { max: 3 } }, { listen: "0.0.0.0:7411" }, [], { restartCircuit: "x" }]) {
+    await Bun.write(path, JSON.stringify({ runners, progressTemplate: "x", store: "json" }));
+    const config = await loadConfig(path, "/home/ana");
+    expect("runners" in config).toBe(false);
+    expect("progressTemplate" in config).toBe(false);
+    expect(config.store).toBe("json");
   }
-});
-
-test("an obsolete key warns once per process and is dropped; the shipped list names progressTemplate", async () => {
-  expect(OBSOLETE_CONFIG_KEYS).toEqual(["progressTemplate"]);
-  const lines: string[] = [];
-  const original = console.error;
-  console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };
-  try {
-    const warned = new Set<string>();
-    expect(warnObsoleteKeys({ oldKey: 1, fine: 2 }, "c.json", ["oldKey", "other"], warned)).toEqual(["oldKey"]);
-    warnObsoleteKeys({ oldKey: 1 }, "c.json", ["oldKey"], warned);
-  } finally { console.error = original; }
-  expect(lines.filter((l) => l.startsWith("CONFIG_KEY_OBSOLETE oldKey"))).toHaveLength(1);
+  expect("runners" in defaultConfig("/home/ana")).toBe(false);
 });

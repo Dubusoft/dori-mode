@@ -177,7 +177,7 @@ test("a version 6 database is migrated to 7 and keeps decision obligations", asy
   again.close();
 });
 
-test("config: resolveKinds and resolveTimeoutMin default, load from the file, and a malformed kind is refused", async () => {
+test("config: resolveKinds and resolveTimeoutMin are built in; file values, even malformed ones, are ignored", async () => {
   const state = withState();
   cleanups.push(state.done);
   expect(defaultConfig("/h").resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
@@ -185,10 +185,10 @@ test("config: resolveKinds and resolveTimeoutMin default, load from the file, an
   const path = join(state.dir, "c.json");
   writeFileSync(path, JSON.stringify({ resolveKinds: ["WAIT_DONE", "GH_PR * review"], resolveTimeoutMin: 3 }));
   const c = await loadConfig(path, "/h");
-  expect([c.resolveKinds, c.resolveTimeoutMin]).toEqual([["WAIT_DONE", "GH_PR * review"], 3]);
+  expect([c.resolveKinds, c.resolveTimeoutMin]).toEqual([DEFAULT_RESOLVE_KINDS, 15]);
   for (const bad of ["WAIT_DONE", ["* x"], ["A  B"], [7]]) {
     writeFileSync(path, JSON.stringify({ resolveKinds: bad }));
-    expect(loadConfig(path, "/h")).rejects.toThrow("resolveKinds");
+    expect((await loadConfig(path, "/h")).resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
   }
 });
 

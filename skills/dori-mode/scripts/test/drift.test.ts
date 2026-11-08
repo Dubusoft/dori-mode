@@ -109,17 +109,13 @@ test("LANE_DRIFT wakes the lead", () => {
   expect(eventClass("LANE_DRIFT lane-a ci-failing 3 consecutive failures https://github.com/acme/app/pull/7")).toBe("lead-urgent");
 });
 
-test("drift config defaults, partial override, and validation", async () => {
-  expect(defaultConfig("/home/ana").drift).toEqual({ enabled: true, milestoneOverdueMin: 90, ciFailStreak: 3 });
+test("drift config is built in: a drift key in the file, valid or malformed, is ignored", async () => {
+  const defaults = { enabled: true, milestoneOverdueMin: 90, ciFailStreak: 3 };
+  expect(defaultConfig("/home/ana").drift).toEqual(defaults);
   const path = join(state.dir, "drift.json");
-  await Bun.write(path, JSON.stringify({ drift: { milestoneOverdueMin: 45 } }));
-  expect((await loadConfig(path, "/home/ana")).drift).toEqual({ enabled: true, milestoneOverdueMin: 45, ciFailStreak: 3 });
-  for (const [drift, message] of [
-    ["x", "drift must be an object"], [{ enabled: "yes" }, "drift.enabled must be true or false"],
-    [{ milestoneOverdueMin: 0 }, "drift.milestoneOverdueMin must be positive"], [{ ciFailStreak: 1.5 }, "drift.ciFailStreak must be an integer of at least 1"],
-  ] as const) {
+  for (const drift of [{ milestoneOverdueMin: 45 }, "x", { enabled: "yes" }, { milestoneOverdueMin: 0 }, { ciFailStreak: 1.5 }]) {
     await Bun.write(path, JSON.stringify({ drift }));
-    await expect(loadConfig(path, "/home/ana")).rejects.toThrow(message);
+    expect((await loadConfig(path, "/home/ana")).drift).toEqual(defaults);
   }
 });
 

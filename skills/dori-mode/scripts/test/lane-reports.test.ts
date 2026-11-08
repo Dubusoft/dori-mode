@@ -165,21 +165,16 @@ test("routing: progress with no thread hook, or a failing one, reaches the lead 
   expect(store.list()[0]?.route).toBe("journal");
 });
 
-test("milestone and progress reports are digest unless eventPolicy names them, question and blocked stay urgent", async () => {
+test("milestone and progress reports are digest, question and blocked stay urgent; a config-file eventPolicy is ignored", async () => {
   const dir = stateDir();
   const file = join(dir, "config.json");
-  await Bun.write(file, JSON.stringify({}));
+  await Bun.write(file, JSON.stringify({ eventPolicy: { kinds: { "LANE_REPORT * progress": "engine-only" } } }));
   const plain = await loadConfig(file, "/home/test");
   expect(eventClass("LANE_REPORT demo milestone tests green", plain.eventPolicy)).toBe("lead-digest");
   expect(eventClass("LANE_REPORT demo progress half way", plain.eventPolicy)).toBe("lead-digest");
-
-  await Bun.write(file, JSON.stringify({ eventPolicy: { kinds: { "LANE_REPORT * progress": "engine-only" } } }));
-  const on = await loadConfig(file, "/home/test");
-  expect(eventClass("LANE_REPORT demo milestone tests green", on.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("LANE_REPORT demo progress half way", on.eventPolicy)).toBe("engine-only");
-  expect(eventClass("LANE_REPORT demo question which base?", on.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("LANE_REPORT demo blocked CI down", on.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", on.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("LANE_REPORT demo question which base?", plain.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("LANE_REPORT demo blocked CI down", plain.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", plain.eventPolicy)).toBe("lead-digest");
 });
 
 const cli = async (dir: string, args: string[], env: Record<string, string> = {}, config: Record<string, unknown> = {}) => {

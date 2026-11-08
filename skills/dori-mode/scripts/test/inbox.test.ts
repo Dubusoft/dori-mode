@@ -87,7 +87,7 @@ test("the supervisor consumes take receipts in every mode: cursor file first, th
   expect(receipts(s.dir)).toEqual([]);
 });
 
-test("delivery config: the defaults load, unsafe timings are refused, partial keys keep the defaults", async () => {
+test("delivery config: the defaults are safe, unsafe timings are refused, and a delivery key in the file is ignored", async () => {
   const base = defaultConfig().delivery;
   expect("mode" in base).toBe(false);
   expect(deliveryConfigError(base)).toBeUndefined();
@@ -98,7 +98,7 @@ test("delivery config: the defaults load, unsafe timings are refused, partial ke
   const path = join(dir, "config.json");
   writeFileSync(path, JSON.stringify({ delivery: { mode: "shadow", push: { ackSec: 60, debounceMs: 2000 } } }));
   const loaded = await loadConfig(path, dir);
-  expect(loaded.delivery).toEqual({ ...base, push: { ...base.push, ackSec: 60 } });
+  expect(loaded.delivery).toEqual(base);
 });
 
 test("the sqlite store keeps inbox and forcedRestarts, and a version 3 database is migrated to hold them", () => {

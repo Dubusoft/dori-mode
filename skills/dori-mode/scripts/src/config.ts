@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
+import { DEFAULT_EVENT_POLICY, type EventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { redactSecrets } from "./redact.ts";
@@ -67,12 +67,6 @@ export type DeliveryConfig = {
   readonly push: PushConfig;
 };
 
-/** delivery keys that were removed; a config that still has them loads, with one warning. */
-export const REMOVED_DELIVERY_KEYS = ["mode"] as const;
-
-/** delivery.push keys that were removed; a config that still has them loads, with one warning. */
-export const REMOVED_PUSH_KEYS = ["debounceMs"] as const;
-
 /** The supervisor's delivery tick: the push step runs at most once per tick. */
 export const DELIVERY_TICK_SEC = 5;
 
@@ -109,19 +103,6 @@ export type DriftConfig = {
 
 export const DEFAULT_DRIFT: DriftConfig = { enabled: true, milestoneOverdueMin: 90, ciFailStreak: 3 };
 
-/** The config's `drift` (absent: the default), laid over the default; throws TypeError on a bad shape or value. */
-const driftConfig = (raw: unknown): DriftConfig => {
-  if (raw === undefined) return DEFAULT_DRIFT;
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("drift must be an object");
-  const merged = { ...DEFAULT_DRIFT, ...(raw as Partial<DriftConfig>) };
-  if (typeof merged.enabled !== "boolean") throw new TypeError("drift.enabled must be true or false");
-  if (typeof merged.milestoneOverdueMin !== "number" || !Number.isFinite(merged.milestoneOverdueMin) || merged.milestoneOverdueMin <= 0) {
-    throw new TypeError("drift.milestoneOverdueMin must be positive");
-  }
-  if (!Number.isInteger(merged.ciFailStreak) || merged.ciFailStreak < 1) throw new TypeError("drift.ciFailStreak must be an integer of at least 1");
-  return { enabled: merged.enabled, milestoneOverdueMin: merged.milestoneOverdueMin, ciFailStreak: merged.ciFailStreak };
-};
-
 /** The shortest pointer (kinds cut to `+N more`) fits in MIN_POINTER_CHARS; omo kept 800 typed chars in one input. */
 export const MIN_POINTER_CHARS = 140;
 export const MAX_POINTER_CHARS = 800;
@@ -134,76 +115,6 @@ export type PlacementConfig = {
   readonly workspaces: Readonly<Record<string, string>>;
   /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
   readonly fallback: readonly string[];
-};
-
-/** The optional `runners` section. */
-export type RunnersConfig = {
-  /** Private-network address the runner hub listens on. */
-  readonly listen?: string;
-  /** Restart circuit-breaker settings, passed through as written. */
-  readonly restartCircuit?: Readonly<Record<string, unknown>>;
-};
-
-let warnedRunnersMode = false;
-
-/** The `runners` section (absent: undefined); throws TypeError when its shape is wrong. */
-const runnersConfig = (raw: unknown, path: string): RunnersConfig | undefined => {
-  if (raw === undefined) return undefined;
-  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-  if (!isObject(raw)) throw new TypeError("runners must be an object");
-  const { listen, mode, restartCircuit } = raw;
-  if (listen !== undefined) {
-    const value = typeof listen === "string" ? listen.trim() : String(listen);
-    const invalid = typeof listen !== "string" || !listen.trim()
-      ? true
-      : (() => {
-          const match = /^(\[[^\]]*\]|[^:]*):([0-9]+)$/.exec(value);
-          if (!match || !match[1] || Number(match[2]) < 1 || Number(match[2]) > 65535) return true;
-          const host = match[1].startsWith("[") ? match[1].slice(1, -1).toLowerCase() : match[1];
-          let privateHost = false;
-          if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
-            const octets = host.split(".").map(Number);
-            const a = octets[0]!;
-            const b = octets[1]!;
-            privateHost = octets.every((n) => n >= 0 && n <= 255) &&
-              (a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) ||
-                (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127));
-          } else if (host === "::1" || host === "0:0:0:0:0:0:0:1") privateHost = true;
-          else if (/^f[cd][0-9a-f]{2}:/i.test(host)) privateHost = true;
-          return !privateHost;
-        })();
-    if (invalid) throw new TypeError(`CONFIG_RUNNER_LISTEN_INVALID ${value}`);
-  }
-  if (mode !== undefined && !warnedRunnersMode) {
-    warnedRunnersMode = true;
-    console.error(`CONFIG_RUNNERS_MODE_REMOVED runners.mode in ${path}: every lane is owned by its runner, the key is ignored and can be deleted`);
-  }
-  if (restartCircuit !== undefined && !isObject(restartCircuit)) throw new TypeError("runners.restartCircuit must be an object");
-  return {
-    ...(listen !== undefined ? { listen: (listen as string).trim() } : {}),
-    ...(restartCircuit !== undefined ? { restartCircuit: { ...restartCircuit } } : {}),
-  };
-};
-
-/** Top-level config keys that are obsolete: ignored on load, each named once per process as CONFIG_KEY_OBSOLETE. Later phases add keys here. */
-export const OBSOLETE_CONFIG_KEYS: readonly string[] = ["progressTemplate"];
-
-const warnedObsoleteKeys = new Set<string>();
-
-/**
- * Warns CONFIG_KEY_OBSOLETE on stderr for each of `obsolete` present in `loaded`, once per key per process (per `warned`);
- * returns the keys that were present.
- */
-export const warnObsoleteKeys = (
-  loaded: Readonly<Record<string, unknown>>, path: string, obsolete: readonly string[] = OBSOLETE_CONFIG_KEYS, warned: Set<string> = warnedObsoleteKeys,
-): string[] => {
-  const present = obsolete.filter((key) => key in loaded);
-  for (const key of present) {
-    if (warned.has(key)) continue;
-    warned.add(key);
-    console.error(`CONFIG_KEY_OBSOLETE ${key} in ${path}: the key is ignored and can be deleted`);
-  }
-  return present;
 };
 
 export type DiscordConfig = {
@@ -341,8 +252,6 @@ export type DoriConfig = {
   readonly delivery: DeliveryConfig;
   /** Which machine a launch runs on. */
   readonly placement: PlacementConfig;
-  /** Runner hub settings; absent means the hub is not opened and behavior is unchanged. */
-  readonly runners?: RunnersConfig;
   /** Lane drift signals (LANE_DRIFT). */
   readonly drift: DriftConfig;
 };
@@ -431,45 +340,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   drift: DEFAULT_DRIFT,
 });
 
-/**
- * Removed feature flags: their behavior is always on. A config that still carries one loads fine; the key
- * is dropped and named in one warning per process.
- */
-export const REMOVED_FLAGS = [
-  "sweepSnapshot", "sweepTask", "superviseTasks", "operations", "threadArchive", "ciFollowUp", "toodoReconcile",
-  "claimDelivery", "branchCleanup", "eventSources", "schedules", "laneReports",
-] as const;
-
-/** Top-level keys of the removed lane quota stall sweep; a config that still has them loads, with one warning. */
-export const REMOVED_QUOTA_STALL_KEYS = ["quotaCheck"] as const;
-
-/** Top-level keys of the removed Claude quota gate (any old sub-keys included); a config that still has them loads, with one warning. */
-export const REMOVED_QUOTA_GATE_KEYS = ["quotaGate"] as const;
-
-/** Keys of the removed supervisor lane-finish line: the supervisor no longer posts to the owner itself; one warning. */
-export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
-
-/** Keys of the removed Toodo integration (the Toodo Lead chat channel and its Discord mirror); one warning. */
-export const REMOVED_TOODO_KEYS = ["toodo"] as const;
-
-/** Keys of the removed `hooks` entry that marked a messenger thread done on close (a close leaves the thread open); one warning. */
-export const REMOVED_HOOK_KEYS = ["threadDone"] as const;
-
-export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
-
-let warnedRemovedQuotaKeys = false;
-let warnedLeadArray = false;
-let warnedRemovedFlags = false;
-let warnedRemovedQuotaGateKeys = false;
-let warnedRemovedQuotaStallKeys = false;
-let warnedRemovedPushKeys = false;
-let warnedRemovedDeliveryKeys = false;
-let warnedRemovedOwnerPostKeys = false;
-let warnedRemovedToodoKeys = false;
-let warnedRemovedHookKeys = false;
-let warnedSandboxDefault = false;
-let warnedPaneKeys = false;
-
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
   const language = typeof ownerLanguage === "string" ? ownerLanguage.trim() : "";
@@ -490,38 +360,15 @@ export const DEFAULT_LANE_SANDBOX: LaneSandbox = { command: ["lane-sandbox"] };
 
 /**
  * The config's `laneSandbox`, or DEFAULT_LANE_SANDBOX when absent; throws TypeError unless { command: non-empty string[] }.
- * The removed `default` key (the sandbox is always on) is ignored with one warning, whatever its value.
+ * The removed `default` key (the sandbox is always on) is ignored and named in CONFIG_KEYS_IGNORED, whatever its value.
  */
-const laneSandbox = (raw: unknown, path: string): LaneSandbox => {
+const laneSandbox = (raw: unknown): LaneSandbox => {
   if (raw == null) return DEFAULT_LANE_SANDBOX;
   const bad = () => new TypeError("laneSandbox must be { \"command\": [non-empty strings, at least one] }");
   if (typeof raw !== "object" || Array.isArray(raw)) throw bad();
   const { command } = raw as Record<string, unknown>;
-  if ("default" in raw && !warnedSandboxDefault) {
-    warnedSandboxDefault = true;
-    console.error(`CONFIG_SANDBOX_DEFAULT_REMOVED laneSandbox.default in ${path}: every new local lane runs in the sandbox; the key is ignored and can be deleted`);
-  }
   if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string" || !part.trim())) throw bad();
   return { command: command as string[] };
-};
-
-/** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */
-const heavyKill = (raw: unknown, fallback: readonly string[]): readonly string[] => {
-  if (raw === undefined) return fallback;
-  if (!Array.isArray(raw) || raw.some((p) => typeof p !== "string")) throw new TypeError("heavyKill must be an array of strings");
-  return (raw as string[]).map((p) => p.trim()).filter(Boolean);
-};
-
-/** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
-const resolveKinds = (raw: unknown): readonly string[] => {
-  if (raw === undefined) return DEFAULT_RESOLVE_KINDS;
-  if (!Array.isArray(raw)) throw new EventPolicyError("resolveKinds must be an array of event kinds");
-  for (const kind of raw) {
-    if (typeof kind !== "string" || !kind || kind.split(" ").some((word) => !word) || kind.split(" ")[0] === "*") {
-      throw new EventPolicyError(`resolveKinds: ${JSON.stringify(kind)} is not a kind (words separated by single spaces, starting with the event name)`);
-    }
-  }
-  return raw as string[];
 };
 
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
@@ -560,94 +407,69 @@ const placement = (raw: unknown): PlacementConfig => {
   };
 };
 
+/**
+ * The only top-level keys read from config.json: who the owner is and where things live on this machine. Every other
+ * tunable is a built-in constant (defaultConfig), so a config written by any dori version loads on any other.
+ */
+export const CONFIG_FILE_KEYS = [
+  "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
+  "laneThinking", "leadArgs", "discordChannels", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
+  "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes",
+] as const;
+
+/** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
+const HOOK_KEYS = ["threadReply", "transcribe"] as const;
+
+let warnedIgnoredKeys = false;
+let warnedLeadArray = false;
+let warnedPaneKeys = false;
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
   const base = defaultConfig(home);
   const file = Bun.file(path);
   const loaded = (await file.exists()) ? ((await file.json()) as Record<string, unknown>) : {};
-  const leftover = REMOVED_FLAGS.filter((key) => key in loaded);
-  if (leftover.length && !warnedRemovedFlags) {
-    warnedRemovedFlags = true;
-    console.error(`CONFIG_FLAGS_REMOVED ${leftover.join(", ")} in ${path}: these flags were removed and their behavior is always on; the keys are ignored and can be deleted`);
+  const paneKeys = legacyPaneKeys(loaded);
+  const kept = CONFIG_FILE_KEYS as readonly string[];
+  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key));
+  const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
+  const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
+  ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
+  const rawMemory = isRecord(raw.memoryCheck) ? raw.memoryCheck : {};
+  ignored.push(...Object.keys(rawMemory).filter((key) => key !== "repo").map((key) => `memoryCheck.${key}`));
+  if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
+  if (ignored.length && !warnedIgnoredKeys) {
+    warnedIgnoredKeys = true;
+    console.error(`CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
   }
-  const oldStall = REMOVED_QUOTA_STALL_KEYS.filter((key) => key in loaded);
-  if (oldStall.length && !warnedRemovedQuotaStallKeys) {
-    warnedRemovedQuotaStallKeys = true;
-    console.error(`CONFIG_QUOTA_STALL_KEYS_REMOVED ${oldStall.join(", ")} in ${path}: lanes are no longer checked or paused on quota; the keys are ignored and can be deleted`);
-  }
-  const oldGate = REMOVED_QUOTA_GATE_KEYS.filter((key) => key in loaded);
-  if (oldGate.length && !warnedRemovedQuotaGateKeys) {
-    warnedRemovedQuotaGateKeys = true;
-    console.error(`CONFIG_QUOTA_GATE_KEYS_REMOVED ${oldGate.join(", ")} in ${path}: launches are no longer gated on Claude quota; the keys are ignored and can be deleted`);
-  }
-  const oldLead = REMOVED_QUOTA_KEYS.filter((key) => key in loaded);
-  if (oldLead.length && !warnedRemovedQuotaKeys) {
-    warnedRemovedQuotaKeys = true;
-    console.error(`CONFIG_QUOTA_KEYS_REMOVED ${oldLead.join(", ")} in ${path}: the lead uses one model; the keys are ignored and can be deleted`);
-  }
-  const oldOwnerPost = REMOVED_OWNER_POST_KEYS.filter((key) => key in loaded);
-  if (oldOwnerPost.length && !warnedRemovedOwnerPostKeys) {
-    warnedRemovedOwnerPostKeys = true;
-    console.error(`CONFIG_OWNER_POST_KEYS_REMOVED ${oldOwnerPost.join(", ")} in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`);
-  }
-  const oldToodo = REMOVED_TOODO_KEYS.filter((key) => key in loaded);
-  if (oldToodo.length && !warnedRemovedToodoKeys) {
-    warnedRemovedToodoKeys = true;
-    console.error(`CONFIG_TOODO_KEYS_REMOVED ${oldToodo.join(", ")} in ${path}: the Toodo integration was removed (Discord is the only messenger); the keys are ignored and can be deleted`);
-  }
-  if (Array.isArray(loaded.leadModel)) {
+  if (Array.isArray(raw.leadModel)) {
     if (!warnedLeadArray) {
       warnedLeadArray = true;
       console.error(`CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
     }
-    loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
+    raw.leadModel = modelEntries(raw.leadModel, undefined)[0];
   }
-  const obsolete = warnObsoleteKeys(loaded, path);
-  const dropped: readonly string[] = [...obsolete, ...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS, ...REMOVED_TOODO_KEYS];
-  const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
-  const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
-  const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);
-  if (oldDelivery.length && !warnedRemovedDeliveryKeys) {
-    warnedRemovedDeliveryKeys = true;
-    console.error(`CONFIG_DELIVERY_KEYS_REMOVED delivery.${oldDelivery.join(", delivery.")} in ${path}: push delivery is the only mode; the keys are ignored and can be deleted`);
-  }
-  const rawPush = (rawDelivery.push ?? {}) as Record<string, unknown>;
-  const oldPush = REMOVED_PUSH_KEYS.filter((key) => key in rawPush);
-  if (oldPush.length && !warnedRemovedPushKeys) {
-    warnedRemovedPushKeys = true;
-    console.error(`CONFIG_PUSH_KEYS_REMOVED delivery.push.${oldPush.join(", delivery.push.")} in ${path}: a burst becomes one push through the single outstanding push; the keys are ignored and can be deleted`);
-  }
-  const push = Object.fromEntries(Object.entries(rawPush).filter(([key]) => !(REMOVED_PUSH_KEYS as readonly string[]).includes(key))) as Partial<PushConfig>;
-  const delivery: DeliveryConfig = { ...base.delivery, ...Object.fromEntries(Object.entries(rawDelivery).filter(([key]) => !(REMOVED_DELIVERY_KEYS as readonly string[]).includes(key))), push: { ...base.delivery.push, ...push } };
-  const rawHooks = (typeof raw.hooks === "object" && raw.hooks !== null && !Array.isArray(raw.hooks) ? raw.hooks : {}) as Record<string, unknown>;
-  const oldHooks = REMOVED_HOOK_KEYS.filter((key) => key in rawHooks);
-  if (oldHooks.length && !warnedRemovedHookKeys) {
-    warnedRemovedHookKeys = true;
-    console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is left open for the owner to close, no hook marks it done; the keys are ignored and can be deleted`);
-  }
-  const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => !(REMOVED_HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
-  const stateDir = expandHome(process.env.DORI_STATE_DIR ?? raw.stateDir ?? base.stateDir, home);
+  const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
+  const memoryRepo = typeof rawMemory.repo === "string" ? rawMemory.repo : base.memoryCheck.repo;
+  const fromFile = raw as Partial<DoriConfig>;
+  const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
   const panes = resolveManagedPanes(stateDir, loaded);
-  const paneKeys = legacyPaneKeys(loaded);
   if (paneKeys.length && !warnedPaneKeys) {
     warnedPaneKeys = true;
     console.error(panes.migrated?.saved
       ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
       : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
   }
-  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...hooks }, delivery };
+  const merged: DoriConfig = { ...base, ...fromFile, hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
-    eventPolicy: resolveEventPolicy(raw.eventPolicy),
-    resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
-    laneSandbox: laneSandbox(raw.laneSandbox, path),
-    heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
+    laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
-    runners: runnersConfig(raw.runners, path),
-    drift: driftConfig(raw.drift),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
-    memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
+    memoryCheck: { ...base.memoryCheck, repo: expandHome(memoryRepo, home) },
     stateDir,
     defaultCwd: expandHome(merged.defaultCwd, home),
     sessionsDir: expandHome(merged.sessionsDir, home),

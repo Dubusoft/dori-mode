@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node
 import { join } from "node:path";
 
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
+import { CONFIG_FILE_KEYS } from "../src/config.ts";
 import { ACK_KEEP_MS, eventPriority, OWNER_NOTIFY_ATTEMPTS, Supervisor } from "../src/supervise.ts";
 import { enqueueLaunch, launchQueue, launchQueueText, recordLaunchVerdict } from "../src/routing.ts";
 import { supervisorSweeps } from "../src/supervise-loop.ts";
@@ -182,7 +183,7 @@ test("handled CLI persists task count and reply coverage through the real comman
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner alpha beta");
   const config = join(f.state.dir, "config.json");
-  const { leadPane: _lead, laneWorkspace: _lanes, workspaces: _watched, ...persisted } = f.deps.config;
+  const persisted = { ...Object.fromEntries(Object.entries(f.deps.config).filter(([key]) => (CONFIG_FILE_KEYS as readonly string[]).includes(key))), memoryCheck: { repo: f.deps.config.memoryCheck.repo } };
   writeFileSync(config, JSON.stringify(persisted));
   // When the lead declares two tasks and links one reply through the CLI.
   const child = Bun.spawn([process.execPath, "src/cli.ts", "handled", "11", "22", "--tasks", "2", "--reply"], {
