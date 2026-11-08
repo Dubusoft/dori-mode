@@ -302,6 +302,10 @@ export class SupervisorAuth {
          ON CONFLICT(label) DO UPDATE SET hostId = excluded.hostId, pubKey = excluded.pubKey, enrolledAt = excluded.enrolledAt,
            rotatedAt = NULL, revokedAt = NULL`,
       ).run(body.label, body.hostId, body.runnerPubKey, now);
+      // Enrollment can run in the installer before a hub opens. Rebind an existing row just as hub enrollment does.
+      if (this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runners'").get()) {
+        this.db.query("UPDATE runners SET hostId = ? WHERE label = ?").run(body.hostId, body.label);
+      }
       return true;
     }).immediate();
     if (!stored) return refuse("enrollment code already used");
@@ -501,6 +505,15 @@ export type EnrollParams = {
   readonly hostId: string;
   /** The supervisor key fingerprint the runner must see before it pins the key. */
   readonly expectedFingerprint: string;
+};
+
+/** First SSH pass emits only the enrollment proof; the second verifies and pins the supervisor's reply. */
+export const enrollOverStdio = (params: Omit<EnrollParams, "connect">, reply?: string): string | undefined => {
+  const request = params.auth.enrollRequest(params.code, params.label, params.hostId);
+  if (reply === undefined) return encodeFrame(runnerControl({ runner: params.label, gen: 0, epoch: 0 }, "enroll", request)).trimEnd();
+  const frame = decodeFrame(Buffer.from(reply, "base64").toString("utf8"), "supervisor");
+  if (frame.type !== "enroll.ok" || frame.runner !== params.label) throw new Error("RUNNER_AUTH_FAILED expected enroll.ok for this runner");
+  params.auth.pinSupervisor(params.code, request, frame.body as SupervisorControlBodies["enroll.ok"], params.expectedFingerprint);
 };
 
 /** Runs one enrollment exchange on a new connection and closes it; on success `keys/supervisor.pub` is pinned. */

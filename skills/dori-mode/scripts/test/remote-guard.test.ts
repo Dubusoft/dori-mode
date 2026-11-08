@@ -26,6 +26,7 @@ import {
   sshArgv,
 } from "../src/remote-guard.ts";
 import type { Ran, RunOptions, Runner } from "../src/run.ts";
+import { writeRunnerMachine } from "../src/runner/machines.ts";
 
 type Call = { argv: string[]; opts: RunOptions | undefined };
 
@@ -86,6 +87,24 @@ test("readGuardMachines reports a herdr failure or invalid JSON as not ok, with 
   expect(bad.ok ? "" : bad.detail).toStartWith("invalid JSON: ");
   expect(await readGuardMachines(fake(() => ok(JSON.stringify([{ id: "m1", label: "a", target: "a1" }]))).run, { a: "a2" }))
     .toEqual({ ok: true, machines: [{ label: "a", target: "a2", id: "m1" }] });
+});
+
+test("readGuardMachines adds the runner-machines state file at the lowest precedence: herdr and overrides replace it by label", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dori-rm-"));
+  try {
+    writeRunnerMachine(dir, "w1", "me@100.64.1.2");
+    writeRunnerMachine(dir, "a", "state-a");
+    writeRunnerMachine(dir, "b", "state-b");
+    const herdr = fake(() => ok(JSON.stringify([{ id: "m1", label: "a", target: "herdr-a" }])));
+    expect((await readGuardMachines(herdr.run, { b: "override-b" }, dir)).machines).toEqual([
+      { label: "a", target: "herdr-a", id: "m1" }, { label: "b", target: "override-b" }, { label: "w1", target: "me@100.64.1.2" },
+    ]);
+    // A herdr failure still lists the state machines; without a stateDir they are not read.
+    expect(await listGuardMachines(fake(() => ({ code: 1, out: "", err: "down" })).run, {}, dir)).toHaveLength(3);
+    expect(await listGuardMachines(fake(() => ok("[]")).run, {})).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("parseAgentSample reads the sample line, keeps -1 values, rejects junk", () => {

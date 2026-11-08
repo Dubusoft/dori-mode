@@ -4,7 +4,7 @@
 # it to exit, and starts it again 5 s later. The log is rotated by size before each start. ASCII only.
 param(
   [Parameter(Mandatory = $true)][string]$Label,
-  [Parameter(Mandatory = $true)][string]$Connect
+  [Parameter(Mandatory = $true)][string]$Listen
 )
 
 $ErrorActionPreference = 'Continue'
@@ -39,7 +39,7 @@ while ($true) {
     $BunDir = Join-Path $R ('bun\' + $Version)
     $Bun = Join-Path $BunDir 'bun.exe'
     $env:PATH = $Bin + ';' + $BunDir + ';' + $BasePath
-    $Line = '"' + $Bun + '" "' + (Join-Path $Bin 'dori.js') + '" runner serve --label ' + $Label + ' --connect ' + $Connect + ' >> "' + $Log + '" 2>&1'
+    $Line = '"' + $Bun + '" "' + (Join-Path $Bin 'dori.js') + '" runner serve --label ' + $Label + ' --listen ' + $Listen + ' >> "' + $Log + '" 2>&1'
     $Child = Start-Process -FilePath $env:ComSpec -ArgumentList ('/d /s /c "' + $Line + '"') -WorkingDirectory $R -NoNewWindow -PassThru
     $null = $Child.Handle
     [IO.File]::WriteAllText($PidFile, [string]$Child.Id)

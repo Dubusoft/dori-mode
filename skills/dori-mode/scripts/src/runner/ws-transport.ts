@@ -1,4 +1,5 @@
 import type { ServerWebSocket } from "bun";
+import { realTimers, type Timers } from "./call.ts";
 import { MAX_FRAME_BYTES } from "./protocol.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 
@@ -190,7 +191,7 @@ export const listenWs = (hostPort: string): WsListener => {
   };
 };
 
-/** Connects to a hub at `url` (`ws://host:port`); the connector rejects when the socket cannot be opened. */
+/** Opens a WebSocket transport; rejects when the socket cannot be opened. */
 export const connectWs = (url: string): Connector => () =>
   new Promise<Transport>((resolve, reject) => {
     const socket = new WebSocket(url);
@@ -215,3 +216,132 @@ export const connectWs = (url: string): Connector => () =>
       transport.ended(event.reason || `peer closed (${event.code})`);
     });
   });
+
+export type AcceptingConnector = {
+  readonly connect: Connector;
+  readonly host: string;
+  readonly port: number;
+  close(): void;
+};
+
+/** A worker owns the listening socket. Keep one early inbound connection for its next connectOnce(). */
+export const acceptWs = (hostPort: string): AcceptingConnector => {
+  const listener = listenWs(hostPort);
+  let closed = false;
+  let held: Transport | undefined;
+  let active: Transport | undefined;
+  let waiting: { resolve: (transport: Transport) => void; reject: (error: Error) => void } | undefined;
+  listener.onConnection((transport) => {
+    if (active?.open || held?.open) {
+      transport.close("runner already connected");
+      return;
+    }
+    if (waiting) {
+      const { resolve } = waiting;
+      waiting = undefined;
+      active = transport;
+      resolve(transport);
+    } else held = transport;
+  });
+  return {
+    host: listener.host, port: listener.port,
+    connect: () => {
+      if (closed) return Promise.reject(new Error("runner listener closed"));
+      if (waiting || active?.open) return Promise.reject(new Error("runner already connecting"));
+      if (held?.open) {
+        active = held;
+        held = undefined;
+        return Promise.resolve(active);
+      }
+      held = undefined;
+      return new Promise<Transport>((resolve, reject) => { waiting = { resolve, reject }; });
+    },
+    close() {
+      closed = true;
+      waiting?.reject(new Error("runner listener closed"));
+      waiting = undefined;
+      listener.close();
+    },
+  };
+};
+
+export type DialingOptions = {
+  readonly endpoints: () => Readonly<Record<string, string>>;
+  readonly timers?: Timers;
+  readonly random?: () => number;
+  readonly dial?: (url: string) => Promise<Transport>;
+  readonly refreshMs?: number;
+  readonly log?: (line: string) => void;
+};
+export type DialingListener = Listener & { refresh(): void };
+
+/** Dial each recorded worker, redial broken links, and periodically discover endpoint file changes. */
+export const dialWs = (options: DialingOptions): DialingListener => {
+  const timers = options.timers ?? realTimers;
+  const random = options.random ?? Math.random;
+  const dial = options.dial ?? ((url: string) => connectWs(url)());
+  const handlers = new Set<(transport: Transport) => void>();
+  type Peer = { endpoint: string; attempt: number; transport?: Transport; timer?: unknown };
+  const peers = new Map<string, Peer>();
+  let closed = false;
+  let started = false;
+  let refreshTimer: unknown;
+  const current = (label: string, peer: Peer): boolean => !closed && peers.get(label) === peer;
+  const connect = (label: string, peer: Peer): void => {
+    const retry = (): void => {
+      if (!current(label, peer)) return;
+      peer.timer = timers.set(() => { peer.timer = undefined; connect(label, peer); }, backoff(peer.attempt++, random));
+    };
+    void dial(`ws://${peer.endpoint}`).then((transport) => {
+      if (!current(label, peer)) { transport.close("endpoint removed"); return; }
+      peer.transport = transport;
+      if (!transport.open) { retry(); return; }
+      peer.attempt = 0;
+      transport.onClose(retry);
+      for (const handler of [...handlers]) handler(transport);
+    }, (error: unknown) => {
+      if (!current(label, peer)) return;
+      options.log?.(`RUNNER_CONNECT_FAILED runner=${label} endpoint=${peer.endpoint} ${error instanceof Error ? error.message : String(error)}`);
+      retry();
+    });
+  };
+  const remove = (label: string, peer: Peer): void => {
+    peers.delete(label);
+    if (peer.timer !== undefined) timers.clear(peer.timer);
+    peer.transport?.close("endpoint removed");
+  };
+  const refresh = (): void => {
+    if (closed || !started) return;
+    const endpoints = options.endpoints();
+    for (const [label, peer] of peers) if (endpoints[label] !== peer.endpoint) remove(label, peer);
+    for (const [label, endpoint] of Object.entries(endpoints)) {
+      if (peers.has(label)) continue;
+      if (!isPrivateListen(endpoint)) {
+        options.log?.(`RUNNER_LISTEN_REFUSED runner=${label} endpoint=${endpoint} is not a private host:port`);
+        continue;
+      }
+      const peer: Peer = { endpoint, attempt: 0 };
+      peers.set(label, peer);
+      connect(label, peer);
+    }
+  };
+  const tick = (): void => {
+    try { refresh(); }
+    catch (error) { options.log?.(`RUNNER_ENDPOINTS_FAILED ${error instanceof Error ? error.message : String(error)}`); }
+    if (!closed) refreshTimer = timers.set(tick, options.refreshMs ?? 1000);
+  };
+  return {
+    refresh,
+    onConnection(handler) {
+      handlers.add(handler);
+      if (!started && !closed) { started = true; tick(); }
+      return () => { handlers.delete(handler); };
+    },
+    close() {
+      closed = true;
+      timers.clear(refreshTimer);
+      for (const [label, peer] of peers) remove(label, peer);
+      handlers.clear();
+    },
+  };
+};

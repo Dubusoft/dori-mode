@@ -15,7 +15,7 @@ const setup = async () => {
   const s = withState();
   cleanups.push(s.done);
   const clock = fakeClock(T0);
-  const deps = depsFor(newWorld(), clock, s.dir, { runners: {} });
+  const deps = depsFor(newWorld(), clock, s.dir, {});
   await deps.registry.write({ key: "lane-a", title: "a", thread: "none", brief: join(s.dir, "a.md"), done: "x", openedAt: new Date(T0).toISOString(), status: "working", machine: "worker-a", runner: "worker-a", pane: "pa" } as unknown as Lane);
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });

@@ -7,19 +7,21 @@ import { defaultConfig } from "../src/config.ts";
 import { runnerChecks } from "../src/doctor.ts";
 import { openOperations, plan } from "../src/operations.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
+import { writeRunnerEndpoint } from "../src/runner/endpoints.ts";
 import { markHerdr } from "./herdr-world.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const NOW = 1_800_000_000_000;
 
-const setup = (runners: object | undefined) => {
+const setup = (endpoint?: string) => {
   const stateDir = mkdtempSync(join(tmpdir(), "runner-doctor-"));
   dirs.push(stateDir);
   mkdirSync(join(stateDir, ".dori", "runner"), { recursive: true, mode: 0o700 });
   chmodSync(join(stateDir, ".dori"), 0o700);
   chmodSync(join(stateDir, ".dori", "runner"), 0o700);
-  const config = { ...defaultConfig(), stateDir, store: "json" as const, ...(runners ? { runners } : {}) };
+  const config = { ...defaultConfig(), stateDir, store: "json" as const };
+  if (endpoint) writeRunnerEndpoint(stateDir, "worker-a", endpoint);
   return { config, stateDir, deps: { config, clock: { now: () => NOW, sleep: async () => {} }, home: stateDir, exists: existsSync } };
 };
 
@@ -30,35 +32,35 @@ const addRunner = (stateDir: string, label: string, proto: number): void => {
   db.close();
 };
 
-test("without a runners section doctor still checks local runner basics", () => {
+test("without recorded endpoints doctor still checks local runner basics", () => {
   const checks = runnerChecks(setup(undefined).deps);
-  expect(checks.find((c) => c.id === "runner listen")).toMatchObject({ level: "WARN" });
+  expect(checks.find((c) => c.id === "runner endpoints")).toMatchObject({ level: "WARN" });
 });
 
-test("a missing listen address warns; a healthy runner is OK", () => {
-  const s = setup({});
+test("missing endpoints warn; a healthy runner is OK", () => {
+  const s = setup();
   addRunner(s.stateDir, "worker-a", 3);
   const checks = runnerChecks(s.deps);
-  expect(checks.find((c) => c.id === "runner listen")?.level).toBe("WARN");
+  expect(checks.find((c) => c.id === "runner endpoints")?.level).toBe("WARN");
   expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 3, gen 4, restarts1h 0" });
 });
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
-  const s = setup({ listen: "100.101.1.2:7411" });
+  const s = setup("100.101.1.2:7411");
   addRunner(s.stateDir, "worker-a", 6);
   const ops = openOperations(s.config);
   for (const n of [1, 2, 3]) plan(ops, NOW - n * 60_000, { lane: "runner:worker-a", action: "restart", target: `1-${n}` });
   plan(ops, NOW - 2 * 60 * 60_000, { lane: "runner:worker-a", action: "restart", target: "0-9" });
   ops.close();
   const checks = runnerChecks(s.deps);
-  expect(checks.find((c) => c.id === "runner listen")).toMatchObject({ level: "OK", detail: "100.101.1.2:7411 (private)" });
+  expect(checks.find((c) => c.id === "runner endpoints")).toMatchObject({ level: "OK", detail: "worker-a=100.101.1.2:7411" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
   expect(row?.detail).toBe("proto 6 is not 4 or 3; restart circuit open (3 restarts in the last hour)");
 });
 
 test("a runner whose machine's herdr is down or hung is FAIL with the herdr command for that machine; up is OK", () => {
-  const s = setup({ listen: "100.101.1.2:7411" });
+  const s = setup("100.101.1.2:7411");
   addRunner(s.stateDir, "worker-a", 4);
   addRunner(s.stateDir, "worker-b", 4);
   addRunner(s.stateDir, "worker-c", 3);

@@ -33,7 +33,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const stateDir = join(state.dir, "state");
   const runnerDir = join(state.dir, "runner");
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
-  const deps = depsFor(newWorld(), clock, stateDir, { runners: {} });
+  const deps = depsFor(newWorld(), clock, stateDir, {});
 
   // Supervisor side: the hub on <runnerDir>/sock/control, as supervise() opens it; it enrolls the local runner in-process.
   const logs: string[] = [];

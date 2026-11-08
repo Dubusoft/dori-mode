@@ -7,10 +7,12 @@ import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
 import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
 import { loadPolicy } from "../src/runner/policy.ts";
+import { enrollOverStdio, RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
+import { readRunnerEndpoints } from "../src/runner/endpoints.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
 const FINGERPRINT = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
-const UNIT = "ExecStart=@BUN@ %h/.dori/runner/bin/dori.js runner serve --label @LABEL@ --connect @CONNECT@\nEnvironment=PATH=@PATH@\n";
+const UNIT = "ExecStart=@BUN@ %h/.dori/runner/bin/dori.js runner serve --label @LABEL@ --listen @LISTEN@\nEnvironment=PATH=@PATH@\n";
 const BUNDLE = "console.log('runner bundle');\n";
 const machine = { label: "worker-a", target: "dori@worker-a" };
 const AGENT = ["omo", "--model", "{model}", "{prompt}"];
@@ -27,10 +29,15 @@ const fakeRun = (result: Partial<Ran> = {}) => {
   return { run, calls };
 };
 const posixKind = async () => ({ ok: true as const, kind: "posix" as const });
-const request = (issued: { count: number }) => ({
-  machine, label: "worker-a", connectUrl: "ws://100.101.1.2:7411", agentCommand: AGENT,
-  issue: () => { issued.count += 1; return { code: CODE, fingerprint: FINGERPRINT }; },
-});
+const request = (issued: { count: number }) => {
+  const stateDir = mkdtempSync(join(tmpdir(), "runner-install-state-"));
+  dirs.push(stateDir);
+  return {
+    machine, label: "worker-a", listenAddress: "100.101.1.2:7411", stateDir, agentCommand: AGENT,
+    issue: () => { issued.count += 1; return { code: CODE, fingerprint: FINGERPRINT }; },
+    enroll: () => { throw new Error("unexpected enrollment request"); },
+  };
+};
 
 test("the enrollment code and fingerprint go only on stdin, never in an argv element", async () => {
   const { run, calls } = fakeRun();
@@ -47,8 +54,9 @@ test("the enrollment code and fingerprint go only on stdin, never in an argv ele
   const stdin = call.opts?.stdin ?? "";
   expect(stdin).toContain(CODE);
   expect(stdin).toContain(FINGERPRINT);
-  expect(stdin).toContain("--label 'worker-a' --connect 'ws://100.101.1.2:7411'");
-  expect(stdin).toContain(remoteUnit(UNIT, "worker-a", "ws://100.101.1.2:7411").trimEnd());
+  expect(stdin).toContain("runner serve --enroll-only --label 'worker-a'");
+  expect(stdin).not.toContain("--connect");
+  expect(stdin).toContain(remoteUnit(UNIT, "worker-a", "100.101.1.2:7411").trimEnd());
   expect(issued.count).toBe(1);
 });
 
@@ -74,11 +82,11 @@ test("each script exit maps to its result code", async () => {
 test("bad inputs are refused before a code is issued or ssh runs", async () => {
   const { run, calls } = fakeRun();
   const issued = { count: 0 };
-  const bad = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, { ...request(issued), connectUrl: "ws://h:1; rm -rf ~" });
+  const bad = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, { ...request(issued), listenAddress: "h:1; rm -rf ~" });
   expect(bad.ok).toBe(false);
   expect(calls).toHaveLength(0);
   expect(issued.count).toBe(0);
-  expect(() => installScript("x\nDORI_RUNNER_EOF\ny", UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT })).toThrow("heredoc delimiter");
+  expect(() => installScript("x\nDORI_RUNNER_EOF\ny", UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT })).toThrow("heredoc delimiter");
 });
 
 const LOGIN_DIR = "/opt/login&tools|x/bin";
@@ -121,8 +129,8 @@ const runDarwin = async (host: ReturnType<typeof fakeHost>, script: string) => {
   return { code, err, out };
 };
 const darwinScript = () =>
-  installScript(BUNDLE, UNIT, "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, remoteUnit(PLIST, "worker-a", "ws://100.101.1.2:7411"), AGENT);
-const ARGS = ["runner", "serve", "--label", "worker-a", "--connect", "ws://100.101.1.2:7411"];
+  installScript(BUNDLE, UNIT, "worker-a", "100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, remoteUnit(PLIST, "worker-a", "100.101.1.2:7411"), AGENT);
+const ARGS = ["runner", "serve", "--label", "worker-a", "--listen", "100.101.1.2:7411"];
 
 const runScript = async (host: ReturnType<typeof fakeHost>, script: string) => {
   const p = Bun.spawn(["/bin/sh", "-s"], {
@@ -133,9 +141,78 @@ const runScript = async (host: ReturnType<typeof fakeHost>, script: string) => {
   return { code, err, out };
 };
 
+test("real runner enroll-only completes two SSH stdio passes without a supervisor listener, then install records the worker endpoint", async () => {
+  const host = fakeHost();
+  host.tool("bun", `exec '${process.execPath}' "$@"`);
+  const req = request({ count: 0 });
+  const auth = new SupervisorAuth(req.stateDir, { now: () => 1000 });
+  const bundle = `import { runnerHostMain } from ${JSON.stringify(join(import.meta.dir, "../src/runner/main.ts"))};\nprocess.exit(await runnerHostMain(process.argv.slice(3)));\n`;
+  const calls: Call[] = [];
+  try {
+    const result = await installRunner({
+      run: async (argv, opts) => {
+        calls.push({ argv, opts });
+        expect(readRunnerEndpoints(req.stateDir)).toEqual({});
+        return runScript(host, opts!.stdin!);
+      },
+      bundle: async () => bundle, kind: posixKind,
+    }, {
+      ...req, issue: () => ({ code: auth.issueCode(req.label).code, fingerprint: auth.fingerprint }),
+      enroll: (body) => auth.enroll(body),
+    });
+    expect(result).toEqual({ ok: true, version: bundleVersion(bundle), herdr: "started" });
+    expect(calls).toHaveLength(2);
+    expect(calls.every((c) => c.argv.at(-1) === "sh -s")).toBe(true);
+    expect(calls[0]!.opts!.stdin).not.toContain("reply=");
+    expect(calls[1]!.opts!.stdin).toContain("reply=");
+    const worker = new RunnerAuth(join(host.home, ".dori/runner"));
+    expect(worker.supervisorKey()).toBe(auth.publicKey);
+    expect(auth.key(req.label)?.pubKey).toBe(worker.keyPair().pub);
+    expect(readRunnerEndpoints(req.stateDir)).toEqual({ "worker-a": req.listenAddress });
+    const log = readFileSync(host.log, "utf8");
+    expect(log.match(/systemctl --user restart --job-mode=ignore-dependencies dori-runner.service/g)).toHaveLength(1);
+  } finally { auth.close(); }
+});
+
+test("Windows enrollment returns its proof on SSH stdout and receives the response only through stdin", async () => {
+  const req = request({ count: 0 });
+  const runnerDir = join(req.stateDir, "worker");
+  mkdirSync(runnerDir, { mode: 0o700 });
+  const auth = new SupervisorAuth(req.stateDir, { now: () => 1000 });
+  const worker = new RunnerAuth(runnerDir);
+  const code = auth.issueCode(req.label).code;
+  const params = { auth: worker, code, label: req.label, hostId: "windows-host", expectedFingerprint: auth.fingerprint };
+  const calls: Call[] = [];
+  try {
+    const result = await installRunner({
+      run: async (argv, opts) => {
+        calls.push({ argv, opts });
+        const reply = /reply=([A-Za-z0-9+/=]+)/.exec(opts!.stdin!)?.[1];
+        const request = enrollOverStdio(params, reply);
+        return request ? { code: INSTALL_EXIT.enrollPending, out: `RUNNER_ENROLL_REQUEST ${request}\r\n`, err: "" } : { code: 0, out: "", err: "" };
+      },
+      bundle: async () => BUNDLE, kind: async () => ({ ok: true, kind: "windows" }),
+    }, { ...req, issue: () => ({ code, fingerprint: auth.fingerprint }), enroll: (body) => auth.enroll(body) });
+    expect(result).toMatchObject({ ok: true });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.opts!.stdin).toContain("$Enroll.StandardInput.Write('reply=");
+    expect(calls.flatMap((call) => call.argv).join(" ")).not.toContain(code);
+    expect(worker.supervisorKey()).toBe(auth.publicKey);
+  } finally { auth.close(); }
+});
+
+test("a malformed SSH enrollment request fails without recording an endpoint", async () => {
+  const req = request({ count: 0 });
+  const { run, calls } = fakeRun({ code: INSTALL_EXIT.enrollPending, out: "RUNNER_ENROLL_REQUEST garbage" });
+  const result = await installRunner({ run, bundle: async () => BUNDLE, kind: posixKind }, req);
+  expect(result).toMatchObject({ ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED" });
+  expect(calls).toHaveLength(1);
+  expect(readRunnerEndpoints(req.stateDir)).toEqual({});
+});
+
 test("run by sh, the script installs, enrolls through a pipe, and keeps the keys on reinstall", async () => {
   const host = fakeHost();
-  const script = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://100.101.1.2:7411"), "worker-a", "ws://100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
+  const script = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "100.101.1.2:7411"), "worker-a", "100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
   const first = await runScript(host, script);
   expect(first).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
   const policyFile = join(host.home, ".dori/runner/runner-config.json");
@@ -145,7 +222,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   expect(argvLog).not.toContain(CODE);
   expect(argvLog).not.toContain(FINGERPRINT);
   expect(argvLog).toContain("bun ");
-  expect(argvLog).toContain("runner serve --enroll-only --label worker-a --connect ws://100.101.1.2:7411");
+  expect(argvLog).toContain("runner serve --enroll-only --label worker-a");
   expect(argvLog).toContain("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service");
   expect(argvLog).toContain("loginctl enable-linger dori");
   expect(readFileSync(join(host.home, "enroll-stdin"), "utf8")).toBe(`code=${CODE}\nfingerprint=${FINGERPRINT}\n`);
@@ -155,7 +232,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   expect(statSync(wrapper).mode & 0o777).toBe(0o700);
   expect(statSync(join(host.home, ".dori/runner")).mode & 0o777).toBe(0o700);
   const unit = readFileSync(join(host.home, ".config/systemd/user/dori-runner.service"), "utf8");
-  expect(unit).toContain(`ExecStart=${join(host.bin, "bun")} %h/.dori/runner/bin/dori.js runner serve --label worker-a --connect ws://100.101.1.2:7411`);
+  expect(unit).toContain(`ExecStart=${join(host.bin, "bun")} %h/.dori/runner/bin/dori.js runner serve --label worker-a --listen 100.101.1.2:7411`);
   expect(unit).not.toMatch(/@[A-Z]+@/);
   expect(existsSync(join(host.home, ".dori/runner/dori-runner.service.tmp"))).toBe(false);
 
@@ -172,7 +249,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
 test("run by sh without bun on PATH, the script exits with the no-bun code", async () => {
   const host = fakeHost();
   rmSync(join(host.bin, "bun"));
-  const script = installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT });
+  const script = installScript(BUNDLE, UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT });
   const p = Bun.spawn(["/bin/sh", "-s"], { stdin: new TextEncoder().encode(script), stdout: "pipe", stderr: "pipe", env: { HOME: host.home, PATH: host.bin, SHELL: join(host.bin, "loginsh") } });
   expect(await p.exited).toBe(INSTALL_EXIT.noBun);
 });
@@ -205,7 +282,7 @@ test("on Darwin with bun on PATH, the script writes the launchd agent, boots it 
   expect(argvLog).not.toContain("loginctl");
   expect(argvLog).not.toContain(CODE);
   expect(argvLog).not.toContain(FINGERPRINT);
-  expect(argvLog).toContain("runner serve --enroll-only --label worker-a --connect ws://100.101.1.2:7411");
+  expect(argvLog).toContain("runner serve --enroll-only --label worker-a");
   expect(readFileSync(join(host.home, "enroll-stdin"), "utf8")).toBe(`code=${CODE}\nfingerprint=${FINGERPRINT}\n`);
   expect(existsSync(join(host.home, ".config"))).toBe(false);
   expect(existsSync(join(host.home, ".dori/runner/com.dori.runner.plist.tmp"))).toBe(false);
@@ -279,7 +356,7 @@ test("on any other OS the script exits with the unsupported code before touching
 
 test("the runner directory the script leaves passes the runner's own safety check, on Linux and on Darwin", async () => {
   const linux = fakeHost();
-  const linuxScript = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://h:1"), "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
+  const linuxScript = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "h:1"), "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
   expect((await runScript(linux, linuxScript)).code).toBe(0);
   checkRunnerDir(join(linux.home, ".dori/runner"));
   const darwin = darwinHost();
@@ -306,7 +383,7 @@ test("the script creates ~/.dori/runner/evidence at 0700 and tightens an existin
 });
 
 test("the launchd plist is checked against the heredoc delimiter too", () => {
-  expect(() => installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, "a\nDORI_RUNNER_EOF\n")).toThrow("heredoc delimiter");
+  expect(() => installScript(BUNDLE, UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, "a\nDORI_RUNNER_EOF\n")).toThrow("heredoc delimiter");
 });
 
 test("a bundle run outside any git checkout reports the git SHA it was built from", async () => {
@@ -326,7 +403,7 @@ console.log((await runnerVersion(run, import.meta.dir)) ?? "-");\n`);
 }, 60_000);
 
 const herdrUnitPath = (home: string) => join(home, ".config/systemd/user/herdr-server.service");
-const linuxScript = () => installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "ws://h:1"), "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
+const linuxScript = () => installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "h:1"), "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
 const logLines = (log: string) => readFileSync(log, "utf8").split("\n");
 /** Every call that could stop or restart a running herdr. */
 const HERDR_DISRUPTION = /systemctl --user (restart|stop|kill|try-restart|reload-or-restart)[^\n]*herdr-server|launchctl (bootout|kickstart|kill|stop)[^\n]*com\.dori\.herdr|herdr server stop/;
@@ -473,5 +550,5 @@ test("the script's DORI_HERDR line is the install result's herdr, named on the R
 });
 
 test("the herdr templates are checked against the heredoc delimiter too", () => {
-  expect(() => installScript(BUNDLE, UNIT, "worker-a", "ws://h:1", { code: CODE, fingerprint: FINGERPRINT }, "plist", [], { unit: "a\nDORI_RUNNER_EOF\n", plist: "p" })).toThrow("heredoc delimiter");
+  expect(() => installScript(BUNDLE, UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, "plist", [], { unit: "a\nDORI_RUNNER_EOF\n", plist: "p" })).toThrow("heredoc delimiter");
 });

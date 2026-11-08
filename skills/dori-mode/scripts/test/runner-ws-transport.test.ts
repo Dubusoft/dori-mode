@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_FRAME_BYTES } from "../src/runner/protocol.ts";
-import type { Transport } from "../src/runner/transport.ts";
-import { backoff, connectWs, isPrivateListen, listenWs } from "../src/runner/ws-transport.ts";
+import { memoryPair, type Transport } from "../src/runner/transport.ts";
+import { acceptWs, backoff, connectWs, dialWs, isPrivateListen, listenWs } from "../src/runner/ws-transport.ts";
 
 const nextLine = (transport: Transport): Promise<string> =>
   new Promise((resolve) => {
@@ -109,4 +109,75 @@ describe("ws transport over loopback", () => {
     await clientClosed;
     await expect(connectWs(`ws://127.0.0.1:${port}`)()).rejects.toThrow("RUNNER_CONNECT_FAILED");
   });
+});
+
+test("the accepting connector holds an early connection, rejects a competing link and cancels a pending accept on close", async () => {
+  const worker = acceptWs("127.0.0.1:0");
+  try {
+    const supervisor = await connectWs(`ws://127.0.0.1:${worker.port}`)();
+    const runner = await worker.connect();
+    const got = nextLine(runner);
+    supervisor.send("held");
+    expect(await got).toBe("held");
+    const competing = await connectWs(`ws://127.0.0.1:${worker.port}`)();
+    if (competing.open) await closed(competing);
+    expect(runner.open).toBe(true);
+    const ended = closed(runner);
+    supervisor.close("drop");
+    await ended;
+    const pending = worker.connect().catch((error: Error) => error.message);
+    worker.close();
+    expect(await pending).toBe("runner listener closed");
+  } finally { worker.close(); }
+});
+
+test("the dialing listener backs off failed dials, discovers replacements and discards a late dial after close", async () => {
+  const scheduled = new Map<number, { fn: () => void; ms: number }>();
+  let nextTimer = 0;
+  const attempts: { url: string; resolve: (transport: Transport) => void; reject: (error: Error) => void }[] = [];
+  let endpoints: Record<string, string> = { worker: "127.0.0.1:7411" };
+  const accepted: Transport[] = [];
+  const listener = dialWs({
+    endpoints: () => endpoints, random: () => 0.5, refreshMs: 99_000,
+    timers: {
+      set(fn, ms) { scheduled.set(++nextTimer, { fn, ms }); return nextTimer; },
+      clear(handle) { scheduled.delete(handle as number); },
+    },
+    dial: (url) => new Promise((resolve, reject) => { attempts.push({ url, resolve, reject }); }),
+  });
+  const fire = (ms: number) => {
+    const entry = [...scheduled].find(([, timer]) => timer.ms === ms);
+    expect(entry).toBeDefined();
+    const [id, timer] = entry!;
+    scheduled.delete(id);
+    timer.fn();
+  };
+  listener.onConnection((transport) => accepted.push(transport));
+  expect(attempts[0]?.url).toBe("ws://127.0.0.1:7411");
+  attempts[0]!.reject(new Error("offline"));
+  await Promise.resolve();
+  fire(1000);
+  attempts[1]!.reject(new Error("offline"));
+  await Promise.resolve();
+  fire(2000);
+  const first = memoryPair();
+  attempts[2]!.resolve(first.supervisor);
+  await Promise.resolve();
+  expect(accepted).toEqual([first.supervisor]);
+  first.sever();
+  fire(1000);
+  const late = memoryPair();
+  endpoints = { worker: "127.0.0.1:7412", new: "10.1.2.3:7411" };
+  fire(99_000);
+  expect(attempts.slice(-2).map((a) => a.url)).toEqual(["ws://127.0.0.1:7412", "ws://10.1.2.3:7411"]);
+  attempts[3]!.resolve(late.supervisor);
+  await Promise.resolve();
+  expect(late.runner.open).toBe(false);
+  listener.close();
+  const afterClose = memoryPair();
+  attempts[4]!.resolve(afterClose.supervisor);
+  await Promise.resolve();
+  expect(afterClose.runner.open).toBe(false);
+  expect(scheduled.size).toBe(0);
+  expect(accepted).toHaveLength(1);
 });

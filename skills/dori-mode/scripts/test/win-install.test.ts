@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearShellModes, encodedPowerShell, sshArgv } from "../src/remote-guard.ts";
 import { INSTALL_EXIT, WIN_BOOTSTRAP, WIN_BUN, bunPinDir, bunPinUrl, bundleVersion, installRunner, installScript, remoteUnit, windowsInstallScript, windowsTemplates } from "../src/runner/install.ts";
@@ -12,14 +13,15 @@ const ISSUE = { code: CODE, fingerprint: FINGERPRINT };
 // Non-ASCII on purpose: the script must still be pure ASCII.
 const BUNDLE = "console.log('runner bundle \u00e9\u2014\u{1F680}');\n";
 const LABEL = "win-a";
-const CONNECT = "ws://100.101.1.2:7411";
+const LISTEN = "100.101.1.2:7411";
 const AGENT = ["omo", "--model", "{model}", "\u00fcber {prompt}"];
 const TEMPLATES = join(import.meta.dir, "..", "templates");
 const machine = { label: LABEL, target: "dori@win-a" };
 
-afterEach(() => { clearShellModes(); });
+const dirs: string[] = [];
+afterEach(() => { clearShellModes(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-const script = () => windowsInstallScript(BUNDLE, LABEL, CONNECT, ISSUE, AGENT);
+const script = () => windowsInstallScript(BUNDLE, LABEL, LISTEN, ISSUE, AGENT);
 const decodePs = (command: string): string => {
   const m = /-EncodedCommand (\S+)$/.exec(command);
   if (!m?.[1]) throw new Error(`not an encoded command: ${command}`);
@@ -45,10 +47,10 @@ test("every payload decodes to its input, the task XML with label and connect fi
     ["runner-task.ps1", t.runnerTask],
     ["runner-sample.ps1", readFileSync(join(TEMPLATES, "runner-sample.ps1"), "utf8")],
     ["uninstall.ps1", t.uninstall],
-    ["dori-runner-task.xml", remoteUnit(t.taskXml, LABEL, CONNECT)],
+    ["dori-runner-task.xml", remoteUnit(t.taskXml, LABEL, LISTEN)],
   ]));
   const xml = got.get("dori-runner-task.xml") ?? "";
-  expect(xml).toContain(`-Label ${LABEL} -Connect ${CONNECT}`);
+  expect(xml).toContain(`-Label ${LABEL} -Listen ${LISTEN}`);
   for (const want of ["<LogonType>InteractiveToken</LogonType>", "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
     "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>", "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", "<StartWhenAvailable>true</StartWhenAvailable>",
     "<Interval>PT1M</Interval>", "<Count>999</Count>", "<LogonTrigger>"]) expect(xml).toContain(want);
@@ -91,7 +93,7 @@ test("the directory gets the protected DACL, the starter policy and the task reg
   expect(s).toContain("Register-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner' -Xml $Xml -Force");
   expect(s).toContain("Start-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner'");
   expect(s).toContain(`} catch { Exit-Dori ${INSTALL_EXIT.systemd} `);
-  expect(windowsInstallScript(BUNDLE, LABEL, CONNECT, ISSUE, [])).not.toContain("runner-config.json");
+  expect(windowsInstallScript(BUNDLE, LABEL, LISTEN, ISSUE, [])).not.toContain("runner-config.json");
 });
 
 test("the enrollment secret goes to the enrolling process's stdin, never its arguments", () => {
@@ -100,7 +102,9 @@ test("the enrollment secret goes to the enrolling process's stdin, never its arg
   expect(s).toContain(`$F = '${FINGERPRINT}'`);
   expect(s).toContain("$Enroll.StandardInput.Write('code=' + $C + [char]10 + 'fingerprint=' + $F + [char]10)");
   const args = s.split("\n").find((l) => l.includes("$Psi.Arguments")) ?? "";
-  expect(args).toContain(`runner serve --enroll-only --label ' + '${LABEL}' + ' --connect ' + '${CONNECT}'`);
+  expect(args).toContain(`runner serve --enroll-only --label ' + '${LABEL}'`);
+  expect(args).not.toContain("--connect");
+  expect(args).not.toContain("--listen");
   expect(args).not.toContain("$C");
   expect(args).not.toContain(CODE);
   expect(s).toContain("if (-not (Test-Path -LiteralPath (Join-Path $R 'keys\\supervisor.pub'))) {");
@@ -115,7 +119,12 @@ const fakeRun = (answer: (command: string) => Partial<Ran>) => {
   };
   return { run, calls };
 };
-const request = () => ({ machine, label: LABEL, connectUrl: CONNECT, agentCommand: AGENT, issue: () => ISSUE });
+const request = () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "win-install-state-"));
+  dirs.push(stateDir);
+  return { machine, label: LABEL, listenAddress: LISTEN, stateDir, agentCommand: AGENT, issue: () => ISSUE,
+    enroll: () => { throw new Error("unexpected enrollment request"); } };
+};
 const deps = (run: ReturnType<typeof fakeRun>["run"], kind?: "posix" | "windows") => ({
   run, bundle: async () => BUNDLE, unitTemplate: "ExecStart=@BUN@\n",
   ...(kind ? { kind: async () => ({ ok: true as const, kind }) } : {}),
@@ -163,7 +172,7 @@ test("installRunner probes the machine kind and branches on it", async () => {
 });
 
 test("the POSIX script exits 8 on a Windows uname, and installRunner then retries the Windows install", async () => {
-  expect(installScript(BUNDLE, "u", LABEL, CONNECT, ISSUE, "p", [], { unit: "", plist: "" })).toContain(`MINGW*|MSYS*|CYGWIN*) exit ${INSTALL_EXIT.windowsShell} ;;`);
+  expect(installScript(BUNDLE, "u", LABEL, LISTEN, ISSUE, "p", [], { unit: "", plist: "" })).toContain(`MINGW*|MSYS*|CYGWIN*) exit ${INSTALL_EXIT.windowsShell} ;;`);
   const { run, calls } = fakeRun((c) => (c === "sh -s" ? { code: INSTALL_EXIT.windowsShell } : {}));
   expect(await installRunner(deps(run, "posix"), request())).toEqual({ ok: true, version: bundleVersion(BUNDLE) });
   expect(calls.map((c) => c.argv)).toEqual([sshArgv(machine.target, "sh -s"), BOOT]);

@@ -15,10 +15,10 @@ export interface Transport {
   readonly open: boolean;
 }
 
-/** Opens one connection to the supervisor (runner side). Rejects when the peer cannot be reached. */
+/** Supplies one connection to the supervisor (runner side), whether dialed locally or accepted from the network. */
 export type Connector = () => Promise<Transport>;
 
-/** Accepts connections (hub side). */
+/** Supplies connections to the hub, whether accepted locally or dialed to worker endpoints. */
 export interface Listener {
   onConnection(handler: (transport: Transport) => void): () => void;
   close(): void;

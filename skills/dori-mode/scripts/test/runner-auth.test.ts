@@ -3,13 +3,13 @@ import { sign } from "node:crypto";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
-  ENROLL_CODE_TTL_MS, RUNNER_KEY_FILES, RunnerAuth, SupervisorAuth, enrollRunner, fingerprint, transcript, type HandshakeParams,
+  ENROLL_CODE_TTL_MS, RUNNER_KEY_FILES, RunnerAuth, SupervisorAuth, enrollOverStdio, enrollRunner, fingerprint, transcript, type HandshakeParams,
 } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { RunnerHub } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import {
-  decodeFrame, encodeFrame, runnerControl, runnerEvent, supervisorControl, type SupervisorControlBodies,
+  decodeFrame, encodeFrame, runnerControl, runnerEvent, supervisorControl, type RunnerControlBodies, type SupervisorControlBodies,
 } from "../src/runner/protocol.ts";
 import { acceptRunners } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
@@ -79,6 +79,27 @@ const enroll = (sup: Sup, run: Run, code = sup.auth.issueCode(LABEL).code) =>
   drive([sup.net], enrollRunner({ auth: run.auth, connect: sup.net.connect, code, label: LABEL, hostId: HOST, expectedFingerprint: sup.auth.fingerprint }));
 
 const connect = (sup: Sup, run: Run) => drive([sup.net], run.client.connectOnce());
+
+test("SSH enrollment exchanges the original proof frames and refuses a wrong fingerprint before pinning", () => {
+  const sup = supervisor("ssh-supervisor");
+  const run = runner("ssh-worker", sup.net);
+  const code = sup.auth.issueCode(LABEL).code;
+  const params = { auth: run.auth, code, label: LABEL, hostId: HOST, expectedFingerprint: sup.auth.fingerprint };
+  const request = enrollOverStdio(params)!;
+  expect(request).not.toContain(code);
+  expect(request).not.toContain("PRIVATE KEY");
+  expect(run.auth.enrolled).toBe(false);
+  const body = decodeFrame(request, "runner").body as RunnerControlBodies["enroll"];
+  const accepted = sup.auth.enroll(body);
+  expect(accepted.ok).toBe(true);
+  if (!accepted.ok) throw new Error(accepted.detail);
+  const reply = Buffer.from(encodeFrame(supervisorControl({ runner: LABEL, gen: 0, epoch: 0 }, "enroll.ok", accepted.reply))).toString("base64");
+  expect(() => enrollOverStdio({ ...params, expectedFingerprint: `sha256:${"0".repeat(64)}` }, reply)).toThrow("RUNNER_AUTH_FAILED");
+  expect(run.auth.enrolled).toBe(false);
+  expect(enrollOverStdio(params, reply)).toBeUndefined();
+  expect(run.auth.supervisorKey()).toBe(sup.auth.publicKey);
+  expect(sup.auth.enroll(body)).toMatchObject({ ok: false, detail: "enrollment code already used" });
+});
 
 describe("runner authentication", () => {
   test("a hello answer signed by a different supervisor key makes the runner close the connection", async () => {

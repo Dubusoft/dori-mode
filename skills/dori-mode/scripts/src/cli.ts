@@ -163,13 +163,16 @@ const USAGE = `dori <command> [options]
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
-  runner serve [--label LABEL] [--enroll] [--connect ws://HOST:PORT]
-                                       a runner (needs a runners section in the config): connects to the supervisor over
-                                       ~/.dori/runner/sock/control (or --connect), signed handshake, heartbeats, reports lane
+  runner serve [--label LABEL] [--enroll] [--listen HOST:PORT]
+                                       a worker listens on its private address; the local runner connects over
+                                       ~/.dori/runner/sock/control; signed handshake, heartbeats, reports lane
                                        observations; commands are checked against ~/.dori/runner/runner-config.json;
                                        --enroll reads code= and fingerprint= lines on stdin first; --enroll-only enrolls and exits
-  runner install --machine LABEL       install or upgrade the runner on a Linux worker over ssh (bundle, unit, linger, enrollment
-                                       through ssh stdin); needs runners.listen and bun on the worker
+  runner install TARGET [--label LABEL] | --machine LABEL
+                                       install or upgrade the runner on a Linux worker over ssh (bundle, unit, linger, enrollment
+                                       through ssh stdin/stdout); listens on the worker's private IP, port 7411.
+                                       TARGET is user@ip, ip or user@host; LABEL defaults to a slug of the host (100.64.1.2 -> 100-64-1-2)
+                                       and the machine is remembered in <stateDir>/runner-machines.json
   runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
   runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
   runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
@@ -292,10 +295,11 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
   const { staleRunnerLabels, upgradeRunners } = await import("./runner/upgrade.ts");
   const { gitVersion } = await import("./runner/version.ts");
   const { buildBundle, installRunner } = await import("./runner/install.ts");
+  const { runnerListenAddress } = await import("./runner/endpoints.ts");
   const { SupervisorAuth } = await import("./runner/auth.ts");
   const rows = readRunnerRows(cfg.stateDir);
   const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
-  const machines = await listGuardMachines(run, cfg.guardMachines);
+  const machines = await listGuardMachines(run, cfg.guardMachines, cfg.stateDir);
   let bundle: string | undefined;
   const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
   const before = new Map(rows.map((r) => [r.label, r.maxGen]));
@@ -305,12 +309,12 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
       install: async (label) => {
         const machine = machines.find((m) => m.label === label);
         if (!machine) return { ok: false, detail: `no machine ${label}` };
-        if (!cfg.runners?.listen) return { ok: false, detail: "runners.listen is not set" };
         bundle ??= await buildBundle(run)();
         const done = await installRunner({ run, bundle: async () => bundle as string }, {
-          machine, label, connectUrl: `ws://${cfg.runners.listen}`,
+          machine, label, listenAddress: await runnerListenAddress(machine.target), stateDir: cfg.stateDir,
           agentCommand: cfg.agentCommand,
           issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
+          enroll: (body) => auth.enroll(body),
         });
         return done.ok ? { ok: true, version: done.version } : { ok: false, detail: `${done.code} ${done.detail}` };
       },
@@ -335,10 +339,10 @@ if (process.argv[2] === "runner") {
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
   // enroll, install, revoke, rotate, reset-gen and upgrade run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--connect ws://HOST:PORT] | probe [--json] | enroll --machine LABEL | install --machine LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
-    options: { machine: { type: "string" }, yes: { type: "boolean" } },
+    options: { machine: { type: "string" }, label: { type: "string" }, yes: { type: "boolean" } },
   });
   const [sub = "", target, ...extra] = parsed.positionals;
   if (extra.length) die(usage);
@@ -348,6 +352,7 @@ if (process.argv[2] === "runner") {
     return value as string;
   };
   if (parsed.values.yes && sub !== "herdr") die(usage);
+  if (parsed.values.label !== undefined && sub !== "install") die(usage);
   if (sub === "herdr") {
     const label = labelArg(parsed.values.machine);
     const cfg = await loadConfig();
@@ -383,27 +388,40 @@ if (process.argv[2] === "runner") {
     process.exit(0);
   }
   if (sub === "install") {
-    const label = labelArg(parsed.values.machine);
-    if (target !== undefined) die(usage);
+    // Exactly one of a positional ssh target (user@ip, ip, user@host) or --machine LABEL.
+    if ((target === undefined) === (parsed.values.machine === undefined)) die(usage);
+    if (parsed.values.machine !== undefined && parsed.values.label !== undefined) die(usage);
+    const { labelFromHost, parseInstallTarget, writeRunnerMachine } = await import("./runner/machines.ts");
+    let direct: { label: string; target: string } | undefined;
+    if (target !== undefined) {
+      try {
+        const parsedTarget = parseInstallTarget(target);
+        direct = { label: parsed.values.label === undefined ? labelFromHost(parsedTarget.host) : labelArg(parsed.values.label), target: parsedTarget.target };
+      } catch (e) {
+        die(`${e instanceof Error ? e.message : String(e)}\n${usage}`);
+      }
+    }
+    const label = direct?.label ?? labelArg(parsed.values.machine);
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
-    const listen = cfg.runners?.listen;
-    if (!listen) die("RUNNER_INSTALL_NO_LISTEN set runners.listen to the supervisor's private address first");
     const { readGuardMachines } = await import("./remote-guard.ts");
-    const machines = await readGuardMachines(run, cfg.guardMachines);
-    const machine = machines.machines.find((m) => m.label === label);
-    if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+    const machine = direct ?? machines.machines.find((m) => m.label === label)
+      ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
     const { SupervisorAuth } = await import("./runner/auth.ts");
     const { buildBundle, herdrInstallNote, installRunner } = await import("./runner/install.ts");
+    const { runnerListenAddress } = await import("./runner/endpoints.ts");
     const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
     try {
       // The code is issued in this process and handed to the installer as data; it never enters an argv.
       const result = await installRunner({ run, bundle: buildBundle(run) }, {
-        machine: machine as NonNullable<typeof machine>, label, connectUrl: `ws://${listen}`,
+        machine, label, listenAddress: await runnerListenAddress(machine.target), stateDir: cfg.stateDir,
         agentCommand: cfg.agentCommand,
         issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
+        enroll: (body) => auth.enroll(body),
       });
       if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+      if (direct) writeRunnerMachine(cfg.stateDir, direct.label, direct.target);
       console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${herdrInstallNote(result.ok ? result.herdr : undefined)}`);
     } finally {
       auth.close();
@@ -417,7 +435,7 @@ if (process.argv[2] === "runner") {
     const { machineKind, readGuardMachines, sshArgv } = await import("./remote-guard.ts");
     const { openLaneReports } = await import("./lane-reports.ts");
     const { evacuate } = await import("./runner/evacuate.ts");
-    const machine = (await readGuardMachines(run, cfg.guardMachines)).machines.find((m) => m.label === label);
+    const machine = (await readGuardMachines(run, cfg.guardMachines, cfg.stateDir)).machines.find((m) => m.label === label);
     if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     const sshTarget = (machine as NonNullable<typeof machine>).target;
     // The worker's commands take the form of its kind (POSIX sh or Windows PowerShell); found once, on first use.
@@ -629,7 +647,7 @@ try {
       }
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
-        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readGuardAgentScripts(), (line) => console.log(line)),
+        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines, config.stateDir), await readGuardAgentScripts(), (line) => console.log(line)),
         // A fresh process: this one still holds the modules it loaded before the pull, which the pulled runner code may not
         // be able to import from (a missing export throws).
         upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
@@ -968,7 +986,7 @@ try {
     case "guard": {
       if (key === "machines" || key === "install") {
         if (flags.positionals.length > 1 || (key === "machines" && opt("machine") !== undefined)) die("usage: dori guard machines | dori guard install [--machine LABEL]", 2);
-        const listed = await listGuardMachines(run, config.guardMachines);
+        const listed = await listGuardMachines(run, config.guardMachines, config.stateDir);
         if (key === "machines") {
           const want = guardAgentWants(await readGuardAgentScripts());
           const results = await Promise.all(listed.map(async (m) => ({ m, r: await sampleMachine(run, m) })));
@@ -1022,7 +1040,7 @@ try {
       break;
     }
     case "can-launch": {
-      const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines) : [];
+      const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines, config.stateDir) : [];
       const machines = flags.values.all
         ? [LOCAL_MACHINE, ...listed.map((m) => m.label)]
         : [resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement).machine];

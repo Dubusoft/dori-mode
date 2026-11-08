@@ -12,8 +12,8 @@
     <string>serve</string>
     <string>--label</string>
     <string>@LABEL@</string>
-    <string>--connect</string>
-    <string>@CONNECT@</string>
+    <string>--listen</string>
+    <string>@LISTEN@</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

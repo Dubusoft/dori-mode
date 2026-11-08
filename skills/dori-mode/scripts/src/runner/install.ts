@@ -6,6 +6,10 @@ import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindRe
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
 import { WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
 import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
+import type { SupervisorAuth } from "./auth.ts";
+import { writeRunnerEndpoint } from "./endpoints.ts";
+import { decodeFrame, encodeFrame, supervisorControl, type RunnerControlBodies } from "./protocol.ts";
+import { isPrivateListen } from "./ws-transport.ts";
 
 /**
  * Installs or upgrades the runner on a remote Linux or macOS machine over ssh, as design 3.2 and 5.4 lay out. The ssh
@@ -13,7 +17,10 @@ import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
  * the one-time enrollment code and the supervisor key fingerprint - travels on ssh's stdin as one POSIX sh script
  * that branches on `uname -s`. The code and fingerprint
  * are shell variables inside that script and reach the enrolling process through a pipe from the `printf` builtin,
- * so they never appear in any process's argv on either machine.
+ * so they never appear in any process's argv on either machine. A first install returns the runner's `enroll` proof
+ * on SSH stdout and exits 9 before starting a service. The installer accepts it with its local SupervisorAuth and
+ * sends `enroll.ok` on stdin in a second pass, which pins the key and starts the service. No network listener or
+ * running supervisor is needed for enrollment. Reinstalls with an already pinned key need only one pass.
  *
  * On both systems the script writes the bundle to `~/.dori/runner/bin/dori.js` through a temporary file and `mv`, the
  * `~/.dori/runner/bin/dori` wrapper that runs it with an absolute bun, creates `~/.dori/runner/evidence` (or tightens an
@@ -41,7 +48,7 @@ import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
  *
  * Script exit codes: 0 installed; 3 no usable `bun`; 4 unsupported OS; 5 enrollment refused or failed; 6 service
  * manager (systemd, linger or launchd) failed; 7 no `herdr` on the login PATH; 8 a POSIX shell on Windows (Git Bash,
- * MSYS, Cygwin), which `installRunner` retries as a Windows install; anything else is a generic failure.
+ * MSYS, Cygwin), which `installRunner` retries as a Windows install; 9 enrollment response needed; anything else is a generic failure.
  * ssh's own 255 or a timeout is unreachable.
  *
  * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead: a PowerShell script on ssh's stdin
@@ -59,10 +66,9 @@ export const RUNNER_CLI_ENTRY = join(import.meta.dir, "bin.ts");
 export const INSTALL_TIMEOUT_MS = 180_000;
 const HEREDOC = "DORI_RUNNER_EOF";
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const CONNECT = /^ws:\/\/[A-Za-z0-9.:[\]-]+:\d{1,5}$/;
 const ENROLL_VALUE = /^[A-Za-z0-9_:=+/.-]+$/;
 
-export const INSTALL_EXIT = { noBun: 3, notLinux: 4, enroll: 5, systemd: 6, noHerdr: 7, windowsShell: 8 } as const;
+export const INSTALL_EXIT = { noBun: 3, notLinux: 4, enroll: 5, systemd: 6, noHerdr: 7, windowsShell: 8, enrollPending: 9 } as const;
 
 export type InstallFailure =
   | "RUNNER_INSTALL_UNREACHABLE"
@@ -70,6 +76,7 @@ export type InstallFailure =
   | "RUNNER_INSTALL_NO_BUN"
   | "RUNNER_INSTALL_NO_HERDR"
   | "RUNNER_INSTALL_ENROLL_FAILED"
+  | "RUNNER_LISTEN_REFUSED"
   | "RUNNER_INSTALL_FAILED";
 /** What the install did with herdr: started its unit, found the unit already running it, or found a herdr started by hand. */
 export type HerdrInstall = "started" | "managed" | "unmanaged";
@@ -88,7 +95,7 @@ export const herdrInstallNote = (herdr: HerdrInstall | undefined): string =>
 export type HerdrTemplates = { readonly unit: string; readonly plist: string };
 const herdrTemplates = (): HerdrTemplates => ({ unit: readFileSync(HERDR_REMOTE_UNIT_TEMPLATE, "utf8"), plist: readFileSync(HERDR_LAUNCHD_PLIST_TEMPLATE, "utf8") });
 
-export type EnrollIssue = { readonly code: string; readonly fingerprint: string };
+export type EnrollIssue = { readonly code: string; readonly fingerprint: string; readonly reply?: string };
 
 export type InstallDeps = {
   readonly run: Runner;
@@ -108,10 +115,13 @@ export type InstallDeps = {
 export type InstallRequest = {
   readonly machine: GuardMachine;
   readonly label: string;
-  /** `ws://<host>:<port>` of the supervisor's `runners.listen`. */
-  readonly connectUrl: string;
+  /** The private IP host:port the worker listens on. */
+  readonly listenAddress: string;
+  readonly stateDir: string;
   /** Issues the one-time enrollment code; called only after every input checked out. */
   readonly issue: () => EnrollIssue;
+  /** Accepts the request received over SSH stdout using the installer's SupervisorAuth. */
+  readonly enroll: SupervisorAuth["enroll"];
   /** The lead's agent command: the `default` profile of the starter runner-config.json the script writes when there is none. */
   readonly agentCommand: readonly string[];
 };
@@ -121,11 +131,11 @@ export const bundleVersion = (bundle: string): string => createHash("sha256").up
 const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 
 /**
- * The unit text for `label` and `connectUrl`; `@BUN@` and `@PATH@` are filled on the remote host by the script. The
+ * The unit text for `label` and `listenAddress`; `@BUN@` and `@PATH@` are filled on the remote host by the script. The
  * template uses `@NAME@` markers rather than setup's `{{NAME}}`, because setup does not render it.
  */
-export const remoteUnit = (template: string, label: string, connectUrl: string): string =>
-  template.replaceAll("@LABEL@", label).replaceAll("@CONNECT@", connectUrl);
+export const remoteUnit = (template: string, label: string, listenAddress: string): string =>
+  template.replaceAll("@LABEL@", label).replaceAll("@LISTEN@", listenAddress);
 
 const BUN_RELEASE = "https://github.com/oven-sh/bun/releases/latest/download";
 
@@ -133,9 +143,9 @@ export const installScript = (
   bundle: string,
   unit: string,
   label: string,
-  connectUrl: string,
+  listenAddress: string,
   issue: EnrollIssue,
-  plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, connectUrl),
+  plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, listenAddress),
   agentCommand: readonly string[] = [],
   herdr: HerdrTemplates = herdrTemplates(),
 ): string => {
@@ -228,7 +238,10 @@ export const installScript = (
     `C=${quote(issue.code)}`,
     `F=${quote(issue.fingerprint)}`,
     'if [ ! -f "$R/keys/supervisor.pub" ]; then',
-    `  printf 'code=%s\\nfingerprint=%s\\n' "$C" "$F" | "$BUN" "$R/bin/dori.js" runner serve --enroll-only --label ${quote(label)} --connect ${quote(connectUrl)} || exit ${INSTALL_EXIT.enroll}`,
+    `  printf 'code=%s\\nfingerprint=%s\\n${issue.reply ? `reply=${issue.reply}\\n` : ""}' "$C" "$F" | "$BUN" "$R/bin/dori.js" runner serve --enroll-only --label ${quote(label)}`,
+    '  E=$?',
+    `  [ "$E" -ne ${INSTALL_EXIT.enrollPending} ] || exit ${INSTALL_EXIT.enrollPending}`,
+    `  [ "$E" -eq 0 ] || exit ${INSTALL_EXIT.enroll}`,
     "fi",
     "unset C F",
     'if [ "$OS" = Linux ]; then',
@@ -353,7 +366,7 @@ const TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
 export const windowsInstallScript = (
   bundle: string,
   label: string,
-  connectUrl: string,
+  listenAddress: string,
   issue: EnrollIssue,
   agentCommand: readonly string[] = [],
   files: WindowsTemplates = windowsTemplates(),
@@ -367,7 +380,7 @@ export const windowsInstallScript = (
     ["runner-task.ps1", files.runnerTask],
     ["runner-sample.ps1", files.sampler],
     ["uninstall.ps1", files.uninstall],
-    ["dori-runner-task.xml", remoteUnit(files.taskXml, label, connectUrl)],
+    ["dori-runner-task.xml", remoteUnit(files.taskXml, label, listenAddress)],
   ];
   const lines = [
     "$ErrorActionPreference = 'Stop'",
@@ -457,14 +470,16 @@ export const windowsInstallScript = (
     "if (-not (Test-Path -LiteralPath (Join-Path $R 'keys\\supervisor.pub'))) {",
     "  $Psi = New-Object System.Diagnostics.ProcessStartInfo",
     "  $Psi.FileName = $Bun",
-    `  $Psi.Arguments = '"' + (Join-Path $Bin 'dori.js') + '" runner serve --enroll-only --label ' + ${psq(label)} + ' --connect ' + ${psq(connectUrl)}`,
+    `  $Psi.Arguments = '"' + (Join-Path $Bin 'dori.js') + '" runner serve --enroll-only --label ' + ${psq(label)}`,
     "  $Psi.UseShellExecute = $false",
     "  $Psi.RedirectStandardInput = $true",
     "  $Psi.WorkingDirectory = $R",
     "  $Enroll = [System.Diagnostics.Process]::Start($Psi)",
     "  $Enroll.StandardInput.Write('code=' + $C + [char]10 + 'fingerprint=' + $F + [char]10)",
+    ...(issue.reply ? [`  $Enroll.StandardInput.Write('reply=${issue.reply}' + [char]10)`] : []),
     "  $Enroll.StandardInput.Close()",
     "  $Enroll.WaitForExit()",
+    `  if ($Enroll.ExitCode -eq ${INSTALL_EXIT.enrollPending}) { exit ${INSTALL_EXIT.enrollPending} }`,
     `  if ($Enroll.ExitCode -ne 0) { Exit-Dori ${INSTALL_EXIT.enroll} ('enrollment failed with exit ' + $Enroll.ExitCode) }`,
     "}",
     "Remove-Variable C, F",
@@ -505,24 +520,43 @@ const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult
 
 export const installRunner = async (deps: InstallDeps, req: InstallRequest): Promise<InstallResult> => {
   if (!LABEL.test(req.label)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: `bad label ${req.label}` };
-  if (!CONNECT.test(req.connectUrl)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: `bad connect url ${req.connectUrl}` };
+  if (!isPrivateListen(req.listenAddress)) return { ok: false, code: "RUNNER_LISTEN_REFUSED", detail: `${req.listenAddress} is not a private host:port` };
   const k = await (deps.kind ?? machineKind)(deps.run, req.machine);
   if (!k.ok) return { ok: false, code: k.unsupported ? "RUNNER_INSTALL_UNSUPPORTED" : "RUNNER_INSTALL_UNREACHABLE", detail: k.detail };
   const bundle = await deps.bundle();
-  const unit = remoteUnit(deps.unitTemplate ?? readFileSync(RUNNER_REMOTE_UNIT_TEMPLATE, "utf8"), req.label, req.connectUrl);
-  const plist = remoteUnit(deps.plistTemplate ?? readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), req.label, req.connectUrl);
+  const unit = remoteUnit(deps.unitTemplate ?? readFileSync(RUNNER_REMOTE_UNIT_TEMPLATE, "utf8"), req.label, req.listenAddress);
+  const plist = remoteUnit(deps.plistTemplate ?? readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), req.label, req.listenAddress);
   const issue = req.issue();
   if (!ENROLL_VALUE.test(issue.code) || !ENROLL_VALUE.test(issue.fingerprint)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: "bad enrollment code or fingerprint" };
-  const windows = async (): Promise<InstallResult> => {
-    const script = windowsInstallScript(bundle, req.label, req.connectUrl, issue, req.agentCommand, deps.windowsTemplates ?? windowsTemplates());
-    return installResult("windows", await deps.run(sshArgv(req.machine.target, encodedPowerShell(WIN_BOOTSTRAP)), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS }), bundle);
+  let kind: InstallKind = k.kind;
+  const install = (enrollment: EnrollIssue): Promise<Ran> => {
+    const script = kind === "windows"
+      ? windowsInstallScript(bundle, req.label, req.listenAddress, enrollment, req.agentCommand, deps.windowsTemplates ?? windowsTemplates())
+      : installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates);
+    return deps.run(sshArgv(req.machine.target, kind === "windows" ? encodedPowerShell(WIN_BOOTSTRAP) : "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   };
-  if (k.kind === "windows") return windows();
-  const script = installScript(bundle, unit, req.label, req.connectUrl, issue, plist, req.agentCommand, deps.herdrTemplates);
-  const r = await deps.run(sshArgv(req.machine.target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
+  let r = await install(issue);
   // A POSIX shell on Windows: powershell.exe is reachable from it, so the Windows install runs instead.
-  if (r.code === INSTALL_EXIT.windowsShell) return windows();
-  return installResult("posix", r, bundle);
+  if (kind === "posix" && r.code === INSTALL_EXIT.windowsShell) { kind = "windows"; r = await install(issue); }
+  if (r.code === INSTALL_EXIT.enrollPending) {
+    try {
+      const line = /^RUNNER_ENROLL_REQUEST (.+)$/m.exec(r.out)?.[1];
+      if (!line) throw new Error("missing enrollment request on SSH stdout");
+      const frame = decodeFrame(line, "runner");
+      if (frame.type !== "enroll" || frame.runner !== req.label) throw new Error("unexpected enrollment request");
+      const body = frame.body as RunnerControlBodies["enroll"];
+      if (body.label !== req.label) throw new Error("enrollment request label differs from install label");
+      const accepted = req.enroll(body);
+      if (!accepted.ok) throw new Error(`${accepted.code} ${accepted.detail}`);
+      const reply = Buffer.from(encodeFrame(supervisorControl({ runner: req.label, gen: 0, epoch: 0 }, "enroll.ok", accepted.reply))).toString("base64");
+      r = await install({ ...issue, reply });
+    } catch (error) {
+      return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  const result = installResult(kind, r, bundle);
+  if (result.ok) writeRunnerEndpoint(req.stateDir, req.label, req.listenAddress);
+  return result;
 };
 
 /**

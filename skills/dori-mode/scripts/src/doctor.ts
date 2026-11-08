@@ -22,6 +22,7 @@ import { checkRunnerDir, defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safe
 import { herdrUnitInstalled } from "./runner/herdr-watch.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { readRunnerRows } from "./runner/hub.ts";
+import { readRunnerEndpoints } from "./runner/endpoints.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
@@ -339,8 +340,14 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
  */
 export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
   const checks: Check[] = [];
-  const listen = d.config.runners?.listen;
-  checks.push(listen ? ok("runner listen", `${listen} (private)`) : warn("runner listen", "runners.listen is not set: only the local runner can connect", "set runners.listen to this host's private address, e.g. <tailnet-ip>:7411"));
+  try {
+    const endpoints = Object.entries(readRunnerEndpoints(d.config.stateDir));
+    checks.push(endpoints.length
+      ? ok("runner endpoints", endpoints.map(([label, endpoint]) => `${label}=${endpoint}`).join(", "))
+      : warn("runner endpoints", "no worker endpoints recorded", "dori runner install --machine LABEL"));
+  } catch (error) {
+    checks.push(fail("runner endpoints", error instanceof Error ? error.message : String(error), "repair runner-endpoints.json or reinstall the worker"));
+  }
   const dir = defaultRunnerDir(d.home);
   const rootsFile = join(dir, "runner-config.json");
   const roots = d.exists(rootsFile)

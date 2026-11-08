@@ -7,6 +7,7 @@ import type { GuardThresholds } from "./config.ts";
 import { alertReasons } from "./host-guard.ts";
 import { herdrMachineList } from "./herdr-machines.ts";
 import { type Ran, RUN_TIMEOUT_CODE, type Runner } from "./run.ts";
+import { readRunnerMachines } from "./runner/machines.ts";
 
 /** The agent script the server installs on each worker machine as `$HOME/.dori/guard-agent.sh`. */
 export const GUARD_AGENT_TEMPLATE = join(import.meta.dir, "..", "templates", "guard-agent.sh");
@@ -73,26 +74,29 @@ export const parseMachineList = (json: string): GuardMachine[] => {
 /** A machine list read; on failure `machines` holds only the overrides and `detail` says why herdr's list is missing. */
 export type MachineListResult = { ok: true; machines: GuardMachine[] } | { ok: false; detail: string; machines: GuardMachine[] };
 
-const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Record<string, string>>): GuardMachine[] => {
-  const byLabel = new Map(listed.map((m) => [m.label, m]));
+/** `stateMachines` (label -> target from `dori runner install <target>`) rank lowest: herdr's list and `overrides` replace them by label. */
+const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Record<string, string>>, stateMachines: Readonly<Record<string, string>> = {}): GuardMachine[] => {
+  const byLabel = new Map<string, GuardMachine>(Object.entries(stateMachines).map(([label, target]) => [label, { label, target }]));
+  for (const m of listed) byLabel.set(m.label, m);
   for (const [label, target] of Object.entries(overrides)) byLabel.set(label, { ...byLabel.get(label), label, target });
   return [...byLabel.values()].sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 };
 
 /** herdr's saved machines with `overrides` (label -> ssh target) replacing or adding by label; a herdr failure or invalid JSON is not ok. */
-export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<MachineListResult> => {
+export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>, stateDir?: string): Promise<MachineListResult> => {
+  const state = stateDir === undefined ? {} : readRunnerMachines(stateDir);
   const r = await herdrMachineList(run);
-  if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides) };
+  if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides, state) };
   try {
-    return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides) };
+    return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides, state) };
   } catch (e) {
-    return { ok: false, detail: `invalid JSON: ${e instanceof Error ? e.message : String(e)}`, machines: withOverrides([], overrides) };
+    return { ok: false, detail: `invalid JSON: ${e instanceof Error ? e.message : String(e)}`, machines: withOverrides([], overrides, state) };
   }
 };
 
 /** readGuardMachines' machines, failure or not (only the overrides when herdr fails). */
-export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<GuardMachine[]> =>
-  (await readGuardMachines(run, overrides)).machines;
+export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>, stateDir?: string): Promise<GuardMachine[]> =>
+  (await readGuardMachines(run, overrides, stateDir)).machines;
 
 export const sshArgv = (target: string, command: string): string[] => ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, command];
 

@@ -13,7 +13,7 @@ Type=simple
 Environment=LANG=C.UTF-8
 Environment=PATH=@PATH@
 UMask=0077
-ExecStart=@BUN@ %h/.dori/runner/bin/dori.js runner serve --label @LABEL@ --connect @CONNECT@
+ExecStart=@BUN@ %h/.dori/runner/bin/dori.js runner serve --label @LABEL@ --listen @LISTEN@
 Restart=always
 RestartSec=5
 

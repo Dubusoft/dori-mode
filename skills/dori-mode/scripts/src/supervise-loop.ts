@@ -26,7 +26,8 @@ import {
 } from "./runner/serve.ts";
 import type { Listener } from "./runner/transport.ts";
 import { controlSocketPath, listenUnix } from "./runner/unix-transport.ts";
-import { listenWs, type WsListener } from "./runner/ws-transport.ts";
+import { dialWs, type DialingListener, type DialingOptions } from "./runner/ws-transport.ts";
+import { readRunnerEndpoints } from "./runner/endpoints.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -186,8 +187,8 @@ export type RunnerHubHandle = {
   readonly journal: RunnerJournal;
   /** The local control socket. */
   readonly listener: Listener;
-  /** The network listener on `runners.listen`, when configured and bound. */
-  readonly network?: WsListener;
+  /** Supervisor dialer for the recorded worker endpoints. */
+  readonly network: DialingListener;
   readonly auth: SupervisorAuth;
   /** Live connection operations (revoke, rotate, commands). */
   readonly accept: RunnerAccept;
@@ -199,8 +200,8 @@ export type RunnerHubHandle = {
 };
 
 export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent"> & {
-  /** `runners.listen` (already checked private by the config loader): also accept runners over WebSocket there. */
-  readonly listen?: string;
+  /** Discovery and reconnect dependencies; production reads runner-endpoints.json. */
+  readonly network?: Partial<DialingOptions>;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
   readonly hostId?: string;
   /** The call/query timeout timers (default real timers). */
@@ -230,11 +231,11 @@ const enrollLocalRunner = (auth: SupervisorAuth, hub: RunnerHub, runnerDir: stri
 };
 
 /**
- * Opens the runner hub on `<runnerDir>/sock/control` and, with `options.listen`, on that private address over
- * WebSocket. Every connection runs the signed handshake (auth.ts) against the keys in `<stateDir>`; the local runner is
+ * Opens the runner hub on `<runnerDir>/sock/control` and dials the recorded worker endpoints over WebSocket.
+ * Every connection runs the signed handshake (auth.ts) against the keys in `<stateDir>`; the local runner is
  * enrolled in-process first. The runner directory and its 0700 `sock/` are created or checked first; the supervisor
- * epoch is committed before any listener opens. A network listener that cannot bind is logged
- * `RUNNER_LISTEN_FAILED` and the local socket keeps serving. Runner events are committed to the hub's own journal
+ * epoch is committed before any listener opens. Failed network connections retry while the local socket keeps
+ * serving. Runner events are committed to the hub's own journal
  * table, never to the lead's events, and nothing here changes a lane.
  */
 export const openRunnerHub = (
@@ -253,11 +254,7 @@ export const openRunnerHub = (
     enrollLocalRunner(auth, hub, runnerDir, options.hostId ?? hostname(), log);
     listener = listenUnix(controlSocketPath(runnerDir));
   } catch (e) { auth?.close(); hub.close(); journal.close(); throw e; }
-  let network: WsListener | undefined;
-  if (options.listen) {
-    try { network = listenWs(options.listen); }
-    catch (e) { log(`RUNNER_LISTEN_FAILED listen=${options.listen} ${e instanceof Error ? e.message : String(e)}`); }
-  }
+  const network = dialWs({ endpoints: () => readRunnerEndpoints(stateDir), log, ...options.network });
   const guard = new RunnerGuardBoard(monotonic);
   const herdr = new HerdrDownInference({
     read: (label) => {
@@ -269,7 +266,7 @@ export const openRunnerHub = (
   // The proto each label said hello with on its current connection: RunnerCalls refuses newer types to a proto-2 runner.
   const protos = new Map<string, number>();
   let calls: RunnerCalls | undefined;
-  const accept = acceptRunners(hub, network ? [listener, network] : [listener], {
+  const accept = acceptRunners(hub, [listener, network], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
     onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
     onEvent: (label, frame) => {
@@ -293,10 +290,10 @@ export const openRunnerHub = (
       settle: (label, cmdId) => { hub.settleAttempt(label, cmdId); },
     },
   });
-  log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)}${network ? ` listen=${network.host}:${network.port}` : ""}`);
+  log(`RUNNER_HUB_READY epoch=${epoch} socket=${controlSocketPath(runnerDir)} network=dial`);
   const keys = auth;
   return {
-    hub, journal, listener, auth: keys, accept, guard, calls, ...(network ? { network } : {}),
+    hub, journal, listener, auth: keys, accept, guard, calls, network,
     close() { accept(); listener.close(); network?.close(); keys.close(); hub.close(); journal.close(); },
   };
 };
@@ -656,7 +653,7 @@ export const supervisorSweeps = (
     ["machine-guard", async (emit) => {
       const now = deps.clock.now();
       if (!guardMachines || now - guardMachines.at >= MACHINE_LIST_TTL_MS) {
-        const listed = await readGuardMachines(deps.run, deps.config.guardMachines);
+        const listed = await readGuardMachines(deps.run, deps.config.guardMachines, deps.config.stateDir);
         if (listed.ok) guardMachines = { at: now, list: listed.machines };
         else {
           guardMachines = { at: now - MACHINE_LIST_TTL_MS + MACHINE_LIST_RETRY_MS, list: guardMachines?.list ?? listed.machines };
@@ -1034,7 +1031,6 @@ export const supervise = async (
     let takeLaneEvents: () => Promise<void> = async () => {};
     const openRunners = async (step: <T>(name: string, work: () => T) => T): Promise<void> => {
       try {
-        const listen = deps.config.runners?.listen;
         const runnerDir = defaultRunnerDir(home || undefined);
         // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
         let monitor: LivenessMonitor | undefined;
@@ -1063,7 +1059,6 @@ export const supervise = async (
           laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
         };
         const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
-          ...(listen ? { listen } : {}),
           onHeartbeat: (label) => { void monitor?.heartbeat(label); },
           onHerdr: (id, line) => { enqueueSweep(id, line); },
           onHello: (label, body) => {
@@ -1093,7 +1088,7 @@ export const supervise = async (
           return laneWork;
         };
         let livenessSeq = 0;
-        const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines)).machines);
+        const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines, deps.config.stateDir)).machines);
         monitor = liveness = new LivenessMonitor({
           monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
           probe: io.probe,

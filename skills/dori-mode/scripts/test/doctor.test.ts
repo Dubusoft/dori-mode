@@ -82,12 +82,12 @@ const fixture = (patch: Patch = {}) => {
     run, http, clock, configPath: "/home/test/config.json", envPath: "/home/test/.dori/env", token: TOKEN, tokenSource: "file", exists: () => true, home: state.dir,
     config: {
       ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
-      runners: { listen: "100.101.1.2:7411", restartCircuit: { max: 3, windowMs: 3_600_000 } },
       memoryCheck: { ...defaultConfig("/home/test").memoryCheck, repo: join(state.dir, "memory") },
       discordChannels: ["500"], discord: { applicationId: "100", guildId: "200", ownerId: "300" },
     },
     ...patch.deps,
   };
+  writeFileSync(join(state.dir, "runner-endpoints.json"), JSON.stringify({ worker: "100.101.1.2:7411" }));
   return { deps, calls, requests };
 };
 const find = (checks: readonly Check[], id: string): Check => {

@@ -6,6 +6,7 @@ import { enrollRunner, RunnerAuth } from "../src/runner/auth.ts";
 import { CALL_TIMEOUT_MS, COMMAND_TIMEOUTS, NEEDS_PROTO, newCmdId, QUERY_TIMEOUT_MS, RunnerUnavailable } from "../src/runner/call.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { readRunnerRows, resetRunnerGen } from "../src/runner/hub.ts";
+import { writeRunnerEndpoint } from "../src/runner/endpoints.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { DEFAULT_POLICY } from "../src/runner/policy.ts";
 import type { AnyRunnerEvent, RunnerEventBodies } from "../src/runner/protocol.ts";
@@ -13,9 +14,9 @@ import {
   commandDispatcher, drainRunnerAdmin, parseEnrollInput, queueRunnerAdmin, runnerAdminResult,
 } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
-import type { Connector } from "../src/runner/transport.ts";
+import type { Connector, Transport } from "../src/runner/transport.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
-import { connectWs } from "../src/runner/ws-transport.ts";
+import { acceptWs } from "../src/runner/ws-transport.ts";
 import { openRunnerHub } from "../src/supervise-loop.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
@@ -138,29 +139,57 @@ test("enroll over the unix socket, connect, a policy-rejected command answers RU
   expect(runnerAdminResult(stateDir, late)).toBe("expired");
 });
 
-test("a runner over WebSocket on 127.0.0.1 enrolls, connects and shows in readRunnerRows", async () => {
+test("the supervisor discovers a listening worker, authenticates its real WebSocket hello and redials after a drop", async () => {
   const tmp = withState();
   cleanups.push(tmp.done);
   const stateDir = join(tmp.dir, "state");
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
   const lines: string[] = [];
+  const worker = acceptWs("127.0.0.1:0");
+  cleanups.push(() => worker.close());
+  const scheduled: { fn: () => void; ms: number }[] = [];
+  let retryReady: ((fn: () => void) => void) | undefined;
+  const retry = (): Promise<() => void> => {
+    const index = scheduled.findIndex((t) => t.ms === 1000);
+    if (index >= 0) return Promise.resolve(scheduled.splice(index, 1)[0]!.fn);
+    return new Promise((resolve) => { retryReady = resolve; });
+  };
   const handle = openRunnerHub(stateDir, join(tmp.dir, "runner"), clock.now, clock.now, (line) => { lines.push(line); }, {
-    hostId: "host-a", listen: "127.0.0.1:0",
+    hostId: "host-a", network: {
+      random: () => 0.5, refreshMs: 60_000,
+      timers: {
+        set(fn, ms) {
+          const timer = { fn, ms };
+          if (ms === 1000 && retryReady) { const resolve = retryReady; retryReady = undefined; resolve(fn); }
+          else scheduled.push(timer);
+          return timer;
+        },
+        clear(timer) { const index = scheduled.indexOf(timer as typeof scheduled[number]); if (index >= 0) scheduled.splice(index, 1); },
+      },
+    },
   });
   cleanups.push(() => handle.close());
-  const port = handle.network?.port;
-  expect(port).toBeGreaterThan(0);
-  expect(lines.some((line) => line.startsWith("RUNNER_HUB_READY ") && line.endsWith(` listen=127.0.0.1:${port}`))).toBe(true);
+  expect(worker.port).toBeGreaterThan(0);
+  expect(lines.some((line) => line.startsWith("RUNNER_HUB_READY ") && line.endsWith(" network=dial"))).toBe(true);
 
-  const connect = connectWs(`ws://127.0.0.1:${port}`);
+  let link: Transport | undefined;
+  const connect: Connector = async () => (link = await worker.connect());
   const remote = runnerAt(join(tmp.dir, "remote"), "remote", "host-r", connect, clock);
-  // Not enrolled yet: the network listener refuses it as the local socket does.
+  writeRunnerEndpoint(stateDir, "remote", `127.0.0.1:${worker.port}`);
+  // The discovery timer sees an install recorded after the hub opened, without a restart.
+  scheduled.shift()!.fn();
   expect(await remote.client.connectOnce()).toMatchObject({ ok: false, code: "RUNNER_AUTH_FAILED" });
   const { code } = handle.auth.issueCode("remote");
-  expect(await enrollRunner({ auth: remote.auth, connect, code, label: "remote", hostId: "host-r", expectedFingerprint: handle.auth.fingerprint }))
-    .toMatchObject({ ok: true });
+  (await retry())();
+  const enrolled = await enrollRunner({ auth: remote.auth, connect, code, label: "remote", hostId: "host-r", expectedFingerprint: handle.auth.fingerprint });
+  expect(enrolled).toMatchObject({ ok: true });
+  (await retry())();
   expect(await remote.client.connectOnce()).toMatchObject({ ok: true });
   expect(readRunnerRows(stateDir).find((row) => row.label === "remote")).toMatchObject({ hostId: "host-r", maxGen: 1 });
+  link!.close("drop");
+  (await retry())();
+  expect(await remote.client.connectOnce()).toMatchObject({ ok: true });
+  expect(lines.filter((line) => line.startsWith("RUNNER_CONNECTED runner=remote"))).toHaveLength(2);
 });
 
 test("the dispatcher answers a schema failure and a stale epoch, runs nothing twice, and answers a resent final cmdId again", () => {
