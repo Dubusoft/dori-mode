@@ -6,8 +6,8 @@ import { claimDone, watchTick } from "../src/done-flow.ts";
 import { adoptLane, LaunchError } from "../src/launch.ts";
 import type { Http } from "../src/messenger/http.ts";
 import { statusOf } from "../src/registry.ts";
-import { run } from "../src/run.ts";
-import { checkDone, checkSignal, doneSyntaxErrors, splitDone } from "../src/signals.ts";
+import { run, type Runner } from "../src/run.ts";
+import { checkDone, checkSignal, doneSyntaxErrors, parseSignal, splitDone } from "../src/signals.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const state = withState();
@@ -109,6 +109,74 @@ test("a QA-only lane's claim is re-checked at close time: the lane says done, bu
   const after = await deps.registry.read("local-setup");
   expect(after && statusOf(after)).toBe("not-done");
   expect(after?.objection?.reasons[0]).toContain("exit 1");
+  own.done();
+});
+
+test("a pr signal names a repo and a branch; a branch may hold / and, when quoted, ; or spaces", () => {
+  expect(parseSignal("pr acme/app feat/add-x-12")).toEqual({ kind: "pr", repo: "acme/app", branch: "feat/add-x-12" });
+  expect(parseSignal('pr acme/app "odd;branch name"')).toEqual({ kind: "pr", repo: "acme/app", branch: "odd;branch name" });
+  expect(splitDone('Done = pr acme/app "a;b"; closed acme/app#2')).toEqual(['pr acme/app "a;b"', "closed acme/app#2"]);
+  expect(() => parseSignal("pr acme/app a;b")).toThrow("must be quoted");
+  expect(() => parseSignal("pr feat/add-x-12")).toThrow("pr takes <owner/repo> <branch>");
+  expect(() => parseSignal("pr acme/app")).toThrow("pr takes <owner/repo> <branch>");
+  expect(() => parseSignal("pr acme/app main extra")).toThrow("pr takes only");
+  expect(doneSyntaxErrors("pr acme/app feat;x")).toHaveLength(1);
+});
+
+const URL7 = "https://github.com/acme/app/pull/7";
+const ghPrs = (out: unknown, code = 0) => {
+  const calls: { argv: readonly string[]; cwd?: string }[] = [];
+  const fake: Runner = async (argv, opts) => {
+    calls.push({ argv, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
+    return code ? { code, out: "", err: "gh: HTTP 502" } : { code: 0, out: typeof out === "string" ? out : JSON.stringify(out), err: "" };
+  };
+  return { calls, fake };
+};
+const pr = (p: Record<string, unknown> = {}) => ({ number: 7, state: "OPEN", isDraft: false, isCrossRepository: false, url: URL7, createdAt: "2026-11-01T00:00:00Z", statusCheckRollup: [{ conclusion: "SUCCESS" }, { state: "SUCCESS" }, { conclusion: "SKIPPED" }], ...p });
+
+test("a pr signal passes when the newest PR from the branch is merged, or open, not draft, and every check is green", async () => {
+  const merged = ghPrs([pr({ state: "MERGED", statusCheckRollup: [] })]);
+  expect(await checkSignal("pr acme/app feat/x", merged.fake, io)).toEqual({ signal: "pr acme/app feat/x", ok: true, detail: `MERGED ${URL7}` });
+  expect(merged.calls).toEqual([{ argv: ["gh", "pr", "list", "--repo", "acme/app", "--head", "feat/x", "--state", "all", "--json", "number,state,isDraft,statusCheckRollup,isCrossRepository,url,createdAt"] }]);
+  expect(await checkSignal("pr acme/app feat/x", ghPrs([pr()]).fake, io)).toMatchObject({ ok: true, detail: `OPEN, 3 checks green ${URL7}` });
+});
+
+test("a pr signal is not live while a check is pending, before any check exists, on a draft, closed or missing PR", async () => {
+  const cases: [unknown, string][] = [
+    [[pr({ statusCheckRollup: [{ conclusion: "SUCCESS" }, { conclusion: "", status: "IN_PROGRESS" }] })], `OPEN, 1 of 2 checks not green ${URL7}`],
+    [[pr({ statusCheckRollup: [{ conclusion: "FAILURE" }] })], `OPEN, 1 of 1 checks not green ${URL7}`],
+    [[pr({ statusCheckRollup: [] })], `OPEN with no checks yet ${URL7}`],
+    [[pr({ statusCheckRollup: null })], `OPEN with no checks yet ${URL7}`],
+    [[pr({ isDraft: true })], `OPEN draft ${URL7}`],
+    [[pr({ state: "CLOSED" })], `CLOSED ${URL7}`],
+    [[], "no PR from feat/x"],
+  ];
+  for (const [out, detail] of cases) {
+    const c = await checkSignal("pr acme/app feat/x", ghPrs(out).fake, io);
+    expect(c).toEqual({ signal: "pr acme/app feat/x", ok: false, detail });
+  }
+});
+
+test("a pr signal judges the newest PR, so an old merged PR from a reused branch name does not count", async () => {
+  const newer = "https://github.com/acme/app/pull/9";
+  const prs = [pr({ state: "MERGED", createdAt: "2026-10-01T00:00:00Z" }), pr({ number: 9, url: newer, createdAt: "2026-11-05T00:00:00Z", statusCheckRollup: [{ conclusion: "" }] })];
+  expect(await checkSignal("pr acme/app feat/x", ghPrs(prs).fake, io)).toMatchObject({ ok: false, detail: `OPEN, 1 of 1 checks not green ${newer}` });
+});
+
+test("a pr signal reports an error, not an unmet condition, when gh fails, answers no JSON, or the PR comes from a fork", async () => {
+  expect(await checkSignal("pr acme/app feat/x", ghPrs([], 1).fake, io)).toMatchObject({ ok: false, error: "gh: HTTP 502" });
+  expect((await checkSignal("pr acme/app feat/x", ghPrs("<html>").fake, io)).error).toStartWith("gh answered no JSON");
+  const fork = await checkSignal("pr acme/app feat/x", ghPrs([pr({ isCrossRepository: true, state: "MERGED" })]).fake, io);
+  expect(fork).toMatchObject({ ok: false, error: `${URL7} comes from a fork; pr signals support same-repo branches only` });
+});
+
+test("a pr Done line is accepted at launch, and a pr signal without a repo is refused", async () => {
+  // Its own state: the earlier qa-lane already holds the fake checkout in the shared one.
+  const own = withState();
+  const deps = depsFor(newWorld(), fakeClock(0), own.dir);
+  await expect(adoptLane(deps, { key: "pr-lane", title: "pr", brief: "/b.md", done: "pr feat/x", pane: "w:p9" })).rejects.toBeInstanceOf(LaunchError);
+  const lane = await adoptLane(deps, { key: "pr-lane", title: "pr", brief: "/b.md", done: "pr acme/app feat/x; closed acme/app#2", pane: "w:p9" });
+  expect(lane.done).toBe("pr acme/app feat/x; closed acme/app#2");
   own.done();
 });
 

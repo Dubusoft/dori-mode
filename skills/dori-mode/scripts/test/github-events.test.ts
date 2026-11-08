@@ -294,13 +294,14 @@ test("per-repo auth failure is bounded, isolated and rate-limited durably while 
   expect(f.events).toHaveLength(2);
 });
 
-test("lane targets include merged PRs, command head branches and git worktree branches", async () => {
-  const lane = { key: "lane", title: "", thread: "none", brief: "", openedAt: "", cwd: "/worktree", done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","feature","--json","number"]' };
+test("lane targets include merged PRs, pr and command head branches and git worktree branches", async () => {
+  const lane = { key: "lane", title: "", thread: "none", brief: "", openedAt: "", cwd: "/worktree", done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","feature","--json","number"]; pr Acme/App feat/pr-branch' };
   const w = newWorld();
   w.inspection = { git: { origin: "git@github.com:git/repo.git", branch: "working-branch", worktrees: [{ path: "/worktree", branch: "side-branch", exists: true }] } };
   const targets = await githubTargets([lane], fakeLaneOps(w));
   expect(w.ops.find((e) => e.op === "inspect")?.args).toMatchObject({ want: { git: true } });
   expect([...targets.get("acme/app")?.numbers ?? []]).toEqual([7]);
+  expect([...targets.get("acme/app")?.branches ?? []]).toEqual(["feat/pr-branch"]);
   expect([...targets.get("other/repo")?.branches ?? []]).toEqual(["feature"]);
   expect([...targets.get("git/repo")?.branches ?? []]).toEqual(["working-branch", "side-branch"]);
 });

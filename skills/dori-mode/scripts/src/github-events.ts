@@ -103,6 +103,7 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
       try {
         const signal = parseSignal(part);
         if (signal.kind === "merged") target(signal.repo).numbers.add(Number(signal.n));
+        if (signal.kind === "pr") target(signal.repo).branches.add(signal.branch);
         if (signal.kind === "command" && signal.argv[0] === "gh" && signal.argv[1] === "pr") {
           const at = signal.argv.findIndex((arg) => arg === "-R" || arg === "--repo");
           const repo = signal.argv[at + 1];

@@ -2,7 +2,7 @@
 
 The `dori launch` footer already carries these rules to every lane, so the Dori does not paste them. This file is the full version.
 
-When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
+When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, a branch's PR merged or green (`pr <owner/repo> <branch>`), an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
 
 A `merged <repo>#N` signal is the exception: the supervisor merges your PR only after your claim, so it cannot be live before you claim. Push everything, open the PR, and claim as soon as its CI is running or green; do not wait for the merge. The claim records the PR's head, and the supervisor merges exactly that head once its checks are green and GitHub calls it clean.
 
