@@ -180,17 +180,13 @@ export const RUNNER_LANE_CLI = "~/.dori/runner/bin/dori";
 const hasMergedSignal = (done: string): boolean => splitDone(done).some((part) => /^merged\s/i.test(part.trim()));
 
 export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => [
-  "- Set a goal first: restate the deliverable and the observable condition that ends this lane. The `Done =` signals below still decide when the lane closes; your restatement does not replace them.",
-  "- Work until that condition holds. Do not stop to ask permission for reversible steps the brief already covers; only a decision the brief leaves open goes to the owner, as below.",
-  "- Done rules: when every `Done =` signal below is live and all work is pushed, claim done with the dori report done command below yourself, then stay idle and start no new work.",
-  "  The watcher re-reads every signal live and closes the lane 5 min after your claim unless the Dori objects. It refuses to close while a worktree has uncommitted tracked changes or unpushed commits. The lane closes only when every signal reads back live.",
-  "  On `[LEAD] not done: <reasons>`, fix every reason and claim again.",
+  "- Set a goal restating the deliverable and its end condition (the `Done =` signals below decide the close), and work until it holds without asking leave for reversible steps the brief covers.",
+  "- Done: once every `Done =` signal is live and all work is pushed, run the done command below, then stay idle. The watcher closes the lane 5 min later unless the Dori objects, and refuses while a worktree has uncommitted or unpushed changes. On `[LEAD] not done: <reasons>`, fix them and claim again.",
   ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: once the PR is pushed and its CI is running or green, claim done without waiting for the merge. The supervisor merges the PR at the head your claim recorded and the lane closes after it; push nothing after the claim, or claim again if you must."] : []),
-  "- PR bodies, issues, commit messages, code comments and repo docs carry no owner quotes, chat message ids, or quota, usage or cost numbers.",
-  "- Keep decisions and conversations out of the repo: no decision log, chat record or who-asked-what in code, comments, docs or commits. Describe the change and its evidence in your own words.",
-  "- For any owner decision, run the dori report question command below and wait for the answer; never ask only through an on-screen ask-user prompt, which the owner does not see.",
+  "- Repo text (PRs, issues, commits, comments, docs) carries no owner quotes, chat ids, usage or cost numbers, decision logs or chat records; describe the change in your own words.",
+  "- Owner decisions go only through the dori report question command below (the owner never sees on-screen prompts); wait for the answer.",
   ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
-  `- Start emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${laneCli(lane)} heavy <label> -- <command>\`: one heavy job runs per machine at a time and the command waits for the slot. When memory runs critically low the guard kills configured heavy processes and may pause the lane.`,
+  `- Run emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${laneCli(lane)} heavy <label> -- <command>\` (one per machine; it waits for the slot).`,
   ...laneRules.map((rule) => `- ${rule}`),
   ...(lane.autoClose === "machine" ? ["- autoClose: machine. When the Done signals read back live the lane closes on its own; the lead is not woken for the claim or the close."] : []),
 ].join("\n");
@@ -198,7 +194,7 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
 const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 
 /** The kinds of a `dori report` footer and where each goes. */
-const REPORT_KINDS_TEXT = 'milestone = a state change the owner would care about: what now works or landed, where the lane stands against its Done condition, and "scope unchanged" or what changed; it reaches the lead with its next update. progress = 1-2 sentences, done since last and next; it updates your work thread\'s status message. question and blocked wake the lead.';
+const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question/blocked wake the lead.";
 
 /** The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner. */
 export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly string[]): string => [
@@ -211,12 +207,12 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   `- Done = ${lane.done}`,
   ...(lane.machine
     ? [
-      `- This lane runs on machine ${lane.machine} under its runner. Report to the lead with ${RUNNER_LANE_CLI} report, never by typing into any pane: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
-      `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>". See references/done-protocol.md.`,
+      `- Runs on machine ${lane.machine} under its runner. Report only with: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
+      `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>".`,
     ]
     : [
-      `- Report to the lead with dori report, never by typing into the lead's pane: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>". ${REPORT_KINDS_TEXT}`,
-      `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>" (the same claim as dori claim-done). See references/done-protocol.md.`,
+      `- Report only with: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT}`,
+      `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>".`,
     ]),
   "",
 ].join("\n");
