@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { upgradeRunners } from "../src/runner/upgrade.ts";
+import { staleRunnerLabels, upgradeRunners } from "../src/runner/upgrade.ts";
 import { updateInstall } from "../src/update.ts";
 import type { Ran, Runner } from "../src/run.ts";
 
@@ -26,6 +26,32 @@ test("a runner that never says hello with a higher gen stops the rollout too", a
   });
   expect(installed).toEqual(["worker-a"]);
   expect(log).toEqual(["RUNNER_UPGRADE_FAILED runner=worker-a no hello with a higher gen after the install; the remaining runners were not upgraded"]);
+});
+
+test("the rollout skips the local runner and workers already on the wanted version", () => {
+  const rows = [{ label: "local", version: "old" }, { label: "worker-a", version: "new" }, { label: "worker-b", version: "old" }, { label: "worker-c" }];
+  expect(staleRunnerLabels(rows, "local", "new")).toEqual(["worker-b", "worker-c"]);
+  expect(staleRunnerLabels(rows, "local", undefined)).toEqual(["worker-a", "worker-b", "worker-c"]);
+});
+
+test("an up-to-date dori update still runs the runner rollout, without restarting the supervisor", async () => {
+  const order: string[] = [];
+  const run: Runner = async (argv) => {
+    const a = argv.join(" ");
+    if (a.startsWith("git rev-parse --show-toplevel")) return { code: 0, out: "/repo", err: "" };
+    if (a === "git rev-parse HEAD") return { code: 0, out: "same", err: "" };
+    if (a === "git branch --show-current") return { code: 0, out: "dev", err: "" };
+    if (argv[0] === "systemctl") order.push(a);
+    return { code: 0, out: "", err: "" };
+  };
+  const log: string[] = [];
+  const code = await updateInstall(
+    { run, sleep: async () => {}, log: (l) => { log.push(l); }, upgradeRunners: async () => { order.push("runners"); return 0; } },
+    { packageDir: "/repo/skills/dori-mode/scripts", branch: "dev", force: false },
+  );
+  expect(code).toBe(0);
+  expect(log).toEqual(["UP_TO_DATE dev same"]);
+  expect(order).toEqual(["runners"]);
 });
 
 test("dori update restarts the supervisor before it upgrades any runner", async () => {

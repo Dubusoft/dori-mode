@@ -11,8 +11,9 @@ export type UpdateDeps = {
   /** Re-installs outdated remote guard agents; returns the failure count (logged by the callee, never changes the exit code). */
   readonly refreshGuardAgents?: () => Promise<number>;
   /**
-   * Upgrades the runners one at a time once the restarted supervisor is active (runner/upgrade.ts); returns the failure
-   * count, which is logged by the callee and never changes the exit code.
+   * Upgrades the runners one at a time once the restarted supervisor is active (runner/upgrade.ts), and also when the
+   * checkout was already up to date so a rollout an earlier update left unfinished is retried (runners on the current
+   * version are skipped); returns the failure count, which is logged by the callee and never changes the exit code.
    */
   readonly upgradeRunners?: () => Promise<number>;
   /** Installs the template over an outdated lane sandbox (lane-sandbox-install.ts); returns the line to log, if any. */
@@ -52,6 +53,10 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
   const refreshBootPrep = (): void => {
     if (!d.refreshBootPrep) return;
     try { const line = d.refreshBootPrep(); if (line) d.log(line); } catch (e) { d.log(`WARN boot prep: ${e instanceof Error ? e.message : String(e)}`); }
+  };
+  const upgradeRunners = async (): Promise<void> => {
+    if (!d.upgradeRunners) return;
+    try { await d.upgradeRunners(); } catch (e) { d.log(`WARN runners: ${e instanceof Error ? e.message : String(e)}`); }
   };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);
@@ -101,6 +106,7 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       refreshSandbox();
       refreshBootPrep();
       await refreshAgents();
+      await upgradeRunners();
       return 0;
     }
     refreshSandbox();
@@ -117,9 +123,7 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     }
     d.log(`UPDATED ${o.branch} ${short(old)}..${short(now)} supervisor=${state}`);
     if (state !== "active") return 1;
-    if (d.upgradeRunners) {
-      try { await d.upgradeRunners(); } catch (e) { d.log(`WARN runners: ${e instanceof Error ? e.message : String(e)}`); }
-    }
+    await upgradeRunners();
     return 0;
   } catch (e) {
     if (!(e instanceof UpdateStop)) throw e;

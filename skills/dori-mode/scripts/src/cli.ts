@@ -284,12 +284,13 @@ if (process.argv[2] === "status") {
 /**
  * `dori update`'s runner rollout: each worker runner gets the new bundle through `dori runner install`'s path, one at
  * a time, each confirmed by a hello with a higher gen within 2 minutes. The local runner is the supervisor's child, so
- * the supervisor restart that `dori update` already did restarted it on the updated checkout. Returns 1 when one
- * failed (the rest were not touched), else 0.
+ * the supervisor restart that `dori update` already did restarted it on the updated checkout. A runner that already
+ * reports this checkout's version is skipped. Returns 1 when one failed (the rest were not touched), else 0.
  */
 const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
   const { readRunnerRows } = await import("./runner/hub.ts");
-  const { upgradeRunners } = await import("./runner/upgrade.ts");
+  const { staleRunnerLabels, upgradeRunners } = await import("./runner/upgrade.ts");
+  const { gitVersion } = await import("./runner/version.ts");
   const { buildBundle, installRunner } = await import("./runner/install.ts");
   const { SupervisorAuth } = await import("./runner/auth.ts");
   const rows = readRunnerRows(cfg.stateDir);
@@ -300,7 +301,7 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
   const before = new Map(rows.map((r) => [r.label, r.maxGen]));
   try {
     const result = await upgradeRunners({
-      labels: rows.filter((r) => r.label !== LOCAL_RUNNER).map((r) => r.label),
+      labels: staleRunnerLabels(rows, LOCAL_RUNNER, await gitVersion(run, import.meta.dir)),
       install: async (label) => {
         const machine = machines.find((m) => m.label === label);
         if (!machine) return { ok: false, detail: `no machine ${label}` };
