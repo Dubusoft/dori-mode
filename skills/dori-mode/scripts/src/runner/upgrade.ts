@@ -16,6 +16,14 @@ export type UpgradeDeps = {
   readonly log: (line: string) => void;
 };
 
+/**
+ * The worker runners a rollout installs: every runner but `local` whose last hello did not report `want` (the supervisor
+ * checkout's version). A runner that already runs `want` is skipped, so the rollout can run on every `dori update` and
+ * finishes one that an earlier update left halfway. Without a known `want` every worker is installed.
+ */
+export const staleRunnerLabels = (rows: readonly { readonly label: string; readonly version?: string }[], local: string, want: string | undefined): string[] =>
+  rows.filter((r) => r.label !== local && (want === undefined || r.version !== want)).map((r) => r.label);
+
 export const upgradeRunners = async (deps: UpgradeDeps): Promise<{ readonly upgraded: number; readonly failed?: string }> => {
   let upgraded = 0;
   for (const label of deps.labels) {
