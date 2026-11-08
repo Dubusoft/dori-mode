@@ -271,11 +271,15 @@ test("footer puts the shared done rules first and every lane value after '### Th
       expect(rules, `${name} ${v}`).not.toContain(v);
       expect(text.indexOf(v), `${name} ${v}`).toBeGreaterThan(at);
     }
-    expect(rules, name).toContain("no owner quotes");
-    expect(rules, name).toContain("not done");
-    expect(rules, name).toContain("Keep decisions and conversations out of the repo");
-    expect(rules, name).toContain("never ask only through an on-screen ask-user prompt");
-    expect(rules, name).toContain("run the dori report question command below");
+    // Each shared rule is present, whatever its wording: done claim and re-claim, the dirty-worktree refusal, no quotes or
+    // ids or usage numbers in repo text, no decision records in the repo, owner decisions only through a question report.
+    expect(rules, name).toMatch(/`Done =` signal/);
+    expect(rules, name).toContain("[LEAD] not done");
+    expect(rules, name).toMatch(/uncommitted or unpushed/);
+    expect(rules, name).toMatch(/no owner quotes, chat ids, usage or cost numbers/);
+    expect(rules, name).toMatch(/decision logs or chat records/);
+    expect(rules, name).toMatch(/Owner decisions go only through the dori report question command/);
+    expect(rules, name).toMatch(/on-screen prompts/);
     expect(text, name).not.toContain("[REPORT]");
     expect(text, name).not.toContain("sent to pane");
   }
