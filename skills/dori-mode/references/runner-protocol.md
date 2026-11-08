@@ -151,15 +151,19 @@ connection; every later hello is refused with `RUNNER_REVOKED`. A revoked runner
 `rotate` and `revoke` reach the running supervisor through a request table (`runner_admin` in `runners.sqlite`) that
 the `runners` task drains every 5 seconds; a request not answered within 2 minutes is answered `expired`.
 
-## Network listener
+## Network link
 
-With `runners.listen` set (`host:port`), the supervisor also listens for runners on a WebSocket at that address,
-next to the local unix socket. The host must be a single private address: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
-192.168.0.0/16, 100.64.0.0/10 (tailnet), fd00::/8 or ::1, IPv6 written `[addr]:port`. A wildcard such as `0.0.0.0`,
-a hostname or a public address fails config loading with `CONFIG_RUNNER_LISTEN_INVALID`. If the address cannot be
-bound the supervisor logs `RUNNER_LISTEN_FAILED` and keeps serving the local socket. A remote runner connects with
-`dori runner serve --connect ws://<host>:<port>` and reconnects with backoff: 1 s doubling to 60 s, scaled by a
-random 0.8 to 1.2.
+A worker's runner listens and the supervisor dials it. The runner runs
+`dori runner serve --label <label> --listen <host>:<port>` and accepts one WebSocket connection at a time; a second
+connection while one is open is refused. The supervisor reads `<stateDir>/runner-endpoints.json`, an object mapping
+labels to `host:port` (`{"worker-a":"100.101.1.2:7411","worker-b":"[fd12::1]:7411"}`), dials each endpoint next to
+its local unix socket, and redials after a failure or close with backoff: 1 s doubling to 60 s, scaled by a random
+0.8 to 1.2. It rereads the file every second, so an added, changed or removed endpoint takes effect without a
+restart; a removed one stops its retries and closes its connection. `dori runner install` writes the entry (mode 0600,
+replaced atomically, other labels kept). The host is the worker's ssh target with the user and port stripped,
+resolved on the supervisor to one private address: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+100.64.0.0/10 (tailnet), fd00::/8 or ::1. A wildcard or public result fails with `RUNNER_LISTEN_REFUSED`, a lookup
+failure with `RUNNER_LISTEN_RESOLVE_FAILED`. The port is 7411. There is no `runners` config section any more.
 
 ## Command policy
 
@@ -284,9 +288,11 @@ chmod and the database lock-down is skipped. Socket paths over 107 UTF-8 bytes f
 
 ## Remote install
 
-`dori runner install --machine <label>` puts a runner on a Linux, macOS or Windows worker (Windows is covered at the end of this section). The machine is looked up like the guard's
-machines (herdr's saved machines plus `guardMachines`), and `runners.listen` must be set; otherwise it stops with
-`RUNNER_INSTALL_NO_LISTEN`. The supervisor issues the enrollment code in its own process and runs
+`dori runner install <target> [--label <label>]` or `dori runner install --machine <label>` puts a runner on a Linux, macOS or Windows worker (Windows is covered at the end of this section). With `--machine` the machine is looked up like the guard's
+machines (herdr's saved machines plus `guardMachines`); a positional target is used as given and, once installed, is
+saved in `<stateDir>/runner-machines.json` so the guard knows it too. The listen address comes from the target (see
+[Network link](#network-link)) and is recorded in `runner-endpoints.json` only after enrollment and the service
+install succeed. The supervisor issues the enrollment code in its own process and runs
 `ssh <target> sh -s`. That command line never changes: everything else goes on ssh's stdin as one sh script.
 
 - The bundle is `bun build src/runner/bin.ts --target=bun`, a single file holding only the runner. It is written to
@@ -294,7 +300,7 @@ machines (herdr's saved machines plus `guardMachines`), and `runners.listen` mus
   worker takes it from the PATH, `~/.dori/runner/bun/bun`, `/opt/homebrew/bin`, `/usr/local/bin` or `~/.bun/bin`, and
   otherwise downloads the latest release into `~/.dori/runner/bun`.
 - On Linux, `~/.config/systemd/user/dori-runner.service` (from `templates/dori-runner-remote.service`) runs
-  `bun ~/.dori/runner/bin/dori.js runner serve --label <label> --connect ws://<runners.listen>`. It has no
+  `bun ~/.dori/runner/bin/dori.js runner serve --label <label> --listen <host>:7411`. It has no
   `EnvironmentFile`: a worker holds no supervisor or Discord credentials.
 - The enrollment code and the supervisor fingerprint are shell variables in the script. They reach
   `runner serve --enroll-only` through a pipe from the `printf` builtin, so they appear in no process's argv on either
@@ -396,7 +402,7 @@ PowerShell guard agent (`guard-agent.ps1`) and lane reports.
 
 ## Guard
 
-A worker's runner (one started with `--connect`) samples its host every 30 seconds with the same readings the
+A worker's runner (one started with `--listen`) samples its host every 30 seconds with the same readings the
 supervisor takes of its own host, judged against `runner-config.json`'s `guard` thresholds:
 
 - `guard.sample {level, reasons, sampledAt, load1, memFreePct, diskFreeGb, swapFreeGb, swapTotalGb, os}` goes out once
@@ -511,8 +517,8 @@ code stay the runner's alone.
 ## Shadow mode (removed)
 
 Shadow mode is gone. The supervisor always opens the hub, `dori supervise` always spawns the local runner as its
-child (label `local`), and every lane is runner-owned. A leftover `runners.mode` in the config is ignored, with one
-`CONFIG_RUNNERS_MODE_REMOVED` warning per process. `dori runner shadow-report` was removed with it, nothing is
+child (label `local`), and every lane is runner-owned. A leftover `runners` section in the config is ignored and named in the
+one `CONFIG_KEYS_IGNORED` warning per process. `dori runner shadow-report` was removed with it, nothing is
 compared against a legacy path any more, and a `shadow_diffs` table left in `runners.sqlite` is ignored.
 
 ## Liveness rule
@@ -566,7 +572,7 @@ wake the lead a second time (staying down 10 minutes or a dead probe still does)
 `RUNNER_ONLINE machine=<label>` (digest), with the number of disconnects folded into it. The runner's unit is separate from herdr's (it only
 `Wants=` and is `After=` the herdr unit), so a restart never touches a lane's pane.
 
-`dori status` shows the restarts of the last hour on the runner's machine line (`restarts1h` in `--json`). `dori doctor` checks the listen address, the local
+`dori status` shows the restarts of the last hour on the runner's machine line (`restarts1h` in `--json`). `dori doctor` checks the recorded runner endpoints, the local
 runner directory, and each runner's protocol, outbox backlog and restart circuit.
 
 `dori update` restarts the supervisor first. Only once it is active again does it move the runners, one at a time.
@@ -617,7 +623,7 @@ Command records are kept 30 days.
 
 Every lane is runner-owned. `dori launch` starts a local lane through the local runner, the supervisor's child, and
 `dori launch --machine <label>` starts it through that machine's runner. There's no direct herdr path and no mode
-that picks one: `runners.mode` is ignored (`CONFIG_RUNNERS_MODE_REMOVED`). A lane whose runner is down waits for it,
+that picks one: a `runners` config section is ignored (`CONFIG_KEYS_IGNORED`). A lane whose runner is down waits for it,
 and losing a runner never hands the lane back to the supervisor.
 
 **Launch.** `dori launch` registers the lane at once with `runner: <label>` and appends the runner footer to the
