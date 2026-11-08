@@ -17,6 +17,8 @@ export type UpdateDeps = {
   readonly upgradeRunners?: () => Promise<number>;
   /** Installs the template over an outdated lane sandbox (lane-sandbox-install.ts); returns the line to log, if any. */
   readonly refreshLaneSandbox?: () => string | undefined;
+  /** Installs the template over an outdated supervisor boot-prep script (boot-prep-install.ts); returns the line to log, if any. */
+  readonly refreshBootPrep?: () => string | undefined;
 };
 export type UpdateOptions = {
   readonly packageDir: string;
@@ -46,6 +48,10 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
   const refreshSandbox = (): void => {
     if (!d.refreshLaneSandbox) return;
     try { const line = d.refreshLaneSandbox(); if (line) d.log(line); } catch (e) { d.log(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
+  };
+  const refreshBootPrep = (): void => {
+    if (!d.refreshBootPrep) return;
+    try { const line = d.refreshBootPrep(); if (line) d.log(line); } catch (e) { d.log(`WARN boot prep: ${e instanceof Error ? e.message : String(e)}`); }
   };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);
@@ -93,10 +99,12 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     if (now === old && !quotaMoved && !o.force) {
       d.log(`UP_TO_DATE ${o.branch} ${short(now)}`);
       refreshSandbox();
+      refreshBootPrep();
       await refreshAgents();
       return 0;
     }
     refreshSandbox();
+    refreshBootPrep();
     // Agents first: the restarted supervisor then samples the new agents instead of reporting the old ones OUTDATED.
     await refreshAgents();
     const restart = await d.run(["systemctl", "--user", "restart", SUPERVISOR_UNIT], { timeoutMs: 120_000 });

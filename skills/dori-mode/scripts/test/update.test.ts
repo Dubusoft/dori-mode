@@ -105,6 +105,17 @@ test("the lane sandbox is refreshed on UP_TO_DATE and on UPDATED, its line logge
   expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
 });
 
+test("the boot-prep script is refreshed before the restart, its line logged and a throw kept as a WARN", async () => {
+  const boot = (refreshBootPrep: () => string | undefined, branch: "main" | "dev") =>
+    updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), refreshBootPrep }, { packageDir: pkg, branch, force: false });
+  expect(await boot(() => "BOOT_PREP_UPDATED x", "dev")).toBe(0);
+  expect(lines).toContain("BOOT_PREP_UPDATED x");
+  await commit(origin, "notes.txt", "two\n");
+  expect(await boot(() => { calls.push("boot"); throw new Error("EACCES"); }, "main")).toBe(0);
+  expect(lines).toContain("WARN boot prep: EACCES");
+  expect(calls.indexOf("boot")).toBeLessThan(calls.indexOf("systemctl --user restart dori-supervisor.service"));
+});
+
 test("guard agents are refreshed before the supervisor restarts", async () => {
   await commit(origin, "notes.txt", "two\n");
   expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);

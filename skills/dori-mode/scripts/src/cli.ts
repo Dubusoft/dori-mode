@@ -49,6 +49,7 @@ import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sour
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
 import { updateInstall } from "./update.ts";
+import { refreshBootPrep } from "./boot-prep-install.ts";
 import { refreshLaneSandbox } from "./lane-sandbox-install.ts";
 import { laneOps, type LaneOps, LaneOpsError } from "./lane-ops.ts";
 import { type CliRunnerCall, cliRunnerCall, cliSocketPath } from "./runner/cli-relay.ts";
@@ -632,6 +633,7 @@ try {
         // be able to import from (a missing export throws).
         upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
         refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
+        refreshBootPrep: () => refreshBootPrep(homedir()),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
