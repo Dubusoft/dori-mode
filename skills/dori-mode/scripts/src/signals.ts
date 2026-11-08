@@ -9,6 +9,7 @@ export type Check = { readonly signal: string; readonly ok: boolean; readonly de
 
 export type Signal =
   | { readonly kind: "merged" | "closed"; readonly repo: string; readonly n: string }
+  | { readonly kind: "pr"; readonly repo: string; readonly branch: string }
   | { readonly kind: "published"; readonly pkg: string; readonly version: string }
   | { readonly kind: "command"; readonly argv: readonly string[]; readonly stdout?: RegExp }
   | { readonly kind: "file"; readonly path: string; readonly sha256?: string; readonly json?: { readonly path: readonly (string | number)[]; readonly value: unknown } }
@@ -20,7 +21,7 @@ export const COMMAND_TIMEOUT_MS = 120_000;
 
 export const UNREADABLE = [
   "unreadable signal; use one of:",
-  "merged <owner/repo>#N | closed <owner/repo>#N | published <pkg>@<version>",
+  "merged <owner/repo>#N | closed <owner/repo>#N | pr <owner/repo> <branch> | published <pkg>@<version>",
   'command ["argv","as","json"] [stdout~"regex"]',
   'file <path> [sha256=<hex>] [json:.a.b=<json value>]',
   'url <http(s) url> [status=200] [body~"regex"]',
@@ -117,6 +118,17 @@ export const parseSignal = (raw: string): Signal => {
   if (gh?.[1] && gh[2] && gh[3]) return { kind: gh[1].toLowerCase() as "merged" | "closed", repo: gh[2], n: gh[3] };
   const pub = /^published\s+(\S+)@(\S+)\s*$/i.exec(s);
   if (pub?.[1] && pub[2]) return { kind: "published", pkg: pub[1], version: pub[2] };
+  const pr = /^pr\s+([\w.-]+\/[\w.-]+)\s+/i.exec(s);
+  if (pr?.[1]) {
+    const at = pr[0].length;
+    const word = /^\S+/.exec(s.slice(at))?.[0] ?? "";
+    const tok = s[at] === '"' ? readJson(s, at) : { value: word, end: at + word.length };
+    if (typeof tok.value !== "string" || !tok.value) throw new SignalSyntaxError("pr needs a branch: pr <owner/repo> <branch>");
+    if (s[at] !== '"' && tok.value.includes(";")) throw new SignalSyntaxError('pr: a branch with ; must be quoted, e.g. pr acme/app "a;b"');
+    if (s.slice(tok.end).trim()) throw new SignalSyntaxError("pr takes only <owner/repo> <branch>");
+    return { kind: "pr", repo: pr[1], branch: tok.value };
+  }
+  if (/^pr\b/i.test(s)) throw new SignalSyntaxError("pr takes <owner/repo> <branch>, e.g. pr acme/app feat/x");
   const head = /^(command|file|url)\s+/i.exec(s);
   if (!head?.[1]) {
     const nearMiss = /^(merged|closed)\b/i.test(s);
@@ -201,6 +213,39 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
       }
       const j = JSON.parse(r.out) as { state?: string };
       return { signal: s, ok: j.state === "CLOSED", detail: j.state ?? (r.err || "no answer") };
+    }
+    case "pr": {
+      // No cwd: the check reads GitHub only, so a deleted worktree cannot break it.
+      const r = await run(["gh", "pr", "list", "--repo", sig.repo, "--head", sig.branch, "--state", "all", "--json", "number,state,isDraft,statusCheckRollup,isCrossRepository,url,createdAt"]);
+      if (r.code !== 0 || r.timedOut) {
+        const detail = r.err || `gh exited ${r.code}`;
+        return { signal: s, ok: false, detail, error: detail };
+      }
+      type Pr = { state?: string; isDraft?: boolean; isCrossRepository?: boolean; url?: string; createdAt?: string; statusCheckRollup?: { conclusion?: string; state?: string }[] | null };
+      let prs: Pr[];
+      try {
+        prs = JSON.parse(r.out) as Pr[];
+      } catch {
+        const detail = `gh answered no JSON: ${short(r.out) || "(empty)"}`;
+        return { signal: s, ok: false, detail, error: detail };
+      }
+      // The newest PR decides, so an older merged PR from a reused branch name never counts for new work.
+      const latest = [...prs].sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))[0];
+      if (!latest) return { signal: s, ok: false, detail: `no PR from ${sig.branch}` };
+      const url = latest.url ?? "";
+      if (latest.isCrossRepository) {
+        const detail = `${url} comes from a fork; pr signals support same-repo branches only`;
+        return { signal: s, ok: false, detail, error: detail };
+      }
+      if (latest.state === "MERGED") return { signal: s, ok: true, detail: `MERGED ${url}` };
+      if (latest.state !== "OPEN") return { signal: s, ok: false, detail: `${latest.state ?? "no state"} ${url}` };
+      if (latest.isDraft) return { signal: s, ok: false, detail: `OPEN draft ${url}` };
+      const checks = latest.statusCheckRollup ?? [];
+      if (!checks.length) return { signal: s, ok: false, detail: `OPEN with no checks yet ${url}` };
+      const notGreen = checks.filter((c) => !["SUCCESS", "SKIPPED", "NEUTRAL"].includes(c.conclusion || c.state || "")).length;
+      return notGreen
+        ? { signal: s, ok: false, detail: `OPEN, ${notGreen} of ${checks.length} checks not green ${url}` }
+        : { signal: s, ok: true, detail: `OPEN, ${checks.length} checks green ${url}` };
     }
     case "published": {
       const r = await run(["npm", "view", `${sig.pkg}@${sig.version}`, "version", "--json"]);

@@ -95,9 +95,9 @@ const sandboxedCwdInDoriHome = (deps: FlowDeps, input: LaunchInput): string | un
 const threadSharers = async (deps: FlowDeps, input: LaunchInput): Promise<string[]> =>
   !input.thread || input.thread === "none" ? [] : (await deps.registry.open()).filter((l) => l.key !== input.key && l.thread !== "none" && threadIdOf(l.thread) === threadIdOf(input.thread ?? "")).map((l) => l.key);
 
-/** owner/repo names in the Done line's merged/closed signals, lowercased. */
+/** owner/repo names in the Done line's merged/closed/pr signals, lowercased. */
 export const doneRepos = (done: string): string[] => [...new Set(splitDone(done).flatMap((part) => {
-  try { const s = parseSignal(part); return s.kind === "merged" || s.kind === "closed" ? [s.repo.toLowerCase()] : []; } catch { return []; }
+  try { const s = parseSignal(part); return s.kind === "merged" || s.kind === "closed" || s.kind === "pr" ? [s.repo.toLowerCase()] : []; } catch { return []; }
 }))];
 
 /** owner/repo from a git remote URL (https, ssh or scp form), lowercased. */

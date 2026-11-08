@@ -44,12 +44,13 @@ Leave out what the footer already says to every lane: how to report and claim do
 |---|---|
 | `merged <owner/repo>#N` | the PR is merged and has a merge commit |
 | `closed <owner/repo>#N` | the issue is closed |
+| `pr <owner/repo> <branch>` | the newest PR from that branch is merged, or is open, not a draft, and has at least one check with every check green (success, skipped or neutral) |
 | `published <pkg>@<version>` | npm has that exact version |
 | `command ["argv","as","json"] [stdout~"regex"]` | the command exits 0 when the watcher runs it, and stdout matches if a regex is given |
 | `file <path> [sha256=<hex>] [json:.a.b=<json value>]` | the file exists, its sha256 matches, and the JSON field equals the value |
 | `url <http(s) url> [status=200] [body~"regex"]` | a GET returns that status, and the body matches if a regex is given |
 
-Worked examples: `Done = merged acme/app#12` for a lane that lands a PR, and `Done = merged acme/app#12; closed acme/app#7` when it also closes an issue. A `command [...] stdout~` signal that can only hold after the work is done is never live for a cancel, so a cancelled lane never passes it: cancel with `dori close <key> --cancelled --reason TEXT`.
+Worked examples: `Done = merged acme/app#12` for a lane that lands a PR, and `Done = merged acme/app#12; closed acme/app#7` when it also closes an issue. When the PR number is not known at launch, or the lane stops at a green PR, use `Done = pr acme/app feat/add-x-12`. Quote a branch that holds `;` or spaces (`pr acme/app "a;b"`). Only the newest PR from the branch counts, so give every lane its own branch name. A PR from a fork is reported as an error: `pr` covers branches in the repo itself only. A `command [...] stdout~` signal that can only hold after the work is done is never live for a cancel, so a cancelled lane never passes it: cancel with `dori close <key> --cancelled --reason TEXT`.
 
 The last three are for work that never lands as a PR: a local setup, a QA pass, a running service. Write the check so that it can fail. `command ["bun","test"] stdout~" 0 fail"` is a real check, while `command ["true"]` checks nothing. The watcher runs commands itself, in the lane's directory, as a plain argv with no shell. They have a 2-minute limit. It never trusts the lane's own report that something passed. Relative file paths resolve from the lane's directory, and `~` is your home. JSON values compare as JSON, so `json:.n=3` and `json:.n="3"` are different checks.
 

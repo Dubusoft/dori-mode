@@ -37,6 +37,7 @@ test("a path rule beats a repo rule; the first Done repo that is a key wins, cas
   expect(resolvePlacement({ cwd: "/data/repos/app", done }, config({ workspaces }))).toMatchObject({ machine: "mini", rule: "/data/repos/app" });
   expect(resolvePlacement({ cwd: "/elsewhere", done }, config({ workspaces }))).toEqual({ machine: "lib-box", source: "workspace", rule: "Acme/Lib", movable: false });
   expect(resolvePlacement({ done }, config({ workspaces }))).toMatchObject({ machine: "lib-box", rule: "Acme/Lib" });
+  expect(resolvePlacement({ done: "pr ACME/app feat/x" }, config({ workspaces }))).toEqual({ machine: "app-box", source: "workspace", rule: "acme/app", movable: false });
 });
 
 test("\"*\" catches every other workspace task, including --pane and --workspace launches", () => {
