@@ -294,6 +294,8 @@ saved in `<stateDir>/runner-machines.json` so the guard knows it too. The listen
 [Network link](#network-link)) and is recorded in `runner-endpoints.json` only after enrollment and the service
 install succeed. The supervisor issues the enrollment code in its own process and runs
 `ssh <target> sh -s`. That command line never changes: everything else goes on ssh's stdin as one sh script.
+`dori runner remove <label>` undoes an install: it removes the runner service and `~/.dori/runner` (keys included) on
+the worker, leaves herdr running, and only then revokes the runner and drops it from both state files.
 
 - The bundle is `bun build src/runner/bin.ts --target=bun`, a single file holding only the runner. It is written to
   `~/.dori/runner/bin/dori.js` through a temporary file and `mv`. A Linux worker needs `bun` on its PATH. A macOS

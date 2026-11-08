@@ -173,6 +173,7 @@ const USAGE = `dori <command> [options]
                                        through ssh stdin/stdout); listens on the worker's private IP, port 7411.
                                        TARGET is user@ip, ip or user@host; LABEL defaults to a slug of the host (100.64.1.2 -> 100-64-1-2)
                                        and the machine is remembered in <stateDir>/runner-machines.json
+  runner remove LABEL                  stop and delete the runner on that worker over ssh, revoke its key and forget its endpoint (RUNNER_REMOVED)
   runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
   runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
   runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
@@ -339,7 +340,7 @@ if (process.argv[2] === "runner") {
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
   // enroll, install, revoke, rotate, reset-gen and upgrade run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) | remove LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
     options: { machine: { type: "string" }, label: { type: "string" }, yes: { type: "boolean" } },
@@ -426,6 +427,38 @@ if (process.argv[2] === "runner") {
     } finally {
       auth.close();
     }
+    process.exit(0);
+  }
+  if (sub === "remove") {
+    if (parsed.values.machine !== undefined) die(usage);
+    const label = labelArg(target);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    const { readGuardMachines } = await import("./remote-guard.ts");
+    const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+    const machine = machines.machines.find((m) => m.label === label)
+      ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    const { runnerOf } = await import("./lane-ops.ts");
+    const busy = (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed" && runnerOf(lane) === label);
+    if (busy.length) die(`RUNNER_REMOVE_BUSY runner=${label} open lanes: ${busy.map((lane) => lane.key).join(",")}; close them or run dori runner evacuate ${label} first`);
+    const { removeRunner } = await import("./runner/remove.ts");
+    const result = await removeRunner({ run }, { machine, label });
+    if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+    // Only after the worker is clean: the key, a live supervisor's link, the endpoint and the remembered machine go.
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const { queueRunnerAdmin } = await import("./runner/serve.ts");
+    const { removeRunnerEndpoint } = await import("./runner/endpoints.ts");
+    const { removeRunnerMachine } = await import("./runner/machines.ts");
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      auth.revoke(label);
+    } finally {
+      auth.close();
+    }
+    queueRunnerAdmin(cfg.stateDir, "revoke", label, realClock.now());
+    removeRunnerEndpoint(cfg.stateDir, label);
+    removeRunnerMachine(cfg.stateDir, label);
+    console.log(`RUNNER_REMOVED runner=${label}`);
     process.exit(0);
   }
   if (sub === "evacuate") {

@@ -28,6 +28,13 @@ export const writeRunnerEndpoint = (stateDir: string, label: string, endpoint: s
   writeRunnerFile(join(stateDir, RUNNER_ENDPOINTS_FILE), `${JSON.stringify({ ...readRunnerEndpoints(stateDir), [label]: endpoint }, null, 2)}\n`);
 };
 
+/** Atomically drop this label's endpoint, keeping the others; no file or no entry is a no-op. */
+export const removeRunnerEndpoint = (stateDir: string, label: string): void => {
+  const { [label]: gone, ...rest } = readRunnerEndpoints(stateDir);
+  if (gone === undefined) return;
+  writeRunnerFile(join(stateDir, RUNNER_ENDPOINTS_FILE), `${JSON.stringify(rest, null, 2)}\n`);
+};
+
 /** Resolve the SSH target on the supervisor; never ask a worker to bind a hostname or public address. */
 export const runnerListenAddress = async (
   target: string, resolve: (host: string) => Promise<string> = async (host) => (await lookup(host)).address,

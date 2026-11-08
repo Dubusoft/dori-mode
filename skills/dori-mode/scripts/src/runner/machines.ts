@@ -42,3 +42,10 @@ export const writeRunnerMachine = (stateDir: string, label: string, target: stri
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   writeRunnerFile(join(stateDir, RUNNER_MACHINES_FILE), `${JSON.stringify({ ...readRunnerMachines(stateDir), [label]: target }, null, 2)}\n`);
 };
+
+/** Atomically drop one label, keeping the others; no file or no entry is a no-op. */
+export const removeRunnerMachine = (stateDir: string, label: string): void => {
+  const { [label]: gone, ...rest } = readRunnerMachines(stateDir);
+  if (gone === undefined) return;
+  writeRunnerFile(join(stateDir, RUNNER_MACHINES_FILE), `${JSON.stringify(rest, null, 2)}\n`);
+};
