@@ -11,6 +11,29 @@ import { currentUserSid, evaluateSddl, readSddl } from "./runner/win-acl.ts";
 export const LEAD_ATTACHMENT_ROOTS = (stateDir: string): readonly string[] => [
   join(dirname(stateDir), "research"), join(stateDir, "briefs"),
 ];
+/**
+ * The attachment sources a fresh launch shipped, pinned beside the research root rather than under stateDir: local
+ * sandboxes mount stateDir (briefs and registry included) read-write, while the rest of the dori home stays read-only to
+ * a lane. Recovery ships only references inside this set, so a lane that rewrites its own brief gains no new reads.
+ */
+const attachmentPinPath = (stateDir: string, key: string): string => join(dirname(resolve(stateDir)), "lane-attachments", `${key}.json`);
+export const writeLaneAttachmentPin = (stateDir: string, key: string, sources: readonly string[]): void => {
+  validateFileKey(key);
+  const path = attachmentPinPath(stateDir, key);
+  if (sources.length === 0) { rmSync(path, { force: true }); return; }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  saveJsonFile(path, { key, sources });
+};
+/** A lane launched without a pin (no attachments, or before pins existed) ships nothing on recovery. */
+export const readLaneAttachmentPin = (stateDir: string, key: string): readonly string[] => {
+  validateFileKey(key);
+  let text: string;
+  try { text = readFileSync(attachmentPinPath(stateDir, key), "utf8"); } catch (e) { if (codeOf(e) === "ENOENT") return []; throw e; }
+  let pin: { key?: unknown; sources?: unknown };
+  try { pin = JSON.parse(text) as typeof pin; } catch { return []; }
+  if (pin.key !== key || !Array.isArray(pin.sources) || !pin.sources.every((s) => typeof s === "string" && isAbsolute(s))) return [];
+  return pin.sources as string[];
+};
 export const FILE_LIMITS = {
   fileBytes: 262144, totalBytes: 393216, files: 64, directories: 128, references: 256, depth: 16,
   relativePathBytes: 240, componentBytes: 120, sourcePathBytes: 4096, briefBytes: 65536,
@@ -192,7 +215,9 @@ export const prepareLaneBrief = (input: {
   readonly key: string; readonly stateDir: string; readonly briefText: string; readonly requiredReport: boolean;
   readonly rawBriefText?: string;
   readonly runId?: string; readonly readers?: FileReaders;
-}): { readonly files: LaneBriefFiles; readonly notes: readonly string[] } => {
+  /** Real source paths a recovery may ship (the launch pin); unset on a fresh launch, which may ship any in-root path. */
+  readonly allowed?: readonly string[];
+}): { readonly files: LaneBriefFiles; readonly notes: readonly string[]; readonly sources: readonly string[] } => {
   const { key, stateDir, briefText, requiredReport } = input;
   validateFileKey(key);
   limit(key, "briefBytes", bytes(input.rawBriefText ?? briefBody(briefText)));
@@ -219,6 +244,14 @@ export const prepareLaneBrief = (input: {
       try { stat(path); if (!noted.has(occurrence.path)) { noted.add(occurrence.path); notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} is outside the attachment roots and stays literal`); } } catch {}
       continue;
     }
+    const pinned = (real: string): boolean => !input.allowed || input.allowed.some((a) => inside(a, real));
+    const notPinned = (): void => {
+      if (noted.has(occurrence.path)) return;
+      noted.add(occurrence.path);
+      notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} was not attached at launch and stays literal`);
+    };
+    // Checked before any stat, so a reference the launch never attached can neither ship nor refuse the recovery.
+    if (!pinned(inside(root.path, path) ? join(root.real, relative(root.path, path)) : path)) { notPinned(); continue; }
     limit(key, "sourcePathBytes", bytes(occurrence.path));
     const base = inside(root.path, path) ? root.path : root.real;
     let cursor = base, missing = false;
@@ -233,6 +266,7 @@ export const prepareLaneBrief = (input: {
     if (missing) continue;
     const real = realpathSync(path);
     if (!inside(root.real, real)) unsafe(path, "outside-root");
+    if (!pinned(real)) { notPinned(); continue; }
     source.set(occurrence.path, real);
   }
   const unique = [...new Set(source.values())].sort(compare);
@@ -283,7 +317,7 @@ export const prepareLaneBrief = (input: {
   validateLaneTree(key, tree);
   const run = { id: input.runId ?? randomUUID(), requiredReport };
   if (!runValid(run)) throw invalidFiles(key, "run-id");
-  const result = { files: { run, tree, references }, notes };
+  const result = { files: { run, tree, references }, notes, sources: top };
   checkLaneFilesBody(key, { briefText, files: result.files });
   return result;
 };

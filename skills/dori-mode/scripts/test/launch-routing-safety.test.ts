@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src/launch.ts";
+import { readLaneAttachmentPin, writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { type LaneOps, LaneOpsError, laneOps } from "../src/lane-ops.ts";
 import { type RunnerCall, RunnerCalls, RunnerUnavailable } from "../src/runner/call.ts";
 import type { Lane } from "../src/registry.ts";
@@ -105,9 +106,9 @@ const tabs = () => world.ops.filter((e) => e.op === "start");
 test("attachment preparation refuses before reservation, workspace creation, start or lead brief rewrite", async () => {
   const base = deps();
   const entry = input("bad-files", { cwd: "/scratch" });
-  writeFileSync(entry.brief, "deliverable: unknown\noriginal");
-  await expect(launchLane(base, entry)).rejects.toThrow("LANE_DELIVERABLE_INVALID bad-files:");
-  expect(readFileSync(entry.brief, "utf8")).toBe("deliverable: unknown\noriginal");
+  writeFileSync(entry.brief, "x".repeat(70_000));
+  await expect(launchLane(base, entry)).rejects.toThrow("LANE_FILES_LIMIT bad-files:");
+  expect(readFileSync(entry.brief, "utf8")).toBe("x".repeat(70_000));
   expect(await base.registry.open()).toEqual([]);
   expect(tabs()).toEqual([]);
   expect(world.calls.filter((c) => c.slice(0, 3).join(" ") === "herdr workspace create")).toEqual([]);
@@ -148,6 +149,11 @@ test("local and remote launch carry the same binary attachment tree and retain l
   const starts = tabs().map((e) => e.args as Parameters<LaneOps["start"]>[0]);
   expect(starts[0]!.files!.tree).toEqual(starts[1]!.files!.tree);
   expect(starts[0]!.files!.references).toEqual(starts[1]!.files!.references);
+  // A fresh launch pins what it shipped where no lane can write; recovery ships only that set.
+  for (const entry of entries) {
+    expect(readLaneAttachmentPin(state.dir, entry.key)).toEqual([realpathSync(source)]);
+    writeLaneAttachmentPin(state.dir, entry.key, []);
+  }
   for (const entry of entries) {
     expect(readFileSync(entry.brief, "utf8")).toContain(`update ${source}:12`);
     expect((await base.registry.read(entry.key))?.fileRun?.requiredReport).toBe(true);

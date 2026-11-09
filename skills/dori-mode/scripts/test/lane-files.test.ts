@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { briefDeliverable, prepareLeadLaneBrief } from "../src/launch.ts";
-import { checkLaneFilesBody, checkLaneReportText, FILE_LIMITS, installLaneReports, LaneFileError, LEAD_ATTACHMENT_ROOTS, prepareLaneBrief, protectLaneCollectionDirectory, scanBriefPaths, treeDigest, validateLaneOutput, validateLaneTree, verifyLaneFileReceipt } from "../src/lane-files.ts";
+import { checkLaneFilesBody, checkLaneReportText, FILE_LIMITS, installLaneReports, LaneFileError, LEAD_ATTACHMENT_ROOTS, prepareLaneBrief, protectLaneCollectionDirectory, scanBriefPaths, treeDigest, validateLaneOutput, validateLaneTree, verifyLaneFileReceipt, writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { StateLockError, tryStateLock } from "../src/state-lock.ts";
 import type { Lane } from "../src/registry.ts";
 import type { LaneFile, LaneOutputFiles } from "../src/runner/protocol.ts";
@@ -56,10 +56,51 @@ test("word apostrophes and non-path quote/code spans do not hide in-root paths",
   expect(scanBriefPaths(`"a" "/p q" 'x ${p}'`, "linux").map((x) => x.path)).toEqual(["/p q", p]);
 });
 
-test("declarations use the first match and refuse unknown/empty values", () => {
-  expect(briefDeliverable("lane-a", "none")).toBe(false);
-  expect(briefDeliverable("lane-a", "- `deliverable: RePoRt`\ndeliverable: other")).toBe(true);
-  for (const value of ["", "other"]) expect(() => briefDeliverable("lane-a", `deliverable: ${value}`)).toThrow(`LANE_DELIVERABLE_INVALID lane-a: the brief declares deliverable: ${value}; use deliverable: report or remove the declaration`);
+test("only a deliverable: report line declares a report; any other deliverable line is ordinary brief text", () => {
+  expect(briefDeliverable("none")).toBe(false);
+  expect(briefDeliverable("- `deliverable: RePoRt`\ndeliverable: other")).toBe(true);
+  for (const line of ["deliverable:", "- Deliverable:", "Deliverable: PR", "deliverable: reports"]) expect(briefDeliverable(line)).toBe(false);
+});
+
+const notAttached = (path: string): string => `LANE_FILE_NOT_SHIPPED lane-a: ${JSON.stringify(path)} was not attached at launch and stays literal`;
+
+test("recovery ships only what the launch pinned, whatever the lane later writes into its own brief", async () => {
+  const f = fixture(), deps = depsFor(newWorld(), fakeClock(0), f.stateDir);
+  const mine = join(f.research, "mine"), other = join(f.research, "other");
+  mkdirSync(mine); mkdirSync(other);
+  writeFileSync(join(mine, "a.md"), "mine"); writeFileSync(join(other, "secret.md"), "secret");
+  writeFileSync(f.lane.brief, `read ${join(mine, "a.md")}`);
+  const launched = await prepareLeadLaneBrief(deps, f.lane, run.id);
+  expect(launched.sources).toEqual([realpathSync(join(mine, "a.md"))]);
+  writeLaneAttachmentPin(f.stateDir, f.lane.key, launched.sources);
+  // stateDir is read-write inside a local sandbox: the lane names another lane's research and the whole root.
+  writeFileSync(f.lane.brief, `read ${join(mine, "a.md")} and ${join(other, "secret.md")} and ${f.research}`);
+  const recovered = await prepareLeadLaneBrief(deps, f.lane, run.id, true);
+  expect(recovered.files.tree.files).toEqual([file("r0000/a.md", "mine")]);
+  expect(recovered.notes).toEqual([notAttached(join(other, "secret.md")), notAttached(f.research)]);
+});
+
+test("a lane with no launch pin recovers without attachments and without re-reading its declarations", async () => {
+  const f = fixture(), deps = depsFor(newWorld(), fakeClock(0), f.stateDir), briefs = join(f.stateDir, "briefs");
+  mkdirSync(briefs); writeFileSync(join(briefs, "big"), Buffer.alloc(FILE_LIMITS.fileBytes + 1)); symlinkSync("/etc", join(briefs, "link"));
+  writeFileSync(f.lane.brief, `see ${briefs}\n- Deliverable:\ndeliverable: report`);
+  const legacy = await prepareLeadLaneBrief(deps, { ...f.lane, fileRun: undefined }, run.id, true);
+  expect(legacy.files.tree).toEqual({ directories: [], files: [] });
+  expect(legacy.files.run.requiredReport).toBe(false);
+  expect(legacy.notes).toEqual([notAttached(briefs)]);
+  expect((await prepareLeadLaneBrief(deps, { ...f.lane, fileRun: { ...run, requiredReport: true } }, run.id, true)).files.run.requiredReport).toBe(true);
+});
+
+test("pinned attachments that outgrew the caps relaunch the lane without them, while a fresh launch still refuses", async () => {
+  const f = fixture(), deps = depsFor(newWorld(), fakeClock(0), f.stateDir), data = join(f.research, "data.md");
+  writeFileSync(data, "small"); writeFileSync(f.lane.brief, `use ${data}`);
+  writeLaneAttachmentPin(f.stateDir, f.lane.key, [realpathSync(data)]);
+  writeFileSync(data, Buffer.alloc(FILE_LIMITS.fileBytes + 1));
+  const recovered = await prepareLeadLaneBrief(deps, f.lane, run.id, true);
+  expect(recovered.files.tree).toEqual({ directories: [], files: [] });
+  expect(recovered.notes[0]).toStartWith("LANE_FILES_SKIPPED lane-a: relaunched without attachments (LANE_FILE_TOO_LARGE lane-a:");
+  expect(recovered.notes.slice(1)).toEqual([notAttached(data)]);
+  await expect(prepareLeadLaneBrief(deps, f.lane, run.id)).rejects.toThrow("LANE_FILE_TOO_LARGE");
 });
 
 test("preparation ships binary and empty directories, deduplicates overlapping references, and preserves lead spelling", () => {

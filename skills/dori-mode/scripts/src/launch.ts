@@ -15,7 +15,7 @@ import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
-import { briefBody, FILE_FOOTER_HEADING, LaneFileError, prepareLaneBrief } from "./lane-files.ts";
+import { briefBody, FILE_FOOTER_HEADING, LaneFileError, prepareLaneBrief, readLaneAttachmentPin, writeLaneAttachmentPin } from "./lane-files.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
 import type { LaneBriefFiles } from "./runner/protocol.ts";
 import type { RecoveryLane } from "./recover.ts";
@@ -155,16 +155,13 @@ export const briefAutoClose = (brief: string): Lane["autoClose"] => {
   throw new LaunchError(`the brief declares autoClose: ${m[1]}; use autoClose: machine (or lead, the default)`);
 };
 
-export const briefDeliverable = (key: string, body: string): boolean => {
-  const match = /^[ \t]*(?:[-*][ \t]+)?`?deliverable:[ \t]*(\S*?)`?[ \t]*$/im.exec(body);
-  if (!match) return false;
-  if ((match[1] ?? "").toLowerCase() === "report") return true;
-  throw new LaunchError(`LANE_DELIVERABLE_INVALID ${key}: the brief declares deliverable: ${match[1] ?? ""}; use deliverable: report or remove the declaration`);
-};
+/** Only a `deliverable: report` line declares a required report; any other `deliverable:` line is ordinary brief text. */
+export const briefDeliverable = (body: string): boolean =>
+  /^[ \t]*(?:[-*][ \t]+)?`?deliverable:[ \t]*report`?[ \t]*$/im.test(body);
 
 export const prepareLeadLaneBrief = async (deps: FlowDeps, lane: Lane, runId?: string, existing = false): Promise<{
   readonly briefText: string; readonly files: LaneBriefFiles; readonly notes: readonly string[];
-  readonly autoClose?: Lane["autoClose"]; readonly ghIssue?: string;
+  readonly autoClose?: Lane["autoClose"]; readonly ghIssue?: string; readonly sources: readonly string[];
 }> => {
   const file = Bun.file(lane.brief);
   if (!(await file.exists())) throw new LaunchError(`brief not found: ${lane.brief}`);
@@ -174,12 +171,25 @@ export const prepareLeadLaneBrief = async (deps: FlowDeps, lane: Lane, runId?: s
   // The separator written before our footer is generated, rather than part of the raw user brief.
   const body = raw === scannedBody ? scannedBody : scannedBody.replace(/\n$/, "");
   if (Buffer.byteLength(body) > 65536) throw new LaunchError(`LANE_FILES_LIMIT ${lane.key}: briefBytes is ${Buffer.byteLength(body)}, above 65536; reduce the attachment tree or brief and launch again`);
-  const requiredReport = briefDeliverable(lane.key, body);
+  // An existing lane keeps the policy its launch recorded: the brief lives where the lane itself can rewrite it.
+  const requiredReport = existing ? lane.fileRun?.requiredReport ?? false : briefDeliverable(body);
   const autoClose = existing ? lane.autoClose : briefAutoClose(body), ghIssue = existing ? lane.ghIssue : briefIssue(body);
   const forFooter = { ...lane, autoClose, fileRun: { id: runId ?? deps.newFileRunId?.() ?? randomUUID(), requiredReport } };
   const briefText = `${body.replace(/\s*$/, "")}\n${footer(forFooter, deps.config.ownerLanguage, deps.config.laneRules)}`;
+  const prepare = (allowed?: readonly string[]) => prepareLaneBrief({
+    key: lane.key, stateDir: deps.config.stateDir, briefText, rawBriefText: body, requiredReport, runId: forFooter.fileRun.id, ...(allowed ? { allowed } : {}),
+  });
   try {
-    return { briefText, ...prepareLaneBrief({ key: lane.key, stateDir: deps.config.stateDir, briefText, rawBriefText: body, requiredReport, runId: forFooter.fileRun.id }), autoClose, ghIssue };
+    if (!existing) return { briefText, ...prepare(), autoClose, ghIssue };
+    const pinned = readLaneAttachmentPin(deps.config.stateDir, lane.key);
+    try {
+      return { briefText, ...prepare(pinned), autoClose, ghIssue };
+    } catch (e) {
+      // Attachments that no longer pass the caps or safety checks must not keep a running lane from coming back.
+      if (!(e instanceof LaneFileError) || pinned.length === 0) throw e;
+      const bare = prepare([]);
+      return { briefText, ...bare, notes: [`LANE_FILES_SKIPPED ${lane.key}: relaunched without attachments (${e.message})`, ...bare.notes], autoClose, ghIssue };
+    }
   } catch (e) {
     if (e instanceof LaneFileError) throw new LaunchError(e.message);
     throw e;
@@ -485,6 +495,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
           recoveryAfter: runnerJournalHead(deps.config.stateDir), recoveryPreviousPane: current.pane };
       });
     }
+    // Only a fresh launch decides what recovery may ship again; it lives where no lane can write.
+    if (!existing) writeLaneAttachmentPin(deps.config.stateDir, input.key, prepared.sources);
     // The lead-side brief keeps the footer for reference; the runner writes its own copy on the lane's host.
     await Bun.write(input.brief, brief);
     const start: StartInput = {

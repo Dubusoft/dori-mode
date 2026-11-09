@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
+import { writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { acceptLaneEvent, type LaneHubDeps } from "../src/runner/lanes-hub.ts";
 import type { LaneBriefFiles } from "../src/runner/protocol.ts";
 import { launchLane } from "../src/launch.ts";
@@ -19,7 +20,8 @@ type Deps = ReturnType<typeof depsFor>;
 
 let state: ReturnType<typeof withState>;
 beforeEach(() => { state = withState(); withSqliteStore(state.dir); });
-afterEach(() => state.done());
+// The launch pin lives beside stateDir, outside the per-test directory.
+afterEach(() => { writeLaneAttachmentPin(state.dir, "recover-lane", []); state.done(); });
 
 const fixture = async () => {
   const world = newWorld();
@@ -107,9 +109,9 @@ test.each(["recover", "start"])("a timed-out %s proposal is retired by its faile
 
 test.each(["autoClose: lead\nissue: changed/repo#2", "autoClose: invalid\nissue: invalid"])("relaunch retains stored policy despite edited declarations: %s", async (body) => {
   const { deps, lane } = await fixture();
-  const existing = { ...lane, runner: "local", autoClose: "machine" as const, ghIssue: "a/b#1" };
+  const existing = { ...lane, runner: "local", autoClose: "machine" as const, ghIssue: "a/b#1", fileRun: { id: "00000000-0000-4000-8000-0000000000aa", requiredReport: true } };
   await deps.registry.write(existing);
-  await Bun.write(lane.brief, `${body}\ndeliverable: report`);
+  await Bun.write(lane.brief, `${body}\ndeliverable: none`);
   const result = await launchLane(deps, { key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, cwd: lane.cwd }, existing);
   expect(result.lane).toMatchObject({ autoClose: "machine", ghIssue: "a/b#1", fileRun: { requiredReport: true } });
   expect(await Bun.file(lane.brief).text()).toContain("- autoClose: machine.");
@@ -141,6 +143,7 @@ test("ordinary recovery rereads changed attachments and installs its fresh propo
   mkdirSync(join(state.dir, "briefs"));
   const source = join(state.dir, "briefs", "input");
   await Bun.write(source, "new bytes"); await Bun.write(lane.brief, source);
+  writeLaneAttachmentPin(state.dir, lane.key, [realpathSync(source)]);
   let files: LaneBriefFiles | undefined;
   const ops: LaneOps = { ...deps.ops, recover: async (current, opts) => {
     files = opts!.files;
@@ -156,8 +159,8 @@ test("ordinary recovery rereads changed attachments and installs its fresh propo
 test("input refusal precedes attempt accounting and intentional old-pane close", async () => {
   const { deps, lane, world, control } = await fixture();
   control.live(true); control.argv = ["omo", "--model", "wrong"];
-  await Bun.write(lane.brief, "deliverable: invalid");
-  expect((await recoverLanes(deps, lane.key))[0]).toContain("LANE_DELIVERABLE_INVALID");
+  await Bun.write(lane.brief, "x".repeat(70_000));
+  expect((await recoverLanes(deps, lane.key))[0]).toContain("LANE_FILES_LIMIT");
   expect(opsOf(world, "recover", "start", "close")).toEqual([]);
   expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
 });
@@ -167,6 +170,7 @@ test("unknown-runner fallback rescans with a new persisted run and converges wit
   mkdirSync(join(state.dir, "briefs"));
   const source = join(state.dir, "briefs", "input");
   await Bun.write(source, "before"); await Bun.write(lane.brief, source);
+  writeLaneAttachmentPin(state.dir, lane.key, [realpathSync(source)]);
   let failedRun: LaneBriefFiles["run"] | undefined, startRun: LaneBriefFiles["run"] | undefined;
   const hub: LaneHubDeps = { stateDir: state.dir, registry: deps.registry, reports: () => undefined,
     now: deps.clock.now, emit: () => {}, prepareRecovery: async () => ({ cmdId: "unused", notes: [] }), recover: () => undefined };

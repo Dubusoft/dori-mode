@@ -193,7 +193,7 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
     ...(session !== undefined ? { session } : {}),
   }, stored);
   return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined,
-    notes: launched.notes.filter((note) => /^(?:LANE_FILE_NOT_SHIPPED|SANDBOX_SKIPPED) /.test(note)) };
+    notes: launched.notes.filter((note) => /^(?:LANE_FILE_NOT_SHIPPED|LANE_FILES_SKIPPED|SANDBOX_SKIPPED) /.test(note)) };
 };
 
 /**
