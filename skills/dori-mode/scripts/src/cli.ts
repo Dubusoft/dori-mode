@@ -33,7 +33,7 @@ import { discordOwnerConfigured, discordThread } from "./messenger/discord-inbou
 import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
-import { supervise } from "./supervise-loop.ts";
+import { supervise, SUPERVISE_STOP_DEADLINE_MS } from "./supervise-loop.ts";
 import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
@@ -822,7 +822,16 @@ try {
     }
     case "supervise": {
       const controller = new AbortController();
-      const stop = () => controller.abort();
+      // A stop exits within SUPERVISE_STOP_DEADLINE_MS even when a shutdown step hangs, so systemd never waits out its
+      // stop timeout (90 s by default) while the owner's clicks and messages have no process to reach.
+      const stop = () => {
+        if (controller.signal.aborted) return;
+        controller.abort();
+        setTimeout(() => {
+          console.error(`SUPERVISOR_STOP_FORCED shutdown still running ${SUPERVISE_STOP_DEADLINE_MS} ms after the stop signal; exiting`);
+          process.exit(0);
+        }, SUPERVISE_STOP_DEADLINE_MS).unref();
+      };
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
       // dori update runs the code it started with, so the supervisor it restarts installs the new checkout's sandbox.
@@ -830,7 +839,9 @@ try {
       catch (e) { console.error(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
       try { await supervise(deps, controller.signal); }
       finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
-      break;
+      // Shutdown is done: leftover timers, sockets or child pipes must not hold the process.
+      console.log("SUPERVISOR_STOPPED");
+      process.exit(0);
     }
     case "quota": {
       const read = await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(30_000));

@@ -214,7 +214,12 @@ type GatewayOptions = {
   readonly random?: () => number;
   /** A close code no reconnect can fix (see DISCORD_FATAL_CLOSE): the gateway stops reconnecting and calls this once. */
   readonly onFatal?: (code: number, reason: string) => void;
+  /** A session an earlier process left (see GatewaySession): the first connect RESUMEs it, so Discord replays what it missed. */
+  readonly resume?: GatewaySession;
 };
+
+/** What RESUME needs: the session id, the last sequence number seen and the session's resume gateway URL. */
+export type GatewaySession = { readonly session: string; readonly seq: number; readonly url: string };
 
 /**
  * Close codes Discord documents as not to be reconnected after: retrying only burns the daily IDENTIFY budget until
@@ -240,9 +245,9 @@ export const discordPresence = (
   options: GatewayOptions = {},
 ) => {
   let ws: GatewaySocket | undefined;
-  let seq: number | null = null;
-  let session: string | undefined;
-  let resumeUrl: string | undefined;
+  let seq: number | null = options.resume?.seq ?? null;
+  let session: string | undefined = options.resume?.session;
+  let resumeUrl: string | undefined = options.resume?.url;
   let beat: unknown;
   let firstBeat: unknown;
   let retry: unknown;
@@ -404,6 +409,10 @@ export const discordPresence = (
     /** The fatal close code that stopped reconnecting, if any. */
     get fatal() { return fatal; },
     async settled() { await Promise.all(handlers); },
+    /** The session a later process can resume, when this one has a READY session. */
+    session(): GatewaySession | undefined {
+      return session !== undefined && seq !== null && resumeUrl !== undefined ? { session, seq, url: resumeUrl } : undefined;
+    },
     close() {
       stopped = true;
       clearConnection();

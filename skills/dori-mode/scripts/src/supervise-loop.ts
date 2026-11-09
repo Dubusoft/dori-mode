@@ -777,6 +777,29 @@ const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promi
 };
 
 /**
+ * How long a stop waits for the task passes in flight. A pass ends at its next pause, but one inside a slow command or
+ * request runs on to that call's own timeout (up to runTimeoutMs); the stop goes on without it, so systemd's stop and
+ * with it a restart never wait on a pass.
+ */
+export const STOP_TASKS_GRACE_MS = 3_000;
+
+/**
+ * `dori supervise` exits this long after SIGTERM/SIGINT however far shutdown got: past the task grace and the local
+ * runner's own stop grace (LOCAL_STOP_GRACE_MS), well inside systemd's stop timeout.
+ */
+export const SUPERVISE_STOP_DEADLINE_MS = 15_000;
+
+/** Waits for `tasks` up to STOP_TASKS_GRACE_MS. */
+const settle = async (tasks: Promise<unknown> | undefined): Promise<void> => {
+  if (!tasks) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<boolean>((resolve) => { timer = setTimeout(() => { resolve(true); }, STOP_TASKS_GRACE_MS); });
+  const pending = await Promise.race([tasks.then(() => false, () => false), late]);
+  clearTimeout(timer);
+  if (pending) console.error(`SUPERVISOR_STOP_TASKS_PENDING a task pass still running ${STOP_TASKS_GRACE_MS} ms after the stop; stopping without it`);
+};
+
+/**
  * Polling and sweeps enqueue independently of the single serialized lead delivery. There is no single loop: inbound,
  * delivery (with the owner notices and ack ticks), sweeps and GitHub/wait polling each run as their own task, so none
  * waits behind another; a stuck one is reported by name (TASK_STALLED) while the other three keep working, and each sweep
@@ -1261,7 +1284,9 @@ export const supervise = async (
       await wait(5_000, halted);
     }
     stop.abort();
-    await tasks;
+    await settle(tasks);
+    // Waited for once: the finally below does not spend a second grace on a pass still running.
+    tasks = undefined;
     if (deliveryError) throw deliveryError;
   } finally {
     // A startup that failed or was stopped early still logs how far it got.
@@ -1271,7 +1296,7 @@ export const supervise = async (
     }
     if (petting !== undefined) clearInterval(petting);
     stop.abort();
-    await tasks;
+    await settle(tasks);
     await inbound?.close();
     if (inbound) writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, messageContent: false });
     reports?.close();

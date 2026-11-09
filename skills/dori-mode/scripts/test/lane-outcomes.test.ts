@@ -475,6 +475,28 @@ test("the supervisor posts the close button once the last lane on a thread is cl
   f.supervisor.close();
 });
 
+test("a reported done-claimed lane still open holds the button back across a supervisor restart, until it closes", async () => {
+  const f = closeButtons();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", claim: { at: new Date(T0).toISOString(), evidence: "PR o/r#1" } }));
+  f.supervisor.enqueue("claim:alpha", "LANE_DONE_CLAIMED alpha w:p1 PR o/r#1");
+  f.clock.at += 1_000;
+  f.report("alpha");
+  await f.tick();
+  f.supervisor.close();
+  // A new process on the same state: its first passes see the claim reported and the lane still open.
+  const restarted = new Supervisor(f.deps);
+  const tick = async () => { await restarted.reportTick(); await restarted.closeButtonTick(async (thread, id) => { f.posts.push({ thread, id }); }); };
+  await tick();
+  await tick();
+  expect(f.posts).toEqual([]);
+  expect(readCloseButtons(f.state.dir)).toEqual({});
+  f.clock.at += 1_000;
+  await f.close("alpha");
+  await tick();
+  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0 + 1_000}` }]);
+  restarted.close();
+});
+
 test("a --final report's button stands for the thread: the supervisor posts none", async () => {
   const f = closeButtons();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
