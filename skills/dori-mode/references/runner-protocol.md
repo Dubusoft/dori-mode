@@ -177,6 +177,16 @@ refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAIL
 (urgent); the supervisor's own recovery never relaunches a runner-owned lane, which only its runner recovers
 (`lane.recover`).
 
+Edits apply without restarting the runner. It watches `runner-config.json` (the local runner also watches the
+`config.json` its derived policy and guard defaults come from), debounced by 0.5 s, with a stat check every 30 s for
+filesystems that miss watch events. A file that loads and validates replaces the live policy in place: the next command,
+query and guard tick use it, and running lanes are left alone. `RUNNER_CONFIG_RELOADED <keys>` is logged and sent as a
+`runner.config` event (`state` `reloaded`), which the supervisor journals for the lead as digest
+`RUNNER_CONFIG_RELOADED runner=<label> <keys>`. When the reported workspaces change, the runner reconnects at once so
+its next hello carries them; unacked events replay from the outbox as after any reconnect. A file that does not load
+or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `invalid`). On the local runner a changed
+`diskGuardPath` applies only after a restart: `RUNNER_CONFIG_RESTART_NEEDED` (state `restart`).
+
 | Key | Meaning | Default |
 |---|---|---|
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |

@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_LANE_SANDBOX, type DoriConfig, withThinking } from "../config.ts";
-import { parsePolicy, POLICY_FILE, type RunnerPolicy } from "./policy.ts";
+import { DEFAULT_POLICY, loadPolicy, parsePolicy, POLICY_FILE, type RunnerPolicy } from "./policy.ts";
 
 /**
  * The local runner's policy when `~/.dori/runner/runner-config.json` is absent (design D20): derived from the lead's
@@ -38,6 +38,17 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
     sandboxCheck: [...sandbox, "--check"],
     jobs: "allow",
   };
+};
+
+/**
+ * The policy a runner serves with (at start and on every reload): runner-config.json wins when present; without it the
+ * local runner derives its policy from config.json (D20) and a worker keeps the empty default (no profiles, no roots).
+ * A local file with only placement keys layers them on. Throws on an unreadable or invalid file.
+ */
+export const runnerPolicy = (runnerDir: string, remote: boolean, cfg: LocalPolicyConfig): RunnerPolicy => {
+  const hasFile = existsSync(join(runnerDir, POLICY_FILE));
+  if (remote) return hasFile ? loadPolicy(runnerDir) : DEFAULT_POLICY;
+  return hasFile ? localRunnerPolicy(runnerDir, cfg) : localPolicy(cfg);
 };
 
 /** The runner-config keys that only declare placement; a file holding nothing else keeps the derived local policy. */

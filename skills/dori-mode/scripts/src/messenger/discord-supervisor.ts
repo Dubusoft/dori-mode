@@ -69,7 +69,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   // The owner's hook button click reaches the lead as one journal line after the configured hook was started.
   const clicked = (name: string, arg: string, channel: string, interactionId: string): Promise<void> =>
     options.emit(`discord:${channel}:button:${interactionId}`, `BUTTON_CLICKED_BY_OWNER ${name} ${arg}`);
-  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, deps.config.discordChannels, options.statusLookup, threadClosed,
+  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, () => deps.config.discordChannels, options.statusLookup, threadClosed,
     { hooks: deps.config.buttonHooks ?? {}, clicked });
   let lastPoll = -Infinity;
   let polling: Promise<void> | undefined;
@@ -77,8 +77,10 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   let stopped = false;
   let watched: readonly string[] = [];
   const statePath = join(deps.config.stateDir, "discord-inbound.json");
-  const configuredChannels = deps.config.discordChannels;
-  const configured = () => discordChannels(configuredChannels, []);
+  // Read on every use: a config reload (config-watch.ts) replaces discordChannels in place, and the next tick catches
+  // a newly added channel up like a restart would, on the same gateway connection.
+  const configuredChannels = (): readonly string[] => deps.config.discordChannels;
+  const configured = () => discordChannels(configuredChannels(), []);
   if (!discordOwnerConfigured(config.ownerId)) {
     log("DISCORD_INBOUND_WARNING discord.ownerId is not configured; every Discord author is treated as a VISITOR, never the owner (run dori setup)");
   }
@@ -101,7 +103,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     },
   };
   const watches = async (channel: string): Promise<boolean> =>
-    discordChannels(configuredChannels, await deps.registry.open()).includes(channel) || configured().includes((await parentOf(channel)) ?? "");
+    discordChannels(configuredChannels(), await deps.registry.open()).includes(channel) || configured().includes((await parentOf(channel)) ?? "");
   // Channel id -> parent (null: not a thread) and name. Fed by gateway channel and thread events and REST; a rename
   // arrives as CHANNEL_UPDATE / THREAD_UPDATE. An event without a name keeps the one already known.
   const channels = new Map<string, DiscordChannelInfo>();
@@ -155,7 +157,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
         catchupRequested = false;
         lastPoll = deps.clock.now();
         try {
-          watched = discordChannels(configuredChannels, await deps.registry.open());
+          watched = discordChannels(configuredChannels(), await deps.registry.open());
           let threads: string[] = [];
           let floor: string | undefined;
           try {
@@ -231,7 +233,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     /** Gateway state for the heartbeat file. */
     state: () => ({ connected: gateway.connected, messageContent: gateway.messageContent }),
     async tick(): Promise<void> {
-      const channels = discordChannels(configuredChannels, await deps.registry.open());
+      const channels = discordChannels(configuredChannels(), await deps.registry.open());
       if (polling) { await polling; return; }
       const newChannel = channels.some((channel) => !watched.includes(channel));
       const interval = gateway.healthy ? deps.config.discordSafetyPollSeconds * 1_000 : 5_000;

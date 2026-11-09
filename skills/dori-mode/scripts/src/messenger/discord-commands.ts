@@ -95,8 +95,8 @@ export class DiscordCommands {
     private readonly config: DiscordConfig,
     private readonly lookup: QuotaLookup,
     private readonly deadline: () => AbortSignal = () => AbortSignal.timeout(20_000),
-    /** Channels this Dori owns; empty answers everywhere. */
-    private readonly channels: readonly string[] = [],
+    /** Channels this Dori owns, or a function read per interaction (the supervisor's live config); empty answers everywhere. */
+    private readonly ownChannels: readonly string[] | (() => readonly string[]) = [],
     /** The /status text source; without it /status is ignored. */
     private readonly statusLookup?: StatusLookup,
     /** Told about each thread the owner's close button archived; without it the close is only logged. */
@@ -208,7 +208,8 @@ export class DiscordCommands {
     const label = interaction.command === "status" ? "Status" : "Quota";
     const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
     try {
-      if (this.channels.length > 0 && !interaction.channelIds.some((id) => this.channels.includes(id))) {
+      const channels = typeof this.ownChannels === "function" ? this.ownChannels() : this.ownChannels;
+      if (channels.length > 0 && !interaction.channelIds.some((id) => channels.includes(id))) {
         await this.request("POST", callback, { type: 4, data: { flags: 64, content: `이 채널은 다른 Dori의 채널입니다. 해당 Dori 봇의 /${interaction.command}를 사용해 주세요.` } });
         return;
       }

@@ -911,7 +911,7 @@ try {
       // dori update runs the code it started with, so the supervisor it restarts installs the new checkout's sandbox.
       try { const line = refreshLaneSandbox(homedir()); if (line) console.log(line); }
       catch (e) { console.error(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
-      try { await supervise(deps, controller.signal); }
+      try { await supervise(deps, controller.signal, { configFile: configPath() }); }
       finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
       // Shutdown is done: leftover timers, sockets or child pipes must not hold the process.
       console.log("SUPERVISOR_STOPPED");

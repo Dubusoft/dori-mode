@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { deliveryConfigError } from "./config.ts";
+import { applyConfigPatch, configReloader, watchConfigFiles } from "./config-watch.ts";
 import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
@@ -812,10 +813,12 @@ export const supervise = async (
     readonly gatewayLockDir?: string;
     /** Starts the local runner child (default Bun.spawn); tests inject one that starts nothing. */
     readonly spawnRunner?: LocalChildDeps["spawn"];
+    /** The config.json to hot-reload (cli.ts: configPath()); without it nothing is watched. */
+    readonly configFile?: string;
   } = {},
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
-  const { gatewayLockDir, spawnRunner, ...discordOptions } = options;
+  const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
   if (!Number.isFinite(deps.config.cacheTtlMin) || deps.config.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
   if (!Number.isFinite(deps.config.leadContextCapTokens) || deps.config.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
   if (!Number.isFinite(deps.config.leadContextHardCapTokens) || deps.config.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
@@ -848,6 +851,7 @@ export const supervise = async (
   let stopRelay: (() => void) | undefined;
   let relayListener: Listener | undefined;
   let laneMessages: LaneMessageStore | undefined;
+  let stopConfigWatch: (() => void) | undefined;
   // Lane operations go through the hub's RunnerCalls; until the hub is open every call fails closed.
   const hubCall: RunnerCall = {
     call: (label, type, body, opts) => {
@@ -1107,6 +1111,12 @@ export const supervise = async (
           // A runner-owned wait that the runner saw met ends here (deduped with the check's own result by its event id);
           // `job.result` is kept in the runner journal only.
           onEvent: (label, frame) => {
+            // A runner's own config reload (runner-config.json): reloaded, kept the last good one, or needs a restart.
+            if (frame.type === "runner.config") {
+              const kind = { reloaded: "RUNNER_CONFIG_RELOADED", invalid: "RUNNER_CONFIG_INVALID", restart: "RUNNER_CONFIG_RESTART_NEEDED" }[frame.body.state];
+              enqueueSweep(`runner-config:${label}:${frame.gen}:${frame.seq}`, `${kind} runner=${label} ${frame.body.detail}`);
+              return;
+            }
             if (frame.type !== "wait.result" || frame.body.outcome !== "WAIT_DONE") return;
             try { waits.settleRemote(label, frame.body.waitId, enqueueWait); }
             catch (e) { console.error(`WAIT_ERROR runner=${label} wait=${frame.body.waitId} ${e instanceof Error ? e.message : String(e)}`); }
@@ -1189,6 +1199,16 @@ export const supervise = async (
       }
     };
     await tryOpenRunners((name, work) => probe.step(name, work));
+    // config.json edits apply without a restart: the live keys are written into the config objects every part holds
+    // (this loop's and the supervisor core's), so in-flight events, waits, lanes and the gateway are untouched.
+    if (configFile) {
+      const reload = configReloader({
+        path: configFile, current: () => deps.config,
+        apply: (patch) => { applyConfigPatch([deps.config, supervisor.config], patch); },
+        enqueue: (id, line) => { enqueueSweep(id, line); }, log: (line) => { console.error(line); },
+      });
+      stopConfigWatch = watchConfigFiles([configFile], reload);
+    }
     let lastJournalPrune = -Infinity;
     let lastAdoption = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
@@ -1322,6 +1342,7 @@ export const supervise = async (
       probe.close();
     }
     if (petting !== undefined) clearInterval(petting);
+    stopConfigWatch?.();
     stop.abort();
     await settle(tasks);
     await inbound?.close();
