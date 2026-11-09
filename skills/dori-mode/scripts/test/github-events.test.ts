@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -8,7 +8,7 @@ import { Repos } from "../src/repos.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE } from "../src/store.ts";
 import { Supervisor, eventPriority } from "../src/supervise.ts";
-import { depsFor, fakeClock, newWorld, readGithub, TEST_STORE, withState } from "./fakes.ts";
+import { depsFor, fakeClock, fakeLaneOps, newWorld, readGithub, TEST_STORE, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -241,6 +241,39 @@ test("a repo timeout still lets a healthy repo emit its decision event", async (
   expect(f.events.some((e) => e.line.startsWith("HOST_GITHUB slow/repo poll_failed "))).toBe(true);
 });
 
+test("a repo poll cut short keeps what it read: the next tick resumes after the finished PRs instead of starting over", async () => {
+  const f = await fixture();
+  const LIST = "repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100";
+  const human = [{ id: 3, user: { login: "human", type: "User" } }];
+  const seven = pull({ updated_at: "2026-10-20T00:00:00Z" });
+  const eight = pull({ number: 8, head: { sha: "def", ref: "other", repo: { full_name: "Acme/App" } }, updated_at: "2026-10-20T00:00:00Z", html_url: "https://github.com/acme/app/pull/8" });
+  f.responses.set(LIST, ok([seven, eight], '"v2"'));
+  f.responses.set("repos/acme/app/pulls/7", ok(seven, '"v2"'));
+  f.responses.set("repos/acme/app/issues/7/comments?per_page=100", ok(human, '"v2"'));
+  f.responses.set("repos/acme/app/pulls/8", ok(eight));
+  f.responses.set("repos/acme/app/commits/def/check-runs?per_page=100", ok({ check_runs: [] }));
+  f.responses.set("repos/acme/app/commits/def/status?per_page=100", ok({ state: "pending", statuses: [] }));
+  f.responses.set("repos/acme/app/pulls/8/reviews?per_page=100", { code: 124, out: "", err: "timeout" });
+  f.responses.set("repos/acme/app/issues/8/comments?per_page=100", ok(human));
+  f.responses.set("repos/acme/app/pulls/8/comments?per_page=100", ok([]));
+  // The first tick finishes PR 7 (its comment goes out) and is cut short inside PR 8.
+  await f.github.tick(f.deps, f.emit);
+  expect(f.events.map((e) => e.line.split(" ").slice(0, 3).join(" "))).toEqual(["GH_PR acme/app#7 comment", "GH_PR acme/app#7 updated", "HOST_GITHUB acme/app poll_failed"]);
+  // The next tick reads the list conditionally from what the failed tick kept, and does not read PR 7 again.
+  f.responses.set("repos/acme/app/pulls/8/reviews?per_page=100", ok([]));
+  const before = f.calls.length;
+  await f.github.tick(f.deps, f.emit);
+  const resumed = f.calls.slice(before);
+  expect(resumed.find((c) => c.argv[5] === LIST)?.argv).toContain('If-None-Match: "v2"');
+  expect(resumed.some((c) => c.argv[5]?.includes("/7"))).toBe(false);
+  expect(f.events.filter((e) => e.line.startsWith("GH_PR acme/app#8 ")).map((e) => e.line.split(" ")[2])).toEqual(["comment", "opened"]);
+  // Once the repo finished, the snapshot is durable and a later tick reads every PR again without repeating an event.
+  const events = f.events.length;
+  await poller(f.state.dir).tick(f.deps, f.emit);
+  expect(f.events.length).toBe(events);
+  expect(githubSummary(f.state.dir).failures).toEqual({});
+});
+
 test("per-repo auth failure is bounded, isolated and rate-limited durably while repos hot reload", async () => {
   const f = await fixture();
   new Repos(f.state.dir).add("bad/repo");
@@ -261,13 +294,16 @@ test("per-repo auth failure is bounded, isolated and rate-limited durably while 
   expect(f.events).toHaveLength(2);
 });
 
-test("lane targets include merged PRs, command head branches and git worktree branches", async () => {
-  const lane = { key: "lane", title: "", thread: "none", brief: "", openedAt: "", cwd: "/worktree", done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","feature","--json","number"]' };
-  const run: Runner = async (argv) => ({ code: 0, out: argv.includes("get-url") ? "git@github.com:git/repo.git" : "working-branch", err: "" });
-  const targets = await githubTargets([lane], run);
+test("lane targets include merged PRs, pr and command head branches and git worktree branches", async () => {
+  const lane = { key: "lane", title: "", thread: "none", brief: "", openedAt: "", cwd: "/worktree", done: 'merged acme/app#7; command ["gh","pr","list","-R","other/repo","--head","feature","--json","number"]; pr Acme/App feat/pr-branch' };
+  const w = newWorld();
+  w.inspection = { git: { origin: "git@github.com:git/repo.git", branch: "working-branch", worktrees: [{ path: "/worktree", branch: "side-branch", exists: true }] } };
+  const targets = await githubTargets([lane], fakeLaneOps(w));
+  expect(w.ops.find((e) => e.op === "inspect")?.args).toMatchObject({ want: { git: true } });
   expect([...targets.get("acme/app")?.numbers ?? []]).toEqual([7]);
+  expect([...targets.get("acme/app")?.branches ?? []]).toEqual(["feat/pr-branch"]);
   expect([...targets.get("other/repo")?.branches ?? []]).toEqual(["feature"]);
-  expect([...targets.get("git/repo")?.branches ?? []]).toEqual(["working-branch"]);
+  expect([...targets.get("git/repo")?.branches ?? []]).toEqual(["working-branch", "side-branch"]);
 });
 
 test("closing a reopened PR produces a new stable event identity", async () => {
@@ -397,6 +433,47 @@ test("a successful poll clears the repo's failure marker while the failure throt
 
 const DAY = 24 * 60 * 60_000;
 const LIST = "repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100";
+
+test("a multi-repo tick commits successful snapshots and failure markers exactly once", async () => {
+  const f = await fixture();
+  new Repos(f.state.dir).add("acme/other");
+  new Repos(f.state.dir).add("bad/repo");
+  const run: Runner = async (argv, opts) => {
+    if (argv[5]?.startsWith("repos/acme/other/")) return ok([]);
+    if (argv[5]?.startsWith("repos/bad/repo/")) throw new Error("unavailable");
+    return f.deps.run(argv, opts);
+  };
+  const commit = spyOn(f.github as unknown as { commit: (next: unknown) => void }, "commit");
+  try {
+    await f.github.tick({ ...f.deps, run }, f.emit);
+    expect(commit).toHaveBeenCalledTimes(1);
+    const saved = readGithub(f.state.dir);
+    expect(Object.keys(saved.repos).sort()).toEqual(["acme/app", "acme/other"]);
+    expect(saved.failures).toEqual({ "bad/repo": f.clock.now() });
+    expect(saved.polledAt).toBe(f.clock.now());
+  } finally { commit.mockRestore(); }
+});
+
+test("closing PRs immediately drops their response caches and drops a SHA only after its last open PR closes", async () => {
+  const f = await fixture();
+  const closed = pull({ state: "closed" });
+  const other = pull({ number: 8 });
+  f.responses.set(LIST, ok([closed, other]));
+  f.responses.set("repos/acme/app/pulls/7", ok(closed));
+  f.responses.set("repos/acme/app/pulls/8", ok(other));
+  for (const path of ["pulls/8/reviews", "issues/8/comments", "pulls/8/comments"]) f.responses.set(`repos/acme/app/${path}?per_page=100`, ok([]));
+  await f.github.tick(f.deps, f.emit);
+  const cache = readGithub(f.state.dir).repos["acme/app"].cache;
+  expect(Object.keys(cache).filter((path) => /\/(?:pulls|issues)\/7(?:\/|\?|$)/.test(path))).toEqual([]);
+  expect(cache["repos/acme/app/commits/abc/check-runs?per_page=100"]).toBeDefined();
+  const merged = pull({ number: 8, state: "closed", merged_at: "2026-11-07T00:00:00Z" });
+  f.responses.set(LIST, ok([closed, merged]));
+  f.responses.set("repos/acme/app/pulls/8", ok(merged));
+  await f.github.tick(f.deps, f.emit);
+  const saved = readGithub(f.state.dir).repos["acme/app"];
+  expect(Object.keys(saved.cache).filter((path) => path.includes("/commits/") || /\/(?:pulls|issues)\/8(?:\/|\?|$)/.test(path))).toEqual([]);
+  expect(saved.pulls["8"].state).toBe("merged");
+});
 
 test("closed PR history keeps its baseline but drops activity and unused cached responses after 30 days, replaying nothing", async () => {
   const f = await fixture();

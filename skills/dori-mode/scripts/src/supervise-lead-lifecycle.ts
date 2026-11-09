@@ -12,6 +12,8 @@ import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { completeLeadRestart } from "./lead-restart.ts";
+import { herdrDownSince } from "./runner/herdr-down.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
 import type { Durability } from "./store.ts";
@@ -209,7 +211,7 @@ export class LeadLifecycle {
       this.journal = { ...this.journal, inbox: { ...inbox, capNotice: hour } };
       this.persist();
       this.enqueue(`lead-unresponsive:${hour}`, `LEAD_UNRESPONSIVE ${what}: you did not take pushed events or handle owner messages, and ${count} forced restarts in the last hour reached delivery.restartMaxPerHour ${delivery.restartMaxPerHour}, so you are not restarted; run dori inbox take now`);
-      this.owners.announce(`lead-restart-capped:${hour}`, `The lead is not taking new events, but it was already restarted ${count} times in the last hour, so it is not restarted again for now. The supervisor keeps notifying it.`);
+      this.owners.announce(`lead-restart-capped:${hour}`, `리드가 새 이벤트를 받지 않고 있지만, 지난 한 시간 동안 이미 ${count}번 재시작했기 때문에 당분간은 다시 재시작하지 않습니다. 수퍼바이저가 계속 리드에게 알립니다.`);
     }
     return true;
   }
@@ -269,7 +271,7 @@ export class LeadLifecycle {
       const session = randomUUID();
       console.log(`LEAD_STUCK_RESTART ${config.leadPane} ${status} ${minutes} min, ${count} owner message(s) unread`);
       await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.defaultCwd);
-      this.owners.announce(`lead-stuck:${session}`, `The lead has been stuck (${status}) for ${minutes} min without reading your messages, so it is being restarted; your unanswered messages go to the new lead.`);
+      this.owners.announce(`lead-stuck:${session}`, `리드가 ${minutes}분째 멈춘 상태(${status})로 메시지를 읽지 못하고 있어 재시작합니다. 답변받지 못한 메시지는 새 리드에게 넘어갑니다.`);
       this.setRestart({
         session, events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
         phase: "stopping", force: true,
@@ -335,11 +337,12 @@ export class LeadLifecycle {
 
   /**
    * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at defaultCwd.
-   * The runtime leadPane changes and persistLeadPane writes it back to the loaded config. Returns the new
+   * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
    * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
    */
   async repairLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
+    if (this.herdrHeld()) return undefined;
     if ((await listPanes(run)).some((p) => p.pane_id === config.leadPane)) return undefined;
     const pane = await this.createLeadPane();
     if (!pane) return undefined;
@@ -365,8 +368,24 @@ export class LeadLifecycle {
    * created again, as dori-boot-prep.sh does, and its root pane becomes the lead. Undefined, with herdr's reason logged,
    * when herdr refuses.
    */
+  /**
+   * While the local runner reports this host's herdr down or hung (HERDR_DOWN / HERDR_HUNG machine=local, saved on its
+   * hub row) the lead pane is not created again: herdr cannot hold it, and each refused attempt would only add a
+   * failure. Re-creation resumes once the runner reads herdr again (HERDR_UP). Logged once per held state.
+   */
+  private heldSince: number | undefined;
+  private herdrHeld(): boolean {
+    const since = herdrDownSince(this.deps.config.stateDir).get(LOCAL_RUNNER);
+    if (since !== undefined && since !== this.heldSince) {
+      console.log(`LEAD_PANE_HELD herdr on machine=${LOCAL_RUNNER} has been unreadable since ${new Date(since).toISOString()}; the lead pane is created again after HERDR_UP`);
+    }
+    this.heldSince = since;
+    return since !== undefined;
+  }
+
   private async createLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
+    if (this.herdrHeld()) return undefined;
     const refused = (what: string, result: { readonly out: string; readonly err: string }): undefined => {
       console.error(`LEAD_PANE_CREATE_FAILED ${what}: ${result.err || result.out}`);
       return undefined;
@@ -547,7 +566,7 @@ export class LeadLifecycle {
       "Supervised mode: do not start inbound pollers or sweeps.",
       "Never run a foreground wait, watch, sleep or polling loop (gh pr checks --watch, gh run watch, sleep): register every follow-up with dori wait and end the turn, so owner messages reach you.",
     ];
-    const replyFirst = "Owner messages come first, each step its own call: dori ack alone, dori inbox take once more, then one short reply that merges related follow-ups in that channel (an edit replaces, a delete withdraws); only then investigate or work and send the result as a follow-up.";
+    const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     return [
       ...head,

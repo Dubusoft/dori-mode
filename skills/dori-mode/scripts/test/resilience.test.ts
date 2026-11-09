@@ -7,6 +7,9 @@ import type { Runner } from "../src/run.ts";
 import { BACKOFF_MAX_MS, BACKOFF_MIN_MS, RetryingDelivery, STUCK_AFTER_MS, SuperviseError, Supervisor, TransientSuperviseError } from "../src/supervise.ts";
 import { recordLaunchVerdict } from "../src/routing.ts";
 import { runSweeps, supervise, supervisorSweeps, WARN_REPEAT_MS } from "../src/supervise-loop.ts";
+import { LaneOpsError } from "../src/lane-ops.ts";
+import { RunnerGuardBoard } from "../src/runner/guard.ts";
+import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -74,34 +77,44 @@ test("the SUPERVISOR_STUCK channel post is scrubbed of home paths and pane ids; 
   expect(s.notified).toEqual(["SUPERVISOR_STUCK cannot stop owned lead process in (pane) (~/.dori/state)"]);
 });
 
-/** The real supervisor sweeps over a registry and runner; the queue is what Supervisor.enqueue would receive. */
-const sweepWorld = (fail: (argv: readonly string[]) => boolean) => {
+/**
+ * The real supervisor sweeps over a registry and the lane facade; `failPanes` makes every pane list through the runner
+ * fail. The host's numbers are the local runner's guard sample: 200 GB free disk, no load, memory free, one pane.
+ * The queue is what Supervisor.enqueue would receive.
+ */
+const sweepWorld = (failPanes: boolean) => {
   const state = withState();
   cleanups.push(state.done);
   const world = newWorld();
   const clock = fakeClock(T0);
   const base = depsFor(world, clock, state.dir);
-  // A host with 200 GB free disk, no load reading and unknown memory: room for a launch once panes allow it.
-  const run: Runner = async (argv) => (fail(argv) ? { code: 1, out: "", err: "herdr: server unreachable" }
-    : argv[0] === "df" ? { code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200", err: "" }
-    : base.run(argv));
-  const deps = { ...base, run };
+  const ops = failPanes
+    ? { ...base.ops, panes: async () => { throw new LaneOpsError("RUNNER_UNAVAILABLE", "local", "disconnected: runner down"); } }
+    : base.ops;
+  const deps = { ...base, ops };
+  const board = new RunnerGuardBoard(clock.now);
+  board.event("local", {
+    v: 1, runner: "local", gen: 1, epoch: 1, seq: 1, type: "guard.sample",
+    body: { level: "ok", reasons: [], sampledAt: T0, load1: 0, memFreePct: 100, diskFreeGb: 200, swapFreeGb: 0, swapTotalGb: 0, os: "linux", panes: 1 },
+  } as unknown as AnyRunnerEvent);
   const queue: string[] = [];
   const logs: string[] = [];
   const recent = new Map<string, number>();
-  const sweeps = supervisorSweeps(deps, "/home/test");
+  const sweeps = supervisorSweeps(deps, "/home/test", undefined, undefined, undefined, () => board);
   const tick = () => runSweeps(sweeps, async (line) => { queue.push(line); }, clock.now, recent, (line) => { logs.push(line); });
   return { deps, clock, queue, logs, tick, world };
 };
 
+const PANES_DOWN = "RUNNER_UNAVAILABLE runner=local disconnected: runner down";
+
 test("a failing sweep never ends the supervisor or loses a done claim: the claim is enqueued, the failure is one digest warning", async () => {
-  const w = sweepWorld((argv) => argv.join(" ") === "herdr pane list");
+  const w = sweepWorld(true);
   await w.deps.registry.write({ key: "demo-lane", title: "d", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), status: "done-claimed", claim: { at: new Date(T0).toISOString(), evidence: "merged acme/app#1 abc", emitted: false } });
   await w.tick();
   expect(w.queue).toContain("LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc");
-  expect(w.queue).toContain("SWEEP_WARN dead-panes herdr pane list failed: herdr: server unreachable");
+  expect(w.queue).toContain(`SWEEP_WARN dead-panes ${PANES_DOWN}`);
   expect((await w.deps.registry.read("demo-lane"))?.claim?.emitted).toBe(true);
-  expect(w.logs).toContain("SWEEP_ERROR dead-panes herdr pane list failed: herdr: server unreachable");
+  expect(w.logs).toContain(`SWEEP_ERROR dead-panes ${PANES_DOWN}`);
   // The same failure on the next ticks is logged but not queued again within the hour.
   const queued = w.queue.length;
   await w.tick();
@@ -112,8 +125,31 @@ test("a failing sweep never ends the supervisor or loses a done claim: the claim
   expect(w.queue.filter((line) => line.startsWith("SWEEP_WARN dead-panes"))).toHaveLength(2);
 });
 
+test("a runner without an admitted connection is one RUNNER_UNAVAILABLE per outage, never a warning per lane and sweep", async () => {
+  const w = sweepWorld(false);
+  const at = new Date(T0).toISOString();
+  const lane = { title: "l", thread: "none", brief: "/b.md", done: "merged acme/app#1", openedAt: at };
+  w.world.panes = ["w:p1", "w:p2"].map((pane_id) => ({ pane_id, workspace_id: "w", agent: "omo", agent_status: "idle" }));
+  await w.deps.registry.write({ ...lane, key: "claimed", pane: "w:p1", status: "done-claimed", claim: { at, evidence: "merged acme/app#1 abc", emitted: true } });
+  await w.deps.registry.write({ ...lane, key: "silent", pane: "w:p2", status: "working", lastReplyAt: T0 - 3 * 3_600_000 });
+  await w.deps.registry.write({ ...lane, key: "kept", pane: "w:p3", closedAt: at, receipt: { cleanup: ["worktree /data/repos/worktrees/kept kept: dirty"] } } as Parameters<typeof w.deps.registry.write>[0]);
+  w.world.runnerDown = true; // a supervisor restart: the local runner has not said hello yet
+  for (let i = 0; i < 3; i++) { await w.tick(); w.clock.at += 30_000; }
+  const down = "RUNNER_UNAVAILABLE runner=local no admitted connection: watch, dead-panes and freshness skip its lanes until it says hello";
+  // The host guard, memory and machine-guard sweeps read no lane through the runner and say what they say regardless.
+  const runnerLines = (lines: string[]) => lines.filter((line) => !/^(HOST_GUARD |MEMORY_CHECK|SWEEP_WARN machine-guard )/.test(line));
+  expect(runnerLines(w.queue)).toEqual([down]);
+  w.world.runnerDown = false;
+  await w.tick();
+  const back = w.queue.length;
+  w.world.runnerDown = true; // the next outage is its own transition
+  await w.tick();
+  await w.tick();
+  expect(runnerLines(w.queue.slice(back))).toEqual([down]);
+});
+
 test("a launch held by dori can-launch wakes the lead with LAUNCH_READY once the host has room, once", async () => {
-  const w = sweepWorld(() => false);
+  const w = sweepWorld(false);
   w.world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "working" }];
   recordLaunchVerdict(w.deps.config.stateDir, { ok: false, reasons: ["panes 20 >= 20"] }, T0);
   await w.tick();

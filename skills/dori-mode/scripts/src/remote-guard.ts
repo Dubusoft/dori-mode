@@ -5,7 +5,9 @@ import { dirname, join } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
 import { alertReasons } from "./host-guard.ts";
+import { herdrMachineList } from "./herdr-machines.ts";
 import { type Ran, RUN_TIMEOUT_CODE, type Runner } from "./run.ts";
+import { readRunnerMachines } from "./runner/machines.ts";
 
 /** The agent script the server installs on each worker machine as `$HOME/.dori/guard-agent.sh`. */
 export const GUARD_AGENT_TEMPLATE = join(import.meta.dir, "..", "templates", "guard-agent.sh");
@@ -31,7 +33,6 @@ const REMOTE_VERSION_TMP = '"$HOME/.dori/guard-agent.version.tmp.$$"';
 const HEREDOC = "DORI_GUARD_EOF";
 const INSTALL_TIMEOUT_MS = 30_000;
 const SAMPLE_TIMEOUT_MS = 20_000;
-const KILL_TIMEOUT_MS = 30_000;
 
 /** First 12 hex chars of the script's sha256: what `guard-agent.version` holds once installed. */
 export const guardAgentVersion = (script: string): string => createHash("sha256").update(script).digest("hex").slice(0, 12);
@@ -73,26 +74,29 @@ export const parseMachineList = (json: string): GuardMachine[] => {
 /** A machine list read; on failure `machines` holds only the overrides and `detail` says why herdr's list is missing. */
 export type MachineListResult = { ok: true; machines: GuardMachine[] } | { ok: false; detail: string; machines: GuardMachine[] };
 
-const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Record<string, string>>): GuardMachine[] => {
-  const byLabel = new Map(listed.map((m) => [m.label, m]));
+/** `stateMachines` (label -> target from `dori runner install <target>`) rank lowest: herdr's list and `overrides` replace them by label. */
+const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Record<string, string>>, stateMachines: Readonly<Record<string, string>> = {}): GuardMachine[] => {
+  const byLabel = new Map<string, GuardMachine>(Object.entries(stateMachines).map(([label, target]) => [label, { label, target }]));
+  for (const m of listed) byLabel.set(m.label, m);
   for (const [label, target] of Object.entries(overrides)) byLabel.set(label, { ...byLabel.get(label), label, target });
   return [...byLabel.values()].sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 };
 
 /** herdr's saved machines with `overrides` (label -> ssh target) replacing or adding by label; a herdr failure or invalid JSON is not ok. */
-export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<MachineListResult> => {
-  const r = await run(["herdr", "machine", "list", "--json"]);
-  if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides) };
+export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>, stateDir?: string): Promise<MachineListResult> => {
+  const state = stateDir === undefined ? {} : readRunnerMachines(stateDir);
+  const r = await herdrMachineList(run);
+  if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides, state) };
   try {
-    return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides) };
+    return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides, state) };
   } catch (e) {
-    return { ok: false, detail: `invalid JSON: ${e instanceof Error ? e.message : String(e)}`, machines: withOverrides([], overrides) };
+    return { ok: false, detail: `invalid JSON: ${e instanceof Error ? e.message : String(e)}`, machines: withOverrides([], overrides, state) };
   }
 };
 
 /** readGuardMachines' machines, failure or not (only the overrides when herdr fails). */
-export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>): Promise<GuardMachine[]> =>
-  (await readGuardMachines(run, overrides)).machines;
+export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>, stateDir?: string): Promise<GuardMachine[]> =>
+  (await readGuardMachines(run, overrides, stateDir)).machines;
 
 export const sshArgv = (target: string, command: string): string[] => ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, command];
 
@@ -161,7 +165,6 @@ const NO_SHELL = `${UNSUPPORTED_SHELL} (no POSIX sh or PowerShell)`;
 export const encodedPowerShell = (snippet: string): string =>
   `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(snippet, "utf16le").toString("base64")}`;
 
-const psQuote = (s: string): string => `'${s.replace(/'/g, "''")}'`;
 const psAgent = (args: string): string => encodedPowerShell(`& (Join-Path $env:USERPROFILE '.dori\\guard-agent.ps1') ${args}; exit $LASTEXITCODE`);
 const PS_VERSION = encodedPowerShell(
   "$f = Join-Path $env:USERPROFILE '.dori\\guard-agent.version'; if (Test-Path -LiteralPath $f) { Get-Content -LiteralPath $f -TotalCount 1; exit 0 } else { exit 1 }",
@@ -174,7 +177,10 @@ export type MachineKind = "posix" | "windows";
 const machineKinds = new Map<string, MachineKind>();
 
 /** Forgets every machine's resolved kind. */
-export const clearShellModes = (): void => machineKinds.clear();
+export const clearShellModes = (): void => {
+  machineKinds.clear();
+  runnerKinds.clear();
+};
 
 /** The ssh command (and its stdin) for one kind of machine. */
 type KindCommand = (kind: MachineKind) => { readonly command: string; readonly stdin?: string };
@@ -197,6 +203,32 @@ const resolveKind = async (run: Runner, target: string, timeoutMs: number): Prom
     why ||= stderrLine(r.err);
   }
   return { ok: false, unsupported: true, detail: `${NO_SHELL}: ${why || "no probe output"}` };
+};
+
+/** A machine's kind, or why it could not be found. */
+export type KindResult = { readonly ok: true; readonly kind: MachineKind } | ShellFailure;
+const runnerKinds = new Map<string, MachineKind>();
+const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
+
+/**
+ * The kind of commands `m`'s runner takes: the cached or probed kind, except that a POSIX shell on Windows (Git Bash,
+ * MSYS or Cygwin as the ssh shell, whose `uname -s` says so) counts as `windows`, since that runner is installed and
+ * controlled through PowerShell. Cached per target; `clearShellModes` forgets it.
+ */
+export const machineKind = async (run: Runner, m: GuardMachine, timeoutMs: number = SAMPLE_TIMEOUT_MS): Promise<KindResult> => {
+  const known = runnerKinds.get(m.target);
+  if (known) return { ok: true, kind: known };
+  const cached = machineKinds.get(m.target);
+  const k = cached ? { ok: true as const, kind: cached } : await resolveKind(run, m.target, timeoutMs);
+  if (!k.ok) return k;
+  let kind = k.kind;
+  if (kind === "posix") {
+    const r = await runIn(run, m.target, { command: "uname -s" }, timeoutMs);
+    if (unreachable(r)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(r)}` };
+    if (r.code === 0 && WINDOWS_UNAME.test(r.out.trim())) kind = "windows";
+  }
+  runnerKinds.set(m.target, kind);
+  return { ok: true, kind };
 };
 
 /** A result showing the cached kind is wrong: cmd's/PowerShell's unknown-command error under posix; exit 127 or an unknown command other than the agent under windows. */
@@ -240,44 +272,10 @@ const sampleWith = async (run: Runner, m: GuardMachine, timeoutMs: number): Prom
 /** Runs the installed agent's `sample` over ssh. */
 export const sampleMachine = (run: Runner, m: GuardMachine): Promise<SampleResult> => sampleWith(run, m, SAMPLE_TIMEOUT_MS);
 
+/** A runner's kills on its machine (`RunnerGuardBoard.takeKills`, from `guard.critical`), as the critical stage reads them. */
 export type KillResult =
   | { ok: true; killed: { pid: number; rssKb: number; cmd: string }[] }
   | { ok: false; detail: string };
-
-const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-
-/** Parses the agent's `DORI_GUARD_KILLED` lines; undefined without the closing `DORI_GUARD_KILL_DONE` line. */
-const parseKillOutput = (out: string): { pid: number; rssKb: number; cmd: string }[] | undefined => {
-  const killed: { pid: number; rssKb: number; cmd: string }[] = [];
-  let done = false;
-  for (const line of out.split("\n").map((l) => l.trim())) {
-    if (line.startsWith("DORI_GUARD_KILL_DONE")) done = true;
-    const m = /^DORI_GUARD_KILLED pid=(\d+) rss_kb=(\d+) cmd=(\S*)$/.exec(line);
-    if (m) killed.push({ pid: Number(m[1]), rssKb: Number(m[2]), cmd: m[3]! });
-  }
-  return done ? killed : undefined;
-};
-
-/** Runs the installed agent's `kill` over ssh: ends that machine's processes whose command line contains any of `patterns`. */
-export const killOnMachine = async (run: Runner, m: GuardMachine, patterns: readonly string[]): Promise<KillResult> => {
-  const pats = patterns.filter((p) => p.trim());
-  if (pats.length === 0) return { ok: true, killed: [] };
-  const p = await runOn(run, m, (kind) => ({
-    command: kind === "windows" ? psAgent(`kill ${pats.map(psQuote).join(" ")}`) : `sh ${REMOTE_SCRIPT} kill ${pats.map(shellQuote).join(" ")}`,
-  }), KILL_TIMEOUT_MS);
-  if (!p.ok) return { ok: false, detail: p.detail };
-  const r = p.r;
-  if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, detail: `unreachable: ${sshError(r)}` };
-  if (p.kind === "windows" && psAgentMissing(r)) return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
-  const unsupported = unsupportedShell(r);
-  if (unsupported) return { ok: false, detail: unsupported };
-  if (r.code === 127 || (r.code !== 0 && /No such file|Can't open|cannot open/i.test(r.err))) {
-    return { ok: false, detail: `guard agent not installed; run dori guard install --machine ${m.label}` };
-  }
-  if (r.code !== 0) return { ok: false, detail: `kill failed (exit ${r.code}): ${sshError(r)}` };
-  const killed = parseKillOutput(r.out);
-  return killed ? { ok: true, killed } : { ok: false, detail: `bad kill output: ${firstLine(r.out).slice(0, 200) || "(empty)"}` };
-};
 
 /** `unsupported` marks a worker with neither POSIX sh nor PowerShell: the agent is skipped there, not failed. */
 export type InstallResult =

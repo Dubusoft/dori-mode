@@ -18,12 +18,10 @@ test("the shipped example config loads, with ~ paths expanded and unset fields d
   expect(c.leadDiet).toBe(true);
 });
 
-test("leadDiet defaults to true when absent and parses false from the file", async () => {
+test("leadDiet is always the built-in true: a leadDiet key in the file is ignored", async () => {
   const path = join(state.dir, "diet.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
-  expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(true);
   await Bun.write(path, JSON.stringify({ leadDiet: false }));
-  expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(false);
+  expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(true);
 });
 
 test("laneRules defaults to none, collapses whitespace, drops blanks, and refuses anything but an array of strings", async () => {
@@ -77,93 +75,33 @@ test("a stray leadModel key in the config file is ignored, and the default model
   expect(c.massLaunchKeywords).toBe("/mass-ulw set goal and work");
 });
 
-test("an old config's removed feature flags load fine: the keys are dropped and named in one warning per process", async () => {
-  const path = join(state.dir, "old-flags.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 7, operations: false, laneReports: true, superviseTasks: false, store: "json" }));
+test("only user and environment keys are read: unknown, removed and malformed tunable keys load as defaults, named in one CONFIG_KEYS_IGNORED line per process", async () => {
+  const path = join(state.dir, "mixed.json");
+  await Bun.write(path, JSON.stringify({
+    defaultModel: "m/lane", store: "json", ciMergeBase: "release",
+    futureKey: { a: 1 }, operations: false, quotaGate: { pollMin: 5 }, toodo: { url: "x" }, laneFinishNotice: true,
+    drift: "x", runners: { listen: "8.8.8.8:1", mode: { mini: "shadow" } }, eventPolicy: 7, resolveKinds: "x",
+    delivery: { mode: "push", push: { ackSec: 1 } }, guard: { memFreeCritPct: 3 }, heavyKill: "qemu-system", closeAfterMin: 7,
+    memoryCheck: { repo: "~/memory", maxKb: 9 }, hooks: { threadDone: ["x"], threadReply: ["reply", "{text}"] },
+    laneSandbox: { command: ["lane-sandbox"], default: false },
+  }));
   // A fresh process, so the once-per-process warning is not already spent by another test file.
-  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
+  const script = `const { defaultConfig, loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
     const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
     const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    console.log(JSON.stringify({ closeAfterMin: a.closeAfterMin, store: b.store, leftover: ["operations", "laneReports", "superviseTasks"].filter((k) => k in a || k in b) }));`;
+    const d = defaultConfig("/home/ana");
+    const same = ["closeAfterMin", "drift", "eventPolicy", "resolveKinds", "delivery", "guard", "heavyKill"].filter((k) => JSON.stringify(a[k]) === JSON.stringify(d[k]));
+    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a }));`;
   const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   expect(code).toBe(0);
-  expect(JSON.parse(out)).toEqual({ closeAfterMin: 7, store: "json", leftover: [] });
-  const warnings = err.split("\n").filter((line) => line.startsWith("CONFIG_FLAGS_REMOVED "));
-  expect(warnings).toEqual([`CONFIG_FLAGS_REMOVED superviseTasks, operations, laneReports in ${path}: these flags were removed and their behavior is always on; the keys are ignored and can be deleted`]);
-});
-
-test("an old config's quotaCheck loads fine: the key is dropped and named in one warning per process", async () => {
-  const path = join(state.dir, "old-quota-check.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 9, quotaCheck: ["omo", "auth", "check", "--provider", "{provider}", "--json"] }));
-  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
-    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    console.log(JSON.stringify({ closeAfterMin: a.closeAfterMin, leftover: ["quotaCheck" in a, "quotaCheck" in b] }));`;
-  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-  expect(code).toBe(0);
-  expect(JSON.parse(out)).toEqual({ closeAfterMin: 9, leftover: [false, false] });
-  const warnings = err.split("\n").filter((line) => line.startsWith("CONFIG_QUOTA_STALL_KEYS_REMOVED "));
-  expect(warnings).toEqual([`CONFIG_QUOTA_STALL_KEYS_REMOVED quotaCheck in ${path}: lanes are no longer checked or paused on quota; the keys are ignored and can be deleted`]);
-});
-
-test("an old config's quotaGate loads fine: the key is dropped and named in one warning per process", async () => {
-  const path = join(state.dir, "old-quota-gate.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 8, quotaGate: { holdLanesHeadroomPct: 70, holdLanes5hPct: 80, pollMin: 5 } }));
-  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
-    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    console.log(JSON.stringify({ closeAfterMin: a.closeAfterMin, leftover: ["quotaGate" in a, "quotaGate" in b] }));`;
-  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-  expect(code).toBe(0);
-  expect(JSON.parse(out)).toEqual({ closeAfterMin: 8, leftover: [false, false] });
-  const warnings = err.split("\n").filter((line) => line.startsWith("CONFIG_QUOTA"));
-  expect(warnings).toEqual([`CONFIG_QUOTA_GATE_KEYS_REMOVED quotaGate in ${path}: launches are no longer gated on Claude quota; the keys are ignored and can be deleted`]);
-});
-
-test("an old config's delivery.mode loads fine: the key is dropped and named in one warning per process", async () => {
-  const path = join(state.dir, "old-delivery-mode.json");
-  await Bun.write(path, JSON.stringify({ delivery: { mode: "push", tailMonitor: false } }));
-  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
-    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    console.log(JSON.stringify({ tailMonitor: a.delivery.tailMonitor, mode: ["mode" in a.delivery, "mode" in b.delivery] }));`;
-  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-  expect(code).toBe(0);
-  expect(JSON.parse(out)).toEqual({ tailMonitor: false, mode: [false, false] });
-  const warnings = err.split("\n").filter((line) => line.startsWith("CONFIG_DELIVERY_KEYS_REMOVED "));
-  expect(warnings).toEqual([`CONFIG_DELIVERY_KEYS_REMOVED delivery.mode in ${path}: push delivery is the only mode; the keys are ignored and can be deleted`]);
-});
-
-test("an old config's laneFinishNotice loads fine: the key is dropped and named in one warning per process", async () => {
-  const path = join(state.dir, "old-lane-finish.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 6, laneFinishNotice: true }));
-  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
-    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    console.log(JSON.stringify({ closeAfterMin: a.closeAfterMin, leftover: ["laneFinishNotice" in a, "laneFinishNotice" in b] }));`;
-  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-  expect(code).toBe(0);
-  expect(JSON.parse(out)).toEqual({ closeAfterMin: 6, leftover: [false, false] });
-  expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_OWNER_POST_KEYS_REMOVED laneFinishNotice in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`]);
-});
-
-test("an old config's toodo (the removed Toodo integration) loads fine: the key is dropped and named in one warning per process", async () => {
-  const path = join(state.dir, "old-toodo.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 7, toodo: { url: "http://127.0.0.1:1", leadTokenFile: "~/lead-token", discordMirror: { channel: "123" } } }));
-  const script = `const { loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
-    const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
-    console.log(JSON.stringify({ closeAfterMin: a.closeAfterMin, leftover: ["toodo" in a, "toodo" in b] }));`;
-  const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-  expect(code).toBe(0);
-  expect(JSON.parse(out)).toEqual({ closeAfterMin: 7, leftover: [false, false] });
-  expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_TOODO_KEYS_REMOVED toodo in ${path}: the Toodo integration was removed (Discord is the only messenger); the keys are ignored and can be deleted`]);
+  expect(JSON.parse(out)).toEqual({
+    same: ["closeAfterMin", "drift", "eventPolicy", "resolveKinds", "delivery", "guard", "heavyKill"],
+    model: "m/lane", base: "release", memoryCheck: { repo: "/home/ana/memory", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
+    sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
+  });
+  const ignored = "futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, runners, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, hooks.threadDone, memoryCheck.maxKb, laneSandbox.default";
+  expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
 });
 
 test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ciToodoWorkspaces) load without error", async () => {
@@ -174,7 +112,7 @@ test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ci
   }));
   const c = await loadConfig(path, "/home/ana");
   expect(c.memoryCheck.repo).toBe("/home/ana/memory");
-  expect(c.memoryCheck.maxKb).toBe(9);
+  expect(c.memoryCheck.maxKb).toBe(15);
   expect(c.ciMergeBase).toBe("dev");
 });
 
@@ -191,13 +129,13 @@ test("leadCommand handles --flag=value templates and a template without --model"
   expect(leadCommand({ ...config, agentCommand: ["agent", "{prompt}"] }, "@p")).toEqual(["agent", "--thinking", "high", "@p"]);
 });
 
-test("the configured lead context cap overrides the default", async () => {
+test("a lead context cap in the file is ignored: the built-in default holds", async () => {
   const local = withState();
   try {
     const path = join(local.dir, "cap.json");
     await Bun.write(path, JSON.stringify({ leadContextCapTokens: 42_000 }));
     const c = await loadConfig(path, "/home/ana");
-    expect(c.leadContextCapTokens).toBe(42_000);
+    expect(c.leadContextCapTokens).toBe(150_000);
   } finally { local.done(); }
 });
 
@@ -223,7 +161,7 @@ test("old lead controls are ignored and legacy arrays select only the first vali
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   expect(code).toBe(0);
   expect(JSON.parse(out)).toEqual({ models: [{ model: "a/one", thinking: "high" }], model: { model: "a/one", thinking: "high" }, leftover: [] });
-  expect(err.split("\n").filter((line) => line.startsWith("CONFIG_QUOTA_KEYS_REMOVED "))).toHaveLength(1);
+  expect(err.split("\n").filter((line) => line.startsWith("CONFIG_KEYS_IGNORED "))).toHaveLength(1);
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_LEAD_CHAIN_REMOVED "))).toHaveLength(1);
 });
 
@@ -260,17 +198,10 @@ test("placement refuses a non-object and a malformed fallback", async () => {
   }
 });
 
-test("critical pressure keys default, merge into guard, and heavyKill drops blanks and refuses non-arrays", async () => {
+test("guard thresholds and heavyKill are built in: file values, even malformed ones, are ignored", async () => {
   const path = join(state.dir, "crit.json");
-  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  await Bun.write(path, JSON.stringify({ guard: { memFreeCritPct: 3 }, heavyKill: "qemu-system" }));
   const c = await loadConfig(path, "/home/ana");
-  expect(c.guard.memFreeCritPct).toBe(5);
-  expect(c.guard.swapFreeCritPct).toBe(5);
+  expect(c.guard).toEqual(defaultConfig("/home/ana").guard);
   expect(c.heavyKill).toEqual(["qemu-system", "emulator", "expo export"]);
-  await Bun.write(path, JSON.stringify({ guard: { memFreeCritPct: 3 }, heavyKill: [" gradle ", "  "] }));
-  const d = await loadConfig(path, "/home/ana");
-  expect(d.guard).toMatchObject({ memFreeCritPct: 3, swapFreeCritPct: 5, memFreeMinPct: 20 });
-  expect(d.heavyKill).toEqual(["gradle"]);
-  await Bun.write(path, JSON.stringify({ heavyKill: "qemu-system" }));
-  await expect(loadConfig(path, "/home/ana")).rejects.toThrow("heavyKill must be an array of strings");
 });

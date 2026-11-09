@@ -11,6 +11,7 @@ import { recordAck, recordHandled } from "../src/ack.ts";
 import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { recordReported, takeReminders } from "../src/lane-outcomes.ts";
+import { readWakes } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -171,6 +172,22 @@ test("an untaken event is pushed again after ackSec though nothing is pending, a
   await flush(supervisor);
   expect(f.texts()).toHaveLength(2);
   expect(readJournal(f.state.dir).inbox.push).toBeUndefined();
+});
+
+test("a re-push that starts an idle lead's turn is a wake; the pointer right after a warm append is not a second one", async () => {
+  const f = fixture({ delivery: delivery({ push: { escalateMin: 60 } }) });
+  f.onEnter("working");
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  expect(readWakes(f.state.dir, 0)).toMatchObject([{ trigger: ["WAIT_DONE"], kinds: { WAIT_DONE: 1 } }]);
+  // The lead ended that turn without taking: the re-push starts another one.
+  f.pane.agent_status = "idle";
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+  expect(readWakes(f.state.dir, 0)).toMatchObject([{ trigger: ["WAIT_DONE"] }, { trigger: ["WAIT_DONE"], kinds: { WAIT_DONE: 1 } }]);
 });
 
 test("a burst within one tick and more within ackSec become a single push", async () => {
@@ -512,7 +529,7 @@ test("past restartMaxPerHour the ladder refuses, logs and tells the owner once, 
   await supervisor.reactionsSettled();
   expect(f.launches()).toEqual([]);
   expect(lines.filter((line) => line.startsWith("LEAD_RESTART_CAPPED"))).toHaveLength(1);
-  expect(announced.filter((text) => text.includes("not restarted again"))).toHaveLength(1);
+  expect(announced.filter((text) => text.includes("다시 재시작하지 않습니다"))).toHaveLength(1);
   expect(f.texts().length).toBeGreaterThan(3);
   // The lead hears why nobody restarts it: one urgent LEAD_UNRESPONSIVE per hour, named in its next pointer; it
   // reaches a stale idle lead in place, never as a cold start the cap would not allow.
@@ -609,6 +626,71 @@ test("digest traffic is pushed only once overdue, and a _WARN line never", async
   await flush(supervisor);
   expect(f.texts()).toHaveLength(1);
   expect(f.texts()[0]).toContain("(digest: NUDGED)");
+});
+
+test("a noise-only batch keeps one pointer at its take cursor: never typed again, idle or working, until a take", async () => {
+  const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  f.clock.at += 61 * 60_000;
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  for (const status of ["idle", "working", "idle", "working"]) {
+    f.pane.agent_status = status;
+    f.clock.at += 11 * 60_000;
+    utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+    supervisor.enqueue(`nudge:${f.clock.now()}`, "NUDGED lane silent");
+    await flush(supervisor);
+  }
+  expect(f.texts()).toHaveLength(1);
+  expect(f.launches()).toHaveLength(0);
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  supervisor.enqueue("nudge:after", "NUDGED lane silent");
+  f.clock.at += 61 * 60_000;
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  f.pane.agent_status = "idle";
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+});
+
+test("an actionable event joining a pointed noise-only batch still retries after ackSec and escalates an idle lead", async () => {
+  const f = fixture({ delivery: delivery({ tailMonitor: false }), digestMaxDelayMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  f.clock.at += 61 * 60_000;
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(1);
+  f.clock.at += 60_000;
+  supervisor.enqueue("wait:1", "WAIT_DONE ci green");
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(2);
+  expect(f.texts()[1]).toContain("urgent: WAIT_DONE");
+  f.clock.at += 45_000;
+  await flush(supervisor);
+  expect(f.texts()).toHaveLength(3);
+  for (let i = 0; i < 10 && !f.launches().length; i++) {
+    f.clock.at += 60_000;
+    await flush(supervisor);
+  }
+  expect(f.launches()).toHaveLength(1);
+});
+
+test("a first runner disconnect waits in the digest batch; an owner message arriving meanwhile is pushed at once and carries it", async () => {
+  const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("runner:offline:1", "RUNNER_OFFLINE machine=mac runner heartbeat missing for 180 s");
+  await flush(supervisor);
+  expect(f.texts()).toEqual([]);
+  f.clock.at += 5 * 60_000;
+  // Keep the lead warm so the push is appended, not a cold start.
+  utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
+  supervisor.enqueue("discord:1:1", "INBOUND 1 1 is the build done?");
+  await flush(supervisor);
+  // One pointer for both: the owner message and the batched disconnect the same take prints.
+  expect(f.texts()).toHaveLength(1);
+  expect(f.texts()[0]).toContain("2 new events (urgent: INBOUND)");
 });
 
 test("push mode enqueues no ACK_MISSING but the owner still gets the ack notice", async () => {

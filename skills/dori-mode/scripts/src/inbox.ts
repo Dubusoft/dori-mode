@@ -198,8 +198,16 @@ export const writeCarried = (stateDir: string, items: readonly Carried[]): void 
   else dropTake(join(stateDir, CARRIED_FILE));
 };
 
+/** Removes one carried entry (an owner message that is fully handled); no write when it is not there. */
+export const dropCarried = (stateDir: string, id: string): void => {
+  const carried = readCarried(stateDir);
+  const next = carried.filter((item) => item.id !== id);
+  if (next.length !== carried.length) writeCarried(stateDir, next);
+};
+
 /** `dori inbox take`'s reminder lines (id<TAB>line, like the events) for unfinished taken or carried work. */
-export const takeCarriedReminders = (stateDir: string): string[] => readCarried(stateDir).map((item) => item.kind === "owner"
+export const takeCarriedReminders = (stateDir: string, skipIds: ReadonlySet<string> = new Set()): string[] => readCarried(stateDir)
+  .filter((item) => !skipIds.has(item.id)).map((item) => item.kind === "owner"
   ? `unfinished:${item.id}\tUNFINISHED ${item.id} taken and not handled (dori ack it unless acked, then handle it): ${item.line}`
   : `${item.id}\t${item.line}`);
 
@@ -260,24 +268,70 @@ export const unreadAfterAck = (stateDir: string, acked: readonly { readonly chan
     if (from === undefined) return [`UNREAD_UNAVAILABLE the supervisor has not published ${cursorPath(stateDir)} yet; run dori inbox take`];
     const skip = new Set(acked.map(({ channel, message }) => `discord:${channel}:${message}`));
     const channels = [...new Set(acked.map(({ channel }) => channel))];
-    const byChannel = new Map<string, string[]>(channels.map((channel) => [channel, []]));
-    for (const { text } of completeLines(join(stateDir, EVENT_LOG), from)) {
-      const event = parseLogLine(text);
-      const m = UNREAD_KIND.exec(event.line);
-      const lines = m ? byChannel.get(m[2] ?? "") : undefined;
-      if (!m || !lines || skip.has(event.id) || !event.id.startsWith(`discord:${m[2]}:`)) continue;
-      const body = (m[4] ?? "").replace(/\s+/g, " ").trim();
-      const preview = body.length > UNREAD_PREVIEW_CHARS ? `${body.slice(0, UNREAD_PREVIEW_CHARS)}...` : body;
-      lines.push(`UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}`);
+    const byChannel = new Map<string, OwnerEvent[]>(channels.map((channel) => [channel, []]));
+    for (const event of ownerEventsPast(stateDir, from)) {
+      if (!skip.has(event.id)) byChannel.get(event.channel)?.push(event);
     }
-    return channels.flatMap((channel) => {
-      const lines = byChannel.get(channel) ?? [];
-      if (!lines.length) return [`UNREAD_NONE ${channel}`];
-      return [...lines.slice(0, max), ...(lines.length > max ? [`UNREAD_MORE ${channel} ${lines.length - max}`] : [])];
+    // Seen from here on: the acked originals and every event printed below (never the ones cut off by `max`).
+    const shown = [...skip];
+    const out = channels.flatMap((channel) => {
+      const events = byChannel.get(channel) ?? [];
+      if (!events.length) return [`UNREAD_NONE ${channel}`];
+      shown.push(...events.slice(0, max).map((event) => event.id));
+      return [...events.slice(0, max).map((event) => event.text), ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}`] : [])];
     });
+    recordSeen(stateDir, shown);
+    return out;
   } catch (e) {
     return [`UNREAD_UNAVAILABLE ${e instanceof Error ? e.message : String(e)}; run dori inbox take`];
   }
+};
+
+/**
+ * `dori send`'s stale guard: owner events in `channel` (a channel or thread id) that the lead has not seen. Seen = taken
+ * (at or before the take cursor), acked, or printed by an ack preview or an earlier SEND_STALE (state/seen-owner.json).
+ * Returns the `UNREAD ...` lines in the ack preview's format (at most `max`, then `UNREAD_MORE`) plus the total count, and
+ * records the printed ones as seen so a resend after merging them goes through. No cursor: nothing to compare, not stale.
+ */
+export const staleOwnerEvents = (stateDir: string, channel: string, max = UNREAD_PREVIEW_MAX): { readonly count: number; readonly lines: string[] } => {
+  const from = takeCursor(stateDir);
+  if (from === undefined) return { count: 0, lines: [] };
+  const seen = new Set(readSeen(stateDir));
+  const events = ownerEventsPast(stateDir, from).filter((event) => event.channel === channel && !seen.has(event.id));
+  if (!events.length) return { count: 0, lines: [] };
+  recordSeen(stateDir, events.slice(0, max).map((event) => event.id));
+  return { count: events.length, lines: [...events.slice(0, max).map((event) => event.text), ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}`] : [])] };
+};
+
+type OwnerEvent = { readonly channel: string; readonly id: string; readonly text: string };
+
+/** Owner events (INBOUND, INBOUND_EDIT, INBOUND_DELETE) of the Discord log past `from`, as `UNREAD ...` preview lines. */
+const ownerEventsPast = (stateDir: string, from: number): OwnerEvent[] => {
+  const out: OwnerEvent[] = [];
+  for (const { text } of completeLines(join(stateDir, EVENT_LOG), from)) {
+    const event = parseLogLine(text);
+    const m = UNREAD_KIND.exec(event.line);
+    if (!m || !event.id.startsWith(`discord:${m[2]}:`)) continue;
+    const body = (m[4] ?? "").replace(/\s+/g, " ").trim();
+    const preview = body.length > UNREAD_PREVIEW_CHARS ? `${body.slice(0, UNREAD_PREVIEW_CHARS)}...` : body;
+    out.push({ channel: m[2] ?? "", id: event.id, text: `UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}` });
+  }
+  return out;
+};
+
+/** Event ids the lead has seen without taking them (ack, ack preview, SEND_STALE); the newest SEEN_MAX are kept. */
+export const SEEN_FILE = "seen-owner.json";
+const SEEN_MAX = 500;
+export const readSeen = (stateDir: string): string[] => {
+  try {
+    const ids: unknown = JSON.parse(readFileSync(join(stateDir, SEEN_FILE), "utf8"));
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+  } catch { return []; }
+};
+const recordSeen = (stateDir: string, ids: readonly string[]): void => {
+  if (!ids.length) return;
+  const merged = [...new Set([...readSeen(stateDir), ...ids])];
+  writeDurable(join(stateDir, SEEN_FILE), stateDir, JSON.stringify(merged.slice(-SEEN_MAX)));
 };
 
 /**

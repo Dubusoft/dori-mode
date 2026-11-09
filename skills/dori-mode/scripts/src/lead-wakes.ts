@@ -25,6 +25,27 @@ export type Wake = {
 /** The trigger of a wake that carried no event (a lead restart by request, or to make owner messages readable). */
 export const RESTART_TRIGGER = "(restart)";
 
+/**
+ * Who a wake was for: `owner` (a person's message, its reminder, or an event-less restart), `lane` (lane work: reports,
+ * panes, PRs, merges, waits, outcomes and decisions), or `noise` (everything else: host guard, runner links, herdr,
+ * gateway, issues). A wake with several triggers counts for the first of owner, lane, noise that any of them names.
+ */
+export type WakeSource = "owner" | "lane" | "noise";
+export const WAKE_SOURCES: readonly WakeSource[] = ["owner", "lane", "noise"];
+const OWNER_EVENTS = new Set(["INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "UNHANDLED", RESTART_TRIGGER]);
+const LANE_EVENTS = new Set([
+  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-PROGRESS", "IDLE-ESCALATE", "NUDGED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
+  "WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED", "UNREPORTED", "UNRESOLVED", "CI_MERGED", "CI_CONFLICT", "GH_PR",
+  "MERGE_UNVERIFIED", "MERGE_STALLED", "MERGE_VERIFIED", "RUNNER_LANE_DEAD", "RUNNER_LAUNCH_FAILED", "RUNNER_RECOVER_FAILED",
+]);
+
+export const wakeSource = (trigger: readonly string[]): WakeSource => {
+  const names = trigger.map((kind) => kind.split(" ", 1)[0] as string);
+  if (names.some((name) => OWNER_EVENTS.has(name))) return "owner";
+  if (names.some((name) => name.startsWith("LANE_") || LANE_EVENTS.has(name))) return "lane";
+  return "noise";
+};
+
 /** Assistant records (model calls) in an omo session file at or after `since`. */
 export const callsSince = (file: string, since: number): number => {
   let calls = 0;
@@ -53,14 +74,23 @@ export class WakeMeter {
     }
   }
 
+  /** Like record, for a turn started by a push pointer: `kinds` are the kinds the pointer named, each once per item. */
+  recordKinds(session: string, kinds: readonly string[]): void {
+    try { this.start(session, kinds, kinds); } catch (e) {
+      if (!(e instanceof Error)) throw e;
+      console.error(`LEAD_WAKE_RECORD_FAILED ${session} ${e.message}`);
+    }
+  }
+
   private open(session: string, events: readonly { readonly line: string }[], trigger: readonly { readonly line: string }[]): void {
     const policy = this.config().eventPolicy;
+    this.start(session, events.map((event) => eventKind(event.line, policy)), trigger.map((event) => eventKind(event.line, policy)));
+  }
+
+  private start(session: string, carried: readonly string[], trigger: readonly string[]): void {
     const kinds: Record<string, number> = {};
-    for (const event of events) {
-      const kind = eventKind(event.line, policy);
-      kinds[kind] = (kinds[kind] ?? 0) + 1;
-    }
-    const triggers = [...new Set(trigger.map((event) => eventKind(event.line, policy)))];
+    for (const kind of carried) kinds[kind] = (kinds[kind] ?? 0) + 1;
+    const triggers = [...new Set(trigger)];
     this.close();
     this.store.recordWake({ at: this.now(), session, trigger: triggers.length ? triggers : [RESTART_TRIGGER], kinds });
   }

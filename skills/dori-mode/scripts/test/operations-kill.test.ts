@@ -19,6 +19,9 @@ const seed = async (): Promise<void> => {
   state = withState();
   world = join(state.dir, "world");
   for (const dir of ["repo", "wt/demo-lane", "wt/demo-lane-2"]) mkdirSync(join(world, dir), { recursive: true });
+  // The lane's cwd is the main checkout (its .git is a directory), which a close never removes.
+  mkdirSync(join(world, "repo", ".git"));
+  writeFileSync(join(world, "repo", ".git", "HEAD"), "ref: refs/heads/main\n");
   writeFileSync(join(world, "world.json"), JSON.stringify({ panes: [{ pane_id: "w:p1", workspace_id: "w" }] }));
   mkdirSync(stateDir());
   if (TEST_STORE === "sqlite") new SqliteStore(join(stateDir(), SQLITE_FILE), { create: true }).close();

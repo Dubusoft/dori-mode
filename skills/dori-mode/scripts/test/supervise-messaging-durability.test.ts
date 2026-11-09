@@ -3,9 +3,12 @@ import { mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node
 import { join } from "node:path";
 
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
+import { CONFIG_FILE_KEYS } from "../src/config.ts";
 import { ACK_KEEP_MS, eventPriority, OWNER_NOTIFY_ATTEMPTS, Supervisor } from "../src/supervise.ts";
 import { enqueueLaunch, launchQueue, launchQueueText, recordLaunchVerdict } from "../src/routing.ts";
 import { supervisorSweeps } from "../src/supervise-loop.ts";
+import { RunnerGuardBoard } from "../src/runner/guard.ts";
+import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
 import { SqliteStore } from "../src/store.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal, writeJournal } from "./fakes.ts";
@@ -180,7 +183,8 @@ test("handled CLI persists task count and reply coverage through the real comman
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner alpha beta");
   const config = join(f.state.dir, "config.json");
-  writeFileSync(config, JSON.stringify(f.deps.config));
+  const persisted = { ...Object.fromEntries(Object.entries(f.deps.config).filter(([key]) => (CONFIG_FILE_KEYS as readonly string[]).includes(key))), memoryCheck: { repo: f.deps.config.memoryCheck.repo } };
+  writeFileSync(config, JSON.stringify(persisted));
   // When the lead declares two tasks and links one reply through the CLI.
   const child = Bun.spawn([process.execPath, "src/cli.ts", "handled", "11", "22", "--tasks", "2", "--reply"], {
     cwd: join(import.meta.dir, ".."), env: { ...process.env, DORI_CONFIG: config, DORI_STATE_DIR: f.state.dir },
@@ -259,7 +263,13 @@ test("LAUNCH_READY snapshots the persisted launch queue before the hold clears",
       ? { code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200", err: "" }
       : f.deps.run(argv),
   };
-  const guard = supervisorSweeps(deps, f.state.dir).find(([name]) => name === "guard");
+  // The host's numbers come from the local runner's guard sample.
+  const board = new RunnerGuardBoard(() => 0);
+  board.event("local", {
+    v: 1, runner: "local", gen: 1, epoch: 1, seq: 1, type: "guard.sample",
+    body: { level: "ok", reasons: [], sampledAt: 0, load1: 1, memFreePct: 50, diskFreeGb: 200, swapFreeGb: 2, swapTotalGb: 4, os: "linux", panes: 1 },
+  } as unknown as AnyRunnerEvent);
+  const guard = supervisorSweeps(deps, f.state.dir, undefined, undefined, undefined, () => board).find(([name]) => name === "guard");
   if (!guard) throw new Error("guard sweep missing");
   // When the actual guard sweep journals readiness and clears the hold.
   let sequence = 0;

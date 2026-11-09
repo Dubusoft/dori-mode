@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dori.runner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BUN@</string>
+    <string>@HOME@/.dori/runner/bin/dori.js</string>
+    <string>runner</string>
+    <string>serve</string>
+    <string>--label</string>
+    <string>@LABEL@</string>
+    <string>--listen</string>
+    <string>@LISTEN@</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>@HOME@/.dori/runner/runner.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/.dori/runner/runner.log</string>
+</dict>
+</plist>

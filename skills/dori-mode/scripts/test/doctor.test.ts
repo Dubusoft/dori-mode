@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
@@ -14,9 +14,10 @@ import type { Ran } from "../src/run.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const TOKEN = "secret-token-xyz";
+const PATH = process.env.PATH;
 const NOW = 1_800_000_000_000;
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const done of cleanups.splice(0)) done(); });
+afterEach(() => { for (const done of cleanups.splice(0)) done(); process.env.PATH = PATH; });
 
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
 const no = (out = "", code = 1): Ran => ({ code, out, err: "" });
@@ -26,10 +27,12 @@ const happyRun: Record<string, Ran> = {
   "systemctl --user is-active herdr-server.service": ok("active"),
   "systemctl --user is-enabled dori-supervisor.service": ok("enabled"),
   "systemctl --user is-active dori-supervisor.service": ok("active"),
+  "systemctl --user is-enabled dori-runner.service": no("disabled"),
+  "systemctl --user is-active dori-runner.service": no("inactive", 3),
   "systemctl --user is-enabled dori-presence.service": no("disabled"),
   "systemctl --user is-active dori-presence.service": no("inactive", 3),
   "pgrep -f (dori|cli\\.ts) presence": no(),
-  "herdr workspace list": ok("{}"),
+  "herdr workspace list": ok(JSON.stringify({ result: { workspaces: [{ label: "lanes", workspace_id: "w1" }] } })),
   "pgrep -f herdr server": ok("101"),
   "systemctl --user show dori-supervisor.service --property=WorkingDirectory --value": ok("/work"),
   "herdr pane list": ok(pane),
@@ -48,6 +51,9 @@ type Patch = { run?: Record<string, Ran>; http?: Record<string, ReturnType<typeo
 const fixture = (patch: Patch = {}) => {
   const state = withState();
   cleanups.push(state.done);
+  mkdirSync(join(state.dir, ".dori", "runner"), { recursive: true });
+  chmodSync(join(state.dir, ".dori", "runner"), 0o700);
+  chmodSync(join(state.dir, ".dori"), 0o700);
   const table = { ...happyRun, ...patch.run };
   const routes = { ...happyHttp, ...patch.http };
   const calls: string[] = [];
@@ -81,6 +87,7 @@ const fixture = (patch: Patch = {}) => {
     },
     ...patch.deps,
   };
+  writeFileSync(join(state.dir, "runner-endpoints.json"), JSON.stringify({ worker: "100.101.1.2:7411" }));
   return { deps, calls, requests };
 };
 const find = (checks: readonly Check[], id: string): Check => {
@@ -105,6 +112,27 @@ test("doctor only reads: no unit changes and Discord is GET only", async () => {
   expect(f.requests.every((r) => r.method === "GET")).toBe(true);
 });
 
+test("doctor warns when the installed lane sandbox differs from the template", async () => {
+  const f = fixture();
+  const installed = join(f.deps.home, ".local", "bin", "lane-sandbox");
+  mkdirSync(join(f.deps.home, ".local", "bin"), { recursive: true });
+  mkdirSync(join(f.deps.home, ".dori", "runner"), { recursive: true });
+  chmodSync(join(f.deps.home, ".dori", "runner"), 0o700);
+  chmodSync(join(f.deps.home, ".dori"), 0o700);
+  writeFileSync(installed, "old sandbox");
+  const path = process.env.PATH;
+  process.env.PATH = `${join(f.deps.home, ".local", "bin")}:${path ?? ""}`;
+  const check = find(await runDoctor(f.deps), "lane sandbox");
+  expect(check).toMatchObject({ level: "WARN" });
+  expect(check.detail).toContain("LANE_SANDBOX_OUTDATED");
+  process.env.PATH = path;
+});
+
+test("doctor warns when the obsolete local runner unit is enabled", async () => {
+  const f = fixture({ run: { "systemctl --user is-enabled dori-runner.service": ok("enabled") } });
+  expect(find(await runDoctor(f.deps), "runner unit")).toMatchObject({ level: "WARN", detail: expect.stringContaining("supervisor runs the local runner itself") });
+});
+
 test("doctor warns when a lead restart is pending without consuming it or touching the warm lead", async () => {
   const f = fixture();
   const request = { id: "restart-doctor-177", at: NOW, models: [{ model: "qa/lead", thinking: "high" }, { model: "qa/fallback" }] };
@@ -119,13 +147,17 @@ test("doctor warns when a lead restart is pending without consuming it or touchi
   expect(f.calls.filter((c) => c.startsWith("herdr ") && c !== "herdr pane list" && c !== "herdr workspace list")).toEqual([]);
 });
 
-test("doctor warns when lead wakes exceed the 24-hour threshold", async () => {
+test("doctor warns when lead wakes not from owner messages exceed the 24-hour threshold, naming their top trigger", async () => {
   const f = fixture();
-  writeFileSync(join(f.deps.config.stateDir, WAKES_FILE), Array.from({ length: 21 }, (_, i) => JSON.stringify({
-    at: NOW - i, session: "lead", trigger: ["INBOUND"], kinds: { INBOUND: 1 },
-  })).join("\n"));
+  const wakes = (trigger: string[], n: number, from: number) => Array.from({ length: n }, (_, i) => JSON.stringify({ at: NOW - from - i, session: "lead", trigger, kinds: {} }));
+  const path = join(f.deps.config.stateDir, WAKES_FILE);
+  writeFileSync(path, wakes(["INBOUND"], 25, 0).join("\n"));
+  expect((await runDoctor(f.deps)).some((check) => check.id === "lead wakes")).toBe(false);
+  writeFileSync(path, [...wakes(["INBOUND"], 25, 0), ...wakes(["HOST_GUARD OFFLINE"], 15, 100), ...wakes(["LANE_REPORT"], 6, 200)].join("\n"));
   const check = find(await runDoctor(f.deps), "lead wakes");
-  expect(check).toMatchObject({ level: "WARN", detail: "21 lead wakes in the last 24 hours (threshold 20)" });
+  expect(check).toMatchObject({
+    level: "WARN", detail: "21 lead wakes not from owner messages in the last 24 hours (threshold 20; lane 6, noise 15); most from HOST_GUARD OFFLINE (15)",
+  });
   expect(doctorExit([check])).toBe(0);
 });
 
@@ -156,6 +188,17 @@ test("herdr: unreachable and duplicate servers are FAIL", async () => {
   expect(find(await runDoctor(dup.deps), "herdr")).toMatchObject({ level: "FAIL", detail: "2 herdr server processes" });
 });
 
+test("herdr unreachable on a worker machine points at the lead host's runner herdr command, or at install without a herdr unit", async () => {
+  const f = fixture({ run: { "herdr workspace list": no("", 1) } });
+  writeFileSync(join(f.deps.home, ".dori", "runner", "runner.json"), JSON.stringify({ id: "i", label: "worker-a", hostId: "h" }));
+  expect(find(await runDoctor(f.deps), "herdr")).toMatchObject({ level: "FAIL", fix: "on the lead host: dori runner herdr start --machine worker-a" });
+  const bare = { ...f.deps, exists: (path: string) => !path.endsWith("herdr-server.service") && !path.endsWith("com.dori.herdr.plist") };
+  expect(find(await runDoctor(bare), "herdr")).toMatchObject({ level: "FAIL", fix: "on the lead host: dori runner install --machine worker-a (installs the herdr unit)" });
+  // The lead host's local runner is labelled local: its own unit stays the fix.
+  writeFileSync(join(f.deps.home, ".dori", "runner", "runner.json"), JSON.stringify({ id: "i", label: "local", hostId: "h" }));
+  expect(find(await runDoctor(f.deps), "herdr")).toMatchObject({ level: "FAIL", fix: "systemctl --user start herdr-server.service" });
+});
+
 test("missing WorkingDirectory, missing dirs, missing config keys and a missing lead pane are FAIL", async () => {
   const wd = fixture({ run: { "systemctl --user show dori-supervisor.service --property=WorkingDirectory --value": ok("") } });
   expect(find(await runDoctor(wd.deps), "supervisor WorkingDirectory").detail).toContain("200/CHDIR");
@@ -164,13 +207,16 @@ test("missing WorkingDirectory, missing dirs, missing config keys and a missing 
   expect(find(c, "stateDir")).toMatchObject({ level: "FAIL" });
   expect(find(c, "defaultCwd").fix).toStartWith("mkdir -p ");
   const keys = fixture({ deps: { config: { ...fixture().deps.config, laneWorkspace: "", discordChannels: [], discord: { applicationId: "x", guildId: "200", ownerId: "300" } } } });
-  const k = find(await runDoctor(keys.deps), "config");
+  const kc = await runDoctor(keys.deps);
+  const k = find(kc, "config");
   expect(k.level).toBe("FAIL");
-  expect(k.detail).toContain("laneWorkspace");
+  expect(find(kc, "lanes workspace")).toMatchObject({ level: "WARN", fix: "systemctl --user restart dori-supervisor.service" });
   expect(k.detail).toContain("discordChannels");
   expect(k.detail).toContain("discord.applicationId");
   const lead = fixture({ run: { "herdr pane list": ok(JSON.stringify({ result: { panes: [] } })) } });
   expect(find(await runDoctor(lead.deps), "leadPane")).toMatchObject({ level: "FAIL", fix: "dori lead-restart" });
+  const gone = fixture({ run: { "herdr workspace list": ok(JSON.stringify({ result: { workspaces: [{ label: "lanes", workspace_id: "w9" }] } })) } });
+  expect(find(await runDoctor(gone.deps), "lanes workspace")).toMatchObject({ level: "WARN" });
   const bad = fixture({ deps: { configError: "Unexpected token" } });
   expect(find(await runDoctor(bad.deps), "config")).toMatchObject({ level: "FAIL" });
 });

@@ -13,6 +13,14 @@ import { supervise } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, manualPause, newWorld, readJournal, withState } from "./fakes.ts";
 
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
+
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   mock.restore();
@@ -174,7 +182,7 @@ test("a heavy command job waits for a free slot, releases it, and a failing comm
   expect(readSourceStatus(w.dir)?.sources.backup?.lastResult).toBe("failed exit 2");
   expect(readSourceStatus(w.dir)?.sources.nightly?.waiting).toBeUndefined();
   const status = await collectStatus({ ...w.deps, run: async () => ok("active") });
-  expect(renderStatus(status)).toContain("\nSchedules\n- nightly: next 10-24 09:00 KST (in 24h)\n- backup: next 10-24 09:00 KST (in 24h), last run failed exit 2\n");
+  expect(renderStatus(status)).toContain("\n■ 예약 작업\n- nightly: 다음 10-24 09:00 KST (24시간 후)\n- backup: 다음 10-24 09:00 KST (24시간 후), 지난 실행 failed exit 2\n");
 });
 
 test("a crash mid-command leaves an attempted row: it reads back ambiguous once and never reruns until resolved", async () => {
@@ -260,7 +268,7 @@ test("the real supervisor runs a due job through the registry", async () => {
   };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `schedule-test-${state.dir}`,
+    token: `schedule-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"),
     http: async (request) => ({ status: 200, headers: {}, body: request.url.endsWith("/threads/active") ? JSON.stringify({ threads: [] }) : "[]" }),
     lookup: async () => "", statusLookup: async () => "",
     open: () => {

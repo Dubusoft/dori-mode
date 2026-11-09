@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, readFileSync, watch } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, watch } from "node:fs";
 import { join } from "node:path";
 
 import * as quota from "../src/claude-quota.ts";
@@ -7,10 +7,21 @@ import { gatewayStatusPath } from "../src/gateway-status.ts";
 import type { Http } from "../src/messenger/http.ts";
 import { Repos } from "../src/repos.ts";
 import type { Ran } from "../src/run.ts";
-import { supervise, SUPERVISOR_TASKS, type SupervisorTask, TASK_ALERT_MS, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
+import { defaultRunnerDir } from "../src/runner/fs-safety.ts";
+import { JsonOperations, SqliteOperations } from "../src/operations.ts";
+import { JsonLaneReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { RUNNER_HUB_RETRY_MS, supervise, SUPERVISOR_TASKS, type SupervisorTask, TASK_ALERT_MS, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { Waits } from "../src/waits.ts";
-import { depsFor, fakeClock, manualPause, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, manualPause, newWorld, TEST_STORE, withState } from "./fakes.ts";
+
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -19,7 +30,6 @@ afterEach(() => {
 });
 
 const T0 = 1_800_000_000_000;
-const DF = "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200";
 const OWNER = "123456789012345";
 const MESSAGE = "1900000000000000001";
 const REPORT = "LANE_REPORT demo-lane journaled before the supervisor started";
@@ -36,12 +46,14 @@ const until = (subscribe: (signal: () => void) => () => void, check: () => boole
 
 /**
  * The real supervise(), where the work of `stalled` hangs until the test ends: the inbound Discord
- * catch-up, the delivery task's owner delay notice, the guard sweep's df, or the GitHub poll's gh api call (a wait check
+ * catch-up, the delivery task's owner delay notice, the machine-guard sweep's `herdr machine list` (the host guard reads the
+ * local runner's sample and runs nothing), or the GitHub poll's gh api call (a wait check
  * has its own 10 s budget, so it cannot hold the polling task).
  */
-const setup = (stalled: SupervisorTask) => {
+const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
   const state = withState();
   cleanups.push(state.done);
+  before?.(state.dir);
   const home = process.env.HOME;
   const socket = process.env.NOTIFY_SOCKET;
   process.env.HOME = state.dir;
@@ -84,14 +96,14 @@ const setup = (stalled: SupervisorTask) => {
     const ok = new Response(JSON.stringify({ id: "33" }), { status: 200 });
     return stalled === "delivery" && body.includes(base.config.ownerDelayNotice) ? hang(ok) : ok;
   }, { preconnect: fetch.preconnect }));
-  const done = { df: 0, gh: 0 };
+  const done = { machines: 0, gh: 0 };
   const deps = {
     ...base,
     run: async (argv: readonly string[]): Promise<Ran> => {
-      if (argv[0] === "df") {
-        const ran = { code: 0, out: DF, err: "" };
+      if (argv.join(" ") === "herdr machine list --json") {
+        const ran = { code: 0, out: "[]", err: "" };
         if (stalled === "sweeps") return hang(ran);
-        done.df++;
+        done.machines++;
         changed();
         return ran;
       }
@@ -126,7 +138,7 @@ const setup = (stalled: SupervisorTask) => {
   const pause = (ms: number, signal: AbortSignal) => { const parked = pauses.pause(ms, signal); changed(); return parked; };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `supervise-tasks-test-${state.dir}`, http, lookup: async () => "", statusLookup: async () => "",
+    token: `supervise-tasks-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
     open: () => {
       let closed = (_code: number) => {};
       return {
@@ -141,7 +153,7 @@ const setup = (stalled: SupervisorTask) => {
     // The inbound pass ends with the gateway heartbeat.
     inbound: () => existsSync(gatewayStatusPath(state.dir)),
     delivery: () => existsSync(log) && readFileSync(log, "utf8").includes(REPORT),
-    sweeps: () => done.df > 0,
+    sweeps: () => done.machines > 0,
     polling: () => done.gh > 0,
   };
   const subscribe = (signal: () => void) => {
@@ -150,15 +162,30 @@ const setup = (stalled: SupervisorTask) => {
     return () => { listeners.delete(signal); watcher.close(); };
   };
   const stop = async () => { controller.abort(); release(); await running; };
-  // Once the three working tasks and the stall check are parked, each takes its next pass.
+  // Once the three working tasks, the runners task (the hub always opens) and the stall check are parked, each takes its next pass.
   const next = async () => {
-    await until(subscribe, () => pauses.parked() === 4, 10_000, "the three working tasks and the stall check parked");
+    await until(subscribe, () => pauses.parked() === 5, 10_000, "the three working tasks, the runners task and the stall check parked");
     pauses.tick();
   };
   return { clock, errors, posts, hung, working, subscribe, stop, next };
 };
 
 const others = (stalled: SupervisorTask): SupervisorTask[] => SUPERVISOR_TASKS.filter((task) => task !== stalled);
+
+test("the report polling path prunes operation and report history at startup and once per hour", async () => {
+  const operations = spyOn(TEST_STORE === "json" ? JsonOperations.prototype : SqliteOperations.prototype, "prune");
+  const reports = spyOn(TEST_STORE === "json" ? JsonLaneReports.prototype : SqliteLaneReports.prototype, "prune");
+  const s = setup("inbound");
+  try {
+    await until(s.subscribe, () => operations.mock.calls.length === 1 && reports.mock.calls.length === 1, 10_000, "initial history pruning");
+    await s.next();
+    expect(operations).toHaveBeenCalledTimes(1);
+    expect(reports).toHaveBeenCalledTimes(1);
+    s.clock.at += 60 * 60_000;
+    await s.next();
+    await until(s.subscribe, () => operations.mock.calls.length === 2 && reports.mock.calls.length === 2, 10_000, "hourly history pruning");
+  } finally { await s.stop(); }
+}, 30_000);
 
 const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>) => void) =>
   test(`a stalled ${stalled} task leaves the other three working and is reported by name, then withholds the watchdog`, async () => {
@@ -183,6 +210,35 @@ const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>)
       await s.stop();
     }
   }, 60_000);
+
+test("a runner hub that cannot open at startup wakes the lead, and the runners task opens it once the cause is gone", async () => {
+  // Given a runner directory the hub refuses (not 0700), as a busy socket or a bad directory would at a restart.
+  let runnerDir = "";
+  const s = setup("polling", (home) => {
+    runnerDir = defaultRunnerDir(home);
+    mkdirSync(runnerDir, { recursive: true });
+    chmodSync(runnerDir, 0o755);
+  });
+  const logs: string[] = [];
+  const log = console.log;
+  console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+  cleanups.push(() => { console.log = log; });
+  try {
+    // When the supervisor starts, the failure is not swallowed: it reaches the lead's events, not only stderr.
+    const leadLog = join(process.env.HOME ?? "", "lead-events.log");
+    const leadSaw = (text: string) => existsSync(leadLog) && readFileSync(leadLog, "utf8").includes(text);
+    await until(s.subscribe, () => leadSaw("RUNNER_HUB_DISABLED "), 10_000, "RUNNER_HUB_DISABLED delivered to the lead");
+    expect(s.errors.some((line) => line.startsWith("RUNNER_HUB_DISABLED "))).toBe(true);
+    // Then once the directory is fixed and the retry interval has passed, the next runners pass opens the hub.
+    chmodSync(runnerDir, 0o700);
+    s.clock.at += RUNNER_HUB_RETRY_MS;
+    await s.next();
+    await until(s.subscribe, () => logs.includes("RUNNER_HUB_OPENED"), 10_000, "RUNNER_HUB_OPENED");
+    expect(existsSync(join(runnerDir, "sock"))).toBe(true);
+  } finally {
+    await s.stop();
+  }
+}, 60_000);
 
 stallTest("inbound");
 // A stalled delivery task cannot hand TASK_STALLED to the lead, so the owner is told in the main channel.

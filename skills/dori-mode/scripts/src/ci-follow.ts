@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
@@ -11,9 +11,11 @@ import {
 import {
   FINAL_STATES, type Observed, type Operation, operationId, type OperationSpec, type OperationStore, openOperations, perform, plan, type ReadBack, reconcile, settleOperation,
 } from "./operations.ts";
-import { agentRefusal, holds, inputState, laneRunner, leftInInput, listPanes, type Pane, readScreen } from "./panes.ts";
+import { agentRefusal } from "./pane-state.ts";
+import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
+import { parseSignal, splitDone } from "./signals.ts";
 
 /**
  * CI follow-up for lane PRs (design 4.5, item 1.4). After each GitHub poll, for every open PR that
@@ -29,6 +31,9 @@ import { canLaunch } from "./routing.ts";
  * - a merged PR of an open lane that the supervisor did not merge itself: its merge is read back once (a `merge-verify`
  *   operation) as digest MERGE_VERIFIED with the merge SHA, or urgent MERGE_UNVERIFIED when it cannot be confirmed.
  *   The watcher then closes a done-claimed lane at once (done-flow.ts mergeConfirmed), with its worktree and branch.
+ * - an open lane PR the supervisor cannot merge for a reason only a person fixes (claimed at its head but no checks, a
+ *   required review, a draft; or green and clean while its lane never claimed at that head) for `mergeStallMin`: urgent
+ *   MERGE_STALLED once per head. Pending CI is no stall: the claim's own merge wait (done-flow.ts mergeWait) bounds it.
  * Each merge and launch is an operation (operations.ts), keyed by PR and head SHA, so a restart never repeats it. The
  * lanes keep waiting on their own CI; nothing here replaces that wait.
  */
@@ -53,6 +58,12 @@ export const MERGE_ATTEMPTS = 3;
 const short = (sha: string): string => sha.slice(0, 7);
 const repoName = (repo: string): string => (repo.split("/")[1] ?? repo).toLowerCase().replace(/[^a-z0-9.-]/g, "-");
 const subjectOf = (pull: OpenPull): string => `${pull.repo}#${pull.number}@${pull.sha}`;
+/** Queues the message; one superseded earlier whose reason is back at the same head is queued again, with a fresh deadline. */
+const requeueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text">): LaneMessage => {
+  const stored = queueLaneMessage(store, now, message);
+  return stored.state === "superseded" ? updateLaneMessage(store, stored, { state: "queued", at: now, blocked: undefined, escalatedAt: undefined }, now) : stored;
+};
+
 export const ciMessageId = (pull: OpenPull): string => `ci-${repoName(pull.repo)}-${pull.number}-${short(pull.sha)}`;
 
 /** The merge lane's key: `merge-<repo>-<n>`, shortened to fit LANE_KEY. */
@@ -109,28 +120,70 @@ export const laneDown = (lane: Lane, panes: readonly Pane[] | Error): string | u
 };
 
 /**
- * Delivers queued lane messages and tells the lead about unconfirmed ones. A message is typed (send-text, then one
- * Enter) only when paneRefusal allows it, as its own operation: an interrupted delivery is never retyped. Anything
- * still queued, or delivered without an ack, `ciConfirmMin` after it was queued is one LANE_MESSAGE_UNCONFIRMED.
+ * A delivery attempt of the same message this recent, still `attempted`, is taken to be running in another process (the
+ * CLI's first attempt, the supervisor's pass): left alone, not reconciled to ambiguous under it. One older than this was
+ * interrupted, and its read-back decides as for any crash.
  */
-export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, emit: CiEmit): Promise<void> => {
+export const ATTEMPT_IN_FLIGHT_MS = 2 * 60_000;
+
+const panesReader = (deps: FlowDeps): ((lane: Lane) => Promise<Pane[] | Error>) => {
   const panes = new Map<string, Promise<Pane[] | Error>>();
-  const panesOf = (lane: Lane): Promise<Pane[] | Error> => {
+  return (lane) => {
     const machine = lane.machine ?? "";
     let hit = panes.get(machine);
     if (!hit) {
-      hit = listPanes(laneRunner(deps.run, lane)).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e))));
+      hit = deps.ops.panes(lane.machine).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e))));
       panes.set(machine, hit);
     }
     return hit;
   };
+};
+
+/**
+ * Queues a lead steering message to `lane` (`whileWorking`) with its intent `id` and the line the lane confirms it with
+ * (`<dori> report ack <id>`), superseding any open message of the same lane and `subject` it replaces (a newer claim
+ * notice or objection). Returns the stored message; a known id is the same intent and stays as it is.
+ */
+export const queueSteering = (
+  store: LaneMessageStore, now: number, lane: Pick<Lane, "key" | "machine">, message: Pick<LaneMessage, "id" | "subject" | "text">,
+): LaneMessage => {
+  const dori = lane.machine ? "~/.dori/runner/bin/dori" : "dori";
+  const queued = queueLaneMessage(store, now, {
+    id: message.id, lane: lane.key, subject: message.subject, whileWorking: true,
+    text: `${message.text.replace(/\.$/, "")}. Confirm you got this message: ${dori} report ack ${message.id}`,
+  });
+  for (const old of store.list({ lane: lane.key, states: OPEN_MESSAGE_STATES })) {
+    if (old.subject === message.subject && old.id !== queued.id) updateLaneMessage(store, old, { state: "superseded", blocked: `replaced by ${queued.id}` }, now);
+  }
+  return queued;
+};
+
+/** One delivery attempt of a queued message now (its sender's first try); a refusal leaves it queued for deliverLaneMessages. */
+export const deliverLaneMessage = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, lane: Lane, message: LaneMessage): Promise<LaneMessage> =>
+  message.state === "queued" ? deliver(deps, ops, messages, lane, message, panesReader(deps)) : message;
+
+/**
+ * Why a lead steering message waits without being sent: the lane is paused or has no pane. Anything about the pane
+ * itself (no live agent, other text in its input line, no prompt) is the runner's to decide when it is sent.
+ */
+const steeringRefusal = (lane: Lane): string | undefined =>
+  statusOf(lane) === "paused" ? "lane paused" : lane.pane ? undefined : "lane has no pane";
+
+/**
+ * Delivers queued lane messages and tells the lead about unconfirmed ones. A message is typed (send-text, then one
+ * Enter) only when paneRefusal allows it, as its own operation: an interrupted delivery is never retyped. Anything
+ * still queued, or delivered without an ack, `ciConfirmMin` after it was queued is one LANE_MESSAGE_UNCONFIRMED, naming
+ * the message and why it was not delivered (the pane's state and the runner's refusal); the message stays queued.
+ */
+export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, emit: CiEmit): Promise<void> => {
+  const panesOf = panesReader(deps);
   for (let message of messages.list({ states: OPEN_MESSAGE_STATES })) {
     const lane = await deps.registry.read(message.lane);
     if (!lane || statusOf(lane) === "closed") {
       updateLaneMessage(messages, message, { state: "superseded", blocked: "lane closed" }, deps.clock.now());
       continue;
     }
-    if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, await panesOf(lane));
+    if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, panesOf);
     if (message.state === "acked" || message.escalatedAt !== undefined) continue;
     if (deps.clock.now() - message.at < deps.config.ciConfirmMin * 60_000) continue;
     const why = message.state === "delivered" ? "delivered but not confirmed" : `not delivered: ${message.blocked ?? "waiting"}`;
@@ -140,46 +193,45 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
   }
 };
 
-const deliver = async (deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, lane: Lane, message: LaneMessage, panes: readonly Pane[] | Error): Promise<LaneMessage> => {
+const deliver = async (
+  deps: FlowDeps, ops: OperationStore, messages: LaneMessageStore, lane: Lane, message: LaneMessage, panesOf: (lane: Lane) => Promise<Pane[] | Error>,
+): Promise<LaneMessage> => {
   const now = deps.clock.now();
-  const refusal = paneRefusal(lane, panes);
+  const refusal = message.whileWorking ? steeringRefusal(lane) : paneRefusal(lane, await panesOf(lane));
   if (refusal) return refusal === message.blocked ? message : updateLaneMessage(messages, message, { blocked: refusal }, now);
-  const run = laneRunner(deps.run, lane);
-  const pane = lane.pane ?? "";
-  // Text in the lane's input box may be the owner's: ours would be appended and submitted with it, so the message waits
-  // (and reaches the lead as LANE_MESSAGE_UNCONFIRMED if it keeps waiting). Our own text left there unsubmitted by an
-  // earlier attempt only gets Enter.
-  const input = inputState(await readScreen(run, pane), holds(message.text));
-  if (input === "busy") {
-    const why = `pane ${pane} input line holds other text (or shows no prompt)`;
-    return why === message.blocked ? message : updateLaneMessage(messages, message, { blocked: why }, now);
-  }
-  // The lane's ack proves the text arrived. Short of it, only this attempt's own herdr exits can tell: a refused
-  // send-text typed nothing (not done), text plus enter both accepted is done. An interrupted attempt (a new process,
-  // no exits seen) or text typed without its enter stays unknown, so it is ambiguous and never retyped.
+  const spec: OperationSpec = { lane: lane.key, action: "lane-message", target: message.id };
+  const inFlight = ops.get(operationId(spec));
+  if (inFlight?.state === "attempted" && now - inFlight.updatedAt < ATTEMPT_IN_FLIGHT_MS) return message;
+  // The runner's send refuses while the lane's input box holds the owner's text and presses Enter at most once; its
+  // verdict is the only evidence of this attempt. A failed send typed nothing (not done), delivered or unconfirmed is
+  // done. An interrupted attempt (a new process, no verdict seen) stays unknown, so it is ambiguous and never retyped.
+  // The lane's ack proves the text arrived and wins over everything.
   let typedHere: Observed = "unknown";
   const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
-  const { op } = await perform(ops, deps.clock.now, { lane: lane.key, action: "lane-message", target: message.id }, async () => {
-    const typed = input === "ours" ? undefined : await run(["herdr", "pane", "send-text", pane, message.text]);
-    if (typed && typed.code !== 0) {
+  let refused: string | undefined;
+  const { op } = await perform(ops, deps.clock.now, spec, async () => {
+    // The runner answers a repeated cmdId with its first result, so each attempt has its own id (done-flow.ts act):
+    // a retry after a definitive failure reaches the effect again, while a replay of one attempt keeps its id.
+    const id = operationId(spec);
+    const delivery = await deps.ops.send(lane, message.text, {
+      mode: "verified", inputCheck: true, cmdId: `op:${id}:${ops.get(id)?.attempts ?? 0}`, onFailed: (detail) => { refused = detail; },
+    });
+    if (delivery === "failed") {
       typedHere = "not-done";
-      return { ok: false, detail: typed.err || typed.out || "send-text failed" };
-    }
-    const entered = await run(["herdr", "pane", "send-keys", pane, "enter"]);
-    if (entered.code !== 0) return { ok: false, detail: entered.err || "send-keys failed" };
-    // Enter accepted is not the text submitted: still in the input box after a second Enter, it did not reach the
-    // agent, so this attempt fails and the next pass only presses Enter.
-    if (await leftInInput(run, deps.clock, pane, message.text)) {
-      typedHere = "not-done";
-      return { ok: false, detail: "text stayed in the input line" };
+      return { ok: false, detail: refused ?? "the runner could not deliver the text (input line busy, refused, or runner unavailable)" };
     }
     typedHere = "done";
-    return { ok: true, detail: "" };
+    return { ok: true, detail: delivery === "unconfirmed" ? "typed, not confirmed in the pane" : "" };
   }, readBack);
   const current = messages.get(message.id) ?? message;
   if (current.state === "acked") return current;
   if (op.state === "verified") return updateLaneMessage(messages, current, { state: "delivered", deliveredAt: deps.clock.now(), blocked: undefined }, deps.clock.now());
-  const blocked = op.state === "ambiguous" ? "an interrupted delivery may or may not have been typed; not retyped" : `send failed: ${op.detail}`;
+  const panes = await panesOf(lane);
+  const status = panes instanceof Error ? "status unreadable" : (panes.find((p) => p.pane_id === lane.pane)?.agent_status ?? "not listed");
+  const where = `pane ${lane.pane ?? "-"} ${status}`;
+  const blocked = op.state === "ambiguous"
+    ? "an interrupted delivery may or may not have been typed; not retyped"
+    : `send failed (${where}): ${(refused ?? op.detail).replace(/\s+/g, " ").slice(0, 240)}`;
   return updateLaneMessage(messages, current, { blocked }, deps.clock.now());
 };
 
@@ -204,6 +256,26 @@ const viewPull = async (deps: FlowDeps, pull: Pick<OpenPull, "repo" | "number">,
 };
 
 const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+
+/** mergeGate `wait` reasons that no further CI run clears at the same head: a person has to act. */
+const stuckWait = (why: string): boolean => why === "no checks" || why === "draft" || why === "every check skipped or neutral" || why.startsWith("mergeable ");
+
+/**
+ * Whether a lane that has not claimed this PR at its head is stuck on its merge rather than still working: a lane told
+ * not done, or claimed at another head, waits for a merge that will not come; a working lane only when its Done names
+ * this PR as merged (it may be waiting for that merge instead of claiming). A paused lane is left alone.
+ */
+const waitsOnMerge = (lane: Lane, pull: Pick<OpenPull, "repo" | "number">): boolean => {
+  const status = statusOf(lane);
+  if (status === "paused") return false;
+  if (status !== "working") return true;
+  return splitDone(lane.done).some((part) => {
+    try {
+      const s = parseSignal(part);
+      return s.kind === "merged" && s.repo.toLowerCase() === pull.repo.toLowerCase() && s.n === String(pull.number);
+    } catch { return false; }
+  });
+};
 
 /**
  * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
@@ -250,6 +322,11 @@ export class CiFollowUp {
   private readonly settled = new Set<string>();
   /** Subjects of this poll's conflicting PRs whose live lane was asked to rebase; any other rebase message is stale. */
   private rebasing = new Set<string>();
+  /** Subjects (PR at a head) this process saw stalled, with when it first saw it; dropped once a poll finds it moving. */
+  private readonly stalls = new Map<string, { readonly since: number; alerted: boolean }>();
+  private stalledNow = new Set<string>();
+  /** The delivery pass in progress: the GitHub poll's and the supervisor's own pass never run at once. */
+  private delivering: Promise<void> = Promise.resolve();
 
   constructor(private readonly deps: FlowDeps, private readonly io: CiIo = defaultCiIo, stores?: { readonly ops: OperationStore; readonly messages: LaneMessageStore }) {
     this.ops = stores?.ops ?? deps.operations ?? openOperations(deps.config);
@@ -265,20 +342,27 @@ export class CiFollowUp {
     await this.follow(pulls, emit);
     await this.closeIssues(merged, emit);
     await this.verifyMerges(merged, emit);
-    await deliverLaneMessages(this.deps, this.ops, this.messages, emit);
+    await this.deliver(emit);
+  }
+
+  /** Delivers the queued lane messages (CI, rebase and lead steering) once, after any pass still running. */
+  deliver(emit: CiEmit): Promise<void> {
+    const pass = this.delivering.then(() => deliverLaneMessages(this.deps, this.ops, this.messages, emit));
+    this.delivering = pass.catch(() => {});
+    return pass;
   }
 
   /**
    * The open lane of each same-repo PR (`repo#n`, repo lowercased): its Done signal names it, or a lane worktree has its
    * branch. A fork PR (sameRepoHead false) has no lane, so it gets no CI message, merge, merge lane or issue close.
    */
-  private async owners(pulls: readonly (Pick<OpenPull, "repo" | "number" | "headRepo"> & { readonly branch?: string })[]): Promise<Map<string, Lane>> {
+  private async owners(pulls: readonly (Pick<OpenPull, "repo" | "number" | "headRepo"> & { readonly branch?: string })[], unresolved?: Set<string>): Promise<Map<string, Lane>> {
     const owner = new Map<string, Lane>();
     if (!pulls.length) return owner;
     // Oldest lane first: the lane that opened the PR keeps its operations even after a merge lane joins it.
     const lanes = (await this.deps.registry.open()).filter((l) => statusOf(l) !== "closed").sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.key.localeCompare(b.key));
     for (const lane of lanes) {
-      for (const [repo, targets] of await githubTargets([lane], this.deps.run)) {
+      for (const [repo, targets] of await githubTargets([lane], this.deps.ops, unresolved)) {
         for (const pull of pulls) {
           if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || (pull.branch !== undefined && targets.branches.has(pull.branch)))) continue;
           const key = `${repo}#${pull.number}`;
@@ -291,9 +375,12 @@ export class CiFollowUp {
 
   private async follow(pulls: readonly OpenPull[], emit: CiEmit): Promise<void> {
     const deps = this.deps;
-    const owner = await this.owners(pulls);
+    // Lanes whose runner could not answer this poll: their PRs may be missing from `owner`, so their messages stay open.
+    const unresolved = new Set<string>();
+    const owner = await this.owners(pulls, unresolved);
     const failing = new Set<string>();
     this.rebasing = new Set();
+    this.stalledNow = new Set();
     for (const pull of pulls) {
       const lane = owner.get(`${pull.repo.toLowerCase()}#${pull.number}`);
       if (!lane) continue;
@@ -303,16 +390,23 @@ export class CiFollowUp {
         if (issue) plan(this.ops, deps.clock.now(), { lane: lane.key, action: "close-issue", target: `${issue.repo}#${issue.number}@${pull.repo}#${pull.number}` });
         if (pull.checks === "failing") {
           failing.add(subjectOf(pull));
-          queueLaneMessage(this.messages, deps.clock.now(), { id: ciMessageId(pull), lane: lane.key, subject: subjectOf(pull), text: ciFailingText(pull, ciMessageId(pull)) });
+          requeueLaneMessage(this.messages, deps.clock.now(), { id: ciMessageId(pull), lane: lane.key, subject: subjectOf(pull), text: ciFailingText(pull, ciMessageId(pull)) });
         }
         if (pull.conflicting) await this.conflict(lane, pull, emit);
         else if (pull.checks === "green") await this.merge(lane, pull, emit);
+        else if (pull.checks === "none") {
+          const fresh = (await deps.registry.read(lane.key)) ?? lane;
+          if (claimGate(fresh, pull).ok) this.stall(fresh, pull, "no checks", "the supervisor merges only after a green check: add or run its checks, or merge it by hand", emit);
+        }
       } catch (e) {
         console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+    for (const subject of this.stalls.keys()) if (!this.stalledNow.has(subject)) this.stalls.delete(subject);
     // A failing message whose PR moved on (new head, checks no longer failing, merged or closed) is no longer true.
     for (const message of this.messages.list({ states: OPEN_MESSAGE_STATES })) {
+      // Supersede only on a positive observation: a lane the poll could not resolve proves nothing about its PR.
+      if (unresolved.has(message.lane)) continue;
       if (message.id.startsWith("ci-") && !failing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "CI no longer failing at this head" }, deps.clock.now());
       // A rebase request whose PR moved on, stopped conflicting, or went to a merge lane (its lane went down) is stale.
       if (message.id.startsWith("rebase-") && !this.rebasing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "no longer a conflict for this live lane at this head" }, deps.clock.now());
@@ -439,13 +533,18 @@ export class CiFollowUp {
       const view = await viewPull(deps, pull);
       const gate = mergeGate(view, pull.sha, base);
       if (gate.verdict === "conflict") return this.conflict(lane, pull, emit);
-      if (gate.verdict === "wait") {
-        if (gate.why.startsWith("base ")) this.settled.add(target);
-        return;
-      }
       // Merged only once the lane says it is done with this head; read fresh so a claim made since the poll counts.
       const fresh = (await deps.registry.read(lane.key)) ?? lane;
-      if (!claimGate(fresh, pull).ok) return;
+      const claim = claimGate(fresh, pull);
+      if (gate.verdict === "wait") {
+        if (gate.why.startsWith("base ")) this.settled.add(target);
+        else if (claim.ok && stuckWait(gate.why)) this.stall(fresh, pull, gate.why, "claimed at this head, but the supervisor cannot merge it as it stands: fix its checks, review or draft state, or merge it by hand", emit);
+        return;
+      }
+      if (!claim.ok) {
+        if (waitsOnMerge(fresh, pull)) this.stall(fresh, pull, claim.why, "green and clean, but the supervisor merges only a lane that claimed done at this head: have the lane claim again, or merge it by hand", emit);
+        return;
+      }
       // pull.sha is the head the claim recorded (claimGate) and the fresh read saw (mergeGate): GitHub merges no other.
       ({ op } = await perform(this.ops, deps.clock.now, spec, async () => {
         const r = await deps.run(["gh", "pr", "merge", String(pull.number), "-R", pull.repo, "--merge", "--match-head-commit", pull.sha], { timeoutMs: 60_000 });
@@ -455,6 +554,22 @@ export class CiFollowUp {
     }
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
+  }
+
+  /**
+   * Records this poll's stall of `pull`; once it has lasted `mergeStallMin` the lead hears MERGE_STALLED, once per PR head
+   * in this process (the journal dedupes the same id after a restart).
+   */
+  private stall(lane: Lane, pull: OpenPull, why: string, hint: string, emit: CiEmit): void {
+    const subject = subjectOf(pull);
+    this.stalledNow.add(subject);
+    const now = this.deps.clock.now();
+    const seen = this.stalls.get(subject) ?? { since: now, alerted: false };
+    this.stalls.set(subject, seen);
+    const min = this.deps.config.mergeStallMin;
+    if (seen.alerted || now - seen.since < min * 60_000) return;
+    seen.alerted = true;
+    emit(`merge-stalled:${subject}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} ${why} for ${min}+ min: ${hint} ${pull.url}`);
   }
 
   private async conflict(lane: Lane, pull: OpenPull, emit: CiEmit): Promise<void> {
@@ -479,12 +594,12 @@ export class CiFollowUp {
       if (merging && statusOf(merging) !== "closed") down = "merge lane already open";
       else {
         const fresh = (await deps.registry.read(lane.key)) ?? lane;
-        const panes = fresh.pane ? await listPanes(laneRunner(deps.run, fresh)).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e)))) : [];
+        const panes = fresh.pane ? await deps.ops.panes(fresh.machine).catch((e: unknown) => (e instanceof Error ? e : new Error(String(e)))) : [];
         down = laneDown(fresh, panes);
         if (down === undefined) {
           const id = rebaseMessageId(pull);
           this.rebasing.add(target);
-          queueLaneMessage(this.messages, deps.clock.now(), { id, lane: lane.key, subject: target, text: rebaseText(pull, deps.config.ciMergeBase, id) });
+          requeueLaneMessage(this.messages, deps.clock.now(), { id, lane: lane.key, subject: target, text: rebaseText(pull, deps.config.ciMergeBase, id) });
           return;
         }
       }
@@ -534,13 +649,14 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
   if (!deps.config.worktreeRoot) return { ok: false, detail: "worktreeRoot is not set" };
-  const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config)), deps.config.guard);
+  const paneCount = async (): Promise<number> => deps.ops.panes().then((panes) => panes.length, () => -1); // the local runner's panes; -1 when unreadable
+  const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config), paneCount), deps.config.guard);
   if (!host.ok) return { ok: false, detail: `HOLD ${host.reasons.join(" | ")}` };
   const worktree = join(deps.config.worktreeRoot, repoName(pull.repo), key);
-  if (existsSync(worktree)) return { ok: false, detail: `worktree ${worktree} already exists` };
-  const fetched = await deps.run(["git", "-C", source.cwd, "fetch", "--end-of-options", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  if ((await deps.ops.exists(undefined, [worktree]))[0]) return { ok: false, detail: `worktree ${worktree} already exists` };
+  const fetched = await deps.ops.git(source, { op: "fetch-branch", root: source.cwd, remote: "origin", branch });
   if (fetched.code !== 0) return { ok: false, detail: `git fetch failed: ${(fetched.err || fetched.out).trim()}` };
-  const added = await deps.run(["git", "-C", source.cwd, "worktree", "add", "--detach", worktree, `refs/remotes/origin/${branch}`]);
+  const added = await deps.ops.git(source, { op: "worktree-add", root: source.cwd, path: worktree, ref: `refs/remotes/origin/${branch}` });
   if (added.code !== 0) return { ok: false, detail: `git worktree add failed: ${(added.err || added.out).trim()}` };
   const briefs = join(deps.config.stateDir, "briefs");
   mkdirSync(briefs, { recursive: true });

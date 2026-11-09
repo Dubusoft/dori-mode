@@ -42,6 +42,23 @@ test("a verified operation never runs its effect again", async () => {
   expect({ state: again.op.state, ran: again.ran, effects: ran }).toEqual({ state: "verified", ran: false, effects: 1 });
 });
 
+test.each(["json", "sqlite"] as const)("%s operation retention removes only verified rows older than 30 days", (kind) => {
+  const dir = withState();
+  if (kind === "sqlite") new SqliteStore(join(dir.dir, SQLITE_FILE), { create: true }).close();
+  const history = openOperations({ stateDir: dir.dir, store: kind });
+  try {
+    const cutoff = T0 - 30 * 24 * 60 * 60_000;
+    for (const state of ["verified", "planned", "attempted", "failed", "ambiguous"] as const) {
+      history.put({ id: state, ...spec, state, detail: state, attempts: 1, at: cutoff - 1, updatedAt: cutoff - 1 });
+    }
+    history.put({ id: "recent", ...spec, state: "verified", detail: "", attempts: 1, at: cutoff, updatedAt: cutoff });
+    history.prune(T0);
+    expect(history.list().map((op) => op.id).sort()).toEqual(["ambiguous", "attempted", "failed", "planned", "recent"]);
+    history.prune(T0);
+    expect(history.get("recent")?.state).toBe("verified");
+  } finally { history.close(); dir.done(); }
+});
+
 test("an attempted row left by a crash is reconciled by read-back: done verifies, not done retries once, unknown is ambiguous", async () => {
   const attempted = { id: "demo-lane/pane-close/w:p1", ...spec, state: "attempted" as const, detail: "attempted", attempts: 1, at: T0, updatedAt: T0 };
   store.put(attempted);
@@ -118,22 +135,16 @@ test("operations survive a store import and export with their states", async () 
 test("a close records its effects and a second close of the same lane repeats none of them", async () => {
   const w: World = newWorld();
   w.panes = [{ pane_id: "w:p1", workspace_id: "w" }];
-  const base = depsFor(w, fakeClock(T0), state.dir);
-  const run: typeof base.run = async (argv, opts) => {
-    if (argv[0] === "herdr" && argv[2] === "close") w.panes = w.panes.filter((p) => p.pane_id !== argv[3]);
-    return base.run(argv, opts);
-  };
-  let removed = false;
-  const deps = { ...base, run, exists: () => !removed };
+  const deps = depsFor(w, fakeClock(T0), state.dir);
   const lane: Lane = { key: "demo-lane", title: "demo", thread: "discord:111/222", pane: "w:p1", brief: "/b.md", done: "merged acme/app#1", cwd: "/repo", openedAt: new Date(T0).toISOString() };
   await deps.registry.write(lane);
-  const removing: typeof run = async (argv, opts) => { if (argv.includes("remove")) removed = true; return run(argv, opts); };
-  const first = await closeLane({ ...deps, run: removing }, lane, "manual");
+  const first = await closeLane(deps, lane, "manual");
   expect(first.closed).toBe(true);
-  const effects = () => w.calls.filter((c) => c.includes("remove") || c[2] === "close").length;
+  // The worktree removal (lane.git) and the pane close (lane.close), each through the lane's runner.
+  const effects = () => w.ops.filter((e) => e.op === "git" || e.op === "close").length;
   expect(effects()).toBe(2);
   expect(store.list().map((op) => `${op.action} ${op.state}`).sort()).toEqual(["close verified", "pane-close verified", "worktree-remove verified"]);
-  const second = await closeLane({ ...deps, run: removing }, lane, "manual");
+  const second = await closeLane(deps, lane, "manual");
   expect(second).toEqual({ closed: true, lines: ["CLOSED demo-lane already closed"] });
   expect(effects()).toBe(2);
 });

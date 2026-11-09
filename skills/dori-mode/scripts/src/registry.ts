@@ -54,8 +54,12 @@ export type Lane = {
   readonly ghIssue?: string;
   readonly recoveryPending?: boolean;
   readonly recoveryPreviousPane?: string;
+  /** A runner lane's recovery: the runner journal head at the hello that asked for it; a lane.started at or before it is stale. */
+  readonly recoveryAfter?: number;
   /** An admission reservation is paused until its agent is registered, so recovery never launches it too. */
   readonly launchReservation?: string;
+  /** The launch stopped waiting for the runner's answer (a timeout); the runner's lane.started confirms the reservation. */
+  readonly launchUnconfirmed?: boolean;
   readonly worktrees?: readonly string[];
   readonly status?: LaneStatus;
   readonly claim?: Claim;
@@ -72,30 +76,32 @@ export type Lane = {
   /** When a nudge last could not be typed (input line busy, pane not live); it is retried each tick, reported once per silence. */
   readonly lastNudgeFailedAt?: number;
   readonly lastAutoReplyAt?: number;
-  /** The todo item the freshness sweep last posted from a working lane's pane, so an unchanged item is never posted twice. */
+  /** @deprecated No longer written (the sweep no longer relays pane todo items); old registries still load with it. */
   readonly lastProgressPost?: string;
-  /** When that todo item was last posted successfully, so an unchanged item is posted again after nudgeAfterMin. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastProgressAt?: number;
-  /** The last failed progress-post error, so a failing hook is reported once per distinct error, not every tick. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastProgressError?: string;
-  /** A remote lane's last [REPORT] line the watcher acted on (claim, LANE_REPORT or nothing for a milestone). */
+  /** The id of the one `[System]` status message the supervisor keeps in the lane's thread and edits on each progress or milestone report. */
+  readonly statusMessageId?: string;
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastRemoteReport?: string;
-  /** Every [REPORT] line the watcher has acted on, by line hash and first-seen time, newest last. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly remoteReportsSeen?: readonly { readonly hash: string; readonly at: string }[];
   /**
-   * `cli`: every local launch and relaunch sets this for the `dori report` footer, so it reports with `dori report` and never types into the lead's pane;
-   * its [REPORT] lines found there are counted as violations. Absent: an older lane on the [REPORT] footer, or a remote one.
+   * `cli`: every launch and relaunch sets this for the `dori report` footer, so it reports with `dori report` (its runner's, on
+   * another machine) and never types into a pane. Absent: a lane registered by an older dori; its next relaunch moves it onto that footer.
    */
   readonly reportVia?: "cli";
   /** Launched behind `laneSandbox.command` (every local `dori launch` that the sandbox fits, or `--sandbox`); recovery relaunches it the same way. */
   readonly sandbox?: true;
-  /** [REPORT] lines of a `reportVia: cli` lane found in the lead's pane, by line hash and first-seen time, newest last. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly leadPaneSeen?: readonly { readonly hash: string; readonly at: string }[];
-  /** How many distinct such lines were found: the lane's lead-pane violations. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly leadPaneViolations?: number;
-  /** The [REPORT] line the freshness sweep last posted, so a stale screen is never posted twice. */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastPostedReport?: string;
-  /** The [REPORT] line seen on the previous freshness tick (a line is posted only once it holds across two ticks). */
+  /** @deprecated No longer written; kept so old registries load. */
   readonly lastSeenReport?: string;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
   readonly lastFreshnessNote?: string;
@@ -108,6 +114,14 @@ export type Lane = {
   /** The status a paused lane had before it was paused; `resume` restores it. */
   readonly pausedFrom?: LaneStatus;
   readonly receipt?: unknown;
+  /** The runner (machine label) that owns this lane; every lane gets one at launch or adopt; there is no direct path, so a lane without it is only a record left by an old version. */
+  readonly runner?: string;
+  /** When the lane was bound to its runner (ms since epoch). */
+  readonly runnerAdoptedAt?: number;
+  /** Since when the owning runner has been silent (ms since epoch); unset while it reports. */
+  readonly runnerStaleSince?: number;
+  /** When the owning runner last reported for this lane (ms since epoch). */
+  readonly lastRunnerReportAt?: number;
   /** Bumped by every registry write; a write carrying an older version than the stored one was made from stale state. */
   readonly version?: number;
 };

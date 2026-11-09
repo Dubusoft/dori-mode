@@ -22,25 +22,42 @@ const URGENT_KINDS = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_NOT_DONE", "LANE_REPORT",
   // A lane waiting on its agent's on-screen question instead of dori report (ask-user.ts).
   "LANE_ASKING",
-  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
+  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-PROGRESS",
   // An idle lane still silent idleEscalateMin after its freshness nudge (freshness.ts); the lane itself gets no more input.
   "IDLE-ESCALATE",
+  // A working lane that drifted: milestones overdue or its PR failing CI again and again (drift.ts). No periodic summaries.
+  "LANE_DRIFT",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "HOST_GUARD OUTDATED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   // The supervisor killed or paused something because memory ran critically low; the lead relays it to the owner.
   "HOST_GUARD CRITICAL",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_RECOVERY_EXHAUSTED",
+  // Runners: a lane whose runner is gone or unknown, a forged or unauthenticated frame, a backed-up outbox, and a
+  // failed runner upgrade need the lead. RUNNER_STALE, RUNNER_UNREACHABLE, RUNNER_RESTARTED, RUNNER_RESTART_FAILED,
+  // RUNNER_PROTO_MISMATCH and RUNNER_CONFLICT stay digest (the default).
+  "LANE_RUNNER_LOST", "LANE_ORPHAN", "RUNNER_LAUNCH_FAILED", "RUNNER_RECOVER_FAILED", "RUNNER_LANE_DEAD", "RUNNER_FORGED_EVENT", "RUNNER_AUTH_FAILED", "RUNNER_OUTBOX_LARGE", "RUNNER_UPGRADE_FAILED",
+  // A machine's herdr is unreadable: its lanes cannot run or be recovered until someone brings herdr back. HERDR_UP
+  // stays digest (the default): held recovery resumes by itself.
+  "HERDR_DOWN",
+  "HERDR_HUNG",
+  // The supervisor could not open its runner hub: every lane operation fails until a retry opens it. RUNNER_HUB_OPENED
+  // stays digest (the default).
+  "RUNNER_HUB_DISABLED",
+  // The supervisor's Discord gateway hit a close code it must not reconnect after (messenger/discord.ts DISCORD_FATAL_CLOSE).
+  "DISCORD_GATEWAY_FATAL",
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
   "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
-  // A merged lane PR whose merge the supervisor could not read back.
-  "MERGE_UNVERIFIED",
+  // A merged lane PR whose merge the supervisor could not read back, and an open one it has been unable to merge.
+  "MERGE_UNVERIFIED", "MERGE_STALLED",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
   "LANE_DONE_CLAIMED",
-  // A lane that ended is news the lead acts on: report to the owner, free the slot.
+  // A lane that ended is news the lead acts on: report to the owner, free the slot, finish its Toodo task. That holds for
+  // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
+  // waits on the close itself, so it must not sit in the digest.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
@@ -53,13 +70,11 @@ const URGENT_KINDS = [
  * or opens a merge lane), and a lane's milestone and progress reports wait for the next urgent delivery. The supervisor
  * settles the rest itself: a done claim (urgent LANE_DONE_CLAIMED) is re-checked live (then closed, or objected to,
  * LANE_NOT_DONE, which is urgent), and a merged lane PR has its merge read back (MERGE_VERIFIED, or urgent MERGE_UNVERIFIED).
- * A close whose LANE_DONE_CLAIMED the lead already received (`LANE_CLOSED <key> closed seen-claim`) is digest: the lead
- * heard of the claim, and the close only confirms it. A close of an undelivered claim stays urgent.
  */
 const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
-  "MERGE_VERIFIED", "LANE_CLOSED * closed seen-claim",
+  "MERGE_VERIFIED",
   // A worker machine without the guard agent, one whose shell cannot run it, or one whose agent is current again,
   // needs no action now.
   "HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT",

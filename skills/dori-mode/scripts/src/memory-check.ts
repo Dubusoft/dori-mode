@@ -219,6 +219,7 @@ export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[
   const fingerprint = line
     ? createHash("sha256").update(JSON.stringify([report.bytes > report.limitBytes, report.stale.flatMap((s) => s.refs).sort()])).digest("hex").slice(0, 16)
     : undefined;
-  saveState(path, { ...next, at: now, pendingSince: undefined, ...(fingerprint ? { sent: fingerprint } : {}) });
+  // A clean check forgets the last finding, so the same finding coming back later is said again.
+  saveState(path, { ...next, at: now, pendingSince: undefined, sent: fingerprint });
   return line && fingerprint !== state.sent ? [line] : [];
 };

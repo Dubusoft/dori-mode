@@ -58,14 +58,14 @@ Everything lives in `~/.dori/config.json`, and every field is optional. The ones
 
 | Field | What it is |
 |---|---|
-| `leadPane` | your Dori's own herdr pane (`herdr pane current`). Lanes report here. |
-| `laneWorkspace` | the herdr workspace new lane tabs open in |
 | `defaultCwd` | where lanes start, and the repo whose worktrees they own |
 | `agentCommand` | how to start an agent, as an argv list with `{model}` and `{prompt}` |
-| `laneSandbox` | `{ "command": ["lane-sandbox"] }` when unset: every new local lane's agent (never the lead's) runs behind `command`; there is no setting or flag that turns it off. A `--machine` lane, a `--pane` lane, or a missing `command` on PATH passes through and the launch prints `SANDBOX_SKIPPED <key>: <why>`; `dori launch --sandbox` wraps a `--pane` lane anyway, and remote lanes refuse it. A bubblewrap wrapper ships as [`scripts/templates/lane-sandbox.sh`](skills/dori-mode/scripts/templates/lane-sandbox.sh); install it on PATH as `lane-sandbox`. It takes extra read-write paths from `LANE_SANDBOX_RW`, so review it before use |
+| `laneSandbox` | `{ "command": ["lane-sandbox"] }` when unset: every new local lane's agent (never the lead's) runs behind `command`; there is no setting or flag that turns it off. A `--machine` lane, a `--pane` lane, or a missing `command` on PATH passes through and the launch prints `SANDBOX_SKIPPED <key>: <why>`; `dori launch --sandbox` wraps a `--pane` lane anyway, and remote lanes refuse it. A bubblewrap wrapper ships as [`scripts/templates/lane-sandbox.sh`](skills/dori-mode/scripts/templates/lane-sandbox.sh); install it on PATH as `lane-sandbox`; once it is in `~/.local/bin`, `dori update` and the supervisor's start keep it in step with the template. It takes extra read-write paths from `LANE_SANDBOX_RW`, and the local runner has it bind `<defaultCwd>/state/verify` read-write through `LANE_SANDBOX_VERIFY`, so review it before use |
 | `hooks.threadReply` | your messenger CLI, as an argv list with `{thread}` and `{text}`, so lanes can post progress |
 
 The rest (timings, thresholds, heavy-slot count) has sensible defaults. The full table is in [`references/scripts.md`](skills/dori-mode/references/scripts.md). `DORI_CONFIG`, `DORI_STATE_DIR` and `DORI_LEAD_PANE` override the file.
+
+The lead's herdr pane and the workspace new lane tabs open in are not configured: the supervisor finds them, creates them when missing (a `dori-lead` tab in a `Dori` workspace, and a `lanes` workspace) and records them in `<stateDir>/herdr-panes.json`. An older config's `leadPane`, `laneWorkspace` and `workspaces` are copied there once and then ignored.
 
 ## Onboarding
 

@@ -1,0 +1,4 @@
+skills/dori-mode/scripts/templates/*.ps1 text eol=lf
+skills/dori-mode/scripts/templates/*.cmd text eol=lf
+skills/dori-mode/scripts/templates/*.xml text eol=lf
+skills/dori-mode/scripts/templates/dori text eol=lf

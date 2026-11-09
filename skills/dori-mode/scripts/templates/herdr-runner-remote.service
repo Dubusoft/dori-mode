@@ -1,0 +1,21 @@
+[Unit]
+Description=herdr headless server (the lanes of this runner host live here)
+# Installed by `dori runner install`. The runner unit only Wants= and is After= this one, so a runner restart never
+# restarts herdr; a herdr restart ends every lane pane on this host.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+# PATH and SHELL come from the user's login shell: every lane shell herdr opens inherits them.
+Environment=PATH=@PATH@
+Environment=SHELL=@SHELL@
+Environment=LANG=C.UTF-8
+Environment=TERM=xterm-256color
+ExecStart=@HERDR_BIN@ server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

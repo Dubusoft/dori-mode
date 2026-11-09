@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
 import type { Http } from "./messenger/http.ts";
+import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
 import { listPanes } from "./panes.ts";
 import { Repos } from "./repos.ts";
 import type { Runner } from "./run.ts";
@@ -10,8 +11,6 @@ import type { Runner } from "./run.ts";
 export class SetupError extends Error {}
 
 export const TOKEN_KEY = "DORI_DISCORD_TOKEN";
-export const LEAD_WORKSPACE = "Dori";
-export const LANES_WORKSPACE = "lanes";
 export const UNITS = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const BOOT_PREP = "dori-boot-prep.sh";
 /** Started by OnFailure= of the units above; never enabled itself. */
@@ -57,13 +56,48 @@ export type SetupInput = {
 
 type Json = Record<string, unknown>;
 
-export const writeFileAtomic = (path: string, content: string, mode: number): void => {
+/** Seams for `renameWithRetry`: the platform (default `process.platform`), the rename itself, and the pause between tries. */
+export type RenameDeps = {
+  readonly platform?: NodeJS.Platform;
+  readonly rename?: (from: string, to: string) => void;
+  readonly sleep?: (ms: number) => void;
+};
+
+/** Retries after the first failed rename on Windows, where antivirus and the indexer briefly hold files open. */
+export const RENAME_RETRIES = 5;
+export const RENAME_RETRY_MS = 50;
+const RENAME_BUSY: ReadonlySet<string> = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * `renameSync(from, to)`. On win32 an `EPERM`, `EACCES` or `EBUSY` failure is retried up to `RENAME_RETRIES` times,
+ * `RENAME_RETRY_MS` apart; any other error, or the last one, is thrown. Elsewhere it is a plain rename.
+ */
+export const renameWithRetry = (from: string, to: string, deps: RenameDeps = {}): void => {
+  const rename = deps.rename ?? renameSync;
+  if ((deps.platform ?? process.platform) !== "win32") {
+    rename(from, to);
+    return;
+  }
+  const sleep = deps.sleep ?? Bun.sleepSync;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rename(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (attempt >= RENAME_RETRIES || !code || !RENAME_BUSY.has(code)) throw error;
+      sleep(RENAME_RETRY_MS);
+    }
+  }
+};
+
+export const writeFileAtomic = (path: string, content: string, mode: number, deps: RenameDeps = {}): void => {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   const fd = openSync(tmp, "w", mode);
   try { writeFileSync(fd, content); fsyncSync(fd); } finally { closeSync(fd); }
   chmodSync(tmp, mode);
-  renameSync(tmp, path);
+  renameWithRetry(tmp, path, deps);
 };
 
 export const readConfigObject = (path: string): Json => {
@@ -164,39 +198,41 @@ const exists = async (run: Runner, kind: "pane" | "workspace", id: string): Prom
 export type HerdrResult = { readonly patch: Json; readonly lines: string[] };
 
 /**
- * Same steps as the boot prep script: keep the lead pane and lanes workspace from the config when they still exist,
- * otherwise create them. A new lanes workspace starts with a shell pane that is not a lane, so it goes on ignorePanes.
+ * The supervisor's own steps, run once ahead of it: keep the lead pane and lanes workspace recorded in dori state (or,
+ * before the first migration, named by the config) when they still exist, otherwise create them, and record both in
+ * `stateDir`. The patch carries only config keys: a new lanes workspace starts with a shell pane that is not a lane, so it
+ * goes on ignorePanes.
  */
-export const ensureHerdr = async (run: Runner, current: Json, leadCwd: string): Promise<HerdrResult> => {
+export const ensureHerdr = async (run: Runner, current: Json, leadCwd: string, stateDir: string): Promise<HerdrResult> => {
   const lines: string[] = [];
   const patch: Json = {};
-  const lead = str(current.leadPane);
+  const recorded = resolveManagedPanes(stateDir, current);
+  const lead = recorded.leadPane;
+  let leadPane = lead;
   if (lead && (await exists(run, "pane", lead))) lines.push(`SETUP herdr lead pane ${lead} reused`);
   else {
     const ws = await ensureWorkspace(run, LEAD_WORKSPACE);
     const tab = (await herdrJson(run, ["tab", "create", "--workspace", ws.id, "--cwd", leadCwd, "--label", "dori-lead", "--no-focus"])) as { result?: { root_pane?: { pane_id?: string } } };
     const pane = tab.result?.root_pane?.pane_id;
     if (!pane) throw new SetupError("herdr tab create returned no pane id for the lead");
-    patch.leadPane = pane;
+    leadPane = pane;
     lines.push(`SETUP herdr lead pane ${pane} created in workspace ${LEAD_WORKSPACE} (${ws.id})${lead ? `; ${lead} was gone` : ""}`);
   }
-  const oldLanes = str(current.laneWorkspace);
-  const known = strings(current.workspaces);
+  const oldLanes = recorded.laneWorkspace;
   const ignore = strings(current.ignorePanes);
   let lanes = oldLanes;
   if (oldLanes && (await exists(run, "workspace", oldLanes))) lines.push(`SETUP herdr lanes workspace ${oldLanes} reused`);
   else {
     const ws = await ensureWorkspace(run, LANES_WORKSPACE);
     lanes = ws.id;
-    patch.laneWorkspace = lanes;
     if (ws.created) {
       const shells = (await listPanes(run)).filter((p) => p.workspace_id === lanes).map((p) => p.pane_id);
       patch.ignorePanes = [...new Set([...ignore, ...shells])];
     }
     lines.push(`SETUP herdr lanes workspace ${lanes} ${ws.created ? "created" : "found by label"}${oldLanes ? `; ${oldLanes} was gone` : ""}`);
   }
-  const workspaces = [lanes, ...known.filter((w) => w !== lanes && w !== oldLanes)];
-  if (JSON.stringify(workspaces) !== JSON.stringify(known)) patch.workspaces = workspaces;
+  saveManagedPanes(stateDir, { leadPane, laneWorkspace: lanes, migrated: true });
+  lines.push(`SETUP herdr ids recorded in ${managedPanesPath(stateDir)}`);
   if (patch.ignorePanes === undefined && !Array.isArray(current.ignorePanes)) patch.ignorePanes = ignore;
   return { patch, lines };
 };
@@ -343,11 +379,12 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     } else {
       serverUp = true;
       try {
-        const h = await ensureHerdr(d.run, config, workDir);
+        const h = await ensureHerdr(d.run, config, workDir, expandHome(stateDir, d.home));
         for (const l of h.lines) d.log(l);
         const before = config;
-        config = mergeConfig(config, h.patch);
-        d.log(`SETUP config ${saveConfig(d.configPath, before, config) ? "updated with herdr ids" : "already has the herdr ids"}`);
+        // The herdr ids live in dori state; setup drops the legacy keys from the config.
+        config = Object.fromEntries(Object.entries(mergeConfig(config, h.patch)).filter(([key]) => !(LEGACY_PANE_KEYS as readonly string[]).includes(key)));
+        d.log(`SETUP config ${saveConfig(d.configPath, before, config) ? "updated" : "unchanged"} for herdr`);
       } catch (e) {
         problems.push("herdr");
         d.log(`SETUP herdr failed: ${e instanceof Error ? e.message : String(e)}`);

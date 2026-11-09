@@ -36,12 +36,11 @@ const machineWorld = () => {
     if (argv[0] === "df") return ok("Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200");
     if (argv[0] === "ssh" && argv.at(-1)?.startsWith("x=6;")) return ok("DORI_POSIX_42");
     if (argv[0] === "ssh") return ok(agentLine(mem[argv[argv.indexOf("--") + 1] ?? ""] ?? 0));
-    if (argv[0] === "herdr" && argv[1] === "--machine" && argv[3] === "pane" && argv[4] === "list") {
-      return ok(JSON.stringify({ result: { panes: [{ pane_id: `${argv[2]}:p1`, workspace_id: "w" }] } }));
-    }
     return base.run(argv);
   };
-  const deps = { ...base, run };
+  // Each machine's runner lists one pane.
+  const ops = { ...base.ops, panes: async (machine?: string) => [{ pane_id: `${machine ?? "local"}:p1`, workspace_id: "w" }] };
+  const deps = { ...base, run, ops };
   const queue: string[] = [];
   const sweeps = supervisorSweeps(deps, "/home/test");
   const tick = () => runSweeps(sweeps, async (line) => { queue.push(line); }, clock.now, new Map(), () => {});
@@ -117,7 +116,7 @@ test("planLaunch keeps a pinned or workspace launch on its HOLD target, and a de
   expect(none.lines).toHaveLength(1);
 });
 
-/** `bun src/cli.ts` with a config saving machine big (ssh to it fails) and fake herdr/ssh on PATH. */
+/** `bun src/cli.ts` with a config saving machine big and fake herdr/ssh on PATH; no supervisor runs, so no runner observes big. */
 const cliWorld = () => {
   const state = withState();
   cleanups.push(state.done);
@@ -145,7 +144,8 @@ test("dori launch on a HOLD machine queues the launch with machine=<label> and e
   const r = await w.cli(["launch", "big-lane", "--title", "t", "--brief", "/b.md", "--done", "merged acme/app#1", "--machine", "big"]);
   expect(r.code).toBe(4);
   expect(r.out).toContain("PLACEMENT machine=big source=flag");
-  expect(r.out).toContain("HOLD machine=big machine big unreachable: unreachable: ssh: connect to host big: No route to host");
+  // The reason is checkMachine's (placement.test.ts): big has no runner to observe it.
+  expect(r.out).toContain("HOLD machine=big ");
   expect(r.out).toContain("QUEUED big-lane (1 waiting; dori hold list)");
   expect(launchQueue(w.state.dir).map((q) => [q.key, q.machine])).toEqual([["big-lane", "big"]]);
   expect(launchHeld(w.state.dir, "big")).toBe(true);
@@ -155,7 +155,7 @@ test("dori can-launch --machine records that machine's verdict and prints its li
   const w = cliWorld();
   const r = await w.cli(["can-launch", "--machine", "big"]);
   expect(r.code).toBe(4);
-  expect(r.out.trim()).toStartWith("HOLD machine=big machine big unreachable:");
+  expect(r.out.trim()).toStartWith("HOLD machine=big ");
   expect(launchHeld(w.state.dir, "big")).toBe(true);
   const all = await w.cli(["can-launch", "--all"]);
   expect(all.code).toBe(4);

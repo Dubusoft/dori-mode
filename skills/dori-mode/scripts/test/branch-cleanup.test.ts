@@ -7,6 +7,11 @@ import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { run as realRun, type Runner } from "../src/run.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
+import { laneOps, type LaneOps } from "../src/lane-ops.ts";
+import type { RunnerCall } from "../src/runner/call.ts";
+import { laneGitEffect } from "../src/runner/lane-git.ts";
+import type { AnySupervisorControl, SupervisorCommandBodies } from "../src/runner/protocol.ts";
+import { answerQuery } from "../src/runner/queries.ts";
 import { depsFor, fakeClock, newWorld, TEST_STORE, withState, type World } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -57,8 +62,33 @@ const runner = (): Runner => {
     return fake(argv, opts);
   };
 };
-const deps = (patch: Parameters<typeof depsFor>[3] = {}) =>
-  ({ ...depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo, worktreeRoot: state.dir, ...patch }), run: runner(), exists: undefined });
+/**
+ * The lane facade over the runner's own code on this host: `q.lane.inspect`/`q.stat` answered by runner/queries.ts and
+ * `lane.git` by runner/lane-git.ts, both running `run`, so git facts and cleanup are real; every other operation is
+ * `base` (the fake World's). Each `lane.git` is recorded in `w.ops`.
+ */
+const runnerGitOps = (run: Runner, base: LaneOps, w: World): LaneOps => {
+  const call: RunnerCall = {
+    query: async (_label, type, body) =>
+      (await answerQuery({ run, clock: fakeClock(T0), lane: () => undefined }, { type, body: { qid: "q", ...body } } as unknown as AnySupervisorControl)) as never,
+    call: async (_label, type, body, opts) => {
+      if (type !== "lane.git") throw new Error(`unexpected runner command ${type}`);
+      const r = await laneGitEffect(run, body as Omit<SupervisorCommandBodies["lane.git"], "cmdId">);
+      return { cmdId: opts?.cmdId ?? "-", state: "verified", detail: r.detail, result: r.result } as never;
+    },
+    connected: () => true,
+  };
+  const real = laneOps(call, { now: () => T0 });
+  return {
+    ...base, inspect: real.inspect, exists: real.exists,
+    git: async (lane, op, opts) => { w.ops.push({ op: "git", key: lane.key, args: { ...op, ...(opts ? { opts } : {}) } }); return real.git(lane, op, opts); },
+  };
+};
+/** Lane git (facts, worktree removal, branch deletes) runs through runnerGitOps over `run`; gh and the World fakes stay as they are. */
+const deps = (patch: Parameters<typeof depsFor>[3] = {}, run: Runner = runner()) => {
+  const base = depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo, worktreeRoot: state.dir, ...patch });
+  return { ...base, run, exists: undefined, ops: runnerGitOps(run, base.ops, world) };
+};
 const lane = (): Lane => ({ key: "demo-lane", title: "demo", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#7", cwd: wt, worktrees: [wt], openedAt: new Date(T0).toISOString() });
 const updateRefs = () => world.calls.filter((c) => c.includes("update-ref"));
 /** The close's cleanup lines, read from the registry receipt (the CLOSED line no longer carries it). */
@@ -90,7 +120,13 @@ test("a branch still at the merged head SHA loses its worktree and its local bra
   expect(existsSync(wt)).toBe(false);
   expect(await localTip()).toBeUndefined();
   expect((await receipt())).toContain(`branch feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)})`);
-  expect(updateRefs()).toEqual([["git", "--git-dir", join(repo, ".git"), "update-ref", "-d", "refs/heads/feat-x", mergedHead]]);
+  expect(updateRefs()).toEqual([["git", "-C", repo, "update-ref", "-d", "refs/heads/feat-x", mergedHead]]);
+  // Both deletes are recorded operations carrying the merged head, so the runner's compare-and-delete guards them.
+  const deletes = world.ops.filter((e) => e.op === "git" && (e.args as { op: string }).op !== "worktree-remove").map((e) => e.args);
+  expect(deletes).toEqual([
+    { op: "remote-branch-delete", root: repo, branch: "feat-x", remote: "origin", sha: mergedHead, opts: { cmdId: `op:demo-lane/remote-branch-delete/acme/app#7@${mergedHead}:1` } },
+    { op: "branch-delete", root: repo, branch: "feat-x", sha: mergedHead, opts: { cmdId: `op:demo-lane/branch-delete/acme/app#7@${mergedHead}:1` } },
+  ]);
   const ops = openOperations({ stateDir: state.dir, store: TEST_STORE });
   try {
     expect(ops.get(`demo-lane/branch-delete/acme/app#7@${mergedHead}`)?.state).toBe("verified");
@@ -124,6 +160,7 @@ test("a remote branch that moved after the merge keeps the local branch even whe
   expect(existsSync(wt)).toBe(false);
   expect(await localTip()).toBe(mergedHead);
   expect((await receipt()).some((l) => l.startsWith(`branch feat-x kept: origin/feat-x is at `) && l.includes("a commit pushed after the merge"))).toBe(true);
+  expect(await remoteTip()).not.toBe(mergedHead);
   expect(updateRefs()).toEqual([]);
 });
 
@@ -136,12 +173,12 @@ test("another open lane naming the same PR keeps the branch", async () => {
 });
 
 test("a close interrupted after the worktree went still deletes the branch on resume, from the git dir it recorded", async () => {
-  const base = deps();
+  const live = runner();
   const crashing: Runner = async (argv, opts) => {
     if (argv.includes("ls-remote")) throw new Error("killed");
-    return base.run(argv, opts);
+    return live(argv, opts);
   };
-  await expect(closeLane({ ...base, run: crashing }, lane(), "manual")).rejects.toThrow("killed");
+  await expect(closeLane(deps({}, crashing), lane(), "manual")).rejects.toThrow("killed");
   expect(existsSync(wt)).toBe(false);
   expect(await localTip()).toBe(mergedHead);
   const lines = await watchTick(deps());
@@ -221,6 +258,58 @@ test("a done-claimed lane whose worktree branch GitHub reports merged at its HEA
   expect(lines[0]).toStartWith("LANE_CLOSED plain-lane");
   expect((await deps().registry.read("plain-lane"))?.receipt).toMatchObject({ note: expect.stringContaining("closed at once: acme/app#9 merged into dev") });
 });
+
+/** `runner()` with every git read whose argv matches `hit` failing as git does without access (exit 128), from when `armed()` holds. */
+const failingReads = (hit: (argv: readonly string[]) => boolean, armed: () => boolean = () => true): Runner => {
+  const live = runner();
+  return async (argv, opts) => (hit(argv) && armed() ? { code: 128, out: "", err: "fatal: permission denied" } : live(argv, opts));
+};
+const localRead = (argv: readonly string[]) => argv.includes("rev-parse") && argv.includes("refs/heads/feat-x");
+const remoteRead = (argv: readonly string[]) => argv.includes("ls-remote");
+
+test("an unreadable local branch is kept as unreadable, never 'already gone', and its remote branch is left", async () => {
+  const r = await closeLane(deps({}, failingReads(localRead)), lane(), "manual");
+  expect(r.closed).toBe(true);
+  expect(await receipt()).toContain(`branch feat-x kept: cannot read refs/heads/feat-x in ${repo}`);
+  expect((await receipt()).some((l) => l.includes("already gone"))).toBe(false);
+  expect(await localTip()).toBe(mergedHead);
+  expect(await remoteTip()).toBe(mergedHead);
+  expect(world.ops.filter((e) => e.op === "git" && (e.args as { op: string }).op !== "worktree-remove")).toEqual([]);
+});
+
+test("a failed remote read keeps the branch instead of passing the remote-tip gate", async () => {
+  const r = await closeLane(deps({}, failingReads(remoteRead)), lane(), "manual");
+  expect(r.closed).toBe(true);
+  expect(await receipt()).toContain(`branch feat-x kept: cannot read refs/heads/feat-x in ${repo}`);
+  expect(await localTip()).toBe(mergedHead);
+  expect(await remoteTip()).toBe(mergedHead);
+  expect(updateRefs()).toEqual([]);
+});
+
+test("a branch delete whose read-back fails is ambiguous, never verified", async () => {
+  const r = await closeLane(deps({}, failingReads(localRead, () => updateRefs().length > 0)), lane(), "manual");
+  expect(r.closed).toBe(false);
+  expect(r.lines.some((l) => l.startsWith(`OPERATION_AMBIGUOUS demo-lane/branch-delete/acme/app#7@${mergedHead}`))).toBe(true);
+  const ops = openOperations({ stateDir: state.dir, store: TEST_STORE });
+  try { expect(ops.get(`demo-lane/branch-delete/acme/app#7@${mergedHead}`)?.state).toBe("ambiguous"); } finally { ops.close(); }
+});
+
+for (const [name, hold] of [
+  // The main checkout's HEAD names feat-x (git refuses a checkout of a branch another worktree has; HEAD is set directly).
+  ["the main checkout", async () => { await git("-C", repo, "symbolic-ref", "HEAD", "refs/heads/feat-x"); return repo; }],
+  ["an unrelated worktree", async () => { const other = join(state.dir, "unrelated"); await git("-C", repo, "worktree", "add", "-q", "-f", other, "feat-x"); return other; }],
+] as const) {
+  test(`a merged branch still checked out in ${name} is kept, locally and on the remote`, async () => {
+    const at = await hold();
+    const r = await closeLane(deps(), lane(), "manual");
+    expect(r.closed).toBe(true);
+    expect(existsSync(wt)).toBe(false);
+    expect(await localTip()).toBe(mergedHead);
+    expect(await remoteTip()).toBe(mergedHead);
+    expect(updateRefs()).toEqual([]);
+    expect(await receipt()).toContain(`branch feat-x kept: branch feat-x is checked out in ${at}`);
+  });
+}
 
 test("a done-claimed lane with no merged PR waits out its claim window", async () => {
   await deps().registry.write(claimed());

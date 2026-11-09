@@ -19,6 +19,11 @@ import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journ
  * `dori reported <key>`, an immutable receipt the supervisor consumes.
  * An obligation still open after reportTimeoutMin comes back as urgent `UNREPORTED <key> ...`, re-sent with backoff; in
  * push mode it also keeps the lead pushed and counts toward the push escalation. The supervisor never posts the report.
+ *
+ * The obligation is also the lane's one finish record: a finish event that joins it with nothing new for the lead is
+ * quiet and wakes no one (supervise-delivery.ts); it rides along with the next delivery. That is a claimed lane's first
+ * CI_MERGED, or one at a PR head the row already saw merged: the claim already woke the lead, and the merge closes the
+ * lane at once (done-flow.ts mergeConfirmed). A claim, a close and a merge at another PR head always wake.
  */
 
 export const REPORTED_DIR = "reported";
@@ -37,6 +42,10 @@ export class ReportedError extends Error {}
 
 const CLAIM = "LANE_DONE_CLAIMED ";
 const REJECTED = "LANE_NOT_DONE ";
+const MERGED = "CI_MERGED ";
+
+/** The PR head a `CI_MERGED ... head=<sha> ...` line names. */
+const mergedHead = (line: string): string | undefined => (line.startsWith(MERGED) ? / head=(\S+)/.exec(line)?.[1] : undefined);
 
 const keyOf = (lane: string | undefined): string | undefined => (lane && LANE_KEY.test(lane) ? lane : undefined);
 
@@ -159,8 +168,17 @@ export class OutcomeTracking {
     if (found?.events?.includes(event.id)) return;
     // Claim-only while every event in the row is a claim (a receipt-only row has none yet).
     const claim = event.line.startsWith(CLAIM) && (!found || found.claim === true || !found.events?.length);
+    const head = mergedHead(event.line);
+    const heads = found?.heads ?? [];
+    // A merge after the claim (of the claimed head, or one already merged) adds nothing the lead must do now.
+    const quiet = event.line.startsWith(MERGED) && found?.claimed === true && (!heads.length || (head !== undefined && heads.includes(head)));
     const { claim: _was, ...kept } = found ?? { lane, since: event.at ?? this.core.deps.clock.now() };
-    const next: LaneOutcome = { ...kept, line: kept.line ?? line, events: [...(kept.events ?? []), event.id], ...(claim ? { claim } : {}) };
+    const next: LaneOutcome = {
+      ...kept, line: kept.line ?? line, events: [...(kept.events ?? []), event.id], ...(claim ? { claim } : {}),
+      ...(event.line.startsWith(CLAIM) ? { claimed: true as const } : {}),
+      ...(head && !heads.includes(head) ? { heads: [...heads, head] } : {}),
+      ...(quiet ? { quiet: [...(kept.quiet ?? []), event.id] } : {}),
+    };
     this.journal = { ...this.journal, outcomes: at < 0 ? [...outcomes, next] : outcomes.map((outcome, i) => (i === at ? next : outcome)) };
   }
 
@@ -204,6 +222,11 @@ export class OutcomeTracking {
     this.core.persist();
     for (const receipt of receipts) dropReported(receipt.path);
     this.publish();
+  }
+
+  /** Event `id` joined its lane's finish record with nothing new for the lead: it must not wake it (supervise-delivery.ts). */
+  quiet(id: string): boolean {
+    return (this.journal.outcomes ?? []).some((outcome) => outcome.quiet?.includes(id));
   }
 
   /** Reminded obligations, or those past their first window: they keep a pushed lead pushed (supervise-push.ts). */
@@ -293,7 +316,9 @@ export class OutcomeTracking {
 
   /**
    * Posts the owner's close-thread button into each thread whose work is finished: a report into it was recorded after the
-   * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. Run
+   * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. A
+   * report for a lane that closed before that button is covered by it and re-arms nothing; one for a lane that closed
+   * later (or has not closed yet) is new work. Run
    * every pass, so it fires right after the last report or right after the last lane closes, whichever comes later. A
    * failed post is retried on the next pass; `post` gets a stable id per thread and report, so a retry is not doubled.
    */
@@ -304,6 +329,11 @@ export class OutcomeTracking {
     const latest = new Map<string, number>();
     for (const outcome of outcomes) {
       if (outcome.thread === undefined || outcome.lastReportAt === undefined) continue;
+      const button = buttons[outcome.thread];
+      if (button !== undefined && outcome.lastReportAt > button) {
+        const closedAt = (await registry.read(outcome.lane))?.closedAt;
+        if (closedAt && Date.parse(closedAt) < button) continue;
+      }
       latest.set(outcome.thread, Math.max(latest.get(outcome.thread) ?? -Infinity, outcome.lastReportAt));
     }
     const due = [...latest].filter(([thread, at]) => at > (buttons[thread] ?? -Infinity));

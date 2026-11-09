@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 
 import type { FlowDeps } from "./done-flow.ts";
+import type { LaneOps } from "./lane-ops.ts";
 import type { Lane } from "./registry.ts";
 import { Repos } from "./repos.ts";
 import type { Runner } from "./run.ts";
@@ -85,8 +86,11 @@ const text = (value: unknown): string => typeof value === "string" ? value : "";
 const repoFromRemote = (remote: string): string | undefined =>
   /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
 
-/** Registry signals carry PR identity; a lane worktree carries its branch identity. */
-export const githubTargets = async (lanes: readonly Lane[], run: Runner): Promise<Map<string, Targets>> => {
+/**
+ * Registry signals carry PR identity; a lane worktree carries its branch identity. A lane whose runner could not answer
+ * is added to `unresolved`: its targets may be incomplete this time, which is not evidence that it owns no PR.
+ */
+export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "inspect">, unresolved?: Set<string>): Promise<Map<string, Targets>> => {
   const targets = new Map<string, Targets>();
   const target = (repo: string): Targets => {
     const key = repo.toLowerCase();
@@ -99,6 +103,7 @@ export const githubTargets = async (lanes: readonly Lane[], run: Runner): Promis
       try {
         const signal = parseSignal(part);
         if (signal.kind === "merged") target(signal.repo).numbers.add(Number(signal.n));
+        if (signal.kind === "pr") target(signal.repo).branches.add(signal.branch);
         if (signal.kind === "command" && signal.argv[0] === "gh" && signal.argv[1] === "pr") {
           const at = signal.argv.findIndex((arg) => arg === "-R" || arg === "--repo");
           const repo = signal.argv[at + 1];
@@ -111,13 +116,11 @@ export const githubTargets = async (lanes: readonly Lane[], run: Runner): Promis
       }
     }
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
-    for (const cwd of new Set([lane.cwd, ...(lane.worktrees ?? [])].filter((p): p is string => Boolean(p)))) {
-      const remote = await run(["git", "-C", cwd, "remote", "get-url", "origin"], { timeoutMs: 2_000 });
-      const repo = remote.code === 0 ? repoFromRemote(remote.out) : undefined;
-      if (!repo) continue;
-      const branch = await run(["git", "-C", cwd, "branch", "--show-current"], { timeoutMs: 2_000 });
-      if (branch.code === 0 && branch.out) target(repo).branches.add(branch.out);
-    }
+    // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
+    const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; }))?.git;
+    const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
+    if (!git || !repo) continue;
+    for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) if (branch) target(repo).branches.add(branch);
   }
   return targets;
 };
@@ -185,7 +188,8 @@ const checkState = (runs: readonly unknown[], statuses: Json): Pull["checks"] =>
 /**
  * GitHub status history (RETENTION.statusHistoryMs): a closed or merged PR quiet that long keeps its baseline but not its
  * activity ids (a later reply is still new: the poll's closed-history rule never replays older ones), and a cached
- * response no poll used that long is dropped (the next request is simply unconditional).
+ * response no poll used that long is dropped (the next request is simply unconditional). Closed PR detail and
+ * activity responses are discarded immediately, as are commit responses not used by an open PR.
  */
 const retainHistory = (pulls: Record<string, Pull>, cache: Readonly<Record<string, Cached>>, now: number): Record<string, Cached> => {
   const cutoff = now - RETENTION.statusHistoryMs;
@@ -193,16 +197,30 @@ const retainHistory = (pulls: Record<string, Pull>, cache: Readonly<Record<strin
     if (pull.state !== "open" && pull.activity.length && Date.parse(pull.updated) < cutoff) pulls[number] = { ...pull, activity: [] };
   }
   const kept: Record<string, Cached> = {};
+  const openShas = new Set(Object.values(pulls).filter((pull) => pull.state === "open").map((pull) => pull.sha));
   for (const [path, entry] of Object.entries(cache)) {
+    const number = /\/(?:pulls|issues)\/(\d+)(?:\/|\?|$)/.exec(path)?.[1];
+    if (number && pulls[number] && pulls[number].state !== "open") continue;
+    const sha = /\/commits\/([^/]+)\//.exec(path)?.[1];
+    if (sha && !openShas.has(sha)) continue;
     if (entry.usedAt === undefined) kept[path] = { ...entry, usedAt: now };
     else if (entry.usedAt >= cutoff) kept[path] = entry;
   }
   return kept;
 };
 
+/**
+ * A repo poll cut short (its time budget spent or a request failed): the responses read so far, the snapshot it built,
+ * and the PRs it finished (their events already emitted). The next tick resumes from it, so a repo too slow for one
+ * budget still converges instead of repeating the same requests every tick. Kept in memory only: after a restart the
+ * poll starts over from the durable snapshot, and a re-emitted event carries the same id.
+ */
+type RepoProgress = { readonly cache: Readonly<Record<string, Cached>>; readonly pulls: Readonly<Record<string, Pull>>; readonly done: ReadonlySet<number> };
+
 export class GitHubEvents {
   private readonly path: string;
   private state: State;
+  private readonly partial = new Map<string, RepoProgress>();
   /** The store holding the poll state once the journal is on sqlite; github-events.json otherwise. */
   private readonly store?: SqliteStore;
 
@@ -259,21 +277,26 @@ export class GitHubEvents {
   }
 
   async tick(deps: FlowDeps, emit: Emit): Promise<void> {
-    const targets = await githubTargets(await deps.registry.open(), deps.run);
+    const targets = await githubTargets(await deps.registry.open(), deps.ops);
     // Re-read on every tick: machine repos can change without restarting supervise.
     for (const repo of new Repos(this.stateDir).list()) if (!targets.has(repo)) targets.set(repo, { numbers: new Set(), branches: new Set() });
+    let next = this.state;
     await Promise.all([...targets].map(async ([repo, lanes]) => {
+      const old = this.state.repos[repo];
+      const carried = this.partial.get(repo);
+      const api = new Api(deps.run, carried?.cache ?? old?.cache ?? {}, deps.config.githubTimeoutMs, deps.clock.now());
+      const pulls: Record<string, Pull> = { ...old?.pulls, ...carried?.pulls };
+      const done = new Set(carried?.done);
       try {
-        const old = this.state.repos[repo];
-        const api = new Api(deps.run, old?.cache ?? {}, deps.config.githubTimeoutMs, deps.clock.now());
         const self = text(object((await api.get("user")).body).login).toLowerCase();
         const owner = repo.split("/")[0];
-        const pulls: Record<string, Pull> = { ...old?.pulls };
         const rows = await api.pages(`repos/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`);
         for (const row of rows) {
           const summary = object(row);
           const number = summary.number;
           if (typeof number !== "number" || !Number.isInteger(number)) throw new GitHubError("invalid PR number");
+          // Finished by an earlier, cut-short tick and unchanged since: its events are out, so it is not read again.
+          if (done.has(number) && pulls[number]?.updated === text(summary.updated_at)) continue;
           const prior = old?.pulls[number];
           // Closed history is baselined cheaply; continue following previously open PRs through closure.
           const inspect = summary.state === "open" || prior?.state === "open" || Boolean(old && (!prior || prior.updated !== summary.updated_at));
@@ -335,24 +358,34 @@ export class GitHubEvents {
           }
           for (const event of events) emit(`github:${repo}#${number}:${event.identity}`, `GH_PR ${repo}#${number} ${event.kind} ${event.detail} ${current.url}`);
           pulls[number] = current;
+          done.add(number);
         }
         const issues = await this.issues(api, repo, old?.issues, deps.config.githubIssueAuthors, emit);
         // Only commit source progress after every durable enqueue has succeeded.
         // A successful poll also clears this repo's earlier failure marker in the same commit.
-        const { [repo]: _recovered, ...failures } = this.state.failures;
+        const { [repo]: _recovered, ...failures } = next.failures;
         const cache = retainHistory(pulls, api.cache, deps.clock.now());
-        this.commit({ ...this.state, failures: repo in this.state.failures ? failures : this.state.failures, repos: { ...this.state.repos, [repo]: { cache, pulls, issues } } });
+        next = { ...next, failures, repos: { ...next.repos, [repo]: { cache, pulls, issues } } };
+        this.partial.delete(repo);
       } catch (e) {
         if (!(e instanceof Error)) throw e;
+        // Keep what this tick read (conditional responses and finished PRs) for the next one instead of discarding it.
+        this.partial.set(repo, { cache: { ...api.cache }, pulls, done });
         const now = deps.clock.now();
         const last = this.state.failures[repo];
         if (last === undefined || now - last >= 15 * 60_000) {
-          emit(`github-error:${repo}:${now}`, `HOST_GITHUB ${repo} poll_failed ${e instanceof GitHubError ? e.message : e.name}`);
-          this.commit({ ...this.state, failures: { ...this.state.failures, [repo]: now } });
+          try {
+            emit(`github-error:${repo}:${now}`, `HOST_GITHUB ${repo} poll_failed ${e instanceof GitHubError ? e.message : e.name}`);
+            next = { ...next, failures: { ...next.failures, [repo]: now } };
+          } catch (failed) {
+            // One repo's failure line that cannot be queued must not fail the other repos' poll; it is retried next tick.
+            if (!(failed instanceof Error)) throw failed;
+            console.error(`GITHUB_ERROR ${repo} cannot queue its poll failure: ${failed.message}`);
+          }
         }
       }
     }));
-    this.commit({ ...this.state, polledAt: deps.clock.now() });
+    this.commit({ ...next, polledAt: deps.clock.now() });
   }
 
   /**

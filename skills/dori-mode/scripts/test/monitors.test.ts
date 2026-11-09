@@ -31,7 +31,7 @@ test("the host-guard filter wakes on alerts and clears, never on the ready line"
 });
 
 test("the freshness filter wakes only on a paused lane that is working; the rest goes to the log", () => {
-  const kinds = ["nudged", "posted", "no-report", "pending-report", "stale-report", "working-while-paused"];
+  const kinds = ["nudged", "working-while-paused"];
   expect(wakes("freshness", kinds.map((k) => `${k.toUpperCase()} lane-a detail`))).toEqual(["WORKING-WHILE-PAUSED lane-a detail"]);
 });
 

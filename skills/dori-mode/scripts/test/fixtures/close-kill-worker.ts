@@ -9,8 +9,10 @@ import { defaultConfig } from "../../src/config.ts";
 import { closeLane, type FlowDeps, watchTick } from "../../src/done-flow.ts";
 import { openOperations, type OperationStore } from "../../src/operations.ts";
 import { Registry } from "../../src/registry.ts";
+import type { LaneOps } from "../../src/lane-ops.ts";
 import type { Ran, Runner } from "../../src/run.ts";
-import { fakeClock, TEST_STORE } from "../fakes.ts";
+import { checkDone } from "../../src/signals.ts";
+import { fakeClock, fakeLaneOps, newWorld, TEST_STORE } from "../fakes.ts";
 
 const [stateDir = "", worldDir = "", killArg = "-1", mode = "watch"] = process.argv.slice(2);
 const killAt = Number(killArg);
@@ -27,30 +29,37 @@ const panes = (): { pane_id: string; workspace_id: string }[] => (JSON.parse(rea
 const repo = join(worldDir, "repo");
 const wtRoot = join(worldDir, "wt");
 
+// The lead host's own commands: only gh (the Done signal) runs here.
 const runner: Runner = async (argv) => {
   const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
-  const [cmd, a1, a2] = argv;
-  if (cmd === "gh") return ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "abc1234567890" } }));
-  if (cmd === "git" && argv.includes("worktree") && argv.includes("list")) {
-    const wts = existsSync(wtRoot) ? readdirSync(wtRoot) : [];
-    return ok([`worktree ${repo}\nbranch refs/heads/main`, ...wts.map((name) => `worktree ${join(wtRoot, name)}\nbranch refs/heads/${name}`)].join("\n\n"));
-  }
-  if (cmd === "git" && argv.includes("worktree") && argv.includes("remove")) {
-    const wt = argv.at(-1) ?? "";
-    rmSync(wt, { recursive: true, force: true });
-    effect(`worktree-remove ${wt}`);
-    return ok();
-  }
-  if (cmd === "git" && argv.includes("status")) return ok("");
-  if (cmd === "git" && argv.includes("rev-list")) return ok("0");
-  if (cmd === "herdr" && a1 === "pane" && a2 === "list") return ok(JSON.stringify({ result: { panes: panes() } }));
-  if (cmd === "herdr" && a1 === "pane" && a2 === "close") {
-    writeFileSync(worldFile, JSON.stringify({ panes: panes().filter((p) => p.pane_id !== argv[3]) }));
-    effect(`pane-close ${argv[3]}`);
-    return ok();
-  }
-  if (cmd === "herdr") return ok();
+  if (argv[0] === "gh") return ok(JSON.stringify({ state: "MERGED", mergeCommit: { oid: "abc1234567890" } }));
   return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` };
+};
+
+/** The lane's runner over the world directory: worktree facts and removals, the pane list and pane close are effects on disk. */
+const laneOps: LaneOps = {
+  ...fakeLaneOps(newWorld()),
+  panes: async () => panes(),
+  exists: async (_machine, paths) => paths.map((p) => existsSync(p)),
+  inspect: async (lane, want) => {
+    const cwd = (want.cwd ?? lane.cwd ?? repo).replace(/\/\.$/, "");
+    const wts = existsSync(wtRoot) ? readdirSync(wtRoot) : [];
+    const worktrees = [{ path: repo, branch: "main" }, ...wts.map((name) => ({ path: join(wtRoot, name), branch: name }))]
+      .map((w) => ({ ...w, dirty: false, ahead: 0, exists: true }));
+    const done = want.done !== undefined ? { cwd, fallback: false, checks: await checkDone(want.done, runner, { cwd }) } : undefined;
+    return { status: "idle", cwd, cwdExists: existsSync(cwd), ...(want.git ? { git: { toplevel: repo, branch: "main", worktrees } } : {}), ...(done ? { done } : {}) };
+  },
+  git: async (_lane, op) => {
+    if (op.op !== "worktree-remove") return { code: 1, out: "", err: `unexpected ${op.op}` };
+    rmSync(op.path, { recursive: true, force: true });
+    effect(`worktree-remove ${op.path}`);
+    return { code: 0, out: "", err: "" };
+  },
+  close: async (lane) => {
+    writeFileSync(worldFile, JSON.stringify({ panes: panes().filter((p) => p.pane_id !== lane.pane) }));
+    effect(`pane-close ${lane.pane}`);
+    return { closed: "pane", gone: true };
+  },
 };
 
 class StepRegistry extends Registry {
@@ -67,9 +76,10 @@ const operations: OperationStore = {
   get: (id) => inner.get(id),
   put: (op) => { inner.put(op); step(); },
   list: (filter) => inner.list(filter),
+  prune: (now) => inner.prune(now),
   close: () => inner.close(),
 };
-const deps: FlowDeps = { run: runner, clock: fakeClock(Date.parse("2026-01-01T12:00:00.000Z")), registry: new StepRegistry(stateDir), config, operations };
+const deps: FlowDeps = { run: runner, clock: fakeClock(Date.parse("2026-01-01T12:00:00.000Z")), registry: new StepRegistry(stateDir), config, operations, ops: laneOps };
 const lines: string[] = [];
 if (mode === "close") {
   const lane = await deps.registry.read("demo-lane");

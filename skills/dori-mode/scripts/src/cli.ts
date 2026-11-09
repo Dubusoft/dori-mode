@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { homedir, loadavg } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -8,19 +9,19 @@ import { configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
-import { callerLane, claimDone, closeLane, type FlowDeps, laneActRefusal, laneSendRefusal, objectDone, watchTick } from "./done-flow.ts";
+import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
-import { alertReasons, diskGuardPath, guardTick, sampleHost } from "./host-guard.ts";
-import { laneMemory, laneMemoryDetail, sampleProcs } from "./lane-memory.ts";
-import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
-import { adoptLane, doneRepos, type LaunchInput, launchLane, LaunchError, validateLaunch } from "./launch.ts";
+import { guardTick } from "./host-guard.ts";
+import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, type MachineKind, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
+import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, validateLaunch } from "./launch.ts";
+import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
-import { type Lane, LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
+import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
+import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { syncRegistry } from "./sync.ts";
-import { readToodoStart } from "./toodo-start.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
@@ -38,16 +39,96 @@ import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, recordHandled } from "./ack.ts";
-import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, unreadAfterAck } from "./inbox.ts";
+import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
-import { ackLaneMessage, LaneMessageError, openLaneMessages } from "./lane-messages.ts";
-import { isReportKind, laneGeneration, oneLine, openLaneReports, REPORT_KINDS, type ReportKind } from "./lane-reports.ts";
+import { LaneMessageError } from "./lane-messages.ts";
+import { oneLine, openLaneReports } from "./lane-reports.ts";
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { kst } from "./status.ts";
 import { updateInstall } from "./update.ts";
+import { refreshBootPrep } from "./boot-prep-install.ts";
+import { refreshLaneSandbox } from "./lane-sandbox-install.ts";
+import { laneOps, type LaneOps, LaneOpsError } from "./lane-ops.ts";
+import { type CliRunnerCall, cliRunnerCall, cliSocketPath } from "./runner/cli-relay.ts";
+import { RunnerUnavailable } from "./runner/call.ts";
+import { defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
+import { heavyDirOf, laneCliMain } from "./runner/lane-cli.ts";
+import { LANE_SOCKET } from "./runner/lane-socket.ts";
+import { readLaneIdentity } from "./runner/lane-identity.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
+import type { Connector, Transport } from "./runner/transport.ts";
+import { connectUnix } from "./runner/unix-transport.ts";
+
+/** How long the lane-mode check waits for the lane socket's whoami answer before it falls back to the runner's lane record. */
+const WHOAMI_TIMEOUT_MS = 500;
+
+/** The lane socket's whoami for `pane`; `answered` only when the runner replied ok (with or without a key). */
+const whoami = async (pane: string, socketPath: string, connect: Connector): Promise<{ answered: boolean; key: string | undefined }> => {
+  if (!existsSync(socketPath)) return { answered: false, key: undefined };
+  let link: Transport | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const reply = await new Promise<string | undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), WHOAMI_TIMEOUT_MS);
+      connect().then((opened) => {
+        link = opened;
+        opened.onLine(resolve);
+        opened.onClose(() => resolve(undefined));
+        opened.send(`${JSON.stringify({ kind: "whoami", pane })}\n`);
+      }, () => resolve(undefined));
+    });
+    const parsed = reply === undefined ? undefined : JSON.parse(reply) as { ok?: unknown; key?: unknown };
+    if (parsed?.ok !== true) return { answered: false, key: undefined };
+    return { answered: true, key: typeof parsed.key === "string" && parsed.key ? parsed.key : undefined };
+  } catch {
+    return { answered: false, key: undefined };
+  } finally {
+    clearTimeout(timer);
+    link?.close("whoami");
+  }
+};
+
+/**
+ * Lane mode (design 5, D11; gate B1): `DORI_LANE_KEY` names the lane; else the runner's lane socket is asked which lane
+ * holds `HERDR_PANE_ID` (`{kind:"whoami", pane}`), and when it names none (no socket, no answer within
+ * WHOAMI_TIMEOUT_MS, a failed reply, no key) the runner's own record `<runnerDir>/lanes.json` is read, so an adopted
+ * lane (no DORI_LANE_KEY) stays a lane while its runner is down. Lead mode only when neither maps the pane. A record
+ * that cannot be read while the socket did not answer exits 2 LANE_IDENTITY_UNKNOWN: a transport failure never grants
+ * lead authority. Reads nothing but the environment, the socket and lanes.json.
+ */
+const laneContext = async (env: Readonly<Record<string, string | undefined>>, runnerDir: string, socketPath: string, connect: Connector): Promise<string | undefined> => {
+  const named = env.DORI_LANE_KEY?.trim();
+  if (named) return named;
+  const pane = env.HERDR_PANE_ID?.trim();
+  if (!pane) return undefined;
+  const asked = await whoami(pane, socketPath, connect);
+  if (asked.key) return asked.key;
+  const recorded = readLaneIdentity(runnerDir, pane);
+  if (recorded.kind === "lane") return recorded.key;
+  if (recorded.kind === "unreadable" && !asked.answered) {
+    console.error(`LANE_IDENTITY_UNKNOWN pane ${pane}: the runner's lane socket did not answer and its lane record cannot be read (${recorded.detail}); dori will not run as the lead from a pane that may be a lane. Bring the runner back (its lane socket answers whoami) or repair the lane record.`);
+    process.exit(2);
+  }
+  return undefined;
+};
+
+// The lane-mode gate runs before anything else (help, setup, runner *, loadConfig): inside a lane dori takes only
+// report, claim-done, report ack, lane status and heavy, all over the runner's lane socket, and opens no registry,
+// store, journal, inbox or state-dir file.
+{
+  const laneRunnerDir = defaultRunnerDir();
+  const laneSocket = join(laneRunnerDir, RUNNER_PATHS.sock, LANE_SOCKET);
+  const laneKey = await laneContext(process.env, laneRunnerDir, laneSocket, connectUnix(laneSocket));
+  if (laneKey !== undefined) {
+    process.exit(await laneCliMain(process.argv.slice(2), {
+      env: process.env, laneKey, connect: connectUnix(laneSocket),
+      out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
+    }));
+  }
+}
 
 const USAGE = `dori <command> [options]
 
@@ -55,31 +136,53 @@ const USAGE = `dori <command> [options]
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
   setup  [--yes] [--token-file F] [--channel ID] [--autostart]   interactive install: token, channels, herdr, autostart (dori setup --help)
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
-  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
+  launch <key> --title T (--brief FILE | --from-message CHANNEL MESSAGE_ID ... [--note TEXT ...]) --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
+                [--from-message CHANNEL MESSAGE_ID]   repeatable, instead of --brief: the brief is "# <title>", "## Owner request" with those owner messages (latest edit) in order,
+                                       then "## Lead notes" with each --note as a bullet; written to <stateDir>/briefs/<key>.md; a deleted, visitor or unknown message exits 1
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
                 [--sandbox]   every local lane's agent runs in laneSandbox.command (a --machine or --pane lane, or a missing command, passes through with SANDBOX_SKIPPED); --sandbox wraps a --pane lane too, refused for --machine
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
-                [--toodo-start FILE-OR-JSON]   a Toodo task the lead started: run in the worktree and first shell pane of its start_task response
-                                       (no pane, or a stale one not found again in its herdr workspace: a new tab there, LAUNCH_FALLBACK <reason>)
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
-  claim-done [<key>] --evidence TEXT  key defaults to the lane registered for $HERDR_PANE_ID
+  claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
   object-done <key> --reason TEXT [--reason TEXT ...]
-  lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); key defaults as for claim-done
+  lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); inside a lane its own (from its runner), the lead names the lane
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
   close  <key> --cancelled --reason TEXT [--force]   lead-only: close a lane whose work was cancelled or whose Done can never hold;
                                        Done signals are not checked, the lane is recorded closed as cancelled with the reason
-                                       inside a lane (DORI_LANE_KEY or its pane) claim-done/close/pause/resume act on its own key only, send is lead-only (a lane asks with report <key> question), and a session replaced by recovery may not claim-done or report
+                                       inside a lane (DORI_LANE_KEY, or a pane its runner knows) dori takes only report, claim-done, report ack,
+                                       lane status and heavy (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
+                                       supervisor (RUNNER_UNAVAILABLE, exit 2, while it is down)
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
+  runner serve [--label LABEL] [--enroll] [--listen HOST:PORT]
+                                       a worker listens on its private address; the local runner connects over
+                                       ~/.dori/runner/sock/control; signed handshake, heartbeats, reports lane
+                                       observations; commands are checked against ~/.dori/runner/runner-config.json;
+                                       --enroll reads code= and fingerprint= lines on stdin first; --enroll-only enrolls and exits
+  runner install TARGET [--label LABEL] | --machine LABEL
+                                       install or upgrade the runner on a Linux worker over ssh (bundle, unit, linger, enrollment
+                                       through ssh stdin/stdout); listens on the worker's private IP, port 7411.
+                                       TARGET is user@ip, ip or user@host; LABEL defaults to a slug of the host (100.64.1.2 -> 100-64-1-2)
+                                       and the machine is remembered in <stateDir>/runner-machines.json
+  runner remove LABEL                  stop and delete the runner on that worker over ssh, revoke its key and forget its endpoint (RUNNER_REMOVED)
+  runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
+  runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
+  runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
+  runner rotate LABEL                  have the connected runner switch to a new key; prints the new key fingerprint
+  runner reset-gen LABEL               forget the runner's highest gen (after restoring its state from a backup)
+  runner herdr start|restart|stop|status --machine LABEL [--yes]
+                                       the machine's herdr through its runner (proto 4; LABEL local is the lead host);
+                                       restart and stop end every lane pane there: they list the open lanes and need --yes;
+                                       stop keeps herdr down (the runner does not start it again) until start
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
@@ -114,8 +217,8 @@ const USAGE = `dori <command> [options]
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
-                                       a lane's structured report (own key only): one row the supervisor routes
-  report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up)
+                                       inside a lane: its structured report (own key only), sent through its runner to the supervisor
+  report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up, done-claim notice, objection)
   inbox take [--max-bytes N] [--peek]  the lead's read path: delivered events past the take cursor as id<TAB>line, whole lines
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
   reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT]
@@ -130,19 +233,37 @@ const USAGE = `dori <command> [options]
                                        hourglass off, eyes on; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
                                        link what handled an owner message
-  send discord --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON]
-                                       post or edit a Discord message (token from DORI_DISCORD_TOKEN)
-  thread discord --to CHANNEL [--message ID] --name NAME
+  send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
+                                       post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN). A new post is refused with
+                                       SEND_STALE <n> (the unseen owner events follow, exit 3) when the destination got owner messages
+                                       you have not taken, acked or seen in an ack preview; merge them and resend. --force skips the
+                                       check; --edit is never checked
+  thread [discord] --to CHANNEL [--message ID] --name NAME
                                        start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
                                        prints THREAD discord:<channel>/<thread>
-  typing discord <channel>             show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
-  presence discord                     keep the bot shown as online until stopped
+  typing [discord] <channel>           show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
+  presence [discord]                   keep the bot shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text`;
 
 const die = (message: string, code = 1): never => {
   console.error(message);
   process.exit(code);
 };
+
+const helpCommand = process.argv[2] ?? "";
+if (helpCommand !== "setup" && process.argv.slice(3).some((arg) => arg === "--help" || arg === "-h")) {
+  const lines = USAGE.split("\n");
+  const start = lines.findIndex((line) => {
+    const prefix = `  ${helpCommand}`;
+    return helpCommand !== "" && line.startsWith(prefix) && /\s/.test(line[prefix.length] ?? "");
+  });
+  if (start >= 0) {
+    let end = start + 1;
+    while (end < lines.length && !/^  \S/.test(lines[end] ?? "")) end++;
+    console.log(lines.slice(start, end).join("\n").trimEnd());
+    process.exit(0);
+  }
+}
 
 if (process.argv[2] === "setup") {
   const { setupMain } = await import("./setup-cli.ts");
@@ -159,14 +280,297 @@ if (process.argv[2] === "status") {
   const { collectStatus, statusPage } = await import("./status.ts");
   const cfg = await loadConfig();
   setDefaultRunTimeout(cfg.runTimeoutMs);
-  const status = await collectStatus({ run, clock: realClock, config: cfg, registry: new Registry(cfg.stateDir) });
+  const status = await collectStatus({ run, clock: realClock, config: cfg, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
   console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
   process.exit(0);
 }
 
+/**
+ * `dori update`'s runner rollout: each worker runner gets the new bundle through `dori runner install`'s path, one at
+ * a time, each confirmed by a hello with a higher gen within 2 minutes. The local runner is the supervisor's child, so
+ * the supervisor restart that `dori update` already did restarted it on the updated checkout. A runner that already
+ * reports this checkout's version is skipped. Returns 1 when one failed (the rest were not touched), else 0.
+ */
+const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
+  const { readRunnerRows } = await import("./runner/hub.ts");
+  const { staleRunnerLabels, upgradeRunners } = await import("./runner/upgrade.ts");
+  const { gitVersion } = await import("./runner/version.ts");
+  const { buildBundle, installRunner } = await import("./runner/install.ts");
+  const { runnerListenAddress } = await import("./runner/endpoints.ts");
+  const { SupervisorAuth } = await import("./runner/auth.ts");
+  const rows = readRunnerRows(cfg.stateDir);
+  const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
+  const machines = await listGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+  let bundle: string | undefined;
+  const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+  const before = new Map(rows.map((r) => [r.label, r.maxGen]));
+  try {
+    const result = await upgradeRunners({
+      labels: staleRunnerLabels(rows, LOCAL_RUNNER, await gitVersion(run, import.meta.dir)),
+      install: async (label) => {
+        const machine = machines.find((m) => m.label === label);
+        if (!machine) return { ok: false, detail: `no machine ${label}` };
+        bundle ??= await buildBundle(run)();
+        const done = await installRunner({ run, bundle: async () => bundle as string }, {
+          machine, label, listenAddress: await runnerListenAddress(machine.target), stateDir: cfg.stateDir,
+          agentCommand: cfg.agentCommand,
+          issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
+          enroll: (body) => auth.enroll(body),
+        });
+        return done.ok ? { ok: true, version: done.version } : { ok: false, detail: `${done.code} ${done.detail}` };
+      },
+      confirm: async (label) => {
+        for (const until = realClock.now() + 120_000; realClock.now() < until; await realClock.sleep(2_000)) {
+          if (genOf(label) > (before.get(label) ?? 0)) return true;
+        }
+        return false;
+      },
+      log: (line) => console.log(line),
+    });
+    return result.failed ? 1 : 0;
+  } finally {
+    auth.close();
+  }
+};
+
+if (process.argv[2] === "runner") {
+  // serve and probe run on runner hosts and live in runner/main.ts, which the worker bundle (runner/bin.ts) also runs.
+  if (process.argv[3] === "serve" || process.argv[3] === "probe") {
+    const { runnerHostMain } = await import("./runner/main.ts");
+    process.exit(await runnerHostMain(process.argv.slice(3)));
+  }
+  // enroll, install, revoke, rotate, reset-gen and upgrade run on the supervisor host against <stateDir>.
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) | remove LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
+  const parsed = parseArgs({
+    args: process.argv.slice(3), allowPositionals: true,
+    options: { machine: { type: "string" }, label: { type: "string" }, yes: { type: "boolean" } },
+  });
+  const [sub = "", target, ...extra] = parsed.positionals;
+  if (extra.length) die(usage);
+  const { LABEL_PATTERN } = await import("./runner/protocol.ts");
+  const labelArg = (value: string | undefined): string => {
+    if (!value || !LABEL_PATTERN.test(value)) die(usage);
+    return value as string;
+  };
+  if (parsed.values.yes && sub !== "herdr") die(usage);
+  if (parsed.values.label !== undefined && sub !== "install") die(usage);
+  if (sub === "herdr") {
+    const label = labelArg(parsed.values.machine);
+    const cfg = await loadConfig();
+    const { readRunnerRows } = await import("./runner/hub.ts");
+    const { runnerHerdrMain } = await import("./runner/herdr-cli.ts");
+    process.exit(await runnerHerdrMain({ action: target, machine: label, yes: parsed.values.yes === true }, {
+      calls: cliRunnerCall(cliSocketPath(defaultRunnerDir())),
+      rows: () => readRunnerRows(cfg.stateDir),
+      lanes: async () => (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed"),
+      out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
+    }));
+  }
+  if (sub === "upgrade") {
+    if (target !== undefined || parsed.values.machine !== undefined) die(usage);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    process.exit(await upgradeRunnersNow(cfg));
+  }
+  if (sub === "enroll") {
+    // The code and fingerprint go to stdout only: the installer pipes them into the runner's stdin over ssh.
+    const label = labelArg(parsed.values.machine);
+    if (target !== undefined) die(usage);
+    const cfg = await loadConfig();
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      const issued = auth.issueCode(label);
+      process.stdout.write(`code=${issued.code}\nfingerprint=${auth.fingerprint}\n`);
+      process.stderr.write(`RUNNER_ENROLL_CODE runner=${label} expiresAt=${new Date(issued.expiresAt).toISOString()}\n`);
+    } finally {
+      auth.close();
+    }
+    process.exit(0);
+  }
+  if (sub === "install") {
+    // Exactly one of a positional ssh target (user@ip, ip, user@host) or --machine LABEL.
+    if ((target === undefined) === (parsed.values.machine === undefined)) die(usage);
+    if (parsed.values.machine !== undefined && parsed.values.label !== undefined) die(usage);
+    const { labelFromHost, parseInstallTarget, writeRunnerMachine } = await import("./runner/machines.ts");
+    let direct: { label: string; target: string } | undefined;
+    if (target !== undefined) {
+      try {
+        const parsedTarget = parseInstallTarget(target);
+        direct = { label: parsed.values.label === undefined ? labelFromHost(parsedTarget.host) : labelArg(parsed.values.label), target: parsedTarget.target };
+      } catch (e) {
+        die(`${e instanceof Error ? e.message : String(e)}\n${usage}`);
+      }
+    }
+    const label = direct?.label ?? labelArg(parsed.values.machine);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    const { readGuardMachines } = await import("./remote-guard.ts");
+    const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+    const machine = direct ?? machines.machines.find((m) => m.label === label)
+      ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const { buildBundle, herdrInstallNote, installRunner } = await import("./runner/install.ts");
+    const { runnerListenAddress } = await import("./runner/endpoints.ts");
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      // The code is issued in this process and handed to the installer as data; it never enters an argv.
+      const result = await installRunner({ run, bundle: buildBundle(run) }, {
+        machine, label, listenAddress: await runnerListenAddress(machine.target), stateDir: cfg.stateDir,
+        agentCommand: cfg.agentCommand,
+        issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
+        enroll: (body) => auth.enroll(body),
+      });
+      if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+      if (direct) writeRunnerMachine(cfg.stateDir, direct.label, direct.target);
+      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${herdrInstallNote(result.ok ? result.herdr : undefined)}`);
+    } finally {
+      auth.close();
+    }
+    process.exit(0);
+  }
+  if (sub === "remove") {
+    if (parsed.values.machine !== undefined) die(usage);
+    const label = labelArg(target);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    const { readGuardMachines } = await import("./remote-guard.ts");
+    const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+    const { hasLocalRunnerState, planRemove, removeRunner } = await import("./runner/remove.ts");
+    // A label dropped from herdr and config but still known locally (keys, hub row, endpoint) is cleaned up here only.
+    const plan = planRemove(machines, label, hasLocalRunnerState(cfg.stateDir, label));
+    if (plan.kind === "unknown") die(`RUNNER_UNKNOWN_MACHINE ${label}${plan.detail === undefined ? "" : `: ${plan.detail}`}`);
+    const { runnerOf } = await import("./lane-ops.ts");
+    const busy = (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed" && runnerOf(lane) === label);
+    if (busy.length) die(`RUNNER_REMOVE_BUSY runner=${label} open lanes: ${busy.map((lane) => lane.key).join(",")}; close them or run dori runner evacuate ${label} first`);
+    if (plan.kind === "remote") {
+      const result = await removeRunner({ run }, { machine: plan.machine, label });
+      if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+    }
+    // Only after the worker is clean: the key, a live supervisor's link, the endpoint and the remembered machine go.
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const { queueRunnerAdmin } = await import("./runner/serve.ts");
+    const { removeRunnerEndpoint } = await import("./runner/endpoints.ts");
+    const { removeRunnerMachine } = await import("./runner/machines.ts");
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      auth.revoke(label);
+    } finally {
+      auth.close();
+    }
+    queueRunnerAdmin(cfg.stateDir, "revoke", label, realClock.now());
+    removeRunnerEndpoint(cfg.stateDir, label);
+    removeRunnerMachine(cfg.stateDir, label);
+    const { forgetRunner } = await import("./runner/hub.ts");
+    forgetRunner(cfg.stateDir, label);
+    console.log(`RUNNER_REMOVED runner=${label}${plan.kind === "local" ? " local-only (no saved machine; the worker was not touched)" : ""}`);
+    process.exit(0);
+  }
+  if (sub === "evacuate") {
+    const label = labelArg(target);
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    const { machineKind, readGuardMachines, sshArgv } = await import("./remote-guard.ts");
+    const { openLaneReports } = await import("./lane-reports.ts");
+    const { evacuate } = await import("./runner/evacuate.ts");
+    const machine = (await readGuardMachines(run, cfg.guardMachines, cfg.stateDir)).machines.find((m) => m.label === label);
+    if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}`);
+    const sshTarget = (machine as NonNullable<typeof machine>).target;
+    // The worker's commands take the form of its kind (POSIX sh or Windows PowerShell); found once, on first use.
+    let kind: Promise<MachineKind> | undefined;
+    const kindOf = (): Promise<MachineKind> => (kind ??= machineKind(run, machine as NonNullable<typeof machine>).then((k) => {
+      if (!k.ok) throw new Error(`machine kind: ${k.detail}`);
+      return k.kind;
+    }));
+    const store = openLaneReports(cfg);
+    // The notice goes through the runner being evacuated (D9), so it is sent before the runner is stopped.
+    const ops = laneOps(cliRunnerCall(cliSocketPath(defaultRunnerDir())), { now: realClock.now, log: (line) => { console.error(line); } });
+    try {
+      const lines = await evacuate({
+        hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined },
+        exportOutbox: async () => {
+          const r = await run(sshArgv(sshTarget, remoteRunnerCli("runner export-outbox", await kindOf())), { timeoutMs: 30_000 });
+          if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);
+          return JSON.parse(r.out.trim().split("\n").at(-1) ?? "[]");
+        },
+        tellLane: async (lane, text) => (await ops.send(lane, text)) !== "failed",
+        stopRunner: async () => {
+          const r = await run(sshArgv(sshTarget, remoteRunnerService("stop", await kindOf())), { timeoutMs: 30_000 });
+          return { ok: r.code === 0, detail: (r.err || r.out).trim().split("\n").at(-1) || `exit ${r.code}` };
+        },
+      }, label);
+      for (const line of lines) console.log(line);
+    } finally {
+      store.close();
+    }
+    process.exit(0);
+  }
+  if (sub === "revoke" || sub === "rotate" || sub === "reset-gen") {
+    const label = labelArg(target);
+    const cfg = await loadConfig();
+    if (sub === "reset-gen") {
+      const { resetRunnerGen } = await import("./runner/hub.ts");
+      if (!resetRunnerGen(cfg.stateDir, label)) die(`RUNNER_UNKNOWN ${label}`);
+      console.log(`RUNNER_GEN_RESET runner=${label}`);
+      process.exit(0);
+    }
+    const { SupervisorAuth } = await import("./runner/auth.ts");
+    const { queueRunnerAdmin, runnerAdminResult } = await import("./runner/serve.ts");
+    // The supervisor's runners task answers queued requests every few seconds.
+    const waitFor = async <T>(read: () => T | undefined, ms: number): Promise<T | undefined> => {
+      for (const until = realClock.now() + ms; realClock.now() < until; await realClock.sleep(500)) {
+        const value = read();
+        if (value !== undefined) return value;
+      }
+      return read();
+    };
+    const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
+    try {
+      if (sub === "revoke") {
+        // The key is deleted here at once, so later hellos are refused even with the supervisor down; the live link
+        // closes when the supervisor takes the request.
+        if (!auth.revoke(label)) die(`RUNNER_UNKNOWN ${label} is not enrolled`);
+        const id = queueRunnerAdmin(cfg.stateDir, "revoke", label, realClock.now());
+        const result = await waitFor(() => runnerAdminResult(cfg.stateDir, id), 15_000);
+        console.log(`RUNNER_REVOKED runner=${label} link=${result ?? "pending (supervisor has not answered)"}`);
+        process.exit(0);
+      }
+      const before = auth.key(label);
+      if (!before?.pubKey) die(`RUNNER_UNKNOWN ${label} is not enrolled`);
+      const id = queueRunnerAdmin(cfg.stateDir, "rotate", label, realClock.now());
+      const result = await waitFor(() => runnerAdminResult(cfg.stateDir, id), 15_000);
+      if (!result?.startsWith("sent ")) die(`RUNNER_ROTATE_FAILED runner=${label} ${result ?? "the supervisor did not answer"}`);
+      const rotated = await waitFor(() => {
+        const row = auth.key(label);
+        return row?.pubKey && row.pubKey !== before?.pubKey ? row.pubKey : undefined;
+      }, 15_000);
+      if (!rotated) die(`RUNNER_ROTATE_PENDING runner=${label} ${result} (the runner has not answered yet)`);
+      const { fingerprint } = await import("./runner/auth.ts");
+      console.log(`RUNNER_KEY_ROTATED runner=${label} key=${fingerprint(rotated as string)}`);
+      process.exit(0);
+    } finally {
+      auth.close();
+    }
+  }
+  die(usage);
+}
+
 const config = await loadConfig();
 setDefaultRunTimeout(config.runTimeoutMs);
-const deps: FlowDeps = { run, clock: realClock, registry: new Registry(config.stateDir), config };
+// Lane operations go through the supervisor's CLI relay; built on first use, so commands that touch no lane never connect.
+let cliCall: CliRunnerCall | undefined;
+const relay = (): CliRunnerCall => (cliCall ??= cliRunnerCall(cliSocketPath(defaultRunnerDir())));
+let cliOps: LaneOps | undefined;
+const deps: FlowDeps = {
+  run, clock: realClock, registry: new Registry(config.stateDir), config,
+  get ops(): LaneOps { return cliOps ??= laneOps(relay(), { now: realClock.now, log: (line) => { console.error(line); } }); },
+};
+
+/** RUNNER_UNAVAILABLE (exit 2) at once when the supervisor's CLI relay does not answer: every lane operation needs it (D7). */
+const needSupervisor = async (): Promise<void> => {
+  try { await relay().refresh(LOCAL_RUNNER); }
+  catch (e) { if (e instanceof RunnerUnavailable) die(e.message, 2); throw e; }
+};
 const [command = "", ...rest] = process.argv.slice(2);
 
 const flags = parseArgs({
@@ -175,7 +579,7 @@ const flags = parseArgs({
   strict: false,
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, "toodo-start": { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
+    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
@@ -202,46 +606,12 @@ const commandArgv = (command: string | undefined): unknown => {
   try { return JSON.parse(command) as unknown; } catch { return die("--command starting with [ must be a JSON argv array"); }
 };
 
-/** Lane permission isolation: inside a lane, a lane command may name only that lane (and defaults to it); the lead may name any. */
-const ownKey = async (command: string, k: string | undefined): Promise<string | undefined> => {
-  const caller = await callerLane(deps);
-  const refusal = k === undefined ? undefined : laneActRefusal(caller, command, k);
-  return refusal ? die(refusal) : (k ?? caller);
-};
+// Lead mode from here on: lane mode (DORI_LANE_KEY, or a pane its runner knows) was handled before loadConfig, so every
+// command below runs for the lead and may name any lane.
 
-/** Lead-only commands: a lane (DORI_LANE_KEY or its pane) may not run them. */
-const LEAD_ONLY = new Set(["ack", "handled", "typing", "reported", "resolved", "inbox", "launch", "adopt", "hold", "lead-restart", "update", "store", "ops", "source", "schedule", "send", "thread"]);
-if (LEAD_ONLY.has(command)) {
-  const caller = await callerLane(deps);
-  if (caller !== undefined) die(command === "send" ? laneSendRefusal(caller) ?? "" : `LANE_PERMISSION_DENIED lane ${caller} may not run ${command}; it is lead-only`);
-}
-if (command === "guard" && flags.positionals[0] === "install") {
-  const caller = await callerLane(deps);
-  if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run guard install; it is lead-only`);
-}
-
-/**
- * Why the calling process may not report as lane `lane` (claim-done, report), or undefined when it may. Ownership
- * fencing on the CLI side: a lane's active session is the one in its registered pane, so a session replaced by
- * recovery (still alive in the old pane, DORI_LANE_KEY unchanged) cannot claim or report for the lane that replaced it.
- * The lead (no caller lane) and a process with no pane id are not fenced.
- */
-const staleLaneRefusal = (caller: string | undefined, lane: Lane, env: Readonly<Record<string, string | undefined>> = process.env): string | undefined => {
-  const pane = env.HERDR_PANE_ID?.trim();
-  if (caller === undefined || caller !== lane.key || !pane || !lane.pane || pane === lane.pane) return undefined;
-  return `LANE_STALE_SESSION lane ${lane.key} is now owned by pane ${lane.pane}; this session (pane ${pane}) was replaced and may not report for it`;
-};
-
-/** `lane(k)` for a command that reports as the lane (claim-done, report): a session replaced by recovery is refused. */
-const activeLane = async (command: string, k: string | undefined) => {
-  const found = await lane(await ownKey(command, k));
-  const stale = staleLaneRefusal(await callerLane(deps), found);
-  return stale ? die(stale) : found;
-};
-
-const lane = async (k: string | undefined) => {
-  const found = k ? await deps.registry.read(k) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? "", opt("machine"));
-  if (!found) return die(k ? `no registered lane "${k}"` : "no open lane is registered for this pane");
+const lane = async (k: string) => {
+  const found = await deps.registry.read(k);
+  if (!found) return die(`no registered lane "${k}"`);
   if (statusOf(found) === "closed") return die(`lane ${found.key} is already closed`);
   return found;
 };
@@ -280,6 +650,7 @@ try {
     case "recover": {
       if (flags.positionals.length > 1 || Object.keys(flags.values).length) die("usage: dori recover [key]");
       if (key && !(await deps.registry.read(key))) die(`no registered lane "${key}"`);
+      await needSupervisor();
       for (const line of await recoverLanes(deps, key)) console.log(line);
       break;
     }
@@ -314,7 +685,12 @@ try {
       }
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
-        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines), await readGuardAgentScripts(), (line) => console.log(line)),
+        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines, config.stateDir), await readGuardAgentScripts(), (line) => console.log(line)),
+        // A fresh process: this one still holds the modules it loaded before the pull, which the pulled runner code may not
+        // be able to import from (a missing export throws).
+        upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
+        refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
+        refreshBootPrep: () => refreshBootPrep(homedir()),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
       process.exit(code);
@@ -449,6 +825,9 @@ try {
       const stop = () => controller.abort();
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
+      // dori update runs the code it started with, so the supervisor it restarts installs the new checkout's sandbox.
+      try { const line = refreshLaneSandbox(homedir()); if (line) console.log(line); }
+      catch (e) { console.error(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
       try { await supervise(deps, controller.signal); }
       finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
       break;
@@ -465,16 +844,24 @@ try {
       if (flags.values["no-sandbox"]) console.error("LAUNCH_NO_SANDBOX_REMOVED --no-sandbox was removed and is ignored: every local lane runs in the sandbox");
       if (flags.values.sandbox && !config.laneSandbox) die("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
       const sandbox = flags.values.sandbox ? (true as const) : undefined;
-      const toodoArg = opt("toodo-start");
-      if (toodoArg !== undefined && (opt("cwd") || opt("pane") || opt("workspace"))) die("--toodo-start takes the directory and pane from the start_task response; drop --cwd, --pane and --workspace");
-      const toodo = toodoArg === undefined ? undefined : await readToodoStart(toodoArg).catch((error: unknown) => die(error instanceof Error ? error.message : String(error)));
-      const input: LaunchInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: toodo ? toodo.worktreePath : opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), ...(toodo ? { toodo } : {}), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
+      if (flags.values["toodo-start"] !== undefined) die("LAUNCH_TOODO_START_REMOVED --toodo-start was removed: launch the lane with --cwd like any other and record the task in Toodo yourself over MCP");
+      const fromArgs = (() => { try { return launchBriefArgs(rest); } catch (e) { return die(e instanceof Error ? e.message : String(e)); } })();
+      const fromMessage = fromArgs.refs.length > 0;
+      if (fromMessage === (flags.values.brief !== undefined)) die("launch needs exactly one of --brief FILE or --from-message <channel> <messageId> (repeatable)");
+      if (!fromMessage && fromArgs.notes.length) die("--note goes with --from-message; with --brief put lead notes in the brief file");
+      const title = need("title");
+      const generated = fromMessage ? (() => {
+        try {
+          return { path: generatedBriefPath(config.stateDir, key ?? ""), text: assembleBrief(title, fromArgs.refs.map((ref) => ownerMessageText(config.stateDir, ref)), fromArgs.notes) };
+        } catch (e) { return die(e instanceof Error ? e.message : String(e)); }
+      })() : undefined;
+      const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
-      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(run, config, machine));
+      if (generated) writeGeneratedBrief(generated.path, generated.text);
+      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine));
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
       const machine = target === LOCAL_MACHINE ? undefined : target;
-      if (!machine && toodo?.worktreePath && !existsSync(toodo.worktreePath)) die(`start_task's worktree ${toodo.worktreePath} is not on this host; for a task on a remote workspace pass --machine <its herdr machine>`);
       if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
       if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
@@ -493,6 +880,7 @@ try {
       for (const note of r.notes) console.log(note);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
+      const next = launchNextLine(r.lane.key, r.startup); if (next) console.log(next);
       process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
     }
     case "hold": {
@@ -505,11 +893,14 @@ try {
     }
     case "adopt": {
       if (opt("mode") !== undefined) die("--mode applies to launch only");
-      const l = await adoptLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) });
+      const adoptInput = { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), pane: need("pane"), machine: opt("machine"), cwd: opt("cwd"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]) };
+      await needSupervisor();
+      const l = await adoptLane(deps, { ...adoptInput, thread: await laneThreadRef(opt("thread"), config.discordChannels) });
       console.log(`ADOPTED ${l.key} pane=${l.pane} thread=${l.thread}`);
       break;
     }
     case "sync": {
+      await needSupervisor();
       const r = await syncRegistry(deps, Boolean(flags.values.write));
       if (flags.values.full) {
         console.log("key | thread | pane | session | status");
@@ -525,22 +916,27 @@ try {
       console.log(flags.values.write ? "WROTE session ids" : "READ_ONLY");
       break;
     }
-    case "claim-done":
-      console.log(await claimDone(deps, await activeLane("claim-done", key), need("evidence")));
+    case "claim-done": {
+      // Inside a lane claim-done is lane mode's (a done report over the lane socket); the lead names the lane.
+      const target = await lane(key ?? die("claim-done needs a lane key"));
+      const evidence = need("evidence");
+      await needSupervisor();
+      console.log(await claimDone(deps, target, evidence));
       break;
+    }
     case "lane": {
       const [action, laneKey, ...extra] = flags.positionals;
-      if (action !== "status" || extra.length || Object.keys(flags.values).length) die("usage: dori lane status [<key>]");
-      const own = await ownKey("read the status of", laneKey);
-      const found = (own ? await deps.registry.read(own) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? ""))
-        ?? die(own ? `no registered lane "${own}"` : "no open lane is registered for this pane");
+      if (action !== "status" || !laneKey || extra.length || Object.keys(flags.values).length) die("usage: dori lane status <key> (inside a lane: dori lane status)");
+      const found = (await deps.registry.read(laneKey ?? "")) ?? die(`no registered lane "${laneKey}"`);
       console.log(JSON.stringify({ key: found.key, status: statusOf(found), objection: found.objection ?? null, claim: found.claim ?? null }, null, 2));
       break;
     }
     case "object-done": {
       const reasons = (flags.values.reason as string[] | undefined)?.map((r) => r.trim()).filter(Boolean) ?? [];
       if (!reasons.length) die("--reason is required");
-      console.log(await objectDone(deps, await lane(await ownKey("object-done", key ?? die("object-done needs a lane key"))), reasons));
+      const target = await lane(key ?? die("object-done needs a lane key"));
+      await needSupervisor();
+      console.log(await objectDone(deps, target, reasons));
       break;
     }
     case "ops": {
@@ -569,22 +965,27 @@ try {
     }
     case "close": {
       let cancelled: { reason: string } | undefined;
+      if (!flags.values.cancelled && flags.values.reason !== undefined) {
+        die("--reason goes with --cancelled: dori close <key> --cancelled --reason TEXT");
+      }
       if (flags.values.cancelled) {
-        const caller = await callerLane(deps);
-        if (caller !== undefined) die(`LANE_PERMISSION_DENIED lane ${caller} may not run close --cancelled; it is lead-only`);
         const reasons = (Array.isArray(flags.values.reason) ? flags.values.reason : []).filter((r): r is string => typeof r === "string" && r.trim() !== "");
         if (!reasons.length) die("usage: dori close <key> --cancelled --reason TEXT [--force]");
         cancelled = { reason: reasons.map((r) => r.trim()).join("; ") };
       }
       const note = opt("note") ?? (cancelled ? `cancelled: ${cancelled.reason}` : "closed by the lead");
-      const r = await closeLane(deps, await lane(await ownKey("close", key ?? die("close needs a lane key"))), note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
+      const target = await lane(key ?? die("close needs a lane key"));
+      await needSupervisor();
+      const r = await closeLane(deps, target, note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
       for (const line of r.lines) console.log(line);
       process.exit(r.closed ? 0 : 2);
     }
     case "pause":
     case "resume": {
       const act = command === "pause" ? pauseLane : resumeLane;
-      const r = await act(deps, await lane(await ownKey(command, key ?? die(`${command} needs a lane key`))), opt("note") ?? `${command}d by the lead`);
+      const target = await lane(key ?? die(`${command} needs a lane key`));
+      await needSupervisor();
+      const r = await act(deps, target, opt("note") ?? `${command}d by the lead`);
       for (const line of r.lines) console.log(line);
       process.exit(r.code);
     }
@@ -602,25 +1003,28 @@ try {
       }
     }
     case "freshness":
+      // A one-shot run fails closed with the supervisor down; a loop warns per pass and retries (D7).
+      if (loopMin <= 0) await needSupervisor();
       await every(loopMin, async () => {
         const reports = openLaneReports(deps.config);
         try {
-          for (const a of await freshnessTick(deps, process.env.HOME ?? "", undefined, reports)) console.log(`${a.kind.toUpperCase()} ${a.lane} ${a.detail}`);
+          for (const a of await freshnessTick(deps, undefined, reports)) console.log(`${a.kind.toUpperCase()} ${a.lane} ${a.detail}`);
         } finally { reports.close(); }
       });
       break;
     case "dead-panes": {
       const seen = new Set<string>();
       const paneState = newDeadPaneState();
+      if (loopMin <= 0) await needSupervisor();
       await every(loopMin, async () => {
-        for (const line of await deadPaneTick(run, config, seen, new Date().toISOString().slice(0, 13), paneState, await deps.registry.open())) console.log(line);
+        for (const line of await deadPaneTick(deps.ops, config, seen, new Date().toISOString().slice(0, 13), paneState, await deps.registry.open())) console.log(line);
       });
       break;
     }
     case "guard": {
       if (key === "machines" || key === "install") {
         if (flags.positionals.length > 1 || (key === "machines" && opt("machine") !== undefined)) die("usage: dori guard machines | dori guard install [--machine LABEL]", 2);
-        const listed = await listGuardMachines(run, config.guardMachines);
+        const listed = await listGuardMachines(run, config.guardMachines, config.stateDir);
         if (key === "machines") {
           const want = guardAgentWants(await readGuardAgentScripts());
           const results = await Promise.all(listed.map(async (m) => ({ m, r: await sampleMachine(run, m) })));
@@ -646,12 +1050,14 @@ try {
         if (outcomes.includes(false)) process.exitCode = 1;
         break;
       }
+      // The lead host's load, memory, disk and pane count as the local runner samples them (q.machine.observe); the
+      // lanes-by-memory detail is the supervisor's (from guard.sample), not this loop's.
       const state = { alerting: false };
+      if (loopMin <= 0) await needSupervisor();
       console.log("HOST_GUARD_READY");
       await every(loopMin, async () => {
-        const sample = await sampleHost(run, diskGuardPath(config));
-        const detail = !state.alerting && alertReasons(sample, config.guard).length ? laneMemoryDetail(laneMemory(await sampleProcs(run))) : undefined;
-        for (const line of guardTick(sample, config.guard, state, detail)) console.log(line);
+        const observed = await deps.ops.observeMachine();
+        for (const line of guardTick(observed.sample, config.guard, state)) console.log(line);
       });
       break;
     }
@@ -660,8 +1066,9 @@ try {
       const label = rest[0];
       const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
       if (!label || label === "--" || !cmd.length) die("usage: dori heavy <label> -- <command ...>");
-      const load = async () => (await sampleHost(run, diskGuardPath(config))).load1;
-      const slot = await acquireSlot({ dir: `${config.stateDir}/heavy`, slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
+      // One slot directory per host (D17), shared with the lanes' `dori heavy` and the supervisor's scheduled heavy jobs.
+      const load = async () => loadavg()[0] ?? 0;
+      const slot = await acquireSlot({ dir: heavyDirOf(), slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
       try {
         const child = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit", stdin: "inherit" });
         process.exitCode = await child.exited;
@@ -671,11 +1078,11 @@ try {
       break;
     }
     case "can-launch": {
-      const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines) : [];
+      const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines, config.stateDir) : [];
       const machines = flags.values.all
         ? [LOCAL_MACHINE, ...listed.map((m) => m.label)]
         : [resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement).machine];
-      const checks = await Promise.all(machines.map((m) => checkMachine(run, config, m, flags.values.all ? { listMachines: async () => listed } : {})));
+      const checks = await Promise.all(machines.map((m) => checkMachine(deps.ops, config, m)));
       const at = Date.now();
       for (const c of checks) {
         recordLaunchVerdict(config.stateDir, c.verdict, at, c.machine);
@@ -721,7 +1128,7 @@ try {
         const { takeDecisionReminders } = await import("./decision-obligations.ts");
         const lines = takeOutput(result);
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
-        const reminders = [...takeCarriedReminders(config.stateDir), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
+        const reminders = [...takeCarriedReminders(config.stateDir, new Set(result.events.map((event) => event.id))), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
         // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
         const checklist = checklistLine([...result.events.map((event) => `${event.id}\t${event.line}`), ...reminders]);
         for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...sentinel]) console.log(line);
@@ -752,35 +1159,11 @@ try {
       for (const line of unreadAfterAck(config.stateDir, acked)) console.log(line);
       break;
     }
-    case "report": {
-      const [action, id, ...extra] = flags.positionals;
-      if (action !== "ack" || Object.keys(flags.values).length) {
-        // `dori report <key> <kind> --text T [--evidence E]`: one row the supervisor routes.
-        const kind = id;
-        if (!action || !isReportKind(kind) || extra.length || Object.keys(flags.values).some((name) => name !== "text" && name !== "evidence")) {
-          die(`usage: dori report <key> <${REPORT_KINDS.join("|")}> --text T [--evidence E] | dori report ack <id>`);
-        }
-        // Newlines stay: the store redacts, and routeReports saves a multi-line body to a file for the lead.
-        const text = need("text").trim();
-        const evidence = opt("evidence")?.trim();
-        const target = await activeLane("report", action);
-        const reports = openLaneReports(config);
-        try {
-          const row = reports.append({ lane: target.key, generation: laneGeneration(target), kind: kind as ReportKind, text, ...(evidence ? { evidence } : {}), at: realClock.now() });
-          console.log(`LANE_REPORTED ${row.id} ${row.kind}`);
-        } finally { reports.close(); }
-        break;
-      }
-      if (!id || extra.length) die("usage: dori report ack <id>");
-      const me = await callerLane(deps);
-      if (!me) die("dori report ack runs inside a lane (DORI_LANE_KEY or its pane): it confirms a message to that lane");
-      const messages = openLaneMessages(config);
-      try {
-        const acked = ackLaneMessage(messages, me ?? "", id ?? "", realClock.now());
-        console.log(`LANE_MESSAGE_ACKED ${acked.lane} ${acked.id}`);
-      } finally { messages.close(); }
+    case "report":
+      // A report is the lane's own voice, sent by its runner over the lane socket (lane mode); the lead has no lane to
+      // report as.
+      die(`DORI_CLI_LANE_COMMAND dori report${flags.positionals[0] === "ack" ? " ack" : ""} runs only inside a lane (DORI_LANE_KEY, or a pane its runner knows)`, 2);
       break;
-    }
     case "reported": {
       // `dori reported <key> --text T`: post lane <key>'s outcome to the owner (the lane's thread unless --to/--thread),
       // then record the receipt. A failed post records nothing, so the obligation stays open.
@@ -861,9 +1244,9 @@ try {
       break;
     }
     case "send": {
-      const platform = key ?? die("send needs discord");
-      const named = platform === "discord" ? platform : die(`unknown platform ${platform}`);
-      const { to } = resolveTarget(named, need("to"), opt("thread"));
+      const platform = key ?? "discord";
+      if (platform !== "discord") die(`unknown platform ${platform}`);
+      const { to } = resolveTarget("discord", need("to"), opt("thread"));
       const text = need("text");
       const edit = opt("edit");
       const buttons = opt("buttons");
@@ -871,16 +1254,25 @@ try {
       let components: unknown[] | undefined;
       try { components = buttons === undefined ? undefined : buttonRow(buttons); } catch (e) { die(e instanceof Error ? e.message : String(e)); }
       if (!edit) {
+        if (flags.values.force !== true) {
+          const stale = staleOwnerEvents(config.stateDir, to);
+          if (stale.count) {
+            console.log(`SEND_STALE ${stale.count}`);
+            for (const line of stale.lines) console.log(line);
+            process.exit(3);
+          }
+        }
         const sent = await postMessage(to, text, components);
         console.log(`SENT ${sent}`);
       } else await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);
       break;
     }
     case "thread": {
-      // `dori thread discord --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
+      // `dori thread [discord] --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
       // make discord.ownerId a member. The thread ref is printed either way; a failed add prints THREAD_OWNER_FAILED and exits 1.
-      if (key !== "discord" || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
-        die("usage: dori thread discord --to CHANNEL [--message ID] --name NAME");
+      if ((key ?? "discord") !== "discord") die(`unknown platform ${key}`);
+      if (flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
+        die("usage: dori thread [discord] --to CHANNEL [--message ID] --name NAME");
       }
       const { to } = resolveTarget("discord", need("to"));
       const owner = config.discord?.ownerId;
@@ -897,26 +1289,26 @@ try {
     }
     case "typing": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { off: { type: "boolean" } } });
-      const typingUsage = "usage: dori typing discord <channel>";
       const [target, ...extra] = parsed.positionals;
       const on = parsed.values.off !== true;
-      if (target === "discord" && extra.length === 1 && on) {
-        const { to, thread } = resolveTarget("discord", extra[0]!);
+      const channel = target === "discord" ? extra[0] : target;
+      if (channel && extra.length === (target === "discord" ? 1 : 0) && on) {
+        const { to, thread } = resolveTarget("discord", channel);
         const id = thread ?? to;
         const dc = new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`));
         await dc.typing(id);
         console.log(`TYPING discord ${id} on`);
-      } else die(typingUsage);
+      } else die("usage: dori typing [discord] <channel>");
       break;
     }
     case "presence": {
-      if (key === "discord") {
+      if ((key ?? "discord") === "discord") {
         const token = resolveCredential("DORI_DISCORD_TOKEN") ?? die(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`);
         const release = acquireDiscordGateway(token);
         let presence: ReturnType<typeof discordPresence> | undefined;
         try {
           if (!config.discord) console.warn("PRESENCE_WARNING discord slash commands skipped: config.discord is missing; run dori setup");
-          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults()), undefined, config.discordChannels, lookupStatus(deps)) : undefined;
+          const commands = config.discord ? new DiscordCommands(fetchHttp, token, config.discord, quotaReport(lookupQuotaResults()), undefined, config.discordChannels, lookupStatus({ ...deps, runnerDir: defaultRunnerDir() })) : undefined;
           await commands?.register();
           presence = discordPresence(openDiscordGateway, token, realTimers, commands ? (data) => commands.handle(data) : undefined);
           console.log("PRESENCE_READY discord");
@@ -929,7 +1321,7 @@ try {
           await presence?.settled();
           release();
         }
-      } else die("presence needs discord");
+      } else die(`unknown platform ${key}`);
       break;
     }
     case "transcribe":
@@ -940,6 +1332,8 @@ try {
       process.exit(command ? 1 : 0);
   }
 } catch (e) {
+  // The supervisor (and with it every runner) is unreachable, or a runner answered RUNNER_UNAVAILABLE: fail closed (D7).
+  if (e instanceof RunnerUnavailable || (e instanceof LaneOpsError && e.code === "RUNNER_UNAVAILABLE")) die(e.message, 2);
   if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof ReposError || e instanceof DiscordGatewayOwnedError || e instanceof AckError || e instanceof LeadRestartError || e instanceof StoreError || e instanceof LaneMessageError || e instanceof SourceError) die(e.message);
   throw e;
 }

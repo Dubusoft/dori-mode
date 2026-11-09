@@ -12,7 +12,6 @@ import {
   type MachineSample,
   guardAgentVersion,
   installGuardAgent,
-  killOnMachine,
   listGuardMachines,
   loadMachineGuardState,
   machineBackoffMs,
@@ -27,6 +26,7 @@ import {
   sshArgv,
 } from "../src/remote-guard.ts";
 import type { Ran, RunOptions, Runner } from "../src/run.ts";
+import { writeRunnerMachine } from "../src/runner/machines.ts";
 
 type Call = { argv: string[]; opts: RunOptions | undefined };
 
@@ -89,6 +89,24 @@ test("readGuardMachines reports a herdr failure or invalid JSON as not ok, with 
     .toEqual({ ok: true, machines: [{ label: "a", target: "a2", id: "m1" }] });
 });
 
+test("readGuardMachines adds the runner-machines state file at the lowest precedence: herdr and overrides replace it by label", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dori-rm-"));
+  try {
+    writeRunnerMachine(dir, "w1", "me@100.64.1.2");
+    writeRunnerMachine(dir, "a", "state-a");
+    writeRunnerMachine(dir, "b", "state-b");
+    const herdr = fake(() => ok(JSON.stringify([{ id: "m1", label: "a", target: "herdr-a" }])));
+    expect((await readGuardMachines(herdr.run, { b: "override-b" }, dir)).machines).toEqual([
+      { label: "a", target: "herdr-a", id: "m1" }, { label: "b", target: "override-b" }, { label: "w1", target: "me@100.64.1.2" },
+    ]);
+    // A herdr failure still lists the state machines; without a stateDir they are not read.
+    expect(await listGuardMachines(fake(() => ({ code: 1, out: "", err: "down" })).run, {}, dir)).toHaveLength(3);
+    expect(await listGuardMachines(fake(() => ok("[]")).run, {})).toEqual([]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("parseAgentSample reads the sample line, keeps -1 values, rejects junk", () => {
   expect(parseAgentSample(`motd\n${sampleLine("abc", "load1=-1 mem_free_pct=-1 swap_free_gb=-1 disk_free_gb=12.5")}\n`)).toEqual({
     version: "abc", os: "darwin", load1: -1, memFreePct: -1, swapFreeGb: -1, swapTotalGb: -1, diskFreeGb: 12.5,
@@ -120,33 +138,6 @@ test("sampleMachine runs the agent over ssh and maps failures", async () => {
   expect(await detail({ code: 127, out: "", err: "sh: not found" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
   expect(await detail({ code: 2, out: "", err: "sh: 0: Can't open /home/me/.dori/guard-agent.sh" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
   expect(await detail(ok("garbage"))).toBe("bad sample: garbage");
-});
-
-test("killOnMachine single-quotes patterns, parses killed lines, maps failures", async () => {
-  const out = "DORI_GUARD_KILLED pid=4242 rss_kb=4000000 cmd=qemu-system-x86\nDORI_GUARD_KILLED pid=7 rss_kb=10 cmd=emulator\nDORI_GUARD_KILL_DONE count=2\n";
-  const f = fake(() => ok(out));
-  expect(await killOnMachine(f.run, mac, ["qemu-system", "it's; rm -rf $HOME", "  "])).toEqual({
-    ok: true,
-    killed: [{ pid: 4242, rssKb: 4_000_000, cmd: "qemu-system-x86" }, { pid: 7, rssKb: 10, cmd: "emulator" }],
-  });
-  expect(f.calls[1]).toEqual({
-    argv: sshArgv("me@mac", `sh "$HOME/.dori/guard-agent.sh" kill 'qemu-system' 'it'\\''s; rm -rf $HOME'`),
-    opts: { timeoutMs: 30_000 },
-  });
-  expect(await killOnMachine(fake(() => ok("DORI_GUARD_KILL_DONE count=0")).run, mac, ["x"])).toEqual({ ok: true, killed: [] });
-  const none = fake(() => ok());
-  expect(await killOnMachine(none.run, mac, [" "])).toEqual({ ok: true, killed: [] });
-  expect(none.calls).toHaveLength(0);
-
-  const detail = async (r: Ran) => {
-    const res = await killOnMachine(fake(() => r).run, mac, ["x"]);
-    return res.ok ? "ok" : res.detail;
-  };
-  expect(await detail({ code: 255, out: "", err: "No route to host" })).toBe("unreachable: No route to host");
-  expect(await detail({ code: 124, out: "", err: "timed out", timedOut: true })).toBe("unreachable: timed out");
-  expect(await detail({ code: 127, out: "", err: "" })).toBe("guard agent not installed; run dori guard install --machine mac mini");
-  expect(await detail({ code: 2, out: "", err: "usage: kill" })).toBe("kill failed (exit 2): usage: kill");
-  expect(await detail(ok("garbage"))).toBe("bad kill output: garbage");
 });
 
 test("installGuardAgent writes both files to temp files and moves them into place in one call, then checks the version", async () => {

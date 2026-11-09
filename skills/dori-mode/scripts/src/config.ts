@@ -1,9 +1,9 @@
-import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_EVENT_POLICY, type EventPolicy, EventPolicyError, resolveEventPolicy } from "./event-policy.ts";
+import { DEFAULT_EVENT_POLICY, type EventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
+import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
 
@@ -67,12 +67,6 @@ export type DeliveryConfig = {
   readonly push: PushConfig;
 };
 
-/** delivery keys that were removed; a config that still has them loads, with one warning. */
-export const REMOVED_DELIVERY_KEYS = ["mode"] as const;
-
-/** delivery.push keys that were removed; a config that still has them loads, with one warning. */
-export const REMOVED_PUSH_KEYS = ["debounceMs"] as const;
-
 /** The supervisor's delivery tick: the push step runs at most once per tick. */
 export const DELIVERY_TICK_SEC = 5;
 
@@ -97,6 +91,18 @@ export const deliveryConfigError = (delivery: DeliveryConfig): string | undefine
   return undefined;
 };
 
+/** Lane drift signals (drift.ts): urgent LANE_DRIFT for a working lane that misses milestones or keeps failing CI. */
+export type DriftConfig = {
+  /** Off: no LANE_DRIFT line is raised. */
+  readonly enabled: boolean;
+  /** Minutes a working lane may go without a milestone report (since its last one, or its open) before milestone-overdue. */
+  readonly milestoneOverdueMin: number;
+  /** Failing head SHAs in a row (no green between) of a lane PR before ci-failing. */
+  readonly ciFailStreak: number;
+};
+
+export const DEFAULT_DRIFT: DriftConfig = { enabled: true, milestoneOverdueMin: 90, ciFailStreak: 3 };
+
 /** The shortest pointer (kinds cut to `+N more`) fits in MIN_POINTER_CHARS; omo kept 800 typed chars in one input. */
 export const MIN_POINTER_CHARS = 140;
 export const MAX_POINTER_CHARS = 800;
@@ -120,9 +126,12 @@ export type DiscordConfig = {
 export type DoriConfig = {
   readonly discord?: DiscordConfig;
   readonly stateDir: string;
+  /** The herdr workspace new local lane tabs open in, from dori state (managed-panes.ts); never read from the config file after migration. */
   readonly laneWorkspace: string;
+  /** The workspaces the sweeps watch: the lanes workspace (empty: every workspace). Derived, not configured. */
   readonly workspaces: readonly string[];
   readonly ignorePanes: readonly string[];
+  /** The lead's herdr pane, from dori state (managed-panes.ts) or DORI_LEAD_PANE; the supervisor creates and records it. */
   readonly leadPane: string;
   readonly defaultCwd: string;
   readonly agentCommand: ArgvTemplate;
@@ -156,13 +165,22 @@ export type DoriConfig = {
   readonly laneThinking?: string;
   readonly sessionsDir: string;
   readonly nudgeAfterMin: number;
-  readonly postAfterMin: number;
   /**
    * Minutes an idle lane may stay silent after its freshness nudge before the lead hears urgent IDLE-ESCALATE; each
    * further one for the same silence waits twice as long. Must be positive.
    */
   readonly idleEscalateMin: number;
   readonly closeAfterMin: number;
+  /**
+   * Minutes after a claim's window starts that the claim keeps waiting for the supervisor's merge, when its only failing
+   * Done signals are `merged` PRs it bound at their still-current head with no failed check and no conflict.
+   */
+  readonly mergeWaitMaxMin: number;
+  /**
+   * Minutes an open lane PR may stay unmergeable for a reason only a person fixes (claimed but no checks, review or
+   * draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
+   */
+  readonly mergeStallMin: number;
   /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
@@ -174,8 +192,6 @@ export type DoriConfig = {
    * The lead is never wrapped.
    */
   readonly laneSandbox?: LaneSandbox;
-  /** The thread line posted for a working lane's todo item; `{todo}` and `{elapsed}` are filled in. */
-  readonly progressTemplate: string;
   /** Digest events wait for an urgent one, but never longer than this. */
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
@@ -236,6 +252,8 @@ export type DoriConfig = {
   readonly delivery: DeliveryConfig;
   /** Which machine a launch runs on. */
   readonly placement: PlacementConfig;
+  /** Lane drift signals (LANE_DRIFT). */
+  readonly drift: DriftConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -281,17 +299,17 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   laneThinking: "medium",
   sessionsDir: join(home, ".omo", "agent", "sessions"),
   nudgeAfterMin: 15,
-  postAfterMin: 20,
   idleEscalateMin: 30,
   closeAfterMin: 5,
+  mergeWaitMaxMin: 60,
+  mergeStallMin: 15,
   worktreeRoot: "/data/repos/worktrees",
-  progressTemplate: "{todo}",
   digestMaxDelayMin: 60,
-  ownerDelayNotice: "Got your message. The lead session is not taking it yet; it stays queued and will be answered as soon as the lead is back.",
+  ownerDelayNotice: "메시지를 받았습니다. 리드 세션이 아직 메시지를 받지 못하고 있어 대기열에 보관해 두었고, 리드가 돌아오는 대로 답변드립니다.",
   ackTimeoutSec: 60,
-  ackMissingNotice: "Your message reached the lead session, but it has not confirmed reading it yet. It has been reminded and will answer here.",
+  ackMissingNotice: "메시지가 리드 세션에 전달됐지만 아직 읽었다는 확인이 없습니다. 리드에게 다시 알렸고, 이곳으로 답변드립니다.",
   handledTimeoutMin: 30,
-  unhandledNotice: "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
+  unhandledNotice: "메시지는 읽혔지만 요청하신 일 가운데 아직 작업이나 답변으로 이어지지 않은 것이 있습니다. 리드에게 처리하라고 다시 알렸습니다.",
   reportTimeoutMin: 5,
   resolveKinds: DEFAULT_RESOLVE_KINDS,
   resolveTimeoutMin: 15,
@@ -319,45 +337,8 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
     push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
   },
   placement: { defaultMachine: "local", workspaces: {}, fallback: [] },
+  drift: DEFAULT_DRIFT,
 });
-
-/**
- * Removed feature flags: their behavior is always on. A config that still carries one loads fine; the key
- * is dropped and named in one warning per process.
- */
-export const REMOVED_FLAGS = [
-  "sweepSnapshot", "sweepTask", "superviseTasks", "operations", "threadArchive", "ciFollowUp", "toodoReconcile",
-  "claimDelivery", "branchCleanup", "eventSources", "schedules", "laneReports",
-] as const;
-
-/** Top-level keys of the removed lane quota stall sweep; a config that still has them loads, with one warning. */
-export const REMOVED_QUOTA_STALL_KEYS = ["quotaCheck"] as const;
-
-/** Top-level keys of the removed Claude quota gate (any old sub-keys included); a config that still has them loads, with one warning. */
-export const REMOVED_QUOTA_GATE_KEYS = ["quotaGate"] as const;
-
-/** Keys of the removed supervisor lane-finish line: the supervisor no longer posts to the owner itself; one warning. */
-export const REMOVED_OWNER_POST_KEYS = ["laneFinishNotice"] as const;
-
-/** Keys of the removed Toodo integration (the Toodo Lead chat channel and its Discord mirror); one warning. */
-export const REMOVED_TOODO_KEYS = ["toodo"] as const;
-
-/** Keys of the removed `hooks` entry that marked a messenger thread done on close (a close leaves the thread open); one warning. */
-export const REMOVED_HOOK_KEYS = ["threadDone"] as const;
-
-export const REMOVED_QUOTA_KEYS = ["leadEmergencyModels", "leadPrimaryRetryMin", "leadQuotaBusySwitchMin", "leadPrimaryReturnChecks"] as const;
-
-let warnedRemovedQuotaKeys = false;
-let warnedLeadArray = false;
-let warnedRemovedFlags = false;
-let warnedRemovedQuotaGateKeys = false;
-let warnedRemovedQuotaStallKeys = false;
-let warnedRemovedPushKeys = false;
-let warnedRemovedDeliveryKeys = false;
-let warnedRemovedOwnerPostKeys = false;
-let warnedRemovedToodoKeys = false;
-let warnedRemovedHookKeys = false;
-let warnedSandboxDefault = false;
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -379,43 +360,20 @@ export const DEFAULT_LANE_SANDBOX: LaneSandbox = { command: ["lane-sandbox"] };
 
 /**
  * The config's `laneSandbox`, or DEFAULT_LANE_SANDBOX when absent; throws TypeError unless { command: non-empty string[] }.
- * The removed `default` key (the sandbox is always on) is ignored with one warning, whatever its value.
+ * The removed `default` key (the sandbox is always on) is ignored and named in CONFIG_KEYS_IGNORED, whatever its value.
  */
-const laneSandbox = (raw: unknown, path: string): LaneSandbox => {
+const laneSandbox = (raw: unknown): LaneSandbox => {
   if (raw == null) return DEFAULT_LANE_SANDBOX;
   const bad = () => new TypeError("laneSandbox must be { \"command\": [non-empty strings, at least one] }");
   if (typeof raw !== "object" || Array.isArray(raw)) throw bad();
   const { command } = raw as Record<string, unknown>;
-  if ("default" in raw && !warnedSandboxDefault) {
-    warnedSandboxDefault = true;
-    console.error(`CONFIG_SANDBOX_DEFAULT_REMOVED laneSandbox.default in ${path}: every new local lane runs in the sandbox; the key is ignored and can be deleted`);
-  }
   if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string" || !part.trim())) throw bad();
   return { command: command as string[] };
 };
 
-/** The config's `heavyKill` (absent: the default), trimmed, blanks dropped; throws TypeError unless an array of strings. */
-const heavyKill = (raw: unknown, fallback: readonly string[]): readonly string[] => {
-  if (raw === undefined) return fallback;
-  if (!Array.isArray(raw) || raw.some((p) => typeof p !== "string")) throw new TypeError("heavyKill must be an array of strings");
-  return (raw as string[]).map((p) => p.trim()).filter(Boolean);
-};
-
-/** The config's `resolveKinds` (absent: the default); throws EventPolicyError on a malformed kind, like eventPolicy. */
-const resolveKinds = (raw: unknown): readonly string[] => {
-  if (raw === undefined) return DEFAULT_RESOLVE_KINDS;
-  if (!Array.isArray(raw)) throw new EventPolicyError("resolveKinds must be an array of event kinds");
-  for (const kind of raw) {
-    if (typeof kind !== "string" || !kind || kind.split(" ").some((word) => !word) || kind.split(" ")[0] === "*") {
-      throw new EventPolicyError(`resolveKinds: ${JSON.stringify(kind)} is not a kind (words separated by single spaces, starting with the event name)`);
-    }
-  }
-  return raw as string[];
-};
-
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
-export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
+export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") || path.startsWith("~\\") ? join(home, path.slice(2)) : path);
 
 /** An object's string-valued entries; anything else is no entries. */
 const stringRecord = (v: unknown): Record<string, string> =>
@@ -449,108 +407,76 @@ const placement = (raw: unknown): PlacementConfig => {
   };
 };
 
+/**
+ * The only top-level keys read from config.json: who the owner is and where things live on this machine. Every other
+ * tunable is a built-in constant (defaultConfig), so a config written by any dori version loads on any other.
+ */
+export const CONFIG_FILE_KEYS = [
+  "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
+  "laneThinking", "leadArgs", "discordChannels", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
+  "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes",
+] as const;
+
+/** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
+const HOOK_KEYS = ["threadReply", "transcribe"] as const;
+
+let warnedIgnoredKeys = false;
+let warnedLeadArray = false;
+let warnedPaneKeys = false;
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
   const base = defaultConfig(home);
   const file = Bun.file(path);
   const loaded = (await file.exists()) ? ((await file.json()) as Record<string, unknown>) : {};
-  const leftover = REMOVED_FLAGS.filter((key) => key in loaded);
-  if (leftover.length && !warnedRemovedFlags) {
-    warnedRemovedFlags = true;
-    console.error(`CONFIG_FLAGS_REMOVED ${leftover.join(", ")} in ${path}: these flags were removed and their behavior is always on; the keys are ignored and can be deleted`);
+  const paneKeys = legacyPaneKeys(loaded);
+  const kept = CONFIG_FILE_KEYS as readonly string[];
+  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key));
+  const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
+  const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
+  ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
+  const rawMemory = isRecord(raw.memoryCheck) ? raw.memoryCheck : {};
+  ignored.push(...Object.keys(rawMemory).filter((key) => key !== "repo").map((key) => `memoryCheck.${key}`));
+  if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
+  if (ignored.length && !warnedIgnoredKeys) {
+    warnedIgnoredKeys = true;
+    console.error(`CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
   }
-  const oldStall = REMOVED_QUOTA_STALL_KEYS.filter((key) => key in loaded);
-  if (oldStall.length && !warnedRemovedQuotaStallKeys) {
-    warnedRemovedQuotaStallKeys = true;
-    console.error(`CONFIG_QUOTA_STALL_KEYS_REMOVED ${oldStall.join(", ")} in ${path}: lanes are no longer checked or paused on quota; the keys are ignored and can be deleted`);
-  }
-  const oldGate = REMOVED_QUOTA_GATE_KEYS.filter((key) => key in loaded);
-  if (oldGate.length && !warnedRemovedQuotaGateKeys) {
-    warnedRemovedQuotaGateKeys = true;
-    console.error(`CONFIG_QUOTA_GATE_KEYS_REMOVED ${oldGate.join(", ")} in ${path}: launches are no longer gated on Claude quota; the keys are ignored and can be deleted`);
-  }
-  const oldLead = REMOVED_QUOTA_KEYS.filter((key) => key in loaded);
-  if (oldLead.length && !warnedRemovedQuotaKeys) {
-    warnedRemovedQuotaKeys = true;
-    console.error(`CONFIG_QUOTA_KEYS_REMOVED ${oldLead.join(", ")} in ${path}: the lead uses one model; the keys are ignored and can be deleted`);
-  }
-  const oldOwnerPost = REMOVED_OWNER_POST_KEYS.filter((key) => key in loaded);
-  if (oldOwnerPost.length && !warnedRemovedOwnerPostKeys) {
-    warnedRemovedOwnerPostKeys = true;
-    console.error(`CONFIG_OWNER_POST_KEYS_REMOVED ${oldOwnerPost.join(", ")} in ${path}: the supervisor no longer posts lane-finish lines (the lead reports finished lanes); the keys are ignored and can be deleted`);
-  }
-  const oldToodo = REMOVED_TOODO_KEYS.filter((key) => key in loaded);
-  if (oldToodo.length && !warnedRemovedToodoKeys) {
-    warnedRemovedToodoKeys = true;
-    console.error(`CONFIG_TOODO_KEYS_REMOVED ${oldToodo.join(", ")} in ${path}: the Toodo integration was removed (Discord is the only messenger); the keys are ignored and can be deleted`);
-  }
-  if (Array.isArray(loaded.leadModel)) {
+  if (Array.isArray(raw.leadModel)) {
     if (!warnedLeadArray) {
       warnedLeadArray = true;
       console.error(`CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
     }
-    loaded.leadModel = modelEntries(loaded.leadModel, undefined)[0];
+    raw.leadModel = modelEntries(raw.leadModel, undefined)[0];
   }
-  const dropped: readonly string[] = [...REMOVED_FLAGS, ...REMOVED_QUOTA_STALL_KEYS, ...REMOVED_QUOTA_GATE_KEYS, ...REMOVED_QUOTA_KEYS, ...REMOVED_OWNER_POST_KEYS, ...REMOVED_TOODO_KEYS];
-  const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => !dropped.includes(key))) as Partial<DoriConfig>;
-  const rawDelivery = (raw.delivery ?? {}) as Partial<DeliveryConfig>;
-  const oldDelivery = REMOVED_DELIVERY_KEYS.filter((key) => key in rawDelivery);
-  if (oldDelivery.length && !warnedRemovedDeliveryKeys) {
-    warnedRemovedDeliveryKeys = true;
-    console.error(`CONFIG_DELIVERY_KEYS_REMOVED delivery.${oldDelivery.join(", delivery.")} in ${path}: push delivery is the only mode; the keys are ignored and can be deleted`);
+  const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
+  const memoryRepo = typeof rawMemory.repo === "string" ? rawMemory.repo : base.memoryCheck.repo;
+  const fromFile = raw as Partial<DoriConfig>;
+  const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
+  const panes = resolveManagedPanes(stateDir, loaded);
+  if (paneKeys.length && !warnedPaneKeys) {
+    warnedPaneKeys = true;
+    console.error(panes.migrated?.saved
+      ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
+      : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
   }
-  const rawPush = (rawDelivery.push ?? {}) as Record<string, unknown>;
-  const oldPush = REMOVED_PUSH_KEYS.filter((key) => key in rawPush);
-  if (oldPush.length && !warnedRemovedPushKeys) {
-    warnedRemovedPushKeys = true;
-    console.error(`CONFIG_PUSH_KEYS_REMOVED delivery.push.${oldPush.join(", delivery.push.")} in ${path}: a burst becomes one push through the single outstanding push; the keys are ignored and can be deleted`);
-  }
-  const push = Object.fromEntries(Object.entries(rawPush).filter(([key]) => !(REMOVED_PUSH_KEYS as readonly string[]).includes(key))) as Partial<PushConfig>;
-  const delivery: DeliveryConfig = { ...base.delivery, ...Object.fromEntries(Object.entries(rawDelivery).filter(([key]) => !(REMOVED_DELIVERY_KEYS as readonly string[]).includes(key))), push: { ...base.delivery.push, ...push } };
-  const rawHooks = (typeof raw.hooks === "object" && raw.hooks !== null && !Array.isArray(raw.hooks) ? raw.hooks : {}) as Record<string, unknown>;
-  const oldHooks = REMOVED_HOOK_KEYS.filter((key) => key in rawHooks);
-  if (oldHooks.length && !warnedRemovedHookKeys) {
-    warnedRemovedHookKeys = true;
-    console.error(`CONFIG_HOOK_KEYS_REMOVED hooks.${oldHooks.join(", hooks.")} in ${path}: a closing lane's thread is left open for the owner to close, no hook marks it done; the keys are ignored and can be deleted`);
-  }
-  const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => !(REMOVED_HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
-  const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, memoryCheck: { ...base.memoryCheck, ...raw.memoryCheck }, hooks: { ...base.hooks, ...hooks }, delivery };
+  const merged: DoriConfig = { ...base, ...fromFile, hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
-    eventPolicy: resolveEventPolicy(raw.eventPolicy),
-    resolveKinds: resolveKinds(raw.resolveKinds),
     laneRules: laneRules(raw.laneRules),
-    laneSandbox: laneSandbox(raw.laneSandbox, path),
-    heavyKill: heavyKill(raw.heavyKill, base.heavyKill),
+    laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
-    memoryCheck: { ...merged.memoryCheck, repo: expandHome(merged.memoryCheck.repo, home) },
-    stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),
+    memoryCheck: { ...base.memoryCheck, repo: expandHome(memoryRepo, home) },
+    stateDir,
     defaultCwd: expandHome(merged.defaultCwd, home),
     sessionsDir: expandHome(merged.sessionsDir, home),
-    leadPane: process.env.DORI_LEAD_PANE ?? merged.leadPane,
+    leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
+    laneWorkspace: panes.laneWorkspace,
+    workspaces: panes.laneWorkspace ? [panes.laneWorkspace] : [],
   };
-};
-
-/**
- * Persist a recreated lead pane into the config file that was loaded. Every other key is kept as
- * written, the file mode is preserved, and the rename happens only after the new bytes are on disk.
- * A missing file is left alone: nothing was loaded from it.
- */
-export const saveLeadPane = (path: string, leadPane: string): boolean => {
-  let real: string;
-  try { real = realpathSync(path); } catch { return false; }
-  const raw: unknown = JSON.parse(readFileSync(real, "utf8"));
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError(`${path} is not a JSON object`);
-  const mode = statSync(real).mode & 0o777;
-  const tmp = `${real}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", mode);
-  try {
-    writeFileSync(fd, `${JSON.stringify({ ...raw, leadPane }, null, 2)}\n`);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  renameSync(tmp, real);
-  return true;
 };
 
 /** `fill` for the thread hooks: their `text` and `title` leave the host, so secrets are masked on the way out. */

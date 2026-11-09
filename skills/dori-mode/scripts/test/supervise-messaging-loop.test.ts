@@ -8,6 +8,14 @@ import type { OwnerNoticeKind } from "../src/supervise.ts";
 import { sdNotify, supervise } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal, writeJournal } from "./fakes.ts";
 
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
+
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   mock.restore();
@@ -85,7 +93,7 @@ const fixture = (kind: OwnerNoticeKind, reminded = true) => {
     }, { preconnect: fetch.preconnect }));
     try {
       await supervise(deps, controller.signal, {
-        token: `loop-test-${state.dir}`, http, lookup: async () => "", statusLookup: async () => "",
+        token: `loop-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"), http, lookup: async () => "", statusLookup: async () => "",
         open: () => {
           let closed = (_code: number) => {};
           return {

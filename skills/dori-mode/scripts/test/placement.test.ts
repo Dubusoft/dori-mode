@@ -2,9 +2,11 @@ import { expect, test } from "bun:test";
 
 import { defaultConfig, type GuardThresholds, type PlacementConfig } from "../src/config.ts";
 import type { HostSample } from "../src/host-guard.ts";
+import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
+import type { Pane } from "../src/panes.ts";
 import { checkMachine, LOCAL_MACHINE, machineVerdict, placementLine, resolvePlacement, verdictLine } from "../src/placement.ts";
-import type { GuardMachine, MachineSample, SampleResult } from "../src/remote-guard.ts";
-import type { Ran, Runner } from "../src/run.ts";
+import type { MachineSample, SampleResult } from "../src/remote-guard.ts";
+import type { MachineObservation } from "../src/runner/protocol.ts";
 
 const config = (p: Partial<PlacementConfig> = {}): PlacementConfig => ({ defaultMachine: "local", workspaces: {}, fallback: [], ...p });
 const RESEARCH = "report posted in the thread";
@@ -35,6 +37,7 @@ test("a path rule beats a repo rule; the first Done repo that is a key wins, cas
   expect(resolvePlacement({ cwd: "/data/repos/app", done }, config({ workspaces }))).toMatchObject({ machine: "mini", rule: "/data/repos/app" });
   expect(resolvePlacement({ cwd: "/elsewhere", done }, config({ workspaces }))).toEqual({ machine: "lib-box", source: "workspace", rule: "Acme/Lib", movable: false });
   expect(resolvePlacement({ done }, config({ workspaces }))).toMatchObject({ machine: "lib-box", rule: "Acme/Lib" });
+  expect(resolvePlacement({ done: "pr ACME/app feat/x" }, config({ workspaces }))).toEqual({ machine: "app-box", source: "workspace", rule: "acme/app", movable: false });
 });
 
 test("\"*\" catches every other workspace task, including --pane and --workspace launches", () => {
@@ -74,64 +77,50 @@ test("machineVerdict: memory, disk and pane thresholds use canLaunch's reasons",
   expect(machineVerdict(sample(), T.panesMax - 1, T, "big")).toEqual({ ok: true, reasons: [] });
 });
 
-const ran = (code: number, out = ""): Ran => ({ code, out, err: "" });
-const panesJson = (n: number): string => JSON.stringify({ result: { panes: Array.from({ length: n }, (_, i) => ({ pane_id: `p${i}` })) } });
+const host = (s: Partial<HostSample> = {}): HostSample => ({ load1: 500, memFreePct: 60, diskFreeGb: 200, swapFreeGb: 4, swapTotalGb: 8, panes: 2, ...s });
+const listed = (n: number): Pane[] => Array.from({ length: n }, (_, i) => ({ pane_id: `p${i}`, workspace_id: "w" }));
 
-/** A runner answering `herdr --machine <label> pane list` from `panes`; every call is recorded. */
-const remoteRunner = (panes: Record<string, Ran>, calls: string[][]): Runner => async (argv) => {
-  calls.push([...argv]);
-  if (argv[0] === "herdr" && argv[1] === "--machine" && argv[3] === "pane" && argv[4] === "list") return panes[argv[2]!] ?? ran(1);
-  return ran(1);
-};
-
-const MACHINES: GuardMachine[] = [{ label: "big", target: "ana@big" }];
-const deps = (result: SampleResult) => ({ listMachines: async () => MACHINES, sampleMachine: async () => result });
+/** A facade whose runners answer `observeMachine` from `answer` (by machine; undefined = the local runner); every machine asked is recorded. */
+const observing = (answer: (machine: string | undefined) => MachineObservation, asked: (string | undefined)[] = []): LaneOps =>
+  ({ observeMachine: async (machine?: string) => { asked.push(machine); return answer(machine); } }) as unknown as LaneOps;
 const cfg = { ...defaultConfig("/home/test"), stateDir: "/state" };
 
-test("checkMachine local samples the host on the disk guard path and applies canLaunch", async () => {
-  const seen: string[] = [];
-  const host: HostSample = { load1: 500, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2, panes: T.panesMax };
-  const c = await checkMachine(remoteRunner({}, []), cfg, "local", { sampleHost: async (_run, path) => { seen.push(path); return host; } });
-  expect(seen).toEqual(["/state"]);
+test("checkMachine local asks the local runner and applies canLaunch to its sample", async () => {
+  const asked: (string | undefined)[] = [];
+  const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ memFreePct: 50, diskFreeGb: 100, panes: T.panesMax }), panes: listed(T.panesMax) }), asked), cfg, "local");
+  expect(asked).toEqual([undefined]);
   expect(c).toEqual({ machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}` });
 });
 
-test("checkMachine remote counts panes from herdr --machine <label> pane list", async () => {
-  const calls: string[][] = [];
-  const c = await checkMachine(remoteRunner({ big: ran(0, panesJson(2)) }, calls), cfg, "big", deps(sample()));
+test("checkMachine remote asks that machine's runner and counts the panes it lists", async () => {
+  const asked: (string | undefined)[] = [];
+  const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host(), panes: listed(2) }), asked), cfg, "big");
+  expect(asked).toEqual(["big"]);
   expect(c).toEqual({ machine: "big", verdict: { ok: true, reasons: [] }, summary: "memory free 60%, disk free 200 GB, panes 2" });
-  expect(calls).toContainEqual(["herdr", "--machine", "big", "pane", "list"]);
 });
 
-test("checkMachine remote: a failed or malformed pane list is unreadable and holds", async () => {
-  for (const answer of [ran(1), ran(0, "not json"), ran(0, JSON.stringify({ result: {} }))]) {
-    const c = await checkMachine(remoteRunner({ big: answer }, []), cfg, "big", deps(sample()));
-    expect(c.verdict).toEqual({ ok: false, reasons: ["pane count unreadable"] });
-  }
+test("checkMachine remote: unreadable memory and disk never hold, CPU load never holds, a pane list the runner could not read holds", async () => {
+  const unreadable = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ memFreePct: -1, diskFreeGb: -1 }), panes: listed(1) })), cfg, "big");
+  expect(unreadable.verdict).toEqual({ ok: true, reasons: [] });
+  const noList = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ panes: -1 }), panes: [] })), cfg, "big");
+  expect(noList.verdict).toEqual({ ok: false, reasons: ["pane count unreadable"] });
 });
 
-test("checkMachine remote: an unreachable machine holds with an empty summary", async () => {
-  const c = await checkMachine(remoteRunner({ big: ran(0, panesJson(0)) }, []), cfg, "big", deps({ ok: false, detail: "ssh exit 255" }));
-  expect(c).toEqual({ machine: "big", verdict: { ok: false, reasons: ["machine big unreachable: ssh exit 255"] }, summary: "" });
+test("checkMachine holds with no runner when the machine's runner is unavailable", async () => {
+  const down = { observeMachine: async (machine?: string) => { throw new LaneOpsError("RUNNER_UNAVAILABLE", machine ?? "local", "disconnected: no admitted connection"); } } as unknown as LaneOps;
+  const remote = await checkMachine(down, cfg, "ghost");
+  expect(remote).toEqual({ machine: "ghost", verdict: { ok: false, reasons: ["no runner (dori runner install --machine ghost)"] }, summary: "" });
+  expect(verdictLine("ghost", remote.verdict)).toBe("HOLD machine=ghost no runner (dori runner install --machine ghost)");
+  const local = await checkMachine(down, cfg, "local");
+  expect(local.verdict.ok).toBe(false);
+  expect(local.verdict.reasons[0]).toStartWith("no runner (the supervisor runs the local runner");
 });
 
-test("checkMachine remote: an unknown machine holds without sampling", async () => {
-  const calls: string[][] = [];
-  let sampled = false;
-  const c = await checkMachine(remoteRunner({}, calls), cfg, "ghost", { listMachines: async () => MACHINES, sampleMachine: async () => { sampled = true; return sample(); } });
-  expect(c).toEqual({ machine: "ghost", verdict: { ok: false, reasons: ["unknown machine ghost; see dori guard machines"] }, summary: "" });
-  expect(sampled).toBe(false);
-  expect(calls).toEqual([]);
-});
-
-test("checkMachine remote finds the label through the real listing (herdr list merged with guardMachines)", async () => {
-  const run: Runner = async (argv) => {
-    if (argv.join(" ") === "herdr machine list --json") return ran(0, JSON.stringify([{ label: "big", ssh_target: "ana@big" }]));
-    if (argv[1] === "--machine") return ran(0, panesJson(1));
-    return ran(1);
-  };
-  const c = await checkMachine(run, { ...cfg, guardMachines: { extra: "ana@extra" } }, "extra", { sampleMachine: async (_r, m) => { expect(m).toEqual({ label: "extra", target: "ana@extra" }); return sample(); } });
-  expect(c.verdict.ok).toBe(true);
+test("checkMachine holds with the runner's error when the observation fails otherwise", async () => {
+  const failing = { observeMachine: async () => { throw new LaneOpsError("LANE_OP_FAILED", "big", "RUNNER_QUERY_FAILED q.machine.observe df failed"); } } as unknown as LaneOps;
+  const c = await checkMachine(failing, cfg, "big");
+  expect(c.summary).toBe("");
+  expect(c.verdict).toEqual({ ok: false, reasons: ["machine big unreachable: LANE_OP_FAILED runner=big RUNNER_QUERY_FAILED q.machine.observe df failed"] });
 });
 
 test("verdictLine keeps the legacy local text and tags remote machines", () => {

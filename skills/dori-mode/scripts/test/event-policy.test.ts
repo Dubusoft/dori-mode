@@ -13,7 +13,7 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 /** The hard-coded classifier this table replaced (supervise-delivery.ts before 1.7), kept verbatim as the reference. */
 const LEGACY_URGENT = [
   "INBOUND", "INBOUND_EDIT", "INBOUND_DELETE", "VISITOR", "LANE_DONE_CLAIMED", "LANE_NOT_DONE", "LANE_CLOSED", "LANE_REPORT",
-  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-REPORT", "NO-PROGRESS",
+  "DEAD_PANE", "UNRECOGNISED_PANE", "NO-PROGRESS",
   "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "ACK_MISSING", "UNHANDLED",
   "LANE_RECOVERY_EXHAUSTED",
@@ -45,11 +45,11 @@ test("the default table classifies every line as the hard-coded list did, except
   expect(corpus.filter((line) => eventPriority(line) === "urgent").length).toBeGreaterThan(LEGACY_URGENT.length);
 });
 
-test("the done claim and lane-ending events are lead-urgent; a close after a received claim and the merge readback stay lead-digest", () => {
-  for (const line of ["LANE_DONE_CLAIMED alpha w:p1 proof", "LANE_CLOSED alpha closed", "LANE_AUTO_CLOSED alpha {}", "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x"]) {
+test("the done claim and lane-ending events, a close after a received claim too, are lead-urgent; the merge readback stays lead-digest", () => {
+  for (const line of ["LANE_DONE_CLAIMED alpha w:p1 proof", "LANE_CLOSED alpha closed", "LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "LANE_AUTO_CLOSED alpha {}", "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x"]) {
     expect(eventClass(line)).toBe("lead-urgent");
   }
-  for (const line of ["LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
+  for (const line of ["MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
     expect(eventClass(line)).toBe("lead-digest");
   }
 });
@@ -90,20 +90,14 @@ test("LANE_REPORT_LATE follows LANE_REPORT: question, blocked and done are urgen
   expect(eventClass("UNRESOLVED wait:1 WAIT_DONE alpha ci green")).toBe("lead-urgent");
 });
 
-test("a config file changes a kind's class and the default with no code change", async () => {
+test("an eventPolicy in the config file is ignored: the built-in table holds", async () => {
   const state = withState();
   cleanups.push(state.done);
   const path = join(state.dir, "config.json");
-  writeFileSync(path, JSON.stringify({ eventPolicy: { default: "lead-urgent", kinds: { "GH_PR * opened": "lead-urgent", LANE_REPORT: "lead-digest", NUDGED: "engine-only" } } }));
-  const policy = (await loadConfig(path, state.dir)).eventPolicy;
-  expect(eventPriority("GH_PR acme/app#7 opened", policy)).toBe("urgent");
-  expect(eventClass("LANE_REPORT lane question", policy)).toBe("lead-digest");
-  expect(eventClass("NUDGED lane", policy)).toBe("engine-only");
-  // Unknown kinds take the configured default; kinds the file does not name keep the default table.
-  expect(eventClass("NEW_SOURCE_KIND x", policy)).toBe("lead-urgent");
-  expect(eventClass("INBOUND 1 2 hi", policy)).toBe("lead-urgent");
-  writeFileSync(path, "{}");
-  expect((await loadConfig(path, state.dir)).eventPolicy).toBe(DEFAULT_EVENT_POLICY);
+  for (const eventPolicy of [{ default: "lead-urgent", kinds: { NUDGED: "engine-only" } }, 7]) {
+    writeFileSync(path, JSON.stringify({ eventPolicy }));
+    expect((await loadConfig(path, state.dir)).eventPolicy).toBe(DEFAULT_EVENT_POLICY);
+  }
 });
 
 test("an old config's removed owner-only class loads as lead-digest, named in one warning per process", async () => {

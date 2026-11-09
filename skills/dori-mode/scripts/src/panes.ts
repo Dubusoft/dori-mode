@@ -1,24 +1,23 @@
 import type { Clock, Runner } from "./run.ts";
-import type { Lane } from "./registry.ts";
+import { agentRefusal, ALIVE_STATUSES } from "./pane-state.ts";
 
-/** Herdr IDs belong to a server, not to the host running Dori. */
-export const herdrArgv = (lane: Pick<Lane, "machine">, args: readonly string[]): string[] =>
-  ["herdr", ...(lane.machine ? ["--machine", lane.machine] : []), ...args];
-
-/** Scope existing pane helpers to a lane; nested lifecycle calls must not add the selector twice. */
-export const laneRunner = (run: Runner, lane: Pick<Lane, "machine">): Runner =>
-  lane.machine ? (argv, opts) => run(argv[0] === "herdr" && argv[1] !== "--machine" ? herdrArgv(lane, argv.slice(1)) : argv, opts) : run;
+export { agentRefusal, ALIVE_STATUSES };
 
 export type Pane = {
   readonly pane_id: string;
   readonly workspace_id: string;
   readonly tab_id?: string;
+  readonly terminal_id?: string;
   readonly agent?: string;
   readonly agent_status?: string;
   readonly title?: string;
+  /** The title the program in the pane set for its terminal. */
+  readonly terminal_title?: string;
   readonly cwd?: string;
-  /** Bumped by herdr whenever the pane's content changes. */
+  /** Bumped by herdr on prompt and command events; printed output alone does not bump it. */
   readonly revision?: number;
+  /** How far the pane can scroll back: grows as output scrolls off the screen, until the scrollback is full. */
+  readonly scroll?: { readonly max_offset_from_bottom?: number };
 };
 
 export class UnsafeTextError extends Error {}
@@ -32,8 +31,9 @@ export const listPanes = async (run: Runner): Promise<Pane[]> => {
 export const readScreen = async (run: Runner, pane: string, lines?: number): Promise<string> =>
   (await run(["herdr", "pane", "read", pane, "--source", lines ? "recent" : "visible", ...(lines ? ["--lines", String(lines)] : [])])).out;
 
-/** States herdr reports for a pane whose agent is running. A screen read never stands in for these. */
-export const ALIVE_STATUSES: ReadonlySet<string> = new Set(["idle", "working", "blocked", "done"]);
+/** A lane's agent is alive when its pane is in herdr's pane list and its agent_status is one of ALIVE_STATUSES. */
+export const paneAlive = (pane: Pane | undefined): boolean =>
+  pane?.agent_status !== undefined && ALIVE_STATUSES.has(pane.agent_status);
 
 export const agentStatus = async (run: Runner, pane: string): Promise<string | undefined> =>
   (await listPanes(run)).find((p) => p.pane_id === pane)?.agent_status;
@@ -107,14 +107,6 @@ export const leftInInput = async (run: Runner, clock: Clock, pane: string, text:
   return true;
 };
 
-/** Why `pane` cannot take typed text as an agent prompt: missing from the list, or no agent runs in it (only a shell). */
-export const agentRefusal = (panes: readonly Pane[], pane: string): string | undefined => {
-  const found = panes.find((p) => p.pane_id === pane);
-  if (!found) return `pane ${pane} missing`;
-  if (!found.agent) return `pane ${pane} runs no agent`;
-  return undefined;
-};
-
 /** Sleeps between successive status lookups after Enter; the first lookup is immediate. */
 export const CONFIRM_BACKOFF_MS: readonly number[] = [150, 300, 600, 900, 1000, 1000, 1000];
 
@@ -131,7 +123,7 @@ const typeAndEnter = async (run: Runner, pane: string, text: string): Promise<"s
  * as a command, and only into an empty input box, since text there may be the owner's and ours would be appended to it
  * and submitted with it. The same text already sitting there unsubmitted (an earlier send) only gets Enter.
  */
-const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ readonly sent: "sent" | "failed"; readonly status?: string }> => {
+const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ readonly sent: "sent" | "failed"; readonly status?: string; readonly refusal?: string }> => {
   if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
   let refusal: string | undefined;
   let status: string | undefined;
@@ -149,7 +141,7 @@ const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ r
   }
   if (refusal) {
     console.error(`sendVerified ${pane}: not typed: ${refusal}`);
-    return { sent: "failed", status };
+    return { sent: "failed", status, refusal };
   }
   return { sent: await typeAndEnter(run, pane, text), status };
 };
@@ -163,11 +155,17 @@ export const sendGuarded = async (run: Runner, pane: string, text: string): Prom
  * only by a state change: the pane's agent_status moving to "working" from something else. A pane that was already
  * working cannot show that change. Short of it, the input box is read back (leftInInput): text still there after a
  * second Enter is "failed" (not submitted), otherwise the send is "unconfirmed" and the caller decides. A caller that
- * reads the input box back itself passes `inputCheck` false.
+ * reads the input box back itself passes `inputCheck` false. `refused` hears why a "failed" send was not typed or not
+ * submitted.
  */
-export const sendVerified = async (run: Runner, clock: Clock, pane: string, text: string, inputCheck = true): Promise<Delivery> => {
-  const { sent, status } = await guardedSend(run, pane, text);
-  if (sent === "failed") return "failed";
+export const sendVerified = async (
+  run: Runner, clock: Clock, pane: string, text: string, inputCheck = true, refused: (why: string) => void = () => {},
+): Promise<Delivery> => {
+  const { sent, status, refusal } = await guardedSend(run, pane, text);
+  if (sent === "failed") {
+    refused(refusal ?? `herdr send-text to pane ${pane} failed`);
+    return "failed";
+  }
   if (status !== "working") {
     for (let attempt = 0; attempt <= CONFIRM_BACKOFF_MS.length; attempt++) {
       if (attempt > 0) await clock.sleep(CONFIRM_BACKOFF_MS[attempt - 1] ?? 1000);
@@ -177,7 +175,10 @@ export const sendVerified = async (run: Runner, clock: Clock, pane: string, text
     }
   }
   if (!inputCheck) return "unconfirmed";
-  if (await leftInInput(run, clock, pane, text, status !== "working")) return "failed";
+  if (await leftInInput(run, clock, pane, text, status !== "working")) {
+    refused(`pane ${pane} kept the text in its input line after a second Enter`);
+    return "failed";
+  }
   if (status !== "working" && (await statusLookup(run, pane)).status === "working") return "delivered";
   return "unconfirmed";
 };

@@ -177,7 +177,7 @@ test("a version 6 database is migrated to 7 and keeps decision obligations", asy
   again.close();
 });
 
-test("config: resolveKinds and resolveTimeoutMin default, load from the file, and a malformed kind is refused", async () => {
+test("config: resolveKinds and resolveTimeoutMin are built in; file values, even malformed ones, are ignored", async () => {
   const state = withState();
   cleanups.push(state.done);
   expect(defaultConfig("/h").resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
@@ -185,10 +185,10 @@ test("config: resolveKinds and resolveTimeoutMin default, load from the file, an
   const path = join(state.dir, "c.json");
   writeFileSync(path, JSON.stringify({ resolveKinds: ["WAIT_DONE", "GH_PR * review"], resolveTimeoutMin: 3 }));
   const c = await loadConfig(path, "/h");
-  expect([c.resolveKinds, c.resolveTimeoutMin]).toEqual([["WAIT_DONE", "GH_PR * review"], 3]);
+  expect([c.resolveKinds, c.resolveTimeoutMin]).toEqual([DEFAULT_RESOLVE_KINDS, 15]);
   for (const bad of ["WAIT_DONE", ["* x"], ["A  B"], [7]]) {
     writeFileSync(path, JSON.stringify({ resolveKinds: bad }));
-    expect(loadConfig(path, "/h")).rejects.toThrow("resolveKinds");
+    expect((await loadConfig(path, "/h")).resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
   }
 });
 
@@ -207,8 +207,8 @@ test("dori resolved is lead-only, takes several ids, names unmatched ones, and w
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");
   supervisor.resolveTick();
   const denied = await cli(f.state.dir, ["resolved", "wait:1"], { DORI_LANE_KEY: "alpha" });
-  expect(denied.code).toBe(1);
-  expect(denied.err).toContain("LANE_PERMISSION_DENIED lane alpha may not run resolved; it is lead-only");
+  expect(denied.code).toBe(2);
+  expect(denied.err).toStartWith("DORI_CLI_LANE_ONLY resolved:");
   const usage = await cli(f.state.dir, ["resolved"]);
   expect(usage.code).toBe(1);
   expect(existsSync(join(f.state.dir, RESOLVED_DIR))).toBe(false);

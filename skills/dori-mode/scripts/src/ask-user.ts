@@ -1,15 +1,11 @@
-import { createHash } from "node:crypto";
-
-import { type Emit, type FlowDeps, laneMeta } from "./done-flow.ts";
 import { redactSecrets } from "./redact.ts";
-import { statusOf } from "./registry.ts";
-import { passthroughView, type SweepView } from "./sweep-view.ts";
 
 /**
  * A lane should ask with `dori report <key> question`, which wakes the lead. A lane that asks only through its agent's
- * on-screen question UI (omo's ask-user) wakes nobody and sits there until someone looks at its pane. This sweep reads
- * each open lane's pane for such a prompt and raises one urgent `LANE_ASKING` per question, with its text and options;
- * once the prompt is gone (answered, cancelled, timed out) the next prompt is raised again.
+ * on-screen question UI (omo's ask-user) wakes nobody and sits there until someone looks at its pane. The lane's runner
+ * reads each lane's pane for such a prompt with `screenQuestion` and publishes one `lane.asking` per question
+ * (runner/lanes.ts), which the supervisor raises as urgent `LANE_ASKING` (`askingLine`); the supervisor never reads
+ * the screen itself (design D21). This module is the shared parser.
  */
 
 /** A question prompt on screen: the current question's header, text and options, and how many questions it holds. */
@@ -103,34 +99,4 @@ export const askingLine = (key: string, q: ScreenQuestion): string => {
   const more = q.pending > 1 ? ` | ${q.pending} questions pending` : "";
   const body = redactSecrets(clean(`${q.header ? `[${q.header}] ` : ""}${q.question}${options}${more}`)).slice(0, 400);
   return `LANE_ASKING ${key} waits on an on-screen question, not dori report: ${body}`;
-};
-
-/**
- * What identifies one question across ticks: the same prompt still showing is never raised twice, also when the lane's
- * owner opens the collapsed widget into the dialog (their pending counts differ, so the count is left out).
- */
-const questionKey = (q: ScreenQuestion): string =>
-  createHash("sha256").update(JSON.stringify(q.tabs && q.tabs.length > 1 ? [q.tabs] : [q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
-
-/**
- * One pass over the open lanes (a paused lane is skipped: it is stopped on purpose). A prompt not raised yet is emitted
- * as urgent LANE_ASKING and remembered on the lane (`lastAskPrompt`); a lane whose prompt is gone forgets it, so its next
- * question is raised again. Empty screen reads leave the remembered prompt unchanged. The line is emitted before the lane
- * records it, so a crash in between repeats it, never drops it.
- */
-export const askUserTick = async (deps: FlowDeps, emit: Emit, view: SweepView = passthroughView(deps.run)): Promise<void> => {
-  let firstError: unknown;
-  for (const lane of await deps.registry.open()) {
-    try {
-      if (!lane.pane || lane.recoveryPending || statusOf(lane) === "paused") continue;
-      const screen = await view.screen(lane, ASK_SCREEN_LINES);
-      if (!screen.trim()) continue;
-      const asked = screenQuestion(screen);
-      const seen = asked ? questionKey(asked) : undefined;
-      if (seen === lane.lastAskPrompt) continue;
-      if (asked) await emit(askingLine(lane.key, asked), undefined, laneMeta(lane));
-      await deps.registry.patch(lane.key, { lastAskPrompt: seen });
-    } catch (error) { firstError ??= error; }
-  }
-  if (firstError !== undefined) throw firstError;
 };

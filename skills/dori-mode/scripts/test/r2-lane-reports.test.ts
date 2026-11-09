@@ -5,9 +5,8 @@ import { Database } from "bun:sqlite";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { freshnessTick } from "../src/freshness.ts";
 import { INLINE_REPORT_MAX, JsonLaneReports, type LaneReportStore, openLaneReports, POISON_ALERT_AFTER, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
-import { footer, launchLane } from "../src/launch.ts";
+import { launchLane } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, withSqliteStore, withState } from "./fakes.ts";
@@ -154,10 +153,10 @@ test("a dead lane pane leaves one synthetic blocked row under the lane's key; a 
   const lanes = [lane(dir)];
   const seen = new Set<string>();
   const st = newDeadPaneState();
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st, lanes, undefined, () => T0)).toEqual([]);
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T12", st, lanes, undefined, () => T0)).toEqual(["DEAD_PANE w:p7", "DEAD_PANE w:p9"]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st, lanes, undefined, () => T0)).toEqual([]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st, lanes, undefined, () => T0)).toEqual(["DEAD_PANE w:p7", "DEAD_PANE w:p9"]);
   // Announced again the next hour, but the row is written once.
-  expect(await deadPaneTick(deps.run, deps.config, seen, "2026-01-01T13", st, lanes, undefined, () => T0 + 60 * MIN)).toEqual(["DEAD_PANE w:p7", "DEAD_PANE w:p9"]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T13", st, lanes, undefined, () => T0 + 60 * MIN)).toEqual(["DEAD_PANE w:p7", "DEAD_PANE w:p9"]);
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });
   const rows = store.list();
@@ -166,33 +165,15 @@ test("a dead lane pane leaves one synthetic blocked row under the lane's key; a 
   expect(eventClass(`LANE_REPORT local-lane blocked ${rows[0]?.text}`, deps.config.eventPolicy)).toBe("lead-urgent");
 });
 
-test("a freshness post of a lane's last [REPORT] line is marked [System] relayed, not the lane speaking", async () => {
-  const dir = stateDir();
-  const world = newWorld();
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
-  world.screen = "noise\n[REPORT] quiet-lane | milestone | tests green, PR open\n❯ ";
-  const deps = (ms: number) => depsFor(world, fakeClock(ms), dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
-  await deps(T0).registry.write({ ...lane(dir), key: "quiet-lane", thread: "chat:team/9", lastReplyAt: T0, lastNudgeAt: T0 + 16 * MIN });
-  await freshnessTick(deps(T0 + 21 * MIN), "/home/test");
-  expect((await freshnessTick(deps(T0 + 26 * MIN), "/home/test")).map((a) => a.kind)).toEqual(["posted"]);
-  expect(world.calls.find((c) => c[0] === "notify")?.[2]).toBe("[System] relayed from lane quiet-lane: Progress (from the lane's last report): tests green, PR open");
-});
-
 test("a lane registered on the old [REPORT] footer moves onto dori report when it is relaunched", async () => {
   const dir = stateDir();
   const world = newWorld();
-  const base = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });
-  const deps = {
-    ...base,
-    run: async (argv: readonly string[]) => argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create"
-      ? { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }), err: "" }
-      : base.run(argv),
-  };
+  const deps = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });
   const brief = join(dir, "old-lane.md");
   const old = lane(dir, { key: "old-lane", brief, pane: "w:p3" });
   expect(old.reportVia).toBeUndefined();
-  await Bun.write(brief, `do the thing\n${footer(old, "w:lead")}`);
-  expect(await Bun.file(brief).text()).toContain("sent to pane w:lead");
+  // The brief as an older dori wrote it: its footer told the lane to type [REPORT] lines into the lead's pane.
+  await Bun.write(brief, "do the thing\n\n## Lane footer (written by dori launch)\n- Report: print one line [REPORT] old-lane | <milestone|blocker|question|done> | <what, with links>, sent to pane w:lead as an argv array\n");
   await deps.registry.write(old);
   const { lane: relaunched } = await launchLane(deps, { key: "old-lane", title: "t", brief, done: old.done, thread: old.thread, cwd: join(dir, "nogit") }, old);
   expect(relaunched.reportVia).toBe("cli");

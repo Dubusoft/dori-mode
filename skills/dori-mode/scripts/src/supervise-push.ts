@@ -123,10 +123,11 @@ export class PushDelivery {
 
   /**
    * The push step of one delivery pass. Returns true when it set a restart (the caller's loop carries it out). Makes no
-   * herdr call while nothing untaken is due.
+   * herdr call while nothing untaken is due. A pointer that starts an idle lead's turn is a lead wake, unless this pass
+   * already `woke` the lead (the pointer then belongs to that turn).
    */
   async tick(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
-    (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane)): Promise<boolean> {
+    (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane), woke = false): Promise<boolean> {
     const { config, clock, run } = this.core.deps;
     const { delivery } = config;
     if (this.journal.restart) return false;
@@ -195,6 +196,12 @@ export class PushDelivery {
       if (this.working?.offset !== inbox.takenOffset) this.working = { offset: inbox.takenOffset, since: now };
       if (now - this.working.since < delivery.push.ackSec * 1000) return false;
     }
+    // A noise-only batch (overdue digest events, nothing urgent or owed) keeps the one pointer it got at this take cursor
+    // and lead session (a take or a new session clears the push): it is never typed again, idle or working.
+    if (push && push.attempts > 0 && !urgent.length && !due.length && !decisions.length && !owners.length) {
+      this.once("noise", `LEAD_PUSH_NOISE_HELD ${batch} ${untaken.length} digest event(s): one pointer already sent, not re-pushing`);
+      return false;
+    }
     // A take permits the next urgent batch immediately, without erasing an unfinished owner's escalation clock.
     if (push && now - push.at < this.interval(push.attempts) && !(inbox.takenOffset >= push.upto && urgent.length)) return false;
     if (push && push.attempts > delivery.push.retries && !push.untakenLogged) {
@@ -239,6 +246,7 @@ export class PushDelivery {
     const sent = await sendVerified(run, clock, config.leadPane, pointer, false);
     console.log(`LEAD_PUSH ${batch} ${total} ${kinds.join(",")} ${sent} attempt=${next.attempts}`);
     if (sent === "delivered") {
+      if (idle && !woke) this.core.wakes.recordKinds(this.lead.warmSession, kinds);
       // sendVerified already observed the post-handoff transition to working; do not poll the pane again.
       await this.outcomes.tick(this.core.deps.registry, async () => "working");
       return false;

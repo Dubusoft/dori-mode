@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as quota from "../src/claude-quota.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import {
-  EMIT_DIR, EventSources, publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews, validateSpec,
+  EMIT_DIR, EventSources, publicSpec, queueEmit, readSourceStatus, SOURCE_STATUS_FILE, SourceError, SourceSpecs, sourceViews, validateSpec,
 } from "../src/event-sources.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
@@ -14,6 +14,14 @@ import { supervise } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { Waits } from "../src/waits.ts";
 import { depsFor, fakeClock, manualPause, newWorld, readJournal, withState } from "./fakes.ts";
+
+/** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
+const idleRunner = () => {
+  let exit = (_code: number) => {};
+  const exited = new Promise<number>((resolve) => { exit = resolve; });
+  return { pid: 4242, exited, kill: () => { exit(0); } };
+};
+
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -60,7 +68,25 @@ test("dori emit: spooled events are journaled once per --id and delivered by the
   queueEmit(f.dir, "DEPLOY", "replayed", T0 + 3, "deploy-42");
   await f.sources.tick();
   expect(f.events().filter((event) => event.line.startsWith("DEPLOY "))).toHaveLength(2);
-  expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ type: "builtin", events: 2, duplicates: 2, lastKind: "DEPLOY", lastEventAt: T0 });
+  expect(readSourceStatus(f.dir)?.sources.emit).toMatchObject({ type: "builtin", events: 2, duplicates: 1, lastKind: "DEPLOY", lastEventAt: T0 });
+});
+
+test("duplicate-only source events leave the status file untouched and their counters persist with the next new event", async () => {
+  const f = fixture({ DEPLOY: "lead-digest" });
+  const enqueue = f.sources.enqueueFor("github");
+  expect(enqueue("one", "DEPLOY one")).toBe(true);
+  await f.sources.tick();
+  const path = join(f.dir, SOURCE_STATUS_FILE);
+  const before = statSync(path);
+  const bytes = readFileSync(path, "utf8");
+  f.clock.at++;
+  expect(enqueue("one", "DEPLOY duplicate")).toBe(false);
+  await f.sources.tick();
+  expect(statSync(path).ino).toBe(before.ino);
+  expect(readFileSync(path, "utf8")).toBe(bytes);
+  expect(enqueue("two", "DEPLOY two")).toBe(true);
+  await f.sources.tick();
+  expect(readSourceStatus(f.dir)?.sources.github).toMatchObject({ events: 2, duplicates: 1 });
 });
 
 test("emit retains its spool after a failed save and retries without a false duplicate", async () => {
@@ -218,8 +244,8 @@ test("a failing source is isolated: the others keep delivering, it is reported o
   expect(failed[1]).toStartWith("SOURCE_FAILED missing file: ENOENT");
   const status = await collectStatus({ ...f.deps, run: async () => ok("active") });
   const text = renderStatus(status);
-  expect(text).toContain("- Source bad failing since just now: bad exited 2: boom: no such host");
-  expect(text).toContain("- Event sources: discord no events yet, github no events yet, sweeps no events yet, waits no events yet, emit no events yet, bad (poll) no events yet FAILING, good (poll) GOOD just now, missing (file) no events yet FAILING");
+  expect(text).toContain("- 소스 bad 실패 (방금부터): bad exited 2: boom: no such host");
+  expect(text).toContain("- 이벤트 소스: discord 이벤트 없음, github 이벤트 없음, sweeps 이벤트 없음, waits 이벤트 없음, emit 이벤트 없음, bad (poll) 이벤트 없음 실패, good (poll) GOOD 방금, missing (file) 이벤트 없음 실패");
   // Recovered: no longer failing, and its last error stays visible.
   broken = false;
   f.clock.at += 5_000;
@@ -317,7 +343,7 @@ test("the real supervisor runs the built-ins and the user sources through the re
   };
   const controller = new AbortController();
   const running = supervise(deps, controller.signal, {
-    token: `event-sources-test-${state.dir}`,
+    token: `event-sources-test-${state.dir}`, spawnRunner: idleRunner, gatewayLockDir: join(state.dir, "gateway-locks"),
     http: async (request) => ({ status: 200, headers: {}, body: request.url.endsWith("/threads/active") ? JSON.stringify({ threads: [] }) : "[]" }),
     lookup: async () => "", statusLookup: async () => "",
     open: () => {

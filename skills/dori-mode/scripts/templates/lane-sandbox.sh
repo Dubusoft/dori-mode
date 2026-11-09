@@ -5,6 +5,7 @@
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
+#   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <defaultCwd>/state/verify)
 set -eu
 
 if [ "$#" -eq 0 ]; then
@@ -30,8 +31,8 @@ chmod 700 "$LT"
 # Root is a namespace-owned tmpfs (uid = us, 0755) instead of --ro-bind / /, so
 # / and the parent of $HOME do not show up as nobody-owned. Host top-level
 # entries are re-bound read-only and top-level symlinks recreated.
-top=/${H#/}
-top=${top%%/*}
+top=${H#/}
+top=/${top%%/*}
 opts=(--perms 0755 --tmpfs /)
 shopt -s nullglob dotglob
 for e in /*; do
@@ -57,7 +58,8 @@ opts+=(
 
 # ~/.dori gets its own tmpfs that is made read-only after the ro binds, so
 # rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env stays hidden.
-opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state")
+# Every rw mount point under it is created here: bwrap cannot mkdir one once it is read-only.
+opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state" --dir "$H/.dori/heavy")
 
 # Read-only re-binds (skipped when missing)
 for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
@@ -65,6 +67,11 @@ for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
   .npmrc .dori/config.json .dori/src .dori/bin; do
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
+opts+=(--ro-bind-try "$H/.dori/runner/sock" "$H/.dori/runner/sock")
+opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
+if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then
+  opts+=(--ro-bind-try "$DORI_LANE_TOKEN_FILE" "$DORI_LANE_TOKEN_FILE")
+fi
 opts+=(--remount-ro "$H/.dori")
 
 # ssh rejects root-owned include files inside the user namespace (root shows as
@@ -81,12 +88,18 @@ for p in "$H/.omo" "$H/.dori/state" "$H/.cache" "$H/.npm" "$H/.bun/install/cache
   "$H/.cargo/registry" "$H/.cargo/git"; do
   opts+=(--bind-try "$p" "$p")
 done
+mkdir -p "$H/.dori/heavy"
+opts+=(--bind-try "$H/.dori/heavy" "$H/.dori/heavy")
 
 if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   IFS=: read -r -a extra <<<"$LANE_SANDBOX_RW"
   for p in "${extra[@]}"; do
     [ -n "$p" ] && opts+=(--bind-try "$p" "$p")
   done
+fi
+# Only the verify directory itself: the rest of its parent stays read-only.
+if [ -n "${LANE_SANDBOX_VERIFY:-}" ]; then
+  opts+=(--bind-try "$LANE_SANDBOX_VERIFY" "$LANE_SANDBOX_VERIFY")
 fi
 
 # Private key only when the ssh agent has no identities

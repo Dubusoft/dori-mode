@@ -1,6 +1,11 @@
 import { formatKb, type Proc, procLanes } from "./lane-memory.ts";
 import type { Clock } from "./run.ts";
 
+/**
+ * Critical-pressure kills, runner-side only (runner/guard.ts): a runner kills its own host's lane processes and reports
+ * them in `guard.critical`; the supervisor never signals a lane process. `describeKilled` and `KilledProc` are shared.
+ */
+
 /** A process the critical-pressure stage sent a signal to. */
 export type KilledProc = { readonly pid: number; readonly lane?: string; readonly comm: string; readonly rssKb: number };
 

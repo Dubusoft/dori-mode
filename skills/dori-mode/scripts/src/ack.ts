@@ -1,9 +1,11 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { COLD_START_EMOJI } from "./supervise.ts";
 import { MessengerError } from "./messenger/http.ts";
+import { dropCarried } from "./inbox.ts";
+import { JOURNAL_FILE, readStoreView, SQLITE_FILE } from "./store.ts";
 
 /** The lead's read receipt, the one reaction it puts on an owner message. */
 export const EYES_EMOJI = "\u{1F440}";
@@ -80,7 +82,34 @@ export const recordHandled = (stateDir: string, channel: string, message: string
   if (!coverage.lanes?.length && !coverage.reply && !coverage.all) throw new AckError("handled needs --lane <key>, --reply and/or --all");
   if (coverage.lanes?.some((lane) => !/^[\w.-]+$/.test(lane))) throw new AckError("--lane must name a lane key");
   recordReceipt(stateDir, channel, message, at, coverage);
+  // A complete message no longer needs its UNFINISHED reminder. Completeness is the supervisor's merge (consumeReceipts)
+  // of the coverage it already tracks with the receipts it has not consumed yet; an unreadable store leaves the pruning
+  // to the supervisor.
+  const id = ownerMessageId(channel, message);
+  const tracked = trackedCoverage(stateDir, id);
+  if (!tracked) return;
+  const entry = tracked.entry ?? {};
+  const receipts = pendingAcks(stateDir).filter((receipt) => receipt.id === id);
+  const all = receipts.some((receipt) => receipt.all);
+  const lanes = new Set([...(entry.lanes ?? []), ...receipts.flatMap((receipt) => receipt.lanes ?? [])]);
+  const reply = !!(entry.reply || receipts.some((receipt) => receipt.reply) || (all && !lanes.size));
+  const covered = lanes.size + Number(reply);
+  const tasks = all ? covered : Math.max(entry.tasks ?? 1, ...receipts.map((receipt) => receipt.tasks ?? 1));
+  if (covered >= tasks) dropCarried(stateDir, id);
 };
+
+/** The coverage the supervisor tracks for owner message `id` (`entry` absent when untracked); undefined when the store cannot be read. */
+const trackedCoverage = (stateDir: string, id: string): { readonly entry?: MessageCoverage } | undefined =>
+  !existsSync(join(stateDir, JOURNAL_FILE)) && !existsSync(join(stateDir, SQLITE_FILE)) ? {} : readStoreView(stateDir, {
+  json: (journal) => {
+    const entry = journal.awaitingAck?.find((tracked) => tracked.id === id);
+    return entry ? { entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply } } : {};
+  },
+  sqlite: (db) => {
+    const row = db.query("SELECT tasks, lanes, reply FROM owner_messages WHERE id = ?").get(id) as { tasks: number | null; lanes: string | null; reply: number | null } | null;
+    return row ? { entry: { tasks: row.tasks ?? undefined, lanes: row.lanes ? JSON.parse(row.lanes) as string[] : undefined, reply: row.reply === 1 } } : {};
+  },
+});
 
 /** Acks waiting for the supervisor, as inbound ids (discord:<channel>:<message>) with their file paths and ack times. */
 export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id: string; readonly path: string; readonly at: number })[] => {

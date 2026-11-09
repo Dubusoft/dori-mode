@@ -92,7 +92,11 @@ test("failing CI on a lane PR is one lane message with an ID, typed once into th
   await ci.tick([pull()], emit);
   expect(sent(world)).toHaveLength(1);
   expect(sent(world)[0]).toContain(`dori report ack ${id}`);
-  expect(world.calls.filter((c) => c[0] === "herdr" && c[2] === "send-keys")).toHaveLength(1);
+  // One facade send, as the recorded operation's effect: verified, input-checked, keyed by the operation's cmdId.
+  expect(world.ops.filter((e) => e.op === "send")).toHaveLength(1);
+  expect(world.ops.find((e) => e.op === "send")?.args).toMatchObject({
+    opts: { mode: "verified", inputCheck: true, cmdId: `op:demo-lane/lane-message/${id}:1` },
+  });
   expect(ci.messages.get(id)).toMatchObject({ lane: "demo-lane", state: "delivered" });
 
   expect(() => ackLaneMessage(ci.messages, "other-lane", id, clock.now())).toThrow(LaneMessageError);
@@ -121,7 +125,6 @@ for (const [name, setup, reason] of [
   ["busy", () => { world.panes = [{ ...idle, agent_status: "working" }]; }, "busy (working)"],
   ["paused", async () => { await deps.registry.update(lane.key, () => ({ ...lane, status: "paused" })); }, "lane paused"],
   ["missing", () => { world.panes = []; }, "pane w:p1 missing"],
-  ["owner-draft", () => { world.screen = "❯ half a sentence"; }, "input line holds other text"],
 ] as const) {
   test(`a ${name} pane keeps the message queued, untyped, and wakes the lead once after the deadline`, async () => {
     await setup();
@@ -138,6 +141,28 @@ for (const [name, setup, reason] of [
     expect(sent(world)).toEqual([]);
   });
 }
+
+test("a send the runner refuses (owner's text in the input line, runner down) keeps the message queued and wakes the lead once after the deadline", async () => {
+  world.sendDelivery = "failed";
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)).toMatchObject({ state: "queued", blocked: expect.stringContaining("send failed") });
+  clock.at += 21 * MIN;
+  await ci.tick([pull()], emit);
+  expect(events.filter(([, l]) => l.startsWith("LANE_MESSAGE_UNCONFIRMED"))).toHaveLength(1);
+  expect(lines("LANE_MESSAGE_UNCONFIRMED")[0]).toContain(`demo-lane ${id} not delivered: `);
+});
+
+test("an unconfirmed send counts as delivered and is never retyped", async () => {
+  world.sendDelivery = "unconfirmed";
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)).toMatchObject({ state: "delivered" });
+  expect(sent(world)).toHaveLength(1);
+});
 
 test("a new head SHA supersedes the queued message for the old one", async () => {
   world.panes = [{ ...idle, agent_status: "working" }];
@@ -159,6 +184,38 @@ test("a delivered message whose PR went green is superseded and never reaches th
   await ci.tick([pull({ checks: "green" })], emit);
   expect(ci.messages.get(ciMessageId(pull()))?.state).toBe("superseded");
   expect(lines("LANE_MESSAGE_UNCONFIRMED")).toEqual([]);
+});
+
+test("a lane whose runner cannot answer keeps its failing-CI message open, and it is typed once the runner is back", async () => {
+  // The PR belongs to the lane only through its worktree branch, which the lane's runner reports.
+  await deps.registry.update(lane.key, () => ({ ...lane, done: "merged acme/other#99" }));
+  world.inspection = { git: { toplevel: "/repo", branch: "feat", origin: "git@github.com:acme/app.git", worktrees: [] } };
+  world.panes = [{ ...idle, agent_status: "working" }];
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)?.state).toBe("queued");
+  world.runnerDown = true;
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)?.state).toBe("queued");
+  world.runnerDown = false;
+  world.panes = [{ ...idle }];
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)?.state).toBe("delivered");
+  expect(sent(world)).toHaveLength(1);
+});
+
+test("a superseded failing-CI message is queued again when the same head fails again", async () => {
+  world.panes = [{ ...idle, agent_status: "working" }];
+  const ci = follow();
+  const id = ciMessageId(pull());
+  await ci.tick([pull()], emit);
+  await ci.tick([pull({ checks: "pending" })], emit);
+  expect(ci.messages.get(id)?.state).toBe("superseded");
+  world.panes = [{ ...idle }];
+  await ci.tick([pull()], emit);
+  expect(ci.messages.get(id)).toMatchObject({ state: "delivered" });
+  expect(sent(world)).toHaveLength(1);
 });
 
 test("a green, clean lane PR into dev is merged once with --match-head-commit and no --admin; a second poll and a restart merge nothing", async () => {
@@ -193,6 +250,57 @@ test("a green lane PR is merged only at the head its done claim recorded: no cla
   await deps.registry.update(lane.key, () => claimedLane);
   await ci.tick([green], emit);
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
+});
+
+test("a claimed PR the supervisor cannot merge (review BLOCKED, no checks) wakes the lead once as urgent MERGE_STALLED after mergeStallMin; pending CI never does", async () => {
+  gh.view = greenView({ mergeStateStatus: "BLOCKED" });
+  const ci = follow();
+  await ci.tick([pull({ checks: "green" })], emit);
+  clock.at += 14 * MIN;
+  await ci.tick([pull({ checks: "green" })], emit);
+  expect(lines("MERGE_STALLED")).toEqual([]);
+  clock.at += 2 * MIN;
+  await ci.tick([pull({ checks: "green" })], emit);
+  await ci.tick([pull({ checks: "green" })], emit);
+  expect(events.filter(([, l]) => l.startsWith("MERGE_STALLED"))).toHaveLength(1);
+  expect(lines("MERGE_STALLED")[0]).toStartWith("MERGE_STALLED acme/app#7 lane=demo-lane head=abcdef1 mergeable MERGEABLE state BLOCKED for 15+ min");
+  expect(eventClass(lines("MERGE_STALLED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(gh.merges).toEqual([]);
+
+  events = [];
+  const none = follow();
+  await none.tick([pull({ checks: "none" })], emit);
+  clock.at += 16 * MIN;
+  await none.tick([pull({ checks: "none" })], emit);
+  expect(lines("MERGE_STALLED")[0]).toContain(" no checks for 15+ min");
+
+  // Long CI is the claim's own merge wait, never a stall; a poll that sees it moving resets the clock.
+  events = [];
+  const pending = follow();
+  await pending.tick([pull({ checks: "none" })], emit);
+  for (let i = 0; i < 4; i++) {
+    clock.at += 20 * MIN;
+    await pending.tick([pull({ checks: "pending" })], emit);
+  }
+  expect(lines("MERGE_STALLED")).toEqual([]);
+});
+
+test("a green, clean PR left unmerged for want of a claim is MERGE_STALLED only while its lane waits on that merge", async () => {
+  const stalledFor = async (patch: Partial<Lane>): Promise<string[]> => {
+    events = [];
+    await deps.registry.update(lane.key, () => ({ ...lane, ...patch }));
+    const ci = follow();
+    await ci.tick([pull({ checks: "green" })], emit);
+    clock.at += 16 * MIN;
+    await ci.tick([pull({ checks: "green" })], emit);
+    return lines("MERGE_STALLED");
+  };
+  // Told not done after its claim (the settle re-check or the lead objected): the supervisor never merges it.
+  expect((await stalledFor({ status: "not-done" }))[0]).toContain("lane is not-done, no done claim for 15+ min: green and clean");
+  // Still working with Done naming this PR as merged: it may be waiting for the merge instead of claiming.
+  expect((await stalledFor({}))[0]).toContain("lane is working, no done claim");
+  expect(await stalledFor({ status: "paused" })).toEqual([]);
+  expect(gh.merges).toEqual([]);
 });
 
 test("a fork PR named like the lane's PR or branch gets no merge, CI message, merge lane or issue close", async () => {
@@ -243,6 +351,29 @@ test("a merge lane refuses a fork head and an option-shaped or invalid branch be
   }
   const bad = await launchMergeLane({ ...deps, run: async (argv, opts) => (argv[1] === "check-ref-format" ? { code: 1, out: "", err: "" } : deps.run(argv, opts)) }, { key: mergeLaneKey(pull()), source, pull: pull({ branch: "a..b" }), base: "dev" });
   expect(bad).toEqual({ ok: false, detail: 'branch name "a..b" of acme/app#7 is not a valid branch' });
+  expect(world.calls.filter((c) => c[0] === "git" && c[1] !== "check-ref-format")).toEqual([]);
+});
+
+test("a merge lane asks the runner, in order, whether the worktree exists, then to fetch and to add it; each refusal keeps its detail", async () => {
+  const request = { key: mergeLaneKey(pull()), source: { ...claimedLane }, pull: pull(), base: "dev" };
+  const roomy = (argv: readonly string[], opts?: Parameters<typeof deps.run>[1]) =>
+    argv[0] === "df" ? Promise.resolve({ code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200", err: "" }) : deps.run(argv, opts);
+  const exists = async () => [false];
+  const failing = (fail: string) => ({ ...deps.ops, exists, git: async (lane: Parameters<typeof deps.ops.git>[0], op: Parameters<typeof deps.ops.git>[1]) => {
+    await deps.ops.git(lane, op);
+    return op.op === fail ? { code: 128, out: "", err: `${fail} boom\n` } : { code: 0, out: "", err: "" };
+  } });
+  const fetchFail = await launchMergeLane({ ...deps, run: roomy, ops: failing("fetch-branch") }, request);
+  expect(fetchFail).toEqual({ ok: false, detail: "git fetch failed: fetch-branch boom" });
+  world.ops.length = 0;
+  const addFail = await launchMergeLane({ ...deps, run: roomy, ops: failing("worktree-add") }, request);
+  expect(addFail).toEqual({ ok: false, detail: "git worktree add failed: worktree-add boom" });
+  const git = world.ops.filter((o) => o.op === "git");
+  expect(git.map((o) => (o.args as { op: string }).op)).toEqual(["fetch-branch", "worktree-add"]);
+  expect(git[0]!.args).toMatchObject({ root: claimedLane.cwd, remote: "origin", branch: "feat" });
+  expect(git[1]!.args).toMatchObject({ root: claimedLane.cwd, ref: "refs/remotes/origin/feat" });
+  const present = await launchMergeLane({ ...deps, run: roomy, ops: { ...deps.ops, exists: async () => [true] } }, request);
+  expect(present.detail).toMatch(/^worktree .* already exists$/);
   expect(world.calls.filter((c) => c[0] === "git" && c[1] !== "check-ref-format")).toEqual([]);
 });
 
@@ -448,17 +579,12 @@ test("a merged lane PR that cannot be read back wakes the lead once as MERGE_UNV
   expect(eventClass(lines("MERGE_UNVERIFIED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
 });
 
-test("GH_PR checks_failing and conflicting are digest by default, unless eventPolicy names them", async () => {
+test("GH_PR checks_failing and conflicting are digest; an eventPolicy in the config file is ignored", async () => {
   const file = join(state.dir, "config.json");
-  writeFileSync(file, JSON.stringify({}));
+  writeFileSync(file, JSON.stringify({ eventPolicy: { kinds: { "GH_PR * conflicting": "lead-urgent" } } }));
   const plain = await loadConfig(file, "/home/test");
   expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", plain.eventPolicy)).toBe("lead-digest");
   expect(eventClass("GH_PR acme/app#7 conflicting sha=x u", plain.eventPolicy)).toBe("lead-digest");
-
-  writeFileSync(file, JSON.stringify({ eventPolicy: { kinds: { "GH_PR * conflicting": "lead-urgent" } } }));
-  const on = await loadConfig(file, "/home/test");
-  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", on.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("GH_PR acme/app#7 conflicting sha=x u", on.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", on.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("CI_CONFLICT acme/app#7 x", on.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", plain.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("CI_CONFLICT acme/app#7 x", plain.eventPolicy)).toBe("lead-urgent");
 });

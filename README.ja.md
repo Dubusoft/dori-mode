@@ -58,13 +58,13 @@ Dori はあなたの話し方に合わせます。短く、くだけた調子で
 
 | 項目 | 意味 |
 |---|---|
-| `leadPane` | Dori 自身の herdr pane(`herdr pane current`)。レーンの報告はここに届きます。 |
-| `laneWorkspace` | 新しいレーンのタブを開く herdr workspace |
 | `defaultCwd` | レーンが始まるディレクトリで、レーンが worktree を作るリポジトリ |
 | `agentCommand` | エージェントの起動コマンド。`{model}` と `{prompt}` を含む argv のリスト |
 | `hooks.threadReply` | メッセンジャー CLI を `{thread}` と `{text}` を含む argv のリストで。レーンの進捗投稿に使います。 |
 
 残り(時間、しきい値、heavy スロット数)は既定値で十分です。全項目の表は [`references/scripts.md`](skills/dori-mode/references/scripts.md) にあります。環境変数 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` はファイルより優先されます。
+
+リードの herdr pane と、新しいレーンのタブを開く workspace は設定しません。スーパーバイザーが見つけ、なければ作り(`Dori` workspace の `dori-lead` タブと `lanes` workspace)、`<stateDir>/herdr-panes.json` に記録します。古い設定の `leadPane`、`laneWorkspace`、`workspaces` は一度だけそこへ移され、以後は無視されます。
 
 ## オンボーディング
 
