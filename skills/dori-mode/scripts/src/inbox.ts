@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { outcomeLane } from "./lane-outcomes.ts";
+import { splitChannelName } from "./messenger/discord-inbound.ts";
 
 /**
  * The lead's read path for delivered events (`dori inbox take`). It prints lead-events.log from the take cursor to the
@@ -258,7 +259,8 @@ const UNREAD_KIND = /^(INBOUND|INBOUND_EDIT|INBOUND_DELETE) (\d+) (\d+)(?: (.*))
  * each acked channel, so a follow-up that arrived with or after the acked message is seen before the reply. It never
  * writes a take receipt or carried owner text, so the next `dori inbox take` still prints these events. Only the acked
  * originals are left out: their edits and deletes stay. Per channel (first-acked order, each once) it prints at most
- * `max` lines `UNREAD <channel> <kind> <eventId> <preview>`, then `UNREAD_MORE <channel> <n>` for the rest, or
+ * `max` lines `UNREAD <channel> <kind> <eventId> <preview>`, then `UNREAD_MORE <channel> <n>` for the rest (both end with
+ * the event's ` channel=#<name>` token when the supervisor knew the name), or
  * `UNREAD_NONE <channel>`. A missing cursor or a failed read prints one `UNREAD_UNAVAILABLE` line instead of throwing:
  * the ack is already recorded and must not fail because of the preview.
  */
@@ -278,7 +280,7 @@ export const unreadAfterAck = (stateDir: string, acked: readonly { readonly chan
       const events = byChannel.get(channel) ?? [];
       if (!events.length) return [`UNREAD_NONE ${channel}`];
       shown.push(...events.slice(0, max).map((event) => event.id));
-      return [...events.slice(0, max).map((event) => event.text), ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}`] : [])];
+      return previewLines(channel, events, max);
     });
     recordSeen(stateDir, shown);
     return out;
@@ -300,10 +302,15 @@ export const staleOwnerEvents = (stateDir: string, channel: string, max = UNREAD
   const events = ownerEventsPast(stateDir, from).filter((event) => event.channel === channel && !seen.has(event.id));
   if (!events.length) return { count: 0, lines: [] };
   recordSeen(stateDir, events.slice(0, max).map((event) => event.id));
-  return { count: events.length, lines: [...events.slice(0, max).map((event) => event.text), ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}`] : [])] };
+  return { count: events.length, lines: previewLines(channel, events, max) };
 };
 
-type OwnerEvent = { readonly channel: string; readonly id: string; readonly text: string };
+type OwnerEvent = { readonly channel: string; readonly id: string; readonly text: string; readonly token: string };
+
+const previewLines = (channel: string, events: readonly OwnerEvent[], max: number): string[] => [
+  ...events.slice(0, max).map((event) => event.text),
+  ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}${events.findLast((event) => event.token)?.token ?? ""}`] : []),
+];
 
 /** Owner events (INBOUND, INBOUND_EDIT, INBOUND_DELETE) of the Discord log past `from`, as `UNREAD ...` preview lines. */
 const ownerEventsPast = (stateDir: string, from: number): OwnerEvent[] => {
@@ -312,9 +319,11 @@ const ownerEventsPast = (stateDir: string, from: number): OwnerEvent[] => {
     const event = parseLogLine(text);
     const m = UNREAD_KIND.exec(event.line);
     if (!m || !event.id.startsWith(`discord:${m[2]}:`)) continue;
-    const body = (m[4] ?? "").replace(/\s+/g, " ").trim();
+    // The channel name token is kept out of the cut preview and goes last again.
+    const { text: rest, token } = splitChannelName(m[4] ?? "");
+    const body = rest.replace(/\s+/g, " ").trim();
     const preview = body.length > UNREAD_PREVIEW_CHARS ? `${body.slice(0, UNREAD_PREVIEW_CHARS)}...` : body;
-    out.push({ channel: m[2] ?? "", id: event.id, text: `UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}` });
+    out.push({ channel: m[2] ?? "", id: event.id, token, text: `UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}${token}` });
   }
   return out;
 };

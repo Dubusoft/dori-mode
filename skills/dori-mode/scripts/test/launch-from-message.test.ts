@@ -45,6 +45,14 @@ test("the latest INBOUND_EDIT replaces the original text", () => {
   expect(ownerMessageText(state.dir, { channel: "111", message: "501" })).toBe("newest version");
 });
 
+test("the supervisor's trailing channel name token is not part of the owner's text", () => {
+  log("discord:111:501", "INBOUND 111 501 owner fix it channel=#일반");
+  log("discord:111:502", "INBOUND 111 502 owner first channel=#일반/작업");
+  log("discord:111:502:edit:2026-01-01T12:02:00.000000+00:00", `INBOUND_EDIT 111 502 owner ${EDIT_NOTE} second channel=#일반/작업`);
+  expect(ownerMessageText(state.dir, { channel: "111", message: "501" })).toBe("fix it");
+  expect(ownerMessageText(state.dir, { channel: "111", message: "502" })).toBe("second");
+});
+
 test("a deleted owner message is refused", () => {
   log("discord:111:501", "INBOUND 111 501 owner do it");
   log("discord:111:501:delete", `INBOUND_DELETE 111 501 ${DELETE_NOTE}`);

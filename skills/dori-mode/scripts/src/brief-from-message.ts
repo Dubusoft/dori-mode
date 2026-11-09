@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { completeLines, EVENT_LOG, parseLogLine } from "./inbox.ts";
-import { EDIT_NOTE } from "./messenger/discord-inbound.ts";
+import { EDIT_NOTE, splitChannelName } from "./messenger/discord-inbound.ts";
 
 /**
  * `dori launch --from-message <channel> <messageId> ... [--note TEXT ...]`: the lane brief assembled mechanically from
@@ -65,7 +65,8 @@ export const ownerMessageText = (stateDir: string, ref: MessageRef): string => {
     const event = parseLogLine(text);
     const m = OWNER_KIND.exec(event.line);
     if (!m || m[2] !== ref.channel || m[3] !== ref.message || !event.id.startsWith(`discord:${ref.channel}:${ref.message}`)) continue;
-    const rest = m[4] ?? "";
+    // The trailing channel name token is the supervisor's, not the owner's text.
+    const rest = splitChannelName(m[4] ?? "").text;
     if (m[1] === "VISITOR") visitor = true;
     else if (m[1] === "INBOUND_DELETE") deleted = true;
     else if (m[1] === "INBOUND") original = afterAuthor(rest);

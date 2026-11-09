@@ -247,6 +247,15 @@ test("unreadAfterAck caps each channel and counts the overflow, prints each chan
   ]);
 });
 
+test("unreadAfterAck keeps the channel name token last, outside the cut preview, and on UNREAD_MORE", () => {
+  const dir = state();
+  log(dir, line("discord:11:2", `INBOUND 11 2 owner ${"x".repeat(400)} channel=#일반/작업`)
+    + line("discord:11:3", "INBOUND 11 3 owner short channel=#일반/작업"));
+  const [first, more] = unreadAfterAck(dir, [{ channel: "11", message: "1" }], 1);
+  expect(first).toEndWith("x... channel=#일반/작업");
+  expect(more).toBe("UNREAD_MORE 11 1 channel=#일반/작업");
+});
+
 test("unreadAfterAck cuts a long preview and reports UNREAD_UNAVAILABLE instead of throwing without a cursor or on a read failure", () => {
   const dir = state();
   log(dir, line("discord:11:2", `INBOUND 11 2 owner ${"x".repeat(400)}`));

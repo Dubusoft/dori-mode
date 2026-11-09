@@ -1,5 +1,6 @@
 import { dropAck, ownerMessageId, pendingAcks } from "./ack.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { splitChannelName } from "./messenger/discord-inbound.ts";
 import { redactSecrets } from "./redact.ts";
 import type { Durability } from "./store.ts";
 import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "./supervise-journal.ts";
@@ -218,7 +219,9 @@ export class OwnerTracking {
   private messageBody(id: string): string {
     const entry = this.journal.awaitingAck?.find((tracked) => tracked.id === id);
     const source = entry ? latest(entry) : id;
-    return redactSecrets(this.journal.events.find((event) => event.id === source)?.line ?? "").slice(0, OWNER_BODY_MAX);
+    // A long message is cut, but its channel name token stays at the end.
+    const { text, token } = splitChannelName(this.journal.events.find((event) => event.id === source)?.line ?? "");
+    return `${redactSecrets(text).slice(0, OWNER_BODY_MAX - token.length)}${token}`;
   }
 
   /**

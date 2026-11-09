@@ -438,6 +438,32 @@ test("MESSAGE_CREATE in any thread under a watched channel is inbound, parents f
   expect(["203", "999", "207", "208"].map((id) => lookups(f, id))).toEqual([1, 1, 1, 1]);
 });
 
+test("owner lines end with the channel name from gateway channel and thread events, renames included, else one cached lookup", async () => {
+  const f = inboundFixture();
+  await f.inbound.tick();
+  f.channelObjects.set("203", { ...thread("203"), name: "rest thread" });
+  f.socket().receive(hello);
+  f.socket().receive(ready);
+  f.socket().receive({ op: 0, t: "GUILD_CREATE", s: 2, d: { id: "2", channels: [{ id: "100", type: 0, name: "일반" }], threads: [{ ...thread("201"), name: "작업 스레드" }] } });
+  let s = 3;
+  const deliver = async (id: string, d: unknown) => {
+    const done = f.waitFor(id);
+    f.socket().receive({ op: 0, t: "MESSAGE_CREATE", s: s++, d });
+    await done;
+  };
+  await deliver("discord:100:41", rawMessage("41", "100"));
+  await deliver("discord:201:42", rawMessage("42", "201"));
+  await deliver("discord:203:43", rawMessage("43", "203"));
+  f.socket().receive({ op: 0, t: "CHANNEL_UPDATE", s: s++, d: { id: "100", type: 0, name: "공지" } });
+  f.socket().receive({ op: 0, t: "THREAD_UPDATE", s: s++, d: { ...thread("201"), name: "새 이름" } });
+  await deliver("discord:201:44", rawMessage("44", "201"));
+  expect(f.emitted.get("discord:100:41")).toBe("INBOUND 100 41 Owner message 41 channel=#일반");
+  expect(f.emitted.get("discord:201:42")).toBe("INBOUND 201 42 Owner message 42 channel=#일반/작업_스레드");
+  expect(f.emitted.get("discord:203:43")).toBe("INBOUND 203 43 Owner message 43 channel=#일반/rest_thread");
+  expect(f.emitted.get("discord:201:44")).toBe("INBOUND 201 44 Owner message 44 channel=#공지/새_이름");
+  expect(["201", "203"].map((id) => lookups(f, id))).toEqual([0, 1]);
+});
+
 test("an archived thread the owner reopens by posting reaches the lead over the gateway and REST catch-up", async () => {
   const f = inboundFixture();
   const start = 1_800_000_000_000;
