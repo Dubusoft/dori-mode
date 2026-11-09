@@ -10,7 +10,7 @@
  * every process it starts stays in the container. Writes are allowed only to the worktree (and its git common dir, hooks
  * excluded), the lane's TEMP, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy and package caches; every volume the lane
  * touches is otherwise read-only. ~/.dori is denied except what a lane needs (config, dori itself, the runner's bin and bun,
- * the lane socket, its own brief and token), and ~/.dori/env and ~/.ssh private keys are denied outright.
+ * the runner's sock directory, its own brief and token), and ~/.dori/env and ~/.ssh private keys are denied outright.
  *
  * Hosts without MXC support are refused with the requirement named; there is no other Windows backend.
  */
@@ -19,7 +19,6 @@ import { homedir } from "node:os";
 import { win32 } from "node:path";
 import { run as realRun, type Runner } from "../run.ts";
 import { defaultRunnerDir } from "./fs-safety.ts";
-import { LANE_SOCKET } from "./lane-socket.ts";
 
 /** The MXC release `dori runner install` puts on a Windows runner: the npm package carrying `bin\x64\wxc-exec.exe`. */
 export const MXC_PIN = {
@@ -199,8 +198,9 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
     ...(input.rw ?? []).filter((p) => p !== ""),
     ...(input.verify ? [input.verify] : []),
     ...work,
-    // Connecting to an AF_UNIX socket needs write access to the socket file; the runner's other sockets stay denied.
-    win32.join(runner, "sock", LANE_SOCKET),
+    // Connecting to the lane socket needs write access. The grant names the directory: an AF_UNIX socket file is a reparse
+    // point Windows cannot open, so naming it fails CreateProcessSecurityEnvironment with 0x80070780 (ERROR_CANT_ACCESS_FILE).
+    win32.join(runner, "sock"),
   ]);
   const readonlyPaths = unique([
     // Every volume the lane starts on is readable (a read-only volume-root grant covers the whole volume).
