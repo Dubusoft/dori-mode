@@ -57,7 +57,7 @@ export type Status = {
     /** The lane's latest `dori report` row (highest seq), routed or not. */
     readonly report?: LaneReport;
   }[];
-  readonly waits: readonly { readonly key: string; readonly until: string; readonly deadline?: string; readonly note?: string }[];
+  readonly waits: readonly { readonly key: string; readonly until: string; readonly deadline?: string; readonly note?: string; readonly machine?: string }[];
   readonly github: {
     readonly repos: readonly string[];
     readonly lastPollAt?: string;
@@ -296,9 +296,9 @@ const readWaits = (stateDir: string): Status["waits"] => {
     const raw: unknown = JSON.parse(readFileSync(join(stateDir, "waits.json"), "utf8"));
     if (!Array.isArray(raw)) return [];
     return raw.flatMap((w: unknown) => {
-      const r = w as { key?: unknown; until?: unknown; deadline?: unknown; note?: unknown };
+      const r = w as { key?: unknown; until?: unknown; deadline?: unknown; note?: unknown; machine?: unknown };
       return typeof r.key === "string" && typeof r.until === "string"
-        ? [{ key: r.key, until: r.until, ...(typeof r.deadline === "number" && Number.isFinite(r.deadline) ? { deadline: new Date(r.deadline).toISOString() } : {}), ...(typeof r.note === "string" && r.note.trim() ? { note: r.note } : {}) }]
+        ? [{ key: r.key, until: r.until, ...(typeof r.deadline === "number" && Number.isFinite(r.deadline) ? { deadline: new Date(r.deadline).toISOString() } : {}), ...(typeof r.note === "string" && r.note.trim() ? { note: r.note } : {}), ...(typeof r.machine === "string" && r.machine ? { machine: r.machine } : {}) }]
         : [];
     });
   } catch {
@@ -564,12 +564,19 @@ const LIMITS: readonly Limits[] = [
 
 const iso = (ms: number | undefined): string | undefined => (ms === undefined ? undefined : new Date(ms).toISOString());
 
+/** "@mac-mini", or "@mac-mini 오프라인" while that machine's runner is not connected (offline, lost or revoked); empty for the supervisor host. */
+const machineMark = (s: Status, machine: string | undefined): string => {
+  if (!machine) return "";
+  const state = (s.runners ?? []).find((r) => r.label === machine)?.state;
+  return `@${machine}${state === "offline" || state === "lost" || state === "revoked" ? " 오프라인" : ""}`;
+};
+
 /** "- 이벤트 소스: discord INBOUND 2분 전, github 이벤트 없음, deploys (poll) ... 실패": each source's last event age. */
 const sourceLine = (s: Status, now: number, max: number): string[] => {
   if (!s.sources) return [];
   const parts = s.sources.sources.map((src) => {
     const last = src.lastEventAt === undefined ? "이벤트 없음" : `${src.lastKind ?? "?"} ${ago(iso(src.lastEventAt), now)}`;
-    return `${src.name}${src.type === "builtin" ? "" : ` (${src.type})`} ${last}${src.failing ? " 실패" : ""}`;
+    return `${src.name}${src.machine ? machineMark(s, src.machine) : ""}${src.type === "builtin" ? "" : ` (${src.type})`} ${last}${src.failing ? " 실패" : ""}`;
   });
   return parts.length ? [`- 이벤트 소스: ${list(parts, max, 400)}`] : [];
 };
@@ -577,7 +584,7 @@ const sourceLine = (s: Status, now: number, max: number): string[] => {
 /** "- brief: 다음 10-24 09:00 KST (20시간 후)", "- backup: ..., 지난 실행 failed exit 1": one line per scheduled job. */
 const scheduleLines = (s: Status, now: number): string[] => (s.schedules ?? []).map((job) => {
   const next = job.waiting ? `${job.waiting} 기다리는 중` : job.nextRunAt === undefined ? "다음 실행 없음" : `다음 ${kst(job.nextRunAt)} KST (${left(job.nextRunAt, now)})`;
-  return clip(`- ${job.name}: ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? `, 지난 실행 ${job.lastResult}` : ""}`, 200);
+  return clip(`- ${job.name}${job.machine ? machineMark(s, job.machine) : ""}: ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? `, 지난 실행 ${job.lastResult}` : ""}`, 200);
 });
 
 const perWake = (calls: number, measured: number): string => (measured ? (calls / measured).toFixed(1) : "?");
@@ -651,7 +658,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
       const when = fire !== null ? `${kst(fire)} KST에 실행 (${left(fire, now)})`
         : timeout !== null ? `신호 대기, ${kst(timeout)} KST 시한 (${left(timeout, now)})`
         : `조건: ${clip(w.until, 50)}`;
-      return `- ${w.key}: ${when}${w.note ? ` - ${clip(w.note, lim.progress)}` : ""}`;
+      return `- ${w.key}${w.machine ? machineMark(s, w.machine) : ""}: ${when}${w.note ? ` - ${clip(w.note, lim.progress)}` : ""}`;
     }),
     ...(s.waits.length > lim.waits ? [`- 외 ${s.waits.length - lim.waits}개`] : []),
   ] : ["- 없음"]);

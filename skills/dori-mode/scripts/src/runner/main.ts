@@ -20,6 +20,7 @@ import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
+import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
@@ -61,7 +62,11 @@ const probeMain = async (json: boolean): Promise<number> => {
 export const runnerEffects = (deps: {
   readonly lanes: RunnerLanes; readonly guard: Pick<RunnerGuard, "killLanes">; readonly run: Runner;
   readonly herdr?: ReturnType<typeof hostHerdr>;
-}): DispatchDeps["effects"] => ({
+  /** Where wait.result and job.result go; a caller that never receives those commands may omit it. */
+  readonly publish?: ConstructorParameters<typeof RunnerLanes>[0]["publish"];
+}): DispatchDeps["effects"] => {
+  const effectPublish: NonNullable<typeof deps.publish> = deps.publish ?? (() => { throw new Error("runner publish is not wired"); });
+  return {
   ...(deps.herdr ? { "host.herdr": async (command: { readonly body: { readonly action: HerdrAction } }) => (deps.herdr as ReturnType<typeof hostHerdr>)(command.body.action) } : {}),
   "guard.kill": async (command) => {
     const killed = await deps.guard.killLanes(command.body.keys);
@@ -83,7 +88,10 @@ export const runnerEffects = (deps: {
     return deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace, command.body.briefText, command.body.files);
   },
   "lane.observe": async (command) => deps.lanes.observe(command.body.key),
-});
+  "wait.check": waitCheckEffect({ run: deps.run, publish: effectPublish }),
+  "job.run": jobRunEffect({ run: deps.run, publish: effectPublish }),
+  };
+};
 
 const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-only"?: boolean; listen?: string }): Promise<number> => {
   const runnerDir = defaultRunnerDir();
@@ -197,7 +205,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       state, policy, realpath: realpathSync, log,
       publish: (body) => { client?.publish("cmd.result", body); },
       effects: runnerEffects({
-        lanes: runnerLanes, guard, run,
+        lanes: runnerLanes, guard, run, publish,
         herdr: hostHerdr({ run, runnerDir, now: realClock.now, sleep: realClock.sleep, signal: platform.signal }),
       }),
     });

@@ -5,6 +5,8 @@ import { isAbsolute, join } from "node:path";
 import { SourceError, type SourceEnqueue, type SourceStatus, sourceText } from "./event-sources.ts";
 import { type Operation, type OperationStore, OPEN_STATES, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import type { Runner } from "./run.ts";
+import { machineLabel, remoteRunner } from "./remote-jobs.ts";
+import type { RunnerCall } from "./runner/call.ts";
 
 /*
  * Scheduled jobs (design 1.9): a `schedule` source in sources.json fires on a cron
@@ -43,6 +45,8 @@ export type ScheduleSpec = {
   /** Exactly one of text (emit `<kind> <text>`) and command (an argv; its result is the event). */
   readonly text?: string; readonly command?: readonly string[]; readonly cwd?: string;
   readonly heavy?: true; readonly timeoutSec?: number;
+  /** A command job's runner (`job.run`, in `cwd` on that machine); absent: the supervisor host. */
+  readonly machine?: string;
   readonly catchUp: CatchUp;
   /** When the job was added: no earlier slot ever runs, and every-N slots count from here. */
   readonly since: number;
@@ -180,6 +184,10 @@ export const validateSchedule = (r: Record<string, unknown>, name: string, kind:
   }
   if (r.cwd !== undefined && (typeof r.cwd !== "string" || !isAbsolute(r.cwd))) throw new SourceError(`schedule ${name}: cwd must be an absolute path`);
   if (r.heavy !== undefined && r.heavy !== true) throw new SourceError(`schedule ${name}: heavy must be true or absent`);
+  const machine = machineLabel(r.machine, (why) => new SourceError(`schedule ${name}: ${why}`));
+  if (machine && command === undefined) throw new SourceError(`schedule ${name}: machine is for command jobs`);
+  if (machine && r.heavy !== undefined) throw new SourceError(`schedule ${name}: heavy jobs run on the supervisor host only`);
+  if (machine && r.cwd === undefined) throw new SourceError(`schedule ${name}: a job on a machine needs cwd (a directory on that machine)`);
   const timeout = r.timeoutSec;
   if (timeout !== undefined && (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > SCHEDULE_MAX_TIMEOUT_SEC)) {
     throw new SourceError(`schedule ${name}: timeoutSec must be 1-${SCHEDULE_MAX_TIMEOUT_SEC}`);
@@ -195,6 +203,7 @@ export const validateSchedule = (r: Record<string, unknown>, name: string, kind:
     ...(typeof r.cwd === "string" ? { cwd: r.cwd } : {}),
     ...(r.heavy === true ? { heavy: true as const } : {}),
     ...(typeof timeout === "number" ? { timeoutSec: timeout } : {}),
+    ...(machine ? { machine } : {}),
     catchUp, since: r.since,
   };
   if (hasCron) parseCron(spec.cron ?? "");
@@ -218,6 +227,7 @@ export const queueRunNow = (stateDir: string, name: string, now: number): void =
 export type ScheduleRow = {
   readonly name: string; readonly kind: string; readonly when: string; readonly catchUp: CatchUp; readonly heavy?: true;
   readonly nextRunAt?: number; readonly lastRunAt?: number; readonly lastResult?: string; readonly waiting?: string;
+  readonly machine?: string;
 };
 
 export const scheduleRow = (spec: ScheduleSpec, status: Partial<SourceStatus> | undefined, now: number): ScheduleRow => {
@@ -228,6 +238,7 @@ export const scheduleRow = (spec: ScheduleSpec, status: Partial<SourceStatus> | 
     ...(status?.lastRunAt !== undefined ? { lastRunAt: status.lastRunAt } : {}),
     ...(status?.lastResult !== undefined ? { lastResult: status.lastResult } : {}),
     ...(status?.waiting !== undefined ? { waiting: status.waiting } : {}),
+    ...(spec.machine ? { machine: spec.machine } : {}),
   };
 };
 
@@ -254,6 +265,8 @@ export type ScheduleHost = {
   readonly fail: (name: string, error: unknown) => void;
   readonly ok: (name: string) => void;
   readonly log?: (line: string) => void;
+  /** Runs the command jobs that name a machine on that machine's runner. */
+  readonly remote?: RunnerCall;
 };
 
 const laneOf = (name: string): string => `schedule:${name}`;
@@ -347,6 +360,11 @@ export class Scheduler {
       slot = await this.deps.heavy.take(`schedule:${spec.name}`);
       if (slot === undefined) { this.host.update(spec.name, { waiting: "heavy slot" }); return; }
     }
+    // A job on an offline machine stays planned and runs once its runner is back; a read-back needs no runner.
+    if (command && spec.machine && row.state === "planned" && !this.host.remote?.connected(spec.machine)) {
+      this.host.update(spec.name, { waiting: `runner ${spec.machine} offline` });
+      return;
+    }
     try {
       let result = "";
       const readBack: ReadBack = async () => (this.deps.journaled(resultId) ? "done" : command ? "unknown" : "not-done");
@@ -356,7 +374,8 @@ export class Scheduler {
           result = "emitted";
           return { ok: true, detail: result };
         }
-        const done = await this.host.run(command, { timeoutMs: (spec.timeoutSec ?? SCHEDULE_TIMEOUT_SEC) * 1_000, ...(spec.cwd ? { cwd: spec.cwd } : {}) });
+        const run = spec.machine === undefined ? this.host.run : this.remoteRun(spec.machine, spec.name, row.target);
+        const done = await run(command, { timeoutMs: (spec.timeoutSec ?? SCHEDULE_TIMEOUT_SEC) * 1_000, ...(spec.cwd ? { cwd: spec.cwd } : {}) });
         const output = sourceText(done.code === 0 ? done.out : `${done.err} ${done.out}`) || "(no output)";
         // A failed command is a run that happened: it is reported, and the slot is not tried again.
         if (done.code === 0) put(resultId, `${spec.kind} ${spec.name}: ${output}`);
@@ -377,6 +396,11 @@ export class Scheduler {
     } finally {
       if (slot !== undefined) this.deps.heavy?.release(slot);
     }
+  }
+
+  private remoteRun(machine: string, name: string, target: string): Runner {
+    if (!this.host.remote) throw new SourceError("runner calls are not available");
+    return remoteRunner(this.host.remote, machine, { opKey: `schedule:${name}:${target}`, name });
   }
 
   /** Resolves when every job started so far has finished (tests and shutdown). */
