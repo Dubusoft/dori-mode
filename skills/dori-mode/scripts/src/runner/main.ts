@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
+import { laneSandboxWindowsMain } from "./lane-sandbox-windows.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
 import { LANE_SOCKET, serveLaneSocket } from "./lane-socket.ts";
@@ -262,6 +263,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
 
 /** Runs `serve` or `probe` from `args` (the words after `runner`). */
 export const runnerHostMain = async (args: readonly string[]): Promise<number> => {
+  // The Windows lane sandbox runs with the lane's DORI_LANE_KEY already set, so it comes before the lane-mode CLI.
+  if (args[0] === "lane-sandbox") return laneSandboxWindowsMain(args.slice(1));
   // Inside a lane this bundle is the lane-mode `dori`: report, claim-done and heavy for the lane's own key, nothing else.
   if (process.env.DORI_LANE_KEY) {
     return laneCliMain(args, {

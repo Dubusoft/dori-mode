@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../lane-sandbox-install.ts";
+import { MXC_PIN, MXC_REQUIREMENT, WINDOWS_PS1_ARGV } from "./lane-sandbox-windows.ts";
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
 import { WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
 import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
@@ -407,9 +408,14 @@ const TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
  *   are removed;
  * - writes every file as `.tmp`, checks the bundle's full SHA-256, stops a running runner (task and recorded tree),
  *   and moves the files into `bin\`; `bin\bun.txt` names the Bun directory the shims and the wrapper use;
- * - writes a starter runner-config.json (allowedRoots `%USERPROFILE%` and `%TEMP%`, `sandbox: "required"` and no
- *   `sandboxed` profile: Windows has no lane sandbox, so every lane start is refused until the operator opts the host in)
- *   only when there is none;
+ * - on Windows 11 builds that can have MXC ProcessContainer (26100 and later), puts the pinned MXC executors
+ *   (`@microsoft/mxc-sdk` `bin\x64`, `wxc-exec.exe` among them) in `mxc\<version>\` after checking the package's SHA-256;
+ *   a failed download prints `MXC_INSTALL_FAILED` and an older build `MXC_UNSUPPORTED`, and the install goes on (its
+ *   sandboxed lanes are refused with the reason); other versions there are removed;
+ * - writes a starter runner-config.json (allowedRoots `%USERPROFILE%` and `%TEMP%`, `sandbox: "required"`, a
+ *   `sandboxed` profile that runs the agent behind `dori.ps1 lane-sandbox` and a sandboxCheck running its `--check`)
+ *   only when there is none; an existing one is the operator's, and what it lacks for sandboxed lanes is printed
+ *   (`RUNNER_CONFIG_SANDBOX_MISSING`);
  * - enrolls once, skipped when `keys\supervisor.pub` exists: the code and fingerprint go to the enrolling process's
  *   stdin through a ProcessStartInfo, never its argv (exit 5 when it fails);
  * - registers and starts the `\dori\dori-runner` task (exit 6 when the Task Scheduler refuses).
@@ -492,6 +498,30 @@ export const windowsInstallScript = (
     "}",
     `if (-not $BunDir) { Exit-Dori ${INSTALL_EXIT.noBun} 'no usable bun: the pinned bun-windows-x64 builds could not be downloaded, verified or run' }`,
     "$Bun = Join-Path $R ('bun\\' + $BunDir + '\\bun.exe')",
+    // MXC: the executor sandboxed lanes run in (lane-sandbox-windows.ts). The exact build gate is the lane check's.
+    "Step 'mxc'",
+    `$MxcVersion = ${psq(MXC_PIN.version)}`,
+    "$MxcRoot = Join-Path $R 'mxc'",
+    "$MxcDir = Join-Path $MxcRoot $MxcVersion",
+    "if ($Build -lt 26100) {",
+    `  Write-Output ('MXC_UNSUPPORTED Windows build ' + $Build + ': sandboxed lanes need ' + ${psq(MXC_REQUIREMENT)})`,
+    "} elseif (-not (Test-Path -LiteralPath (Join-Path $MxcDir 'wxc-exec.exe'))) {",
+    "  $T = Join-Path $MxcRoot ('download-' + [Guid]::NewGuid().ToString('N'))",
+    "  try {",
+    "    [void][IO.Directory]::CreateDirectory($T)",
+    "    $Tgz = Join-Path $T 'mxc-sdk.tgz'",
+    `    Invoke-WebRequest -UseBasicParsing -Uri ${psq(MXC_PIN.url)} -OutFile $Tgz`,
+    "    $Got = (Get-FileHash -Algorithm SHA256 -LiteralPath $Tgz).Hash.ToLowerInvariant()",
+    `    if ($Got -ne ${psq(MXC_PIN.sha256)}) { throw ('MXC package checksum mismatch: ' + $Got) }`,
+    "    & tar.exe -xzf $Tgz -C $T package/bin/x64",
+    "    if ($LASTEXITCODE -ne 0) { throw ('tar could not unpack the MXC package (exit ' + $LASTEXITCODE + ')') }",
+    "    if (Test-Path -LiteralPath $MxcDir) { Remove-Item -LiteralPath $MxcDir -Recurse -Force }",
+    "    Move-Item -LiteralPath (Join-Path $T 'package\\bin\\x64') -Destination $MxcDir",
+    "  } catch { Write-Output ('MXC_INSTALL_FAILED ' + $_.Exception.Message + '; sandboxed lanes are refused until an install puts ' + (Join-Path $MxcDir 'wxc-exec.exe')) }",
+    "  finally { Remove-Item -LiteralPath $T -Recurse -Force -ErrorAction SilentlyContinue }",
+    "}",
+    // A running lane's wxc-exec.exe keeps its directory: that one goes at a later install.
+    "if (Test-Path -LiteralPath $MxcRoot) { Get-ChildItem -LiteralPath $MxcRoot -Directory | Where-Object { $_.Name -ne $MxcVersion } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } }",
     // Every file is written beside its target first; the bundle's hash is checked before anything is replaced.
     "Step 'files'",
     "function Write-DoriFile([string]$Name, [string]$Data) { [IO.File]::WriteAllBytes((Join-Path $Bin ($Name + '.tmp')), [Convert]::FromBase64String($Data)) }",
@@ -518,13 +548,23 @@ export const windowsInstallScript = (
     "[IO.File]::WriteAllText($BunTxt, $BunDir)",
     // A starter command policy, only when the host has none; an existing runner-config.json is the operator's.
     "Step 'config'",
+    // Sandboxing is required: the `sandboxed` profile runs the agent behind `dori.ps1 lane-sandbox` (MXC), and its
+    // `--check` runs before each sandboxed start. The sandboxed argv is dori.ps1, lane-sandbox, then $Agent's elements.
     ...(agentCommand.length ? [
       "$Cfg = Join-Path $R 'runner-config.json'",
       "if (-not (Test-Path -LiteralPath $Cfg)) {",
       `  $Agent = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(JSON.stringify(agentCommand))}'))`,
-      "  $Json = '{\"agents\":{\"default\":' + $Agent + '},\"allowedRoots\":[' + (ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP) + '],\"sandbox\":\"required\"}'",
+      "  $Ps1 = ConvertTo-Json (Join-Path $Bin 'dori.ps1')",
+      `  $Json = '{"agents":{"default":' + $Agent + ',"sandboxed":[' + $Ps1 + ',"lane-sandbox",' + $Agent.Substring(1) + '},"allowedRoots":[' + (ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP) + '],"sandbox":"required","sandboxCheck":[${JSON.stringify(WINDOWS_PS1_ARGV).slice(1, -1)},' + $Ps1 + ',"lane-sandbox","--check"]}'`,
       "  [IO.File]::WriteAllText($Cfg + '.tmp', $Json + [char]10)",
       "  Move-Item -LiteralPath ($Cfg + '.tmp') -Destination $Cfg -Force",
+      "} else {",
+      "  $Have = [IO.File]::ReadAllText($Cfg)",
+      "  $M = @()",
+      "  if ($Have -notmatch '\"sandbox\"\\s*:\\s*\"required\"') { $M += 'sandbox:required' }",
+      "  if ($Have -notmatch '\"sandboxed\"') { $M += 'agents.sandboxed' }",
+      "  if ($Have -notmatch '\"sandboxCheck\"') { $M += 'sandboxCheck' }",
+      "  if ($M.Count) { Write-Output ('RUNNER_CONFIG_SANDBOX_MISSING ' + ($M -join ' ') + ' in ' + $Cfg + '; add them to sandbox lanes on this runner') }",
       "}",
     ] : []),
     "Set-DoriOwner",
@@ -688,6 +728,11 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   }
   step("install", "done");
   step("service", "done", kind === "windows" ? "scheduled task registered and started" : `runner service registered and started; ${herdrInstallNote(result.herdr)}`);
+  if (kind === "windows") {
+    // What keeps this host's sandboxed lanes refused: the install itself went through.
+    const notes = [...r.out.matchAll(/^(?:MXC_UNSUPPORTED|MXC_INSTALL_FAILED|RUNNER_CONFIG_SANDBOX_MISSING) .*$/gm)].map((m) => m[0].trim());
+    step("sandbox", notes.length ? "failed" : "done", notes.length ? notes.join("; ") : `MXC ${MXC_PIN.version} ProcessContainer executor in place`);
+  }
   step("verify", "start");
   writeRunnerEndpoint(req.stateDir, req.label, req.listenAddress);
   step("verify", "done", `remote pass exited 0, version=${result.version}, endpoint ${req.listenAddress} recorded`);

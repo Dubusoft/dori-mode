@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearShellModes, encodedPowerShell, sshArgv } from "../src/remote-guard.ts";
+import { MXC_PIN } from "../src/runner/lane-sandbox-windows.ts";
 import { INSTALL_EXIT, INSTALL_TIMEOUT_MS, WIN_BUN, WIN_INSTALL_TIMEOUT_MS, bunPinDir, bunPinUrl, bundleVersion, installRunner, installScript, remoteUnit, scpArgv, windowsInstallScript, windowsTemplates, winRun } from "../src/runner/install.ts";
 import type { Ran, RunOptions } from "../src/run.ts";
 
@@ -42,7 +43,7 @@ test("the script ends with exit 0 and logs each step to the progress log in orde
   expect(s).toContain("'runner-install.log'");
   expect(s).toContain("[IO.File]::AppendAllText(");
   const steps = [...s.matchAll(/^Step '([a-z-]+)'$/gm)].map((m) => m[1]);
-  expect(steps).toEqual(["start", "checks", "acl", "bun", "files", "stop-runner", "move", "config", "enroll", "task", "done"]);
+  expect(steps).toEqual(["start", "checks", "acl", "bun", "mxc", "files", "stop-runner", "move", "config", "enroll", "task", "done"]);
 });
 
 test("winRun reads the uploaded file from the profile, deletes it, then runs it as a scriptblock", () => {
@@ -105,16 +106,74 @@ test("the directory gets the protected DACL, the starter policy and the task reg
   const s = script();
   expect(s).toContain("& icacls.exe $R /inheritance:r /grant:r ('*' + $Sid + ':(OI)(CI)F') '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'");
   expect(s).toContain("& icacls.exe $R /setowner ('*' + $Sid) /T /C /Q");
-  expect(s).toContain("(ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP) + '],\"sandbox\":\"required\"}'");
-  // No lane sandbox on Windows: no sandboxed profile, so every start is refused until the operator opts the host in.
-  expect(s).not.toContain("sandboxed");
-  expect(s).not.toContain("sandboxCheck");
   const agent = /FromBase64String\('([A-Za-z0-9+/=]+)'\)\)\n/.exec(s)?.[1] ?? "";
   expect(JSON.parse(Buffer.from(agent, "base64").toString("utf8"))).toEqual(AGENT);
+  // The starter policy runs sandboxed lanes behind dori.ps1 lane-sandbox and checks it before each start.
+  const bin = "C:\\Users\\me\\.dori\\runner\\bin";
+  const ps1 = `${bin}\\dori.ps1`;
+  expect(JSON.parse(starterPolicy(s, { USERPROFILE: "C:\\Users\\me", TEMP: "C:\\Users\\me\\AppData\\Local\\Temp", Bin: bin }))).toEqual({
+    agents: { default: AGENT, sandboxed: [ps1, "lane-sandbox", ...AGENT] },
+    allowedRoots: ["C:\\Users\\me", "C:\\Users\\me\\AppData\\Local\\Temp"],
+    sandbox: "required",
+    sandboxCheck: ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1, "lane-sandbox", "--check"],
+  });
+  // An existing policy is left alone; what it lacks for sandboxed lanes is printed.
+  for (const want of ["$Have -notmatch '\"sandbox\"\\s*:\\s*\"required\"'", "$Have -notmatch '\"sandboxed\"'", "$Have -notmatch '\"sandboxCheck\"'", "Write-Output ('RUNNER_CONFIG_SANDBOX_MISSING ' + ($M -join ' ')"]) expect(s).toContain(want);
   expect(s).toContain("Register-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner' -Xml $Xml -Force");
   expect(s).toContain("Start-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner'");
   expect(s).toContain(`} catch { Exit-Dori ${INSTALL_EXIT.systemd} `);
   expect(windowsInstallScript(BUNDLE, LABEL, LISTEN, ISSUE, [])).not.toContain("runner-config.json");
+});
+
+/**
+ * Evaluates the starter policy's `$Json = ...` concatenation the way PowerShell would: single-quoted literals, $Agent,
+ * $Agent.Substring(1), $Ps1 (ConvertTo-Json of dori.ps1 under $Bin) and ConvertTo-Json of the two environment paths.
+ */
+const starterPolicy = (s: string, at: { USERPROFILE: string; TEMP: string; Bin: string }): string => {
+  const agent = Buffer.from(/FromBase64String\('([A-Za-z0-9+/=]+)'\)\)\n/.exec(s)?.[1] ?? "", "base64").toString("utf8");
+  const line = /^ {2}\$Json = (.+)$/m.exec(s)?.[1] ?? "";
+  const values: Record<string, string> = {
+    "$Agent": agent, "$Agent.Substring(1)": agent.slice(1), "$Ps1": JSON.stringify(`${at.Bin}\\dori.ps1`),
+    "(ConvertTo-Json $env:USERPROFILE)": JSON.stringify(at.USERPROFILE), "(ConvertTo-Json $env:TEMP)": JSON.stringify(at.TEMP),
+  };
+  return [...line.matchAll(/'((?:[^']|'')*)'|(\([^)]*\)|\$[A-Za-z.()0-9]+)/g)].map((m) => {
+    if (m[1] !== undefined) return m[1].replace(/''/g, "'");
+    const v = values[m[2] ?? ""];
+    if (v === undefined) throw new Error(`unknown term ${m[2]}`);
+    return v;
+  }).join("");
+};
+
+test("MXC comes from the pinned npm package checked by hash; a failure or an old build is printed and the install goes on", () => {
+  const s = script();
+  expect(MXC_PIN.sha256).toMatch(/^[0-9a-f]{64}$/);
+  for (const want of [
+    `$MxcVersion = '${MXC_PIN.version}'`,
+    `Invoke-WebRequest -UseBasicParsing -Uri '${MXC_PIN.url}' -OutFile $Tgz`,
+    `if ($Got -ne '${MXC_PIN.sha256}') { throw`,
+    "& tar.exe -xzf $Tgz -C $T package/bin/x64",
+    "Move-Item -LiteralPath (Join-Path $T 'package\\bin\\x64') -Destination $MxcDir",
+    "} catch { Write-Output ('MXC_INSTALL_FAILED ",
+    "if ($Build -lt 26100) {",
+    "Write-Output ('MXC_UNSUPPORTED Windows build ' + $Build",
+  ]) expect(s).toContain(want);
+  // The hash is checked before anything is unpacked, and the download is skipped when this version is in place.
+  expect(s.indexOf("& tar.exe")).toBeGreaterThan(s.indexOf(`if ($Got -ne '${MXC_PIN.sha256}')`));
+  expect(s).toContain("} elseif (-not (Test-Path -LiteralPath (Join-Path $MxcDir 'wxc-exec.exe'))) {");
+  // Nothing in the MXC step ends the install.
+  const mxc = s.slice(s.indexOf("Step 'mxc'"), s.indexOf("Step 'files'"));
+  expect(mxc).not.toContain("Exit-Dori");
+});
+
+test("installRunner reports why a Windows host's sandboxed lanes stay refused", async () => {
+  const lines: string[] = [];
+  const unsupported = fakeRun((_c, argv) => (argv[0] === "scp" ? {} : { out: "MXC_UNSUPPORTED Windows build 19045: sandboxed lanes need Windows 11\r\nDORI_BUN 1.4.4\r\n" }));
+  expect((await installRunner({ ...deps(unsupported.run, "windows"), progress: (l) => lines.push(l) }, request())).ok).toBe(true);
+  expect(lines).toContain(`RUNNER_STEP runner=${LABEL} sandbox failed: MXC_UNSUPPORTED Windows build 19045: sandboxed lanes need Windows 11`);
+  lines.length = 0;
+  const fine = fakeRun(() => ({}));
+  expect((await installRunner({ ...deps(fine.run, "windows"), progress: (l) => lines.push(l) }, request())).ok).toBe(true);
+  expect(lines).toContain(`RUNNER_STEP runner=${LABEL} sandbox done: MXC ${MXC_PIN.version} ProcessContainer executor in place`);
 });
 
 test("the enrollment secret goes to the enrolling process's stdin, never its arguments", () => {
