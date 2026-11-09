@@ -263,6 +263,14 @@ const closeId = (key: string): string => operationId({ lane: key, action: CLOSE_
 /** Held for a whole close of one lane; a killed holder releases it, so a resumer can tell a live close. */
 const closeLockPath = (deps: FlowDeps, key: string): string => join(deps.registry.dir, `${key}.close.lock.sqlite`);
 
+/** A close of lane `key` holds its lock right now (in this or another process). */
+export const closeRunning = (deps: FlowDeps, key: string): boolean => {
+  const release = tryStateLock(closeLockPath(deps, key));
+  if (!release) return true;
+  release();
+  return false;
+};
+
 const withOperations = async <T>(deps: FlowDeps, body: (store: OperationStore) => Promise<T>): Promise<T> => {
   const store = deps.operations ?? openOperations(deps.config);
   try { return await body(store); } finally { if (!deps.operations) store.close(); }

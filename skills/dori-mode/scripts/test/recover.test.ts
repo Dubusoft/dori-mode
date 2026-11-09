@@ -8,6 +8,7 @@ import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { StartupVerdict, TurnEvidence } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
+import { tryStateLock } from "../src/state-lock.ts";
 
 let state: ReturnType<typeof withState>;
 beforeEach(() => { state = withState(); withSqliteStore(state.dir); });
@@ -84,6 +85,16 @@ test("a lane its runner does not know is started again from its brief", async ()
   expect(start).toMatchObject({ key: "recover-lane", cwd: lane.cwd, model: lane.model });
   // A lane on the old footer moves onto the dori report one when it is started again.
   expect(start?.briefText).toStartWith("Execute the task.\n\n## Lane footer (written by dori launch)");
+});
+
+test("a lane whose close is running is not relaunched when its pane is gone", async () => {
+  const { deps, world, lane } = await fixture();
+  const release = tryStateLock(join(deps.registry.dir, `${lane.key}.close.lock.sqlite`));
+  try {
+    expect(await recoverLanes(deps, lane.key)).toEqual([]);
+  } finally { release?.(); }
+  expect(opsOf(world, "recover", "start")).toEqual([]);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
 });
 
 test.each([
