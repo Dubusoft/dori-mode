@@ -17,7 +17,9 @@ export const WIN_HERDR_SCRIPT = [
 
 /**
  * The current user's `herdr server` processes on Windows as `<pid>@<CreationDate>`, or undefined when the CIM query
- * failed or its output could not be read.
+ * failed or its output could not be read. Also undefined when no server matched but a `herdr.exe` hid its command line:
+ * an unelevated runner can't read an elevated process (herdr started from an administrator's ssh session), so that
+ * one may be the server.
  */
 export const winHerdrServers = async (run: Runner, user: string = userInfo().username): Promise<string[] | undefined> => {
   const r = await run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WIN_HERDR_SCRIPT]);
@@ -29,25 +31,43 @@ export const winHerdrServers = async (run: Runner, user: string = userInfo().use
   const rows = Array.isArray(parsed) ? parsed : [parsed];
   const me = user.toLowerCase();
   const ids: string[] = [];
+  let hidden = false;
   for (const row of rows) {
     if (typeof row !== "object" || row === null) return undefined;
     const v = row as Record<string, unknown>;
     if (!Number.isSafeInteger(v.ProcessId) || typeof v.CreationDate !== "string") return undefined;
-    if (typeof v.CommandLine !== "string" || !/\bserver\b/.test(v.CommandLine)) continue;
+    if (typeof v.CommandLine !== "string") { hidden = true; continue; }
+    if (!/\bserver\b/.test(v.CommandLine)) continue;
     const owner = typeof v.Owner === "string" ? v.Owner.toLowerCase() : "";
     const domain = typeof v.Domain === "string" ? v.Domain.toLowerCase() : "";
     if (owner !== me && `${domain}\\${owner}` !== me) continue;
     ids.push(`${v.ProcessId}@${v.CreationDate}`);
   }
-  return ids.sort();
+  return ids.length || !hidden ? ids.sort() : undefined;
+};
+
+export const WIN_HERDR_SOCKET_SCRIPT = [
+  "$j = herdr status server --json 2>$null | ConvertFrom-Json;",
+  "if ($j.running -and $j.socket) { (Get-Item -LiteralPath $j.socket -Force).CreationTimeUtc.ToString('o') }",
+].join(" ");
+
+/**
+ * The running herdr server's instance on Windows as `socket@<creation time>` of the socket it binds at start, read
+ * through herdr itself; undefined when herdr does not answer. For a server whose process this runner can't read.
+ */
+export const winHerdrSocketInstance = async (run: Runner): Promise<string | undefined> => {
+  const r = await run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WIN_HERDR_SOCKET_SCRIPT]);
+  const at = r.out.trim();
+  return r.code === 0 && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(at) ? `socket@${at}` : undefined;
 };
 
 /** Process inspection failure is treated as possibly running: it must never authorize a start. */
 export const herdrProcess = async (run: Runner, opts: WinHerdrOptions = {}): Promise<{ running: boolean; instance?: string }> => {
   if ((opts.platform ?? process.platform) === "win32") {
     const ids = await winHerdrServers(run, opts.user);
-    if (!ids) return { running: true };
-    return ids.length ? { running: true, instance: ids.join(";") } : { running: false };
+    if (ids) return ids.length ? { running: true, instance: ids.join(";") } : { running: false };
+    const socket = await winHerdrSocketInstance(run);
+    return { running: true, ...(socket ? { instance: socket } : {}) };
   }
   const pids = await run(["pgrep", "-u", String(process.getuid?.() ?? 0), "-f", "(^|/)herdr server($| )"]);
   if (pids.code === 1) return { running: false };
