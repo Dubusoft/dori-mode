@@ -228,6 +228,11 @@ const USAGE = `dori <command> [options]
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin;
                                        --final adds the owner's close-thread button unless the thread still has work or already got it
                                        (REPORT_BUTTON_WITHHELD); without --final, supervise posts it once the thread's work is finished
+  reported <key> --append TEXT [--note TEXT]
+                                       a follow-up after the report (merge result, Toodo done): appended to the lane's last report
+                                       by editing it (else its status message), no new post (REPORT_APPENDED)
+                                       a report, append or send into a thread the owner closed goes to the owner channel instead,
+                                       as one line linking the thread (REPORT_REDIRECTED / SENT_REDIRECTED); the thread stays closed
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
@@ -582,7 +587,7 @@ const flags = parseArgs({
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
     model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
-    to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
+    to: { type: "string" }, text: { type: "string" }, append: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
     list: { type: "boolean" }, final: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, sandbox: { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
@@ -1184,12 +1189,42 @@ try {
       // `dori reported <key> --text T`: post lane <key>'s outcome to the owner (the lane's thread unless --to/--thread),
       // then record the receipt. A failed post records nothing, so the obligation stays open.
       const { recordReported } = await import("./lane-outcomes.ts");
-      const options = ["text", "to", "thread", "note"];
+      const options = ["text", "append", "to", "thread", "note"];
       const final = flags.values.final === true;
-      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !options.includes(name) && name !== "final") || options.some((name) => name in flags.values && !opt(name)) || !opt("text")) {
-        die("usage: dori reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT]");
+      const append = opt("append");
+      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !options.includes(name) && name !== "final") || options.some((name) => name in flags.values && !opt(name))
+        || !opt("text") === (append === undefined) || (append !== undefined && (final || "to" in flags.values || "thread" in flags.values))) {
+        die("usage: dori reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT] | dori reported <key> --append TEXT [--note TEXT]");
       }
       const found = (await deps.registry.read(key ?? "")) ?? die(`no registered lane "${key}"`);
+      const followUps = await import("./thread-followup.ts");
+      const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
+      const owner = config.discordChannels[0];
+      const note = opt("note");
+      const receipt = (posted: { message: string; target: string; thread?: string; button?: boolean; followUp?: boolean }): void => {
+        recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, posted);
+      };
+      // A thread the owner closed is never posted into: one line linking it goes to the owner channel, and the thread stays archived.
+      const redirect = async (thread: string, text: string): Promise<void> => {
+        if (!owner) die(`REPORT_NOT_POSTED ${found.key}: thread ${thread} was closed by the owner and no discordChannels entry names the owner channel; nothing recorded`);
+        const message = await discord.send(owner ?? "", followUps.closedThreadLine(thread, text), randomUUID());
+        receipt({ message, target: `discord:${owner}`, followUp: true });
+        console.log(`REPORT_REDIRECTED ${found.key} ${message}: thread ${thread} was closed by the owner, so one line linking it went to the owner channel`);
+      };
+      if (append !== undefined) {
+        // The follow-up edits the lane's last report (else its [System] status message): nothing new lands in the thread.
+        const status = found.statusMessageId && found.thread.startsWith("discord:") ? { channel: resolveTarget("discord", found.thread).to, message: found.statusMessageId } : undefined;
+        const last = followUps.readLastReports(config.stateDir)[found.key] ?? status
+          ?? die(`REPORT_APPEND_NO_MESSAGE ${found.key}: this lane has no report or status message to append to; post the report with --text`);
+        if (await followUps.closedByOwner(config.stateDir, discord, last.channel)) { await redirect(last.channel, append); break; }
+        const archived = await discord.threadArchived(last.channel).catch(() => false);
+        if (!(await followUps.appendToMessage(discord, last.channel, last.message, append, archived))) {
+          die(`REPORT_APPEND_TOO_LONG ${found.key}: the report with this text would pass Discord's message limit; shorten it, or post a new report with --text`);
+        }
+        receipt({ message: last.message, target: `discord:${last.channel}`, followUp: true });
+        console.log(`REPORT_APPENDED ${found.key} ${last.message}`);
+        break;
+      }
       const bound = found.thread && found.thread !== "none" ? found.thread : undefined;
       const ref = opt("to") ?? bound ?? die(`lane ${key} has no bound thread; name where to post with --to TARGET (a thread ref such as discord:<channel>/<thread>)`);
       // A Discord ref posts there; a bare --to id posts on Discord only when the lane's bound thread is a Discord one.
@@ -1203,6 +1238,7 @@ try {
       const { finalityBlockers, readCloseButtons } = await import("./thread-finality.ts");
       // `discord:<thread>` and a bare thread id count as a thread too, unless the id is a configured channel.
       const threadId = opt("thread") ?? discordThreadOf(ref, config.discordChannels);
+      if (threadId === to && await followUps.closedByOwner(config.stateDir, discord, to)) { await redirect(to, opt("text") ?? ""); break; }
       let withheld: string[] = [];
       if (final) {
         const { publishedDecisions } = await import("./decision-obligations.ts");
@@ -1216,11 +1252,12 @@ try {
       const message = await postMessage(to, opt("text") ?? "", button ? closeThreadButton(to) : undefined);
       if (!message) die(`REPORT_NOT_POSTED ${key}: ${platform} returned no message id; nothing recorded`);
       if (withheld.length) console.log(`REPORT_BUTTON_WITHHELD ${found.key}: ${withheld.join("; ")}`);
-      const note = opt("note");
+      // The message a later --append edits.
+      if (threadId === to) followUps.recordLastReport(config.stateDir, found.key, { channel: to, message, at: realClock.now() });
       // The lane's thread for the supervisor's close-button check: the thread that got this report's button, else its bound
       // thread, else the thread this report went into.
       const laneThread = button ? to : (bound && isDiscord(bound) ? discordThreadOf(bound, config.discordChannels) : undefined) ?? (threadId === to ? to : undefined);
-      recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, {
+      receipt({
         message, target: `${platform}:${to}${thread ? `/${thread}` : ""}`, ...(laneThread ? { thread: laneThread } : {}), ...(button ? { button } : {}),
       });
       console.log(`REPORTED_RECORDED ${found.key} ${message}`);
@@ -1278,9 +1315,20 @@ try {
             process.exit(3);
           }
         }
+      }
+      const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
+      const { closedByOwner, closedThreadLine } = await import("./thread-followup.ts");
+      // A thread the owner closed is never posted into (a post would reopen it): one line linking it goes to the owner channel.
+      if (await closedByOwner(config.stateDir, discord, to)) {
+        const owner = config.discordChannels[0] ?? die(`SEND_NOT_POSTED thread ${to} was closed by the owner and no discordChannels entry names the owner channel`);
+        const sent = await discord.send(owner, closedThreadLine(to, text), randomUUID(), components);
+        console.log(`SENT_REDIRECTED ${sent}: thread ${to} was closed by the owner, so one line linking it went to the owner channel ${owner}`);
+        break;
+      }
+      if (!edit) {
         const sent = await postMessage(to, text, components);
         console.log(`SENT ${sent}`);
-      } else await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).edit(to, edit, text);
+      } else await discord.edit(to, edit, text);
       break;
     }
     case "thread": {

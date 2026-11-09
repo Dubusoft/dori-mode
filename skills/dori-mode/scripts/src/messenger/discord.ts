@@ -116,6 +116,12 @@ export class Discord {
     await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(content) });
   }
 
+  /** A message's current text. */
+  async content(channelId: string, messageId: string): Promise<string> {
+    const content = (await this.call<{ content?: unknown }>("GET", `/channels/${channelId}/messages/${messageId}`)).content;
+    return typeof content === "string" ? content : "";
+  }
+
   async react(channelId: string, messageId: string, emoji: string): Promise<void> {
     await this.call("PUT", `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`);
   }

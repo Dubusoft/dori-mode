@@ -2,6 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 
 import { postOwnerLine, type FinishDiscord } from "../src/lane-finish.ts";
 import { MessengerError } from "../src/messenger/http.ts";
+import { recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
 
@@ -33,9 +34,11 @@ test("a lane-finish outbox row left by an older journal is dropped with one log 
   } finally { errors.mockRestore(); }
 });
 
-const fakeDiscord = (opts: { archived?: boolean; fail?: MessengerError | Error } = {}) => {
+const fakeDiscord = (opts: { archived?: boolean; fail?: MessengerError | Error; content?: string } = {}) => {
   const calls: string[] = [];
   const discord: FinishDiscord = {
+    edit: async (channel, message, text) => { calls.push(`edit ${channel} ${message} ${text}`); },
+    content: async (channel, message) => { calls.push(`read ${channel} ${message}`); return opts.content ?? ""; },
     send: async (channel, text, id) => {
       if (opts.fail && channel !== "main") throw opts.fail;
       calls.push(`send ${channel} ${id} ${text}`);
@@ -80,4 +83,32 @@ test("postOwnerLine: the lane thread first, the main channel without a Discord t
   await expect(postOwnerLine(down.discord, "main", "discord:111/222", "hi", "x")).rejects.toThrow("502");
   expect(down.calls).toEqual([]);
   await expect(postOwnerLine(fakeDiscord().discord, undefined, "none", "hi", "x")).rejects.toThrow("no discordChannels configured");
+});
+
+test("postOwnerLine in a lane thread appends to its last report or status message, and never posts into a thread the owner closed", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const options = { stateDir: state.dir, statusMessage: async (thread: string) => (thread === "222" ? "status-1" : undefined) };
+  // No report yet: the lane's [System] status message takes the line.
+  const status = fakeDiscord({ content: "[System] status" });
+  expect(await postOwnerLine(status.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("222");
+  expect(status.calls).toEqual(["archived? 222", "read 222 status-1", "edit 222 status-1 [System] status\n[System] merged"]);
+  // The last report wins over the status message; a thread Discord archived on its own is unarchived for the edit only.
+  recordLastReport(state.dir, "alpha", { channel: "222", message: "r-1", at: T0 });
+  const archived = fakeDiscord({ archived: true, content: "alpha done" });
+  expect(await postOwnerLine(archived.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("222");
+  expect(archived.calls).toEqual(["archived? 222", "read 222 r-1", 'set 222 {"archived":false}', "edit 222 r-1 alpha done\n[System] merged", 'set 222 {"archived":true}']);
+  // A retry after a crash finds its line already there.
+  const retried = fakeDiscord({ content: "alpha done\n[System] merged" });
+  await postOwnerLine(retried.discord, "main", "discord:111/222", "[System] merged", "m:1", options);
+  expect(retried.calls).toEqual(["archived? 222", "read 222 r-1"]);
+  // Too long to append: one line linking the thread goes to the main channel.
+  const full = fakeDiscord({ content: "x".repeat(1995) });
+  expect(await postOwnerLine(full.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("main");
+  expect(full.calls.at(-1)).toBe("send main m:1 <#222> [System] merged");
+  // The owner closed the thread: nothing touches it, the line goes to the main channel.
+  recordOwnerClosed(state.dir, "222", T0);
+  const closed = fakeDiscord({ archived: true });
+  expect(await postOwnerLine(closed.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("main");
+  expect(closed.calls).toEqual(["archived? 222", "send main m:1 <#222> [System] merged"]);
 });
