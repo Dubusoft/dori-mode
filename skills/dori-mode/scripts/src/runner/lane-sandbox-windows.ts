@@ -13,18 +13,19 @@
  * the lane socket, its own brief and token), and ~/.dori/env and ~/.ssh private keys are denied outright.
  *
  * MXC rewrites LOCALAPPDATA (and TEMP) to a per-container AppContainer folder no grant can name in advance, so the container
- * runs the runner's bun with the same `dori.js lane-sandbox <agent argv>`: seeing LANE_SANDBOX_ACTIVE=1 there, it restores
+ * runs the runner's bun on a copy of `dori.js` in the lane's TEMP with the same `lane-sandbox <agent argv>`: seeing LANE_SANDBOX_ACTIVE=1 there, it restores
  * the host LOCALAPPDATA and the lane's TEMP from DORI_LANE_LOCALAPPDATA and DORI_LANE_TEMP, then starts the agent and exits
  * with its code.
  *
  * Hosts without MXC support are refused with the requirement named; there is no other Windows backend.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { win32 } from "node:path";
 import { run as realRun, type Runner } from "../run.ts";
 import { defaultRunnerDir } from "./fs-safety.ts";
-import { LANE_SOCKET } from "./lane-socket.ts";
+import { CLI_SOCKET } from "./cli-relay.ts";
+import { CONTROL_SOCKET } from "./unix-transport.ts";
 
 /** The MXC release `dori runner install` puts on a Windows runner: the npm package carrying `bin\x64\wxc-exec.exe`. */
 export const MXC_PIN = {
@@ -226,8 +227,10 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
     ...(input.rw ?? []).filter((p) => p !== ""),
     ...(input.verify ? [input.verify] : []),
     ...work,
-    // Connecting to an AF_UNIX socket needs write access to the socket file; the runner's other sockets stay denied.
-    win32.join(runner, "sock", LANE_SOCKET),
+    // Connecting to the lane AF_UNIX socket needs write access, but MXC refuses a grant on the socket file itself (a
+    // reparse point: CreateProcessSecurityEnvironment fails with 0x80070780), so the folder is granted and the runner's
+    // other sockets are denied below.
+    win32.join(runner, "sock"),
   ]);
   const readonlyPaths = unique([
     // Every volume the lane starts on is readable (a read-only volume-root grant covers the whole volume).
@@ -241,7 +244,9 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
     // A hook written by a lane would run outside the sandbox at the next git command on the host.
     ...(!broad && input.gitCommonDir ? [win32.join(input.gitCommonDir, "hooks")] : []),
   ]);
-  const deniedPaths = unique([dori, win32.join(dori, "env"), ...(input.sshKeys ?? [])]);
+  const deniedPaths = unique([
+    dori, win32.join(dori, "env"), ...[CONTROL_SOCKET, CLI_SOCKET].map((s) => win32.join(runner, "sock", s)), ...(input.sshKeys ?? []),
+  ]);
   return {
     version: "1.0.0",
     containment: "processcontainer",
@@ -290,6 +295,7 @@ export type LaneSandboxDeps = {
   readonly writeFile: (path: string, text: string) => void;
   /** The file's text; throws when it is missing or unreadable. */
   readonly readFile: (path: string) => string;
+  readonly copyFile: (from: string, to: string) => void;
   /**
    * Runs argv with the pane's console (stdin, stdout, stderr inherited) and resolves its exit code; `env` replaces the
    * environment and `verbatim` passes the words unquoted (windowsVerbatimArguments).
@@ -311,6 +317,7 @@ const realDeps = (): LaneSandboxDeps => ({
   mkdir: (path) => { mkdirSync(path, { recursive: true }); },
   writeFile: (path, text) => { writeFileSync(path, text, { mode: 0o600 }); },
   readFile: (path) => readFileSync(path, "utf8"),
+  copyFile: (from, to) => { copyFileSync(from, to); },
   spawn: async (argv, cwd, opts = {}) => {
     // Ctrl+C in the pane reaches every process on its console: the wrapper keeps waiting so the agent decides.
     const ignore = (): void => {};
@@ -341,8 +348,10 @@ const hostRefusal = async (d: LaneSandboxDeps): Promise<string | undefined> => {
 };
 
 /** The request for `key` in `cwd` running `commandLine`, with the git common dir and ssh keys looked up on this host. */
+const laneTmpDir = (home: string, key: string): string => win32.join(home, ".cache", "omo-tmp", "lane-sandbox", key);
+
 const buildRequest = async (d: LaneSandboxDeps, key: string, cwd: string, commandLine: string): Promise<{ request: MxcRequest; laneTmp: string }> => {
-  const laneTmp = win32.join(d.home, ".cache", "omo-tmp", "lane-sandbox", key);
+  const laneTmp = laneTmpDir(d.home, key);
   d.mkdir(laneTmp);
   // MXC grants need existing paths; omo creates its engine-trust store under this one.
   const localAppData = envValue(d.env, "LOCALAPPDATA");
@@ -420,10 +429,13 @@ export const laneSandboxWindowsMain = async (args: readonly string[], deps: Part
   try {
     // Resolved here only to refuse a missing program or a batch argument before MXC starts; the shim resolves it again.
     agentCommandLine(args, d.which);
-    const shim = windowsCommandLine([
-      win32.join(d.runnerDir, "bun", bunVersion, "bun.exe"), win32.join(d.runnerDir, "bin", "dori.js"), "lane-sandbox", ...args,
-    ]);
-    const { request, laneTmp } = await buildRequest(d, sandboxKey(d.env.DORI_LANE_KEY), cwd, shim);
+    // bun cannot load a script under the denied ~/.dori inside the container (resolving it reads the parent folders and
+    // gets EPERM), so the container runs a copy of the bundle in the lane's TEMP.
+    const key = sandboxKey(d.env.DORI_LANE_KEY);
+    const bundle = win32.join(laneTmpDir(d.home, key), "dori.js");
+    const shim = windowsCommandLine([win32.join(d.runnerDir, "bun", bunVersion, "bun.exe"), bundle, "lane-sandbox", ...args]);
+    const { request, laneTmp } = await buildRequest(d, key, cwd, shim);
+    d.copyFile(win32.join(d.runnerDir, "bin", "dori.js"), bundle);
     if (broadCwd(cwd, d.home, (d.env.LANE_SANDBOX_NO_CWD ?? "").split(";"))) d.err(`lane-sandbox: warning: cwd ${cwd} is too broad; not making it writable`);
     config = win32.join(laneTmp, "mxc-policy.json");
     d.writeFile(config, `${JSON.stringify(request, null, 2)}\n`);

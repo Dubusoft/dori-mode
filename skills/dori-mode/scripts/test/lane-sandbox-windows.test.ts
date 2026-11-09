@@ -24,16 +24,16 @@ test("a lane writes only its worktree, git dir, TEMP and the caches; its volumes
   const p = policy({ rw: ["E:\\scratch", ""], verify: "C:\\lead\\state\\verify" });
   expect(p.filesystem.readwritePaths).toEqual([
     TMP, `${HOME}\\.omo`, `${HOME}\\.cache`, `${DORI}\\state`, `${DORI}\\heavy`, `${HOME}\\.npm`, `${HOME}\\.bun\\install\\cache`,
-    `${HOME}\\.cargo\\registry`, `${HOME}\\.cargo\\git`, `${HOME}\\AppData\\Local\\omo`, "E:\\scratch", "C:\\lead\\state\\verify", WT, GCD, `${RUNNER}\\sock\\lane`,
+    `${HOME}\\.cargo\\registry`, `${HOME}\\.cargo\\git`, `${HOME}\\AppData\\Local\\omo`, "E:\\scratch", "C:\\lead\\state\\verify", WT, GCD, `${RUNNER}\\sock`,
   ]);
   expect(p.filesystem.readonlyPaths).toEqual([
     "C:\\", "D:\\", `${DORI}\\config.json`, `${DORI}\\src`, `${DORI}\\bin`, `${RUNNER}\\bin`, `${RUNNER}\\bun`,
     `${RUNNER}\\briefs\\lane-a.md`, `${RUNNER}\\briefs\\lane-a.2.token`, `${GCD}\\hooks`,
   ]);
-  expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${HOME}\\.ssh\\id_ed25519`]);
+  expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${RUNNER}\\sock\\control`, `${RUNNER}\\sock\\cli`, `${HOME}\\.ssh\\id_ed25519`]);
   // Nothing else of the runner directory: other lanes' briefs and tokens, its keys, config and other sockets stay under the denied ~/.dori.
   const granted = lower([...p.filesystem.readwritePaths, ...p.filesystem.readonlyPaths]);
-  for (const hidden of ["briefs\\lane-b.md", "briefs", "keys", "runner-config.json", "sock\\control", "sock\\cli", "sock", "mxc"]) expect(granted).not.toContain(`${RUNNER}\\${hidden}`.toLowerCase());
+  for (const hidden of ["briefs\\lane-b.md", "briefs", "keys", "runner-config.json", "sock\\control", "sock\\cli", "mxc"]) expect(granted).not.toContain(`${RUNNER}\\${hidden}`.toLowerCase());
   expect(granted).not.toContain(`${DORI}\\env`.toLowerCase());
   expect(p).toMatchObject({
     version: "1.0.0", containment: "processcontainer", containerId: "dori-lane-lane-a",
@@ -57,7 +57,7 @@ test("paths are normalized and deduplicated without case, and a missing git dir 
   expect(p.filesystem.readwritePaths.filter((x) => x.toLowerCase() === WT.toLowerCase())).toHaveLength(1);
   expect(p.process.cwd).toBe("d:\\work\\repo\\wt-1");
   expect(p.filesystem.readonlyPaths.some((x) => x.endsWith(".token") || x.endsWith("hooks"))).toBe(false);
-  expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`]);
+  expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${RUNNER}\\sock\\control`, `${RUNNER}\\sock\\cli`]);
 });
 
 test("the agent's environment keeps the pane's, with TEMP, TMP and TMPDIR on the lane's TEMP; MXC's required names must be there", () => {
@@ -150,6 +150,7 @@ const host = (over: { build?: string; probe?: Partial<Ran>; wxc?: boolean; env?:
       if (path === `${RUNNER}\\bin\\bun.txt` && over.bunTxt !== "") return over.bunTxt ?? "1.3.2\r\n";
       throw new Error(`ENOENT: ${path}`);
     },
+    copyFile: (from, to) => { files.set(to, `copy of ${from}`); },
     spawn: async (argv, cwd, opts) => { spawned.push(opts ? { argv, cwd, opts } : { argv, cwd }); return 7; },
     err: (line) => { errs.push(line); },
   };
@@ -193,13 +194,14 @@ test("a lane runs its agent through wxc-exec with the written policy and exits w
   expect(config).toBe(`${TMP}\\mxc-policy.json`);
   expect(lane.spawned[0]?.cwd).toBe(WT);
   const written = JSON.parse(lane.files.get(config ?? "") ?? "{}");
-  expect(written.process.commandLine).toBe(`${RUNNER}\\bun\\1.3.2\\bun.exe ${RUNNER}\\bin\\dori.js lane-sandbox omo --model m "do it"`);
+  expect(written.process.commandLine).toBe(`${RUNNER}\\bun\\1.3.2\\bun.exe ${TMP}\\dori.js lane-sandbox omo --model m "do it"`);
+  expect(lane.files.get(`${TMP}\\dori.js`)).toBe(`copy of ${RUNNER}\\bin\\dori.js`);
   expect(written.process.env).toEqual(expect.arrayContaining([`DORI_LANE_LOCALAPPDATA=${HOME}\\AppData\\Local`, `DORI_LANE_TEMP=${TMP}`]));
   expect(written.filesystem.readwritePaths).toContain(`${HOME}\\AppData\\Local\\omo`);
   expect(lane.dirs).toEqual(expect.arrayContaining([TMP, `${HOME}\\AppData\\Local\\omo`]));
   expect(written.filesystem.readwritePaths).toEqual(expect.arrayContaining(["E:\\a", "E:\\b", WT, GCD]));
   expect(written.filesystem.readonlyPaths).toEqual(expect.arrayContaining([`${RUNNER}\\briefs\\lane-a.3.token`, `${GCD}\\hooks`]));
-  expect(written.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${HOME}\\.ssh\\id_rsa`]);
+  expect(written.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${RUNNER}\\sock\\control`, `${RUNNER}\\sock\\cli`, `${HOME}\\.ssh\\id_rsa`]);
 
   const bare = host({ env: { ...ENV, DORI_LANE_KEY: "" } });
   expect(await laneSandboxWindowsMain(["omo", "x"], bare.deps)).toBe(7);
