@@ -8,10 +8,22 @@ export const WIN_TASK_NAME = "dori-runner";
 const WIN_TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
 
 /**
- * PowerShell that ends the runner tree `runner-task.ps1` recorded in `runner-task.pid` (`taskkill /T /F`), only while
- * that pid still is a dori runner (its command line names dori.js), so a reused pid is never killed.
+ * PowerShell that ends the task wrapper `runner-task.ps1` recorded in `runner-task-wrapper.pid`, then the runner tree it
+ * recorded in `runner-task.pid` (`taskkill /T /F` each), each only while that pid still is what it was (its command
+ * line names runner-task.ps1, or dori.js), so a reused pid is never killed. The task runs the wrapper under
+ * `conhost --headless`, and stopping the task ends only that conhost, so the wrapper goes first: it would otherwise
+ * start the runner again 5 s later.
  */
 export const WIN_KILL_RUNNER = [
+  "$DoriWrapperPid = Join-Path $env:USERPROFILE '.dori\\runner\\runner-task-wrapper.pid'",
+  "if (Test-Path -LiteralPath $DoriWrapperPid) {",
+  "  $DoriId = ([IO.File]::ReadAllText($DoriWrapperPid)).Trim()",
+  "  if ($DoriId -match '^\\d+$') {",
+  "    $DoriProc = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $DoriId) -ErrorAction SilentlyContinue",
+  "    if ($DoriProc -and $DoriProc.CommandLine -like '*runner-task.ps1*') { & taskkill.exe /PID $DoriId /T /F | Out-Null }",
+  "  }",
+  "  Remove-Item -LiteralPath $DoriWrapperPid -Force -ErrorAction SilentlyContinue",
+  "}",
   "$DoriPid = Join-Path $env:USERPROFILE '.dori\\runner\\runner-task.pid'",
   "if (Test-Path -LiteralPath $DoriPid) {",
   "  $DoriId = ([IO.File]::ReadAllText($DoriPid)).Trim()",

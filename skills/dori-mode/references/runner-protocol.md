@@ -378,8 +378,12 @@ code and fingerprint reach `runner serve --enroll-only` through stdin, never an 
 4. Writes a starter `runner-config.json` (roots `%USERPROFILE%` and `%TEMP%`) only if none exists, and enrolls unless
    `keys\supervisor.pub` exists (failure exits 5).
 5. Registers and starts the Task Scheduler task `\dori\dori-runner` (failure exits 6): at logon, interactive token,
-   least privilege, runs on battery, restarts every minute on failure. Its action runs `runner-task.ps1`, which loops
-   `bun dori.js runner serve`, logs to `logs\runner.log` (rotated at 10 MB between starts) and restarts after 5 s.
+   least privilege, runs on battery, restarts every minute on failure. Its action runs `runner-task.ps1` as
+   `conhost.exe --headless powershell.exe ...`, so no console window opens at logon: a console program started
+   directly by the task always gets a window, and `-WindowStyle Hidden` only hides it after it has appeared (and not at
+   all when Windows Terminal is the default terminal). The wrapper loops `bun dori.js runner serve`, logs to
+   `logs\runner.log` (rotated at 10 MB between starts) and restarts after 5 s. It records its own pid in
+   `runner-task-wrapper.pid` and the runner's in `runner-task.pid`.
 
 Shims in `bin\`, all finding Bun through `bun.txt` next to them:
 
@@ -389,9 +393,10 @@ Shims in `bin\`, all finding Bun through `bun.txt` next to them:
 | cmd.exe | `dori.cmd` |
 | Git Bash / MSYS | `dori` (sh, turns off MSYS path conversion) |
 
-The supervisor drives the task with PowerShell: restart stops the task, kills the tree and starts it; stop disables
-the task first so the wrapper can't bring Bun back. `uninstall.ps1` removes the task and the install, and
-`-Purge` removes the whole runner dir.
+The supervisor drives the task with PowerShell: restart stops the task, kills the trees and starts it; stop disables
+the task first. Stopping the task ends only the headless conhost, so every stop (restart, stop, install, remove,
+`uninstall.ps1`) kills the wrapper by its recorded pid before the runner tree, so it can't bring Bun back.
+`uninstall.ps1` removes the task and the install, and `-Purge` removes the whole runner dir.
 
 On Windows the runner:
 

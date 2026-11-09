@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>dori runner: bin\runner-task.ps1 runs the runner and restarts it 5 s after any exit.</Description>
+    <Description>dori runner: bin\runner-task.ps1 runs the runner and restarts it 5 s after any exit, under a headless console so no window opens.</Description>
     <URI>\dori\dori-runner</URI>
   </RegistrationInfo>
   <Triggers>
@@ -42,8 +42,8 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>powershell.exe</Command>
-      <Arguments>-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "@RUNNER@\bin\runner-task.ps1" -Label @LABEL@ -Listen @LISTEN@</Arguments>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "@RUNNER@\bin\runner-task.ps1" -Label @LABEL@ -Listen @LISTEN@</Arguments>
       <WorkingDirectory>@RUNNER@</WorkingDirectory>
     </Exec>
   </Actions>
