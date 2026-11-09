@@ -67,7 +67,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
     },
   });
   const started = await lanes.start(start);
-  expect(started.result).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "ok", detail: "ready" } });
+  expect(started.result).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "ok", detail: "ready" }, cwd: start.cwd });
   const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
   expect(command).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")} env LANE_SANDBOX_VERIFY=${repo}/state/verify lane-sandbox omo --model m1 --thinking medium 'ulw set goal and work. Read and execute the lane brief at `);
   expect(lanes.records()["lane-a"]?.profile).toBe("sandboxed");

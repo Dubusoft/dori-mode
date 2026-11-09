@@ -2,6 +2,7 @@
 // Pure apart from the optional config read in `loadPolicy`; path resolution is injected into `checkCommand`.
 
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import {
   isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
@@ -14,6 +15,8 @@ export type RunnerPolicy = {
   readonly agents: Readonly<Record<string, readonly string[]>>;
   /** Directories under which every command cwd must resolve. */
   readonly allowedRoots: readonly string[];
+  /** Where a `lane.start` without `cwd` starts (absolute, a leading `~` already expanded); absent: the runner's home. */
+  readonly defaultCwd?: string;
   readonly sandbox: "required" | "optional";
   /**
    * Argv run before every `lane.start` with `sandbox: true` (e.g. `["lane-sandbox", "--check"]`); a non-zero exit refuses
@@ -44,10 +47,13 @@ export const rejectionText = (rule: string): string => `RUNNER_CMD_REJECTED ${ru
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** Reads a policy from parsed JSON; unknown keys or wrong types throw. */
-export function parsePolicy(value: unknown): RunnerPolicy {
+/** `~` or `~/...` under `home`; any other path unchanged. */
+const expandHome = (path: string, home: string): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
+
+/** Reads a policy from parsed JSON (`home` expands a leading `~` in `defaultCwd`); unknown keys or wrong types throw. */
+export function parsePolicy(value: unknown, home: string = homedir()): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
-  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck"]);
+  const known = new Set(["agents", "allowedRoots", "defaultCwd", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck"]);
   for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
   const agents: Record<string, readonly string[]> = {};
@@ -59,6 +65,10 @@ export function parsePolicy(value: unknown): RunnerPolicy {
     }
   }
   if (value.allowedRoots !== undefined && !strings(value.allowedRoots)) throw new Error("runner-config: allowedRoots must be a string array");
+  const defaultCwd = typeof value.defaultCwd === "string" ? expandHome(value.defaultCwd, home) : undefined;
+  if (value.defaultCwd !== undefined && (defaultCwd === undefined || !isAbsolute(defaultCwd))) {
+    throw new Error("runner-config: defaultCwd must be an absolute path or start with ~/");
+  }
   if (value.sandbox !== undefined && value.sandbox !== "required" && value.sandbox !== "optional") throw new Error("runner-config: sandbox must be required|optional");
   if (value.jobs !== undefined && value.jobs !== "allow" && value.jobs !== "deny") throw new Error("runner-config: jobs must be allow|deny");
   if (value.heavyKill !== undefined && !strings(value.heavyKill)) throw new Error("runner-config: heavyKill must be a string array");
@@ -79,6 +89,7 @@ export function parsePolicy(value: unknown): RunnerPolicy {
     ...(guard ? { guard } : {}),
     ...(value.heavyKill !== undefined ? { heavyKill: value.heavyKill as string[] } : {}),
     ...(value.sandboxCheck !== undefined ? { sandboxCheck: value.sandboxCheck as string[] } : {}),
+    ...(defaultCwd !== undefined ? { defaultCwd } : {}),
     agents,
     allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
@@ -103,9 +114,24 @@ const underRoot = (root: string, path: string): boolean => {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 };
 
-/** `cwd-missing` / `cwd-outside-roots` for `path` (absolute, resolving, under an allowed root), else undefined. */
+/**
+ * `cwd-missing` / `cwd-outside-roots` for `path` (absolute, resolving, under an allowed root), else undefined.
+ * A lexical pre-check runs first: a path whose `path.resolve` form is under neither a root's normalized nor its
+ * real form is refused with no filesystem access, because `realpath` on a macOS TCC-protected folder (~/Documents)
+ * blocks the launchd-run runner instead of failing. Only a lexically admitted path is then realpath'd and re-checked
+ * against the real roots, so a symlink inside a root that escapes it is still refused.
+ */
 const checkRootedPath = (policy: RunnerPolicy, path: string, realpath: (path: string) => string, missingOk = false): { readonly rule: string; readonly detail: string } | undefined => {
   if (!isAbsolute(path)) return { rule: "cwd-missing", detail: `${path} is not absolute` };
+  // Roots are safe to resolve (the operator chose them); $TMPDIR-style roots resolve elsewhere (/var -> /private/var) and a path may use either form.
+  const roots: string[] = [];
+  const lexicalRoots: string[] = [];
+  for (const root of policy.allowedRoots) {
+    lexicalRoots.push(resolvePath(root));
+    try { const real = realpath(root); roots.push(real); lexicalRoots.push(real); } catch { /* a root that does not exist admits nothing */ }
+  }
+  const normalized = resolvePath(path);
+  if (!lexicalRoots.some((root) => underRoot(root, normalized))) return { rule: "cwd-outside-roots", detail: normalized };
   let resolved: string;
   try {
     resolved = realpath(path);
@@ -123,17 +149,14 @@ const checkRootedPath = (policy: RunnerPolicy, path: string, realpath: (path: st
       }
     }
   }
-  const roots: string[] = [];
-  for (const root of policy.allowedRoots) {
-    try { roots.push(realpath(root)); } catch { /* a root that does not exist admits nothing */ }
-  }
   if (!roots.some((root) => underRoot(root, resolved))) return { rule: "cwd-outside-roots", detail: resolved };
   return undefined;
 };
 
 /**
  * The same root check for a directory the runner learns only on its host, such as an adopted or target pane's
- * `foreground_cwd`/`cwd`: `cwd-missing` / `cwd-outside-roots` (symlinks resolved, path segments compared), else undefined.
+ * `foreground_cwd`/`cwd`: `cwd-missing` / `cwd-outside-roots` (lexical pre-check without touching the path, then symlinks
+ * resolved, path segments compared), else undefined.
  */
 export const checkCwd = (policy: RunnerPolicy, path: string, realpath: (path: string) => string): { readonly rule: string; readonly detail: string } | undefined =>
   checkRootedPath(policy, path, realpath);
@@ -141,9 +164,10 @@ export const checkCwd = (policy: RunnerPolicy, path: string, realpath: (path: st
 /**
  * Checks a parsed supervisor command frame against the policy. `realpath` resolves symlinks and throws when the
  * path does not exist (as `fs.realpathSync` does). Every `cwd` (`lane.start`, `lane.adopt`, `job.run`,
- * `wait.check`) and `lane.git.root` must be absolute, resolve and lie under `allowedRoots`.
+ * `wait.check`) and `lane.git.root` must be absolute, resolve and lie under `allowedRoots`. A `lane.start` without
+ * `cwd` gets `policy.defaultCwd`, else `home`, before that check; the returned command carries the filled `cwd`.
  */
-export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (path: string) => string): CheckResult {
+export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (path: string) => string, home: string = homedir()): CheckResult {
   const reject = (rule: string, detail: string): CheckResult => ({ ok: false, rule, detail });
   // A shell string is reported by its own rule rather than as a generic type error.
   if (isRecord(command) && command.type === "job.run" && isRecord(command.body) && command.body.command !== undefined) {
@@ -160,6 +184,7 @@ export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (
     throw error;
   }
 
+  if (frame.type === "lane.start" && frame.body.cwd === undefined) frame = { ...frame, body: { ...frame.body, cwd: policy.defaultCwd ?? home } };
   const body = frame.body as Record<string, unknown>;
   if ((frame.type === "job.run" || frame.type === "wait.check" || frame.type === "lane.git") && policy.jobs === "deny") return reject("jobs-denied", frame.type);
   if (frame.type === "lane.start") {

@@ -140,6 +140,26 @@ test("observeMachine fills the pane count from the pane list, -1 when it is unre
   const blind = await observeMachine(depsOf(down, { os: "linux", readMemInfo: mem }));
   expect(blind.panes).toEqual([]);
   expect(blind.sample.panes).toBe(-1);
+  expect("guard" in got).toBe(false);
+});
+
+test("q.machine.observe reports the guard thresholds runner-config.json sets (policy.guard), none when it sets none", async () => {
+  const w = newWorld();
+  const run: Runner = async (argv, opts) => (argv[0] === "df" ? { code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 100 50 10485760", err: "" } : fakeRunner(w)(argv, opts));
+  const mem = async () => "MemTotal: 1000 kB\nMemAvailable: 250 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+  const ask = async (guard?: { readonly panesMax: number }) => {
+    const replies: RunnerControlBodies["q.result"][] = [];
+    let settle: () => void = () => {};
+    const answered = new Promise<void>((r) => { settle = r; });
+    queryDispatcher({
+      ...depsOf(run, { os: "linux", readMemInfo: mem }), policy: { jobs: "allow", ...(guard ? { guard } : {}) },
+      reply: (body) => { replies.push(body); settle(); }, log: () => {},
+    })(frame("q.machine.observe", { qid: "m1" }));
+    await answered;
+    return replies[0]?.result as { guard?: object };
+  };
+  expect((await ask({ panesMax: 6 })).guard).toEqual({ panesMax: 6 });
+  expect("guard" in (await ask())).toBe(false);
 });
 
 // ---------------------------------------------------------------------------------------------------------------

@@ -467,9 +467,9 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const notes = [...prepared.notes, ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
   const dir = input.cwd ?? target?.cwd;
-  // The runner starts every lane in a directory on its own host; the lead's defaultCwd means nothing on another machine.
-  if (input.machine && !dir) throw new LaunchError(`a lane on machine ${input.machine} needs --cwd (a directory on that machine)`);
-  const cwd = dir ?? deps.config.defaultCwd;
+  // The lead's defaultCwd means nothing on another machine: without --cwd the start names none and that machine's
+  // runner uses its runner-config defaultCwd (else its home), reporting the directory back in the result.
+  const cwd = dir ?? (input.machine ? undefined : deps.config.defaultCwd);
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
   let draft: SharedThreadLane = {
@@ -503,7 +503,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     // The lead-side brief keeps the footer for reference; the runner writes its own copy on the lane's host.
     await Bun.write(input.brief, brief);
     const start: StartInput = {
-      key: input.key, cmdId, briefText: brief, files: prepared.files, done: input.done, thread: draft.thread, cwd, sandbox, mode, model,
+      key: input.key, cmdId, briefText: brief, files: prepared.files, done: input.done, thread: draft.thread, ...(cwd !== undefined ? { cwd } : {}), sandbox, mode, model,
       keywords: mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords,
       ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
       ...(input.session !== undefined ? { session: input.session } : {}),
@@ -533,7 +533,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       throw new LaunchError(`${input.key}: the start may have happened (${error instanceof Error ? error.message : String(error)}); the lane stays reserved and paused: check dori status, or cancel it with dori close ${input.key} --cancelled --reason TEXT`);
     }
     started = true;
-    const lane: Lane = { ...draft, fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
+    const lane: Lane = { ...draft, ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
     // A relaunch writes only what this launch changed, so a pause or objection that landed meanwhile survives.
     const launched = (current: Lane): Lane => existing
       ? { ...current, ...Object.fromEntries(Object.entries(lane).filter(([k, v]) => (existing as Record<string, unknown>)[k] !== v)), key: lane.key } as Lane

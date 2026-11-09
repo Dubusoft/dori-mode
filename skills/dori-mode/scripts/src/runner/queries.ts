@@ -45,6 +45,8 @@ export type QueryDeps = {
   readonly signalIo?: Omit<SignalIo, "cwd">;
   /** The agent session directory a `session` inspection reads when the query names none. */
   readonly sessionsDir?: string;
+  /** The guard thresholds runner-config.json sets (policy.ts `guard`), reported by `q.machine.observe`. */
+  readonly guard?: RunnerPolicy["guard"];
 };
 
 /** Default agent session directory on a host (omo's own). */
@@ -124,13 +126,17 @@ export const laneInspect = async (deps: QueryDeps, body: Body<"q.lane.inspect">)
   };
 };
 
-/** `q.machine.observe`: this host's guard sample (its `panes` filled from the pane list, -1 when unreadable) and pane list. */
+/**
+ * `q.machine.observe`: this host's guard sample (its `panes` filled from the pane list, -1 when unreadable), pane list,
+ * and the guard thresholds its runner-config.json sets (`guard`, only when it sets any).
+ */
 export const observeMachine = async (deps: QueryDeps): Promise<MachineObservation> => {
   let panes: Pane[] | undefined;
   try { panes = await listPanes(deps.run); } catch { panes = undefined; }
   const listed = panes;
   const sample: HostSample = await sampleHost(deps.run, deps.dataPath ?? "/", async () => listed?.length ?? -1, deps.readMemInfo);
-  return { os: deps.os ?? platform(), sampledAt: deps.clock.now(), sample, panes: listed ?? [] };
+  const guard = deps.guard && Object.keys(deps.guard).length > 0 ? { guard: deps.guard } : {};
+  return { os: deps.os ?? platform(), sampledAt: deps.clock.now(), sample, panes: listed ?? [], ...guard };
 };
 
 /** Runs one checked query and resolves to its result. */
@@ -156,7 +162,8 @@ export const answerQuery = async (deps: QueryDeps, query: AnySupervisorControl):
 };
 
 export type QueryDispatchDeps = QueryDeps & {
-  readonly policy: Pick<RunnerPolicy, "jobs">;
+  /** `guard` (runner-config.json's thresholds) is what `q.machine.observe` reports. */
+  readonly policy: Pick<RunnerPolicy, "jobs" | "guard">;
   /** Sends the `q.result` control frame (client.ts `control("q.result", ...)`). */
   readonly reply: (body: RunnerControlBodies["q.result"]) => void;
   readonly log: (line: string) => void;
@@ -184,7 +191,7 @@ export const queryDispatcher = (deps: QueryDispatchDeps) => (frame: unknown): vo
     send({ qid, ok: false, detail: `RUNNER_CMD_REJECTED ${checked.rule}` });
     return;
   }
-  void answerQuery(deps, checked.query).then(
+  void answerQuery({ ...deps, guard: deps.guard ?? deps.policy.guard }, checked.query).then(
     (result) => {
       const response = { qid, ok: true, detail: "", result };
       if (checked.query.type === "q.lane.files") {

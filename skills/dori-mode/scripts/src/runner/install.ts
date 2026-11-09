@@ -268,7 +268,7 @@ export const installScript = (
     `PL="$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist"`,
     `cat > "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(plist)}${HEREDOC}`,
-    `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(dirname "$BUN"):$PATH|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$PL" || exit 1`,
+    `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$PL" || exit 1`,
     `rm -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp"`,
     'chmod 644 "$PL"',
     // launchd appends the agent's output here; created 0600 beforehand so the runner's directory check accepts it.

@@ -273,14 +273,17 @@ const plistPath = (home: string) => join(home, "Library/LaunchAgents/com.dori.ru
 
 test("on Darwin with bun on PATH, the script writes the launchd agent, boots it into the gui domain, and enrolls through a pipe", async () => {
   const host = darwinHost();
-  const result = await runDarwin(host, darwinScript());
+  const script = darwinScript();
+  expect(script).toContain('sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g"');
+  expect(script).not.toContain('$(dirname "$BUN"):$PATH');
+  const result = await runDarwin(host, script);
   expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\n" });
   expect(loadPolicy(join(host.home, ".dori/runner")).allowedRoots).toEqual([host.home, "/private/tmp"]);
   const bun = join(host.bin, "bun");
   const plist = readFileSync(plistPath(host.home), "utf8");
   expect(plist).not.toMatch(/@[A-Z]+@/);
   expect(programArguments(plist)).toEqual([bun, join(host.home, ".dori/runner/bin/dori.js"), ...ARGS]);
-  expect(plist).toContain(`<key>PATH</key>\n    <string>${host.bin}:${host.bin}</string>`);
+  expect(plist).toContain(`<key>PATH</key>\n    <string>${host.bin}:/opt/login&amp;tools|x/bin:${host.bin}</string>`);
   expect(plist).toContain(`<string>${join(host.home, ".dori/runner/runner.log")}</string>`);
   expect(statSync(plistPath(host.home)).mode & 0o777).toBe(0o644);
   const domain = join(host.home, ".dori/runner/launchd-domain");
@@ -319,7 +322,7 @@ test.skipIf(!Bun.which("zip") || CANDIDATES.some((p) => existsSync(p)))("on Darw
   expect(readFileSync(host.log, "utf8")).toContain("https://github.com/oven-sh/bun/releases/latest/download/bun-darwin-aarch64.zip");
   const plist = readFileSync(plistPath(host.home), "utf8");
   expect(programArguments(plist)[0]).toBe(bun);
-  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/bun")}:${host.bin}</string>`);
+  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/bun")}:/opt/login&amp;tools|x/bin:${host.bin}</string>`);
   expect(readFileSync(join(host.home, ".dori/runner/bin/dori"), "utf8")).toContain(`exec "${bun}"`);
   const left = new Bun.Glob("bun-download.*").scanSync({ cwd: join(host.home, ".dori/runner"), onlyFiles: false });
   expect([...left]).toEqual([]);
