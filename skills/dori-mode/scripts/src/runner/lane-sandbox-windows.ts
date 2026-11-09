@@ -8,17 +8,24 @@
  * `dori runner install` puts the pinned MXC executor in `<runner>\mxc\<version>\`, and the runner's sandboxed profile runs
  * `dori.ps1 lane-sandbox <agent argv>` in the lane's pane. MXC starts the agent suspended inside a kill-on-close job, so
  * every process it starts stays in the container. Writes are allowed only to the worktree (and its git common dir, hooks
- * excluded), the lane's TEMP, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy and package caches; every volume the lane
- * touches is otherwise read-only. ~/.dori is denied except what a lane needs (config, dori itself, the runner's bin and bun,
+ * excluded), the lane's TEMP, ~/.omo, %LOCALAPPDATA%\omo, ~/.cache, ~/.dori/state, ~/.dori/heavy and package caches; every
+ * volume the lane touches is otherwise read-only. ~/.dori is denied except what a lane needs (config, dori itself, the runner's bin and bun,
  * the runner's sock directory, its own brief and token), and ~/.dori/env and ~/.ssh private keys are denied outright.
+ *
+ * MXC rewrites LOCALAPPDATA (and TEMP) to a per-container AppContainer folder no grant can name in advance, so the container
+ * runs the runner's bun on a copy of `dori.js` in the lane's TEMP with the same `lane-sandbox <agent argv>`: seeing LANE_SANDBOX_ACTIVE=1 there, it restores
+ * the host LOCALAPPDATA and the lane's TEMP from DORI_LANE_LOCALAPPDATA and DORI_LANE_TEMP, then starts the agent and exits
+ * with its code.
  *
  * Hosts without MXC support are refused with the requirement named; there is no other Windows backend.
  */
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { win32 } from "node:path";
 import { run as realRun, type Runner } from "../run.ts";
 import { defaultRunnerDir } from "./fs-safety.ts";
+import { CLI_SOCKET } from "./cli-relay.ts";
+import { CONTROL_SOCKET } from "./unix-transport.ts";
 
 /** The MXC release `dori runner install` puts on a Windows runner: the npm package carrying `bin\x64\wxc-exec.exe`. */
 export const MXC_PIN = {
@@ -99,6 +106,15 @@ export const windowsCommandLine = (argv: readonly string[]): string => argv.map(
  * cannot carry a `"` inside a quoted argument, so a batch program with such an argument is refused.
  */
 export const agentCommandLine = (argv: readonly string[], which: (cmd: string) => string | null): string => {
+  const launch = agentLaunch(argv, which);
+  return launch.verbatim ? launch.argv.join(" ") : windowsCommandLine(launch.argv);
+};
+
+/**
+ * The argv that starts the agent, resolved as `agentCommandLine` does. `verbatim` marks a preformatted cmd.exe line: its
+ * words go to Bun.spawn with windowsVerbatimArguments, joined by spaces without further quoting.
+ */
+export const agentLaunch = (argv: readonly string[], which: (cmd: string) => string | null): { argv: string[]; verbatim: boolean } => {
   const [first, ...rest] = argv;
   if (!first) throw new Error("lane-sandbox: no command");
   const program = which(first);
@@ -107,11 +123,18 @@ export const agentCommandLine = (argv: readonly string[], which: (cmd: string) =
   if (ext === ".cmd" || ext === ".bat") {
     const bad = rest.find((arg) => /["%\r\n]/.test(arg));
     if (bad !== undefined) throw new Error(`lane-sandbox: ${program} is a batch file and cmd.exe cannot pass the argument ${JSON.stringify(bad)} intact (it holds " or %)`);
-    return `cmd.exe /d /s /c "${windowsCommandLine([program, ...rest])}"`;
+    return { argv: ["cmd.exe", "/d", "/s", "/c", `"${windowsCommandLine([program, ...rest])}"`], verbatim: true };
   }
-  if (ext === ".ps1") return windowsCommandLine(["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", program, ...rest]);
-  return windowsCommandLine([program, ...rest]);
+  if (ext === ".ps1") return { argv: ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", program, ...rest], verbatim: false };
+  return { argv: [program, ...rest], verbatim: false };
 };
+
+/** `name` from a Windows environment, matched without case. */
+export const envValue = (env: Readonly<Record<string, string | undefined>>, name: string): string | undefined =>
+  Object.entries(env).find(([k, v]) => v !== undefined && k.toUpperCase() === name.toUpperCase())?.[1];
+
+/** omo's Windows state folder (its engine-trust store lives here), granted read-write to every lane. */
+export const omoLocalDir = (localAppData: string): string => win32.join(localAppData, "omo");
 
 /** Inputs of one lane's MXC request; every path is an absolute Windows path. */
 export type PolicyInput = {
@@ -173,7 +196,8 @@ export const broadCwd = (cwd: string, home: string, noCwd: readonly string[] = [
 /**
  * The environment block MXC gives the agent: the wrapper's own environment (one entry per name, compared without case
  * as Windows does), with TEMP, TMP and TMPDIR pointed at the lane's TEMP and LANE_SANDBOX_ACTIVE=1. MXC refuses a block
- * without SYSTEMROOT and LOCALAPPDATA.
+ * without SYSTEMROOT and LOCALAPPDATA. DORI_LANE_LOCALAPPDATA and DORI_LANE_TEMP carry the host values past MXC's rewrite
+ * to the in-container `lane-sandbox` run.
  */
 export const laneEnv = (env: Readonly<Record<string, string | undefined>>, laneTmp: string): string[] => {
   const byName = new Map<string, [string, string]>();
@@ -182,6 +206,8 @@ export const laneEnv = (env: Readonly<Record<string, string | undefined>>, laneT
   byName.set("LANE_SANDBOX_ACTIVE", ["LANE_SANDBOX_ACTIVE", "1"]);
   const missing = ["SYSTEMROOT", "LOCALAPPDATA"].filter((name) => !byName.has(name));
   if (missing.length) throw new Error(`lane-sandbox: ${missing.join(" and ")} must be set: MXC refuses an environment without them`);
+  byName.set("DORI_LANE_LOCALAPPDATA", ["DORI_LANE_LOCALAPPDATA", byName.get("LOCALAPPDATA")?.[1] ?? ""]);
+  byName.set("DORI_LANE_TEMP", ["DORI_LANE_TEMP", laneTmp]);
   return [...byName.values()].map(([name, value]) => `${name}=${value}`);
 };
 
@@ -192,14 +218,18 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
   const runner = win32.join(dori, "runner");
   const broad = broadCwd(input.cwd, h, input.noCwd);
   const work = broad ? [] : [input.cwd, ...(input.gitCommonDir ? [input.gitCommonDir] : [])];
+  const localAppData = envValue(input.env, "LOCALAPPDATA");
   const readwritePaths = unique([
     input.laneTmp,
     ...[".omo", ".cache", ".dori\\state", ".dori\\heavy", ".npm", ".bun\\install\\cache", ".cargo\\registry", ".cargo\\git"].map((p) => win32.join(h, p)),
+    // omo's engine-trust store: %LOCALAPPDATA%\omo on Windows.
+    ...(localAppData ? [omoLocalDir(localAppData)] : []),
     ...(input.rw ?? []).filter((p) => p !== ""),
     ...(input.verify ? [input.verify] : []),
     ...work,
     // Connecting to the lane socket needs write access. The grant names the directory: an AF_UNIX socket file is a reparse
     // point Windows cannot open, so naming it fails CreateProcessSecurityEnvironment with 0x80070780 (ERROR_CANT_ACCESS_FILE).
+    // The runner's other sockets in it are denied below.
     win32.join(runner, "sock"),
   ]);
   const readonlyPaths = unique([
@@ -214,7 +244,9 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
     // A hook written by a lane would run outside the sandbox at the next git command on the host.
     ...(!broad && input.gitCommonDir ? [win32.join(input.gitCommonDir, "hooks")] : []),
   ]);
-  const deniedPaths = unique([dori, win32.join(dori, "env"), ...(input.sshKeys ?? [])]);
+  const deniedPaths = unique([
+    dori, win32.join(dori, "env"), ...[CONTROL_SOCKET, CLI_SOCKET].map((s) => win32.join(runner, "sock", s)), ...(input.sshKeys ?? []),
+  ]);
   return {
     version: "1.0.0",
     containment: "processcontainer",
@@ -247,6 +279,8 @@ export const WINDOWS_PS1_ARGV = ["powershell.exe", "-NoLogo", "-NoProfile", "-No
 export const windowsSandboxCheckArgv = (runnerDir: string): string[] =>
   [...WINDOWS_PS1_ARGV, win32.join(runnerDir, "bin", "dori.ps1"), "lane-sandbox", "--check"];
 
+export type SpawnOpts = { readonly env?: Readonly<Record<string, string | undefined>>; readonly verbatim?: boolean };
+
 export type LaneSandboxDeps = {
   readonly platform: string;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -259,8 +293,14 @@ export type LaneSandboxDeps = {
   readonly listDir: (path: string) => string[];
   readonly mkdir: (path: string) => void;
   readonly writeFile: (path: string, text: string) => void;
-  /** Runs argv with the pane's console (stdin, stdout, stderr inherited) and resolves its exit code. */
-  readonly spawn: (argv: readonly string[], cwd: string) => Promise<number>;
+  /** The file's text; throws when it is missing or unreadable. */
+  readonly readFile: (path: string) => string;
+  readonly copyFile: (from: string, to: string) => void;
+  /**
+   * Runs argv with the pane's console (stdin, stdout, stderr inherited) and resolves its exit code; `env` replaces the
+   * environment and `verbatim` passes the words unquoted (windowsVerbatimArguments).
+   */
+  readonly spawn: (argv: readonly string[], cwd: string, opts?: SpawnOpts) => Promise<number>;
   readonly err: (line: string) => void;
 };
 
@@ -276,11 +316,18 @@ const realDeps = (): LaneSandboxDeps => ({
   listDir: (path) => { try { return readdirSync(path); } catch { return []; } },
   mkdir: (path) => { mkdirSync(path, { recursive: true }); },
   writeFile: (path, text) => { writeFileSync(path, text, { mode: 0o600 }); },
-  spawn: async (argv, cwd) => {
+  readFile: (path) => readFileSync(path, "utf8"),
+  copyFile: (from, to) => { copyFileSync(from, to); },
+  spawn: async (argv, cwd, opts = {}) => {
     // Ctrl+C in the pane reaches every process on its console: the wrapper keeps waiting so the agent decides.
     const ignore = (): void => {};
     process.on("SIGINT", ignore);
-    try { return await Bun.spawn([...argv], { cwd, stdio: ["inherit", "inherit", "inherit"] }).exited; } finally { process.off("SIGINT", ignore); }
+    try {
+      return await Bun.spawn([...argv], {
+        cwd, stdio: ["inherit", "inherit", "inherit"],
+        ...(opts.env ? { env: { ...opts.env } } : {}), ...(opts.verbatim ? { windowsVerbatimArguments: true } : {}),
+      }).exited;
+    } finally { process.off("SIGINT", ignore); }
   },
   err: (line) => { console.error(line); },
 });
@@ -301,9 +348,14 @@ const hostRefusal = async (d: LaneSandboxDeps): Promise<string | undefined> => {
 };
 
 /** The request for `key` in `cwd` running `commandLine`, with the git common dir and ssh keys looked up on this host. */
+const laneTmpDir = (home: string, key: string): string => win32.join(home, ".cache", "omo-tmp", "lane-sandbox", key);
+
 const buildRequest = async (d: LaneSandboxDeps, key: string, cwd: string, commandLine: string): Promise<{ request: MxcRequest; laneTmp: string }> => {
-  const laneTmp = win32.join(d.home, ".cache", "omo-tmp", "lane-sandbox", key);
+  const laneTmp = laneTmpDir(d.home, key);
   d.mkdir(laneTmp);
+  // MXC grants need existing paths; omo creates its engine-trust store under this one.
+  const localAppData = envValue(d.env, "LOCALAPPDATA");
+  if (localAppData) d.mkdir(omoLocalDir(localAppData));
   const list = (name: string): string[] => (d.env[name] ?? "").split(";").filter((p) => p !== "");
   const git = await d.run(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], { timeoutMs: 15_000 });
   // git prints C:/... on Windows.
@@ -319,6 +371,25 @@ const buildRequest = async (d: LaneSandboxDeps, key: string, cwd: string, comman
     ...(gcd && d.exists(gcd) ? { gitCommonDir: gcd } : {}),
   });
   return { request, laneTmp };
+};
+
+/**
+ * `lane-sandbox <argv>` with LANE_SANDBOX_ACTIVE=1, run by the runner's bun inside the container: puts back the host LOCALAPPDATA and the
+ * lane's TEMP that MXC rewrote, then runs the agent and exits with its code.
+ */
+const innerMain = async (d: LaneSandboxDeps, argv: readonly string[]): Promise<number> => {
+  const env: Record<string, string | undefined> = { ...d.env };
+  const set = (name: string, value: string): void => {
+    for (const k of Object.keys(env)) if (k.toUpperCase() === name) delete env[k];
+    env[name] = value;
+  };
+  const localAppData = d.env.DORI_LANE_LOCALAPPDATA;
+  const temp = d.env.DORI_LANE_TEMP;
+  if (localAppData) set("LOCALAPPDATA", localAppData);
+  if (temp) for (const name of ["TEMP", "TMP", "TMPDIR"]) set(name, temp);
+  let launch: { argv: string[]; verbatim: boolean };
+  try { launch = agentLaunch(argv, d.which); } catch (e) { d.err(e instanceof Error ? e.message : String(e)); return 3; }
+  return d.spawn(launch.argv, d.cwd(), { env, verbatim: launch.verbatim });
 };
 
 /**
@@ -344,13 +415,27 @@ export const laneSandboxWindowsMain = async (args: readonly string[], deps: Part
     return 0;
   }
   if (args.length === 0) { d.err(USAGE); return 2; }
+  // Inside the container (laneEnv sets this): run the agent, never wrap it again.
+  if (d.env.LANE_SANDBOX_ACTIVE === "1") return innerMain(d, args);
   if (!d.env.DORI_LANE_KEY) return d.spawn(args, d.cwd());
   const refused = await hostRefusal(d);
   if (refused) { d.err(`lane-sandbox: ${refused}`); return 3; }
+  const bunTxt = win32.join(d.runnerDir, "bin", "bun.txt");
+  let bunVersion = "";
+  try { bunVersion = d.readFile(bunTxt).trim(); } catch { bunVersion = ""; }
+  if (!bunVersion) { d.err(`lane-sandbox: cannot read ${bunTxt}; rerun dori runner install for this machine from the lead`); return 3; }
   const cwd = d.cwd();
   let config: string;
   try {
-    const { request, laneTmp } = await buildRequest(d, sandboxKey(d.env.DORI_LANE_KEY), cwd, agentCommandLine(args, d.which));
+    // Resolved here only to refuse a missing program or a batch argument before MXC starts; the shim resolves it again.
+    agentCommandLine(args, d.which);
+    // bun cannot load a script under the denied ~/.dori inside the container (resolving it reads the parent folders and
+    // gets EPERM), so the container runs a copy of the bundle in the lane's TEMP.
+    const key = sandboxKey(d.env.DORI_LANE_KEY);
+    const bundle = win32.join(laneTmpDir(d.home, key), "dori.js");
+    const shim = windowsCommandLine([win32.join(d.runnerDir, "bun", bunVersion, "bun.exe"), bundle, "lane-sandbox", ...args]);
+    const { request, laneTmp } = await buildRequest(d, key, cwd, shim);
+    d.copyFile(win32.join(d.runnerDir, "bin", "dori.js"), bundle);
     if (broadCwd(cwd, d.home, (d.env.LANE_SANDBOX_NO_CWD ?? "").split(";"))) d.err(`lane-sandbox: warning: cwd ${cwd} is too broad; not making it writable`);
     config = win32.join(laneTmp, "mxc-policy.json");
     d.writeFile(config, `${JSON.stringify(request, null, 2)}\n`);
