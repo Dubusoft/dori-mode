@@ -14,6 +14,7 @@
  * are the only frames without one).
  */
 
+import type { GuardThresholds } from "../config.ts";
 import type { HostSample } from "../host-guard.ts";
 import type { Pane } from "../panes.ts";
 import type { Check } from "../signals.ts";
@@ -186,7 +187,8 @@ export type SupervisorCommandBodies = {
    * (the herdr workspace a new tab opens in; absent on remote runners: find or create `lanes`).
    */
   readonly "lane.start": Cmd<{
-    readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd: string;
+    /** `cwd` absent (a `--machine` launch without `--cwd`): the runner fills its runner-config `defaultCwd`, else its home. */
+    readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd?: string;
     readonly agentProfile: string; readonly mode: string; readonly model: string; readonly sandbox: boolean; readonly expectedLaneGen: number;
     readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
     readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
@@ -336,7 +338,8 @@ export type StartupVerdict = { readonly verdict: "ok" | "error" | "unconfirmed";
 
 /** The `result` of a verified `cmd.result`, per command type. */
 export type CommandResults = {
-  readonly "lane.start": { readonly pane: string; readonly tab: string; readonly startup: StartupVerdict };
+  /** `cwd`: the directory the lane started in (the filled default, or a target pane's own). */
+  readonly "lane.start": { readonly pane: string; readonly tab: string; readonly startup: StartupVerdict; readonly cwd?: string };
   readonly "lane.adopt": { readonly pane: string; readonly tab: string; readonly tokenFile: string };
   readonly "lane.stop": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
   readonly "lane.close": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
@@ -403,7 +406,14 @@ export type LaneInspection = {
 };
 
 /** `sample.panes` is filled with the pane count. */
-export type MachineObservation = { readonly os: string; readonly sampledAt: number; readonly sample: HostSample; readonly panes: readonly Pane[] };
+/**
+ * `guard`: the guard thresholds this runner's runner-config.json sets (only the keys it sets); absent from a runner that
+ * sets none or predates the field. Placement judges the machine at these keys, the supervisor's config.guard for the rest.
+ */
+export type MachineObservation = {
+  readonly os: string; readonly sampledAt: number; readonly sample: HostSample; readonly panes: readonly Pane[];
+  readonly guard?: Readonly<Partial<GuardThresholds>>;
+};
 
 /** The `result` of an `ok` `q.result`, per query type. */
 export type QueryResults = {
@@ -546,7 +556,7 @@ const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
 
 const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
   "lane.start": cmd({
-    key: req("string"), briefText: req("string"), done: req("string"), thread: req("string"), cwd: req("string"),
+    key: req("string"), briefText: req("string"), done: req("string"), thread: req("string"), cwd: opt("string"),
     agentProfile: req("string"), mode: req("string"), model: req("string"), sandbox: req("bool"), expectedLaneGen: req("int"),
     keywords: opt("string"), session: opt("string"), target: opt({ object: { pane: opt("string"), workspace: opt("string") } }),
     heavySlots: opt("int"), heavyMaxLoad: opt("number"), tabWorkspace: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),

@@ -181,6 +181,7 @@ refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAIL
 |---|---|---|
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
 | `allowedRoots` | directories every `cwd` must be under | none |
+| `defaultCwd` | where a `lane.start` without `cwd` (`dori launch --machine M` with no `--cwd`) starts: absolute or `~/...` (the runner's home); filled before the `allowedRoots` check, and the `lane.start` result reports it as `cwd` | the runner's home |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
 | `sandboxCheck` | argv run before a `lane.start` with `sandbox: true`; a non-zero exit refuses it with `sandbox-unavailable` and its stderr. `dori runner install` sets it to `lane-sandbox --check` on Linux and macOS, where it also ships the wrapper (bubblewrap on Linux, Seatbelt `sandbox-exec` on macOS) and sets `sandbox: required`; Windows has no lane sandbox, so it gets `sandbox: optional`, only the `default` profile and no `sandboxCheck` (an older install's `lane-sandbox` profile and check are removed); the lead starts its lanes unsandboxed with `SANDBOX_SKIPPED` | none |
 | `jobs` | `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with `done` | `allow` |

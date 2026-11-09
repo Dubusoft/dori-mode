@@ -102,14 +102,21 @@ test("remote --workspace launch resolves the shell pane from that machine's inve
   expect(startInput()).toMatchObject({ target: { pane: "w:p3" } });
 });
 
-test("plain remote launch needs a directory on the machine and never sends the lead's workspace or defaultCwd", async () => {
+test("a plain remote launch without --cwd names no directory (the runner's defaultCwd), never the lead's defaultCwd", async () => {
+  const d = deps();
+  await Bun.write(lane().brief, "work\n");
+  world.startResult = { pane: "w:p7", tab: "w:t7", startup: { verdict: "ok", detail: "" } };
+  const bare = await launchLane(d, lane({ pane: undefined, cwd: undefined }));
+  expect(startInput()).toMatchObject({ machine: MACHINE });
+  expect(startInput()).not.toHaveProperty("cwd");
+  expect(bare.lane.cwd).toBeUndefined();
+  expect(bare.lane.remoteCwd).toBeUndefined();
+});
+
+test("plain remote launch never sends the lead's workspace or defaultCwd", async () => {
   const d = deps();
   const config = { ...d.config, laneWorkspace: "local-only-workspace" };
   await Bun.write(lane().brief, "work\n");
-  // The lead's defaultCwd means nothing on the machine.
-  await expect(launchLane({ ...d, config }, lane({ pane: undefined, cwd: undefined }))).rejects.toThrow(`a lane on machine ${MACHINE} needs --cwd`);
-  expect(opsOf("start")).toEqual([]);
-  expect(await d.registry.read("remote-lane")).toBeNull();
   world.startResult = { pane: "w:p8", tab: "w:t8", startup: { verdict: "ok", detail: "" } };
   expect((await launchLane({ ...d, config }, lane({ pane: undefined }))).lane.tab).toBe("w:t8");
   expectRemote();

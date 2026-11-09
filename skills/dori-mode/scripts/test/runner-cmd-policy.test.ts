@@ -104,6 +104,36 @@ describe("runner command policy", () => {
     expect(checkCwd(policy, "relative", realpath)?.rule).toBe("cwd-missing");
   });
 
+  test("a cwd lexically outside every root is refused without any realpath call on it (TCC folders block realpath)", () => {
+    const seen: string[] = [];
+    const recording = (p: string): string => { seen.push(p); return realpath(p); };
+    const outside = "/Users/hsnam/Documents";
+    expect(checkCwd(policy, outside, recording)).toEqual({ rule: "cwd-outside-roots", detail: outside });
+    expect(checkCwd(policy, "/data/repos/../repos-evil/x", recording)).toEqual({ rule: "cwd-outside-roots", detail: "/data/repos-evil/x" });
+    const r = checkCommand(policy, start({ cwd: outside }), recording);
+    expect(r.ok ? undefined : [r.rule, r.detail]).toEqual(["cwd-outside-roots", outside]);
+    expect(rule(job({ cwd: outside }))).toBe("cwd-outside-roots");
+    expect(seen.filter((p) => p.startsWith("/Users") || p.includes("repos-evil"))).toEqual([]);
+    // Even a throwing stub is never reached for the path (only roots may be resolved).
+    const guarded = (p: string): string => { if (!p.startsWith("/data/repos")) throw new Error(`realpath touched ${p}`); return realpath(p); };
+    expect(checkCwd(policy, outside, guarded)?.rule).toBe("cwd-outside-roots");
+  });
+
+  test("a cwd inside a root still resolves, and a symlink escaping the root is still refused after the lexical pre-check", () => {
+    expect(checkCwd(policy, "/data/repos/a", realpath)).toBeUndefined();
+    expect(checkCwd(policy, "/data/repos/escape", (p) => { if (p === "/data/repos/escape") return "/data/repos/a"; return realpath(p); })).toBeUndefined();
+    expect(checkCwd(policy, "/data/repos/escape", realpath)).toEqual({ rule: "cwd-outside-roots", detail: "/etc" });
+  });
+
+  test("a root given in symlinked form admits a cwd given in either its symlinked or resolved form", () => {
+    const fs: Record<string, string> = { "/var/tmp/root": "/private/var/tmp/root", "/private/var/tmp/root": "/private/var/tmp/root", "/private/var/tmp/root/w": "/private/var/tmp/root/w", "/var/tmp/root/w": "/private/var/tmp/root/w" };
+    const rp = (p: string): string => { const r = fs[p]; if (r === undefined) throw new Error(`ENOENT ${p}`); return r; };
+    const linked: RunnerPolicy = { ...policy, allowedRoots: ["/var/tmp/root"] };
+    expect(checkCwd(linked, "/private/var/tmp/root/w", rp)).toBeUndefined();
+    expect(checkCwd(linked, "/var/tmp/root/w", rp)).toBeUndefined();
+    expect(checkCwd(linked, "/private/var/other", rp)?.rule).toBe("cwd-outside-roots");
+  });
+
   test("lane.git root must resolve under allowedRoots, and jobs deny refuses it", () => {
     const git = (over: Record<string, unknown> = {}) => frame("lane.git", { key: "k", op: "branch-delete", root: "/data/repos/a", branch: "lane-k", ...over });
     expect(checkCommand(policy, git(), realpath).ok).toBe(true);
@@ -178,6 +208,29 @@ describe("runner command policy", () => {
     for (const bad of [[], [""], "lane-sandbox --check", ["lane-sandbox", 3]]) {
       expect(() => parsePolicy({ sandboxCheck: bad })).toThrow("sandboxCheck must be a non-empty string array");
     }
+  });
+
+  test("defaultCwd parses absolute or ~-relative (expanded to the runner's home); anything else is refused", () => {
+    expect(parsePolicy({ defaultCwd: "~/work" }, "/Users/me").defaultCwd).toBe("/Users/me/work");
+    expect(parsePolicy({ defaultCwd: "~" }, "/Users/me").defaultCwd).toBe("/Users/me");
+    expect(parsePolicy({ defaultCwd: "/data/repos/a" }).defaultCwd).toBe("/data/repos/a");
+    expect(parsePolicy({})).not.toHaveProperty("defaultCwd");
+    for (const bad of ["work", "~other/x", "", 3, ["/a"]]) {
+      expect(() => parsePolicy({ defaultCwd: bad }, "/Users/me")).toThrow("runner-config: defaultCwd must be an absolute path or start with ~/");
+    }
+  });
+
+  test("a lane.start without cwd gets defaultCwd, else home, and that directory is checked against allowedRoots", () => {
+    const { cwd: _, ...noCwd } = start().body as Record<string, unknown>;
+    const bare = { ...start(), body: noCwd };
+    const filled = (p: RunnerPolicy, home: string) => { const r = checkCommand(p, bare, realpath, home); return r.ok ? (r.command.body as { cwd?: string }).cwd : r.rule; };
+    expect(filled({ ...policy, defaultCwd: "/data/repos/a" }, "/etc")).toBe("/data/repos/a");
+    expect(filled(policy, "/data/repos")).toBe("/data/repos");
+    const outside = checkCommand({ ...policy, defaultCwd: "/etc" }, bare, realpath, "/data/repos");
+    expect(rejection(outside)).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+    expect(filled(policy, "/etc")).toBe("cwd-outside-roots");
+    // An explicit cwd is never replaced.
+    expect(checkCommand({ ...policy, defaultCwd: "/data/repos" }, start(), realpath, "/data/repos")).toMatchObject({ ok: true, command: { body: { cwd: "/data/repos/a" } } });
   });
 
   test("absent config file yields defaults", () => {

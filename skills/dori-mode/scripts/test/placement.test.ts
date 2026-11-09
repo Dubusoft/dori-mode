@@ -106,6 +106,20 @@ test("checkMachine remote: unreadable memory and disk never hold, CPU load never
   expect(noList.verdict).toEqual({ ok: false, reasons: ["pane count unreadable"] });
 });
 
+test("checkMachine remote holds at the panesMax its runner reports, over the supervisor's config.guard", async () => {
+  const wide = { ...cfg, guard: { ...cfg.guard, panesMax: 20 } };
+  const seen = (guard?: MachineObservation["guard"]): MachineObservation => ({ os: "darwin", sampledAt: 0, sample: host({ panes: 6 }), panes: listed(6), ...(guard ? { guard } : {}) });
+  const own = await checkMachine(observing(() => seen({ panesMax: 6 })), wide, "mini");
+  expect(own.verdict).toEqual({ ok: false, reasons: ["panes 6 >= 6"] });
+  expect(verdictLine("mini", own.verdict)).toBe("HOLD machine=mini panes 6 >= 6");
+  // A runner that reports no thresholds (or an older one) is judged at config.guard.
+  expect((await checkMachine(observing(() => seen()), wide, "mini")).verdict).toEqual({ ok: true, reasons: [] });
+  expect((await checkMachine(observing(() => seen()), { ...cfg, guard: { ...cfg.guard, panesMax: 6 } }, "mini")).verdict.reasons).toEqual(["panes 6 >= 6"]);
+  // Only the reported keys win; the local machine ignores a reported guard.
+  expect((await checkMachine(observing(() => seen({ diskFreeMinGb: 500 })), wide, "mini")).verdict.reasons).toEqual(["disk free 200 GB < 500 GB"]);
+  expect((await checkMachine(observing(() => seen({ panesMax: 6 })), wide, "local")).verdict).toEqual({ ok: true, reasons: [] });
+});
+
 test("checkMachine holds with no runner when the machine's runner is unavailable", async () => {
   const down = { observeMachine: async (machine?: string) => { throw new LaneOpsError("RUNNER_UNAVAILABLE", machine ?? "local", "disconnected: no admitted connection"); } } as unknown as LaneOps;
   const remote = await checkMachine(down, cfg, "ghost");

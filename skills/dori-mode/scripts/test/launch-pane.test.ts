@@ -203,12 +203,20 @@ test("a relaunch keeps the recorded choice: a sandboxed record is checked again,
   expect(again.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
 });
 
-test("a remote lane goes to its machine's runner with its remote directory and no heavy-slot settings; without a directory it is refused", async () => {
+test("a remote lane without --cwd sends no cwd (its runner uses its defaultCwd) and records the directory the runner reports", async () => {
   await writeBrief();
   const d = deps({});
-  await expect(launchLane(d, input({ machine: "m1" }))).rejects.toThrow("a lane on machine m1 needs --cwd");
-  expect(starts()).toEqual([]);
-  expect(await d.registry.read("pane-lane")).toBeNull();
+  world.startResult = { pane: "w:p3", tab: "w:t7", startup: { verdict: "ok", detail: "ready" }, cwd: "/Users/u/work" };
+  const r = await launchLane(d, input({ machine: "m1" }));
+  expect(starts()[0]).toMatchObject({ machine: "m1", sandbox: true });
+  expect(starts()[0]).not.toHaveProperty("cwd");
+  expect(r.lane).toMatchObject({ machine: "m1", runner: "m1", remoteCwd: "/Users/u/work" });
+  expect(r.lane.cwd).toBeUndefined();
+});
+
+test("a remote lane goes to its machine's runner with its remote directory and no heavy-slot settings", async () => {
+  await writeBrief();
+  const d = deps({});
   const r = await launchLane(d, input({ machine: "m1", cwd: "/home/u/app" }));
   const start = starts()[0]!;
   expect(start).toMatchObject({ machine: "m1", cwd: "/home/u/app", sandbox: true });

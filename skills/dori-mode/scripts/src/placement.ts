@@ -83,7 +83,8 @@ const unobservable = (machine: string, error: unknown): string => {
 /**
  * Whether `machine` ("local" or a label) has room for one more lane, with a short metrics summary ("" on failure). The
  * machine's runner observes it (`q.machine.observe`: its guard sample and pane list); a machine without a connected runner
- * cannot host a lane, so it holds.
+ * cannot host a lane, so it holds. A remote machine is judged at the thresholds its runner-config.json sets (the
+ * observation's `guard`), config.guard for every key it does not set; the local machine always at config.guard.
  */
 export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: string): Promise<MachineCheck> => {
   let seen;
@@ -99,7 +100,8 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
     ok: true,
     sample: { version: "runner", os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
   };
-  return { machine, verdict: machineVerdict(result, panes, config.guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes) };
+  const guard: GuardThresholds = { ...config.guard, ...seen.guard };
+  return { machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes) };
 };
 
 /** Local keeps the legacy `CAN_LAUNCH` / `HOLD <reasons>`; a remote line names its machine. */

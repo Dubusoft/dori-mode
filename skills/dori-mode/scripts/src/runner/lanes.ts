@@ -178,7 +178,7 @@ type LaunchInput = {
   readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
   readonly restored?: boolean;
 };
-type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict };
+type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string };
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
@@ -323,6 +323,9 @@ export class RunnerLanes {
     if (!body.files) throw new LaneFileError("LANE_FILES_INPUT_REQUIRED", body.key, "this start needs a fresh lead brief and attachment scan; launch the lane again from the lead");
     validateBriefFiles(body.key, body.briefText, body.files);
     checkFileBody(body.key, body);
+    // policy.ts checkCommand fills a missing cwd (defaultCwd, else home) at dispatch; a body without one never got checked.
+    const cwd = body.cwd;
+    if (cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} ${body.key}`);
     if (body.sandbox) await this.checkSandbox(body.key);
     let mayStart = false;
     try {
@@ -330,13 +333,13 @@ export class RunnerLanes {
       const launched = await this.launch({
         sandbox: body.sandbox,
         fileRun: body.files.run, mayStart: (value) => { mayStart = value; },
-        key: body.key, cwd: body.cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
+        key: body.key, cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
         ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
         ...(body.target ? { target: body.target } : {}),
         ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
         ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
       });
-      return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup } };
+      return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd } };
     } catch (error) {
       if (!mayStart && !this.records()[body.key]) {
         const paths = laneFilePaths(this.deps.runnerDir, body.key);
@@ -455,7 +458,7 @@ export class RunnerLanes {
     if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
     this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
     const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
-    return { pane, tab, resumed, startup };
+    return { pane, tab, resumed, startup, cwd };
   }
 
   private record(key: string): LaneRecord {

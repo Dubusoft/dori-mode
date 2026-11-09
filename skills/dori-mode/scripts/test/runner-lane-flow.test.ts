@@ -208,10 +208,34 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe a
   await send(3, "lane.observe", { cmdId: "lane.observe:lane-a:3:1", key: "lane-a" });
   await send(4, "guard.kill", { cmdId: "guard.kill:-:4:1", keys: ["lane-a"] });
   expect(published.map(({ state: s, detail, result }) => ({ s, detail, result }))).toEqual([
-    { s: "verified", detail: "started pane=p7 tab=t7", result: { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "ready" } } },
+    { s: "verified", detail: "started pane=p7 tab=t7", result: { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "ready" }, cwd: "/repo" } },
     { s: "verified", detail: "noted done-claimed", result: {} },
     { s: "verified", detail: "observed working", result: { status: "working" } },
     { s: "verified", detail: "killed 1", result: { killed: [{ pid: 40, comm: "qemu", rssKb: 9, lane: "lane-a" }] } },
   ]);
   expect(lanes.notice("lane-a")).toEqual({ status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
+});
+
+test("a lane.start without cwd opens its tab in the runner-config defaultCwd and reports that directory", async () => {
+  const t = await setup();
+  const runnerDir = join(t.s.dir, "runner");
+  mkdirSync(runnerDir, { mode: 0o700 });
+  const state = new RunnerState(runnerDir, { now: () => T0 });
+  cleanups.push(() => { state.close(); });
+  const policy = { ...DEFAULT_POLICY, agents: { default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], defaultCwd: "/repo/work" };
+  const calls: string[][] = [];
+  const herdr = async (argv: readonly string[]): Promise<Ran> => {
+    calls.push([...argv]);
+    if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
+    return { code: 0, out: "", err: "" } as Ran;
+  };
+  const lanes = new RunnerLanes({ instance: async () => "server-1", runnerDir, run: herdr, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
+  const published: RunnerEventBodies["cmd.result"][] = [];
+  const done = new Promise<void>((resolve) => {
+    const dispatch = commandDispatcher({ state, policy, realpath: (p) => p, log: () => {}, publish: (body) => { published.push(body); resolve(); }, effects: runnerEffects({ lanes, guard: { killLanes: async () => [] }, run: herdr }) });
+    dispatch({ v: 1, runner: "local", gen: 1, epoch: 1, cmdSeq: 1, type: "lane.start", body: { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES } });
+  });
+  await done;
+  expect(published[0]).toMatchObject({ state: "verified", result: { pane: "p7", cwd: "/repo/work" } });
+  expect(calls.find((a) => a.slice(0, 3).join(" ") === "herdr tab create")).toContain("/repo/work");
 });
