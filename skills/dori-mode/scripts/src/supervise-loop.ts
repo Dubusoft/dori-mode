@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { deliveryConfigError } from "./config.ts";
+import { alertsChannelOf, deliveryConfigError } from "./config.ts";
 import { applyConfigPatch, configReloader, watchConfigFiles } from "./config-watch.ts";
 import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
@@ -886,8 +886,9 @@ export const supervise = async (
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(stateDir, pane); },
       // A line into a lane thread is appended to its last report (or status message), never a new post into a thread the owner closed.
+      // A line with no thread (lead stuck, restarts capped) is a system notice: config alertsChannel, else the main channel.
       announce: async (text, id, thread) => {
-        await postOwnerLine(discord, deps.config.discordChannels[0], thread, systemText(text), id, {
+        await postOwnerLine(discord, thread ? deps.config.discordChannels[0] : alertsChannelOf(deps.config), thread, systemText(text), id, {
           stateDir,
           statusMessage: async (threadId) => (await deps.registry.open()).find((lane) => lane.thread.endsWith(`/${threadId}`))?.statusMessageId,
         });
@@ -948,7 +949,7 @@ export const supervise = async (
       repair: () => supervisor.repairLeadPane(),
       enqueue: (id, line) => supervisor.enqueue(id, line),
       notify: async (text) => {
-        const channel = deps.config.discordChannels[0];
+        const channel = alertsChannelOf(deps.config);
         if (!channel) throw new Error("no discordChannels configured");
         await discord.send(channel, systemText(`수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`));
       },
@@ -1317,9 +1318,9 @@ export const supervise = async (
         const id = `task-stalled:${boot}:${which}:${deps.clock.now() - ms}`;
         console.error(line);
         try { supervisor.enqueue(id, line); } catch (e) { console.error(`TASK_STALLED_ENQUEUE_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); }
-        // A stuck delivery task cannot hand the line to the lead, so the owner hears it in the main channel. Not awaited:
-        // a hung post must not stop this loop.
-        const channel = deps.config.discordChannels[0];
+        // A stuck delivery task cannot hand the line to the lead, so the owner hears it in the alerts channel (else the
+        // main channel). Not awaited: a hung post must not stop this loop.
+        const channel = alertsChannelOf(deps.config);
         if (which === "delivery" && channel) {
           const notice = `도리 경고: 수퍼바이저의 전달 작업이 ${Math.round(ms / 60_000)}분째 끝나지 않고 있습니다. 다른 작업은 계속 돌아가며, ${Math.round(WATCHDOG_STALL_MS / 60_000)}분까지 멈춰 있으면 수퍼바이저가 재시작됩니다. (TASK_STALLED ${which})`;
           void discord.send(channel, systemText(scrubForThread(notice, homedir())), id)

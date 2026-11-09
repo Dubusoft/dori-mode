@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Runs from dori-failure-notify@.service (OnFailure= of the Dori units). Rendered by `dori setup`.
-# Posts one line to the owner's first Discord channel: which unit stopped, free disk on the
-# state directory, and the last log lines. Needs no free disk space itself.
+# Posts one line to the owner's alerts channel (config alertsChannel, else the first discordChannels
+# entry): which unit stopped, free disk on the state directory, and the last log lines. Needs no free
+# disk space itself.
 set -uo pipefail
 
 unit="${1:-unknown unit}"
 cfg="${DORI_CONFIG:-{{CONFIG}}}"
-channel="$(jq -r '.discordChannels[0] // empty' "$cfg" 2>/dev/null)"
+channel="$(jq -r 'if (.alertsChannel | type) == "string" and (.alertsChannel | test("\\S")) then (.alertsChannel | gsub("\\s"; "")) else (.discordChannels[0] // empty) end' "$cfg" 2>/dev/null)"
 [ -n "$channel" ] || { echo "FAILURE_NOTIFY no discordChannels in $cfg; cannot alert the owner that $unit failed" >&2; exit 1; }
 
 state="$(jq -r '.stateDir // empty' "$cfg" 2>/dev/null)"
