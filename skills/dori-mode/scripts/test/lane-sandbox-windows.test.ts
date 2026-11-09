@@ -24,16 +24,19 @@ test("a lane writes only its worktree, git dir, TEMP and the caches; its volumes
   const p = policy({ rw: ["E:\\scratch", ""], verify: "C:\\lead\\state\\verify" });
   expect(p.filesystem.readwritePaths).toEqual([
     TMP, `${HOME}\\.omo`, `${HOME}\\.cache`, `${DORI}\\state`, `${DORI}\\heavy`, `${HOME}\\.npm`, `${HOME}\\.bun\\install\\cache`,
-    `${HOME}\\.cargo\\registry`, `${HOME}\\.cargo\\git`, "E:\\scratch", "C:\\lead\\state\\verify", WT, GCD, `${RUNNER}\\sock\\lane`,
+    `${HOME}\\.cargo\\registry`, `${HOME}\\.cargo\\git`, "E:\\scratch", "C:\\lead\\state\\verify", WT, GCD, `${RUNNER}\\sock`,
   ]);
   expect(p.filesystem.readonlyPaths).toEqual([
     "C:\\", "D:\\", `${DORI}\\config.json`, `${DORI}\\src`, `${DORI}\\bin`, `${RUNNER}\\bin`, `${RUNNER}\\bun`,
     `${RUNNER}\\briefs\\lane-a.md`, `${RUNNER}\\briefs\\lane-a.2.token`, `${GCD}\\hooks`,
   ]);
   expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${HOME}\\.ssh\\id_ed25519`]);
-  // Nothing else of the runner directory: other lanes' briefs and tokens, its keys, config and other sockets stay under the denied ~/.dori.
+  for (const paths of [p.filesystem.readwritePaths, p.filesystem.readonlyPaths, p.filesystem.deniedPaths]) {
+    expect(paths.some((path) => path.toLowerCase().endsWith("\\sock\\lane"))).toBe(false);
+  }
+  // Nothing else of the runner directory: other lanes' briefs and tokens, its keys and config stay under the denied ~/.dori.
   const granted = lower([...p.filesystem.readwritePaths, ...p.filesystem.readonlyPaths]);
-  for (const hidden of ["briefs\\lane-b.md", "briefs", "keys", "runner-config.json", "sock\\control", "sock\\cli", "sock", "mxc"]) expect(granted).not.toContain(`${RUNNER}\\${hidden}`.toLowerCase());
+  for (const hidden of ["briefs\\lane-b.md", "briefs", "keys", "runner-config.json", "mxc"]) expect(granted).not.toContain(`${RUNNER}\\${hidden}`.toLowerCase());
   expect(granted).not.toContain(`${DORI}\\env`.toLowerCase());
   expect(p).toMatchObject({
     version: "1.0.0", containment: "processcontainer", containerId: "dori-lane-lane-a",
