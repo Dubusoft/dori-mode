@@ -4,8 +4,8 @@ import type { FlowDeps } from "../done-flow.ts";
 import { recordOwnerClosed } from "../thread-followup.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
 import {
-  type DiscordInboundOptions, discordChannels, discordDispatchThreads, discordMessageChannel, discordOwnerConfigured, discordThread,
-  discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound, listDiscordThreads,
+  channelNameToken, type DiscordChannelInfo, discordChannelInfo, type DiscordInboundOptions, discordChannels, discordDispatchChannels,
+  discordMessageChannel, discordOwnerConfigured, discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound, listDiscordThreads,
   parseDiscordMessage, pollDiscordInbound,
 } from "./discord-inbound.ts";
 import { Discord, discordPresence, type GatewaySession, openDiscordGateway, type GatewaySocket } from "./discord.ts";
@@ -64,7 +64,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   const threadClosed = async (threadId: string, interactionId: string): Promise<void> => {
     recordOwnerClosed(deps.config.stateDir, threadId, deps.clock.now());
     const lane = (await deps.registry.open()).find((l) => l.thread.endsWith(`/${threadId}`))?.key;
-    await options.emit(`discord:${threadId}:close:${interactionId}`, `THREAD_CLOSED_BY_OWNER ${threadId}${lane ? ` lane ${lane}` : ""}`);
+    await options.emit(`discord:${threadId}:close:${interactionId}`, `THREAD_CLOSED_BY_OWNER ${threadId}${lane ? ` lane ${lane}` : ""}${await channelName(threadId)}`);
   };
   // The owner's hook button click reaches the lead as one journal line after the configured hook was started.
   const clicked = (name: string, arg: string, channel: string, interactionId: string): Promise<void> =>
@@ -102,29 +102,50 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   };
   const watches = async (channel: string): Promise<boolean> =>
     discordChannels(configuredChannels, await deps.registry.open()).includes(channel) || configured().includes((await parentOf(channel)) ?? "");
-  // Thread id -> parent channel; null marks a channel that is not a thread. Fed by gateway thread events and REST.
-  const parents = new Map<string, string | null>();
-  const lookups = new Map<string, Promise<string | null>>();
-  const parentOf = (channel: string): Promise<string | null> => {
-    const known = parents.get(channel);
+  // Channel id -> parent (null: not a thread) and name. Fed by gateway channel and thread events and REST; a rename
+  // arrives as CHANNEL_UPDATE / THREAD_UPDATE. An event without a name keeps the one already known.
+  const channels = new Map<string, DiscordChannelInfo>();
+  const remember = (id: string, info: DiscordChannelInfo): void => {
+    const name = info.name ?? channels.get(id)?.name;
+    channels.set(id, { parent: info.parent, ...(name === undefined ? {} : { name }) });
+  };
+  const lookups = new Map<string, Promise<DiscordChannelInfo>>();
+  // Only a channel the gateway has not described costs one cached GET /channels/{id}.
+  const infoOf = (channel: string): Promise<DiscordChannelInfo> => {
+    const known = channels.get(channel);
     if (known !== undefined) return Promise.resolve(known);
     let pending = lookups.get(channel);
     if (!pending) {
       pending = discord.call("GET", `/channels/${channel}`).then(
-        (value) => discordThread(value)?.parent ?? null,
-        (error: unknown) => {
+        (value): DiscordChannelInfo => discordChannelInfo(value) ?? { parent: null },
+        (error: unknown): DiscordChannelInfo => {
           // Channels the bot cannot read are cached as foreign; other failures retry on the next message.
-          if (error instanceof MessengerError && (error.status === 403 || error.status === 404)) return null;
+          if (error instanceof MessengerError && (error.status === 403 || error.status === 404)) return { parent: null };
           throw error;
         },
-      ).then((parent) => {
-        if (!parents.has(channel)) parents.set(channel, parent);
-        return parents.get(channel) ?? null;
+      ).then((info) => {
+        if (!channels.has(channel)) channels.set(channel, info);
+        return channels.get(channel) ?? info;
       }).finally(() => { lookups.delete(channel); });
       lookups.set(channel, pending);
     }
     return pending;
   };
+  const parentOf = async (channel: string): Promise<string | null> => (await infoOf(channel)).parent;
+  // The ` channel=#name` (thread: `#parent/thread`) token for an owner event line; "" when the name is unknown, so
+  // delivery never waits on or fails for it.
+  const channelName = async (channel: string): Promise<string> => {
+    try {
+      const info = await infoOf(channel);
+      if (info.name === undefined) return "";
+      if (info.parent === null) return channelNameToken(info.name);
+      return channelNameToken(info.name, (await infoOf(info.parent)).name ?? info.parent);
+    } catch {
+      return "";
+    }
+  };
+  const emitIn = (channel: string) => async (id: string, line: string): Promise<void> =>
+    options.emit(id, `${line}${await channelName(channel)}`);
   const catchup = (): Promise<void> => {
     if (stopped) return Promise.resolve();
     catchupRequested = true;
@@ -139,7 +160,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
           let floor: string | undefined;
           try {
             const active = await listDiscordThreads(discord, config.guildId);
-            for (const thread of active) parents.set(thread.id, thread.parent);
+            for (const thread of active) remember(thread.id, thread);
             const parentsWatched = configured();
             threads = active.filter((thread) => parentsWatched.includes(thread.parent) && !watched.includes(thread.id)).map((thread) => thread.id);
             floor = await discordThreadFloor(statePath, deps.clock.now(), log);
@@ -150,7 +171,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
           for (const channel of [...watched, ...threads]) {
             if (stopped) break;
             try {
-              await pollDiscordInbound(deps.run, [channel], statePath, options.emit,
+              await pollDiscordInbound(deps.run, [channel], statePath, emitIn(channel),
                 (ch, after) => listDiscordInbound(discord, ch, after, deps.config.discordFirstSeenLimit), config.ownerId,
                 watched.includes(channel) ? undefined : floor, inboundOptions);
             } catch {
@@ -185,25 +206,25 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
           const user: unknown = data.user;
           if (typeof user === "object" && user !== null && "id" in user && typeof user.id === "string") botId = user.id;
         }
-        for (const thread of discordDispatchThreads(type, data)) parents.set(thread.id, thread.parent);
+        for (const channel of discordDispatchChannels(type, data)) remember(channel.id, channel);
       },
       onMessage: async (value) => {
         if (stopped) return;
         const channel = discordMessageChannel(value);
         if (!channel) return;
-        if (await watches(channel)) await emitDiscordInbound(channel, parseDiscordMessage(value), options.emit, config.ownerId, inboundOptions);
+        if (await watches(channel)) await emitDiscordInbound(channel, parseDiscordMessage(value), emitIn(channel), config.ownerId, inboundOptions);
       },
       onMessageUpdate: async (value) => {
         if (stopped) return;
         const channel = discordMessageChannel(value);
-        if (channel && await watches(channel)) await emitDiscordEdit(channel, value, options.emit, config.ownerId, inboundOptions);
+        if (channel && await watches(channel)) await emitDiscordEdit(channel, value, emitIn(channel), config.ownerId, inboundOptions);
       },
       onMessageDelete: async (value) => {
         if (stopped || typeof value !== "object" || value === null || !("id" in value) || typeof value.id !== "string") return;
         const channel = ownerMessages.get(value.id);
         if (!channel || discordMessageChannel(value) !== channel) return;
         ownerMessages.delete(value.id);
-        await emitDiscordDelete(channel, value.id, options.emit);
+        await emitDiscordDelete(channel, value.id, emitIn(channel));
       },
     });
   return {
