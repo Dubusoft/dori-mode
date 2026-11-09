@@ -218,6 +218,14 @@ export class RunnerClient {
     return true;
   }
 
+  /**
+   * Closes the live connection so `run` reconnects at once with a fresh hello (new workspaces after a config reload).
+   * Nothing is lost: unacked events replay from the outbox and commands are acked by `cmdAck`, as after any reconnect.
+   */
+  rehello(): void {
+    this.transport?.close("rehello");
+  }
+
   /** Sends a heartbeat with the outbox figures when connected (the serve loop calls it every `HEARTBEAT_MS`). */
   heartbeat(): void {
     if (!this.connected) return;

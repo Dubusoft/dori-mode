@@ -409,6 +409,14 @@ const laneSandbox = (raw: unknown): LaneSandbox => {
   return { command: command as string[] };
 };
 
+/**
+ * Writes `patch` into `config` in place. The supervisor holds one config object per role and hands it to every part, so
+ * a hot reload (config-watch.ts) and a recreated lead pane reach all of them through this one write.
+ */
+export const assignConfig = (config: DoriConfig, patch: Partial<DoriConfig>): void => {
+  Object.assign(config as { -readonly [K in keyof DoriConfig]: DoriConfig[K] }, patch);
+};
+
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
 
 export const expandHome = (path: string, home = homedir()): string => (path === "~" ? home : path.startsWith("~/") || path.startsWith("~\\") ? join(home, path.slice(2)) : path);

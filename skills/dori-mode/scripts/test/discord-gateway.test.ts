@@ -10,6 +10,7 @@ import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { readOwnerClosed } from "../src/thread-followup.ts";
 import type { DoriConfig } from "../src/config.ts";
+import { applyConfigPatch, type ConfigReload, configReloader, watchConfigFiles } from "../src/config-watch.ts";
 import { eventClass } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal } from "./fakes.ts";
 
@@ -391,6 +392,35 @@ test("a newly watched lane thread is caught up and receives gateway inbound with
   await f.inbound.tick();
   expect(f.listed.some((url) => url.includes("/channels/200/"))).toBe(true);
   expect(f.emitted.get("discord:200:20")).toBe("INBOUND 200 20 Owner message 20");
+});
+
+test("a discordChannels id added to config.json while the supervisor runs is caught up and receives gateway inbound on the same connection", async () => {
+  const f = inboundFixture();
+  await f.inbound.tick();
+  f.socket().receive(hello);
+  f.socket().receive(ready);
+  await f.inbound.tick();
+  expect(f.listed.some((url) => url.includes("/channels/500/messages"))).toBe(false);
+  const path = join(f.dir, "config.json");
+  writeFileSync(path, JSON.stringify({ discord: { applicationId: "1", guildId: "2", ownerId: "300" }, discordChannels: ["100", "500"], stateDir: f.dir }));
+  const reload = configReloader({
+    path, current: () => f.deps.config, apply: (patch) => { applyConfigPatch([f.deps.config], patch); },
+    enqueue: () => {}, log: () => {},
+  });
+  const reloaded = Promise.withResolvers<ConfigReload>();
+  cleanups.push(watchConfigFiles([path], async () => { reloaded.resolve(await reload()); }, { debounceMs: 10, pollMs: 60_000 }));
+  writeFileSync(path, JSON.stringify({ discord: { applicationId: "1", guildId: "2", ownerId: "300" }, discordChannels: ["100", "500", "600"], stateDir: f.dir }));
+  const result = await reloaded.promise;
+  expect(result.state === "applied" && result.live.includes("discordChannels")).toBe(true);
+  expect(result.state === "applied" ? result.restart.filter((key) => key === "discord" || key === "stateDir") : undefined).toEqual([]);
+  f.batches.set("500", [rawMessage("50", "500")]);
+  await f.inbound.tick();
+  expect(f.listed.some((url) => url.includes("/channels/500/messages"))).toBe(true);
+  expect(f.emitted.get("discord:500:50")).toBe("INBOUND 500 50 Owner message 50");
+  const live = f.waitFor("discord:600:60");
+  f.socket().receive({ op: 0, t: "MESSAGE_CREATE", s: 2, d: rawMessage("60", "600") });
+  await live;
+  expect(f.sockets).toHaveLength(1);
 });
 
 const thread = (id: string, parent_id = "100", archived = false) => ({

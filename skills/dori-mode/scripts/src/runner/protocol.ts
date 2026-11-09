@@ -150,6 +150,12 @@ export type RunnerEventBodies = {
   readonly "lane.progress": { readonly key: string; readonly reportHash?: string; readonly text?: string };
   /** The lane confirmed the supervisor's lane message `id` (`dori report ack <id>`, since proto 3). */
   readonly "lane.ack": { readonly key: string; readonly id: string };
+  /**
+   * The runner reloaded its policy after runner-config.json (or, on the local runner, config.json) changed: `reloaded`
+   * (applied; `detail` names what changed), `invalid` (the last good policy is kept; `detail` says why) or `restart`
+   * (`detail` names settings that apply only after the runner restarts).
+   */
+  readonly "runner.config": { readonly state: "reloaded" | "invalid" | "restart"; readonly detail: string };
   readonly "wait.result": { readonly waitId: string; readonly outcome: WaitOutcome; readonly detail: string };
   readonly "job.result": { readonly opKey: string; readonly state: "verified" | "failed"; readonly exitCode: number; readonly output: string };
   /** The level with its reasons, plus the readings the supervisor's HOST_GUARD lines quote (-1 when unreadable). */
@@ -544,6 +550,7 @@ const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
   "lane.asking": { key: req("string"), text: req("string") },
   "lane.progress": { key: req("string"), reportHash: opt("string"), text: opt("string") },
   "lane.ack": { key: req("string"), id: req("string") },
+  "runner.config": { state: req({ enum: ["reloaded", "invalid", "restart"] }), detail: req("string") },
   "wait.result": { waitId: req("string"), outcome: req({ enum: ["WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED"] }), detail: req("string") },
   "job.result": { opKey: req("string"), state: req({ enum: ["verified", "failed"] }), exitCode: req("int"), output: req("string") },
   "guard.sample": {

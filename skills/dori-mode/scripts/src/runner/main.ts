@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
@@ -6,7 +6,9 @@ import { type Observation, pruneCommandRecords, resolveInterrupted } from "./dur
 import { RunnerLanes } from "./lanes.ts";
 import { LANE_SOCKET, serveLaneSocket } from "./lane-socket.ts";
 import { laneGitEffect } from "./lane-git.ts";
-import { localPolicy, localRunnerPolicy } from "./local-policy.ts";
+import { runnerPolicy } from "./local-policy.ts";
+import { policyReloader } from "./policy-reload.ts";
+import { watchConfigFiles } from "../config-watch.ts";
 import { workspaceReport, type WorkspaceReport } from "./workspaces.ts";
 import { queryDispatcher } from "./queries.ts";
 import { checkFileBody } from "./lane-files.ts";
@@ -16,7 +18,7 @@ import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSo
 import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
 import { parseArgs } from "node:util";
-import { loadConfig } from "../config.ts";
+import { configPath, loadConfig } from "../config.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
@@ -31,7 +33,7 @@ import { defaultRunnerDir, holdServeLock, runStartupCheck, SERVE_LOCK } from "./
 import { probe, probeHerdr, startHealth } from "./health.ts";
 import { observeHost } from "./observe.ts";
 import { Outbox, OUTBOX_MAINTENANCE_MS, outboxMaintenance } from "./outbox.ts";
-import { DEFAULT_POLICY, loadPolicy, POLICY_FILE } from "./policy.ts";
+import { POLICY_FILE } from "./policy.ts";
 import { commandDispatcher, type DispatchDeps, LOCAL_RUNNER, loadIdentity, parseEnrollInput, realEvery, serveRunner, trackedConnector } from "./serve.ts";
 import { RunnerState } from "./state.ts";
 import { connectUnix, controlSocketPath } from "./unix-transport.ts";
@@ -136,10 +138,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     }
     if (!auth.enrolled) fail(`RUNNER_NOT_ENROLLED runner=${identity.label}: start once with --enroll (the local runner is enrolled by the supervisor)`);
     const remote = values.listen !== undefined;
-    // runner-config.json wins when present; without it the local runner derives its policy from config.json (D20) and
-    // a worker keeps the empty default (no profiles, no roots). A local file with only placement keys layers them on.
-    const hasFile = existsSync(join(runnerDir, POLICY_FILE));
-    const policy = remote ? (hasFile ? loadPolicy(runnerDir) : DEFAULT_POLICY) : hasFile ? localRunnerPolicy(runnerDir, cfg) : localPolicy(cfg);
+    // The runner's own copy: a config reload rewrites it in place, so every part below that holds it sees the change.
+    const policy = structuredClone(runnerPolicy(runnerDir, remote, cfg));
     // Before the gen bump: a second serve on this directory exits here and leaves the running one's gen alone.
     const releaseServeLock = holdServeLock(runnerDir);
     if (!releaseServeLock) fail(`RUNNER_ALREADY_SERVING another runner serve holds ${join(runnerDir, SERVE_LOCK)}; stop it (e.g. a leftover dori-runner.service next to dori supervise) before starting this one`);
@@ -262,12 +262,33 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
     const stopLaneServe = serveLaneSocket(laneListener, runnerLanes, publish, log);
     const stopLaneSocket = (): void => { stopLaneServe(); laneListener.close(); };
+    // runner-config.json (and, on the local runner, the config.json its policy and guard defaults come from) apply
+    // without a restart: a valid edit rewrites the live policy, an invalid one keeps the last good policy.
+    const reloadPolicy = policyReloader({
+      policy,
+      load: async () => {
+        const next = remote ? cfg : await loadConfig();
+        const reloaded = runnerPolicy(runnerDir, remote, next);
+        guard.reconfigure({ ...next.guard, ...reloaded.guard }, reloaded.heavyKill ?? next.heavyKill);
+        return { policy: reloaded, restart: !remote && diskGuardPath(next) !== dataPath ? ["diskGuardPath"] : [] };
+      },
+      applied: () => {
+        // New workspaces reach the supervisor only in a hello: rescan now and reconnect when the report changed.
+        const sent = report?.value;
+        report = undefined;
+        if (!Bun.deepEquals(sent, workspaces())) client?.rehello();
+      },
+      publish: (body) => { client?.publish("runner.config", body); },
+      log,
+    });
+    const stopConfigWatch = watchConfigFiles(remote ? [join(runnerDir, POLICY_FILE)] : [join(runnerDir, POLICY_FILE), configPath()], reloadPolicy, { log });
     try {
       await serveRunner({
         client, latest: tracked.latest, clock: realClock, every: realEvery, heartbeatMs: HEARTBEAT_MS,
         observe, log,
       }, controller.signal);
     } finally {
+      stopConfigWatch();
       stopLaneSocket();
       stopGuard();
       stopPrune();

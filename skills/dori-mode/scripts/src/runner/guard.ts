@@ -63,7 +63,12 @@ export class RunnerGuard {
   private level: GuardLevel | undefined;
   private sentAt = -Infinity;
 
-  constructor(private readonly deps: RunnerGuardDeps) {}
+  constructor(private deps: RunnerGuardDeps) {}
+
+  /** New thresholds and kill patterns from a reloaded runner-config.json, used from the next tick. */
+  reconfigure(thresholds: GuardThresholds, heavyKill: readonly string[]): void {
+    this.deps = { ...this.deps, thresholds, heavyKill };
+  }
 
   async tick(): Promise<void> {
     const s = await this.deps.sample();
