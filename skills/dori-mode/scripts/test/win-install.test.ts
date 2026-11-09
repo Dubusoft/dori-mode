@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearShellModes, encodedPowerShell, sshArgv } from "../src/remote-guard.ts";
-import { INSTALL_EXIT, WIN_BOOTSTRAP, WIN_BUN, bunPinDir, bunPinUrl, bundleVersion, installRunner, installScript, remoteUnit, windowsInstallScript, windowsTemplates } from "../src/runner/install.ts";
+import { INSTALL_EXIT, WIN_BOOTSTRAP, WIN_BUN, WIN_SCRIPT_END, bunPinDir, bunPinUrl, bundleVersion, installRunner, installScript, remoteUnit, windowsInstallScript, windowsTemplates } from "../src/runner/install.ts";
 import type { Ran, RunOptions } from "../src/run.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
@@ -34,6 +34,15 @@ test("the Windows install script is pure ASCII with LF lines", () => {
   const s = script();
   expect(/^[\x00-\x7f]*$/.test(s)).toBe(true);
   expect(s).not.toContain("\r");
+});
+
+test("the script ends with its own end marker and the bootstrap reads lines up to it, not to EOF", () => {
+  const lines = script().split("\n").filter((line) => line !== "");
+  expect(lines.at(-1)).toBe(WIN_SCRIPT_END);
+  expect(lines.filter((line) => line === WIN_SCRIPT_END)).toHaveLength(1);
+  expect(WIN_BOOTSTRAP).toContain("ReadLine");
+  expect(WIN_BOOTSTRAP).toContain(WIN_SCRIPT_END);
+  expect(WIN_BOOTSTRAP).not.toContain("ReadToEnd");
 });
 
 test("every payload decodes to its input, the task XML with label and connect filled in", () => {

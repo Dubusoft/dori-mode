@@ -52,7 +52,7 @@ import { isPrivateListen } from "./ws-transport.ts";
  * ssh's own 255 or a timeout is unreachable.
  *
  * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead: a PowerShell script on ssh's stdin
- * behind the short `WIN_BOOTSTRAP` encoded command, with the same exit code meanings.
+ * behind the short `WIN_BOOTSTRAP` encoded command (read up to its end-marker line, not to EOF), with the same exit code meanings.
  */
 
 export const RUNNER_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-runner-remote.service");
@@ -334,11 +334,16 @@ export const windowsTemplates = (): WindowsTemplates => {
   };
 };
 
+/** The last line of the Windows install script: the bootstrap reads stdin up to it, so a missing stdin EOF cannot hang. */
+export const WIN_SCRIPT_END = "DORI_INSTALL_SCRIPT_END";
+
 /**
- * The encoded command a Windows install runs over ssh: it reads the ASCII install script from stdin and runs it, so the
- * command line stays far under cmd.exe's 8191-character limit whatever the payload size.
+ * The encoded command a Windows install runs over ssh: it reads the ASCII install script from stdin line by line up to
+ * the `WIN_SCRIPT_END` line (a stdin EOF that never reaches the remote PowerShell cannot hang it; a stream that ends
+ * before the marker exits 1 without running anything) and runs it, so the command line stays far under cmd.exe's
+ * 8191-character limit whatever the payload size.
  */
-export const WIN_BOOTSTRAP = "$ErrorActionPreference='Stop'; [Console]::InputEncoding=[Text.Encoding]::ASCII; $s=[Console]::In.ReadToEnd(); & ([scriptblock]::Create($s)); exit $LASTEXITCODE";
+export const WIN_BOOTSTRAP = `$ErrorActionPreference='Stop'; [Console]::InputEncoding=[Text.Encoding]::ASCII; $b=New-Object Text.StringBuilder; $e=$false; while(($l=[Console]::In.ReadLine()) -ne $null){ if($l.TrimEnd([char]13) -eq '${WIN_SCRIPT_END}'){ $e=$true; break }; [void]$b.Append($l).Append([char]10) }; if(-not $e){ [Console]::Error.WriteLine('install script truncated before its end marker'); exit 1 }; & ([scriptblock]::Create($b.ToString())); exit $LASTEXITCODE`;
 
 const psq = (value: string): string => `'${value.replace(/'/g, "''")}'`;
 const b64 = (text: string): string => Buffer.from(text, "utf8").toString("base64");
@@ -346,7 +351,8 @@ const sha256 = (text: string): string => createHash("sha256").update(text).diges
 const TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
 
 /**
- * The PowerShell install script for a Windows worker, sent on stdin behind `WIN_BOOTSTRAP`. It is pure ASCII: the
+ * The PowerShell install script for a Windows worker, sent on stdin behind `WIN_BOOTSTRAP` and ending with the
+ * `WIN_SCRIPT_END` line, which the bootstrap reads up to instead of waiting for EOF. It is pure ASCII: the
  * bundle and every template travel as base64 literals written byte-exact with `[IO.File]::WriteAllBytes`, so no code
  * page, BOM or line-ending conversion can touch them. In order it:
  *
@@ -491,8 +497,10 @@ export const windowsInstallScript = (
     `} catch { Exit-Dori ${INSTALL_EXIT.systemd} ('task scheduler: ' + $_.Exception.Message) }`,
     "Write-Output ('DORI_BUN ' + $BunDir)",
     "exit 0",
+    WIN_SCRIPT_END,
     "",
   ];
+  if (lines.slice(0, -2).some((line) => line.replace(/\r$/, "") === WIN_SCRIPT_END)) throw new Error(`install payload contains the script end marker ${WIN_SCRIPT_END}`);
   return lines.join("\n");
 };
 
