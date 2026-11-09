@@ -20,6 +20,7 @@ import { readStoreView, readWakes } from "./store.ts";
 import { readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_STALE_MS, type RunnerMachine, type RunnerRow } from "./runner/hub.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { probe as probeRunner, type Verdict } from "./runner/health.ts";
+import { unsandboxedReason } from "./runner-sandbox.ts";
 import { openOperations } from "./operations.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
@@ -99,6 +100,8 @@ export type RunnerView = {
   readonly herdrSince?: number;
   /** The machine's readings from the runner's last guard sample (CPU load, free memory, disk, swap), and how old they are. */
   readonly machine?: Omit<RunnerMachine, "at"> & { readonly sampledAt: string; readonly ageSec: number };
+  /** Why its lanes run without a sandbox (runner-sandbox.ts: a Windows runner, or allowUnsandboxed); absent: sandboxed. */
+  readonly unsandboxed?: string;
   /**
    * The local runner only: its process as the supervisor's child, from the health file it writes
    * (`<runnerDir>/health`, the same reading as `dori runner probe`).
@@ -122,10 +125,12 @@ export const localChildState = (runnerDir: string, now: number): NonNullable<Run
  */
 export const runnerViews = (rows: readonly RunnerRow[], now: number, opts: {
   readonly restarts?: (label: string) => number | undefined; readonly lanes?: (label: string) => number; readonly child?: RunnerView["child"];
+  readonly unsandboxed?: (label: string, os: string | undefined) => string | undefined;
 } = {}): RunnerView[] => {
   const local = rows.find((r) => r.label === LOCAL_RUNNER) ?? { label: LOCAL_RUNNER, eventAck: 0, maxGen: 0, cmdSeq: 0, cmdAck: 0 };
   return [local, ...rows.filter((r) => r.label !== LOCAL_RUNNER)].map((row) => {
-    const view = runnerView(row, now, opts.restarts?.(row.label), opts.lanes?.(row.label));
+    const why = opts.unsandboxed?.(row.label, row.machine?.os);
+    const view = { ...runnerView(row, now, opts.restarts?.(row.label), opts.lanes?.(row.label)), ...(why ? { unsandboxed: why } : {}) };
     return row.label === LOCAL_RUNNER && opts.child ? { ...view, child: opts.child } : view;
   });
 };
@@ -371,6 +376,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     schedules: scheduleRows(d.config.stateDir, now),
     runners: runnerViews(readRunnerRows(d.config.stateDir), now, {
       restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
+      unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
       ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
     }),
   };
@@ -483,6 +489,7 @@ export const machineLines = (r: RunnerView): string[] => {
   const level = m && m.level !== "ok" ? `[${LEVEL_WORDS[m.level]}] ` : "";
   const head = [
     RUNNER_WORDS[r.state],
+    ...(r.unsandboxed ? ["샌드박스 없음"] : []),
     ...(r.state !== "connected" && r.heartbeatAgeSec !== undefined ? [`마지막 응답 ${agoSec(r.heartbeatAgeSec)}`] : []),
     ...(r.lanes !== undefined ? [count(r.lanes, "레인")] : []),
     `herdr ${r.herdr ? HERDR_WORDS[r.herdr] : "미확인"}`,

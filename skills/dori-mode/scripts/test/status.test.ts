@@ -14,7 +14,8 @@ import { JsonLaneReports, type LaneReportStore, SqliteLaneReports } from "../src
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind, WAKES_FILE } from "../src/store.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { healthPath } from "../src/runner/health.ts";
-import { collectStatus, kst, lookupStatus, renderStatus, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
+import { collectStatus, kst, lookupStatus, machineLines, renderStatus, runnerViews, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
+import { unsandboxedReason } from "../src/runner-sandbox.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const OPENED = "2026-10-19T00:00:00.000Z";
@@ -430,4 +431,15 @@ test("each runner's machine shows CPU load, free memory, disk and swap from its 
     "  머신 샘플 없음\n",
   ].join("\n"));
   expect(text).toContain("\n- 머신 macbook 경고: memory free 8% < 10%\n");
+});
+
+test("dori status marks a runner whose lanes run without a sandbox: a Windows machine, or one opted in with allowUnsandboxed", () => {
+  const config = { ...defaultConfig(), runners: { mini: { allowUnsandboxed: true } } };
+  const row = (label: string, os: string) => ({ label, eventAck: 0, maxGen: 1, cmdSeq: 0, cmdAck: 0, machine: { at: 0, level: "ok" as const, reasons: [], os } });
+  const views = runnerViews([row("win", "win32"), row("mini", "linux"), row("box", "linux")], 0, { unsandboxed: (label, os) => unsandboxedReason(config, label, os) });
+  expect(views.map((v) => [v.label, v.unsandboxed])).toEqual([
+    ["local", undefined], ["win", "is a Windows runner (Windows has no lane sandbox)"], ["mini", "is opted in with runners.mini.allowUnsandboxed"], ["box", undefined],
+  ]);
+  expect(machineLines(views[1]!)[0]).toBe("- win (win32): 오프라인 · 샌드박스 없음 · herdr 미확인");
+  expect(machineLines(views[3]!)[0]).toBe("- box (linux): 오프라인 · herdr 미확인");
 });

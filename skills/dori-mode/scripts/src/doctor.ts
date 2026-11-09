@@ -27,6 +27,7 @@ import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/livenes
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
+import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -90,10 +91,12 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
 /**
  * Lanes on a Linux host run inside bwrap and on a macOS host inside Seatbelt (sandbox-exec), via the installed
  * lane-sandbox wrapper, so a missing wrapper, a missing bwrap or a wrapper whose --check fails is a FAIL (lanes there are
- * refused, not run bare). Other platforms have no wrapper: lanes there need runners.<label>.allowUnsandboxed.
+ * refused, not run bare). Windows has no lane sandbox: its lanes run without one by design, a WARN so it stays in view.
+ * Other platforms have no wrapper: lanes there need runners.<label>.allowUnsandboxed.
  */
 const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which">): Promise<Check[]> => {
   const platform = d.platform ?? process.platform;
+  if (platform === "win32") return [warn("lane sandbox", "none: Windows has no lane sandbox, so lanes on this machine run WITHOUT one (each launch says SANDBOX_SKIPPED)", "none needed: Windows runners run lanes unsandboxed by design")];
   if (platform !== "linux" && platform !== "darwin") return [ok("lane sandbox", `not available on ${platform}; lanes on this machine need runners.<label>.allowUnsandboxed in the lead config`)];
   const mac = platform === "darwin";
   // A worker runner host runs its lanes behind the copy `dori runner install` puts in the runner's bin; the lead host uses ~/.local/bin.
@@ -388,7 +391,8 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
   } catch (e) {
     checks.push(warn("runner restarts", `cannot read the operations store: ${e instanceof Error ? e.message : String(e)}`, "dori doctor again once the supervisor has started"));
   }
-  for (const row of readRunnerRows(d.config.stateDir)) {
+  const rows = readRunnerRows(d.config.stateDir);
+  for (const row of rows) {
     const id = `runner ${row.label}`;
     const problems: string[] = [];
     if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
@@ -410,6 +414,14 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     checks.push(problems.length
       ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
       : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}${row.herdr ? `, herdr ${row.herdr}` : ""}`));
+  }
+  // Runners whose lanes run without a sandbox (launch.ts sandboxChoice): Windows by design, others by opt-in.
+  for (const label of new Set([...rows.map((row) => row.label), ...Object.keys(d.config.runners ?? {})])) {
+    const os = rows.find((row) => row.label === label)?.machine?.os;
+    const why = unsandboxedReason(d.config, label, os);
+    if (!why) continue;
+    checks.push(warn(`runner ${label} sandbox`, `none: runner ${label} ${why}, so its lanes run WITHOUT a sandbox (each launch says SANDBOX_SKIPPED)`,
+      isWindowsOs(os) ? "none needed: Windows runners run lanes unsandboxed by design" : `remove runners.${label}.allowUnsandboxed from the lead config once that machine can sandbox`));
   }
   return checks;
 };

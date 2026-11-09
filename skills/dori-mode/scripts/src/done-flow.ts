@@ -28,6 +28,8 @@ export type FlowDeps = {
   readonly exists?: (path: string) => boolean;
   /** PATH lookup for laneSandbox.command; absent uses Bun.which. */
   readonly which?: (cmd: string) => string | null;
+  /** The OS runner `label` last reported (Windows runners run lanes unsandboxed); absent reads the hub's runners table. */
+  readonly runnerOs?: (label: string) => string | undefined;
   readonly signalIo?: SignalIo;
   /** The operation rows; absent opens the configured store per call. */
   readonly operations?: OperationStore;
