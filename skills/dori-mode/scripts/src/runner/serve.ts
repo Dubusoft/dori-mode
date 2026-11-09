@@ -407,9 +407,9 @@ export const runnerAdminResult = (stateDir: string, id: number): string | undefi
 /**
  * Supervisor side: answers every open request through `accept`. `revoke` -> `revoked` / `not-enrolled` (the live link
  * is closed either way); `rotate` -> `sent cmdId=<id>` / `not-connected`; older than `RUNNER_ADMIN_TTL_MS` ->
- * `expired`. Returns one log line per request.
+ * `expired`. Returns one log line per request; `onRevoked` hears each label whose revoke was processed (not `expired`).
  */
-export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "revoke" | "rotate" | "command" | "connected">, now: number): string[] => {
+export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "revoke" | "rotate" | "command" | "connected">, now: number, onRevoked?: (label: string) => void): string[] => {
   const db = openHubDb(stateDir);
   try {
     adminTable(db);
@@ -417,7 +417,10 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
     return open.map((row) => {
       let result: string;
       if (now - row.at > RUNNER_ADMIN_TTL_MS) result = "expired";
-      else if (row.op === "revoke") result = accept.revoke(row.label) ? "revoked" : "not-enrolled";
+      else if (row.op === "revoke") {
+        result = accept.revoke(row.label) ? "revoked" : "not-enrolled";
+        onRevoked?.(row.label);
+      }
       else if (row.op === "rotate") {
         const cmdId = accept.rotate(row.label);
         result = cmdId ? `sent cmdId=${cmdId}` : "not-connected";

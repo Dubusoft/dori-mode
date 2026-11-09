@@ -128,15 +128,18 @@ test("enroll over the unix socket, connect, a policy-rejected command answers RU
 
   const gone = logs.when((line) => line === "RUNNER_DISCONNECTED runner=lab");
   queueRunnerAdmin(stateDir, "revoke", "lab", clock.now());
-  expect(drainRunnerAdmin(stateDir, handle.accept, clock.now())).toEqual(["RUNNER_ADMIN op=revoke runner=lab result=revoked"]);
+  const revoked: string[] = [];
+  expect(drainRunnerAdmin(stateDir, handle.accept, clock.now(), (label) => { revoked.push(label); })).toEqual(["RUNNER_ADMIN op=revoke runner=lab result=revoked"]);
+  expect(revoked).toEqual(["lab"]);
   await gone;
   expect(await twin.connectOnce()).toMatchObject({ ok: false, code: "RUNNER_REVOKED" });
 
   // A request nobody took in time is answered expired.
   const late = queueRunnerAdmin(stateDir, "rotate", "lab", clock.now());
   clock.at += 3 * 60_000;
-  drainRunnerAdmin(stateDir, handle.accept, clock.now());
+  drainRunnerAdmin(stateDir, handle.accept, clock.now(), (label) => { revoked.push(label); });
   expect(runnerAdminResult(stateDir, late)).toBe("expired");
+  expect(revoked).toEqual(["lab"]);
 });
 
 test("the supervisor discovers a listening worker, authenticates its real WebSocket hello and redials after a drop", async () => {
