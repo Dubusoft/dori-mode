@@ -76,6 +76,8 @@ export type World = {
   /** Merged over the inspection fakeLaneOps derives from the World. */
   inspection?: Partial<LaneInspection>;
   startResult?: CommandResults["lane.start"];
+  /** What `lane-sandbox --check` answers (default exit 0: the local sandbox works). */
+  sandboxCheck?: Ran;
   /** Every runner is down: reads and effects throw RUNNER_UNAVAILABLE, send answers "failed", status an error. */
   runnerDown?: boolean;
   /** The herdr workspaces `herdr workspace list` answers; `workspace create` adds one (`w<n>`). */
@@ -130,6 +132,7 @@ export const fakeRunner = (w: World): Runner => async (argv) => {
   if (cmd === "gh" && a1 === "pr") return ok(JSON.stringify({ state: w.prState, mergeCommit: w.prState === "MERGED" ? { oid: "abc1234567890" } : null }));
   if (cmd === "gh" && a1 === "issue") return ok(JSON.stringify({ state: w.issueState }));
   if (cmd === "notify") return ok();
+  if (cmd === "lane-sandbox" && a1 === "--check") return w.sandboxCheck ?? ok();
   return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` };
 };
 
@@ -280,7 +283,8 @@ export const fakeLaneOps = (w: World): LaneOps => {
 /** FlowDeps over the World, plus `ops` (a fakeLaneOps over the same World) for modules that reach lanes through the facade. */
 export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps & { readonly ops: LaneOps } => {
   const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, toodoEvents: { ...defaultConfig("/home/test").toodoEvents, enabled: false }, ...patch };
-  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w) };
+  // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
+  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w), which: (cmd) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null) };
 };
 
 /** The texts sent to lanes: through the facade (`w.ops` sends), and through herdr `send-text` by modules not yet moved onto it. */

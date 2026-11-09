@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkCommand, checkCwd, checkQuery, loadPolicy, rejection, type RunnerPolicy } from "../src/runner/policy.ts";
+import { checkCommand, checkCwd, checkQuery, loadPolicy, parsePolicy, rejection, type RunnerPolicy } from "../src/runner/policy.ts";
 
 const policy: RunnerPolicy = { agents: { omo: ["omo", "run"] }, allowedRoots: ["/data/repos"], sandbox: "required", jobs: "allow" };
 
@@ -169,6 +169,15 @@ describe("runner command policy", () => {
     expect(qrule({ ...q("q.panes", {}), cmdSeq: 1 })).toBe("sequence");
     expect(qrule({ v: 1, runner: "r1", gen: 1, epoch: 1, type: "ack", body: { eventAck: 1 } })).toBe("not-a-command");
     expect(rule(q("q.panes", {}))).toBe("not-a-command");
+  });
+
+  test("sandboxCheck parses as an argv; an empty, non-array or non-string one is refused", () => {
+    expect(parsePolicy({ sandbox: "required", sandboxCheck: ["/h/.dori/runner/bin/lane-sandbox", "--check"] }).sandboxCheck)
+      .toEqual(["/h/.dori/runner/bin/lane-sandbox", "--check"]);
+    expect(parsePolicy({}).sandboxCheck).toBeUndefined();
+    for (const bad of [[], [""], "lane-sandbox --check", ["lane-sandbox", 3]]) {
+      expect(() => parsePolicy({ sandboxCheck: bad })).toThrow("sandboxCheck must be a non-empty string array");
+    }
   });
 
   test("absent config file yields defaults", () => {

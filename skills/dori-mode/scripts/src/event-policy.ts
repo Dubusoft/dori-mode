@@ -32,6 +32,12 @@ const URGENT_KINDS = [
   "HOST_GUARD CRITICAL",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_RECOVERY_EXHAUSTED",
+  // Sandbox (launch.ts SandboxRefusal): a lane its sandbox refused to relaunch stays down until someone fixes the sandbox,
+  // a lane allowed to run unsandboxed (runners.<label>.allowUnsandboxed, or a relaunch recorded without one) runs
+  // without isolation, and a sandbox notice that reached no Discord channel (sandbox-notice.ts) carries the owner's warning.
+  // Other LANE_RECOVERY_ERROR lines stay digest (the default); SANDBOX_NOTICE_FALLBACK did reach the owner and stays digest.
+  "LANE_RECOVERY_ERROR * sandbox-missing:", "LANE_RECOVERY_ERROR * sandbox-broken:", "LANE_RECOVERY_ERROR * sandbox-unavailable:",
+  "SANDBOX_MISSING", "SANDBOX_BROKEN", "SANDBOX_UNAVAILABLE", "SANDBOX_SKIPPED", "SANDBOX_NOTICE_ERROR",
   // Runners: a lane whose runner is gone or unknown, a forged or unauthenticated frame, a backed-up outbox, and a
   // failed runner upgrade need the lead. RUNNER_STALE, RUNNER_UNREACHABLE, RUNNER_RESTARTED, RUNNER_RESTART_FAILED,
   // RUNNER_PROTO_MISMATCH and RUNNER_CONFLICT stay digest (the default).

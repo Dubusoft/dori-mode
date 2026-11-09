@@ -195,6 +195,11 @@ export type DoriConfig = {
    * The lead is never wrapped.
    */
   readonly laneSandbox?: LaneSandbox;
+  /**
+   * Per-runner (machine label) lead-side settings. `allowUnsandboxed: true` is the only way a lane runs without a sandbox:
+   * remote lanes on that machine start unsandboxed (SANDBOX_SKIPPED, posted to the owner) instead of being refused.
+   */
+  readonly runners?: Readonly<Record<string, RunnerConfig>>;
   /** Digest events wait for an urgent one, but never longer than this. */
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
@@ -359,7 +364,36 @@ const laneRules = (raw: unknown): readonly string[] => {
 
 export type LaneSandbox = { readonly command: readonly string[] };
 
-/** Used when the config has no `laneSandbox`: new local lanes run behind `lane-sandbox` on PATH, and pass through when it is missing. */
+/** Lead-side settings for one runner (config `runners.<label>`). */
+export type RunnerConfig = { readonly allowUnsandboxed?: boolean };
+
+/**
+ * Keys an older dori's `runners` section carried (the shadow runner's listen address, modes, restart circuit). They are
+ * ignored and named in CONFIG_KEYS_IGNORED, never read as machine labels, so an old config keeps loading.
+ */
+const LEGACY_RUNNER_KEYS: readonly string[] = ["listen", "mode", "restartCircuit"];
+
+/** The `runners` keys loadConfig ignores: the legacy ones, or the whole section when it is an (old) array. */
+const ignoredRunnerKeys = (raw: unknown): string[] =>
+  Array.isArray(raw) ? ["runners"] : isRecord(raw) ? Object.keys(raw).filter((key) => LEGACY_RUNNER_KEYS.includes(key)).map((key) => `runners.${key}`) : [];
+
+/**
+ * The config's `runners` without its legacy keys; undefined when no machine entry is left. Throws TypeError unless absent,
+ * an old array, or { <label>: { allowUnsandboxed?: boolean } }.
+ */
+const runners = (raw: unknown): Readonly<Record<string, RunnerConfig>> | undefined => {
+  if (raw == null || Array.isArray(raw)) return undefined;
+  const bad = (what: string) => new TypeError(`runners${what} must be { "<machine label>": { "allowUnsandboxed": true|false } }`);
+  if (!isRecord(raw)) throw bad("");
+  const entries = Object.entries(raw).filter(([label]) => !LEGACY_RUNNER_KEYS.includes(label));
+  if (!entries.length) return undefined;
+  return Object.fromEntries(entries.map(([label, entry]) => {
+    if (!isRecord(entry) || (entry.allowUnsandboxed !== undefined && typeof entry.allowUnsandboxed !== "boolean")) throw bad(`.${label}`);
+    return [label, entry.allowUnsandboxed === undefined ? {} : { allowUnsandboxed: entry.allowUnsandboxed }];
+  }));
+};
+
+/** Used when the config has no `laneSandbox`: new local lanes run behind `lane-sandbox` on PATH, and are refused (SANDBOX_MISSING) when it is missing. */
 export const DEFAULT_LANE_SANDBOX: LaneSandbox = { command: ["lane-sandbox"] };
 
 /**
@@ -418,7 +452,7 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "laneThinking", "leadArgs", "discordChannels", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
-  "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes", "toodoEvents",
+  "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes", "toodoEvents",
 ] as const;
 
 /** The config's `toodoEvents` laid over the default: `url` (http or https), `tokenFile` (`~` expanded) and `enabled`. */
@@ -459,6 +493,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const rawMemory = isRecord(raw.memoryCheck) ? raw.memoryCheck : {};
   ignored.push(...Object.keys(rawMemory).filter((key) => key !== "repo").map((key) => `memoryCheck.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
+  ignored.push(...ignoredRunnerKeys(raw.runners));
   if (ignored.length && !warnedIgnoredKeys) {
     warnedIgnoredKeys = true;
     console.error(`CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
@@ -481,7 +516,9 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
       ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
       : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
   }
-  const merged: DoriConfig = { ...base, ...fromFile, hooks: { ...base.hooks, ...hooks } };
+  const { runners: rawRunners, ...rest } = fromFile;
+  const machineRunners = runners(rawRunners);
+  const merged: DoriConfig = { ...base, ...rest, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
     laneRules: laneRules(raw.laneRules),

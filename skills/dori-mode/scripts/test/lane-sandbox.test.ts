@@ -26,7 +26,7 @@ const sandboxArgv = async (home: string, env: Record<string, string>): Promise<s
   return readFileSync(out, "utf8").split("\n");
 };
 
-test("a sandboxed lane gets its own token file, the runner socket and its brief, and nothing else of the runner dir or the env file", async () => {
+test("a sandboxed lane gets its own token file, the runner socket, its brief and the runner's bin (read-only), and nothing else of the runner dir or the env file", async () => {
   const home = join(tempDir(), "home");
   const runner = join(home, ".dori", "runner");
   mkdirSync(join(runner, "briefs"), { recursive: true });
@@ -43,7 +43,10 @@ test("a sandboxed lane gets its own token file, the runner socket and its brief,
   expect(tokenBind).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.md"), join(runner, "sock")]);
+  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.md"), join(runner, "sock")]);
+  // A worker host's dori lives in bin: bound read-only, never read-write, so a lane cannot rewrite what the runner runs.
+  const bin = join(runner, "bin");
+  expect(argv.flatMap((a, i) => (argv[i + 1] === bin && argv[i + 2] === bin ? [a] : []))).toEqual(["--ro-bind-try"]);
   expect(argv.some((a) => a.startsWith(join(home, ".dori", "env")))).toBe(false);
 });
 
@@ -104,4 +107,38 @@ test("refreshLaneSandbox replaces an outdated install, keeps the old copy, and l
   expect(readFileSync(`${installed}.bak`, "utf8")).toBe("#!/bin/sh\nold sandbox\n");
 
   expect(refreshLaneSandbox(home)).toBeUndefined();
+});
+
+/** Runs `lane-sandbox --check` with PATH limited to `bin` (plus the dirs bash needs) and DORI_LANE_KEY unset, like the lead. */
+const check = async (bin: string) => {
+  const child = Bun.spawn([Bun.which("bash") ?? "bash", LANE_SANDBOX_TEMPLATE, "--check"], { env: { PATH: bin, HOME: bin }, stdout: "pipe", stderr: "pipe" });
+  return { code: await child.exited, err: await new Response(child.stderr).text() };
+};
+const fakeBwrap = (dir: string, body: string): string => {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "bwrap"), `#!/bin/sh\n${body}\n`);
+  chmodSync(join(bin, "bwrap"), 0o755);
+  return bin;
+};
+
+test("--check exits 3 with one stderr line when bwrap is not on PATH", async () => {
+  const empty = join(tempDir(), "empty");
+  mkdirSync(empty);
+  const r = await check(empty);
+  expect(r.code).toBe(3);
+  expect(r.err.trim().split("\n")).toEqual(["lane-sandbox: bwrap not found on PATH"]);
+});
+
+test("--check exits 0 when bwrap --ro-bind / / true succeeds, even without DORI_LANE_KEY", async () => {
+  const dir = tempDir();
+  const bin = fakeBwrap(dir, `[ "$*" = "--ro-bind / / true" ] || exit 9`);
+  expect(await check(bin)).toEqual({ code: 0, err: "" });
+});
+
+test("--check exits 3 with bwrap's reason on one line when bwrap cannot create a sandbox", async () => {
+  const bin = fakeBwrap(tempDir(), 'echo "bwrap: No permissions to create new namespace" >&2; exit 1');
+  const r = await check(bin);
+  expect(r.code).toBe(3);
+  expect(r.err.trim().split("\n")).toEqual(["lane-sandbox: bwrap cannot create a sandbox: bwrap: No permissions to create new namespace"]);
 });

@@ -100,7 +100,7 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     model: "m/lane", base: "release", memoryCheck: { repo: "/home/ana/memory", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
     sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
   });
-  const ignored = "futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, runners, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, hooks.threadDone, memoryCheck.maxKb, laneSandbox.default";
+  const ignored = "futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, hooks.threadDone, memoryCheck.maxKb, laneSandbox.default, runners.listen, runners.mode";
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
 });
 
@@ -204,4 +204,14 @@ test("guard thresholds and heavyKill are built in: file values, even malformed o
   const c = await loadConfig(path, "/home/ana");
   expect(c.guard).toEqual(defaultConfig("/home/ana").guard);
   expect(c.heavyKill).toEqual(["qemu-system", "emulator", "expo export"]);
+});
+
+test("runners.<label>.allowUnsandboxed loads per machine, legacy runner keys are dropped, and a bad shape is refused", async () => {
+  const path = join(state.dir, "runners.json");
+  await Bun.write(path, JSON.stringify({ runners: { listen: "0.0.0.0:7411", mini: { allowUnsandboxed: true }, box: {} } }));
+  expect((await loadConfig(path, "/home/ana")).runners).toEqual({ mini: { allowUnsandboxed: true }, box: {} });
+  for (const runners of [{ mini: { allowUnsandboxed: "yes" } }, { mini: true }, "mini"]) {
+    await Bun.write(path, JSON.stringify({ runners }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toBeInstanceOf(TypeError);
+  }
 });
