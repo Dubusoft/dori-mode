@@ -245,7 +245,7 @@ test("a failing source is isolated: the others keep delivering, it is reported o
   const status = await collectStatus({ ...f.deps, run: async () => ok("active") });
   const text = renderStatus(status);
   expect(text).toContain("- 소스 bad 실패 (방금부터): bad exited 2: boom: no such host");
-  expect(text).toContain("- 이벤트 소스: discord 이벤트 없음, github 이벤트 없음, sweeps 이벤트 없음, waits 이벤트 없음, emit 이벤트 없음, bad (poll) 이벤트 없음 실패, good (poll) GOOD 방금, missing (file) 이벤트 없음 실패");
+  expect(text).toContain("- 이벤트 소스: discord 이벤트 없음, github 이벤트 없음, sweeps 이벤트 없음, waits 이벤트 없음, emit 이벤트 없음, toodo 이벤트 없음, bad (poll) 이벤트 없음 실패, good (poll) GOOD 방금, missing (file) 이벤트 없음 실패");
   // Recovered: no longer failing, and its last error stays visible.
   broken = false;
   f.clock.at += 5_000;

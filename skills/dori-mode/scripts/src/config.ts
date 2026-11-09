@@ -6,6 +6,7 @@ import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { redactSecrets } from "./redact.ts";
 import type { StoreKind } from "./store.ts";
+import type { ToodoEventsConfig } from "./toodo-events.ts";
 
 export type ArgvTemplate = readonly string[];
 
@@ -157,6 +158,8 @@ export type DoriConfig = {
   readonly githubTimeoutMs: number;
   /** GitHub logins whose new or reopened issues wake the lead as GH_ISSUE; anyone else is digest only. */
   readonly githubIssueAuthors: readonly string[];
+  /** The toodo-server event stream the supervisor follows for task status changes and readiness (toodo-events.ts). */
+  readonly toodoEvents: ToodoEventsConfig;
   /** Opening keywords of a `--mode ulw` lane (the default): clear, contained work. */
   readonly launchKeywords: string;
   /** Opening keywords of a `--mode mass-ulw` lane: wide changes or vague instructions that need investigation first. */
@@ -294,6 +297,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   githubPollSeconds: 90,
   githubTimeoutMs: 30_000,
   githubIssueAuthors: [],
+  toodoEvents: { enabled: true, url: "http://127.0.0.1:47616", tokenFile: join(home, ".local", "share", "toodo-server", "web-token") },
   launchKeywords: "ulw set goal and work",
   massLaunchKeywords: "/mass-ulw set goal and work",
   laneThinking: "medium",
@@ -414,8 +418,24 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "laneThinking", "leadArgs", "discordChannels", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
-  "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes",
+  "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes", "toodoEvents",
 ] as const;
+
+/** The config's `toodoEvents` laid over the default: `url` (http or https), `tokenFile` (`~` expanded) and `enabled`. */
+const toodoEventsConfig = (raw: unknown, base: ToodoEventsConfig, home: string): ToodoEventsConfig => {
+  if (raw === undefined) return base;
+  const bad = (what: string) => new TypeError(`toodoEvents.${what}`);
+  if (!isRecord(raw)) throw new TypeError("toodoEvents must be an object");
+  const { url, tokenFile, enabled } = raw;
+  if (url !== undefined && (typeof url !== "string" || !/^https?:\/\/\S+$/.test(url))) throw bad("url must be an http(s) URL");
+  if (tokenFile !== undefined && (typeof tokenFile !== "string" || !tokenFile.trim())) throw bad("tokenFile must be a path");
+  if (enabled !== undefined && typeof enabled !== "boolean") throw bad("enabled must be true or false");
+  return {
+    url: url ?? base.url,
+    tokenFile: typeof tokenFile === "string" ? expandHome(tokenFile.trim(), home) : base.tokenFile,
+    enabled: enabled ?? base.enabled,
+  };
+};
 
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
 const HOOK_KEYS = ["threadReply", "transcribe"] as const;
@@ -468,6 +488,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
+    toodoEvents: toodoEventsConfig(raw.toodoEvents, base.toodoEvents, home),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     memoryCheck: { ...base.memoryCheck, repo: expandHome(memoryRepo, home) },
     stateDir,

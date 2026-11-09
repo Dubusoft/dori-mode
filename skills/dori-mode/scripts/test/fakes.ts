@@ -276,7 +276,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
 
 /** FlowDeps over the World, plus `ops` (a fakeLaneOps over the same World) for modules that reach lanes through the facade. */
 export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps & { readonly ops: LaneOps } => {
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, ...patch };
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, toodoEvents: { ...defaultConfig("/home/test").toodoEvents, enabled: false }, ...patch };
   return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w) };
 };
 
