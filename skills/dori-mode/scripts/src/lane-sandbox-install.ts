@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const LANE_SANDBOX_TEMPLATE = fileURLToPath(new URL("../templates/lane-sandbox.sh", import.meta.url));
+/** The macOS (Seatbelt) wrapper `dori runner install` puts on a Mac runner; same inputs as the Linux one. */
+export const LANE_SANDBOX_MACOS_TEMPLATE = fileURLToPath(new URL("../templates/lane-sandbox-macos.sh", import.meta.url));
 
 export const installedLaneSandbox = (home: string): string => join(home, ".local", "bin", "lane-sandbox");
 

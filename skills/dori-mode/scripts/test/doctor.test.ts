@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import { type Check, type DoctorDeps, doctorExit, renderDoctor, runDoctor, tokenFrom } from "../src/doctor.ts";
-import { LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { defaultRunnerDir, RUNNER_PATHS } from "../src/runner/fs-safety.ts";
 import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
 import { pendingLeadRestart } from "../src/lead-restart.ts";
@@ -160,8 +160,23 @@ test("on a Linux worker runner host doctor checks the wrapper dori runner instal
   expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "OK" });
 });
 
-test("doctor does not fail a non-Linux worker host for a missing sandbox", async () => {
+test("on a macOS worker runner host doctor checks the seatbelt wrapper in the runner's bin, without bwrap", async () => {
   const f = fixture({ deps: { platform: "darwin", which: () => undefined } });
+  const runnerDir = defaultRunnerDir(f.deps.home);
+  const wrapper = join(runnerDir, "bin", "lane-sandbox");
+  writeFileSync(join(runnerDir, RUNNER_PATHS.identity), JSON.stringify({ label: "mini" }));
+  expect(find(await runDoctor(f.deps), "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining(wrapper), fix: expect.stringContaining("dori runner install") });
+  mkdirSync(join(runnerDir, "bin"), { recursive: true });
+  copyFileSync(LANE_SANDBOX_MACOS_TEMPLATE, wrapper);
+  const run = async (argv: readonly string[]) => (argv.join(" ") === `${wrapper} --check` ? ok() : f.deps.run(argv, {}));
+  expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "OK", detail: expect.stringContaining("seatbelt") });
+  // The Linux wrapper on a Mac is outdated, not current.
+  copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);
+  expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "WARN", detail: expect.stringContaining("templates/lane-sandbox-macos.sh (LANE_SANDBOX_OUTDATED)"), fix: expect.stringContaining("dori runner install") });
+});
+
+test("doctor does not fail a host with no lane sandbox wrapper for its platform", async () => {
+  const f = fixture({ deps: { platform: "win32", which: () => undefined } });
   rmSync(join(f.deps.home, ".local", "bin", "lane-sandbox"));
   const check = find(await runDoctor(f.deps), "lane sandbox");
   expect(check).toMatchObject({ level: "OK", detail: expect.stringContaining("allowUnsandboxed") });

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
@@ -26,7 +26,7 @@ import { readRunnerEndpoints } from "./runner/endpoints.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
-import { installedLaneSandbox, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
+import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -88,22 +88,26 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
 };
 
 /**
- * Lanes on a Linux host run inside bwrap via the installed lane-sandbox wrapper, so a missing wrapper, a missing bwrap or a
- * wrapper whose --check fails is a FAIL (lanes there are refused, not run bare). Other platforms have no bwrap: lanes
- * there need runners.<label>.allowUnsandboxed.
+ * Lanes on a Linux host run inside bwrap and on a macOS host inside Seatbelt (sandbox-exec), via the installed
+ * lane-sandbox wrapper, so a missing wrapper, a missing bwrap or a wrapper whose --check fails is a FAIL (lanes there are
+ * refused, not run bare). Other platforms have no wrapper: lanes there need runners.<label>.allowUnsandboxed.
  */
 const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which">): Promise<Check[]> => {
-  if ((d.platform ?? process.platform) !== "linux") return [ok("lane sandbox", `not available on ${d.platform ?? process.platform}; lanes on this machine need runners.<label>.allowUnsandboxed in the lead config`)];
+  const platform = d.platform ?? process.platform;
+  if (platform !== "linux" && platform !== "darwin") return [ok("lane sandbox", `not available on ${platform}; lanes on this machine need runners.<label>.allowUnsandboxed in the lead config`)];
+  const mac = platform === "darwin";
   // A worker runner host runs its lanes behind the copy `dori runner install` puts in the runner's bin; the lead host uses ~/.local/bin.
   const worker = workerLabel(d) !== undefined;
   const installed = worker ? join(defaultRunnerDir(d.home), "bin", "lane-sandbox") : installedLaneSandbox(d.home);
   if (!existsSync(installed)) return [fail("lane sandbox", `${installed} is missing; lanes are refused (SANDBOX_MISSING)`, worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs it")];
-  if (!(d.which ?? Bun.which)("bwrap")) return [fail("lane sandbox", "bwrap is not on PATH; lanes are refused", "install bubblewrap: sudo apt install bubblewrap")];
+  if (!mac && !(d.which ?? Bun.which)("bwrap")) return [fail("lane sandbox", "bwrap is not on PATH; lanes are refused", "install bubblewrap: sudo apt install bubblewrap")];
   const probe = await d.run([installed, "--check"], T);
-  if (probe.code !== 0) return [fail("lane sandbox", `${installed} --check failed: ${probe.err.trim() || probe.out.trim() || `exit ${probe.code}`}`, "fix bubblewrap (user namespaces enabled, AppArmor profile), then rerun dori doctor")];
+  if (probe.code !== 0) return [fail("lane sandbox", `${installed} --check failed: ${probe.err.trim() || probe.out.trim() || `exit ${probe.code}`}`, mac ? "check that /usr/bin/sandbox-exec runs (sandbox-exec -p '(version 1)(allow default)' /usr/bin/true), then rerun dori doctor" : "fix bubblewrap (user namespaces enabled, AppArmor profile), then rerun dori doctor")];
+  const template = mac ? LANE_SANDBOX_MACOS_TEMPLATE : LANE_SANDBOX_TEMPLATE;
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
-  const templateHash = createHash("sha256").update(readFileSync(LANE_SANDBOX_TEMPLATE)).digest("hex");
-  return [installedHash === templateHash ? ok("lane sandbox", `${installed} works (bwrap available)`) : warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
+  const templateHash = createHash("sha256").update(readFileSync(template)).digest("hex");
+  if (installedHash === templateHash) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`)];
+  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
 };
 
 /** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */

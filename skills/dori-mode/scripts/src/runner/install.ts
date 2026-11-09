@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
-import { LANE_SANDBOX_TEMPLATE } from "../lane-sandbox-install.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../lane-sandbox-install.ts";
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
 import { WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
 import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
@@ -116,6 +116,8 @@ export type InstallDeps = {
   readonly windowsTemplates?: WindowsTemplates;
   /** The lane-sandbox wrapper a Linux host gets as `~/.dori/runner/bin/lane-sandbox`; defaults to templates/lane-sandbox.sh. */
   readonly laneSandbox?: string;
+  /** The lane-sandbox wrapper a macOS host gets there instead; defaults to templates/lane-sandbox-macos.sh. */
+  readonly laneSandboxMacos?: string;
   /** How the machine runs commands; defaults to `machineKind`. */
   readonly kind?: (run: Runner, machine: GuardMachine) => Promise<KindResult>;
 };
@@ -157,8 +159,9 @@ export const installScript = (
   agentCommand: readonly string[] = [],
   herdr: HerdrTemplates = herdrTemplates(),
   laneSandbox: string = readFileSync(LANE_SANDBOX_TEMPLATE, "utf8"),
+  laneSandboxMacos: string = readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"),
 ): string => {
-  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, laneSandbox]) {
+  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, laneSandbox, laneSandboxMacos]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
   }
   const body = (text: string): string => (text.endsWith("\n") ? text : `${text}\n`);
@@ -206,20 +209,22 @@ export const installScript = (
     // made it) is tightened, since the runner refuses to start on any runner directory that is not 0700.
     'mkdir -p "$R/evidence" || exit 1',
     'chmod 700 "$HOME/.dori" "$R" "$R/bin" "$R/evidence" || exit 1',
-    // Linux lanes run sandboxed through the lane-sandbox wrapper (bubblewrap), installed beside the runner's own files.
-    // It needs no extra binds here: the runner socket, the lane's brief and token file and its cwd are bound by the
-    // wrapper itself, and the lead's verify directory is not on this host.
+    // Lanes run sandboxed through the lane-sandbox wrapper, installed beside the runner's own files: bubblewrap on Linux,
+    // Seatbelt (sandbox-exec) on macOS. It needs no extra paths here: the runner socket, the lane's brief and token file
+    // and its cwd are handled by the wrapper itself, and the lead's verify directory is not on this host.
     'if [ "$OS" = Linux ]; then',
     `cat > "$R/bin/lane-sandbox.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(laneSandbox)}${HEREDOC}`,
+    "else",
+    `cat > "$R/bin/lane-sandbox.tmp" <<'${HEREDOC}' || exit 1`,
+    `${body(laneSandboxMacos)}${HEREDOC}`,
+    "fi",
     // 0700 like `dori`: the runner refuses to start on a runner directory holding anything wider (fs-safety.ts).
     'chmod 700 "$R/bin/lane-sandbox.tmp" && mv -f "$R/bin/lane-sandbox.tmp" "$R/bin/lane-sandbox" || exit 1',
-    "fi",
     // A starter command policy, only when the host has none: without an agent profile and a root every lane.start is
-    // refused. Sandboxing is required: Linux gets a `sandboxed` profile behind the wrapper and its `--check`; macOS has
-    // no wrapper, so no `sandboxed` profile, and a sandboxed start is refused `agent-profile` (an unsandboxed one
-    // `sandbox-required`) until the operator opts the host in. An existing runner-config.json is the operator's and is
-    // never rewritten; what it lacks for sandboxed lanes is printed instead.
+    // refused. Sandboxing is required: the `sandboxed` profile runs the agent behind the wrapper, and its `--check` runs
+    // before each sandboxed start. An existing runner-config.json is the operator's and is never rewritten; what it
+    // lacks for sandboxed lanes is printed instead.
     'if [ ! -e "$R/runner-config.json" ]; then',
     ...(agentCommand.length ? [
       `  A=${quote(JSON.stringify(agentCommand))}`,
@@ -227,21 +232,15 @@ export const installScript = (
       `  H=$(printf '%s' "$HOME" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')`,
       // The sandboxed argv is the wrapper, then A's elements: A without its leading '['.
       '  W="$H/.dori/runner/bin/lane-sandbox"',
-      '  if [ "$OS" = Linux ]; then',
-      `    printf '{"agents":{"default":%s,"sandboxed":["%s",%s},"allowedRoots":["%s","%s"],"sandbox":"required","sandboxCheck":["%s","--check"]}\\n' "$A" "$W" "\${A#?}" "$H" "$TR" "$W" > "$R/runner-config.json.tmp" || exit 1`,
-      "  else",
-      `    printf '{"agents":{"default":%s},"allowedRoots":["%s","%s"],"sandbox":"required"}\\n' "$A" "$H" "$TR" > "$R/runner-config.json.tmp" || exit 1`,
-      "  fi",
+      `  printf '{"agents":{"default":%s,"sandboxed":["%s",%s},"allowedRoots":["%s","%s"],"sandbox":"required","sandboxCheck":["%s","--check"]}\\n' "$A" "$W" "\${A#?}" "$H" "$TR" "$W" > "$R/runner-config.json.tmp" || exit 1`,
       '  mv -f "$R/runner-config.json.tmp" "$R/runner-config.json" || exit 1',
       "  unset A H TR W",
     ] : ["  :"]),
     "else",
     "  M=",
     `  grep -Eq '"sandbox"[[:space:]]*:[[:space:]]*"required"' "$R/runner-config.json" || M="$M sandbox:required"`,
-    '  if [ "$OS" = Linux ]; then',
-    `    grep -q '"sandboxed"' "$R/runner-config.json" || M="$M agents.sandboxed"`,
-    `    grep -q '"sandboxCheck"' "$R/runner-config.json" || M="$M sandboxCheck"`,
-    "  fi",
+    `  grep -q '"sandboxed"' "$R/runner-config.json" || M="$M agents.sandboxed"`,
+    `  grep -q '"sandboxCheck"' "$R/runner-config.json" || M="$M sandboxCheck"`,
     `  [ -z "$M" ] || printf 'RUNNER_CONFIG_SANDBOX_MISSING %s in %s; add them to sandbox lanes on this runner\\n' "\${M# }" "$R/runner-config.json"`,
     "  unset M",
     "fi",
@@ -619,7 +618,7 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   };
   const install = (enrollment: EnrollIssue): Promise<Ran | InstallResult> => {
     if (kind === "windows") return installWindows(windowsInstallScript(bundle, req.label, req.listenAddress, enrollment, req.agentCommand, deps.windowsTemplates ?? windowsTemplates()));
-    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates, deps.laneSandbox);
+    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates, deps.laneSandbox, deps.laneSandboxMacos);
     return deps.run(sshArgv(target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   };
   let pass = await install(issue);
