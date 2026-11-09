@@ -9,6 +9,7 @@ import { LANE_SOCKET, serveLaneSocket } from "./lane-socket.ts";
 import { laneGitEffect } from "./lane-git.ts";
 import { localPolicy } from "./local-policy.ts";
 import { queryDispatcher } from "./queries.ts";
+import { checkFileBody } from "./lane-files.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSource } from "../host-guard.ts";
@@ -78,7 +79,10 @@ export const runnerEffects = (deps: {
   "lane.resume": async (command) => deps.lanes.resume(command.body.key),
   "lane.notify": async (command) => deps.lanes.notify(command.body),
   "lane.git": async (command) => laneGitEffect(deps.run, command.body),
-  "lane.recover": async (command) => deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace),
+  "lane.recover": async (command) => {
+    if (command.body.files) checkFileBody(command.body.key, command.body);
+    return deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace, command.body.briefText, command.body.files);
+  },
   "lane.observe": async (command) => deps.lanes.observe(command.body.key),
 });
 
@@ -172,7 +176,10 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const hostProcs = winSample ? () => sampleProcs(run, undefined, false, { sample: winSample.procs, seeds: laneShells }) : () => sampleProcs(run);
     const tracked = trackedConnector(connector);
     let client: RunnerClient | undefined;
-    const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => { client?.publish(type, body); };
+    const publish: ConstructorParameters<typeof RunnerLanes>[0]["publish"] = (type, body) => {
+      if (!client) throw new Error("runner client is not initialized");
+      client.publish(type, body);
+    };
     // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
     const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}) });
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
@@ -197,6 +204,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     });
     // Read-only q.* control frames: answered on this host, never queued or recorded.
     const onQuery = queryDispatcher({
+      files: (key) => runnerLanes.reportFiles(key),
       run, clock: realClock, policy, log, dataPath, os: process.platform,
       lane: (key) => { const r = runnerLanes.records()[key]; return r ? { pane: r.pane, cwd: r.cwd } : undefined; },
       currentPane: async (key, panes) => { const r = runnerLanes.records()[key]; return r ? runnerLanes.currentPane(r, panes) : undefined; },

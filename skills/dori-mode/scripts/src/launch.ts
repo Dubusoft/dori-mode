@@ -15,6 +15,10 @@ import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
+import { briefBody, FILE_FOOTER_HEADING, LaneFileError, prepareLaneBrief } from "./lane-files.ts";
+import { runnerJournalHead } from "./runner/lanes-hub.ts";
+import type { LaneBriefFiles } from "./runner/protocol.ts";
+import type { RecoveryLane } from "./recover.ts";
 
 // The startup check and the pane-shell reader run inside the runner's lane.start now; re-exported for their callers.
 export { paneShell, type PaneShell, screenLines, startupFailure, STARTUP_POLL_MS, STARTUP_POLLS, STARTUP_READY_READS } from "./runner/lane-control.ts";
@@ -151,6 +155,45 @@ export const briefAutoClose = (brief: string): Lane["autoClose"] => {
   throw new LaunchError(`the brief declares autoClose: ${m[1]}; use autoClose: machine (or lead, the default)`);
 };
 
+export const briefDeliverable = (key: string, body: string): boolean => {
+  const match = /^[ \t]*(?:[-*][ \t]+)?`?deliverable:[ \t]*(\S*?)`?[ \t]*$/im.exec(body);
+  if (!match) return false;
+  if ((match[1] ?? "").toLowerCase() === "report") return true;
+  throw new LaunchError(`LANE_DELIVERABLE_INVALID ${key}: the brief declares deliverable: ${match[1] ?? ""}; use deliverable: report or remove the declaration`);
+};
+
+export const prepareLeadLaneBrief = async (deps: FlowDeps, lane: Lane, runId?: string, existing = false): Promise<{
+  readonly briefText: string; readonly files: LaneBriefFiles; readonly notes: readonly string[];
+  readonly autoClose?: Lane["autoClose"]; readonly ghIssue?: string;
+}> => {
+  const file = Bun.file(lane.brief);
+  if (!(await file.exists())) throw new LaunchError(`brief not found: ${lane.brief}`);
+  // Read only enough to recognize a footer after the largest permitted user body.
+  const raw = await file.slice(0, 65536 + Buffer.byteLength(FILE_FOOTER_HEADING) + 2).text();
+  const scannedBody = briefBody(raw);
+  // The separator written before our footer is generated, rather than part of the raw user brief.
+  const body = raw === scannedBody ? scannedBody : scannedBody.replace(/\n$/, "");
+  if (Buffer.byteLength(body) > 65536) throw new LaunchError(`LANE_FILES_LIMIT ${lane.key}: briefBytes is ${Buffer.byteLength(body)}, above 65536; reduce the attachment tree or brief and launch again`);
+  const requiredReport = briefDeliverable(lane.key, body);
+  const autoClose = existing ? lane.autoClose : briefAutoClose(body), ghIssue = existing ? lane.ghIssue : briefIssue(body);
+  const forFooter = { ...lane, autoClose, fileRun: { id: runId ?? deps.newFileRunId?.() ?? randomUUID(), requiredReport } };
+  const briefText = `${body.replace(/\s*$/, "")}\n${footer(forFooter, deps.config.ownerLanguage, deps.config.laneRules)}`;
+  try {
+    return { briefText, ...prepareLaneBrief({ key: lane.key, stateDir: deps.config.stateDir, briefText, rawBriefText: body, requiredReport, runId: forFooter.fileRun.id }), autoClose, ghIssue };
+  } catch (e) {
+    if (e instanceof LaneFileError) throw new LaunchError(e.message);
+    throw e;
+  }
+};
+
+export const recoveryFields = (lane: Partial<RecoveryLane>): Partial<RecoveryLane> => ({
+  pendingFileRun: lane.pendingFileRun, recoveryPending: lane.recoveryPending, recoveryAfter: lane.recoveryAfter,
+  recoveryPreviousPane: lane.recoveryPreviousPane, recoveryExhausted: lane.recoveryExhausted, fileProposal: lane.fileProposal,
+});
+export const restoreFileProposal = async (deps: FlowDeps, key: string, runId: string, prior: Lane): Promise<void> => {
+  await deps.registry.update(key, (current) => current?.pendingFileRun?.id === runId ? { ...current, ...recoveryFields(prior) } : undefined);
+};
+
 /**
  * A brief's `issue:` declaration (a line of its own, optionally a list item): the GitHub issue `owner/repo#N` the lane
  * was started from. CI follow-up closes it with a comment once the lane's PR is merged into ciMergeBase.
@@ -188,6 +231,8 @@ export const RUNNER_LANE_CLI = "~/.dori/runner/bin/dori";
 const hasMergedSignal = (done: string): boolean => splitDone(done).some((part) => /^merged\s/i.test(part.trim()));
 
 export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => [
+  "- Rewritten paths under briefs/<key>.files are read-only snapshots of lead files; do not edit them. Write every output to DORI_LANE_OUT, including updated versions of an attached file.",
+  '- Write report files in DORI_LANE_OUT (POSIX: "$DORI_LANE_OUT"; PowerShell: "$env:DORI_LANE_OUT"). Finish writing before claiming done. dori ships that entire directory to the lead when you run claim-done or report done; files elsewhere are not collected. Keep each file at or below 262144 bytes and the directory at or below 393216 bytes total, with at most 64 files.',
   "- Set a goal restating the deliverable and its end condition (the `Done =` signals below decide the close), and work until it holds without asking leave for reversible steps the brief covers.",
   "- Done: once every `Done =` signal is live and all work is pushed, run the done command below, then stop and stay idle. A lane ends at its green PR: never wait for the merge (no monitor, wait, sleep, polling loop or `gh pr checks --watch` on it). The supervisor merges the PR at the head your claim recorded and the watcher closes the lane after that merge (5 min after the claim when nothing is left to merge) unless the Dori objects; it refuses while a worktree has uncommitted or unpushed changes. On `[LEAD] not done: <reasons>`, fix them and claim again.",
   ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: claim done once the PR is pushed and its CI is running or green. Push nothing after the claim, or claim again if you must."] : []),
@@ -213,6 +258,7 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}`,
+  ...(lane.fileRun?.requiredReport ? ["- This lane declares deliverable: report. Write at least one regular report file in DORI_LANE_OUT before claiming done."] : []),
   ...(lane.machine
     ? [
       `- Runs on machine ${lane.machine} under its runner. Report only with: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
@@ -398,9 +444,14 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   if (!existing) await validateLaunch(deps, input);
   const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which, existing);
   const sandbox = choice.on;
+  // All attachment reads and declaration validation precede reservations, workspace creation and brief writes.
+  const prepared = await prepareLeadLaneBrief(deps, {
+    ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"),
+    brief: input.brief, done: input.done, openedAt: existing?.openedAt ?? iso(deps.clock), ...(input.machine ? { machine: input.machine } : {}),
+  }, undefined, Boolean(existing));
   if (sandbox && !input.machine) await checkLocalSandbox(deps, input.key);
   const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
-  const notes = [...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
+  const notes = [...prepared.notes, ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
   const dir = input.cwd ?? target?.cwd;
   // The runner starts every lane in a directory on its own host; the lead's defaultCwd means nothing on another machine.
@@ -411,23 +462,33 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   let draft: SharedThreadLane = {
     ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), ...(input.machine ? { machine: input.machine } : {}),
     runner: machineRunner(input.machine), runnerAdoptedAt: existing?.runnerAdoptedAt ?? deps.clock.now(),
-    brief: input.brief, done: input.done, ...(existing ? {} : await autoCloseOf(input.brief)),
+    brief: input.brief, done: input.done, autoClose: prepared.autoClose, ghIssue: prepared.ghIssue,
+    ...(!existing ? { fileRun: prepared.files.run } : {}),
     reportVia: "cli" as const, // every lane reports through its runner; an old-footer lane moves onto dori report when recovery relaunches it
     ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
   };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
   let started = false;
+  let proposalPersisted = false;
+  const cmdId = `lane-start:${input.key}:${deps.clock.now()}`;
   try {
-    // A relaunched lane still on a footer an older dori wrote (pane report lines) gets the dori report one.
-    const migrate = Boolean(existing && (!existing.reportVia || (existing.machine && !existing.runner)));
-    const text = await briefFile.text();
-    const body = migrate ? text.slice(0, text.includes(FOOTER_HEADING) ? text.indexOf(FOOTER_HEADING) : undefined) : text;
-    const brief = existing && !migrate ? text : `${body.replace(/\s*$/, "")}\n${footer(draft, deps.config.ownerLanguage, deps.config.laneRules)}`;
+    const brief = prepared.briefText;
+    if (existing) {
+      await deps.registry.update(input.key, (current) => {
+        if (!current || current.closedAt || (current.runner !== undefined && current.runner !== draft.runner)
+          || current.fileRun?.id !== existing.fileRun?.id || current.pendingFileRun?.id !== existing.pendingFileRun?.id)
+          throw new LaunchError(`lane ${input.key} changed during launch preparation`);
+        proposalPersisted = true;
+        return { ...current, runner: draft.runner, pendingFileRun: prepared.files.run, recoveryPending: true,
+          fileProposal: { cmdId, runId: prepared.files.run.id, prior: recoveryFields(current) },
+          recoveryAfter: runnerJournalHead(deps.config.stateDir), recoveryPreviousPane: current.pane };
+      });
+    }
     // The lead-side brief keeps the footer for reference; the runner writes its own copy on the lane's host.
-    if (!existing || migrate) await Bun.write(input.brief, brief);
+    await Bun.write(input.brief, brief);
     const start: StartInput = {
-      key: input.key, briefText: brief, done: input.done, thread: draft.thread, cwd, sandbox, mode, model,
+      key: input.key, cmdId, briefText: brief, files: prepared.files, done: input.done, thread: draft.thread, cwd, sandbox, mode, model,
       keywords: mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords,
       ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
       ...(input.session !== undefined ? { session: input.session } : {}),
@@ -438,6 +499,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     try {
       result = await deps.ops.start(start);
     } catch (error) {
+      const leaf = /(?:LANE_FILES_|LANE_REPORT_)[A-Z_]+ [^\r\n]*/.exec(error instanceof Error ? error.message : String(error))?.[0];
+      if (leaf) throw new LaunchError(leaf);
       // A sandbox refusal started nothing, whatever error shape carried it.
       const refusal = runnerSandboxRefusal(input.key, input.machine, error);
       if (refusal) throw refusal;
@@ -455,18 +518,22 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       throw new LaunchError(`${input.key}: the start may have happened (${error instanceof Error ? error.message : String(error)}); the lane stays reserved and paused: check dori status, or cancel it with dori close ${input.key} --cancelled --reason TEXT`);
     }
     started = true;
-    const lane: Lane = { ...draft, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
+    const lane: Lane = { ...draft, fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
     // A relaunch writes only what this launch changed, so a pause or objection that landed meanwhile survives.
     const launched = (current: Lane): Lane => existing
       ? { ...current, ...Object.fromEntries(Object.entries(lane).filter(([k, v]) => (existing as Record<string, unknown>)[k] !== v)), key: lane.key } as Lane
       : { ...current, ...lane, status: current.status === "paused" ? lane.status : current.status, launchReservation: undefined };
     await deps.registry.update(lane.key, (current) => {
+      if (existing && current?.pendingFileRun?.id !== prepared.files.run.id && current?.fileRun?.id !== prepared.files.run.id) return undefined;
+      if (existing && current?.fileRun?.id === prepared.files.run.id && !current.pendingFileRun) return undefined;
       if (token && current?.launchReservation !== token) throw new LaunchError(`lane ${lane.key} lost its launch reservation`);
-      return current ? launched(current) : lane;
+      const next = current ? launched(current) : lane;
+      return { ...next, pendingFileRun: undefined, fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined };
     });
-    return { lane, notes, startup: startupLine(input.key, result.pane, result.startup) };
+    return { lane: await deps.registry.read(lane.key) ?? lane, notes, startup: startupLine(input.key, result.pane, result.startup) };
   } catch (error) {
     if (token && !started) await deps.registry.releaseReservation(input.key, token);
+    if (existing && proposalPersisted && !started) await restoreFileProposal(deps, input.key, prepared.files.run.id, existing);
     throw error;
   }
 };

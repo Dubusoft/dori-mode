@@ -11,13 +11,15 @@ import { fingerprint, type PendingHello, type Session, type SupervisorAuth } fro
 import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
-  decodeFrame, encodeFrame, LABEL_PATTERN, ProtocolError, supervisorCommand, supervisorControl,
+  decodeFrame, encodeFrame, LABEL_PATTERN, MAX_FRAME_BYTES, ProtocolError, supervisorCommand, supervisorControl,
   type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type InventoryLane, type JsonValue, type LaneStatus,
   type QueryBodies, type QueryType, type RejectCode, type RunnerControl, type RunnerEventBodies, type SupervisorCommandBodies,
   type SupervisorCommandType,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
+import { fileCapabilityDetail, isFileOperation, RunnerUnavailable } from "./call.ts";
+import { checkLaneFilesBody } from "../lane-files.ts";
 
 /**
  * The P1 wiring between the runner modules and the product: the runner's identity file, the supervisor epoch, the hub's
@@ -101,7 +103,7 @@ export const nextEpoch = (stateDir: string): number => {
   }
 };
 
-export type RunnerJournal = { readonly commit: CommitFn; prune(now: number): number; close(): void };
+export type RunnerJournal = { readonly commit: CommitFn; prune(now: number, cursor?: number): number; close(): void };
 
 /**
  * The hub's own journal: the hub commits runner events into `runner_events` of `runners.sqlite` instead of the lead's
@@ -113,7 +115,8 @@ export const openRunnerJournal = (stateDir: string, now: () => number): RunnerJo
   const insert = db.query("INSERT OR IGNORE INTO runner_events (id, line, at) VALUES (?, ?, ?)");
   return {
     commit: (id, line) => insert.run(id, line, now()).changes > 0,
-    prune: (at) => db.query("DELETE FROM runner_events WHERE at < ?").run(at - RUNNER_JOURNAL_RETENTION_MS).changes,
+    // Missing/invalid cursor fails closed: unprocessed durable file bytes never age out.
+    prune: (at, cursor = 0) => db.query("DELETE FROM runner_events WHERE at < ? AND position < ?").run(at - RUNNER_JOURNAL_RETENTION_MS, cursor).changes,
     close: () => { db.close(); },
   };
 };
@@ -137,6 +140,7 @@ export type HubHooks = {
 
 /** `acceptRunners`' stop function, with the operations on live connections. */
 export type RunnerAccept = (() => void) & {
+  checkFileCapability(label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void;
   /** Deletes the label's key, sends `hello.reject RUNNER_REVOKED` and closes its connection; false when it held no key. */
   revoke(label: string): boolean;
   /** Sends `runner.rotate` to the label's connection; returns the cmdId, or undefined when it is not connected. */
@@ -155,6 +159,7 @@ export type RunnerAccept = (() => void) & {
 };
 
 type Connection = {
+  readonly proto: number;
   readonly transport: Transport;
   readonly gen: number;
   readonly send: (frame: Frame) => void;
@@ -183,6 +188,11 @@ type Connection = {
  */
 export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Listener[], hooks: HubHooks): RunnerAccept => {
   const current = new Map<string, Connection>();
+  const checkFileCapability = (label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void => {
+    const connection = current.get(label);
+    if (!connection?.transport.open) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for ${type}`);
+    if (connection.proto === undefined || connection.proto < 5) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(connection.proto));
+  };
   const auth = hooks.auth;
   const head = (label: string, gen: number) => ({ runner: label, gen, epoch: hub.epoch });
   const serve = (transport: Transport): void => {
@@ -191,7 +201,11 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     let phase: "start" | "proof" | "ready" | "done" = "start";
     let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
     const reply = (frame: Frame | undefined): void => {
-      if (frame && transport.open) transport.send(encodeFrame(session ? session.seal(frame) : frame));
+      if (frame && transport.open) {
+        const encoded = encodeFrame(session ? session.seal(frame) : frame);
+        if (Buffer.byteLength(encoded) > MAX_FRAME_BYTES) throw new ProtocolError("frame-too-large", "encoded frame exceeds MAX_FRAME_BYTES");
+        transport.send(encoded);
+      }
     };
     const refuse = (code: RejectCode, detail: string, who: string, gen: number): void => {
       reply(supervisorControl(head(who, gen), "hello.reject", { code, detail }));
@@ -212,7 +226,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       label = hello.body.label;
       phase = "ready";
       const previous = current.get(label);
-      current.set(label, { transport, gen: hello.body.gen, send: reply });
+      current.set(label, { transport, gen: hello.body.gen, proto: hello.body.proto, send: reply });
       if (previous) {
         previous.transport.close("replaced by a newer connection");
         hooks.log(`RUNNER_REPLACED runner=${label} gen=${previous.gen}->${hello.body.gen}`);
@@ -323,8 +337,13 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
   };
   const stops = (Array.isArray(listeners) ? listeners : [listeners as Listener]).map((listener) => listener.onConnection(serve));
   return Object.assign(() => { for (const stop of stops) stop(); }, {
+    checkFileCapability,
     connected: (name: string): boolean => current.get(name)?.transport.open === true,
     command<T extends SupervisorCommandType>(name: string, type: T, body: SupervisorCommandBodies[T]): number | undefined {
+      if (type === "lane.start" || type === "lane.recover") {
+        checkFileCapability(name, type);
+        checkLaneFilesBody((body as { key: string }).key, body);
+      }
       const connection = current.get(name);
       if (!connection?.transport.open) return undefined;
       const cmdSeq = hub.nextCmdSeq(name);
@@ -332,6 +351,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       return cmdSeq;
     },
     control<T extends QueryType>(name: string, type: T, body: QueryBodies[T]): boolean {
+      if (isFileOperation(type)) checkFileCapability(name, type);
       const connection = current.get(name);
       if (!connection?.transport.open) return false;
       connection.send(supervisorControl(head(name, connection.gen), type, body as never) as Frame);
@@ -427,8 +447,12 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
       } else if (row.op === "lane.start" && row.body) {
         // Not connected now: the request stays open and is tried again on the next pass until it expires.
         if (!accept.connected(row.label)) return `RUNNER_ADMIN op=${row.op} runner=${row.label} waiting for the runner`;
-        const cmdSeq = accept.command(row.label, "lane.start", JSON.parse(row.body) as SupervisorCommandBodies["lane.start"]);
-        result = cmdSeq ? `sent cmdSeq=${cmdSeq}` : "not-connected";
+        try {
+          const cmdSeq = accept.command(row.label, "lane.start", JSON.parse(row.body) as SupervisorCommandBodies["lane.start"]);
+          result = cmdSeq ? `sent cmdSeq=${cmdSeq}` : "not-connected";
+        } catch (e) {
+          result = `failed ${e instanceof Error ? e.message : String(e)}`;
+        }
       } else result = `unknown op ${row.op}`;
       db.query("UPDATE runner_admin SET doneAt = ?, result = ? WHERE id = ?").run(now, result, row.id);
       return `RUNNER_ADMIN op=${row.op} runner=${row.label} result=${result}`;

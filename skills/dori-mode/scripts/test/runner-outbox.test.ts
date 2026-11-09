@@ -1,11 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { treeDigest } from "../src/runner/lane-files.ts";
+import { RunnerClient } from "../src/runner/client.ts";
+import { RunnerState } from "../src/runner/state.ts";
+import { memoryPair } from "../src/runner/transport.ts";
+import { encodeFrame, supervisorControl } from "../src/runner/protocol.ts";
 import { join } from "node:path";
 import {
   Outbox, OUTBOX_ACKED_RETENTION_MS, OUTBOX_BODY_CAP, OUTBOX_EVENT_MAX, OUTBOX_FILE, OUTBOX_INLINE_MAX, OutboxEventTooLarge, TRUNCATION_MARKER,
   bodyRefFor, outboxLargeLine, outboxMaintenance,
 } from "../src/runner/outbox.ts";
-import { withState } from "./fakes.ts";
+import { fakeClock, withState } from "./fakes.ts";
 
 const mode = (path: string) => statSync(path).mode & 0o777;
 
@@ -22,6 +28,80 @@ describe("runner outbox", () => {
   afterEach(() => { box.close(); done(); });
 
   const report = (text: string) => ({ key: "k", kind: "progress" as const, text });
+
+  const managed = (text = "done") => {
+    const data = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+    const tree = { directories: ["empty"], files: [{ path: "report.bin", bytes: data.length, base64: data.toString("base64"), sha256: createHash("sha256").update(data).digest("hex") }] };
+    return { key: "lane-a", kind: "done" as const, text, evidence: "\u0000evidence", files: {
+      run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: true }, revision: 1, sha256: treeDigest(tree), tree,
+    } };
+  };
+
+  test("managed done bytes, text and evidence survive source removal, reopen, hydration and ack", () => {
+    const body = managed("é".repeat(32768));
+    const output = join(dir, "briefs/lane-a.out");
+    mkdirSync(output, { recursive: true });
+    writeFileSync(join(output, "report.bin"), Buffer.from(body.files.tree.files[0]!.base64, "base64"));
+    const row = box.append("lane.report", body);
+    expect(row.body).toEqual({ ...body, bodyRef: bodyRefFor(body.text, false) });
+    expect(row.body.bodyRef?.truncated).toBe(false);
+    rmSync(output, { recursive: true });
+    box.close();
+    box = new Outbox(dir, { now: () => at });
+    expect(box.unacked(0)[0]?.body).toEqual(row.body);
+    expect(box.unacked(0)[0]?.body).toEqual(row.body);
+    expect(box.ack(row.seq)).toBe(1);
+    expect(box.unacked(0)).toEqual([]);
+  });
+
+  test("managed event refusal allocates no sequence and never invokes the string fitter", () => {
+    const body = managed();
+    expect(() => box.append("lane.report", { ...body, text: "x".repeat(65537) })).toThrow("LANE_REPORT_LIMIT");
+    expect(() => box.append("lane.report", { ...body, evidence: "x".repeat(16385) })).toThrow("LANE_REPORT_LIMIT");
+    expect(() => box.append("lane.report", { ...body, files: { ...body.files, tree: { directories: [], files: [{ ...body.files.tree.files[0]!, base64: "x".repeat(500000) }] } } })).toThrow("(base64)");
+    // Escaping can exceed the wire cap while every decoded limit passes.
+    const data = Buffer.alloc(262144), more = Buffer.alloc(131072);
+    const tree = { directories: [], files: [data, more].map((buf, i) => ({ path: `p${i}`, bytes: buf.length, base64: buf.toString("base64"), sha256: createHash("sha256").update(buf).digest("hex") })) };
+    expect(() => box.append("lane.report", { ...body, text: "\u0001".repeat(65536), files: { ...body.files, tree, sha256: treeDigest(tree) } })).toThrow("LANE_FILES_FRAME_TOO_LARGE");
+    expect(box.stats().lastSeq).toBe(0);
+    expect(box.append("lane.report", body).seq).toBe(1);
+  });
+
+  test("RunnerClient propagates managed append refusal and offline durable success returns its sequence", () => {
+    const state = new RunnerState(dir, { now: () => at });
+    try {
+      const client = new RunnerClient({ label: "local", hostId: "host" }, {
+        outbox: box, state, clock: fakeClock(at), connect: async () => { throw new Error("offline"); },
+      });
+      expect(() => client.publish("lane.report", managed("x".repeat(65537)))).toThrow("LANE_REPORT_LIMIT");
+      expect(box.stats().lastSeq).toBe(0);
+      expect(client.publish("lane.report", managed())).toBe(1);
+      expect(box.unacked(0)[0]?.body).toEqual(managed());
+    } finally { state.close(); }
+  });
+
+  test("a failed live send after managed append remains durable success with immutable replay bytes", async () => {
+    const state = new RunnerState(dir, { now: () => at });
+    state.boot();
+    const pair = memoryPair(), logs: string[] = [];
+    let fail = false;
+    pair.supervisor.onLine((line) => {
+      if (JSON.parse(line).type === "hello") pair.supervisor.send(encodeFrame(supervisorControl({ runner: "local", gen: 1, epoch: 1 }, "hello.ok", { proto: 5, epoch: 1, eventAck: 0 })));
+    });
+    const client = new RunnerClient({ label: "local", hostId: "host" }, { state, outbox: box, clock: fakeClock(at), log: (line) => logs.push(line),
+      connect: async () => ({ ...pair.runner, send: (line) => { if (fail) throw new Error("send failed"); pair.runner.send(line); } }),
+    });
+    try {
+      const connected = client.connectOnce();
+      await Promise.resolve();
+      pair.pump();
+      expect(await connected).toMatchObject({ ok: true });
+      fail = true;
+      expect(client.publish("lane.report", managed())).toBe(1);
+      expect(logs.at(-1)).toBe("RUNNER_SEND_FAILED seq=1 send failed");
+      expect(box.unacked(0)[0]?.body).toEqual(managed());
+    } finally { pair.sever(); state.close(); }
+  });
 
   test("seq is durable, increasing and never reused after prune", () => {
     expect(box.append("lane.state", { key: "a", status: "idle" }).seq).toBe(1);

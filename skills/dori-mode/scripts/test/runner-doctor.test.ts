@@ -39,15 +39,15 @@ test("without recorded endpoints doctor still checks local runner basics", () =>
 
 test("missing endpoints warn; a healthy runner is OK", () => {
   const s = setup();
-  addRunner(s.stateDir, "worker-a", 3);
+  addRunner(s.stateDir, "worker-a", 4);
   const checks = runnerChecks(s.deps);
   expect(checks.find((c) => c.id === "runner endpoints")?.level).toBe("WARN");
-  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 3, gen 4, restarts1h 0" });
+  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 4, gen 4, restarts1h 0" });
 });
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
   const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "worker-a", 6);
+  addRunner(s.stateDir, "worker-a", 7);
   const ops = openOperations(s.config);
   for (const n of [1, 2, 3]) plan(ops, NOW - n * 60_000, { lane: "runner:worker-a", action: "restart", target: `1-${n}` });
   plan(ops, NOW - 2 * 60 * 60_000, { lane: "runner:worker-a", action: "restart", target: "0-9" });
@@ -56,7 +56,7 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   expect(checks.find((c) => c.id === "runner endpoints")).toMatchObject({ level: "OK", detail: "worker-a=100.101.1.2:7411" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
-  expect(row?.detail).toBe("proto 6 is not 4 or 3; restart circuit open (3 restarts in the last hour)");
+  expect(row?.detail).toBe("proto 7 is not 5 or 4; restart circuit open (3 restarts in the last hour)");
 });
 
 test("a runner whose machine's herdr is down or hung is FAIL with the herdr command for that machine; up is OK", () => {

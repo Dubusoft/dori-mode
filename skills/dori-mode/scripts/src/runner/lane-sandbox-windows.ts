@@ -220,6 +220,7 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
   const work = broad ? [] : [input.cwd, ...(input.gitCommonDir ? [input.gitCommonDir] : [])];
   const localAppData = envValue(input.env, "LOCALAPPDATA");
   const readwritePaths = unique([
+    win32.join(runner, "briefs", `${input.key}.out`),
     input.laneTmp,
     ...[".omo", ".cache", ".dori\\state", ".dori\\heavy", ".npm", ".bun\\install\\cache", ".cargo\\registry", ".cargo\\git"].map((p) => win32.join(h, p)),
     // omo's engine-trust store: %LOCALAPPDATA%\omo on Windows.
@@ -240,6 +241,7 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
     win32.join(runner, "bin"),
     win32.join(runner, "bun"),
     win32.join(runner, "briefs", `${input.key}.md`),
+    win32.join(runner, "briefs", `${input.key}.files`),
     ...(input.tokenFile ? [input.tokenFile] : []),
     // A hook written by a lane would run outside the sandbox at the next git command on the host.
     ...(!broad && input.gitCommonDir ? [win32.join(input.gitCommonDir, "hooks")] : []),
@@ -282,6 +284,7 @@ export const windowsSandboxCheckArgv = (runnerDir: string): string[] =>
 export type SpawnOpts = { readonly env?: Readonly<Record<string, string | undefined>>; readonly verbatim?: boolean };
 
 export type LaneSandboxDeps = {
+  readonly out: (line: string) => void;
   readonly platform: string;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly home: string;
@@ -330,6 +333,7 @@ const realDeps = (): LaneSandboxDeps => ({
     } finally { process.off("SIGINT", ignore); }
   },
   err: (line) => { console.error(line); },
+  out: (line) => { console.log(line); },
 });
 
 const USAGE = "usage: dori lane-sandbox <cmd> [args...] | dori lane-sandbox --check";
@@ -412,6 +416,7 @@ export const laneSandboxWindowsMain = async (args: readonly string[], deps: Part
     const ran = await d.run([wxcExecPath(d.runnerDir), "--probe", "--config", probe], { timeoutMs: 30_000 });
     const why = mxcProbeRefusal(ran.code, ran.out, ran.err);
     if (why) { d.err(`lane-sandbox: ${why}`); return 3; }
+    d.out("DORI_LANE_FILES=1");
     return 0;
   }
   if (args.length === 0) { d.err(USAGE); return 2; }

@@ -89,6 +89,7 @@ test("a sandboxed local lane reaches the runner as lane.start with agentProfile 
   expect(stored).toMatchObject({ pane: "w:p9", tab: "w:t9" });
   expect(stored?.status).toBeUndefined();
   expect(stored?.launchReservation).toBeUndefined();
+  expect(calls[0]?.body.files).toEqual({ run: stored!.fileRun, tree: { directories: [], files: [] }, references: [] });
 });
 
 test("--mode mass-ulw opens with massLaunchKeywords and records the mode; the default is ulw", async () => {
@@ -182,7 +183,8 @@ test("a relaunch keeps the recorded choice: a sandboxed record is checked again,
   expect(starts()[0]?.sandbox).toBe(false);
   expect(r.notes).toContain("SANDBOX_SKIPPED pane-lane: relaunch of a lane recorded without a sandbox");
   expect(world.calls.filter((c) => c[0] === "lane-sandbox")).toEqual([]);
-  const boxed = record({ sandbox: true });
+  const boxed = { ...r.lane, sandbox: true as const };
+  await base.registry.write(boxed);
   await expect(launchLane({ ...base, which: () => null }, { ...input({ cwd: wt }), sandbox: true }, boxed)).rejects.toMatchObject({ code: "SANDBOX_MISSING" });
   const again = await launchLane(base, { ...input({ cwd: wt }), sandbox: true }, boxed);
   expect(starts().at(-1)?.sandbox).toBe(true);

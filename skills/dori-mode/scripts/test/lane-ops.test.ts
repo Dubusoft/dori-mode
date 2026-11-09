@@ -72,6 +72,7 @@ const ALL = {
     "q.stat": () => ({ exists: [true, false] }),
     "q.lane.inspect": () => INSPECTION,
     "q.machine.observe": () => OBSERVATION,
+    "q.lane.files": () => ({}),
   },
 };
 
@@ -87,6 +88,7 @@ describe("laneOps: one runner call per method", () => {
     ["inspect", (o) => o.inspect(local, { git: true, roots: ["/repo"], branches: ["b1"], session: true, sessionsDir: "/s" }),
       { fn: "query", label: LOCAL_RUNNER, type: "q.lane.inspect", body: { key: "demo", cwd: "/repo/demo", git: true, roots: ["/repo"], branches: ["b1"], session: true, sessionsDir: "/s" } }, INSPECTION],
     ["observeMachine", (o) => o.observeMachine("box"), { fn: "query", label: "box", type: "q.machine.observe", body: {} }, OBSERVATION],
+    ["files", (o) => o.files(remote), { fn: "query", label: "box", type: "q.lane.files", body: { key: "far" } }, undefined],
     ["send", (o) => o.send(remote, "hi", { mode: "guarded", refuseWhileAsking: true, inputCheck: false, cmdId: "op:9" }),
       { fn: "call", label: "box", type: "lane.send", body: { key: "far", text: "hi", verify: false, mode: "guarded", refuseWhileAsking: true }, opts: { cmdId: "op:9" } }, "delivered"],
     ["pause", (o) => o.pause(local, "stop"), { fn: "call", label: LOCAL_RUNNER, type: "lane.pause", body: { key: "demo", step: "stop" } },
@@ -104,7 +106,7 @@ describe("laneOps: one runner call per method", () => {
     ["adopt", (o) => o.adopt({ key: "demo", pane: "w1:p1", cwd: "/repo/demo", mode: "ulw", model: "m" }),
       { fn: "call", label: LOCAL_RUNNER, type: "lane.adopt", body: { key: "demo", pane: "w1:p1", mode: "ulw", model: "m", cwd: "/repo/demo" } },
       { pane: "w1:p1", tab: "w1:t1", tokenFile: "/t" }],
-    ["recover", (o) => o.recover(local, { session: "s2" }), { fn: "call", label: LOCAL_RUNNER, type: "lane.recover", body: { key: "demo", session: "s2" } },
+    ["recover", (o) => o.recover(local, { session: "s2" }), { fn: "call", label: LOCAL_RUNNER, type: "lane.recover", body: { key: "demo", session: "s2" }, opts: { cmdId: "recover:demo:1000000" } },
       { pane: "w1:p3", tab: "w1:t3", relaunched: true, resumed: true }],
     ["close", (o) => o.close(remote, { cmdId: "op:3" }), { fn: "call", label: "box", type: "lane.close", body: { key: "far", worktreeChecks: false }, opts: { cmdId: "op:3" } },
       { closed: "tab", gone: true }],
@@ -171,6 +173,24 @@ describe("laneOps: one runner call per method", () => {
 });
 
 describe("laneOps routing", () => {
+  test("start and recover explicitly forward fresh file pairs while files queries the owning runner", async () => {
+    const call = recording(ALL), ops = laneOps(call, clock());
+    const files = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: true }, tree: { directories: [], files: [] }, references: [] };
+    await ops.start({ key: "k", briefText: "body", files, done: "d", thread: "none", cwd: "/repo", sandbox: true, mode: "ulw", model: "m", keywords: "ulw", cmdId: "start" });
+    await ops.recover(remote, { briefText: "fresh", files, cmdId: "recover" });
+    expect(call.seen.map((s) => [s.label, s.type, s.body, "opts" in s ? s.opts : undefined])).toEqual([
+      ["local", "lane.start", { key: "k", briefText: "body", files, done: "d", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0, keywords: "ulw" }, { cmdId: "start" }],
+      ["box", "lane.recover", { key: "far", briefText: "fresh", files }, { cmdId: "recover" }],
+    ]);
+  });
+
+  test("files rejects unknown query fields and malformed nested manifests", async () => {
+    for (const value of [{ files: null }, { extra: true }, { files: { run: {}, tree: {} } }]) {
+      const call = recording({ queries: { "q.lane.files": () => value } });
+      await expect(laneOps(call, clock()).files(remote)).rejects.toThrow("malformed q.result q.lane.files");
+    }
+  });
+
   test("runnerOf prefers Lane.runner, then the machine, then the local runner", () => {
     expect(runnerOf({ runner: "r", machine: "m" })).toBe("r");
     expect(runnerOf({ machine: "m" })).toBe("m");
@@ -195,7 +215,7 @@ describe("laneOps routing", () => {
     await laneOps(call, clock()).start({ key: "k", briefText: "B", done: "d", thread: "t", cwd: "/c", sandbox: false, mode: "mass-ulw", model: "m", keywords: "mass-ulw" });
     expect(call.seen).toEqual([{ fn: "call", label: LOCAL_RUNNER, type: "lane.start", body: {
       key: "k", briefText: "B", done: "d", thread: "t", cwd: "/c", agentProfile: "default", mode: "mass-ulw", model: "m", sandbox: false, expectedLaneGen: 0, keywords: "mass-ulw",
-    } }]);
+    }, opts: { cmdId: "lane-start:k:1000000" } }]);
   });
 
   test("send verifies by default and pause sends no step when none is asked", async () => {

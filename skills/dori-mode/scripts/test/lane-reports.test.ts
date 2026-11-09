@@ -1,9 +1,10 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 
 import { loadConfig } from "../src/config.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { JsonLaneReports, type LaneReportStore, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { JsonLaneReports, type LaneReportStore, putReportRows, readReportRows, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { footer, launchLane } from "../src/launch.ts";
 import { watchTick } from "../src/done-flow.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -56,6 +57,69 @@ test.each(STORES)("%s store: seq counts up per lane, ids carry (lane, generation
     { id: "lane-a:0:2", lane: "lane-a", generation: 0, seq: 2, kind: "blocked", text: "CI down", at: T0 + 2 },
   ]);
   expect(store.list({ lane: "lane-b" })[0]?.evidence).toBe("PR #4");
+});
+
+test.each(STORES)("%s store preserves receipts across reopen and SQLite export/import without storing file bytes", (_name, open) => {
+  const dir = stateDir(), store = open(dir);
+  const fileReceipt = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: true }, revision: 3, sha256: "a".repeat(64) };
+  const row = store.append({ lane: "lane-a", generation: 0, kind: "done", text: "done", at: T0, fileReceipt });
+  store.close();
+  const reopened = _name === "json" ? new JsonLaneReports(dir) : new SqliteLaneReports(join(dir, SQLITE_FILE));
+  cleanups.push(() => reopened.close());
+  expect(reopened.pending()[0]).toEqual(row);
+  expect(Object.keys(row.fileReceipt!)).toEqual(["run", "revision", "sha256"]);
+  const db = new Database(":memory:");
+  try {
+    putReportRows(db, reopened.list());
+    expect(readReportRows(db)).toEqual([row]);
+    expect((db.query("SELECT file_receipt FROM lane_reports").get() as { file_receipt: string }).file_receipt).toBe(JSON.stringify(fileReceipt));
+  } finally { db.close(); }
+});
+
+test("pre-feature SQLite report layouts gain a nullable receipt column and preserve legacy rows", () => {
+  const path = join(stateDir(), "old.sqlite"), db = new Database(path);
+  db.exec("CREATE TABLE lane_reports (id TEXT PRIMARY KEY, lane TEXT, generation INTEGER, seq INTEGER, kind TEXT, text TEXT, evidence TEXT, at INTEGER, consumed_at INTEGER, route TEXT)");
+  db.run("INSERT INTO lane_reports VALUES ('old', 'lane-a', 0, 1, 'done', 'old text', NULL, 1, NULL, NULL)");
+  db.close();
+  const store = new SqliteLaneReports(path);
+  try { expect(store.pending()[0]?.fileReceipt).toBeUndefined(); } finally { store.close(); }
+  const read = new Database(path);
+  try {
+    expect((read.query("PRAGMA table_info(lane_reports)").all() as { name: string; notnull: number }[]).find((c) => c.name === "file_receipt")?.notnull).toBe(0);
+    expect(readReportRows(read)[0]?.text).toBe("old text");
+  } finally { read.close(); }
+});
+
+test("managed done rows without receipts are refused once with the leaf line, never retried or queried", async () => {
+  const dir = stateDir(), world = newWorld(), deps = depsFor(world, fakeClock(T0), dir);
+  const managed = lane(dir, { fileRun: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false } });
+  await deps.registry.write(managed);
+  const store = new JsonLaneReports(dir); cleanups.push(() => store.close());
+  const row = store.append({ lane: managed.key, generation: 0, kind: "done", text: "missing", at: T0 });
+  const journal: [string, string][] = [];
+  const enqueue = (id: string, line: string) => { journal.push([id, line]); };
+  expect(await routeReports(deps, store, enqueue)).toEqual([`LANE_REPORT_ROUTED ${row.id} done journal`]);
+  expect(journal).toEqual([[`lane-report-refused:${row.id}`, "LANE_REPORT_FILES_MISSING local-lane: this managed lane's done report has no file snapshot; claim done again through its runner"]]);
+  expect(store.pending()).toEqual([]);
+  expect(await routeReports(deps, store, enqueue)).toEqual([]);
+  expect(world.ops.filter((op) => op.op === "files")).toEqual([]);
+  expect((await deps.registry.read(managed.key))?.claim).toBeUndefined();
+});
+
+test("a done row for an older lane run is routed late under lane-report-late and consumed", async () => {
+  const dir = stateDir(), world = newWorld(), deps = depsFor(world, fakeClock(T0), dir);
+  const managed = lane(dir, { fileRun: { id: "00000000-0000-4000-8000-000000000002", requiredReport: false } });
+  await deps.registry.write(managed);
+  const store = new JsonLaneReports(dir); cleanups.push(() => store.close());
+  const fileReceipt = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, revision: 1, sha256: "a".repeat(64) };
+  const row = store.append({ lane: managed.key, generation: 0, kind: "done", text: "old run", at: T0, fileReceipt });
+  const journal: [string, string][] = [];
+  const enqueue = (id: string, line: string) => { journal.push([id, line]); };
+  expect(await routeReports(deps, store, enqueue)).toEqual([`LANE_REPORT_ROUTED ${row.id} done late`]);
+  expect(journal.map(([id]) => id)).toEqual([`lane-report-late:${row.id}`]);
+  expect(journal[0]?.[1]).toContain("(from a replaced session)");
+  expect(store.pending()).toEqual([]);
+  expect((await deps.registry.read(managed.key))?.claim).toBeUndefined();
 });
 
 test.each(STORES)("%s report retention removes old consumed rows while keeping pending, recent, and latest rows and sequence continuity", (_name, open) => {

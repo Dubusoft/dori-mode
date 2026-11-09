@@ -13,6 +13,8 @@ import type {
   AnySupervisorControl, JsonValue, LaneInspection, MachineObservation, ProcessInfo, QueryBodies, QueryResults, QueryType, RunnerControlBodies,
 } from "./protocol.ts";
 import { laneStatus } from "./serve.ts";
+import { checkFileBody, LaneFileError } from "./lane-files.ts";
+import type { LaneOutputFiles } from "./protocol.ts";
 
 /**
  * The runner's answers to the supervisor's read-only `q.*` queries (design 0.3, 2.4): control frames that are never
@@ -27,6 +29,7 @@ export const SCREEN_MAX_LINES = 400;
 export type QueryLane = { readonly pane?: string; readonly cwd?: string };
 
 export type QueryDeps = {
+  readonly files?: (key: string) => LaneOutputFiles | undefined;
   readonly currentPane?: (key: string, panes: readonly Pane[]) => Promise<Pane | undefined>;
   readonly run: Runner;
   readonly clock: Clock;
@@ -135,6 +138,11 @@ export const answerQuery = async (deps: QueryDeps, query: AnySupervisorControl):
   const { qid: _qid, ...body } = query.body as { readonly qid: string } & Record<string, unknown>;
   const result: QueryResults[QueryType] = await (async () => {
     switch (query.type) {
+      case "q.lane.files": {
+        if (!deps.files) throw new Error("RUNNER_QUERY_UNSUPPORTED q.lane.files");
+        const files = deps.files((body as Body<"q.lane.files">).key);
+        return files ? { files } : {};
+      }
       case "q.panes": return queryPanes(deps);
       case "q.screen": return queryScreen(deps, body as Body<"q.screen">);
       case "q.process": return queryProcess(deps, body as Body<"q.process">);
@@ -177,9 +185,16 @@ export const queryDispatcher = (deps: QueryDispatchDeps) => (frame: unknown): vo
     return;
   }
   void answerQuery(deps, checked.query).then(
-    (result) => send({ qid, ok: true, detail: "", result }),
+    (result) => {
+      const response = { qid, ok: true, detail: "", result };
+      if (checked.query.type === "q.lane.files") {
+        try { checkFileBody(checked.query.body.key, response); }
+        catch (error) { send({ qid, ok: false, detail: (error as Error).message }); return; }
+      }
+      send(response);
+    },
     (error: unknown) => {
-      const detail = `RUNNER_QUERY_FAILED ${type} ${error instanceof Error ? error.message : String(error)}`.slice(0, 400);
+      const detail = error instanceof LaneFileError ? error.message : `RUNNER_QUERY_FAILED ${type} ${error instanceof Error ? error.message : String(error)}`.slice(0, 400);
       deps.log(`${detail} qid=${qid}`);
       send({ qid, ok: false, detail });
     },

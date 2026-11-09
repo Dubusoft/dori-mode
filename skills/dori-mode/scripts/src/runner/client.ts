@@ -190,6 +190,7 @@ export class RunnerClient {
     try {
       row = this.deps.outbox.append(type, body);
     } catch (error) {
+      if (type === "lane.report" && (body as RunnerEventBodies["lane.report"]).files !== undefined) throw error;
       if (!(error instanceof OutboxEventTooLarge)) throw error;
       this.log(`RUNNER_EVENT_DROPPED type=${type} ${error.message}`);
       return undefined;

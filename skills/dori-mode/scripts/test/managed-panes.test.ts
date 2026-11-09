@@ -9,6 +9,8 @@ import type { Ran } from "../src/run.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, withState } from "./fakes.ts";
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const T0 = 1_800_000_000_000;
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -126,14 +128,14 @@ test("the runner opens a lane tab in tabWorkspace and a relaunch uses the worksp
     },
   });
   const creates = () => herdr.filter((a) => a.slice(0, 3).join(" ") === "herdr tab create");
-  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, tabWorkspace: "wS" });
+  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES, tabWorkspace: "wS" });
   expect(creates()[0]).toEqual(["herdr", "tab", "create", "--workspace", "wS", "--cwd", "/repo", "--label", "lane-a", "--no-focus"]);
   expect(lanes.records()["lane-a"]?.tabWorkspace).toBe("wS");
 
   panes = [];
-  await lanes.recover("lane-a", undefined, "wT");
+  await lanes.recover("lane-a", undefined, "wT", "# fresh brief\n", FILES);
   expect(creates()[1]?.slice(3, 5)).toEqual(["--workspace", "wT"]);
   panes = [];
-  await lanes.recover("lane-a");
+  await lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES);
   expect(creates()[2]?.slice(3, 5)).toEqual(["--workspace", "wT"]);
 });

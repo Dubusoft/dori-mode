@@ -23,12 +23,13 @@ const lower = (paths: readonly string[]): string[] => paths.map((p) => p.toLower
 test("a lane writes only its worktree, git dir, TEMP and the caches; its volumes are read-only and ~/.dori is denied but for what it needs", () => {
   const p = policy({ rw: ["E:\\scratch", ""], verify: "C:\\lead\\state\\verify" });
   expect(p.filesystem.readwritePaths).toEqual([
+    `${RUNNER}\\briefs\\lane-a.out`,
     TMP, `${HOME}\\.omo`, `${HOME}\\.cache`, `${DORI}\\state`, `${DORI}\\heavy`, `${HOME}\\.npm`, `${HOME}\\.bun\\install\\cache`,
     `${HOME}\\.cargo\\registry`, `${HOME}\\.cargo\\git`, `${HOME}\\AppData\\Local\\omo`, "E:\\scratch", "C:\\lead\\state\\verify", WT, GCD, `${RUNNER}\\sock`,
   ]);
   expect(p.filesystem.readonlyPaths).toEqual([
     "C:\\", "D:\\", `${DORI}\\config.json`, `${DORI}\\src`, `${DORI}\\bin`, `${RUNNER}\\bin`, `${RUNNER}\\bun`,
-    `${RUNNER}\\briefs\\lane-a.md`, `${RUNNER}\\briefs\\lane-a.2.token`, `${GCD}\\hooks`,
+    `${RUNNER}\\briefs\\lane-a.md`, `${RUNNER}\\briefs\\lane-a.files`, `${RUNNER}\\briefs\\lane-a.2.token`, `${GCD}\\hooks`,
   ]);
   expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${RUNNER}\\sock\\control`, `${RUNNER}\\sock\\cli`, `${HOME}\\.ssh\\id_ed25519`]);
   for (const paths of [p.filesystem.readwritePaths, p.filesystem.readonlyPaths, p.filesystem.deniedPaths]) {
@@ -75,6 +76,15 @@ test("the agent's environment keeps the pane's, with TEMP, TMP and TMPDIR on the
   expect(env.filter((e) => /^path=/i.test(e))).toEqual(["Path=dup"]);
   expect(env.filter((e) => /^temp=/i.test(e))).toHaveLength(1);
   expect(() => laneEnv({ PATH: "x" }, TMP)).toThrow("SYSTEMROOT and LOCALAPPDATA must be set");
+});
+
+test("output environment is preserved but never authorizes a grant outside the derived own-key directory", () => {
+  const p = policy({ env: { ...ENV, DORI_LANE_OUT: "E:\\untrusted-client-path" } });
+  expect(p.process.env).toContain("DORI_LANE_OUT=E:\\untrusted-client-path");
+  expect(p.filesystem.readwritePaths).toContain(`${RUNNER}\\briefs\\lane-a.out`);
+  expect(p.filesystem.readonlyPaths).toContain(`${RUNNER}\\briefs\\lane-a.files`);
+  expect(p.filesystem.readwritePaths).not.toContain("E:\\untrusted-client-path");
+  expect(p.filesystem.readwritePaths).not.toContain(`${RUNNER}\\briefs\\lane-b.out`);
 });
 
 test("Windows arguments are quoted the way CommandLineToArgvW reads them back", () => {
@@ -134,6 +144,7 @@ const host = (over: { build?: string; probe?: Partial<Ran>; wxc?: boolean; env?:
   const dirs: string[] = [];
   const spawned: { argv: readonly string[]; cwd: string; opts?: SpawnOpts }[] = [];
   const errs: string[] = [];
+  const outs: string[] = [];
   const wxc = wxcExecPath(RUNNER);
   const deps: Partial<LaneSandboxDeps> = {
     platform: "win32", env: over.env ?? ENV, home: HOME, runnerDir: RUNNER, cwd: () => WT,
@@ -156,13 +167,15 @@ const host = (over: { build?: string; probe?: Partial<Ran>; wxc?: boolean; env?:
     copyFile: (from, to) => { files.set(to, `copy of ${from}`); },
     spawn: async (argv, cwd, opts) => { spawned.push(opts ? { argv, cwd, opts } : { argv, cwd }); return 7; },
     err: (line) => { errs.push(line); },
+    out: (line) => { outs.push(line); },
   };
-  return { deps, calls, files, dirs, spawned, errs, wxc };
+  return { deps, calls, files, dirs, spawned, errs, outs, wxc };
 };
 
 test("--check probes the same policy shape a lane gets and refuses an unsupported host with the requirement", async () => {
   const ok = host();
   expect(await laneSandboxWindowsMain(["--check"], ok.deps)).toBe(0);
+  expect(ok.outs).toEqual(["DORI_LANE_FILES=1"]);
   const probeCall = ok.calls.find((c) => c[0] === ok.wxc) ?? [];
   expect(probeCall.slice(1, 3)).toEqual(["--probe", "--config"]);
   const checked = JSON.parse(ok.files.get(probeCall[3] ?? "") ?? "{}");

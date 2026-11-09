@@ -8,6 +8,8 @@ import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { connectUnix, listenUnix } from "../src/runner/unix-transport.ts";
+import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
+import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -18,22 +20,51 @@ const io = () => {
   const err: string[] = [];
   return { out, err, deps: { out: (l: string) => { out.push(l); }, err: (l: string) => { err.push(l); } } };
 };
-const laneSocket = () => {
+const laneSocket = (capture?: () => LaneOutputFiles | undefined) => {
   const net = memoryNetwork();
   const published: [RunnerEventType, unknown][] = [];
-  serveLaneSocket(net.listener, { tokenFor: (key, token) => key === "lane-a" && token === "tok-a" }, (type, body) => { published.push([type, body]); }, () => {});
+  serveLaneSocket(net.listener, { tokenFor: (key, token) => key === "lane-a" && token === "tok-a", ...(capture ? { reportFiles: capture } : {}) }, (type, body) => { published.push([type, body]); }, () => {});
+  const requests: Record<string, unknown>[] = [];
   // The in-memory link delivers on pump(); pumping on each send delivers the request and the socket's reply in order.
   const connect: Connector = async () => {
     const link = await net.connect();
     const pair = net.pairs.at(-1) as (typeof net.pairs)[number];
     return {
-      send: (line) => { link.send(line); pair.pump(); },
+      send: (line) => { requests.push(JSON.parse(line)); link.send(line); pair.pump(); },
       onLine: (h) => link.onLine(h), onClose: (h) => link.onClose(h), close: (reason) => { link.close(reason); },
       get open() { return link.open; },
     } satisfies Transport;
   };
-  return { connect, published };
+  return { connect, published, requests };
 };
+
+test("claim-done and report done share authenticated capture without extra CLI arguments or client file paths", async () => {
+  const tree = { directories: [], files: [] }, files = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, revision: 1, tree, sha256: treeDigest(tree) };
+  let captures = 0;
+  const sock = laneSocket(() => { captures++; return files; });
+  for (const args of [
+    ["claim-done", "lane-a", "--evidence", "same"],
+    ["report", "lane-a", "done", "--text", "same", "--evidence", "same"],
+  ]) {
+    const output = io();
+    expect(await laneCliMain(args, { env, connect: sock.connect, ...output.deps })).toBe(0);
+  }
+  expect(captures).toBe(2);
+  expect(sock.published[0]).toEqual(sock.published[1]);
+  for (const request of sock.requests) {
+    expect(Object.keys(request).sort()).toEqual(["evidence", "key", "kind", "text", "token"]);
+    expect(request).toEqual({ kind: "done", key: "lane-a", token: "tok-a", text: "same", evidence: "same" });
+  }
+});
+
+test("typed capture refusal makes the unchanged CLI exit nonzero with the complete repair message", async () => {
+  const detail = 'DORI_LANE_OUT is empty; write your report to "/runner/briefs/lane-a.out/report.md", then run dori report lane-a done --text "<one line>" --evidence "<summary>"';
+  const sock = laneSocket(() => { throw new LaneFileError("LANE_REPORT_REQUIRED", "lane-a", detail); });
+  const output = io();
+  expect(await laneCliMain(["claim-done", "lane-a", "--evidence", "done"], { env, connect: sock.connect, ...output.deps })).toBe(1);
+  expect(output.err).toEqual([`LANE_REPORT_REQUIRED lane-a: ${detail}`]);
+  expect(sock.published).toEqual([]);
+});
 
 test("a lane reports only for its own key, with its own token", async () => {
   const sock = laneSocket();

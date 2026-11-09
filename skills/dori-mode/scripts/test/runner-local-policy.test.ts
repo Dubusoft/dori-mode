@@ -9,6 +9,8 @@ import { localPolicy } from "../src/runner/local-policy.ts";
 import { checkCommand } from "../src/runner/policy.ts";
 import { fakeClock } from "./fakes.ts";
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const scratch = (): string => {
@@ -45,7 +47,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const policy = localPolicy(cfg, { home, tmp: home });
   const start = {
     cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: repo, agentProfile: "sandboxed",
-    mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, keywords: "ulw set goal and work",
+    mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES, keywords: "ulw set goal and work",
   };
   const frame = (body: object) => ({ v: 1, runner: "local", gen: 1, epoch: 1, cmdSeq: 1, type: "lane.start", body });
   expect(checkCommand(policy, frame(start), realpathSync).ok).toBe(true);
@@ -59,6 +61,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
     runnerDir, clock: fakeClock(0), policy, token: () => "tok", publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     run: async (argv) => {
       calls.push([...argv]);
+      if (argv[0] === "lane-sandbox" && argv.includes("--check")) return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
       if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" } as Ran;
       return { code: 0, out: "", err: "" } as Ran;
     },
@@ -66,7 +69,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const started = await lanes.start(start);
   expect(started.result).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "ok", detail: "ready" } });
   const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
-  expect(command).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} env LANE_SANDBOX_VERIFY=${repo}/state/verify lane-sandbox omo --model m1 --thinking medium 'ulw set goal and work. Read and execute the lane brief at `);
+  expect(command).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")} env LANE_SANDBOX_VERIFY=${repo}/state/verify lane-sandbox omo --model m1 --thinking medium 'ulw set goal and work. Read and execute the lane brief at `);
   expect(lanes.records()["lane-a"]?.profile).toBe("sandboxed");
   // The wrapper's check ran before anything else of the launch.
   expect(calls[0]).toEqual(["lane-sandbox", "--check"]);
@@ -93,7 +96,7 @@ test("a sandboxed lane.start whose sandboxCheck fails is refused sandbox-unavail
   });
   const start = {
     cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: repo, agentProfile: "sandboxed",
-    mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0,
+    mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES,
   };
   await expect(lanes.start(start)).rejects.toThrow("RUNNER_CMD_REJECTED sandbox-unavailable lane-sandbox: bwrap not found on PATH");
   expect(calls).toEqual([["lane-sandbox", "--check"]]);

@@ -6,9 +6,11 @@ import { join } from "node:path";
 import { RunnerAuth } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { runStartupCheck } from "../src/runner/fs-safety.ts";
-import { HUB_FILE, readRunnerRows } from "../src/runner/hub.ts";
+import { HUB_FILE, readRunnerRows, RunnerHub } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { loadIdentity, type ObservedLane, serveRunner, trackedConnector } from "../src/runner/serve.ts";
+import { acceptRunners, drainRunnerAdmin, loadIdentity, type ObservedLane, queueRunnerAdmin, runnerAdminResult, serveRunner, trackedConnector } from "../src/runner/serve.ts";
+import { encodeFrame, MAX_FRAME_BYTES, runnerControl } from "../src/runner/protocol.ts";
+import { memoryNetwork } from "../src/runner/transport.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
@@ -26,6 +28,39 @@ const waiter = <T>() => {
     when: (match: (value: T) => boolean) => new Promise<void>((resolve) => { waiting.push({ match, resolve }); }),
   };
 };
+
+test.each([4, 5])("direct and queued file operations gate admitted proto %i before allocating command sequence", async (proto) => {
+  const tmp = withState(); cleanups.push(tmp.done);
+  const hub = new RunnerHub({ stateDir: tmp.dir, now: () => 1000, monotonic: () => 1000, epoch: 1, commit: () => true });
+  cleanups.push(() => hub.close());
+  const network = memoryNetwork();
+  const accept = acceptRunners(hub, network.listener, { log: () => {} }); cleanups.push(accept);
+  const transport = await network.connect();
+  transport.send(encodeFrame(runnerControl({ runner: "box", gen: 1, epoch: 1 }, "hello", { label: "box", hostId: "host", gen: 1, proto, cmdAck: 0 })));
+  network.pairs[0]!.pump();
+  const start = { cmdId: "s", key: "a", briefText: "", done: "x", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0 } as const;
+  if (proto === 4) {
+    for (const action of [
+      () => accept.command("box", "lane.start", start),
+      () => accept.command("box", "lane.recover", { cmdId: "r", key: "a" }),
+      () => accept.control("box", "q.lane.files", { qid: "q", key: "a" }),
+    ]) expect(action).toThrow("lane files require proto 5 (runner proto 4); run dori runner update");
+    expect(hub.runner("box")?.cmdSeq).toBe(0);
+    expect(network.pairs[0]!.queued()).toBe(0);
+    const id = queueRunnerAdmin(tmp.dir, "lane.start", "box", 1000, start);
+    drainRunnerAdmin(tmp.dir, accept, 1000);
+    expect(runnerAdminResult(tmp.dir, id)).toStartWith("failed RUNNER_UNAVAILABLE runner=box outdated:");
+    expect(drainRunnerAdmin(tmp.dir, accept, 1000)).toEqual([]);
+  } else {
+    expect(accept.command("box", "lane.start", start)).toBe(1);
+    expect(accept.command("box", "lane.recover", { cmdId: "r", key: "a" })).toBe(2);
+    expect(accept.control("box", "q.lane.files", { qid: "q", key: "a" })).toBe(true);
+    expect(network.pairs[0]!.queued()).toBe(3);
+    expect(() => accept.command("box", "lane.start", { ...start, briefText: "x".repeat(786432) })).toThrow("LANE_FILES_FRAME_TOO_LARGE");
+    expect(hub.runner("box")?.cmdSeq).toBe(2);
+    expect(() => accept.command("box", "job.run", { cmdId: "big", opKey: "o", name: "n", command: ["x".repeat(MAX_FRAME_BYTES)], cwd: "/repo", timeoutSec: 1, heavy: false })).toThrow("frame-too-large");
+  }
+});
 
 test("a local runner over the real unix socket says hello, replays its outbox, heartbeats and shows as RUNNER local connected", async () => {
   const state = withState();
@@ -83,7 +118,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 4, gen: 1, heartbeatAgeSec: 0 });
+  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 5, gen: 1, heartbeatAgeSec: 0 });
   // The lane count is the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
   expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · herdr 미확인 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
 

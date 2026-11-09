@@ -29,6 +29,11 @@ test("footer carries the language line only when ownerLanguage is set, for every
     const set = footer(l, "Korean");
     expect(set).toContain("- Write every dori report text and every todo item in Korean; code, commands, commit messages and PR text follow the repo convention.");
     expect(set.replace(/- Write every dori report[^\n]*\n/, "")).toBe(without);
+    const shared = footer(l, "Korean", ["Use repository conventions."]).split("### This lane")[0]!;
+    expect(shared).toContain("briefs/<key>.files are read-only snapshots");
+    expect(shared).toContain("Write every output to DORI_LANE_OUT");
+    expect(shared).toContain("- Use repository conventions.");
+    expect(shared).not.toContain(l.key);
   }
 });
 

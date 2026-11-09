@@ -19,6 +19,7 @@ if [ "${1:-}" = "--check" ]; then
     echo "lane-sandbox: bwrap cannot create a sandbox: ${err//$'\n'/ }" >&2
     exit 3
   fi
+  echo "DORI_LANE_FILES=1"
   exit 0
 fi
 
@@ -85,6 +86,8 @@ opts+=(--ro-bind-try "$H/.dori/runner/sock" "$H/.dori/runner/sock")
 # A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
+opts+=(--dir "$H/.dori/runner/briefs/$key.out")
+opts+=(--ro-bind "$H/.dori/runner/briefs/$key.files" "$H/.dori/runner/briefs/$key.files")
 if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then
   opts+=(--ro-bind-try "$DORI_LANE_TOKEN_FILE" "$DORI_LANE_TOKEN_FILE")
 fi
@@ -100,6 +103,7 @@ for f in /etc/ssh/ssh_config.d/*; do
 done
 
 # Read-write re-binds (after ro ones so nested rw paths win)
+opts+=(--bind "$H/.dori/runner/briefs/$key.out" "$H/.dori/runner/briefs/$key.out")
 for p in "$H/.omo" "$H/.dori/state" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
   "$H/.cargo/registry" "$H/.cargo/git"; do
   opts+=(--bind-try "$p" "$p")

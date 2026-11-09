@@ -15,10 +15,12 @@ import { fakeClock } from "./fakes.ts";
  * DORI_LANE_TOKEN_FILE and re-reads it on every call, no longer finds a valid token (gate review B5, probe E2).
  */
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0 };
+const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES };
 
 const setup = () => {
   const root = mkdtempSync(join(tmpdir(), "runner-stale-session-"));
@@ -83,7 +85,7 @@ test("after a relaunch the old session's unchanged DORI_LANE_TOKEN_FILE is refus
   expect(await t.cli(["report", "lane-a", "progress", "--text", "first session"], oldEnv)).toBe(0);
 
   t.world.panes = []; // the pane is gone; the old agent process may live on outside it (no sandbox)
-  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("started pane=p2 tab=t2");
   const newEnv = t.envOf(t.launches[1] ?? "", "p2");
   expect(newEnv.DORI_LANE_TOKEN_FILE).not.toBe(oldEnv.DORI_LANE_TOKEN_FILE);
   expect(existsSync(oldEnv.DORI_LANE_TOKEN_FILE ?? "")).toBe(false);
@@ -104,7 +106,7 @@ test("an unsandboxed lane started in a target pane is fenced the same way after 
   await t.lanes.start({ ...START, target: { pane: "p9" } });
   const oldEnv = t.envOf(t.launches[0] ?? "", "p9");
   t.world.panes = [];
-  await t.lanes.recover("lane-a");
+  await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES);
   const newEnv = t.envOf(t.launches[1] ?? "", "p1");
   expect(await t.cli(["report", "lane-a", "done", "--text", "from the old target pane"], oldEnv)).toBe(1);
   expect(t.err.at(-1)).toStartWith("RUNNER_LANE_AUTH_FAILED");

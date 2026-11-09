@@ -238,4 +238,5 @@ test("call.ts: cmdId shapes lanes-hub parses, the fail-closed error, and the pro
   expect(NEEDS_PROTO["q.panes"]).toBe(3);
   expect(NEEDS_PROTO["lane.pause"]).toBe(3);
   expect(NEEDS_PROTO["lane.close"]).toBeUndefined();
+  expect([NEEDS_PROTO["lane.start"], NEEDS_PROTO["lane.recover"], NEEDS_PROTO["q.lane.files"]]).toEqual([5, 5, 5]);
 });
