@@ -532,7 +532,8 @@ const NOT_POSIX = /not recognized|is not recognized as|CommandNotFoundException/
 type InstallKind = "posix" | "windows";
 
 const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult => {
-  const detail = (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}`;
+  // PowerShell over a non-tty ssh appends its progress stream to stderr as CLIXML, which hides the real error line.
+  const detail = r.err.trim().split("\n").filter((line) => !/^(#< CLIXML|<Objs )/.test(line.trim())).at(-1) || `exit ${r.code}`;
   const windows = kind === "windows";
   if (r.code === 0) {
     const herdr = [...r.out.matchAll(/^DORI_HERDR (started|managed|unmanaged)$/gm)].at(-1)?.[1] as HerdrInstall | undefined;

@@ -237,6 +237,8 @@ test("each Windows script exit maps to its result code", async () => {
     [{ code: INSTALL_EXIT.noBun, err: "bun checksum mismatch" }, "RUNNER_INSTALL_NO_BUN", "pinned Windows build"],
     [{ code: INSTALL_EXIT.noHerdr }, "RUNNER_INSTALL_NO_HERDR"],
     [{ code: INSTALL_EXIT.enroll, err: "enrollment failed with exit 1" }, "RUNNER_INSTALL_ENROLL_FAILED"],
+    // PowerShell's CLIXML progress records after the real error line are skipped.
+    [{ code: INSTALL_EXIT.enroll, err: "RUNNER_DIR_UNSAFE bin\\dori owner\nenrollment failed with exit 1\n#< CLIXML\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\" RefId=\"0\"></Obj></Objs>" }, "RUNNER_INSTALL_ENROLL_FAILED", "enrollment failed with exit 1"],
     [{ code: INSTALL_EXIT.systemd, err: "task scheduler: Access is denied." }, "RUNNER_INSTALL_FAILED", "task scheduler"],
     // A PowerShell error naming an unknown command is a failure here, not an unsupported shell.
     [{ code: 1, err: "The term 'Expand-Archive' is not recognized as the name of a cmdlet" }, "RUNNER_INSTALL_FAILED"],
