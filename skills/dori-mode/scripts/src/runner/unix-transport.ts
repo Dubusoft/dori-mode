@@ -129,11 +129,13 @@ const assertSocketPathLength = (path: string, platform: NodeJS.Platform): void =
 
 export const listenUnix = (path: string, platform: NodeJS.Platform = process.platform): Listener => {
   assertSocketPathLength(path, platform);
+  const winSockEntry = platform === "win32" && basename(dirname(path)) === RUNNER_PATHS.sock;
   let stale: ReturnType<typeof lstatSync> | undefined;
-  try { stale = lstatSync(path); } catch { stale = undefined; }
-  if (stale) {
-    const winSockEntry = platform === "win32" && basename(dirname(path)) === RUNNER_PATHS.sock;
-    if (!stale.isSocket() && !winSockEntry) throw new Error(`RUNNER_SOCKET_INVALID ${path} exists and is not a socket`);
+  // Bun on Windows can't lstat a socket whose listener died (EACCES), and binding over it fails with EADDRINUSE.
+  let denied = false;
+  try { stale = lstatSync(path); } catch (e) { denied = winSockEntry && (e as NodeJS.ErrnoException).code === "EACCES"; }
+  if (stale || denied) {
+    if (stale && !stale.isSocket() && !winSockEntry) throw new Error(`RUNNER_SOCKET_INVALID ${path} exists and is not a socket`);
     unlinkSync(path);
   }
   const subscribers = new Set<(transport: Transport) => void>();
