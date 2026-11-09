@@ -23,7 +23,7 @@ import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, valid
  * and the others keep running. The per-source last event and error are written to sources-status.json for dori status.
  */
 
-export const BUILTIN_SOURCES = ["discord", "github", "sweeps", "waits", "emit"] as const;
+export const BUILTIN_SOURCES = ["discord", "github", "sweeps", "waits", "emit", "toodo"] as const;
 export type BuiltinSource = (typeof BUILTIN_SOURCES)[number];
 export const SOURCE_TYPES = ["poll", "webhook", "file", "schedule"] as const;
 export type SourceType = (typeof SOURCE_TYPES)[number];
@@ -298,7 +298,7 @@ export class EventSources {
         ...(deps.log ? { log: deps.log } : {}),
       }, deps.schedules);
     }
-    // A built-in no longer in BUILTIN_SOURCES (an old status file's `toodo`, the removed Toodo chat) is dropped.
+    // A built-in no longer in BUILTIN_SOURCES is dropped.
     for (const [name, entry] of Object.entries(readSourceStatus(deps.stateDir)?.sources ?? {})) {
       if (entry.type !== "builtin" || (BUILTIN_SOURCES as readonly string[]).includes(name)) this.status.set(name, entry);
     }

@@ -63,6 +63,9 @@ const URGENT_KINDS = [
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
   "GH_ISSUE * opened", "GH_ISSUE * reopened",
+  // A Toodo task whose last unfinished dependency was just done: the lead may launch it. Plain status changes stay digest,
+  // so the lead's own MCP calls never wake it.
+  "TOODO_TASK_READY",
 ] as const;
 
 /**
@@ -75,6 +78,7 @@ const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED",
+  "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
   // A worker machine without the guard agent, one whose shell cannot run it, or one whose agent is current again,
   // needs no action now.
   "HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT",

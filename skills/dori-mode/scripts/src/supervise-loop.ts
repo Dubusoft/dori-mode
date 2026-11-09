@@ -67,6 +67,7 @@ import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sw
 import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue } from "./event-sources.ts";
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
+import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, openLaneReports, routeReports } from "./lane-reports.ts";
 
@@ -887,6 +888,10 @@ export const supervise = async (
     const enqueueWait = enqueueOf("waits");
     const enqueueGitHub = enqueueOf("github");
     const enqueueDiscord = enqueueOf("discord");
+    const toodoEvents = new ToodoEvents({
+      config: deps.config.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
+      fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
+    });
     const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.config.waitMaxFailures));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
     const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps));
@@ -1163,6 +1168,8 @@ export const supervise = async (
       }
     })();
     tasks = Promise.all([
+      // A long-lived stream, not a pass: it reconnects on its own and is not tracked by the watchdog.
+      toodoEvents.run(halted),
       task("inbound", 5_000, async () => {
         try { await guarded("discord", discordInbound.tick()); } catch (e) { console.error(`INBOUND_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         heartbeat();

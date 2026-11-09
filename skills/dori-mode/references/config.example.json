@@ -28,6 +28,7 @@
   "githubIssueAuthors": [
     "your-github-login"
   ],
+  "toodoEvents": { "url": "http://127.0.0.1:47616", "tokenFile": "~/.local/share/toodo-server/web-token", "enabled": true },
   "discord": {
     "applicationId": "1100000000000000001",
     "guildId": "1100000000000000002",
