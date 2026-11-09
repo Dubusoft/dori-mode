@@ -43,7 +43,11 @@ test("a sandboxed lane gets its own token file, the runner socket, its brief and
   expect(tokenBind).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.md"), join(runner, "sock")]);
+  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "sock")]);
+  const input = join(runner, "briefs", "lane-a.files"), output = join(runner, "briefs", "lane-a.out");
+  expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === input && argv[i + 2] === input)).toBeLessThan(doriRo);
+  expect(argv.findIndex((a, i) => a === "--dir" && argv[i + 1] === output)).toBeLessThan(doriRo);
+  expect(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === output && argv[i + 2] === output)).toBeGreaterThan(doriRo);
   // A worker host's dori lives in bin: bound read-only, never read-write, so a lane cannot rewrite what the runner runs.
   const bin = join(runner, "bin");
   expect(argv.flatMap((a, i) => (argv[i + 1] === bin && argv[i + 2] === bin ? [a] : []))).toEqual(["--ro-bind-try"]);
@@ -112,7 +116,7 @@ test("refreshLaneSandbox replaces an outdated install, keeps the old copy, and l
 /** Runs `lane-sandbox --check` with PATH limited to `bin` (plus the dirs bash needs) and DORI_LANE_KEY unset, like the lead. */
 const check = async (bin: string) => {
   const child = Bun.spawn([Bun.which("bash") ?? "bash", LANE_SANDBOX_TEMPLATE, "--check"], { env: { PATH: bin, HOME: bin }, stdout: "pipe", stderr: "pipe" });
-  return { code: await child.exited, err: await new Response(child.stderr).text() };
+  return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
 };
 const fakeBwrap = (dir: string, body: string): string => {
   const bin = join(dir, "bin");
@@ -133,7 +137,7 @@ test("--check exits 3 with one stderr line when bwrap is not on PATH", async () 
 test("--check exits 0 when bwrap --ro-bind / / true succeeds, even without DORI_LANE_KEY", async () => {
   const dir = tempDir();
   const bin = fakeBwrap(dir, `[ "$*" = "--ro-bind / / true" ] || exit 9`);
-  expect(await check(bin)).toEqual({ code: 0, err: "" });
+  expect(await check(bin)).toEqual({ code: 0, out: "DORI_LANE_FILES=1\n", err: "" });
 });
 
 test("--check exits 3 with bwrap's reason on one line when bwrap cannot create a sandbox", async () => {
@@ -254,6 +258,12 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
 
   const write = (p: string) => allows(sb, "file-write-data", p);
   const read = (p: string) => allows(sb, "file-read-data", p);
+  expect(read(join(runner, "briefs/lane-a.files/input.bin"))).toBe(true);
+  expect(write(join(runner, "briefs/lane-a.files/input.bin"))).toBe(false);
+  expect(read(join(runner, "briefs/lane-a.out/report.md"))).toBe(true);
+  expect(write(join(runner, "briefs/lane-a.out/report.md"))).toBe(true);
+  expect(read(join(runner, "briefs/lane-b.files/input.bin"))).toBe(false);
+  expect(write(join(runner, "briefs/lane-b.out/report.md"))).toBe(false);
   for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null"]) {
     expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
   }
@@ -266,6 +276,28 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   for (const no of [join(home, ".dori", "env"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
+});
+
+test("refresh selects the maintained macOS or Linux template from the injected native platform", () => {
+  for (const platform of ["darwin", "linux"] as const) {
+    const home = tempDir(), installed = installedLaneSandbox(home);
+    mkdirSync(join(home, ".local/bin"), { recursive: true });
+    writeFileSync(installed, "old");
+    expect(refreshLaneSandbox(home, undefined, platform)).toContain(platform === "darwin" ? "lane-sandbox-macos.sh" : "lane-sandbox.sh");
+    expect(readFileSync(installed)).toEqual(readFileSync(platform === "darwin" ? LANE_SANDBOX_MACOS_TEMPLATE : LANE_SANDBOX_TEMPLATE));
+    expect(readFileSync(installed, "utf8")).toContain("DORI_LANE_FILES=1");
+  }
+});
+
+test("Linux non-try input binding refuses a missing managed source", async () => {
+  const home = tempDir(), work = join(home, "work");
+  mkdirSync(work);
+  const bin = fakeBwrap(home, 'while [ "$#" -gt 0 ]; do case "$1" in --ro-bind) case "$2" in *.files) [ -d "$2" ] || exit 9 ;; esac ;; esac; shift; done');
+  const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "true"], {
+    cwd: work, env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, DORI_LANE_KEY: "lane-a" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  expect(await child.exited).toBe(9);
+  expect(await new Response(child.stderr).text()).toBe("");
 });
 
 test("macOS: every path reaches the profile resolved (as /var does to /private/var), and only as a -D parameter", async () => {
@@ -315,7 +347,7 @@ test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a m
   const passing = join(root, "passing-sandbox-exec");
   writeFileSync(passing, `#!/bin/sh\nprintf '%s\\0' "$@" > "${argvFile}"\n`);
   chmodSync(passing, 0o755);
-  expect(await runMacos(home, wt, ["--check"], {}, passing)).toEqual({ code: 0, out: "", err: "" });
+  expect(await runMacos(home, wt, ["--check"], {}, passing)).toEqual({ code: 0, out: "DORI_LANE_FILES=1\n", err: "" });
   const argv = readFileSync(argvFile, "utf8").split("\0").slice(0, -1);
   expect(argv[0]).toBe("-p");
   expect(argv[1]).toContain("(deny file-write*)");

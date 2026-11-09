@@ -4,7 +4,9 @@ import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, closeRunning, type FlowDeps, finishedReason } from "./done-flow.ts";
-import { LaunchError, laneTabWorkspace, launchLane, SandboxRefusal, startupLine } from "./launch.ts";
+import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
+import { runnerJournalHead } from "./runner/lanes-hub.ts";
+import { checkLaneFilesBody } from "./lane-files.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
@@ -24,6 +26,12 @@ export type RecoveryEnqueue = (line: string, id: string) => Promise<void>;
 
 /** Lane record fields recovery keeps (the registry stores whatever the record carries). */
 export type RecoveryLane = Lane & {
+  /** Durable command identity and rollback state for an unresolved replacement. */
+  readonly fileProposal?: {
+    readonly cmdId: string;
+    readonly runId?: string;
+    readonly prior: Partial<RecoveryLane>;
+  };
   /** Every recovery attempt failed; LANE_RECOVERY_EXHAUSTED was sent once. Cleared when the lane is confirmed again. */
   readonly recoveryExhausted?: boolean;
   /** A session a recovery tried to resume and could not; the next attempt starts from the brief. */
@@ -144,13 +152,20 @@ export const barShowsModel = (screen: string, expected: string): boolean => {
 
 const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promise<string[]> => {
   const current = await deps.registry.read(lane.key);
-  if (!current || statusOf(current) !== "working" || current.pane !== lane.pane || current.model !== lane.model) return [];
+  if (!current || current.pendingFileRun || statusOf(current) !== "working" || current.pane !== lane.pane || current.model !== lane.model) return [];
   lane = current;
   // The runner closed the replaced pane's tab itself (lane.recover / lane.close); this only confirms it is gone.
   const previous = lane.recoveryPreviousPane;
   const left = previous && previous !== lane.pane && (await deps.ops.panes(lane.machine)).some((pane) => pane.pane_id === previous)
     ? [`LANE_RECOVERY_WARN ${lane.key} the replaced pane ${previous} is still open; close it by hand`] : [];
-  await deps.registry.patch<RecoveryLane>(lane.key, { recoveryPending: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined });
+  let confirmed = false;
+  await deps.registry.update(lane.key, (fresh) => {
+    if (!fresh || fresh.closedAt || fresh.pendingFileRun || fresh.pane !== current.pane || fresh.fileRun?.id !== current.fileRun?.id
+      || statusOf(fresh) !== "working") return undefined;
+    confirmed = true;
+    return { ...fresh, recoveryPending: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined };
+  });
+  if (!confirmed) return [];
   const event = `LANE_RECOVERED ${lane.key} ${lane.pane} ${reason}`;
   const hook = deps.config.hooks.threadReply;
   if (hook && lane.thread !== "none") {
@@ -167,6 +182,7 @@ const unknownToRunner = (error: unknown): boolean => error instanceof LaneOpsErr
 
 /** Starts the lane again from its brief through its runner (`lane.start`, launchLane with the stored record). */
 const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined): Promise<Relaunched> => {
+  lane = stored;
   const cwd = lane.machine ? lane.remoteCwd : lane.cwd;
   const launched = await launchLane(deps, {
     key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, thread: lane.thread,
@@ -176,29 +192,44 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
     ...(lane.sandbox ? { sandbox: true as const } : {}),
     ...(session !== undefined ? { session } : {}),
   }, stored);
-  return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined, notes: launched.notes };
+  return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined,
+    notes: launched.notes.filter((note) => /^(?:LANE_FILE_NOT_SHIPPED|LANE_FILES_SKIPPED|SANDBOX_SKIPPED) /.test(note)) };
 };
 
 /**
  * A lane whose pane or agent is gone: its runner relaunches it from its own record (`lane.recover`, which closes the
  * dead pane's tab and keeps the lane token's brief and profile). A runner that has no record of the lane starts it anew.
  */
-const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined): Promise<Relaunched> => {
+const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined,
+  prepared: Awaited<ReturnType<typeof prepareLeadLaneBrief>>, cmdId: string, prior: Lane): Promise<Relaunched> => {
   let r;
   try {
     // A local relaunch opens its new tab in the lanes workspace as it is now (herdr may have renumbered it since the start).
     const tabWorkspace = lane.machine ? undefined : await laneTabWorkspace(deps, (line) => { console.error(line); });
-    r = await deps.ops.recover(stored, { ...(session !== undefined ? { session } : {}), ...(tabWorkspace ? { tabWorkspace } : {}) });
+    r = await deps.ops.recover(stored, { briefText: prepared.briefText, files: prepared.files, cmdId,
+      ...(session !== undefined ? { session } : {}), ...(tabWorkspace ? { tabWorkspace } : {}) });
   } catch (error) {
-    if (unknownToRunner(error)) return startAgain(deps, lane, stored, session);
+    if (unknownToRunner(error)) {
+      await restoreFileProposal(deps, lane.key, prepared.files.run.id, prior);
+      const fresh = await deps.registry.read(lane.key);
+      if (!fresh) throw new LaunchError(`lane ${lane.key} disappeared during recovery`);
+      return startAgain(deps, lane, fresh, session);
+    }
+    if (error instanceof LaneOpsError && (error.code === "LANE_OP_FAILED" || error.code === "RUNNER_OUTDATED"
+      || (error.code === "RUNNER_UNAVAILABLE" && error.detail.startsWith("disconnected"))))
+      await restoreFileProposal(deps, lane.key, prepared.files.run.id, prior);
     throw error;
   }
-  const moved = await deps.registry.patch<RecoveryLane>(lane.key, { pane: r.pane, ...(r.tab ? { tab: r.tab } : {}) });
-  const next: Lane = moved ?? { ...stored, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}) };
+  const moved = await deps.registry.update(lane.key, (current) => {
+    if (!current || current.closedAt || current.pendingFileRun?.id !== prepared.files.run.id) return undefined;
+    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}),
+      fileRun: r.relaunched ? prepared.files.run : current.fileRun, pendingFileRun: undefined, fileProposal: undefined };
+  });
+  const next: Lane = moved ?? await deps.registry.read(lane.key) ?? stored;
   // A live lane the runner left alone: its record had the pane the registry lost.
-  if (!r.relaunched) return { lane: next, ok: true, resumed: false };
+  if (!r.relaunched) return { lane: next, ok: true, resumed: false, notes: prepared.notes };
   const startup = r.startup ? startupLine(lane.key, r.pane, r.startup) : `STARTUP_UNCONFIRMED ${lane.key} ${r.pane}: the runner gave no startup verdict`;
-  return { lane: next, startup, ok: r.startup?.verdict === "ok", resumed: r.resumed };
+  return { lane: next, startup, ok: r.startup?.verdict === "ok", resumed: r.resumed, notes: prepared.notes };
 };
 
 const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue | undefined, view: SweepView): Promise<string[]> => {
@@ -237,6 +268,8 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   // A running close takes the pane's tab down before it writes the lane closed: that missing pane is not relaunched.
   if (closeRunning(deps, lane.key)) return [];
   const current: RecoveryLane = read;
+  // An unresolved proposal may still start. Its journal/result must settle before a new recovery.
+  if (current.pendingFileRun) return [];
   // A lane whose work is finished (Done signals hold, PR merged) is never relaunched: close it, or leave it for the close.
   const finished = await finishedReason(deps, current);
   if (finished) {
@@ -261,23 +294,38 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   const now = deps.clock.now();
   // Resume the lane's own session when the registry has one, so it continues its work instead of restarting from the brief.
   const session = current.recoveryResumeFailed !== current.session && resumeCommand(deps.config.agentCommand, current.session) ? current.session : undefined;
+  const prepared = await prepareLeadLaneBrief(deps, current, undefined, true);
+  const cmdId = `recover:${lane.key}:${now}`;
+  checkLaneFilesBody(lane.key, { cmdId, key: lane.key, briefText: prepared.briefText, files: prepared.files, ...(session ? { session } : {}) });
   const pending = (fresh: RecoveryLane): Partial<RecoveryLane> => ({
     ...(session ? {} : { session: undefined, sessionVia: undefined }),
     recoveryAttempts: (fresh.recoveryAttempts ?? 0) + 1, lastRecoveryAt: now, recoveryPending: true,
+    runner: current.runner ?? machineRunner(current.machine), pendingFileRun: prepared.files.run,
+    fileProposal: { cmdId, runId: prepared.files.run.id, prior: recoveryFields(fresh) },
+    recoveryAfter: runnerJournalHead(deps.config.stateDir),
     ...(old ? { recoveryPreviousPane: old.pane_id } : {}),
   });
-  const stored = (await deps.registry.patch<RecoveryLane>(lane.key, pending)) ?? { ...current, ...pending(current) };
+  let admitted = false;
+  const stored = await deps.registry.update(lane.key, (fresh) => {
+    if (!fresh || fresh.closedAt || statusOf(fresh) !== "working" || fresh.pane !== current.pane
+      || fresh.model !== current.model || fresh.runner !== current.runner || fresh.fileRun?.id !== current.fileRun?.id
+      || fresh.pendingFileRun) return undefined;
+    admitted = true;
+    return { ...fresh, ...pending(fresh) };
+  });
+  if (!admitted || !stored) return [];
   let relaunched: Relaunched;
   if (old && reason !== "agent-gone") {
     // A live agent on the wrong model: the runner leaves a live lane alone, so the lane is closed and started again.
     await deps.ops.close(stored);
-    relaunched = await startAgain(deps, lane, stored, session);
+    await restoreFileProposal(deps, lane.key, prepared.files.run.id, current);
+    relaunched = await startAgain(deps, lane, await deps.registry.read(lane.key) ?? stored, session);
   } else {
-    relaunched = await runnerRecover(deps, lane, stored, session);
+    relaunched = await runnerRecover(deps, lane, stored, session, prepared, cmdId, current);
   }
   // A relaunch that runs without a sandbox (a lane recorded without one) is said to the owner and the lead every time.
   const skipped = (relaunched.notes ?? []).filter((note) => note.startsWith("SANDBOX_SKIPPED"));
-  const unsandboxed = [...skipped, ...await postSkippedNotices(deps, lane, skipped)];
+  const unsandboxed = [...(relaunched.notes ?? []), ...await postSkippedNotices(deps, lane, skipped)];
   if (!relaunched.ok) {
     const startup = relaunched.startup ?? `STARTUP_UNCONFIRMED ${lane.key} -`;
     if (!session) return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed`, ...unsandboxed];

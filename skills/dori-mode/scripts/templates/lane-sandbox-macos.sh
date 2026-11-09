@@ -98,6 +98,9 @@ build_profile() {
     case "$p" in runner-brief) r "$H/.dori/runner/briefs/$key.md" ;; *) r "$H/$p" ;; esac
   done
   if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then r "$DORI_LANE_TOKEN_FILE"; fi
+  r "$H/.dori/runner/briefs/$key.files"
+  r "$H/.dori/runner/briefs/$key.out"
+  w "$H/.dori/runner/briefs/$key.out"
 
   param DORI "$H/.dori"
   param DORI_RUNNER "$H/.dori/runner"
@@ -138,6 +141,7 @@ if [ "${1:-}" = "--check" ]; then
     echo "lane-sandbox: sandbox-exec cannot create a sandbox: ${err//$'\n'/ }" >&2
     exit 3
   fi
+  echo "DORI_LANE_FILES=1"
   exit 0
 fi
 

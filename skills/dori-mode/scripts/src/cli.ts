@@ -499,7 +499,14 @@ if (process.argv[2] === "runner") {
     const ops = laneOps(cliRunnerCall(cliSocketPath(defaultRunnerDir())), { now: realClock.now, log: (line) => { console.error(line); } });
     try {
       const lines = await evacuate({
-        hub: { registry: new Registry(cfg.stateDir), reports: () => store, now: realClock.now, emit: (_id, line) => { console.log(line); }, recover: () => undefined },
+        hub: {
+          stateDir: cfg.stateDir, registry: new Registry(cfg.stateDir), reports: () => store,
+          now: realClock.now, emit: (_id, line) => { console.log(line); },
+          // Evacuation imports events without dispatching inventory recovery. Like the supervisor's
+          // absent-inventory path, preparation carries no attachments.
+          prepareRecovery: async (_label, key) => ({ cmdId: `recover:${key}:${realClock.now()}`, notes: [] }),
+          recover: () => undefined,
+        },
         exportOutbox: async () => {
           const r = await run(sshArgv(sshTarget, remoteRunnerCli("runner export-outbox", await kindOf())), { timeoutMs: 30_000 });
           if (r.code !== 0) throw new Error(`export-outbox exit ${r.code}: ${(r.err || r.out).trim().split("\n").at(-1) ?? ""}`);

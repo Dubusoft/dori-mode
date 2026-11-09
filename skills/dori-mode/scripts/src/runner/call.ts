@@ -2,6 +2,7 @@ import type {
   AnyRunnerEvent, CommandResults, CommandStatusState, DurableCommandType, QueryBodies, QueryResults, QueryType, RunnerControl, SupervisorCommandBodies,
 } from "./protocol.ts";
 import type { RunnerAccept } from "./serve.ts";
+import { checkLaneFilesBody } from "../lane-files.ts";
 
 /**
  * The supervisor's awaitable runner calls (design D6): durable effects await their `cmd.result` by `cmdId`, read-only
@@ -49,10 +50,16 @@ export const COMMAND_TIMEOUTS: Partial<Record<DurableCommandType, number>> = {
 
 /** The lowest proto that carries each type; anything not listed is proto 2 (today's commands). */
 export const NEEDS_PROTO: Partial<Record<DurableCommandType | QueryType, number>> = {
+  "lane.start": 5, "lane.recover": 5, "q.lane.files": 5,
   "lane.adopt": 3, "lane.pause": 3, "lane.resume": 3, "lane.notify": 3, "lane.git": 3,
   "q.panes": 3, "q.screen": 3, "q.process": 3, "q.stat": 3, "q.lane.inspect": 3, "q.machine.observe": 3,
   "host.herdr": 4,
 };
+export const isFileOperation = (type: string): type is "lane.start" | "lane.recover" | "q.lane.files" =>
+  type === "lane.start" || type === "lane.recover" || type === "q.lane.files";
+export const fileCapabilityDetail = (proto: number | undefined): string => proto === undefined
+  ? "lane files require proto 5 (runner proto unknown); run dori runner update, wait for its hello, and retry"
+  : `lane files require proto 5 (runner proto ${proto}); run dori runner update`;
 
 /**
  * A new cmdId. `lane-start:<key>:<ms>` and `recover:<key>:<ms>` keep the shapes lanes-hub.ts parses; every other type
@@ -129,6 +136,7 @@ export class RunnerCalls implements RunnerCall {
     if (!this.deps.accept.connected(label)) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for ${type}`);
     const need = NEEDS_PROTO[type];
     const proto = this.deps.proto(label);
+    if (isFileOperation(type) && (proto === undefined || proto < 5)) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(proto));
     if (need !== undefined && proto !== undefined && proto < need) {
       throw new RunnerUnavailable(label, "outdated", `${type} needs runner proto ${need}, the runner speaks ${proto}`);
     }
@@ -140,6 +148,7 @@ export class RunnerCalls implements RunnerCall {
     this.gate(label, type);
     this.n += 1;
     const cmdId = opts.cmdId ?? newCmdId(type, (body as { key?: string }).key, this.deps.now(), this.n);
+    if (type === "lane.start" || type === "lane.recover") checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
     const timeoutMs = opts.timeoutMs ?? COMMAND_TIMEOUTS[type] ?? CALL_TIMEOUT_MS;
     const answer = new Promise<CmdResultBody>((resolve, reject) => {
       const waiter: Waiter<CmdResultBody> = { label, resolve, reject, timer: undefined };
@@ -154,7 +163,13 @@ export class RunnerCalls implements RunnerCall {
     const key = (body as { key?: string }).key;
     const recorded = ATTEMPT_TYPES.has(type) && this.deps.attempts !== undefined;
     if (recorded) this.deps.attempts?.record(label, type, cmdId, key, body);
-    const sent = this.deps.accept.command(label, type, { ...body, cmdId } as SupervisorCommandBodies[T]);
+    let sent;
+    try { sent = this.deps.accept.command(label, type, { ...body, cmdId } as SupervisorCommandBodies[T]); }
+    catch (e) {
+      if (recorded) this.deps.attempts?.settle(label, cmdId);
+      this.rejectCmd(cmdId, label, e instanceof Error ? e : new Error(String(e)));
+      return answer.then(() => { throw e; });
+    }
     if (sent === undefined) {
       if (recorded) this.deps.attempts?.settle(label, cmdId);
       this.rejectCmd(cmdId, label, new RunnerUnavailable(label, "disconnected", `${type} was not sent`));
@@ -179,7 +194,14 @@ export class RunnerCalls implements RunnerCall {
         reject(new RunnerUnavailable(label, "timeout", `no q.result for ${type} ${qid} within ${timeoutMs} ms`));
       }, timeoutMs);
     });
-    if (!this.deps.accept.control(label, type, { ...body, qid } as QueryBodies[T])) {
+    let sent;
+    try { sent = this.deps.accept.control(label, type, { ...body, qid } as QueryBodies[T]); }
+    catch (e) {
+      const waiter = this.queryWaiters.get(qid);
+      if (waiter) { this.deps.timers.clear(waiter.timer); this.queryWaiters.delete(qid); }
+      throw e;
+    }
+    if (!sent) {
       const waiter = this.queryWaiters.get(qid);
       if (waiter) { this.deps.timers.clear(waiter.timer); this.queryWaiters.delete(qid); }
       answer.catch(() => undefined);

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { askingLine } from "../ask-user.ts";
@@ -10,6 +11,10 @@ import { type AttemptRow, HUB_FILE } from "./hub.ts";
 import { LOCAL_RUNNER } from "./serve.ts";
 import type { Lane, Registry } from "../registry.ts";
 import { journalId, type AnyRunnerEvent, type CommandStatusState, type InventoryLane } from "./protocol.ts";
+import type { LaneBriefFiles, LaneFileReceipt } from "./protocol.ts";
+import { installLaneReports, invalidFiles, LaneFileError, validateLaneOutput, checkLaneFilesBody, checkLaneReportText } from "../lane-files.ts";
+import { RunnerUnavailable } from "./call.ts";
+import { recoveryFields } from "../launch.ts";
 
 /**
  * The supervisor side of runner-owned lanes (design 4.4, 4.5, 5.7).
@@ -52,14 +57,25 @@ import { journalId, type AnyRunnerEvent, type CommandStatusState, type Inventory
  * on its next pass and stores it then. Everything done with an event is idempotent (a report's `source`, stable ids).
  */
 
+export type PreparedLaneRecovery = {
+  readonly cmdId: string;
+  // Hello recovery has no runner record and sends no attachments (addendum 9).
+  readonly briefText?: string;
+  readonly files?: LaneBriefFiles;
+  readonly notes: readonly string[];
+};
 export type LaneHubDeps = {
+  readonly stateDir: string;
+  readonly newFileRunId?: () => string;
+  readonly fileStep?: (name: string) => void;
+  readonly prepareRecovery: (label: string, key: string, runId: string) => Promise<PreparedLaneRecovery>;
   readonly registry: Pick<Registry, "read" | "open" | "update">;
   readonly reports: () => LaneReportStore | undefined;
   /** Journals a line under a stable id. */
   readonly emit: (id: string, line: string) => void;
   readonly now: () => number;
   /** Sends a command to the runner; undefined when it is not connected. */
-  readonly recover: (label: string, key: string) => number | undefined;
+  readonly recover: (label: string, key: string, prepared: PreparedLaneRecovery) => number | undefined;
   /** Sends `lane.close` for `key` to the runner under `cmdId`; undefined when it is not connected. */
   readonly close?: (label: string, key: string, cmdId: string) => number | undefined;
   /** The runner journal's newest position (0 when empty); a recovery records it so older journaled starts stay stale. */
@@ -93,7 +109,10 @@ const LANE_START_CMD = /^lane-start:([^:]+):\d+$/;
 /** The cmdId prefix supervise-loop.ts gives a `lane.recover`: `recover:<key>:<ms>`. */
 const RECOVER_CMD = /^recover:([^:]+):\d+$/;
 
-const oneLine = (text: string): string => text.replace(/\s+/g, " ").slice(0, 200);
+const oneLine = (text: string): string => {
+  const flat = text.replace(/\s+/g, " ");
+  return /\bLANE_[A-Z_]+\b/.test(flat) ? flat : flat.slice(0, 200);
+};
 
 /** The journal column laneEventsAfter orders by: `position`, or `rowid` in a journal from before that column. */
 const positionColumn = (db: Database): string =>
@@ -143,6 +162,17 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
     // A refused or failed lane.start leaves a registered lane with no agent: the lead has to hear of it.
     const b = frame.body;
     if (b.state !== "failed") return;
+    const failedKey = RECOVER_CMD.exec(b.cmdId)?.[1] ?? LANE_START_CMD.exec(b.cmdId)?.[1];
+    let retired = false;
+    if (failedKey) await deps.registry.update(failedKey, (current) => {
+      const lane = current as RecoveryLane | null;
+      const proposal = lane?.fileProposal;
+      if (!lane || lane.closedAt || lane.runner !== label || !proposal || proposal.cmdId !== b.cmdId
+        || lane.pendingFileRun?.id !== proposal.runId) return undefined;
+      // The final result proves this proposal did not start. Never retire a newer writer's pending run.
+      retired = true;
+      return { ...lane, ...recoveryFields(proposal.prior) };
+    });
     const recoverKey = RECOVER_CMD.exec(b.cmdId)?.[1];
     if (recoverKey) {
       // A failed lane.recover leaves the lane recoveryPending with no agent the runner knows of.
@@ -154,7 +184,7 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
     const key = LANE_START_CMD.exec(b.cmdId)?.[1];
     if (!key) return;
     const lane = await deps.registry.read(key);
-    if (!lane || lane.closedAt || lane.runner !== label || lane.pane) return;
+    if (!lane || lane.closedAt || lane.runner !== label || (lane.pane && !retired)) return;
     deps.emit(`runner-launch-failed:${label}:${frame.seq}`, `RUNNER_LAUNCH_FAILED ${key} runner=${label} ${oneLine(b.detail)}; the lane has no agent: fix the runner, dori close ${key} --cancelled and launch again`);
     return;
   }
@@ -181,14 +211,20 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
     if (lr.pane && !lr.recoveryPending && lr.pane !== b.pane) return;
     // A start journaled before the hello that asked for the recovery is not the recovery's.
     if (lr.recoveryPending && position !== undefined && lr.recoveryAfter !== undefined && position <= lr.recoveryAfter) return;
+    if ((lane.fileRun || lane.pendingFileRun) && (!b.fileRun || ![lane.fileRun?.id, lane.pendingFileRun?.id].includes(b.fileRun.id))) return;
+    if (b.fileRun && (b.fileRun.requiredReport !== (b.fileRun.id === lane.pendingFileRun?.id ? lane.pendingFileRun : lane.fileRun)?.requiredReport)) return;
     // A start or a recovery: either way the lane runs again, so a pending recovery (reconcileInventory) is over.
     // A launch that gave up waiting (launchUnconfirmed) left its reservation paused: this start confirms it.
     const late = Boolean(lane.launchReservation && lane.launchUnconfirmed);
-    await patch(deps, key, {
+    await deps.registry.update(key, (current) => {
+      if (!current || current.closedAt || current.runner !== label
+        || (b.fileRun && ![current.fileRun?.id, current.pendingFileRun?.id].includes(b.fileRun.id))) return undefined;
+      return { ...current,
       pane: b.pane, tab: b.tab, ...(b.session ? { session: b.session } : {}),
-      recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined,
+      ...(b.fileRun ? { fileRun: b.fileRun, pendingFileRun: undefined } : {}),
+      fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined,
       ...(late ? { status: undefined, launchReservation: undefined, launchUnconfirmed: undefined } : {}),
-    });
+    }; });
     if (late) deps.emit(`launch-confirmed-late:${label}:${frame.seq}`, `LAUNCH_CONFIRMED_LATE ${key} runner=${label} pane=${b.pane} the runner started the lane after its launch stopped waiting; the reservation is released and the lane is working`);
     return;
   }
@@ -223,9 +259,33 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
   const store = deps.reports();
   if (!store) throw new Error(`RUNNER_REPORT_UNSTORED no lane report store for ${key}`);
   const b = frame.body;
+  let fileReceipt: LaneFileReceipt | undefined;
+  try {
+    if (b.files && b.kind !== "done") throw invalidFiles(key, "report-kind");
+    if (b.kind === "done") {
+      if (lane.closedAt || (b.files && b.files.run.id !== lane.fileRun?.id)) {
+        deps.emit(`lane-report-late:${label}:${frame.seq}`, `LANE_REPORT_LATE ${key} done ${oneLine(b.text)} (from a replaced session)`);
+        return;
+      }
+      if (lane.fileRun && !b.files) throw new LaneFileError("LANE_REPORT_FILES_MISSING", key, "this managed lane's done report has no file snapshot; claim done again through its runner");
+      if (b.files && lane.fileRun) {
+        validateLaneOutput(key, b.files, lane.fileRun);
+        checkLaneReportText(key, b.text, b.evidence);
+        checkLaneFilesBody(key, b);
+        fileReceipt = await installLaneReports(deps.stateDir, key, b.files, {
+          now: deps.now, emit: deps.emit, checkCurrent: () => deps.registry.read(key), step: deps.fileStep,
+        });
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof LaneFileError)) throw e;
+    deps.emit(`lane-report-refused:${label}:${frame.seq}`, e.message);
+    if (e.transient) throw e;
+    return;
+  }
   store.append({
     lane: key, generation: laneGeneration(lane), kind: b.kind, text: b.text, ...(b.evidence ? { evidence: b.evidence } : {}),
-    at: deps.now(), source: journalId(label, frame.seq),
+    at: deps.now(), source: journalId(label, frame.seq), ...(fileReceipt ? { fileReceipt } : {}),
   });
   await patch(deps, key, { lastRunnerReportAt: deps.now() });
 };
@@ -236,19 +296,43 @@ export const reconcileInventory = async (deps: LaneHubDeps, label: string, inven
   const owned = open.filter((l) => l.runner === label);
   const seen = new Map(inventory.map((l) => [l.key, l]));
   for (const lane of owned) {
+    const runId = deps.newFileRunId?.() ?? randomUUID();
+    const refusal = (e: unknown): void => deps.emit(`lane-recover-refused:${label}:${lane.key}:${runId}`, e instanceof Error ? e.message : String(e));
+    try {
     await deps.notify?.(label, lane);
     const there = seen.get(lane.key);
     if (!there) {
       // No pane yet: never started, its lane.start is still queued for this runner; there is nothing to recover.
       if (!lane.pane) continue;
+      if (lane.pendingFileRun) continue;
+      const prepared = await deps.prepareRecovery(label, lane.key, runId);
+      prepared.notes.forEach((line, i) => deps.emit(`lane-recover-note:${label}:${lane.key}:${runId}:${i}`, line));
       const head = deps.journalHead?.();
-      await patch(deps, lane.key, { recoveryPending: true, ...(head !== undefined ? { recoveryAfter: head } : {}) });
-      deps.recover(label, lane.key);
+      let saved: Lane | undefined;
+      await deps.registry.update(lane.key, (current) => {
+        if (!current || current.closedAt || current.runner !== label || current.fileRun?.id !== lane.fileRun?.id || current.pendingFileRun) return undefined;
+        saved = current;
+        return { ...current, ...(prepared.files ? { pendingFileRun: prepared.files.run } : {}), recoveryPending: true,
+          fileProposal: { cmdId: prepared.cmdId, runId: prepared.files?.run.id, prior: recoveryFields(current) },
+          recoveryPreviousPane: current.pane, ...(head !== undefined ? { recoveryAfter: head } : {}) };
+      });
+      if (!saved) continue;
+      try {
+        if (deps.recover(label, lane.key, prepared) === undefined) throw new RunnerUnavailable(label, "disconnected", "lane.recover was not sent");
+      } catch (e) {
+        if (e instanceof RunnerUnavailable) await deps.registry.update(lane.key, (current) => {
+          const own = prepared.files ? current?.pendingFileRun?.id === prepared.files.run.id : current?.pendingFileRun === undefined && current?.recoveryAfter === head;
+          if (!current || !own) return undefined;
+          return { ...current, ...recoveryFields(saved!) };
+        });
+        throw e;
+      }
       continue;
     }
     if (there.pane !== lane.pane || there.tab !== lane.tab || (there.session !== undefined && there.session !== lane.session)) {
       await patch(deps, lane.key, { pane: there.pane, tab: there.tab, ...(there.session !== undefined ? { session: there.session } : {}) });
     }
+    } catch (e) { refusal(e); }
   }
   for (const [key, there] of seen) {
     if (openKeys.has(key)) continue;

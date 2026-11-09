@@ -1071,9 +1071,18 @@ export const supervise = async (
         // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
         let laneWork: Promise<void> = Promise.resolve();
         const laneDeps: LaneHubDeps = {
+          stateDir: deps.config.stateDir,
           registry: deps.registry, reports: () => reports, now: deps.clock.now,
           emit: (id, line) => { enqueueSweep(id, line); },
-          recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+          prepareRecovery: async (label, key) => {
+            // Inventory absence means RUNNER_LANE_UNKNOWN; only ordinary recovery scans for a relaunch.
+            runnerHub?.accept.checkFileCapability(label, "lane.recover");
+            return { cmdId: `recover:${key}:${deps.clock.now()}`, notes: [] };
+          },
+          recover: (label, key, prepared) => runnerHub?.accept.command(label, "lane.recover", {
+            cmdId: prepared.cmdId, key, ...(prepared.briefText !== undefined ? { briefText: prepared.briefText } : {}),
+            ...(prepared.files ? { files: prepared.files } : {}),
+          }),
           close: (label, key, cmdId) => runnerHub?.accept.command(label, "lane.close", { cmdId, key, worktreeChecks: false }),
           journalHead: () => runnerJournalHead(deps.config.stateDir),
           // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
@@ -1255,7 +1264,12 @@ export const supervise = async (
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
           lastJournalPrune = deps.clock.now();
-          handle.journal.prune(lastJournalPrune);
+          let cursor = 0;
+          try {
+            const value: unknown = JSON.parse(readFileSync(join(deps.config.stateDir, RUNNER_LANE_CURSOR_FILE), "utf8"));
+            if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) cursor = value;
+          } catch {}
+          handle.journal.prune(lastJournalPrune, cursor);
         }
       }),
     ]);

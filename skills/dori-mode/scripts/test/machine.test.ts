@@ -164,6 +164,10 @@ test("remote footer reports through the runner's lane CLI; local footer through 
   expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"');
   expect(local).not.toContain("~/.dori/runner/bin/dori");
   expect(local).not.toContain("[REPORT]");
+  for (const text of [local, remote]) {
+    expect(text).toContain("Rewritten paths under briefs/<key>.files are read-only snapshots of lead files; do not edit them. Write every output to DORI_LANE_OUT, including updated versions of an attached file.");
+    expect(text).toContain('Write report files in DORI_LANE_OUT (POSIX: "$DORI_LANE_OUT"; PowerShell: "$env:DORI_LANE_OUT"). Finish writing before claiming done. dori ships that entire directory to the lead when you run claim-done or report done; files elsewhere are not collected. Keep each file at or below 262144 bytes and the directory at or below 393216 bytes total, with at most 64 files.');
+  }
 });
 
 test("close runs a remote lane's command signals in the local defaultCwd, also for entries that stored the remote path", async () => {

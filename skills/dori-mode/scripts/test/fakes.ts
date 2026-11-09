@@ -11,7 +11,7 @@ import { Database } from "bun:sqlite";
 import { GITHUB_FILE, loadGithub } from "../src/github-events.ts";
 import { LaneOpsError, type Delivery, type LaneOps, type LaneRef, runnerOf, machineRunner } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
-import type { CommandResults, LaneInspection, TurnEvidence } from "../src/runner/protocol.ts";
+import type { CommandResults, LaneInspection, TurnEvidence, LaneOutputFiles } from "../src/runner/protocol.ts";
 import { laneStatus } from "../src/runner/serve.ts";
 import { checkDone } from "../src/signals.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
@@ -47,6 +47,7 @@ export const journalBytes = (stateDir: string): string => (TEST_STORE === "json"
   .filter((name) => existsSync(join(stateDir, name))).map((name) => readFileSync(join(stateDir, name), "latin1")).join("");
 
 export type World = {
+  files?: LaneOutputFiles;
   prState: string;
   /** What `gh pr list` answers (a `pr <repo> <branch>` signal read); unset, it answers like `gh pr view`. */
   prList?: unknown[];
@@ -188,6 +189,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
   };
   const statusOf = (lane: LaneRef) => laneStatus(paneOf(lane.pane) as Pane | undefined);
   return {
+    files: async (lane) => { record("files", lane.key, {}); down(runnerOf(lane)); return w.files; },
     panes: async (machine) => { record("panes", undefined, { machine }); down(machineRunner(machine)); return w.panes.map((p) => ({ ...p })); },
     screen: async (ref, lines) => {
       record("screen", undefined, { ...ref, lines }); down(machineRunner(ref.machine));
@@ -281,10 +283,16 @@ export const fakeLaneOps = (w: World): LaneOps => {
 };
 
 /** FlowDeps over the World, plus `ops` (a fakeLaneOps over the same World) for modules that reach lanes through the facade. */
+const fileRunCounters = new WeakMap<World, number>();
 export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps & { readonly ops: LaneOps } => {
   const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, toodoEvents: { ...defaultConfig("/home/test").toodoEvents, enabled: false }, ...patch };
   // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
-  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w), which: (cmd) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null) };
+  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),
+    newFileRunId: () => {
+      const n = (fileRunCounters.get(w) ?? 0) + 1; fileRunCounters.set(w, n);
+      return `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    },
+    which: (cmd) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null) };
 };
 
 /** The texts sent to lanes: through the facade (`w.ops` sends), and through herdr `send-text` by modules not yet moved onto it. */

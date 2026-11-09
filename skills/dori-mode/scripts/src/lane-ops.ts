@@ -8,6 +8,8 @@ import type {
   SupervisorCommandBodies, TurnEvidence,
 } from "./runner/protocol.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
+import { checkLaneFilesBody, isLaneOutputFiles } from "./lane-files.ts";
+import type { LaneBriefFiles, LaneOutputFiles } from "./runner/protocol.ts";
 
 /**
  * The lane facade (design 3.3): every lane and host-pane operation the supervisor and the CLI need, each one a single
@@ -29,6 +31,7 @@ export type InspectWant = {
   readonly process?: boolean; readonly session?: boolean; readonly sessionsDir?: string; readonly cwd?: string;
 };
 export type StartInput = {
+  readonly files?: LaneBriefFiles;
   readonly key: string; readonly machine?: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd: string;
   readonly sandbox: boolean; readonly mode: string; readonly model: string; readonly keywords: string; readonly session?: string;
   readonly target?: { pane?: string; workspace?: string }; readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly cmdId?: string;
@@ -63,6 +66,7 @@ export const machineRunner = (machine: string | undefined): string => machine ??
 
 /** Every lane and host-pane operation the supervisor and the CLI need. Supervisor modules import only this; this module imports only RunnerCall. */
 export type LaneOps = {
+  readonly files: (lane: LaneRef) => Promise<LaneOutputFiles | undefined>;
   // reads (q.*; throw LaneOpsError RUNNER_UNAVAILABLE / RUNNER_OUTDATED / LANE_OP_FAILED)
   readonly panes: (machine?: string) => Promise<Pane[]>;
   /** `lines` undefined: the visible screen; n: the last n lines of scrollback and screen ("recent"). */
@@ -82,7 +86,7 @@ export type LaneOps = {
   /** Throws LaneOpsError LANE_OP_FAILED with the runner's detail (RUNNER_CMD_REJECTED cwd-outside-roots, RUNNER_LANE_TARGET_BUSY, ...). */
   readonly start: (input: StartInput) => Promise<CommandResults["lane.start"]>;
   readonly adopt: (input: AdoptInput) => Promise<CommandResults["lane.adopt"]>;
-  readonly recover: (lane: LaneRef, opts?: { readonly session?: string; readonly tabWorkspace?: string }) => Promise<CommandResults["lane.recover"]>;
+  readonly recover: (lane: LaneRef, opts?: { readonly session?: string; readonly tabWorkspace?: string; readonly briefText?: string; readonly files?: LaneBriefFiles; readonly cmdId?: string }) => Promise<CommandResults["lane.recover"]>;
   /** An ambiguous close throws LANE_OP_AMBIGUOUS (closeSequence maps it to its ambiguous step). */
   readonly close: (lane: LaneRef, opts?: { readonly cmdId?: string }) => Promise<CommandResults["lane.close"]>;
   /** failed → {code: 1, err: detail}; ambiguous → {code: 2, err: "ambiguous: ..."} (the operation's read-back decides). */
@@ -129,6 +133,7 @@ const isTurn = (v: unknown): boolean => isObj(v) && isNum(v.gen) && isNum(v.stop
   && oneOf(["none", "goal-paused", "session-paused", "goal-stopped", "goal-blocked", "goal-complete", "no-goal", "question"])(v.hold);
 
 const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
+  "q.lane.files": (v) => isObj(v) && Object.keys(v).every((k) => k === "files") && (v.files === undefined || isLaneOutputFiles(v.files)),
   "q.panes": (v) => isObj(v) && listOf(v.panes, isPane),
   "q.screen": (v) => isObj(v) && isStr(v.text),
   "q.process": (v) => isObj(v) && (v.info === undefined || isObj(v.info)) && optStr(v.error),
@@ -198,6 +203,10 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
   ): Promise<CommandResults[T]> => {
     let r;
     try {
+      if (type === "lane.start" || type === "lane.recover") {
+        cmdId ??= `${type === "lane.start" ? "lane-start" : "recover"}:${(body as { key?: string }).key}:${deps.now()}`;
+        checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
+      }
       r = await call.call(label, type, body, cmdId ? { cmdId } : undefined);
     } catch (e) {
       throw toOpsError(e, label);
@@ -222,6 +231,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
   const panes = async (machine?: string): Promise<Pane[]> => [...(await query(machineRunner(machine), "q.panes", {})).panes];
 
   return {
+    files: async (lane) => (await query(runnerOf(lane), "q.lane.files", { key: lane.key })).files,
     panes,
     screen: async (ref, lines) => {
       const label = machineRunner(ref.machine);
@@ -296,6 +306,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
       key: input.key, briefText: input.briefText, done: input.done, thread: input.thread, cwd: input.cwd,
       agentProfile: input.sandbox ? SANDBOXED_PROFILE : AGENT_PROFILE, mode: input.mode, model: input.model, sandbox: input.sandbox,
       expectedLaneGen: 0, keywords: input.keywords,
+      ...(input.files !== undefined ? { files: input.files } : {}),
       ...(input.session !== undefined ? { session: input.session } : {}),
       ...(input.target ? { target: input.target } : {}),
       ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}),
@@ -307,7 +318,8 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
     }),
     recover: (lane, opts = {}) => effect(runnerOf(lane), "lane.recover", {
       key: lane.key, ...(opts.session !== undefined ? { session: opts.session } : {}), ...(opts.tabWorkspace !== undefined ? { tabWorkspace: opts.tabWorkspace } : {}),
-    }),
+      ...(opts.briefText !== undefined ? { briefText: opts.briefText } : {}), ...(opts.files !== undefined ? { files: opts.files } : {}),
+    }, opts.cmdId),
     // Worktree checks are the supervisor's (q.lane.inspect before the close, D10), never the runner's.
     close: (lane, opts = {}) => effect(runnerOf(lane), "lane.close", { key: lane.key, worktreeChecks: false }, opts.cmdId),
     git: async (lane, op, opts = {}) => {

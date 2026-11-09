@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { treeDigest } from "../src/lane-files.ts";
 import { eventClass } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
@@ -27,7 +29,8 @@ const setup = async () => {
   const emitted: [string, string][] = [];
   const recovered: [string, string][] = [];
   const hub: LaneHubDeps = {
-    registry: deps.registry, reports: () => store, now: clock.now,
+    stateDir: s.dir, registry: deps.registry, reports: () => store, now: clock.now,
+    prepareRecovery: async (_label, key) => ({ cmdId: `recover:${key}:${clock.now()}`, notes: [] }),
     emit: (id, line) => { emitted.push([id, line]); }, recover: (label, key) => { recovered.push([label, key]); return 1; },
   };
   return { deps, store, hub, emitted, recovered };
@@ -38,6 +41,32 @@ const event = (runner: string, seq: number, type: string, body: object): AnyRunn
 
 const done = (runner: string, seq: number, key: string): AnyRunnerEvent =>
   ({ v: 1, runner, gen: 1, epoch: 1, seq, type: "lane.report", body: { key, kind: "done", text: "merged", evidence: "abc" } }) as unknown as AnyRunnerEvent;
+
+test("managed forged, missing, malformed, obsolete and closed reports never write files or done rows", async () => {
+  const t = await setup(), stateDir = join(t.deps.config.stateDir, "collection-state");
+  const run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  const tree = { directories: [], files: [] }, files = { run, revision: 1, tree, sha256: treeDigest(tree) };
+  await t.deps.registry.patch("lane-a", { fileRun: run });
+  const hub = { ...t.hub, stateDir };
+  const bodies = [
+    { key: "lane-a", kind: "done", text: "missing" },
+    { key: "lane-a", kind: "done", text: "bad", files: { ...files, sha256: "bad" } },
+    { key: "lane-a", kind: "milestone", text: "wrong kind", files },
+    { key: "lane-a", kind: "done", text: "x".repeat(65537), files },
+    { key: "lane-a", kind: "done", text: "text", evidence: "x".repeat(16385), files },
+    { key: "lane-a", kind: "done", text: "stale", files: { ...files, run: { ...run, id: "00000000-0000-4000-8000-000000000002" } } },
+    { key: "unknown", kind: "done", text: "foreign", files },
+  ];
+  let seq = 0;
+  await acceptLaneEvent(hub, "worker-b", event("worker-b", ++seq, "lane.report", { key: "lane-a", kind: "done", text: "", files }));
+  for (const body of bodies) await acceptLaneEvent(hub, "worker-a", event("worker-a", ++seq, "lane.report", body));
+  await t.deps.registry.patch("lane-a", { closedAt: "closed" });
+  await acceptLaneEvent(hub, "worker-a", event("worker-a", ++seq, "lane.report", { key: "lane-a", kind: "done", text: "", files }));
+  expect(t.store.pending()).toEqual([]);
+  expect(existsSync(stateDir)).toBe(false);
+  expect(t.emitted.some(([, line]) => line.startsWith("LANE_REPORT_FILES_MISSING"))).toBe(true);
+  expect(t.emitted.some(([, line]) => line.startsWith("LANE_REPORT_LATE"))).toBe(true);
+});
 
 test("runner B reporting done for runner A's lane makes no claim and one RUNNER_FORGED_EVENT", async () => {
   const t = await setup();

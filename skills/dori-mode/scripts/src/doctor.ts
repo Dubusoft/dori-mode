@@ -104,10 +104,13 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
   const probe = await d.run([installed, "--check"], T);
   if (probe.code !== 0) return [fail("lane sandbox", `${installed} --check failed: ${probe.err.trim() || probe.out.trim() || `exit ${probe.code}`}`, mac ? "check that /usr/bin/sandbox-exec runs (sandbox-exec -p '(version 1)(allow default)' /usr/bin/true), then rerun dori doctor" : "fix bubblewrap (user namespaces enabled, AppArmor profile), then rerun dori doctor")];
   const template = mac ? LANE_SANDBOX_MACOS_TEMPLATE : LANE_SANDBOX_TEMPLATE;
+  const refresh = worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak";
+  // A runner refuses every sandboxed lane start and recovery behind a wrapper that does not grant the lane-file directories.
+  if (!probe.out.split(/\r?\n/).includes("DORI_LANE_FILES=1")) return [fail("lane sandbox", `${installed} --check does not print DORI_LANE_FILES=1; sandboxed lane starts and recoveries are refused (LANE_FILES_SANDBOX_OLD)`, refresh)];
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
   const templateHash = createHash("sha256").update(readFileSync(template)).digest("hex");
   if (installedHash === templateHash) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`)];
-  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
+  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh)];
 };
 
 /** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */
@@ -389,6 +392,8 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     const id = `runner ${row.label}`;
     const problems: string[] = [];
     if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
+    // Lane start and recover carry lane files since proto 5: an older runner keeps its lanes but cannot start or recover any.
+    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} refuses lane start and recover (they need proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
     if (row.herdr === "down" || row.herdr === "hung") {

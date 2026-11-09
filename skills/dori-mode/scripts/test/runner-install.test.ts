@@ -370,6 +370,9 @@ test("on Darwin the script installs the seatbelt lane-sandbox and a starter poli
   });
   expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ sandbox: "required", sandboxCheck: [wrapperPath, "--check"] });
   expect(readFileSync(wrapperPath, "utf8")).toBe(readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"));
+  expect(readFileSync(wrapperPath, "utf8")).toContain('r "$H/.dori/runner/briefs/$key.files"');
+  expect(readFileSync(wrapperPath, "utf8")).toContain('w "$H/.dori/runner/briefs/$key.out"');
+  expect(readFileSync(wrapperPath, "utf8")).toContain('echo "DORI_LANE_FILES=1"');
   expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
   expect(result.out).not.toContain("RUNNER_CONFIG_SANDBOX_MISSING");
   // A reinstall over an operator's file names every key it lacks for sandboxed lanes, and leaves the file alone.
@@ -383,6 +386,10 @@ test("on Darwin the script installs the seatbelt lane-sandbox and a starter poli
 test("a Linux reinstall over a complete sandbox policy prints no missing-key line; the generated script parses under sh -n", async () => {
   const host = fakeHost();
   expect((await runScript(host, linuxScript())).code).toBe(0);
+  const wrapper = readFileSync(join(host.home, ".dori/runner/bin/lane-sandbox"), "utf8");
+  expect(wrapper).toContain('--ro-bind "$H/.dori/runner/briefs/$key.files"');
+  expect(wrapper).toContain('--bind "$H/.dori/runner/briefs/$key.out"');
+  expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
   const again = await runScript(host, linuxScript());
   expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
   const p = Bun.spawn(["/bin/sh", "-n"], { stdin: new TextEncoder().encode(linuxScript()), stdout: "pipe", stderr: "pipe" });

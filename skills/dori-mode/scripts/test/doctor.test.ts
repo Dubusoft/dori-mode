@@ -22,6 +22,8 @@ const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); process.env.PATH = PATH; });
 
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
+/** A current wrapper's successful --check. */
+const checked = (): Ran => ok("DORI_LANE_FILES=1\n");
 const no = (out = "", code = 1): Ran => ({ code, out, err: "" });
 const pane = JSON.stringify({ result: { panes: [{ pane_id: "lead:p1", workspace_id: "w" }] } });
 const happyRun: Record<string, Ran> = {
@@ -60,7 +62,7 @@ const fixture = (patch: Patch = {}) => {
   const wrapper = join(state.dir, ".local", "bin", "lane-sandbox");
   mkdirSync(join(state.dir, ".local", "bin"), { recursive: true });
   copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);
-  const table = { ...happyRun, [`${wrapper} --check`]: ok(), ...patch.run };
+  const table = { ...happyRun, [`${wrapper} --check`]: checked(), ...patch.run };
   const routes = { ...happyHttp, ...patch.http };
   const calls: string[] = [];
   const requests: HttpRequest[] = [];
@@ -121,9 +123,15 @@ test("doctor only reads: no unit changes and Discord is GET only", async () => {
 test("doctor warns when the installed lane sandbox differs from the template", async () => {
   const f = fixture();
   writeFileSync(join(f.deps.home, ".local", "bin", "lane-sandbox"), "old sandbox");
-  const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? ok() : f.deps.run(argv, {})) }), "lane sandbox");
+  const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? checked() : f.deps.run(argv, {})) }), "lane sandbox");
   expect(check).toMatchObject({ level: "WARN" });
   expect(check.detail).toContain("LANE_SANDBOX_OUTDATED");
+});
+
+test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {
+  const f = fixture();
+  const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? ok() : f.deps.run(argv, {})) }), "lane sandbox");
+  expect(check).toMatchObject({ level: "FAIL", detail: expect.stringContaining("LANE_FILES_SANDBOX_OLD"), fix: expect.stringContaining("dori update") });
 });
 
 test("doctor fails when the lane-sandbox wrapper is not installed", async () => {
@@ -156,7 +164,7 @@ test("on a Linux worker runner host doctor checks the wrapper dori runner instal
   expect(find(await runDoctor(f.deps), "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining(join(runnerDir, "bin", "lane-sandbox")), fix: expect.stringContaining("dori runner install") });
   mkdirSync(join(runnerDir, "bin"), { recursive: true });
   copyFileSync(LANE_SANDBOX_TEMPLATE, join(runnerDir, "bin", "lane-sandbox"));
-  const run = async (argv: readonly string[]) => (argv.join(" ") === `${join(runnerDir, "bin", "lane-sandbox")} --check` ? ok() : f.deps.run(argv, {}));
+  const run = async (argv: readonly string[]) => (argv.join(" ") === `${join(runnerDir, "bin", "lane-sandbox")} --check` ? checked() : f.deps.run(argv, {}));
   expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "OK" });
 });
 
@@ -168,7 +176,7 @@ test("on a macOS worker runner host doctor checks the seatbelt wrapper in the ru
   expect(find(await runDoctor(f.deps), "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining(wrapper), fix: expect.stringContaining("dori runner install") });
   mkdirSync(join(runnerDir, "bin"), { recursive: true });
   copyFileSync(LANE_SANDBOX_MACOS_TEMPLATE, wrapper);
-  const run = async (argv: readonly string[]) => (argv.join(" ") === `${wrapper} --check` ? ok() : f.deps.run(argv, {}));
+  const run = async (argv: readonly string[]) => (argv.join(" ") === `${wrapper} --check` ? checked() : f.deps.run(argv, {}));
   expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "OK", detail: expect.stringContaining("seatbelt") });
   // The Linux wrapper on a Mac is outdated, not current.
   copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);

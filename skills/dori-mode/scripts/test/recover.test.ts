@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
+import { mkdirSync, realpathSync } from "node:fs";
+import { writeLaneAttachmentPin } from "../src/lane-files.ts";
+import { acceptLaneEvent, type LaneHubDeps } from "../src/runner/lanes-hub.ts";
+import type { LaneBriefFiles } from "../src/runner/protocol.ts";
+import { launchLane } from "../src/launch.ts";
 
 import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, resumeCommand, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
 import { freshnessTick } from "../src/freshness.ts";
@@ -15,7 +20,8 @@ type Deps = ReturnType<typeof depsFor>;
 
 let state: ReturnType<typeof withState>;
 beforeEach(() => { state = withState(); withSqliteStore(state.dir); });
-afterEach(() => state.done());
+// The launch pin lives beside stateDir, outside the per-test directory.
+afterEach(() => { writeLaneAttachmentPin(state.dir, "recover-lane", []); state.done(); });
 
 const fixture = async () => {
   const world = newWorld();
@@ -71,6 +77,46 @@ const fixture = async () => {
 const opsOf = (world: World, ...names: string[]) => world.ops.filter((e) => names.includes(e.op));
 const SKIP = "SANDBOX_SKIPPED recover-lane: relaunch of a lane recorded without a sandbox";
 
+test.each(["recover", "start"])("a timed-out %s proposal is retired by its failed result so the next sweep retries", async (kind) => {
+  const { deps, lane, clock, world } = await fixture();
+  const active = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  await deps.registry.patch(lane.key, { runner: "local", fileRun: active, recoveryAfter: 2, recoveryPreviousPane: "prior" });
+  let cmdId = "";
+  const timeout = new LaneOpsError("RUNNER_UNAVAILABLE", "local", "timeout");
+  const ops: LaneOps = { ...deps.ops,
+    recover: async (_lane, opts) => {
+      cmdId = opts!.cmdId!;
+      if (kind === "start") throw new LaneOpsError("LANE_OP_FAILED", "local", "RUNNER_LANE_UNKNOWN recover-lane");
+      throw timeout;
+    },
+    start: async (input) => { cmdId = input.cmdId!; throw timeout; },
+  };
+  expect((await recoverLanes({ ...deps, ops }, lane.key))[0]).toContain(kind === "recover" ? "LANE_RECOVERY_HELD" : "LANE_RECOVERY_ERROR");
+  const pending = (await deps.registry.read(lane.key)) as RecoveryLane;
+  expect(pending.pendingFileRun).toBeDefined();
+  expect(pending.fileProposal?.cmdId).toBe(cmdId);
+  expect(await recoverLanes(deps, lane.key)).toEqual([]);
+  const hub: LaneHubDeps = { stateDir: state.dir, registry: deps.registry, reports: () => undefined,
+    now: clock.now, emit: () => {}, prepareRecovery: async () => ({ cmdId: "unused", notes: [] }), recover: () => undefined };
+  await acceptLaneEvent(hub, "local", { v: 1, runner: "local", gen: 1, epoch: 1, seq: 1, type: "cmd.result",
+    body: { cmdId, cmdSeq: 1, state: "failed", detail: "RUNNER_CMD_FAILED not started" } }, 3);
+  expect(await deps.registry.read(lane.key)).toMatchObject({ fileRun: active, recoveryAfter: 2, recoveryPreviousPane: "prior" });
+  expect((await deps.registry.read(lane.key))?.pendingFileRun).toBeUndefined();
+  clock.at += 1;
+  expect((await recoverLanes(deps, lane.key))[0]).toStartWith("LANE_RECOVERED");
+  expect(opsOf(world, "recover")).toHaveLength(1);
+});
+
+test.each(["autoClose: lead\nissue: changed/repo#2", "autoClose: invalid\nissue: invalid"])("relaunch retains stored policy despite edited declarations: %s", async (body) => {
+  const { deps, lane } = await fixture();
+  const existing = { ...lane, runner: "local", autoClose: "machine" as const, ghIssue: "a/b#1", fileRun: { id: "00000000-0000-4000-8000-0000000000aa", requiredReport: true } };
+  await deps.registry.write(existing);
+  await Bun.write(lane.brief, `${body}\ndeliverable: none`);
+  const result = await launchLane(deps, { key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, cwd: lane.cwd }, existing);
+  expect(result.lane).toMatchObject({ autoClose: "machine", ghIssue: "a/b#1", fileRun: { requiredReport: true } });
+  expect(await Bun.file(lane.brief).text()).toContain("- autoClose: machine.");
+});
+
 test("recovers a missing pane through its runner with persisted attempt and original launch metadata", async () => {
   const { deps, world, lane, control } = await fixture();
   const events = await recoverLanes(deps, lane.key);
@@ -90,6 +136,80 @@ test("a lane its runner does not know is started again from its brief", async ()
   expect(start).toMatchObject({ key: "recover-lane", cwd: lane.cwd, model: lane.model });
   // A lane on the old footer moves onto the dori report one when it is started again.
   expect(start?.briefText).toStartWith("Execute the task.\n\n## Lane footer (written by dori launch)");
+});
+
+test("ordinary recovery rereads changed attachments and installs its fresh proposal before dispatch", async () => {
+  const { deps, lane } = await fixture();
+  mkdirSync(join(state.dir, "briefs"));
+  const source = join(state.dir, "briefs", "input");
+  await Bun.write(source, "new bytes"); await Bun.write(lane.brief, source);
+  writeLaneAttachmentPin(state.dir, lane.key, [realpathSync(source)]);
+  let files: LaneBriefFiles | undefined;
+  const ops: LaneOps = { ...deps.ops, recover: async (current, opts) => {
+    files = opts!.files;
+    expect((await deps.registry.read(lane.key))?.pendingFileRun).toEqual(files!.run);
+    expect(Buffer.from(files!.tree.files[0]!.base64, "base64").toString()).toBe("new bytes");
+    return deps.ops.recover(current, opts);
+  } };
+  await recoverLanes({ ...deps, ops }, lane.key);
+  expect((await deps.registry.read(lane.key))?.fileRun).toEqual(files!.run);
+  expect((await deps.registry.read(lane.key))?.pendingFileRun).toBeUndefined();
+});
+
+test("input refusal precedes attempt accounting and intentional old-pane close", async () => {
+  const { deps, lane, world, control } = await fixture();
+  control.live(true); control.argv = ["omo", "--model", "wrong"];
+  await Bun.write(lane.brief, "x".repeat(70_000));
+  expect((await recoverLanes(deps, lane.key))[0]).toContain("LANE_FILES_LIMIT");
+  expect(opsOf(world, "recover", "start", "close")).toEqual([]);
+  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
+});
+
+test("unknown-runner fallback rescans with a new persisted run and converges with an early started event", async () => {
+  const { deps, lane } = await fixture();
+  mkdirSync(join(state.dir, "briefs"));
+  const source = join(state.dir, "briefs", "input");
+  await Bun.write(source, "before"); await Bun.write(lane.brief, source);
+  writeLaneAttachmentPin(state.dir, lane.key, [realpathSync(source)]);
+  let failedRun: LaneBriefFiles["run"] | undefined, startRun: LaneBriefFiles["run"] | undefined;
+  const hub: LaneHubDeps = { stateDir: state.dir, registry: deps.registry, reports: () => undefined,
+    now: deps.clock.now, emit: () => {}, prepareRecovery: async () => ({ cmdId: "unused", notes: [] }), recover: () => undefined };
+  const ops: LaneOps = { ...deps.ops,
+    recover: async (_current, opts) => {
+      failedRun = opts!.files!.run;
+      await Bun.write(source, "after");
+      throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover RUNNER_LANE_UNKNOWN recover-lane");
+    },
+    start: async (input) => {
+      startRun = input.files!.run;
+      expect(startRun.id).not.toBe(failedRun!.id);
+      expect((await deps.registry.read(lane.key))?.pendingFileRun).toEqual(startRun);
+      expect(Buffer.from(input.files!.tree.files[0]!.base64, "base64").toString()).toBe("after");
+      await acceptLaneEvent(hub, "local", { v: 1, runner: "local", gen: 1, epoch: 1, seq: 1, type: "lane.started",
+        body: { key: lane.key, pane: "event:pane", tab: "event:tab", session: "", fileRun: startRun } }, 1);
+      return deps.ops.start(input);
+    },
+  };
+  await recoverLanes({ ...deps, ops }, lane.key);
+  expect(await deps.registry.read(lane.key)).toMatchObject({ pane: "event:pane", fileRun: startRun });
+  expect((await deps.registry.read(lane.key))?.pendingFileRun).toBeUndefined();
+  await acceptLaneEvent(hub, "local", { v: 1, runner: "local", gen: 1, epoch: 1, seq: 2, type: "lane.started",
+    body: { key: lane.key, pane: "event:pane", tab: "stale", session: "", fileRun: failedRun! } }, 2);
+  expect((await deps.registry.read(lane.key))?.tab).toBe("event:tab");
+});
+
+test("a definite fallback refusal retires only its own proposal and preserves newer fields", async () => {
+  const { deps, lane } = await fixture();
+  const newer = { id: "00000000-0000-4000-8000-000000000099", requiredReport: false };
+  const ops: LaneOps = { ...deps.ops,
+    recover: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover RUNNER_LANE_UNKNOWN recover-lane"); },
+    start: async () => {
+      await deps.registry.patch(lane.key, { pendingFileRun: newer, title: "new writer" });
+      throw new LaneOpsError("LANE_OP_FAILED", "local", "LANE_FILES_INPUT_REQUIRED recover-lane: fresh input required");
+    },
+  };
+  expect((await recoverLanes({ ...deps, ops }, lane.key))[0]).toContain("LANE_FILES_INPUT_REQUIRED");
+  expect(await deps.registry.read(lane.key)).toMatchObject({ title: "new writer", pendingFileRun: newer });
 });
 
 test("a lane whose close is running is not relaunched when its pane is gone", async () => {

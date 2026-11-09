@@ -2,6 +2,8 @@ import { isReportKind } from "./report-kinds.ts";
 import type { LaneNotice } from "./lanes.ts";
 import type { RunnerEventBodies, RunnerEventType } from "./protocol.ts";
 import type { Listener, Transport } from "./transport.ts";
+import { LaneFileError } from "./lane-files.ts";
+import type { LaneOutputFiles } from "./protocol.ts";
 
 /**
  * The lane socket `<runnerDir>/sock/lane` (design 2.5): one JSON request line in, one JSON reply line out, many per
@@ -26,6 +28,7 @@ export type LaneRequest = { readonly key: string; readonly token: string; readon
  * reports; without them `status` answers the default and `whoami` answers no key.
  */
 export type LaneSocketLanes = {
+  readonly reportFiles?: (key: string) => LaneOutputFiles | undefined;
   readonly tokenFor: (key: string, token: string) => boolean;
   readonly notice?: (key: string) => LaneNotice | undefined;
   readonly keyForPane?: (pane: string) => string | undefined;
@@ -71,7 +74,14 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
         reply({ ok: true });
         return;
       }
-      publish("lane.report", { key: req.key, kind: req.kind as RunnerEventBodies["lane.report"]["kind"], text: req.text as string, ...(str(req.evidence) && req.evidence ? { evidence: req.evidence } : {}) });
-      reply({ ok: true });
+      try {
+        const files = req.kind === "done" ? lanes.reportFiles?.(req.key) : undefined;
+        publish("lane.report", { key: req.key, kind: req.kind as RunnerEventBodies["lane.report"]["kind"], text: req.text as string, ...(str(req.evidence) && req.evidence ? { evidence: req.evidence } : {}), ...(files ? { files } : {}) });
+        reply({ ok: true });
+      } catch (error) {
+        const failure = error instanceof LaneFileError ? error : new LaneFileError("LANE_REPORT_STORE_FAILED", req.key,
+          "the complete report was not stored by the runner; fix runner disk space and permissions, then claim done again");
+        reply({ ok: false, code: failure.code, detail: failure.message.slice(failure.code.length + 1) });
+      }
     });
   });

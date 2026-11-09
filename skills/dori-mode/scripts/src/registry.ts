@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
+import type { LaneFileRun } from "./runner/protocol.ts";
 export { LOCK_WAIT_MS, StateLockError as RegistryLockError } from "./state-lock.ts";
 
 export const LANE_KEY = /^[a-z0-9][a-z0-9._-]{1,60}$/;
@@ -31,6 +32,8 @@ export type Objection = { readonly at: string; readonly reasons: readonly string
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
 
 export type Lane = {
+  readonly fileRun?: LaneFileRun;
+  readonly pendingFileRun?: LaneFileRun;
   readonly key: string;
   readonly title: string;
   readonly thread: string;

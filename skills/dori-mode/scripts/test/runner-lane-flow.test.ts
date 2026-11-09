@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { treeDigest } from "../src/lane-files.ts";
 import { join } from "node:path";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
@@ -15,6 +17,8 @@ import { RunnerState } from "../src/runner/state.ts";
 import type { AnyRunnerEvent, RunnerEventBodies, RunnerEventType } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const T0 = 1_800_000_000_000;
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -23,13 +27,14 @@ const setup = async () => {
   const s = withState();
   cleanups.push(s.done);
   const clock = fakeClock(T0);
-  const deps = depsFor(newWorld(), clock, s.dir);
+  const deps = depsFor(newWorld(), clock, join(s.dir, "state"));
   const lane = { key: "lane-a", title: "lane a", thread: "none", brief: join(s.dir, "brief.md"), done: "command [\"true\"]", openedAt: new Date(T0).toISOString(), machine: "worker-a", runner: "worker-a", status: "working" } as unknown as Lane;
   await deps.registry.write(lane);
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });
   const emitted: [string, string][] = [];
-  const hub: LaneHubDeps = { registry: deps.registry, reports: () => store, now: clock.now, emit: (id, line) => { emitted.push([id, line]); }, recover: () => undefined };
+  const hub: LaneHubDeps = { stateDir: deps.config.stateDir, registry: deps.registry, reports: () => store, now: clock.now, emit: (id, line) => { emitted.push([id, line]); },
+    prepareRecovery: async (_label, key) => ({ cmdId: `recover:${key}:${clock.now()}`, notes: [] }), recover: () => undefined };
   let seq = 0;
   const event = (type: RunnerEventType, body: object): AnyRunnerEvent => ({ v: 1, runner: "worker-a", gen: 1, epoch: 1, seq: ++seq, type, body }) as unknown as AnyRunnerEvent;
   const journal: string[] = [];
@@ -46,30 +51,36 @@ test("lane.start on the runner, its lane.started, then a done report make exactl
   const lanes = new RunnerLanes({
     instance: async () => "server-1",
     runnerDir, clock: fakeClock(T0), token: () => "lane-token-1",
-    policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
+    policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] },
     publish: (type, body) => { published.push([type, body]); },
     run: async (argv) => {
       herdr.push(argv as [string, ...string[]]);
+      if (argv[0] === "lane-sandbox") return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
       if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
       return { code: 0, out: "", err: "" } as Ran;
     },
   });
-  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0 });
+  await t.deps.registry.patch("lane-a", { fileRun: FILES.run });
+  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES });
   const run = herdr.find((a) => a[2] === "run");
-  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} omo --model m1 `);
+  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")} omo --model m1 `);
   expect(lanes.tokenFor("lane-a", "lane-token-1")).toBe(true);
   expect(lanes.tokenFor("lane-a", "other")).toBe(false);
   const [type, started] = published[0] as [RunnerEventType, object];
   await acceptLaneEvent(t.hub, "worker-a", t.event(type, started));
   expect((await t.deps.registry.read("lane-a"))?.pane).toBe("p7");
 
-  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.report", { key: "lane-a", kind: "done", text: "merged", evidence: "abc123 merged" }));
+  const binary = Buffer.from([0, 255, 128, 1]);
+  writeFileSync(join(runnerDir, "briefs/lane-a.out/report.bin"), binary);
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.report", { key: "lane-a", kind: "done", text: "merged", evidence: "abc123 merged", files: lanes.reportFiles("lane-a") }));
+  expect(readFileSync(join(t.s.dir, "research/lane-a/report.bin"))).toEqual(binary);
+  expect((await t.deps.registry.read("lane-a"))?.claim).toBeUndefined();
   expect(await t.route()).toEqual([expect.stringMatching(/^LANE_REPORT_ROUTED lane-a:\d+:1 done claim$/)]);
   const claimed = await t.deps.registry.read("lane-a");
   expect(claimed?.status).toBe("done-claimed");
 
   // The same done again (a resend after a reconnect, or the lane reporting twice) keeps the one claim and its one event.
-  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.report", { key: "lane-a", kind: "done", text: "merged", evidence: "abc123 merged" }));
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.report", { key: "lane-a", kind: "done", text: "merged", evidence: "abc123 merged", files: lanes.reportFiles("lane-a") }));
   await t.route();
   const again = await t.deps.registry.read("lane-a");
   expect(again?.claim?.at).toBe(claimed?.claim?.at);
@@ -116,6 +127,23 @@ test("one runner event stored twice (an evacuate import of an event that already
   expect(t.store.list({ lane: "lane-a" })).toHaveLength(1);
 });
 
+test("durable managed binary bytes install before their report row and claim, with no runner query", async () => {
+  const t = await setup(), run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: true };
+  await t.deps.registry.patch("lane-a", { fileRun: run, pane: "p7" });
+  const data = Buffer.from([0, 255, 1, 128]), tree = { directories: ["empty"], files: [
+    { path: "report.bin", bytes: data.length, base64: data.toString("base64"), sha256: createHash("sha256").update(data).digest("hex") },
+  ] };
+  const files = { run, revision: 1, tree, sha256: treeDigest(tree) };
+  const event = t.event("lane.report", { key: "lane-a", kind: "done", text: "done", evidence: "binary", files });
+  await acceptLaneEvent(t.hub, "worker-a", event);
+  expect((await t.deps.registry.read("lane-a"))?.claim).toBeUndefined();
+  expect(readFileSync(join(t.s.dir, "research", "lane-a", "report.bin"))).toEqual(data);
+  expect(t.store.pending()[0]?.fileReceipt).toEqual({ run, revision: 1, sha256: files.sha256 });
+  await t.route(); await acceptLaneEvent(t.hub, "worker-a", event); await t.route();
+  expect(t.store.list()).toHaveLength(1);
+  expect((await t.deps.registry.read("lane-a"))?.status).toBe("done-claimed");
+});
+
 test("an effect's {detail, result} goes out in cmd.result.result and the lanes hub takes the result like a detail-only one", async () => {
   const t = await setup();
   const runnerDir = join(t.s.dir, "runner");
@@ -135,7 +163,7 @@ test("an effect's {detail, result} goes out in cmd.result.result and the lanes h
   const sent = (n: number) => new Promise<void>((resolve) => { settled = () => { if (published.length >= n) resolve(); }; });
   const first = sent(1);
   dispatch({ v: 1, runner: "worker-a", gen: 1, epoch: 1, cmdSeq: 1, type: "lane.start", body: {
-    cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0,
+    cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES,
   } });
   await first;
   const second = sent(2);
@@ -155,8 +183,9 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe a
   mkdirSync(runnerDir, { mode: 0o700 });
   const state = new RunnerState(runnerDir, { now: () => T0 });
   cleanups.push(() => { state.close(); });
-  const policy = { ...DEFAULT_POLICY, agents: { sandboxed: ["lane-sandbox", "omo", "{prompt}"] }, allowedRoots: ["/repo"] };
+  const policy = { ...DEFAULT_POLICY, sandboxCheck: ["lane-sandbox", "--check"], agents: { sandboxed: ["lane-sandbox", "omo", "{prompt}"] }, allowedRoots: ["/repo"] };
   const herdr = async (argv: readonly string[]): Promise<Ran> => {
+    if (argv[0] === "lane-sandbox") return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
     if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
     if (argv.slice(0, 3).join(" ") === "herdr pane list") return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "p7", workspace_id: "w", tab_id: "t7", agent: "omo", agent_status: "working" }] } }), err: "" } as Ran;
     return { code: 0, out: "", err: "" } as Ran;
@@ -174,7 +203,7 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe a
     dispatch({ v: 1, runner: "local", gen: 1, epoch: 1, cmdSeq, type, body });
     await done;
   };
-  await send(1, "lane.start", { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0 });
+  await send(1, "lane.start", { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0, files: FILES });
   await send(2, "lane.notify", { cmdId: "lane.notify:lane-a:2:1", key: "lane-a", status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
   await send(3, "lane.observe", { cmdId: "lane.observe:lane-a:3:1", key: "lane-a" });
   await send(4, "guard.kill", { cmdId: "guard.kill:-:4:1", keys: ["lane-a"] });

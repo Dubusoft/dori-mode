@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { treeDigest } from "../src/lane-files.ts";
+import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
 import { claimGate } from "../src/ci-follow.ts";
@@ -28,6 +33,49 @@ beforeEach(async () => {
   await at(T0).registry.write(lane);
 });
 afterEach(() => state.done());
+
+test("managed direct claims query before admission and repeated evidence updates bytes without moving the claim window", async () => {
+  const d = depsFor(world, fakeClock(T0), join(state.dir, "state"));
+  const run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  const managed = { ...lane, fileRun: run };
+  await d.registry.write(managed);
+  const snapshot = (text: string, revision: number): LaneOutputFiles => {
+    const data = Buffer.from(text);
+    const tree = { directories: [], files: [{ path: "report", bytes: data.length, base64: data.toString("base64"), sha256: createHash("sha256").update(data).digest("hex") }] };
+    return { run, revision, tree, sha256: treeDigest(tree) };
+  };
+  world.files = snapshot("first", 1);
+  expect(await claimDone(d, managed, "same")).toStartWith("LANE_DONE_CLAIMED");
+  const first = (await d.registry.read(lane.key))!.claim!;
+  world.files = snapshot("changed", 2);
+  expect(await claimDone({ ...d, clock: fakeClock(T0 + MIN) }, managed, "same")).toContain(`LANE_DONE_ALREADY_CLAIMED ${lane.key} ${first.at}`);
+  expect(readFileSync(join(state.dir, "research", lane.key, "report"), "utf8")).toBe("changed");
+  expect((await d.registry.read(lane.key))!.claim).toEqual(first);
+  expect(world.ops.filter((op) => op.op === "files")).toHaveLength(2);
+  // A saved older row verifies the newer local revision, without querying an offline runner.
+  world.runnerDown = true;
+  expect(await claimDone(d, managed, "same", snapshot("first", 1))).toStartWith("LANE_DONE_ALREADY_CLAIMED");
+});
+
+test("required-empty, missing, stale and unsafe direct collections never claim or close a managed lane", async () => {
+  const d = depsFor(world, fakeClock(T0), join(state.dir, "state"));
+  const run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: true };
+  const managed = { ...lane, fileRun: run, autoClose: "machine" as const };
+  await d.registry.write(managed);
+  const tree = { directories: [], files: [] };
+  world.files = { run, revision: 1, tree, sha256: treeDigest(tree) };
+  await expect(claimDone(d, managed, "x")).rejects.toThrow(`LANE_FILES_INVALID ${lane.key}: invalid file payload (run-requirement)`);
+  world.files = undefined;
+  await expect(claimDone(d, managed, "x")).rejects.toThrow("LANE_REPORT_FILES_MISSING");
+  world.files = { run: { ...run, id: "00000000-0000-4000-8000-000000000002" }, revision: 1, tree, sha256: treeDigest(tree) };
+  await expect(claimDone(d, managed, "x")).rejects.toThrow("LANE_REPORT_STALE");
+  await d.registry.patch(lane.key, { fileRun: { ...run, requiredReport: false } });
+  world.files = { run: { ...run, requiredReport: false }, revision: 1, tree, sha256: treeDigest(tree) };
+  mkdirSync(join(state.dir, "research")); symlinkSync(join(state.dir, "state"), join(state.dir, "research", lane.key));
+  await expect(claimDone(d, managed, "x")).rejects.toThrow("LANE_REPORT_DESTINATION_UNSAFE");
+  expect((await d.registry.read(lane.key))?.claim).toBeUndefined();
+  expect(closedVia()).toEqual([]);
+});
 
 test("an objection inside the window keeps the lane open; the lane hears a fixed sentence and reads the reasons from its status", async () => {
   livePane();

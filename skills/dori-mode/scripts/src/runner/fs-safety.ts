@@ -1,9 +1,10 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { writeFileAtomic } from "../setup.ts";
 import { tryStateLock } from "../state-lock.ts";
 import { currentUserSid, evaluateSddl, IO_REPARSE_TAG_AF_UNIX, readSddl, type AclInfo } from "./win-acl.ts";
+import { LANE_KEY } from "../registry.ts";
 
 /**
  * The runner directory and its safety rules. The directory (default `~/.dori/runner`) and every directory under it
@@ -132,19 +133,27 @@ const lstatDenied = (path: string): boolean => {
   try { lstatSync(path); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "EACCES"; }
 };
 
-const walk = (dir: string, uid: number | undefined, top: boolean, executable = false, win?: WinCheck): void => {
+const outputName = (name: string): boolean => name.endsWith(".out") && LANE_KEY.test(name.slice(0, -4))
+  && !/^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(name.slice(0, -4)) && !name.slice(0, -4).endsWith(".");
+const walk = (dir: string, uid: number | undefined, top: boolean, executable = false, win?: WinCheck, root = dir): void => {
   if (win) inspectWindows(dir, win, "dir");
   else inspect(dir, uid, "dir");
+  // Lane output is untrusted data. Audit its exact root, then let bounded capture audit descendants.
+  if (dirname(dir) === join(root, RUNNER_PATHS.briefs) && outputName(basename(dir))) return;
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
     // A socket left under `sock\` by a killed runner can't be lstat'd on Windows (EACCES); inspectWindows reads it.
     if (win && dir === join(win.root, RUNNER_PATHS.sock) && lstatDenied(path)) { inspectWindows(path, win, "file"); continue; }
     const st = lstatSync(path);
+    if (dir === join(root, RUNNER_PATHS.briefs) && outputName(name)) {
+      walk(path, uid, false, false, win, root);
+      continue;
+    }
     // Only the entries the runner itself defines have a fixed type; anything else is checked by what it is.
     const isTopDir = top && DIRECTORY_ENTRIES.has(name);
     const isTopFile = top && (FILE_ENTRIES.has(name) || /^(state|outbox)\.sqlite-(wal|shm)$/.test(name));
     if (st.isSymbolicLink() && !win) throw new RunnerDirUnsafe(path, "symlink");
-    if (isTopDir || (st.isDirectory() && !st.isSymbolicLink() && !isTopFile)) walk(path, uid, false, top ? EXECUTABLE_DIRS.has(name) : executable, win);
+    if (isTopDir || (st.isDirectory() && !st.isSymbolicLink() && !isTopFile)) walk(path, uid, false, top ? EXECUTABLE_DIRS.has(name) : executable, win, root);
     else if (win) inspectWindows(path, win, "file");
     else inspect(path, uid, "file", executable);
   }

@@ -15,6 +15,8 @@ import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
 import { REPORT_KINDS, type ReportKind } from "./runner/report-kinds.ts";
+import type { LaneFileReceipt } from "./runner/protocol.ts";
+import { LaneFileError } from "./lane-files.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -28,6 +30,7 @@ export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kin
 export type ReportRoute = "journal" | "thread" | "claim" | "dropped" | "late";
 
 export type LaneReport = {
+  readonly fileReceipt?: LaneFileReceipt;
   /** `<lane>:<generation>:<seq>`. */
   readonly id: string;
   readonly lane: string;
@@ -47,7 +50,7 @@ export type LaneReport = {
   readonly source?: string;
 };
 
-export type NewReport = Pick<LaneReport, "lane" | "generation" | "kind" | "text" | "evidence" | "at" | "source">;
+export type NewReport = Pick<LaneReport, "lane" | "generation" | "kind" | "text" | "evidence" | "at" | "source" | "fileReceipt">;
 
 /** A row written without an ownership generation (older dori, or a writer that does not fence): never fenced. */
 export const UNFENCED_GENERATION = 0;
@@ -79,6 +82,7 @@ const withId = (report: NewReport, seq: number): LaneReport => ({
   id: `${report.lane}:${report.generation}:${seq}`, lane: report.lane, generation: report.generation, seq, kind: report.kind,
   text: redactSecrets(report.text), ...(report.evidence ? { evidence: redactSecrets(report.evidence) } : {}), at: report.at,
   ...(report.source ? { source: report.source } : {}),
+  ...(report.fileReceipt ? { fileReceipt: report.fileReceipt } : {}),
 });
 
 /** `lane-reports.json` beside supervisor.json, rewritten whole under a short state lock (lanes and the supervisor both write). */
@@ -136,15 +140,17 @@ const ensureSchema = (db: Database): void => {
   const columns = db.query("PRAGMA table_info(lane_reports)").all() as { name: string }[];
   if (!columns.some((c) => c.name === "event_id")) db.exec("ALTER TABLE lane_reports ADD COLUMN event_id TEXT");
   if (!columns.some((c) => c.name === "source")) db.exec("ALTER TABLE lane_reports ADD COLUMN source TEXT");
+  if (!columns.some((c) => c.name === "file_receipt")) db.exec("ALTER TABLE lane_reports ADD COLUMN file_receipt TEXT");
 };
 
-type Row = { id: string; lane: string; generation: number; seq: number; kind: string; text: string; evidence: string | null; at: number; consumed_at: number | null; route: string | null; event_id?: string | null; source?: string | null };
+type Row = { id: string; lane: string; generation: number; seq: number; kind: string; text: string; evidence: string | null; at: number; consumed_at: number | null; route: string | null; event_id?: string | null; source?: string | null; file_receipt?: string | null };
 const reportOf = (row: Row): LaneReport => ({
   id: row.id, lane: row.lane, generation: row.generation, seq: row.seq, kind: row.kind as ReportKind, text: row.text,
   ...(row.evidence !== null ? { evidence: row.evidence } : {}), at: row.at,
   ...(row.consumed_at !== null ? { consumedAt: row.consumed_at } : {}), ...(row.route !== null ? { route: row.route as ReportRoute } : {}),
   ...(row.event_id != null ? { eventId: row.event_id } : {}),
   ...(row.source != null ? { source: row.source } : {}),
+  ...(row.file_receipt != null ? { fileReceipt: JSON.parse(row.file_receipt) as LaneFileReceipt } : {}),
 });
 
 /** Every row of `db`'s lane_reports table, as stored and in list() order; no table reads as no rows (`dori store export`). */
@@ -156,8 +162,8 @@ export const readReportRows = (db: Database): LaneReport[] =>
 /** Inserts `rows` with every column kept (id, seq, consumed_at, route), for `dori store import`; an id already there throws. */
 export const putReportRows = (db: Database, rows: readonly LaneReport[]): void => {
   ensureSchema(db);
-  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null, r.eventId ?? null, r.source ?? null);
+  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id, source, file_receipt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null, r.eventId ?? null, r.source ?? null, r.fileReceipt ? JSON.stringify(r.fileReceipt) : null);
 };
 
 /** The `lane_reports` table of supervisor.sqlite, on its own connection (WAL: the supervisor's connection keeps writing). */
@@ -184,8 +190,8 @@ export class SqliteLaneReports implements LaneReportStore {
       }
       const max = this.db.query("SELECT max(seq) AS seq FROM lane_reports WHERE lane = ?").get(report.lane) as { seq: number | null };
       const row = withId(report, (max.seq ?? 0) + 1);
-      this.db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .run(row.id, row.lane, row.generation, row.seq, row.kind, row.text, row.evidence ?? null, row.at, row.source ?? null);
+      this.db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, source, file_receipt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(row.id, row.lane, row.generation, row.seq, row.kind, row.text, row.evidence ?? null, row.at, row.source ?? null, row.fileReceipt ? JSON.stringify(row.fileReceipt) : null);
       return row;
     }).immediate();
   }
@@ -396,7 +402,8 @@ export const routeReports = async (
         await enqueue(eventId, stale ? `${line} (from a replaced session)` : line, lane ? laneMeta(lane) : { lane: report.lane });
         route = "late";
       } else if (report.kind === "done") {
-        await claimDone(deps, lane, oneLine(report.evidence ?? report.text));
+        if (lane.fileRun && !report.fileReceipt) throw new LaneFileError("LANE_REPORT_FILES_MISSING", lane.key, "this managed lane's done report has no file snapshot; claim done again through its runner");
+        await claimDone(deps, lane, oneLine(report.evidence ?? report.text), report.fileReceipt);
         const claim = (await deps.registry.read(report.lane))?.claim;
         // done-flow.ts claimEventId's format, spelled here: test/cli-sync-watch.test.ts mocks done-flow with a fixed export list.
         if (claim) eventId = `done-claim:${report.lane}:${claim.at}`;
@@ -435,6 +442,26 @@ export const routeReports = async (
       failed.delete(report.id);
       out.push(`LANE_REPORT_ROUTED ${report.id} ${report.kind} ${route}`);
     } catch (e) {
+      if (e instanceof LaneFileError && !e.transient) {
+        // A permanent file refusal never retries: a stale report is routed late, any other refusal journals its exact leaf line.
+        try {
+          const lane = await deps.registry.read(report.lane);
+          const meta = lane ? laneMeta(lane) : { lane: report.lane };
+          let route: ReportRoute = "journal";
+          let eventId = `lane-report-refused:${report.id}`;
+          if (e.code === "LANE_REPORT_STALE") {
+            eventId = `lane-report-late:${report.id}`;
+            route = "late";
+            await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report), "LANE_REPORT_LATE")} (from a replaced session)`, meta);
+          } else await enqueue(eventId, e.message, meta);
+          store.consume(report.id, deps.clock.now(), route, eventId);
+          failed.delete(report.id);
+          out.push(`LANE_REPORT_ROUTED ${report.id} ${report.kind} ${route}`);
+          continue;
+        } catch (refuse) {
+          console.error(`LANE_REPORT_REFUSE_ERROR ${report.id} ${refuse instanceof Error ? refuse.message : String(refuse)}`);
+        }
+      }
       // Poison isolation: the row stays pending and is retried on the next supervisor pass, never in a hot loop.
       const message = e instanceof Error ? e.message : String(e);
       console.error(`LANE_REPORT_ERROR ${report.id} ${message}`);
