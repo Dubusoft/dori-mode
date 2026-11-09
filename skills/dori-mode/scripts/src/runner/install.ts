@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
@@ -51,8 +51,11 @@ import { isPrivateListen } from "./ws-transport.ts";
  * MSYS, Cygwin), which `installRunner` retries as a Windows install; 9 enrollment response needed; anything else is a generic failure.
  * ssh's own 255 or a timeout is unreachable.
  *
- * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead: a PowerShell script on ssh's stdin
- * behind the short `WIN_BOOTSTRAP` encoded command (read up to its end-marker line, not to EOF), with the same exit code meanings.
+ * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead, with the same exit code meanings.
+ * Nothing travels on ssh's stdin there (a large script streamed into a PowerShell console host's stdin does not reliably
+ * finish): each pass uploads the script with scp as `.dori-runner-install-<random>.ps1` into the user's profile directory
+ * (the scp start directory on Windows OpenSSH), then runs the short `winRun` encoded command over ssh, which reads that
+ * file, deletes it (it holds the one-time enrollment code) and runs its text as a scriptblock.
  */
 
 export const RUNNER_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-runner-remote.service");
@@ -64,6 +67,8 @@ export const HERDR_LAUNCHD_LABEL = "com.dori.herdr";
 export const HERDR_UNIT = "herdr-server.service";
 export const RUNNER_CLI_ENTRY = join(import.meta.dir, "bin.ts");
 export const INSTALL_TIMEOUT_MS = 180_000;
+/** The ssh step of a Windows pass: a first install downloads and expands the pinned Bun zip, perhaps twice. */
+export const WIN_INSTALL_TIMEOUT_MS = 600_000;
 const HEREDOC = "DORI_RUNNER_EOF";
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENROLL_VALUE = /^[A-Za-z0-9_:=+/.-]+$/;
@@ -334,16 +339,20 @@ export const windowsTemplates = (): WindowsTemplates => {
   };
 };
 
-/** The last line of the Windows install script: the bootstrap reads stdin up to it, so a missing stdin EOF cannot hang. */
-export const WIN_SCRIPT_END = "DORI_INSTALL_SCRIPT_END";
+/**
+ * The scp command that uploads a Windows install script to `remoteName`, relative to the scp start directory (the
+ * user's profile directory on Windows OpenSSH).
+ */
+export const scpArgv = (target: string, localFile: string, remoteName: string): string[] =>
+  ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", localFile, `${target}:${remoteName}`];
 
 /**
- * The encoded command a Windows install runs over ssh: it reads the ASCII install script from stdin line by line up to
- * the `WIN_SCRIPT_END` line (a stdin EOF that never reaches the remote PowerShell cannot hang it; a stream that ends
- * before the marker exits 1 without running anything) and runs it, so the command line stays far under cmd.exe's
- * 8191-character limit whatever the payload size.
+ * The PowerShell a Windows pass runs over ssh as an encoded command: it reads the uploaded script from the profile
+ * directory, deletes the file before anything runs (it holds the one-time enrollment code), and runs the text as a
+ * scriptblock, so the execution policy does not apply and the command line stays far under cmd.exe's limit.
  */
-export const WIN_BOOTSTRAP = `$ErrorActionPreference='Stop'; [Console]::InputEncoding=[Text.Encoding]::ASCII; $b=New-Object Text.StringBuilder; $e=$false; while(($l=[Console]::In.ReadLine()) -ne $null){ if($l.TrimEnd([char]13) -eq '${WIN_SCRIPT_END}'){ $e=$true; break }; [void]$b.Append($l).Append([char]10) }; if(-not $e){ [Console]::Error.WriteLine('install script truncated before its end marker'); exit 1 }; & ([scriptblock]::Create($b.ToString())); exit $LASTEXITCODE`;
+export const winRun = (remoteName: string): string =>
+  `$ErrorActionPreference='Stop'; $f = Join-Path $env:USERPROFILE '${remoteName}'; $s = [IO.File]::ReadAllText($f); Remove-Item -LiteralPath $f -Force; & ([scriptblock]::Create($s)); exit $LASTEXITCODE`;
 
 const psq = (value: string): string => `'${value.replace(/'/g, "''")}'`;
 const b64 = (text: string): string => Buffer.from(text, "utf8").toString("base64");
@@ -351,9 +360,9 @@ const sha256 = (text: string): string => createHash("sha256").update(text).diges
 const TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
 
 /**
- * The PowerShell install script for a Windows worker, sent on stdin behind `WIN_BOOTSTRAP` and ending with the
- * `WIN_SCRIPT_END` line, which the bootstrap reads up to instead of waiting for EOF. It is pure ASCII: the
- * bundle and every template travel as base64 literals written byte-exact with `[IO.File]::WriteAllBytes`, so no code
+ * The PowerShell install script for a Windows worker, uploaded with scp and run from that file by `winRun`. Each step
+ * appends `<ISO time> <step>` to `%USERPROFILE%\.dori\runner-install.log` as it starts, so a hang shows where it
+ * stopped. It is pure ASCII: the bundle and every template travel as base64 literals written byte-exact with `[IO.File]::WriteAllBytes`, so no code
  * page, BOM or line-ending conversion can touch them. In order it:
  *
  * - refuses anything but x64 Windows 10 1809+ (exit 4) and a host without `herdr` on PATH (exit 7);
@@ -392,11 +401,15 @@ export const windowsInstallScript = (
     "$ErrorActionPreference = 'Stop'",
     "$ProgressPreference = 'SilentlyContinue'",
     "function Exit-Dori([int]$Code, [string]$Why) { [Console]::Error.WriteLine($Why); exit $Code }",
+    "function Step([string]$N) { $L = Join-Path $env:USERPROFILE '.dori'; [void][IO.Directory]::CreateDirectory($L); [IO.File]::AppendAllText((Join-Path $L 'runner-install.log'), ([DateTime]::UtcNow.ToString('o') + ' ' + $N + [char]10), [Text.Encoding]::ASCII) }",
+    "Step 'start'",
+    "Step 'checks'",
     "$Arch = $env:PROCESSOR_ARCHITEW6432",
     "if (-not $Arch) { $Arch = $env:PROCESSOR_ARCHITECTURE }",
     "$Build = [Environment]::OSVersion.Version.Build",
     `if ($Arch -ne 'AMD64' -or $Build -lt 17763) { Exit-Dori ${INSTALL_EXIT.notLinux} ('unsupported Windows host: ' + $Arch + ' build ' + $Build + '; a runner needs x64 Windows 10 1809 or later') }`,
     `if (-not (Get-Command herdr -ErrorAction SilentlyContinue)) { Exit-Dori ${INSTALL_EXIT.noHerdr} 'no herdr on PATH' }`,
+    "Step 'acl'",
     "$Sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$R = Join-Path $env:USERPROFILE '.dori\\runner'",
     "$Bin = Join-Path $R 'bin'",
@@ -408,6 +421,7 @@ export const windowsInstallScript = (
     "if ($LASTEXITCODE -ne 0) { Exit-Dori 1 'icacls could not make the user the owner of the runner directory' }",
     "foreach ($D in 'bin', 'bun', 'logs', 'evidence') { [void][IO.Directory]::CreateDirectory((Join-Path $R $D)) }",
     // Bun: a pinned build, checked against the hash carried here, and run once before it is used.
+    "Step 'bun'",
     "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12",
     "$Pins = @(",
     pins.map((p) => `  @{ Dir = ${psq(bunPinDir(p))}; Asset = ${psq(p.asset)}; Folder = ${psq(p.asset.replace(/\.zip$/, ""))}; Url = ${psq(bunPinUrl(p))}; Sha256 = ${psq(p.sha256)} }`).join(",\n"),
@@ -441,12 +455,15 @@ export const windowsInstallScript = (
     `if (-not $BunDir) { Exit-Dori ${INSTALL_EXIT.noBun} 'no usable bun: the pinned bun-windows-x64 builds could not be downloaded, verified or run' }`,
     "$Bun = Join-Path $R ('bun\\' + $BunDir + '\\bun.exe')",
     // Every file is written beside its target first; the bundle's hash is checked before anything is replaced.
+    "Step 'files'",
     "function Write-DoriFile([string]$Name, [string]$Data) { [IO.File]::WriteAllBytes((Join-Path $Bin ($Name + '.tmp')), [Convert]::FromBase64String($Data)) }",
     ...payloads.map(([name, text]) => `Write-DoriFile ${psq(name)} '${b64(text)}'`),
     `if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Bin 'dori.js.tmp')).Hash.ToLowerInvariant() -ne '${sha256(bundle)}') { Exit-Dori 1 'dori.js does not match its SHA-256 after writing' }`,
     // A running runner is stopped before its files are replaced: the task first, so its wrapper does not start it again.
+    "Step 'stop-runner'",
     `if (Get-ScheduledTask ${TASK} -ErrorAction SilentlyContinue) { Stop-ScheduledTask ${TASK} }`,
     WIN_KILL_RUNNER,
+    "Step 'move'",
     "function Move-DoriFile([string]$Name) {",
     "  $To = Join-Path $Bin $Name",
     "  for ($N = 1; ; $N++) {",
@@ -462,6 +479,7 @@ export const windowsInstallScript = (
     "Get-ChildItem -LiteralPath (Join-Path $R 'bun') -Directory | Where-Object { $_.Name -ne $BunDir -and $_.Name -ne $Prev } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }",
     "[IO.File]::WriteAllText($BunTxt, $BunDir)",
     // A starter command policy, only when the host has none; an existing runner-config.json is the operator's.
+    "Step 'config'",
     ...(agentCommand.length ? [
       "$Cfg = Join-Path $R 'runner-config.json'",
       "if (-not (Test-Path -LiteralPath $Cfg)) {",
@@ -471,6 +489,7 @@ export const windowsInstallScript = (
       "  Move-Item -LiteralPath ($Cfg + '.tmp') -Destination $Cfg -Force",
       "}",
     ] : []),
+    "Step 'enroll'",
     `$C = ${psq(issue.code)}`,
     `$F = ${psq(issue.fingerprint)}`,
     "if (-not (Test-Path -LiteralPath (Join-Path $R 'keys\\supervisor.pub'))) {",
@@ -489,18 +508,18 @@ export const windowsInstallScript = (
     `  if ($Enroll.ExitCode -ne 0) { Exit-Dori ${INSTALL_EXIT.enroll} ('enrollment failed with exit ' + $Enroll.ExitCode) }`,
     "}",
     "Remove-Variable C, F",
+    "Step 'task'",
     "try {",
     "  $Xml = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $Bin 'dori-runner-task.xml'))).Replace('@RUNNER@', [Security.SecurityElement]::Escape($R)).Replace('@USER@', $Sid)",
     `  Register-ScheduledTask ${TASK} -Xml $Xml -Force | Out-Null`,
     `  Enable-ScheduledTask ${TASK} | Out-Null`,
     `  Start-ScheduledTask ${TASK}`,
     `} catch { Exit-Dori ${INSTALL_EXIT.systemd} ('task scheduler: ' + $_.Exception.Message) }`,
+    "Step 'done'",
     "Write-Output ('DORI_BUN ' + $BunDir)",
     "exit 0",
-    WIN_SCRIPT_END,
     "",
   ];
-  if (lines.slice(0, -2).some((line) => line.replace(/\r$/, "") === WIN_SCRIPT_END)) throw new Error(`install payload contains the script end marker ${WIN_SCRIPT_END}`);
   return lines.join("\n");
 };
 
@@ -515,7 +534,9 @@ const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult
     const herdr = [...r.out.matchAll(/^DORI_HERDR (started|managed|unmanaged)$/gm)].at(-1)?.[1] as HerdrInstall | undefined;
     return { ok: true, version: bundleVersion(bundle), ...(herdr ? { herdr } : {}) };
   }
-  if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, code: "RUNNER_INSTALL_UNREACHABLE", detail };
+  if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) {
+    return { ok: false, code: "RUNNER_INSTALL_UNREACHABLE", detail: windows ? `${detail} (progress: %USERPROFILE%\\.dori\\runner-install.log on the host)` : detail };
+  }
   if (windows && r.code === INSTALL_EXIT.notLinux) return { ok: false, code: "RUNNER_INSTALL_UNSUPPORTED", detail: `unsupported OS: a Windows runner needs x64 Windows 10 1809 or later (${detail})` };
   if (!windows && (r.code === INSTALL_EXIT.notLinux || NOT_POSIX.test(r.err))) return { ok: false, code: "RUNNER_INSTALL_UNSUPPORTED", detail: `unsupported OS: only Linux and macOS machines take a runner (${detail})` };
   if (r.code === INSTALL_EXIT.noBun) {
@@ -537,15 +558,41 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   const issue = req.issue();
   if (!ENROLL_VALUE.test(issue.code) || !ENROLL_VALUE.test(issue.fingerprint)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: "bad enrollment code or fingerprint" };
   let kind: InstallKind = k.kind;
-  const install = (enrollment: EnrollIssue): Promise<Ran> => {
-    const script = kind === "windows"
-      ? windowsInstallScript(bundle, req.label, req.listenAddress, enrollment, req.agentCommand, deps.windowsTemplates ?? windowsTemplates())
-      : installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates);
-    return deps.run(sshArgv(req.machine.target, kind === "windows" ? encodedPowerShell(WIN_BOOTSTRAP) : "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
+  const target = req.machine.target;
+  // A Windows pass: scp uploads the script to the profile directory, then ssh runs it from there with an empty stdin.
+  // An scp failure is returned as the install's result and the ssh step is skipped.
+  const installWindows = async (script: string): Promise<Ran | InstallResult> => {
+    const dir = mkdtempSync(join(tmpdir(), "dori-runner-install-"));
+    try {
+      const local = join(dir, "install.ps1");
+      writeFileSync(local, script, { mode: 0o600 });
+      const remoteName = `.dori-runner-install-${randomBytes(8).toString("hex")}.ps1`;
+      const up = await deps.run(scpArgv(target, local, remoteName), { timeoutMs: INSTALL_TIMEOUT_MS });
+      if (up.code !== 0) {
+        const detail = `scp: ${(up.err.trim().split("\n").at(-1) ?? "") || `exit ${up.code}`}`;
+        const unreachable = up.timedOut || up.code === RUN_TIMEOUT_CODE || up.code === 255;
+        return { ok: false, code: unreachable ? "RUNNER_INSTALL_UNREACHABLE" : "RUNNER_INSTALL_FAILED", detail };
+      }
+      return await deps.run(sshArgv(target, encodedPowerShell(winRun(remoteName))), { timeoutMs: WIN_INSTALL_TIMEOUT_MS });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   };
-  let r = await install(issue);
+  const install = (enrollment: EnrollIssue): Promise<Ran | InstallResult> => {
+    if (kind === "windows") return installWindows(windowsInstallScript(bundle, req.label, req.listenAddress, enrollment, req.agentCommand, deps.windowsTemplates ?? windowsTemplates()));
+    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates);
+    return deps.run(sshArgv(target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
+  };
+  let pass = await install(issue);
+  if ("ok" in pass) return pass;
+  let r = pass;
   // A POSIX shell on Windows: powershell.exe is reachable from it, so the Windows install runs instead.
-  if (kind === "posix" && r.code === INSTALL_EXIT.windowsShell) { kind = "windows"; r = await install(issue); }
+  if (kind === "posix" && r.code === INSTALL_EXIT.windowsShell) {
+    kind = "windows";
+    pass = await install(issue);
+    if ("ok" in pass) return pass;
+    r = pass;
+  }
   if (r.code === INSTALL_EXIT.enrollPending) {
     try {
       const line = /^RUNNER_ENROLL_REQUEST (.+)$/m.exec(r.out)?.[1];
@@ -557,7 +604,9 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
       const accepted = req.enroll(body);
       if (!accepted.ok) throw new Error(`${accepted.code} ${accepted.detail}`);
       const reply = Buffer.from(encodeFrame(supervisorControl({ runner: req.label, gen: 0, epoch: 0 }, "enroll.ok", accepted.reply))).toString("base64");
-      r = await install({ ...issue, reply });
+      pass = await install({ ...issue, reply });
+      if ("ok" in pass) return pass;
+      r = pass;
     } catch (error) {
       return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail: error instanceof Error ? error.message : String(error) };
     }

@@ -183,19 +183,24 @@ test("Windows enrollment returns its proof on SSH stdout and receives the respon
   const code = auth.issueCode(req.label).code;
   const params = { auth: worker, code, label: req.label, hostId: "windows-host", expectedFingerprint: auth.fingerprint };
   const calls: Call[] = [];
+  // Each Windows pass uploads the script with scp, then runs it over ssh with no stdin.
+  const uploads: string[] = [];
   try {
     const result = await installRunner({
       run: async (argv, opts) => {
         calls.push({ argv, opts });
-        const reply = /reply=([A-Za-z0-9+/=]+)/.exec(opts!.stdin!)?.[1];
+        if (argv[0] === "scp") { uploads.push(readFileSync(argv.at(-2)!, "utf8")); return { code: 0, out: "", err: "" }; }
+        expect(opts?.stdin).toBeUndefined();
+        const reply = /reply=([A-Za-z0-9+/=]+)/.exec(uploads.at(-1)!)?.[1];
         const request = enrollOverStdio(params, reply);
         return request ? { code: INSTALL_EXIT.enrollPending, out: `RUNNER_ENROLL_REQUEST ${request}\r\n`, err: "" } : { code: 0, out: "", err: "" };
       },
       bundle: async () => BUNDLE, kind: async () => ({ ok: true, kind: "windows" }),
     }, { ...req, issue: () => ({ code, fingerprint: auth.fingerprint }), enroll: (body) => auth.enroll(body) });
     expect(result).toMatchObject({ ok: true });
-    expect(calls).toHaveLength(2);
-    expect(calls[1]!.opts!.stdin).toContain("$Enroll.StandardInput.Write('reply=");
+    expect(calls.map((call) => call.argv[0])).toEqual(["scp", "ssh", "scp", "ssh"]);
+    expect(uploads[0]).not.toContain("$Enroll.StandardInput.Write('reply=");
+    expect(uploads[1]).toContain("$Enroll.StandardInput.Write('reply=");
     expect(calls.flatMap((call) => call.argv).join(" ")).not.toContain(code);
     expect(worker.supervisorKey()).toBe(auth.publicKey);
   } finally { auth.close(); }
