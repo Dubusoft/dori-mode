@@ -24,7 +24,10 @@ import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { syncRegistry } from "./sync.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
-import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "./placement.ts";
+import {
+  checkMachine, LOCAL_MACHINE, PlacementConflict, placementLine, placementTable, placementWarnings, planLaunch, resolvePlacement, type RunnerPlacement,
+  runnerPlacements, verdictLine,
+} from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
 import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/discord-lock.ts";
@@ -212,6 +215,10 @@ const USAGE = `dori <command> [options]
   guard machines                       the remote guard agent of every saved machine: version and load, memory, swap, disk (GUARD_MACHINE lines)
   guard install [--machine LABEL]      install or update the guard agent over ssh on all listed machines, or one (exit 1 on any failure)
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
+  placement [--repo owner/repo] [--cwd D] [--done "..."] [--json]
+                                       without flags: the repos each runner declares (WORKSPACE, PLACEMENT_CONFLICT), the repos
+                                       only detected under its allowedRoots (DETECTED, information) and the default machine; with
+                                       flags: where a launch would go (PLACEMENT line; exit 2 on PLACEMENT_CONFLICT)
   can-launch [--machine M] [--cwd D] [--done "..."] [--all]
                                        exit 0 if the machine a launch with these flags is placed on (none: placement.defaultMachine)
                                        has room for a new lane, else print why and exit 4; --all checks local and every listed machine
@@ -607,7 +614,7 @@ const flags = parseArgs({
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
-    dev: { type: "boolean" }, buttons: { type: "string" },
+    dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -635,6 +642,18 @@ const machineOpt = async (stateDir: string): Promise<{ machine: string; offline:
   const offline = await runnerOffline(stateDir, machine);
   if (offline === undefined) die(`RUNNER_UNKNOWN_MACHINE ${machine}: no runner with that label has enrolled; see them with \`dori status\` or \`dori runner probe\``);
   return { machine, offline: offline === true };
+};
+/** What every runner reported about its repos, `online` unless its runner is offline, lost or revoked (as runnerOffline). */
+const placementReports = async (stateDir: string): Promise<RunnerPlacement[]> => {
+  const { readRunnerRows } = await import("./runner/hub.ts");
+  const { runnerView } = await import("./status.ts");
+  const now = Date.now();
+  return runnerPlacements(readRunnerRows(stateDir), (row) => !["offline", "lost", "revoked"].includes(runnerView(row, now).state));
+};
+/** PLACEMENT_CONFLICT dies with exit 2; anything else is rethrown. */
+const conflictDie = (e: unknown): never => { if (e instanceof PlacementConflict) die(e.message, 2); throw e; };
+const placeOrDie = <T>(place: () => T): T => {
+  try { return place(); } catch (e) { return conflictDie(e); }
 };
 const offlineWarn = (machine: string, what: "wait" | "source" | "schedule"): string =>
   `WARN runner ${machine} is not connected; the ${what} is kept and runs when it reconnects`;
@@ -923,16 +942,19 @@ try {
       const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
-      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine));
+      const reports = await placementReports(config.stateDir);
+      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine), reports).catch(conflictDie);
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
       const machine = target === LOCAL_MACHINE ? undefined : target;
+      // A remote launch without --cwd starts in the checkout its owning runner declared.
+      const cwd = input.cwd ?? (machine && plan.placement.machine === target ? plan.placement.cwd : undefined);
       if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
       if (!plan.check.verdict.ok) {
         const repos = doneRepos(input.done);
         const queue = enqueueLaunch(config.stateDir, {
           key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [plan.check.verdict.reasons.join(" | ")],
-          ...(input.cwd ? { cwd: input.cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
+          ...(cwd ? { cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
           ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}),
           ...(machine ? { machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
         });
@@ -941,7 +963,7 @@ try {
         process.exit(4);
       }
       // A refused sandbox and an allowed unsandboxed run both reach the owner on Discord (sandbox-notice.ts) before the exit.
-      const r = await launchLane(deps, { ...input, machine }).catch(async (e: unknown) => {
+      const r = await launchLane(deps, { ...input, machine, ...(cwd ? { cwd } : {}) }).catch(async (e: unknown) => {
         if (e instanceof SandboxRefusal) for (const line of await postSandboxNotice(deps, input, e.message)) console.error(line);
         throw e;
       });
@@ -1149,16 +1171,41 @@ try {
     }
     case "can-launch": {
       const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines, config.stateDir) : [];
-      const machines = flags.values.all
-        ? [LOCAL_MACHINE, ...listed.map((m) => m.label)]
-        : [resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement).machine];
-      const checks = await Promise.all(machines.map((m) => checkMachine(deps.ops, config, m)));
+      const reports = flags.values.all ? [] : await placementReports(config.stateDir);
+      const p = flags.values.all ? undefined
+        : placeOrDie(() => resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement, reports));
+      for (const line of p ? placementWarnings(p) : []) console.error(line);
+      const machines = p ? [p.machine] : [LOCAL_MACHINE, ...listed.map((m) => m.label)];
+      // An offline owning runner holds the launch without observing anything (planLaunch does the same).
+      const checks = p?.online === false
+        ? [{ machine: p.machine, verdict: { ok: false, reasons: [`runner ${p.machine} that owns ${p.rule} is offline; the launch waits for it`] }, summary: "" }]
+        : await Promise.all(machines.map((m) => checkMachine(deps.ops, config, m)));
       const at = Date.now();
       for (const c of checks) {
         recordLaunchVerdict(config.stateDir, c.verdict, at, c.machine);
         console.log(verdictLine(c.machine, c.verdict));
       }
       process.exit(checks.every((c) => c.verdict.ok) ? 0 : 4);
+    }
+    case "placement": {
+      if (flags.positionals.length) die("usage: dori placement [--repo owner/repo] [--cwd D] [--done \"...\"] [--json]", 2);
+      const reports = await placementReports(config.stateDir);
+      const repo = opt("repo");
+      if (repo === undefined && opt("cwd") === undefined && opt("done") === undefined) {
+        if (flags.values.json) console.log(JSON.stringify({ runners: reports, defaultMachine: config.placement.defaultMachine, fallback: config.placement.fallback }, null, 2));
+        else for (const line of placementTable(reports, config.placement)) console.log(line);
+        process.exit(0);
+      }
+      // --repo reads as a Done line naming that repo, so it matches exactly what a launch with that repo would.
+      const done = [opt("done"), repo ? `merged ${repo}#0` : undefined].filter(Boolean).join("; ");
+      const p = placeOrDie(() => resolvePlacement({ cwd: opt("cwd"), done }, config.placement, reports));
+      if (flags.values.json) console.log(JSON.stringify(p));
+      else {
+        console.log(placementLine(p));
+        for (const line of placementWarnings(p)) console.error(line);
+        if (p.online === false) console.log(`HOLD machine=${p.machine} runner ${p.machine} that owns ${p.rule} is offline; the launch waits for it`);
+      }
+      process.exit(0);
     }
     case "memory": {
       if (key !== "check" || flags.positionals.length > 1 || Object.keys(flags.values).length) die("usage: dori memory check", 2);

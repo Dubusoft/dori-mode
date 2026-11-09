@@ -1,7 +1,8 @@
+import { readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_LANE_SANDBOX, type DoriConfig, withThinking } from "../config.ts";
-import type { RunnerPolicy } from "./policy.ts";
+import { parsePolicy, POLICY_FILE, type RunnerPolicy } from "./policy.ts";
 
 /**
  * The local runner's policy when `~/.dori/runner/runner-config.json` is absent (design D20): derived from the lead's
@@ -36,5 +37,25 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
     sandbox: "optional",
     sandboxCheck: [...sandbox, "--check"],
     jobs: "allow",
+  };
+};
+
+/** The runner-config keys that only declare placement; a file holding nothing else keeps the derived local policy. */
+export const PLACEMENT_ONLY_KEYS: readonly string[] = ["workspaces", "detectWorkspaces"];
+
+/**
+ * The local runner's policy when `<runnerDir>/runner-config.json` exists: a file that sets only PLACEMENT_ONLY_KEYS
+ * layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
+ * with any other key is the whole policy, unchanged.
+ */
+export const localRunnerPolicy = (runnerDir: string, cfg: LocalPolicyConfig, env: { readonly home?: string; readonly tmp?: string } = {}): RunnerPolicy => {
+  const raw: unknown = JSON.parse(readFileSync(join(runnerDir, POLICY_FILE), "utf8"));
+  const parsed = parsePolicy(raw, env.home ?? homedir());
+  const keys = typeof raw === "object" && raw !== null ? Object.keys(raw) : [];
+  if (!keys.every((key) => PLACEMENT_ONLY_KEYS.includes(key))) return parsed;
+  return {
+    ...localPolicy(cfg, env),
+    ...(parsed.workspaces ? { workspaces: parsed.workspaces } : {}),
+    ...(parsed.detectWorkspaces !== undefined ? { detectWorkspaces: parsed.detectWorkspaces } : {}),
   };
 };

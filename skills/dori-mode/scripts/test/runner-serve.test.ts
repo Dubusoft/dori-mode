@@ -96,6 +96,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const tracked = trackedConnector(connectUnix(controlSocketPath(runnerDir)));
   const client = new RunnerClient({ label: identity.label, hostId: identity.hostId }, {
     connect: tracked.connect, outbox, state: runnerState, clock, auth: new RunnerAuth(runnerDir), inventory: () => observed.map(({ status: _s, ...lane }) => lane),
+    workspaces: () => ({ workspaces: [{ repo: "acme/app", path: "/data/repos/app" }], detected: [{ repo: "acme/lib", path: "/data/repos/lib" }] }),
   });
   const timers: { ms: number; tick: () => void }[] = [];
   const controller = new AbortController();
@@ -112,6 +113,8 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // The lane.state observed before the connection was appended to the outbox, replayed and committed to the hub's own journal.
   expect(hub.hub.runner("local")?.eventAck).toBe(1);
+  // The hello's placement report is stored on the runner's row.
+  expect(hub.hub.runner("local")?.workspaces).toEqual({ declared: [{ repo: "acme/app", path: "/data/repos/app" }], detected: [{ repo: "acme/lib", path: "/data/repos/lib" }] });
   const db = new Database(join(stateDir, HUB_FILE), { readonly: true });
   expect((db.query("SELECT id FROM runner_events").all() as { id: string }[]).map((r) => r.id)).toEqual(["runner:local:1"]);
   db.close();
