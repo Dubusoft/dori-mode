@@ -316,6 +316,16 @@ test("wait time: a date-epoch signal is the fire time; the deadline field is onl
   expect(text).toContain("\n- m: 조건: merged o/r#7\n");
 });
 
+test("a machine wait shows @machine after its key, marked 오프라인 while that runner is not connected; a local wait is unchanged", () => {
+  const runner = (label: string, state: "connected" | "offline") => ({ label, state, gen: 1, cmds: 0, restarts1h: 0, lanes: 0 });
+  const text = renderStatus({ ...base, runners: [runner("mini", "offline"), runner("box", "connected")], waits: [
+    { key: "a", until: "merged o/r#7", machine: "mini" }, { key: "b", until: "merged o/r#8", machine: "box" }, { key: "c", until: "merged o/r#9" },
+  ] });
+  expect(text).toContain("\n- a@mini 오프라인: 조건: merged o/r#7\n");
+  expect(text).toContain("\n- b@box: 조건: merged o/r#8\n");
+  expect(text).toContain("\n- c: 조건: merged o/r#9\n");
+});
+
 test("a (#N) in the lane title is never shown as a PR", async () => {
   const f = await fixture();
   await f.registry.write(lane("task-lane", { title: "polish dori /status (#55)", done: 'command ["gh","pr","list","-R","dev-bokdong/dori-mode","--head","b","--json","number"] stdout~"number"' }));

@@ -191,16 +191,16 @@ const USAGE = `dori <command> [options]
                                        then set "store": "sqlite" in the config
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
                                        from supervisor.sqlite (rollback), then set "store": "json" in the config
-  wait <key> --until SIGNAL --note TEXT [--thread REF] [--every SEC] [--timeout MIN]
+  wait <key> --until SIGNAL --note TEXT [--thread REF] [--every SEC] [--timeout MIN] [--machine M --cwd DIR]
   wait --list | --cancel <key>          durable supervisor-owned follow-ups
   emit <KIND> --text T [--id ID]       journal one event (dedupe by --id); its class comes from eventPolicy
   source list [--json]                 event sources: built-ins and registered ones, with their last event and error
-  source add <name> --type poll --command CMD --every SEC --match RE --kind KIND [--cwd DIR]
+  source add <name> --type poll --command CMD --every SEC --match RE --kind KIND [--cwd DIR] [--machine M]
                                        CMD is a shell line, or a JSON argv array; each stdout line matching RE is one event
   source add <name> --type webhook --port P --kind KIND [--secret S]   POST to 127.0.0.1:P with X-Dori-Secret (secret printed once when generated)
   source add <name> --type file --path FILE --match RE --kind KIND     each new line of FILE matching RE is one event
   source remove <name>                 stop and forget a registered source
-  schedule add <name> (--cron EXPR | --every SEC) (--text T | --command CMD [--cwd DIR] [--heavy] [--timeout SEC]) --kind KIND
+  schedule add <name> (--cron EXPR | --every SEC) (--text T | --command CMD [--cwd DIR] [--machine M] [--heavy] [--timeout SEC]) --kind KIND
                [--tz ZONE] [--catch-up once|skip]   a scheduled job: emit <KIND> T, or run CMD and emit its result;
                                        cron in ZONE (default Asia/Seoul); a missed slot runs once after downtime (or is skipped)
   schedule list [--json] | schedule remove <name> | schedule run-now <name>   jobs with their next and last run; run one now
@@ -618,6 +618,27 @@ const need = (name: string): string => opt(name) || die(`--${name} is required`)
 const key = flags.positionals[0];
 const loopMin = Number(opt("loop") ?? 0);
 
+/** Runner label -> true when its runner is not connected, from the hub table (`runners.sqlite`) the way `dori status` reads it; undefined: no such runner. */
+const runnerOffline = async (stateDir: string, label: string): Promise<boolean | undefined> => {
+  const { readRunnerRows } = await import("./runner/hub.ts");
+  const { runnerView } = await import("./status.ts");
+  const row = readRunnerRows(stateDir).find((r) => r.label === label);
+  if (!row) return undefined;
+  const state = runnerView(row, Date.now()).state;
+  return state === "offline" || state === "lost" || state === "revoked";
+};
+
+/** `--machine`: undefined when absent or `local`; else a runner label known to the hub, otherwise the command dies. */
+const machineOpt = async (stateDir: string): Promise<{ machine: string; offline: boolean } | undefined> => {
+  const machine = opt("machine");
+  if (machine === undefined || machine === "local") return undefined;
+  const offline = await runnerOffline(stateDir, machine);
+  if (offline === undefined) die(`RUNNER_UNKNOWN_MACHINE ${machine}: no runner with that label has enrolled; see them with \`dori status\` or \`dori runner probe\``);
+  return { machine, offline: offline === true };
+};
+const offlineWarn = (machine: string, what: "wait" | "source" | "schedule"): string =>
+  `WARN runner ${machine} is not connected; the ${what} is kept and runs when it reconnects`;
+
 /** `--command`: a JSON argv array, else a shell line run with `sh -c`. */
 const commandArgv = (command: string | undefined): unknown => {
   if (!command) return die("--command is required");
@@ -741,11 +762,15 @@ try {
         if (!waits.cancel(cancelled)) die(`no wait "${cancelled}"`);
         console.log(`WAIT_CANCELLED ${cancelled}`);
       } else {
+        const target = await machineOpt(config.stateDir);
+        if (target && !opt("cwd")) die("dori wait --machine needs --cwd (a directory on that machine)");
         const wait = waits.register({
           key: key ?? die("wait needs a key"), until: need("until"), note: need("note"),
-          thread: opt("thread"), every: opt("every"), timeout: opt("timeout"), cwd: process.cwd(),
+          thread: opt("thread"), every: opt("every"), timeout: opt("timeout"), cwd: target ? need("cwd") : process.cwd(),
+          ...(target ? { machine: target.machine } : {}),
         }, realClock.now());
-        console.log(`WAIT_REGISTERED ${wait.key}`);
+        console.log(`WAIT_REGISTERED ${wait.key}${target ? ` machine=${target.machine}` : ""}`);
+        if (target?.offline) console.log(offlineWarn(target.machine, "wait"));
       }
       break;
     }
@@ -759,14 +784,16 @@ try {
     case "source": {
       const [action, name, ...extra] = flags.positionals;
       const specs = new SourceSpecs(config.stateDir);
-      const usage = "usage: dori source list [--json] | dori source add <name> --type poll|webhook|file ... | dori source remove <name>";
+      const usage = "usage: dori source list [--json] | dori source add <name> --type poll|webhook|file ... [--machine M] | dori source remove <name>";
       if (extra.length) die(usage);
       if (action === "list" && name === undefined) {
         const view = sourceViews(config.stateDir);
         const registered = new Map(specs.list().map((spec) => [spec.name, publicSpec(spec)]));
         const rows = view.sources.map((source) => ({ ...source, ...(registered.get(source.name) ?? {}) }));
+        const offline = new Map<string, boolean | undefined>();
+        for (const row of rows) if (row.machine && !offline.has(row.machine)) offline.set(row.machine, await runnerOffline(config.stateDir, row.machine));
         if (flags.values.json) console.log(JSON.stringify(rows, null, 2));
-        else for (const row of rows) console.log(`${row.name} ${row.type}${row.kind ? ` ${row.kind}` : ""} events=${row.events ?? 0} duplicates=${row.duplicates ?? 0} last=${row.lastEventAt === undefined ? "never" : `${row.lastKind} ${new Date(row.lastEventAt).toISOString()}`}${row.failing ? ` FAILING ${row.lastError}` : ""}${"identity" in row && row.identity ? ` identity=${row.identity}` : ""}`);
+        else for (const row of rows) console.log(`${row.name} ${row.type}${row.kind ? ` ${row.kind}` : ""} events=${row.events ?? 0} duplicates=${row.duplicates ?? 0} last=${row.lastEventAt === undefined ? "never" : `${row.lastKind} ${new Date(row.lastEventAt).toISOString()}`}${row.failing ? ` FAILING ${row.lastError}` : ""}${"identity" in row && row.identity ? ` identity=${row.identity}` : ""}${row.machine ? ` machine=${row.machine}${offline.get(row.machine) ? " (runner offline)" : ""}` : ""}`);
         break;
       }
       if (action === "remove" && name) {
@@ -778,11 +805,14 @@ try {
       const type = need("type");
       const command = opt("command");
       const generated = type === "webhook" && !opt("secret") ? randomBytes(24).toString("hex") : undefined;
+      const target = await machineOpt(config.stateDir);
+      if (target && type !== "poll") die("--machine is for --type poll sources (a webhook or file source runs on the supervisor host)");
       const spec = specs.add({
         name, type, kind: need("kind"),
         ...(type === "poll" ? {
           command: commandArgv(command),
           everySec: Number(need("every")), match: need("match"), ...(opt("cwd") ? { cwd: opt("cwd") } : {}),
+          ...(target ? { machine: target.machine } : {}),
         } : {}),
         ...(type === "webhook" ? { port: Number(need("port")), secret: generated ?? need("secret") } : {}),
         ...(type === "file" ? { path: need("path"), match: need("match") } : {}),
@@ -790,12 +820,13 @@ try {
       console.log(JSON.stringify(publicSpec(spec), null, 2));
       if (generated) console.log(`WEBHOOK_SECRET ${generated} (shown once; send it as X-Dori-Secret)`);
       console.log(`SOURCE_ADDED ${spec.name}`);
+      if (target?.offline) console.log(offlineWarn(target.machine, "source"));
       break;
     }
     case "schedule": {
       const [action, name, ...extra] = flags.positionals;
       const specs = new SourceSpecs(config.stateDir);
-      const usage = "usage: dori schedule list [--json] | dori schedule add <name> (--cron EXPR | --every SEC) (--text T | --command CMD [--cwd DIR] [--heavy] [--timeout SEC]) --kind KIND [--tz ZONE] [--catch-up once|skip] | dori schedule remove <name> | dori schedule run-now <name>";
+      const usage = "usage: dori schedule list [--json] | dori schedule add <name> (--cron EXPR | --every SEC) (--text T | --command CMD [--cwd DIR] [--machine M] [--heavy] [--timeout SEC]) --kind KIND [--tz ZONE] [--catch-up once|skip] | dori schedule remove <name> | dori schedule run-now <name>";
       if (extra.length) die(usage);
       const now = realClock.now();
       const find = (job: string): ScheduleSpec => {
@@ -806,9 +837,11 @@ try {
       if (action === "list" && name === undefined) {
         const status = readSourceStatus(config.stateDir)?.sources ?? {};
         const rows = specs.list().filter((spec): spec is ScheduleSpec => spec.type === "schedule").map((spec) => scheduleRow(spec, status[spec.name], now));
+        const offline = new Map<string, boolean | undefined>();
+        for (const row of rows) if (row.machine && !offline.has(row.machine)) offline.set(row.machine, await runnerOffline(config.stateDir, row.machine));
         if (flags.values.json) console.log(JSON.stringify(rows, null, 2));
         else if (!rows.length) console.log("SCHEDULES none");
-        else for (const row of rows) console.log(`${row.name} ${row.kind} ${row.when}${row.heavy ? " heavy" : ""} catch-up=${row.catchUp} next=${row.waiting ? `waiting for a ${row.waiting}` : at(row.nextRunAt)} last=${at(row.lastRunAt)}${row.lastResult ? ` ${row.lastResult}` : ""}`);
+        else for (const row of rows) console.log(`${row.name} ${row.kind} ${row.when}${row.heavy ? " heavy" : ""} catch-up=${row.catchUp} next=${row.waiting ? `waiting for a ${row.waiting}` : at(row.nextRunAt)} last=${at(row.lastRunAt)}${row.lastResult ? ` ${row.lastResult}` : ""}${row.machine ? ` machine=${row.machine}${offline.get(row.machine) ? " (runner offline)" : ""}` : ""}`);
         break;
       }
       if (action === "remove" && name) {
@@ -826,17 +859,20 @@ try {
       if (action !== "add" || !name) die(usage);
       const every = opt("every");
       const timeout = opt("timeout");
+      const target = await machineOpt(config.stateDir);
       const spec = specs.add({
         name, type: "schedule", kind: need("kind"), since: now,
         ...(opt("cron") ? { cron: opt("cron") } : {}), ...(every !== undefined ? { everySec: Number(every) } : {}),
         ...(opt("text") !== undefined ? { text: opt("text") } : {}),
         ...(opt("command") !== undefined ? { command: commandArgv(opt("command")) } : {}),
         ...(opt("cwd") ? { cwd: opt("cwd") } : {}), ...(flags.values.heavy ? { heavy: true } : {}),
+        ...(target ? { machine: target.machine } : {}),
         ...(timeout !== undefined ? { timeoutSec: Number(timeout) } : {}),
         ...(opt("tz") ? { tz: opt("tz") } : {}), ...(opt("catch-up") ? { catchUp: opt("catch-up") } : {}),
       });
       console.log(JSON.stringify(spec, null, 2));
       console.log(`SCHEDULE_ADDED ${spec.name} next ${at(spec.type === "schedule" ? nextSlot(spec, now) : undefined)}`);
+      if (target?.offline) console.log(offlineWarn(target.machine, "schedule"));
       break;
     }
     case "supervise": {

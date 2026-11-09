@@ -47,11 +47,12 @@ fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
 `lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `herdr.state`, `herdr.start`, `heavy.state` and `cmd.result`. Today
-a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, `lane.started`, `lane.report` and
+a runner publishes `lane.state`, `lane.progress`, `cmd.result`, `wait.result` and `job.result` and, on a worker, `lane.started`, `lane.report` and
 the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
 `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `host.herdr`, `runner.rotate`)
 are part of the schema. A worker's runner carries out `lane.start`, `lane.stop`, `lane.close`, `lane.send`,
-`lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); `runner.rotate` is
+`lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); every runner, the local one
+included, carries out `wait.check` and `job.run` (see [Runner-owned waits and jobs](#runner-owned-waits-and-jobs)); `runner.rotate` is
 handled by the connection itself. Every command the runner receives goes through the command policy (below): a refused one is
 answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, a carried-out one `cmd.result verified <detail>`, and an
 accepted one that this release cannot carry out yet `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Both get an
@@ -192,6 +193,29 @@ A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule
 `sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
 `guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
 `lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
+
+## Runner-owned waits and jobs
+
+A wait (`dori wait --machine`), poll source or command schedule (`--machine`) that names a runner is carried out on
+it. The supervisor keeps the scheduling, dedupe and journal; it sends each check or run over `RunnerCall` and waits
+for the `cmd.result`. A runner that is not connected fails the call at once with `RUNNER_UNAVAILABLE`. Both commands
+need protocol 5 (`NEEDS_PROTO`); there is no protocol bump. A runner without the handler answers `cmd.result failed
+RUNNER_CMD_UNSUPPORTED <type>`. Under `jobs: deny` both are refused (`jobs-denied`), and `cwd` must be absolute,
+existing and under `allowedRoots`.
+
+| Command | Body | `cmd.result` result |
+| --- | --- | --- |
+| `wait.check` | `{cmdId, waitId, signal, cwd}` | `{met, error?}` |
+| `job.run` | `{cmdId, opKey, name, command: string[], cwd, timeoutSec, heavy}` | `{exitCode, timedOut, output, err}` |
+
+- `wait.check` runs the `Done =` signal once in `cwd`, bounded by 10 s. A met check also publishes
+  `wait.result {waitId, outcome: WAIT_DONE, detail}` (detail at most 500 characters), which the supervisor settles as
+  the same `WAIT_DONE` a local check gives; an unmet or failed check publishes nothing. A check that throws answers
+  `{met: false, error}`. The supervisor allows 20 s past the check's bound.
+- `job.run` runs the argv in `cwd`, killed after `timeoutSec`, and publishes one `job.result {opKey, state:
+  verified|failed, exitCode, output}` per run (journal only). `output` is capped at 64 KiB and `err` at 4 KiB, cut on
+  a UTF-8 character boundary. `heavy: true` is not supported on a runner and fails before anything runs. The
+  supervisor allows 30 s past `timeoutSec`; a failed or malformed answer is `RUNNER_JOB_REFUSED runner=<label>`.
 
 ## Fencing
 

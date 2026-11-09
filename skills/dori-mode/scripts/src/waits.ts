@@ -7,6 +7,8 @@ import { fetchHttp } from "./messenger/http.ts";
 import type { Runner } from "./run.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { checkSignal, parseSignal, type Check } from "./signals.ts";
+import { machineLabel, REMOTE_MARGIN_MS, remoteWaitCheck } from "./remote-jobs.ts";
+import { type RunnerCall, RunnerUnavailable } from "./runner/call.ts";
 
 export class WaitError extends Error {}
 export const WAIT_CHECK_MS = 10_000;
@@ -38,6 +40,8 @@ export type Wait = {
   readonly outcome?: Outcome;
   /** Consecutive operational check failures; a successful check, even if unmet, resets it. */
   readonly failures?: number;
+  /** The runner that checks this wait (`wait.check`); absent: the supervisor host checks it. */
+  readonly machine?: string;
 };
 
 type Registration = {
@@ -48,6 +52,8 @@ type Registration = {
   readonly cwd: string;
   readonly every?: string;
   readonly timeout?: string;
+  /** A runner label; absent or `local`: the supervisor host. */
+  readonly machine?: string;
 };
 
 const positive = (value: string, name: string): number => {
@@ -68,7 +74,8 @@ const decode = (value: unknown): Wait => {
       ("thread" in value && typeof value.thread !== "string") ||
       ("deadline" in value && (typeof value.deadline !== "number" || !Number.isFinite(value.deadline))) ||
       ("outcome" in value && !OUTCOMES.includes(value.outcome)) ||
-      ("failures" in value && (typeof value.failures !== "number" || !Number.isInteger(value.failures) || value.failures < 0))) {
+      ("failures" in value && (typeof value.failures !== "number" || !Number.isInteger(value.failures) || value.failures < 0)) ||
+      ("machine" in value && typeof value.machine !== "string")) {
     throw new WaitError("invalid wait state");
   }
   return {
@@ -78,13 +85,15 @@ const decode = (value: unknown): Wait => {
     ...("deadline" in value && typeof value.deadline === "number" ? { deadline: value.deadline } : {}),
     ...("outcome" in value && OUTCOMES.includes(value.outcome) ? { outcome: value.outcome as Outcome } : {}),
     ...("failures" in value && typeof value.failures === "number" && value.failures > 0 ? { failures: value.failures } : {}),
+    ...("machine" in value && typeof value.machine === "string" ? { machine: value.machine } : {}),
   };
 };
 
 /** CLI mutations and sweep commits serialize; checks never hold this lock. */
 export class Waits {
   private readonly path: string;
-  constructor(private readonly stateDir: string, private readonly maxFailures = WAIT_MAX_FAILURES) {
+  /** `remote` checks the waits that name a machine; without it such a check fails as RUNNER_UNAVAILABLE. */
+  constructor(private readonly stateDir: string, private readonly maxFailures = WAIT_MAX_FAILURES, private readonly remote?: RunnerCall) {
     this.path = join(stateDir, "waits.json");
   }
 
@@ -152,10 +161,12 @@ export class Waits {
     const everyMs = positive(input.every ?? "60", "--every") * 1000;
     const deadline = input.timeout === undefined ? undefined : now + positive(input.timeout, "--timeout") * 60_000;
     if (!Number.isFinite(everyMs) || (deadline !== undefined && !Number.isFinite(deadline))) throw new WaitError("wait duration is too large");
+    const machine = machineLabel(input.machine, (why) => new WaitError(`--machine: ${why}`));
     const wait: Wait = {
       id: randomUUID(), key: input.key, until: input.until, note: input.note, cwd: input.cwd,
       everyMs, nextAt: now, ...(deadline === undefined ? {} : { deadline }),
       ...(input.thread ? { thread: input.thread } : {}),
+      ...(machine ? { machine } : {}),
     };
     return this.locked((waits) => {
       if (waits.some((w) => w.key === wait.key)) throw new WaitError(`wait ${wait.key} already exists; cancel it first`);
@@ -190,17 +201,23 @@ export class Waits {
       return due;
     });
     await Promise.all(due.map(async (wait) => {
+      const remote = this.remote;
+      // A wait on a machine is checked by its runner; the call has a network round trip on top of the check.
+      const checkOf: typeof check = wait.machine === undefined ? check
+        : remote ? remoteWaitCheck(remote, wait.machine, WAIT_CHECK_MS + REMOTE_MARGIN_MS)
+        : async () => { throw new RunnerUnavailable(wait.machine ?? "", "disconnected", "runner calls are not available"); };
+      const limit = wait.machine === undefined ? WAIT_CHECK_MS : WAIT_CHECK_MS + REMOTE_MARGIN_MS;
       try {
         let outcome = wait.outcome;
         let failure: string | undefined;
         if (!outcome && wait.deadline !== undefined && wait.deadline <= now()) outcome = "WAIT_TIMEOUT";
         if (!outcome) {
           const controller = new AbortController();
-          const budget = Math.min(WAIT_CHECK_MS, wait.deadline === undefined ? WAIT_CHECK_MS : Math.max(0, wait.deadline - now()));
+          const budget = Math.min(limit, wait.deadline === undefined ? limit : Math.max(0, wait.deadline - now()));
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
             const checked = await Promise.race([
-              check(wait, controller.signal),
+              checkOf(wait, controller.signal),
               new Promise<Check>((_, reject) => {
                 timer = setTimeout(() => {
                   controller.abort();
@@ -244,5 +261,19 @@ export class Waits {
         console.error(`WAIT_ERROR ${wait.key} ${e instanceof Error ? e.message : String(e)}`);
       }
     }));
+  }
+
+  /**
+   * A `wait.result WAIT_DONE` from runner `label`: the open wait `waitId` on that machine ends as a local WAIT_DONE
+   * does (same event id and line). Anything else (another runner's wait, an unknown or settled one) is ignored.
+   */
+  settleRemote(label: string, waitId: string, emit: (id: string, line: string, meta?: EventMeta) => void): void {
+    this.locked((waits) => {
+      const wait = waits.find((w) => w.id === waitId);
+      if (!wait || wait.machine !== label || wait.outcome) return;
+      this.save(waits.map((w) => w.id === waitId ? { ...w, outcome: "WAIT_DONE" as const } : w));
+      emit(`wait:${wait.id}`, `WAIT_DONE ${wait.key} ${wait.note}${wait.thread ? ` thread=${wait.thread}` : ""}`, wait.key ? { lane: wait.key } : undefined);
+      this.save(waits.filter((w) => w.id !== waitId));
+    });
   }
 }

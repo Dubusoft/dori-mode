@@ -352,6 +352,16 @@ export type CommandResults = {
   readonly "lane.observe": { readonly status: LaneStatus; readonly turn?: TurnEvidence };
   readonly "guard.kill": { readonly killed: readonly { readonly pid: number; readonly lane?: string; readonly comm: string; readonly rssKb: number }[] };
   /**
+   * One check of a wait signal on the runner's host: `met` when it held, `error` when the check itself could not run
+   * (it counts as a failed check, as a local one does). A met check also goes out as `wait.result WAIT_DONE`.
+   */
+  readonly "wait.check": { readonly met: boolean; readonly error?: string };
+  /**
+   * One run of an argv on the runner's host: `output` is its stdout (trimmed, at most 64 KiB) and `err` its stderr (at
+   * most 4 KiB). The same run also goes out as a `job.result` event.
+   */
+  readonly "job.run": { readonly exitCode: number; readonly timedOut: boolean; readonly output: string; readonly err: string };
+  /**
    * herdr as read after the action: `managed` when a herdr unit is installed on the host, `paused` when the watch
    * pause marker is set (`dori runner herdr stop`).
    */

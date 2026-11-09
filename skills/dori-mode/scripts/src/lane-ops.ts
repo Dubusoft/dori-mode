@@ -146,7 +146,7 @@ const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
   "q.machine.observe": (v) => isObj(v) && isStr(v.os) && isNum(v.sampledAt) && isObj(v.sample) && listOf(v.panes, isPane),
 };
 
-const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boolean } = {
+export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boolean } = {
   "lane.start": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStartup(v.startup),
   "lane.adopt": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStr(v.tokenFile),
   "lane.stop": (v) => isObj(v) && CLOSED(v.closed) && isBool(v.gone),
@@ -161,6 +161,8 @@ const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boole
   "guard.kill": (v) => isObj(v) && listOf(v.killed, (k) => isObj(k) && isNum(k.pid) && isStr(k.comm) && isNum(k.rssKb) && optStr(k.lane)),
   "host.herdr": (v) => isObj(v) && oneOf(["start", "restart", "stop", "status"])(v.action) && oneOf(["up", "down", "hung"])(v.state)
     && optStr(v.instance) && isBool(v.managed) && isBool(v.paused),
+  "wait.check": (v) => isObj(v) && isBool(v.met) && optStr(v.error),
+  "job.run": (v) => isObj(v) && isNum(v.exitCode) && isBool(v.timedOut) && isStr(v.output) && isStr(v.err),
 };
 
 /** A RunnerUnavailable from call.ts (or rebuilt by the CLI relay): matched by shape, not class identity. */

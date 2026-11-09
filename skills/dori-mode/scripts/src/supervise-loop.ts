@@ -898,7 +898,7 @@ export const supervise = async (
     const home = process.env.HOME ?? "";
     const registry = sources = new EventSources({
       stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
-      policy: deps.config.eventPolicy, log: (line) => { console.error(line); },
+      policy: deps.config.eventPolicy, log: (line) => { console.error(line); }, remote: hubCall,
       schedules: {
         operations: ops, journaled: (id: string) => supervisor.journaled(id),
         heavy: {
@@ -921,7 +921,7 @@ export const supervise = async (
       config: deps.config.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
       fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
     });
-    const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.config.waitMaxFailures));
+    const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.config.waitMaxFailures, hubCall));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
     const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps));
     // CI follow-up reads the poll it follows, so it runs right after each GitHub tick.
@@ -1104,6 +1104,13 @@ export const supervise = async (
         const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
           onHeartbeat: (label) => { void monitor?.heartbeat(label); },
           onHerdr: (id, line) => { enqueueSweep(id, line); },
+          // A runner-owned wait that the runner saw met ends here (deduped with the check's own result by its event id);
+          // `job.result` is kept in the runner journal only.
+          onEvent: (label, frame) => {
+            if (frame.type !== "wait.result" || frame.body.outcome !== "WAIT_DONE") return;
+            try { waits.settleRemote(label, frame.body.waitId, enqueueWait); }
+            catch (e) { console.error(`WAIT_ERROR runner=${label} wait=${frame.body.waitId} ${e instanceof Error ? e.message : String(e)}`); }
+          },
           onHello: (label, body) => {
             void monitor?.hello(label, body.gen);
             inOrder(`hello ${label}`, async () => {
