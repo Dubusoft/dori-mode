@@ -417,8 +417,10 @@ export const windowsInstallScript = (
     // Protected (no inheritance from the profile), full control for the user, SYSTEM and Administrators only; children inherit it.
     "& icacls.exe $R /inheritance:r /grant:r ('*' + $Sid + ':(OI)(CI)F') '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null",
     "if ($LASTEXITCODE -ne 0) { Exit-Dori 1 'icacls could not protect the runner directory' }",
-    "& icacls.exe $R /setowner ('*' + $Sid) /T /C /Q | Out-Null",
-    "if ($LASTEXITCODE -ne 0) { Exit-Dori 1 'icacls could not make the user the owner of the runner directory' }",
+    // An elevated (administrator) ssh session creates files owned by Administrators, which the runner refuses as unsafe,
+    // so the owner is set again after the files are moved in and after enrollment writes the keys.
+    "function Set-DoriOwner { & icacls.exe $R /setowner ('*' + $Sid) /T /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { Exit-Dori 1 'icacls could not make the user the owner of the runner directory' } }",
+    "Set-DoriOwner",
     "foreach ($D in 'bin', 'bun', 'logs', 'evidence') { [void][IO.Directory]::CreateDirectory((Join-Path $R $D)) }",
     // Bun: a pinned build, checked against the hash carried here, and run once before it is used.
     "Step 'bun'",
@@ -489,6 +491,7 @@ export const windowsInstallScript = (
       "  Move-Item -LiteralPath ($Cfg + '.tmp') -Destination $Cfg -Force",
       "}",
     ] : []),
+    "Set-DoriOwner",
     "Step 'enroll'",
     `$C = ${psq(issue.code)}`,
     `$F = ${psq(issue.fingerprint)}`,
@@ -508,6 +511,7 @@ export const windowsInstallScript = (
     `  if ($Enroll.ExitCode -ne 0) { Exit-Dori ${INSTALL_EXIT.enroll} ('enrollment failed with exit ' + $Enroll.ExitCode) }`,
     "}",
     "Remove-Variable C, F",
+    "Set-DoriOwner",
     "Step 'task'",
     "try {",
     "  $Xml = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $Bin 'dori-runner-task.xml'))).Replace('@RUNNER@', [Security.SecurityElement]::Escape($R)).Replace('@USER@', $Sid)",
@@ -528,7 +532,8 @@ const NOT_POSIX = /not recognized|is not recognized as|CommandNotFoundException/
 type InstallKind = "posix" | "windows";
 
 const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult => {
-  const detail = (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}`;
+  // PowerShell over a non-tty ssh appends its progress stream to stderr as CLIXML, which hides the real error line.
+  const detail = r.err.trim().split("\n").filter((line) => !/^(#< CLIXML|<Objs )/.test(line.trim())).at(-1) || `exit ${r.code}`;
   const windows = kind === "windows";
   if (r.code === 0) {
     const herdr = [...r.out.matchAll(/^DORI_HERDR (started|managed|unmanaged)$/gm)].at(-1)?.[1] as HerdrInstall | undefined;
