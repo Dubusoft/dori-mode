@@ -304,6 +304,61 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
   expect((await objection())?.[1]).toStartWith("not merged within 60 min of the claim");
 });
 
+/** A lane whose Done is `pr acme/app feat/x`: its green PR #7 (into `base`) reads live while open; the claim binds it at HEAD. */
+const greenPrLane = (pr: { state: string; base: string }) => {
+  const HEAD = "c".repeat(40);
+  const bound: Lane = { ...lane, done: "pr acme/app feat/x" };
+  const green = [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }];
+  const deps = (ms: number): FlowDeps => {
+    const base = at(ms);
+    // The signal is read through the lane's runner (the fake world); the claim's bindings and the merge wait through `run`.
+    world.prList = [{ number: 7, state: pr.state, isDraft: false, isCrossRepository: false, statusCheckRollup: green, url: "https://github.com/acme/app/pull/7", createdAt: "2026-01-01T11:00:00Z" }];
+    const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
+      const json = (body: unknown) => ({ code: 0, out: JSON.stringify(body), err: "" });
+      if (argv[0] === "gh" && argv[2] === "list" && argv.includes("open")) return json(pr.state === "OPEN" ? [{ number: 7, state: "OPEN", headRefOid: HEAD, isCrossRepository: false }] : []);
+      if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "7") return json({ state: pr.state, baseRefName: pr.base, headRefOid: HEAD, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: green });
+      return base.run(argv, opts);
+    };
+    return { ...base, run };
+  };
+  return { bound, deps, HEAD };
+};
+
+test("a lane that stops at its green PR into the merge base stays claimed past the window until the supervisor merges it, then closes", async () => {
+  livePane();
+  const pr = { state: "OPEN", base: "dev" };
+  const { bound, deps, HEAD } = greenPrLane(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "https://github.com/acme/app/pull/7 green");
+  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 https://github.com/acme/app/pull/7 green"]);
+  // Its `pr` signal reads live, but closing now would leave the PR unmerged: the claim (and its bound head) stands.
+  expect(await watchTick(deps(T0 + 6 * MIN))).toEqual([]);
+  expect(await watchTick(deps(T0 + 30 * MIN))).toEqual([]);
+  const waiting = (await at(T0).registry.read("demo-lane")) ?? bound;
+  expect(statusOf(waiting)).toBe("done-claimed");
+  expect(claimGate(waiting, { repo: "acme/app", number: 7, sha: HEAD })).toEqual({ ok: true, why: "claimed at this head" });
+  expect(closedVia()).toHaveLength(0);
+  pr.state = "MERGED";
+  expect((await watchTick(deps(T0 + 31 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane closed seen-claim");
+  expect(closedVia()).toEqual(["demo-lane"]);
+});
+
+test("a green PR the supervisor never merges (another base) does not hold the close, nor does one past mergeWaitMaxMin", async () => {
+  livePane();
+  const pr = { state: "OPEN", base: "main" };
+  const { bound, deps } = greenPrLane(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "PR into main green");
+  await watchTick(deps(T0));
+  expect((await watchTick(deps(T0 + 6 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+  pr.base = "dev";
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0 + 10 * MIN), bound, "PR into dev green");
+  await watchTick(deps(T0 + 10 * MIN));
+  expect(await watchTick(deps(T0 + 69 * MIN))).toEqual([]);
+  expect((await watchTick(deps(T0 + 70 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+});
+
 test("a watcher restarted inside the window keeps the original deadline and announces the claim once", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1");

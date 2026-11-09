@@ -29,7 +29,7 @@ export type SweepAct = { readonly kind: "nudged" | "no-progress" | "idle-escalat
  */
 export const nudgeText = (lane: Lane, silentMin: number, ownerLanguage?: string): string => {
   const dori = lane.machine ? "~/.dori/runner/bin/dori" : "dori";
-  const done = `claim it: ${dori} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>"`;
+  const done = `claim it: ${dori} report ${lane.key} done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"`;
   const blocked = `report it: ${dori} report ${lane.key} blocked --text "<what blocks you>"`;
   const language = languageInstruction(ownerLanguage);
   return `[LEAD] your work thread has had no update for ${silentMin} min. If the deliverable is done and every Done signal is live, ${done}. If you are blocked on something outside this lane, ${blocked}. Otherwise post a 1-2 sentence progress line (done since last, next), keep its status true, and continue the work now.${language ? ` ${language}` : ""}`;
