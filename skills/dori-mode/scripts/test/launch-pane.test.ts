@@ -297,8 +297,8 @@ test("footer puts the shared done rules first and every lane value after '### Th
   expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
 });
 
-test("only a lane whose Done names a merged PR is told to claim without waiting for the merge", () => {
-  const line = "claim done without waiting for the merge";
+test("only a lane whose Done names a merged PR is told to claim while its CI is still running", () => {
+  const line = "claim done once the PR is pushed and its CI is running or green";
   expect(footerDoneRules(footerLane({ done: "merged acme/app#1; closed acme/app#3" }))).toContain(line);
   expect(footerDoneRules(footerLane())).not.toContain(line);
 });

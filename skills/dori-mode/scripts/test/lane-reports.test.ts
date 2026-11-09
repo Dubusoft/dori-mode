@@ -224,7 +224,7 @@ test("footer: every lane is told to use dori report and never a pane; a remote l
   const on = await launchLocal(dir);
   expect(on.lane.reportVia).toBe("cli");
   expect(on.brief).toContain('dori report cli-lane <milestone|progress|question|blocked> --text "<what, with links>"');
-  expect(on.brief).toContain('When done: dori report cli-lane done --text "<one line>" --evidence "<merge SHA, closed issue, version>"');
+  expect(on.brief).toContain('When done: dori report cli-lane done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"');
   expect(on.brief).not.toContain("w:lead");
   expect(on.brief).not.toContain("[REPORT] cli-lane |");
   // A lane registered by an older dori (no reportVia) is told the same: no footer types into the lead's pane (D4).

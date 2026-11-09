@@ -161,7 +161,7 @@ test("remote footer reports through the runner's lane CLI; local footer through 
   expect(remote).not.toContain("[REPORT]");
   expect(remote).not.toContain("lead:p1");
   const local = footer(lane({ machine: undefined }));
-  expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<merge SHA, closed issue, version>"');
+  expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"');
   expect(local).not.toContain("~/.dori/runner/bin/dori");
   expect(local).not.toContain("[REPORT]");
 });

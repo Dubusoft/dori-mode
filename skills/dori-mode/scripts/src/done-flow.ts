@@ -195,7 +195,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string): P
     const when = claimWaitsForLead(deps, lane)
       ? `${deps.config.closeAfterMin} minutes after the lead receives this claim`
       : `at ${closesAt}Z (${deps.config.closeAfterMin} minutes) once its Done signals read back live`;
-    await steerLane(deps, lane, "claim", `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons. Stay idle until then; an objection arrives here as [LEAD] not done.`);
+    await steerLane(deps, lane, "claim", `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons; a PR the claim recorded is merged by the supervisor first. Stop here and stay idle: do not watch or wait for the merge. An objection arrives here as [LEAD] not done.`);
   }
   return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${eventText(evidence)}`;
 };
@@ -512,8 +512,31 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
 };
 
 /**
+ * Whether a claim whose Done signals all read back live still waits for the supervisor to merge a PR it bound: a lane
+ * ends at its green PR (a `pr` signal is live while the PR is open), and the supervisor merges only a lane that is
+ * still claimed (ci-follow.ts claimGate), so closing first would leave that PR unmerged. It waits while a bound PR into
+ * `ciMergeBase` is OPEN at exactly the bound head, not a draft, not conflicting, with no failed check, for less than
+ * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. Anything the
+ * supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes the lane as before.
+ */
+const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<boolean> => {
+  if (deps.clock.now() - start >= deps.config.mergeWaitMaxMin * 60_000) return false;
+  for (const bound of lane.claim?.pulls ?? []) {
+    const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], { timeoutMs: 20_000 });
+    let view: (WaitView & { readonly baseRefName?: string }) | undefined;
+    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView & { readonly baseRefName?: string }) : undefined; } catch { view = undefined; }
+    if (!view) return true;
+    if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
+    if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") continue;
+    const failed = (view.statusCheckRollup ?? []).some((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+    if (!failed) return true;
+  }
+  return false;
+};
+
+/**
  * Settles a claim whose window ended: closes the lane, or objects. A claim only waiting for the supervisor's merge of
- * its bound PR (mergeWait) is kept: undefined, nothing to report, and the next pass settles it again.
+ * its bound PR (mergeWait, boundMergeWait) is kept: undefined, nothing to report, and the next pass settles it again.
  */
 const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: number): Promise<string | undefined> => {
   const read = await readLane(deps, lane, { done: true });
@@ -526,6 +549,7 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
     if (wait.waiting) return undefined;
     return objectDone(deps, lane, [...failing.map((c) => `${c.signal} -> ${c.detail}`), ...wait.why]);
   }
+  if (await boundMergeWait(deps, lane, start)) return undefined;
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
   await withOperations(deps, async (store) => {
     const prior = store.get(closeId(lane.key));

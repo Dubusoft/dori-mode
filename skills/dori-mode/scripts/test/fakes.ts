@@ -48,6 +48,8 @@ export const journalBytes = (stateDir: string): string => (TEST_STORE === "json"
 
 export type World = {
   prState: string;
+  /** What `gh pr list` answers (a `pr <repo> <branch>` signal read); unset, it answers like `gh pr view`. */
+  prList?: unknown[];
   issueState: string;
   aheadCount: string;
   dirty: string;
@@ -124,6 +126,7 @@ export const fakeRunner = (w: World): Runner => async (argv) => {
   if (cmd === "git" && argv.includes("status")) return ok(w.dirty);
   if (cmd === "git" && argv.includes("rev-list")) return ok(w.aheadCount);
   if (cmd === "git") return ok();
+  if (cmd === "gh" && a1 === "pr" && a2 === "list" && w.prList) return ok(JSON.stringify(w.prList));
   if (cmd === "gh" && a1 === "pr") return ok(JSON.stringify({ state: w.prState, mergeCommit: w.prState === "MERGED" ? { oid: "abc1234567890" } : null }));
   if (cmd === "gh" && a1 === "issue") return ok(JSON.stringify({ state: w.issueState }));
   if (cmd === "notify") return ok();

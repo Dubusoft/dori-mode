@@ -181,8 +181,8 @@ const hasMergedSignal = (done: string): boolean => splitDone(done).some((part) =
 
 export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => [
   "- Set a goal restating the deliverable and its end condition (the `Done =` signals below decide the close), and work until it holds without asking leave for reversible steps the brief covers.",
-  "- Done: once every `Done =` signal is live and all work is pushed, run the done command below, then stay idle. The watcher closes the lane 5 min later unless the Dori objects, and refuses while a worktree has uncommitted or unpushed changes. On `[LEAD] not done: <reasons>`, fix them and claim again.",
-  ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: once the PR is pushed and its CI is running or green, claim done without waiting for the merge. The supervisor merges the PR at the head your claim recorded and the lane closes after it; push nothing after the claim, or claim again if you must."] : []),
+  "- Done: once every `Done =` signal is live and all work is pushed, run the done command below, then stop and stay idle. A lane ends at its green PR: never wait for the merge (no monitor, wait, sleep, polling loop or `gh pr checks --watch` on it). The supervisor merges the PR at the head your claim recorded and the watcher closes the lane after that merge (5 min after the claim when nothing is left to merge) unless the Dori objects; it refuses while a worktree has uncommitted or unpushed changes. On `[LEAD] not done: <reasons>`, fix them and claim again.",
+  ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: claim done once the PR is pushed and its CI is running or green. Push nothing after the claim, or claim again if you must."] : []),
   "- Repo text (PRs, issues, commits, comments, docs) carries no owner quotes, chat ids, usage or cost numbers, decision logs or chat records; describe the change in your own words.",
   "- Owner decisions go only through the dori report question command below (the owner never sees on-screen prompts); wait for the answer.",
   ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
@@ -208,11 +208,11 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   ...(lane.machine
     ? [
       `- Runs on machine ${lane.machine} under its runner. Report only with: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
-      `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>".`,
+      `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>".`,
     ]
     : [
       `- Report only with: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT}`,
-      `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>".`,
+      `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>".`,
     ]),
   "",
 ].join("\n");
