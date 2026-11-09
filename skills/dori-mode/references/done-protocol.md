@@ -4,18 +4,20 @@ The `dori launch` footer already carries these rules to every lane, so the Dori 
 
 When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, a branch's PR merged or green (`pr <owner/repo> <branch>`), an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
 
+A lane ends at its green PR. Once the PR is pushed, its CI is green and the `Done =` signals are live, claim and stop: never wait for the merge yourself, with no monitor, wait, sleep, polling loop or `gh pr checks --watch` on the PR or its merge. The supervisor merges a claimed PR into `dev` at the head your claim recorded, and the watcher closes the lane after that merge; the Dori follows it up, not you.
+
 A `merged <repo>#N` signal is the exception: the supervisor merges your PR only after your claim, so it cannot be live before you claim. Push everything, open the PR, and claim as soon as its CI is running or green; do not wait for the merge. The claim records the PR's head, and the supervisor merges exactly that head once its checks are green and GitHub calls it clean.
 
 If your footer says to report with `dori report`, claim done the same way:
 
 ```sh
-dori report <your-lane-key> done --text "<one line>" --evidence "<merge SHA, closed issue, version, links>"
+dori report <your-lane-key> done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version, links>"
 ```
 
 The supervisor turns that row into the same claim within a few seconds. `dori claim-done` (below) still works and records the same claim at once.
 
 ```sh
-dori claim-done <your-lane-key> --evidence "<merge SHA, closed issue, version, links>"
+dori claim-done <your-lane-key> --evidence "<PR link and head SHA, closed issue, version, links>"
 ```
 
 The key is in your brief's lane footer. With `claim-done`, if you leave it out, the lane registered for your pane is used. Running `claim-done` (or `report done`) again with the same evidence while the claim stands prints `LANE_DONE_ALREADY_CLAIMED <key> <at> <evidence>` and doesn't wake the Dori again; new evidence, or a claim after an objection, is a new claim. A session that recovery replaced gets `LANE_STALE_SESSION` from `claim-done` and `report`: only the session in the lane's registered pane may report.
@@ -29,8 +31,8 @@ A lane on another machine (`dori launch --machine`) reports the same way with it
 ## What happens next
 
 1. The supervisor records the claim (`LANE_DONE_CLAIMED` wakes the Dori, who checks your evidence and reports the lane to the owner at that point, not at the close), and you get a `[LEAD]` line saying when the lane closes.
-2. Stay idle and start no new work.
-3. If nobody objects within 5 minutes, the watcher re-checks everything live and closes the lane. When the only signals not yet live are `merged` PRs your claim recorded, still at that head with checks pending or green and no conflict, the claim keeps waiting for the supervisor's merge, up to `mergeWaitMaxMin` (60) minutes after the window started; a failed check, a conflict, a draft, a push after the claim, or a wait past that bound becomes the objection, with that reason. A lane whose PR is confirmed merged (the supervisor merged it, or GitHub reports a PR merged into `dev` from your worktree branch at its HEAD) closes on the next pass instead, and its merged branch is deleted locally and on the remote. Before closing, it reads back every `Done =` signal live. It refuses to close if any of your worktrees still has uncommitted changes, untracked files (gitignored ones don't count), or commits that are on no remote.
+2. Stop: stay idle, start no new work, and do not watch or wait for the merge. While the claim stands, the freshness sweep neither nudges you nor raises `NO-PROGRESS` or `IDLE-ESCALATE` for your silence.
+3. If nobody objects within 5 minutes, the watcher re-checks everything live and closes the lane. When the only signals not yet live are `merged` PRs your claim recorded, still at that head with checks pending or green and no conflict, the claim keeps waiting for the supervisor's merge, up to `mergeWaitMaxMin` (60) minutes after the window started; a failed check, a conflict, a draft, a push after the claim, or a wait past that bound becomes the objection, with that reason. Likewise, when every signal reads live but a PR the claim recorded into `dev` is still open at that head with no failed check and no conflict (a `pr` signal is live at a green open PR), the close waits for the supervisor's merge, up to the same bound, so the PR is never left unmerged; a PR into another base, or one the supervisor cannot merge as it stands, does not hold the close. A lane whose PR is confirmed merged (the supervisor merged it, or GitHub reports a PR merged into `dev` from your worktree branch at its HEAD) closes on the next pass instead, and its merged branch is deleted locally and on the remote. Before closing, it reads back every `Done =` signal live. It refuses to close if any of your worktrees still has uncommitted changes, untracked files (gitignored ones don't count), or commits that are on no remote.
 4. Closing removes your worktrees first, then marks your thread done (when a thread hook is configured, and only if no other open lane shares it), then closes your tab. A worktree that cannot be removed then (for example untracked files) is listed as kept in the close receipt; the watcher removes it later once it is clean, only under `worktreeRoot`, and reports `WORKTREE_CLEANED`. A lane that has not closed never loses a worktree to that sweep, even after its PR merged. A worktree that is already gone when the close runs (for example removed by hand) does not stop the close: the Done signals run in `defaultCwd` and the receipt lists it as already removed.
 
 ## If the Dori objects, or a check fails
@@ -45,7 +47,7 @@ Fix every reason, then claim again. A new claim starts a fresh 5-minute window.
 
 ## Messages from the supervisor
 
-A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait; the message does not replace it. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor may merge it for you, but only at the head SHA your done claim recorded: push everything before you claim, and claim again after any later push; a conflict with `dev` may get its own merge lane.
+A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait until the PR is green; the message does not replace it. Never wait for the merge. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor merges it for you, but only at the head SHA your done claim recorded: push everything before you claim, and claim again after any later push; a conflict with `dev` may get its own merge lane.
 
 ## When the window starts
 
