@@ -181,7 +181,7 @@ refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAIL
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
 | `allowedRoots` | directories every `cwd` must be under | none |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
-| `sandboxCheck` | argv run before a `lane.start` with `sandbox: true`; a non-zero exit refuses it with `sandbox-unavailable` and its stderr. `dori runner install` sets it to `lane-sandbox --check` on Linux and macOS, where it also ships the wrapper (bubblewrap on Linux, Seatbelt `sandbox-exec` on macOS) and sets `sandbox: required`; Windows gets `sandbox: required` with no sandboxed profile | none |
+| `sandboxCheck` | argv run before a `lane.start` with `sandbox: true`; a non-zero exit refuses it with `sandbox-unavailable` and its stderr. `dori runner install` sets it to `lane-sandbox --check` on Linux and macOS, where it also ships the wrapper (bubblewrap on Linux, Seatbelt `sandbox-exec` on macOS) and sets `sandbox: required`; Windows gets `sandbox: required`, a `sandboxed` profile behind `bin\dori.ps1 lane-sandbox` (MXC ProcessContainer) and `sandboxCheck` = `powershell.exe ... -File bin\dori.ps1 lane-sandbox --check` | none |
 | `jobs` | `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with `done` | `allow` |
 | `guard` | this host's guard thresholds (`loadAlert`, `loadOk`, `memFreeMinPct`, `memFreeCritPct`, `swapFreeCritPct`, `diskFreeMinGb`, `panesMax`), each optional | the config's `guard` |
 | `heavyKill` | command-line patterns killed under critical memory | the config's `heavyKill` |
