@@ -10,7 +10,7 @@
  * every process it starts stays in the container. Writes are allowed only to the worktree (and its git common dir, hooks
  * excluded), the lane's TEMP, ~/.omo, %LOCALAPPDATA%\omo, ~/.cache, ~/.dori/state, ~/.dori/heavy and package caches; every
  * volume the lane touches is otherwise read-only. ~/.dori is denied except what a lane needs (config, dori itself, the runner's bin and bun,
- * the lane socket, its own brief and token), and ~/.dori/env and ~/.ssh private keys are denied outright.
+ * the runner's sock directory, its own brief and token), and ~/.dori/env and ~/.ssh private keys are denied outright.
  *
  * MXC rewrites LOCALAPPDATA (and TEMP) to a per-container AppContainer folder no grant can name in advance, so the container
  * runs the runner's bun on a copy of `dori.js` in the lane's TEMP with the same `lane-sandbox <agent argv>`: seeing LANE_SANDBOX_ACTIVE=1 there, it restores
@@ -227,9 +227,9 @@ export const mxcPolicy = (input: PolicyInput): MxcRequest => {
     ...(input.rw ?? []).filter((p) => p !== ""),
     ...(input.verify ? [input.verify] : []),
     ...work,
-    // Connecting to the lane AF_UNIX socket needs write access, but MXC refuses a grant on the socket file itself (a
-    // reparse point: CreateProcessSecurityEnvironment fails with 0x80070780), so the folder is granted and the runner's
-    // other sockets are denied below.
+    // Connecting to the lane socket needs write access. The grant names the directory: an AF_UNIX socket file is a reparse
+    // point Windows cannot open, so naming it fails CreateProcessSecurityEnvironment with 0x80070780 (ERROR_CANT_ACCESS_FILE).
+    // The runner's other sockets in it are denied below.
     win32.join(runner, "sock"),
   ]);
   const readonlyPaths = unique([

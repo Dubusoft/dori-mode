@@ -31,6 +31,9 @@ test("a lane writes only its worktree, git dir, TEMP and the caches; its volumes
     `${RUNNER}\\briefs\\lane-a.md`, `${RUNNER}\\briefs\\lane-a.2.token`, `${GCD}\\hooks`,
   ]);
   expect(p.filesystem.deniedPaths).toEqual([DORI, `${DORI}\\env`, `${RUNNER}\\sock\\control`, `${RUNNER}\\sock\\cli`, `${HOME}\\.ssh\\id_ed25519`]);
+  for (const paths of [p.filesystem.readwritePaths, p.filesystem.readonlyPaths, p.filesystem.deniedPaths]) {
+    expect(paths.some((path) => path.toLowerCase().endsWith("\\sock\\lane"))).toBe(false);
+  }
   // Nothing else of the runner directory: other lanes' briefs and tokens, its keys, config and other sockets stay under the denied ~/.dori.
   const granted = lower([...p.filesystem.readwritePaths, ...p.filesystem.readonlyPaths]);
   for (const hidden of ["briefs\\lane-b.md", "briefs", "keys", "runner-config.json", "sock\\control", "sock\\cli", "mxc"]) expect(granted).not.toContain(`${RUNNER}\\${hidden}`.toLowerCase());
