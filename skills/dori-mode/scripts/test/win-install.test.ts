@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearShellModes, encodedPowerShell, sshArgv } from "../src/remote-guard.ts";
-import { INSTALL_EXIT, WIN_BOOTSTRAP, WIN_BUN, WIN_SCRIPT_END, bunPinDir, bunPinUrl, bundleVersion, installRunner, installScript, remoteUnit, windowsInstallScript, windowsTemplates } from "../src/runner/install.ts";
+import { INSTALL_EXIT, INSTALL_TIMEOUT_MS, WIN_BUN, WIN_INSTALL_TIMEOUT_MS, bunPinDir, bunPinUrl, bundleVersion, installRunner, installScript, remoteUnit, scpArgv, windowsInstallScript, windowsTemplates, winRun } from "../src/runner/install.ts";
 import type { Ran, RunOptions } from "../src/run.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
@@ -36,13 +36,19 @@ test("the Windows install script is pure ASCII with LF lines", () => {
   expect(s).not.toContain("\r");
 });
 
-test("the script ends with its own end marker and the bootstrap reads lines up to it, not to EOF", () => {
-  const lines = script().split("\n").filter((line) => line !== "");
-  expect(lines.at(-1)).toBe(WIN_SCRIPT_END);
-  expect(lines.filter((line) => line === WIN_SCRIPT_END)).toHaveLength(1);
-  expect(WIN_BOOTSTRAP).toContain("ReadLine");
-  expect(WIN_BOOTSTRAP).toContain(WIN_SCRIPT_END);
-  expect(WIN_BOOTSTRAP).not.toContain("ReadToEnd");
+test("the script ends with exit 0 and logs each step to the progress log in order", () => {
+  const s = script();
+  expect(s.split("\n").filter((line) => line !== "").at(-1)).toBe("exit 0");
+  expect(s).toContain("'runner-install.log'");
+  expect(s).toContain("[IO.File]::AppendAllText(");
+  const steps = [...s.matchAll(/^Step '([a-z-]+)'$/gm)].map((m) => m[1]);
+  expect(steps).toEqual(["start", "checks", "acl", "bun", "files", "stop-runner", "move", "config", "enroll", "task", "done"]);
+});
+
+test("winRun reads the uploaded file from the profile, deletes it, then runs it as a scriptblock", () => {
+  const name = ".dori-runner-install-0123456789abcdef.ps1";
+  expect(winRun(name)).toBe(`$ErrorActionPreference='Stop'; $f = Join-Path $env:USERPROFILE '${name}'; $s = [IO.File]::ReadAllText($f); Remove-Item -LiteralPath $f -Force; & ([scriptblock]::Create($s)); exit $LASTEXITCODE`);
+  expect(scpArgv("u@h", "/tmp/x.ps1", name)).toEqual(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", "/tmp/x.ps1", `u@h:${name}`]);
 });
 
 test("every payload decodes to its input, the task XML with label and connect filled in", () => {
@@ -119,14 +125,29 @@ test("the enrollment secret goes to the enrolling process's stdin, never its arg
   expect(s).toContain("if (-not (Test-Path -LiteralPath (Join-Path $R 'keys\\supervisor.pub'))) {");
 });
 
-type Call = { argv: readonly string[]; opts?: RunOptions };
-const fakeRun = (answer: (command: string) => Partial<Ran>) => {
+// An scp call records the uploaded file's content as it was when scp ran.
+type Call = { argv: readonly string[]; opts?: RunOptions; uploaded?: string };
+const fakeRun = (answer: (command: string, argv: readonly string[]) => Partial<Ran>) => {
   const calls: Call[] = [];
   const run = async (argv: readonly string[], opts?: RunOptions): Promise<Ran> => {
-    calls.push({ argv, ...(opts ? { opts } : {}) });
-    return { code: 0, out: "", err: "", ...answer(argv.at(-1) ?? "") } as Ran;
+    calls.push({ argv, ...(opts ? { opts } : {}), ...(argv[0] === "scp" ? { uploaded: readFileSync(argv.at(-2) ?? "", "utf8") } : {}) });
+    return { code: 0, out: "", err: "", ...answer(argv.at(-1) ?? "", argv) } as Ran;
   };
   return { run, calls };
+};
+const REMOTE = /^.+:(\.dori-runner-install-[0-9a-f]{16}\.ps1)$/;
+/** One Windows pass: scp uploads `want`, then ssh runs winRun on that same remote name with no stdin. */
+const expectWinPass = (scp: Call | undefined, ssh: Call | undefined, want: string): void => {
+  expect(scp?.argv[0]).toBe("scp");
+  const remote = REMOTE.exec(scp?.argv.at(-1) ?? "")?.[1] ?? "";
+  expect(remote).not.toBe("");
+  expect(scp?.argv).toEqual(scpArgv(machine.target, scp?.argv.at(-2) ?? "", remote));
+  expect(scp?.opts?.timeoutMs).toBe(INSTALL_TIMEOUT_MS);
+  expect(scp?.uploaded).toBe(want);
+  expect(ssh?.argv).toEqual(sshArgv(machine.target, encodedPowerShell(winRun(remote))));
+  expect(decodePs(ssh?.argv.at(-1) ?? "")).toBe(winRun(remote));
+  expect(ssh?.opts?.stdin).toBeUndefined();
+  expect(ssh?.opts?.timeoutMs).toBe(WIN_INSTALL_TIMEOUT_MS);
 };
 const request = () => {
   const stateDir = mkdtempSync(join(tmpdir(), "win-install-state-"));
@@ -138,25 +159,44 @@ const deps = (run: ReturnType<typeof fakeRun>["run"], kind?: "posix" | "windows"
   run, bundle: async () => BUNDLE, unitTemplate: "ExecStart=@BUN@\n",
   ...(kind ? { kind: async () => ({ ok: true as const, kind }) } : {}),
 });
-const BOOT = sshArgv(machine.target, encodedPowerShell(WIN_BOOTSTRAP));
-
-test("a Windows machine gets the bootstrap command with the script on stdin, and the secret only there", async () => {
+test("a Windows machine gets the script uploaded by scp and run from that file, and the secret only in the file", async () => {
   const { run, calls } = fakeRun(() => ({}));
   expect(await installRunner(deps(run, "windows"), request())).toEqual({ ok: true, version: bundleVersion(BUNDLE) });
-  expect(calls).toHaveLength(1);
-  const call = calls[0] as Call;
-  expect(call.argv).toEqual(BOOT);
-  expect((call.argv.at(-1) ?? "").length).toBeLessThan(8191);
-  expect(decodePs(call.argv.at(-1) ?? "")).toBe(WIN_BOOTSTRAP);
-  for (const arg of call.argv) { expect(arg).not.toContain(CODE); expect(arg).not.toContain(FINGERPRINT); }
-  expect(call.opts?.stdin).toBe(script());
+  expect(calls).toHaveLength(2);
+  expectWinPass(calls[0], calls[1], script());
+  expect((calls[1]?.argv.at(-1) ?? "").length).toBeLessThan(8191);
+  for (const call of calls) for (const arg of call.argv) { expect(arg).not.toContain(CODE); expect(arg).not.toContain(FINGERPRINT); }
+  // The local copy and its directory are gone once installRunner returns.
+  const local = calls[0]?.argv.at(-2) ?? "";
+  expect(existsSync(local)).toBe(false);
+  expect(existsSync(join(local, ".."))).toBe(false);
+});
+
+test("a failed upload maps like an ssh failure and skips the ssh step", async () => {
+  const down = fakeRun((_c, argv) => (argv[0] === "scp" ? { code: 255, err: "ssh: connect to host win-a port 22: Connection timed out" } : {}));
+  const r1 = await installRunner(deps(down.run, "windows"), request());
+  expect(r1.ok ? "ok" : r1.code).toBe("RUNNER_INSTALL_UNREACHABLE");
+  expect(down.calls.map((c) => c.argv[0])).toEqual(["scp"]);
+  const denied = fakeRun((_c, argv) => (argv[0] === "scp" ? { code: 1, err: "scp: dest open: Permission denied" } : {}));
+  const r2 = await installRunner(deps(denied.run, "windows"), request());
+  expect(r2.ok ? "ok" : r2.code).toBe("RUNNER_INSTALL_FAILED");
+  if (!r2.ok) expect(r2.detail.startsWith("scp:")).toBe(true);
+  expect(denied.calls.map((c) => c.argv[0])).toEqual(["scp"]);
+  expect(existsSync(denied.calls[0]?.argv.at(-2) ?? "")).toBe(false);
+});
+
+test("a Windows ssh timeout points at the progress log on the host", async () => {
+  const { run } = fakeRun((_c, argv) => (argv[0] === "scp" ? {} : { code: 124, timedOut: true }));
+  const result = await installRunner(deps(run, "windows"), request());
+  expect(result.ok ? "ok" : result.code).toBe("RUNNER_INSTALL_UNREACHABLE");
+  if (!result.ok) expect(result.detail).toContain("runner-install.log");
 });
 
 test("installRunner probes the machine kind and branches on it", async () => {
   // A PowerShell host: the sh probe is not recognized, the encoded PowerShell probe answers.
   const win = fakeRun((c) => (c.includes("DORI_POSIX") ? { code: 1, err: "'x' is not recognized as an internal or external command" } : c.startsWith("powershell") && decodePs(c).includes("DORI_PS_") ? { out: "DORI_PS_42\r\n" } : {}));
   expect((await installRunner(deps(win.run), request())).ok).toBe(true);
-  expect(win.calls.at(-1)?.argv).toEqual(BOOT);
+  expectWinPass(win.calls.at(-2), win.calls.at(-1), script());
   clearShellModes();
   // A Linux host: the sh probe answers and uname says Linux.
   const linux = fakeRun((c) => (c.includes("DORI_POSIX") ? { out: "DORI_POSIX_42\n" } : c === "uname -s" ? { out: "Linux\n" } : {}));
@@ -166,7 +206,7 @@ test("installRunner probes the machine kind and branches on it", async () => {
   // Git Bash as the ssh shell: POSIX, but uname names MINGW, so the Windows install runs.
   const bash = fakeRun((c) => (c.includes("DORI_POSIX") ? { out: "DORI_POSIX_42\n" } : c === "uname -s" ? { out: "MINGW64_NT-10.0-19045\n" } : {}));
   expect((await installRunner(deps(bash.run), request())).ok).toBe(true);
-  expect(bash.calls.at(-1)?.argv).toEqual(BOOT);
+  expectWinPass(bash.calls.at(-2), bash.calls.at(-1), script());
   clearShellModes();
   // No shell answers, or ssh fails: refused before a code is issued.
   let issued = 0;
@@ -184,8 +224,9 @@ test("the POSIX script exits 8 on a Windows uname, and installRunner then retrie
   expect(installScript(BUNDLE, "u", LABEL, LISTEN, ISSUE, "p", [], { unit: "", plist: "" })).toContain(`MINGW*|MSYS*|CYGWIN*) exit ${INSTALL_EXIT.windowsShell} ;;`);
   const { run, calls } = fakeRun((c) => (c === "sh -s" ? { code: INSTALL_EXIT.windowsShell } : {}));
   expect(await installRunner(deps(run, "posix"), request())).toEqual({ ok: true, version: bundleVersion(BUNDLE) });
-  expect(calls.map((c) => c.argv)).toEqual([sshArgv(machine.target, "sh -s"), BOOT]);
-  expect(calls[1]?.opts?.stdin).toBe(script());
+  expect(calls).toHaveLength(3);
+  expect(calls[0]?.argv).toEqual(sshArgv(machine.target, "sh -s"));
+  expectWinPass(calls[1], calls[2], script());
 });
 
 test("each Windows script exit maps to its result code", async () => {
@@ -196,12 +237,14 @@ test("each Windows script exit maps to its result code", async () => {
     [{ code: INSTALL_EXIT.noBun, err: "bun checksum mismatch" }, "RUNNER_INSTALL_NO_BUN", "pinned Windows build"],
     [{ code: INSTALL_EXIT.noHerdr }, "RUNNER_INSTALL_NO_HERDR"],
     [{ code: INSTALL_EXIT.enroll, err: "enrollment failed with exit 1" }, "RUNNER_INSTALL_ENROLL_FAILED"],
+    // PowerShell's CLIXML progress records after the real error line are skipped.
+    [{ code: INSTALL_EXIT.enroll, err: "RUNNER_DIR_UNSAFE bin\\dori owner\nenrollment failed with exit 1\n#< CLIXML\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\" RefId=\"0\"></Obj></Objs>" }, "RUNNER_INSTALL_ENROLL_FAILED", "enrollment failed with exit 1"],
     [{ code: INSTALL_EXIT.systemd, err: "task scheduler: Access is denied." }, "RUNNER_INSTALL_FAILED", "task scheduler"],
     // A PowerShell error naming an unknown command is a failure here, not an unsupported shell.
     [{ code: 1, err: "The term 'Expand-Archive' is not recognized as the name of a cmdlet" }, "RUNNER_INSTALL_FAILED"],
   ];
   for (const [ran, code, detail] of cases) {
-    const { run } = fakeRun(() => ran);
+    const { run } = fakeRun((_c, argv) => (argv[0] === "scp" ? {} : ran));
     const result = await installRunner(deps(run, "windows"), request());
     expect(result.ok ? "ok" : result.code).toBe(code);
     if (detail && !result.ok) expect(result.detail).toContain(detail);

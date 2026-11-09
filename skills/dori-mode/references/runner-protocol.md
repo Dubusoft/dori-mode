@@ -362,8 +362,12 @@ Prerequisites:
 - The runner runs as a scheduled task at logon, so the user has to be logged on. An always-on worker needs
   auto-logon.
 
-The bootstrap goes over ssh as `powershell -EncodedCommand` and the script comes on stdin; the enrollment code
-and fingerprint reach `runner serve --enroll-only` through stdin, never an argv. It then:
+Each pass uploads the script with scp to `%USERPROFILE%\.dori-runner-install-<hex>.ps1`, then runs a short
+`powershell -EncodedCommand` over ssh with empty stdin that reads the file, deletes it (it holds the one-time
+enrollment code) and runs it as a scriptblock. Progress goes to `%USERPROFILE%\.dori\runner-install.log`. An ssh
+step times out after 600 s, and its `RUNNER_INSTALL_UNREACHABLE` detail points at that log. A failed scp is
+`RUNNER_INSTALL_UNREACHABLE` (ssh-style failure or timeout) or `RUNNER_INSTALL_FAILED` (`scp: ...`). The enrollment
+code and fingerprint reach `runner serve --enroll-only` through stdin, never an argv. The script then:
 
 1. Locks `%USERPROFILE%\.dori\runner` with `icacls` (inheritance removed, full control for the user, SYSTEM and
    Administrators, owner set to the user) and creates `bin`, `bun`, `logs` and `evidence`.
