@@ -421,7 +421,7 @@ if (process.argv[2] === "runner") {
     const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
     try {
       // The code is issued in this process and handed to the installer as data; it never enters an argv.
-      const result = await installRunner({ run, bundle: buildBundle(run) }, {
+      const result = await installRunner({ run, bundle: buildBundle(run), progress: (line) => { console.log(line); } }, {
         machine, label, listenAddress: await runnerListenAddress(machine.target), stateDir: cfg.stateDir,
         agentCommand: cfg.agentCommand,
         issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
@@ -449,10 +449,15 @@ if (process.argv[2] === "runner") {
     const { runnerOf } = await import("./lane-ops.ts");
     const busy = (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed" && runnerOf(lane) === label);
     if (busy.length) die(`RUNNER_REMOVE_BUSY runner=${label} open lanes: ${busy.map((lane) => lane.key).join(",")}; close them or run dori runner evacuate ${label} first`);
+    const { stepper } = await import("./runner/steps.ts");
+    const step = stepper((line) => { console.log(line); }, label);
     if (plan.kind === "remote") {
-      const result = await removeRunner({ run }, { machine: plan.machine, label });
+      const result = await removeRunner({ run, progress: (line) => { console.log(line); } }, { machine: plan.machine, label });
       if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+    } else {
+      step("uninstall", "skipped", "no saved machine; the worker is not touched");
     }
+    step("cleanup", "start", "key, supervisor link, endpoint, machine, hub row");
     // Only after the worker is clean: the key, a live supervisor's link, the endpoint and the remembered machine go.
     const { SupervisorAuth } = await import("./runner/auth.ts");
     const { queueRunnerAdmin } = await import("./runner/serve.ts");
@@ -469,6 +474,7 @@ if (process.argv[2] === "runner") {
     removeRunnerMachine(cfg.stateDir, label);
     const { forgetRunner } = await import("./runner/hub.ts");
     forgetRunner(cfg.stateDir, label);
+    step("cleanup", "done");
     console.log(`RUNNER_REMOVED runner=${label}${plan.kind === "local" ? " local-only (no saved machine; the worker was not touched)" : ""}`);
     process.exit(0);
   }

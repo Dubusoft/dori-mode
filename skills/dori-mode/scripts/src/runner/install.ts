@@ -11,6 +11,7 @@ import type { SupervisorAuth } from "./auth.ts";
 import { writeRunnerEndpoint } from "./endpoints.ts";
 import { decodeFrame, encodeFrame, supervisorControl, type RunnerControlBodies } from "./protocol.ts";
 import { isPrivateListen } from "./ws-transport.ts";
+import { stepper, type Progress } from "./steps.ts";
 
 /**
  * Installs or upgrades the runner on a remote Linux or macOS machine over ssh, as design 3.2 and 5.4 lay out. The ssh
@@ -120,6 +121,8 @@ export type InstallDeps = {
   readonly laneSandboxMacos?: string;
   /** How the machine runs commands; defaults to `machineKind`. */
   readonly kind?: (run: Runner, machine: GuardMachine) => Promise<KindResult>;
+  /** Receives a `RUNNER_STEP` line as each step starts, finishes or fails. */
+  readonly progress?: Progress;
 };
 
 export type InstallRequest = {
@@ -588,9 +591,24 @@ const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult
 export const installRunner = async (deps: InstallDeps, req: InstallRequest): Promise<InstallResult> => {
   if (!LABEL.test(req.label)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: `bad label ${req.label}` };
   if (!isPrivateListen(req.listenAddress)) return { ok: false, code: "RUNNER_LISTEN_REFUSED", detail: `${req.listenAddress} is not a private host:port` };
+  const step = stepper(deps.progress, req.label);
+  step("connect", "start", req.machine.target);
   const k = await (deps.kind ?? machineKind)(deps.run, req.machine);
-  if (!k.ok) return { ok: false, code: k.unsupported ? "RUNNER_INSTALL_UNSUPPORTED" : "RUNNER_INSTALL_UNREACHABLE", detail: k.detail };
-  const bundle = await deps.bundle();
+  if (!k.ok) {
+    const code = k.unsupported ? "RUNNER_INSTALL_UNSUPPORTED" : "RUNNER_INSTALL_UNREACHABLE";
+    step("connect", "failed", `${code} ${k.detail}`);
+    return { ok: false, code, detail: k.detail };
+  }
+  step("connect", "done", k.kind);
+  step("upload", "start", "bundling the runner");
+  let bundle: string;
+  try {
+    bundle = await deps.bundle();
+  } catch (error) {
+    step("upload", "failed", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  step("upload", "done", `bundle ${bundleVersion(bundle)}; ${k.kind === "windows" ? "each install pass copies its script over scp" : "each install pass sends it over ssh stdin"}`);
   const unit = remoteUnit(deps.unitTemplate ?? readFileSync(RUNNER_REMOTE_UNIT_TEMPLATE, "utf8"), req.label, req.listenAddress);
   const plist = remoteUnit(deps.plistTemplate ?? readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), req.label, req.listenAddress);
   const issue = req.issue();
@@ -621,17 +639,24 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
     const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates, deps.laneSandbox, deps.laneSandboxMacos);
     return deps.run(sshArgv(target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   };
+  const failed = (result: InstallResult): InstallResult => {
+    if (!result.ok) step("install", "failed", `${result.code} ${result.detail}`);
+    return result;
+  };
+  step("install", "start", "files, bun, enrollment and service registration in one remote pass");
   let pass = await install(issue);
-  if ("ok" in pass) return pass;
+  if ("ok" in pass) return failed(pass);
   let r = pass;
   // A POSIX shell on Windows: powershell.exe is reachable from it, so the Windows install runs instead.
   if (kind === "posix" && r.code === INSTALL_EXIT.windowsShell) {
     kind = "windows";
+    step("install", "start", "again as a Windows install (the ssh shell is a POSIX shell on Windows)");
     pass = await install(issue);
-    if ("ok" in pass) return pass;
+    if ("ok" in pass) return failed(pass);
     r = pass;
   }
   if (r.code === INSTALL_EXIT.enrollPending) {
+    step("enroll", "start", "the host sent an enrollment request");
     try {
       const line = /^RUNNER_ENROLL_REQUEST (.+)$/m.exec(r.out)?.[1];
       if (!line) throw new Error("missing enrollment request on SSH stdout");
@@ -642,15 +667,30 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
       const accepted = req.enroll(body);
       if (!accepted.ok) throw new Error(`${accepted.code} ${accepted.detail}`);
       const reply = Buffer.from(encodeFrame(supervisorControl({ runner: req.label, gen: 0, epoch: 0 }, "enroll.ok", accepted.reply))).toString("base64");
+      step("enroll", "done", "accepted");
+      step("install", "start", "again with the supervisor's enrollment reply");
       pass = await install({ ...issue, reply });
-      if ("ok" in pass) return pass;
+      if ("ok" in pass) return failed(pass);
       r = pass;
     } catch (error) {
-      return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail: error instanceof Error ? error.message : String(error) };
+      const detail = error instanceof Error ? error.message : String(error);
+      step("enroll", "failed", detail);
+      return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail };
     }
   }
   const result = installResult(kind, r, bundle);
-  if (result.ok) writeRunnerEndpoint(req.stateDir, req.label, req.listenAddress);
+  if (!result.ok) {
+    // Exit `systemd` is the script's service-manager stage, so everything before it went through.
+    if (r.code !== INSTALL_EXIT.systemd) return failed(result);
+    step("install", "done");
+    step("service", "failed", `${result.code} ${result.detail}`);
+    return result;
+  }
+  step("install", "done");
+  step("service", "done", kind === "windows" ? "scheduled task registered and started" : `runner service registered and started; ${herdrInstallNote(result.herdr)}`);
+  step("verify", "start");
+  writeRunnerEndpoint(req.stateDir, req.label, req.listenAddress);
+  step("verify", "done", `remote pass exited 0, version=${result.version}, endpoint ${req.listenAddress} recorded`);
   return result;
 };
 
