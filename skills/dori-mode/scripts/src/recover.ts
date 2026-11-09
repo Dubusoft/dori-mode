@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
-import { closeLane, type FlowDeps, finishedReason } from "./done-flow.ts";
+import { closeLane, closeRunning, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, startupLine } from "./launch.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
@@ -233,6 +233,8 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   }
   const read = await deps.registry.read(lane.key);
   if (!read || statusOf(read) !== "working" || read.pane !== lane.pane || read.model !== lane.model) return [];
+  // A running close takes the pane's tab down before it writes the lane closed: that missing pane is not relaunched.
+  if (closeRunning(deps, lane.key)) return [];
   const current: RecoveryLane = read;
   // A lane whose work is finished (Done signals hold, PR merged) is never relaunched: close it, or leave it for the close.
   const finished = await finishedReason(deps, current);

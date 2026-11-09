@@ -37,6 +37,14 @@ test("win32 herdrProcess: keeps only server command lines owned by the current u
   expect(await herdrProcess(cim(JSON.stringify([row(5, "herdr.exe client", "bob")])), win)).toEqual({ running: false });
 });
 
+test("win32 herdrProcess: a herdr.exe with a hidden command line (elevated) is named by herdr's socket, never read as down", async () => {
+  const hidden = JSON.stringify([{ ProcessId: 9, CommandLine: null, CreationDate: "A", Owner: null, Domain: null }, row(5, "herdr.exe client", "bob")]);
+  const run = (socket: string): Runner => async (argv) => ok(argv.at(-1)?.includes("status server") ? socket : hidden);
+  expect(await herdrProcess(run("2026-11-09T01:10:45.4763120Z\r\n"), win)).toEqual({ running: true, instance: "socket@2026-11-09T01:10:45.4763120Z" });
+  expect(await herdrProcess(run(""), win)).toEqual({ running: true });
+  expect(await herdrProcess(cim(JSON.stringify([row(9, "herdr.exe server", "bob", "B"), { ProcessId: 4, CommandLine: null, CreationDate: "A" }])), win)).toEqual({ running: true, instance: "9@B" });
+});
+
 test("win32 herdrProcess: a failed or unreadable query is treated as running without an instance", async () => {
   expect(await herdrProcess(async () => bad(2), win)).toEqual({ running: true });
   expect(await herdrProcess(cim("not json"), win)).toEqual({ running: true });

@@ -113,16 +113,23 @@ const inspect = (path: string, uid: number | undefined, kind: "dir" | "file", ex
 /**
  * The Windows form of `inspect`: reparse points (symlinks, junctions) are refused except an AF_UNIX socket directly
  * under `sock\`, the type is checked as on POSIX, and the owner and DACL go through `evaluateSddl` instead of uid and mode.
+ * The socket is never lstat'd: Bun on Windows fails that with EACCES once its listener is gone (a hard-killed runner).
  */
 const inspectWindows = (path: string, win: WinCheck, kind: "dir" | "file"): void => {
-  const st = lstatSync(path);
   const info = win.acl(path);
   const socket = info.reparseTag === IO_REPARSE_TAG_AF_UNIX && kind === "file" && dirname(path) === join(win.root, RUNNER_PATHS.sock);
-  if (!socket && (st.isSymbolicLink() || info.reparseTag !== undefined)) throw new RunnerDirUnsafe(path, "symlink", info.reparseTag !== undefined ? `tag=0x${info.reparseTag.toString(16)}` : "");
-  if (kind === "dir" && !st.isDirectory()) throw new RunnerDirUnsafe(path, "not-directory");
-  if (kind === "file" && !socket && !st.isFile() && !st.isSocket()) throw new RunnerDirUnsafe(path, "not-file");
+  if (!socket) {
+    const st = lstatSync(path);
+    if (st.isSymbolicLink() || info.reparseTag !== undefined) throw new RunnerDirUnsafe(path, "symlink", info.reparseTag !== undefined ? `tag=0x${info.reparseTag.toString(16)}` : "");
+    if (kind === "dir" && !st.isDirectory()) throw new RunnerDirUnsafe(path, "not-directory");
+    if (kind === "file" && !st.isFile() && !st.isSocket()) throw new RunnerDirUnsafe(path, "not-file");
+  }
   const verdict = evaluateSddl(info.sddl, win.userSid, { root: path === win.root });
   if (verdict) throw new RunnerDirUnsafe(path, verdict.reason, verdict.detail);
+};
+
+const lstatDenied = (path: string): boolean => {
+  try { lstatSync(path); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "EACCES"; }
 };
 
 const walk = (dir: string, uid: number | undefined, top: boolean, executable = false, win?: WinCheck): void => {
@@ -130,6 +137,8 @@ const walk = (dir: string, uid: number | undefined, top: boolean, executable = f
   else inspect(dir, uid, "dir");
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
+    // A socket left under `sock\` by a killed runner can't be lstat'd on Windows (EACCES); inspectWindows reads it.
+    if (win && dir === join(win.root, RUNNER_PATHS.sock) && lstatDenied(path)) { inspectWindows(path, win, "file"); continue; }
     const st = lstatSync(path);
     // Only the entries the runner itself defines have a fixed type; anything else is checked by what it is.
     const isTopDir = top && DIRECTORY_ENTRIES.has(name);
