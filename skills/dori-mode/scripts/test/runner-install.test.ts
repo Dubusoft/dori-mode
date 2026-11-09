@@ -7,7 +7,7 @@ import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
 import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
 import { loadPolicy } from "../src/runner/policy.ts";
-import { LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { enrollOverStdio, RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { readRunnerEndpoints } from "../src/runner/endpoints.ts";
 
@@ -359,19 +359,24 @@ test("on Darwin the agent is enabled before bootstrap, and a gui domain that ref
   expect(lines.at(-1)).toBe("launchctl kickstart -k user/501/com.dori.runner");
 });
 
-test("on Darwin the starter policy requires a sandbox and has no sandboxed profile, and no lane-sandbox is installed", async () => {
+test("on Darwin the script installs the seatbelt lane-sandbox and a starter policy that runs sandboxed lanes behind it", async () => {
   const host = darwinHost();
   const result = await runDarwin(host, darwinScript());
   expect(result.code).toBe(0);
   const policyFile = join(host.home, ".dori/runner/runner-config.json");
-  expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({ agents: { default: AGENT }, allowedRoots: [host.home, "/private/tmp"], sandbox: "required" });
-  expect(existsSync(join(host.home, ".dori/runner/bin/lane-sandbox"))).toBe(false);
+  const wrapperPath = join(host.home, ".dori/runner/bin/lane-sandbox");
+  expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+    agents: { default: AGENT, sandboxed: [wrapperPath, ...AGENT] }, allowedRoots: [host.home, "/private/tmp"], sandbox: "required", sandboxCheck: [wrapperPath, "--check"],
+  });
+  expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ sandbox: "required", sandboxCheck: [wrapperPath, "--check"] });
+  expect(readFileSync(wrapperPath, "utf8")).toBe(readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"));
+  expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
   expect(result.out).not.toContain("RUNNER_CONFIG_SANDBOX_MISSING");
-  // A reinstall over an operator's file without sandbox:required names only that key (no wrapper on macOS).
+  // A reinstall over an operator's file names every key it lacks for sandboxed lanes, and leaves the file alone.
   writeFileSync(policyFile, '{"agents":{"default":["claude"]}}\n', { mode: 0o600 });
   const again = await runDarwin(host, darwinScript());
   expect(again.code).toBe(0);
-  expect(again.out).toContain(`RUNNER_CONFIG_SANDBOX_MISSING sandbox:required in ${policyFile}; add them to sandbox lanes on this runner\n`);
+  expect(again.out).toContain(`RUNNER_CONFIG_SANDBOX_MISSING sandbox:required agents.sandboxed sandboxCheck in ${policyFile}; add them to sandbox lanes on this runner\n`);
   expect(readFileSync(policyFile, "utf8")).toBe('{"agents":{"default":["claude"]}}\n');
 });
 

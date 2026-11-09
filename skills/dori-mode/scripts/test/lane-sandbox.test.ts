@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { installedLaneSandbox, LANE_SANDBOX_TEMPLATE, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
+import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -141,4 +141,183 @@ test("--check exits 3 with bwrap's reason on one line when bwrap cannot create a
   const r = await check(bin);
   expect(r.code).toBe(3);
   expect(r.err.trim().split("\n")).toEqual(["lane-sandbox: bwrap cannot create a sandbox: bwrap: No permissions to create new namespace"]);
+});
+
+// macOS (Seatbelt) wrapper. sandbox-exec does not exist here, so the template runs with a recording one in place of
+// /usr/bin/sandbox-exec, and the profile it would have been given is evaluated below with SBPL's last-match-wins rule.
+
+type Seatbelt = { profile: string; params: Record<string, string>; command: string[]; env: Record<string, string>; err: string };
+
+/** Runs the macOS template with `sbx` as its sandbox-exec, in `cwd`, with only `env` (plus PATH and HOME). */
+const runMacos = async (home: string, cwd: string, args: string[], env: Record<string, string>, sbx: string) => {
+  const script = join(home, "..", "lane-sandbox-macos.sh");
+  writeFileSync(script, readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8").replace(/^SBX=.*$/m, `SBX=${sbx}`));
+  const child = Bun.spawn(["bash", script, ...args], { cwd, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  return { code, out, err };
+};
+
+/** The sandbox-exec argv and environment a lane in `cwd` would get. */
+const seatbelt = async (home: string, cwd: string, env: Record<string, string>): Promise<Seatbelt> => {
+  const out = join(home, "..", "sbx-argv");
+  const sbx = join(home, "..", "fake-sandbox-exec");
+  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" > "${out}.env"\n`);
+  chmodSync(sbx, 0o755);
+  const r = await runMacos(home, cwd, ["omo", "--model", "m"], env, sbx);
+  expect(r.code).toBe(0);
+  const argv = readFileSync(out, "utf8").split("\0").slice(0, -1);
+  expect(argv[0]).toBe("-p");
+  const params: Record<string, string> = {};
+  let i = 2;
+  for (; argv[i] === "-D"; i += 2) {
+    const kv = argv[i + 1] ?? "";
+    params[kv.slice(0, kv.indexOf("="))] = kv.slice(kv.indexOf("=") + 1);
+  }
+  expect(argv[i]).toBe("--");
+  const envOut = Object.fromEntries(readFileSync(`${out}.env`, "utf8").split("\0").slice(0, -1).map((kv) => [kv.slice(0, kv.indexOf("=")), kv.slice(kv.indexOf("=") + 1)]));
+  return { profile: argv[1] ?? "", params, command: argv.slice(i + 1), env: envOut, err: r.err };
+};
+
+type Sexp = string | { raw: string } | Sexp[];
+const parseSbpl = (text: string): Sexp[] => {
+  const tokens = text.match(/#"(?:[^"\\]|\\.)*"|"(?:[^"\\]|\\.)*"|[()]|[^\s()]+/g) ?? [];
+  let pos = 0;
+  const read = (): Sexp => {
+    const t = tokens[pos++] as string;
+    if (t === "(") {
+      const list: Sexp[] = [];
+      while (tokens[pos] !== ")") list.push(read());
+      pos++;
+      return list;
+    }
+    if (t.startsWith('#"')) return { raw: t.slice(2, -1) };
+    if (t.startsWith('"')) return { raw: t.slice(1, -1) };
+    return t;
+  };
+  const all: Sexp[] = [];
+  while (pos < tokens.length) all.push(read());
+  return all;
+};
+
+/** Whether the profile lets `op` ("file-read-data" or "file-write-data") reach `path`: the last matching rule wins. */
+const allows = (sb: Seatbelt, op: "file-read-data" | "file-write-data", path: string): boolean => {
+  const str = (x: Sexp): string => {
+    if (Array.isArray(x) && x[0] === "param") return sb.params[(x[1] as { raw: string }).raw] ?? "\0unset";
+    return (x as { raw: string }).raw;
+  };
+  const matches = (filter: Sexp): boolean => {
+    if (!Array.isArray(filter)) throw new Error(`unexpected filter ${JSON.stringify(filter)}`);
+    const [kind, arg] = filter;
+    if (kind === "subpath") return path === str(arg as Sexp) || path.startsWith(`${str(arg as Sexp)}/`);
+    if (kind === "literal") return path === str(arg as Sexp);
+    if (kind === "regex") return new RegExp(str(arg as Sexp)).test(path);
+    throw new Error(`unexpected filter ${String(kind)}`);
+  };
+  let verdict: boolean | undefined;
+  for (const rule of parseSbpl(sb.profile)) {
+    if (!Array.isArray(rule) || (rule[0] !== "allow" && rule[0] !== "deny")) continue;
+    const opName = rule[1] as string;
+    const hit = opName === "default" || opName === op || (opName.endsWith("*") && op.startsWith(opName.slice(0, -1)));
+    if (!hit) continue;
+    const filters = rule.slice(2);
+    if (filters.length === 0 || filters.some(matches)) verdict = rule[0] === "allow";
+  }
+  if (verdict === undefined) throw new Error("profile has no default rule");
+  return verdict;
+};
+
+/** A home with a runner dir, two lanes' briefs and tokens, the env file and ssh keys; a git worktree beside it. */
+const macHome = () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const runner = join(home, ".dori", "runner");
+  mkdirSync(join(runner, "briefs"), { recursive: true });
+  mkdirSync(join(home, ".ssh"), { recursive: true });
+  for (const f of ["briefs/lane-a.2.token", "briefs/lane-b.1.token", "briefs/lane-a.md", "briefs/lane-b.md"]) writeFileSync(join(runner, f), "x");
+  writeFileSync(join(home, ".dori", "env"), "SECRET=1");
+  const wt = join(root, "wt");
+  mkdirSync(wt);
+  const git = Bun.spawnSync(["git", "init", "-q", wt]);
+  expect(git.exitCode).toBe(0);
+  return { root, home, runner, wt, token: join(runner, "briefs", "lane-a.2.token") };
+};
+
+test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else, and cannot read ~/.dori/env, ssh keys or another lane's token", async () => {
+  const { home, runner, wt, token } = macHome();
+  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token });
+  const lt = join(home, ".cache", "omo-tmp", "lane-sandbox", "lane-a");
+
+  expect(sb.command).toEqual(["omo", "--model", "m"]);
+  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1" });
+  expect(statSync(lt).mode & 0o777).toBe(0o700);
+  expect(sb.err).toBe("");
+
+  const write = (p: string) => allows(sb, "file-write-data", p);
+  const read = (p: string) => allows(sb, "file-read-data", p);
+  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null"]) {
+    expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
+  }
+  for (const no of [join(home, "probe"), join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {
+    expect({ no, write: write(no) }).toEqual({ no, write: false });
+  }
+  for (const ok of [token, join(runner, "briefs", "lane-a.md"), join(runner, "bin", "dori"), join(home, ".dori", "config.json"), join(home, ".dori", "src", "cli.ts"), join(home, ".ssh", "id_ed25519.pub"), join(home, ".ssh", "known_hosts"), "/etc/hosts", join(wt, "README.md")]) {
+    expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
+  }
+  for (const no of [join(home, ".dori", "env"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key")]) {
+    expect({ no, read: read(no) }).toEqual({ no, read: false });
+  }
+});
+
+test("macOS: every path reaches the profile resolved (as /var does to /private/var), and only as a -D parameter", async () => {
+  const { root, home, wt } = macHome();
+  // Reached through symlinks, the way macOS reaches /private/var/folders through /var.
+  symlinkSync(home, join(root, "home-link"));
+  symlinkSync(wt, join(root, "wt-link"));
+  const extra = join(root, "extra");
+  const sb = await seatbelt(join(root, "home-link"), join(root, "wt-link"), { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: `${join(root, "home-link", "rw")}:${extra}`, LANE_SANDBOX_VERIFY: join(root, "verify") });
+
+  expect(allows(sb, "file-write-data", join(wt, "a"))).toBe(true);
+  expect(allows(sb, "file-write-data", join(home, "rw", "a"))).toBe(true);
+  expect(allows(sb, "file-write-data", join(extra, "a"))).toBe(true);
+  expect(allows(sb, "file-write-data", join(root, "verify", "a"))).toBe(true);
+  expect(allows(sb, "file-write-data", join(root, "a"))).toBe(false);
+  expect(allows(sb, "file-read-data", join(home, ".dori", "env"))).toBe(false);
+  expect(Object.values(sb.params).filter((p) => p.includes("-link"))).toEqual([]);
+  // No host path is written into the profile text itself.
+  expect(sb.profile).not.toContain(root);
+});
+
+test("macOS: a cwd as broad as $HOME is not made writable", async () => {
+  const { home } = macHome();
+  const sb = await seatbelt(home, home, { DORI_LANE_KEY: "lane-a" });
+  expect(sb.err).toBe(`lane-sandbox: warning: cwd ${home} is too broad; not making it writable\n`);
+  expect(allows(sb, "file-write-data", join(home, "probe"))).toBe(false);
+});
+
+test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a missing or failing sandbox-exec", async () => {
+  const { root, home, wt } = macHome();
+  const never = join(root, "never-called");
+  writeFileSync(never, "#!/bin/sh\nexit 99\n");
+  chmodSync(never, 0o755);
+  expect(await runMacos(home, wt, ["echo", "plain"], {}, never)).toEqual({ code: 0, out: "plain\n", err: "" });
+
+  const missing = await runMacos(home, wt, ["--check"], {}, join(root, "no-such-sandbox-exec"));
+  expect({ code: missing.code, err: missing.err }).toEqual({ code: 3, err: `lane-sandbox: ${join(root, "no-such-sandbox-exec")} not found\n` });
+
+  const failing = join(root, "failing-sandbox-exec");
+  writeFileSync(failing, "#!/bin/sh\necho 'sandbox-exec: syntax error' >&2\necho 'line 2' >&2\nexit 65\n");
+  chmodSync(failing, 0o755);
+  const bad = await runMacos(home, wt, ["--check"], { DORI_LANE_KEY: "lane-a" }, failing);
+  expect({ code: bad.code, err: bad.err }).toEqual({ code: 3, err: "lane-sandbox: sandbox-exec cannot create a sandbox: sandbox-exec: syntax error line 2\n" });
+
+  // A passing check runs /usr/bin/true under the same profile a lane gets.
+  const argvFile = join(root, "check-argv");
+  const passing = join(root, "passing-sandbox-exec");
+  writeFileSync(passing, `#!/bin/sh\nprintf '%s\\0' "$@" > "${argvFile}"\n`);
+  chmodSync(passing, 0o755);
+  expect(await runMacos(home, wt, ["--check"], {}, passing)).toEqual({ code: 0, out: "", err: "" });
+  const argv = readFileSync(argvFile, "utf8").split("\0").slice(0, -1);
+  expect(argv[0]).toBe("-p");
+  expect(argv[1]).toContain("(deny file-write*)");
+  expect(argv.at(-1)).toBe("/usr/bin/true");
 });
