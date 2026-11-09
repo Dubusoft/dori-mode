@@ -8,6 +8,7 @@ import { discordSnowflakeAt } from "../src/messenger/discord-inbound.ts";
 import { discordPresence, type GatewaySocket } from "../src/messenger/discord.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Supervisor } from "../src/supervise.ts";
+import { readOwnerClosed } from "../src/thread-followup.ts";
 import type { DoriConfig } from "../src/config.ts";
 import { eventClass } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal } from "./fakes.ts";
@@ -298,6 +299,8 @@ test("a restarted supervisor resumes the stopped one's gateway session and carri
   expect(String(writes[1]?.body)).toContain('"disabled":true');
   expect(JSON.parse(String(writes[2]?.body))).toEqual({ archived: true });
   expect(emitted.get("discord:777:close:900")).toBe("THREAD_CLOSED_BY_OWNER 777");
+  // Recorded, so later posts addressed to the thread go to the owner channel instead of reopening it.
+  expect(readOwnerClosed(state.dir)).toEqual({ "777": clock.at });
 });
 
 test("a stopped supervisor's session older than the resume window, or malformed, is dropped and the next one identifies", async () => {

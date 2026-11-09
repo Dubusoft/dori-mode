@@ -8,6 +8,7 @@ import { unresolved } from "./decision-obligations.ts";
 import type { Registry } from "./registry.ts";
 import { discordThreadOf } from "./messenger/target.ts";
 import { readCloseButtons, recordCloseButton, threadBlockers } from "./thread-finality.ts";
+import { readOwnerClosed } from "./thread-followup.ts";
 import { Waits } from "./waits.ts";
 import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journal.ts";
 
@@ -67,9 +68,10 @@ const fsyncDir = (dir: string): void => {
 /**
  * Where `dori reported` posted the report: the message id and its target (`platform:to[/thread]`); `thread` is the id of
  * the lane's thread (its bound thread, else the thread the report went into), `button` that the post carried the owner's
- * close-thread button.
+ * close-thread button. `followUp` marks a post that is no new report in the thread (an edit appended to the last report,
+ * or a line sent to the owner channel because the owner closed the thread): it never re-arms the thread's close button.
  */
-export type ReportedPost = { readonly message: string; readonly target: string; readonly thread?: string; readonly button?: boolean };
+export type ReportedPost = { readonly message: string; readonly target: string; readonly thread?: string; readonly button?: boolean; readonly followUp?: boolean };
 
 /**
  * The lead's receipt that it told the owner about lane `lane`'s outcome: tmp, fsync, rename, then both directories.
@@ -82,7 +84,7 @@ export const recordReported = (stateDir: string, lane: string, at: number, note?
   const path = join(dir, `${at}-${randomUUID()}.json`);
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}), ...(posted ? { message: posted.message, target: posted.target } : {}),
-    ...(posted?.thread ? { thread: posted.thread } : {}), ...(posted?.button ? { button: true } : {}) }), { mode: 0o600, flush: true });
+    ...(posted?.thread ? { thread: posted.thread } : {}), ...(posted?.button ? { button: true } : {}), ...(posted?.followUp ? { followUp: true } : {}) }), { mode: 0o600, flush: true });
   renameSync(tmp, path);
   fsyncDir(dir);
   fsyncDir(stateDir);
@@ -92,7 +94,7 @@ export const recordReported = (stateDir: string, lane: string, at: number, note?
 /** `message` and `target` are absent in receipts written before `dori reported` posted the report itself. */
 export type ReportedReceipt = {
   readonly path: string; readonly lane: string; readonly at: number; readonly note?: string; readonly message?: string; readonly target?: string;
-  readonly thread?: string; readonly button?: true;
+  readonly thread?: string; readonly button?: true; readonly followUp?: true;
 };
 
 /** Receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
@@ -103,8 +105,8 @@ export const pendingReported = (stateDir: string): ReportedReceipt[] => {
   return names.filter((name) => RECEIPT_FILE.test(name)).flatMap((name) => {
     const path = join(dir, name);
     try {
-      const { lane, at, note, message, target, thread, button } = JSON.parse(readFileSync(path, "utf8")) as {
-        lane?: unknown; at?: unknown; note?: unknown; message?: unknown; target?: unknown; thread?: unknown; button?: unknown;
+      const { lane, at, note, message, target, thread, button, followUp } = JSON.parse(readFileSync(path, "utf8")) as {
+        lane?: unknown; at?: unknown; note?: unknown; message?: unknown; target?: unknown; thread?: unknown; button?: unknown; followUp?: unknown;
       };
       if (typeof lane !== "string" || !LANE_KEY.test(lane)) return [];
       return [{
@@ -114,6 +116,7 @@ export const pendingReported = (stateDir: string): ReportedReceipt[] => {
         ...(typeof target === "string" && target ? { target } : {}),
         ...(typeof thread === "string" && /^\d+$/.test(thread) ? { thread } : {}),
         ...(button === true ? { button: true as const } : {}),
+        ...(followUp === true ? { followUp: true as const } : {}),
       }];
     } catch { return []; }
   });
@@ -194,8 +197,9 @@ export class OutcomeTracking {
    * `dori reported` receipts close their lane's obligation; one for a lane with none yet (reported before its outcome
    * event arrived) is kept, so that event opens nothing. Persisted before the receipts are dropped: a replay only takes
    * the earliest report time again. A repeat report of a lane into the same thread without a button keeps its last report
-   * time, so it does not re-arm that thread's close button; new work in a thread runs under a new lane key. Receipts are
-   * taken in time order.
+   * time, so it does not re-arm that thread's close button; new work in a thread runs under a new lane key. A follow-up
+   * receipt (an appended edit, or a line sent to the owner channel for a closed thread) leaves the thread and its last
+   * report time as they were. Receipts are taken in time order.
    */
   consumeReceipts(): void {
     const receipts = pendingReported(this.core.deps.config.stateDir).sort((a, b) => a.at - b.at);
@@ -211,7 +215,7 @@ export class OutcomeTracking {
         ...(found ?? { lane: receipt.lane, since: receipt.at }),
         reportedAt: Math.min(found?.reportedAt ?? Infinity, receipt.at),
         ...(note ? { note } : {}),
-        ...(thread ? { thread, lastReportAt: repeat ? found.lastReportAt : Math.max(found?.lastReportAt ?? -Infinity, receipt.at) } : {}),
+        ...(thread && !receipt.followUp ? { thread, lastReportAt: repeat ? found.lastReportAt : Math.max(found?.lastReportAt ?? -Infinity, receipt.at) } : {}),
       };
       // A --final report's button counts as the thread's close button: the supervisor posts none for that report.
       if (receipt.button && receipt.thread) recordCloseButton(this.core.deps.config.stateDir, receipt.thread, receipt.at);
@@ -318,7 +322,8 @@ export class OutcomeTracking {
    * Posts the owner's close-thread button into each thread whose work is finished: a report into it was recorded after the
    * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. A
    * report for a lane that closed before that button is covered by it and re-arms nothing; one for a lane that closed
-   * later (or has not closed yet) is new work. Run
+   * later (or has not closed yet) is new work. A thread the owner closed after its last report gets none: a post would
+   * reopen it. Run
    * every pass, so it fires right after the last report or right after the last lane closes, whichever comes later. A
    * failed post is retried on the next pass; `post` gets a stable id per thread and report, so a retry is not doubled.
    */
@@ -336,7 +341,8 @@ export class OutcomeTracking {
       }
       latest.set(outcome.thread, Math.max(latest.get(outcome.thread) ?? -Infinity, outcome.lastReportAt));
     }
-    const due = [...latest].filter(([thread, at]) => at > (buttons[thread] ?? -Infinity));
+    const closed = readOwnerClosed(stateDir);
+    const due = [...latest].filter(([thread, at]) => at > (buttons[thread] ?? -Infinity) && at > (closed[thread] ?? -Infinity));
     if (!due.length) return;
     const open = await registry.open();
     const waits = new Waits(stateDir).list();

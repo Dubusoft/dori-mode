@@ -1,6 +1,7 @@
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FlowDeps } from "../done-flow.ts";
+import { recordOwnerClosed } from "../thread-followup.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
 import {
   type DiscordInboundOptions, discordChannels, discordDispatchThreads, discordMessageChannel, discordOwnerConfigured, discordThread,
@@ -61,6 +62,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   const discord = new Discord(options.http, deps.clock, options.token);
   // The owner's close-thread button reaches the lead as a digest line, with the lane bound to that thread when one is.
   const threadClosed = async (threadId: string, interactionId: string): Promise<void> => {
+    recordOwnerClosed(deps.config.stateDir, threadId, deps.clock.now());
     const lane = (await deps.registry.open()).find((l) => l.thread.endsWith(`/${threadId}`))?.key;
     await options.emit(`discord:${threadId}:close:${interactionId}`, `THREAD_CLOSED_BY_OWNER ${threadId}${lane ? ` lane ${lane}` : ""}`);
   };

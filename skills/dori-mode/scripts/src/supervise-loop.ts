@@ -881,7 +881,13 @@ export const supervise = async (
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(stateDir, pane); },
-      announce: async (text, id, thread) => { await postOwnerLine(discord, deps.config.discordChannels[0], thread, systemText(text), id); },
+      // A line into a lane thread is appended to its last report (or status message), never a new post into a thread the owner closed.
+      announce: async (text, id, thread) => {
+        await postOwnerLine(discord, deps.config.discordChannels[0], thread, systemText(text), id, {
+          stateDir,
+          statusMessage: async (threadId) => (await deps.registry.open()).find((lane) => lane.thread.endsWith(`/${threadId}`))?.statusMessageId,
+        });
+      },
     }));
     deps = await ensureManagedPanes(deps, supervisor);
     // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
