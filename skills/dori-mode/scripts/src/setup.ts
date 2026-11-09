@@ -367,6 +367,10 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     githubIssueAuthors: issueAuthors.length || Array.isArray(raw.githubIssueAuthors) ? issueAuthors : undefined,
   });
   d.log(`SETUP config ${saveConfig(d.configPath, raw, config) ? "written" : "unchanged"}: ${d.configPath}`);
+  const alertsChannel = str(config.alertsChannel).trim();
+  d.log(alertsChannel
+    ? `SETUP alertsChannel ${alertsChannel}: system notices go there`
+    : `SETUP alertsChannel unset: system notices go to the first discordChannels entry; optional, add "alertsChannel": "<channel id>" to ${d.configPath} to send them elsewhere`);
 
   let serverUp = false;
   if (await d.prompt.confirm("Create or reuse the herdr lead pane and lanes workspace?", input.herdr ?? true)) {
