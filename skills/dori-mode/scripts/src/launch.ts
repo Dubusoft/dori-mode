@@ -9,6 +9,7 @@ import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
 import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
+import { runnerOs, unsandboxedReason } from "./runner-sandbox.ts";
 import { cmdRefused, paneShell } from "./runner/lane-control.ts";
 import type { StartupVerdict } from "./runner/protocol.ts";
 import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
@@ -405,14 +406,15 @@ const laneSandboxCommand = (config: FlowDeps["config"]): readonly string[] => (c
 /**
  * Whether this launch runs its agent in a sandbox. Every lane is sandboxed: a local one (--pane too) in laneSandbox.command,
  * a remote one under its runner's `sandboxed` profile. The only unsandboxed runs (`skipped`, the SANDBOX_SKIPPED note) are a
- * new lane on a machine opted in with `runners.<label>.allowUnsandboxed`, and a relaunch of a lane recorded without a
- * sandbox (`existing`), which keeps its recorded choice. A local wrapper missing from PATH throws SANDBOX_MISSING.
+ * new lane on a Windows runner (`os`, which has no lane sandbox) or on a machine opted in with
+ * `runners.<label>.allowUnsandboxed` (runner-sandbox.ts), and a relaunch of a lane recorded without a sandbox
+ * (`existing`), which keeps its recorded choice. A local wrapper missing from PATH throws SANDBOX_MISSING.
  */
-export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, which: (cmd: string) => string | null, existing?: Pick<Lane, "sandbox">): { readonly on: boolean; readonly skipped?: string } => {
+export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, which: (cmd: string) => string | null, existing?: Pick<Lane, "sandbox">, os?: string): { readonly on: boolean; readonly skipped?: string } => {
   if (existing && !existing.sandbox) return { on: false, skipped: "relaunch of a lane recorded without a sandbox" };
   if (input.machine) {
-    const label = machineRunner(input.machine);
-    if (!existing && config.runners?.[label]?.allowUnsandboxed) return { on: false, skipped: `machine ${input.machine} is opted in with runners.${label}.allowUnsandboxed; this lane runs WITHOUT a sandbox` };
+    const why = existing ? undefined : unsandboxedReason(config, machineRunner(input.machine), os);
+    if (why) return { on: false, skipped: `machine ${input.machine} ${why}; this lane runs WITHOUT a sandbox` };
     return { on: true };
   }
   const exe = laneSandboxCommand(config)[0] ?? "";
@@ -452,7 +454,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const model = input.model ?? deps.config.defaultModel;
   const mode = input.mode ?? "ulw";
   if (!existing) await validateLaunch(deps, input);
-  const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which, existing);
+  const os = input.machine ? (deps.runnerOs ?? ((label) => runnerOs(deps.config.stateDir, label)))(machineRunner(input.machine)) : undefined;
+  const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which, existing, os);
   const sandbox = choice.on;
   // All attachment reads and declaration validation precede reservations, workspace creation and brief writes.
   const prepared = await prepareLeadLaneBrief(deps, {

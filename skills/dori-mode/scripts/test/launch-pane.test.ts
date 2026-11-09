@@ -160,6 +160,18 @@ test("a remote lane is sandboxed by default; a machine opted in with runners.<la
   expect(r.notes).toContain("SANDBOX_SKIPPED pane-lane-2: machine m2 is opted in with runners.m2.allowUnsandboxed; this lane runs WITHOUT a sandbox");
 });
 
+test("a lane on a Windows runner runs without a sandbox and says so; a runner reporting another OS stays sandboxed", async () => {
+  await writeBrief();
+  const base = { ...deps({}), runnerOs: (label: string) => (label === "win" ? "win32" : label === "box" ? "linux" : undefined) };
+  const win = await launchLane(base, input({ machine: "win", cwd: "C:\\work\\app" }));
+  expect(starts()[0]).toMatchObject({ machine: "win", sandbox: false });
+  expect(win.lane.sandbox).toBeUndefined();
+  expect(win.notes).toContain("SANDBOX_SKIPPED pane-lane: machine win is a Windows runner (Windows has no lane sandbox); this lane runs WITHOUT a sandbox");
+  const box = await launchLane(base, input({ key: "pane-lane-2", machine: "box", cwd: "/home/u/app" }));
+  expect(starts()[1]).toMatchObject({ machine: "box", sandbox: true });
+  expect(box.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
+});
+
 test("a runner that refuses the sandboxed start is SANDBOX_UNAVAILABLE with the fix, and the reservation is released", async () => {
   await writeBrief();
   const base = deps({});

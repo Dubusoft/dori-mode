@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync }
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
-import { type Check, type DoctorDeps, doctorExit, renderDoctor, runDoctor, tokenFrom } from "../src/doctor.ts";
+import { type Check, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks, tokenFrom } from "../src/doctor.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { defaultRunnerDir, RUNNER_PATHS } from "../src/runner/fs-safety.ts";
 import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
@@ -183,11 +183,18 @@ test("on a macOS worker runner host doctor checks the seatbelt wrapper in the ru
   expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "WARN", detail: expect.stringContaining("templates/lane-sandbox-macos.sh (LANE_SANDBOX_OUTDATED)"), fix: expect.stringContaining("dori runner install") });
 });
 
-test("doctor does not fail a host with no lane sandbox wrapper for its platform", async () => {
+test("doctor warns, without failing, that a Windows host's lanes run without a sandbox", async () => {
   const f = fixture({ deps: { platform: "win32", which: () => undefined } });
   rmSync(join(f.deps.home, ".local", "bin", "lane-sandbox"));
   const check = find(await runDoctor(f.deps), "lane sandbox");
-  expect(check).toMatchObject({ level: "OK", detail: expect.stringContaining("allowUnsandboxed") });
+  expect(check).toMatchObject({ level: "WARN", detail: expect.stringContaining("Windows has no lane sandbox") });
+});
+
+test("doctor names each runner opted into lanes without a sandbox", async () => {
+  const f = fixture({});
+  const checks = runnerChecks({ ...f.deps, config: { ...f.deps.config, runners: { mini: { allowUnsandboxed: true }, box: {} } } });
+  expect(checks.find((c) => c.id === "runner mini sandbox")).toMatchObject({ level: "WARN", detail: expect.stringContaining("runner mini is opted in with runners.mini.allowUnsandboxed, so its lanes run WITHOUT a sandbox") });
+  expect(checks.find((c) => c.id === "runner box sandbox")).toBeUndefined();
 });
 
 test("doctor warns when the obsolete local runner unit is enabled", async () => {
