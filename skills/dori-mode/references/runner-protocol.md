@@ -34,7 +34,7 @@ frame closes the connection without an ack.
 
 Control frames, used in this release:
 
-- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, nonce, dh}`,
+- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
   `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
@@ -187,6 +187,8 @@ refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAIL
 | `jobs` | `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with `done` | `allow` |
 | `guard` | this host's guard thresholds (`loadAlert`, `loadOk`, `memFreeMinPct`, `memFreeCritPct`, `swapFreeCritPct`, `diskFreeMinGb`, `panesMax`), each optional | the config's `guard` |
 | `heavyKill` | command-line patterns killed under critical memory | the config's `heavyKill` |
+| `workspaces` | the repos this host owns for placement: `{"owner/repo": "<checkout path>"}`, absolute or `~/...`; see [Workspace placement](#workspace-placement) | none |
+| `detectWorkspaces` | `false` turns off the scan of `allowedRoots` for checkouts (`detected`) | `true` |
 
 A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
 `unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
@@ -194,6 +196,26 @@ A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule
 `sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
 `guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
 `lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
+
+### Workspace placement
+
+A runner tells the supervisor which repos live on its host, and `dori launch` places work by it (see
+`dori placement` in scripts.md). Each hello carries two optional lists of `{repo, path}`:
+
+- `workspaces`: the runner-config `workspaces` entries whose path passes the same check as a `cwd` (absolute,
+  resolving, under `allowedRoots`). An entry that fails is left out and logged
+  `RUNNER_WORKSPACE_SKIPPED <repo> <rule> <path>`. These decide placement: a launch for a declared repo goes to that
+  runner and holds while it is offline; two runners declaring one repo refuse the launch with `PLACEMENT_CONFLICT`.
+- `detected`: directories with a `.git` directory, up to three levels below an allowed root (dot folders,
+  `node_modules` and, on macOS, the TCC-guarded home folders skipped; a worktree's `.git` file is not a checkout),
+  whose `origin` names an owner/repo the runner does not declare; at most 200, rescanned at most every 10 minutes.
+  Information only: such a repo follows `placement.defaultMachine`.
+
+The hub stores both in the `runners.workspaces` column at each hello that carries either, and keeps the last report
+while the runner is away. The local runner (no runner-config.json) reports the same way: a runner-config.json
+holding only `workspaces` and `detectWorkspaces` adds them to the policy derived from config.json; a file with any
+other key is the whole policy, as before. The fields need no protocol bump, but a supervisor older than them refuses
+the hello `unknown-field`, so update the supervisor before its runners.
 
 ## Runner-owned waits and jobs
 

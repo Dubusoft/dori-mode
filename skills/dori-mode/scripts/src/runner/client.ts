@@ -3,7 +3,7 @@ import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } 
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
   MAX_FRAME_BYTES, PROTO, decodeFrame, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
-  type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies,
+  type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
@@ -58,6 +58,8 @@ export type ClientDeps = {
   readonly random?: () => number;
   /** The lanes the runner sees, sent with each hello (its inventory). */
   readonly inventory?: () => readonly InventoryLane[];
+  /** The repos the runner declares and detects (workspaces.ts), sent with each hello. */
+  readonly workspaces?: () => { readonly workspaces: readonly WorkspaceEntry[]; readonly detected: readonly WorkspaceEntry[] };
   /** Receives commands; when unset, commands are ignored. */
   readonly onCommand?: (command: AnySupervisorCommand) => void;
   /**
@@ -145,6 +147,7 @@ export class RunnerClient {
       cmdAck: this.deps.state.cmdAck(),
       ...(this.config.version !== undefined ? { version: this.config.version } : {}),
       ...(this.deps.inventory ? { inventory: this.deps.inventory() } : {}),
+      ...(this.deps.workspaces ? this.deps.workspaces() : {}),
       ...(this.pendingHello ? { nonce: this.pendingHello.nonce, dh: this.pendingHello.dh } : {}),
     };
     transport.send(encodeFrame(runnerControl(this.head(), "hello", hello)));

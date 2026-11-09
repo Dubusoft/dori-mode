@@ -6,6 +6,7 @@ import { decideHello, recordHello, resetGen, type StoredRunner } from "./fencing
 import {
   PROTO, checkProto, journalId, supervisorControl,
   type AnyRunnerEvent, type RunnerControl, type RunnerEventBodies, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
+  type WorkspaceEntry,
 } from "./protocol.ts";
 
 /**
@@ -73,6 +74,22 @@ export type RunnerRow = {
   readonly herdrSince?: number;
   /** The machine readings of the runner's last `guard.sample` (absent until one arrived). */
   readonly machine?: RunnerMachine;
+  /** The repos the last hello that reported any declared and detected (kept while the runner is away); absent: never reported. */
+  readonly workspaces?: RunnerWorkspaces;
+};
+
+export type RunnerWorkspaces = { readonly declared: readonly WorkspaceEntry[]; readonly detected: readonly WorkspaceEntry[] };
+
+const entries = (v: unknown): WorkspaceEntry[] =>
+  Array.isArray(v) ? v.filter((e): e is WorkspaceEntry => typeof e?.repo === "string" && typeof e?.path === "string").map((e) => ({ repo: e.repo, path: e.path })) : [];
+
+/** The saved `workspaces` column, or undefined when it is missing or does not read as one. */
+const parseWorkspaces = (text: string | null): RunnerWorkspaces | undefined => {
+  if (text === null) return undefined;
+  try {
+    const v = JSON.parse(text) as Record<string, unknown> | null;
+    return v && typeof v === "object" ? { declared: entries(v.declared), detected: entries(v.detected) } : undefined;
+  } catch { return undefined; }
 };
 
 /** One runner's last `guard.sample` as the hub saves it: `at` is the supervisor wall time it arrived, -1 a reading the runner could not take. */
@@ -141,14 +158,14 @@ type DbRow = {
   label: string; hostId: string | null; eventAck: number; cmdSeq: number; maxGen: number; cmdAck: number;
   proto: number | null; version: string | null; lastHelloAt: number | null;
   lastHeartbeatAt: number | null; disconnectedAt: number | null; outboxUnacked: number | null; outboxOldestAgeMs: number | null;
-  lanes: number | null; herdr: string | null; herdrSince: number | null; machine: string | null;
+  lanes: number | null; herdr: string | null; herdrSince: number | null; machine: string | null; workspaces: string | null;
 };
 
-const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, herdr, herdrSince, machine";
+const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, herdr, herdrSince, machine, workspaces";
 /** Columns added after the first table layout, with their types; an older table gets them on open. */
 const LATER_COLUMNS = {
   lastHeartbeatAt: "INTEGER", disconnectedAt: "INTEGER", outboxUnacked: "INTEGER", outboxOldestAgeMs: "INTEGER", lanes: "INTEGER",
-  herdr: "TEXT", herdrSince: "INTEGER", machine: "TEXT",
+  herdr: "TEXT", herdrSince: "INTEGER", machine: "TEXT", workspaces: "TEXT",
 } as const;
 
 const toRow = (r: DbRow): RunnerRow => ({
@@ -168,6 +185,7 @@ const toRow = (r: DbRow): RunnerRow => ({
   ...(r.herdr === "up" || r.herdr === "down" || r.herdr === "hung" ? { herdr: r.herdr } : {}),
   ...(r.herdrSince !== null ? { herdrSince: r.herdrSince } : {}),
   ...(() => { const machine = parseMachine(r.machine); return machine ? { machine } : {}; })(),
+  ...(() => { const workspaces = parseWorkspaces(r.workspaces); return workspaces ? { workspaces } : {}; })(),
 });
 
 type Live = { lastSeen: number; heartbeatAt?: number; outbox?: { unacked: number; oldestAgeMs: number } };
@@ -289,6 +307,11 @@ export class RunnerHub {
          proto = excluded.proto, version = excluded.version, lastHelloAt = excluded.lastHelloAt`,
     ).run(label, body.hostId, maxGen, body.cmdAck, body.proto, body.version ?? null, this.deps.now());
     this.db.query("UPDATE runners SET lanes = ? WHERE label = ?").run(body.inventory ? body.inventory.length : null, label);
+    // A runner that predates placement reports sends neither field; its last report (if any) stays.
+    if (body.workspaces !== undefined || body.detected !== undefined) {
+      this.db.query("UPDATE runners SET workspaces = ? WHERE label = ?")
+        .run(JSON.stringify({ declared: body.workspaces ?? [], detected: body.detected ?? [] }), label);
+    }
     this.lockDown();
     this.live.set(label, { ...(this.live.get(label) ?? {}), lastSeen: this.deps.monotonic() });
     const row = this.get(label) as RunnerRow;

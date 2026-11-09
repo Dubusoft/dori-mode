@@ -6,7 +6,8 @@ import { type Observation, pruneCommandRecords, resolveInterrupted } from "./dur
 import { RunnerLanes } from "./lanes.ts";
 import { LANE_SOCKET, serveLaneSocket } from "./lane-socket.ts";
 import { laneGitEffect } from "./lane-git.ts";
-import { localPolicy } from "./local-policy.ts";
+import { localPolicy, localRunnerPolicy } from "./local-policy.ts";
+import { workspaceReport, type WorkspaceReport } from "./workspaces.ts";
 import { queryDispatcher } from "./queries.ts";
 import { checkFileBody } from "./lane-files.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
@@ -136,8 +137,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     if (!auth.enrolled) fail(`RUNNER_NOT_ENROLLED runner=${identity.label}: start once with --enroll (the local runner is enrolled by the supervisor)`);
     const remote = values.listen !== undefined;
     // runner-config.json wins when present; without it the local runner derives its policy from config.json (D20) and
-    // a worker keeps the empty default (no profiles, no roots).
-    const policy = existsSync(join(runnerDir, POLICY_FILE)) ? loadPolicy(runnerDir) : remote ? DEFAULT_POLICY : localPolicy(cfg);
+    // a worker keeps the empty default (no profiles, no roots). A local file with only placement keys layers them on.
+    const hasFile = existsSync(join(runnerDir, POLICY_FILE));
+    const policy = remote ? (hasFile ? loadPolicy(runnerDir) : DEFAULT_POLICY) : hasFile ? localRunnerPolicy(runnerDir, cfg) : localPolicy(cfg);
     // Before the gen bump: a second serve on this directory exits here and leaves the running one's gen alone.
     const releaseServeLock = holdServeLock(runnerDir);
     if (!releaseServeLock) fail(`RUNNER_ALREADY_SERVING another runner serve holds ${join(runnerDir, SERVE_LOCK)}; stop it (e.g. a leftover dori-runner.service next to dori supervise) before starting this one`);
@@ -217,9 +219,15 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       currentPane: async (key, panes) => { const r = runnerLanes.records()[key]; return r ? runnerLanes.currentPane(r, panes) : undefined; },
       reply: (body) => { client?.control("q.result", body); },
     });
+    // The checkout scan runs at most every 10 min, so a reconnect storm does not rescan the roots.
+    let report: { at: number; value: WorkspaceReport } | undefined;
+    const workspaces = (): WorkspaceReport => {
+      if (!report || realClock.now() - report.at > 10 * 60_000) report = { at: realClock.now(), value: workspaceReport(policy, { realpath: realpathSync, log }) };
+      return report.value;
+    };
     client = new RunnerClient(
       { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
-      { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, auth, log, onCommand: dispatch, onInvalidCommand: dispatch, onQuery },
+      { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, workspaces, auth, log, onCommand: dispatch, onInvalidCommand: dispatch, onQuery },
     );
     // A command a crash left between its intent and its result is settled by looking at herdr, never run again.
     const observeLane = async (key: string): Promise<Observation> => {

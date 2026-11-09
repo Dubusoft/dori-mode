@@ -29,7 +29,17 @@ export type RunnerPolicy = {
   readonly guard?: Readonly<Partial<Record<GuardKey, number>>>;
   /** Command-line patterns killed under critical memory pressure; absent falls back to the config's `heavyKill`. */
   readonly heavyKill?: readonly string[];
+  /**
+   * The repos this host owns for placement: owner/repo -> its checkout (absolute, a leading `~` already expanded). The
+   * runner checks each path against allowedRoots and sends the valid ones in its hello (workspaces.ts).
+   */
+  readonly workspaces?: Readonly<Record<string, string>>;
+  /** `false` turns off the scan of allowedRoots for git checkouts (hello `detected`); default on. */
+  readonly detectWorkspaces?: boolean;
 };
+
+/** owner/repo as GitHub spells it. */
+export const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 const GUARD_KEYS = ["loadAlert", "loadOk", "memFreeMinPct", "memFreeCritPct", "swapFreeCritPct", "diskFreeMinGb", "panesMax"] as const;
 type GuardKey = (typeof GUARD_KEYS)[number];
@@ -53,7 +63,7 @@ const expandHome = (path: string, home: string): string => (path === "~" ? home 
 /** Reads a policy from parsed JSON (`home` expands a leading `~` in `defaultCwd`); unknown keys or wrong types throw. */
 export function parsePolicy(value: unknown, home: string = homedir()): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
-  const known = new Set(["agents", "allowedRoots", "defaultCwd", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck"]);
+  const known = new Set(["agents", "allowedRoots", "defaultCwd", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces"]);
   for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
   const agents: Record<string, readonly string[]> = {};
@@ -75,6 +85,18 @@ export function parsePolicy(value: unknown, home: string = homedir()): RunnerPol
   if (value.sandboxCheck !== undefined && (!strings(value.sandboxCheck) || value.sandboxCheck.length === 0 || value.sandboxCheck[0] === "")) {
     throw new Error("runner-config: sandboxCheck must be a non-empty string array");
   }
+  let workspaces: Record<string, string> | undefined;
+  if (value.workspaces !== undefined) {
+    if (!isRecord(value.workspaces)) throw new Error("runner-config: workspaces must be an object of owner/repo -> path");
+    workspaces = {};
+    for (const [repo, path] of Object.entries(value.workspaces)) {
+      if (!REPO_PATTERN.test(repo)) throw new Error(`runner-config: workspaces key ${repo} must be owner/repo`);
+      const full = typeof path === "string" ? expandHome(path, home) : undefined;
+      if (full === undefined || !isAbsolute(full)) throw new Error(`runner-config: workspaces.${repo} must be an absolute path or start with ~/`);
+      workspaces[repo] = full;
+    }
+  }
+  if (value.detectWorkspaces !== undefined && typeof value.detectWorkspaces !== "boolean") throw new Error("runner-config: detectWorkspaces must be true|false");
   let guard: Partial<Record<GuardKey, number>> | undefined;
   if (value.guard !== undefined) {
     if (!isRecord(value.guard)) throw new Error("runner-config: guard must be an object");
@@ -90,6 +112,8 @@ export function parsePolicy(value: unknown, home: string = homedir()): RunnerPol
     ...(value.heavyKill !== undefined ? { heavyKill: value.heavyKill as string[] } : {}),
     ...(value.sandboxCheck !== undefined ? { sandboxCheck: value.sandboxCheck as string[] } : {}),
     ...(defaultCwd !== undefined ? { defaultCwd } : {}),
+    ...(workspaces ? { workspaces } : {}),
+    ...(value.detectWorkspaces !== undefined ? { detectWorkspaces: value.detectWorkspaces as boolean } : {}),
     agents,
     allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,

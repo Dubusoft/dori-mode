@@ -48,6 +48,9 @@ export type BodyRef = { readonly sha256: string; readonly bytes: number; readonl
 /** One lane the runner sees on its host (hello inventory). */
 export type InventoryLane = { readonly key: string; readonly pane: string; readonly tab: string; readonly session?: string };
 
+/** One repository checkout on the runner's host (hello `workspaces` and `detected`): `repo` is owner/repo, `path` absolute. */
+export type WorkspaceEntry = { readonly repo: string; readonly path: string };
+
 /** Any JSON value; the `json` schema spec accepts one without walking its content. */
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [k: string]: JsonValue };
 
@@ -249,6 +252,10 @@ export type RunnerControlBodies = {
   readonly hello: {
     readonly proto: number; readonly gen: number; readonly label: string; readonly hostId: string; readonly cmdAck: number;
     readonly version?: string; readonly inventory?: readonly InventoryLane[]; readonly nonce?: string; readonly dh?: string;
+    /** The repos this runner declares it owns (runner-config `workspaces`, paths checked on its host). */
+    readonly workspaces?: readonly WorkspaceEntry[];
+    /** Git checkouts found under its allowedRoots whose origin names a repo it does not declare (information only). */
+    readonly detected?: readonly WorkspaceEntry[];
   };
   /**
    * First frame of an enrollment connection. `proof` is HMAC-SHA256 keyed with the enrollment code over the label,
@@ -507,6 +514,7 @@ const laneKey: Shape = { key: req("string") };
 
 const BODY_REF: Shape = { sha256: req("string"), bytes: req("int"), truncated: req("bool") };
 const INVENTORY: Shape = { key: req("string"), pane: req("string"), tab: req("string"), session: opt("string") };
+const WORKSPACE: Shape = { repo: req("string"), path: req("string") };
 const HERDR: Shape = { state: req({ enum: ["up", "down", "hung"] }), instance: opt("string") };
 // Lane file transfer (since proto 5). Structure only: limits, digests, base64, names and ordering are checked by the
 // producing/consuming endpoint, so a semantically bad snapshot is a refusal there, not an undecodable frame.
@@ -594,6 +602,7 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
   hello: {
     proto: req("int"), gen: req("int"), label: req("string"), hostId: req("string"), cmdAck: req("int"),
     version: opt("string"), inventory: opt({ list: INVENTORY }), nonce: opt("string"), dh: opt("string"),
+    workspaces: opt({ list: WORKSPACE }), detected: opt({ list: WORKSPACE }),
   },
   enroll: { label: req("string"), hostId: req("string"), runnerPubKey: req("string"), proof: req("string") },
   "auth.proof": { sig: req("string") },

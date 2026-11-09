@@ -32,7 +32,8 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |
 | `src/claude-quota.ts` | `lookupQuotaResults(agentDir?)`: pi-quota through senpi's native auth storage (defaults to `~/.omo/agent`); `claudeUsage` and the usage report behind `dori quota` and `/quota`: Claude 5h/7d usage and reset times for every account |
 | `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
-| `src/placement.ts` | `resolvePlacement`, `checkMachine`, `planLaunch`: which machine a launch runs on, its per-machine launch verdict, and the fallback |
+| `src/placement.ts` | `resolvePlacement`, `checkMachine`, `planLaunch`, `placementTable`: which machine a launch runs on (the runner declaring its repo, else the default), its per-machine launch verdict, and the fallback |
+| `src/runner/workspaces.ts` | `workspaceReport`: the declared and detected repos a runner sends in its hello |
 | `src/repos.ts` | `Repos(stateDir)`: synchronous `list`, `add`, `remove`, `replace`; atomic machine-local GitHub watched list |
 | `src/registry.ts`, `src/store.ts` | the lane registry and its store |
 | `src/launch.ts`, `src/done-flow.ts` | launching lanes and the done flow |
