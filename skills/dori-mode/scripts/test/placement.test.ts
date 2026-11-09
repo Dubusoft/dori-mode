@@ -60,7 +60,7 @@ test("a workspace-less launch goes to defaultMachine and may fall back", () => {
   expect(resolvePlacement({ done: RESEARCH }, config({ defaultMachine: "big", workspaces: { "*": "mini" } }))).toEqual({ machine: "big", source: "default", movable: true });
 });
 
-const sample = (s: Partial<MachineSample> = {}): SampleResult => ({ ok: true, sample: { version: "v", os: "linux", load1: 999, memFreePct: 60, swapFreeGb: 4, swapTotalGb: 8, diskFreeGb: 200, ...s } });
+const sample = (s: Partial<MachineSample> = {}): SampleResult => ({ ok: true, sample: { os: "linux", load1: 999, memFreePct: 60, swapFreeGb: 4, swapTotalGb: 8, diskFreeGb: 200, ...s } });
 
 test("machineVerdict: offline is one unreachable reason", () => {
   expect(machineVerdict({ ok: false, detail: "unreachable: timeout" }, 3, T, "big")).toEqual({ ok: false, reasons: ["machine big unreachable: unreachable: timeout"] });

@@ -466,8 +466,7 @@ On Windows the runner:
   an argv with a double quote is refused with `RUNNER_LANE_ARGV_UNSAFE`;
 - only watches herdr (through CIM); it never installs or starts a herdr service.
 
-WSL and UNC runner dirs aren't supported. A Windows machine without a runner keeps working the old way: the
-PowerShell guard agent (`guard-agent.ps1`) and lane reports.
+WSL and UNC runner dirs aren't supported. A Windows machine without a runner isn't guarded at all.
 
 ## Guard
 
@@ -486,13 +485,15 @@ supervisor takes of its own host, judged against `runner-config.json`'s `guard` 
 
 The local runner on the lead host does none of this: the supervisor's own guard sweep samples and kills there.
 
-On the supervisor, the machine-guard sweep takes a runner's sample when it is at most 90 seconds old and then makes
-no ssh call to that machine. The sample goes through the same transitions as an ssh sample, so `HOST_GUARD ALERT`,
-`CLEAR`, `OFFLINE`, `ONLINE` and `LAUNCH_READY machine=<label>` read exactly as before. A runner machine never reads
-as `OUTDATED`, because it has no guard agent. Its critical stage reports the runner's kills (`HOST_GUARD CRITICAL
+On the supervisor, the machine-guard sweep judges each runner machine from that runner's latest sample when it is at
+most 90 seconds old; it never samples over ssh. The sample gives `HOST_GUARD ALERT`, `CLEAR` and
+`LAUNCH_READY machine=<label>`, while `OFFLINE` and `ONLINE` come from runner liveness. The critical stage reports the runner's kills (`HOST_GUARD CRITICAL
 machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane on entering critical with nothing
-killed, but it kills nothing over ssh. Without a fresh runner sample (no runner, or it went quiet) the machine is
-sampled over ssh again, as before.
+killed, but it kills nothing over ssh. A machine whose runner sent no fresh sample is skipped that round, and a machine
+without a runner isn't guarded.
+
+When it starts, a runner deletes the old guard agent files on its host (`~/.dori/guard-agent.sh`,
+`guard-agent.ps1`, `guard-agent.version`) and logs `RUNNER_GUARD_AGENT_REMOVED <files>`.
 
 ## herdr outages
 
@@ -717,7 +718,7 @@ for the bundle). In a lane that CLI takes only `report`, `claim-done` and `heavy
 other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane`
 with the lane's token. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
-`guard-agent.sh heavy` uses, so old and new footers share one heavy count per machine.
+the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not

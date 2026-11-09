@@ -13,7 +13,7 @@ import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./do
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
-import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, type MachineKind, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
+import { listGuardMachines, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, SandboxRefusal, validateLaunch } from "./launch.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
@@ -212,8 +212,6 @@ const USAGE = `dori <command> [options]
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
-  guard machines                       the remote guard agent of every saved machine: version and load, memory, swap, disk (GUARD_MACHINE lines)
-  guard install [--machine LABEL]      install or update the guard agent over ssh on all listed machines, or one (exit 1 on any failure)
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
   placement [--repo owner/repo] [--cwd D] [--done "..."] [--json]
                                        without flags: the repos each runner declares (WORKSPACE, PLACEMENT_CONFLICT), the repos
@@ -745,7 +743,7 @@ try {
       }
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
-        refreshGuardAgents: async () => refreshGuardAgents(run, await listGuardMachines(run, config.guardMachines, config.stateDir), await readGuardAgentScripts(), (line) => console.log(line)),
+        removeGuardAgents: async () => removeGuardAgents(run, await listGuardMachines(run, config.guardMachines, config.stateDir), (line) => console.log(line)),
         // A fresh process: this one still holds the modules it loaded before the pull, which the pulled runner code may not
         // be able to import from (a missing export throws).
         upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
@@ -1116,32 +1114,7 @@ try {
     }
     case "guard": {
       if (key === "machines" || key === "install") {
-        if (flags.positionals.length > 1 || (key === "machines" && opt("machine") !== undefined)) die("usage: dori guard machines | dori guard install [--machine LABEL]", 2);
-        const listed = await listGuardMachines(run, config.guardMachines, config.stateDir);
-        if (key === "machines") {
-          const want = guardAgentWants(await readGuardAgentScripts());
-          const results = await Promise.all(listed.map(async (m) => ({ m, r: await sampleMachine(run, m) })));
-          for (const { m, r } of results) {
-            if (!r.ok) { console.log(`GUARD_MACHINE ${m.label} offline ${r.detail.replace(/\s*\n\s*/g, " ")}`); continue; }
-            const s = r.sample;
-            console.log(`GUARD_MACHINE ${m.label} online version=${s.version} ${s.version === wantFor(want, s.os) ? "current" : "outdated"} load ${s.load1.toFixed(0)}, memory free ${s.memFreePct}%, swap free ${s.swapFreeGb.toFixed(1)} GB, disk free ${s.diskFreeGb.toFixed(0)} GB`);
-          }
-          break;
-        }
-        const wanted = opt("machine");
-        const targets = wanted === undefined ? listed : listed.filter((m) => m.label === wanted);
-        if (wanted !== undefined && !targets.length) die(`unknown machine ${wanted}; known: ${listed.map((m) => m.label).join(", ") || "(none)"}`);
-        if (!targets.length) die("GUARD_AGENT_INSTALL_FAILED - no machines listed (herdr machine list, config guardMachines)");
-        const scripts = await readGuardAgentScripts();
-        const outcomes = await Promise.all(targets.map(async (m) => {
-          const r = await installGuardAgent(run, m, scripts).catch((e: unknown): InstallResult => ({ ok: false, detail: e instanceof Error ? e.message : String(e) }));
-          console.log(r.ok ? `GUARD_AGENT_INSTALLED ${m.label} ${r.version}`
-            : `${r.unsupported ? "GUARD_AGENT_SKIPPED" : "GUARD_AGENT_INSTALL_FAILED"} ${m.label} ${r.detail.replace(/\s*\n\s*/g, " ")}`);
-          // A worker whose shell is not POSIX sh is skipped, not failed.
-          return r.ok || r.unsupported === true;
-        }));
-        if (outcomes.includes(false)) process.exitCode = 1;
-        break;
+        die(`GUARD_REMOVED dori guard ${key} is gone: each worker's runner reports its host now (dori status shows the readings); dori update removes old agents`, 2);
       }
       // The lead host's load, memory, disk and pane count as the local runner samples them (q.machine.observe); the
       // lanes-by-memory detail is the supervisor's (from guard.sample), not this loop's.

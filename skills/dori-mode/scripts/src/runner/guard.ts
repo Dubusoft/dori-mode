@@ -15,13 +15,13 @@ import type { AnyRunnerEvent, GuardLevel, HerdrHealth, LaneMemoryBody, RunnerEve
  * the supervisor never sends patterns.
  *
  * On the supervisor, `RunnerGuardBoard` keeps each runner's latest sample and the kills it has not reported yet, so
- * the machine-guard sweep can feed them to the same `machineGuardTick`/`machineCriticalTick` an ssh sample goes
- * through: the HOST_GUARD lines are the same either way.
+ * the guard sweeps can judge each worker from its runner (`machineGuardTick` and the critical stage). A machine
+ * without a runner is not guarded.
  */
 
 export const GUARD_SAMPLE_MS = 30_000;
 export const GUARD_SEND_MS = 60_000;
-/** A runner's sample stands in for an ssh sample while it is at most this old. */
+/** A runner's sample is judged while it is at most this old; an older one is skipped. */
 export const GUARD_SAMPLE_FRESH_MS = 3 * GUARD_SAMPLE_MS;
 /** At most this many lanes, each with at most GUARD_LANE_TOP commands, go out in one `guard.sample.lanes`. */
 export const GUARD_LANES_MAX = 20;
@@ -123,7 +123,7 @@ export class RunnerGuardBoard {
       if (b.load1 === undefined || b.memFreePct === undefined || b.diskFreeGb === undefined) return;
       this.samples.set(label, {
         at: this.now(),
-        sample: { version: "", os: b.os ?? "linux", load1: b.load1, memFreePct: b.memFreePct, diskFreeGb: b.diskFreeGb, swapFreeGb: b.swapFreeGb ?? -1, swapTotalGb: b.swapTotalGb ?? -1 },
+        sample: { os: b.os ?? "linux", load1: b.load1, memFreePct: b.memFreePct, diskFreeGb: b.diskFreeGb, swapFreeGb: b.swapFreeGb ?? -1, swapTotalGb: b.swapTotalGb ?? -1 },
         ...(b.panes !== undefined ? { panes: b.panes } : {}), ...(b.lanes !== undefined ? { lanes: b.lanes } : {}),
       });
     }
@@ -136,20 +136,19 @@ export class RunnerGuardBoard {
   }
 
   /**
-   * The runner's sample as a successful sample result while it is fresh. A runner has no guard agent, so its version
-   * is `versionFor(os)`, the one the sweep wants, and a runner machine never reads as OUTDATED. The pane count and the
-   * per-lane memory come along when the runner sent them (proto 3).
+   * The runner's sample as a successful sample result while it is fresh. The pane count and the per-lane memory come
+   * along when the runner sent them (proto 3).
    */
-  sampleFor(label: string, versionFor: (os: string) => string): RunnerSampleResult | undefined {
+  sampleFor(label: string): RunnerSampleResult | undefined {
     const entry = this.samples.get(label);
     if (!entry || this.now() - entry.at > GUARD_SAMPLE_FRESH_MS) return undefined;
     return {
-      ok: true, sample: { ...entry.sample, version: versionFor(entry.sample.os) },
+      ok: true, sample: { ...entry.sample },
       ...(entry.panes !== undefined ? { panes: entry.panes } : {}), ...(entry.lanes !== undefined ? { lanes: entry.lanes } : {}),
     };
   }
 
-  /** The kills reported since the last call, as the ssh kill path returns them; taking them clears them. */
+  /** The kills reported since the last call; taking them clears them. */
   takeKills(label: string): KillResult {
     const killed = this.kills.get(label) ?? [];
     this.kills.delete(label);

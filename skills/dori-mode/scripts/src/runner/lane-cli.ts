@@ -14,7 +14,7 @@ import type { Connector, Transport } from "./transport.ts";
  * key; any other subcommand exits 2 with `DORI_CLI_LANE_ONLY <cmd>`. A report goes to the runner's lane socket with the lane's token, read from
  * the file `DORI_LANE_TOKEN_FILE` names (or, for a lane an older runner started, `DORI_LANE_TOKEN` itself), so the
  * runner accepts it only from the lane it started. `heavy` uses the host's `~/.dori/heavy/slot.N` directories,
- * the same ones `guard-agent.sh heavy` takes, so old and new footers share one slot count per machine.
+ * the same ones `dori heavy` on the host takes, so every footer on a machine shares one slot count.
  */
 
 export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy"] as const;

@@ -1,8 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GUARD_AGENT_TEMPLATE } from "../src/remote-guard.ts";
 import { heavyDirOf, laneCliMain } from "../src/runner/lane-cli.ts";
 import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
@@ -187,20 +186,13 @@ test("the socket client retries ENOENT/ECONNREFUSED every second for 60 s on the
   expect(sleeps).toHaveLength(60);
 });
 
-test("dori heavy waits for ~/.dori/heavy/slot.1 that guard-agent.sh heavy holds, then takes it", async () => {
+test("dori heavy waits for ~/.dori/heavy/slot.1 that another live footer holds, then takes it", async () => {
   const home = mkdtempSync(join(tmpdir(), "runner-lane-heavy-"));
   dirs.push(home);
-  // The old footer's job holds the slot until the test writes to this fifo: no stdin pipe whose early close would free it.
-  const release = join(home, "release.fifo");
-  expect(Bun.spawnSync(["mkfifo", release]).exitCode).toBe(0);
-  const agent = Bun.spawn(["sh", GUARD_AGENT_TEMPLATE, "heavy", "old-footer", "--", "sh", "-c", 'echo HOLDING; cat "$0" >/dev/null', release], {
-    env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
-  });
-  const reader = agent.stdout.getReader();
-  const first = new TextDecoder().decode((await reader.read()).value);
-  expect(first).toContain("HOLDING");
+  // Another footer on this host (a live pid: this test process) holds slot.1 until it releases the directory.
   const slot = join(heavyDirOf(home), "slot.1");
-  expect(readFileSync(join(slot, "owner"), "utf8")).toContain("old-footer");
+  mkdirSync(slot, { recursive: true });
+  writeFileSync(join(slot, "owner"), `${process.pid} old-footer ${new Date().toISOString()}`);
 
   let waited = 0;
   let ownerWhileRunning = "";
@@ -209,8 +201,8 @@ test("dori heavy waits for ~/.dori/heavy/slot.1 that guard-agent.sh heavy holds,
     env, connect: laneSocket().connect, ...r.deps, heavyDir: heavyDirOf(home),
     clock: {
       now: () => 0,
-      // The first wait is where the old footer's job ends and frees the slot.
-      sleep: async () => { waited += 1; if (waited === 1) { writeFileSync(release, ""); await agent.exited; } },
+      // The first wait is where the other footer's job ends and frees the slot.
+      sleep: async () => { waited += 1; if (waited === 1) rmSync(slot, { recursive: true, force: true }); },
     },
     spawn: async () => { ownerWhileRunning = readFileSync(join(slot, "owner"), "utf8"); return 0; },
   });

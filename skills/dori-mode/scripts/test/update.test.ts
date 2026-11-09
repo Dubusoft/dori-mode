@@ -38,8 +38,8 @@ const runner: Runner = async (argv, opts) => {
 const update = (branch: "main" | "dev", force = false) =>
   updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l) }, { packageDir: pkg, branch, force });
 
-const updateWith = (refreshGuardAgents: () => Promise<number>, branch: "main" | "dev") =>
-  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), refreshGuardAgents }, { packageDir: pkg, branch, force: false });
+const updateWith = (removeGuardAgents: () => Promise<number>, branch: "main" | "dev") =>
+  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), removeGuardAgents }, { packageDir: pkg, branch, force: false });
 
 beforeEach(async () => {
   dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "dori-update-"));

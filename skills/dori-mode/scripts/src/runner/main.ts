@@ -23,6 +23,7 @@ import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
+import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
@@ -203,6 +204,12 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       kill: { clock: realClock, alive: platform.pidAlive, signal: platform.signal },
       publish: (type, body) => { client?.publish(type, body); },
     });
+    try {
+      const removed = removeLegacyGuardAgent(homedir());
+      if (removed.length) log(`RUNNER_GUARD_AGENT_REMOVED ${removed.join(",")}`);
+    } catch (error) {
+      log(`RUNNER_GUARD_AGENT_REMOVE_FAILED ${error instanceof Error ? error.message : String(error)}`);
+    }
     const dispatch = commandDispatcher({
       state, policy, realpath: realpathSync, log,
       publish: (body) => { client?.publish("cmd.result", body); },

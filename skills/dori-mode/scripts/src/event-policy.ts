@@ -27,7 +27,7 @@ const URGENT_KINDS = [
   "IDLE-ESCALATE",
   // A working lane that drifted: milestones overdue or its PR failing CI again and again (drift.ts). No periodic summaries.
   "LANE_DRIFT",
-  "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "HOST_GUARD OUTDATED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
+  "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   // The supervisor killed or paused something because memory ran critically low; the lead relays it to the owner.
   "HOST_GUARD CRITICAL",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
@@ -85,9 +85,6 @@ const DIGEST_KINDS = [
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED",
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
-  // A worker machine without the guard agent, one whose shell cannot run it, or one whose agent is current again,
-  // needs no action now.
-  "HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT",
 ] as const;
 
 /** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */
