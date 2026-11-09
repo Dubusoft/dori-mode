@@ -150,6 +150,11 @@ export class LivenessMonitor {
     }
   }
 
+  /** Stops watching `label` (a removed runner); nothing is emitted. A later heartbeat or hello tracks it afresh. */
+  untrack(label: string): void {
+    this.runners.delete(label);
+  }
+
   async heartbeat(label: string): Promise<void> {
     this.track(label);
     await this.seen(label, this.runners.get(label) as Watched);

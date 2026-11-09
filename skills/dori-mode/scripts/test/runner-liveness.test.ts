@@ -59,6 +59,15 @@ test("heartbeats stop: RUNNER_STALE at 60 s, digest RUNNER_OFFLINE at 180 s, HOS
   expect(r.restarts).toEqual([]);
 });
 
+test("an untracked runner emits nothing on later ticks, however long it stays silent", async () => {
+  const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }));
+  await r.runTo(30_000);
+  r.monitor.untrack("worker-a");
+  await r.runTo(1_500_000);
+  expect(r.lines).toEqual([]);
+  expect(r.restarts).toEqual([]);
+});
+
 test("alive but unreachable: a short disconnect stays digest and its reconnect wakes nobody", async () => {
   const r = rig(() => ({ kind: "alive" }));
   await r.runTo(180_000 + 5 * 60_000);

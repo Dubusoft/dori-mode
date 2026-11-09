@@ -436,14 +436,17 @@ if (process.argv[2] === "runner") {
     setDefaultRunTimeout(cfg.runTimeoutMs);
     const { readGuardMachines } = await import("./remote-guard.ts");
     const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
-    const machine = machines.machines.find((m) => m.label === label)
-      ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    const { hasLocalRunnerState, planRemove, removeRunner } = await import("./runner/remove.ts");
+    // A label dropped from herdr and config but still known locally (keys, hub row, endpoint) is cleaned up here only.
+    const plan = planRemove(machines, label, hasLocalRunnerState(cfg.stateDir, label));
+    if (plan.kind === "unknown") die(`RUNNER_UNKNOWN_MACHINE ${label}${plan.detail === undefined ? "" : `: ${plan.detail}`}`);
     const { runnerOf } = await import("./lane-ops.ts");
     const busy = (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed" && runnerOf(lane) === label);
     if (busy.length) die(`RUNNER_REMOVE_BUSY runner=${label} open lanes: ${busy.map((lane) => lane.key).join(",")}; close them or run dori runner evacuate ${label} first`);
-    const { removeRunner } = await import("./runner/remove.ts");
-    const result = await removeRunner({ run }, { machine, label });
-    if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+    if (plan.kind === "remote") {
+      const result = await removeRunner({ run }, { machine: plan.machine, label });
+      if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
+    }
     // Only after the worker is clean: the key, a live supervisor's link, the endpoint and the remembered machine go.
     const { SupervisorAuth } = await import("./runner/auth.ts");
     const { queueRunnerAdmin } = await import("./runner/serve.ts");
@@ -458,7 +461,9 @@ if (process.argv[2] === "runner") {
     queueRunnerAdmin(cfg.stateDir, "revoke", label, realClock.now());
     removeRunnerEndpoint(cfg.stateDir, label);
     removeRunnerMachine(cfg.stateDir, label);
-    console.log(`RUNNER_REMOVED runner=${label}`);
+    const { forgetRunner } = await import("./runner/hub.ts");
+    forgetRunner(cfg.stateDir, label);
+    console.log(`RUNNER_REMOVED runner=${label}${plan.kind === "local" ? " local-only (no saved machine; the worker was not touched)" : ""}`);
     process.exit(0);
   }
   if (sub === "evacuate") {

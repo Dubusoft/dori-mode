@@ -441,6 +441,24 @@ export const resetRunnerGen = (stateDir: string, label: string): boolean => {
   }
 };
 
+/**
+ * `dori runner remove <label>`: deletes the label's `runners` row and its `runner_attempts`, so a restarted supervisor
+ * no longer tracks it. `runner_keys` stays: its revokedAt is the tombstone that refuses later hellos. Returns whether a
+ * `runners` row went (false when the file or table is missing).
+ */
+export const forgetRunner = (stateDir: string, label: string): boolean => {
+  const path = join(stateDir, HUB_FILE);
+  if (!existsSync(path)) return false;
+  const db = new Database(path);
+  try {
+    const has = (table: string) => db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== null;
+    if (has("runner_attempts")) db.query("DELETE FROM runner_attempts WHERE label = ?").run(label);
+    return has("runners") && db.query("DELETE FROM runners WHERE label = ?").run(label).changes > 0;
+  } finally {
+    db.close();
+  }
+};
+
 /** Reads runner status rows from `<stateDir>/runners.sqlite` without a live hub (read-only; [] when absent). */
 export const readRunnerRows = (stateDir: string): RunnerRow[] => {
   const path = join(stateDir, HUB_FILE);

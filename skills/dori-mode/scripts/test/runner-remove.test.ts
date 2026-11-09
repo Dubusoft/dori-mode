@@ -2,7 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { removeRunner, removeScript, windowsRemoveScript } from "../src/runner/remove.ts";
+import { Database } from "bun:sqlite";
+import { hasLocalRunnerState, planRemove, removeRunner, removeScript, windowsRemoveScript } from "../src/runner/remove.ts";
+import { forgetRunner, HUB_FILE } from "../src/runner/hub.ts";
 import { encodedPowerShell } from "../src/remote-guard.ts";
 import type { Ran, RunOptions } from "../src/run.ts";
 import { readRunnerEndpoints, removeRunnerEndpoint, writeRunnerEndpoint } from "../src/runner/endpoints.ts";
@@ -128,4 +130,55 @@ test("removing an endpoint or a machine keeps the other labels, and a missing fi
   expect(readRunnerMachines(stateDir)).toEqual({ "worker-b": "dori@worker-b" });
   removeRunnerEndpoint(stateDir, "worker-c");
   expect(readRunnerEndpoints(stateDir)).toEqual({ "worker-b": "100.101.1.3:7411" });
+});
+
+/** A runners.sqlite with the hub's two tables and auth's runner_keys, holding worker-a (revoked) and worker-b. */
+const seedHub = (stateDir: string) => {
+  const db = new Database(join(stateDir, HUB_FILE), { create: true });
+  db.run("CREATE TABLE runners (label TEXT PRIMARY KEY, hostId TEXT, maxGen INTEGER NOT NULL DEFAULT 0)");
+  db.run("CREATE TABLE runner_attempts (cmdId TEXT PRIMARY KEY, label TEXT NOT NULL, type TEXT NOT NULL, key TEXT, body TEXT NOT NULL, epoch INTEGER NOT NULL, at INTEGER NOT NULL)");
+  db.run("CREATE TABLE runner_keys (label TEXT PRIMARY KEY, hostId TEXT NOT NULL, pubKey TEXT, enrolledAt INTEGER NOT NULL, rotatedAt INTEGER, revokedAt INTEGER)");
+  for (const label of ["worker-a", "worker-b"]) {
+    db.query("INSERT INTO runners (label, hostId, maxGen) VALUES (?, 'h', 3)").run(label);
+    db.query("INSERT INTO runner_attempts VALUES (?, ?, 'run', NULL, '{}', 1, 1)").run(`c-${label}`, label);
+  }
+  db.run("INSERT INTO runner_keys VALUES ('worker-a', 'h', NULL, 1, NULL, 2)");
+  db.close();
+};
+const labels = (stateDir: string, table: string) => {
+  const db = new Database(join(stateDir, HUB_FILE), { readonly: true });
+  try { return (db.query(`SELECT label FROM ${table} ORDER BY label`).all() as { label: string }[]).map((r) => r.label); } finally { db.close(); }
+};
+
+test("forgetRunner deletes the runners row and attempts, keeps the revoked key, and tolerates a missing file or row", () => {
+  const stateDir = tempDir("runner-remove-hub-");
+  expect(forgetRunner(stateDir, "worker-a")).toBe(false);
+  seedHub(stateDir);
+  expect(forgetRunner(stateDir, "worker-a")).toBe(true);
+  expect(labels(stateDir, "runners")).toEqual(["worker-b"]);
+  expect(labels(stateDir, "runner_attempts")).toEqual(["worker-b"]);
+  expect(labels(stateDir, "runner_keys")).toEqual(["worker-a"]);
+  expect(forgetRunner(stateDir, "worker-a")).toBe(false);
+});
+
+test("an unknown label is local-only with local state, unknown without it, and unknown when the machine list failed", () => {
+  const listed = { ok: true, machines: [machine] };
+  expect(planRemove(listed, "worker-a", false)).toEqual({ kind: "remote", machine });
+  expect(planRemove(listed, "macbook", true)).toEqual({ kind: "local" });
+  expect(planRemove(listed, "macbook", false)).toEqual({ kind: "unknown" });
+  expect(planRemove({ ok: false, detail: "herdr down", machines: [] }, "macbook", true)).toEqual({ kind: "unknown", detail: "herdr down" });
+});
+
+test("local state is a runners or runner_keys row, an endpoint or a recorded machine", () => {
+  const stateDir = tempDir("runner-remove-local-");
+  expect(hasLocalRunnerState(stateDir, "worker-a")).toBe(false);
+  seedHub(stateDir);
+  forgetRunner(stateDir, "worker-a");
+  expect(hasLocalRunnerState(stateDir, "worker-a")).toBe(true);
+  expect(hasLocalRunnerState(stateDir, "worker-b")).toBe(true);
+  expect(hasLocalRunnerState(stateDir, "worker-c")).toBe(false);
+  writeRunnerEndpoint(stateDir, "worker-c", "100.101.1.4:7411");
+  writeRunnerMachine(stateDir, "worker-d", "dori@worker-d");
+  expect(hasLocalRunnerState(stateDir, "worker-c")).toBe(true);
+  expect(hasLocalRunnerState(stateDir, "worker-d")).toBe(true);
 });

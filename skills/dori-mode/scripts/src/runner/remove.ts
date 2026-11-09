@@ -1,6 +1,12 @@
+import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
 import { HERDR_LAUNCHD_LABEL, HERDR_UNIT, RUNNER_LAUNCHD_LABEL } from "./install.ts";
+import { readRunnerEndpoints } from "./endpoints.ts";
+import { HUB_FILE, readRunnerRows } from "./hub.ts";
+import { readRunnerMachines } from "./machines.ts";
 import { RUNNER_UNIT, WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
 
 /**
@@ -68,6 +74,43 @@ const removeResult = (r: Ran): RemoveResult => {
   const detail = (r.err.trim().split("\n").at(-1) ?? "") || `exit ${r.code}`;
   if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) return { ok: false, code: "RUNNER_REMOVE_UNREACHABLE", detail };
   return { ok: false, code: "RUNNER_REMOVE_FAILED", detail };
+};
+
+/** How `dori runner remove` proceeds: uninstall over ssh, clean up local state only, or fail as unknown. */
+export type RemovePlan =
+  | { readonly kind: "remote"; readonly machine: GuardMachine }
+  | { readonly kind: "local" }
+  | { readonly kind: "unknown"; readonly detail?: string };
+
+/**
+ * A label that is not a known machine is cleaned up locally only when the machine list is complete (a failed herdr
+ * listing may hide a reachable worker) and the label has local state; otherwise it is unknown.
+ */
+export const planRemove = (
+  machines: { readonly ok: boolean; readonly machines: readonly GuardMachine[]; readonly detail?: string },
+  label: string,
+  hasLocalState: boolean,
+): RemovePlan => {
+  const machine = machines.machines.find((m) => m.label === label);
+  if (machine) return { kind: "remote", machine };
+  if (!machines.ok) return { kind: "unknown", ...(machines.detail !== undefined ? { detail: machines.detail } : {}) };
+  return hasLocalState ? { kind: "local" } : { kind: "unknown" };
+};
+
+/** Whether the supervisor holds anything for `label`: a `runners` or `runner_keys` row, an endpoint, or a machine. */
+export const hasLocalRunnerState = (stateDir: string, label: string): boolean => {
+  if (readRunnerRows(stateDir).some((r) => r.label === label)) return true;
+  if (label in readRunnerEndpoints(stateDir) || label in readRunnerMachines(stateDir)) return true;
+  const path = join(stateDir, HUB_FILE);
+  if (!existsSync(path)) return false;
+  const db = new Database(path, { readonly: true });
+  try {
+    return db.query("SELECT 1 FROM runner_keys WHERE label = ?").get(label) !== null;
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
 };
 
 export const removeRunner = async (deps: RemoveDeps, req: RemoveRequest): Promise<RemoveResult> => {
