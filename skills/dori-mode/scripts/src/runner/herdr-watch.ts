@@ -48,12 +48,13 @@ export const winHerdrServers = async (run: Runner, user: string = userInfo().use
 
 export const WIN_HERDR_SOCKET_SCRIPT = [
   "$j = herdr status server --json 2>$null | ConvertFrom-Json;",
-  "if ($j.running -and $j.socket) { (Get-Item -LiteralPath $j.socket -Force).CreationTimeUtc.ToString('o') }",
+  "if ($j.running -and $j.socket) { (Get-Item -LiteralPath $j.socket -Force).LastWriteTimeUtc.ToString('o') }",
 ].join(" ");
 
 /**
- * The running herdr server's instance on Windows as `socket@<creation time>` of the socket it binds at start, read
- * through herdr itself; undefined when herdr does not answer. For a server whose process this runner can't read.
+ * The running herdr server's instance on Windows as `socket@<last write time>` of the socket it binds at start, read
+ * through herdr itself; undefined when herdr does not answer. For a server whose process this runner can't read. Not
+ * the creation time: NTFS tunneling hands a socket re-made within seconds of a stop the old file's creation time.
  */
 export const winHerdrSocketInstance = async (run: Runner): Promise<string | undefined> => {
   const r = await run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WIN_HERDR_SOCKET_SCRIPT]);
