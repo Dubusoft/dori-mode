@@ -5,7 +5,7 @@ import { homedir, loadavg } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
-import { configPath, loadConfig } from "./config.ts";
+import { alertsChannelOf, configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
@@ -247,7 +247,8 @@ const USAGE = `dori <command> [options]
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
                                        link what handled an owner message
   send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
-                                       post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN). A new post is refused with
+                                       post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN);
+                                       --to alerts is config alertsChannel, else the first discordChannels entry. A new post is refused with
                                        SEND_STALE <n> (the unseen owner events follow, exit 3) when the destination got owner messages
                                        you have not taken, acked or seen in an ack preview; merge them and resend. --force skips the
                                        check; --edit is never checked
@@ -1395,7 +1396,10 @@ try {
     case "send": {
       const platform = key ?? "discord";
       if (platform !== "discord") die(`unknown platform ${platform}`);
-      const { to } = resolveTarget("discord", need("to"), opt("thread"));
+      // `--to alerts`: the system-notice channel (config alertsChannel, else the main channel), read from the config now.
+      const target = need("to");
+      const ref = target === "alerts" ? alertsChannelOf(config) ?? die("SEND_NOT_POSTED --to alerts: neither alertsChannel nor discordChannels is configured") : target;
+      const { to } = resolveTarget("discord", ref, opt("thread"));
       const text = need("text");
       const edit = opt("edit");
       const buttons = opt("buttons");

@@ -149,6 +149,11 @@ export type DoriConfig = {
   readonly leadContextCapTokens: number;
   readonly leadContextHardCapTokens: number;
   readonly discordChannels: readonly string[];
+  /**
+   * The Discord channel for the supervisor's system notices (alertsChannelOf). Absent: those go to `discordChannels[0]`.
+   * Read where it is used, so a config reload applies it live.
+   */
+  readonly alertsChannel?: string;
   /** Owner-only Discord button hooks: name ([a-z0-9-]{1,20}) -> argv run on a `dori:hook:<name>:...` click. */
   readonly buttonHooks?: Readonly<Record<string, ArgvTemplate>>;
   readonly discordSafetyPollSeconds: number;
@@ -459,7 +464,7 @@ const placement = (raw: unknown): PlacementConfig => {
  */
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
-  "laneThinking", "leadArgs", "discordChannels", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
+  "laneThinking", "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
   "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes", "toodoEvents",
 ] as const;
 
@@ -478,6 +483,21 @@ const toodoEventsConfig = (raw: unknown, base: ToodoEventsConfig, home: string):
     enabled: enabled ?? base.enabled,
   };
 };
+
+/** The config's `alertsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
+const alertsChannel = (raw: unknown): string | undefined => {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") throw new TypeError("alertsChannel must be a Discord channel id string");
+  return raw.trim() || undefined;
+};
+
+/**
+ * Where the supervisor's system notices go (lead stuck or restart-capped, SUPERVISOR_STUCK, TASK_STALLED, a failed
+ * unit, and what the lead posts with `dori send --to alerts`): `alertsChannel` when set, else `discordChannels[0]`.
+ * Lane reports, owner replies, close buttons and closed-thread redirects keep using `discordChannels[0]`.
+ */
+export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "discordChannels">): string | undefined =>
+  config.alertsChannel?.trim() || config.discordChannels[0];
 
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
 const HOOK_KEYS = ["threadReply", "transcribe"] as const;
@@ -526,9 +546,12 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   }
   const { runners: rawRunners, ...rest } = fromFile;
   const machineRunners = runners(rawRunners);
-  const merged: DoriConfig = { ...base, ...rest, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
+  const { alertsChannel: rawAlerts, ...fileValues } = rest;
+  const alerts = alertsChannel(rawAlerts);
+  const merged: DoriConfig = { ...base, ...fileValues, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
+    ...(alerts ? { alertsChannel: alerts } : {}),
     laneRules: laneRules(raw.laneRules),
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),

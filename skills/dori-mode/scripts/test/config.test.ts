@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { defaultConfig, fill, leadCommand, leadModels, loadConfig, providerOf } from "../src/config.ts";
+import { alertsChannelOf, defaultConfig, fill, leadCommand, leadModels, loadConfig, providerOf } from "../src/config.ts";
 import { withState } from "./fakes.ts";
 
 const state = withState();
@@ -196,6 +196,16 @@ test("placement refuses a non-object and a malformed fallback", async () => {
     await Bun.write(path, JSON.stringify({ placement: { fallback } }));
     await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement.fallback must be an array of machine names");
   }
+});
+
+test("alertsChannel routes system notices when set; unset or blank falls back to the first discordChannels entry", async () => {
+  const path = join(state.dir, "alerts.json");
+  const load = async (raw: Record<string, unknown>) => { await Bun.write(path, JSON.stringify(raw)); return loadConfig(path, "/home/ana"); };
+  expect(alertsChannelOf(await load({ discordChannels: ["111", "222"], alertsChannel: " 222 " }))).toBe("222");
+  expect(alertsChannelOf(await load({ discordChannels: ["111", "222"] }))).toBe("111");
+  expect(alertsChannelOf(await load({ discordChannels: ["111"], alertsChannel: " " }))).toBe("111");
+  expect(alertsChannelOf(await load({}))).toBeUndefined();
+  await expect(load({ alertsChannel: 222 })).rejects.toThrow("alertsChannel must be a Discord channel id string");
 });
 
 test("guard thresholds and heavyKill are built in: file values, even malformed ones, are ignored", async () => {
