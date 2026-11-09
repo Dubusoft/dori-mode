@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
-import { languageInstruction } from "./config.ts";
+import { DEFAULT_LANE_SANDBOX, languageInstruction } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { LaneOpsError, machineRunner, type StartInput } from "./lane-ops.ts";
 import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
@@ -45,7 +45,7 @@ export type LaunchInput = {
   readonly shareThread?: boolean;
   /** Allow a cwd whose git remotes name none of the Done line's repos (`--allow-repo-mismatch`). */
   readonly allowRepoMismatch?: boolean;
-  /** Wrap the agent in `laneSandbox.command` even where the sandbox would pass the lane through (`--sandbox`, or a relaunch of a lane recorded as sandboxed). */
+  /** `--sandbox` (or a relaunch of a lane recorded as sandboxed): every lane is sandboxed by default now, so this changes nothing. */
   readonly sandbox?: true;
   /** Resume this agent session (recovery): the runner inserts `--session <id>` when its profile allows. */
   readonly session?: string;
@@ -55,6 +55,13 @@ export type LaunchInput = {
 export type SharedThreadLane = Lane & { readonly threadSharedWith?: readonly string[] };
 
 export class LaunchError extends Error {}
+
+export type SandboxRefusalCode = "SANDBOX_MISSING" | "SANDBOX_BROKEN" | "SANDBOX_UNAVAILABLE";
+
+/** A launch refused because its lane would run without a working sandbox; the message starts `<code> <key>: `. */
+export class SandboxRefusal extends LaunchError {
+  constructor(readonly code: SandboxRefusalCode, key: string, detail: string) { super(`${code} ${key}: ${detail}`); }
+}
 
 export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
   if (!LANE_KEY.test(input.key)) throw new LaunchError(`key must match ${LANE_KEY}`);
@@ -80,11 +87,12 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
 const within = (dir: string, parent: string): boolean => { const r = relative(parent, dir); return r === "" || (!r.startsWith("..") && !r.startsWith("/")); };
 
 /**
- * The dori home (~/.dori) when a sandboxed local launch's --cwd is inside it: lane-sandbox mounts a read-only tmpfs there and
- * binds only <home>/.dori/state read-write, so any other directory under it cannot be bound as the lane's cwd.
+ * The dori home (~/.dori) when a local launch's --cwd is inside it (every new local lane, --pane ones too, is sandboxed):
+ * lane-sandbox mounts a read-only tmpfs there and binds only <home>/.dori/state read-write, so any other directory under
+ * it cannot be bound as the lane's cwd. A remote lane's directory is on its own machine.
  */
 const sandboxedCwdInDoriHome = (deps: FlowDeps, input: LaunchInput): string | undefined => {
-  if (!input.cwd || !sandboxChoice(deps.config, input, deps.which ?? Bun.which).on) return undefined;
+  if (!input.cwd || input.machine) return undefined;
   const state = resolve(deps.config.stateDir);
   const home = basename(state) === "state" && basename(dirname(state)) === ".dori" ? dirname(state) : join(homedir(), ".dori"); // the sandbox always uses $HOME/.dori
   const cwd = resolve(input.cwd);
@@ -335,36 +343,62 @@ export const laneTabWorkspace = async (deps: Pick<FlowDeps, "run" | "config">, l
 export const startupLine = (key: string, pane: string, startup: StartupVerdict): string =>
   startup.verdict === "ok" ? `STARTUP_OK ${key} ${pane}` : `STARTUP_${startup.verdict === "error" ? "ERROR" : "UNCONFIRMED"} ${key} ${pane}: ${startup.detail}`;
 
+/** The local sandbox wrapper argv: the config's laneSandbox, or the default for an in-code config (loadConfig always fills it). */
+const laneSandboxCommand = (config: FlowDeps["config"]): readonly string[] => (config.laneSandbox ?? DEFAULT_LANE_SANDBOX).command;
+
 /**
- * Whether this launch wraps its agent in laneSandbox.command. Every local lane is wrapped; there is no opt-out. `--sandbox` (and a
- * relaunch's recorded choice) wraps it even where it would otherwise pass through, with the reason, because the sandbox does not fit.
- * A config without laneSandbox (only an in-code config: loadConfig always fills it) wraps nothing.
+ * Whether this launch runs its agent in a sandbox. Every lane is sandboxed: a local one (--pane too) in laneSandbox.command,
+ * a remote one under its runner's `sandboxed` profile. The only unsandboxed runs (`skipped`, the SANDBOX_SKIPPED note) are a
+ * new lane on a machine opted in with `runners.<label>.allowUnsandboxed`, and a relaunch of a lane recorded without a
+ * sandbox (`existing`), which keeps its recorded choice. A local wrapper missing from PATH throws SANDBOX_MISSING.
  */
-export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, which: (cmd: string) => string | null): { readonly on: boolean; readonly skipped?: string } => {
-  if (input.sandbox) return { on: true };
-  const configured = config.laneSandbox;
-  if (!configured) return { on: false };
-  if (input.machine) return { on: false, skipped: `remote lane on ${input.machine}; laneSandbox wraps local lanes only` };
-  if (input.pane) return { on: false, skipped: `--pane ${input.pane} reuses an existing pane whose directory the sandbox may not bind; pass --sandbox to wrap it anyway` };
-  const exe = configured.command[0] ?? "";
-  if (!which(exe)) return { on: false, skipped: `${exe} is not on PATH; install scripts/templates/lane-sandbox.sh as ${exe} or set laneSandbox.command` };
+export const sandboxChoice = (config: FlowDeps["config"], input: LaunchInput, which: (cmd: string) => string | null, existing?: Pick<Lane, "sandbox">): { readonly on: boolean; readonly skipped?: string } => {
+  if (existing && !existing.sandbox) return { on: false, skipped: "relaunch of a lane recorded without a sandbox" };
+  if (input.machine) {
+    const label = machineRunner(input.machine);
+    if (!existing && config.runners?.[label]?.allowUnsandboxed) return { on: false, skipped: `machine ${input.machine} is opted in with runners.${label}.allowUnsandboxed; this lane runs WITHOUT a sandbox` };
+    return { on: true };
+  }
+  const exe = laneSandboxCommand(config)[0] ?? "";
+  if (!which(exe)) throw new SandboxRefusal("SANDBOX_MISSING", input.key, `${exe} is not on PATH; install scripts/templates/lane-sandbox.sh as ${exe} or set laneSandbox.command (dori doctor shows it)`);
   return { on: true };
+};
+
+/** Runs `<laneSandbox.command> --check` once before a sandboxed local start; a wrapper that cannot sandbox throws SANDBOX_BROKEN. */
+const checkLocalSandbox = async (deps: FlowDeps, key: string): Promise<void> => {
+  const argv = [...laneSandboxCommand(deps.config), "--check"];
+  const ran = await deps.run(argv);
+  if (ran.code !== 0) throw new SandboxRefusal("SANDBOX_BROKEN", key, `${argv.join(" ")} failed (exit ${ran.code}): ${(ran.err || ran.out).replace(/\s+/g, " ").trim() || "no output"}; fix the sandbox (dori doctor shows it) before launching`);
+};
+
+/**
+ * The runner refused the start for its sandbox rules: no `sandboxed` profile (`RUNNER_CMD_REJECTED agent-profile sandboxed`),
+ * sandbox required (`... sandbox-required sandbox:false`), or its async sandbox check failed (`RUNNER_CMD_FAILED
+ * RUNNER_CMD_REJECTED sandbox-unavailable <why>`). Matched as substrings, since the wrapping differs by path.
+ */
+const SANDBOX_RULE = /agent-profile|sandbox-required|sandbox-unavailable/;
+
+const runnerSandboxRefusal = (key: string, machine: string | undefined, error: unknown): SandboxRefusal | undefined => {
+  const detail = error instanceof LaneOpsError ? error.detail : error instanceof Error ? error.message : String(error);
+  if (!SANDBOX_RULE.test(`${detail} ${error instanceof Error ? error.message : ""}`)) return undefined;
+  const label = machineRunner(machine);
+  return new SandboxRefusal("SANDBOX_UNAVAILABLE", key, `${machine ? `machine ${machine}` : "this host's runner"} refused the sandboxed start (${detail.replace(/\s+/g, " ").trim()}); install lane-sandbox on that runner (dori runner install), or opt the machine in with runners.${label}.allowUnsandboxed in the lead config and set "sandbox": "optional" in its runner-config.json`);
 };
 
 /**
  * Starts a lane through its runner (`lane.start`): the lane is reserved (paused, with a token), its brief gets the
  * footer, and the runner opens the pane (a new tab, or the checked target pane), runs the agent from its own profile
- * (`sandboxed` for a sandboxed local lane), and confirms the startup. The returned pane is recorded on the lane.
- * `existing` relaunches a registered lane (recovery) without a reservation.
+ * (`sandboxed` for a sandboxed lane), and confirms the startup. The returned pane is recorded on the lane.
+ * `existing` relaunches a registered lane (recovery) without a reservation, keeping its recorded sandbox choice.
+ * A lane that cannot be sandboxed is refused with a SandboxRefusal (sandboxChoice, checkLocalSandbox, runnerSandboxRefusal).
  */
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: Lane): Promise<{ readonly lane: Lane; readonly startup: string; readonly notes: readonly string[] }> => {
   const model = input.model ?? deps.config.defaultModel;
   const mode = input.mode ?? "ulw";
   if (!existing) await validateLaunch(deps, input);
-  const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which);
+  const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which, existing);
   const sandbox = choice.on;
-  if (sandbox && !deps.config.laneSandbox) throw new LaunchError("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
-  if (sandbox && input.machine) throw new LaunchError(`--sandbox wraps local lanes only; machine ${input.machine} cannot run it, drop --sandbox`);
+  if (sandbox && !input.machine) await checkLocalSandbox(deps, input.key);
   const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
   const notes = [...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
@@ -404,6 +438,9 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     try {
       result = await deps.ops.start(start);
     } catch (error) {
+      // A sandbox refusal started nothing, whatever error shape carried it.
+      const refusal = runnerSandboxRefusal(input.key, input.machine, error);
+      if (refusal) throw refusal;
       if (nothingStarted(error)) throw new LaunchError(`${input.key}: ${error instanceof Error ? error.message : String(error)}`);
       started = true; // a timeout or an ambiguous answer: the runner may have started the agent, so the reservation stays visible
       if (token) {

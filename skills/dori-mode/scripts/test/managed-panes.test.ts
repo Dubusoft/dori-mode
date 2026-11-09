@@ -93,7 +93,8 @@ test("a local launch opens its tab in the managed lanes workspace; a pane target
 test("a local launch is refused, not sent to herdr's focused workspace, when herdr cannot give a lanes workspace", async () => {
   const s = state();
   const w = newWorld();
-  const deps = { ...depsFor(w, fakeClock(T0), s.dir, { defaultModel: "m1" }), run: async (): Promise<Ran> => ({ code: 1, out: "", err: "server not running" }) };
+  // The local sandbox check passes; every herdr call fails.
+  const deps = { ...depsFor(w, fakeClock(T0), s.dir, { defaultModel: "m1" }), run: async (argv: readonly string[]): Promise<Ran> => (argv[0] === "lane-sandbox" ? { code: 0, out: "", err: "" } : { code: 1, out: "", err: "server not running" }) };
   const brief = join(s.dir, "brief.md");
   writeFileSync(brief, "# brief\n");
   expect(launchLane(deps, { key: "lane-a", title: "a", brief, done: "command [\"true\"]", thread: "none", cwd: "/repo" })).rejects.toThrow("no lanes workspace");

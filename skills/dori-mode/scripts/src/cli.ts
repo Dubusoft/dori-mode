@@ -14,7 +14,8 @@ import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
 import { guardAgentWants, installGuardAgent, type InstallResult, listGuardMachines, type MachineKind, readGuardAgentScripts, refreshGuardAgents, sampleMachine, wantFor } from "./remote-guard.ts";
-import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, validateLaunch } from "./launch.ts";
+import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, SandboxRefusal, validateLaunch } from "./launch.ts";
+import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -141,7 +142,7 @@ const USAGE = `dori <command> [options]
                                        then "## Lead notes" with each --note as a bullet; written to <stateDir>/briefs/<key>.md; a deleted, visitor or unknown message exits 1
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
-                [--sandbox]   every local lane's agent runs in laneSandbox.command (a --machine or --pane lane, or a missing command, passes through with SANDBOX_SKIPPED); --sandbox wraps a --pane lane too, refused for --machine
+                [--sandbox]   every lane runs in the sandbox (--sandbox is accepted and changes nothing): a local one (--pane too) in laneSandbox.command after a --check preflight, a --machine one under its runner's sandboxed profile; a missing or broken sandbox refuses the launch (SANDBOX_MISSING / SANDBOX_BROKEN / SANDBOX_UNAVAILABLE) and warns on Discord; only machines opted in with runners.<label>.allowUnsandboxed run unsandboxed, with SANDBOX_SKIPPED and a Discord warning each time
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
@@ -841,8 +842,7 @@ try {
     case "launch": {
       const mode = opt("mode");
       if (mode !== undefined && !(LANE_MODES as readonly string[]).includes(mode)) die(`--mode must be one of ${LANE_MODES.join(", ")}`);
-      if (flags.values["no-sandbox"]) console.error("LAUNCH_NO_SANDBOX_REMOVED --no-sandbox was removed and is ignored: every local lane runs in the sandbox");
-      if (flags.values.sandbox && !config.laneSandbox) die("--sandbox needs laneSandbox in the config (laneSandbox.command, e.g. [\"lane-sandbox\"])");
+      if (flags.values["no-sandbox"]) console.error("LAUNCH_NO_SANDBOX_REMOVED --no-sandbox was removed and is ignored: every lane runs in the sandbox unless its machine is opted in with runners.<label>.allowUnsandboxed");
       const sandbox = flags.values.sandbox ? (true as const) : undefined;
       if (flags.values["toodo-start"] !== undefined) die("LAUNCH_TOODO_START_REMOVED --toodo-start was removed: launch the lane with --cwd like any other and record the task in Toodo yourself over MCP");
       const fromArgs = (() => { try { return launchBriefArgs(rest); } catch (e) { return die(e instanceof Error ? e.message : String(e)); } })();
@@ -875,9 +875,14 @@ try {
         console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
         process.exit(4);
       }
-      const r = await launchLane(deps, { ...input, machine });
+      // A refused sandbox and an allowed unsandboxed run both reach the owner on Discord (sandbox-notice.ts) before the exit.
+      const r = await launchLane(deps, { ...input, machine }).catch(async (e: unknown) => {
+        if (e instanceof SandboxRefusal) for (const line of await postSandboxNotice(deps, input, e.message)) console.error(line);
+        throw e;
+      });
       dequeueLaunch(config.stateDir, input.key);
       for (const note of r.notes) console.log(note);
+      for (const line of await postSkippedNotices(deps, input, r.notes)) console.error(line);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
       const next = launchNextLine(r.lane.key, r.startup); if (next) console.log(next);

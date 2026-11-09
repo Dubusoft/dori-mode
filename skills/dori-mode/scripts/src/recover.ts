@@ -4,12 +4,13 @@ import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
 import { closeLane, closeRunning, type FlowDeps, finishedReason } from "./done-flow.ts";
-import { LaunchError, laneTabWorkspace, launchLane, startupLine } from "./launch.ts";
+import { LaunchError, laneTabWorkspace, launchLane, SandboxRefusal, startupLine } from "./launch.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
+import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 
@@ -159,7 +160,7 @@ const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promi
   return [event, ...left];
 };
 
-type Relaunched = { readonly lane: Lane; readonly startup?: string; readonly ok: boolean; readonly resumed: boolean };
+type Relaunched = { readonly lane: Lane; readonly startup?: string; readonly ok: boolean; readonly resumed: boolean; readonly notes?: readonly string[] };
 
 /** The runner knows no lane `key` (a lane it never started, or one closed for a replacement that did not start). */
 const unknownToRunner = (error: unknown): boolean => error instanceof LaneOpsError && error.code === "LANE_OP_FAILED" && error.detail.includes("RUNNER_LANE_UNKNOWN");
@@ -175,7 +176,7 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
     ...(lane.sandbox ? { sandbox: true as const } : {}),
     ...(session !== undefined ? { session } : {}),
   }, stored);
-  return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined };
+  return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined, notes: launched.notes };
 };
 
 /**
@@ -274,14 +275,17 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   } else {
     relaunched = await runnerRecover(deps, lane, stored, session);
   }
+  // A relaunch that runs without a sandbox (a lane recorded without one) is said to the owner and the lead every time.
+  const skipped = (relaunched.notes ?? []).filter((note) => note.startsWith("SANDBOX_SKIPPED"));
+  const unsandboxed = [...skipped, ...await postSkippedNotices(deps, lane, skipped)];
   if (!relaunched.ok) {
     const startup = relaunched.startup ?? `STARTUP_UNCONFIRMED ${lane.key} -`;
-    if (!session) return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed`];
+    if (!session) return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed`, ...unsandboxed];
     await deps.registry.patch<RecoveryLane>(lane.key, { session: undefined, sessionVia: undefined, recoveryResumeFailed: current.session });
-    return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed; session ${current.session} not resumed, the next attempt starts from the brief`];
+    return [startup, `LANE_RECOVERY_ERROR ${lane.key} replacement-unconfirmed; session ${current.session} not resumed, the next attempt starts from the brief`, ...unsandboxed];
   }
   const why = relaunched.startup ? (relaunched.resumed ? `${reason} session-resumed` : reason) : `${reason} runner-alive`;
-  return [...await finishRecovery(deps, relaunched.lane, why), ...(relaunched.startup ? [relaunched.startup] : [])];
+  return [...await finishRecovery(deps, relaunched.lane, why), ...(relaunched.startup ? [relaunched.startup] : []), ...unsandboxed];
 };
 
 /** The lane's runner has no admitted connection (not said hello yet, gone, or too old for the call): nothing to recover through. */
@@ -299,6 +303,12 @@ const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue
     catch (error) {
       // A runner that dropped mid-recovery is the liveness monitor's to report; the lane is tried again once it is back.
       if (runnerDown(error)) return byKey ? [runnerHeld(lane, error.label)] : [];
+      // A lane its sandbox refused stays down until someone fixes the sandbox: the owner hears it in the lane's thread
+      // and the lead gets an urgent LANE_RECOVERY_ERROR <key> sandbox-missing|sandbox-broken|sandbox-unavailable: (event-policy.ts).
+      if (error instanceof SandboxRefusal) {
+        const event = `LANE_RECOVERY_ERROR ${lane.key} ${error.code.toLowerCase().replace("_", "-")}: ${error.message}`;
+        return [event, ...await postSandboxNotice(deps, current, error.message)];
+      }
       return [`LANE_RECOVERY_ERROR ${lane.key} ${message(error)}`];
     }
   });

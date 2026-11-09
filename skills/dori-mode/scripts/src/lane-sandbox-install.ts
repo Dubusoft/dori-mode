@@ -10,7 +10,7 @@ export const installedLaneSandbox = (home: string): string => join(home, ".local
  * Replaces an installed `~/.local/bin/lane-sandbox` that differs from the template with the template, keeping the old
  * copy as `lane-sandbox.bak`, so new lanes get the template's mounts (their own lane token and the runner socket). The new
  * file is renamed into place, so a lane whose shell is still reading the old script keeps its own inode. A missing install
- * is left missing: launch then passes lanes through with SANDBOX_SKIPPED, as before. Returns the line to log, if any.
+ * is left missing: launch then refuses local lanes (SANDBOX_MISSING) and `dori doctor` reports it. Returns the line to log, if any.
  */
 export const refreshLaneSandbox = (home: string, template: string = LANE_SANDBOX_TEMPLATE): string | undefined => {
   const installed = installedLaneSandbox(home);

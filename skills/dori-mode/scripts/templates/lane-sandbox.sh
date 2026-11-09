@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 # lane-sandbox: run a dori lane agent command inside a bubblewrap sandbox.
-# Usage: lane-sandbox <cmd> [args...]
+# Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check
 # Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <defaultCwd>/state/verify)
 set -eu
+
+# --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
+# below so it also answers on the lead; exit 3 (not 2) keeps "no sandbox here" apart from a usage error.
+if [ "${1:-}" = "--check" ]; then
+  if ! command -v bwrap >/dev/null 2>&1; then
+    echo "lane-sandbox: bwrap not found on PATH" >&2
+    exit 3
+  fi
+  if ! err=$(bwrap --ro-bind / / true 2>&1); then
+    echo "lane-sandbox: bwrap cannot create a sandbox: ${err//$'\n'/ }" >&2
+    exit 3
+  fi
+  exit 0
+fi
 
 if [ "$#" -eq 0 ]; then
   echo "usage: lane-sandbox <cmd> [args...]" >&2
@@ -68,6 +82,8 @@ for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
 opts+=(--ro-bind-try "$H/.dori/runner/sock" "$H/.dori/runner/sock")
+# A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
+opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
 if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then
   opts+=(--ro-bind-try "$DORI_LANE_TOKEN_FILE" "$DORI_LANE_TOKEN_FILE")

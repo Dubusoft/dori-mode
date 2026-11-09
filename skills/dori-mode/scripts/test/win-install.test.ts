@@ -105,7 +105,10 @@ test("the directory gets the protected DACL, the starter policy and the task reg
   const s = script();
   expect(s).toContain("& icacls.exe $R /inheritance:r /grant:r ('*' + $Sid + ':(OI)(CI)F') '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'");
   expect(s).toContain("& icacls.exe $R /setowner ('*' + $Sid) /T /C /Q");
-  expect(s).toContain("(ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP)");
+  expect(s).toContain("(ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP) + '],\"sandbox\":\"required\"}'");
+  // No lane sandbox on Windows: no sandboxed profile, so every start is refused until the operator opts the host in.
+  expect(s).not.toContain("sandboxed");
+  expect(s).not.toContain("sandboxCheck");
   const agent = /FromBase64String\('([A-Za-z0-9+/=]+)'\)\)\n/.exec(s)?.[1] ?? "";
   expect(JSON.parse(Buffer.from(agent, "base64").toString("utf8"))).toEqual(AGENT);
   expect(s).toContain("Register-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner' -Xml $Xml -Force");

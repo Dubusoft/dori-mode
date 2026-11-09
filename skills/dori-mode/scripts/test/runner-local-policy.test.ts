@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
@@ -23,7 +23,7 @@ test("localPolicy derives default and sandboxed profiles from agentCommand, lane
   expect(policy.agents.default).toEqual(["omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
   expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/data/repos/app/state/verify", "lane-sandbox", "--strict", "omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
   expect(policy.allowedRoots).toEqual(["/home/u", "/tmp", "/data/repos", "/data/repos/worktrees"]);
-  expect(policy).toMatchObject({ sandbox: "optional", jobs: "allow" });
+  expect(policy).toMatchObject({ sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--strict", "--check"] });
   expect(policy.guard).toBeUndefined();
   expect(policy.heavyKill).toBeUndefined();
 });
@@ -68,4 +68,41 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
   expect(command).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} env LANE_SANDBOX_VERIFY=${repo}/state/verify lane-sandbox omo --model m1 --thinking medium 'ulw set goal and work. Read and execute the lane brief at `);
   expect(lanes.records()["lane-a"]?.profile).toBe("sandboxed");
+  // The wrapper's check ran before anything else of the launch.
+  expect(calls[0]).toEqual(["lane-sandbox", "--check"]);
+});
+
+test("a sandboxed lane.start whose sandboxCheck fails is refused sandbox-unavailable and starts nothing; an unsandboxed one skips the check", async () => {
+  const home = scratch();
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  const runnerDir = join(home, ".dori", "runner");
+  mkdirSync(runnerDir, { recursive: true, mode: 0o700 });
+  const policy = localPolicy({ ...defaultConfig(home), defaultCwd: repo, worktreeRoot: "" }, { home, tmp: home });
+  const calls: string[][] = [];
+  const published: string[] = [];
+  const lanes = new RunnerLanes({
+    instance: async () => "server-1",
+    runnerDir, clock: fakeClock(0), policy, token: () => "tok", publish: (type) => { published.push(type); }, startup: async () => ({ verdict: "ok", detail: "ready" }),
+    run: async (argv) => {
+      calls.push([...argv]);
+      if (argv[0] === "lane-sandbox") return { code: 3, out: "", err: "lane-sandbox: bwrap not found on PATH\n" } as Ran;
+      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" } as Ran;
+      return { code: 0, out: "", err: "" } as Ran;
+    },
+  });
+  const start = {
+    cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: repo, agentProfile: "sandboxed",
+    mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0,
+  };
+  await expect(lanes.start(start)).rejects.toThrow("RUNNER_CMD_REJECTED sandbox-unavailable lane-sandbox: bwrap not found on PATH");
+  expect(calls).toEqual([["lane-sandbox", "--check"]]);
+  expect(lanes.records()).toEqual({});
+  expect(existsSync(lanes.briefPath("lane-a"))).toBe(false);
+  expect(published).toEqual([]);
+
+  calls.length = 0;
+  await lanes.start({ ...start, agentProfile: "default", sandbox: false });
+  expect(calls.some((a) => a[0] === "lane-sandbox")).toBe(false);
+  expect(lanes.records()["lane-a"]?.profile).toBe("default");
 });

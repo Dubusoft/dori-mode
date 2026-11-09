@@ -12,6 +12,9 @@ import type { RunnerPolicy } from "./policy.ts";
  * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that, run with
  *   `LANE_SANDBOX_VERIFY=<defaultCwd>/state/verify` so the lane can write its result files there (the lane's pane gets
  *   no environment from the runner beyond its own DORI_* variables).
+ * - `sandboxCheck`: `<laneSandbox.command> --check`, so a sandboxed start on a host where the wrapper cannot sandbox is
+ *   refused `sandbox-unavailable` before its pane opens. `sandbox` stays `optional`: lanes recorded unsandboxed must keep
+ *   recovering, and the lead decides which new lanes need a sandbox.
  * - `allowedRoots`: `$HOME`, the temp directory, `dirname(defaultCwd)` and `worktreeRoot` when set, without repeats.
  * Guard thresholds and `heavyKill` stay unset, so the runner reads them from the same config as the supervisor.
  */
@@ -31,6 +34,7 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
     agents: { default: lane, sandboxed: ["env", `LANE_SANDBOX_VERIFY=${join(cfg.defaultCwd, "state", "verify")}`, ...sandbox, ...lane] },
     allowedRoots: [...new Set(roots)],
     sandbox: "optional",
+    sandboxCheck: [...sandbox, "--check"],
     jobs: "allow",
   };
 };

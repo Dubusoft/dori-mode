@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { FlowDeps } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
-import { launchLane } from "./launch.ts";
+import { launchLane, SandboxRefusal } from "./launch.ts";
 import {
   type LaneMessage, type LaneMessageStore, OPEN_MESSAGE_STATES, openLaneMessages, queueLaneMessage, updateLaneMessage,
 } from "./lane-messages.ts";
@@ -15,6 +15,7 @@ import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
+import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { parseSignal, splitDone } from "./signals.ts";
 
 /**
@@ -662,11 +663,22 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   mkdirSync(briefs, { recursive: true });
   const brief = join(briefs, `${key}.md`);
   await Bun.write(brief, mergeLaneBrief(request, worktree));
-  const { startup } = await launchLane(deps, {
-    key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `merged ${pull.repo}#${pull.number}`,
-    thread: source.thread, cwd: worktree, shareThread: true,
-  });
-  return { ok: true, detail: startup };
+  // A refused sandbox (or an allowed unsandboxed run) reaches the owner in the source lane's thread; a notice that could
+  // not be posted is logged, since this path returns only a detail line.
+  const notice = { key, thread: source.thread };
+  const logged = (lines: readonly string[]): void => { for (const line of lines) console.error(line); };
+  try {
+    const { startup, notes } = await launchLane(deps, {
+      key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `merged ${pull.repo}#${pull.number}`,
+      thread: source.thread, cwd: worktree, shareThread: true,
+    });
+    logged(await postSkippedNotices(deps, notice, notes));
+    return { ok: true, detail: startup };
+  } catch (error) {
+    if (!(error instanceof SandboxRefusal)) throw error;
+    logged(await postSandboxNotice(deps, notice, error.message));
+    return { ok: false, detail: error.message };
+  }
 };
 
 export const defaultCiIo: CiIo = { launch: launchMergeLane };

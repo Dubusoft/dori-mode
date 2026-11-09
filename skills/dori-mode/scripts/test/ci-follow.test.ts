@@ -588,3 +588,14 @@ test("GH_PR checks_failing and conflicting are digest; an eventPolicy in the con
   expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", plain.eventPolicy)).toBe("lead-urgent");
   expect(eventClass("CI_CONFLICT acme/app#7 x", plain.eventPolicy)).toBe("lead-urgent");
 });
+
+test("a merge lane its sandbox refuses is not started: the refusal is its detail and reaches the owner in the source lane's thread", async () => {
+  const roomy = (argv: readonly string[], opts?: Parameters<typeof deps.run>[1]) =>
+    argv[0] === "df" ? Promise.resolve({ code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200", err: "" }) : deps.run(argv, opts);
+  const hooked = { ...deps, run: roomy, which: () => null, ops: { ...deps.ops, exists: async () => [false] }, config: { ...deps.config, hooks: { ...deps.config.hooks, threadReply: ["notify", "{thread}", "{text}"] } } };
+  const r = await launchMergeLane(hooked, { key: mergeLaneKey(pull()), source: { ...claimedLane }, pull: pull(), base: "dev" });
+  expect(r.ok).toBe(false);
+  expect(r.detail).toStartWith(`SANDBOX_MISSING ${mergeLaneKey(pull())}: lane-sandbox is not on PATH`);
+  expect(world.ops.filter((o) => o.op === "start")).toEqual([]);
+  expect(world.calls.filter((c) => c[0] === "notify")).toEqual([["notify", lane.thread, `[sandbox] ${r.detail}`]]);
+});

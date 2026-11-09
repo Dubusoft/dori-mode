@@ -129,3 +129,15 @@ test.each([
   expect(() => resolveEventPolicy(raw)).toThrow(EventPolicyError);
   expect(() => resolveEventPolicy(raw)).toThrow(message);
 });
+
+test("a sandbox refusal of a recovery, an allowed unsandboxed run and an undelivered sandbox notice wake the lead; other recovery errors stay digest", () => {
+  for (const line of [
+    "LANE_RECOVERY_ERROR k1 sandbox-missing: SANDBOX_MISSING k1: lane-sandbox is not on PATH",
+    "LANE_RECOVERY_ERROR k1 sandbox-broken: SANDBOX_BROKEN k1: lane-sandbox --check failed",
+    "LANE_RECOVERY_ERROR k1 sandbox-unavailable: SANDBOX_UNAVAILABLE k1: machine m2 refused",
+    "SANDBOX_SKIPPED k1: relaunch of a lane recorded without a sandbox", "SANDBOX_NOTICE_ERROR k1 (no discordChannels configured): [sandbox] x",
+  ]) expect(eventClass(line)).toBe("lead-urgent");
+  for (const line of ["LANE_RECOVERY_ERROR k1 replacement-unconfirmed", "LANE_RECOVERY_ERROR k1 process-info failed: x", "SANDBOX_NOTICE_FALLBACK k1 posted to the owner channel (thread post failed: x)"]) {
+    expect(eventClass(line)).toBe("lead-digest");
+  }
+});

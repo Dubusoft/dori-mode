@@ -9,6 +9,9 @@ import type { StartupVerdict, TurnEvidence } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
 import { tryStateLock } from "../src/state-lock.ts";
+import { eventClass } from "../src/event-policy.ts";
+
+type Deps = ReturnType<typeof depsFor>;
 
 let state: ReturnType<typeof withState>;
 beforeEach(() => { state = withState(); withSqliteStore(state.dir); });
@@ -66,6 +69,7 @@ const fixture = async () => {
 };
 
 const opsOf = (world: World, ...names: string[]) => world.ops.filter((e) => names.includes(e.op));
+const SKIP = "SANDBOX_SKIPPED recover-lane: relaunch of a lane recorded without a sandbox";
 
 test("recovers a missing pane through its runner with persisted attempt and original launch metadata", async () => {
   const { deps, world, lane, control } = await fixture();
@@ -80,7 +84,8 @@ test("recovers a missing pane through its runner with persisted attempt and orig
 test("a lane its runner does not know is started again from its brief", async () => {
   const { deps, world, lane } = await fixture();
   const ops: LaneOps = { ...deps.ops, recover: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover RUNNER_LANE_UNKNOWN recover-lane"); } };
-  expect(await recoverLanes({ ...deps, ops }, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
+  // The fixture lane is recorded without a sandbox: its relaunch runs unsandboxed and says so (SKIP below).
+  expect(await recoverLanes({ ...deps, ops }, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1", SKIP]);
   const start = opsOf(world, "start")[0]?.args as { briefText: string } | undefined;
   expect(start).toMatchObject({ key: "recover-lane", cwd: lane.cwd, model: lane.model });
   // A lane on the old footer moves onto the dori report one when it is started again.
@@ -112,7 +117,9 @@ test.each([
   expect(opsOf(world, "recover", "start", "close").map((e) => e.op)).toEqual(["close", "start"]);
   expect(opsOf(world, "start")[0]?.args).toMatchObject({ model: "provider/expected" });
   expect(world.panes.some((p) => p.pane_id === "old:p1")).toBe(false);
-  expect(world.calls.filter((call) => call[0] === "notify")).toHaveLength(1);
+  // The unsandboxed relaunch's sandbox notice, then LANE_RECOVERED.
+  expect(events.at(-1)).toBe(SKIP);
+  expect(world.calls.filter((call) => call[0] === "notify").map((call) => call[2])).toEqual([`[sandbox] ${SKIP}`, "LANE_RECOVERED recover-lane new:p1 " + reason]);
 });
 
 /** The lane's pane with only its shell left: herdr names no agent, process-info shows no omo. */
@@ -360,6 +367,26 @@ test("a sandboxed lane replaced on the wrong model is started sandboxed again, r
   expect(await recoverLanes(wrapped)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-model session-resumed", "STARTUP_OK recover-lane new:p1"]);
   expect(opsOf(world, "start")[0]?.args).toMatchObject({ sandbox: true, session: "0b1c2d3e-aaaa-bbbb-cccc-123456789abc" });
   expect((await deps.registry.read(lane.key))?.sandbox).toBe(true);
+});
+
+test.each([
+  { name: "missing", setup: (d: Deps) => ({ ...d, which: () => null }), event: "LANE_RECOVERY_ERROR recover-lane sandbox-missing: SANDBOX_MISSING recover-lane: " },
+  { name: "broken", setup: (d: Deps, w: World) => { w.sandboxCheck = { code: 3, out: "", err: "lane-sandbox: bwrap not found" }; return d; }, event: "LANE_RECOVERY_ERROR recover-lane sandbox-broken: SANDBOX_BROKEN recover-lane: " },
+])("a sandboxed lane whose sandbox is $name is not relaunched: an urgent LANE_RECOVERY_ERROR and a notice in its thread", async ({ setup, event }) => {
+  const { deps, world, lane, control, clock } = await fixture();
+  clock.at = STARTUP_GRACE_MS;
+  control.live(true);
+  control.argv = ["omo"];
+  await deps.registry.write({ ...lane, sandbox: true });
+  const events = await recoverLanes(setup(deps, world));
+  expect(events).toHaveLength(1);
+  expect(events[0]).toStartWith(event);
+  expect(eventClass(events[0]!)).toBe("lead-urgent");
+  expect(opsOf(world, "start")).toEqual([]);
+  const notices = world.calls.filter((call) => call[0] === "notify");
+  expect(notices).toHaveLength(1);
+  expect(notices[0]?.[1]).toBe("chat:1");
+  expect(notices[0]?.[2]).toStartWith(`[sandbox] ${event.split(": ")[1]}`);
 });
 
 test("item 7: a resume that does not start falls back to the brief on the next attempt", async () => {

@@ -253,6 +253,22 @@ export class RunnerLanes {
     if (refused) throw new Error(`${rejectionText(refused.rule)} ${refused.detail}`);
   }
 
+  /**
+   * Runs the policy's `sandboxCheck` (when set) before a sandboxed start writes or opens anything: a wrapper that cannot
+   * sandbox on this host (no bwrap, user namespaces off) would otherwise run the agent unsandboxed or not at all.
+   * Throws `RUNNER_CMD_REJECTED sandbox-unavailable <stderr>`, the shape checkPaneCwd uses, so the lead sees the rule.
+   */
+  private async checkSandbox(): Promise<void> {
+    const argv = this.deps.policy.sandboxCheck;
+    if (!argv?.length) return;
+    let why: string | undefined;
+    try {
+      const ran = await this.deps.run(argv, { timeoutMs: 30_000 });
+      if (ran.code !== 0) why = ran.err.trim() || ran.out.trim() || `${argv.join(" ")} exited ${ran.code}`;
+    } catch (e) { why = `${argv.join(" ")}: ${e instanceof Error ? e.message : String(e)}`; }
+    if (why !== undefined) throw new Error(`${rejectionText("sandbox-unavailable")} ${why}`);
+  }
+
   inventory(): InventoryLane[] {
     return Object.values(this.records()).map((r) => ({ key: r.key, pane: r.pane, tab: r.tab }));
   }
@@ -278,6 +294,7 @@ export class RunnerLanes {
 
   async start(body: SupervisorCommandBodies["lane.start"]): Promise<Effect<"lane.start">> {
     if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
+    if (body.sandbox) await this.checkSandbox();
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
     writeRunnerFile(this.briefPath(body.key), body.briefText);
     const launched = await this.launch({

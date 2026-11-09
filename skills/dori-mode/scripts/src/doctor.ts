@@ -44,6 +44,9 @@ export type DoctorDeps = {
   readonly exists: (path: string) => boolean;
   /** Where omo memory is looked for when memoryCheck.repo is blank. */
   readonly home: string;
+  /** Test seams for the sandbox check: the host platform (default process.platform) and the PATH lookup (default Bun.which). */
+  readonly platform?: string;
+  readonly which?: (cmd: string) => string | null | undefined;
 };
 
 const ok = (id: string, detail: string): Check => ({ id, level: "OK", detail });
@@ -84,13 +87,23 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
   return checks;
 };
 
-const sandbox = (d: Pick<DoctorDeps, "home">): Check[] => {
-  const installed = installedLaneSandbox(d.home);
-  if (!existsSync(installed)) return [];
-  const templatePath = LANE_SANDBOX_TEMPLATE;
+/**
+ * Lanes on a Linux host run inside bwrap via the installed lane-sandbox wrapper, so a missing wrapper, a missing bwrap or a
+ * wrapper whose --check fails is a FAIL (lanes there are refused, not run bare). Other platforms have no bwrap: lanes
+ * there need runners.<label>.allowUnsandboxed.
+ */
+const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which">): Promise<Check[]> => {
+  if ((d.platform ?? process.platform) !== "linux") return [ok("lane sandbox", `not available on ${d.platform ?? process.platform}; lanes on this machine need runners.<label>.allowUnsandboxed in the lead config`)];
+  // A worker runner host runs its lanes behind the copy `dori runner install` puts in the runner's bin; the lead host uses ~/.local/bin.
+  const worker = workerLabel(d) !== undefined;
+  const installed = worker ? join(defaultRunnerDir(d.home), "bin", "lane-sandbox") : installedLaneSandbox(d.home);
+  if (!existsSync(installed)) return [fail("lane sandbox", `${installed} is missing; lanes are refused (SANDBOX_MISSING)`, worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs it")];
+  if (!(d.which ?? Bun.which)("bwrap")) return [fail("lane sandbox", "bwrap is not on PATH; lanes are refused", "install bubblewrap: sudo apt install bubblewrap")];
+  const probe = await d.run([installed, "--check"], T);
+  if (probe.code !== 0) return [fail("lane sandbox", `${installed} --check failed: ${probe.err.trim() || probe.out.trim() || `exit ${probe.code}`}`, "fix bubblewrap (user namespaces enabled, AppArmor profile), then rerun dori doctor")];
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
-  const templateHash = createHash("sha256").update(readFileSync(templatePath)).digest("hex");
-  return installedHash === templateHash ? [] : [warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
+  const templateHash = createHash("sha256").update(readFileSync(LANE_SANDBOX_TEMPLATE)).digest("hex");
+  return [installedHash === templateHash ? ok("lane sandbox", `${installed} works (bwrap available)`) : warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
 };
 
 /** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */
@@ -393,7 +406,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
 };
 
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), Promise.resolve(sandbox(d))])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

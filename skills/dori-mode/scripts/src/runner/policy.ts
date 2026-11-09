@@ -15,6 +15,11 @@ export type RunnerPolicy = {
   /** Directories under which every command cwd must resolve. */
   readonly allowedRoots: readonly string[];
   readonly sandbox: "required" | "optional";
+  /**
+   * Argv run before every `lane.start` with `sandbox: true` (e.g. `["lane-sandbox", "--check"]`); a non-zero exit refuses
+   * the start `sandbox-unavailable` with its stderr, so a host whose wrapper cannot sandbox never opens the lane's pane.
+   */
+  readonly sandboxCheck?: readonly string[];
   /** `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with a `done` section. */
   readonly jobs: "allow" | "deny";
   /** Guard thresholds for this host; each one absent falls back to the runner's config defaults. */
@@ -30,7 +35,7 @@ export const DEFAULT_POLICY: RunnerPolicy = { agents: {}, allowedRoots: [], sand
 
 /** Rules beyond the protocol schema rules (which pass through under their own names, e.g. `unknown-field`). */
 export type PolicyRule =
-  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "command-not-argv" | "jobs-denied";
+  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "sandbox-unavailable" | "command-not-argv" | "jobs-denied";
 
 export type CheckResult = { readonly ok: true; readonly command: AnySupervisorCommand } | { readonly ok: false; readonly rule: string; readonly detail: string };
 
@@ -42,7 +47,7 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 /** Reads a policy from parsed JSON; unknown keys or wrong types throw. */
 export function parsePolicy(value: unknown): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
-  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill"]);
+  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck"]);
   for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
   const agents: Record<string, readonly string[]> = {};
@@ -57,6 +62,9 @@ export function parsePolicy(value: unknown): RunnerPolicy {
   if (value.sandbox !== undefined && value.sandbox !== "required" && value.sandbox !== "optional") throw new Error("runner-config: sandbox must be required|optional");
   if (value.jobs !== undefined && value.jobs !== "allow" && value.jobs !== "deny") throw new Error("runner-config: jobs must be allow|deny");
   if (value.heavyKill !== undefined && !strings(value.heavyKill)) throw new Error("runner-config: heavyKill must be a string array");
+  if (value.sandboxCheck !== undefined && (!strings(value.sandboxCheck) || value.sandboxCheck.length === 0 || value.sandboxCheck[0] === "")) {
+    throw new Error("runner-config: sandboxCheck must be a non-empty string array");
+  }
   let guard: Partial<Record<GuardKey, number>> | undefined;
   if (value.guard !== undefined) {
     if (!isRecord(value.guard)) throw new Error("runner-config: guard must be an object");
@@ -70,6 +78,7 @@ export function parsePolicy(value: unknown): RunnerPolicy {
   return {
     ...(guard ? { guard } : {}),
     ...(value.heavyKill !== undefined ? { heavyKill: value.heavyKill as string[] } : {}),
+    ...(value.sandboxCheck !== undefined ? { sandboxCheck: value.sandboxCheck as string[] } : {}),
     agents,
     allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
