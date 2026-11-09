@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DiscordCommands } from "../src/messenger/discord-commands.ts";
 import { acquireDiscordGateway } from "../src/messenger/discord-lock.ts";
-import { supervisorDiscord } from "../src/messenger/discord-supervisor.ts";
+import { GATEWAY_SESSION_FILE, GATEWAY_SESSION_MAX_AGE_MS, saveGatewaySession, supervisorDiscord, takeGatewaySession } from "../src/messenger/discord-supervisor.ts";
 import { discordSnowflakeAt } from "../src/messenger/discord-inbound.ts";
 import { discordPresence, type GatewaySocket } from "../src/messenger/discord.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
@@ -245,6 +245,73 @@ const inboundFixture = (patch: Partial<DoriConfig> = {}) => {
     queue: () => readJournal(state.dir),
   };
 };
+
+test("a restarted supervisor resumes the stopped one's gateway session and carries out a close click Discord replays past its answer window", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const clock = fakeClock(1_000);
+  const deps = depsFor(newWorld(), clock, state.dir, { discord: { applicationId: "1", guildId: "2", ownerId: "300" }, discordChannels: ["100"] });
+  const writes: HttpRequest[] = [];
+  const http: Http = async (request) => {
+    if (request.method === "GET") return { status: 200, headers: {}, body: request.url.includes("/threads/active") ? '{"threads":[]}' : "[]" };
+    writes.push(request);
+    // The click's interaction token expired while no supervisor was connected.
+    if (request.url.includes("/interactions/")) return { status: 404, headers: {}, body: '{"code":10062}' };
+    return { status: 200, headers: {}, body: "{}" };
+  };
+  const emitted = new Map<string, string>();
+  const closedEvent = Promise.withResolvers<void>();
+  const start = () => {
+    const t = timerFixture();
+    const s = socketsFixture();
+    const inbound = supervisorDiscord(deps, {
+      token: "test-token", http, open: s.open, timers: t.timers, lookup: async () => "", log: () => {},
+      emit: async (id, line) => { emitted.set(id, line); if (line.startsWith("THREAD_CLOSED_BY_OWNER")) closedEvent.resolve(); },
+    });
+    cleanups.push(() => inbound.close());
+    return { s, inbound };
+  };
+  const first = start();
+  first.s.socket().receive(hello);
+  first.s.socket().receive(ready);
+  first.s.socket().receive({ op: 0, t: "MESSAGE_CREATE", s: 7, d: rawMessage("11", "999") });
+  await first.inbound.close();
+  // The stop closed with a resumable code and left the session: the next supervisor RESUMEs instead of identifying.
+  clock.at += 30_000;
+  const second = start();
+  expect(second.s.urls[0]).toBe("wss://resume.example/?v=10&encoding=json");
+  second.s.socket().receive(hello);
+  expect(second.s.socket().sent[0]).toEqual({ op: 6, d: { token: "test-token", session_id: "session", seq: 7 } });
+  writes.length = 0;
+  second.s.socket().receive({ op: 0, t: "INTERACTION_CREATE", s: 8, d: {
+    type: 3, id: "900", token: "expired", application_id: "1", guild_id: "2", member: { user: { id: "300" } },
+    message: { id: "555" }, data: { component_type: 2, custom_id: "dori:close-thread:777" },
+  } });
+  second.s.socket().receive({ op: 0, t: "RESUMED", s: 9, d: {} });
+  await closedEvent.promise;
+  expect(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`)).toEqual([
+    "POST /api/v10/interactions/900/expired/callback",
+    "PATCH /api/v10/channels/777/messages/555",
+    "PATCH /api/v10/channels/777",
+  ]);
+  expect(writes[1]?.headers).toMatchObject({ Authorization: "Bot test-token" });
+  expect(String(writes[1]?.body)).toContain('"disabled":true');
+  expect(JSON.parse(String(writes[2]?.body))).toEqual({ archived: true });
+  expect(emitted.get("discord:777:close:900")).toBe("THREAD_CLOSED_BY_OWNER 777");
+});
+
+test("a stopped supervisor's session older than the resume window, or malformed, is dropped and the next one identifies", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  saveGatewaySession(state.dir, { session: "old", seq: 3, url: "wss://resume.example/?v=10&encoding=json" }, 0);
+  expect(takeGatewaySession(state.dir, GATEWAY_SESSION_MAX_AGE_MS + 1)).toBeUndefined();
+  // Taken once: the file is gone, so a refused RESUME is never retried by a later start.
+  saveGatewaySession(state.dir, { session: "s", seq: 3, url: "wss://resume.example/?v=10&encoding=json" }, 0);
+  expect(takeGatewaySession(state.dir, 1_000)).toEqual({ session: "s", seq: 3, url: "wss://resume.example/?v=10&encoding=json" });
+  expect(takeGatewaySession(state.dir, 1_000)).toBeUndefined();
+  writeFileSync(join(state.dir, GATEWAY_SESSION_FILE), '{"session":"s","seq":3,"url":"http://elsewhere","at":0}');
+  expect(takeGatewaySession(state.dir, 1_000)).toBeUndefined();
+});
 
 test("MESSAGE_CREATE and REST catch-up dedupe owner inbound while filtering foreign channels and bots", async () => {
   const f = inboundFixture();

@@ -1,3 +1,4 @@
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FlowDeps } from "../done-flow.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
@@ -6,7 +7,7 @@ import {
   discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound, listDiscordThreads,
   parseDiscordMessage, pollDiscordInbound,
 } from "./discord-inbound.ts";
-import { Discord, discordPresence, openDiscordGateway, type GatewaySocket } from "./discord.ts";
+import { Discord, discordPresence, type GatewaySession, openDiscordGateway, type GatewaySocket } from "./discord.ts";
 import { type Http, MessengerError } from "./http.ts";
 import { realTimers, type Timers } from "./typing.ts";
 
@@ -19,6 +20,34 @@ export type SupervisorDiscordOptions = {
   readonly open?: (url?: string) => GatewaySocket;
   readonly timers?: Timers;
   readonly log?: (line: string) => void;
+};
+
+/** The gateway session a stopping supervisor leaves for the next one. */
+export const GATEWAY_SESSION_FILE = "discord-gateway-session.json";
+/** An older session is not tried: Discord keeps a closed session resumable only briefly, and a refused RESUME costs a reconnect. */
+export const GATEWAY_SESSION_MAX_AGE_MS = 5 * 60_000;
+
+/** Takes (reads and removes) the session a stopped supervisor left, when it is recent enough to resume. */
+export const takeGatewaySession = (stateDir: string, now: number): GatewaySession | undefined => {
+  const path = join(stateDir, GATEWAY_SESSION_FILE);
+  let raw: string;
+  try { raw = readFileSync(path, "utf8"); } catch { return undefined; }
+  rmSync(path, { force: true });
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (typeof value !== "object" || value === null) return undefined;
+    const { session, seq, url, at } = value as Record<string, unknown>;
+    if (typeof session !== "string" || typeof seq !== "number" || typeof url !== "string" || !url.startsWith("wss://") || typeof at !== "number") return undefined;
+    if (now - at > GATEWAY_SESSION_MAX_AGE_MS || at > now) return undefined;
+    return { session, seq, url };
+  } catch { return undefined; }
+};
+
+/** Leaves `session` for the next supervisor (tmp + rename, owner-only). */
+export const saveGatewaySession = (stateDir: string, session: GatewaySession, now: number): void => {
+  const path = join(stateDir, GATEWAY_SESSION_FILE);
+  writeFileSync(`${path}.tmp`, JSON.stringify({ ...session, at: now }), { mode: 0o600 });
+  renameSync(`${path}.tmp`, path);
 };
 
 /**
@@ -134,9 +163,14 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     return polling;
   };
   const registration = commands.register().catch(() => { log("DISCORD_COMMANDS_ERROR guild command registration failed"); });
+  // Resuming the session the previous supervisor left makes Discord replay what arrived while no process was connected,
+  // a close-button click during a restart included.
+  const resume = takeGatewaySession(deps.config.stateDir, deps.clock.now());
+  if (resume) log("DISCORD_GATEWAY resuming the previous supervisor's session");
   const gateway = discordPresence(options.open ?? openDiscordGateway, options.token, options.timers ?? realTimers,
     (data) => commands.handle(data), {
       messageContent: true,
+      ...(resume ? { resume } : {}),
       log,
       onReady: catchup,
       // The gateway has stopped for good (bad token, intents or sharding): the lead hears it once; REST catch-up keeps polling.
@@ -183,6 +217,11 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     async close(): Promise<void> {
       stopped = true;
       gateway.close();
+      const session = gateway.session();
+      if (session) {
+        try { saveGatewaySession(deps.config.stateDir, session, deps.clock.now()); }
+        catch { log("DISCORD_GATEWAY_ERROR cannot save the gateway session for the next supervisor"); }
+      }
       await gateway.settled();
       await polling;
       await registration;
