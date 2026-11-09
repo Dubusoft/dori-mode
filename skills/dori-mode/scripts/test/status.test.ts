@@ -49,10 +49,10 @@ test("status lists working lanes with model, age and last progress; paused and c
   await f.registry.write(lane("beta", { status: "paused" }));
   await f.registry.write(lane("gamma", { closedAt: OPENED }));
   const s = await collectStatus(f.deps);
-  expect(s.lanes).toEqual([{ key: "alpha", model: "m/one", ageMin: 90, progress: "Write the tests" }]);
+  expect(s.lanes).toEqual([{ key: "alpha", model: "m/one", ageMin: 90, progress: "Write the tests", machine: "local" }]);
   const text = renderStatus(s);
   expect(text).toContain("작업 중 레인 1개");
-  expect(text).toContain("\n■ 레인 (1)\n- alpha (90분 · one): Write the tests");
+  expect(text).toContain("\n■ 레인 (1)\n▸ local: 오프라인 · 레인 1개\n- alpha (90분 · one): Write the tests");
   expect(text).not.toContain("beta");
 });
 
@@ -270,6 +270,7 @@ test("healthy status reads as titled sections with one line per item, in KST", (
     "- 새 레인 워크스페이스: wS",
     "",
     "■ 레인 (1)",
+    "▸ local: 미확인 · 레인 1개",
     "- ops (27분 · opus-5-5 · dori-mode #55): Full run then the docs",
     "",
     "■ 대기 (0)",
@@ -388,6 +389,35 @@ test("RUNNER lanes= follows the registry's open lanes on each runner's machine, 
   await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
   expect(await counts()).toEqual({ local: 1, macbook: 1 });
   expect(renderStatus(await collectStatus(f.deps))).toMatch(/^- macbook: 연결됨 · 레인 1개 · herdr 미확인$/m);
+});
+
+test("lanes are grouped by runner: each runner's heading has its state and lane count, a runner with no lanes still shows", async () => {
+  const f = await fixture();
+  new RunnerHub({ stateDir: f.dir, commit: () => true, now: () => NOW, monotonic: () => 0, epoch: 1 }).close();
+  const db = new Database(join(f.dir, HUB_FILE));
+  db.run("INSERT INTO runners (label, maxGen, lastHeartbeatAt) VALUES ('local', 1, ?), ('macbook', 1, ?), ('mac-mini', 1, NULL)", [NOW, NOW]);
+  db.close();
+  await f.registry.write(lane("alpha"));
+  await f.registry.write(lane("beta", { machine: "macbook", runner: "macbook" }));
+  await f.registry.write(lane("delta", { machine: "macbook" }));
+  const s = await collectStatus(f.deps);
+  expect(Object.fromEntries(s.lanes.map((l) => [l.key, l.machine]))).toEqual({ alpha: "local", beta: "macbook", delta: "macbook" });
+  // Within a group the lanes keep Status.lanes order (the registry's).
+  const mac = s.lanes.filter((l) => l.machine === "macbook").map((l) => l.key);
+  expect(s.laneGroups).toEqual([
+    { machine: "local", state: "connected", online: true, lanes: ["alpha"] },
+    { machine: "mac-mini", state: "offline", online: false, lanes: [] },
+    { machine: "macbook", state: "connected", online: true, lanes: mac },
+  ]);
+  expect(renderStatus(s)).toContain([
+    "■ 레인 (3)",
+    "▸ local: 연결됨 · 레인 1개",
+    "- alpha (90분)",
+    "▸ mac-mini: 오프라인 · 레인 없음",
+    "▸ macbook: 연결됨 · 레인 2개",
+    ...mac.map((key) => `- ${key} (90분)`),
+    "",
+  ].join("\n"));
 });
 
 test("the local runner row is always shown, with its child's state from the health file, even before the hub ever opened", async () => {

@@ -52,6 +52,8 @@ export type Status = {
   readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string };
   readonly lanes: readonly {
     readonly key: string; readonly model?: string; readonly ageMin: number; readonly progress?: string; readonly repo?: string; readonly pr?: number;
+    /** The runner the lane runs on (its owning runner, else its machine, else "local"); absent in an older status reads as "local". */
+    readonly machine?: string;
     /** recoveryPending: "exhausted" after every recovery attempt failed (LANE_RECOVERY_EXHAUSTED), else "pending". */
     readonly recovery?: "pending" | "exhausted";
     /** The lane's latest `dori report` row (highest seq), routed or not. */
@@ -78,6 +80,37 @@ export type Status = {
   readonly schedules?: readonly ScheduleRow[];
   /** Every runner in the hub's table (`runners.sqlite`), and always the local runner (offline until it first says hello). */
   readonly runners?: readonly RunnerView[];
+  /** The working lanes grouped by runner (see laneGroups): every runner, even one with no lanes, local first. */
+  readonly laneGroups?: readonly LaneGroup[];
+};
+
+/** One runner's working lanes as `dori status` groups them. `state` is absent for a machine no runner row names. */
+export type LaneGroup = {
+  readonly machine: string;
+  readonly state?: RunnerView["state"];
+  /** Not offline, lost or revoked (the same reading as a wait's "@machine 오프라인" mark). */
+  readonly online: boolean;
+  /** Lane keys, in the order of Status.lanes. */
+  readonly lanes: readonly string[];
+};
+
+const OFFLINE_STATES: ReadonlySet<RunnerView["state"]> = new Set(["offline", "lost", "revoked"]);
+const laneMachine = (lane: { readonly machine?: string }): string => lane.machine ?? LOCAL_RUNNER;
+
+/**
+ * The lanes grouped by the runner they run on: one group per runner in `runners` (in that order, so local first), lanes
+ * or not, then one per other machine a lane names. Without runners (an older status) only the lanes' machines appear.
+ */
+export const laneGroups = (runners: readonly RunnerView[] | undefined, lanes: Status["lanes"]): LaneGroup[] => {
+  const labels = (runners ?? []).map((r) => r.label);
+  for (const lane of lanes) if (!labels.includes(laneMachine(lane))) labels.push(laneMachine(lane));
+  return labels.map((machine) => {
+    const state = runners?.find((r) => r.label === machine)?.state;
+    return {
+      machine, ...(state ? { state } : {}), online: state !== undefined && !OFFLINE_STATES.has(state),
+      lanes: lanes.filter((lane) => laneMachine(lane) === machine).map((lane) => lane.key),
+    };
+  });
 };
 
 /** One runner as `dori status` shows it. Fields the hub does not track yet are absent and print `-`. */
@@ -349,17 +382,25 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   let repos: string[] = [];
   try { repos = new Repos(d.config.stateDir).list(); } catch { /* unreadable list: show none */ }
   const reports = latestLaneReports(d.config);
+  const lanes = open.filter((l) => statusOf(l) === "working").map((l) => ({
+    key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
+    ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
+    ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
+    ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
+    ...(reports.has(l.key) ? { report: reports.get(l.key) } : {}),
+    // The same owner rule as runnerLaneCount: the owning runner, else the unowned lane's machine, else local.
+    machine: l.runner ?? (l.machine || LOCAL_RUNNER),
+  }));
+  const runners = runnerViews(readRunnerRows(d.config.stateDir), now, {
+    restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
+    unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
+    ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
+  });
   return {
     at: new Date(now).toISOString(),
     services,
     lead: { ...lead, cacheTtlMin: d.config.cacheTtlMin, capTokens: d.config.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
-    lanes: open.filter((l) => statusOf(l) === "working").map((l) => ({
-      key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
-      ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
-      ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
-      ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
-      ...(reports.has(l.key) ? { report: reports.get(l.key) } : {}),
-    })),
+    lanes,
     waits: readWaits(d.config.stateDir),
     github: {
       repos,
@@ -374,11 +415,8 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     events: eventStats(d.config, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
-    runners: runnerViews(readRunnerRows(d.config.stateDir), now, {
-      restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
-      unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
-      ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
-    }),
+    runners,
+    laneGroups: laneGroups(runners, lanes),
   };
 };
 
@@ -611,6 +649,16 @@ const laneLine = (lane: Lanes[number], progress: number): string => {
   return `- ${flag}${lane.key} (${facts})${lane.progress ? `: ${clip(lane.progress, progress)}` : ""}`;
 };
 
+/** "▸ local: 연결됨 · 레인 2개", "▸ mac-mini: 오프라인 · 레인 없음": a runner's heading over its lanes. */
+const groupLine = (g: LaneGroup): string =>
+  `▸ ${g.machine}: ${g.state ? RUNNER_WORDS[g.state] : "미확인"} · ${g.lanes.length ? count(g.lanes.length, "레인") : "레인 없음"}`;
+
+/** The lanes in runner-group order, each with its group; pages 2.. continue from page 1 in this order. */
+const groupedLanes = (s: Status): { readonly lane: Lanes[number]; readonly group: LaneGroup }[] => {
+  const byKey = new Map(s.lanes.map((lane) => [lane.key, lane]));
+  return laneGroups(s.runners, s.lanes).flatMap((group) => group.lanes.map((key) => ({ lane: byKey.get(key)!, group })));
+};
+
 const leadLine = (l: Status["lead"]): string => {
   const state = l.state === "cold" && l.idleMin === undefined ? "멈춤" : LEAD_WORDS[l.state];
   const parts = [
@@ -646,8 +694,15 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
     ...(l.pendingRestart ? [clip(`- 재시작 ${l.pendingRestart.id} 대기 중: ${l.pendingRestart.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}, 다음 유휴 때`, 300)] : []),
   ]);
 
-  section(`레인 (${s.lanes.length})`, s.lanes.length ? [
-    ...s.lanes.slice(0, lim.lanes).map((lane) => laneLine(lane, lim.progress)),
+  const groups = laneGroups(s.runners, s.lanes);
+  const byKey = new Map(s.lanes.map((lane) => [lane.key, lane]));
+  let room = lim.lanes;
+  section(`레인 (${s.lanes.length})`, groups.length ? [
+    ...groups.flatMap((g) => {
+      const shown = g.lanes.slice(0, room);
+      room -= shown.length;
+      return [groupLine(g), ...shown.map((key) => laneLine(byKey.get(key)!, lim.progress))];
+    }),
     ...(s.lanes.length > lim.lanes ? [`- ${more(s.lanes.length - lim.lanes)}`] : []),
   ] : ["- 없음"]);
 
@@ -715,16 +770,23 @@ const PAGE_BODY_MAX = STATUS_MAX_CHARS - 120;
 export const statusPages = (s: Status): string[] => {
   // Choose page 1's limits with the longest "more" line it can get, so the real one never pushes it over.
   const { lim } = fit(s, (hidden) => `외 ${hidden}개 (2-99999쪽)`);
-  const rest = s.lanes.slice(lim.lanes);
+  const ordered = groupedLanes(s);
+  const rest = ordered.slice(lim.lanes);
   if (!rest.length) return [renderStatus(s)];
   const chunks: string[][] = [];
   let chunk: string[] = [];
   let size = 0;
-  for (const lane of rest) {
+  // A runner's heading opens its group; a page that starts inside a group repeats it as "이어서".
+  let prev = ordered[lim.lanes - 1]?.group.machine;
+  for (const { lane, group } of rest) {
     const line = clip(laneLine(lane, PAGE_PROGRESS), PAGE_LINE_MAX);
-    if (chunk.length && size + line.length + 1 > PAGE_BODY_MAX) { chunks.push(chunk); chunk = []; size = 0; }
+    let head = group.machine !== prev ? groupLine(group) : undefined;
+    if (chunk.length && size + line.length + 1 + (head ? head.length + 1 : 0) > PAGE_BODY_MAX) { chunks.push(chunk); chunk = []; size = 0; }
+    if (!chunk.length && !head) head = `▸ ${group.machine} 이어서`;
+    if (head) { chunk.push(head); size += head.length + 1; }
     chunk.push(line);
     size += line.length + 1;
+    prev = group.machine;
   }
   chunks.push(chunk);
   const total = chunks.length + 1;
