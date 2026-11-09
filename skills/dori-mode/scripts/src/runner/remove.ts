@@ -8,6 +8,7 @@ import { readRunnerEndpoints } from "./endpoints.ts";
 import { HUB_FILE, readRunnerRows } from "./hub.ts";
 import { readRunnerMachines } from "./machines.ts";
 import { RUNNER_UNIT, WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
+import { stepper, type Progress } from "./steps.ts";
 
 /**
  * `dori runner remove LABEL`'s remote half, the inverse of installRunner: stops and deletes the runner on a worker over
@@ -26,6 +27,8 @@ export type RemoveDeps = {
   readonly run: Runner;
   /** How the machine runs commands; defaults to `machineKind`. */
   readonly kind?: (run: Runner, machine: GuardMachine) => Promise<KindResult>;
+  /** Receives a `RUNNER_STEP` line as each step starts, finishes or fails. */
+  readonly progress?: Progress;
 };
 
 export type RemoveRequest = { readonly machine: GuardMachine; readonly label: string };
@@ -114,10 +117,21 @@ export const hasLocalRunnerState = (stateDir: string, label: string): boolean =>
 };
 
 export const removeRunner = async (deps: RemoveDeps, req: RemoveRequest): Promise<RemoveResult> => {
+  const step = stepper(deps.progress, req.label);
+  step("connect", "start", req.machine.target);
   const k = await (deps.kind ?? machineKind)(deps.run, req.machine);
-  if (!k.ok) return { ok: false, code: k.unsupported ? "RUNNER_REMOVE_UNSUPPORTED" : "RUNNER_REMOVE_UNREACHABLE", detail: k.detail };
+  if (!k.ok) {
+    const code = k.unsupported ? "RUNNER_REMOVE_UNSUPPORTED" : "RUNNER_REMOVE_UNREACHABLE";
+    step("connect", "failed", `${code} ${k.detail}`);
+    return { ok: false, code, detail: k.detail };
+  }
+  step("connect", "done", k.kind);
+  step("uninstall", "start", k.kind === "windows" ? "stop and unregister the scheduled task, delete ~/.dori/runner" : "stop and delete the runner service, disable herdr's, delete ~/.dori/runner");
   const r = k.kind === "windows"
     ? await deps.run(sshArgv(req.machine.target, encodedPowerShell(windowsRemoveScript())), { timeoutMs: REMOVE_TIMEOUT_MS })
     : await deps.run(sshArgv(req.machine.target, "sh -s"), { stdin: removeScript(), timeoutMs: REMOVE_TIMEOUT_MS });
-  return removeResult(r);
+  const result = removeResult(r);
+  if (result.ok) step("uninstall", "done");
+  else step("uninstall", "failed", `${result.code} ${result.detail}`);
+  return result;
 };
