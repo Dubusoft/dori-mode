@@ -54,6 +54,13 @@ test("the tree is killed from runner-task.pid only while that pid still runs dor
   expect(WIN_KILL_RUNNER).toContain("if ($DoriProc -and $DoriProc.CommandLine -like '*dori.js*') { & taskkill.exe /PID $DoriId /T /F | Out-Null }");
 });
 
+test("the task wrapper is killed from runner-task-wrapper.pid before the runner tree", () => {
+  const wrapper = WIN_KILL_RUNNER.indexOf("if ($DoriProc -and $DoriProc.CommandLine -like '*runner-task.ps1*') { & taskkill.exe /PID $DoriId /T /F | Out-Null }");
+  expect(WIN_KILL_RUNNER).toContain("'.dori\\runner\\runner-task-wrapper.pid'");
+  expect(wrapper).toBeGreaterThan(-1);
+  expect(wrapper).toBeLessThan(WIN_KILL_RUNNER.indexOf("'.dori\\runner\\runner-task.pid'"));
+});
+
 test("liveness probes and restarts a worker in the form of its kind", async () => {
   const argv: string[][] = [];
   const run: Runner = async (a) => { argv.push([...a]); return { code: 0, out: '{"verdict":"healthy"}', err: "" } as Ran; };

@@ -1,7 +1,9 @@
 # dori runner task wrapper: the Windows counterpart of the systemd unit's Restart=always, RestartSec=5.
-# The scheduled task \dori\dori-runner runs it at logon. Each round starts the runner hidden, appends its stdout and
-# stderr to logs\runner.log, records the child's pid in runner-task.pid (service control kills that tree), waits for
-# it to exit, and starts it again 5 s later. The log is rotated by size before each start. ASCII only.
+# The scheduled task \dori\dori-runner runs it at logon under conhost --headless, so neither this script nor the
+# runner it starts ever gets a console window. It records its own pid in runner-task-wrapper.pid: stopping the task
+# ends only that conhost, so service control kills this wrapper by pid before the runner tree. Each round starts the
+# runner hidden, appends its stdout and stderr to logs\runner.log, records the child's pid in runner-task.pid (service
+# control kills that tree), waits for it to exit, and starts it again 5 s later. The log is rotated by size before each start. ASCII only.
 param(
   [Parameter(Mandatory = $true)][string]$Label,
   [Parameter(Mandatory = $true)][string]$Listen
@@ -13,6 +15,7 @@ $R = Split-Path -Parent $Bin
 $Logs = Join-Path $R 'logs'
 $Log = Join-Path $Logs 'runner.log'
 $PidFile = Join-Path $R 'runner-task.pid'
+$WrapperPidFile = Join-Path $R 'runner-task-wrapper.pid'
 $MaxLogBytes = 10MB
 $KeepLogs = 3
 $BasePath = $env:PATH
@@ -32,6 +35,7 @@ function Step-DoriLog {
 }
 
 [void][IO.Directory]::CreateDirectory($Logs)
+[IO.File]::WriteAllText($WrapperPidFile, [string]$PID)
 while ($true) {
   try {
     Step-DoriLog

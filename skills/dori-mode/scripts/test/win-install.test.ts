@@ -66,6 +66,9 @@ test("every payload decodes to its input, the task XML with label and connect fi
   ]));
   const xml = got.get("dori-runner-task.xml") ?? "";
   expect(xml).toContain(`-Label ${LABEL} -Listen ${LISTEN}`);
+  // A headless console host runs the wrapper, so the logon task never opens a window.
+  expect(xml).toContain("<Command>conhost.exe</Command>");
+  expect(xml).toContain("<Arguments>--headless powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"@RUNNER@\\bin\\runner-task.ps1\" ");
   for (const want of ["<LogonType>InteractiveToken</LogonType>", "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
     "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>", "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", "<StartWhenAvailable>true</StartWhenAvailable>",
     "<Interval>PT1M</Interval>", "<Count>999</Count>", "<LogonTrigger>"]) expect(xml).toContain(want);
