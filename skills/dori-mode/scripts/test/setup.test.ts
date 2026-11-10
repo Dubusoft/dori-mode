@@ -257,12 +257,12 @@ test("setup persists optional repo answers and rereads the chosen state director
   };
   const d = deps({ prompt, interactive: true });
   const stateDir = "~/custom-state";
-  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], stateDir, herdr: false })).toBe(0);
+  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], stateDir, herdr: false, advanced: true })).toBe(0);
   const repos = new Repos(join(d.home, "custom-state"));
   expect(repos.list()).toEqual(["owner/repo", "other/repo"]);
   repos.add("external/change");
   answer = undefined;
-  expect(await runSetup(d, { herdr: false })).toBe(0);
+  expect(await runSetup(d, { herdr: false, advanced: true })).toBe(0);
   expect(currents).toEqual(["", "owner/repo,other/repo,external/change"]);
   expect(repos.list()).toEqual(["owner/repo", "other/repo", "external/change"]);
 });
@@ -282,7 +282,7 @@ test("invalid setup repo input leaves the stored list and config intact", async 
   repos.add("keep/repo");
   const before = readFileSync(d.configPath, "utf8");
   const prompt: Prompter = { ...defaults, ask: async (q, current) => q.startsWith("GitHub repos") ? "https://github.com/owner/repo" : current };
-  await expect(runSetup({ ...d, prompt }, { herdr: false })).rejects.toThrow(ReposError);
+  await expect(runSetup({ ...d, prompt }, { herdr: false, advanced: true })).rejects.toThrow(ReposError);
   expect(repos.list()).toEqual(["keep/repo"]);
   expect(readFileSync(d.configPath, "utf8")).toBe(before);
 });
@@ -300,7 +300,7 @@ test("issue authors are optional, saved lowercased as githubIssueAuthors, kept o
   expect(readFileSync(d.configPath, "utf8")).toBe(before);
 });
 
-test("each system step asks first: declining linger and enable runs neither", async () => {
+test("with --advanced each system step asks first: declining linger and enable runs neither", async () => {
   const answers: Record<string, boolean> = {};
   const prompt: Prompter = {
     ...defaults,
@@ -311,7 +311,7 @@ test("each system step asks first: declining linger and enable runs neither", as
     },
   };
   const d = deps({ prompt, interactive: true });
-  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
+  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false, advanced: true })).toBe(0);
   expect(answers).toEqual({ linger: false, enable: false });
   const system = herdr.calls.filter((c) => c[0] !== "herdr").map((c) => c.join(" "));
   expect(system).toEqual(["loginctl show-user ana --property=Linger", "systemctl --user daemon-reload", "systemctl --user list-unit-files dori-presence.service --no-legend --no-pager"]);
@@ -344,7 +344,7 @@ test.each([true, false])("legacy presence migration accepted=%s respects confirm
   await Bun.write(legacyPath, legacyContent);
 
   // When setup migrates this installation.
-  const code = await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false, autostart: true });
+  const code = await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false, autostart: true, advanced: true });
 
   // Then only an accepted migration disables and stops presence, without deleting it.
   expect(code).toBe(0);
@@ -449,12 +449,56 @@ const recording = (answers: Record<string, string> = {}): { prompt: Prompter; as
 test("--set values are applied as given and never asked", async () => {
   const { prompt, asked } = recording();
   const d = deps({ prompt, interactive: true });
-  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false, patch: { defaultModel: "x/y", alertsChannel: "1100000000000000300" } })).toBe(0);
+  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false, advanced: true, patch: { defaultModel: "x/y", alertsChannel: "1100000000000000300" } })).toBe(0);
   expect(readJson(d.configPath)).toMatchObject({ defaultModel: "x/y", alertsChannel: "1100000000000000300" });
   expect(asked.some((q) => q.startsWith("Default model") || q.startsWith("alertsChannel"))).toBe(false);
   expect(asked).toContain("State directory [required]");
   expect(log).toContain("SETUP_KEY_SET defaultModel");
   expect(log).toContain("SETUP_KEY_SET alertsChannel");
+});
+
+const everyQuestion = (): { prompt: Prompter; asked: string[] } => {
+  const asked: string[] = [];
+  return {
+    asked,
+    prompt: {
+      ask: async (q, current) => { asked.push(q.split(" (")[0] ?? q); return current; },
+      secret: async (q) => { asked.push(q); return TOKEN; },
+      confirm: async (q, fallback) => { asked.push(q.split("\n")[0] ?? q); return fallback; },
+    },
+  };
+};
+
+test("a first interactive setup asks five questions, records every key as settled, and --advanced asks the rest", async () => {
+  const fresh = everyQuestion();
+  const prompt: Prompter = { ...fresh.prompt, ask: async (q, current) => { const a = await fresh.prompt.ask(q, current); return q.startsWith("Main Discord") ? CHANNEL : a; } };
+  expect(await runSetup(deps({ prompt, interactive: true }), {})).toBe(0);
+  expect(fresh.asked).toEqual([
+    "Discord bot token [required]",
+    "Main Discord channel id(s), comma separated [required]",
+    "Discord owner user id for slash commands [required]",
+    "Start work automatically when a watched GitHub repo gets a new issue?",
+    "Start herdr and the supervisor automatically at boot (systemd user units)?",
+  ]);
+  const seen = JSON.parse(readFileSync(join(state.dir, "home", ".dori", "state", SETUP_KEYS_FILE), "utf8")) as string[];
+  expect(seen).toEqual(DORI_CONFIG_KEYS.map((s) => s.key).sort());
+
+  const advanced = everyQuestion();
+  expect(await runSetup(deps({ prompt: advanced.prompt, interactive: true }), { advanced: true })).toBe(0);
+  for (const q of ["Default model for lanes", "Lead model [optional]", "Working directory of the lead session", "State directory [required]", "GitHub repos to watch", "Edit the other optional keys too?", "Create or reuse the herdr lead pane and lanes workspace?"]) {
+    expect(advanced.asked.some((a) => a.startsWith(q))).toBe(true);
+  }
+});
+
+test("answering yes to issue auto-start asks the logins and repos; no clears the logins", async () => {
+  const d = deps({ interactive: true, prompt: { ...defaults, confirm: async (q, f) => q.startsWith("Start work automatically") ? true : f, ask: async (q, current) => q.startsWith("GitHub accounts") ? "Octo" : q.startsWith("GitHub repos") ? "o/r" : current } });
+  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
+  expect(readJson(d.configPath).githubIssueAuthors).toEqual(["octo"]);
+  expect(new Repos(join(d.home, ".dori", "state")).list()).toEqual(["o/r"]);
+  const off = deps({ interactive: true, prompt: { ...defaults, confirm: async (q, f) => q.startsWith("Start work automatically") ? false : f } });
+  expect(await runSetup(off, { herdr: false })).toBe(0);
+  expect(readJson(d.configPath).githubIssueAuthors).toEqual([]);
+  expect(new Repos(join(d.home, ".dori", "state")).list()).toEqual(["o/r"]);
 });
 
 const backups = (configPath: string): string[] =>
