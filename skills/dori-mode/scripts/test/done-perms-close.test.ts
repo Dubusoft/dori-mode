@@ -81,7 +81,7 @@ test("in a real worktree an untracked file is unpushed work and a gitignored fil
   await git("-C", repo, "push", "-q", "origin", "HEAD");
   mkdirSync(join(repo, "build"));
   writeFileSync(join(repo, "build", "out.js"), "ignored");
-  const base = depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo });
+  const base = depsFor(world, fakeClock(T0), state.dir, { leadCwd: repo });
   const d = { ...base, run, exists: undefined, ops: runnerGitOps(run, base.ops, world) };
   const real: Lane = { ...lane, cwd: repo, worktrees: [repo] };
   expect(await unpushedWork(d, real)).toEqual([]);
@@ -116,7 +116,7 @@ test("a lane whose worktree was removed before the close (someone got there firs
   await at(T0).registry.write(toodoLane);
   const r = await closeLane(at(T0), toodoLane, "manual");
   expect(r.closed).toBe(true);
-  expect(r.lines).toContain(`SIGNAL_CWD demo-lane: lane cwd ${WT} no longer exists; Done signals and git ran in defaultCwd /repo`);
+  expect(r.lines).toContain(`SIGNAL_CWD demo-lane: lane cwd ${WT} no longer exists; Done signals and git ran in leadCwd /repo`);
   expect(removes()).toHaveLength(0);
   const receipt = (await at(T0).registry.read("demo-lane"))?.receipt as { cleanup?: string[] } | undefined;
   expect(receipt?.cleanup).toContain(`worktree ${WT} already removed`);

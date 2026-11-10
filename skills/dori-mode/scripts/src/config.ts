@@ -27,7 +27,7 @@ export type GuardThresholds = {
 
 /** `dori memory check` and the supervisor's daily memory sweep. Read-only: the memory repo is never written. */
 export type MemoryCheckConfig = {
-  /** The lead's omo memory repo (holds system/human.md); blank finds omo's repo for `defaultCwd` under ~/.omo/memory/agents. */
+  /** The lead's omo memory repo (holds system/human.md); blank finds omo's repo for `leadCwd` under ~/.omo/memory/agents. */
   readonly repo: string;
   /** human.md above this many KB (1024 bytes) needs condensing. */
   readonly maxKb: number;
@@ -130,7 +130,8 @@ export type DoriConfig = {
   readonly ignorePanes: readonly string[];
   /** The lead's herdr pane, from dori state (managed-panes.ts) or DORI_LEAD_PANE; the supervisor creates and records it. */
   readonly leadPane: string;
-  readonly defaultCwd: string;
+  /** The lead session's working directory (config key `leadCwd`, formerly `defaultCwd`); local lanes started without --cwd start here too. */
+  readonly leadCwd: string;
   readonly agentCommand: ArgvTemplate;
   readonly defaultModel: string;
   /** Model for the lead only; absent or blank means `defaultModel`. */
@@ -224,7 +225,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   laneWorkspace: "",
   ignorePanes: [],
   leadPane: "",
-  defaultCwd: home,
+  leadCwd: join(home, ".dori", "lead"),
   agentCommand: ["omo", "--model", "{model}", "{prompt}"],
   defaultModel: "anthropic-subscription/claude-opus-5-5",
   leadArgs: [],
@@ -356,7 +357,7 @@ const placement = (raw: unknown): PlacementConfig => {
  * tunable is a built-in constant (BUILT_IN in tunables.ts), so a config written by any dori version loads on any other.
  */
 export const CONFIG_FILE_KEYS = [
-  "discord", "stateDir", "defaultCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
+  "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
   "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes",
 ] as const;
@@ -379,7 +380,11 @@ export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "disc
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
 export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
 
+/** `leadCwd`'s former name: still read while a file has no `leadCwd`, until `dori setup` renames it. */
+export const LEGACY_LEAD_CWD_KEY = "defaultCwd";
+
 let warnedIgnoredKeys = false;
+let warnedLegacyLeadCwd = false;
 let warnedLeadArray = false;
 let warnedPaneKeys = false;
 
@@ -391,8 +396,15 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const loaded = (await file.exists()) ? ((await file.json()) as Record<string, unknown>) : {};
   const paneKeys = legacyPaneKeys(loaded);
   const kept = CONFIG_FILE_KEYS as readonly string[];
-  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key) && key !== CONFIG_SCHEMA_KEY);
+  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key) && key !== CONFIG_SCHEMA_KEY && key !== LEGACY_LEAD_CWD_KEY);
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
+  if (LEGACY_LEAD_CWD_KEY in loaded) {
+    if (!("leadCwd" in loaded)) raw.leadCwd = loaded[LEGACY_LEAD_CWD_KEY];
+    if (!warnedLegacyLeadCwd) {
+      warnedLegacyLeadCwd = true;
+      console.error(`CONFIG_KEY_RENAMED ${LEGACY_LEAD_CWD_KEY} -> leadCwd in ${path}: ${"leadCwd" in loaded ? "leadCwd is set, so defaultCwd is ignored" : "still read as leadCwd for now"}; run dori setup to rename it`);
+    }
+  }
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
@@ -433,7 +445,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     stateDir,
     store: storeOnDisk(stateDir),
-    defaultCwd: expandHome(merged.defaultCwd, home),
+    leadCwd: expandHome(merged.leadCwd, home),
     leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
     laneWorkspace: panes.laneWorkspace,
   };

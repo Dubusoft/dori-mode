@@ -303,7 +303,7 @@ export const splitTunables = (patch: Partial<DoriConfig & Tunables>): { readonly
 
 export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig & Tunables> = {}): FlowDeps & { readonly ops: LaneOps } => {
   const split = splitTunables(patch);
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "lead:p1", store: TEST_STORE, ...split.config };
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, leadCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "lead:p1", store: TEST_STORE, ...split.config };
   const tunables = testTunables(split.tunables);
   // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
   return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, tunables, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),

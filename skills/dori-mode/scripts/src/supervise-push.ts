@@ -177,7 +177,7 @@ export class PushDelivery {
         if (!this.lead.capRefuses("push ladder")) {
           console.log(`LEAD_PUSH_ESCALATE ${config.leadPane} ${reason}`);
           // A safety restart: owner messages outrank the lead's running children, which it names in the log.
-          await this.lead.noteRestart("push-escalate", reason, pane.cwd ?? config.defaultCwd);
+          await this.lead.noteRestart("push-escalate", reason, pane.cwd ?? config.leadCwd);
           this.lead.setRestart({
             session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: this.core.logSize(),
             phase: "stopping", force: true, reason: `it did not take pushed events (${reason}), so the supervisor restarted it`,

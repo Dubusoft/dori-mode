@@ -89,7 +89,7 @@ const fixture = (patch: Patch = {}) => {
   const deps: DoctorDeps = {
     run, http, clock, configPath: "/home/test/config.json", envPath: "/home/test/.dori/env", token: TOKEN, tokenSource: "file", exists: () => true, home: state.dir, platform: "linux", which: () => "/usr/bin/bwrap",
     config: {
-      ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
+      ...defaultConfig("/home/test"), stateDir: state.dir, leadCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
       memoryCheck: { ...defaultConfig("/home/test").memoryCheck, repo: join(state.dir, "memory") },
       discordChannels: ["500"], discord: { applicationId: "100", guildId: "200", ownerId: "300" },
     },
@@ -286,7 +286,7 @@ test("missing WorkingDirectory, missing dirs, missing config keys and a missing 
   const dirs = fixture({ deps: { exists: (p) => p === "/work" } });
   const c = await runDoctor(dirs.deps);
   expect(find(c, "stateDir")).toMatchObject({ level: "FAIL" });
-  expect(find(c, "defaultCwd").fix).toStartWith("mkdir -p ");
+  expect(find(c, "leadCwd").fix).toStartWith("mkdir -p ");
   const keys = fixture({ deps: { config: { ...fixture().deps.config, laneWorkspace: "", discordChannels: [], discord: { applicationId: "x", guildId: "200", ownerId: "300" } } } });
   const kc = await runDoctor(keys.deps);
   const k = find(kc, "config");
@@ -386,15 +386,15 @@ test("tokenFrom reads the env file forms and gatewayView ages with the injected 
   expect(gatewayView(s, 1000 + 61_000).state).toBe("stale");
 });
 
-test("memory check: omo's repo for defaultCwd, WARN over maxKb or when nothing is found", async () => {
+test("memory check: omo's repo for leadCwd, WARN over maxKb or when nothing is found", async () => {
   const f = fixture();
   const real = { ...f.deps, exists: existsSync };
   expect(find(await runDoctor(real), "memory check").level).toBe("OK");
   const discovered = { ...real, config: { ...real.config, memoryCheck: { ...real.config.memoryCheck, repo: "" } } };
   const missing = find(await runDoctor(discovered), "memory check");
   expect(missing.level).toBe("WARN");
-  expect(missing.fix).toContain("defaultCwd");
-  const agent = join(f.deps.home, ".omo", "memory", "agents", `lead-${createHash("sha256").update(f.deps.config.defaultCwd).digest("hex").slice(0, 8)}`, "repo", "system");
+  expect(missing.fix).toContain("leadCwd");
+  const agent = join(f.deps.home, ".omo", "memory", "agents", `lead-${createHash("sha256").update(f.deps.config.leadCwd).digest("hex").slice(0, 8)}`, "repo", "system");
   mkdirSync(agent, { recursive: true });
   writeFileSync(join(agent, "human.md"), "x".repeat(16 * 1024));
   const over = find(await runDoctor(discovered), "memory check");

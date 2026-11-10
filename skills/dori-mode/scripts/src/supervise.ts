@@ -175,7 +175,7 @@ export class Supervisor {
   }
 
   /**
-   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at defaultCwd.
+   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at leadCwd.
    * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
    * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
    */

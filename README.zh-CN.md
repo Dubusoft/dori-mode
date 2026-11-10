@@ -58,7 +58,7 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 
 | 字段 | 含义 |
 |---|---|
-| `defaultCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
+| `leadCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
 | `agentCommand` | 启动智能体的命令，写成含 `{model}` 和 `{prompt}` 的 argv 列表 |
 | `hooks.threadReply` | 你的消息 CLI,写成含 `{thread}` 和 `{text}` 的 argv 列表，用来发布 lane 进度 |
 

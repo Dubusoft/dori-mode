@@ -102,7 +102,7 @@ test("remote --workspace launch resolves the shell pane from that machine's inve
   expect(startInput()).toMatchObject({ target: { pane: "w:p3" } });
 });
 
-test("a plain remote launch without --cwd names no directory (the runner's defaultCwd), never the lead's defaultCwd", async () => {
+test("a plain remote launch without --cwd names no directory (the runner's defaultCwd), never the lead's leadCwd", async () => {
   const d = deps();
   await Bun.write(lane().brief, "work\n");
   world.startResult = { pane: "w:p7", tab: "w:t7", startup: { verdict: "ok", detail: "" } };
@@ -113,7 +113,7 @@ test("a plain remote launch without --cwd names no directory (the runner's defau
   expect(bare.lane.remoteCwd).toBeUndefined();
 });
 
-test("plain remote launch never sends the lead's workspace or defaultCwd", async () => {
+test("plain remote launch never sends the lead's workspace or leadCwd", async () => {
   const d = deps();
   const config = { ...d.config, laneWorkspace: "local-only-workspace" };
   await Bun.write(lane().brief, "work\n");
@@ -177,7 +177,7 @@ test("remote footer reports through the runner's lane CLI; local footer through 
   }
 });
 
-test("close runs a remote lane's command signals in the local defaultCwd, also for entries that stored the remote path", async () => {
+test("close runs a remote lane's command signals in the local leadCwd, also for entries that stored the remote path", async () => {
   for (const entry of [lane({ cwd: undefined, remoteCwd: "D:\\dev\\app" }), lane({ cwd: "D:\\dev\\app" })]) {
     world.ops = [];
     const d = deps();
@@ -185,7 +185,7 @@ test("close runs a remote lane's command signals in the local defaultCwd, also f
     const result = await closeLane(d, { ...entry, done: 'command ["gh","pr","list"] stdout~"MERGED"' }, "verified");
     expect(result.closed).toBe(true);
     const asked = opsOf("inspect").map((e) => (e.args as { want: Record<string, unknown> }).want).filter((want) => want.done !== undefined);
-    expect(asked).toEqual([{ done: 'command ["gh","pr","list"] stdout~"MERGED"', doneCwd: d.config.defaultCwd }]);
+    expect(asked).toEqual([{ done: 'command ["gh","pr","list"] stdout~"MERGED"', doneCwd: d.config.leadCwd }]);
   }
 });
 

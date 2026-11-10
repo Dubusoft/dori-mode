@@ -68,7 +68,7 @@ export class Delivery {
       if (request) {
         const pane = await readPane();
         if (!pane) throw new TransientSuperviseError(`lead pane ${this.deps.config.leadPane} does not exist`);
-        const cwd = pane.cwd ?? this.deps.config.defaultCwd;
+        const cwd = pane.cwd ?? this.deps.config.leadCwd;
         const models = request.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ");
         if ((!pane.agent || pane.agent_status === "idle" || pane.agent_status === "done") &&
             !(pane.agent && await this.lead.deferForChildren(cwd, "request", `${request.id} ${models}`))) {
@@ -110,7 +110,7 @@ export class Delivery {
         this.outcomes.markDelivered();
         continue;
       }
-      const cwd = pane.cwd ?? this.deps.config.defaultCwd;
+      const cwd = pane.cwd ?? this.deps.config.leadCwd;
       // A LEAD_UNRESPONSIVE alone says the restart cap holds: it must not cold-start the lead the cap spares.
       const capped = pending.every((event) => event.line.startsWith("LEAD_UNRESPONSIVE "));
       const cold = pane.agent ? (capped ? undefined : await this.lead.coldReason(cwd)) : { kind: "no-agent", detail: `no agent runs in lead pane ${pane.pane_id}`, tokens: 0 };

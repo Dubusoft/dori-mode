@@ -112,7 +112,7 @@ export const configReloadError = (c: DoriConfig): string | undefined => {
     if (!strings(c[key])) return `${key} must be an array of strings`;
   }
   if (!strings(c.agentCommand) || c.agentCommand.length === 0) return "agentCommand must be a non-empty array of strings";
-  for (const key of ["defaultModel", "defaultCwd", "worktreeRoot", "ciMergeBase"] as const) {
+  for (const key of ["defaultModel", "leadCwd", "worktreeRoot", "ciMergeBase"] as const) {
     if (typeof c[key] !== "string") return `${key} must be a string`;
   }
   if (!c.defaultModel.trim()) return "defaultModel must not be empty";

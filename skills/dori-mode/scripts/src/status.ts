@@ -306,7 +306,7 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
     const found = (await listPanes(d.run)).find((p) => p.pane_id === pane);
     if (!found) return { pane, state: "missing", note: "pane not found in herdr" };
     if (!found.agent) return { pane, state: "cold", note: "no agent running in the lead pane" };
-    const cwd = found.cwd ?? d.config.defaultCwd;
+    const cwd = found.cwd ?? d.config.leadCwd;
     const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.tunables.sessionsDir });
     if (!hit.id) return { pane, state: "unknown", note: "cannot resolve the lead session" };
     const dir = sessionDirFor(d.tunables.sessionsDir, cwd);

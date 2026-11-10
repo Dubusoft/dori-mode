@@ -165,7 +165,7 @@ test("non-interactive setup writes env 600, config with herdr ids and units, nev
   expect(envGet(readFileSync(d.envPath, "utf8"), "DORI_DISCORD_TOKEN")).toBe(TOKEN);
   const cfg = readJson(d.configPath);
   expect(cfg).not.toHaveProperty("custom");
-  expect(cfg).toMatchObject({ hooks: { threadReply: ["notify", "{text}"] }, discordChannels: [CHANNEL], defaultCwd: "~/code", stateDir: "~/.dori/state", ignorePanes: ["w2:p1"] });
+  expect(cfg).toMatchObject({ hooks: { threadReply: ["notify", "{text}"] }, discordChannels: [CHANNEL], leadCwd: "~/code", stateDir: "~/.dori/state", ignorePanes: ["w2:p1"] });
   expect(cfg).not.toHaveProperty("leadPane");
   expect(cfg).not.toHaveProperty("laneWorkspace");
   expect(readManagedPanes(join(d.home, ".dori", "state"))).toEqual({ leadPane: "w1:p2", laneWorkspace: "w2", migrated: true });
@@ -210,7 +210,7 @@ test("a leadModel fallback chain in the config is kept by setup and never asked 
   expect(asked.some((q) => q.startsWith("Lead model"))).toBe(false);
 });
 
-test("a missing defaultCwd, stateDir and unit dir are created, the rendered files hold no host path, and a rerun creates nothing", async () => {
+test("a missing leadCwd, stateDir and unit dir are created, the rendered files hold no host path, and a rerun creates nothing", async () => {
   const d = deps();
   const cwd = join(state.dir, "home", "work", "deep");
   const stateDir = join(state.dir, "home", "st");
@@ -568,7 +568,7 @@ test("a pre-v2 config without worktreeRoot gets its old default written; a set v
 
 test("a current config that needs no change is neither written nor backed up", async () => {
   const d = deps();
-  const text = `${JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~", stateDir: "~/.dori/state" }, null, 2)}\n`;
+  const text = `${JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", leadCwd: "~", stateDir: "~/.dori/state" }, null, 2)}\n`;
   await Bun.write(d.configPath, text);
   expect(await runSetup(d, { migrate: true })).toBe(0);
   expect(readFileSync(d.configPath, "utf8")).toBe(text);
@@ -588,7 +588,7 @@ test("legacy pane keys are migrated into state before they are removed from the 
 test("migrate prunes, asks only keys never shown before, records them, and touches neither Discord nor herdr", async () => {
   const d = deps();
   const stateDir = join(d.home, ".dori", "state");
-  await Bun.write(d.configPath, JSON.stringify({ discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~", stateDir: "~/.dori/state", memoryCheck: true }));
+  await Bun.write(d.configPath, JSON.stringify({ discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", leadCwd: "~", stateDir: "~/.dori/state", memoryCheck: true }));
   const seen = DORI_CONFIG_KEYS.map((s) => s.key).filter((k) => k !== "ownerLanguage" && k !== "ciMergeBase");
   await Bun.write(join(stateDir, SETUP_KEYS_FILE), JSON.stringify(seen));
   const { prompt, asked } = recording({ ownerLanguage: "Korean" });
@@ -603,6 +603,32 @@ test("migrate prunes, asks only keys never shown before, records them, and touch
   expect(requests).toEqual([]);
   expect(herdr.calls).toEqual([]);
   expect(log.at(-1)).toBe("SETUP_MIGRATE_DONE");
+});
+
+test("the lead directory defaults to ~/.dori/lead, which setup creates; a legacy defaultCwd keeps its value as leadCwd", async () => {
+  const fresh = deps();
+  expect(await runSetup(fresh, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
+  expect(readJson(fresh.configPath).leadCwd).toBe("~/.dori/lead");
+  expect(existsSync(join(fresh.home, ".dori", "lead"))).toBe(true);
+
+  for (const input of [{ token: TOKEN, channels: [CHANNEL], herdr: false }, { migrate: true }]) {
+    const d = deps();
+    log = [];
+    await Bun.write(d.configPath, JSON.stringify({ discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~/work", stateDir: "~/.dori/state" }));
+    expect(await runSetup(d, input)).toBe(0);
+    const cfg = readJson(d.configPath);
+    expect(cfg.leadCwd).toBe("~/work");
+    expect(cfg).not.toHaveProperty("defaultCwd");
+    expect(log).toContain("SETUP_KEY_RENAMED defaultCwd -> leadCwd");
+  }
+
+  // An existing file from before the new default, with neither key, keeps the home directory it ran the lead in.
+  for (const input of [{ token: TOKEN, channels: [CHANNEL], herdr: false }, { migrate: true }]) {
+    const d = deps();
+    await Bun.write(d.configPath, JSON.stringify({ discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", stateDir: "~/.dori/state" }));
+    expect(await runSetup(d, input)).toBe(0);
+    expect(readJson(d.configPath)).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, leadCwd: "~" });
+  }
 });
 
 test("migrate without a config creates nothing", async () => {

@@ -85,7 +85,7 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
     if (typeof keywords !== "string" || !keywords.startsWith("/mass-ulw") || keywords.includes("?") || input.brief.includes("?")) throw new LaunchError("massLaunchKeywords must start with /mass-ulw and the prompt (keywords and brief path) must contain no '?'");
   }
   const unbindable = sandboxedCwdInDoriHome(deps, input);
-  if (unbindable) throw new LaunchError(`--cwd ${input.cwd} is inside ${unbindable}, which the lane sandbox cannot bind; put the worktree outside it (e.g. under ${dirname(deps.config.defaultCwd)})`);
+  if (unbindable) throw new LaunchError(`--cwd ${input.cwd} is inside ${unbindable}, which the lane sandbox cannot bind; put the worktree outside it (e.g. under ${dirname(deps.config.leadCwd)})`);
   const sharing = await threadSharers(deps, input);
   if (sharing.length && !input.shareThread) throw new LaunchError(`thread ${input.thread} already has open lane ${sharing.join(", ")}; one thread per lane, or pass --share-thread`);
 };
@@ -135,7 +135,7 @@ export const validatePlacement = async (deps: FlowDeps, input: LaunchInput, cwd:
   if (!top) return;
   for (const other of await deps.registry.open()) {
     if (other.key === input.key || other.machine) continue;
-    const dir = other.cwd ?? deps.config.defaultCwd;
+    const dir = other.cwd ?? deps.config.leadCwd;
     if (dir === cwd || (await gitOf(deps, other.key, dir)).top === top) throw new LaunchError(`${cwd} is the checkout open lane ${other.key} works in (${top}); give this lane its own worktree with --cwd`);
   }
   const want = doneRepos(input.done);
@@ -293,8 +293,8 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
 ].join("\n");
 
 /** Where a lane's directory lives: a remote path is kept apart from the local cwd that signals and git checks use. */
-const laneDirs = (machine: string | undefined, dir: string | undefined, defaultCwd: string): Pick<Lane, "cwd" | "remoteCwd"> =>
-  machine ? (dir ? { remoteCwd: dir } : {}) : { cwd: dir ?? defaultCwd };
+const laneDirs = (machine: string | undefined, dir: string | undefined, leadCwd: string): Pick<Lane, "cwd" | "remoteCwd"> =>
+  machine ? (dir ? { remoteCwd: dir } : {}) : { cwd: dir ?? leadCwd };
 
 /** The hint for a pane id this host's herdr does not list: lanes without --machine are local lanes. */
 const REMOTE_PANE_HINT = "a pane on another machine needs --machine LABEL";
@@ -311,7 +311,7 @@ export const adoptLane = async (deps: FlowDeps, input: LaunchInput & { readonly 
   const draft: Lane = {
     key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), pane: input.pane, ...(input.machine ? { machine: input.machine } : {}),
     runner: machineRunner(input.machine), runnerAdoptedAt: deps.clock.now(), brief: input.brief, done: input.done, ...(await autoCloseOf(input.brief)),
-    ...laneDirs(input.machine, input.cwd, deps.config.defaultCwd), openedAt: iso(deps.clock),
+    ...laneDirs(input.machine, input.cwd, deps.config.leadCwd), openedAt: iso(deps.clock),
   };
   const token = randomUUID();
   const reserved = await reserveLane(deps, input, draft, token);
@@ -342,7 +342,7 @@ const reserveLane = async (deps: FlowDeps, input: LaunchInput, lane: Lane, token
   const release = await acquireStateLock(join(deps.registry.dir, "launch.lock.sqlite"));
   try {
     await validateLaunch(deps, input);
-    await validatePlacement(deps, input, lane.cwd ?? deps.config.defaultCwd);
+    await validatePlacement(deps, input, lane.cwd ?? deps.config.leadCwd);
     const shared = await threadSharers(deps, input);
     const draft: SharedThreadLane = { ...lane, ...(shared.length ? { threadSharedWith: shared } : {}) };
     await deps.registry.update(input.key, (current) => {
@@ -399,7 +399,7 @@ const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<Ta
  */
 export const laneTabWorkspace = async (deps: Pick<FlowDeps, "run" | "config">, log: (line: string) => void): Promise<string> => {
   try {
-    return await ensureLaneWorkspace(deps.run, deps.config.stateDir, deps.config.defaultCwd, log);
+    return await ensureLaneWorkspace(deps.run, deps.config.stateDir, deps.config.leadCwd, log);
   } catch (error) {
     if (error instanceof ManagedPanesError) throw new LaunchError(`no lanes workspace: ${error.message}`);
     throw error;
@@ -477,9 +477,9 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const notes = [...prepared.notes, ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
   const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
   const dir = input.cwd ?? target?.cwd;
-  // The lead's defaultCwd means nothing on another machine: without --cwd the start names none and that machine's
+  // The lead's leadCwd (a local directory) means nothing on another machine: without --cwd the start names none and that machine's
   // runner uses its runner-config defaultCwd (else its home), reporting the directory back in the result.
-  const cwd = dir ?? (input.machine ? undefined : deps.config.defaultCwd);
+  const cwd = dir ?? (input.machine ? undefined : deps.config.leadCwd);
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
   let draft: SharedThreadLane = {
@@ -488,7 +488,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     brief: input.brief, done: input.done, autoClose: prepared.autoClose, ghIssue: prepared.ghIssue,
     ...(!existing ? { fileRun: prepared.files.run } : {}),
     reportVia: "cli" as const, // every lane reports through its runner; an old-footer lane moves onto dori report when recovery relaunches it
-    ...laneDirs(input.machine, dir, deps.config.defaultCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
+    ...laneDirs(input.machine, dir, deps.config.leadCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
   };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);

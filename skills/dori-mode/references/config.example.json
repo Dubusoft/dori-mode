@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "stateDir": "~/.dori/state",
   "ignorePanes": [],
-  "defaultCwd": "~/code/my-project",
+  "leadCwd": "~/code/my-project",
   "agentCommand": [
     "omo",
     "--model",

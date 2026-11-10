@@ -58,7 +58,7 @@ Dori はあなたの話し方に合わせます。短く、くだけた調子で
 
 | 項目 | 意味 |
 |---|---|
-| `defaultCwd` | レーンが始まるディレクトリで、レーンが worktree を作るリポジトリ |
+| `leadCwd` | レーンが始まるディレクトリで、レーンが worktree を作るリポジトリ |
 | `agentCommand` | エージェントの起動コマンド。`{model}` と `{prompt}` を含む argv のリスト |
 | `hooks.threadReply` | メッセンジャー CLI を `{thread}` と `{text}` を含む argv のリストで。レーンの進捗投稿に使います。 |
 

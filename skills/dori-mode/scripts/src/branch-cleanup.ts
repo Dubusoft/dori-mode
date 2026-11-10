@@ -140,7 +140,7 @@ export type BranchPlanOptions = {
    * to a merged PR and its HEAD is exactly the merged head. The caller passes linked worktrees only.
    */
   readonly candidates?: readonly WorktreeFact[];
-  /** Checkouts on the lane's host, in order of preference, where a branch delete may run (defaultCwd, the lane's cwd). */
+  /** Checkouts on the lane's host, in order of preference, where a branch delete may run (leadCwd, the lane's cwd). */
   readonly roots?: readonly string[];
 };
 

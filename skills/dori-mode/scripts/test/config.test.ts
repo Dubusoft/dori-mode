@@ -13,8 +13,18 @@ afterEach(() => {
 test("the shipped example config loads, with ~ paths expanded and unset fields defaulted", async () => {
   const c = await loadConfig(join(import.meta.dir, "../../references/config.example.json"), "/home/ana");
   expect(c.stateDir).toBe("/home/ana/.dori/state");
-  expect(c.defaultCwd).toBe("/home/ana/code/my-project");
+  expect(c.leadCwd).toBe("/home/ana/code/my-project");
   expect(c.guard.diskFreeMinGb).toBe(50);
+});
+
+test("leadCwd defaults to ~/.dori/lead; the legacy defaultCwd is read only while leadCwd is absent", async () => {
+  const path = join(state.dir, "lead-cwd.json");
+  await Bun.write(path, JSON.stringify({}));
+  expect((await loadConfig(path, "/home/ana")).leadCwd).toBe("/home/ana/.dori/lead");
+  await Bun.write(path, JSON.stringify({ defaultCwd: "~/old" }));
+  expect((await loadConfig(path, "/home/ana")).leadCwd).toBe("/home/ana/old");
+  await Bun.write(path, JSON.stringify({ defaultCwd: "~/old", leadCwd: "/srv/lead" }));
+  expect((await loadConfig(path, "/home/ana")).leadCwd).toBe("/srv/lead");
 });
 
 test("leadDiet is built in: a leadDiet key in the file is ignored", async () => {
