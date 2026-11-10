@@ -116,6 +116,22 @@ test("the boot-prep script is refreshed before the restart, its line logged and 
   expect(calls.indexOf("boot")).toBeLessThan(calls.indexOf("systemctl --user restart dori-supervisor.service"));
 });
 
+test("config.json is migrated once on UP_TO_DATE, before the restart on UPDATED, and a throw kept as a WARN", async () => {
+  const migrate = (migrateConfig: () => Promise<number>, branch: "main" | "dev") =>
+    updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), migrateConfig }, { packageDir: pkg, branch, force: false });
+  let n = 0;
+  expect(await migrate(async () => { n++; return 2; }, "dev")).toBe(0);
+  expect(n).toBe(1);
+  await commit(origin, "notes.txt", "two\n");
+  expect(await migrate(async () => { calls.push("migrate"); return 0; }, "main")).toBe(0);
+  expect(calls.filter((c) => c === "migrate")).toHaveLength(1);
+  expect(calls.indexOf("migrate")).toBeLessThan(calls.indexOf("systemctl --user restart dori-supervisor.service"));
+  await commit(origin, "notes.txt", "three\n");
+  expect(await migrate(async () => { throw new Error("boom"); }, "main")).toBe(0);
+  expect(lines).toContain("WARN config migrate: boom");
+  expect(lines.at(-1)).toMatch(/^UPDATED main /);
+});
+
 test("workers are migrated only after the restarted supervisor is active", async () => {
   await commit(origin, "notes.txt", "two\n");
   expect(await updateWith(async () => { calls.push("migrate"); return 0; }, "main")).toBe(0);

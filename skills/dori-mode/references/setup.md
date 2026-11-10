@@ -52,11 +52,43 @@ The installer clones the repo, links the skill, runs `bun link` (puts `dori` on 
 5. **Autostart (optional, Linux)**: renders only `herdr-server.service` and `dori-supervisor.service` from `scripts/templates` (there is no runner unit on the lead host: the supervisor spawns the local runner as its child) into `~/.config/systemd/user`, plus `~/.dori/dori-boot-prep.sh` (the supervisor's ExecStartPre: it waits for the herdr server; the supervisor then finds or recreates the lead pane and lanes workspace). Then, asking before each: `loginctl enable-linger`, `systemctl --user daemon-reload`, and `systemctl --user enable herdr-server.service dori-supervisor.service`. Before enabling, setup checks systemd for an existing `dori-presence.service` and asks to run `systemctl --user disable --now dori-presence.service`. Accepting stops and disables it without deleting its file; declining leaves it untouched. Stop the legacy presence process before starting the supervisor. Start the new units with `systemctl --user start herdr-server.service dori-supervisor.service`; if herdr already runs by hand, setup instead prints a supervisor-only start command to avoid a socket conflict.
    The supervisor unit uses the systemd watchdog (`Type=notify`, `WatchdogSec=300`) and both units stop after 5 starts in 600 s, then run `dori-failure-notify@.service`, which posts one Discord line with the fix (`systemctl --user reset-failed <unit> && systemctl --user start <unit>`). Rerun autostart and `daemon-reload` on older installs to get them.
 
-The config is written atomically (mode 600) and every key setup does not manage, such as `hooks`, stays as it is. Add the hooks and anything else by hand; `references/scripts.md` explains every field and `config.example.json` shows them all.
+The config is written atomically (mode 600). `references/scripts.md` explains every field and `config.example.json` shows them all.
+
+### Config keys: by argument or interactively
+
+`dori setup` and `dori runner setup` (a runner's `runner-config.json`) work the same way:
+
+- **By argument.** `--set key=value` and `--unset key` (both repeatable) are applied exactly as given and never asked. An empty value unsets. A list takes `a,b` or a JSON array, a JSON key takes JSON. An unknown key or a bad value stops the run before anything is written (`SETUP_FAILED` / exit 1, listing the valid keys).
+- **Interactively.** Every other key is asked with its `[required]` or `[optional]` label and its current value; Enter keeps it and `-` clears an optional key. Required keys and keys never shown before come first, then setup offers the other optional keys. Without a terminal or with `--yes` nothing is asked.
+- **Seen keys.** Each key shown or given is recorded in `<stateDir>/setup-keys.json` (runners: `<stateDir>/runner-setup-keys/<label|local>.json`). A later run in "new" mode (`dori setup --migrate`, `dori runner setup --new`) asks only keys never shown before, such as keys a `dori update` added, plus required keys that are empty.
+- **Automatic removal.** Keys the file no longer reads are deleted: unknown top-level keys, `hooks.*` other than `threadReply`/`transcribe`, `laneSandbox.default`, the old `runners` keys (`listen`, `mode`, `restartCircuit`, or a `runners` array), and in `runner-config.json` unknown keys and `guard.*` subkeys. Legacy pane keys are moved into `<stateDir>` first. The previous file is copied to `config.json.bak` / `runner-config.json.bak` before the write, and each removal is logged (`SETUP_KEY_REMOVED <key>`, `RUNNER_SETUP_KEY_REMOVED <key>`).
+- **Missing required keys** log `SETUP_KEY_MISSING <key> [required]` (`RUNNER_SETUP_KEY_MISSING`) and exit 2.
+
+`config.json` keys:
+
+| Key | Label |
+|---|---|
+| `discord`, `stateDir`, `defaultCwd`, `defaultModel`, `discordChannels` | [required] |
+| `worktreeRoot`, `agentCommand`, `leadModel`, `leadThinking`, `leadArgs`, `alertsChannel`, `githubIssueAuthors`, `ownerLanguage`, `laneRules`, `laneSandbox`, `guardMachines`, `runners`, `placement`, `buttonHooks`, `hooks`, `ciMergeBase`, `ignorePanes` | [optional] |
+
+`runner-config.json` keys:
+
+| Key | Label |
+|---|---|
+| `agents`, `allowedRoots` | [required] |
+| `defaultCwd`, `sandbox` (`required`\|`optional`), `jobs` (`allow`\|`deny`), `guard`, `heavyKill`, `sandboxCheck`, `workspaces`, `detectWorkspaces`, `reposRoot`, `worktreeRoot` | [optional] |
+
+A `runner-config.json` that would not pass the runner's policy check is never written (`RUNNER_SETUP_FAILED invalid runner-config: ...`). The running runner reloads the file itself; no restart.
+
+What runs it for you:
+
+- `dori runner install` runs runner setup on the new runner afterwards (it takes `--set`, `--unset` and `--yes`).
+- `dori update` runs `dori setup --migrate`: prune (with `.bak`) and ask only new keys. With no `config.json` it prints `SETUP_MIGRATE_SKIPPED` and creates nothing.
+- `dori runner upgrade` (and so `dori update`'s rollout) runs `dori runner setup --new` for every upgraded runner.
 
 Figma MCP: set the figma server to `"exposure": "search"` in the global `~/.omo/agent/mcp.json`. Its tools then cost no prompt tokens until a lane activates them with `tool_search`. `dori launch` writes no `.omo/mcp.json` into lane folders and removes one that is exactly the old figma-off file.
 
-Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --channel ID [--model M] [--cwd DIR] [--state-dir DIR] [--no-herdr] [--autostart]`. Flags win, then stored values, then defaults. A channel the bot cannot read stops the run before anything is written. `--autostart` with `--yes` accepts every system step, including disabling and stopping a detected legacy presence unit. Failed system steps are reported and return exit code 2; a failed legacy-unit check stops autostart before enabling the new units.
+Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --channel ID [--model M] [--cwd DIR] [--state-dir DIR] [--set key=value ...] [--unset key ...] [--no-herdr] [--autostart]`. Flags win, then stored values, then defaults. A channel the bot cannot read stops the run before anything is written. `--autostart` with `--yes` accepts every system step, including disabling and stopping a detected legacy presence unit. Failed system steps are reported and return exit code 2; a failed legacy-unit check stops autostart before enabling the new units.
 
 ## 5. Monitors
 

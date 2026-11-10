@@ -17,6 +17,12 @@ export type UpdateDeps = {
    * and never changes the exit code.
    */
   readonly upgradeRunners?: () => Promise<number>;
+  /**
+   * Migrates config.json (`dori setup --migrate`): removes keys it no longer reads and asks only keys never shown before.
+   * Runs on UP_TO_DATE and, before the supervisor restart, on UPDATED. Like `upgradeRunners` it must run in a fresh process
+   * from the updated checkout. Returns its exit code; a failure is logged by the callee and never changes the exit code.
+   */
+  readonly migrateConfig?: () => Promise<number>;
   /** Installs the template over an outdated lane sandbox (lane-sandbox-install.ts); returns the line to log, if any. */
   readonly refreshLaneSandbox?: () => string | undefined;
   /** Installs the template over an outdated supervisor boot-prep script (boot-prep-install.ts); returns the line to log, if any. */
@@ -54,6 +60,10 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
   const upgradeRunners = async (): Promise<void> => {
     if (!d.upgradeRunners) return;
     try { await d.upgradeRunners(); } catch (e) { d.log(`WARN runners: ${e instanceof Error ? e.message : String(e)}`); }
+  };
+  const migrateConfig = async (): Promise<void> => {
+    if (!d.migrateConfig) return;
+    try { await d.migrateConfig(); } catch (e) { d.log(`WARN config migrate: ${e instanceof Error ? e.message : String(e)}`); }
   };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);
@@ -102,11 +112,13 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       d.log(`UP_TO_DATE ${o.branch} ${short(now)}`);
       refreshSandbox();
       refreshBootPrep();
+      await migrateConfig();
       await upgradeRunners();
       return 0;
     }
     refreshSandbox();
     refreshBootPrep();
+    await migrateConfig();
     const restart = await d.run(["systemctl", "--user", "restart", SUPERVISOR_UNIT], { timeoutMs: 120_000 });
     if (restart.code !== 0) d.log(`WARN systemctl restart ${SUPERVISOR_UNIT}: ${(restart.err || restart.out).split("\n")[0]}`);
     let state = "unknown";

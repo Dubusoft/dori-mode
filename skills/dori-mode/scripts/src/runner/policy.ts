@@ -49,7 +49,12 @@ export const effectiveWorktreeRoot = (policy: Pick<RunnerPolicy, "reposRoot" | "
 /** owner/repo as GitHub spells it. */
 export const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
-const GUARD_KEYS = ["loadAlert", "loadOk", "memFreeMinPct", "memFreeCritPct", "swapFreeCritPct", "diskFreeMinGb", "panesMax"] as const;
+/** The top-level keys runner-config.json may hold; parsePolicy throws on any other. */
+export const RUNNER_POLICY_KEYS = [
+  "agents", "allowedRoots", "defaultCwd", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot",
+] as const;
+
+export const GUARD_KEYS = ["loadAlert", "loadOk", "memFreeMinPct", "memFreeCritPct", "swapFreeCritPct", "diskFreeMinGb", "panesMax"] as const;
 type GuardKey = (typeof GUARD_KEYS)[number];
 
 export const DEFAULT_POLICY: RunnerPolicy = { agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow" };
@@ -71,7 +76,7 @@ const expandHome = (path: string, home: string): string => (path === "~" ? home 
 /** Reads a policy from parsed JSON (`home` expands a leading `~` in `defaultCwd`); unknown keys or wrong types throw. */
 export function parsePolicy(value: unknown, home: string = homedir()): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
-  const known = new Set(["agents", "allowedRoots", "defaultCwd", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot"]);
+  const known = new Set<string>(RUNNER_POLICY_KEYS);
   for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
   const agents: Record<string, readonly string[]> = {};

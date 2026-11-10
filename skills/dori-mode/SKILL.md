@@ -118,8 +118,9 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 | `dori sync [--write]` | rebuild the registry from live panes, report drift |
 | `dori claim-done` / `dori object-done` / `dori close` | the done flow |
 | `dori pause` / `dori resume` | the owner said wait: no nudges, goal paused, running turn stopped; and back |
+| `dori setup` / `dori runner setup` | set config keys by `--set`/`--unset` or ask them (`[required]`/`[optional]`), remove keys the file no longer reads (old file kept as `.bak`); `dori runner install` runs runner setup after installing |
 | `dori doctor` / `dori status [--json]` | read-only: health check with the exact fix for each problem; one-screen state (services, lead, lanes, waits, repos, gateway), also Discord `/status` |
-| `dori update [--dev] [--force]` | fast-forward this install to `origin/main` (`--dev`: `origin/dev`), keep local changes, re-resolve pi-quota to its newest commit, restart the supervisor when either moved, remove leftover guard agent files from worker machines, replace an outdated `~/.local/bin/lane-sandbox`, an outdated supervisor boot-prep script (the unit's `ExecStartPre`, old copy kept as `.bak`) |
+| `dori update [--dev] [--force]` | fast-forward this install to `origin/main` (`--dev`: `origin/dev`), keep local changes, re-resolve pi-quota to its newest commit, restart the supervisor when either moved, remove leftover guard agent files from worker machines, replace an outdated `~/.local/bin/lane-sandbox`, run `dori setup --migrate` (and runner setup `--new` on upgraded runners), an outdated supervisor boot-prep script (the unit's `ExecStartPre`, old copy kept as `.bak`) |
 | `dori supervise` | supervised mode: owns Discord presence, slash commands, inbound and the sweeps; feeds the lead through `lead-events.log` |
 | `dori watch` | the 5-minute auto-close watcher (run it as a persistent monitor) |
 | `dori freshness` | raise urgent `NO-PROGRESS` once per silence for a working lane silent `nudgeAfterMin`, nudge idle silent lanes (urgent `IDLE-ESCALATE` when one stays silent `idleEscalateMin` after its nudge), post last reports |
