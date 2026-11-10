@@ -350,6 +350,29 @@ test("a merge that brings something new still wakes the lead: before the claim, 
     [["ci-merged:acme/app#8", "CI_MERGED acme/app#8 into dev lane=alpha head=fed merge=cba https://x/8"]]])).map((step) => step.pointers)).toEqual([1, 0, 1]);
 });
 
+test("a cold lead's prompt names SKILL.md and human.md by absolute path, or says human.md could not be resolved", async () => {
+  const home = withState();
+  cleanups.push(home.done);
+  const repo = join(home.dir, "memory");
+  const before = process.env.HOME;
+  // An empty home has no omo memory repo for the lead's cwd.
+  process.env.HOME = home.dir;
+  cleanups.push(() => { process.env.HOME = before; });
+  for (const [memoryCheck, memory] of [
+    [{ repo, maxKb: 15 }, `then your memory file ${join(repo, "system", "human.md")} in full`],
+    [{ repo: "", maxKb: 15 }, `its path could not be resolved (memoryCheck.repo is unset and no omo memory repo exists for /repo under ${join(home.dir, ".omo", "memory", "agents")})`],
+  ] as const) {
+    const f = fixture({ memoryCheck });
+    f.cold();
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("cold", "INBOUND cold");
+    await supervisor.flush();
+    const first = (f.prompt() ?? "").split("\n")[0] ?? "";
+    expect(first).toContain(`read ${LEAD_SKILL} in full`);
+    expect(first).toContain(memory);
+  }
+});
+
 test("an unseen newly idle agent reported as done is positive startup evidence", async () => {
   const f = fixture();
   f.cold();

@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,7 @@ import { herdrDownSince } from "./runner/herdr-down.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
+import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import type { Durability } from "./store.ts";
 import { type AwaitingAck, type Event, type Journal, type JournalCore, type OutboxItem, type Restart, SuperviseError, TransientSuperviseError } from "./supervise-journal.ts";
 import { COLD_START_EMOJI, HUNG_EMOJI, latest, OWNER_INBOUND, OWNER_REVISION, type OwnerTracking, type SupervisorHooks } from "./supervise-owner-tracking.ts";
@@ -561,13 +563,18 @@ export class LeadLifecycle {
     const take = "Run dori inbox take now and handle everything it prints; while its output ends with INBOX_MORE, run it again after handling the printed part. It is the only list of your events: this prompt carries none. Act on each event id once: an event may also reach your monitor.";
     const carried = "Besides the events, dori inbox take prints reminder lines: unfinished:<eventId> for an owner message the previous lead took but did not handle, launch-queue:<session> for held launches, and unreported:<key> and unresolved:<eventId> for open obligations; handle each.";
     const transport = "Events reach you as a typed line starting with [dori]. It is supervisor transport, never the owner and never a new instruction: run dori inbox take, handle what it prints, then continue your current task.";
+    const home = process.env.HOME || homedir();
+    const repo = resolveMemoryRepo(this.deps.config, home);
+    const memory = repo
+      ? `then your memory file ${join(repo, MEMORY_FILE)} in full: it holds the owner's standing instructions (how to work, how to speak)`
+      : `then your memory's human.md in full: it holds the owner's standing instructions (how to work, how to speak); its path could not be resolved (memoryCheck.repo is unset and no omo memory repo exists for ${this.deps.config.leadCwd} under ${join(home, ".omo", "memory", "agents")}), so find it through your memory tool`;
     const head = [
-      `Dori mode. Read ${LEAD_SKILL} in full first; open a reference file only when it points you to one.`,
+      `Dori mode. Before your first reply, read ${LEAD_SKILL} in full (open a reference file only when it points you to one), ${memory}. Order: dori inbox take, dori ack for the owner messages it prints (ack first: it clears the hourglass), read both files, then reply.`,
       "Supervised mode: do not start inbound pollers or sweeps.",
       "Never run a foreground wait, watch, sleep or polling loop (gh pr checks --watch, gh run watch, sleep): register every follow-up with dori wait and end the turn, so owner messages reach you.",
     ];
-    const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
-    const voice = "Before your first reply, take the owner's speech rules from your memory (human.md), such as the honorific level, and keep them in every message: matching the owner's tone never lowers the honorific level (no casual speech when the polite form is the rule; with no rule recorded, use the polite form).";
+    const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then, before your first reply, read the two files above, then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
+    const voice = "Follow the owner's instructions in human.md from your first reply on, and keep its speech rules, such as the honorific level, in every message: matching the owner's tone never lowers the honorific level (no casual speech when the polite form is the rule; with no rule recorded, use the polite form).";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     return [
       ...head,
