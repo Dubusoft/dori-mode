@@ -135,9 +135,18 @@ const rowLive = (op: Operation, openLanes: ReadonlySet<string>): boolean => {
  * Reservations of other tasks not running as a lane yet (open rows whose laneKey is no open lane): each takes one host
  * slot that the pane count does not show.
  */
-export const pendingReservations = (rows: readonly Operation[], openLanes: ReadonlySet<string>, exceptTaskId: number): number =>
-  rows.filter((op) => op.action === LAUNCH_ACTION && op.lane !== `toodo:${exceptTaskId}` && OPEN_STATES.includes(op.state))
+export const pendingReservations = (rows: readonly Operation[], openLanes: ReadonlySet<string>, exceptTaskId?: number): number =>
+  rows.filter((op) => op.action === LAUNCH_ACTION && (exceptTaskId === undefined || op.lane !== `toodo:${exceptTaskId}`) && OPEN_STATES.includes(op.state))
     .filter((op) => { const key = laneKeyOf(op); return key === undefined || !openLanes.has(key); }).length;
+
+/** A stable key for local autopilot state that can change without a toodo event. */
+export const autopilotLocalStateKey = (store: OperationStore, openLanes: ReadonlySet<string>): string =>
+  JSON.stringify([
+    [...openLanes].sort(),
+    store.list({ states: OPEN_STATES })
+      .filter((op) => op.action === LAUNCH_ACTION && op.lane.startsWith("toodo:"))
+      .map((op) => `${op.id}:${op.state}`).sort(),
+  ]);
 
 /** The lines settleLaneOutcome returns; the lead reports a failure to the owner and completes the toodo task of a done one. */
 export const LANE_DONE_EVENT = "AUTOPILOT_LANE_DONE";
