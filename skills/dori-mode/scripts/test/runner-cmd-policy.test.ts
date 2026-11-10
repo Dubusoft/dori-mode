@@ -233,6 +233,28 @@ describe("runner command policy", () => {
     expect(checkCommand({ ...policy, defaultCwd: "/data/repos" }, start(), realpath, "/data/repos")).toMatchObject({ ok: true, command: { body: { cwd: "/data/repos/a" } } });
   });
 
+  test("reposRoot and the effective worktree root are added to allowedRoots after the explicit ones", () => {
+    const agents = { omo: ["omo", "run"] };
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u"], reposRoot: "/data/repos" }).allowedRoots).toEqual(["/home/u", "/data/repos", "/data/repos/worktrees"]);
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u", "/data/repos"], reposRoot: "/data/repos", worktreeRoot: "/srv/wt" }).allowedRoots)
+      .toEqual(["/home/u", "/data/repos", "/srv/wt"]);
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u"] }).allowedRoots).toEqual(["/home/u"]);
+    // The same directory spelled with a trailing slash or through ~ is not added twice.
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u/repos/", "/home/u/wt"], reposRoot: "~/repos", worktreeRoot: "/home/u/wt/" }, "/home/u").allowedRoots)
+      .toEqual(["/home/u/repos/", "/home/u/wt"]);
+  });
+
+  test("a lane.start under reposRoot passes without listing it in allowedRoots; outside every root it is still refused", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    const reposRoot = join(base, "repos");
+    const cwd = join(reposRoot, "a");
+    const outside = join(base, "outside");
+    for (const dir of [reposRoot, cwd, outside]) mkdirSync(dir, { recursive: true });
+    const p = parsePolicy({ agents: { omo: ["omo", "run"] }, allowedRoots: ["/home/u"], reposRoot });
+    expect(checkCommand(p, start({ cwd }), realpathSync).ok).toBe(true);
+    expect(rejection(checkCommand(p, start({ cwd: outside }), realpathSync))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+  });
+
   test("absent config file yields defaults", () => {
     const p = loadPolicy("/nonexistent-runner-dir-for-test");
     expect(p).toEqual({ agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow" });

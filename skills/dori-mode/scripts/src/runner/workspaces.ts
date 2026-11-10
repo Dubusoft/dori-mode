@@ -53,13 +53,17 @@ export const realScanFs: ScanFs = {
   isDir: (path) => { try { return statSync(path).isDirectory(); } catch { return false; } },
 };
 
-/** Checkouts under `roots` (breadth-first, symlinks not followed, dot folders skipped), first path per repo. */
-export const scanCheckouts = (roots: readonly string[], fs: ScanFs = realScanFs, os: string = process.platform): WorkspaceEntry[] => {
+/**
+ * Checkouts under `roots` (breadth-first, symlinks not followed, dot folders skipped), first path per repo. Nothing at or
+ * under `excluded` (the worktree root, itself an allowed root) is read, so lane worktrees do not use up SCAN_MAX_DIRS.
+ */
+export const scanCheckouts = (roots: readonly string[], fs: ScanFs = realScanFs, os: string = process.platform, excluded?: string): WorkspaceEntry[] => {
   const found = new Map<string, WorkspaceEntry>();
   const queue: { path: string; depth: number }[] = roots.map((path) => ({ path, depth: 0 }));
   let read = 0;
   while (queue.length && read < SCAN_MAX_DIRS && found.size < DETECTED_MAX) {
     const { path, depth } = queue.shift() as { path: string; depth: number };
+    if (excluded !== undefined && under(excluded, path)) continue;
     let entries;
     try { entries = fs.readdir(path); read++; } catch { continue; }
     if (entries.some((e) => e.name === ".git" && e.dir)) {
@@ -135,7 +139,7 @@ export const workspaceReport = (policy: RunnerPolicy, deps: {
     else workspaces.push({ repo, path });
   }
   const declared = new Set(candidates.map(([repo]) => repo.toLowerCase()));
-  const detected = policy.detectWorkspaces === false ? [] : scanCheckouts(policy.allowedRoots, deps.fs, deps.os)
-    .filter((d) => !declared.has(d.repo.toLowerCase()) && !(worktreeRoot !== undefined && under(worktreeRoot, d.path)));
+  const detected = policy.detectWorkspaces === false ? [] : scanCheckouts(policy.allowedRoots, deps.fs, deps.os, worktreeRoot)
+    .filter((d) => !declared.has(d.repo.toLowerCase()));
   return { workspaces, detected, ...(worktreeRoot !== undefined ? { worktreeRoot } : {}) };
 };
