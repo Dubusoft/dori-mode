@@ -6,7 +6,7 @@ type Json = Record<string, unknown>;
 /** The top-level key that holds a file's schema version; absent means version 0 (written before versions existed). */
 export const CONFIG_SCHEMA_KEY = "schemaVersion";
 /** The version this dori writes. Raise it together with a new CONFIG_MIGRATIONS entry. */
-export const CONFIG_SCHEMA_VERSION = 4;
+export const CONFIG_SCHEMA_VERSION = 5;
 
 export type ConfigMigration = {
   /** The version a file has after this step. */
@@ -42,6 +42,9 @@ export const CONFIG_MIGRATIONS: readonly ConfigMigration[] = [
   // leadCwd's built-in default became ~/.dori/lead (it was the home directory). A separate step so the rename above runs
   // first: fills apply before renames within one step and would shadow a defaultCwd value.
   { to: 4, fills: { leadCwd: "~" } },
+  // Placement routes a workspace task only by what the runners declare (reposRoot discovery or runner-config.json
+  // workspaces); the config's own table is gone.
+  { to: 5, removes: { "placement.workspaces": "each runner declares its repos (reposRoot discovery or its runner-config.json workspaces)" } },
 ];
 
 export class ConfigSchemaError extends Error {}

@@ -25,14 +25,14 @@ test("pruneDoriConfig drops what loadConfig no longer reads and keeps the rest i
   const raw = {
     stateDir: "~/.dori/state", memoryCheck: { enabled: true }, sessionsDir: "/x", store: "sqlite",
     hooks: { threadReply: ["a"], threadDone: ["b"] }, laneSandbox: { command: ["lane-sandbox"], default: true },
-    runners: { listen: "0.0.0.0", mac: { allowUnsandboxed: true } }, discordChannels: ["1"],
+    runners: { listen: "0.0.0.0", mac: { allowUnsandboxed: true } }, discordChannels: ["1"], placement: { defaultMachine: "mini", workspaces: { "*": "mini" }, fallback: ["local"] },
   };
   const before = JSON.stringify(raw);
   const { next, removed } = pruneDoriConfig(raw);
   expect(JSON.stringify(raw)).toBe(before);
-  expect(next).toEqual({ stateDir: "~/.dori/state", hooks: { threadReply: ["a"] }, laneSandbox: { command: ["lane-sandbox"] }, runners: { mac: { allowUnsandboxed: true } }, discordChannels: ["1"] });
-  expect(Object.keys(next)).toEqual(["stateDir", "hooks", "laneSandbox", "runners", "discordChannels"]);
-  expect(removed).toEqual(["memoryCheck", "sessionsDir", "store", "hooks.threadDone", "laneSandbox.default", "runners.listen"]);
+  expect(next).toEqual({ stateDir: "~/.dori/state", hooks: { threadReply: ["a"] }, laneSandbox: { command: ["lane-sandbox"] }, runners: { mac: { allowUnsandboxed: true } }, discordChannels: ["1"], placement: { defaultMachine: "mini", fallback: ["local"] } });
+  expect(Object.keys(next)).toEqual(["stateDir", "hooks", "laneSandbox", "runners", "discordChannels", "placement"]);
+  expect(removed).toEqual(["memoryCheck", "sessionsDir", "store", "hooks.threadDone", "laneSandbox.default", "runners.listen", "placement.workspaces"]);
   expect(pruneDoriConfig({ runners: [{ label: "a" }] })).toEqual({ next: {}, removed: ["runners"] });
 });
 

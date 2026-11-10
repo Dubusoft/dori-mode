@@ -509,12 +509,12 @@ const backups = (configPath: string): string[] =>
 
 test("keys config.json no longer reads are warned about and kept once, then removed, each write after a timestamped backup", async () => {
   const d = deps();
-  const before = JSON.stringify({ memoryCheck: true, hooks: { threadReply: ["x"], threadDone: ["y"] }, laneSandbox: { default: ["sb"] } });
+  const before = JSON.stringify({ memoryCheck: true, hooks: { threadReply: ["x"], threadDone: ["y"] }, laneSandbox: { default: ["sb"] }, placement: { defaultMachine: "mini", workspaces: { "*": "mini" } } });
   await Bun.write(d.configPath, before);
-  const obsolete = ["memoryCheck", "hooks.threadDone", "laneSandbox.default"];
+  const obsolete = ["memoryCheck", "hooks.threadDone", "laneSandbox.default", "placement.workspaces"];
   expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
   const first = readJson(d.configPath);
-  expect(first).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, memoryCheck: true, hooks: { threadReply: ["x"], threadDone: ["y"] }, laneSandbox: { default: ["sb"] } });
+  expect(first).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, memoryCheck: true, hooks: { threadReply: ["x"], threadDone: ["y"] }, laneSandbox: { default: ["sb"] }, placement: { defaultMachine: "mini", workspaces: { "*": "mini" } } });
   for (const key of obsolete) expect(log.some((l) => l.startsWith(`SETUP_KEY_REMOVAL_PENDING ${key} (`))).toBe(true);
   expect(log.some((l) => l.startsWith("SETUP_KEY_REMOVED "))).toBe(false);
   const [bak] = backups(d.configPath);
@@ -529,6 +529,7 @@ test("keys config.json no longer reads are warned about and kept once, then remo
   expect(cfg).not.toHaveProperty("memoryCheck");
   expect(cfg.hooks).toEqual({ threadReply: ["x"] });
   expect(cfg.laneSandbox).toEqual({});
+  expect(cfg.placement).toEqual({ defaultMachine: "mini" });
   for (const key of obsolete) expect(log.some((l) => l.startsWith(`SETUP_KEY_REMOVED ${key} (`))).toBe(true);
   const all = backups(d.configPath);
   expect(all).toHaveLength(2);

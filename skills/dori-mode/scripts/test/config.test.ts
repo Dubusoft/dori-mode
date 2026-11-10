@@ -91,7 +91,7 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     drift: "x", runners: { listen: "8.8.8.8:1", mode: { mini: "shadow" } }, eventPolicy: 7, resolveKinds: "x",
     delivery: { mode: "push", push: { ackSec: 1 } }, guard: { memFreeCritPct: 3 }, heavyKill: "qemu-system", closeAfterMin: 7,
     memoryCheck: { repo: "~/memory", maxKb: 9 }, hooks: { threadDone: ["x"], threadReply: ["reply", "{text}"] },
-    laneSandbox: { command: ["lane-sandbox"], default: false },
+    laneSandbox: { command: ["lane-sandbox"], default: false }, placement: { defaultMachine: "big", workspaces: { "*": "mini" } },
     sessionsDir: "~/sessions", diskGuardPath: "/mnt", laneThinking: "high", toodoEvents: { enabled: false },
   }));
   // A fresh process, so the once-per-process warning is not already spent by another test file.
@@ -111,7 +111,7 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
     store: "json", tunables: [], diskGuard: false,
   });
-  const ignored = "store, futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, memoryCheck, sessionsDir, diskGuardPath, laneThinking, toodoEvents, hooks.threadDone, laneSandbox.default, runners.listen, runners.mode";
+  const ignored = "store, futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, memoryCheck, sessionsDir, diskGuardPath, laneThinking, toodoEvents, hooks.threadDone, laneSandbox.default, placement.workspaces, runners.listen, runners.mode";
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
 });
 
@@ -182,19 +182,19 @@ test("legacy arrays with no usable entry fall back to the lane model", async () 
   expect(leadModels(await loadConfig(path))).toEqual([{ model: "m/default", thinking: "low" }]);
 });
 
-test("placement defaults to local with no workspace rules or fallback", async () => {
-  expect(defaultConfig("/home/ana").placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+test("placement defaults to local with no fallback", async () => {
+  expect(defaultConfig("/home/ana").placement).toEqual({ defaultMachine: "local", fallback: [] });
   const path = join(state.dir, "placement-none.json");
   await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
-  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", fallback: [] });
 });
 
-test("placement parses trimmed machines, drops blank workspace values, and blank defaultMachine means local", async () => {
+test("placement parses trimmed machines, does not read a workspaces table, and blank defaultMachine means local", async () => {
   const path = join(state.dir, "placement.json");
   await Bun.write(path, JSON.stringify({ placement: { defaultMachine: " big ", workspaces: { "/data/repos": " mini ", "acme/app": "", "*": 3 }, fallback: [" mini ", "big"] } }));
-  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "big", workspaces: { "/data/repos": "mini" }, fallback: ["mini", "big"] });
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "big", fallback: ["mini", "big"] });
   await Bun.write(path, JSON.stringify({ placement: { defaultMachine: "  " } }));
-  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", workspaces: {}, fallback: [] });
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", fallback: [] });
 });
 
 test("placement refuses a non-object and a malformed fallback", async () => {

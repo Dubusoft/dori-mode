@@ -14,9 +14,9 @@ export type PlacementInput = { readonly machine?: string; readonly cwd?: string;
 export type Placement = {
   /** "local" or a machine label. */
   readonly machine: string;
-  /** `runner`: a runner declares the workspace; `workspace`: the deprecated config.placement.workspaces table. */
+  /** `runner`: a runner declares the workspace; `workspace`: a workspace task while no runner declares any (this host). */
   readonly source: "flag" | "runner" | "workspace" | "default";
-  /** The owner/repo a runner declares, or the `workspaces` key that matched ("*" included). */
+  /** source runner: the owner/repo the owning runner declares. */
   readonly rule?: string;
   /** Only a default placement may move to a fallback machine. */
   readonly movable: boolean;
@@ -51,11 +51,8 @@ export const runnerPlacements = (rows: readonly RunnerRow[], online: (row: Runne
     ...(row.workspaces.worktreeRoot !== undefined ? { worktreeRoot: row.workspaces.worktreeRoot } : {}),
   }] : []));
 
-/** Runners declare workspaces: the config table is no longer read. */
+/** Some runner declares workspaces. */
 const declaring = (reports: readonly RunnerPlacement[]): boolean => reports.some((r) => r.declared.length > 0);
-
-export const DEPRECATED_TABLE_READ = "PLACEMENT_CONFIG_DEPRECATED placement.workspaces is read because no runner declares workspaces; declare each repo in its machine's runner-config.json workspaces, then delete the table";
-export const DEPRECATED_TABLE_IGNORED = "PLACEMENT_CONFIG_DEPRECATED placement.workspaces is ignored because runners declare workspaces; delete it from the config";
 
 /**
  * The declared owners of a workspace task: the runners whose declared path is the longest prefix of `cwd`, else the
@@ -93,18 +90,11 @@ const preferred = <T extends { readonly machine: string }>(candidates: readonly 
 
 const filled = (s: string | undefined): s is string => typeof s === "string" && s.trim() !== "";
 
-/** The longest absolute-path key equal to `cwd` or a parent of it at a path boundary. */
-const pathRule = (cwd: string, keys: readonly string[]): string | undefined =>
-  keys
-    .filter((key) => key.startsWith("/") && (cwd === key || cwd.startsWith(key.endsWith("/") ? key : `${key}/`)))
-    .sort((a, b) => b.length - a.length)[0];
-
 /**
  * --machine wins. Once any runner declares workspaces, a workspace task goes to the runner that declares it (held while
  * that runner is offline) and an undeclared one to `defaultMachine`. When several runners declare it, all are
  * `candidates` and the preferred online one (defaultMachine first, else candidate order) is placed; planLaunch picks.
- * Before that, a workspace task follows the deprecated `placement.workspaces` table (else local). Anything else goes to
- * `defaultMachine`.
+ * Before that, a workspace task stays on this host. Anything else goes to `defaultMachine`.
  */
 export const resolvePlacement = (input: PlacementInput, placement: PlacementConfig, reports: readonly RunnerPlacement[] = []): Placement => {
   if (filled(input.machine)) return { machine: input.machine.trim(), source: "flag", movable: false };
@@ -118,14 +108,7 @@ export const resolvePlacement = (input: PlacementInput, placement: PlacementConf
       return { machine: lead.machine, source: "runner", rule: owners.repo, movable: false, cwd: lead.cwd, online: lead.online, ...(candidates.length > 1 ? { candidates } : {}) };
     }
   } else if (workspaceTask) {
-    const keys = Object.keys(placement.workspaces);
-    const byLower = new Map(keys.map((key) => [key.toLowerCase(), key]));
-    const rule = (filled(input.cwd) ? pathRule(input.cwd, keys) : undefined)
-      ?? repos.map((repo) => byLower.get(repo.toLowerCase())).find((key) => key !== undefined)
-      ?? (keys.includes("*") ? "*" : undefined);
-    return rule === undefined
-      ? { machine: LOCAL_MACHINE, source: "workspace", movable: false }
-      : { machine: placement.workspaces[rule]!, source: "workspace", rule, movable: false };
+    return { machine: LOCAL_MACHINE, source: "workspace", movable: false };
   }
   return { machine: placement.defaultMachine, source: "default", movable: true };
 };
@@ -199,14 +182,11 @@ export const verdictLine = (machine: string, v: LaunchVerdict): string => {
 export const placementLine = (p: Placement): string =>
   `PLACEMENT machine=${p.machine} source=${p.source}${p.rule === undefined ? "" : ` rule=${p.rule}`}${p.cwd === undefined ? "" : ` cwd=${p.cwd}`}`;
 
-/** The PLACEMENT_CONFIG_DEPRECATED line when a table rule decided `p`, else none. */
-export const placementWarnings = (p: Placement): string[] => (p.source === "workspace" && p.rule !== undefined ? [DEPRECATED_TABLE_READ] : []);
-
 /**
  * `dori placement`: one line per declared repo and declaring runner (`WORKSPACE repo=R machine=M path=P
  * runner=online|offline`, by repo then machine; several runners of one repo are launch candidates), one per repo only detected (`DETECTED ...`, information: it follows
  * defaultMachine), one per runner that reported a lane worktree root (`WORKTREES machine=M root=P`), then
- * `DEFAULT machine=D fallback=a,b|-` and a deprecation line when config.placement.workspaces is set.
+ * `DEFAULT machine=D fallback=a,b|-`.
  */
 export const placementTable = (reports: readonly RunnerPlacement[], placement: PlacementConfig): string[] => {
   const lines: string[] = [];
@@ -226,7 +206,6 @@ export const placementTable = (reports: readonly RunnerPlacement[], placement: P
   for (const d of detected) lines.push(`DETECTED repo=${d.repo} machine=${d.machine} path=${d.path} (no runner declares it)`);
   for (const r of reports.filter((r) => r.worktreeRoot !== undefined).sort((a, b) => a.machine.localeCompare(b.machine))) lines.push(`WORKTREES machine=${r.machine} root=${r.worktreeRoot}`);
   lines.push(`DEFAULT machine=${placement.defaultMachine} fallback=${placement.fallback.length ? placement.fallback.join(",") : "-"}`);
-  if (Object.keys(placement.workspaces).length) lines.push(declaring(reports) ? DEPRECATED_TABLE_IGNORED : DEPRECATED_TABLE_READ);
   return lines;
 };
 
@@ -256,12 +235,12 @@ const planCandidates = async (p: Placement, candidates: readonly PlacementCandid
   const pick = preferred(checks.filter((x) => x.check.verdict.ok).map((x) => ({ ...x, machine: x.c.machine })), placement);
   if (pick) {
     const placed: Placement = { ...p, machine: pick.c.machine, cwd: pick.c.cwd, online: true };
-    return { placement: placed, check: pick.check, lines: [placementLine(placed), ...placementWarnings(placed), candidatesLine(placed, pick.c.machine)] };
+    return { placement: placed, check: pick.check, lines: [placementLine(placed), candidatesLine(placed, pick.c.machine)] };
   }
   const held = candidates.filter((c) => c.machine !== p.machine)
     .map((c) => { const x = checks.find((y) => y.c.machine === c.machine); return verdictLine(c.machine, (x?.check ?? offlineHold(c.machine, p.rule)).verdict); });
   const lead = checks.find((x) => x.c.machine === p.machine)!.check;
-  return { placement: p, check: lead, lines: [placementLine(p), ...placementWarnings(p), candidatesLine(p, "none"), ...held] };
+  return { placement: p, check: lead, lines: [placementLine(p), candidatesLine(p, "none"), ...held] };
 };
 
 /**
@@ -271,7 +250,7 @@ const planCandidates = async (p: Placement, candidates: readonly PlacementCandid
  */
 export const planLaunch = async (input: PlacementInput, placement: PlacementConfig, check: (machine: string) => Promise<MachineCheck>, reports: readonly RunnerPlacement[] = []): Promise<LaunchPlan> => {
   const p = resolvePlacement(input, placement, reports);
-  const lines = [placementLine(p), ...placementWarnings(p)];
+  const lines = [placementLine(p)];
   if (p.online === false) return { placement: p, check: offlineHold(p.machine, p.rule), lines: p.candidates ? [...lines, candidatesLine(p, "none")] : lines };
   if (p.candidates) return planCandidates(p, p.candidates, placement, check);
   const first = await check(p.machine);
