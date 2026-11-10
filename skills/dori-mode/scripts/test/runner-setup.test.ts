@@ -113,6 +113,14 @@ describe("runRunnerSetup", () => {
     expect(existsSync(join(dir, "seen.json"))).toBe(false);
   });
 
+  test("a worker's absent file is reported as missing (exit 2) and nothing is created", async () => {
+    const dir = temp();
+    const { deps, lines } = setup(dir, { requireFile: true, mode: "new" });
+    expect(await runRunnerSetup(deps, { patch: {}, unset: [] })).toBe(2);
+    expect(lines).toEqual([`RUNNER_SETUP_FILE_MISSING no runner-config.json at ${cfgPath(dir)} (the runner has no agents and no allowedRoots)`]);
+    expect(existsSync(cfgPath(dir))).toBe(false);
+  });
+
   test("mode new asks only unseen keys and reports missing required keys", async () => {
     const dir = temp();
     writeFileSync(cfgPath(dir), JSON.stringify({ agents: BASE.agents }));

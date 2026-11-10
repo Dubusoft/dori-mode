@@ -24,6 +24,35 @@ export type UpgradeDeps = {
 export const staleRunnerLabels = (rows: readonly { readonly label: string; readonly version?: string }[], local: string, want: string | undefined): string[] =>
   rows.filter((r) => r.label !== local && (want === undefined || r.version !== want)).map((r) => r.label);
 
+export type PolicyCheckDeps = {
+  readonly labels: readonly string[];
+  /** `dori runner setup --new` on that runner: 0 ok, 2 runner-config.json or a required key missing, else failed. */
+  readonly check: (label: string) => Promise<number>;
+  readonly log: (line: string) => void;
+};
+
+/**
+ * The policy pass that follows the rollout: every runner's runner-config.json is checked whatever its version, because a
+ * runner the rollout skipped (already on `want`) can still lack its file or a required key. One failing runner never
+ * stops the others; the pass ends with one `RUNNER_POLICY_CHECKED` line.
+ */
+export const checkRunnerPolicies = async (deps: PolicyCheckDeps): Promise<{ readonly missing: readonly string[]; readonly failed: readonly string[] }> => {
+  const missing: string[] = [];
+  const failed: string[] = [];
+  for (const label of deps.labels) {
+    const code = await deps.check(label).catch((e: unknown) => {
+      deps.log(`RUNNER_POLICY_CHECK_FAILED runner=${label} ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ")}`);
+      return undefined;
+    });
+    if (code === undefined) failed.push(label);
+    else if (code === 2) { missing.push(label); deps.log(`RUNNER_POLICY_MISSING runner=${label}; run: dori runner setup${label === "local" ? "" : ` --machine ${label}`}`); }
+    else if (code !== 0) { failed.push(label); deps.log(`RUNNER_POLICY_CHECK_FAILED runner=${label} exit ${code}`); }
+  }
+  const list = (xs: readonly string[]): string => (xs.length ? xs.join(",") : "none");
+  deps.log(`RUNNER_POLICY_CHECKED runners=${deps.labels.length} missing=${list(missing)} failed=${list(failed)}`);
+  return { missing, failed };
+};
+
 export const upgradeRunners = async (deps: UpgradeDeps): Promise<{ readonly upgraded: number; readonly failed: readonly string[] }> => {
   let upgraded = 0;
   const failed: string[] = [];
