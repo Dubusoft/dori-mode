@@ -200,7 +200,8 @@ const USAGE = `dori <command> [options]
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always);
-                                       also runs dori setup --migrate, and runner setup --new for every upgraded runner
+                                       also runs dori setup --migrate, and runner setup --new for every upgraded runner;
+                                       ends with UPDATE_SUMMARY (changed, failed); exit 2 when a step failed (migrate degraded)
   store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field);
                                        the store follows the files in the state dir
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
@@ -832,7 +833,14 @@ try {
         // removed or exports the pulled code no longer has.
         // stdin is inherited so runner setup and `dori setup --migrate` can ask new keys on a terminal.
         upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["inherit", "inherit", "inherit"] }).exited,
-        migrateConfig: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "setup", "--migrate"], { stdio: ["inherit", "inherit", "inherit"] }).exited,
+        // stdout is passed through as it arrives (prompts included) and kept for the update summary.
+        migrateConfig: async () => {
+          const p = Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "setup", "--migrate"], { stdio: ["inherit", "pipe", "inherit"] });
+          const decoder = new TextDecoder();
+          let output = "";
+          for await (const chunk of p.stdout) { process.stdout.write(chunk); output += decoder.decode(chunk, { stream: true }); }
+          return { code: await p.exited, output };
+        },
         refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
         refreshBootPrep: () => refreshBootPrep(homedir()),
       },
