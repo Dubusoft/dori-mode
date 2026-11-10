@@ -8,12 +8,13 @@ export type UpdateDeps = {
   readonly run: Runner;
   readonly sleep: (ms: number) => Promise<void>;
   readonly log: (line: string) => void;
-  /** Removes the old standalone guard agent files from every worker machine; returns the failure count (logged by the callee, never changes the exit code). */
-  readonly removeGuardAgents?: () => Promise<number>;
   /**
-   * Upgrades the runners one at a time once the restarted supervisor is active (runner/upgrade.ts), and also when the
-   * checkout was already up to date so a rollout an earlier update left unfinished is retried (runners on the current
-   * version are skipped); returns the failure count, which is logged by the callee and never changes the exit code.
+   * Migrates the workers once the restarted supervisor is active: removes the old standalone guard agent files from every
+   * worker machine, then upgrades the runners one at a time (runner/upgrade.ts). It also runs when the checkout was
+   * already up to date so a rollout an earlier update left unfinished is retried (runners on the current version are
+   * skipped). It must run in a fresh process from the updated checkout: this one still holds the modules it loaded
+   * before the pull, which may refer to files the pull removed. Returns the failure count, which is logged by the callee
+   * and never changes the exit code.
    */
   readonly upgradeRunners?: () => Promise<number>;
   /** Installs the template over an outdated lane sandbox (lane-sandbox-install.ts); returns the line to log, if any. */
@@ -42,10 +43,6 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     return r.out;
   };
   let root = o.packageDir;
-  const removeAgents = async (): Promise<void> => {
-    if (!d.removeGuardAgents) return;
-    try { await d.removeGuardAgents(); } catch (e) { d.log(`WARN guard agents: ${e instanceof Error ? e.message : String(e)}`); }
-  };
   const refreshSandbox = (): void => {
     if (!d.refreshLaneSandbox) return;
     try { const line = d.refreshLaneSandbox(); if (line) d.log(line); } catch (e) { d.log(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
@@ -105,14 +102,11 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
       d.log(`UP_TO_DATE ${o.branch} ${short(now)}`);
       refreshSandbox();
       refreshBootPrep();
-      await removeAgents();
       await upgradeRunners();
       return 0;
     }
     refreshSandbox();
     refreshBootPrep();
-    // Old standalone guard agents go before the restart; each worker's runner reports its host instead.
-    await removeAgents();
     const restart = await d.run(["systemctl", "--user", "restart", SUPERVISOR_UNIT], { timeoutMs: 120_000 });
     if (restart.code !== 0) d.log(`WARN systemctl restart ${SUPERVISOR_UNIT}: ${(restart.err || restart.out).split("\n")[0]}`);
     let state = "unknown";

@@ -3,7 +3,7 @@ import { staleRunnerLabels, upgradeRunners } from "../src/runner/upgrade.ts";
 import { updateInstall } from "../src/update.ts";
 import type { Ran, Runner } from "../src/run.ts";
 
-test("when the second runner's install fails the third is not tried and RUNNER_UPGRADE_FAILED is logged once", async () => {
+test("when the second runner's install fails the third is still upgraded and RUNNER_UPGRADE_FAILED is logged once", async () => {
   const installed: string[] = [];
   const log: string[] = [];
   const result = await upgradeRunners({
@@ -12,20 +12,21 @@ test("when the second runner's install fails the third is not tried and RUNNER_U
     confirm: async () => true,
     log: (line) => { log.push(line); },
   });
-  expect(installed).toEqual(["worker-a", "worker-b"]);
-  expect(result).toEqual({ upgraded: 1, failed: "worker-b" });
-  expect(log.filter((l) => l.startsWith("RUNNER_UPGRADE_FAILED"))).toEqual(["RUNNER_UPGRADE_FAILED runner=worker-b RUNNER_INSTALL_UNREACHABLE ssh failed; the remaining runners were not upgraded"]);
+  expect(installed).toEqual(["worker-a", "worker-b", "worker-c"]);
+  expect(result).toEqual({ upgraded: 2, failed: ["worker-b"] });
+  expect(log.filter((l) => l.startsWith("RUNNER_UPGRADE_FAILED"))).toEqual(["RUNNER_UPGRADE_FAILED runner=worker-b RUNNER_INSTALL_UNREACHABLE ssh failed"]);
+  expect(log).toContain("RUNNER_UPGRADED runner=worker-c version=abc123");
 });
 
-test("a runner that never says hello with a higher gen stops the rollout too", async () => {
+test("a runner that never says hello with a higher gen fails alone and the rollout goes on", async () => {
   const installed: string[] = [];
   const log: string[] = [];
   await upgradeRunners({
     labels: ["worker-a", "worker-b"], install: async (label) => { installed.push(label); return { ok: true }; },
     confirm: async (label) => label !== "worker-a", log: (line) => { log.push(line); },
   });
-  expect(installed).toEqual(["worker-a"]);
-  expect(log).toEqual(["RUNNER_UPGRADE_FAILED runner=worker-a no hello with a higher gen after the install; the remaining runners were not upgraded"]);
+  expect(installed).toEqual(["worker-a", "worker-b"]);
+  expect(log).toEqual(["RUNNER_UPGRADE_FAILED runner=worker-a no hello with a higher gen after the install", "RUNNER_UPGRADED runner=worker-b"]);
 });
 
 test("the rollout skips the local runner and workers already on the wanted version", () => {
