@@ -278,6 +278,21 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   }
 });
 
+test("macOS: a lane may rewrite its own login keychain and Claude Code's lock dir, but no other keychain file", async () => {
+  const { root, home, wt } = macHome();
+  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" });
+  const kc = join(home, "Library", "Keychains");
+  const write = (p: string) => allows(sb, "file-write-data", p);
+
+  for (const ok of [join(kc, "login.keychain-db"), join(kc, "login.keychain-db.sb-d1fd7dce-8dNHuB"), join(home, ".local", "state", "claude", "locks", "x.lock")]) {
+    expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
+  }
+  for (const no of [join(kc, "login.keychain-db-journal"), join(kc, "login.keychain-db-wal"), join(kc, "login.keychain-db.sb-x", "y"), join(kc, "metadata.keychain-db"), join(kc, ".fl34AC2A0A"), join(kc, "78D2CB8D", "keychain-2.db"), join(root, "other", "Library", "Keychains", "login.keychain-db"), join(root, "other", "Library", "Keychains", "login.keychain-db.sb-x"), join(home, ".local", "state", "other")]) {
+    expect({ no, write: write(no) }).toEqual({ no, write: false });
+  }
+  expect(sb.profile).not.toContain(root);
+});
+
 test("refresh selects the maintained macOS or Linux template from the injected native platform", () => {
   for (const platform of ["darwin", "linux"] as const) {
     const home = tempDir(), installed = installedLaneSandbox(home);

@@ -10,8 +10,9 @@
 #
 # Seatbelt cannot hide or remap paths the way bubblewrap does; it only refuses access (EPERM). So the profile allows
 # reads almost everywhere and refuses writes by default, with a whitelist: the cwd (worktree) and its git common dir,
-# the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp
-# and the terminal and null devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner socket and bin, its
+# the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
+# Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
+# devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner socket and bin, its
 # own brief and token), and ~/.dori/env and ~/.ssh private keys are refused outright. Every path is resolved first
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
@@ -52,7 +53,7 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" d_rules="" gcd broad
+  local n=0 p w_rules="" r_rules="" d_rules="" gcd broad kc
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   param() { PARAMS+=(-D "$1=$(canon "$2")"); }
@@ -65,6 +66,15 @@ build_profile() {
     "$H/.cargo/registry" "$H/.cargo/git" "$H/Library/Caches" "$H/Library/Developer" /tmp; do
     w "$p"
   done
+  # Claude Code's lock files: its processes take them so only one refreshes an account's OAuth token at a time.
+  w "$H/.local/state/claude"
+  # The login keychain, where Claude Code (through /usr/bin/security) stores a refreshed OAuth token; without it the
+  # rotated token is lost. securityd rewrites the file atomically: a full copy as login.keychain-db.sb-<random> in the
+  # same directory, then a rename over the original, so both names need writes. It is not SQLite (no -journal, -wal or
+  # -shm), and nothing else in Keychains, nor another user's keychain, is opened.
+  kc=$(canon "$H/Library/Keychains/login.keychain-db")
+  param_raw KEYCHAIN "$kc"
+  param_raw KEYCHAIN_TMP "^$(printf '%s' "$kc" | sed 's/[][\.*^$+?(){}|]/\\&/g')[.]sb-[^/]+\$"
   # Per-user temp and cache dirs under /var/folders (Xcode, clang module cache and other Apple tools use these, not TMPDIR).
   for p in "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || :)" "$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || :)"; do
     if [ -n "$p" ]; then w "$p"; fi
@@ -118,6 +128,7 @@ build_profile() {
 (allow default)
 (deny file-write*)
 (allow file-write*$w_rules)
+(allow file-write* (literal (param \"KEYCHAIN\")) (regex (param \"KEYCHAIN_TMP\")))
 (allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/ttys[0-9]+\$\") (regex #\"^/dev/fd/[0-9]+\$\"))
 $d_rules
 (deny file-read* (subpath (param \"DORI\")))
