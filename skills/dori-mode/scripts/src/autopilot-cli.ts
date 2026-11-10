@@ -1,22 +1,24 @@
 import { parseArgs } from "node:util";
 
 import {
-  type AutopilotConfig, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll, ledgerRows,
-  type QuotaSummary, recordShadow, type ToodoTask,
+  type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll,
+  LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaSummary, recordShadow, type ToodoTask,
 } from "./autopilot.ts";
 import type { ClaudeUsage } from "./claude-quota.ts";
-import type { OperationStore } from "./operations.ts";
+import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
 import { ToodoUnreadable } from "./toodo-client.ts";
 
 /**
- * `dori autopilot` (shadow mode, lead-only): judges the planned toodo tasks marked for autopilot and adds the hourly
- * reconcile job. Nothing here launches a lane, writes to toodo or merges: candidates only reads (and with --record
- * writes shadow rows), schedule writes one schedule job.
+ * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot, adds the hourly reconcile job, and
+ * reserves a launch. Nothing here launches a lane, writes to toodo or merges: candidates only reads (and with --record
+ * writes shadow rows), schedule writes one schedule job, launch writes and settles launch-attempt rows; the lead runs
+ * `start_task` and `dori launch` between the reservation and its settle.
  */
 
 export const AUTOPILOT_USAGE = [
   "usage: dori autopilot candidates [--tasks 12,13] [--json] [--record]",
   "       dori autopilot schedule",
+  "       dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]",
 ].join("\n");
 
 export const RECONCILE_JOB = "autopilot-reconcile";
@@ -44,6 +46,8 @@ export type AutopilotDeps = {
   /** The can-launch verdict and free slots of the default machine; must not throw. */
   readonly host: () => Promise<HostSummary>;
   readonly schedules: () => ScheduleRegistry;
+  /** Takes the autopilot launch lock (waits for it); the result releases it. */
+  readonly lock: () => Promise<() => void>;
   /** argv that runs this CLI: [bun, <absolute cli.ts>]. */
   readonly cliArgv: readonly string[];
   readonly now: () => number;
@@ -74,8 +78,13 @@ export const within = async <T>(ms: number, work: () => Promise<T>, fallback: (w
 
 class UsageError extends Error {}
 
-const FLAGS = { json: { type: "boolean" }, record: { type: "boolean" }, tasks: { type: "string" } } as const;
-const ALLOWED: Readonly<Record<string, readonly string[]>> = { candidates: ["json", "record", "tasks"], schedule: [] };
+const FLAGS = {
+  json: { type: "boolean" }, record: { type: "boolean" }, tasks: { type: "string" },
+  launched: { type: "string" }, failed: { type: "boolean" }, ambiguous: { type: "boolean" }, note: { type: "string" },
+} as const;
+const ALLOWED: Readonly<Record<string, readonly string[]>> = {
+  candidates: ["json", "record", "tasks"], schedule: [], launch: ["launched", "failed", "ambiguous", "note"],
+};
 
 const taskIds = (value: string | undefined): number[] => {
   const parts = (value ?? "").split(",").map((p) => p.trim()).filter(Boolean);
@@ -87,8 +96,11 @@ const taskIds = (value: string | undefined): number[] => {
  * Judges every planned task marked for autopilot plus `extraIds` and prints the report; --record writes one shadow row
  * per task this hour. Exit 1 with AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read, since nothing can be judged.
  */
-const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, extraIds: readonly number[]): Promise<number> => {
-  const now = deps.now();
+/**
+ * The marked planned tasks, `extraIds` and every dependency of them, plus the ids to judge (marked planned ones and
+ * `extraIds`); undefined after printing AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read.
+ */
+const readTasks = async (deps: AutopilotDeps, extraIds: readonly number[]): Promise<{ tasks: Map<number, ToodoTask>; ids: number[] } | undefined> => {
   const tasks = new Map<number, ToodoTask>();
   try {
     const toodo = deps.toodo();
@@ -100,9 +112,16 @@ const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, e
   } catch (e) {
     if (!(e instanceof ToodoUnreadable)) throw e;
     deps.err(`AUTOPILOT_TOODO_UNREADABLE ${e.message}`);
-    return 1;
+    return undefined;
   }
-  const ids = [...new Set([...[...tasks.values()].filter((t) => t.autopilot && t.status === "planned").map((t) => t.id), ...extraIds])];
+  return { tasks, ids: [...new Set([...[...tasks.values()].filter((t) => t.autopilot && t.status === "planned").map((t) => t.id), ...extraIds])] };
+};
+
+const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, extraIds: readonly number[]): Promise<number> => {
+  const now = deps.now();
+  const read = await readTasks(deps, extraIds);
+  if (!read) return 1;
+  const { tasks, ids } = read;
   let report: CandidatesReport = { mode: deps.config.mode, slots: null, verdicts: [] };
   if (ids.length) {
     const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
@@ -128,6 +147,69 @@ const schedule = (deps: AutopilotDeps): number => {
   return 0;
 };
 
+/**
+ * Reserves the next launch attempt of `taskId` under the launch lock: re-reads toodo, the ledger, open lanes, quota and
+ * the host, judges the task among every marked one (other tasks' reservations not running yet take a host slot each),
+ * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH.
+ */
+const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
+  const read = await readTasks(deps, [taskId]);
+  if (!read) return 1;
+  const ledger = ledgerRows(deps.store);
+  const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
+  const pending = pendingReservations(ledger, openLanes, taskId);
+  const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
+  const verdict = judgeAll({ tasks: read.tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, read.ids)
+    .find((v) => v.taskId === taskId)!;
+  if (verdict.verdict !== "LAUNCH") {
+    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} ${verdict.verdict} ${verdict.reasons.join(", ")}`);
+    return 1;
+  }
+  const attempt = ledgerState(ledger, taskId, openLanes).attempts + 1;
+  const laneKey = autopilotLaneKey(taskId, attempt);
+  plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: LAUNCH_ACTION, target: String(attempt), data: JSON.stringify({ laneKey }) });
+  deps.out(`AUTOPILOT_RESERVED #${taskId} lane=${laneKey} attempt=${attempt}`);
+  return 0;
+};
+
+type Settle = { readonly state: Extract<OperationState, "verified" | "failed" | "ambiguous">; readonly laneKey?: string };
+
+/** Settles the open reservation of `taskId`: launched (verified, its lane key must match), failed or ambiguous. */
+const settle = (deps: AutopilotDeps, taskId: number, how: Settle, note: string | undefined): number => {
+  const open = ledgerRows(deps.store).filter((op) => op.lane === `toodo:${taskId}` && OPEN_STATES.includes(op.state));
+  const op = open.at(-1);
+  if (!op) { deps.err(`AUTOPILOT_NO_RESERVATION #${taskId}`); return 1; }
+  const reserved = laneKeyOf(op);
+  if (how.laneKey !== undefined && how.laneKey !== reserved) {
+    deps.err(`AUTOPILOT_LANE_MISMATCH #${taskId} reserved=${reserved ?? "?"} given=${how.laneKey}`);
+    return 1;
+  }
+  const what = how.state === "verified" ? `launched ${reserved}` : how.state === "failed" ? "launch failed" : "launch outcome unknown";
+  settleOperation(deps.store, deps.now(), op.id, how.state, note ? `${what}: ${note}` : what);
+  deps.out(`AUTOPILOT_SETTLED #${taskId} attempt=${op.target} ${how.state} lane=${reserved ?? "?"}`);
+  return 0;
+};
+
+/** `dori autopilot launch <taskId> [settle flag]`: reserve, or settle the reservation, holding the launch lock throughout. */
+const launch = async (deps: AutopilotDeps, positionals: readonly string[], v: Record<string, unknown>): Promise<number> => {
+  const [id, ...more] = positionals;
+  if (id === undefined || more.length || !/^\d+$/.test(id)) throw new UsageError("autopilot launch takes one toodo task id");
+  const settles: Settle[] = [
+    ...(v.launched !== undefined ? [{ state: "verified" as const, laneKey: v.launched as string }] : []),
+    ...(v.failed === true ? [{ state: "failed" as const }] : []),
+    ...(v.ambiguous === true ? [{ state: "ambiguous" as const }] : []),
+  ];
+  if (settles.length > 1) throw new UsageError("--launched, --failed and --ambiguous exclude each other");
+  const note = v.note as string | undefined;
+  if (note !== undefined && !settles.length) throw new UsageError("--note goes with --launched, --failed or --ambiguous");
+  const release = await deps.lock();
+  try {
+    return settles[0] ? settle(deps, Number(id), settles[0], note) : await reserve(deps, Number(id));
+  } finally {
+    release();
+  }
+};
+
 /** `dori autopilot <sub> ...`; returns the exit code (2 on a usage error). */
 export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps): Promise<number> => {
   try {
@@ -139,8 +221,9 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     if (!allowed) throw new UsageError(sub ? `unknown subcommand ${sub}` : "a subcommand is required");
     const stray = Object.keys(parsed.values).filter((f) => !allowed.includes(f));
     if (stray.length) throw new UsageError(`${stray.map((f) => `--${f}`).join(", ")} is not an option of autopilot ${sub}`);
-    if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
     const v = parsed.values as Record<string, unknown>;
+    if (sub === "launch") return await launch(deps, extra, v);
+    if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
     if (sub === "schedule") return schedule(deps);
     const extraIds = v.tasks === undefined ? [] : taskIds(v.tasks as string);
     return await candidates(deps, v.json === true, v.record === true, extraIds);

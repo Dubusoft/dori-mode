@@ -3,9 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AUTOPILOT_LANE, DEFAULT_AUTOPILOT, type HostSummary, SHADOW_ACTION, type ToodoTask } from "../src/autopilot.ts";
+import { AUTOPILOT_LANE, DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, SHADOW_ACTION, type ToodoTask } from "../src/autopilot.ts";
 import { type AutopilotDeps, autopilotMain, RECONCILE_JOB } from "../src/autopilot-cli.ts";
 import { JsonOperations } from "../src/operations.ts";
+import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -89,7 +90,7 @@ test("401, a network error and a missing token file are all ToodoUnreadable", as
 type Run = { code: number; out: string[]; err: string[] };
 
 /** `tasks` is toodo's whole task set; flaggedTasks returns its marked planned ones, as the real client does. */
-const harness = (tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000) => {
+const harness = (tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set()) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
   const unreadable = () => { throw new ToodoUnreadable("toodo-server list_tasks answered HTTP 401"); };
@@ -105,10 +106,11 @@ const harness = (tasks: readonly ToodoTask[] | "unreadable", host: HostSummary =
         return tasks === "unreadable" ? unreadable() : tasks.filter((t) => ids.includes(t.id));
       },
     }),
-    openLanes: async () => new Set(),
+    openLanes: async () => openLanes,
     quota: async () => { probes.quota++; return { readable: true, maxUsedPct: 10 }; },
     host: async () => { probes.host++; return host; },
     schedules: () => { throw new Error("candidates never touches schedules"); },
+    lock: () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
     cliArgv: ["bun", "/x/cli.ts"], now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
   });
   const run = async (...args: string[]): Promise<Run> => {
@@ -184,6 +186,82 @@ test("--record writes one shadow row per task, and a second run in the same hour
   expect(shadows()).toEqual(first);
 });
 
+// launch
+
+const rows = () => ledgerRows(store).map((op) => [op.id, op.state, op.data, op.detail]);
+
+test("launch reserves attempt 1 as a planned row with a deterministic lane key; a second reserve holds lane-live", async () => {
+  const h = harness([task(12)]);
+  expect(await h.run("launch", "12")).toEqual({ code: 0, out: ["AUTOPILOT_RESERVED #12 lane=ap-12-1 attempt=1"], err: [] });
+  expect(rows()).toEqual([["toodo:12/autopilot-launch/1", "planned", JSON.stringify({ laneKey: "ap-12-1" }), "planned"]]);
+  expect(await h.run("launch", "12")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_LAUNCH_REFUSED #12 HOLD lane-live"] });
+  expect(rows().length).toBe(1);
+});
+
+test("two reserves at once under the lock: exactly one reserves", async () => {
+  const h = harness([task(12)]);
+  const both = await Promise.all([h.run("launch", "12"), h.run("launch", "12")]);
+  expect(both.map((r) => r.code).sort()).toEqual([0, 1]);
+  expect(rows().map((r) => r[0])).toEqual(["toodo:12/autopilot-launch/1"]);
+});
+
+test("--launched verifies the reservation; the running lane holds, the closed one refuses already-attempted", async () => {
+  await harness([task(12)]).run("launch", "12");
+  const mismatch = await harness([task(12)]).run("launch", "12", "--launched", "ap-12-2");
+  expect([mismatch.code, mismatch.err]).toEqual([1, ["AUTOPILOT_LANE_MISMATCH #12 reserved=ap-12-1 given=ap-12-2"]]);
+  expect(rows()[0]![1]).toBe("planned");
+  const done = await harness([task(12)]).run("launch", "12", "--launched", "ap-12-1");
+  expect(done).toEqual({ code: 0, out: ["AUTOPILOT_SETTLED #12 attempt=1 verified lane=ap-12-1"], err: [] });
+  expect(rows()[0]!.slice(1)).toEqual(["verified", JSON.stringify({ laneKey: "ap-12-1" }), "launched ap-12-1"]);
+  expect((await harness([task(12)], { ok: true }, T0, new Set(["ap-12-1"])).run("launch", "12")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #12 HOLD lane-live"]);
+  expect((await harness([task(12)]).run("launch", "12")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #12 REFUSE already-attempted"]);
+});
+
+test("--failed and --ambiguous settle with the note and are never retried by itself", async () => {
+  await harness([task(12), task(13)]).run("launch", "12");
+  await harness([task(12), task(13)]).run("launch", "13");
+  expect((await harness([task(12), task(13)]).run("launch", "12", "--failed", "--note", "pane did not start")).out)
+    .toEqual(["AUTOPILOT_SETTLED #12 attempt=1 failed lane=ap-12-1"]);
+  expect((await harness([task(12), task(13)]).run("launch", "13", "--ambiguous")).code).toBe(0);
+  expect(rows().map((r) => [r[0], r[1], r[3]])).toEqual([
+    ["toodo:12/autopilot-launch/1", "failed", "launch failed: pane did not start"],
+    ["toodo:13/autopilot-launch/1", "ambiguous", "launch outcome unknown"],
+  ]);
+  const h = harness([task(12), task(13)]);
+  expect((await h.run("launch", "12")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #12 REFUSE already-attempted"]);
+  expect((await h.run("launch", "13")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #13 REFUSE already-attempted, ledger-ambiguous"]);
+  expect(await h.run("launch", "12", "--failed")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_NO_RESERVATION #12"] });
+});
+
+test("another task's pending reservation takes a host slot; launch order and a held host refuse too", async () => {
+  const tasks = [task(12), task(13), task(14, { autopilot: false })];
+  // 12 comes first in launch order, so with one slot 13 waits.
+  expect((await harness(tasks, { ok: true, slots: 1 }).run("launch", "13")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #13 HOLD no-slot"]);
+  expect((await harness(tasks, { ok: true, slots: 2 }).run("launch", "12")).code).toBe(0);
+  // 12 is reserved but has no pane yet: the host still reports 1 free slot, and 12's reservation takes it.
+  expect((await harness(tasks, { ok: true, slots: 1 }).run("launch", "13")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #13 HOLD no-slot"]);
+  // Once 12's lane runs, its pane is counted by the host instead, so the free slot goes to 13.
+  expect((await harness(tasks, { ok: true, slots: 1 }, T0 + 60_000, new Set(["ap-12-1"])).run("launch", "13")).out)
+    .toEqual(["AUTOPILOT_RESERVED #13 lane=ap-13-1 attempt=1"]);
+  expect((await harness(tasks, { ok: true, slots: 5 }).run("launch", "14")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #14 REFUSE not-flagged"]);
+  expect((await harness([task(15)], { ok: false, reason: "panes 20 >= 20", slots: 0 }).run("launch", "15")).err)
+    .toEqual(["AUTOPILOT_LAUNCH_REFUSED #15 HOLD host-hold"]);
+  const unreadable = await harness("unreadable").run("launch", "15");
+  expect([unreadable.code, unreadable.err[0]?.split(" ")[0]]).toEqual([1, "AUTOPILOT_TOODO_UNREADABLE"]);
+  expect(rows().map((r) => r[0])).toEqual(["toodo:12/autopilot-launch/1", "toodo:13/autopilot-launch/1"]);
+});
+
+test("launch usage errors exit 2 and write nothing", async () => {
+  const h = harness([task(12)]);
+  for (const args of [["launch"], ["launch", "12", "13"], ["launch", "x"], ["launch", "12", "--failed", "--ambiguous"],
+    ["launch", "12", "--launched", "ap-12-1", "--failed"], ["launch", "12", "--note", "why"], ["launch", "12", "--json"]]) {
+    const r = await h.run(...args);
+    expect(r.code).toBe(2);
+    expect(r.err.join("\n")).toContain("dori autopilot launch <taskId>");
+  }
+  expect([h.reads, rows()]).toEqual([[], []]);
+});
+
 // other subcommands
 
 test("schedule adds the reconcile job once", async () => {
@@ -193,6 +271,7 @@ test("schedule adds the reconcile job once", async () => {
     config: DEFAULT_AUTOPILOT, store, toodo: () => { throw new Error("unused"); }, openLanes: async () => new Set(),
     quota: async () => ({ readable: false }), host: async () => ({ ok: true }),
     schedules: () => ({ list: () => added as { name: string }[], add: (raw) => { added.push(raw); return raw; } }),
+    lock: () => { throw new Error("schedule never locks"); },
     cliArgv: ["/usr/bin/bun", "/abs/cli.ts"], now: () => T0, out: (l) => { out.push(l); }, err: () => {},
   });
   expect(await autopilotMain(["schedule"], deps())).toBe(0);
