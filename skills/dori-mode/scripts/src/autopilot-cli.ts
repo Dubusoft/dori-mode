@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 import {
@@ -14,13 +16,46 @@ import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
  * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
  * launches a lane, writes to toodo or merges: candidates only reads (and with --record writes shadow rows), launch
  * writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
- * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every AUTOPILOT_TICK_MS.
+ * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every `autopilot.tickSec`.
+ * A reservation needs `autopilot.mode` "on" and no pause; `pause` / `resume` set and clear the pause file.
  */
 
 export const AUTOPILOT_USAGE = [
   "usage: dori autopilot candidates [--tasks 12,13] [--json] [--record]",
   "       dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]",
+  "       dori autopilot pause [--reason TEXT]",
+  "       dori autopilot resume",
 ].join("\n");
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pause
+
+/** The pause file: present while `dori autopilot pause` is in force. */
+export const autopilotPausePath = (stateDir: string): string => join(stateDir, "autopilot-pause.json");
+
+export type Pause = { readonly since: string; readonly reason: string | null };
+
+/** The pause in force, or undefined. A file that cannot be parsed still pauses (since "?"): a brake fails closed. */
+export const readPause = (path: string): Pause | undefined => {
+  let text: string;
+  try { text = readFileSync(path, "utf8"); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    return { since: "?", reason: `pause file unreadable: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  try {
+    const raw = JSON.parse(text) as { since?: unknown; reason?: unknown };
+    return { since: typeof raw.since === "string" ? raw.since : "?", reason: typeof raw.reason === "string" ? raw.reason : null };
+  } catch { return { since: "?", reason: null }; }
+};
+
+const pauseText = (p: Pause): string => `since ${p.since}${p.reason ? `: ${p.reason}` : ""}`;
+
+const writePause = (path: string, pause: Pause): void => {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(pause)}\n`);
+  renameSync(tmp, path);
+};
 
 /** The hourly schedule job the supervisor's autopilot tick replaced; the supervisor removes it at startup. */
 export const RECONCILE_JOB = "autopilot-reconcile";
@@ -36,6 +71,8 @@ export type ToodoReader = {
 export type JudgeDeps = {
   readonly config: AutopilotConfig;
   readonly store: OperationStore;
+  /** autopilotPausePath of the state dir. */
+  readonly pauseFile: string;
   readonly toodo: () => ToodoReader;
   /** Keys of open registry lanes. */
   readonly openLanes: () => Promise<ReadonlySet<string>>;
@@ -81,7 +118,7 @@ const PROBE_MS = 15_000;
  * can-launch check (without recording a launch verdict). `dori autopilot` and the supervisor's tick share it.
  */
 export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry" | "tunables" | "clock">, store: OperationStore): JudgeDeps => ({
-  config: flow.config.autopilot, store,
+  config: flow.config.autopilot, store, pauseFile: autopilotPausePath(flow.config.stateDir),
   toodo: () => new ToodoClient(flow.tunables.toodoEvents),
   openLanes: async () => new Set((await flow.registry.open()).map((l) => l.key)),
   quota: () => within(PROBE_MS, async () => quotaSummary((await readUsage(lookupQuotaResults(), flow.clock.now(), AbortSignal.timeout(PROBE_MS))).usage), () => ({ readable: false })),
@@ -97,9 +134,10 @@ class UsageError extends Error {}
 const FLAGS = {
   json: { type: "boolean" }, record: { type: "boolean" }, tasks: { type: "string" },
   launched: { type: "string" }, failed: { type: "boolean" }, ambiguous: { type: "boolean" }, note: { type: "string" },
+  reason: { type: "string" },
 } as const;
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  candidates: ["json", "record", "tasks"], launch: ["launched", "failed", "ambiguous", "note"],
+  candidates: ["json", "record", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], pause: ["reason"], resume: [],
 };
 
 const taskIds = (value: string | undefined): number[] => {
@@ -140,10 +178,11 @@ const readTasks = async (deps: AutopilotDeps, extraIds: readonly number[]): Prom
  */
 export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number[] = []): Promise<CandidatesReport> => {
   const { tasks, ids } = await loadTasks(deps, extraIds);
-  if (!ids.length) return { mode: deps.config.mode, slots: null, verdicts: [] };
+  const paused = readPause(deps.pauseFile) !== undefined;
+  if (!ids.length) return { mode: deps.config.mode, paused, slots: null, verdicts: [] };
   const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
   const verdicts = judgeAll({ tasks, ledger: ledgerRows(deps.store), openLanes, quota, host, config: deps.config }, ids);
-  return { mode: deps.config.mode, slots: host.ok ? host.slots ?? null : 0, verdicts };
+  return { mode: deps.config.mode, paused, slots: host.ok ? host.slots ?? null : 0, verdicts };
 };
 
 /**
@@ -167,9 +206,19 @@ const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, e
 /**
  * Reserves the next launch attempt of `taskId` under the launch lock: re-reads toodo, the ledger, open lanes, quota and
  * the host, judges the task among every marked one (other tasks' reservations not running yet take a host slot each),
- * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH.
+ * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH, and before
+ * reading anything when the mode is not "on" or a pause is in force.
  */
 const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
+  if (deps.config.mode !== "on") {
+    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} mode=${deps.config.mode}: nothing launches unless autopilot.mode is "on"`);
+    return 1;
+  }
+  const pause = readPause(deps.pauseFile);
+  if (pause) {
+    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} paused ${pauseText(pause)} (dori autopilot resume lifts it)`);
+    return 1;
+  }
   const read = await readTasks(deps, [taskId]);
   if (!read) return 1;
   const ledger = ledgerRows(deps.store);
@@ -227,6 +276,24 @@ const launch = async (deps: AutopilotDeps, positionals: readonly string[], v: Re
   }
 };
 
+/** `dori autopilot pause`: new reservations refuse until `resume`; running lanes go on. Pausing twice keeps the first. */
+const pause = (deps: AutopilotDeps, reason: string | undefined): number => {
+  const current = readPause(deps.pauseFile);
+  if (current) { deps.out(`AUTOPILOT_PAUSED ${pauseText(current)} (already paused)`); return 0; }
+  const next: Pause = { since: new Date(deps.now()).toISOString(), reason: reason?.trim() || null };
+  writePause(deps.pauseFile, next);
+  deps.out(`AUTOPILOT_PAUSED ${pauseText(next)}`);
+  return 0;
+};
+
+/** `dori autopilot resume`: lifts the pause. */
+const resume = (deps: AutopilotDeps): number => {
+  if (!readPause(deps.pauseFile)) { deps.out("AUTOPILOT_NOT_PAUSED"); return 0; }
+  rmSync(deps.pauseFile, { force: true });
+  deps.out("AUTOPILOT_RESUMED");
+  return 0;
+};
+
 /** `dori autopilot <sub> ...`; returns the exit code (2 on a usage error). */
 export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps): Promise<number> => {
   try {
@@ -241,6 +308,8 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     const v = parsed.values as Record<string, unknown>;
     if (sub === "launch") return await launch(deps, extra, v);
     if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
+    if (sub === "pause") return pause(deps, v.reason as string | undefined);
+    if (sub === "resume") return resume(deps);
     const extraIds = v.tasks === undefined ? [] : taskIds(v.tasks as string);
     return await candidates(deps, v.json === true, v.record === true, extraIds);
   } catch (e) {

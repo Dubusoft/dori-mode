@@ -178,7 +178,7 @@ test("recordShadow writes one verified row per task per hour", () => {
 
 test("formatCandidates prints the header and one line per verdict; none prints AUTOPILOT_NO_CANDIDATES", () => {
   const report = {
-    mode: "shadow" as const, slots: 1,
+    mode: "shadow" as const, paused: false, slots: 1,
     verdicts: [
       { taskId: 12, verdict: "LAUNCH" as const, reasons: [] },
       { taskId: 13, verdict: "HOLD" as const, reasons: ["no-slot" as const] },
@@ -193,8 +193,12 @@ test("formatCandidates prints the header and one line per verdict; none prints A
   ]);
   expect(formatCandidates({ ...report, slots: null })[0]).toBe("AUTOPILOT mode=shadow record-only: nothing launches slots=unlimited candidates=3");
   expect(formatCandidates({ ...report, verdicts: [] })).toEqual(["AUTOPILOT_NO_CANDIDATES"]);
+  // Only mode on without a pause launches; a pause is named in any mode.
+  expect(formatCandidates({ ...report, mode: "on" })[0]).toBe("AUTOPILOT mode=on slots=1 candidates=3");
+  expect(formatCandidates({ ...report, mode: "on", paused: true })[0]).toBe("AUTOPILOT mode=on paused record-only: nothing launches slots=1 candidates=3");
+  expect(formatCandidates({ ...report, mode: "off" })[0]).toBe("AUTOPILOT mode=off record-only: nothing launches slots=1 candidates=3");
   expect(candidatesJson(report)).toEqual({
-    mode: "shadow", slots: 1,
+    mode: "shadow", paused: false, slots: 1,
     candidates: [
       { taskId: 12, verdict: "LAUNCH", reasons: [] },
       { taskId: 13, verdict: "HOLD", reasons: ["no-slot"] },
@@ -209,6 +213,10 @@ test("parseAutopilotConfig defaults every key", () => {
   expect(parseAutopilotConfig(undefined)).toEqual(DEFAULT_AUTOPILOT);
   expect(parseAutopilotConfig({})).toEqual(DEFAULT_AUTOPILOT);
   expect(parseAutopilotConfig({ quotaMaxUsedPct: 90, mergeBase: "develop" })).toEqual({ ...DEFAULT_AUTOPILOT, quotaMaxUsedPct: 90, mergeBase: "develop" });
+  expect([DEFAULT_AUTOPILOT.mode, DEFAULT_AUTOPILOT.tickSec]).toEqual(["shadow", 300]);
+  for (const mode of ["off", "shadow", "on"] as const) expect(parseAutopilotConfig({ mode }).mode).toBe(mode);
+  expect(parseAutopilotConfig({ tickSec: 30 }).tickSec).toBe(30);
+  expect(parseAutopilotConfig({ tickSec: 3600 }).tickSec).toBe(3600);
 });
 
 test("parseAutopilotConfig ignores the removed bundle keys with one warning", () => {
@@ -226,6 +234,10 @@ test("parseAutopilotConfig throws TypeError naming the key on an invalid value o
     [{ mergeBase: "" }, /^autopilot\.mergeBase /],
     [{ crossWorkspacePrereqs: "allow" }, /^autopilot\.crossWorkspacePrereqs /],
     [{ mode: "live" }, /^autopilot\.mode /],
+    [{ tickSec: 29 }, /^autopilot\.tickSec /],
+    [{ tickSec: 3601 }, /^autopilot\.tickSec /],
+    [{ tickSec: 60.5 }, /^autopilot\.tickSec /],
+    [{ tickSec: "300" }, /^autopilot\.tickSec /],
     [{ wipcap: 2 }, /^autopilot\.wipcap is not a known key/],
   ];
   for (const [raw, message] of cases) {

@@ -156,13 +156,17 @@ const USAGE = `dori <command> [options]
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   autopilot candidates [--tasks 12,13] [--json] [--record]
-                                       lead-only, shadow mode (nothing launches): judge every planned toodo task marked for
-                                       autopilot, plus --tasks (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free
-                                       slots; --record writes one shadow row per task per hour); the supervisor runs the same every 5 min
+                                       lead-only, read-only: judge every planned toodo task marked for autopilot, plus --tasks
+                                       (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free slots; --record writes one
+                                       shadow row per task per hour); the supervisor runs the same every autopilot.tickSec (mode shadow or on)
   autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
                                        lead-only, under a lock: re-judge the task and on LAUNCH reserve attempt <n> as lane
                                        ap-<taskId>-<n> (planned ledger row; exit 1 with the verdict otherwise); a settle flag closes
-                                       the reservation as launched, failed or ambiguous (never retried by itself)
+                                       the reservation as launched, failed or ambiguous (never retried by itself); a reserve
+                                       refuses unless autopilot.mode is "on" and autopilot is not paused
+  autopilot pause [--reason TEXT] | autopilot resume
+                                       lead-only: stop new autopilot reservations and AUTOPILOT_READY wakes until resume (running
+                                       lanes go on to claim); kept in <stateDir>/autopilot-pause.json
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
