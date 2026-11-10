@@ -13,6 +13,8 @@ import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
+import { discordStatusTransport } from "./lane-reports.ts";
+import { redirectHookPost } from "./thread-followup.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 
@@ -169,6 +171,14 @@ const finishRecovery = async (deps: FlowDeps, lane: Lane, reason: string): Promi
   const event = `LANE_RECOVERED ${lane.key} ${lane.pane} ${reason}`;
   const hook = deps.config.hooks.threadReply;
   if (hook && lane.thread !== "none") {
+    // A thread the owner closed is not posted into: one line linking it goes to its parent channel instead.
+    try {
+      const to = await redirectHookPost(deps.config.stateDir, discordStatusTransport(deps.clock), lane.thread, event, deps.config.discordChannels[0], `lane-recovered:${lane.key}:${lane.pane}`);
+      if (to) return [event, ...left];
+    } catch (e) {
+      console.error(`LANE_RECOVERY_NOTICE_ERROR ${lane.key} ${e instanceof Error ? e.message : String(e)}`);
+      return [event, ...left, `LANE_RECOVERY_NOTICE_ERROR ${lane.key}`];
+    }
     const notice = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, title: lane.title, text: event }));
     if (notice.code !== 0) return [event, ...left, `LANE_RECOVERY_NOTICE_ERROR ${lane.key}`];
   }
