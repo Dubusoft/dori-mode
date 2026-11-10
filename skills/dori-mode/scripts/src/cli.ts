@@ -13,7 +13,8 @@ import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./do
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
-import { listGuardMachines, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
+import { type GuardMachine, listGuardMachines, machineKind, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
+import type { Json, KeyPrompter } from "./config-keys.ts";
 import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, SandboxRefusal, validateLaunch } from "./launch.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
@@ -138,7 +139,10 @@ const USAGE = `dori <command> [options]
 
   doctor                                                         read-only health check: OK/WARN/FAIL with the exact fix; exit 1 on any FAIL
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
-  setup  [--yes] [--token-file F] [--channel ID] [--autostart]   interactive install: token, channels, herdr, autostart (dori setup --help)
+  setup  [--yes] [--token-file F] [--channel ID] [--autostart] [--set KEY=VALUE ...] [--unset KEY ...] [--migrate]
+                                       interactive install: token, channels, herdr, autostart; --set/--unset set or delete config.json
+                                       keys as given without asking; keys config.json no longer reads are removed (backup in config.json.bak);
+                                       --migrate only removes those and asks keys never shown before (dori setup --help)
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
   launch <key> --title T (--brief FILE | --from-message CHANNEL MESSAGE_ID ... [--note TEXT ...]) --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
                 [--from-message CHANNEL MESSAGE_ID]   repeatable, instead of --brief: the brief is "# <title>", "## Owner request" with those owner messages (latest edit) in order,
@@ -172,11 +176,17 @@ const USAGE = `dori <command> [options]
                                        ~/.dori/runner/sock/control; signed handshake, heartbeats, reports lane
                                        observations; commands are checked against ~/.dori/runner/runner-config.json;
                                        --enroll reads code= and fingerprint= lines on stdin first; --enroll-only enrolls and exits
-  runner install TARGET [--label LABEL] | --machine LABEL
+  runner install (TARGET [--label LABEL] | --machine LABEL) [--set KEY=VALUE ...] [--unset KEY ...] [--yes]
                                        install or upgrade the runner on a Linux worker over ssh (bundle, unit, linger, enrollment
                                        through ssh stdin/stdout); listens on the worker's private IP, port 7411.
                                        TARGET is user@ip, ip or user@host; LABEL defaults to a slug of the host (100.64.1.2 -> 100-64-1-2)
-                                       and the machine is remembered in <stateDir>/runner-machines.json
+                                       and the machine is remembered in <stateDir>/runner-machines.json;
+                                       then runs runner setup for it with --set/--unset (--yes: ask nothing)
+  runner setup [--machine LABEL] [--set KEY=VALUE ...] [--unset KEY ...] [--yes] [--new]
+                                       edit runner-config.json (the local runner's, or LABEL's over ssh): --set/--unset are applied
+                                       as given (an empty VALUE unsets), every other key is asked with [required]/[optional] and its
+                                       current value (Enter keeps it); keys the file no longer reads are removed (backup in
+                                       runner-config.json.bak); --new asks only keys never shown before; --yes asks nothing
   runner remove LABEL                  stop and delete the runner on that worker over ssh, revoke its key and forget its endpoint (RUNNER_REMOVED)
   runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
   runner enroll --machine LABEL        a one-time enrollment code (10 min) and the supervisor key fingerprint, on stdout only
@@ -189,7 +199,8 @@ const USAGE = `dori <command> [options]
                                        stop keeps herdr down (the runner does not start it again) until start
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
-                                       bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
+                                       bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always);
+                                       also runs dori setup --migrate, and runner setup --new for every upgraded runner
   store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field);
                                        the store follows the files in the state dir
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
@@ -267,10 +278,11 @@ const die = (message: string, code = 1): never => {
 const helpCommand = process.argv[2] ?? "";
 if (helpCommand !== "setup" && process.argv.slice(3).some((arg) => arg === "--help" || arg === "-h")) {
   const lines = USAGE.split("\n");
-  const start = lines.findIndex((line) => {
-    const prefix = `  ${helpCommand}`;
-    return helpCommand !== "" && line.startsWith(prefix) && /\s/.test(line[prefix.length] ?? "");
-  });
+  const entry = (prefix: string): number =>
+    lines.findIndex((line) => helpCommand !== "" && line.startsWith(prefix) && /\s/.test(line[prefix.length] ?? ""));
+  const sub = process.argv[3] ?? "";
+  const subStart = helpCommand === "runner" && sub && !sub.startsWith("-") ? entry(`  runner ${sub}`) : -1;
+  const start = subStart >= 0 ? subStart : entry(`  ${helpCommand}`);
   if (start >= 0) {
     let end = start + 1;
     while (end < lines.length && !/^  \S/.test(lines[end] ?? "")) end++;
@@ -299,13 +311,39 @@ if (process.argv[2] === "status") {
   process.exit(0);
 }
 
+let ttyKeyPrompter: KeyPrompter | undefined;
+
+/**
+ * `dori runner setup` against the local runner (no machine) or a saved machine over ssh; the keys shown are recorded in
+ * <stateDir>/runner-setup-keys/<label|local>.json. Returns runRunnerSetup's code; an unknown machine kind or a remote IO
+ * failure throws.
+ */
+const runnerSetupNow = async (
+  stateDir: string, machine: GuardMachine | undefined,
+  o: { readonly patch: Json; readonly unset: readonly string[]; readonly interactive: boolean; readonly mode: "full" | "new" },
+): Promise<number> => {
+  const { localRunnerConfigIO, remoteRunnerConfigIO, runRunnerSetup } = await import("./runner/runner-setup.ts");
+  const { defaultsPrompter, ttyPrompter } = await import("./setup-cli.ts");
+  let io = localRunnerConfigIO(defaultRunnerDir());
+  if (machine !== undefined) {
+    const kind = await machineKind(run, machine);
+    if (!kind.ok) throw new Error(`RUNNER_SETUP_FAILED ${machine.label}: ${kind.detail}`);
+    io = remoteRunnerConfigIO(run, machine, kind.kind);
+  }
+  return runRunnerSetup({
+    io, prompt: o.interactive ? (ttyKeyPrompter ??= ttyPrompter()) : defaultsPrompter, interactive: o.interactive,
+    log: (line) => { console.log(line); }, seenPath: join(stateDir, "runner-setup-keys", `${machine?.label ?? "local"}.json`), mode: o.mode,
+  }, { patch: o.patch, unset: o.unset });
+};
+
 /**
  * `dori update`'s worker migration: first the old standalone guard agent files are removed from every machine (their
  * failures are logged and never change the exit code), then each worker runner gets the new bundle through
  * `dori runner install`'s path, one at a time, each confirmed by a hello with a higher gen within 2 minutes. The local
  * runner is the supervisor's child, so the supervisor restart that `dori update` already did restarted it on the
- * updated checkout. A runner that already reports this checkout's version is skipped. Returns 1 when any runner failed
- * (the others were still upgraded), else 0.
+ * updated checkout. A runner that already reports this checkout's version is skipped. Each upgraded runner then gets
+ * runner setup in "new" mode (asks only keys never shown before; a failure is a WARN line, never an upgrade failure).
+ * Returns 1 when any runner failed (the others were still upgraded), else 0.
  */
 const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
   const { readRunnerRows } = await import("./runner/hub.ts");
@@ -334,7 +372,11 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
           issue: () => ({ code: auth.issueCode(label).code, fingerprint: auth.fingerprint }),
           enroll: (body) => auth.enroll(body),
         });
-        return done.ok ? { ok: true, version: done.version } : { ok: false, detail: `${done.code} ${done.detail}` };
+        if (!done.ok) return { ok: false, detail: `${done.code} ${done.detail}` };
+        const setup = await runnerSetupNow(cfg.stateDir, machine, { patch: {}, unset: [], interactive: Boolean(process.stdin.isTTY), mode: "new" })
+          .catch((e: unknown) => { console.log(`WARN runner setup runner=${label}: ${e instanceof Error ? e.message : String(e)}`); return 0; });
+        if (setup !== 0) console.log(`WARN runner setup runner=${label} exit ${setup}; run: dori runner setup --machine ${label}`);
+        return { ok: true, version: done.version };
       },
       confirm: async (label) => {
         for (const until = realClock.now() + 120_000; realClock.now() < until; await realClock.sleep(2_000)) {
@@ -357,10 +399,13 @@ if (process.argv[2] === "runner") {
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
   // enroll, install, revoke, rotate, reset-gen and upgrade run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) | remove LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) [--set KEY=VALUE ...] [--unset KEY ...] [--yes] | setup [--machine LABEL] [--set KEY=VALUE ...] [--unset KEY ...] [--yes] [--new] | remove LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
-    options: { machine: { type: "string" }, label: { type: "string" }, yes: { type: "boolean" } },
+    options: {
+      machine: { type: "string" }, label: { type: "string" }, yes: { type: "boolean" },
+      set: { type: "string", multiple: true }, unset: { type: "string", multiple: true }, new: { type: "boolean" },
+    },
   });
   const [sub = "", target, ...extra] = parsed.positionals;
   if (extra.length) die(usage);
@@ -369,8 +414,41 @@ if (process.argv[2] === "runner") {
     if (!value || !LABEL_PATTERN.test(value)) die(usage);
     return value as string;
   };
-  if (parsed.values.yes && sub !== "herdr") die(usage);
+  if (parsed.values.yes && sub !== "herdr" && sub !== "setup" && sub !== "install") die(usage);
   if (parsed.values.label !== undefined && sub !== "install") die(usage);
+  if ((parsed.values.set !== undefined || parsed.values.unset !== undefined) && sub !== "setup" && sub !== "install") die(usage);
+  if (parsed.values.new && sub !== "setup") die(usage);
+  /** --set/--unset against runner-config.json's keys; an unknown key or bad value stops before anything runs. */
+  const runnerKeys = async (): Promise<{ patch: Json; unset: readonly string[] }> => {
+    const { ConfigKeyError, parseSetArgs, RUNNER_CONFIG_KEYS } = await import("./config-keys.ts");
+    try {
+      return parseSetArgs(RUNNER_CONFIG_KEYS, parsed.values.set ?? [], parsed.values.unset ?? []);
+    } catch (e) {
+      if (!(e instanceof ConfigKeyError)) throw e;
+      return die(`RUNNER_SETUP_FAILED ${e.message}`);
+    }
+  };
+  const setupInteractive = !parsed.values.yes && Boolean(process.stdin.isTTY);
+  if (sub === "setup") {
+    if (target !== undefined) die(usage);
+    const keys = await runnerKeys();
+    const cfg = await loadConfig();
+    setDefaultRunTimeout(cfg.runTimeoutMs);
+    let machine: GuardMachine | undefined;
+    if (parsed.values.machine !== undefined) {
+      const label = labelArg(parsed.values.machine);
+      const { readGuardMachines } = await import("./remote-guard.ts");
+      const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+      machine = machines.machines.find((m) => m.label === label) ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    }
+    let code: number;
+    try {
+      code = await runnerSetupNow(cfg.stateDir, machine, { ...keys, interactive: setupInteractive, mode: parsed.values.new ? "new" : "full" });
+    } catch (e) {
+      code = die(e instanceof Error ? e.message : String(e));
+    }
+    process.exit(code);
+  }
   if (sub === "herdr") {
     const label = labelArg(parsed.values.machine);
     const cfg = await loadConfig();
@@ -420,6 +498,7 @@ if (process.argv[2] === "runner") {
       }
     }
     const label = direct?.label ?? labelArg(parsed.values.machine);
+    const keys = await runnerKeys();
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
     const { readGuardMachines } = await import("./remote-guard.ts");
@@ -443,6 +522,12 @@ if (process.argv[2] === "runner") {
       console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${herdrInstallNote(result.ok ? result.herdr : undefined)}`);
     } finally {
       auth.close();
+    }
+    const setup = await runnerSetupNow(cfg.stateDir, machine, { ...keys, interactive: setupInteractive, mode: "full" })
+      .catch((e: unknown) => { console.log(e instanceof Error ? e.message : String(e)); return 1; });
+    if (setup !== 0) {
+      console.log(`RUNNER_SETUP_AFTER_INSTALL_FAILED runner=${label} run: dori runner setup --machine ${label}`);
+      process.exit(setup);
     }
     process.exit(0);
   }
@@ -745,7 +830,9 @@ try {
         run, sleep: realClock.sleep, log: (line) => console.log(line),
         // A fresh process: this one still holds the modules it loaded before the pull, which may refer to files the pull
         // removed or exports the pulled code no longer has.
-        upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
+        // stdin is inherited so runner setup and `dori setup --migrate` can ask new keys on a terminal.
+        upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["inherit", "inherit", "inherit"] }).exited,
+        migrateConfig: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "setup", "--migrate"], { stdio: ["inherit", "inherit", "inherit"] }).exited,
         refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
         refreshBootPrep: () => refreshBootPrep(homedir()),
       },
