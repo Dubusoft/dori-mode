@@ -155,10 +155,10 @@ const USAGE = `dori <command> [options]
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
-  autopilot candidates [--tasks 12,13] [--json] [--record] | schedule
+  autopilot candidates [--tasks 12,13] [--json] [--record]
                                        lead-only, shadow mode (nothing launches): judge every planned toodo task marked for
                                        autopilot, plus --tasks (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free
-                                       slots; --record writes one shadow row per task per hour), add the hourly autopilot-reconcile job
+                                       slots; --record writes one shadow row per task per hour); the supervisor runs the same every 5 min
   autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
                                        lead-only, under a lock: re-judge the task and on LAUNCH reserve attempt <n> as lane
                                        ap-<taskId>-<n> (planned ledger row; exit 1 with the verdict otherwise); a settle flag closes
@@ -1087,24 +1087,12 @@ try {
       process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
     }
     case "autopilot": {
-      const { autopilotMain, quotaSummary, within } = await import("./autopilot-cli.ts");
-      const { ToodoClient } = await import("./toodo-client.ts");
+      const { autopilotMain, liveJudgeDeps } = await import("./autopilot-cli.ts");
       const { acquireStateLock } = await import("./state-lock.ts");
       const store = openOperations(config);
       const code = await autopilotMain(rest, {
-        config: config.autopilot, store, now: realClock.now,
-        toodo: () => new ToodoClient(BUILT_IN.toodoEvents),
-        openLanes: async () => new Set((await deps.registry.open()).map((l) => l.key)),
-        quota: () => within(15_000, async () => quotaSummary((await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(15_000))).usage), () => ({ readable: false })),
-        // The can-launch check of the default machine, without recording a launch verdict.
-        host: () => within(15_000, async () => {
-          const c = await checkMachine(deps.ops, config, config.placement.defaultMachine);
-          const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
-          return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
-        }, (why) => ({ ok: false, reason: why })),
-        schedules: () => new SourceSpecs(config.stateDir),
+        ...liveJudgeDeps(deps, store), now: realClock.now,
         lock: () => acquireStateLock(join(config.stateDir, "autopilot-launch.lock.sqlite")),
-        cliArgv: [process.execPath, join(import.meta.dir, "cli.ts")],
         out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
       });
       store.close();

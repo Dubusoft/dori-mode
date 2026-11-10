@@ -4,26 +4,26 @@ import {
   type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll,
   LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaSummary, recordShadow, type ToodoTask,
 } from "./autopilot.ts";
-import type { ClaudeUsage } from "./claude-quota.ts";
+import { type ClaudeUsage, lookupQuotaResults, readUsage } from "./claude-quota.ts";
+import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
-import { ToodoUnreadable } from "./toodo-client.ts";
+import { checkMachine } from "./placement.ts";
+import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
 
 /**
- * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot, adds the hourly reconcile job, and
- * reserves a launch. Nothing here launches a lane, writes to toodo or merges: candidates only reads (and with --record
- * writes shadow rows), schedule writes one schedule job, launch writes and settles launch-attempt rows; the lead runs
- * `start_task` and `dori launch` between the reservation and its settle.
+ * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
+ * launches a lane, writes to toodo or merges: candidates only reads (and with --record writes shadow rows), launch
+ * writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
+ * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every AUTOPILOT_TICK_MS.
  */
 
 export const AUTOPILOT_USAGE = [
   "usage: dori autopilot candidates [--tasks 12,13] [--json] [--record]",
-  "       dori autopilot schedule",
   "       dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]",
 ].join("\n");
 
+/** The hourly schedule job the supervisor's autopilot tick replaced; the supervisor removes it at startup. */
 export const RECONCILE_JOB = "autopilot-reconcile";
-export const RECONCILE_KIND = "AUTOPILOT_RECONCILE";
-export const RECONCILE_CRON = "0 * * * *";
 
 /** The toodo reads autopilot needs; any failure throws (ToodoUnreadable from the real client). */
 export type ToodoReader = {
@@ -32,10 +32,8 @@ export type ToodoReader = {
   readonly flaggedTasks: () => Promise<ToodoTask[]>;
 };
 
-/** The schedule registry (SourceSpecs) as far as `schedule` uses it. */
-export type ScheduleRegistry = { readonly list: () => readonly { readonly name: string }[]; readonly add: (raw: unknown) => unknown };
-
-export type AutopilotDeps = {
+/** What judging the candidates reads: toodo, the launch ledger, open lanes, quota and the host. */
+export type JudgeDeps = {
   readonly config: AutopilotConfig;
   readonly store: OperationStore;
   readonly toodo: () => ToodoReader;
@@ -45,11 +43,11 @@ export type AutopilotDeps = {
   readonly quota: () => Promise<QuotaSummary>;
   /** The can-launch verdict and free slots of the default machine; must not throw. */
   readonly host: () => Promise<HostSummary>;
-  readonly schedules: () => ScheduleRegistry;
+};
+
+export type AutopilotDeps = JudgeDeps & {
   /** Takes the autopilot launch lock (waits for it); the result releases it. */
   readonly lock: () => Promise<() => void>;
-  /** argv that runs this CLI: [bun, <absolute cli.ts>]. */
-  readonly cliArgv: readonly string[];
   readonly now: () => number;
   readonly out: (line: string) => void;
   readonly err: (line: string) => void;
@@ -76,6 +74,24 @@ export const within = async <T>(ms: number, work: () => Promise<T>, fallback: (w
   }
 };
 
+const PROBE_MS = 15_000;
+
+/**
+ * JudgeDeps over the live world: toodo-server, the registry's open lanes, the Claude quota and the default machine's
+ * can-launch check (without recording a launch verdict). `dori autopilot` and the supervisor's tick share it.
+ */
+export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry" | "tunables" | "clock">, store: OperationStore): JudgeDeps => ({
+  config: flow.config.autopilot, store,
+  toodo: () => new ToodoClient(flow.tunables.toodoEvents),
+  openLanes: async () => new Set((await flow.registry.open()).map((l) => l.key)),
+  quota: () => within(PROBE_MS, async () => quotaSummary((await readUsage(lookupQuotaResults(), flow.clock.now(), AbortSignal.timeout(PROBE_MS))).usage), () => ({ readable: false })),
+  host: () => within(PROBE_MS, async () => {
+    const c = await checkMachine(flow.ops, flow.config, flow.config.placement.defaultMachine);
+    const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
+    return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
+  }, (why) => ({ ok: false, reason: why })),
+});
+
 class UsageError extends Error {}
 
 const FLAGS = {
@@ -83,7 +99,7 @@ const FLAGS = {
   launched: { type: "string" }, failed: { type: "boolean" }, ambiguous: { type: "boolean" }, note: { type: "string" },
 } as const;
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  candidates: ["json", "record", "tasks"], schedule: [], launch: ["launched", "failed", "ambiguous", "note"],
+  candidates: ["json", "record", "tasks"], launch: ["launched", "failed", "ambiguous", "note"],
 };
 
 const taskIds = (value: string | undefined): number[] => {
@@ -92,58 +108,59 @@ const taskIds = (value: string | undefined): number[] => {
   return [...new Set(parts.map(Number))];
 };
 
-/**
- * Judges every planned task marked for autopilot plus `extraIds` and prints the report; --record writes one shadow row
- * per task this hour. Exit 1 with AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read, since nothing can be judged.
- */
+type ReadTasks = { tasks: Map<number, ToodoTask>; ids: number[] };
+
 /**
  * The marked planned tasks, `extraIds` and every dependency of them, plus the ids to judge (marked planned ones and
- * `extraIds`); undefined after printing AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read.
+ * `extraIds`). Throws ToodoUnreadable when toodo cannot be read.
  */
-const readTasks = async (deps: AutopilotDeps, extraIds: readonly number[]): Promise<{ tasks: Map<number, ToodoTask>; ids: number[] } | undefined> => {
+const loadTasks = async (deps: JudgeDeps, extraIds: readonly number[]): Promise<ReadTasks> => {
   const tasks = new Map<number, ToodoTask>();
-  try {
-    const toodo = deps.toodo();
-    for (const t of await toodo.flaggedTasks()) tasks.set(t.id, t);
-    const extra = extraIds.filter((id) => !tasks.has(id));
-    if (extra.length) for (const t of await toodo.tasksByIds(extra)) tasks.set(t.id, t);
-    const missingDeps = [...tasks.values()].flatMap((t) => t.dependsOn).filter((id) => !tasks.has(id));
-    if (missingDeps.length) for (const t of await toodo.tasksByIds(missingDeps)) tasks.set(t.id, t);
-  } catch (e) {
+  const toodo = deps.toodo();
+  for (const t of await toodo.flaggedTasks()) tasks.set(t.id, t);
+  const extra = extraIds.filter((id) => !tasks.has(id));
+  if (extra.length) for (const t of await toodo.tasksByIds(extra)) tasks.set(t.id, t);
+  const missingDeps = [...tasks.values()].flatMap((t) => t.dependsOn).filter((id) => !tasks.has(id));
+  if (missingDeps.length) for (const t of await toodo.tasksByIds(missingDeps)) tasks.set(t.id, t);
+  return { tasks, ids: [...new Set([...[...tasks.values()].filter((t) => t.autopilot && t.status === "planned").map((t) => t.id), ...extraIds])] };
+};
+
+/** loadTasks, or undefined after printing AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read. */
+const readTasks = async (deps: AutopilotDeps, extraIds: readonly number[]): Promise<ReadTasks | undefined> => {
+  try { return await loadTasks(deps, extraIds); } catch (e) {
     if (!(e instanceof ToodoUnreadable)) throw e;
     deps.err(`AUTOPILOT_TOODO_UNREADABLE ${e.message}`);
     return undefined;
   }
-  return { tasks, ids: [...new Set([...[...tasks.values()].filter((t) => t.autopilot && t.status === "planned").map((t) => t.id), ...extraIds])] };
 };
 
+/**
+ * Judges every planned task marked for autopilot plus `extraIds`. Quota and host are probed only when there is a task to
+ * judge. Throws ToodoUnreadable when toodo cannot be read, since nothing can be judged.
+ */
+export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number[] = []): Promise<CandidatesReport> => {
+  const { tasks, ids } = await loadTasks(deps, extraIds);
+  if (!ids.length) return { mode: deps.config.mode, slots: null, verdicts: [] };
+  const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
+  const verdicts = judgeAll({ tasks, ledger: ledgerRows(deps.store), openLanes, quota, host, config: deps.config }, ids);
+  return { mode: deps.config.mode, slots: host.ok ? host.slots ?? null : 0, verdicts };
+};
+
+/**
+ * Judges every planned task marked for autopilot plus `extraIds` and prints the report; --record writes one shadow row
+ * per task this hour. Exit 1 with AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read, since nothing can be judged.
+ */
 const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, extraIds: readonly number[]): Promise<number> => {
   const now = deps.now();
-  const read = await readTasks(deps, extraIds);
-  if (!read) return 1;
-  const { tasks, ids } = read;
-  let report: CandidatesReport = { mode: deps.config.mode, slots: null, verdicts: [] };
-  if (ids.length) {
-    const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
-    const verdicts = judgeAll({ tasks, ledger: ledgerRows(deps.store), openLanes, quota, host, config: deps.config }, ids);
-    report = { mode: deps.config.mode, slots: host.ok ? host.slots ?? null : 0, verdicts };
+  let report: CandidatesReport;
+  try { report = await judgeCandidates(deps, extraIds); } catch (e) {
+    if (!(e instanceof ToodoUnreadable)) throw e;
+    deps.err(`AUTOPILOT_TOODO_UNREADABLE ${e.message}`);
+    return 1;
   }
   if (record) recordShadow(deps.store, now, report.verdicts);
   if (json) deps.out(JSON.stringify(candidatesJson(report), null, 2));
   else for (const line of formatCandidates(report)) deps.out(line);
-  return 0;
-};
-
-/** Adds the hourly reconcile job unless a job of that name exists already. */
-const schedule = (deps: AutopilotDeps): number => {
-  const specs = deps.schedules();
-  if (specs.list().some((s) => s.name === RECONCILE_JOB)) { deps.out(`AUTOPILOT_SCHEDULE_EXISTS ${RECONCILE_JOB}`); return 0; }
-  // No tz: the schedule's default zone (Asia/Seoul) applies.
-  specs.add({
-    name: RECONCILE_JOB, type: "schedule", kind: RECONCILE_KIND, cron: RECONCILE_CRON, catchUp: "once",
-    command: [...deps.cliArgv, "autopilot", "candidates", "--record"], since: deps.now(),
-  });
-  deps.out(`AUTOPILOT_SCHEDULE_ADDED ${RECONCILE_JOB} cron=${RECONCILE_CRON} kind=${RECONCILE_KIND}`);
   return 0;
 };
 
@@ -224,7 +241,6 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     const v = parsed.values as Record<string, unknown>;
     if (sub === "launch") return await launch(deps, extra, v);
     if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
-    if (sub === "schedule") return schedule(deps);
     const extraIds = v.tasks === undefined ? [] : taskIds(v.tasks as string);
     return await candidates(deps, v.json === true, v.record === true, extraIds);
   } catch (e) {

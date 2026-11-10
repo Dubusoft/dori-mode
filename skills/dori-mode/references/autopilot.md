@@ -50,13 +50,13 @@ REFUSE means the task needs the owner or the lead, or is not eligible yet:
 | `task-missing` | Toodo no longer returns the task (archived or deleted). |
 | `not-planned` | Status is not `planned` and the task has no wait. |
 | `prerequisite-missing` | A dependency is no longer returned by toodo (archived or bulk-deleted). |
-| `prerequisite-open` | A dependency is not done yet. The next reconcile after it is done judges again. |
+| `prerequisite-open` | A dependency is not done yet. The next tick after it is done judges again. |
 | `prerequisite-not-adopted` | A dependency is done with resolution `not_adopted`. |
 | `cross-workspace-prerequisite` | A dependency lives in another workspace. |
 | `already-attempted` | A launch attempt exists for the task and none is running. |
 | `ledger-ambiguous` | A ledger row for the task is `ambiguous`. |
 
-HOLD is temporary; the next reconcile judges again:
+HOLD is temporary; the next tick judges again:
 
 | Reason | When |
 | --- | --- |
@@ -77,7 +77,6 @@ Lead-only; inside a lane each one exits with `LANE_PERMISSION_DENIED`.
 
 ```
 dori autopilot candidates [--tasks 12,13] [--json] [--record]
-dori autopilot schedule
 dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
 ```
 
@@ -93,12 +92,15 @@ dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [
   With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ mode, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit). Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
 - `launch <taskId>` reserves the task's next launch attempt. It holds a state lock (`<stateDir>/autopilot-launch.lock.sqlite`) while it reads toodo, the ledger, open lanes, quota and the host again, and judges the task among every marked task as `candidates` does. Another task's reservation that is not running as a lane yet takes one of the host's free slots, since its pane does not exist yet. Only on LAUNCH it writes the `planned` row and prints `AUTOPILOT_RESERVED #<id> lane=ap-<id>-<n> attempt=<n>` (exit 0). Otherwise it prints `AUTOPILOT_LAUNCH_REFUSED #<id> <HOLD|REFUSE> <reasons>` and writes nothing (exit 1). A second reserve of the same task holds `lane-live`, so handling one event twice launches once.
 - `launch <taskId> --launched <laneKey>` settles the open reservation as `verified` (the key must be the reserved one, else `AUTOPILOT_LANE_MISMATCH`, exit 1). `--failed` settles it `failed` when the launch surely did not happen, and `--ambiguous` settles it `ambiguous` when that cannot be told; `--note` adds why to the row. Each prints `AUTOPILOT_SETTLED #<id> attempt=<n> <state> lane=<key>`; with no open reservation, `AUTOPILOT_NO_RESERVATION #<id>` (exit 1). A settled attempt is never retried by itself: `failed` and a closed lane refuse `already-attempted`, `ambiguous` also refuses `ledger-ambiguous`.
-- `schedule` adds, idempotently, the job `autopilot-reconcile`: cron `0 * * * *` (`Asia/Seoul`), kind `AUTOPILOT_RECONCILE`, catch-up `once`, running this same CLI as `autopilot candidates --record`. Its kind is digest under the default event policy, so it never wakes the lead by itself.
+
+## Supervisor tick
+
+The supervisor judges the same candidates itself every 5 minutes (sooner after a toodo task event, `tasks-changed` included, at most once per 15 s) and writes the hour's shadow rows. It wakes the lead with urgent `AUTOPILOT_READY #12,#15 slots=<n|unlimited>` only when the set of LAUNCH tasks or the free slots change, and once more as `AUTOPILOT_READY ... again` every 30 minutes while the same set waits; a tick with nothing to launch forgets the set, so it is news again when it comes back. A tick that cannot read toodo logs `AUTOPILOT_TICK_ERROR <why>` once and tries again at the next tick. The tick runs only while the `toodo` event source is enabled, and it replaced the hourly `autopilot-reconcile` schedule job, which the supervisor removes at startup (`AUTOPILOT_RECONCILE_JOB_REMOVED`).
 
 ## Rules for the lead
 
 - A `TOODO_TASK_READY` event never launches by itself. Run `dori autopilot candidates --record` (add `--tasks <id>` to see why an unmarked ready task would not run). Only a marked task that judges LAUNCH may run; in v1 even LAUNCH only records "would launch #<n>". Any other ready task is recorded, not launched.
-- Reconcile at lead startup, on every `TOODO_TASK_READY` and `TOODO_TASK_RESYNC`, and hourly through `autopilot-reconcile`. Batch several ready lines into one reconcile.
+- On `AUTOPILOT_READY`, take the named tasks through the order below: `dori autopilot launch <id>` judges each again under its lock, so a task that changed since the tick is refused there. The supervisor's tick replaces any periodic reconcile of your own. Run `candidates --record` at lead startup.
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
 - Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (an ambiguous one goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.

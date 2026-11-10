@@ -40,6 +40,8 @@ export type ToodoEventsDeps = {
   readonly fail: (error: unknown) => void;
   readonly ok: () => void;
   readonly log: (line: string) => void;
+  /** Every stream event's name, journaled or not (e.g. `tasks-changed`), after its line is enqueued: the autopilot tick's kick. */
+  readonly onEvent?: (event: string) => void;
   readonly fetch?: typeof fetch;
   readonly idleMs?: number;
   readonly retryMinMs?: number;
@@ -196,6 +198,7 @@ export class ToodoEvents {
         // Journaled before the cursor moves: a crash in between replays the event, and the journal drops the repeat.
         if (line) this.deps.enqueue(`toodo:${event.id}`, line);
         writeCursor(stateDir, event.id);
+        this.deps.onEvent?.(event.event);
       }
     } catch (e) {
       if (idle.signal.aborted && !signal.aborted) throw idle.signal.reason;
