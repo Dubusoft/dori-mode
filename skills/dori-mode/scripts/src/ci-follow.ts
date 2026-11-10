@@ -651,7 +651,8 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (!valid) return { ok: false, detail: `branch name ${JSON.stringify(branch.slice(0, 80))} of ${pull.repo}#${pull.number} is not a valid branch` };
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
-  // The local runner's reported worktree root wins over the lead config's.
+  // The local runner's reported worktree root (it reports config.worktreeRoot unless its runner-config sets one); the
+  // config's only while that runner has reported none. The closed-lane sweep (done-flow.ts) uses the same root.
   const root = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(undefined)) || deps.config.worktreeRoot;
   if (!root) return { ok: false, detail: "worktreeRoot is not set" };
   const paneCount = async (): Promise<number> => deps.ops.panes().then((panes) => panes.length, () => -1); // the local runner's panes; -1 when unreadable

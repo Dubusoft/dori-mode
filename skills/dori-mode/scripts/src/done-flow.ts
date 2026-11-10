@@ -634,14 +634,14 @@ const keptWorktrees = (lane: Lane): string[] => {
 
 /**
  * Finish a closed lane's worktree cleanup: a worktree its close kept is removed once it is clean, only under
- * `worktreeRoot` or the local runner's reported worktree root (older lanes sit under the former). Open lanes (working, not-done, paused, done-claimed) are never touched: their Done signals have
+ * the local runner's reported worktree root, or `config.worktreeRoot` while that runner has reported none. Open lanes (working, not-done, paused, done-claimed) are never touched: their Done signals have
  * not all read back yet, and work can continue after a merge. Failures come back as LANE_WATCH_WARN lines.
  */
 export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
   if (lane.machine || statusOf(lane) !== "closed") return [];
   const reported = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(lane.machine));
-  const roots = [deps.config.worktreeRoot, reported ?? ""].map((r) => r.replace(/\/+$/, "")).filter((r) => r !== "");
-  const kept = keptWorktrees(lane).filter((wt) => roots.some((root) => wt.startsWith(`${root}/`)) && !wt.includes(".."));
+  const root = (reported || deps.config.worktreeRoot).replace(/\/+$/, "");
+  const kept = root ? keptWorktrees(lane).filter((wt) => wt.startsWith(`${root}/`) && !wt.includes("..")) : [];
   if (!kept.length) return [];
   const [cwdThere = false, ...present] = await deps.ops.exists(undefined, [lane.cwd ?? deps.config.defaultCwd, ...kept]);
   const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.defaultCwd;
