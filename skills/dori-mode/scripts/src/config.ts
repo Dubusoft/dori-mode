@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DEFAULT_EVENT_POLICY, type EventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
+import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
 import { type StoreKind, storeOnDisk } from "./store.ts";
 import type { ToodoEventsConfig } from "./toodo-events.ts";
@@ -498,7 +499,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const loaded = (await file.exists()) ? ((await file.json()) as Record<string, unknown>) : {};
   const paneKeys = legacyPaneKeys(loaded);
   const kept = CONFIG_FILE_KEYS as readonly string[];
-  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key));
+  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key) && key !== CONFIG_SCHEMA_KEY);
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));

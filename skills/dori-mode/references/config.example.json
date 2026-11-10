@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 1,
   "stateDir": "~/.dori/state",
   "ignorePanes": [],
   "defaultCwd": "~/code/my-project",

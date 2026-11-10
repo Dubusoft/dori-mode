@@ -7,7 +7,8 @@ import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { Repos, ReposError } from "../src/repos.ts";
 import { DORI_CONFIG_KEYS } from "../src/config-keys.ts";
-import { envGet, envSet, mergeConfig, type Prompter, renderTemplate, runSetup, saveConfig, type SetupDeps, SetupError, SETUP_KEYS_FILE, UNITS, NOTIFY_UNIT, FAILURE_NOTIFY } from "../src/setup.ts";
+import { CONFIG_REMOVALS_FILE, envGet, envSet, mergeConfig, type Prompter, renderTemplate, runSetup, saveConfig, type SetupDeps, SetupError, SETUP_KEYS_FILE, UNITS, NOTIFY_UNIT, FAILURE_NOTIFY } from "../src/setup.ts";
+import { CONFIG_SCHEMA_VERSION } from "../src/config-schema.ts";
 import { withState } from "./fakes.ts";
 
 const TOKEN = "MTIz.fake-token_value";
@@ -156,6 +157,7 @@ test("autostart writes the notify unit and an executable notify script but enabl
 test("non-interactive setup writes env 600, config with herdr ids and units, never logs the token, and a second run changes nothing", async () => {
   const d = deps();
   await Bun.write(d.configPath, JSON.stringify({ custom: "keep me", hooks: { threadReply: ["notify", "{text}"] } }));
+  await Bun.write(join(d.home, ".dori", "state", CONFIG_REMOVALS_FILE), JSON.stringify(["custom"]));
   const code = await runSetup(d, { token: TOKEN, channels: [CHANNEL], cwd: "~/code", autostart: true });
   expect(code).toBe(0);
 
@@ -455,20 +457,62 @@ test("--set values are applied as given and never asked", async () => {
   expect(log).toContain("SETUP_KEY_SET alertsChannel");
 });
 
-test("keys config.json no longer reads are removed after a .bak copy of the previous file", async () => {
+const backups = (configPath: string): string[] =>
+  readdirSync(join(configPath, "..")).flatMap((f) => {
+    const m = /^config\.json\.(\d{8}T\d{6}Z)(?:-(\d+))?\.bak$/.exec(f);
+    return m ? [{ f, key: `${m[1]}:${(m[2] ?? "0").padStart(4, "0")}` }] : [];
+  }).sort((a, b) => a.key.localeCompare(b.key)).map(({ f }) => join(configPath, "..", f));
+
+test("keys config.json no longer reads are warned about and kept once, then removed, each write after a timestamped backup", async () => {
   const d = deps();
   const before = JSON.stringify({ memoryCheck: true, hooks: { threadReply: ["x"], threadDone: ["y"] }, laneSandbox: { default: ["sb"] } });
   await Bun.write(d.configPath, before);
+  const obsolete = ["memoryCheck", "hooks.threadDone", "laneSandbox.default"];
+  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
+  const first = readJson(d.configPath);
+  expect(first).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, memoryCheck: true, hooks: { threadReply: ["x"], threadDone: ["y"] }, laneSandbox: { default: ["sb"] } });
+  for (const key of obsolete) expect(log.some((l) => l.startsWith(`SETUP_KEY_REMOVAL_PENDING ${key} (`))).toBe(true);
+  expect(log.some((l) => l.startsWith("SETUP_KEY_REMOVED "))).toBe(false);
+  const [bak] = backups(d.configPath);
+  expect(readFileSync(bak!, "utf8")).toBe(before);
+  expect(mode(bak!)).toBe(0o600);
+  expect(log).toContain(`SETUP_CONFIG_BACKUP ${bak}`);
+
+  log = [];
+  const warned = readFileSync(d.configPath, "utf8");
   expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
   const cfg = readJson(d.configPath);
   expect(cfg).not.toHaveProperty("memoryCheck");
   expect(cfg.hooks).toEqual({ threadReply: ["x"] });
   expect(cfg.laneSandbox).toEqual({});
-  const bak = `${d.configPath}.bak`;
-  expect(readFileSync(bak, "utf8")).toBe(before);
-  expect(mode(bak)).toBe(0o600);
-  for (const key of ["memoryCheck", "hooks.threadDone", "laneSandbox.default"]) expect(log).toContain(`SETUP_KEY_REMOVED ${key} (no longer read from config.json)`);
-  expect(log).toContain(`SETUP_CONFIG_BACKUP ${bak}`);
+  for (const key of obsolete) expect(log.some((l) => l.startsWith(`SETUP_KEY_REMOVED ${key} (`))).toBe(true);
+  const all = backups(d.configPath);
+  expect(all).toHaveLength(2);
+  expect(readFileSync(all[0]!, "utf8")).toBe(before);
+  expect(readFileSync(all[1]!, "utf8")).toBe(warned);
+  expect(JSON.parse(readFileSync(join(d.home, ".dori", "state", CONFIG_REMOVALS_FILE), "utf8"))).toEqual([]);
+});
+
+test("a config with a newer schemaVersion is refused before anything is written", async () => {
+  const d = deps();
+  const before = JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION + 1, futureKey: { a: 1 }, defaultModel: "a/b" });
+  await Bun.write(d.configPath, before);
+  for (const input of [{ migrate: true }, { token: TOKEN, channels: [CHANNEL], herdr: false }]) {
+    await expect(runSetup(d, input)).rejects.toThrow(SetupError);
+    expect(readFileSync(d.configPath, "utf8")).toBe(before);
+  }
+  expect(backups(d.configPath)).toEqual([]);
+  expect(existsSync(join(d.home, ".dori", "state", CONFIG_REMOVALS_FILE))).toBe(false);
+});
+
+test("a current config that needs no change is neither written nor backed up", async () => {
+  const d = deps();
+  const text = `${JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~", stateDir: "~/.dori/state" }, null, 2)}\n`;
+  await Bun.write(d.configPath, text);
+  expect(await runSetup(d, { migrate: true })).toBe(0);
+  expect(readFileSync(d.configPath, "utf8")).toBe(text);
+  expect(backups(d.configPath)).toEqual([]);
+  expect(log).toContain(`SETUP config unchanged: ${d.configPath}`);
 });
 
 test("legacy pane keys are migrated into state before they are removed from the config", async () => {
@@ -491,8 +535,9 @@ test("migrate prunes, asks only keys never shown before, records them, and touch
   expect(asked.map((q) => q.split(" ")[0])).toEqual(["ownerLanguage", "ciMergeBase"]);
   const cfg = readJson(d.configPath);
   expect(cfg.ownerLanguage).toBe("Korean");
-  expect(cfg).not.toHaveProperty("memoryCheck");
-  expect(existsSync(`${d.configPath}.bak`)).toBe(true);
+  expect(cfg).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, memoryCheck: true });
+  expect(log.some((l) => l.startsWith("SETUP_KEY_REMOVAL_PENDING memoryCheck ("))).toBe(true);
+  expect(backups(d.configPath)).toHaveLength(1);
   expect(JSON.parse(readFileSync(join(stateDir, SETUP_KEYS_FILE), "utf8"))).toEqual(DORI_CONFIG_KEYS.map((s) => s.key).sort());
   expect(requests).toEqual([]);
   expect(herdr.calls).toEqual([]);

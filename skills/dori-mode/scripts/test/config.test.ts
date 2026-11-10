@@ -78,7 +78,7 @@ test("a stray leadModel key in the config file is ignored, and the default model
 test("only user and environment keys are read: unknown, removed and malformed tunable keys load as defaults, named in one CONFIG_KEYS_IGNORED line per process", async () => {
   const path = join(state.dir, "mixed.json");
   await Bun.write(path, JSON.stringify({
-    defaultModel: "m/lane", store: "sqlite", ciMergeBase: "release",
+    schemaVersion: 1, defaultModel: "m/lane", store: "sqlite", ciMergeBase: "release",
     futureKey: { a: 1 }, operations: false, quotaGate: { pollMin: 5 }, toodo: { url: "x" }, laneFinishNotice: true,
     drift: "x", runners: { listen: "8.8.8.8:1", mode: { mini: "shadow" } }, eventPolicy: 7, resolveKinds: "x",
     delivery: { mode: "push", push: { ackSec: 1 } }, guard: { memFreeCritPct: 3 }, heavyKill: "qemu-system", closeAfterMin: 7,
