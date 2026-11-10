@@ -20,6 +20,13 @@ Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-lau
 - A row in `ambiguous` sends the task to the owner (REFUSE `ledger-ambiguous`); it is never retried.
 - A row that is open (`planned`, `attempted`), or `verified` with its `laneKey` an open registry lane, means the task is running (HOLD `lane-live`).
 
+When the lane a row names closes, the close settles the row once and adds `outcome` to its data (every close path: `dori close`, a settled done claim, a merge, a recovery close, a close the supervisor resumes after a crash):
+
+- A close with `--cancelled` (the lane never started, e.g. after `RUNNER_LAUNCH_FAILED`, was given up, or its Done can never hold) settles the row `failed` with `outcome: "failed"` and gives the lead `AUTOPILOT_LANE_FAILED #<id> lane=<key> attempt=<n> cancelled: <reason>: tell the owner; autopilot does not launch it again`.
+- Any other close (every Done signal held, or its PR merged) keeps the row `verified` with `outcome: "done"` and gives `AUTOPILOT_LANE_DONE #<id> lane=<key> attempt=<n>: complete toodo task #<id>`.
+
+`dori close` prints the line; a close the supervisor runs journals it as an urgent event under the id `autopilot-outcome:<key>`, so it is told once. A row the launch itself settled `failed` or `ambiguous` is left as it is.
+
 Shadow records are rows too: lane `autopilot`, action `autopilot-shadow`, target `<taskId>@<slot ISO>` (slot is the current hour floored, UTC), state `verified`, detail `<VERDICT> <reasons joined by ", ">`. Only `--record` writes them, one per task per hour.
 
 ## Configuration
@@ -102,7 +109,8 @@ The supervisor judges the same candidates itself every 5 minutes (sooner after a
 - A `TOODO_TASK_READY` event never launches by itself. Run `dori autopilot candidates --record` (add `--tasks <id>` to see why an unmarked ready task would not run). Only a marked task that judges LAUNCH may run; in v1 even LAUNCH only records "would launch #<n>". Any other ready task is recorded, not launched.
 - On `AUTOPILOT_READY`, take the named tasks through the order below: `dori autopilot launch <id>` judges each again under its lock, so a task that changed since the tick is refused there. The supervisor's tick replaces any periodic reconcile of your own. Run `candidates --record` at lead startup.
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
-- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (an ambiguous one goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
+- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
+- A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them (`report_blocker` on it). On `AUTOPILOT_LANE_DONE` complete the task (`complete_task` with the PR as a ref), which lets its dependents become ready.
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
 - Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 
