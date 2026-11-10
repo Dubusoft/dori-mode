@@ -13,7 +13,7 @@ It ships as a skill (`skills/dori-mode/SKILL.md` plus references) and a small bu
 ## Install
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 This clones the repo to `~/.dori/src`, links the skill into `~/.agents/skills/dori-mode`, puts `dori` on your PATH with `bun link`, and starts `dori setup`. Set `SKILLS_DIR` if your agent loads skills from somewhere else.

@@ -6,7 +6,7 @@
       "name": "dori-mode-scripts",
       "dependencies": {
         "@code-yeongyu/senpi": "2026.10.18-1",
-        "pi-quota": "git+https://github.com/dev-bokdong/pi-quota.git",
+        "pi-quota": "git+https://github.com/Dubusoft/pi-quota.git",
       },
       "devDependencies": {
         "@types/bun": "^1.3.0",
@@ -445,7 +445,7 @@
 
     "path-to-regexp": ["path-to-regexp@8.4.2", "", {}, "sha512-qRcuIdP69NPm4qbACK+aDogI5CBDMi1jKe0ry5rSQJz8JVLsC7jV8XpiJjGRLLol3N+R5ihGYcrPLTno6pAdBA=="],
 
-    "pi-quota": ["pi-quota@github:dev-bokdong/pi-quota#9e165ce", { "peerDependencies": { "@code-yeongyu/senpi": "*", "@earendil-works/pi-ai": "*" }, "optionalPeers": ["@code-yeongyu/senpi", "@earendil-works/pi-ai"] }, "dev-bokdong-pi-quota-9e165ce", "sha512-igJ0gB6lMkCwyhbTyxQZzVNsvQkULRRSqqLRovBQLRtRicDXQt3Gyiahwy6Kk6M2I1TUvWQVs0gtBK4VPsDrqg=="],
+    "pi-quota": ["pi-quota@github:Dubusoft/pi-quota#9e165ce", { "peerDependencies": { "@code-yeongyu/senpi": "*", "@earendil-works/pi-ai": "*" }, "optionalPeers": ["@code-yeongyu/senpi", "@earendil-works/pi-ai"] }, "Dubusoft-pi-quota-9e165ce", "sha512-L+w1rVOafeUKAWjH3+TajpcTmo4zBs9Vr53z0kWDUK+LRaUL92i+1Lq5xOw/7oM26y7+8LFgohjWgxj93bl2nA=="],
 
     "picomatch": ["picomatch@4.0.7", "", {}, "sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA=="],
 
