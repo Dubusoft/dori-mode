@@ -567,12 +567,14 @@ export class LeadLifecycle {
       "Never run a foreground wait, watch, sleep or polling loop (gh pr checks --watch, gh run watch, sleep): register every follow-up with dori wait and end the turn, so owner messages reach you.",
     ];
     const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
+    const voice = "Before your first reply, take the owner's speech rules from your memory (human.md), such as the honorific level, and keep them in every message: matching the owner's tone never lowers the honorific level (no casual speech when the polite form is the rule; with no rule recorded, use the polite form).";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     return [
       ...head,
       take,
       carried,
       replyFirst,
+      voice,
       ...(restart.reason ? [`The previous lead stopped: ${restart.reason}. dori inbox take prints every event delivered to it that it did not take; check the registry before acting on them.`] : []),
       persist,
       transport,
