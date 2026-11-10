@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
+import { alertsChannelOf, CONFIG_FILE_KEYS, configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
@@ -49,6 +49,8 @@ export type DoctorDeps = {
   /** Test seams for the sandbox check: the host platform (default process.platform) and the PATH lookup (default Bun.which). */
   readonly platform?: string;
   readonly which?: (cmd: string) => string | null | undefined;
+  /** Test seam for the config source report: the environment loadConfig read (default process.env). */
+  readonly env?: Readonly<Record<string, string | undefined>>;
 };
 
 const ok = (id: string, detail: string): Check => ({ id, level: "OK", detail });
@@ -224,6 +226,50 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
   checks.push(...await managedPanes(d));
+  return checks;
+};
+
+/** A value for one report line: objects show only their key names, so ids and argv stay short and secrets stay out. */
+const shown = (v: unknown): string => {
+  const s = v === undefined ? "(none)"
+    : typeof v === "object" && v !== null && !Array.isArray(v) ? `{${Object.keys(v).join(", ")}}`
+    : JSON.stringify(v);
+  return s.length > 80 ? `${s.slice(0, 77)}...` : s;
+};
+
+/**
+ * Where each config value came from, following loadConfig (config.ts): `file` (config.json), `default` (defaultConfig),
+ * `env` (DORI_CONFIG, DORI_STATE_DIR, DORI_LEAD_PANE) or `derived` (state on disk or another key). Keys in config.json
+ * that loadConfig does not read are a WARN; the legacy pane keys are reported by the config check.
+ */
+export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "configError" | "env">): Check[] => {
+  if (d.configError) return [];
+  const env = d.env ?? process.env;
+  let raw: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(d.configPath, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>;
+  } catch { /* no file: every value is a default, and the config check reports the missing file */ }
+  const c = d.config;
+  const values = c as Readonly<Record<string, unknown>>;
+  const line = (key: string, source: string, value: unknown): Check => ok(`config.${key}`, `${source}: ${shown(value)}`);
+  const checks: Check[] = [ok("config file", `${d.configPath} (${env.DORI_CONFIG ? "env DORI_CONFIG" : "default path"})`)];
+  for (const key of CONFIG_FILE_KEYS) {
+    const inFile = raw[key] !== undefined && raw[key] !== null;
+    if (key === "stateDir" && env.DORI_STATE_DIR) checks.push(line(key, "env DORI_STATE_DIR", c.stateDir));
+    else if (key === "alertsChannel" && !c.alertsChannel) checks.push(line(key, "derived from discordChannels[0]", alertsChannelOf(c)));
+    else if (key === "leadModel" && !inFile) checks.push(line(key, "derived from defaultModel", c.defaultModel));
+    else checks.push(line(key, inFile ? "file" : values[key] === undefined ? "unset" : "default", values[key]));
+  }
+  checks.push(
+    line("store", `derived from ${c.stateDir}`, c.store),
+    line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
+    line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
+    line("workspaces", "derived from laneWorkspace", c.workspaces),
+  );
+  const kept = CONFIG_FILE_KEYS as readonly string[];
+  const ignored = Object.keys(raw).filter((key) => !kept.includes(key) && !legacyPaneKeys(raw).includes(key));
+  if (ignored.length) checks.push(warn("config ignored keys", `${ignored.join(", ")} in ${d.configPath}: not read from config.json, the built-in values apply`, `delete ${ignored.join(", ")} from ${d.configPath} (dori setup --migrate)`));
   return checks;
 };
 
@@ -429,7 +475,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
 };
 
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 
