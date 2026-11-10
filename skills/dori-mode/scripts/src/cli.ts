@@ -43,8 +43,8 @@ import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
-import { ack, AckError, recordHandled } from "./ack.ts";
-import { checklistLine, InboxError, take, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
+import { ack, AckError, AWAITING_NOTE_MAX, recordHandled } from "./ack.ts";
+import { checklistLine, InboxError, take, takeAwaitingReminders, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
@@ -257,8 +257,8 @@ const USAGE = `dori <command> [options]
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
                                        hourglass off, eyes on; the ack is recorded for the supervisor
-  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all]
-                                       link what handled an owner message
+  handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--awaiting [--note TEXT]]
+                                       link what handled an owner message, or park it on the owner's answer (--awaiting)
   send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
                                        post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN);
                                        --to alerts is config alertsChannel, else the first discordChannels entry. A new post is refused with
@@ -1327,7 +1327,8 @@ try {
         const reminders = [...takeCarriedReminders(config.stateDir, new Set(result.events.map((event) => event.id))), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
         // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
         const checklist = checklistLine([...result.events.map((event) => `${event.id}\t${event.line}`), ...reminders]);
-        for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...sentinel]) console.log(line);
+        // Messages parked on the owner's answer are information, not work: listed last and kept out of the checklist.
+        for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...takeAwaitingReminders(config.stateDir), ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;
@@ -1460,10 +1461,13 @@ try {
     case "handled": {
       const parsed = parseArgs({
         args: rest, allowPositionals: true,
-        options: { lane: { type: "string", multiple: true }, reply: { type: "boolean" }, all: { type: "boolean" }, tasks: { type: "string" } },
+        options: {
+          lane: { type: "string", multiple: true }, reply: { type: "boolean" }, all: { type: "boolean" }, tasks: { type: "string" },
+          awaiting: { type: "boolean" }, note: { type: "string" },
+        },
       });
       const [channel, message, ...extra] = parsed.positionals;
-      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--all]");
+      if (!channel || !message || extra.length) die("usage: dori handled <channel> <messageId> [--tasks N] [--lane key ...] [--reply] [--all] [--awaiting [--note TEXT]]");
       for (const key of parsed.values.lane ?? []) {
         if (!(await deps.registry.read(key))) die(`no registered lane "${key}"`);
       }
@@ -1471,8 +1475,10 @@ try {
       recordHandled(config.stateDir, channel ?? "", message ?? "", realClock.now(), {
         tasks: parsed.values.tasks === undefined ? undefined : Number(parsed.values.tasks),
         lanes: parsed.values.lane, reply, ...(parsed.values.all ? { all: true } : {}),
+        ...(parsed.values.awaiting ? { awaiting: true } : {}),
+        ...(parsed.values.note !== undefined ? { note: oneLine(parsed.values.note).slice(0, AWAITING_NOTE_MAX) } : {}),
       });
-      console.log(`HANDLED_LINKED ${channel} ${message}`);
+      console.log(parsed.values.awaiting ? `HANDLED_AWAITING ${channel} ${message}` : `HANDLED_LINKED ${channel} ${message}`);
       break;
     }
     case "send": {

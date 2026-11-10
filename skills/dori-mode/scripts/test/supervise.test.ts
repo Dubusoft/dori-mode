@@ -19,7 +19,7 @@ import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
-import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
+import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCarried } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 import { recordReported } from "../src/lane-outcomes.ts";
 import { TransientSuperviseError } from "../src/supervise-journal.ts";
@@ -2728,4 +2728,40 @@ test("a quarantined message the lead acks, or the owner edits, is tracked like a
   expect((journal(f).awaitingAck as { quarantined?: true }[]).filter((entry) => entry.quarantined)).toEqual([]);
   expect(reminded(f)).toEqual(["discord:11:2"]);
   expect(ackMissing(f)).toEqual([]);
+});
+
+test.each(["json", "sqlite"] as const)("a message parked with handled --awaiting on the %s store is owed nothing and prints AWAITING_OWNER on take; a later --lane closes it", async (store) => {
+  // Given an owner question the lead took, acked and answered with a question back to the owner.
+  const f = fixture({ store, handledTimeoutMin: 1 });
+  let supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner shall I start the migration?");
+  await supervisor.flush();
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  recordAck(f.state.dir, "11", "22", f.clock.now());
+  f.clock.at += 1;
+  const parkedAt = f.clock.now();
+  recordHandled(f.state.dir, "11", "22", parkedAt, { awaiting: true, note: "asked for a go-ahead" });
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
+  // A carried line left by an older cold start is pruned too.
+  writeCarried(f.state.dir, [{ kind: "owner", id: "discord:11:22", line: "INBOUND 11 22 owner shall I start the migration?" }]);
+  supervisor.ackTick(60_000);
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
+  expect(takeAwaitingReminders(f.state.dir)).toEqual([`awaiting:discord:11:22\tAWAITING_OWNER since ${new Date(parkedAt).toISOString()} ` +
+    "(asked for a go-ahead): INBOUND 11 22 owner shall I start the migration? - do not act until the owner answers"]);
+  // When windows pass, across a supervisor restart.
+  f.clock.at += 10 * 60_000;
+  expect(supervisor.handledTick()).toEqual([]);
+  supervisor.close();
+  supervisor = new Supervisor(f.deps);
+  f.clock.at += 10 * 60_000;
+  expect(supervisor.handledTick()).toEqual([]);
+  // Then nothing came back as UNHANDLED.
+  expect(lines(f.state.dir, store, "UNHANDLED ")).toEqual([]);
+  // When the owner answers and the lead links the lane it launched.
+  recordHandled(f.state.dir, "11", "22", f.clock.now(), { lanes: ["alpha"] });
+  supervisor.handledTick();
+  supervisor.close();
+  // Then the message is handled and the awaiting line is gone.
+  expect(takeAwaitingReminders(f.state.dir)).toEqual([]);
+  expect(stored(f.state.dir, store).awaitingAck?.[0]).toMatchObject({ handledAt: f.clock.now(), awaitingOwnerAt: parkedAt, lanes: ["alpha"] });
 });

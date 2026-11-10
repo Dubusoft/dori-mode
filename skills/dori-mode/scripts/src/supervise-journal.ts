@@ -53,6 +53,12 @@ export type AwaitingAck = {
   readonly handledAt?: number;
   readonly handlingSince?: number;
   readonly unhandledRemindedAt?: number;
+  /**
+   * `dori handled --awaiting`: the lead answered and now waits on the owner (a go-ahead, a choice), so nothing is owed
+   * until the owner answers. A later `--lane`, `--reply` or `--all` closes the message.
+   */
+  readonly awaitingOwnerAt?: number;
+  readonly awaitingNote?: string;
   /** The event id of the owner's latest edit (INBOUND_EDIT); reminders and cold handoffs carry its text. */
   readonly revision?: string;
   /** Every edit/delete event id already applied, so a replay at startup changes nothing. */
@@ -66,6 +72,12 @@ export type AwaitingAck = {
    */
   readonly quarantined?: true;
 };
+/**
+ * Whether the lead still owes work on an owner message: neither handled nor parked waiting on the owner. Every reminder,
+ * escalation and cold-start handoff of owner work asks this one question.
+ */
+export const leadOwes = (entry: Pick<AwaitingAck, "handledAt" | "awaitingOwnerAt">): boolean =>
+  entry.handledAt === undefined && entry.awaitingOwnerAt === undefined;
 /**
  * One report obligation per claimed or finished lane (lane-outcomes.ts): opened by its first LANE_DONE_CLAIMED,
  * LANE_CLOSED or CI_MERGED, joined by later ones, closed by `dori reported <key>`. `since` is the first outcome's enqueue
@@ -338,7 +350,7 @@ export class JournalCore {
       takenOffset = size;
     }
     if (takenOffset !== inbox.takenOffset) {
-      const ownerOpen = this.journal.awaitingAck?.some((entry) => !entry.quarantined && entry.handledAt === undefined);
+      const ownerOpen = this.journal.awaitingAck?.some((entry) => !entry.quarantined && leadOwes(entry));
       this.journal = { ...this.journal, inbox: { ...inbox, takenOffset, push: ownerOpen ? inbox.push : undefined } };
       this.persist();
     }

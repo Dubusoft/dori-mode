@@ -5,7 +5,7 @@ import { completeLines, parseLogLine } from "./inbox.ts";
 import type { OutcomeTracking } from "./lane-outcomes.ts";
 import { dueDecisions, markDecisionsPushed } from "./decision-obligations.ts";
 import { type InputState, inputState as boxState, listPanes, type Pane, PASTE_PLACEHOLDER, readScreen, sendVerified, squash } from "./panes.ts";
-import { type AwaitingAck, type Event, type InboxPush, type Journal, type JournalCore, type LaneOutcome, type Obligation, TransientSuperviseError } from "./supervise-journal.ts";
+import { type AwaitingAck, type Event, type InboxPush, type Journal, type JournalCore, type LaneOutcome, leadOwes, type Obligation, TransientSuperviseError } from "./supervise-journal.ts";
 import { type LeadLifecycle, PAUSED } from "./supervise-lead-lifecycle.ts";
 import { dueOwners, latest } from "./supervise-owner-tracking.ts";
 
@@ -283,7 +283,7 @@ export class PushDelivery {
       ? `${overdueOwners.length} owner message(s) not handled for ${minutes(Math.min(...overdueOwners.map(ownerSince)))} min` : undefined;
     if (delivery.tailMonitor) {
       const unacked = (this.journal.awaitingAck ?? []).filter((entry) => !entry.quarantined && entry.ackedAt === undefined &&
-        entry.handledAt === undefined && entry.since !== undefined && this.core.delivered.has(latest(entry)));
+        leadOwes(entry) && entry.since !== undefined && this.core.delivered.has(latest(entry)));
       const since = Math.min(...unacked.map((entry) => entry.since ?? now));
       return unacked.length && now - since >= limit && now - first >= limit ? `${unacked.length} owner message(s) unacked for ${minutes(since)} min` : ownerReason;
     }

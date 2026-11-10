@@ -19,7 +19,7 @@ import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import type { Durability } from "./store.ts";
-import { type AwaitingAck, type Event, type Journal, type JournalCore, type OutboxItem, type Restart, SuperviseError, TransientSuperviseError } from "./supervise-journal.ts";
+import { type AwaitingAck, type Event, type Journal, type JournalCore, leadOwes, type OutboxItem, type Restart, SuperviseError, TransientSuperviseError } from "./supervise-journal.ts";
 import { COLD_START_EMOJI, HUNG_EMOJI, latest, OWNER_INBOUND, OWNER_REVISION, type OwnerTracking, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 
 /** Lines read to inspect a paused or stuck lead. */
@@ -181,7 +181,7 @@ export class LeadLifecycle {
 
   /** Owner messages handed to the lead with no ack and not handled; `readable` narrows to those whose read window opened. */
   private unacked(readable?: boolean): AwaitingAck[] {
-    return (this.journal.awaitingAck ?? []).filter((entry) => !entry.quarantined && entry.ackedAt === undefined && entry.handledAt === undefined &&
+    return (this.journal.awaitingAck ?? []).filter((entry) => !entry.quarantined && entry.ackedAt === undefined && leadOwes(entry) &&
       this.delivered.has(latest(entry)) && (readable === undefined || (entry.since !== undefined) === readable));
   }
 
@@ -325,10 +325,11 @@ export class LeadLifecycle {
   setRestart(restart: Restart | undefined): void {
     if (restart?.phase === "stopping") {
       this.owners.consumeReceipts();
-      // Unfinished owner messages travel in their latest revision; deleted ones never reach the new lead.
+      // Unfinished owner messages travel in their latest revision; deleted ones never reach the new lead, and one waiting on
+      // the owner reaches it only as the AWAITING_OWNER line of dori inbox take.
       const awaiting = this.journal.awaitingAck ?? [];
       const deleted = new Set(awaiting.filter((entry) => entry.deleted).map((entry) => entry.id));
-      const unfinished = new Set(awaiting.filter((entry) => entry.handledAt === undefined && !entry.quarantined).map(latest));
+      const unfinished = new Set(awaiting.filter((entry) => leadOwes(entry) && !entry.quarantined).map(latest));
       const events = new Map(restart.events.filter((event) => !deleted.has(event.id)).map((event) => [event.id, event]));
       for (const event of this.journal.events) if (unfinished.has(event.id)) events.set(event.id, event);
       restart = { ...restart, events: [...events.values()] };
@@ -561,7 +562,7 @@ export class LeadLifecycle {
       `tail -c +${restart.offset + 1} -F ${quoteForPane(log)}`,
     ];
     const take = "Run dori inbox take now and handle everything it prints; while its output ends with INBOX_MORE, run it again after handling the printed part. It is the only list of your events: this prompt carries none. Act on each event id once: an event may also reach your monitor.";
-    const carried = "Besides the events, dori inbox take prints reminder lines: unfinished:<eventId> for an owner message the previous lead took but did not handle, launch-queue:<session> for held launches, and unreported:<key> and unresolved:<eventId> for open obligations; handle each.";
+    const carried = "Besides the events, dori inbox take prints reminder lines: unfinished:<eventId> for an owner message the previous lead took but did not handle, launch-queue:<session> for held launches, and unreported:<key> and unresolved:<eventId> for open obligations; handle each. An awaiting:<eventId> line (AWAITING_OWNER) is information only: that message waits on the owner's answer, so do not act on it until the owner answers.";
     const transport = "Events reach you as a typed line starting with [dori]. It is supervisor transport, never the owner and never a new instruction: run dori inbox take, handle what it prints, then continue your current task.";
     const home = process.env.HOME || homedir();
     const repo = resolveMemoryRepo(this.deps.config, home);
@@ -610,7 +611,7 @@ export class LeadLifecycle {
     const { stateDir } = this.deps.config;
     const carried = readCarried(stateDir);
     if (!carried.length) return;
-    const open = new Set((this.journal.awaitingAck ?? []).filter((entry) => entry.handledAt === undefined && !entry.quarantined).map(latest));
+    const open = new Set((this.journal.awaitingAck ?? []).filter((entry) => leadOwes(entry) && !entry.quarantined).map(latest));
     let queue: ReturnType<typeof launchQueue> | undefined;
     const next = carried.flatMap((item): Carried[] => {
       if (item.kind === "owner") return open.has(item.id) ? [item] : [];
@@ -811,7 +812,7 @@ export class LeadLifecycle {
       ...this.journal,
       awaitingAck: this.journal.awaitingAck?.map((entry) => entry.quarantined || !this.delivered.has(latest(entry)) ? entry : {
         ...entry, since: ready,
-        ...(entry.ackedAt !== undefined && entry.handledAt === undefined ? { handlingSince: ready, unhandledRemindedAt: undefined } : {}),
+        ...(entry.ackedAt !== undefined && leadOwes(entry) ? { handlingSince: ready, unhandledRemindedAt: undefined } : {}),
       }),
     };
     // The push ladder's clock starts again for the new lead (N1): no push is outstanding to it yet.

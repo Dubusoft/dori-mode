@@ -1,9 +1,9 @@
-import { dropAck, ownerMessageId, pendingAcks } from "./ack.ts";
+import { dropAck, mergeCoverage, ownerMessageId, pendingAcks } from "./ack.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { splitChannelName } from "./messenger/discord-inbound.ts";
 import { redactSecrets } from "./redact.ts";
 import type { Durability } from "./store.ts";
-import type { AwaitingAck, Event, Journal, JournalCore, OwnerNoticeKind } from "./supervise-journal.ts";
+import { type AwaitingAck, type Event, type Journal, type JournalCore, leadOwes, type OwnerNoticeKind } from "./supervise-journal.ts";
 
 /**
  * Owner tracking: one row per owner message (ack, coverage, revisions, deletion, quarantine), the owner notices owed
@@ -50,7 +50,7 @@ export const latest = (entry: AwaitingAck): string => entry.revision ?? entry.id
 /** Readable owner work remains owed independently of take receipts; an ack grants the handling window. */
 export const dueOwners = (core: JournalCore, now: number): AwaitingAck[] =>
   (core.journal.awaitingAck ?? []).filter((entry) => OWNER_INBOUND.test(entry.id) && !entry.quarantined &&
-    entry.handledAt === undefined && entry.since !== undefined && core.delivered.has(latest(entry)) &&
+    leadOwes(entry) && entry.since !== undefined && core.delivered.has(latest(entry)) &&
     (entry.ackedAt === undefined || entry.unhandledRemindedAt !== undefined ||
       now - (entry.handlingSince ?? entry.ackedAt) >= core.deps.tunables.handledTimeoutMin * 60_000));
 const unquarantined = (entry: AwaitingAck): AwaitingAck => {
@@ -167,7 +167,7 @@ export class OwnerTracking {
     const now = this.deps.clock.now();
     const notices: AwaitingAck[] = [];
     const awaiting = (this.journal.awaitingAck ?? []).map((entry): AwaitingAck => {
-      if (entry.handledAt !== undefined || entry.ackedAt === undefined) return entry;
+      if (!leadOwes(entry) || entry.ackedAt === undefined) return entry;
       if (entry.unhandledRemindedAt !== undefined) {
         if (now - entry.unhandledRemindedAt >= timeoutMs) notices.push(entry);
         return entry;
@@ -286,15 +286,10 @@ export class OwnerTracking {
     const awaiting = (this.journal.awaitingAck ?? []).map((entry): AwaitingAck => {
       const matching = receipts.filter((receipt) => receipt.id === entry.id);
       if (!matching.length) return entry;
-      const all = matching.some((receipt) => receipt.all);
-      const lanes = [...new Set([...(entry.lanes ?? []), ...matching.flatMap((receipt) => receipt.lanes ?? [])])];
-      // --all declares every task covered: with nothing linked yet the reply counts, and the task count settles on the coverage.
-      const reply = !!(entry.reply || matching.some((receipt) => receipt.reply) || (all && !lanes.length));
-      const tasks = all ? lanes.length + Number(reply) : Math.max(entry.tasks ?? 1, ...matching.map((receipt) => receipt.tasks ?? 1));
-      const covered = lanes.length + Number(reply) >= tasks;
+      const { covered, ...coverage } = mergeCoverage(entry, matching);
       // The lead took on a quarantined message: from here it is tracked like any other.
       return {
-        ...unquarantined(entry), tasks, lanes, reply, ackedAt: Math.min(entry.ackedAt ?? Infinity, ...matching.map((receipt) => receipt.at)),
+        ...unquarantined(entry), ...coverage, ackedAt: Math.min(entry.ackedAt ?? Infinity, ...matching.map((receipt) => receipt.at)),
         handledAt: covered ? entry.handledAt ?? Math.max(...matching.map((receipt) => receipt.at)) : undefined,
       };
     });
