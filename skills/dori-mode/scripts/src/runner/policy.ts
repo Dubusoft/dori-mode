@@ -2,7 +2,7 @@
 // Pure apart from the optional config read in `loadPolicy`; path resolution is injected into `checkCommand`.
 
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import {
   isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
@@ -13,7 +13,10 @@ export const POLICY_FILE = "runner-config.json";
 export type RunnerPolicy = {
   /** Profile name -> argv template. Only these profiles may be started. */
   readonly agents: Readonly<Record<string, readonly string[]>>;
-  /** Directories under which every command cwd must resolve; parsePolicy appends `reposRoot` and the effective worktree root. */
+  /**
+   * Directories under which every command cwd must resolve; parsePolicy appends `reposRoot` and the effective worktree
+   * root, and derives the rest when the file lists none (derivedRoots).
+   */
   readonly allowedRoots: readonly string[];
   /** Where a `lane.start` without `cwd` starts (absolute, a leading `~` already expanded); absent: the runner's home. */
   readonly defaultCwd?: string;
@@ -73,8 +76,21 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 /** `~` or `~/...` under `home`; any other path unchanged. */
 const expandHome = (path: string, home: string): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
 
-/** Reads a policy from parsed JSON (`home` expands a leading `~` in `defaultCwd`); unknown keys or wrong types throw. */
-export function parsePolicy(value: unknown, home: string = homedir()): RunnerPolicy {
+/**
+ * The allowed roots of a runner-config.json without `allowedRoots` (or with `[]`), before `reposRoot` and the effective
+ * worktree root are appended: the runner's temp directory, `defaultCwd` when set (so a `lane.start` without `cwd` can
+ * start there), and the runner's home only when the file names neither `reposRoot` nor `worktreeRoot`, which leaves
+ * the host no other place to work. Home is left out otherwise because it would widen the boundary to every file the
+ * runner's user owns.
+ */
+const derivedRoots = (o: { readonly tmp: string; readonly home: string; readonly defaultCwd?: string; readonly hasRepoRoots: boolean }): string[] =>
+  [...new Set([o.tmp, o.defaultCwd, o.hasRepoRoots ? undefined : o.home].filter((r): r is string => r !== undefined && r !== ""))];
+
+/**
+ * Reads a policy from parsed JSON (`home` expands a leading `~`; `home` and `tmp` feed derivedRoots); unknown keys or
+ * wrong types throw.
+ */
+export function parsePolicy(value: unknown, home: string = homedir(), tmp: string = tmpdir()): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
   const known = new Set<string>(RUNNER_POLICY_KEYS);
   for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
@@ -119,8 +135,13 @@ export function parsePolicy(value: unknown, home: string = homedir()): RunnerPol
   };
   const reposRoot = rootPath("reposRoot");
   const worktreeRoot = rootPath("worktreeRoot");
-  // Explicit roots stay as written; reposRoot and the effective worktree root are appended unless one already names the same directory.
-  const allowedRoots = [...((value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots)];
+  // Explicit roots stay as written (none listed: derivedRoots); reposRoot and the effective worktree root are appended
+  // unless one already names the same directory.
+  const explicit = (value.allowedRoots as string[] | undefined) ?? [];
+  const base = explicit.length
+    ? explicit
+    : derivedRoots({ tmp, home, ...(defaultCwd !== undefined ? { defaultCwd } : {}), hasRepoRoots: reposRoot !== undefined || worktreeRoot !== undefined });
+  const allowedRoots = [...base];
   for (const root of [reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot })]) {
     if (root !== undefined && !allowedRoots.some((r) => resolvePath(r) === resolvePath(root))) allowedRoots.push(root);
   }

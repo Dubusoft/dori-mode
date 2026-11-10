@@ -190,7 +190,7 @@ or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `in
 | Key | Meaning | Default |
 |---|---|---|
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
-| `allowedRoots` | directories every `cwd` must be under, besides `reposRoot` and the effective worktree root, which are always added | none |
+| `allowedRoots` | directories every `cwd` must be under, besides `reposRoot` and the effective worktree root, which are always added; optional, see [Derived allowed roots](#derived-allowed-roots) | derived |
 | `defaultCwd` | where a `lane.start` without `cwd` (`dori launch --machine M` with no `--cwd`) starts: absolute or `~/...` (the runner's home); filled before the `allowedRoots` check, and the `lane.start` result reports it as `cwd` | the runner's home |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
 | `sandboxCheck` | argv run before a `lane.start` with `sandbox: true`; a non-zero exit refuses it with `sandbox-unavailable` and its stderr. `dori runner install` sets it to `lane-sandbox --check` on Linux and macOS, where it also ships the wrapper (bubblewrap on Linux, Seatbelt `sandbox-exec` on macOS) and sets `sandbox: required`; Windows has no lane sandbox, so it gets `sandbox: optional`, only the `default` profile and no `sandboxCheck` (an older install's `lane-sandbox` profile and check are removed); the lead starts its lanes unsandboxed with `SANDBOX_SKIPPED` | none |
@@ -208,6 +208,23 @@ A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule
 `sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
 `guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
 `lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
+
+### Derived allowed roots
+
+A runner-config.json without `allowedRoots` (or with `[]`) gets these roots instead, then `reposRoot` and the
+effective worktree root as always:
+
+- the runner's temp directory (`os.tmpdir()`: `$TMPDIR`, else `/tmp` on Linux; the per-user `$TMPDIR` on macOS;
+  `%TEMP%` on Windows), where lanes and jobs keep scratch files;
+- `defaultCwd` when set, so a `lane.start` without `cwd` can start there;
+- the runner's home only when the file sets neither `reposRoot` nor `worktreeRoot`. Such a file names no other place
+  to work, and that is the root `dori runner install`'s starter gives. A file that does name a repo location keeps
+  home out, because home would admit every file the runner's user owns, the runner directory and its keys included.
+
+A `lane.start` without `cwd` on a host with `reposRoot`, no `defaultCwd` and no `allowedRoots` is refused
+`cwd-outside-roots` (its fallback cwd is home): set `defaultCwd` or pass `--cwd`. A listed `allowedRoots` is used as
+written and nothing is derived. A worker without any runner-config.json keeps no roots at all (it has no agent
+profile either), and the local runner without the file keeps the policy derived from config.json.
 
 ### Workspace placement
 

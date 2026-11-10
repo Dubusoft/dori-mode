@@ -78,8 +78,8 @@ The config is written atomically (mode 600). `references/scripts.md` explains ev
 
 | Key | Label |
 |---|---|
-| `agents`, `allowedRoots` | [required] |
-| `defaultCwd`, `sandbox` (`required`\|`optional`), `jobs` (`allow`\|`deny`), `guard`, `heavyKill`, `sandboxCheck`, `workspaces`, `detectWorkspaces`, `reposRoot`, `worktreeRoot` | [optional] |
+| `agents` | [required] |
+| `allowedRoots`, `defaultCwd`, `sandbox` (`required`\|`optional`), `jobs` (`allow`\|`deny`), `guard`, `heavyKill`, `sandboxCheck`, `workspaces`, `detectWorkspaces`, `reposRoot`, `worktreeRoot` | [optional] |
 
 A `runner-config.json` that would not pass the runner's policy check is never written (`RUNNER_SETUP_FAILED invalid runner-config: ...`). The running runner reloads the file itself; no restart.
 
