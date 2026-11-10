@@ -26,7 +26,7 @@ const sandboxArgv = async (home: string, env: Record<string, string>): Promise<s
   return readFileSync(out, "utf8").split("\n");
 };
 
-test("a sandboxed lane gets its own token file, the runner socket, its brief and the runner's bin (read-only), and nothing else of the runner dir or the env file", async () => {
+test("a sandboxed lane gets its own token file, the runner socket, its brief and the runner's bin (read-only), its own lanes/<key> mount point, and nothing else of the runner dir or the env file", async () => {
   const home = join(tempDir(), "home");
   const runner = join(home, ".dori", "runner");
   mkdirSync(join(runner, "briefs"), { recursive: true });
@@ -43,7 +43,7 @@ test("a sandboxed lane gets its own token file, the runner socket, its brief and
   expect(tokenBind).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "sock")]);
+  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock")]);
   const input = join(runner, "briefs", "lane-a.files"), output = join(runner, "briefs", "lane-a.out");
   expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === input && argv[i + 2] === input)).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--dir" && argv[i + 1] === output)).toBeLessThan(doriRo);

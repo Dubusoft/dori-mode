@@ -8,7 +8,7 @@ import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane 
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
-import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
+import { checkCwd, laneCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
 import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { turnStop } from "./observe.ts";
@@ -323,9 +323,13 @@ export class RunnerLanes {
     if (!body.files) throw new LaneFileError("LANE_FILES_INPUT_REQUIRED", body.key, "this start needs a fresh lead brief and attachment scan; launch the lane again from the lead");
     validateBriefFiles(body.key, body.briefText, body.files);
     checkFileBody(body.key, body);
-    // policy.ts checkCommand fills a missing cwd (defaultCwd, else home) at dispatch; a body without one never got checked.
+    // policy.ts checkCommand fills a missing cwd (the lane's own laneCwd) at dispatch; a body without one never got checked.
     const cwd = body.cwd;
     if (cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} ${body.key}`);
+    if (cwd === laneCwd(this.deps.runnerDir, body.key)) {
+      ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.lanes);
+      ensureRunnerSubdir(this.deps.runnerDir, join(RUNNER_PATHS.lanes, body.key));
+    }
     if (body.sandbox) await this.checkSandbox(body.key);
     let mayStart = false;
     try {

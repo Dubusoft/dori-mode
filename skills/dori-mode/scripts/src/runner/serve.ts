@@ -607,6 +607,8 @@ export type DispatchDeps = {
   readonly policy: RunnerPolicy;
   /** `fs.realpathSync` in production: resolves symlinks and throws for a missing path. */
   readonly realpath: (path: string) => string;
+  /** Where a `lane.start` without `cwd` gets its directory (`<runnerDir>/lanes/<key>`); absent: `~/.dori/runner`. */
+  readonly runnerDir?: string;
   /** Publishes the `cmd.result` event (through the outbox). */
   readonly publish: (body: RunnerEventBodies["cmd.result"]) => void;
   readonly log: (line: string) => void;
@@ -650,7 +652,7 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
     deps.log(`${outcome === "verified" ? "RUNNER_CMD_DONE" : "RUNNER_CMD_FAILED"} cmdId=${cmdId} type=${type} ${detail}`);
   };
   const intent = { cmdId, cmdSeq: seq, type: type as SupervisorCommandType, epoch, ...(key !== undefined ? { key } : {}) };
-  const checked = checkCommand(deps.policy, raw, deps.realpath);
+  const checked = checkCommand(deps.policy, raw, deps.realpath, deps.runnerDir);
   const recorded = deps.state.recordIntent(intent);
   if (!recorded.fresh) {
     const record = recorded.existing;

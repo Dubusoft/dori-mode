@@ -140,7 +140,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     if (!auth.enrolled) fail(`RUNNER_NOT_ENROLLED runner=${identity.label}: start once with --enroll (the local runner is enrolled by the supervisor)`);
     const remote = values.listen !== undefined;
     // The runner's own copy: a config reload rewrites it in place, so every part below that holds it sees the change.
-    const policy = structuredClone(runnerPolicy(runnerDir, remote, cfg));
+    const policy = structuredClone(runnerPolicy(runnerDir, remote, cfg, (line) => { console.log(line); }));
     // Before the gen bump: a second serve on this directory exits here and leaves the running one's gen alone.
     const releaseServeLock = holdServeLock(runnerDir);
     if (!releaseServeLock) fail(`RUNNER_ALREADY_SERVING another runner serve holds ${join(runnerDir, SERVE_LOCK)}; stop it (e.g. a leftover dori-runner.service next to dori supervise) before starting this one`);
@@ -211,7 +211,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       log(`RUNNER_GUARD_AGENT_REMOVE_FAILED ${error instanceof Error ? error.message : String(error)}`);
     }
     const dispatch = commandDispatcher({
-      state, policy, realpath: realpathSync, log,
+      state, policy, realpath: realpathSync, runnerDir, log,
       publish: (body) => { client?.publish("cmd.result", body); },
       effects: runnerEffects({
         lanes: runnerLanes, guard, run, publish,
@@ -291,6 +291,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     guardTick();
     const stopGuard = realEvery(GUARD_SAMPLE_MS, guardTick);
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
+    // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
+    ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
     const stopLaneServe = serveLaneSocket(laneListener, runnerLanes, publish, log);
     const stopLaneSocket = (): void => { stopLaneServe(); laneListener.close(); };
@@ -300,7 +302,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       policy,
       load: async () => {
         const next = remote ? cfg : await loadConfig();
-        const reloaded = runnerPolicy(runnerDir, remote, next);
+        const reloaded = runnerPolicy(runnerDir, remote, next, log);
         guard.reconfigure({ ...next.guard, ...reloaded.guard }, reloaded.heavyKill ?? next.heavyKill);
         return { policy: reloaded, restart: !remote && diskGuardPath(next) !== dataPath ? ["stateDir"] : [] };
       },

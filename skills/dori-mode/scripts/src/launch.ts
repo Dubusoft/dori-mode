@@ -478,7 +478,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
   const dir = input.cwd ?? target?.cwd;
   // The lead's leadCwd (a local directory) means nothing on another machine: without --cwd the start names none and that machine's
-  // runner uses its runner-config defaultCwd (else its home), reporting the directory back in the result.
+  // runner starts the lane in its own directory (~/.dori/runner/lanes/<key>), reporting the directory back in the result.
   const cwd = dir ?? (input.machine ? undefined : deps.config.leadCwd);
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);

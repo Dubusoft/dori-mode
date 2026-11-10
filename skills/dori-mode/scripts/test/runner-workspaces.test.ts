@@ -77,7 +77,7 @@ test("a local runner-config.json with only placement keys layers them on the der
   writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ allowedRoots: ["/srv"], workspaces: { "acme/app": "/srv/app" } }));
   const whole = localRunnerPolicy(dir, cfg, env);
   expect(whole.agents).toEqual({});
-  expect(whole.allowedRoots).toEqual(["/srv"]);
+  expect(whole.allowedRoots).toEqual(["/srv", join(dir, "lanes")]);
 });
 
 test("the hub stores a hello's workspaces and keeps them across a hello that carries none", () => {

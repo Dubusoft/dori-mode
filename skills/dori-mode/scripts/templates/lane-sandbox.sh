@@ -87,6 +87,8 @@ opts+=(--ro-bind-try "$H/.dori/runner/sock" "$H/.dori/runner/sock")
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
 opts+=(--dir "$H/.dori/runner/briefs/$key.out")
+# The mount point of a lane started without --cwd, whose cwd is ~/.dori/runner/lanes/<key> (bound rw below as the cwd).
+opts+=(--dir "$H/.dori/runner/lanes/$key")
 opts+=(--ro-bind "$H/.dori/runner/briefs/$key.files" "$H/.dori/runner/briefs/$key.files")
 if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then
   opts+=(--ro-bind-try "$DORI_LANE_TOKEN_FILE" "$DORI_LANE_TOKEN_FILE")

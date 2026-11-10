@@ -35,6 +35,7 @@ export const RUNNER_PATHS = {
   logs: "logs",
   bin: "bin",
   bun: "bun",
+  lanes: "lanes",
 } as const;
 
 /** The lock `runner serve` holds for its whole life (0600, inside the runner directory). */
@@ -90,7 +91,7 @@ type WinCheck = { readonly root: string; readonly userSid: string; readonly acl:
 const isUncPath = (path: string): boolean => /^[\\/]{2}(?![?.][\\/][A-Za-z]:)/.test(path);
 
 const DIRECTORY_ENTRIES: ReadonlySet<string> = new Set([
-  RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs, RUNNER_PATHS.bin, RUNNER_PATHS.bun,
+  RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs, RUNNER_PATHS.bin, RUNNER_PATHS.bun, RUNNER_PATHS.lanes,
 ]);
 /** Directories holding executables: their files may also be 0700, still owner-only. */
 const EXECUTABLE_DIRS: ReadonlySet<string> = new Set([RUNNER_PATHS.bin, RUNNER_PATHS.bun]);
@@ -140,6 +141,8 @@ const walk = (dir: string, uid: number | undefined, top: boolean, executable = f
   else inspect(dir, uid, "dir");
   // Lane output is untrusted data. Audit its exact root, then let bounded capture audit descendants.
   if (dirname(dir) === join(root, RUNNER_PATHS.briefs) && outputName(basename(dir))) return;
+  // A lane's own working directory (`lanes/<key>`, policy.ts laneCwd) holds whatever the lane made there: its root only.
+  if (dirname(dir) === join(root, RUNNER_PATHS.lanes)) return;
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
     // A socket left under `sock\` by a killed runner can't be lstat'd on Windows (EACCES); inspectWindows reads it.

@@ -48,6 +48,22 @@ test("only exact own-key .out roots exempt untrusted children; capture still ref
   expect(reasonOf(() => checkRunnerDir(dir))).toBe("not-directory");
 });
 
+test("a lane's own lanes/<key> directory is audited itself, never what the lane put in it", () => {
+  const dir = goodDir(), lanes = ensureRunnerSubdir(dir, "lanes"), lane = ensureRunnerSubdir(dir, join("lanes", "lane-a"));
+  mkdirSync(join(lane, "repo"), { mode: 0o755 });
+  writeFileSync(join(lane, "repo", "README.md"), "", { mode: 0o644 });
+  symlinkSync("/etc", join(lane, "link"));
+  checkRunnerDir(dir);
+  chmodSync(lane, 0o755);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+  rmSync(lane, { recursive: true });
+  symlinkSync("/etc", lane);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("symlink");
+  rmSync(lane);
+  chmodSync(lanes, 0o755);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+});
+
 test("Windows output root ACL/reparse checks remain strict without reading descendants", () => {
   const dir = goodDir(), briefs = ensureRunnerSubdir(dir, "briefs"), out = join(briefs, "lane-a.out");
   mkdirSync(out, { mode: 0o700 });

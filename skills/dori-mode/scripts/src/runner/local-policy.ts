@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_LANE_SANDBOX, type DoriConfig, withThinking } from "../config.ts";
-import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_FILE, type RunnerPolicy } from "./policy.ts";
+import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_FILE, RETIRED_POLICY_KEYS, type RunnerPolicy } from "./policy.ts";
 import { BUILT_IN } from "../tunables.ts";
 
 /**
@@ -50,12 +50,13 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
 /**
  * The policy a runner serves with (at start and on every reload): runner-config.json wins when present; without it the
  * local runner derives its policy from config.json (D20) and a worker keeps the empty default (no profiles, no roots).
- * A local file with only placement keys layers them on. Throws on an unreadable or invalid file.
+ * A local file with only placement keys layers them on. Throws on an unreadable or invalid file; `warn` gets one line per
+ * retired key the file still holds (policy.ts RETIRED_POLICY_KEYS).
  */
-export const runnerPolicy = (runnerDir: string, remote: boolean, cfg: LocalPolicyConfig): RunnerPolicy => {
+export const runnerPolicy = (runnerDir: string, remote: boolean, cfg: LocalPolicyConfig, warn?: (line: string) => void): RunnerPolicy => {
   const hasFile = existsSync(join(runnerDir, POLICY_FILE));
-  if (remote) return hasFile ? loadPolicy(runnerDir) : DEFAULT_POLICY;
-  return hasFile ? localRunnerPolicy(runnerDir, cfg) : localPolicy(cfg);
+  if (remote) return hasFile ? loadPolicy(runnerDir, warn) : DEFAULT_POLICY;
+  return hasFile ? localRunnerPolicy(runnerDir, cfg, warn ? { warn } : {}) : localPolicy(cfg);
 };
 
 /** The runner-config keys that only declare placement; a file holding nothing else keeps the derived local policy. */
@@ -66,12 +67,15 @@ export const PLACEMENT_ONLY_KEYS: readonly string[] = ["workspaces", "detectWork
  * layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
  * with any other key is the whole policy, unchanged. A layered `reposRoot` and the effective worktree root join
  * allowedRoots, so the repos discovered there pass the root check. The file's effective worktree root (its
- * `worktreeRoot`, else `<reposRoot>/worktrees`) replaces the config's; without either the config's stays.
+ * `worktreeRoot`, else `<reposRoot>/worktrees`) replaces the config's; without either the config's stays. Retired keys
+ * are ignored (with a `warn` line) for that choice too.
  */
-export const localRunnerPolicy = (runnerDir: string, cfg: LocalPolicyConfig, env: { readonly home?: string; readonly tmp?: string } = {}): RunnerPolicy => {
+export const localRunnerPolicy = (
+  runnerDir: string, cfg: LocalPolicyConfig, env: { readonly home?: string; readonly tmp?: string; readonly warn?: (line: string) => void } = {},
+): RunnerPolicy => {
   const raw: unknown = JSON.parse(readFileSync(join(runnerDir, POLICY_FILE), "utf8"));
-  const parsed = parsePolicy(raw, env.home ?? homedir());
-  const keys = typeof raw === "object" && raw !== null ? Object.keys(raw) : [];
+  const parsed = parsePolicy(raw, env.home ?? homedir(), tmpdir(), { runnerDir, ...(env.warn ? { warn: env.warn } : {}) });
+  const keys = typeof raw === "object" && raw !== null ? Object.keys(raw).filter((key) => !Object.hasOwn(RETIRED_POLICY_KEYS, key)) : [];
   if (!keys.every((key) => PLACEMENT_ONLY_KEYS.includes(key))) return parsed;
   const local = localPolicy(cfg, env);
   const worktreeRoot = effectiveWorktreeRoot(parsed);

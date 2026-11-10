@@ -196,7 +196,7 @@ export type SupervisorCommandBodies = {
    * (the herdr workspace a new tab opens in; absent on remote runners: find or create `lanes`).
    */
   readonly "lane.start": Cmd<{
-    /** `cwd` absent (a `--machine` launch without `--cwd`): the runner fills its runner-config `defaultCwd`, else its home. */
+    /** `cwd` absent (a `--machine` launch without `--cwd`): the runner fills `<runnerDir>/lanes/<key>`, created by the start. */
     readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd?: string;
     readonly agentProfile: string; readonly mode: string; readonly model: string; readonly sandbox: boolean; readonly expectedLaneGen: number;
     readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };

@@ -101,10 +101,13 @@ build_profile() {
   r "$H/.dori/runner/briefs/$key.files"
   r "$H/.dori/runner/briefs/$key.out"
   w "$H/.dori/runner/briefs/$key.out"
+  # A lane started without --cwd works in ~/.dori/runner/lanes/<key>: readable here, writable as the cwd above.
+  if [ -n "$key" ]; then r "$H/.dori/runner/lanes/$key"; fi
 
   param DORI "$H/.dori"
   param DORI_RUNNER "$H/.dori/runner"
   param DORI_BRIEFS "$H/.dori/runner/briefs"
+  param DORI_LANES "$H/.dori/runner/lanes"
   param DORI_ENV "$H/.dori/env"
   param DOCKER_HOME "$H/.docker/run/docker.sock"
   param DOCKER_VAR /var/run/docker.sock
@@ -119,7 +122,7 @@ build_profile() {
 $d_rules
 (deny file-read* (subpath (param \"DORI\")))
 (allow file-read*$r_rules)
-(allow file-read-metadata (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")))
+(allow file-read-metadata (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")) (literal (param \"DORI_LANES\")))
 (deny file-read* (literal (param \"DORI_ENV\")) (regex #\"/\\.ssh/id_[^/.]+\$\"))
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
 "

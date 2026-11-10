@@ -55,21 +55,21 @@ const fixture = () => {
   return { root, a, b, policy, published, logs, applied, edited, start };
 };
 
-test("a running runner takes an edited runner-config.json live: new roots, defaultCwd and workspaces apply to the next command", async () => {
+test("a running runner takes an edited runner-config.json live: new roots and workspaces apply to the next command", async () => {
   const f = fixture();
   expect(checkCommand(f.policy, f.start(f.b), realpathSync, f.root)).toMatchObject({ ok: false, rule: "cwd-outside-roots" });
   expect(workspaceReport(f.policy, { realpath: realpathSync, log: () => {} }).workspaces).toEqual([]);
   const result = await f.edited({
-    agents: { default: ["omo"] }, allowedRoots: [f.a, f.b], defaultCwd: f.b, workspaces: { "acme/app": f.b }, detectWorkspaces: false,
+    agents: { default: ["omo"] }, allowedRoots: [f.a, f.b], workspaces: { "acme/app": f.b }, detectWorkspaces: false,
   });
   expect(result).toBe("reloaded");
-  const checked = checkCommand(f.policy, f.start(), realpathSync, f.root);
+  const checked = checkCommand(f.policy, f.start(f.b), realpathSync, f.root);
   expect(checked.ok).toBe(true);
   expect(checked.ok ? (checked.command.body as { cwd?: string }).cwd : undefined).toBe(f.b);
   expect(workspaceReport(f.policy, { realpath: realpathSync, log: () => {} }).workspaces).toEqual([{ repo: "acme/app", path: f.b }]);
-  expect(f.applied).toEqual(["1->2"]);
-  expect(f.published).toEqual([{ state: "reloaded", detail: "allowedRoots, defaultCwd, workspaces" }]);
-  expect(f.logs).toEqual(["RUNNER_CONFIG_RELOADED allowedRoots, defaultCwd, workspaces"]);
+  expect(f.applied).toEqual(["2->3"]);
+  expect(f.published).toEqual([{ state: "reloaded", detail: "allowedRoots, workspaces" }]);
+  expect(f.logs).toEqual(["RUNNER_CONFIG_RELOADED allowedRoots, workspaces"]);
 });
 
 test("an invalid runner-config.json edit keeps the last good policy and warns the supervisor", async () => {
