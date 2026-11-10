@@ -239,6 +239,9 @@ describe("runner command policy", () => {
     expect(parsePolicy({ agents, allowedRoots: ["/home/u", "/data/repos"], reposRoot: "/data/repos", worktreeRoot: "/srv/wt" }).allowedRoots)
       .toEqual(["/home/u", "/data/repos", "/srv/wt"]);
     expect(parsePolicy({ agents, allowedRoots: ["/home/u"] }).allowedRoots).toEqual(["/home/u"]);
+    // The same directory spelled with a trailing slash or through ~ is not added twice.
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u/repos/", "/home/u/wt"], reposRoot: "~/repos", worktreeRoot: "/home/u/wt/" }, "/home/u").allowedRoots)
+      .toEqual(["/home/u/repos/", "/home/u/wt"]);
   });
 
   test("a lane.start under reposRoot passes without listing it in allowedRoots; outside every root it is still refused", () => {

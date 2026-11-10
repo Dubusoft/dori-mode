@@ -7,7 +7,7 @@ import { readRunnerRows, RunnerHub } from "../src/runner/hub.ts";
 import { localPolicy, localRunnerPolicy } from "../src/runner/local-policy.ts";
 import { effectiveWorktreeRoot, parsePolicy, POLICY_FILE } from "../src/runner/policy.ts";
 import { PROTO, runnerControl, validateFrame } from "../src/runner/protocol.ts";
-import { discoverRepos, repoFromRemote, type ScanFs, workspaceReport } from "../src/runner/workspaces.ts";
+import { discoverRepos, realScanFs, repoFromRemote, type ScanFs, workspaceReport } from "../src/runner/workspaces.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -160,4 +160,19 @@ test("workspaceReport declares discovered repos, lets a workspaces override win,
   expect(narrow.workspaces).toEqual([{ repo: "ACME/Lib", path: join(root, "other", "lib") }]);
   expect(logs).toContain(`RUNNER_WORKSPACE_SKIPPED acme/app cwd-outside-roots ${join(repos, "app")}`);
   expect(workspaceReport(parsePolicy({ allowedRoots: [root] }), { realpath: realpathSync, log: () => {}, os: "linux" })).not.toHaveProperty("worktreeRoot");
+});
+
+test("the detection scan never reads the worktree root, though parsePolicy adds it to allowedRoots", () => {
+  const root = scratch();
+  const repos = join(root, "repos");
+  const worktrees = join(root, "wt");
+  checkout(join(repos, "app"), "git@github.com:acme/app.git");
+  checkout(join(worktrees, "lane", "inner"), "git@github.com:acme/inner.git");
+  const read: string[] = [];
+  const fs: ScanFs = { ...realScanFs, readdir: (dir) => { read.push(dir); return realScanFs.readdir(dir); } };
+  const policy = parsePolicy({ allowedRoots: [join(root, "home")], reposRoot: repos, worktreeRoot: worktrees });
+  expect(policy.allowedRoots).toContain(worktrees);
+  const report = workspaceReport(policy, { realpath: realpathSync, log: () => {}, fs, os: "linux" });
+  expect(report.detected).toEqual([]);
+  expect(read.filter((dir) => dir.startsWith(worktrees))).toEqual([]);
 });

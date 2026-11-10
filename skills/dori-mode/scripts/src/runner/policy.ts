@@ -114,6 +114,11 @@ export function parsePolicy(value: unknown, home: string = homedir()): RunnerPol
   };
   const reposRoot = rootPath("reposRoot");
   const worktreeRoot = rootPath("worktreeRoot");
+  // Explicit roots stay as written; reposRoot and the effective worktree root are appended unless one already names the same directory.
+  const allowedRoots = [...((value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots)];
+  for (const root of [reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot })]) {
+    if (root !== undefined && !allowedRoots.some((r) => resolvePath(r) === resolvePath(root))) allowedRoots.push(root);
+  }
   let guard: Partial<Record<GuardKey, number>> | undefined;
   if (value.guard !== undefined) {
     if (!isRecord(value.guard)) throw new Error("runner-config: guard must be an object");
@@ -134,10 +139,7 @@ export function parsePolicy(value: unknown, home: string = homedir()): RunnerPol
     ...(reposRoot !== undefined ? { reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     agents,
-    allowedRoots: [...new Set([
-      ...((value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots),
-      ...[reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot })].filter((r): r is string => r !== undefined),
-    ])],
+    allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
     jobs: (value.jobs as RunnerPolicy["jobs"] | undefined) ?? DEFAULT_POLICY.jobs,
   };
