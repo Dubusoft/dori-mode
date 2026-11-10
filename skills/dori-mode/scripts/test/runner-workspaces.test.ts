@@ -109,6 +109,24 @@ test("parsePolicy reads reposRoot and worktreeRoot as absolute paths, expanding 
   expect(effectiveWorktreeRoot({})).toBeUndefined();
 });
 
+test("parsePolicy judges a Windows runner's paths by win32 rules whatever platform reads the file", () => {
+  const win = { platform: "win32" } as const;
+  const p = parsePolicy({
+    reposRoot: "C:\\Users\\x\\repos", worktreeRoot: "D:/wt",
+    workspaces: { "acme/app": "\\\\?\\C:\\src\\app", "acme/lib": "\\\\server\\share\\lib", "acme/home": "~\\work\\home" },
+  }, "C:\\Users\\x", "C:\\Temp", win);
+  expect(p).toMatchObject({
+    reposRoot: "C:\\Users\\x\\repos", worktreeRoot: "D:/wt",
+    workspaces: { "acme/app": "\\\\?\\C:\\src\\app", "acme/lib": "\\\\server\\share\\lib", "acme/home": "C:\\Users\\x\\work\\home" },
+  });
+  expect(p.allowedRoots).toEqual(["C:\\Temp", "C:\\Users\\x\\.dori\\runner\\lanes", "C:\\Users\\x\\repos", "D:/wt"]);
+  expect(parsePolicy({ reposRoot: "C:\\repos" }, "C:\\Users\\x", "C:\\Temp", win).allowedRoots).toContain("C:\\repos\\worktrees");
+  for (const bad of ["repos", "C:repos", "..\\repos"]) expect(() => parsePolicy({ reposRoot: bad }, "C:\\Users\\x", "C:\\Temp", win)).toThrow("runner-config: reposRoot must be an absolute path");
+  // The same file read with POSIX rules (a POSIX runner) still refuses a drive path.
+  expect(() => parsePolicy({ reposRoot: "C:\\Users\\x\\repos" }, "/home/u", "/tmp", { platform: "linux" })).toThrow("reposRoot must be an absolute path");
+  expect(effectiveWorktreeRoot({ reposRoot: "C:\\repos" }, "win32")).toBe("C:\\repos\\worktrees");
+});
+
 test("discoverRepos keys each checkout directly under reposRoot by origin, skipping worktrees, the worktree root, dot folders and repeats", () => {
   const origin = (url: string) => `[remote "origin"]\n\turl = ${url}\n`;
   const tree: Record<string, { dirs: string[]; files?: string[]; config?: string }> = {

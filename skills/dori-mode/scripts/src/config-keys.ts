@@ -216,13 +216,13 @@ export const doriConfigDefault = (home: string): KeyDefault => {
   };
 };
 
-/** runner-config.json's effective defaults (what parsePolicy and the runner use when the key is absent). */
-export const runnerConfigDefault = (home?: string): KeyDefault => (key, next) => {
+/** runner-config.json's effective defaults (what parsePolicy and the runner use when the key is absent), with `platform`'s (the runner host's) path rules. */
+export const runnerConfigDefault = (home?: string, platform?: NodeJS.Platform): KeyDefault => (key, next) => {
   switch (key) {
     case "sandbox": return DEFAULT_POLICY.sandbox;
     case "jobs": return DEFAULT_POLICY.jobs;
     case "detectWorkspaces": return "true";
-    case "worktreeRoot": return typeof next.reposRoot === "string" && next.reposRoot ? effectiveWorktreeRoot({ reposRoot: next.reposRoot }) : undefined;
+    case "worktreeRoot": return typeof next.reposRoot === "string" && next.reposRoot ? effectiveWorktreeRoot({ reposRoot: next.reposRoot }, platform) : undefined;
     default: return undefined;
   }
 };
