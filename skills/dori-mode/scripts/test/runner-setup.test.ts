@@ -90,9 +90,32 @@ describe("runRunnerSetup", () => {
     const old = JSON.stringify(BASE);
     writeFileSync(cfgPath(dir), old);
     const { deps, lines } = setup(dir);
-    expect(await runRunnerSetup(deps, { patch: { defaultCwd: "relative/path" }, unset: [] })).toBe(1);
+    expect(await runRunnerSetup(deps, { patch: { reposRoot: "relative/path" }, unset: [] })).toBe(1);
     expect(readFileSync(cfgPath(dir), "utf8")).toBe(old);
-    expect(lines.at(-1)).toMatch(/^RUNNER_SETUP_FAILED invalid runner-config: .*defaultCwd.*; nothing was written$/);
+    expect(lines.at(-1)).toMatch(/^RUNNER_SETUP_FAILED invalid runner-config: .*reposRoot.*; nothing was written$/);
+  });
+
+  test("a retired defaultCwd is removed with a .bak, and detectWorkspaces is never asked", async () => {
+    const dir = temp();
+    const old = JSON.stringify({ ...BASE, defaultCwd: "~/work" });
+    writeFileSync(cfgPath(dir), old);
+    const prompt = prompter({}, true);
+    const { deps, lines } = setup(dir, { prompt, interactive: true });
+    expect(await runRunnerSetup(deps, { patch: {}, unset: [] })).toBe(0);
+    expect(prompt.asked).toContain("sandbox");
+    expect(prompt.asked).not.toContain("detectWorkspaces");
+    expect(prompt.asked).not.toContain("defaultCwd");
+    expect(readFileSync(`${cfgPath(dir)}.bak`, "utf8")).toBe(old);
+    expect(readCfg(dir)).toEqual(BASE);
+    expect(lines).toContain("RUNNER_SETUP_KEY_REMOVED defaultCwd (runner-config.json no longer reads it)");
+  });
+
+  test("detectWorkspaces is still set by --set", async () => {
+    const dir = temp();
+    writeFileSync(cfgPath(dir), JSON.stringify(BASE));
+    const { deps } = setup(dir);
+    expect(await runRunnerSetup(deps, { patch: { detectWorkspaces: false }, unset: [] })).toBe(0);
+    expect(readCfg(dir)).toEqual({ ...BASE, detectWorkspaces: false });
   });
 
   test("invalid JSON fails without writing", async () => {

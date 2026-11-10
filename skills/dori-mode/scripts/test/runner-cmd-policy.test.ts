@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkCommand, checkCwd, checkQuery, loadPolicy, parsePolicy, rejection, type RunnerPolicy } from "../src/runner/policy.ts";
@@ -210,50 +210,72 @@ describe("runner command policy", () => {
     }
   });
 
-  test("defaultCwd parses absolute or ~-relative (expanded to the runner's home); anything else is refused", () => {
-    expect(parsePolicy({ defaultCwd: "~/work" }, "/Users/me").defaultCwd).toBe("/Users/me/work");
-    expect(parsePolicy({ defaultCwd: "~" }, "/Users/me").defaultCwd).toBe("/Users/me");
-    expect(parsePolicy({ defaultCwd: "/data/repos/a" }).defaultCwd).toBe("/data/repos/a");
-    expect(parsePolicy({})).not.toHaveProperty("defaultCwd");
-    for (const bad of ["work", "~other/x", "", 3, ["/a"]]) {
-      expect(() => parsePolicy({ defaultCwd: bad }, "/Users/me")).toThrow("runner-config: defaultCwd must be an absolute path or start with ~/");
+  test("a retired defaultCwd is ignored with one RUNNER_CONFIG_KEY_IGNORED warning, whatever its value", () => {
+    for (const value of ["~/work", "relative", 3]) {
+      const warnings: string[] = [];
+      const p = parsePolicy({ agents: { omo: ["omo"] }, defaultCwd: value }, "/Users/me", "/tmp", { warn: (line) => { warnings.push(line); } });
+      expect(p).not.toHaveProperty("defaultCwd");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toStartWith("RUNNER_CONFIG_KEY_IGNORED defaultCwd: ");
     }
+    const warnings: string[] = [];
+    parsePolicy({ agents: { omo: ["omo"] } }, "/Users/me", "/tmp", { warn: (line) => { warnings.push(line); } });
+    expect(warnings).toEqual([]);
+    expect(() => parsePolicy({ defaultCwdd: "/x" })).toThrow("runner-config: unknown key defaultCwdd");
   });
 
-  test("a lane.start without cwd gets defaultCwd, else home, and that directory is checked against allowedRoots", () => {
+  test("loadPolicy loads a file that still holds defaultCwd and warns once", () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    writeFileSync(join(dir, "runner-config.json"), JSON.stringify({ agents: { omo: ["omo"] }, allowedRoots: ["/srv"], defaultCwd: "~/work" }));
+    const warnings: string[] = [];
+    const p = loadPolicy(dir, (line) => { warnings.push(line); });
+    expect(p.agents).toEqual({ omo: ["omo"] });
+    expect(p.allowedRoots).toEqual(["/srv", join(dir, "lanes")]);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("a lane.start without cwd gets <runnerDir>/lanes/<key>, checked against allowedRoots before it exists", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    const [home, tmp] = [join(base, "home"), join(base, "tmp")];
+    const runnerDir = join(home, ".dori", "runner");
+    const reposRoot = join(home, "repos");
+    for (const dir of [join(runnerDir, "lanes"), reposRoot, tmp]) mkdirSync(dir, { recursive: true });
+    const p = parsePolicy({ agents: { omo: ["omo", "run"] }, reposRoot }, home, tmp);
+    expect(p.allowedRoots).toContain(join(runnerDir, "lanes"));
     const { cwd: _, ...noCwd } = start().body as Record<string, unknown>;
-    const bare = { ...start(), body: noCwd };
-    const filled = (p: RunnerPolicy, home: string) => { const r = checkCommand(p, bare, realpath, home); return r.ok ? (r.command.body as { cwd?: string }).cwd : r.rule; };
-    expect(filled({ ...policy, defaultCwd: "/data/repos/a" }, "/etc")).toBe("/data/repos/a");
-    expect(filled(policy, "/data/repos")).toBe("/data/repos");
-    const outside = checkCommand({ ...policy, defaultCwd: "/etc" }, bare, realpath, "/data/repos");
-    expect(rejection(outside)).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
-    expect(filled(policy, "/etc")).toBe("cwd-outside-roots");
+    const bare = (key: string) => ({ ...start(), body: { ...noCwd, key } });
+    expect(checkCommand(p, bare("lane-a"), realpathSync, runnerDir)).toMatchObject({ ok: true, command: { body: { cwd: join(runnerDir, "lanes", "lane-a") } } });
+    // A key that is no directory name is refused; a symlink planted as the lane's directory cannot leave the roots.
+    expect(checkCommand(p, bare("../x"), realpathSync, runnerDir)).toMatchObject({ ok: false, rule: "cwd-missing" });
+    symlinkSync(home, join(runnerDir, "lanes", "lane-evil"));
+    expect(rejection(checkCommand(p, bare("lane-evil"), realpathSync, runnerDir))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
     // An explicit cwd is never replaced.
-    expect(checkCommand({ ...policy, defaultCwd: "/data/repos" }, start(), realpath, "/data/repos")).toMatchObject({ ok: true, command: { body: { cwd: "/data/repos/a" } } });
+    expect(checkCommand(p, start({ cwd: reposRoot }), realpathSync, runnerDir)).toMatchObject({ ok: true, command: { body: { cwd: reposRoot } } });
   });
 
   test("reposRoot and the effective worktree root are added to allowedRoots after the explicit ones", () => {
     const agents = { omo: ["omo", "run"] };
-    expect(parsePolicy({ agents, allowedRoots: ["/home/u"], reposRoot: "/data/repos" }).allowedRoots).toEqual(["/home/u", "/data/repos", "/data/repos/worktrees"]);
-    expect(parsePolicy({ agents, allowedRoots: ["/home/u", "/data/repos"], reposRoot: "/data/repos", worktreeRoot: "/srv/wt" }).allowedRoots)
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u"], reposRoot: "/data/repos" }, "/home/u").allowedRoots).toEqual(["/home/u", "/data/repos", "/data/repos/worktrees"]);
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u", "/data/repos"], reposRoot: "/data/repos", worktreeRoot: "/srv/wt" }, "/home/u").allowedRoots)
       .toEqual(["/home/u", "/data/repos", "/srv/wt"]);
-    expect(parsePolicy({ agents, allowedRoots: ["/home/u"] }).allowedRoots).toEqual(["/home/u"]);
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u"] }, "/home/u").allowedRoots).toEqual(["/home/u"]);
+    // The lanes directory joins a list that does not already hold it.
+    expect(parsePolicy({ agents, allowedRoots: ["/srv"] }, "/home/u").allowedRoots).toEqual(["/srv", "/home/u/.dori/runner/lanes"]);
     // The same directory spelled with a trailing slash or through ~ is not added twice.
     expect(parsePolicy({ agents, allowedRoots: ["/home/u/repos/", "/home/u/wt"], reposRoot: "~/repos", worktreeRoot: "/home/u/wt/" }, "/home/u").allowedRoots)
-      .toEqual(["/home/u/repos/", "/home/u/wt"]);
+      .toEqual(["/home/u/repos/", "/home/u/wt", "/home/u/.dori/runner/lanes"]);
   });
 
-  test("without allowedRoots (or with []) the roots are derived: temp, defaultCwd, home only without reposRoot/worktreeRoot", () => {
+  test("without allowedRoots (or with []) the roots are derived: temp, home only without reposRoot/worktreeRoot, then the lanes directory", () => {
     const agents = { omo: ["omo", "run"] };
     const roots = (v: Record<string, unknown>) => parsePolicy({ agents, ...v }, "/home/u", "/tmp").allowedRoots;
-    expect(roots({ reposRoot: "~/repos" })).toEqual(["/tmp", "/home/u/repos", "/home/u/repos/worktrees"]);
-    expect(roots({ allowedRoots: [], reposRoot: "/data/repos", defaultCwd: "~/work" })).toEqual(["/tmp", "/home/u/work", "/data/repos", "/data/repos/worktrees"]);
-    expect(roots({ worktreeRoot: "/srv/wt" })).toEqual(["/tmp", "/srv/wt"]);
+    const lanes = "/home/u/.dori/runner/lanes";
+    expect(roots({ reposRoot: "~/repos" })).toEqual(["/tmp", lanes, "/home/u/repos", "/home/u/repos/worktrees"]);
+    expect(roots({ allowedRoots: [], reposRoot: "/data/repos", defaultCwd: "~/work" })).toEqual(["/tmp", lanes, "/data/repos", "/data/repos/worktrees"]);
+    expect(roots({ worktreeRoot: "/srv/wt" })).toEqual(["/tmp", lanes, "/srv/wt"]);
     expect(roots({})).toEqual(["/tmp", "/home/u"]);
-    expect(roots({ defaultCwd: "/home/u" })).toEqual(["/tmp", "/home/u"]);
     // A listed allowedRoots derives nothing.
-    expect(roots({ allowedRoots: ["/srv"], reposRoot: "/data/repos" })).toEqual(["/srv", "/data/repos", "/data/repos/worktrees"]);
+    expect(roots({ allowedRoots: ["/srv"], reposRoot: "/data/repos" })).toEqual(["/srv", lanes, "/data/repos", "/data/repos/worktrees"]);
   });
 
   test("derived roots admit reposRoot and temp but refuse home and the runner directory when reposRoot is set", () => {

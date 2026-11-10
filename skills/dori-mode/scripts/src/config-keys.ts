@@ -40,18 +40,20 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("ignorePanes", "list", "herdr panes the sweeps ignore"),
 ];
 
+/** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
+export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces"];
+
 /** One entry per RUNNER_POLICY_KEYS member, same order. */
 export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
   spec("agents", "json", "Profile name -> argv template; only these profiles may be started", { required: true }),
-  spec("allowedRoots", "list", "Directories under which every command cwd must resolve; absent: temp dir, defaultCwd, and home only without reposRoot/worktreeRoot"),
-  spec("defaultCwd", "string", "Where a lane.start without cwd starts; absent: the runner's home"),
+  spec("allowedRoots", "list", "Directories under which every command cwd must resolve; absent: temp dir, and home only without reposRoot/worktreeRoot"),
   spec("sandbox", "enum", "Whether every lane must run sandboxed", { values: ["required", "optional"] }),
   spec("jobs", "enum", "deny refuses job.run, wait.check, lane.git and done inspections", { values: ["allow", "deny"] }),
   spec("guard", "json", "Guard thresholds for this host"),
   spec("heavyKill", "list", "Command-line patterns killed under critical memory pressure"),
   spec("sandboxCheck", "list", "Argv run before every sandboxed lane.start; non-zero refuses it"),
   spec("workspaces", "json", "The repos this host owns for placement: owner/repo -> checkout"),
-  spec("detectWorkspaces", "bool", "Scan allowedRoots for git checkouts"),
+  spec("detectWorkspaces", "bool", "Scan allowedRoots for git checkouts (set with --set; setup does not ask it)"),
   spec("reposRoot", "string", "Every checkout directly under it is a declared repo"),
   spec("worktreeRoot", "string", "Where this host's lane worktrees live; absent: <reposRoot>/worktrees"),
 ];
@@ -216,7 +218,6 @@ export const doriConfigDefault = (home: string): KeyDefault => {
 /** runner-config.json's effective defaults (what parsePolicy and the runner use when the key is absent). */
 export const runnerConfigDefault = (home?: string): KeyDefault => (key, next) => {
   switch (key) {
-    case "defaultCwd": return home ?? "~";
     case "sandbox": return DEFAULT_POLICY.sandbox;
     case "jobs": return DEFAULT_POLICY.jobs;
     case "detectWorkspaces": return "true";

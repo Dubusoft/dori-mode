@@ -4,7 +4,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { configureKeys, pruneRunnerConfig, readSeenKeys, RUNNER_CONFIG_KEYS, runnerConfigDefault, writeSeenKeys, type Json, type KeyPrompter } from "../config-keys.ts";
+import { configureKeys, pruneRunnerConfig, readSeenKeys, RUNNER_CONFIG_KEYS, RUNNER_UNASKED_KEYS, runnerConfigDefault, writeSeenKeys, type Json, type KeyPrompter } from "../config-keys.ts";
 import { encodedPowerShell, sshArgv, type GuardMachine } from "../remote-guard.ts";
 import type { Ran, Runner } from "../run.ts";
 import { writeFileAtomic } from "../setup.ts";
@@ -163,7 +163,7 @@ export const runRunnerSetup = async (d: RunnerSetupDeps, input: { readonly patch
   const seen = readSeenKeys(d.seenPath);
   const configured = await configureKeys({
     specs: RUNNER_CONFIG_KEYS, current: pruned.next, patch: input.patch, unset: input.unset,
-    prompt: d.prompt, interactive: d.interactive, seen, mode: d.mode, defaults: runnerConfigDefault(d.home), log: d.log,
+    prompt: d.prompt, interactive: d.interactive, seen, mode: d.mode, skip: RUNNER_UNASKED_KEYS, defaults: runnerConfigDefault(d.home), log: d.log,
   });
   const { next } = configured;
   try {
