@@ -70,7 +70,7 @@ import { type BuiltinSource, EventSources, type SourceEnqueue } from "./event-so
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
-import { type LaneReportStore, openLaneReports, routeReports } from "./lane-reports.ts";
+import { type LaneReportStore, openLaneReports, routeReports, statusTransportOf } from "./lane-reports.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -989,10 +989,7 @@ export const supervise = async (
     // tick of being written.
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
     // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
-    const statusTransport = {
-      post: (channel: string, text: string, id: string) => discord.send(channel, text, id), edit: (channel: string, id: string, text: string) => discord.edit(channel, id, text),
-      threadState: (threadId: string) => discord.threadState(threadId),
-    };
+    const statusTransport = statusTransportOf(discord);
     let nextHistoryPrune = 0;
     const routeLaneReports = (): Promise<void> => watchdog.track("reports", (async () => {
       const now = deps.clock.now();
