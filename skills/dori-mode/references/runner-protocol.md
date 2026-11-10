@@ -34,7 +34,7 @@ frame closes the connection without an ack.
 
 Control frames, used in this release:
 
-- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, nonce, dh}`,
+- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, worktreeRoot?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
   `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
@@ -197,7 +197,9 @@ or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `in
 | `jobs` | `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with `done` | `allow` |
 | `guard` | this host's guard thresholds (`loadAlert`, `loadOk`, `memFreeMinPct`, `memFreeCritPct`, `swapFreeCritPct`, `diskFreeMinGb`, `panesMax`), each optional | the config's `guard` |
 | `heavyKill` | command-line patterns killed under critical memory | the config's `heavyKill` |
-| `workspaces` | the repos this host owns for placement: `{"owner/repo": "<checkout path>"}`, absolute or `~/...`; see [Workspace placement](#workspace-placement) | none |
+| `reposRoot` | the directory whose direct children are this host's repos for placement, absolute or `~/...`; see [Workspace placement](#workspace-placement) | none |
+| `worktreeRoot` | where lanes on this host create their git worktrees, absolute or `~/...`; reported in the hello | `<reposRoot>/worktrees` when `reposRoot` is set, else none |
+| `workspaces` | overrides for discovered repos: `{"owner/repo": "<checkout path>"}`, absolute or `~/...`; an entry replaces the discovered path of that repo (case-insensitive) or adds a repo not under `reposRoot` | none |
 | `detectWorkspaces` | `false` turns off the scan of `allowedRoots` for checkouts (`detected`) | `true` |
 
 A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
@@ -212,19 +214,33 @@ A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule
 A runner tells the supervisor which repos live on its host, and `dori launch` places work by it (see
 `dori placement` in scripts.md). Each hello carries two optional lists of `{repo, path}`:
 
-- `workspaces`: the runner-config `workspaces` entries whose path passes the same check as a `cwd` (absolute,
-  resolving, under `allowedRoots`). An entry that fails is left out and logged
-  `RUNNER_WORKSPACE_SKIPPED <repo> <rule> <path>`. These decide placement: a launch for a declared repo goes to that
-  runner and holds while it is offline; two runners declaring one repo refuse the launch with `PLACEMENT_CONFLICT`.
+- `workspaces`: the declared repos. Every directory directly under `reposRoot` that holds a `.git` directory is one
+  (symlinks not followed; dot folders, the effective worktree root and linked worktrees, whose `.git` is a file, are
+  skipped), named by the owner/repo of its `origin`; a directory without an origin is skipped. When two directories
+  share an origin (case-insensitive) the first by name is kept and each scan logs
+  `RUNNER_WORKSPACE_DUPLICATE <repo> <kept> <skipped>`. Runner-config `workspaces` entries then replace the discovered
+  path of their repo or add one. Each path must pass the same check as a `cwd` (absolute, resolving, under
+  `allowedRoots`); one that fails is left out and logged `RUNNER_WORKSPACE_SKIPPED <repo> <rule> <path>`. These decide
+  placement: a launch for a declared repo goes to that runner and holds while it is offline. A repo several runners
+  declare is not an error: each is a candidate, and the launch takes the first with room (`dori launch` in scripts.md).
 - `detected`: directories with a `.git` directory, up to three levels below an allowed root (dot folders,
   `node_modules` and, on macOS, the TCC-guarded home folders skipped; a worktree's `.git` file is not a checkout),
-  whose `origin` names an owner/repo the runner does not declare; at most 200, rescanned at most every 10 minutes.
+  whose `origin` names an owner/repo the runner does not declare, and not under the worktree root; at most 200.
   Information only: such a repo follows `placement.defaultMachine`.
+- `worktreeRoot`: the effective worktree root, absolute (runner-config `worktreeRoot`, else `<reposRoot>/worktrees`),
+  sent only when there is one. A lane placed on this runner creates its worktrees there (its brief footer says so).
 
-The hub stores both in the `runners.workspaces` column at each hello that carries either, and keeps the last report
+The runner caches the report and rescans when `reposRoot` changes: it watches `reposRoot` with `fs.watch`
+(non-recursive; inotify on Linux, FSEvents on macOS), debounced by 2 s, rescans every 5 minutes as a fallback (also
+re-arming a watch that failed, `RUNNER_REPOS_WATCH_FAILED <detail>`, or a `reposRoot` that did not exist yet), and
+rescans after a runner-config reload. A report that changed is sent with a new hello.
+
+The hub stores the three in the `runners.workspaces` column at each hello that carries any of them, and keeps the last report
 while the runner is away. The local runner (no runner-config.json) reports the same way: a runner-config.json
-holding only `workspaces` and `detectWorkspaces` adds them to the policy derived from config.json; a file with any
-other key is the whole policy, as before. The fields need no protocol bump, but a supervisor older than them refuses
+holding only `workspaces`, `detectWorkspaces`, `reposRoot` and `worktreeRoot` adds them to the policy derived from
+config.json, with `reposRoot` and the worktree root added to `allowedRoots`; a file with any other key is the whole
+policy, as before, and must list `reposRoot` in `allowedRoots` itself (a remote runner too), or its repos are skipped
+`cwd-outside-roots`. The fields need no protocol bump, but a supervisor older than them refuses
 the hello `unknown-field`, so update the supervisor before its runners.
 
 ## Runner-owned waits and jobs
