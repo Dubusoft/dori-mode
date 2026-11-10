@@ -17,6 +17,7 @@ import { healthPath } from "../src/runner/health.ts";
 import { collectStatus, kst, lookupStatus, machineLines, renderStatus, runnerViews, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
 import { unsandboxedReason } from "../src/runner-sandbox.ts";
 import { fakeClock, withState } from "./fakes.ts";
+import { builtInTunables } from "../src/tunables.ts";
 
 const OPENED = "2026-10-19T00:00:00.000Z";
 const NOW = Date.parse(OPENED) + 90 * 60_000;
@@ -38,7 +39,7 @@ const fixture = async (panes: unknown[] = [{ pane_id: "lead:p1", workspace_id: "
     return { code: 127, out: "", err: line };
   };
   const registry = new Registry(state.dir);
-  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1" } };
+  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1" }, tunables: builtInTunables("/home/test") };
   return { deps, registry, calls, dir: state.dir };
 };
 const lane = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, thread: "discord:1/2", brief: "/b", done: "d", openedAt: OPENED, ...extra });
@@ -215,7 +216,7 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
   expect(text).toContain("\n■ 활동 (최근 24시간)\n- 리드 깨움 3회 (소유자 3 · 레인 0 · 노이즈 0), 깨울 때마다 모델 호출 6.5회\n");
   expect(text).toContain("\n- 많은 순: INBOUND 이벤트 2 · 깨움 2; GH_PR * merged 이벤트 1 · 깨움 1; (restart) 이벤트 0 · 깨움 1; NUDGED 이벤트 3");
   // A kind moved by config is counted and classed under the config's table, with no code change.
-  const moved = await collectStatus({ ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
+  const moved = await collectStatus({ ...f.deps, tunables: { ...f.deps.tunables, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
   expect(moved.events.kinds.find((k) => k.kind === "NUDGED lane")).toEqual({ kind: "NUDGED lane", cls: "engine-only", events: 3, wakes: 0, measured: 0, calls: 0 });
 });
 

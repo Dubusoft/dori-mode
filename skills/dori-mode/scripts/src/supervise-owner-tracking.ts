@@ -52,7 +52,7 @@ export const dueOwners = (core: JournalCore, now: number): AwaitingAck[] =>
   (core.journal.awaitingAck ?? []).filter((entry) => OWNER_INBOUND.test(entry.id) && !entry.quarantined &&
     entry.handledAt === undefined && entry.since !== undefined && core.delivered.has(latest(entry)) &&
     (entry.ackedAt === undefined || entry.unhandledRemindedAt !== undefined ||
-      now - (entry.handlingSince ?? entry.ackedAt) >= core.deps.config.handledTimeoutMin * 60_000));
+      now - (entry.handlingSince ?? entry.ackedAt) >= core.deps.tunables.handledTimeoutMin * 60_000));
 const unquarantined = (entry: AwaitingAck): AwaitingAck => {
   if (!entry.quarantined) return entry;
   const { quarantined: _, ...rest } = entry;
@@ -161,7 +161,7 @@ export class OwnerTracking {
   }
 
   /** An explicit ack starts the handling clock. A reminder gets a full second window before owner escalation. */
-  handledTick(timeoutMs = this.deps.config.handledTimeoutMin * 60_000): OwnerMessage[] {
+  handledTick(timeoutMs = this.deps.tunables.handledTimeoutMin * 60_000): OwnerMessage[] {
     this.consumeReceipts();
     if (this.journal.restart) return [];
     const now = this.deps.clock.now();

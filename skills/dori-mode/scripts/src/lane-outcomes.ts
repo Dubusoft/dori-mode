@@ -151,7 +151,7 @@ export class OutcomeTracking {
 
   private get journal(): Journal { return this.core.journal; }
   private set journal(journal: Journal) { this.core.journal = journal; }
-  private get windowMs(): number { return this.core.deps.config.reportTimeoutMin * 60_000; }
+  private get windowMs(): number { return this.core.deps.tunables.reportTimeoutMin * 60_000; }
 
   /**
    * A live done claim or finished-lane event opens its lane's obligation; a later one of the same lane (the claim, then
@@ -163,7 +163,7 @@ export class OutcomeTracking {
     const rejected = rejectedLane(event.line);
     if (rejected) { this.dropClaim(rejected); return; }
     const lane = outcomeLane(event.line);
-    if (!lane || !forLead(eventClass(event.line, this.core.deps.config.eventPolicy))) return;
+    if (!lane || !forLead(eventClass(event.line, this.core.deps.tunables.eventPolicy))) return;
     const outcomes = this.journal.outcomes ?? [];
     const at = outcomes.findIndex((outcome) => outcome.lane === lane);
     const line = event.line.slice(0, OUTCOME_LINE_MAX);

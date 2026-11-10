@@ -93,7 +93,7 @@ test("a long or many-line report is saved to a file and its event carries a cut 
   ]);
   expect(readFileSync(first, "utf8")).toContain(long);
   expect(readFileSync(second, "utf8")).toContain("line 1\nline 2\nline 3\nline 4");
-  expect(eventClass(journal[1] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass(journal[1] ?? "", deps.tunables.eventPolicy)).toBe("lead-urgent");
 });
 
 test("generation fence: a row stamped before the lane's last relaunch is late, never the lane's; unfenced and current rows route", async () => {
@@ -137,7 +137,7 @@ test("a poison row raises one urgent REPORT_STUCK event after POISON_ALERT_AFTER
     "lane-report-stuck:local-lane:0:1",
     `LANE_REPORT local-lane blocked REPORT_STUCK local-lane:0:1 (question) failed to route ${POISON_ALERT_AFTER} times: registry unreadable; it stays pending and is retried every pass`,
   ]]);
-  expect(eventClass(journal[0]?.[1] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass(journal[0]?.[1] ?? "", deps.tunables.eventPolicy)).toBe("lead-urgent");
   expect(store.pending().map((r) => r.id)).toEqual(["local-lane:0:1"]);
   broken = false;
   expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); })).toEqual(["LANE_REPORT_ROUTED local-lane:0:1 question journal"]);
@@ -162,7 +162,7 @@ test("a dead lane pane leaves one synthetic blocked row under the lane's key; a 
   const rows = store.list();
   expect(rows.map((r) => [r.lane, r.kind, r.at])).toEqual([["local-lane", "blocked", T0]]);
   expect(rows[0]?.text).toContain("pane w:p7 stopped");
-  expect(eventClass(`LANE_REPORT local-lane blocked ${rows[0]?.text}`, deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass(`LANE_REPORT local-lane blocked ${rows[0]?.text}`, deps.tunables.eventPolicy)).toBe("lead-urgent");
 });
 
 test("a lane registered on the old [REPORT] footer moves onto dori report when it is relaunched", async () => {

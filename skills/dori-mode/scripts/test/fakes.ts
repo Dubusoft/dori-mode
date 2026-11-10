@@ -16,6 +16,7 @@ import { laneStatus } from "../src/runner/serve.ts";
 import { checkDone } from "../src/signals.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
 import type { Journal } from "../src/supervise.ts";
+import { BUILT_IN, builtInTunables, type Tunables } from "../src/tunables.ts";
 
 /** The journal store the suite runs against: DORI_TEST_STORE=sqlite runs every supervisor test on supervisor.sqlite. */
 export const TEST_STORE: StoreKind = process.env.DORI_TEST_STORE === "sqlite" ? "sqlite" : "json";
@@ -284,10 +285,28 @@ export const fakeLaneOps = (w: World): LaneOps => {
 
 /** FlowDeps over the World, plus `ops` (a fakeLaneOps over the same World) for modules that reach lanes through the facade. */
 const fileRunCounters = new WeakMap<World, number>();
-export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps & { readonly ops: LaneOps } => {
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, toodoEvents: { ...defaultConfig("/home/test").toodoEvents, enabled: false }, ...patch };
+/** BUILT_IN for a /home/test home, with the toodo event stream off. */
+export const testTunables = (patch: Partial<Tunables> = {}): Tunables => {
+  const base = builtInTunables("/home/test");
+  return { ...base, toodoEvents: { ...base.toodoEvents, enabled: false }, ...patch };
+};
+
+/** A fixture patch split into its config part and its tunables part (keys of BUILT_IN). */
+export const splitTunables = (patch: Partial<DoriConfig & Tunables>): { readonly config: Partial<DoriConfig>; readonly tunables: Partial<Tunables> } => {
+  const keys = Object.keys(BUILT_IN);
+  const entries = Object.entries(patch);
+  return {
+    config: Object.fromEntries(entries.filter(([key]) => !keys.includes(key))) as Partial<DoriConfig>,
+    tunables: Object.fromEntries(entries.filter(([key]) => keys.includes(key))) as Partial<Tunables>,
+  };
+};
+
+export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig & Tunables> = {}): FlowDeps & { readonly ops: LaneOps } => {
+  const split = splitTunables(patch);
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, ...split.config };
+  const tunables = testTunables(split.tunables);
   // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
-  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),
+  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, tunables, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),
     newFileRunId: () => {
       const n = (fileRunCounters.get(w) ?? 0) + 1; fileRunCounters.set(w, n);
       return `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;

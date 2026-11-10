@@ -188,10 +188,10 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
     }
     if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, panesOf);
     if (message.state === "acked" || message.escalatedAt !== undefined) continue;
-    if (deps.clock.now() - message.at < deps.config.ciConfirmMin * 60_000) continue;
+    if (deps.clock.now() - message.at < deps.tunables.ciConfirmMin * 60_000) continue;
     const why = message.state === "delivered" ? "delivered but not confirmed" : `not delivered: ${message.blocked ?? "waiting"}`;
     // Journaled before escalatedAt is saved: a crash in between re-emits the same id, which the journal dedupes.
-    emit(`lane-message-unconfirmed:${message.id}`, `LANE_MESSAGE_UNCONFIRMED ${message.lane} ${message.id} ${why} after ${deps.config.ciConfirmMin} min; about ${message.subject}`);
+    emit(`lane-message-unconfirmed:${message.id}`, `LANE_MESSAGE_UNCONFIRMED ${message.lane} ${message.id} ${why} after ${deps.tunables.ciConfirmMin} min; about ${message.subject}`);
     updateLaneMessage(messages, message, { escalatedAt: deps.clock.now() }, deps.clock.now());
   }
 };
@@ -569,7 +569,7 @@ export class CiFollowUp {
     const now = this.deps.clock.now();
     const seen = this.stalls.get(subject) ?? { since: now, alerted: false };
     this.stalls.set(subject, seen);
-    const min = this.deps.config.mergeStallMin;
+    const min = this.deps.tunables.mergeStallMin;
     if (seen.alerted || now - seen.since < min * 60_000) return;
     seen.alerted = true;
     emit(`merge-stalled:${subject}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} ${why} for ${min}+ min: ${hint} ${pull.url}`);

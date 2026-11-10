@@ -13,13 +13,14 @@ import { resolveEventPolicy } from "../src/event-policy.ts";
 import { recordReported, takeReminders } from "../src/lane-outcomes.ts";
 import { readWakes } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
+import { BUILT_IN } from "../src/tunables.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 type Delivery = Partial<Omit<DeliveryConfig, "push">> & { readonly push?: Partial<DeliveryConfig["push"]> };
 const delivery = (patch: Delivery = {}): DeliveryConfig => {
-  const base = defaultConfig().delivery;
+  const base = BUILT_IN.delivery;
   return { ...base, ...patch, push: { ...base.push, ...patch.push } };
 };
 
@@ -390,13 +391,12 @@ test("with the tail monitor on, an acked owner message leaves the untaken set an
 });
 
 test("with the tail monitor on, an owner message unacked for escalateMin restarts an idle lead (the idle rule's clock is the ladder's)", async () => {
-  const f = fixture({ delivery: delivery(), leadUnreadRestartMin: 1 });
+  const f = fixture({ delivery: delivery() });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
   await flush(supervisor);
   f.clock.at += 2 * 60_000;
   await flush(supervisor);
-  // In tail mode leadUnreadRestartMin would have restarted it already.
   expect(f.launches()).toEqual([]);
   f.clock.at += 3 * 60_000;
   await flush(supervisor);
@@ -418,7 +418,7 @@ test("the ladder's safety restart does not wait for the lead's running child, an
 });
 
 test("an owner message the lead took but did not ack still restarts an idle lead in push mode", async () => {
-  const f = fixture({ delivery: delivery(), leadUnreadRestartMin: 1 });
+  const f = fixture({ delivery: delivery() });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");
   await flush(supervisor);
@@ -498,7 +498,7 @@ test("a working lead is never ladder-restarted for a non-owner event, but one to
   }
   expect(progressing.launches()).toEqual([]);
 
-  const held = fixture({ delivery: delivery(), leadUnreadRestartMin: 30 });
+  const held = fixture({ delivery: delivery() });
   held.pane.agent_status = "working";
   inToolCall(held, held.clock.now());
   const s2 = new Supervisor(held.deps);
@@ -749,7 +749,7 @@ test("a journal written under the old tail mode moves the take cursor to the log
 });
 
 test("by default a working lead gets the pointer once its events waited ackSec, only into an empty input box", async () => {
-  expect(defaultConfig().delivery.push.toWorking).toBe(true);
+  expect(BUILT_IN.delivery.push.toWorking).toBe(true);
   const f = fixture({ delivery: delivery() });
   f.pane.agent_status = "working";
   const supervisor = new Supervisor(f.deps);

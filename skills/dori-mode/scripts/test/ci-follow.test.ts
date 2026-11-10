@@ -13,6 +13,7 @@ import type { Lane } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, sent, TEST_STORE, withState, type World } from "./fakes.ts";
+import { BUILT_IN } from "../src/tunables.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MIN = 60_000;
@@ -264,7 +265,7 @@ test("a claimed PR the supervisor cannot merge (review BLOCKED, no checks) wakes
   await ci.tick([pull({ checks: "green" })], emit);
   expect(events.filter(([, l]) => l.startsWith("MERGE_STALLED"))).toHaveLength(1);
   expect(lines("MERGE_STALLED")[0]).toStartWith("MERGE_STALLED acme/app#7 lane=demo-lane head=abcdef1 mergeable MERGEABLE state BLOCKED for 15+ min");
-  expect(eventClass(lines("MERGE_STALLED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass(lines("MERGE_STALLED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-urgent");
   expect(gh.merges).toEqual([]);
 
   events = [];
@@ -531,7 +532,7 @@ test("an issue-bound lane's issue is closed with one comment once its PR is merg
   await follow().tick([], emit, merged);
   expect(gh.closes).toEqual([["gh", "issue", "close", "5", "-R", "acme/app", "--comment", "Closed by dori: acme/app#7 (lane demo-lane) is merged into dev as m3rge5ha. https://github.com/acme/app/pull/7"]]);
   expect(lines("CI_ISSUE_CLOSED")).toEqual(["CI_ISSUE_CLOSED acme/app#5 lane=demo-lane after acme/app#7 merged into dev merge=m3rge5ha https://github.com/acme/app/pull/7"]);
-  expect(eventClass(lines("CI_ISSUE_CLOSED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-digest");
+  expect(eventClass(lines("CI_ISSUE_CLOSED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-digest");
 });
 
 test("an issue is not closed for a PR merged into main, nor commented on when someone already closed it", async () => {
@@ -564,8 +565,8 @@ test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED wit
     ["merge-verified:acme/app#7", "MERGE_VERIFIED acme/app#7 into dev lane=demo-lane merge=m3rge5ha https://github.com/acme/app/pull/7"],
   ]);
   expect(views()).toBe(1);
-  expect(eventClass(lines("MERGE_VERIFIED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("GH_PR acme/app#7 merged sha=x u", deps.config.eventPolicy)).toBe("lead-digest");
+  expect(eventClass(lines("MERGE_VERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("GH_PR acme/app#7 merged sha=x u", deps.tunables.eventPolicy)).toBe("lead-digest");
 });
 
 test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and a PR of no open lane is never read", async () => {
@@ -590,17 +591,18 @@ test("a merged lane PR that cannot be read back wakes the lead once as MERGE_UNV
     expect.stringContaining("MERGE_UNVERIFIED acme/app#7 lane=demo-lane merge could not be read back after 3 tries: gh pr view acme/app#7 exit 1: HTTP 502"),
   ]);
   expect(views()).toBe(3);
-  expect(eventClass(lines("MERGE_UNVERIFIED")[0] ?? "", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass(lines("MERGE_UNVERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-urgent");
 });
 
 test("GH_PR checks_failing and conflicting are digest; an eventPolicy in the config file is ignored", async () => {
   const file = join(state.dir, "config.json");
   writeFileSync(file, JSON.stringify({ eventPolicy: { kinds: { "GH_PR * conflicting": "lead-urgent" } } }));
-  const plain = await loadConfig(file, "/home/test");
-  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", plain.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("GH_PR acme/app#7 conflicting sha=x u", plain.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", plain.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("CI_CONFLICT acme/app#7 x", plain.eventPolicy)).toBe("lead-urgent");
+  expect("eventPolicy" in await loadConfig(file, "/home/test")).toBe(false);
+  const policy = BUILT_IN.eventPolicy;
+  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", policy)).toBe("lead-digest");
+  expect(eventClass("GH_PR acme/app#7 conflicting sha=x u", policy)).toBe("lead-digest");
+  expect(eventClass("LANE_MESSAGE_UNCONFIRMED demo-lane ci-app-7-abcdef1 x", policy)).toBe("lead-urgent");
+  expect(eventClass("CI_CONFLICT acme/app#7 x", policy)).toBe("lead-urgent");
 });
 
 test("a merge lane its sandbox refuses is not started: the refusal is its detail and reaches the owner in the source lane's thread", async () => {

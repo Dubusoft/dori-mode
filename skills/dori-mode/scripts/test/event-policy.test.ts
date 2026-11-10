@@ -94,7 +94,7 @@ test("an eventPolicy in the config file is ignored: the built-in table holds", a
   const path = join(state.dir, "config.json");
   for (const eventPolicy of [{ default: "lead-urgent", kinds: { NUDGED: "engine-only" } }, 7]) {
     writeFileSync(path, JSON.stringify({ eventPolicy }));
-    expect((await loadConfig(path, state.dir)).eventPolicy).toBe(DEFAULT_EVENT_POLICY);
+    expect("eventPolicy" in await loadConfig(path, state.dir)).toBe(false);
   }
 });
 

@@ -231,7 +231,7 @@ export class JournalCore {
     try { this.store = openStore(deps.config.stateDir, deps.config.store, deps.clock.now); } catch (e) {
       throw e instanceof StoreError ? new SuperviseError(e.message) : e;
     }
-    this.wakes = new WakeMeter(this.store, () => this.deps.config, () => this.deps.clock.now());
+    this.wakes = new WakeMeter(this.store, () => this.deps, () => this.deps.clock.now());
     const loaded: Journal = this.store.load() ?? { events: [] };
     // Events journaled before enqueue times existed start their queue clock now.
     this.journal = {
@@ -301,7 +301,7 @@ export class JournalCore {
    */
   initInbox(): void {
     this.consumeTakes();
-    const { tailMonitor } = this.deps.config.delivery;
+    const { tailMonitor } = this.deps.tunables.delivery;
     const key = `push${tailMonitor ? "+tail" : ""}`;
     const size = this.logSize();
     const inbox = this.journal.inbox;
@@ -395,7 +395,7 @@ export class JournalCore {
     for (; i < all.length && ((all[i] as Event).at ?? now) <= cutoff; i++) {
       const event = all[i] as Event;
       // An engine-only event is never delivered to the lead: it ages out like a delivered one.
-      const waiting = !this.delivered.has(event.id) && forLead(eventClass(event.line, this.deps.config.eventPolicy));
+      const waiting = !this.delivered.has(event.id) && forLead(eventClass(event.line, this.deps.tunables.eventPolicy));
       if (waiting || needed.has(event.id)) { kept.push(event); continue; }
       this.eventIds.delete(event.id);
       this.delivered.delete(event.id);

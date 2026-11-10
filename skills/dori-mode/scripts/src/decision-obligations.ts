@@ -99,7 +99,7 @@ export const unresolved = (journal: Journal): Obligation[] => (journal.pending ?
 
 export const resolveRule = (id: string): string => `decide and act on it, then run dori resolved ${id}`;
 
-const windowMs = (core: JournalCore): number => core.deps.config.resolveTimeoutMin * 60_000;
+const windowMs = (core: JournalCore): number => core.deps.tunables.resolveTimeoutMin * 60_000;
 
 /** Open obligations whose first window has passed: they keep a pushed lead pushed (supervise-push.ts). */
 export const dueDecisions = (core: JournalCore, now: number): Obligation[] =>
@@ -139,8 +139,8 @@ export class DecisionTracking {
    * early by a receipt) opens nothing. The caller persists.
    */
   track(event: Event): void {
-    const { config } = this.core.deps;
-    if (!EVENT_ID.test(event.id) || !isDecision(event.line, config.resolveKinds) || !forLead(eventClass(event.line, config.eventPolicy))) return;
+    const { tunables } = this.core.deps;
+    if (!EVENT_ID.test(event.id) || !isDecision(event.line, tunables.resolveKinds) || !forLead(eventClass(event.line, tunables.eventPolicy))) return;
     const pending = this.journal.pending ?? [];
     const line = event.line.slice(0, OBLIGATION_LINE_MAX);
     const at = pending.findIndex((item) => item.id === event.id);

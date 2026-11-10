@@ -43,7 +43,7 @@ const fixture = (kinds: Record<string, string>, run: Runner = async () => ok()) 
   cleanups.push(() => { supervisor.close(); });
   const logs: string[] = [];
   const sources = new EventSources({
-    stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.config.eventPolicy,
+    stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.tunables.eventPolicy,
     log: (line) => { logs.push(line); },
   });
   cleanups.push(() => { sources.close(); });
@@ -139,8 +139,8 @@ test("a poll source runs its command every everySec and journals each matching l
   await f.sources.tick();
   expect(f.events().filter((event) => event.line.startsWith("BUILD ")).map((event) => event.line)).toEqual(["BUILD 101 green", "BUILD 102 red"]);
   // The policy table decides per kind: `BUILD * red` reaches the lead, plain BUILD stays engine-only.
-  expect(eventClass("BUILD 102 red", f.deps.config.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("BUILD 101 green", f.deps.config.eventPolicy)).toBe("engine-only");
+  expect(eventClass("BUILD 102 red", f.deps.tunables.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("BUILD 101 green", f.deps.tunables.eventPolicy)).toBe("engine-only");
   expect(await f.settled()).toEqual([]);
   // Not due yet: no second run.
   await f.sources.tick();

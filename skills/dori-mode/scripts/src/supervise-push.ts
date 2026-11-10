@@ -110,7 +110,7 @@ export class PushDelivery {
 
   /** Re-push interval after `attempts` pushes: ackSec for the first retries + 1, then doubling up to REPUSH_MAX_MS (N7). */
   private interval(attempts: number): number {
-    const { ackSec, retries } = this.core.deps.config.delivery.push;
+    const { ackSec, retries } = this.core.deps.tunables.delivery.push;
     return Math.min(ackSec * 1000 * 2 ** Math.max(0, attempts - retries), Math.max(REPUSH_MAX_MS, ackSec * 1000));
   }
 
@@ -128,8 +128,8 @@ export class PushDelivery {
    */
   async tick(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
     (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane), woke = false): Promise<boolean> {
-    const { config, clock, run } = this.core.deps;
-    const { delivery } = config;
+    const { config, tunables, clock, run } = this.core.deps;
+    const { delivery } = tunables;
     if (this.journal.restart) return false;
     // A take receipt written since the last pass moves the cursor before anything is decided.
     this.core.consumeTakes();
@@ -146,10 +146,10 @@ export class PushDelivery {
     // A report receipt also covers its already-journaled reminders: they must not keep pushing a settled report.
     const reported = new Set(this.journal.outcomes?.filter((outcome) => outcome.reportedAt !== undefined).map((outcome) => outcome.lane));
     const untaken = past.filter((event) => !covered(event.id, at.get(event.id)) && !reported.has(/^UNREPORTED (\S+)/.exec(event.line)?.[1] ?? ""));
-    const policy = config.eventPolicy;
+    const policy = tunables.eventPolicy;
     const urgent = untaken.filter((event) => eventClass(event.line, policy) === "lead-urgent");
     const overdue = untaken.filter((event) => eventClass(event.line, policy) !== "lead-urgent" &&
-      now - ageOf(event.id) >= config.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line));
+      now - ageOf(event.id) >= tunables.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line));
     // A finished lane the owner was not told about keeps the lead pushed until dori reported; its UNREPORTED line,
     // when still untaken, already stands for it in the pointer.
     const due = this.outcomes.due(now);
@@ -271,12 +271,12 @@ export class PushDelivery {
     urgent: readonly Untaken[], first: number, now: number, ageOf: (id: string) => number, owed: readonly LaneOutcome[], decisions: readonly Obligation[],
     owners: readonly AwaitingAck[],
   ): string | undefined {
-    const { delivery } = this.core.deps.config;
+    const { delivery } = this.core.deps.tunables;
     const limit = delivery.push.escalateMin * 60_000;
     const minutes = (since: number): number => Math.round((now - since) / 60_000);
     const ownerSince = (entry: AwaitingAck): number => Math.max(
       entry.ackedAt === undefined ? entry.since ?? now :
-        Math.min(entry.unhandledRemindedAt ?? Infinity, (entry.handlingSince ?? entry.ackedAt) + this.core.deps.config.handledTimeoutMin * 60_000),
+        Math.min(entry.unhandledRemindedAt ?? Infinity, (entry.handlingSince ?? entry.ackedAt) + this.core.deps.tunables.handledTimeoutMin * 60_000),
       this.journal.inbox?.sessionSince ?? 0, first);
     const overdueOwners = owners.filter((entry) => now - ownerSince(entry) >= limit);
     const ownerReason = overdueOwners.length
@@ -289,11 +289,11 @@ export class PushDelivery {
     }
     const start = (id: string): number => Math.max(ageOf(id), this.journal.inbox?.sessionSince ?? 0, first);
     const stale = urgent.filter((event) => now - start(event.id) >= limit);
-    const window = this.core.deps.config.reportTimeoutMin * 60_000;
+    const window = this.core.deps.tunables.reportTimeoutMin * 60_000;
     const owedSince = (outcome: LaneOutcome): number =>
       Math.max(outcome.since + window, this.journal.inbox?.sessionSince ?? 0, outcome.pushedAt ?? Infinity);
     const late = owed.filter((outcome) => now - owedSince(outcome) >= limit);
-    const resolveWindow = this.core.deps.config.resolveTimeoutMin * 60_000;
+    const resolveWindow = this.core.deps.tunables.resolveTimeoutMin * 60_000;
     const openSince = (item: Obligation): number =>
       Math.max(item.since + resolveWindow, this.journal.inbox?.sessionSince ?? 0, item.pushedAt ?? Infinity);
     const undecided = decisions.filter((item) => now - openSince(item) >= limit);

@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_LANE_SANDBOX, type DoriConfig, withThinking } from "../config.ts";
 import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_FILE, type RunnerPolicy } from "./policy.ts";
+import { BUILT_IN } from "../tunables.ts";
 
 /**
  * The local runner's policy when `~/.dori/runner/runner-config.json` is absent (design D20): derived from the lead's
@@ -22,12 +23,14 @@ import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_
  * Guard thresholds and `heavyKill` stay unset, so the runner reads them from the same config as the supervisor.
  */
 
-export type LocalPolicyConfig = Pick<DoriConfig, "agentCommand" | "laneThinking" | "laneSandbox" | "defaultCwd" | "worktreeRoot">;
+/** `laneThinking` absent: BUILT_IN.laneThinking. */
+export type LocalPolicyConfig = Pick<DoriConfig, "agentCommand" | "laneSandbox" | "defaultCwd" | "worktreeRoot"> & { readonly laneThinking?: string };
 
 export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: string; readonly tmp?: string } = {}): RunnerPolicy => {
   const template = cfg.agentCommand;
   const takesThinking = template.some((part) => /^--(model|thinking)(=|$)/.test(part));
-  const thinking = takesThinking ? (typeof cfg.laneThinking === "string" ? cfg.laneThinking.trim() : "") || undefined : undefined;
+  const laneThinking = cfg.laneThinking ?? BUILT_IN.laneThinking;
+  const thinking = takesThinking ? (typeof laneThinking === "string" ? laneThinking.trim() : "") || undefined : undefined;
   // Filling the slots with themselves keeps them for the runner's own fill (lanes.ts agentArgv).
   const lane = withThinking(template, { model: "{model}", prompt: "{prompt}" }, thinking);
   const sandbox = cfg.laneSandbox?.command ?? DEFAULT_LANE_SANDBOX.command;

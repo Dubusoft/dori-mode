@@ -373,7 +373,7 @@ test("a mass-ulw launch refuses keywords or a brief path that omo would not bind
   await writeBrief();
   const base = deps({});
   const mass = (massLaunchKeywords: string, extra: Record<string, string> = {}) =>
-    validateLaunch({ ...base, config: { ...base.config, massLaunchKeywords } }, { ...input({ pane: "w:p3", ...extra }), mode: "mass-ulw" });
+    validateLaunch({ ...base, tunables: { ...base.tunables, massLaunchKeywords } }, { ...input({ pane: "w:p3", ...extra }), mode: "mass-ulw" });
   await expect(mass("mass-ulw set goal and work")).rejects.toThrow(LaunchError);
   await expect(mass("/mass-ulw set goal and work?")).rejects.toThrow(LaunchError);
   await expect(mass("/mass-ulw set goal and work", { brief: join(state.dir, "what?.md") })).rejects.toThrow(LaunchError);

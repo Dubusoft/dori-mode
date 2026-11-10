@@ -50,7 +50,7 @@ const world = (run: Runner = async () => ok()) => {
     const supervisor = new Supervisor(deps);
     const ops = openOperations(deps.config);
     const sources = new EventSources({
-      stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.config.eventPolicy,
+      stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.tunables.eventPolicy,
       schedules: {
         operations: ops, journaled: (id) => supervisor.journaled(id),
         heavy: {

@@ -8,7 +8,7 @@ import type { Pane } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { runSweeps, supervisorSweeps } from "../src/supervise-loop.ts";
 import { boundedCalls, newSweepCache, SWEEP_SCREEN_MAX_AGE_MS, sweepRound } from "../src/sweep-view.ts";
-import { fakeClock, fakeLaneOps, newWorld, withState } from "./fakes.ts";
+import { fakeClock, fakeLaneOps, newWorld, testTunables, withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MODEL = defaultConfig("/home/test").defaultModel;
@@ -52,7 +52,7 @@ const setup = async () => {
   const h = herdr();
   const clock = fakeClock(T0);
   const config = { ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: "/repo", leadPane: "lead:p1", laneWorkspace: "none" };
-  const deps: FlowDeps = { run: async (): Promise<Ran> => ({ code: 1, out: "", err: "no lane access outside the facade" }), clock, registry: new Registry(state.dir), config, exists: () => true, ops: h.ops };
+  const deps: FlowDeps = { run: async (): Promise<Ran> => ({ code: 1, out: "", err: "no lane access outside the facade" }), clock, registry: new Registry(state.dir), config, tunables: testTunables(), exists: () => true, ops: h.ops };
   for (let i = 0; i < 100; i++) {
     const machine = i % 2 ? "box2" : "";
     const pane = `w${i}:p1`;
