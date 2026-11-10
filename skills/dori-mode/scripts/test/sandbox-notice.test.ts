@@ -21,7 +21,9 @@ const setup = (hook: Ran | undefined, channels: string[] = ["main-1"], postFails
   const transport: LaneStatusTransport = {
     post: async (channel, text) => { if (postFails) throw new Error("discord 500"); posts.push([channel, text]); return "m1"; },
     edit: async () => {},
+    remove: async () => {},
     threadState: async () => ({ archived: true, parent: "parent-1" }),
+    laterMessages: async () => ({ messages: [], more: false }),
   };
   return { deps, transport, hooked, posts };
 };

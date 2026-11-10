@@ -7,7 +7,7 @@ import { fillHook } from "./config.ts";
 import { displayTime } from "./display-time.ts";
 import { claimDone, type Emit, type FlowDeps, laneMeta } from "./done-flow.ts";
 import { relayedText, scrubForThread } from "./freshness.ts";
-import { Discord } from "./messenger/discord.ts";
+import { Discord, DISCORD_MESSAGES_PAGE, DISCORD_SUPPRESS_NOTIFICATIONS } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
 import type { Clock } from "./run.ts";
@@ -294,15 +294,34 @@ const failures = new WeakMap<LaneReportStore, Map<string, number>>();
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
 export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
+/** A message posted after a lane's status message, as the status check reads it: by the bot itself, its Discord type, its text. */
+export type LaterMessage = { readonly own: boolean; readonly type: number; readonly content: string };
+
 /**
- * Posts and edits a lane's status message in its thread; `post` returns the new message's id. `threadState` tells a
- * thread the owner closed (thread-followup.ts closedByOwner) from one that is open.
+ * Posts, edits and deletes a lane's status message in its thread; `post` returns the new message's id and `silent` posts
+ * it without a notification. `threadState` tells a thread the owner closed (thread-followup.ts closedByOwner) from one
+ * that is open and names its last message; `laterMessages` lists what was posted after a message (`more` when Discord
+ * has more than one page of them).
  */
 export type LaneStatusTransport = {
-  post(channel: string, text: string, stableId: string): Promise<string>;
+  post(channel: string, text: string, stableId: string, silent?: boolean): Promise<string>;
   edit(channel: string, messageId: string, text: string): Promise<void>;
-  threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined }>;
+  remove(channel: string, messageId: string): Promise<void>;
+  threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined; readonly lastMessageId?: string | undefined }>;
+  laterMessages(channel: string, afterId: string): Promise<{ readonly messages: readonly LaterMessage[]; readonly more: boolean }>;
 };
+
+/** The status transport over a Discord client (the supervisor's own, or one on DORI_DISCORD_TOKEN). */
+export const statusTransportOf = (discord: Discord): LaneStatusTransport => ({
+  post: (channel, text, stableId, silent) => discord.send(channel, text, stableId, undefined, silent ? DISCORD_SUPPRESS_NOTIFICATIONS : undefined),
+  edit: (channel, id, text) => discord.edit(channel, id, text),
+  remove: (channel, id) => discord.deleteMessage(channel, id),
+  threadState: (threadId) => discord.threadState(threadId),
+  laterMessages: async (channel, afterId) => {
+    const [me, messages] = await Promise.all([discord.selfId(), discord.messagesAfter(channel, afterId)]);
+    return { messages: messages.map((m) => ({ own: m.authorId === me, type: m.type, content: m.content })), more: messages.length >= DISCORD_MESSAGES_PAGE };
+  },
+});
 
 /**
  * The Discord status transport, on DORI_DISCORD_TOKEN from the process environment (the supervisor unit loads it from
@@ -311,11 +330,7 @@ export type LaneStatusTransport = {
 export const discordStatusTransport = (clock: Clock, env: Readonly<Record<string, string | undefined>> = process.env): LaneStatusTransport | undefined => {
   const token = env.DORI_DISCORD_TOKEN?.trim();
   if (!token) return undefined;
-  const discord = new Discord(fetchHttp, clock, token);
-  return {
-    post: (channel, text, stableId) => discord.send(channel, text, stableId), edit: (channel, id, text) => discord.edit(channel, id, text),
-    threadState: (threadId) => discord.threadState(threadId),
-  };
+  return statusTransportOf(new Discord(fetchHttp, clock, token));
 };
 
 /** Longest report text a status message line carries. */
@@ -350,13 +365,35 @@ export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: 
   ].join("\n");
 };
 
+const STATUS_HEAD = /^\[System\] 레인 \S+ 상태, 진행 /;
+
+/** Whether `text` is a lane status message (laneStatusText) of any lane. */
+export const isLaneStatusText = (text: string): boolean => STATUS_HEAD.test(text);
+
+/**
+ * Whether status message `statusId` is still the latest thing in thread `channel`: the thread is not archived, and
+ * either its last message is the status message or everything posted after it is the bot's own plain status message
+ * of some lane (so lanes sharing a thread never push each other's status up). Anything else after it, a thread system
+ * message (rename, member added, pin) included, means it is not.
+ */
+const statusIsLatest = async (transport: LaneStatusTransport, channel: string, statusId: string): Promise<boolean> => {
+  const state = await transport.threadState(channel);
+  if (state.archived) return false;
+  if (state.lastMessageId === statusId) return true;
+  const later = await transport.laterMessages(channel, statusId);
+  return !later.more && later.messages.every((m) => m.own && m.type === 0 && isLaneStatusText(m.content));
+};
+
 /** The Discord channel id of a lane's thread, or undefined for no thread or a non-Discord one. */
 const statusChannel = (lane: Lane): string | undefined =>
   lane.thread !== "none" && lane.thread.startsWith("discord:") ? resolveTarget("discord", lane.thread).to : undefined;
 
 /**
- * Edits the lane's status message to the text as of `report`, or posts it when there is none yet or the edit fails (a
- * deleted message), and stores the new id on the lane (statusMessageId). A thread the owner closed is neither edited nor
+ * Keeps the lane's status message at the bottom of its thread with the text as of `report`. While it is still the latest
+ * there (statusIsLatest) it is edited in place; once something else was posted after it, or Discord archived the thread,
+ * a new one is posted without a notification, its id stored on the lane (statusMessageId), and only then the old one
+ * deleted (a failed delete is logged). It is posted when there is none yet or the edit fails (a deleted message). A failed
+ * latest check is logged and the message edited as before. A thread the owner closed is neither edited nor
  * posted into (either would reopen it): the report goes as one line linking the thread to its parent channel, else the
  * owner channel (redirectIfClosed), and the status message is left as it is. A failed post throws.
  */
@@ -369,12 +406,23 @@ const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, chan
     return;
   }
   const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone);
-  if (lane.statusMessageId) {
+  const previous = lane.statusMessageId;
+  if (previous) {
+    let latest = true;
+    try { latest = await statusIsLatest(transport, channel, previous); }
+    catch (e) { console.error(`LANE_STATUS_CHECK_FAILED ${lane.key} ${previous} ${errorText(e)}; editing it in place`); }
+    if (!latest) {
+      const id = await transport.post(channel, text, `lane-status:${report.id}`, true);
+      await deps.registry.patch(lane.key, { statusMessageId: id });
+      try { await transport.remove(channel, previous); }
+      catch (e) { console.error(`LANE_STATUS_DELETE_FAILED ${lane.key} ${previous} ${errorText(e)}`); }
+      return;
+    }
     try {
-      await transport.edit(channel, lane.statusMessageId, text);
+      await transport.edit(channel, previous, text);
       return;
     } catch (e) {
-      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${lane.statusMessageId} ${errorText(e)}; posting a new status message`);
+      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${previous} ${errorText(e)}; posting a new status message`);
     }
   }
   const id = await transport.post(channel, text, `lane-status:${report.id}`);
