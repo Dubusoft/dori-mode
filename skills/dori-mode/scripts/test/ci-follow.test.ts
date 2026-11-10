@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
+import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId, reclaimMessageId } from "../src/ci-follow.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -478,6 +478,76 @@ for (const [name, setup, reason] of [
     expect(ci.messages.get(rebaseMessageId(conflicting))).toBeUndefined();
   });
 }
+
+/** The claimed lane on a remote machine, its Done naming no PR: only its claim binds PR #7 (the lead verifies its Done). */
+const remoteLane = (): Lane => {
+  const { cwd: _local, ...rest } = claimedLane;
+  return { ...rest, machine: "windows-pc", remoteCwd: "C:\\Users\\dev", done: "file /tmp/dori-verified-demo" };
+};
+
+test("a remote lane whose claim bound the conflicting PR gets the rebase request through its runner's dori: rebase, claim again once green, or report blocked", async () => {
+  await deps.registry.update(lane.key, () => remoteLane());
+  const conflicting = pull({ conflicting: true, checks: "green" });
+  const id = rebaseMessageId(conflicting);
+  const ci = follow({ launch: recordLaunch });
+  await ci.tick([conflicting], emit);
+  expect(launches).toEqual([]);
+  expect(sent(world)).toHaveLength(1);
+  expect(sent(world)[0]).toContain("rebase your branch onto origin/dev yourself");
+  expect(sent(world)[0]).toContain('~/.dori/runner/bin/dori report demo-lane done --text "rebased onto dev" --evidence "https://github.com/acme/app/pull/7 head <new head SHA>"');
+  expect(sent(world)[0]).toContain("~/.dori/runner/bin/dori report demo-lane blocked --text");
+  expect(sent(world)[0]).toContain(`~/.dori/runner/bin/dori report ack ${id}`);
+  expect(lines("CI_CONFLICT")).toEqual([]);
+});
+
+test("a rebase request the lane got that leaves the PR conflicting at the same head for mergeStallMin reaches the lead once as MERGE_STALLED", async () => {
+  const conflicting = pull({ conflicting: true, checks: "green" });
+  const id = rebaseMessageId(conflicting);
+  const ci = follow({ launch: recordLaunch });
+  await ci.tick([conflicting], emit);
+  ackLaneMessage(ci.messages, "demo-lane", id, clock.now());
+  clock.at += 14 * MIN;
+  await ci.tick([conflicting], emit);
+  expect(lines("MERGE_STALLED")).toEqual([]);
+  clock.at += MIN;
+  await ci.tick([conflicting], emit);
+  await ci.tick([conflicting], emit);
+  expect(events.filter(([, l]) => l.startsWith("MERGE_STALLED")).map(([eid]) => eid)).toEqual([`merge-stalled:acme/app#7@${SHA}`]);
+  expect(lines("MERGE_STALLED")[0]).toContain(`MERGE_STALLED acme/app#7 lane=demo-lane head=abcdef1 still conflicts with dev 15+ min after the lane was asked to rebase (${id}, acked)`);
+  expect(launches).toEqual([]);
+  expect(sent(world)).toHaveLength(1);
+});
+
+test("a rebased PR green at a head the claim did not record asks the lane to claim again, and merges exactly that head once it does", async () => {
+  const NEW = "1234567890abcdef1234567890abcdef12345678";
+  const rebased = pull({ sha: NEW, checks: "green" });
+  gh.view = greenView({ headRefOid: NEW });
+  const ci = follow();
+  await ci.tick([rebased], emit);
+  expect(gh.merges).toEqual([]);
+  const id = reclaimMessageId(rebased);
+  expect(sent(world)).toHaveLength(1);
+  expect(sent(world)[0]).toContain("is green and mergeable into dev at 1234567");
+  expect(sent(world)[0]).toContain("but your done claim recorded abcdef1");
+  expect(sent(world)[0]).toContain(`dori report demo-lane done --text "green at 1234567" --evidence "https://github.com/acme/app/pull/7 head ${NEW}"`);
+  expect(sent(world)[0]).toContain(`dori report ack ${id}`);
+  await deps.registry.update(lane.key, () => ({ ...claimedLane, claim: { ...claimedLane.claim!, pulls: [{ repo: "acme/app", number: 7, sha: NEW }] } }));
+  await ci.tick([rebased], emit);
+  expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", NEW]]);
+  expect(ci.messages.get(id)?.state).toBe("superseded");
+  expect(sent(world)).toHaveLength(1);
+});
+
+test("a merge lane for a remote lane starts on that lane's machine with no local worktree, and its brief has it make its own checkout", async () => {
+  const request = { key: mergeLaneKey(pull()), source: remoteLane(), pull: pull(), base: "dev" };
+  const r = await launchMergeLane(deps, request);
+  expect(r.ok).toBe(true);
+  const start = world.ops.find((o) => o.op === "start");
+  expect(start?.args).toMatchObject({ key: request.key, machine: "windows-pc" });
+  expect((start?.args as { cwd?: string }).cwd).toBeUndefined();
+  expect(world.ops.filter((o) => o.op === "git" || o.op === "exists")).toEqual([]);
+  expect(await Bun.file(join(deps.config.stateDir, "briefs", `${request.key}.md`)).text()).toContain("No worktree was made for you on windows-pc: in a checkout of acme/app");
+});
 
 test("laneDown: a closed lane is down; an unreadable pane list counts as live", () => {
   expect(laneDown({ ...lane, closedAt: new Date(T0).toISOString() }, [idle])).toBe("lane closed");

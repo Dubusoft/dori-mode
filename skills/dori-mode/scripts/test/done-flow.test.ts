@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { treeDigest } from "../src/lane-files.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
-import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { claimBindings, claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
@@ -284,7 +284,7 @@ test("a Done signal that does not read back live becomes the objection", async (
 });
 
 /** A lane whose Done is one `merged` PR the claim binds at HEAD; its live view follows `pr` (checks, head, state). */
-const mergeOnly = (pr: { state: string; head?: string; checks: { status: string; conclusion?: string }[] }) => {
+const mergeOnly = (pr: { state: string; head?: string; mergeable?: string; checks: { status: string; conclusion?: string }[] }) => {
   const HEAD = "a".repeat(40);
   const bound: Lane = { ...lane, done: "merged acme/app#1" };
   const deps = (ms: number): FlowDeps => {
@@ -292,7 +292,7 @@ const mergeOnly = (pr: { state: string; head?: string; checks: { status: string;
     const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
       const fields = argv[argv.indexOf("--json") + 1] ?? "";
       if (argv[0] === "gh" && argv[2] === "view" && fields.includes("headRefOid") && !fields.includes("headRefName")) {
-        return { code: 0, out: JSON.stringify({ number: 1, state: pr.state, headRefOid: pr.head ?? HEAD, isCrossRepository: false, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED", statusCheckRollup: pr.checks.map((c) => ({ __typename: "CheckRun", ...c })) }), err: "" };
+        return { code: 0, out: JSON.stringify({ number: 1, state: pr.state, headRefOid: pr.head ?? HEAD, isCrossRepository: false, isDraft: false, mergeable: pr.mergeable ?? "MERGEABLE", mergeStateStatus: "BLOCKED", statusCheckRollup: pr.checks.map((c) => ({ __typename: "CheckRun", ...c })) }), err: "" };
       }
       return base.run(argv, opts);
     };
@@ -340,8 +340,11 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
   expect((await claimAndSettle(T0))[0]).toStartWith("LANE_NOT_DONE demo-lane");
   expect(await objection()).toEqual(["merged acme/app#1 -> OPEN", "acme/app#1 has 1 failed check(s)"]);
   pr.checks = [{ status: "QUEUED" }];
-  // A push after the claim: the PR's head is no longer the one the claim recorded.
-  await claimAndSettle(T0 + 10 * MIN, () => { pr.head = "b".repeat(40); });
+  // A push after the claim (a rebase): the claim waits for the lane to claim again at the new head (ci-follow asks it),
+  // and only past mergeWaitMaxMin objects, naming the move.
+  expect(await claimAndSettle(T0 + 10 * MIN, () => { pr.head = "b".repeat(40); })).toEqual([]);
+  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? bound)).toBe("done-claimed");
+  expect((await watchTick(deps(T0 + 70 * MIN)))[0]).toStartWith("LANE_NOT_DONE demo-lane");
   expect((await objection())?.[1]).toStartWith("acme/app#1 head moved to bbbbbbbbbb after the claim");
   delete pr.head;
   await claimAndSettle(T0 + 20 * MIN);
@@ -350,6 +353,35 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
   expect(await watchTick(deps(T0 + 79 * MIN))).toEqual([]);
   expect((await watchTick(deps(T0 + 80 * MIN)))[0]).toStartWith("LANE_NOT_DONE demo-lane");
   expect((await objection())?.[1]).toStartWith("not merged within 60 min of the claim");
+});
+
+test("a claim binds a PR its evidence links together with that PR's live head; a PR the evidence only mentions is not bound", async () => {
+  const HEAD = "d".repeat(40);
+  const { cwd: _local, ...rest } = lane;
+  const remote: Lane = { ...rest, machine: "windows-pc", remoteCwd: "C:\\Users\\dev", done: "file /tmp/dori-verified-demo" };
+  const run = async (argv: readonly string[]) => argv[0] === "gh" && argv[2] === "view"
+    ? { code: 0, out: JSON.stringify({ number: Number(argv[3]), state: "OPEN", headRefOid: HEAD, isCrossRepository: false }), err: "" }
+    : { code: 1, out: "", err: "unexpected" };
+  const ops = at(T0).ops;
+  expect(await claimBindings(run, ops, remote, `https://github.com/Acme/App/pull/253 head ${HEAD.slice(0, 10)}`)).toEqual([{ repo: "acme/app", number: 253, sha: HEAD }]);
+  expect(await claimBindings(run, ops, remote, "rebased after https://github.com/acme/app/pull/250 merged")).toEqual([]);
+  expect(await claimBindings(run, ops, remote, `https://github.com/acme/app/pull/253 head ${"e".repeat(40)}`)).toEqual([]);
+});
+
+test("a Done=merged claim whose PR conflicts keeps waiting for the lane's rebase instead of objecting, until mergeWaitMaxMin", async () => {
+  world.prState = "OPEN";
+  const pr = { state: "OPEN", mergeable: "CONFLICTING", checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }] };
+  const { bound, deps } = mergeOnly(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "claim");
+  await watchTick(deps(T0));
+  expect(await watchTick(deps(T0 + 6 * MIN))).toEqual([]);
+  expect(await watchTick(deps(T0 + 59 * MIN))).toEqual([]);
+  expect(statusOf((await at(T0).registry.read("demo-lane")) ?? bound)).toBe("done-claimed");
+  expect((await watchTick(deps(T0 + 60 * MIN)))[0]).toStartWith("LANE_NOT_DONE demo-lane");
+  expect(((await at(T0).registry.read("demo-lane")) ?? bound).objection?.reasons).toEqual([
+    "merged acme/app#1 -> OPEN", "acme/app#1 conflicts with its base", expect.stringContaining("not merged within 60 min of the claim"),
+  ]);
 });
 
 /** A lane whose Done is `pr acme/app feat/x`: its green PR #7 (into `base`) reads live while open; the claim binds it at HEAD. */

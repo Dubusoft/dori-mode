@@ -115,6 +115,9 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
         // Other/legacy done signals do not establish a GitHub association.
       }
     }
+    // A PR the lane's done claim recorded stays its own (a remote lane too, whose branch no lead-side read establishes):
+    // after an objection the PR keeps getting its CI, rebase and re-claim follow-up until the lane claims again.
+    for (const bound of lane.claim?.pulls ?? []) target(bound.repo).numbers.add(bound.number);
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
     // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
     const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; }))?.git;

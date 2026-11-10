@@ -157,16 +157,29 @@ const claimWaitsForLead = (deps: FlowDeps, lane: Lane): boolean =>
 /** The journal id of a claim's announcement: stable, so a repeated announcement after a crash is the same event. */
 export const claimEventId = (key: string, claimAt: string): string => `done-claim:${key}:${claimAt}`;
 
+/** The PRs (`owner/repo` lowercased, number) a claim's evidence links as `github.com/<owner>/<repo>/pull/<n>`. */
+export const evidencePulls = (evidence: string): [string, number][] => {
+  const out = new Map<string, [string, number]>();
+  for (const m of evidence.matchAll(/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/([1-9]\d*)/gi)) {
+    const repo = (m[1] ?? "").toLowerCase();
+    out.set(`${repo}#${m[2]}`, [repo, Number(m[2])]);
+  }
+  return [...out.values()];
+};
+
 type PrRow = { readonly number?: unknown; readonly state?: unknown; readonly headRefOid?: unknown; readonly isCrossRepository?: unknown };
 const PR_ROW_FIELDS = "number,state,headRefOid,isCrossRepository";
 
 /**
  * The lane's open same-repo PRs and their head SHA right now, read live from GitHub: the PRs its Done signals name and
  * those whose head is one of its branches. The claim records them, and the supervisor merges a PR only at exactly that
- * head (ci-follow.ts claimGate). A fork PR is never recorded, whatever its number or branch; a read that fails records
- * nothing for that target, so that PR is not auto-merged on this claim.
+ * head (ci-follow.ts claimGate). A PR the claim's `evidence` links (`github.com/<owner>/<repo>/pull/<n>`) is recorded too
+ * when the evidence also names its live head (the full SHA or a prefix of at least 7): a lane whose Done names no PR
+ * (a remote lane, whose branch no lead-side read finds) still binds the PR it claims at, and a PR merely mentioned is
+ * not. A fork PR is never recorded, whatever its number or branch; a read that fails records nothing for that target,
+ * so that PR is not auto-merged on this claim.
  */
-export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, lane: Lane): Promise<ClaimedPull[]> => {
+export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, lane: Lane, evidence = ""): Promise<ClaimedPull[]> => {
   const found = new Map<string, ClaimedPull>();
   const add = (repo: string, row: PrRow): void => {
     if (row.isCrossRepository !== false || row.state !== "OPEN" || typeof row.number !== "number" || typeof row.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(row.headRefOid)) return;
@@ -185,6 +198,14 @@ export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, 
   for (const [repo, targets] of await githubTargets([lane], ops)) {
     for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS]);
     for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS]);
+  }
+  const shas = (evidence.toLowerCase().match(/\b[0-9a-f]{7,40}\b/g) ?? []);
+  for (const [repo, n] of evidencePulls(evidence)) {
+    if (found.has(`${repo}#${n}`)) continue;
+    await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS]);
+    // `read` records any open same-repo PR; one whose live head the evidence does not name is dropped again.
+    const row = found.get(`${repo}#${n}`);
+    if (row && !shas.some((s) => row.sha.startsWith(s))) found.delete(`${repo}#${n}`);
   }
   return [...found.values()];
 };
@@ -217,7 +238,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
     return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
   }
-  const pulls = await claimBindings(deps.run, deps.ops, lane);
+  const pulls = await claimBindings(deps.run, deps.ops, lane, evidence);
   const at = iso(deps.clock);
   await deps.registry.update(lane.key, (current) => {
     if (fileReceipt && (!current || current.closedAt || current.fileRun?.id !== fileReceipt.run.id))
@@ -525,15 +546,19 @@ type WaitView = {
 
 /**
  * Whether a settling claim is still waiting for the supervisor's merge instead of failing: every failing Done signal is a
- * `merged` PR the claim bound, still OPEN at exactly the bound head, not a draft, not conflicting, with no failed check
- * (pending is fine), and less than `mergeWaitMaxMin` has passed since the window started. Otherwise `why` says what
- * stops the merge, for the objection. A PR that cannot be read this pass keeps the wait; the bound still ends it.
+ * `merged` PR the claim bound, still OPEN, not a draft, and either at exactly the bound head with no failed check
+ * (pending is fine), or in the supervisor's rebase follow-up (ci-follow.ts): conflicting with its base (the lane is
+ * asked to rebase) or moved past the bound head (the lane is asked to claim again once it is green); and less than
+ * `mergeWaitMaxMin` has passed since the window started. Otherwise `why` says what stops the merge, for the
+ * objection. A PR that cannot be read this pass keeps the wait; the bound still ends it.
  */
 const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], start: number): Promise<{ readonly waiting: boolean; readonly why: string[] }> => {
   const signals = failing.map((c) => { try { return parseSignal(c.signal); } catch { return undefined; } });
   if (!signals.length || signals.some((s) => s?.kind !== "merged")) return { waiting: false, why: [] };
   const maxMin = deps.tunables.mergeWaitMaxMin;
   const why: string[] = [];
+  // Conflicts and moved heads the rebase follow-up is settling: they keep the wait, and are named if it ends.
+  const rebasing: string[] = [];
   for (const s of signals) {
     if (s?.kind !== "merged") continue;
     const ref = `${s.repo}#${s.n}`;
@@ -544,23 +569,26 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
     try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
     if (!view) continue;
     const failed = (view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+    const moved = view.headRefOid !== bound.sha;
+    const conflicting = view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY";
     if (view.state !== "OPEN") why.push(`${ref} is ${view.state ?? "unknown"}`);
-    else if (view.headRefOid !== bound.sha) why.push(`${ref} head moved to ${(view.headRefOid ?? "unknown").slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
     else if (view.isDraft) why.push(`${ref} is a draft, which the supervisor never merges`);
-    else if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") why.push(`${ref} conflicts with its base`);
+    else if (conflicting) rebasing.push(`${ref} conflicts with its base`);
+    else if (moved) rebasing.push(`${ref} head moved to ${(view.headRefOid ?? "unknown").slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
     else if (failed.length) why.push(`${ref} has ${failed.length} failed check(s)`);
   }
-  if (why.length) return { waiting: false, why };
+  if (why.length) return { waiting: false, why: [...why, ...rebasing] };
   if (deps.clock.now() - start < maxMin * 60_000) return { waiting: true, why: [] };
-  return { waiting: false, why: [`not merged within ${maxMin} min of the claim (mergeWaitMaxMin): the supervisor could not merge it; check its checks, reviews and merge state`] };
+  return { waiting: false, why: [...rebasing, `not merged within ${maxMin} min of the claim (mergeWaitMaxMin): the supervisor could not merge it; check its checks, reviews and merge state`] };
 };
 
 /**
  * Whether a claim whose Done signals all read back live still waits for the supervisor to merge a PR it bound: a lane
  * ends at its green PR (a `pr` signal is live while the PR is open), and the supervisor merges only a lane that is
  * still claimed (ci-follow.ts claimGate), so closing first would leave that PR unmerged. It waits while a bound PR into
- * `ciMergeBase` is OPEN at exactly the bound head, not a draft, not conflicting, with no failed check, for less than
- * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. Anything the
+ * `ciMergeBase` is OPEN, not a draft, and either at exactly the bound head with no failed check, or in the rebase
+ * follow-up (conflicting, or moved past the bound head: the lane rebases and claims again), for less than
+ * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. Anything else the
  * supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes the lane as before.
  */
 const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<boolean> => {
@@ -570,8 +598,8 @@ const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promis
     let view: (WaitView & { readonly baseRefName?: string }) | undefined;
     try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView & { readonly baseRefName?: string }) : undefined; } catch { view = undefined; }
     if (!view) return true;
-    if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
-    if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") continue;
+    if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.isDraft) continue;
+    if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY" || view.headRefOid !== bound.sha) return true;
     const failed = (view.statusCheckRollup ?? []).some((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
     if (!failed) return true;
   }

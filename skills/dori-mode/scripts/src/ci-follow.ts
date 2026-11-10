@@ -26,9 +26,13 @@ import { parseSignal, splitDone } from "./signals.ts";
  * - checks failing at the head SHA: a lane message with an ID, delivered safely (deliverLaneMessages);
  * - checks green and mergeable into `ciMergeBase`: the supervisor merges it (`--match-head-commit`, never `--admin`,
  *   never into main) and reads the merge SHA back;
- * - conflicting: while the PR's own lane is live (laneDown) it gets one lane message asking it to rebase, and no merge
- *   lane starts; once that lane is closed, paused or dead, a new merge lane (its own detached worktree) resolves, waits
- *   for green and merges; when none can be launched, the lead hears CI_CONFLICT.
+ * - conflicting: while the PR's own lane is live (laneDown) it gets one lane message asking it to rebase, push, and claim
+ *   again once green (or report blocked when it cannot), and no merge lane starts; a rebase request delivered
+ *   `mergeStallMin` ago while the PR still conflicts at that head is urgent MERGE_STALLED. Once that lane is closed,
+ *   paused or dead, a new merge lane (its own detached worktree; on a remote lane's machine, one it makes itself)
+ *   resolves, waits for green and merges; when none can be launched, the lead hears CI_CONFLICT.
+ * - green and clean at a head other than the one the lane's done claim recorded (it rebased or pushed after claiming):
+ *   one lane message asking it to claim again at this head, beside the MERGE_STALLED bound below.
  * - a lane bound to a GitHub issue (Lane.ghIssue): once its PR is confirmed merged into `ciMergeBase`, the issue is
  *   closed with a comment (a `close-issue` operation planned while the PR is open, so a closed lane still settles it).
  * - a merged PR of an open lane that the supervisor did not merge itself: its merge is read back once (a `merge-verify`
@@ -77,8 +81,20 @@ export const mergeLaneKey = (pull: Pick<OpenPull, "repo" | "number">): string =>
 
 export const rebaseMessageId = (pull: OpenPull): string => `rebase-${repoName(pull.repo)}-${pull.number}-${short(pull.sha)}`;
 
-export const rebaseText = (pull: OpenPull, base: string, id: string): string =>
-  `[LEAD] ${pull.repo}#${pull.number} conflicts with ${base} at ${short(pull.sha)} (${pull.url}). Your lane is live, so no merge lane is started: rebase your branch onto origin/${base} yourself, resolve every conflict keeping the intent of both sides, run the tests, push (--force-with-lease, your own branch only) and keep your own CI wait. Confirm you got this message: dori report ack ${id}`;
+/** The dori command a lane runs: a remote lane's runner installs it at ~/.dori/runner/bin/dori. */
+const doriOf = (lane: Pick<Lane, "machine">): string => (lane.machine ? "~/.dori/runner/bin/dori" : "dori");
+
+export const rebaseText = (pull: OpenPull, base: string, id: string, lane: Pick<Lane, "key" | "machine">): string => {
+  const dori = doriOf(lane);
+  return `[LEAD] ${pull.repo}#${pull.number} conflicts with ${base} at ${short(pull.sha)} (${pull.url}). Your lane is live, so no merge lane is started: rebase your branch onto origin/${base} yourself, resolve every conflict keeping the intent of both sides, run the tests, push (--force-with-lease, your own branch only) and keep your own CI wait. If your lane had claimed done, claim again once CI is green at the new head: ${dori} report ${lane.key} done --text "rebased onto ${base}" --evidence "${pull.url} head <new head SHA>". If you cannot resolve the conflict, say so instead of guessing: ${dori} report ${lane.key} blocked --text "<why>". Confirm you got this message: ${dori} report ack ${id}`;
+};
+
+export const reclaimMessageId = (pull: OpenPull): string => `reclaim-${repoName(pull.repo)}-${pull.number}-${short(pull.sha)}`;
+
+export const reclaimText = (pull: OpenPull, base: string, claimed: string, id: string, lane: Pick<Lane, "key" | "machine">): string => {
+  const dori = doriOf(lane);
+  return `[LEAD] ${pull.repo}#${pull.number} is green and mergeable into ${base} at ${short(pull.sha)} (${pull.url}), but your done claim recorded ${short(claimed)}, so the supervisor cannot merge it. Claim done again at this head: ${dori} report ${lane.key} done --text "green at ${short(pull.sha)}" --evidence "${pull.url} head ${pull.sha}". Confirm you got this message: ${dori} report ack ${id}`;
+};
 
 /** A merged PR from the last poll (GitHubEvents.mergedPulls), for closing the issue its lane was bound to. */
 export type MergedPull = Pick<OpenPull, "repo" | "number" | "url" | "headRepo"> & { readonly branch?: string };
@@ -325,6 +341,10 @@ export class CiFollowUp {
   private readonly settled = new Set<string>();
   /** Subjects of this poll's conflicting PRs whose live lane was asked to rebase; any other rebase message is stale. */
   private rebasing = new Set<string>();
+  /** Subjects of this poll's green PRs whose lane was asked to claim again at the new head; any other such message is stale. */
+  private reclaiming = new Set<string>();
+  /** Subjects whose rebase request already reached the lead as MERGE_STALLED in this process (the journal dedupes after). */
+  private readonly rebaseAlerted = new Set<string>();
   /** Subjects (PR at a head) this process saw stalled, with when it first saw it; dropped once a poll finds it moving. */
   private readonly stalls = new Map<string, { readonly since: number; alerted: boolean }>();
   private stalledNow = new Set<string>();
@@ -383,6 +403,7 @@ export class CiFollowUp {
     const owner = await this.owners(pulls, unresolved);
     const failing = new Set<string>();
     this.rebasing = new Set();
+    this.reclaiming = new Set();
     this.stalledNow = new Set();
     for (const pull of pulls) {
       const lane = owner.get(`${pull.repo.toLowerCase()}#${pull.number}`);
@@ -413,6 +434,8 @@ export class CiFollowUp {
       if (message.id.startsWith("ci-") && !failing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "CI no longer failing at this head" }, deps.clock.now());
       // A rebase request whose PR moved on, stopped conflicting, or went to a merge lane (its lane went down) is stale.
       if (message.id.startsWith("rebase-") && !this.rebasing.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "no longer a conflict for this live lane at this head" }, deps.clock.now());
+      // A re-claim request whose lane claimed at that head, or whose PR moved on or stopped being green, is stale.
+      if (message.id.startsWith("reclaim-") && !this.reclaiming.has(message.subject)) updateLaneMessage(this.messages, message, { state: "superseded", blocked: "no longer green at an unclaimed head" }, deps.clock.now());
     }
   }
 
@@ -545,7 +568,10 @@ export class CiFollowUp {
         return;
       }
       if (!claim.ok) {
-        if (waitsOnMerge(fresh, pull)) this.stall(fresh, pull, claim.why, "green and clean, but the supervisor merges only a lane that claimed done at this head: have the lane claim again, or merge it by hand", emit);
+        if (waitsOnMerge(fresh, pull)) {
+          this.reclaim(fresh, pull);
+          this.stall(fresh, pull, claim.why, "green and clean, but the supervisor merges only a lane that claimed done at this head: have the lane claim again, or merge it by hand", emit);
+        }
         return;
       }
       // pull.sha is the head the claim recorded (claimGate) and the fresh read saw (mergeGate): GitHub merges no other.
@@ -575,6 +601,19 @@ export class CiFollowUp {
     emit(`merge-stalled:${subject}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} ${why} for ${min}+ min: ${hint} ${pull.url}`);
   }
 
+  /**
+   * Asks a lane whose done claim recorded `pull` at another head (it rebased or pushed after claiming) to claim again at
+   * this green head, so the supervisor can merge it; a lane without a pane, or one that never bound this PR, is left to
+   * MERGE_STALLED.
+   */
+  private reclaim(lane: Lane, pull: OpenPull): void {
+    const bound = (lane.claim?.pulls ?? []).find((p) => p.repo.toLowerCase() === pull.repo.toLowerCase() && p.number === pull.number);
+    if (!bound || bound.sha === pull.sha || !lane.pane) return;
+    const id = reclaimMessageId(pull);
+    this.reclaiming.add(subjectOf(pull));
+    requeueLaneMessage(this.messages, this.deps.clock.now(), { id, lane: lane.key, subject: subjectOf(pull), text: reclaimText(pull, this.deps.config.ciMergeBase, bound.sha, id, lane) });
+  }
+
   private async conflict(lane: Lane, pull: OpenPull, emit: CiEmit): Promise<void> {
     const deps = this.deps;
     const key = mergeLaneKey(pull);
@@ -602,7 +641,13 @@ export class CiFollowUp {
         if (down === undefined) {
           const id = rebaseMessageId(pull);
           this.rebasing.add(target);
-          requeueLaneMessage(this.messages, deps.clock.now(), { id, lane: lane.key, subject: target, text: rebaseText(pull, deps.config.ciMergeBase, id) });
+          const asked = requeueLaneMessage(this.messages, deps.clock.now(), { id, lane: lane.key, subject: target, text: rebaseText(pull, deps.config.ciMergeBase, id, fresh) });
+          // The lane got the request and the PR still conflicts at the same head: the rebase did not land, so the lead hears.
+          const min = deps.tunables.mergeStallMin;
+          if (asked.deliveredAt !== undefined && deps.clock.now() - asked.deliveredAt >= min * 60_000 && !this.rebaseAlerted.has(target)) {
+            this.rebaseAlerted.add(target);
+            emit(`merge-stalled:${target}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} still conflicts with ${deps.config.ciMergeBase} ${min}+ min after the lane was asked to rebase (${id}, ${asked.state}): the rebase did not land; help the lane resolve it, or resolve it by hand ${pull.url}`);
+          }
           return;
         }
       }
@@ -620,15 +665,21 @@ export class CiFollowUp {
   }
 }
 
-/** The merge lane's brief: resolve, push to the PR branch, wait for green itself, merge into the base. */
-export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): string => {
+/**
+ * The merge lane's brief: resolve, push to the PR branch, wait for green itself, merge into the base. Without `worktree`
+ * (a merge lane on a remote lane's machine) the lane makes its own detached checkout there first.
+ */
+export const mergeLaneBrief = (request: MergeLaneRequest, worktree?: string): string => {
   const { pull, base, source } = request;
+  const checkout = worktree
+    ? `1. Your worktree ${worktree} is a detached checkout of origin/${pull.branch}.`
+    : `1. No worktree was made for you on ${source.machine ?? "this machine"}: in a checkout of ${pull.repo} on this machine (clone it if there is none), add a detached worktree of origin/${pull.branch} beside the other worktrees and work there.`;
   return [
     `Repo ${pull.repo}, PR #${pull.number} (${pull.url}), branch ${pull.branch}, base ${base}.`,
     "",
     "## Task",
     `The supervisor started this merge lane because the PR conflicts with ${base}. Lane ${source.key} owns the change; you only make it mergeable.`,
-    `1. Your worktree ${worktree} is a detached checkout of origin/${pull.branch}. Run git fetch origin, merge origin/${base} into it and resolve every conflict, keeping the intent of both sides. Run the repo's tests.`,
+    `${checkout} Run git fetch origin, merge origin/${base} into it and resolve every conflict, keeping the intent of both sides. Run the repo's tests.`,
     `2. Push to the PR branch: git push origin HEAD:${pull.branch}. Never force-push, never push to ${base} or main.`,
     "3. Wait for CI yourself with your own monitor; fix failures and push again.",
     `4. When every check is green (at least one passed; all skipped or neutral is not green) and the PR is mergeable, merge it: gh pr merge ${pull.number} -R ${pull.repo} --merge --match-head-commit <the head SHA you pushed>. Never --admin, never into main. The supervisor may merge it first; that is fine.`,
@@ -649,7 +700,9 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   const branch = pull.branch;
   const valid = !branch.startsWith("-") && (await deps.run(["git", "check-ref-format", "--branch", branch])).code === 0;
   if (!valid) return { ok: false, detail: `branch name ${JSON.stringify(branch.slice(0, 80))} of ${pull.repo}#${pull.number} is not a valid branch` };
-  if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
+  // A remote lane's checkout is on its own machine: the merge lane starts there, in the runner's lane directory, and
+  // makes its own worktree (its brief says how). Placement there is that runner's; this host's guard does not apply.
+  if (source.machine) return startMergeLane(deps, request, undefined);
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
   // The local runner's reported worktree root (it reports config.worktreeRoot unless its runner-config sets one); the
   // config's only while that runner has reported none. The closed-lane sweep (done-flow.ts) uses the same root.
@@ -664,6 +717,12 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (fetched.code !== 0) return { ok: false, detail: `git fetch failed: ${(fetched.err || fetched.out).trim()}` };
   const added = await deps.ops.git(source, { op: "worktree-add", root: source.cwd, path: worktree, ref: `refs/remotes/origin/${branch}` });
   if (added.code !== 0) return { ok: false, detail: `git worktree add failed: ${(added.err || added.out).trim()}` };
+  return startMergeLane(deps, request, worktree);
+};
+
+/** Writes the merge lane's brief and launches it in `worktree` (on this host), or on the source lane's machine without one. */
+const startMergeLane = async (deps: FlowDeps, request: MergeLaneRequest, worktree: string | undefined): Promise<{ readonly ok: boolean; readonly detail: string }> => {
+  const { key, source, pull } = request;
   const briefs = join(deps.config.stateDir, "briefs");
   mkdirSync(briefs, { recursive: true });
   const brief = join(briefs, `${key}.md`);
@@ -675,7 +734,7 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   try {
     const { startup, notes } = await launchLane(deps, {
       key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `merged ${pull.repo}#${pull.number}`,
-      thread: source.thread, cwd: worktree, shareThread: true,
+      thread: source.thread, shareThread: true, ...(worktree ? { cwd: worktree } : {}), ...(source.machine ? { machine: source.machine } : {}),
     });
     logged(await postSkippedNotices(deps, notice, notes));
     return { ok: true, detail: startup };
