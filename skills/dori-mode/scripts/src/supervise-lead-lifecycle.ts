@@ -270,7 +270,7 @@ export class LeadLifecycle {
       this.patchJournal({ leadBusySince: undefined, leadScreen: undefined });
       const session = randomUUID();
       console.log(`LEAD_STUCK_RESTART ${config.leadPane} ${status} ${minutes} min, ${count} owner message(s) unread`);
-      await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.defaultCwd);
+      await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.leadCwd);
       this.owners.announce(`lead-stuck:${session}`, `리드가 ${minutes}분째 멈춘 상태(${status})로 메시지를 읽지 못하고 있어 재시작합니다. 답변받지 못한 메시지는 새 리드에게 넘어갑니다.`);
       this.setRestart({
         session, events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
@@ -290,7 +290,7 @@ export class LeadLifecycle {
       // A probe that cannot resolve the session must not stop delivery: the other rules still apply.
       let file: string | undefined;
       let id = "";
-      try { ({ id, file } = await this.sessionFile(pane.cwd ?? config.defaultCwd)); } catch (e) {
+      try { ({ id, file } = await this.sessionFile(pane.cwd ?? config.leadCwd)); } catch (e) {
         if (!(e instanceof Error)) throw e;
         console.error(`LEAD_SESSION_UNRESOLVED ${config.leadPane}: ${e.message}`);
       }
@@ -336,7 +336,7 @@ export class LeadLifecycle {
   }
 
   /**
-   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at defaultCwd.
+   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at leadCwd.
    * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
    * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
    */
@@ -363,7 +363,7 @@ export class LeadLifecycle {
   }
 
   /**
-   * A new "dori-lead" tab in the Dori workspace at defaultCwd, persisted as the lead pane. herdr removes a workspace
+   * A new "dori-lead" tab in the Dori workspace at leadCwd, persisted as the lead pane. herdr removes a workspace
    * together with its last pane, so closing the lead by hand can take the Dori workspace with it: then the workspace is
    * created again, as dori-boot-prep.sh does, and its root pane becomes the lead. Undefined, with herdr's reason logged,
    * when herdr refuses.
@@ -395,11 +395,11 @@ export class LeadLifecycle {
     const workspace = (JSON.parse(listed.out) as { result: { workspaces: { label?: string; workspace_id: string }[] } }).result.workspaces.find((w) => w.label === "Dori");
     let pane: string | undefined;
     if (workspace) {
-      const made = await run(["herdr", "tab", "create", "--workspace", workspace.workspace_id, "--cwd", config.defaultCwd, "--label", "dori-lead"]);
+      const made = await run(["herdr", "tab", "create", "--workspace", workspace.workspace_id, "--cwd", config.leadCwd, "--label", "dori-lead"]);
       if (made.code !== 0) return refused(`herdr tab create in ${workspace.workspace_id}`, made);
       pane = (JSON.parse(made.out) as { result: { root_pane: { pane_id?: string } } }).result.root_pane.pane_id;
     } else {
-      const made = await run(["herdr", "workspace", "create", "--label", "Dori", "--cwd", config.defaultCwd, "--no-focus"]);
+      const made = await run(["herdr", "workspace", "create", "--label", "Dori", "--cwd", config.leadCwd, "--no-focus"]);
       if (made.code !== 0) return refused("herdr workspace create Dori", made);
       const root = (JSON.parse(made.out) as { result: { root_pane: { pane_id?: string; tab_id?: string; workspace_id?: string } } }).result.root_pane;
       pane = root.pane_id;
@@ -627,10 +627,10 @@ export class LeadLifecycle {
     if (restart.phase === "stopping" && !restart.force) {
       const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
       if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) {
-        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.defaultCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
+        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.leadCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
         const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
         if (hit.pid && latest?.agent && (latest.agent_status === "idle" || latest.agent_status === "done")) {
-          const old = (await this.sessionFile(pane.cwd ?? deps.config.defaultCwd)).id || hit.id;
+          const old = (await this.sessionFile(pane.cwd ?? deps.config.leadCwd)).id || hit.id;
           if (restart.request) this.journal = { ...this.journal, models: restart.request.models };
           softStartedAt = deps.clock.now();
           this.owners.record(restart.events);
@@ -672,7 +672,7 @@ export class LeadLifecycle {
         if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
         const table = await procTable(deps.run);
         const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.defaultCwd, table, { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
+        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.leadCwd, table, { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
         if (!hit.pid) throw new TransientSuperviseError("cannot identify reused lead process");
         const targets = await ownedTargets(deps, table, undefined, old);
         const protectedPids = new Set<number>();
@@ -744,10 +744,10 @@ export class LeadLifecycle {
       if (!executable) throw new SuperviseError("agentCommand must name an executable");
       const argv = [
         "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
-        "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.defaultCwd),
+        "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd),
         ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
       ];
-      const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.defaultCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
+      const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.leadCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
       if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${restart.session}`);
     }
     let confirmed = soft ? await softLive(deps) : await confirmLead(deps, restart.session);
@@ -922,7 +922,7 @@ const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
 /** The new session's file once it has started and settled with its agent back, or undefined at the deadline. */
 const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
   let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
@@ -954,7 +954,7 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
 const softEvidence = async (deps: FlowDeps, old: string, markers: readonly string[], startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
   for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
@@ -1031,7 +1031,7 @@ export const STARTUP_EVIDENCE_MS = 20_000;
  * is positive evidence for that exact session and does not depend on the model replying.
  */
 export const hasStartupEvidence = (deps: FlowDeps, session: string): boolean => {
-  const dir = sessionDirFor(deps.tunables.sessionsDir, deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd);
   const names = (path: string): readonly string[] => { try { return readdirSync(path); } catch { return []; } };
   return names(join(dir, "session-holders", session)).some((name) => name.endsWith(".json")) ||
     names(dir).some((name) => name.endsWith(`_${session}.jsonl`) || name === `${session}.jsonl`);
@@ -1097,14 +1097,14 @@ export const stopHung = async (deps: FlowDeps, session: string): Promise<void> =
 
 /** Stop the pane's exact foreground agent tree, then its detached session-owned monitors. */
 export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> => {
-  const { leadPane, defaultCwd } = deps.config;
+  const { leadPane, leadCwd } = deps.config;
   const { sessionsDir } = deps.tunables;
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!pane) throw new TransientSuperviseError(`lead pane ${leadPane} is missing`);
   // `force` (a stuck lead) stops a working/blocked lead too.
   if (!force && pane.agent && pane.agent_status !== "idle" && pane.agent_status !== "done") return false;
   const table = await procTable(deps.run);
-  const hit = await resolveSession(leadPane, pane.cwd ?? defaultCwd, table, { run: deps.run, sessionsDir });
+  const hit = await resolveSession(leadPane, pane.cwd ?? leadCwd, table, { run: deps.run, sessionsDir });
   if (pane.agent && !hit.pid) throw new TransientSuperviseError("cannot identify lead process; refusing broad process cleanup");
   if (!pane.agent && !hit.pid) {
     const info = await deps.run(["herdr", "pane", "process-info", "--pane", leadPane]);
@@ -1112,7 +1112,7 @@ export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> 
     const proc: { readonly shell_pid: number; readonly foreground_process_group_id?: number } = JSON.parse(info.out).result.process_info;
     if (proc.foreground_process_group_id && proc.foreground_process_group_id !== proc.shell_pid) throw new TransientSuperviseError("lead pane contains a non-agent foreground process; refusing to type into it");
   }
-  const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? defaultCwd), hit.pid);
+  const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? leadCwd), hit.pid);
   const targets = await ownedTargets(deps, table, hit.pid, current?.id ?? hit.id);
   const latest = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!latest) throw new TransientSuperviseError("lead pane disappeared during process resolution");

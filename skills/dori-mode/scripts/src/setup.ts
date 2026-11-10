@@ -73,7 +73,7 @@ type Json = Record<string, unknown>;
 /** In `<stateDir>`: the config keys setup has already shown, so a later run asks only new ones. */
 export const SETUP_KEYS_FILE = "setup-keys.json";
 /** The config keys the core setup questions own; the generic key pass skips them. */
-export const SETUP_CORE_KEYS = ["discord", "discordChannels", "defaultModel", "leadModel", "defaultCwd", "stateDir", "githubIssueAuthors", "ignorePanes"] as const;
+export const SETUP_CORE_KEYS = ["discord", "discordChannels", "defaultModel", "leadModel", "leadCwd", "stateDir", "githubIssueAuthors", "ignorePanes"] as const;
 
 const labelOf = (key: string): string => {
   const spec = DORI_CONFIG_KEYS.find((s) => s.key === key);
@@ -502,7 +502,10 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   const chain = typeof leadStored === "object" && leadStored !== null ? leadStored : undefined;
   if (chain && "leadModel" in patch) consumed.push("leadModel");
   const leadModel = chain ? "" : given("leadModel") ?? await askAdvanced("leadModel", "Lead model", str(raw.leadModel), defaultModel);
-  const defaultCwd = (input.cwd ?? given("defaultCwd") ?? await askAdvanced("defaultCwd", "Working directory of the lead session (local lanes started without --cwd start here too)", str(raw.defaultCwd) || "~")).trim();
+  // A file not yet migrated keeps its lead directory under the old defaultCwd name; pruneObsolete then drops that key.
+  // An existing file written before schema step 4 with neither key ran the lead in the home directory and keeps it.
+  const leadFallback = existsSync(d.configPath) && !(typeof raw[CONFIG_SCHEMA_KEY] === "number" && raw[CONFIG_SCHEMA_KEY] >= 4) ? "~" : "~/.dori/lead";
+  const leadCwd = (input.cwd ?? given("leadCwd") ?? await askAdvanced("leadCwd", "Working directory of the lead session (local lanes started without --cwd start here too)", str(raw.leadCwd) || str(raw.defaultCwd) || leadFallback)).trim() || leadFallback;
   const stateDir = (input.stateDir ?? given("stateDir") ?? await askAdvanced("stateDir", "State directory", str(raw.stateDir) || "~/.dori/state")).trim() || "~/.dori/state";
   const repos = new Repos(expandHome(stateDir, d.home));
   const givenAuthors = input.issueAuthors ?? givenList("githubIssueAuthors");
@@ -521,7 +524,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   ) : "").toLowerCase());
   const badAuthor = issueAuthors.find((a) => !/^[a-z0-9](?:[a-z0-9-]{0,38})$/.test(a));
   if (badAuthor) throw new SetupError(`${badAuthor} is not a GitHub login; nothing was written`);
-  const workDir = expandHome(defaultCwd, d.home);
+  const workDir = expandHome(leadCwd, d.home);
   for (const dir of [workDir, expandHome(stateDir, d.home)]) ensureDir(d, dir);
   repos.replace(watchedRepos);
 
@@ -533,7 +536,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   } else d.log(`SETUP env no bot token; set ${TOKEN_KEY} later by running dori setup again`);
 
   const merged = mergeConfig(raw, {
-    discordChannels: channels, defaultModel, leadModel: chain ?? (leadModel || undefined), defaultCwd, stateDir, discord,
+    discordChannels: channels, defaultModel, leadModel: chain ?? (leadModel || undefined), leadCwd, stateDir, discord,
     // Keep configs that never set it byte-identical.
     githubIssueAuthors: issueAuthors.length || Array.isArray(raw.githubIssueAuthors) ? issueAuthors : undefined,
   });

@@ -70,7 +70,7 @@ class StepRegistry extends Registry {
   }
 }
 
-const config = { ...defaultConfig("/home/test"), stateDir, defaultCwd: repo, leadPane: "lead:p1", store: TEST_STORE };
+const config = { ...defaultConfig("/home/test"), stateDir, leadCwd: repo, leadPane: "lead:p1", store: TEST_STORE };
 const inner = openOperations(config);
 const operations: OperationStore = {
   get: (id) => inner.get(id),

@@ -58,7 +58,7 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 
 | 항목 | 뜻 |
 |---|---|
-| `defaultCwd` | 레인이 시작하는 디렉터리이자, 레인이 worktree를 만드는 저장소 |
+| `leadCwd` | 레인이 시작하는 디렉터리이자, 레인이 worktree를 만드는 저장소 |
 | `agentCommand` | 에이전트 실행 명령. `{model}`, `{prompt}`가 들어간 argv 목록 |
 | `hooks.threadReply` | 메신저 CLI를 `{thread}`, `{text}`가 들어간 argv 목록으로. 레인 진행 상황을 올릴 때 씁니다. |
 

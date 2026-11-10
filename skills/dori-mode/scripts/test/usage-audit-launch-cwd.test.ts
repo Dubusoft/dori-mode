@@ -28,7 +28,7 @@ test("launchNextLine omits follow-up for successful startup", () => {
 
 const deps = (which: (cmd: string) => string | null = () => "/bin/lane-sandbox") => {
   const base = depsFor(newWorld(), fakeClock(Date.parse("2026-01-01T12:00:00.000Z")), join(home, ".dori", "state"));
-  return { ...base, which, config: { ...base.config, stateDir: join(home, ".dori", "state"), laneSandbox: { command: ["lane-sandbox"] }, defaultCwd: join(home, "work", "main") } } as typeof base;
+  return { ...base, which, config: { ...base.config, stateDir: join(home, ".dori", "state"), laneSandbox: { command: ["lane-sandbox"] }, leadCwd: join(home, "work", "main") } } as typeof base;
 };
 const input = (extra: Record<string, string | true> = {}) => ({ key: "cwd-lane", title: "t", brief: join(state.dir, "brief.md"), done: "closed acme/app#3", ...extra });
 

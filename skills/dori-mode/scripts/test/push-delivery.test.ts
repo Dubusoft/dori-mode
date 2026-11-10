@@ -36,7 +36,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const world = newWorld();
   world.screen = EMPTY;
   const session = "11111111-1111-4111-8111-111111111111";
-  const config = { sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo", ...extra };
+  const config = { sessionsDir: join(state.dir, "sessions"), leadCwd: "/repo", ...extra };
   const dir = sessionDirFor(config.sessionsDir, "/repo");
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `2027-01-15T08-00-00-000Z_${session}.jsonl`);

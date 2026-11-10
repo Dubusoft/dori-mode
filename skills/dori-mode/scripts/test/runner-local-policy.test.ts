@@ -21,7 +21,7 @@ const scratch = (): string => {
 };
 
 test("localPolicy derives default and sandboxed profiles from agentCommand, laneThinking and laneSandbox", () => {
-  const cfg = { ...defaultConfig("/home/u"), defaultCwd: "/data/repos/app", worktreeRoot: "/data/repos/worktrees", laneThinking: "high", laneSandbox: { command: ["lane-sandbox", "--strict"] } };
+  const cfg = { ...defaultConfig("/home/u"), leadCwd: "/data/repos/app", worktreeRoot: "/data/repos/worktrees", laneThinking: "high", laneSandbox: { command: ["lane-sandbox", "--strict"] } };
   const policy = localPolicy(cfg, { home: "/home/u", tmp: "/tmp" });
   expect(policy.agents.default).toEqual(["omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
   expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/data/repos/app/state/verify", "lane-sandbox", "--strict", "omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
@@ -32,7 +32,7 @@ test("localPolicy derives default and sandboxed profiles from agentCommand, lane
 });
 
 test("localPolicy: no laneSandbox uses lane-sandbox; a template without --model/--thinking keeps its argv; roots are not repeated", () => {
-  const cfg = { ...defaultConfig("/home/u"), agentCommand: ["claude", "{prompt}"], defaultCwd: "/home/u/repo", worktreeRoot: "", laneSandbox: undefined };
+  const cfg = { ...defaultConfig("/home/u"), agentCommand: ["claude", "{prompt}"], leadCwd: "/home/u/repo", worktreeRoot: "", laneSandbox: undefined };
   const policy = localPolicy(cfg, { home: "/home/u", tmp: "/home/u" });
   expect(policy.agents.default).toEqual(["claude", "{prompt}"]);
   expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/home/u/repo/state/verify", "lane-sandbox", "claude", "{prompt}"]);
@@ -42,9 +42,9 @@ test("localPolicy: no laneSandbox uses lane-sandbox; a template without --model/
 
 test("the local runner's hello reports config.worktreeRoot as its worktree root", () => {
   const home = scratch();
-  const report = workspaceReport(localPolicy({ ...defaultConfig(home), defaultCwd: join(home, "dori"), worktreeRoot: join(home, "wt") }, { home, tmp: home }), { realpath: realpathSync, log: () => {}, os: "linux" });
+  const report = workspaceReport(localPolicy({ ...defaultConfig(home), leadCwd: join(home, "dori"), worktreeRoot: join(home, "wt") }, { home, tmp: home }), { realpath: realpathSync, log: () => {}, os: "linux" });
   expect(report.worktreeRoot).toBe(join(home, "wt"));
-  expect(workspaceReport(localPolicy({ ...defaultConfig(home), defaultCwd: join(home, "dori"), worktreeRoot: "" }, { home, tmp: home }), { realpath: realpathSync, log: () => {}, os: "linux" }))
+  expect(workspaceReport(localPolicy({ ...defaultConfig(home), leadCwd: join(home, "dori"), worktreeRoot: "" }, { home, tmp: home }), { realpath: realpathSync, log: () => {}, os: "linux" }))
     .not.toHaveProperty("worktreeRoot");
 });
 
@@ -53,7 +53,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const repo = join(home, "repos", "app");
   mkdirSync(repo, { recursive: true });
   const outside = scratch();
-  const cfg = { ...defaultConfig(home), defaultCwd: repo, worktreeRoot: "", laneThinking: "medium" };
+  const cfg = { ...defaultConfig(home), leadCwd: repo, worktreeRoot: "", laneThinking: "medium" };
   const policy = localPolicy(cfg, { home, tmp: home });
   const start = {
     cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: repo, agentProfile: "sandboxed",
@@ -91,7 +91,7 @@ test("a sandboxed lane.start whose sandboxCheck fails is refused sandbox-unavail
   mkdirSync(repo, { recursive: true });
   const runnerDir = join(home, ".dori", "runner");
   mkdirSync(runnerDir, { recursive: true, mode: 0o700 });
-  const policy = localPolicy({ ...defaultConfig(home), defaultCwd: repo, worktreeRoot: "" }, { home, tmp: home });
+  const policy = localPolicy({ ...defaultConfig(home), leadCwd: repo, worktreeRoot: "" }, { home, tmp: home });
   const calls: string[][] = [];
   const published: string[] = [];
   const lanes = new RunnerLanes({
@@ -122,7 +122,7 @@ test("a sandboxed lane.start whose sandboxCheck fails is refused sandbox-unavail
 
 test("a local runner-config.json with reposRoot/worktreeRoot layers them and adds both roots to allowedRoots without repeats", () => {
   const dir = scratch();
-  const cfg = { ...defaultConfig("/home/u"), defaultCwd: "/data/dori", worktreeRoot: "/data/wt" };
+  const cfg = { ...defaultConfig("/home/u"), leadCwd: "/data/dori", worktreeRoot: "/data/wt" };
   const env = { home: "/home/u", tmp: "/tmp" };
   const local = localPolicy(cfg, env);
   writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ reposRoot: "~/src" }));

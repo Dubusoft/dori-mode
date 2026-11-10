@@ -761,7 +761,7 @@ const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promi
     console.error(`LEAD_PANE_ENSURE_FAILED ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
-    const laneWorkspace = await ensureLaneWorkspace(deps.run, config.stateDir, config.defaultCwd, (line) => { console.log(line); });
+    const laneWorkspace = await ensureLaneWorkspace(deps.run, config.stateDir, config.leadCwd, (line) => { console.log(line); });
     config = { ...config, laneWorkspace };
   } catch (error) {
     if (!(error instanceof ManagedPanesError)) throw error;

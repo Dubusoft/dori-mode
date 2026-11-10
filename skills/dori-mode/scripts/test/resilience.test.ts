@@ -193,7 +193,7 @@ test("a missing lead pane keeps events and journal untouched, then delivers once
   expect(readFileSync(supervisor.eventLog, "utf8")).toContain("INBOUND hello");
 });
 
-test("a vanished lead pane is recreated in the Dori workspace at defaultCwd, in memory only", async () => {
+test("a vanished lead pane is recreated in the Dori workspace at leadCwd, in memory only", async () => {
   const state = withState();
   cleanups.push(state.done);
   const world = newWorld();

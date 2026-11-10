@@ -113,7 +113,7 @@ export class WakeMeter {
   private sessionFile(session: string): string | undefined {
     if (session.includes("/")) return existsSync(session) ? session : undefined;
     const { config, tunables } = this.deps();
-    const dir = sessionDirFor(tunables.sessionsDir, config.defaultCwd);
+    const dir = sessionDirFor(tunables.sessionsDir, config.leadCwd);
     if (!existsSync(dir)) return undefined;
     return Array.from(new Bun.Glob(`*${session}.jsonl`).scanSync({ cwd: dir, absolute: true, onlyFiles: true }))
       .find((path) => path.endsWith(`_${session}.jsonl`) || path.endsWith(`/${session}.jsonl`));

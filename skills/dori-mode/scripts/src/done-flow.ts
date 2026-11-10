@@ -60,11 +60,11 @@ export type LaneReads = {
 type LaneRead = {
   /** The lane's worktrees (found by the runner by key, and those the registry recorded); none for a remote lane. */
   readonly worktrees: readonly WorktreeFact[];
-  /** The Done checks, when asked: in the lane's cwd, or in defaultCwd for a remote lane or a gone cwd (on the local runner). */
+  /** The Done checks, when asked: in the lane's cwd, or in leadCwd for a remote lane or a gone cwd (on the local runner). */
   readonly checks?: readonly Check[];
   /** A local lane's cwd is set and no longer exists. */
   readonly cwdGone: boolean;
-  /** Where a local lane's git runs: its cwd, else defaultCwd. */
+  /** Where a local lane's git runs: its cwd, else leadCwd. */
   readonly root: string;
 };
 
@@ -85,16 +85,16 @@ const probeWorktree = async (deps: FlowDeps, lane: Lane, path: string): Promise<
 /**
  * Reads a lane through its runner: one `q.lane.inspect` (git facts, and the Done checks when `done`), then each worktree
  * the registry recorded or the runner found by key, read one by one (the runner cannot see the registry). A remote
- * lane's worktrees are never read (D10); its Done checks run on the local runner in defaultCwd. Throws LaneOpsError when
+ * lane's worktrees are never read (D10); its Done checks run on the local runner in leadCwd. Throws LaneOpsError when
  * the runner cannot answer.
  */
 const readLane = async (deps: FlowDeps, lane: Lane, want: { readonly done?: boolean } = {}): Promise<LaneRead> => {
-  const done = want.done ? { done: lane.done, doneCwd: deps.config.defaultCwd } : {};
+  const done = want.done ? { done: lane.done, doneCwd: deps.config.leadCwd } : {};
   if (lane.machine) {
     const checks = want.done ? (await deps.ops.inspect(lane, done)).done?.checks : undefined;
-    return { worktrees: [], ...(checks ? { checks } : {}), cwdGone: false, root: deps.config.defaultCwd };
+    return { worktrees: [], ...(checks ? { checks } : {}), cwdGone: false, root: deps.config.leadCwd };
   }
-  const inspection = await deps.ops.inspect(lane, { git: true, roots: [deps.config.defaultCwd], ...done });
+  const inspection = await deps.ops.inspect(lane, { git: true, roots: [deps.config.leadCwd], ...done });
   const cwdGone = Boolean(lane.cwd) && !inspection.cwdExists;
   const listed = (inspection.git?.worktrees ?? []).filter((w) => named(lane.key, baseName(w.path)) || named(lane.key, (w.branch ?? "").split("/").pop() ?? ""));
   const paths = [...new Set([...listed.map((w) => w.path), ...(lane.worktrees ?? []).map((p) => p.replace(/\/+$/, ""))])];
@@ -105,7 +105,7 @@ const readLane = async (deps: FlowDeps, lane: Lane, want: { readonly done?: bool
     worktrees.push((await probeWorktree(deps, lane, path)) ?? listed.find((w) => w.path === path) ?? { path, exists: true, error: "git lists no worktree there" });
   }
   const checks = inspection.done?.checks;
-  return { worktrees, ...(checks ? { checks } : {}), cwdGone, root: lane.cwd && !cwdGone ? lane.cwd : deps.config.defaultCwd };
+  return { worktrees, ...(checks ? { checks } : {}), cwdGone, root: lane.cwd && !cwdGone ? lane.cwd : deps.config.leadCwd };
 };
 
 /**
@@ -119,10 +119,10 @@ const cwdWorktree = async (deps: FlowDeps, lane: Lane, read: LaneRead, linked: b
   return probeWorktree(deps, lane, cwd);
 };
 
-/** The line a close prints when the lane's own cwd is gone and its signals ran in defaultCwd instead. */
+/** The line a close prints when the lane's own cwd is gone and its signals ran in leadCwd instead. */
 const cwdFallbackLine = (deps: FlowDeps, lane: Lane, read: LaneRead): string | undefined =>
   read.cwdGone
-    ? `SIGNAL_CWD ${lane.key}: lane cwd ${lane.cwd} no longer exists; Done signals and git ran in defaultCwd ${deps.config.defaultCwd}`
+    ? `SIGNAL_CWD ${lane.key}: lane cwd ${lane.cwd} no longer exists; Done signals and git ran in leadCwd ${deps.config.leadCwd}`
     : undefined;
 
 const windowMs = (deps: FlowDeps): number => deps.tunables.closeAfterMin * 60_000;
@@ -436,7 +436,7 @@ const closeSequence = async (
   if (!lane.machine) {
     candidate = await cwdWorktree(deps, lane, read, true);
     branches = await planBranchCleanup(deps.run, deps.ops, lane, present, store, deps.clock.now, {
-      base: deps.config.ciMergeBase, candidates: candidate ? [candidate] : [], roots: [deps.config.defaultCwd, root],
+      base: deps.config.ciMergeBase, candidates: candidate ? [candidate] : [], roots: [deps.config.leadCwd, root],
     });
   }
   cleanup.push(...(branches?.notes ?? []));
@@ -646,8 +646,8 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
   const root = (reported || deps.config.worktreeRoot).replace(/\/+$/, "");
   const kept = root ? keptWorktrees(lane).filter((wt) => wt.startsWith(`${root}/`) && !wt.includes("..")) : [];
   if (!kept.length) return [];
-  const [cwdThere = false, ...present] = await deps.ops.exists(undefined, [lane.cwd ?? deps.config.defaultCwd, ...kept]);
-  const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.defaultCwd;
+  const [cwdThere = false, ...present] = await deps.ops.exists(undefined, [lane.cwd ?? deps.config.leadCwd, ...kept]);
+  const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.leadCwd;
   const removed: string[] = [];
   const out: string[] = [];
   for (const [i, wt] of kept.entries()) {

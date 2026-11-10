@@ -70,7 +70,7 @@ test("workspaceReport declares paths under allowedRoots, skips the rest, and det
 
 test("a local runner-config.json with only placement keys layers them on the derived local policy; any other key wins whole", () => {
   const dir = scratch();
-  const cfg = { ...defaultConfig("/home/u"), defaultCwd: "/data/dori" };
+  const cfg = { ...defaultConfig("/home/u"), leadCwd: "/data/dori" };
   const env = { home: "/home/u", tmp: "/tmp" };
   writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ workspaces: { "acme/app": "~/repos/app" }, detectWorkspaces: false }));
   expect(localRunnerPolicy(dir, cfg, env)).toEqual({ ...localPolicy(cfg, env), workspaces: { "acme/app": "/home/u/repos/app" }, detectWorkspaces: false });

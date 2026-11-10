@@ -31,13 +31,13 @@ export type MemoryReport = {
 };
 
 /**
- * The lead's memory repo: `memoryCheck.repo`, else omo's per-cwd repo for the lead's cwd (`defaultCwd`), found as
+ * The lead's memory repo: `memoryCheck.repo`, else omo's per-cwd repo for the lead's cwd (`leadCwd`), found as
  * <home>/.omo/memory/agents/<slug>-<first 8 hex of sha256(cwd)>/repo. Undefined when neither exists.
  */
 export const resolveMemoryRepo = (config: DoriConfig, home: string): string | undefined => {
   if (config.memoryCheck.repo.trim()) return config.memoryCheck.repo.trim();
   const agents = join(home, ".omo", "memory", "agents");
-  const suffix = `-${createHash("sha256").update(config.defaultCwd).digest("hex").slice(0, 8)}`;
+  const suffix = `-${createHash("sha256").update(config.leadCwd).digest("hex").slice(0, 8)}`;
   let names: string[];
   try { names = readdirSync(agents); } catch { return undefined; }
   const hit = names.filter((name) => name.endsWith(suffix)).sort().find((name) => existsSync(join(agents, name, MEMORY_FILE)) || existsSync(join(agents, name, "repo", MEMORY_FILE)));
@@ -131,7 +131,7 @@ const prState = async (run: Runner, ref: string): Promise<{ readonly state?: str
 /** Reads only: the memory file, the registry and gh. Throws MemoryCheckError when the memory file is missing. */
 export const checkMemory = async (deps: FlowDeps, home: string): Promise<MemoryReport> => {
   const repo = resolveMemoryRepo(deps.config, home);
-  if (!repo) throw new MemoryCheckError(`lead memory repo not found: memoryCheck.repo is unset and no omo memory repo exists for ${deps.config.defaultCwd} under ${join(home, ".omo", "memory", "agents")}`);
+  if (!repo) throw new MemoryCheckError(`lead memory repo not found: memoryCheck.repo is unset and no omo memory repo exists for ${deps.config.leadCwd} under ${join(home, ".omo", "memory", "agents")}`);
   const file = join(repo, MEMORY_FILE);
   let text: string;
   try { text = readFileSync(file, "utf8"); } catch { throw new MemoryCheckError(`${file} is missing or unreadable`); }

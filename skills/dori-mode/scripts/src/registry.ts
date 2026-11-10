@@ -46,7 +46,7 @@ export type Lane = {
   readonly done: string;
   /** `machine`: the brief declared its Done signals settle it alone; its claim and close are digest. */
   readonly autoClose?: "machine";
-  /** Local directory: command Done signals and worktree checks run here. Remote lanes leave it unset (defaultCwd). */
+  /** Local directory: command Done signals and worktree checks run here. Remote lanes leave it unset (leadCwd). */
   readonly cwd?: string;
   /** A remote lane's working directory on its machine; never used as a local path. */
   readonly remoteCwd?: string;

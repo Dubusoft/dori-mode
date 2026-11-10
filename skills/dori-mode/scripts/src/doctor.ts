@@ -157,7 +157,7 @@ const paths = async (d: DoctorDeps): Promise<Check[]> => {
   const checks: Check[] = [];
   if (wd.code !== 0 || !dir) checks.push(fail("supervisor WorkingDirectory", "unit has no WorkingDirectory (status 200/CHDIR)", "dori setup --autostart"));
   else checks.push(d.exists(dir) ? ok("supervisor WorkingDirectory", dir) : fail("supervisor WorkingDirectory", `${dir} does not exist`, `mkdir -p ${dir}`));
-  for (const [name, path] of [["defaultCwd", d.config.defaultCwd], ["stateDir", d.config.stateDir]] as const) {
+  for (const [name, path] of [["leadCwd", d.config.leadCwd], ["stateDir", d.config.stateDir]] as const) {
     checks.push(d.exists(path) ? ok(name, path) : fail(name, `${path} does not exist`, `mkdir -p ${path}`));
   }
   return checks;
@@ -352,7 +352,7 @@ const memory = (d: DoctorDeps): Check[] => {
   const limit = Math.round(m.maxKb * 1024);
   const checks: Check[] = [];
   if (!file || !d.exists(file)) {
-    checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.defaultCwd}; dori memory check and its sweep are off`, `check defaultCwd in ${d.configPath}: the memory repo is omo's for that directory`));
+    checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.leadCwd}; dori memory check and its sweep are off`, `check leadCwd in ${d.configPath}: the memory repo is omo's for that directory`));
   } else {
     const bytes = statSync(file).size;
     checks.push(bytes > limit
@@ -365,7 +365,7 @@ const memory = (d: DoctorDeps): Check[] => {
 const tools = async (d: DoctorDeps): Promise<Check[]> => {
   const [gh, auth, jq, bun, df] = await Promise.all([
     d.run(["gh", "--version"], T), d.run(["gh", "auth", "status"], T), d.run(["jq", "--version"], T), d.run(["bun", "--version"], T),
-    d.run(["df", "-Pk", [d.config.stateDir, d.config.defaultCwd].find((p) => d.exists(p)) ?? "/"], T),
+    d.run(["df", "-Pk", [d.config.stateDir, d.config.leadCwd].find((p) => d.exists(p)) ?? "/"], T),
   ]);
   const checks: Check[] = [
     gh.code !== 0 ? fail("gh", "not installed", "install gh: https://cli.github.com")
@@ -417,7 +417,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
   const rootsFile = join(dir, "runner-config.json");
   const roots = d.exists(rootsFile)
     ? "runner-config.json"
-    : [d.home, tmpdir(), dirname(d.config.defaultCwd), d.config.worktreeRoot].join(", ");
+    : [d.home, tmpdir(), dirname(d.config.leadCwd), d.config.worktreeRoot].join(", ");
   checks.push(ok("runner policy", `effective allowedRoots: ${roots}`));
   if (d.exists(dir)) {
     try { checkRunnerDir(dir); checks.push(ok("runner dir", `${dir} 0700, files 0600, no symlinks`)); }

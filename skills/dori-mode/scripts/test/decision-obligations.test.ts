@@ -231,7 +231,7 @@ const pushFixture = () => {
   world.screen = `\u2500\u2500 \u2022 Working ${"\u2500".repeat(40)}\n\u276f \n${"\u2500".repeat(80)}\n/repo\n(\u{1F63A} OmO Native by Q Kim)`;
   const session = "11111111-1111-4111-8111-111111111111";
   const config = {
-    sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo",
+    sessionsDir: join(state.dir, "sessions"), leadCwd: "/repo",
     delivery: { ...BUILT_IN.delivery, tailMonitor: false },
     eventPolicy: resolveEventPolicy({ kinds: { UNRESOLVED: "lead-urgent" } }),
   };

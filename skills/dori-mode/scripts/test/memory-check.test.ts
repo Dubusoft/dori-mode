@@ -109,11 +109,11 @@ test("an oversized file alone needs action; a clean small file does not; failure
   expect(renderMemoryReport(report).split("\n").at(-1)).toBe("MEMORY_CHECK clean");
 });
 
-test("without memoryCheck.repo the repo is omo's for defaultCwd; nothing found is a MemoryCheckError", async () => {
+test("without memoryCheck.repo the repo is omo's for leadCwd; nothing found is a MemoryCheckError", async () => {
   const { deps } = await setup();
   const blank = { ...deps, config: { ...deps.config, memoryCheck: { ...deps.config.memoryCheck, repo: "" } } };
   await expect(checkMemory(blank, state.dir)).rejects.toThrow("lead memory repo not found");
-  const hash = new Bun.CryptoHasher("sha256").update(deps.config.defaultCwd).digest("hex").slice(0, 8);
+  const hash = new Bun.CryptoHasher("sha256").update(deps.config.leadCwd).digest("hex").slice(0, 8);
   const found = join(state.dir, ".omo", "memory", "agents", `repo-${hash}`, "repo");
   mkdirSync(join(found, "system"), { recursive: true });
   writeFileSync(join(found, "system", "human.md"), "## Open\n");
