@@ -3,7 +3,7 @@
 
 import { readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep, win32 } from "node:path";
 import { defaultRunnerDir, RUNNER_PATHS } from "./fs-safety.ts";
 import { validateFileKey } from "./lane-files.ts";
 import {
@@ -45,9 +45,15 @@ export type RunnerPolicy = {
   readonly worktreeRoot?: string;
 };
 
-/** `worktreeRoot`, else `<reposRoot>/worktrees` when `reposRoot` is set, else undefined. */
-export const effectiveWorktreeRoot = (policy: Pick<RunnerPolicy, "reposRoot" | "worktreeRoot">): string | undefined =>
-  policy.worktreeRoot ?? (policy.reposRoot !== undefined ? join(policy.reposRoot, "worktrees") : undefined);
+/**
+ * The path rules of the runner host's platform: a runner-config.json is judged by them, not by the machine reading it
+ * (`dori runner setup` on a Linux lead checks a Windows runner's `C:\...` paths with win32 rules).
+ */
+export const runnerPaths = (platform: NodeJS.Platform = process.platform): typeof posix => (platform === "win32" ? win32 : posix);
+
+/** `worktreeRoot`, else `<reposRoot>/worktrees` when `reposRoot` is set, else undefined; joined by `platform`'s rules. */
+export const effectiveWorktreeRoot = (policy: Pick<RunnerPolicy, "reposRoot" | "worktreeRoot">, platform?: NodeJS.Platform): string | undefined =>
+  policy.worktreeRoot ?? (policy.reposRoot !== undefined ? runnerPaths(platform).join(policy.reposRoot, "worktrees") : undefined);
 
 /** owner/repo as GitHub spells it. */
 export const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -87,8 +93,9 @@ export const rejectionText = (rule: string): string => `RUNNER_CMD_REJECTED ${ru
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** `~` or `~/...` under `home`; any other path unchanged. */
-const expandHome = (path: string, home: string): string => (path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path);
+/** `~` or `~/...` (also `~\...` on win32) under `home`; any other path unchanged. */
+const expandHome = (path: string, home: string, p: typeof posix): string =>
+  path === "~" ? home : path.startsWith("~/") || (p === win32 && path.startsWith("~\\")) ? p.join(home, path.slice(2)) : path;
 
 /**
  * The allowed roots of a runner-config.json without `allowedRoots` (or with `[]`), before the lanes directory,
@@ -104,6 +111,8 @@ export type ParsePolicyOptions = {
   readonly runnerDir?: string;
   /** Receives one `RUNNER_CONFIG_KEY_IGNORED <key>: <why>` line per retired key the file still holds. */
   readonly warn?: (line: string) => void;
+  /** The runner host's platform, whose path rules judge the file (runnerPaths); absent: this process's. */
+  readonly platform?: NodeJS.Platform;
 };
 
 /**
@@ -112,6 +121,7 @@ export type ParsePolicyOptions = {
  */
 export function parsePolicy(value: unknown, home: string = homedir(), tmp: string = tmpdir(), options: ParsePolicyOptions = {}): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
+  const p = runnerPaths(options.platform);
   const known = new Set<string>(RUNNER_POLICY_KEYS);
   for (const key of Object.keys(value)) {
     if (Object.hasOwn(RETIRED_POLICY_KEYS, key)) options.warn?.(`RUNNER_CONFIG_KEY_IGNORED ${key}: ${RETIRED_POLICY_KEYS[key]}; remove it from runner-config.json (dori runner setup does)`);
@@ -139,8 +149,8 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
     workspaces = {};
     for (const [repo, path] of Object.entries(value.workspaces)) {
       if (!REPO_PATTERN.test(repo)) throw new Error(`runner-config: workspaces key ${repo} must be owner/repo`);
-      const full = typeof path === "string" ? expandHome(path, home) : undefined;
-      if (full === undefined || !isAbsolute(full)) throw new Error(`runner-config: workspaces.${repo} must be an absolute path or start with ~/`);
+      const full = typeof path === "string" ? expandHome(path, home, p) : undefined;
+      if (full === undefined || !p.isAbsolute(full)) throw new Error(`runner-config: workspaces.${repo} must be an absolute path or start with ~/`);
       workspaces[repo] = full;
     }
   }
@@ -148,8 +158,8 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
   const rootPath = (key: "reposRoot" | "worktreeRoot"): string | undefined => {
     const raw = value[key];
     if (raw === undefined) return undefined;
-    const full = typeof raw === "string" ? expandHome(raw, home) : undefined;
-    if (full === undefined || !isAbsolute(full)) throw new Error(`runner-config: ${key} must be an absolute path or start with ~/`);
+    const full = typeof raw === "string" ? expandHome(raw, home, p) : undefined;
+    if (full === undefined || !p.isAbsolute(full)) throw new Error(`runner-config: ${key} must be an absolute path or start with ~/`);
     return full;
   };
   const reposRoot = rootPath("reposRoot");
@@ -159,10 +169,10 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
   const explicit = (value.allowedRoots as string[] | undefined) ?? [];
   const base = explicit.length ? explicit : derivedRoots({ tmp, home, hasRepoRoots: reposRoot !== undefined || worktreeRoot !== undefined });
   const allowedRoots = [...base];
-  const lanes = lanesDir(options.runnerDir ?? defaultRunnerDir(home));
-  if (!allowedRoots.some((r) => underRoot(resolvePath(r), resolvePath(lanes)))) allowedRoots.push(lanes);
-  for (const root of [reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot })]) {
-    if (root !== undefined && !allowedRoots.some((r) => resolvePath(r) === resolvePath(root))) allowedRoots.push(root);
+  const lanes = p.join(options.runnerDir ?? p.join(home, ".dori", "runner"), RUNNER_PATHS.lanes);
+  if (!allowedRoots.some((r) => underRoot(p.resolve(r), p.resolve(lanes), p))) allowedRoots.push(lanes);
+  for (const root of [reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot }, options.platform)]) {
+    if (root !== undefined && !allowedRoots.some((r) => p.resolve(r) === p.resolve(root))) allowedRoots.push(root);
   }
   let guard: Partial<Record<GuardKey, number>> | undefined;
   if (value.guard !== undefined) {
@@ -201,9 +211,9 @@ export function loadPolicy(runnerDir: string, warn?: (line: string) => void): Ru
   return parsePolicy(JSON.parse(text), homedir(), tmpdir(), { runnerDir, ...(warn ? { warn } : {}) });
 }
 
-const underRoot = (root: string, path: string): boolean => {
-  const rel = relative(root, path);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+const underRoot = (root: string, path: string, p: typeof posix = runnerPaths()): boolean => {
+  const rel = p.relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${p.sep}`) && !p.isAbsolute(rel));
 };
 
 /**

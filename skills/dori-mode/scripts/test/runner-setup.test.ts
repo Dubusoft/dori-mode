@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { KeyPrompter } from "../src/config-keys.ts";
+import { runnerConfigDefault, type KeyPrompter } from "../src/config-keys.ts";
 import { sshArgv } from "../src/remote-guard.ts";
 import type { RunOptions } from "../src/run.ts";
 import { localRunnerConfigIO, remoteRunnerConfigIO, REMOTE_ABSENT, runRunnerSetup, type RunnerSetupDeps } from "../src/runner/runner-setup.ts";
@@ -209,5 +209,34 @@ describe("remoteRunnerConfigIO posix", () => {
   test("a non-zero exit throws RUNNER_SETUP_REMOTE_FAILED", async () => {
     const f = fake("", 1);
     await expect(remoteRunnerConfigIO(f.run, machine, "posix").write("{}\n")).rejects.toThrow(/^RUNNER_SETUP_REMOTE_FAILED box: boom$/);
+  });
+});
+
+describe("runner setup on a Windows runner", () => {
+  const machine = { label: "win", target: "u@win" };
+  const WIN = {
+    agents: { default: ["pi", "{prompt}"] }, allowedRoots: ["C:\\Users\\x"],
+    reposRoot: "C:\\Users\\x\\repos", worktreeRoot: "D:/wt", workspaces: { "acme/app": "\\\\?\\C:\\src\\app" },
+  };
+  const absentRun = async () => ({ code: 0, out: `${REMOTE_ABSENT}\n`, err: "" });
+  const run = (kind: "posix" | "windows") => {
+    const dir = temp();
+    const io = remoteRunnerConfigIO(absentRun, machine, kind);
+    const { deps, lines } = setup(dir, { io });
+    return { io, lines, code: runRunnerSetup(deps, { patch: WIN, unset: [] }) };
+  };
+
+  test("accepts drive, forward-slash and \\\\?\\ paths, which a POSIX runner refuses", async () => {
+    const win = run("windows");
+    expect(win.io.platform).toBe("win32");
+    expect(await win.code).toBe(0);
+    expect(win.lines).toContain("RUNNER_SETUP_WRITTEN win:%USERPROFILE%\\.dori\\runner\\runner-config.json");
+    const posix = run("posix");
+    expect(await posix.code).toBe(1);
+    expect(posix.lines.at(-1)).toMatch(/^RUNNER_SETUP_FAILED invalid runner-config: .*must be an absolute path.*; nothing was written$/);
+  });
+
+  test("the worktreeRoot default is joined with backslashes", () => {
+    expect(runnerConfigDefault(undefined, "win32")("worktreeRoot", { reposRoot: "C:\\Users\\x\\repos" })).toBe("C:\\Users\\x\\repos\\worktrees");
   });
 });

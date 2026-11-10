@@ -11,9 +11,13 @@ import { writeFileAtomic } from "../setup.ts";
 import { RUNNER_FILE_MODE } from "./fs-safety.ts";
 import { parsePolicy, POLICY_FILE } from "./policy.ts";
 
-/** `read`: undefined when the file is absent. `write`: atomic, 0600. `backup`: `runner-config.json.bak`, 0600. */
+/**
+ * `read`: undefined when the file is absent. `write`: atomic, 0600. `backup`: `runner-config.json.bak`, 0600.
+ * `platform`: the runner host's, whose path rules judge the file's paths; absent: this process's (the local runner).
+ */
 export type RunnerConfigIO = {
   readonly where: string;
+  readonly platform?: NodeJS.Platform;
   readonly read: () => Promise<string | undefined>;
   readonly write: (text: string) => Promise<void>;
   readonly backup: (text: string) => Promise<void>;
@@ -100,6 +104,8 @@ export const remoteRunnerConfigIO = (run: Runner, machine: GuardMachine, kind: "
   const windows = kind === "windows";
   return {
     where: `${machine.label}:${windows ? "%USERPROFILE%\\.dori\\runner\\" : "~/.dori/runner/"}${POLICY_FILE}`,
+    // Any POSIX runner (Linux or macOS) shares one set of path rules.
+    platform: windows ? "win32" : "linux",
     read: async () => {
       const out = await exec(windows ? windowsReadScript() : posixReadScript());
       if (out.trim() === REMOTE_ABSENT) return undefined;
@@ -163,11 +169,11 @@ export const runRunnerSetup = async (d: RunnerSetupDeps, input: { readonly patch
   const seen = readSeenKeys(d.seenPath);
   const configured = await configureKeys({
     specs: RUNNER_CONFIG_KEYS, current: pruned.next, patch: input.patch, unset: input.unset,
-    prompt: d.prompt, interactive: d.interactive, seen, mode: d.mode, skip: RUNNER_UNASKED_KEYS, defaults: runnerConfigDefault(d.home), log: d.log,
+    prompt: d.prompt, interactive: d.interactive, seen, mode: d.mode, skip: RUNNER_UNASKED_KEYS, defaults: runnerConfigDefault(d.home, d.io.platform), log: d.log,
   });
   const { next } = configured;
   try {
-    parsePolicy(next, d.home);
+    parsePolicy(next, d.home, undefined, d.io.platform ? { platform: d.io.platform } : {});
   } catch (e) {
     d.log(`RUNNER_SETUP_FAILED invalid runner-config: ${e instanceof Error ? e.message : String(e)}; nothing was written`);
     return 1;
