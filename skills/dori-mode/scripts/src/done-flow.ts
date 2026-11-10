@@ -17,6 +17,7 @@ import { openLaneMessages } from "./lane-messages.ts";
 import { checkLaneReportText, installLaneReports, LaneFileError, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import type { Tunables } from "./tunables.ts";
+import { isLaneOutcomeLine, laneOutcomeEventId, settleLaneOutcome } from "./autopilot.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -373,9 +374,10 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string, opts: 
     return await withOperations(deps, async (store) => {
       const id = closeId(lane.key);
       // A close that finished while this one waited for the lock (the CLI and the supervisor resuming the same lane).
-      if (statusOf((await deps.registry.read(lane.key)) ?? lane) === "closed") {
+      const fresh = (await deps.registry.read(lane.key)) ?? lane;
+      if (statusOf(fresh) === "closed") {
         if (store.get(id)?.state === "planned") settleOperation(store, deps.clock.now(), id, "verified", "lane recorded closed");
-        return { closed: true, lines: [`CLOSED ${lane.key} already closed`] };
+        return { closed: true, lines: [`CLOSED ${lane.key} already closed`, ...autopilotOutcome(deps, store, fresh)] };
       }
       const data = JSON.stringify({ note, force: Boolean(opts.force), ...(opts.cancelled ? { cancelled: opts.cancelled } : {}) });
       const prior = store.get(id);
@@ -383,11 +385,38 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string, opts: 
       else store.put({ ...prior, state: "planned", detail: "close planned", data, updatedAt: deps.clock.now() });
       const result = await closeSequence(deps, lane, note, opts, actRecorded(deps, store, lane), store);
       const now = deps.clock.now();
-      if (result.closed) settleOperation(store, now, id, "verified", "lane recorded closed");
-      else if (store.get(id)?.state === "planned") settleOperation(store, now, id, "failed", result.lines.at(-1) ?? "refused");
+      if (result.closed) {
+        settleOperation(store, now, id, "verified", "lane recorded closed");
+        return { closed: true, lines: [...result.lines, ...autopilotOutcome(deps, store, lane, opts.cancelled?.reason ?? null)] };
+      }
+      if (store.get(id)?.state === "planned") settleOperation(store, now, id, "failed", result.lines.at(-1) ?? "refused");
       return result;
     });
   } finally { release(); }
+};
+
+/** The cancel reason a closed lane's receipt records (`dori close --cancelled`), else undefined. */
+const cancelledReason = (lane: Lane): string | undefined => {
+  const receipt = lane.receipt;
+  if (typeof receipt !== "object" || receipt === null || !("cancelled" in receipt)) return undefined;
+  const cancelled = receipt.cancelled;
+  return typeof cancelled === "object" && cancelled !== null && "reason" in cancelled && typeof cancelled.reason === "string" ? cancelled.reason : undefined;
+};
+
+/**
+ * Settles the autopilot launch attempt of a lane that is now closed (autopilot.ts settleLaneOutcome): a cancelled close
+ * failed, any other done. `cancelled` is the close's own reason, null for a close that was not cancelled; undefined reads
+ * it from the closed lane's receipt (a close finished earlier). Returns the line for the lead, if any.
+ */
+const autopilotOutcome = (deps: FlowDeps, store: OperationStore, lane: Lane, cancelled?: string | null): string[] => {
+  const reason = cancelled === undefined ? cancelledReason(lane) : cancelled ?? undefined;
+  const line = settleLaneOutcome(store, deps.clock.now(), lane.key, reason === undefined ? undefined : `cancelled: ${reason}`);
+  return line ? [line] : [];
+};
+
+/** The autopilot outcome lines of a close, each handed over under its lane's stable outcome id. */
+const pushOutcomes = async (push: Emit, lane: Lane, lines: readonly string[]): Promise<void> => {
+  for (const line of lines.filter(isLaneOutcomeLine)) await push(line, laneOutcomeEventId(lane.key), laneMeta(lane));
 };
 
 const closeSequence = async (
@@ -502,14 +531,20 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
     release();
     const lane = await deps.registry.read(op.lane);
     if (!lane || statusOf(lane) === "closed") {
-      await withOperations(deps, async (store) => settleOperation(store, deps.clock.now(), op.id, lane ? "verified" : "failed", lane ? "lane recorded closed" : "lane not registered"));
+      const outcome = await withOperations(deps, async (store) => {
+        settleOperation(store, deps.clock.now(), op.id, lane ? "verified" : "failed", lane ? "lane recorded closed" : "lane not registered");
+        return lane ? autopilotOutcome(deps, store, lane) : [];
+      });
+      if (lane) await pushOutcomes(push, lane, outcome);
       continue;
     }
     const { note, force, cancelled } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean; cancelled?: { reason: string } };
     const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force), ...(cancelled ? { cancelled } : {}) });
     const last = result.lines.at(-1) ?? "";
-    if (result.closed) await push(closedEvent(lane.key, note ?? "", result.lines), undefined, laneMeta(lane));
-    else {
+    if (result.closed) {
+      await push(closedEvent(lane.key, note ?? "", result.lines), undefined, laneMeta(lane));
+      await pushOutcomes(push, lane, result.lines);
+    } else {
       const ambiguousLines = result.lines.filter((line) => line.startsWith("OPERATION_AMBIGUOUS "));
       for (const line of ambiguousLines.length ? ambiguousLines : [`OPERATION_FAILED ${op.id} the interrupted close was not finished: ${last}`]) await push(line, undefined, laneMeta(lane));
     }
@@ -581,17 +616,18 @@ const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promis
 /**
  * Settles a claim whose window ended: closes the lane, or objects. A claim only waiting for the supervisor's merge of
  * its bound PR (mergeWait, boundMergeWait) is kept: undefined, nothing to report, and the next pass settles it again.
+ * Returns the line to report and, after a close, the autopilot outcome lines it produced.
  */
-const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: number): Promise<string | undefined> => {
+const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: number): Promise<{ readonly line: string; readonly outcomes?: readonly string[] } | undefined> => {
   const read = await readLane(deps, lane, { done: true });
   const blocked = unpushedIn(read.worktrees);
-  if (blocked.length) return objectDone(deps, lane, blocked);
+  if (blocked.length) return { line: await objectDone(deps, lane, blocked) };
   const checks = read.checks ?? [];
   const failing = checks.filter((c) => !c.ok);
   if (failing.length) {
     const wait = await mergeWait(deps, lane, failing, start);
     if (wait.waiting) return undefined;
-    return objectDone(deps, lane, [...failing.map((c) => `${c.signal} -> ${c.detail}`), ...wait.why]);
+    return { line: await objectDone(deps, lane, [...failing.map((c) => `${c.signal} -> ${c.detail}`), ...wait.why]) };
   }
   if (await boundMergeWait(deps, lane, start)) return undefined;
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
@@ -611,14 +647,14 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
   });
   if (superseded.status) {
     await withOperations(deps, async (store) => settleOperation(store, deps.clock.now(), closeId(lane.key), "failed", `superseded: lane is ${superseded.status}`));
-    return `LANE_SETTLE_SKIPPED ${lane.key} is now ${superseded.status}; the done claim being settled was superseded, not closed`;
+    return { line: `LANE_SETTLE_SKIPPED ${lane.key} is now ${superseded.status}; the done claim being settled was superseded, not closed` };
   }
   const result = await closeLane(deps, verified, `Done: ${evidence}`, { pre: { checks } });
   if (!result.closed) {
     const signals = result.lines.filter((l) => l.startsWith("SIGNAL NOT"));
-    return objectDone(deps, (await deps.registry.read(lane.key)) ?? verified, signals.length ? signals : result.lines.filter((l) => l.startsWith("REFUSED")));
+    return { line: await objectDone(deps, (await deps.registry.read(lane.key)) ?? verified, signals.length ? signals : result.lines.filter((l) => l.startsWith("REFUSED"))) };
   }
-  return closedEvent(lane.key, `Done: ${evidence}`, result.lines);
+  return { line: closedEvent(lane.key, `Done: ${evidence}`, result.lines), outcomes: result.lines };
 };
 
 const remoteWorktreeNote = (lane: Lane): string =>
@@ -730,13 +766,15 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
     if (!merged) return;
     evidence = `${claim.evidence} (closed at once: ${merged})`;
   }
-  const line = await settle(deps, lane, evidence, start ?? deps.clock.now());
-  if (line === undefined) return;
+  const settled = await settle(deps, lane, evidence, start ?? deps.clock.now());
+  if (settled === undefined) return;
+  const line = settled.line;
   // A close whose claim announcement already reached the lead is marked seen-claim; either way it wakes the lead.
   const event = claim.event;
   const seen = event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event));
   const closed = seen ? line.replace(/^(LANE_CLOSED \S+ closed)(?= |$)/, "$1 seen-claim") : line;
   await push(machine && closed.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${closed.slice("LANE_CLOSED ".length)}` : closed, undefined, laneMeta(lane));
+  await pushOutcomes(push, lane, settled.outcomes ?? []);
 };
 
 /**

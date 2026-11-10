@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
+import { isLaneOutcomeLine, laneOutcomeEventId } from "./autopilot.ts";
 import { closeLane, closeRunning, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
@@ -285,9 +286,12 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   if (finished) {
     const closed = await closeLane(deps, current, `recovery: ${finished}; not relaunched`);
     const event = `LANE_RECOVERY_SKIPPED ${lane.key} ${lane.pane ?? "-"} ${reason}: ${finished}; ${closed.closed ? "lane closed" : `not relaunched, left for dori close (${closed.lines.at(-1) ?? "refused"})`}`;
-    if (!enqueue) return [event];
+    // An autopilot lane's close also settles its launch attempt (AUTOPILOT_LANE_DONE).
+    const outcomes = closed.lines.filter(isLaneOutcomeLine);
+    if (!enqueue) return [event, ...outcomes];
     // A refused close leaves the lane for the next sweep: the same lane, generation and reason is said once.
     await enqueue(event, `recovery-skipped:${JSON.stringify([lane.key, lane.openedAt, current.lastRecoveryAt ?? null, reason, finished, closed.closed])}`);
+    for (const line of outcomes) await enqueue(line, laneOutcomeEventId(lane.key));
     return [];
   }
   const noticeId = (kind: string, detail = ""): string =>

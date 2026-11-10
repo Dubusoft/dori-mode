@@ -9,7 +9,9 @@ import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTic
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
-import { type Lane, statusOf } from "../src/registry.ts";
+import { type Lane, statusOf, withStatus } from "../src/registry.ts";
+import { LAUNCH_ACTION, ledgerRows, ledgerState } from "../src/autopilot.ts";
+import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World, WT, withSqliteStore } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -239,6 +241,72 @@ test("cancelling a runner lane whose start never reported a pane still sends lan
   expect(r.closed).toBe(true);
   expect(closedVia()).toEqual(["reserved-lane"]);
   expect((await at(T0).registry.read("reserved-lane"))?.receipt).toMatchObject({ cleanup: expect.arrayContaining(["runner lane reserved-lane closed none"]) });
+});
+
+/** An autopilot launch attempt of task 12 reserved for lane `ap-12-1`: planned, or settled verified when `launched`. */
+const reserveAutopilot = (launched: boolean): void => {
+  const store = openOperations(at(T0).config);
+  try {
+    const op = plan(store, T0, { lane: "toodo:12", action: LAUNCH_ACTION, target: "1", data: JSON.stringify({ laneKey: "ap-12-1" }) });
+    if (launched) settleOperation(store, T0, op.id, "verified", "launched ap-12-1");
+  } finally { store.close(); }
+};
+const autopilotRow = () => {
+  const store = openOperations(at(T0).config);
+  try { return ledgerRows(store)[0]; } finally { store.close(); }
+};
+const apLane: Lane = { ...lane, key: "ap-12-1", pane: undefined, runner: "local" };
+
+test("a cancelled close of an autopilot lane settles its attempt failed once and tells the lead; the task is never relaunched", async () => {
+  await at(T0).registry.write(apLane);
+  reserveAutopilot(true);
+  const r = await closeLane(at(T0), apLane, "cancelled", { cancelled: { reason: "lane start failed on the runner" } });
+  expect(r.closed).toBe(true);
+  expect(r.lines.filter((l) => l.startsWith("AUTOPILOT_"))).toEqual([
+    "AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1 cancelled: lane start failed on the runner: tell the owner; autopilot does not launch it again",
+  ]);
+  const row = autopilotRow()!;
+  expect([row.state, JSON.parse(row.data!)]).toEqual(["failed", { laneKey: "ap-12-1", outcome: "failed" }]);
+  expect(ledgerState([row], 12, new Set()).attempts).toBe(1);
+  // Closing it again says nothing new.
+  expect((await closeLane(at(T0 + MIN), apLane, "again")).lines).toEqual(["CLOSED ap-12-1 already closed"]);
+  expect(autopilotRow()!.updatedAt).toBe(row.updatedAt);
+});
+
+test("a done close of an autopilot lane marks its attempt done; a lane no attempt names settles nothing", async () => {
+  await at(T0).registry.write(apLane);
+  reserveAutopilot(false);
+  const r = await closeLane(at(T0), apLane, "Done: merged acme/app#1", { pre: { checks: [] } });
+  expect(r.lines.at(-1)).toBe("AUTOPILOT_LANE_DONE #12 lane=ap-12-1 attempt=1: complete toodo task #12");
+  const row = autopilotRow()!;
+  expect([row.state, JSON.parse(row.data!).outcome]).toEqual(["verified", "done"]);
+  const other = await closeLane(at(T0), { ...lane, pane: undefined, runner: "local" }, "manual", { pre: { checks: [] } });
+  expect(other.lines.some((l) => l.startsWith("AUTOPILOT_"))).toBe(false);
+});
+
+test("a supervisor-resumed cancelled close of an autopilot lane hands the lead its outcome under the lane's stable id", async () => {
+  await at(T0).registry.write(apLane);
+  reserveAutopilot(true);
+  const store = openOperations(at(T0).config);
+  try {
+    plan(store, T0, { lane: "ap-12-1", action: "close", target: "ap-12-1", data: JSON.stringify({ note: "cancelled", force: false, cancelled: { reason: "start failed" } }) });
+  } finally { store.close(); }
+  const emitted: [string, string | undefined][] = [];
+  await watchTick(at(T0), async (line, id) => { emitted.push([line, id]); });
+  expect(emitted.filter(([line]) => line.startsWith("LANE_CLOSED") || line.startsWith("AUTOPILOT_"))).toEqual([
+    ["LANE_CLOSED ap-12-1 closed", undefined],
+    ["AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1 cancelled: start failed: tell the owner; autopilot does not launch it again", "autopilot-outcome:ap-12-1"],
+  ]);
+});
+
+test("an autopilot close that recorded the lane closed before settling its attempt settles it from the receipt on the next close", async () => {
+  reserveAutopilot(true);
+  const at0 = new Date(T0).toISOString();
+  await at(T0).registry.write(withStatus(apLane, "closed", "cancelled", at0, { closedAt: at0, receipt: { cancelled: { reason: "owner dropped it" } } }));
+  const r = await closeLane(at(T0), apLane, "again");
+  expect(r.lines).toEqual(["CLOSED ap-12-1 already closed", "AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1 cancelled: owner dropped it: tell the owner; autopilot does not launch it again"]);
+  expect(eventClass("AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1", resolveEventPolicy(undefined))).toBe("lead-urgent");
+  expect(eventClass("AUTOPILOT_LANE_DONE #12 lane=ap-12-1 attempt=1", resolveEventPolicy(undefined))).toBe("lead-urgent");
 });
 
 test("with the lane's runner down a close is refused RUNNER_UNAVAILABLE and the lane stays open, its worktree and pane untouched", async () => {

@@ -65,6 +65,9 @@ const URGENT_KINDS = [
   // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
   // waits on the close itself, so it must not sit in the digest.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
+  // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched), a done one
+  // has its Toodo task completed by the lead.
+  "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",

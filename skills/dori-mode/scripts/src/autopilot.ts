@@ -1,4 +1,5 @@
 import { OPEN_STATES, type Operation, type OperationStore, plan, settleOperation } from "./operations.ts";
+import { redactSecrets } from "./redact.ts";
 
 /**
  * Autopilot core (shadow mode): the pure selection predicate over toodo tasks the owner marked for autopilot (toodo's
@@ -8,7 +9,8 @@ import { OPEN_STATES, type Operation, type OperationStore, plan, settleOperation
  *
  * Rows:
  * - launch attempt (written by `dori autopilot launch`): lane `toodo:<taskId>`, action `autopilot-launch`, target
- *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous.
+ *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous. When its lane
+ *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed).
  * - shadow judgment: lane `autopilot`, action `autopilot-shadow`, target `<taskId>@<hour slot ISO>`, state `verified`,
  *   detail `<VERDICT> <reasons>`.
  */
@@ -123,6 +125,39 @@ const rowLive = (op: Operation, openLanes: ReadonlySet<string>): boolean => {
 export const pendingReservations = (rows: readonly Operation[], openLanes: ReadonlySet<string>, exceptTaskId: number): number =>
   rows.filter((op) => op.action === LAUNCH_ACTION && op.lane !== `toodo:${exceptTaskId}` && OPEN_STATES.includes(op.state))
     .filter((op) => { const key = laneKeyOf(op); return key === undefined || !openLanes.has(key); }).length;
+
+/** The lines settleLaneOutcome returns; the lead reports a failure to the owner and completes the toodo task of a done one. */
+export const LANE_DONE_EVENT = "AUTOPILOT_LANE_DONE";
+export const LANE_FAILED_EVENT = "AUTOPILOT_LANE_FAILED";
+export const isLaneOutcomeLine = (line: string): boolean => line.startsWith(`${LANE_DONE_EVENT} `) || line.startsWith(`${LANE_FAILED_EVENT} `);
+/** The journal id of a lane's outcome line: one per lane, so a close resumed after a crash announces it once. */
+export const laneOutcomeEventId = (laneKey: string): string => `autopilot-outcome:${laneKey}`;
+
+const outcomeOf = (op: Operation): unknown => {
+  try { const data = JSON.parse(op.data ?? "") as unknown; return isRecord(data) ? data.outcome : undefined; } catch { return undefined; }
+};
+
+/**
+ * Settles the launch attempt whose lane `laneKey` just closed, once. A close with `failed` set (cancelled: the lane did
+ * not start, was given up, or its Done can never hold) settles the row `failed`; any other close (every Done signal held,
+ * its PR merged) marks it done. Returns the line for the lead, or undefined when no launch attempt names the lane (not an
+ * autopilot lane), the row already has an outcome, or the launch itself was settled failed or ambiguous. Nothing is
+ * relaunched: the predicate refuses the task `already-attempted` from now on.
+ */
+export const settleLaneOutcome = (store: OperationStore, now: number, laneKey: string, failed?: string): string | undefined => {
+  const op = ledgerRows(store).find((row) => laneKeyOf(row) === laneKey);
+  if (!op || outcomeOf(op) !== undefined || op.state === "failed" || op.state === "ambiguous") return undefined;
+  const taskId = op.lane.slice("toodo:".length);
+  const data = JSON.stringify({ ...(JSON.parse(op.data ?? "{}") as Record<string, unknown>), outcome: failed === undefined ? "done" : "failed" });
+  const why = redactSecrets((failed ?? "").replace(/\s+/g, " ").trim()).slice(0, 200);
+  const head = `#${taskId} lane=${laneKey} attempt=${op.target}`;
+  if (failed === undefined) {
+    store.put({ ...op, state: "verified", detail: `lane ${laneKey} closed done`, data, updatedAt: now });
+    return `${LANE_DONE_EVENT} ${head}: complete toodo task #${taskId}`;
+  }
+  store.put({ ...op, state: "failed", detail: `lane ${laneKey} closed without finishing${why ? `: ${why}` : ""}`, data, updatedAt: now });
+  return `${LANE_FAILED_EVENT} ${head}${why ? ` ${why}` : ""}: tell the owner; autopilot does not launch it again`;
+};
 
 export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>): LedgerState => {
   const mine = rowsOf(rows, taskId);
