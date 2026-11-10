@@ -104,7 +104,7 @@ test("a start that hangs is killed and restarted within TimeoutStartSec + 60 s, 
 });
 
 /** The first-pass timing line of each supervisor task (the sweeps report theirs as first-sweep). */
-const FIRSTS = ["first-delivery", "first-inbound", "first-polling", "first-runners", "first-sweep"];
+const FIRSTS = ["first-autopilot", "first-delivery", "first-inbound", "first-polling", "first-runners", "first-sweep"];
 
 test("a normal start logs one STARTUP_TIMINGS line for the steps up to READY=1 and one for each task's first pass", async () => {
   // Given the real supervise() on fakes, stopped as soon as every task has reported its first pass.

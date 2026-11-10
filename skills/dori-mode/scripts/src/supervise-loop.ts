@@ -66,7 +66,9 @@ import { driftTick, pullOwners } from "./drift.ts";
 import { CiFollowUp } from "./ci-follow.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
-import { type BuiltinSource, EventSources, type SourceEnqueue } from "./event-sources.ts";
+import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
+import { judgeCandidates, liveJudgeDeps, RECONCILE_JOB } from "./autopilot-cli.ts";
+import { AUTOPILOT_KICK_EVENTS, AutopilotTick } from "./autopilot-tick.ts";
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
@@ -172,6 +174,9 @@ export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as 
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
 /** The fifth task: liveness, lane events, runner admin, legacy adoption, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
+/** The autopilot tick's task (autopilot-tick.ts); it judges only while the toodo source is enabled. */
+export const AUTOPILOT_TASK = "autopilot";
+export const AUTOPILOT_PASS_MS = 5_000;
 /** How often the runners task tries to adopt open lanes that have no runner yet. */
 export const LEGACY_ADOPT_MS = 60_000;
 /** How often the runners task runs; the hub itself answers frames as they arrive. */
@@ -921,9 +926,18 @@ export const supervise = async (
     const enqueueWait = enqueueOf("waits");
     const enqueueGitHub = enqueueOf("github");
     const enqueueDiscord = enqueueOf("discord");
+    // AUTOPILOT_READY counts under the toodo source: it is what toodo's marked tasks add up to.
+    const autopilot = new AutopilotTick({
+      judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), store: ops, enqueue: enqueueOf("toodo"), now: deps.clock.now,
+      log: (line) => { console.error(line); },
+    });
+    // The tick replaced the hourly autopilot-reconcile schedule job; one left from an earlier version is removed.
+    try { if (new SourceSpecs(deps.config.stateDir).remove(RECONCILE_JOB)) console.log(`AUTOPILOT_RECONCILE_JOB_REMOVED ${RECONCILE_JOB}: the supervisor's autopilot tick replaces it`); }
+    catch (e) { console.error(`AUTOPILOT_RECONCILE_JOB_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     const toodoEvents = new ToodoEvents({
       config: deps.tunables.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
       fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
+      onEvent: (event) => { if (AUTOPILOT_KICK_EVENTS.has(event)) autopilot.kick(); },
     });
     const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.tunables.waitMaxFailures, hubCall));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
@@ -1219,7 +1233,7 @@ export const supervise = async (
     // Each task is its own loop, so one stuck pass costs only that task. Every pass is tracked as task:<name>: the
     // loop below reports one running past TASK_ALERT_MS by name, and past WATCHDOG_STALL_MS it withholds the watchdog.
     const halted = AbortSignal.any([signal, stop.signal]);
-    const task = (name: SupervisorTask | typeof RUNNERS_TASK, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
+    const task = (name: SupervisorTask | typeof RUNNERS_TASK | typeof AUTOPILOT_TASK, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
       const span = name === "sweeps" ? undefined : probe.span();
       while (!halted.aborted) {
         // The pass starts only once task:<name> is tracked, so the watchdog names the task before any work it tracks inside.
@@ -1271,6 +1285,9 @@ export const supervise = async (
         }
         polls.push(tickSources(), routeLaneReports());
         await Promise.all(polls);
+      }),
+      task(AUTOPILOT_TASK, AUTOPILOT_PASS_MS, async () => {
+        if (deps.tunables.toodoEvents.enabled) await autopilot.tick();
       }),
       task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
         if (!runnerHub && deps.clock.now() - lastHubAttempt >= RUNNER_HUB_RETRY_MS) await tryOpenRunners((_name, work) => work());

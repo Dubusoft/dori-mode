@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AUTOPILOT_LANE, DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, SHADOW_ACTION, type ToodoTask } from "../src/autopilot.ts";
-import { type AutopilotDeps, autopilotMain, RECONCILE_JOB } from "../src/autopilot-cli.ts";
+import { type AutopilotDeps, autopilotMain } from "../src/autopilot-cli.ts";
 import { JsonOperations } from "../src/operations.ts";
 import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
@@ -109,9 +109,8 @@ const harness = (tasks: readonly ToodoTask[] | "unreadable", host: HostSummary =
     openLanes: async () => openLanes,
     quota: async () => { probes.quota++; return { readable: true, maxUsedPct: 10 }; },
     host: async () => { probes.host++; return host; },
-    schedules: () => { throw new Error("candidates never touches schedules"); },
     lock: () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
-    cliArgv: ["bun", "/x/cli.ts"], now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
+    now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
   });
   const run = async (...args: string[]): Promise<Run> => {
     const out: string[] = [];
@@ -264,28 +263,9 @@ test("launch usage errors exit 2 and write nothing", async () => {
 
 // other subcommands
 
-test("schedule adds the reconcile job once", async () => {
-  const added: unknown[] = [];
-  const out: string[] = [];
-  const deps = (): AutopilotDeps => ({
-    config: DEFAULT_AUTOPILOT, store, toodo: () => { throw new Error("unused"); }, openLanes: async () => new Set(),
-    quota: async () => ({ readable: false }), host: async () => ({ ok: true }),
-    schedules: () => ({ list: () => added as { name: string }[], add: (raw) => { added.push(raw); return raw; } }),
-    lock: () => { throw new Error("schedule never locks"); },
-    cliArgv: ["/usr/bin/bun", "/abs/cli.ts"], now: () => T0, out: (l) => { out.push(l); }, err: () => {},
-  });
-  expect(await autopilotMain(["schedule"], deps())).toBe(0);
-  expect(await autopilotMain(["schedule"], deps())).toBe(0);
-  expect(out.map((l) => l.split(" ")[0])).toEqual(["AUTOPILOT_SCHEDULE_ADDED", "AUTOPILOT_SCHEDULE_EXISTS"]);
-  expect(added).toEqual([{
-    name: RECONCILE_JOB, type: "schedule", kind: "AUTOPILOT_RECONCILE", cron: "0 * * * *", catchUp: "once",
-    command: ["/usr/bin/bun", "/abs/cli.ts", "autopilot", "candidates", "--record"], since: T0,
-  }]);
-});
-
-test("usage errors exit 2 with the usage; the removed bundle subcommands are unknown", async () => {
+test("usage errors exit 2 with the usage; the removed bundle and schedule subcommands are unknown", async () => {
   const h = harness([]);
-  for (const args of [[], ["nope"], ["approve", "b1"], ["revoke", "b1"], ["bundles"], ["candidates", "--tasks", "x"], ["candidates", "extra"], ["schedule", "--json"], ["candidates", "--bogus"]]) {
+  for (const args of [[], ["nope"], ["approve", "b1"], ["revoke", "b1"], ["bundles"], ["candidates", "--tasks", "x"], ["candidates", "extra"], ["schedule"], ["candidates", "--bogus"]]) {
     const r = await h.run(...args);
     expect(r.code).toBe(2);
     expect(r.err.join("\n")).toContain("usage: dori autopilot candidates");

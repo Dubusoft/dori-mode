@@ -93,13 +93,16 @@ const fixture = (url: string) => {
 test("task events are journaled by class and resume after a restart from the saved id without a duplicate", async () => {
   const server = fakeToodo();
   const f = fixture(server.url);
-  const halt = f.start();
+  const seen: string[] = [];
+  const halt = f.start({ onEvent: (event) => { seen.push(event); } });
   await f.until(() => f.logs.some((line) => line.startsWith("TOODO_EVENTS_CONNECTED")), "the first connection");
   server.push({ id: "ep-1", event: "tasks-changed", data: "{}" });
   server.push({ id: "ep-2", event: "task-status-changed", data: JSON.stringify({ taskId: 12, workspaceId: 2, from: "in_review", to: "done", at: 1 }) });
   server.push({ id: "ep-3", event: "task-ready", data: JSON.stringify({ taskId: 13, workspaceId: 2, unblockedBy: 12, at: 1 }) });
   await f.until(() => f.toodo().length === 2, "two task events");
   expect(readToodoCursor(f.dir)).toBe("ep-3");
+  // Every event reaches onEvent, the unjournaled ready and tasks-changed too: tasks-changed kicks the autopilot tick.
+  expect(seen).toEqual(["ready", "tasks-changed", "task-status-changed", "task-ready"]);
   await halt();
 
   // The restarted supervisor sends the saved id; the server replays ep-3 again, which the journal drops.

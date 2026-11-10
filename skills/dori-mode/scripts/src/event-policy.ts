@@ -72,6 +72,8 @@ const URGENT_KINDS = [
   // A Toodo task whose last unfinished dependency was just done: the lead may launch it. Plain status changes stay digest,
   // so the lead's own MCP calls never wake it.
   "TOODO_TASK_READY",
+  // The supervisor's autopilot tick found a new set of tasks it may launch, or the same set still waiting after 30 min.
+  "AUTOPILOT_READY",
 ] as const;
 
 /**
