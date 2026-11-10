@@ -265,7 +265,6 @@ export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "con
     line("store", `derived from ${c.stateDir}`, c.store),
     line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
     line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
-    line("workspaces", "derived from laneWorkspace", c.workspaces),
   );
   const kept = CONFIG_FILE_KEYS as readonly string[];
   const ignored = Object.keys(raw).filter((key) => !kept.includes(key) && !legacyPaneKeys(raw).includes(key));

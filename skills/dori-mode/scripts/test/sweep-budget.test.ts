@@ -51,7 +51,7 @@ const herdr = () => {
 const setup = async () => {
   const h = herdr();
   const clock = fakeClock(T0);
-  const config = { ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: "/repo", leadPane: "lead:p1", workspaces: ["none"] };
+  const config = { ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: "/repo", leadPane: "lead:p1", laneWorkspace: "none" };
   const deps: FlowDeps = { run: async (): Promise<Ran> => ({ code: 1, out: "", err: "no lane access outside the facade" }), clock, registry: new Registry(state.dir), config, exists: () => true, ops: h.ops };
   for (let i = 0; i < 100; i++) {
     const machine = i % 2 ? "box2" : "";

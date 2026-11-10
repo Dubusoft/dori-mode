@@ -77,7 +77,7 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
     rows.push({ key: lane.key, thread: lane.thread, pane: lane.pane ?? "-", session: hit.id ? `${hit.id} (${hit.via})` : (lane.session ?? "-"), status: statusOf(lane) });
   }
   const owned = new Set(lanes.filter((l) => !l.machine).map((l) => l.pane));
-  const watch = new Set(deps.config.workspaces);
+  const watch = new Set([deps.config.laneWorkspace].filter(Boolean));
   const skip = new Set([deps.config.leadPane, ...deps.config.ignorePanes]);
   const candidates = panes.filter((p) =>
     !owned.has(p.pane_id) && !skip.has(p.pane_id) && !(watch.size > 0 && !watch.has(p.workspace_id)) && p.agent !== undefined);

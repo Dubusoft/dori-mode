@@ -130,8 +130,6 @@ export type DoriConfig = {
   readonly stateDir: string;
   /** The herdr workspace new local lane tabs open in, from dori state (managed-panes.ts); never read from the config file after migration. */
   readonly laneWorkspace: string;
-  /** The workspaces the sweeps watch: the lanes workspace (empty: every workspace). Derived, not configured. */
-  readonly workspaces: readonly string[];
   readonly ignorePanes: readonly string[];
   /** The lead's herdr pane, from dori state (managed-panes.ts) or DORI_LEAD_PANE; the supervisor creates and records it. */
   readonly leadPane: string;
@@ -292,7 +290,6 @@ export const omoSessionsDir = (home = homedir()): string => join(home, ".omo", "
 export const defaultConfig = (home = homedir()): DoriConfig => ({
   stateDir: join(home, ".dori", "state"),
   laneWorkspace: "",
-  workspaces: [],
   ignorePanes: [],
   leadPane: "",
   defaultCwd: home,
@@ -544,7 +541,6 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     defaultCwd: expandHome(merged.defaultCwd, home),
     leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
     laneWorkspace: panes.laneWorkspace,
-    workspaces: panes.laneWorkspace ? [panes.laneWorkspace] : [],
   };
 };
 
