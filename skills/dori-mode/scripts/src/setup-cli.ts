@@ -15,7 +15,10 @@ export const SETUP_USAGE = `dori setup [options]
 
   Interactive by default: every question shows the current value in [brackets] (none shown: the default applies),
   Enter keeps it and - clears an optional key.
-  GitHub repos are optional; setup reads and saves this machine's watched list.
+  Asks five questions: bot token, channel ids, owner id, whether new GitHub issues start work (yes: the logins and
+  repos to watch), and autostart (yes: every system step runs). Everything else keeps its value or default.
+  --advanced              also ask models, directories, every other config key, the herdr step, each autostart step
+                          and whether to keep a channel that failed its check; GitHub repos are asked every time
   --yes, -y               non-interactive: take flags, then stored values, then defaults
   --token-file FILE       read the Discord bot token from FILE ("-" for stdin); never pass it as an argument
   --channel ID            main Discord channel id (repeatable)
@@ -106,6 +109,7 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
       model: { type: "string" }, cwd: { type: "string" }, "state-dir": { type: "string" }, "issue-author": { type: "string", multiple: true },
       "no-herdr": { type: "boolean" }, autostart: { type: "boolean" }, help: { type: "boolean", short: "h" },
       set: { type: "string", multiple: true }, unset: { type: "string", multiple: true }, migrate: { type: "boolean" },
+      advanced: { type: "boolean" },
     },
   });
   if (values.help) {
@@ -136,6 +140,7 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
     patch: keys.patch,
     unset: keys.unset,
     migrate: values.migrate,
+    advanced: values.advanced,
   };
   if (!interactive) console.log("SETUP non-interactive (flags, then stored values, then defaults)");
   try {
