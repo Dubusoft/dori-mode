@@ -18,7 +18,7 @@ test("the spec lists match the keys each file reads, in order", () => {
   expect(DORI_CONFIG_KEYS.map((s) => s.key)).toEqual([...CONFIG_FILE_KEYS]);
   expect(RUNNER_CONFIG_KEYS.map((s) => s.key)).toEqual([...RUNNER_POLICY_KEYS]);
   expect(DORI_CONFIG_KEYS.filter((s) => s.required).map((s) => s.key).sort()).toEqual(["defaultCwd", "defaultModel", "discord", "discordChannels", "stateDir"]);
-  expect(RUNNER_CONFIG_KEYS.filter((s) => s.required).map((s) => s.key)).toEqual(["agents", "allowedRoots"]);
+  expect(RUNNER_CONFIG_KEYS.filter((s) => s.required).map((s) => s.key)).toEqual(["agents"]);
 });
 
 test("pruneDoriConfig drops what loadConfig no longer reads and keeps the rest in order", () => {

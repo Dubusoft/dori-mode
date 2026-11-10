@@ -244,6 +244,30 @@ describe("runner command policy", () => {
       .toEqual(["/home/u/repos/", "/home/u/wt"]);
   });
 
+  test("without allowedRoots (or with []) the roots are derived: temp, defaultCwd, home only without reposRoot/worktreeRoot", () => {
+    const agents = { omo: ["omo", "run"] };
+    const roots = (v: Record<string, unknown>) => parsePolicy({ agents, ...v }, "/home/u", "/tmp").allowedRoots;
+    expect(roots({ reposRoot: "~/repos" })).toEqual(["/tmp", "/home/u/repos", "/home/u/repos/worktrees"]);
+    expect(roots({ allowedRoots: [], reposRoot: "/data/repos", defaultCwd: "~/work" })).toEqual(["/tmp", "/home/u/work", "/data/repos", "/data/repos/worktrees"]);
+    expect(roots({ worktreeRoot: "/srv/wt" })).toEqual(["/tmp", "/srv/wt"]);
+    expect(roots({})).toEqual(["/tmp", "/home/u"]);
+    expect(roots({ defaultCwd: "/home/u" })).toEqual(["/tmp", "/home/u"]);
+    // A listed allowedRoots derives nothing.
+    expect(roots({ allowedRoots: ["/srv"], reposRoot: "/data/repos" })).toEqual(["/srv", "/data/repos", "/data/repos/worktrees"]);
+  });
+
+  test("derived roots admit reposRoot and temp but refuse home and the runner directory when reposRoot is set", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    const [home, tmp] = [join(base, "home"), join(base, "tmp")];
+    const reposRoot = join(home, "repos");
+    for (const dir of [join(reposRoot, "a"), join(home, ".dori", "runner"), join(tmp, "job")]) mkdirSync(dir, { recursive: true });
+    const p = parsePolicy({ agents: { omo: ["omo", "run"] }, reposRoot }, home, tmp);
+    expect(checkCommand(p, start({ cwd: join(reposRoot, "a") }), realpathSync).ok).toBe(true);
+    expect(checkCommand(p, start({ cwd: join(tmp, "job") }), realpathSync).ok).toBe(true);
+    expect(rejection(checkCommand(p, start({ cwd: home }), realpathSync))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+    expect(rejection(checkCommand(p, start({ cwd: join(home, ".dori", "runner") }), realpathSync))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+  });
+
   test("a lane.start under reposRoot passes without listing it in allowedRoots; outside every root it is still refused", () => {
     const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
     const reposRoot = join(base, "repos");

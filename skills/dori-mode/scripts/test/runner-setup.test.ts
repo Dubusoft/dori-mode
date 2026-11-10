@@ -121,17 +121,17 @@ describe("runRunnerSetup", () => {
     expect(existsSync(cfgPath(dir))).toBe(false);
   });
 
-  test("mode new asks only unseen keys and reports missing required keys", async () => {
+  test("mode new asks only unseen keys, and an absent allowedRoots is not a missing key", async () => {
     const dir = temp();
     writeFileSync(cfgPath(dir), JSON.stringify({ agents: BASE.agents }));
     const seenKeys = ["agents", "defaultCwd", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot"];
     writeFileSync(join(dir, "seen.json"), JSON.stringify(seenKeys));
     const prompt = prompter({ worktreeRoot: "~/wt" });
     const { deps, lines } = setup(dir, { prompt, interactive: true, mode: "new" });
-    expect(await runRunnerSetup(deps, { patch: {}, unset: [] })).toBe(2);
+    expect(await runRunnerSetup(deps, { patch: {}, unset: [] })).toBe(0);
     expect(prompt.asked).toEqual(["allowedRoots", "worktreeRoot"]);
     expect(readCfg(dir)).toEqual({ agents: BASE.agents, worktreeRoot: "~/wt" });
-    expect(lines).toContain("RUNNER_SETUP_KEY_MISSING allowedRoots [required]");
+    expect(lines.filter((l) => l.startsWith("RUNNER_SETUP_KEY_MISSING"))).toEqual([]);
     expect(JSON.parse(readFileSync(join(dir, "seen.json"), "utf8"))).toEqual([...seenKeys, "allowedRoots", "worktreeRoot"].sort());
   });
 

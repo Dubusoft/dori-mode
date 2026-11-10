@@ -43,7 +43,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
 /** One entry per RUNNER_POLICY_KEYS member, same order. */
 export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
   spec("agents", "json", "Profile name -> argv template; only these profiles may be started", { required: true }),
-  spec("allowedRoots", "list", "Directories under which every command cwd must resolve", { required: true }),
+  spec("allowedRoots", "list", "Directories under which every command cwd must resolve; absent: temp dir, defaultCwd, and home only without reposRoot/worktreeRoot"),
   spec("defaultCwd", "string", "Where a lane.start without cwd starts; absent: the runner's home"),
   spec("sandbox", "enum", "Whether every lane must run sandboxed", { values: ["required", "optional"] }),
   spec("jobs", "enum", "deny refuses job.run, wait.check, lane.git and done inspections", { values: ["allow", "deny"] }),
