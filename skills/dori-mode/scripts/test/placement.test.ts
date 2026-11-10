@@ -72,14 +72,14 @@ test("checkMachine local asks the local runner and applies canLaunch to its samp
   const asked: (string | undefined)[] = [];
   const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ memFreePct: 50, diskFreeGb: 100, panes: T.panesMax }), panes: listed(T.panesMax) }), asked), cfg, "local");
   expect(asked).toEqual([undefined]);
-  expect(c).toEqual({ machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}` });
+  expect(c).toEqual({ machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}`, freeSlots: 0 });
 });
 
 test("checkMachine remote asks that machine's runner and counts the panes it lists", async () => {
   const asked: (string | undefined)[] = [];
   const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host(), panes: listed(2) }), asked), cfg, "big");
   expect(asked).toEqual(["big"]);
-  expect(c).toEqual({ machine: "big", verdict: { ok: true, reasons: [] }, summary: "memory free 60%, disk free 200 GB, panes 2" });
+  expect(c).toEqual({ machine: "big", verdict: { ok: true, reasons: [] }, summary: "memory free 60%, disk free 200 GB, panes 2", freeSlots: cfg.guard.panesMax - 2 });
 });
 
 test("checkMachine remote: unreadable memory and disk never hold, CPU load never holds, a pane list the runner could not read holds", async () => {
@@ -93,7 +93,7 @@ test("checkMachine remote holds at the panesMax its runner reports, over the sup
   const wide = { ...cfg, guard: { ...cfg.guard, panesMax: 20 } };
   const seen = (guard?: MachineObservation["guard"]): MachineObservation => ({ os: "darwin", sampledAt: 0, sample: host({ panes: 6 }), panes: listed(6), ...(guard ? { guard } : {}) });
   const own = await checkMachine(observing(() => seen({ panesMax: 6 })), wide, "mini");
-  expect(own.verdict).toEqual({ ok: false, reasons: ["panes 6 >= 6"] });
+  expect([own.verdict, own.freeSlots]).toEqual([{ ok: false, reasons: ["panes 6 >= 6"] }, 0]);
   expect(verdictLine("mini", own.verdict)).toBe("HOLD machine=mini panes 6 >= 6");
   // A runner that reports no thresholds (or an older one) is judged at config.guard.
   expect((await checkMachine(observing(() => seen()), wide, "mini")).verdict).toEqual({ ok: true, reasons: [] });

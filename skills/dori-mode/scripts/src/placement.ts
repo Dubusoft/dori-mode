@@ -113,7 +113,11 @@ export const resolvePlacement = (input: PlacementInput, placement: PlacementConf
   return { machine: placement.defaultMachine, source: "default", movable: true };
 };
 
-export type MachineCheck = { readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string };
+/** `freeSlots`: lanes the pane limit still allows; absent when the limit is off or the pane count is unknown. */
+export type MachineCheck = { readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number };
+
+const freeSlots = (panes: number, t: GuardThresholds): { freeSlots?: number } =>
+  t.panesMax > 0 && panes >= 0 ? { freeSlots: Math.max(0, t.panesMax - panes) } : {};
 
 /**
  * A remote machine's launch verdict: canLaunch's memory/disk/pane rules; -1 metrics never hold, CPU load never holds.
@@ -163,14 +167,14 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
     return { machine, verdict: { ok: false, reasons: [unobservable(machine, error)] }, summary: "" };
   }
   const s = seen.sample;
-  if (machine === LOCAL_MACHINE) return { machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes) };
+  if (machine === LOCAL_MACHINE) return { machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard) };
   const panes = s.panes >= 0 ? seen.panes.length : -1;
   const result: SampleResult = {
     ok: true,
     sample: { os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
   };
   const guard: GuardThresholds = { ...config.guard, ...seen.guard };
-  return { machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes) };
+  return { machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes), ...freeSlots(panes, guard) };
 };
 
 /** Local keeps the legacy `CAN_LAUNCH` / `HOLD <reasons>`; a remote line names its machine. */

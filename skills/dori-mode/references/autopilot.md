@@ -1,70 +1,59 @@
 # Autopilot
 
-Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks the owner approved ahead of time, in a closed list called a bundle. v1 is shadow only: `dori autopilot candidates` judges and records, and nothing launches, nothing calls `dori launch`, nothing changes toodo and nothing merges.
+Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). v1 is shadow only: `dori autopilot candidates` judges and records, and nothing launches, nothing calls `dori launch`, nothing changes toodo and nothing merges.
 
-## Approval contract (bundle)
+## Flag contract
 
-A bundle is the owner's approval of a closed list of toodo task ids. It is one operation row: lane `autopilot`, action `autopilot-bundle`, target `<bundleId>` (slug `[a-z0-9-]+`), with `data`:
+- A task is a candidate when it is `planned` and marked for autopilot, in any workspace. There is no workspace allow list and no approval list kept by dori: the mark is the owner's approval, and clearing it withdraws it.
+- Toodo does not record who set the mark, so the lead sets it only when the owner asked for autopilot on that task, and adds the owner's message as a task ref `owner:<ref>` (e.g. `owner:discord:<channel>/<message>`). A marked task without such a ref refuses `owner-ref-missing`.
+- A marked task needs at least one criterion, so the lane has something to verify (`criteria-missing` otherwise).
+- Editing a marked task does not withdraw the mark; there is no content hash. When the lead changes a marked task's scope (title, criteria), it records the change as a `decision` progress note.
+- A follow-up task is never marked by inheritance; the owner asks for it on that task.
 
-```
-{ "v": 1, "bundleId": "b1", "ownerRef": "discord:<channel>/<message>", "approvedAt": <ms>, "expiresAt": <ms>,
-  "attemptBudget": <int>, "members": { "<taskId>": { "hash": "<sha256 hex>", "dependsOn": [ids], "workspaceId": n, "revokedAt"?: <ms> } },
-  "revokedAt"?: <ms> }
-```
-
-- The row stays `planned` while the bundle is in force, so `prune` (which deletes only `verified` rows) never drops it. A bundle revoked as a whole is settled `verified` with detail `revoked ...`.
-- Expiry is computed from `expiresAt`, never stored as a state.
-- A member's hash is the sha256 hex of canonical JSON (stable key order) of `{ workspaceId, title, description, criteria: criteria.map(c => ({text, kind, target: c.target ?? null})), dependsOn: sorted ascending }`. Criterion check state, notes, labels, refs, timeline and status are not hashed, so editing the content or adding or removing a dependency breaks the approval; progress does not.
+Toodo's web RPC `list_tasks` filter has no `autopilot` key, so dori reads every planned task (`{ statuses: ["planned"] }`, all workspaces) and keeps the marked ones.
 
 ## Ledger
 
-Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>` (1, 2, ...), data `{ "bundleId", "bundleVersion": <approvedAt>, "laneKey" }`. v1 never writes them; the predicate reads them:
+Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>` (1, 2, ...), data `{ "laneKey" }`. v1 never writes them; the predicate reads them:
 
-- Attempts used is the number of such rows for the task.
+- Autopilot never retries by itself: any earlier attempt that is not running refuses `already-attempted`, for the owner to decide.
 - A row in `ambiguous` sends the task to the owner (REFUSE `ledger-ambiguous`); it is never retried.
 - A row that is open (`planned`, `attempted`), or `verified` with its `laneKey` an open registry lane, means the task is running (HOLD `lane-live`).
-- WIP in use counts, over all tasks, the rows that are open or verified with a live `laneKey`.
 
 Shadow records are rows too: lane `autopilot`, action `autopilot-shadow`, target `<taskId>@<slot ISO>` (slot is the current hour floored, UTC), state `verified`, detail `<VERDICT> <reasons joined by ", ">`. Only `--record` writes them, one per task per hour.
 
 ## Configuration
 
-Key `autopilot` in `config.json`; every field is optional. An invalid value throws a TypeError at load naming the key.
+Key `autopilot` in `config.json`; every field is optional. An invalid value or an unknown key throws a TypeError at load naming the key. The bundle design's keys (`workspaces`, `bundleExpiryDays`, `wip`, `wipCap`, `attemptCap`, `onRevoke`) are ignored with one `CONFIG_AUTOPILOT_KEYS_IGNORED` line.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `workspaces` | `[]` | Toodo workspace ids autopilot may act in. Empty means every task is REFUSE `workspace-not-allowed`. |
-| `bundleExpiryDays` | `7` | Default expiry of a new bundle. |
-| `wip` | `1` | Concurrent autopilot lanes. |
-| `wipCap` | `2` | Hard ceiling; a larger `wip` is clamped to it with a load warning. |
-| `attemptCap` | `2` | Launch attempts per task; at the cap the task is REFUSE `attempt-cap`, a blocker for the owner. |
 | `quotaMaxUsedPct` | `80` | Any Claude account's 5h or 7d window at or above it holds (`quota-over-threshold`). |
 | `quotaUnreadable` | `"hold"` | Only value in v1: unreadable quota holds (`quota-unreadable`). |
 | `mergeBase` | `"dev"` | Autopilot lanes merge into this branch only. |
-| `onRevoke` | `"stop-new"` | Only value in v1: revoke stops new launches; running lanes go on to claim and their merges wait for the owner. |
 | `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
 | `mode` | `"shadow"` | Only value in v1: record only, nothing launches. |
+
+There is no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
 
 ## Selection predicate
 
 `judge(input)` returns `{ taskId, verdict, reasons }`. Every failing reason is collected, not just the first. The verdict is REFUSE when any reason refuses, else HOLD when any reason holds, else LAUNCH. A dependency is satisfied only when it is `done` with resolution `merged` or `completed`.
 
-REFUSE means the task needs the owner, or is never eligible:
+REFUSE means the task needs the owner or the lead, or is not eligible yet:
 
 | Reason | When |
 | --- | --- |
-| `not-a-bundle-member` | No in-force bundle lists the task, including a task created ready with no dependency that nobody approved. |
-| `bundle-expired` | Now is at or past `expiresAt`. |
-| `bundle-revoked` | The bundle was revoked. |
-| `member-revoked` | This member was revoked; the other members are judged as usual. |
-| `hash-changed` | The current member hash differs from the approved one: content edited, or a dependency added or removed. |
+| `not-flagged` | The task is not marked for autopilot (a `--tasks` id, e.g. a ready task nobody marked). |
+| `owner-ref-missing` | No task ref `owner:<ref>`. |
+| `criteria-missing` | The task has no criterion. |
 | `task-missing` | Toodo no longer returns the task (archived or deleted). |
 | `not-planned` | Status is not `planned` and the task has no wait. |
-| `workspace-not-allowed` | The task's workspace is not in `autopilot.workspaces`. |
-| `prerequisite-missing` | An approved dependency is no longer returned by toodo (archived or bulk-deleted). |
+| `prerequisite-missing` | A dependency is no longer returned by toodo (archived or bulk-deleted). |
+| `prerequisite-open` | A dependency is not done yet. The next reconcile after it is done judges again. |
 | `prerequisite-not-adopted` | A dependency is done with resolution `not_adopted`. |
 | `cross-workspace-prerequisite` | A dependency lives in another workspace. |
-| `attempt-cap` | Attempts used are at least `min(attemptCap, attemptBudget)`. |
+| `already-attempted` | A launch attempt exists for the task and none is running. |
 | `ledger-ambiguous` | A ledger row for the task is `ambiguous`. |
 
 HOLD is temporary; the next reconcile judges again:
@@ -72,49 +61,45 @@ HOLD is temporary; the next reconcile judges again:
 | Reason | When |
 | --- | --- |
 | `waiting` | The task has a wait. A waiting in-progress task reads `planned` plus a wait, so it lands here too. |
-| `prerequisite-open` | A dependency is not done. |
 | `lane-live` | An open ledger row, a verified row whose lane is open, or a task ref `lane:<key>` naming an open lane. |
-| `wip-full` | WIP in use is at least `min(wip, wipCap)`. |
 | `quota-unreadable` | Claude quota could not be read. |
 | `quota-over-threshold` | A Claude account's 5h or 7d window is at or above `quotaMaxUsedPct`. |
 | `host-hold` | `dori can-launch` holds the default machine. |
-| `toodo-unreadable` | Toodo-server could not be read (token file missing or empty, network error, non-200). Every member is then HOLD with only this reason. |
+| `no-slot` | The task would launch, but the host's free slots went to tasks ahead of it. |
+
+## Slots
+
+The default machine's free slots are `guard.panesMax` minus its panes (the runner's thresholds for a remote machine). After every task is judged, only that many LAUNCH tasks keep LAUNCH: those with a due date first (earliest first), then by ascending id. The rest HOLD `no-slot`. With the pane limit off (`panesMax` 0) nothing caps the count. A held host gives every task `host-hold` and reports `slots=0`.
 
 ## Commands
 
 Lead-only; inside a lane each one exits with `LANE_PERMISSION_DENIED`.
 
 ```
-dori autopilot candidates [--json] [--record]
-dori autopilot approve <bundleId> --tasks 12,13 --owner-ref <ref> [--expires-days N] [--attempts N]
-dori autopilot revoke <bundleId> [--task N] [--reason TEXT]
-dori autopilot bundles [--json]
+dori autopilot candidates [--tasks 12,13] [--json] [--record]
 dori autopilot schedule
 ```
 
-- `candidates` judges every member of every in-force bundle. It's read-only unless `--record` is given, which writes shadow rows only. Text output:
+- `candidates` judges every planned task marked for autopilot, plus the `--tasks` ids. It's read-only unless `--record` is given, which writes shadow rows only. Text output:
 
   ```
-  AUTOPILOT mode=shadow record-only: nothing launches wip=<inUse>/<limit> bundles=<n>
-  AUTOPILOT_CANDIDATE #12 LAUNCH bundle=b1 would-launch
-  AUTOPILOT_CANDIDATE #13 HOLD bundle=b1 waiting, prerequisite-open
-  AUTOPILOT_CANDIDATE #14 REFUSE bundle=b1 hash-changed
+  AUTOPILOT mode=shadow record-only: nothing launches slots=<n|unlimited> candidates=<n>
+  AUTOPILOT_CANDIDATE #12 LAUNCH would-launch
+  AUTOPILOT_CANDIDATE #13 HOLD no-slot
+  AUTOPILOT_CANDIDATE #14 REFUSE owner-ref-missing, criteria-missing
   ```
 
-  With no bundle it prints `AUTOPILOT_NO_BUNDLES`. `--json` prints `{ mode, wip: {inUse, limit}, candidates: [{taskId, bundleId, verdict, reasons}] }`. Exit 0 whenever it judged (all HOLD included), 2 on usage errors.
-- `approve` reads the tasks from toodo now and stores their hashes. It refuses with exit 1 and `AUTOPILOT_APPROVE_REFUSED <why>` when toodo is unreadable, a task is missing, or a task's workspace is not in `autopilot.workspaces`.
-- `revoke` revokes the whole bundle, or one member with `--task`.
-- `bundles` lists the bundles and their state.
+  With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ mode, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit). Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
 - `schedule` adds, idempotently, the job `autopilot-reconcile`: cron `0 * * * *` (`Asia/Seoul`), kind `AUTOPILOT_RECONCILE`, catch-up `once`, running this same CLI as `autopilot candidates --record`. Its kind is digest under the default event policy, so it never wakes the lead by itself.
 
 ## Rules for the lead
 
-- A `TOODO_TASK_READY` event never launches by itself. Run `dori autopilot candidates --record`. Only a member of an in-force, owner-approved bundle that judges LAUNCH may run; in v1 even LAUNCH only records "would launch #<n>" in the bundle thread. Any other ready task is recorded, not launched.
+- A `TOODO_TASK_READY` event never launches by itself. Run `dori autopilot candidates --record` (add `--tasks <id>` to see why an unmarked ready task would not run). Only a marked task that judges LAUNCH may run; in v1 even LAUNCH only records "would launch #<n>". Any other ready task is recorded, not launched.
 - Reconcile at lead startup, on every `TOODO_TASK_READY` and `TOODO_TASK_RESYNC`, and hourly through `autopilot-reconcile`. Batch several ready lines into one reconcile.
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
 - Order: `start_task` with a `lane:<key>` ref first, then `dori launch`. After a restart, an in-progress task with no live lane is reported, never relaunched.
-- While any bundle is in force, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds bundle tasks.
-- `dori autopilot revoke` stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
+- While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
+- Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 
 ## Leaving shadow mode
 

@@ -460,7 +460,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     autopilot: parseAutopilotConfig(raw.autopilot, (line) => {
       if (warnedAutopilot) return;
       warnedAutopilot = true;
-      console.error(`CONFIG_AUTOPILOT_CLAMPED ${line} in ${path}`);
+      console.error(`CONFIG_AUTOPILOT_KEYS_IGNORED ${line} in ${path}`);
     }),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     stateDir,

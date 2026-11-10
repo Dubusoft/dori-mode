@@ -46,6 +46,10 @@ const toTask = (raw: unknown): ToodoTask => {
   if (!Array.isArray(criteria) || !criteria.every((c) => isRecord(c) && typeof c.text === "string" && typeof c.kind === "string")) return bad(`unreadable criteria (#${id})`);
   const wait = raw.wait ?? null;
   if (wait !== null && (!isRecord(wait) || typeof wait.until !== "number" || typeof wait.status !== "string")) return bad(`unreadable wait (#${id})`);
+  const autopilot = raw.autopilot ?? false;
+  if (typeof autopilot !== "boolean") return bad(`unreadable autopilot (#${id})`);
+  const dueDate = raw.dueDate ?? null;
+  if (dueDate !== null && typeof dueDate !== "string") return bad(`unreadable dueDate (#${id})`);
   return {
     id, workspaceId: raw.workspaceId, title: raw.title, description: raw.description, status: raw.status as ToodoTask["status"],
     resolution: resolution as ToodoTask["resolution"], dependsOn: dependsOn as number[], refs: refs as string[],
@@ -53,6 +57,7 @@ const toTask = (raw: unknown): ToodoTask => {
       text: c.text as string, kind: c.kind as string, ...(typeof c.target === "string" ? { target: c.target } : {}),
     })),
     wait: wait === null ? null : { until: (wait as { until: number }).until, status: (wait as { status: string }).status },
+    autopilot, dueDate,
   };
 };
 
@@ -106,6 +111,16 @@ export class ToodoClient {
       out.push(...reply.map(toTask));
     }
     return out;
+  }
+
+  /**
+   * The planned tasks marked for autopilot, of every workspace. The RPC task filter has no autopilot key, so this reads
+   * every planned task and keeps the marked ones.
+   */
+  async flaggedTasks(): Promise<ToodoTask[]> {
+    const reply = await this.call("list_tasks", { filter: { statuses: ["planned"] } });
+    if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_tasks did not answer a task list");
+    return reply.map(toTask).filter((t) => t.autopilot);
   }
 
   /** One task, or undefined when toodo-server has no such task (missing or archived). */
