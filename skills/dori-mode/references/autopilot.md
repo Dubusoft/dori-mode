@@ -77,7 +77,7 @@ HOLD is temporary; the next tick judges again:
 
 ## Slots
 
-The default machine's free slots are `guard.panesMax` minus its panes (the runner's thresholds for a remote machine). After every task is judged, only that many LAUNCH tasks keep LAUNCH: those with a due date first (earliest first), then by ascending id. The rest HOLD `no-slot`. With the pane limit off (`panesMax` 0) nothing caps the count. A held host gives every task `host-hold` and reports `slots=0`.
+The default machine's free slots are `guard.panesMax` minus its panes (the runner's thresholds for a remote machine). After every task is judged, only that many LAUNCH tasks keep LAUNCH: those with a due date first (earliest first), then by ascending id. The rest HOLD `no-slot`. The tick and launch count slots the same way: other tasks' reservations that aren't running yet are subtracted first, so `slots=` already counts them. With the pane limit off (`panesMax` 0) nothing caps the count. A held host gives every task `host-hold` and reports `slots=0`.
 
 ## Commands
 
@@ -106,7 +106,7 @@ dori autopilot resume
 
 ## Supervisor tick
 
-The supervisor judges the same candidates itself every `autopilot.tickSec` (5 minutes by default; sooner after a toodo task event, `tasks-changed` included, at most once per 15 s) and writes the hour's shadow rows. In mode `off` it judges nothing. In mode `shadow`, or while paused, it stops there. In mode `on` it wakes the lead with urgent `AUTOPILOT_READY #12,#15 slots=<n|unlimited>` only when the set of LAUNCH tasks or the free slots change, and once more as `AUTOPILOT_READY ... again` every 30 minutes while the same set waits; a tick with nothing to launch (or in shadow, or paused) forgets the set, so it is news again when it comes back or the pause lifts. A tick that cannot read toodo logs `AUTOPILOT_TICK_ERROR <why>` once and tries again at the next tick. The tick runs only while the `toodo` event source is enabled, and it replaced the hourly `autopilot-reconcile` schedule job, which the supervisor removes at startup (`AUTOPILOT_RECONCILE_JOB_REMOVED`).
+The supervisor judges the same candidates itself every `autopilot.tickSec` (5 minutes by default). A toodo task event (`tasks-changed` included) or a local change (a reservation, its settle, a lane opening or closing) brings the next judging forward: it runs once things are quiet for 10 s, and at most 60 s after the first change. Each judging writes the hour's shadow rows. In mode `off` it judges nothing. In mode `shadow`, or while paused, it stops there. In mode `on` it wakes the lead with urgent `AUTOPILOT_READY #12,#15 slots=<n|unlimited>` only when a task id joins the LAUNCH set; a set that only shrinks, or whose slots change, is remembered silently. Every 30 minutes after the last wake, while a LAUNCH set still waits, it sends `AUTOPILOT_READY ... again` naming the current set; a tick with nothing to launch (or in shadow, or paused) forgets the set, so it is news again when it comes back or the pause lifts. A tick that cannot read toodo logs `AUTOPILOT_TICK_ERROR <why>` once and tries again at the next tick. The tick runs only while the `toodo` event source is enabled, and it replaced the hourly `autopilot-reconcile` schedule job, which the supervisor removes at startup (`AUTOPILOT_RECONCILE_JOB_REMOVED`).
 
 ## Rules for the lead
 

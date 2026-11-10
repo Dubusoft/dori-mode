@@ -176,6 +176,16 @@ test("the host's free slots cap LAUNCH; a held host gives slots=0 and holds ever
   expect(held.out.slice(1).every((l) => l.endsWith("HOLD host-hold"))).toBe(true);
 });
 
+test("candidates subtract another task's pending reservation from host slots", async () => {
+  store.put({
+    id: "toodo:99/autopilot-launch/1", lane: "toodo:99", action: "autopilot-launch", target: "1", state: "planned",
+    detail: "planned", data: JSON.stringify({ laneKey: "ap-99-1" }), attempts: 1, at: T0, updatedAt: T0,
+  });
+  const r = await harness([task(12), task(13)], { ok: true, slots: 2 }).run("candidates");
+  expect(r.out[0]).toBe("AUTOPILOT mode=shadow record-only: nothing launches slots=1 candidates=2");
+  expect(r.out.slice(1).filter((line) => line.includes(" LAUNCH "))).toHaveLength(1);
+});
+
 test("--record writes one shadow row per task, and a second run in the same hour adds none", async () => {
   const h = harness([task(12), task(13, { wait: { until: T0 / 1000 + 3600, status: "planned" } })]);
   const shadows = () => store.list({ lane: AUTOPILOT_LANE }).filter((op) => op.action === SHADOW_ACTION).map((op) => [op.target, op.state, op.detail]);

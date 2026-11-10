@@ -67,6 +67,7 @@ import { CiFollowUp } from "./ci-follow.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
+import { autopilotLocalStateKey } from "./autopilot.ts";
 import { judgeCandidates, liveJudgeDeps, RECONCILE_JOB } from "./autopilot-cli.ts";
 import { AUTOPILOT_KICK_EVENTS, AutopilotTick } from "./autopilot-tick.ts";
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
@@ -930,6 +931,7 @@ export const supervise = async (
     const autopilot = new AutopilotTick({
       mode: () => deps.config.autopilot.mode, tickMs: () => deps.config.autopilot.tickSec * 1000,
       judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), store: ops, enqueue: enqueueOf("toodo"), now: deps.clock.now,
+      localState: async () => autopilotLocalStateKey(ops, new Set((await deps.registry.open()).map((l) => l.key))),
       log: (line) => { console.error(line); },
     });
     // The tick replaced the hourly autopilot-reconcile schedule job; one left from an earlier version is removed.

@@ -173,16 +173,19 @@ const readTasks = async (deps: AutopilotDeps, extraIds: readonly number[]): Prom
 };
 
 /**
- * Judges every planned task marked for autopilot plus `extraIds`. Quota and host are probed only when there is a task to
- * judge. Throws ToodoUnreadable when toodo cannot be read, since nothing can be judged.
+ * Judges every planned task marked for autopilot plus `extraIds`, subtracting pending reservations from host slots.
+ * Quota and host are probed only when there is a task to judge. Throws ToodoUnreadable when toodo cannot be read.
  */
 export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number[] = []): Promise<CandidatesReport> => {
   const { tasks, ids } = await loadTasks(deps, extraIds);
   const paused = readPause(deps.pauseFile) !== undefined;
   if (!ids.length) return { mode: deps.config.mode, paused, slots: null, verdicts: [] };
   const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
-  const verdicts = judgeAll({ tasks, ledger: ledgerRows(deps.store), openLanes, quota, host, config: deps.config }, ids);
-  return { mode: deps.config.mode, paused, slots: host.ok ? host.slots ?? null : 0, verdicts };
+  const ledger = ledgerRows(deps.store);
+  const pending = pendingReservations(ledger, openLanes);
+  const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
+  const verdicts = judgeAll({ tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, ids);
+  return { mode: deps.config.mode, paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts };
 };
 
 /**

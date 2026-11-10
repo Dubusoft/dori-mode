@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  candidatesJson, DEFAULT_AUTOPILOT, formatCandidates, type JudgeContext, judge, judgeAll, ledgerRows, ledgerState,
+  autopilotLocalStateKey, candidatesJson, DEFAULT_AUTOPILOT, formatCandidates, type JudgeContext, judge, judgeAll, ledgerRows, ledgerState,
   parseAutopilotConfig, recordShadow, type ToodoTask,
 } from "../src/autopilot.ts";
 import { JsonOperations, type Operation, type OperationState } from "../src/operations.ts";
@@ -162,6 +162,19 @@ test("ledgerRows reads only launch-attempt rows", () => {
   store.put(attempt(12, 1, "failed"));
   recordShadow(store, T0, [{ taskId: 12, verdict: "LAUNCH", reasons: [] }]);
   expect(ledgerRows(store).map((op) => op.id)).toEqual(["toodo:12/autopilot-launch/1"]);
+});
+
+test("autopilotLocalStateKey tracks open lanes and open launch rows, ignoring shadow rows", () => {
+  const empty = autopilotLocalStateKey(store, new Set());
+  const shadow = recordShadow(store, T0, [{ taskId: 12, verdict: "LAUNCH", reasons: [] }]);
+  expect(autopilotLocalStateKey(store, new Set())).toBe(empty);
+  store.put(attempt(12, 1, "planned"));
+  const planned = autopilotLocalStateKey(store, new Set());
+  expect(planned).not.toBe(empty);
+  store.put(attempt(12, 1, "verified"));
+  expect(autopilotLocalStateKey(store, new Set())).toBe(empty);
+  expect(autopilotLocalStateKey(store, new Set(["lane-a"]))).not.toBe(empty);
+  expect(shadow).toHaveLength(1);
 });
 
 test("recordShadow writes one verified row per task per hour", () => {
