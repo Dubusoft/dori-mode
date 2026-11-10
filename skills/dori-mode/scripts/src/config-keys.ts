@@ -84,6 +84,7 @@ export const pruneDoriConfig = (raw: Json): Pruned => {
     if (!kept.includes(key)) removed.push(key);
     else if (key === "hooks" && isRecord(value)) next[key] = pruneSub(key, value, (sub) => hooks.includes(sub), removed);
     else if (key === "laneSandbox" && isRecord(value)) next[key] = pruneSub(key, value, (sub) => sub !== "default", removed);
+    else if (key === "placement" && isRecord(value)) next[key] = pruneSub(key, value, (sub) => sub !== "workspaces", removed);
     else if (key === "runners" && Array.isArray(value)) removed.push(key);
     else if (key === "runners" && isRecord(value)) next[key] = pruneSub(key, value, (sub) => !LEGACY_RUNNER_KEYS.includes(sub), removed);
     else next[key] = value;

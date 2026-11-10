@@ -26,7 +26,7 @@ import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { syncRegistry } from "./sync.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import {
-  candidatesLine, checkMachine, LOCAL_MACHINE, placementLine, placementTable, placementWarnings, planLaunch, resolvePlacement, type RunnerPlacement,
+  candidatesLine, checkMachine, LOCAL_MACHINE, placementLine, placementTable, planLaunch, resolvePlacement, type RunnerPlacement,
   runnerPlacements, verdictLine,
 } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
@@ -1252,7 +1252,6 @@ try {
       const reports = flags.values.all ? [] : await placementReports(config.stateDir);
       const input = { machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" };
       const p = flags.values.all ? undefined : resolvePlacement(input, config.placement, reports);
-      for (const line of p ? placementWarnings(p) : []) console.error(line);
       const machines = p ? [p.machine] : [LOCAL_MACHINE, ...listed.map((m) => m.label)];
       // An offline owning runner holds the launch without observing anything, and several declaring runners are picked
       // among exactly as a launch would: both through planLaunch.
@@ -1283,7 +1282,6 @@ try {
         console.log(placementLine(p));
         // Without checking room, the preferred candidate (online, defaultMachine first) stands for the pick.
         if (p.candidates) console.log(candidatesLine(p, p.online === false ? "none" : p.machine));
-        for (const line of placementWarnings(p)) console.error(line);
         if (p.online === false) console.log(`HOLD machine=${p.machine} runner ${p.machine} that owns ${p.rule} is offline; the launch waits for it`);
       }
       process.exit(0);

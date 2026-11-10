@@ -8,19 +8,19 @@ import type { HostSample } from "../src/host-guard.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
 import {
-  checkMachine, DEPRECATED_TABLE_IGNORED, DEPRECATED_TABLE_READ, LOCAL_MACHINE, machineVerdict, placementLine, placementTable,
-  placementWarnings, planLaunch, resolvePlacement, type RunnerPlacement, runnerPlacements, verdictLine,
+  checkMachine, LOCAL_MACHINE, machineVerdict, placementLine, placementTable, planLaunch, resolvePlacement, type RunnerPlacement,
+  runnerPlacements, verdictLine,
 } from "../src/placement.ts";
 import type { MachineSample, SampleResult } from "../src/remote-guard.ts";
 import { readRunnerRows, RunnerHub, runnerWorktreeRoot } from "../src/runner/hub.ts";
 import { type MachineObservation, PROTO, runnerControl, validateFrame } from "../src/runner/protocol.ts";
 
-const config = (p: Partial<PlacementConfig> = {}): PlacementConfig => ({ defaultMachine: "local", workspaces: {}, fallback: [], ...p });
+const config = (p: Partial<PlacementConfig> = {}): PlacementConfig => ({ defaultMachine: "local", fallback: [], ...p });
 const RESEARCH = "report posted in the thread";
 const T: GuardThresholds = defaultConfig("/home/test").guard;
 
 test("an explicit --machine wins over every workspace rule and is not movable", () => {
-  const p = resolvePlacement({ machine: "mini", cwd: "/data/repos/app", done: "merged acme/app#1" }, config({ workspaces: { "/data/repos": "big", "*": "big" } }));
+  const p = resolvePlacement({ machine: "mini", cwd: "/data/repos/app", done: "merged acme/app#1" }, config({ defaultMachine: "big" }));
   expect(p).toEqual({ machine: "mini", source: "flag", movable: false });
 });
 
@@ -28,40 +28,16 @@ test("a blank --machine is ignored", () => {
   expect(resolvePlacement({ machine: "  ", done: RESEARCH }, config({ defaultMachine: "big" }))).toEqual({ machine: "big", source: "default", movable: true });
 });
 
-test("the longest path prefix of --cwd wins, matching only at a path boundary", () => {
-  const workspaces = { "/data/repos": "big", "/data/repos/app": "mini", "/data/repos/app-old/": "old", "*": "star" };
-  const at = (cwd: string) => resolvePlacement({ cwd, done: RESEARCH }, config({ workspaces }));
-  expect(at("/data/repos/app/sub")).toEqual({ machine: "mini", source: "workspace", rule: "/data/repos/app", movable: false });
-  expect(at("/data/repos/app")).toMatchObject({ machine: "mini", rule: "/data/repos/app" });
-  expect(at("/data/repos/apple")).toMatchObject({ machine: "big", rule: "/data/repos" });
-  expect(at("/data/repos/app-old/x")).toMatchObject({ machine: "old", rule: "/data/repos/app-old/" });
-  expect(at("/srv/other")).toMatchObject({ machine: "star", rule: "*" });
-});
-
-test("a path rule beats a repo rule; the first Done repo that is a key wins, case-insensitively", () => {
-  const workspaces = { "/data/repos/app": "mini", "Acme/Lib": "lib-box", "acme/app": "app-box" };
-  const done = "merged acme/other#3; merged ACME/lib#1; merged acme/app#2";
-  expect(resolvePlacement({ cwd: "/data/repos/app", done }, config({ workspaces }))).toMatchObject({ machine: "mini", rule: "/data/repos/app" });
-  expect(resolvePlacement({ cwd: "/elsewhere", done }, config({ workspaces }))).toEqual({ machine: "lib-box", source: "workspace", rule: "Acme/Lib", movable: false });
-  expect(resolvePlacement({ done }, config({ workspaces }))).toMatchObject({ machine: "lib-box", rule: "Acme/Lib" });
-  expect(resolvePlacement({ done: "pr ACME/app feat/x" }, config({ workspaces }))).toEqual({ machine: "app-box", source: "workspace", rule: "acme/app", movable: false });
-});
-
-test("\"*\" catches every other workspace task, including --pane and --workspace launches", () => {
-  const c = config({ workspaces: { "*": "big" }, defaultMachine: "mini" });
-  expect(resolvePlacement({ pane: "w:p1", done: RESEARCH }, c)).toEqual({ machine: "big", source: "workspace", rule: "*", movable: false });
-  expect(resolvePlacement({ workspace: "w", done: RESEARCH }, c)).toMatchObject({ machine: "big", rule: "*" });
-  expect(resolvePlacement({ done: "closed acme/app#9" }, c)).toMatchObject({ machine: "big", rule: "*" });
-});
-
-test("an unmapped workspace task runs locally, not on defaultMachine", () => {
-  expect(resolvePlacement({ cwd: "/data/repos/app", done: RESEARCH }, config({ defaultMachine: "big", workspaces: { "/srv": "mini" } })))
-    .toEqual({ machine: LOCAL_MACHINE, source: "workspace", movable: false });
+test("while no runner declares a repo, every workspace task (--cwd, --pane, --workspace, a Done repo) runs locally, not on defaultMachine", () => {
+  const c = config({ defaultMachine: "big" });
+  for (const input of [{ cwd: "/data/repos/app", done: RESEARCH }, { pane: "w:p1", done: RESEARCH }, { workspace: "w", done: RESEARCH }, { done: "closed acme/app#9" }]) {
+    expect(resolvePlacement(input, c)).toEqual({ machine: LOCAL_MACHINE, source: "workspace", movable: false });
+  }
 });
 
 test("a workspace-less launch goes to defaultMachine and may fall back", () => {
   expect(resolvePlacement({ done: RESEARCH }, config())).toEqual({ machine: "local", source: "default", movable: true });
-  expect(resolvePlacement({ done: RESEARCH }, config({ defaultMachine: "big", workspaces: { "*": "mini" } }))).toEqual({ machine: "big", source: "default", movable: true });
+  expect(resolvePlacement({ done: RESEARCH }, config({ defaultMachine: "big" }))).toEqual({ machine: "big", source: "default", movable: true });
 });
 
 const sample = (s: Partial<MachineSample> = {}): SampleResult => ({ ok: true, sample: { os: "linux", load1: 999, memFreePct: 60, swapFreeGb: 4, swapTotalGb: 8, diskFreeGb: 200, ...s } });
@@ -162,7 +138,7 @@ const REPORTS = [
 ];
 
 test("a declared repo goes to the runner declaring it, by Done repo or by a --cwd under its path, with that path as cwd", () => {
-  const c = config({ defaultMachine: "mini", workspaces: { "*": "local" } });
+  const c = config({ defaultMachine: "mini" });
   expect(resolvePlacement({ done: "merged ACME/blog#1" }, c, REPORTS))
     .toEqual({ machine: "mini", source: "runner", rule: "acme/blog", movable: false, cwd: "/Users/me/work/repos/blog", online: true });
   expect(resolvePlacement({ cwd: "/data/repos/dori/sub", done: RESEARCH }, c, REPORTS)).toMatchObject({ machine: "local", rule: "acme/dori" });
@@ -171,22 +147,14 @@ test("a declared repo goes to the runner declaring it, by Done repo or by a --cw
   expect(resolvePlacement({ machine: "local", done: "merged acme/blog#1" }, c, REPORTS).machine).toBe("local");
 });
 
-test("once a runner declares, an undeclared or only-detected repo follows defaultMachine and the config table is not read", () => {
-  const c = config({ defaultMachine: "mini", workspaces: { "acme/extra": "local", "*": "local" } });
-  for (const done of ["merged acme/extra#1", "merged acme/unknown#1"]) {
-    const p = resolvePlacement({ done }, c, REPORTS);
-    expect(p).toEqual({ machine: "mini", source: "default", movable: true });
-    expect(placementWarnings(p)).toEqual([]);
-  }
+test("once a runner declares, an undeclared or only-detected repo follows defaultMachine", () => {
+  const c = config({ defaultMachine: "mini" });
+  for (const done of ["merged acme/extra#1", "merged acme/unknown#1"]) expect(resolvePlacement({ done }, c, REPORTS)).toEqual({ machine: "mini", source: "default", movable: true });
 });
 
-test("without any runner declaring, the config table decides and says it is deprecated", () => {
-  const c = config({ workspaces: { "acme/app": "big" } });
+test("a repo only detected while no runner declares any runs locally", () => {
   const undeclared = [runner("mini", [], { detected: [["acme/app", "/w/app"]] })];
-  const p = resolvePlacement({ done: "merged acme/app#1" }, c, undeclared);
-  expect(p).toEqual({ machine: "big", source: "workspace", rule: "acme/app", movable: false });
-  expect(placementWarnings(p)).toEqual([DEPRECATED_TABLE_READ]);
-  expect(placementWarnings(resolvePlacement({ done: "merged acme/other#1" }, c, undeclared))).toEqual([]);
+  expect(resolvePlacement({ done: "merged acme/app#1" }, config({ defaultMachine: "mini" }), undeclared)).toEqual({ machine: LOCAL_MACHINE, source: "workspace", movable: false });
 });
 
 test("every runner declaring the same repo is a candidate, in fallback then label order; the preferred online one is placed", () => {
@@ -218,16 +186,15 @@ test("planLaunch holds a launch for its offline owning runner without checking o
   expect(verdictLine(plan.check.machine, plan.check.verdict)).toBe("HOLD machine=mini runner mini that owns acme/blog is offline; the launch waits for it");
 });
 
-test("placementTable lists declared repos per runner, only-detected repos, the default, and the deprecated table", () => {
+test("placementTable lists declared repos per runner, only-detected repos and the default", () => {
   const rows = [...REPORTS.map((r) => (r.machine === "mini" ? { ...r, online: false } : r)), runner("big", [["acme/twice", "/a"]]), runner("spare", [["acme/twice", "/b"]])];
-  expect(placementTable(rows, config({ defaultMachine: "mini", fallback: ["local"], workspaces: { "*": "local" } }))).toEqual([
+  expect(placementTable(rows, config({ defaultMachine: "mini", fallback: ["local"] }))).toEqual([
     "WORKSPACE repo=acme/blog machine=mini path=/Users/me/work/repos/blog runner=offline",
     "WORKSPACE repo=acme/dori machine=local path=/data/repos/dori runner=online",
     "WORKSPACE repo=acme/twice machine=big path=/a runner=online",
     "WORKSPACE repo=acme/twice machine=spare path=/b runner=online",
     "DETECTED repo=acme/extra machine=mini path=/Users/me/work/repos/extra (no runner declares it)",
     "DEFAULT machine=mini fallback=local",
-    DEPRECATED_TABLE_IGNORED,
   ]);
   expect(placementTable([], config())).toEqual(["DEFAULT machine=local fallback=-"]);
 });

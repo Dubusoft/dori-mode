@@ -107,10 +107,11 @@ test("planLaunch moves a held default launch to the first fallback machine with 
 });
 
 test("planLaunch keeps a pinned or workspace launch on its HOLD target, and a default one when no fallback has room", async () => {
-  const p = placement({ defaultMachine: "big", workspaces: { "*": "big" }, fallback: ["local"] });
+  const p = placement({ defaultMachine: "big", fallback: ["local"] });
+  const reports: RunnerPlacement[] = [{ machine: "big", online: true, declared: [{ repo: "acme/x", path: "/repo/x" }], detected: [] }];
   for (const input of [{ machine: "big", done: "" }, { cwd: "/repo/x", done: "" }]) {
     const c = checks({ big: ["full"] });
-    const plan = await planLaunch(input, p, c.check);
+    const plan = await planLaunch(input, p, c.check, reports);
     expect(plan.check).toEqual({ machine: "big", verdict: { ok: false, reasons: ["full"] }, summary: "" });
     expect(c.asked).toEqual(["big"]);
   }

@@ -110,8 +110,6 @@ export const MAX_POINTER_CHARS = 800;
 export type PlacementConfig = {
   /** Machine for workspace-less launches: "local" (default) or a machine label. */
   readonly defaultMachine: string;
-  /** Workspace -> machine. Key: an absolute path prefix matched against --cwd, an owner/repo matched (case-insensitive) against the Done line's repos, or "*" for every other workspace task. Value: "local" or a machine label. */
-  readonly workspaces: Readonly<Record<string, string>>;
   /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
   readonly fallback: readonly string[];
 };
@@ -244,7 +242,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadChildWaitMaxMin: 60,
   store: "json",
   ciMergeBase: "dev",
-  placement: { defaultMachine: "local", workspaces: {}, fallback: [] },
+  placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
 });
 
@@ -340,14 +338,13 @@ const buttonHooks = (raw: unknown, path: string): Readonly<Record<string, ArgvTe
 
 /** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
 const placement = (raw: unknown): PlacementConfig => {
-  if (raw === undefined) return { defaultMachine: "local", workspaces: {}, fallback: [] };
+  if (raw === undefined) return { defaultMachine: "local", fallback: [] };
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("placement must be an object");
   const o = raw as Record<string, unknown>;
   const fallback = o.fallback ?? [];
   if (!Array.isArray(fallback) || fallback.some((m) => typeof m !== "string" || !m.trim())) throw new TypeError("placement.fallback must be an array of machine names");
   return {
     defaultMachine: typeof o.defaultMachine === "string" && o.defaultMachine.trim() ? o.defaultMachine.trim() : "local",
-    workspaces: Object.fromEntries(Object.entries(stringRecord(o.workspaces)).map(([key, machine]) => [key, machine.trim()])),
     fallback: (fallback as string[]).map((m) => m.trim()),
   };
 };
@@ -408,6 +405,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
+  if (isRecord(raw.placement) && "workspaces" in raw.placement) ignored.push("placement.workspaces");
   ignored.push(...ignoredRunnerKeys(raw.runners));
   if (ignored.length && !warnedIgnoredKeys) {
     warnedIgnoredKeys = true;
