@@ -692,9 +692,15 @@ export const openStore = (stateDir: string, kind: StoreKind, now: () => number =
   return new SqliteStore(sqlitePath, { create: true, now });
 };
 
-/** The store that holds this state dir's journal on disk: sqlite once imported (no supervisor.json left), else json. */
-export const storeOnDisk = (stateDir: string): StoreKind =>
-  existsSync(join(stateDir, SQLITE_FILE)) && !existsSync(join(stateDir, JOURNAL_FILE)) ? "sqlite" : "json";
+/**
+ * The store that holds this state dir's journal on disk: sqlite once imported (no supervisor.json left), else json.
+ * An import marker with neither file left (database lost) also answers sqlite, so openStore stops with STORE_MISSING
+ * instead of starting an empty json journal.
+ */
+export const storeOnDisk = (stateDir: string): StoreKind => {
+  if (existsSync(join(stateDir, JOURNAL_FILE))) return "json";
+  return existsSync(join(stateDir, SQLITE_FILE)) || existsSync(join(stateDir, PRE_SQLITE_FILE)) ? "sqlite" : "json";
+};
 
 /**
  * Read-only views for readers outside the Supervisor (status): they never parse the journal file

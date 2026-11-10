@@ -302,7 +302,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         const next = remote ? cfg : await loadConfig();
         const reloaded = runnerPolicy(runnerDir, remote, next);
         guard.reconfigure({ ...next.guard, ...reloaded.guard }, reloaded.heavyKill ?? next.heavyKill);
-        return { policy: reloaded, restart: !remote && diskGuardPath(next) !== dataPath ? ["diskGuardPath"] : [] };
+        return { policy: reloaded, restart: !remote && diskGuardPath(next) !== dataPath ? ["stateDir"] : [] };
       },
       applied: () => { watchRepos(); rescan(); },
       publish: (body) => { client?.publish("runner.config", body); },

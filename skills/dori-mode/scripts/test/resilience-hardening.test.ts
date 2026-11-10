@@ -81,16 +81,13 @@ test("every write bumps the version and update applies its change to the fresh l
   expect(await registry.update("missing", (current) => current ?? undefined)).toBeNull();
 });
 
-// Item 4: the disk guard checks the state directory's filesystem. The local runner samples it (runner/main.ts passes
-// diskGuardPath), so the supervisor's own guard sweep runs no df.
-test("the disk guard checks the state directory, or diskGuardPath when set, and the guard sweep runs no df itself", async () => {
+// Item 4: the disk guard checks the state directory's filesystem, and the supervisor's own guard sweep runs no df.
+test("the disk guard checks the state directory and the guard sweep runs no df itself", async () => {
   const dir = state();
-  for (const [patch, expected] of [[{}, dir], [{ diskGuardPath: "/srv/data" }, "/srv/data"]] as const) {
-    const world = newWorld();
-    const deps = depsFor(world, fakeClock(1_800_000_000_000), dir, patch);
-    expect(diskGuardPath(deps.config)).toBe(expected);
-    const guard = supervisorSweeps(deps, dir).find(([name]) => name === "guard");
-    await guard?.[1](async () => {});
-    expect(world.calls.filter((c) => c[0] === "df")).toEqual([]);
-  }
+  const world = newWorld();
+  const deps = depsFor(world, fakeClock(1_800_000_000_000), dir);
+  expect(diskGuardPath(deps.config)).toBe(dir);
+  const guard = supervisorSweeps(deps, dir).find(([name]) => name === "guard");
+  await guard?.[1](async () => {});
+  expect(world.calls.filter((c) => c[0] === "df")).toEqual([]);
 });

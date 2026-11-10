@@ -11,7 +11,6 @@
   "defaultModel": "anthropic-subscription/claude-opus-5-5",
   "launchKeywords": "ulw set goal and work",
   "massLaunchKeywords": "/mass-ulw set goal and work",
-  "laneThinking": "medium",
   "leadArgs": [],
   "leadDiet": true,
   "leadStuckRestartMin": 30,
@@ -28,13 +27,11 @@
   "githubIssueAuthors": [
     "your-github-login"
   ],
-  "toodoEvents": { "url": "http://127.0.0.1:47616", "tokenFile": "~/.local/share/toodo-server/web-token", "enabled": true },
   "discord": {
     "applicationId": "1100000000000000001",
     "guildId": "1100000000000000002",
     "ownerId": "<owner Discord user id>"
   },
-  "sessionsDir": "~/.omo/agent/sessions",
   "nudgeAfterMin": 15,
   "idleEscalateMin": 30,
   "drift": { "enabled": true, "milestoneOverdueMin": 90, "ciFailStreak": 3 },
@@ -87,7 +84,6 @@
   },
   "runTimeoutMs": 60000,
   "sweepMachineDeadlineMs": 20000,
-  "store": "json",
   "ciConfirmMin": 20,
   "ciMergeBase": "dev",
   "delivery": {
@@ -103,12 +99,7 @@
       "takeMaxBytes": 16384
     }
   },
-  "diskGuardPath": "",
   "guardMachines": {},
-  "memoryCheck": {
-    "repo": "",
-    "maxKb": 15
-  },
   "hooks": {
     "threadReply": [
       "my-messenger",
