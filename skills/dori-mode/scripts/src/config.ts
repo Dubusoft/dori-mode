@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { DEFAULT_DISPLAY_TIME_ZONE, validTimeZone } from "./display-time.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
@@ -156,6 +157,8 @@ export type DoriConfig = {
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
   readonly ownerLanguage?: string;
+  /** IANA time zone owner-facing system messages show times in, labelled with its abbreviation (display-time.ts). */
+  readonly displayTimeZone: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
   /**
@@ -242,6 +245,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadChildWaitMaxMin: 60,
   store: "json",
   ciMergeBase: "dev",
+  displayTimeZone: DEFAULT_DISPLAY_TIME_ZONE,
   placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
 });
@@ -355,9 +359,16 @@ const placement = (raw: unknown): PlacementConfig => {
  */
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
-  "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
+  "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes",
 ] as const;
+
+/** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
+const displayTimeZone = (raw: unknown): string => {
+  if (raw == null || (typeof raw === "string" && !raw.trim())) return DEFAULT_DISPLAY_TIME_ZONE;
+  if (typeof raw !== "string" || !validTimeZone(raw.trim())) throw new TypeError(`displayTimeZone must be an IANA time zone name such as Asia/Seoul or UTC, not ${JSON.stringify(raw)}`);
+  return raw.trim();
+};
 
 /** The config's `alertsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
 const alertsChannel = (raw: unknown): string | undefined => {
@@ -437,6 +448,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...merged,
     ...(alerts ? { alertsChannel: alerts } : {}),
     laneRules: laneRules(raw.laneRules),
+    displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),

@@ -32,7 +32,8 @@ test("the Discord /quota reply is pi-quota's own block with no QUOTA line, with 
 test("the dori quota line names every account with each window's usage and reset time, and no gate verdict", async () => {
   const read = await readUsage(lookupOf(claude(15, 50, { account: "a" }), { kind: "success", provider: "anthropic", account: "b", windows: [{ label: "Weekly", remainingPercent: 90 }] }), NOW, AbortSignal.timeout(5_000));
   expect(read.text).toBe("pi-quota text");
-  expect(usageLine(read.usage ?? { at: NOW, accounts: [] })).toBe("QUOTA | Claude a: 5h 85% used (resets in 3h, 10-22 15:10 KST), 7d 50% used (resets in 1d 10h, 10-23 22:00 KST) | b: 7d 10% used");
+  expect(usageLine(read.usage ?? { at: NOW, accounts: [] }, "Asia/Seoul")).toBe("QUOTA | Claude a: 5h 85% used (resets in 3h, 10-22 15:10 KST), 7d 50% used (resets in 1d 10h, 10-23 22:00 KST) | b: 7d 10% used");
+  expect(usageLine(read.usage ?? { at: NOW, accounts: [] })).toContain("(resets in 3h, 10-22 06:10 UTC)");
   expect(await readUsage(lookupOf(openai), NOW, AbortSignal.timeout(5_000))).toEqual({ text: "pi-quota text" });
   expect(NO_CLAUDE).toBe("QUOTA | no Claude subscription usage reported");
 });
