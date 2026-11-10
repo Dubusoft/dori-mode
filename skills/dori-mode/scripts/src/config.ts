@@ -149,7 +149,11 @@ export type DoriConfig = {
   readonly buttonHooks?: Readonly<Record<string, ArgvTemplate>>;
   /** GitHub logins whose new or reopened issues wake the lead as GH_ISSUE; anyone else is digest only. */
   readonly githubIssueAuthors: readonly string[];
-  /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
+  /**
+   * Only worktrees under this directory are removed by the closed-lane cleanup sweep. Empty (the default): the local
+   * runner's reported root (runner-config `worktreeRoot`, else `<reposRoot>/worktrees`) is used, and without one the
+   * sweep is off.
+   */
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
   readonly ownerLanguage?: string;
@@ -226,7 +230,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadArgs: [],
   discordChannels: [],
   githubIssueAuthors: [],
-  worktreeRoot: "/data/repos/worktrees",
+  worktreeRoot: "",
   heavySlots: 1,
   heavyKill: ["qemu-system", "emulator", "expo export"],
   heavyMaxLoad: 80,

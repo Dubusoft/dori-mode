@@ -184,7 +184,7 @@ test("a key without a value shows its effective default, and hinted callers get 
     current: { discordChannels: ["123"], defaultModel: "p/m", leadModel: "p/lead" }, patch: {}, unset: [], prompt, interactive: true,
     seen: new Set(), mode: "full", defaults: doriConfigDefault("/h"), hinted: true, log: (l) => lines.push(l),
   });
-  expect(questions.find((q) => q.startsWith("worktreeRoot "))).toEndWith("(default: /data/repos/worktrees)");
+  expect(questions.find((q) => q.startsWith("worktreeRoot "))).not.toContain("(default:");
   expect(questions.find((q) => q.startsWith("alertsChannel "))).toEndWith("(default: 123)");
   expect(questions.find((q) => q.startsWith("leadModel "))).not.toContain("(default:");
   expect(lines).toEqual([]);

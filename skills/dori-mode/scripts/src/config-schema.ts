@@ -6,7 +6,7 @@ type Json = Record<string, unknown>;
 /** The top-level key that holds a file's schema version; absent means version 0 (written before versions existed). */
 export const CONFIG_SCHEMA_KEY = "schemaVersion";
 /** The version this dori writes. Raise it together with a new CONFIG_MIGRATIONS entry. */
-export const CONFIG_SCHEMA_VERSION = 1;
+export const CONFIG_SCHEMA_VERSION = 2;
 
 export type ConfigMigration = {
   /** The version a file has after this step. */
@@ -15,6 +15,11 @@ export type ConfigMigration = {
   readonly renames?: Readonly<Record<string, string>>;
   /** Key -> why config.json no longer reads it. Removal itself is warned about once first (pruneObsolete). */
   readonly removes?: Readonly<Record<string, string>>;
+  /**
+   * Key -> the built-in default a file written before this step got for it. A file without the key gets this value
+   * written, so a changed default never changes what an existing install does.
+   */
+  readonly fills?: Readonly<Record<string, unknown>>;
 };
 
 /** Every change to config.json's keys, oldest first; never edit a published step, add a new one. */
@@ -30,6 +35,8 @@ export const CONFIG_MIGRATIONS: readonly ConfigMigration[] = [
       toodoEvents: "the toodo event stream runs when its token file exists",
     },
   },
+  // worktreeRoot's built-in default became "" (the local runner's reported root, else no cleanup).
+  { to: 2, fills: { worktreeRoot: "/data/repos/worktrees" } },
 ];
 
 export class ConfigSchemaError extends Error {}
@@ -56,6 +63,8 @@ export type SchemaMigrated = {
   readonly next: Json;
   readonly from: number;
   readonly renamed: readonly (readonly [string, string])[];
+  /** The keys a step's `fills` wrote. */
+  readonly filled: readonly string[];
 };
 
 /**
@@ -71,8 +80,14 @@ export const migrateConfigSchema = (raw: Json): SchemaMigrated => {
   const next: Json = { ...raw };
   delete next[CONFIG_SCHEMA_KEY];
   const renamed: [string, string][] = [];
+  const filled: string[] = [];
   for (const m of CONFIG_MIGRATIONS) {
     if (m.to <= from) continue;
+    for (const [key, value] of Object.entries(m.fills ?? {})) {
+      if (key in next) continue;
+      next[key] = value;
+      filled.push(key);
+    }
     for (const [old, now] of Object.entries(m.renames ?? {})) {
       if (!(old in next)) continue;
       if (!(now in next)) next[now] = next[old];
@@ -80,5 +95,5 @@ export const migrateConfigSchema = (raw: Json): SchemaMigrated => {
       renamed.push([old, now]);
     }
   }
-  return { next, from, renamed };
+  return { next, from, renamed, filled };
 };

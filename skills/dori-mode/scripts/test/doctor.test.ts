@@ -426,7 +426,7 @@ test("doctor names each config value's source: file, default, env or derived, an
   const config = await loadConfig(path, f.deps.home);
   const checks = configSources({ ...f.deps, config, configPath: path, env: { DORI_STATE_DIR: config.stateDir } });
   expect(find(checks, "config.defaultModel").detail).toStartWith("file: ");
-  expect(find(checks, "config.worktreeRoot").detail).toBe('default: "/data/repos/worktrees"');
+  expect(find(checks, "config.worktreeRoot").detail).toBe('default: ""');
   expect(find(checks, "config.stateDir").detail).toStartWith("env DORI_STATE_DIR: ");
   expect(find(checks, "config.alertsChannel").detail).toBe('derived from discordChannels[0]: "500"');
   expect(find(checks, "config.store").detail).toStartWith("derived from ");
