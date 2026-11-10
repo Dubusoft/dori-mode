@@ -549,6 +549,23 @@ test("a config with a newer schemaVersion is refused before anything is written"
   expect(existsSync(join(d.home, ".dori", "state", CONFIG_REMOVALS_FILE))).toBe(false);
 });
 
+test("a pre-v2 config without worktreeRoot gets its old default written; a set value and a new file are left alone", async () => {
+  const d = deps();
+  const core = { discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~", stateDir: "~/.dori/state" };
+  await Bun.write(d.configPath, JSON.stringify({ schemaVersion: 1, ...core }));
+  expect(await runSetup(d, { migrate: true })).toBe(0);
+  expect(readJson(d.configPath)).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, worktreeRoot: "/data/repos/worktrees" });
+  expect(log.some((l) => l.startsWith("SETUP_KEY_SET worktreeRoot ("))).toBe(true);
+
+  await Bun.write(d.configPath, JSON.stringify({ worktreeRoot: "", ...core }));
+  expect(await runSetup(d, { migrate: true })).toBe(0);
+  expect(readJson(d.configPath).worktreeRoot).toBe("");
+
+  const fresh = deps({ home: join(state.dir, "fresh"), configPath: join(state.dir, "fresh", "config.json") });
+  expect(await runSetup(fresh, { token: TOKEN, channels: [CHANNEL], herdr: false })).toBe(0);
+  expect(readJson(fresh.configPath)).not.toHaveProperty("worktreeRoot");
+});
+
 test("a current config that needs no change is neither written nor backed up", async () => {
   const d = deps();
   const text = `${JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~", stateDir: "~/.dori/state" }, null, 2)}\n`;

@@ -115,6 +115,7 @@ export const pruneObsolete = (d: Pick<SetupDeps, "log">, stateDir: string, confi
   }
   resolveManagedPanes(stateDir, config);
   for (const [from, to] of migrated.renamed) d.log(`SETUP_KEY_RENAMED ${from} -> ${to}`);
+  for (const key of migrated.filled) d.log(`SETUP_KEY_SET ${key} (kept the built-in default it ran with; that default changed)`);
   const { next, removed } = pruneDoriConfig(migrated.next);
   const removalsPath = join(stateDir, CONFIG_REMOVALS_FILE);
   const warned = readSeenKeys(removalsPath);
@@ -541,7 +542,8 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   const seenPath = join(stateAbs, SETUP_KEYS_FILE);
   const seen = readSeenKeys(seenPath);
   const configured = await configureKeys({
-    specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateAbs, merged),
+    // A new file is written at the current version: no migration step, so no old default is filled in.
+    specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateAbs, existsSync(d.configPath) ? merged : { [CONFIG_SCHEMA_KEY]: CONFIG_SCHEMA_VERSION, ...merged }),
     patch: Object.fromEntries(Object.entries(patch).filter(([key]) => !consumed.includes(key))), unset,
     prompt: d.prompt, interactive: d.interactive && advanced, seen, mode: "full", skip: SETUP_CORE_KEYS, defaults: doriConfigDefault(d.home), hinted: true, log: d.log,
   });

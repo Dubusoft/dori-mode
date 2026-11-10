@@ -19,7 +19,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("discord", "json", "Discord applicationId, guildId and ownerId", { required: true }),
   spec("stateDir", "string", "Where dori keeps its state", { required: true }),
   spec("defaultCwd", "string", "Working directory of the lead session; local lanes started without --cwd start here too", { required: true }),
-  spec("worktreeRoot", "string", "Only worktrees under this directory are removed by the closed-lane cleanup; empty turns it off"),
+  spec("worktreeRoot", "string", "Only worktrees under this directory are removed by the closed-lane cleanup; empty uses the local runner's reported root, and with none the cleanup is off"),
   spec("agentCommand", "list", "Argv template that starts an agent session"),
   spec("defaultModel", "string", "Model lanes (and the lead, unless leadModel is set) run on", { required: true }),
   spec("leadModel", "string", "Model for the lead only; blank means defaultModel"),
