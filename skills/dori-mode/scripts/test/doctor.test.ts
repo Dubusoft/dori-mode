@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultConfig } from "../src/config.ts";
-import { type Check, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks, tokenFrom } from "../src/doctor.ts";
+import { defaultConfig, loadConfig } from "../src/config.ts";
+import { type Check, configSources, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks, tokenFrom } from "../src/doctor.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { defaultRunnerDir, RUNNER_PATHS } from "../src/runner/fs-safety.ts";
 import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
@@ -428,4 +428,19 @@ test("lane command keys: bad launchKeywords or massLaunchKeywords is WARN; laneT
   expect(bad.detail).toContain("massLaunchKeywords");
   const thinking = await runDoctor(fixture({ deps: { config: { ...config, laneThinking: 5 as unknown as string } } }).deps);
   expect(thinking.find((c) => c.id === "lane command")).toBeUndefined();
+});
+
+test("doctor names each config value's source: file, default, env or derived, and warns on keys it does not read", async () => {
+  const f = fixture();
+  const path = join(f.deps.home, "config.json");
+  writeFileSync(path, JSON.stringify({ defaultModel: "p/m", discordChannels: ["500"], laneThinking: "high" }));
+  const config = await loadConfig(path, f.deps.home);
+  const checks = configSources({ ...f.deps, config, configPath: path, env: { DORI_STATE_DIR: config.stateDir } });
+  expect(find(checks, "config.defaultModel").detail).toStartWith("file: ");
+  expect(find(checks, "config.worktreeRoot").detail).toBe('default: "/data/repos/worktrees"');
+  expect(find(checks, "config.stateDir").detail).toStartWith("env DORI_STATE_DIR: ");
+  expect(find(checks, "config.alertsChannel").detail).toBe('derived from discordChannels[0]: "500"');
+  expect(find(checks, "config.store").detail).toStartWith("derived from ");
+  expect(find(checks, "config.leadThinking").detail).toBe("unset: (none)");
+  expect(find(checks, "config ignored keys")).toMatchObject({ level: "WARN", detail: expect.stringContaining("laneThinking") });
 });
