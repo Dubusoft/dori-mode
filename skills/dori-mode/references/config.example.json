@@ -47,6 +47,19 @@
   },
   "runTimeoutMs": 60000,
   "ciMergeBase": "dev",
+  "autopilot": {
+    "workspaces": [],
+    "bundleExpiryDays": 7,
+    "wip": 1,
+    "wipCap": 2,
+    "attemptCap": 2,
+    "quotaMaxUsedPct": 80,
+    "quotaUnreadable": "hold",
+    "mergeBase": "dev",
+    "onRevoke": "stop-new",
+    "crossWorkspacePrereqs": "block",
+    "mode": "shadow"
+  },
   "guardMachines": {},
   "hooks": {
     "threadReply": [

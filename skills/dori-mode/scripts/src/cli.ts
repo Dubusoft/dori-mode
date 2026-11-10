@@ -155,6 +155,11 @@ const USAGE = `dori <command> [options]
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
+  autopilot candidates [--json] [--record] | approve <bundleId> --tasks 12,13 --owner-ref REF [--expires-days N] [--attempts N]
+            | revoke <bundleId> [--task N] [--reason TEXT] | bundles [--json] | schedule
+                                       lead-only, shadow mode (nothing launches): judge every member of an in-force owner-approved
+                                       bundle (LAUNCH/HOLD/REFUSE with reasons; --record writes one shadow row per task per hour),
+                                       store or revoke a bundle, list bundles, add the hourly autopilot-reconcile schedule job
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
@@ -1077,6 +1082,27 @@ try {
       console.log(r.startup);
       const next = launchNextLine(r.lane.key, r.startup); if (next) console.log(next);
       process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
+    }
+    case "autopilot": {
+      const { autopilotMain, quotaSummary, within } = await import("./autopilot-cli.ts");
+      const { ToodoClient } = await import("./toodo-client.ts");
+      const store = openOperations(config);
+      const code = await autopilotMain(rest, {
+        config: config.autopilot, store, now: realClock.now,
+        toodo: () => new ToodoClient(BUILT_IN.toodoEvents),
+        openLanes: async () => new Set((await deps.registry.open()).map((l) => l.key)),
+        quota: () => within(15_000, async () => quotaSummary((await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(15_000))).usage), () => ({ readable: false })),
+        // The can-launch check of the default machine, without recording a launch verdict.
+        host: () => within(15_000, async () => {
+          const c = await checkMachine(deps.ops, config, config.placement.defaultMachine);
+          return c.verdict.ok ? { ok: true } : { ok: false, reason: c.verdict.reasons.join(" | ") };
+        }, (why) => ({ ok: false, reason: why })),
+        schedules: () => new SourceSpecs(config.stateDir),
+        cliArgv: [process.execPath, join(import.meta.dir, "cli.ts")],
+        out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
+      });
+      store.close();
+      process.exit(code);
     }
     case "hold": {
       const [action, dropKey, ...extra] = flags.positionals;

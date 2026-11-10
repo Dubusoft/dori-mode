@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { type AutopilotConfig, DEFAULT_AUTOPILOT, parseAutopilotConfig } from "./autopilot.ts";
 import { DEFAULT_DISPLAY_TIME_ZONE, validTimeZone } from "./display-time.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
@@ -198,6 +199,8 @@ export type DoriConfig = {
   readonly placement: PlacementConfig;
   /** Lane drift signals (LANE_DRIFT). */
   readonly drift: DriftConfig;
+  /** `dori autopilot`: which owner-approved toodo tasks may run unattended, and its limits (shadow mode: judged only). */
+  readonly autopilot: AutopilotConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -248,6 +251,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   displayTimeZone: DEFAULT_DISPLAY_TIME_ZONE,
   placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
+  autopilot: DEFAULT_AUTOPILOT,
 });
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
@@ -360,7 +364,7 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes",
+  "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -395,6 +399,7 @@ let warnedIgnoredKeys = false;
 let warnedLegacyLeadCwd = false;
 let warnedLeadArray = false;
 let warnedPaneKeys = false;
+let warnedAutopilot = false;
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -452,6 +457,11 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
+    autopilot: parseAutopilotConfig(raw.autopilot, (line) => {
+      if (warnedAutopilot) return;
+      warnedAutopilot = true;
+      console.error(`CONFIG_AUTOPILOT_CLAMPED ${line} in ${path}`);
+    }),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     stateDir,
     store: storeOnDisk(stateDir),
