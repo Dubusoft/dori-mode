@@ -17,6 +17,8 @@ import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_
  *   refused `sandbox-unavailable` before its pane opens. `sandbox` stays `optional`: lanes recorded unsandboxed must keep
  *   recovering, and the lead decides which new lanes need a sandbox.
  * - `allowedRoots`: `$HOME`, the temp directory, `dirname(defaultCwd)` and `worktreeRoot` when set, without repeats.
+ * - `worktreeRoot`: the config's `worktreeRoot` when set, so the hello reports it (workspaces.ts) and the supervisor's
+ *   cleanup and merge lanes read the same root back from the runner row.
  * Guard thresholds and `heavyKill` stay unset, so the runner reads them from the same config as the supervisor.
  */
 
@@ -29,7 +31,8 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
   // Filling the slots with themselves keeps them for the runner's own fill (lanes.ts agentArgv).
   const lane = withThinking(template, { model: "{model}", prompt: "{prompt}" }, thinking);
   const sandbox = cfg.laneSandbox?.command ?? DEFAULT_LANE_SANDBOX.command;
-  const roots = [env.home ?? homedir(), env.tmp ?? tmpdir(), dirname(cfg.defaultCwd), cfg.worktreeRoot?.trim() || undefined]
+  const worktreeRoot = cfg.worktreeRoot?.trim() || undefined;
+  const roots = [env.home ?? homedir(), env.tmp ?? tmpdir(), dirname(cfg.defaultCwd), worktreeRoot]
     .filter((r): r is string => typeof r === "string" && r !== "");
   return {
     agents: { default: lane, sandboxed: ["env", `LANE_SANDBOX_VERIFY=${join(cfg.defaultCwd, "state", "verify")}`, ...sandbox, ...lane] },
@@ -37,6 +40,7 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
     sandbox: "optional",
     sandboxCheck: [...sandbox, "--check"],
     jobs: "allow",
+    ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
   };
 };
 
@@ -58,7 +62,8 @@ export const PLACEMENT_ONLY_KEYS: readonly string[] = ["workspaces", "detectWork
  * The local runner's policy when `<runnerDir>/runner-config.json` exists: a file that sets only PLACEMENT_ONLY_KEYS
  * layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
  * with any other key is the whole policy, unchanged. A layered `reposRoot` and the effective worktree root join
- * allowedRoots, so the repos discovered there pass the root check.
+ * allowedRoots, so the repos discovered there pass the root check. The file's effective worktree root (its
+ * `worktreeRoot`, else `<reposRoot>/worktrees`) replaces the config's; without either the config's stays.
  */
 export const localRunnerPolicy = (runnerDir: string, cfg: LocalPolicyConfig, env: { readonly home?: string; readonly tmp?: string } = {}): RunnerPolicy => {
   const raw: unknown = JSON.parse(readFileSync(join(runnerDir, POLICY_FILE), "utf8"));
@@ -73,6 +78,6 @@ export const localRunnerPolicy = (runnerDir: string, cfg: LocalPolicyConfig, env
     ...(parsed.workspaces ? { workspaces: parsed.workspaces } : {}),
     ...(parsed.detectWorkspaces !== undefined ? { detectWorkspaces: parsed.detectWorkspaces } : {}),
     ...(parsed.reposRoot !== undefined ? { reposRoot: parsed.reposRoot } : {}),
-    ...(parsed.worktreeRoot !== undefined ? { worktreeRoot: parsed.worktreeRoot } : {}),
+    ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
   };
 };

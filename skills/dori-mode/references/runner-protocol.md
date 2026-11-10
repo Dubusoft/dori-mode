@@ -227,8 +227,8 @@ A runner tells the supervisor which repos live on its host, and `dori launch` pl
   `node_modules` and, on macOS, the TCC-guarded home folders skipped; a worktree's `.git` file is not a checkout),
   whose `origin` names an owner/repo the runner does not declare, and not under the worktree root; at most 200.
   Information only: such a repo follows `placement.defaultMachine`.
-- `worktreeRoot`: the effective worktree root, absolute (runner-config `worktreeRoot`, else `<reposRoot>/worktrees`),
-  sent only when there is one. A lane placed on this runner creates its worktrees there (its brief footer says so).
+- `worktreeRoot`: the effective worktree root, absolute (runner-config `worktreeRoot`, else `<reposRoot>/worktrees`;
+  the local runner without either reports config.json `worktreeRoot`), sent only when there is one. A lane placed on this runner creates its worktrees there (its brief footer says so).
 
 The runner caches the report and rescans when `reposRoot` changes: it watches `reposRoot` with `fs.watch`
 (non-recursive; inotify on Linux, FSEvents on macOS), debounced by 2 s, rescans every 5 minutes as a fallback (also

@@ -510,15 +510,13 @@ test("the root comes from config, a path outside it is never removed, and a fail
   expect(await watchTick(custom)).toEqual(["WORKTREE_CLEANED demo-lane /repo/.wt/other"]);
 });
 
-test("a kept worktree under the local runner's reported worktree root is removed too, alongside one under config.worktreeRoot", async () => {
+test("the local runner's reported worktree root replaces config.worktreeRoot for the sweep; the config's is used only before a report", async () => {
   const reportedWt = "/srv/wt/app-demo-lane";
   facts([reportedWt, KEPT_WT], false);
-  await at(T0).registry.write(closedKept([reportedWt]));
-  expect(await watchTick({ ...at(T0), runnerWorktreeRoot: () => undefined })).toEqual([]);
-  expect(removals()).toHaveLength(0);
   await at(T0).registry.write(closedKept([reportedWt, KEPT_WT]));
-  const reported = { ...at(T0), runnerWorktreeRoot: (label: string) => (label === "local" ? "/srv/wt" : undefined) };
-  expect(await watchTick(reported)).toEqual([`WORKTREE_CLEANED demo-lane ${reportedWt} ${KEPT_WT}`]);
+  const reported = { ...at(T0), runnerWorktreeRoot: (label: string) => (label === "local" ? "/srv/wt/" : undefined) };
+  expect(await watchTick(reported)).toEqual([`WORKTREE_CLEANED demo-lane ${reportedWt}`]);
+  expect(await watchTick({ ...at(T0), runnerWorktreeRoot: () => undefined })).toEqual([`WORKTREE_CLEANED demo-lane ${KEPT_WT}`]);
 });
 
 test("LANE_DONE_CLAIMED is handed over before the claim is marked announced, and a failed hand-over keeps it unannounced", async () => {

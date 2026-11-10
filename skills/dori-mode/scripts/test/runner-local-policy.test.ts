@@ -7,6 +7,7 @@ import type { Ran } from "../src/run.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import { localPolicy, localRunnerPolicy } from "../src/runner/local-policy.ts";
 import { checkCommand, POLICY_FILE } from "../src/runner/policy.ts";
+import { workspaceReport } from "../src/runner/workspaces.ts";
 import { fakeClock } from "./fakes.ts";
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
@@ -25,7 +26,7 @@ test("localPolicy derives default and sandboxed profiles from agentCommand, lane
   expect(policy.agents.default).toEqual(["omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
   expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/data/repos/app/state/verify", "lane-sandbox", "--strict", "omo", "--model", "{model}", "--thinking", "high", "{prompt}"]);
   expect(policy.allowedRoots).toEqual(["/home/u", "/tmp", "/data/repos", "/data/repos/worktrees"]);
-  expect(policy).toMatchObject({ sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--strict", "--check"] });
+  expect(policy).toMatchObject({ sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--strict", "--check"], worktreeRoot: "/data/repos/worktrees" });
   expect(policy.guard).toBeUndefined();
   expect(policy.heavyKill).toBeUndefined();
 });
@@ -36,6 +37,15 @@ test("localPolicy: no laneSandbox uses lane-sandbox; a template without --model/
   expect(policy.agents.default).toEqual(["claude", "{prompt}"]);
   expect(policy.agents.sandboxed).toEqual(["env", "LANE_SANDBOX_VERIFY=/home/u/repo/state/verify", "lane-sandbox", "claude", "{prompt}"]);
   expect(policy.allowedRoots).toEqual(["/home/u"]);
+  expect(policy).not.toHaveProperty("worktreeRoot");
+});
+
+test("the local runner's hello reports config.worktreeRoot as its worktree root", () => {
+  const home = scratch();
+  const report = workspaceReport(localPolicy({ ...defaultConfig(home), defaultCwd: join(home, "dori"), worktreeRoot: join(home, "wt") }, { home, tmp: home }), { realpath: realpathSync, log: () => {}, os: "linux" });
+  expect(report.worktreeRoot).toBe(join(home, "wt"));
+  expect(workspaceReport(localPolicy({ ...defaultConfig(home), defaultCwd: join(home, "dori"), worktreeRoot: "" }, { home, tmp: home }), { realpath: realpathSync, log: () => {}, os: "linux" }))
+    .not.toHaveProperty("worktreeRoot");
 });
 
 test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with the sandboxed profile; the policy admits the cwd and refuses one outside the roots", async () => {
@@ -116,7 +126,7 @@ test("a local runner-config.json with reposRoot/worktreeRoot layers them and add
   const env = { home: "/home/u", tmp: "/tmp" };
   const local = localPolicy(cfg, env);
   writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ reposRoot: "~/src" }));
-  expect(localRunnerPolicy(dir, cfg, env)).toEqual({ ...local, reposRoot: "/home/u/src", allowedRoots: [...local.allowedRoots, "/home/u/src", "/home/u/src/worktrees"] });
+  expect(localRunnerPolicy(dir, cfg, env)).toEqual({ ...local, reposRoot: "/home/u/src", worktreeRoot: "/home/u/src/worktrees", allowedRoots: [...local.allowedRoots, "/home/u/src", "/home/u/src/worktrees"] });
   writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ reposRoot: "/srv/src", worktreeRoot: "/data/wt" }));
   expect(localRunnerPolicy(dir, cfg, env)).toEqual({ ...local, reposRoot: "/srv/src", worktreeRoot: "/data/wt", allowedRoots: [...local.allowedRoots, "/srv/src"] });
 });
