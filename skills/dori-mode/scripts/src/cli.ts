@@ -181,11 +181,11 @@ const USAGE = `dori <command> [options]
                                        through ssh stdin/stdout); listens on the worker's private IP, port 7411.
                                        TARGET is user@ip, ip or user@host; LABEL defaults to a slug of the host (100.64.1.2 -> 100-64-1-2)
                                        and the machine is remembered in <stateDir>/runner-machines.json;
-                                       then runs runner setup for it with --set/--unset (--yes: ask nothing)
+                                       then runs runner setup --new for it with --set/--unset (--yes: ask nothing)
   runner setup [--machine LABEL] [--set KEY=VALUE ...] [--unset KEY ...] [--yes] [--new]
                                        edit runner-config.json (the local runner's, or LABEL's over ssh): --set/--unset are applied
                                        as given (an empty VALUE unsets), every other key is asked with [required]/[optional] and its
-                                       current value (Enter keeps it); keys the file no longer reads are removed (backup in
+                                       current value (Enter keeps it; required keys with a value are not asked again); keys the file no longer reads are removed (backup in
                                        runner-config.json.bak); --new asks only keys never shown before; --yes asks nothing
   runner remove LABEL                  stop and delete the runner on that worker over ssh, revoke its key and forget its endpoint (RUNNER_REMOVED)
   runner probe [--json]                on a runner host: alive/stalled/dead from ~/.dori/runner/health; exit 0 only when healthy
@@ -524,7 +524,7 @@ if (process.argv[2] === "runner") {
     } finally {
       auth.close();
     }
-    const setup = await runnerSetupNow(cfg.stateDir, machine, { ...keys, interactive: setupInteractive, mode: "full" })
+    const setup = await runnerSetupNow(cfg.stateDir, machine, { ...keys, interactive: setupInteractive, mode: "new" })
       .catch((e: unknown) => { console.log(e instanceof Error ? e.message : String(e)); return 1; });
     if (setup !== 0) {
       console.log(`RUNNER_SETUP_AFTER_INSTALL_FAILED runner=${label} run: dori runner setup --machine ${label}`);
