@@ -106,7 +106,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 - PR bodies, issues and commit messages carry no owner quotes, chat message ids, or quota, usage or cost numbers. Describe the change and its evidence in your own words.
 - Build memory as you work and consult it before asking the owner something it already answers.
 - Keep going until the work is done. Stop only when nothing can move without the owner.
-- When the owner says wait, stop or hold on, pause the lane with `dori pause <key>` in the same turn; if they name no lane, pause every working lane on that topic and say which. A reply alone leaves it running: the freshness sweep nudges it and its goal keeps continuing. `PAUSE_UNVERIFIED` (exit 3) means the goal was not confirmed paused, or its running turn did not stop after Escape, so the lane may still be running: check the pane and retry. `dori resume <key>` when they say go.
+- When the owner says wait, stop or hold on, pause the lane with `dori pause <key>` in the same turn; if they name no lane, pause every working lane on that topic and say which. A reply alone leaves it running: the freshness sweep nudges it and its goal keeps continuing. `PAUSE_UNVERIFIED` (exit 3) means the goal was not confirmed paused, or its running turn did not stop after Escape, so the lane may still be running: check the pane and retry. `dori resume <key>` when they say go: it resumes the goal, types `/resume` when the pause cut a running turn (omo's `Paused ... /resume` footer) so that turn continues, and prints `RESUMED` only once a turn runs; `RESUME_UNVERIFIED` (exit 3) leaves the lane paused.
 
 ## Scripts
 
