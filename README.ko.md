@@ -13,7 +13,7 @@ Dori 모드는 코딩 에이전트 세션 하나를 늘 켜져 있는 메신저 
 ## 설치
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 저장소를 `~/.dori/src`에 받고, 스킬을 `~/.agents/skills/dori-mode`에 링크하고, `bun link`로 `dori`를 PATH에 올린 뒤 `dori setup`을 실행합니다. 에이전트가 다른 곳에서 스킬을 읽는다면 `SKILLS_DIR`를 지정하세요.

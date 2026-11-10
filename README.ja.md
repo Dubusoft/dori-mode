@@ -13,7 +13,7 @@ Dori モードは、コーディングエージェントのセッションひと
 ## インストール
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 リポジトリを `~/.dori/src` に取得し、スキルを `~/.agents/skills/dori-mode` にリンクし、`bun link` で `dori` を PATH に通してから `dori setup` を起動します。エージェントが別の場所からスキルを読む場合は `SKILLS_DIR` を指定してください。

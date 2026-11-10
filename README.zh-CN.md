@@ -13,7 +13,7 @@ Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只
 ## 安装
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 它会把仓库克隆到 `~/.dori/src`,把技能链接到 `~/.agents/skills/dori-mode`,用 `bun link` 把 `dori` 放进 PATH,然后启动 `dori setup`。如果你的智能体从别的目录加载技能，请设置 `SKILLS_DIR`。
