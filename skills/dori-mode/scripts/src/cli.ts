@@ -200,7 +200,7 @@ const USAGE = `dori <command> [options]
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always);
-                                       also runs dori setup --migrate, and runner setup --new for every upgraded runner;
+                                       also runs dori setup --migrate, and runner setup --new for every runner (RUNNER_POLICY_MISSING);
                                        ends with UPDATE_SUMMARY (changed, failed); exit 2 when a step failed (migrate degraded)
   store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field);
                                        the store follows the files in the state dir
@@ -321,7 +321,7 @@ let ttyKeyPrompter: KeyPrompter | undefined;
  */
 const runnerSetupNow = async (
   stateDir: string, machine: GuardMachine | undefined,
-  o: { readonly patch: Json; readonly unset: readonly string[]; readonly interactive: boolean; readonly mode: "full" | "new" },
+  o: { readonly patch: Json; readonly unset: readonly string[]; readonly interactive: boolean; readonly mode: "full" | "new"; readonly requireFile?: boolean },
 ): Promise<number> => {
   const { localRunnerConfigIO, remoteRunnerConfigIO, runRunnerSetup } = await import("./runner/runner-setup.ts");
   const { defaultsPrompter, ttyPrompter } = await import("./setup-cli.ts");
@@ -334,6 +334,7 @@ const runnerSetupNow = async (
   return runRunnerSetup({
     io, prompt: o.interactive ? (ttyKeyPrompter ??= ttyPrompter()) : defaultsPrompter, interactive: o.interactive,
     log: (line) => { console.log(line); }, seenPath: join(stateDir, "runner-setup-keys", `${machine?.label ?? "local"}.json`), mode: o.mode,
+    requireFile: o.requireFile,
   }, { patch: o.patch, unset: o.unset });
 };
 
@@ -342,13 +343,14 @@ const runnerSetupNow = async (
  * failures are logged and never change the exit code), then each worker runner gets the new bundle through
  * `dori runner install`'s path, one at a time, each confirmed by a hello with a higher gen within 2 minutes. The local
  * runner is the supervisor's child, so the supervisor restart that `dori update` already did restarted it on the
- * updated checkout. A runner that already reports this checkout's version is skipped. Each upgraded runner then gets
- * runner setup in "new" mode (asks only keys never shown before; a failure is a WARN line, never an upgrade failure).
- * Returns 1 when any runner failed (the others were still upgraded), else 0.
+ * updated checkout. A runner that already reports this checkout's version is skipped. Then every runner, upgraded or
+ * not (the local one and each worker the hub knows), gets runner setup in "new" mode (asks only keys never shown
+ * before): a worker without runner-config.json, a missing required key or a failed check is reported.
+ * Returns 1 when any runner failed to upgrade or its policy check found a gap (the others still ran), else 0.
  */
 const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
   const { readRunnerRows } = await import("./runner/hub.ts");
-  const { staleRunnerLabels, upgradeRunners } = await import("./runner/upgrade.ts");
+  const { checkRunnerPolicies, staleRunnerLabels, upgradeRunners } = await import("./runner/upgrade.ts");
   const { gitVersion } = await import("./runner/version.ts");
   const { buildBundle, installRunner } = await import("./runner/install.ts");
   const { runnerListenAddress } = await import("./runner/endpoints.ts");
@@ -374,9 +376,6 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
           enroll: (body) => auth.enroll(body),
         });
         if (!done.ok) return { ok: false, detail: `${done.code} ${done.detail}` };
-        const setup = await runnerSetupNow(cfg.stateDir, machine, { patch: {}, unset: [], interactive: Boolean(process.stdin.isTTY), mode: "new" })
-          .catch((e: unknown) => { console.log(`WARN runner setup runner=${label}: ${e instanceof Error ? e.message : String(e)}`); return 0; });
-        if (setup !== 0) console.log(`WARN runner setup runner=${label} exit ${setup}; run: dori runner setup --machine ${label}`);
         return { ok: true, version: done.version };
       },
       confirm: async (label) => {
@@ -387,7 +386,17 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
       },
       log: (line) => console.log(line),
     });
-    return result.failed.length ? 1 : 0;
+    const policy = await checkRunnerPolicies({
+      labels: [LOCAL_RUNNER, ...new Set(readRunnerRows(cfg.stateDir).map((r) => r.label).filter((l) => l !== LOCAL_RUNNER))],
+      check: async (label) => {
+        const local = label === LOCAL_RUNNER;
+        const machine = local ? undefined : machines.find((m) => m.label === label);
+        if (!local && !machine) throw new Error(`no machine ${label}`);
+        return runnerSetupNow(cfg.stateDir, machine, { patch: {}, unset: [], interactive: Boolean(process.stdin.isTTY), mode: "new", requireFile: !local });
+      },
+      log: (line) => console.log(line),
+    });
+    return result.failed.length || policy.missing.length || policy.failed.length ? 1 : 0;
   } finally {
     auth.close();
   }

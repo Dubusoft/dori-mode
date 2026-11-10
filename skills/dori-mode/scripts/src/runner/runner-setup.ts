@@ -121,13 +121,19 @@ export type RunnerSetupDeps = {
   readonly seenPath: string;
   readonly mode: "full" | "new";
   readonly home?: string;
+  /**
+   * A worker runner without the file runs the empty default policy (no agents, no roots), so an absent file there is a
+   * missing config (exit 2), not a skip. The local runner derives its policy from the supervisor config instead.
+   */
+  readonly requireFile?: boolean;
 };
 
 const isRecord = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Exit 0 done (or skipped: no file, nothing to set, not interactive), 1 failed (bad JSON, or a result parsePolicy
- * refuses; nothing written), 2 written or unchanged but required keys are still missing. IO errors propagate.
+ * refuses; nothing written), 2 written or unchanged but required keys are still missing, or no file while `requireFile`.
+ * IO errors propagate.
  */
 export const runRunnerSetup = async (d: RunnerSetupDeps, input: { readonly patch: Json; readonly unset: readonly string[] }): Promise<number> => {
   const old = await d.io.read();
@@ -146,6 +152,10 @@ export const runRunnerSetup = async (d: RunnerSetupDeps, input: { readonly patch
     }
     raw = parsed;
   } else if (Object.keys(input.patch).length === 0 && !d.interactive) {
+    if (d.requireFile) {
+      d.log(`RUNNER_SETUP_FILE_MISSING no ${POLICY_FILE} at ${d.io.where} (the runner has no agents and no allowedRoots)`);
+      return 2;
+    }
     d.log(`RUNNER_SETUP_SKIPPED no ${POLICY_FILE} at ${d.io.where}`);
     return 0;
   }

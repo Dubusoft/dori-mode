@@ -87,7 +87,7 @@ What runs it for you:
 
 - `dori runner install` runs `dori runner setup --new` on the new runner afterwards (it takes `--set`, `--unset` and `--yes`).
 - `dori update` runs `dori setup --migrate`: migrate to the current `schemaVersion`, warn about or prune obsolete keys (timestamped `.bak` before each write) and ask only new keys. With no `config.json` it prints `SETUP_MIGRATE_SKIPPED` and creates nothing.
-- `dori runner upgrade` (and so `dori update`'s rollout) runs `dori runner setup --new` for every upgraded runner.
+- `dori runner upgrade` (and so `dori update`'s rollout) runs `dori runner setup --new` for every runner, upgraded or already on the current version, and reports a worker without `runner-config.json` or with a required key missing (`RUNNER_POLICY_MISSING`, exit 1).
 
 Figma MCP: set the figma server to `"exposure": "search"` in the global `~/.omo/agent/mcp.json`. Its tools then cost no prompt tokens until a lane activates them with `tool_search`. `dori launch` writes no `.omo/mcp.json` into lane folders and removes one that is exactly the old figma-off file.
 

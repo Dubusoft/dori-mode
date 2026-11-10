@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { staleRunnerLabels, upgradeRunners } from "../src/runner/upgrade.ts";
+import { checkRunnerPolicies, staleRunnerLabels, upgradeRunners } from "../src/runner/upgrade.ts";
 import { updateInstall } from "../src/update.ts";
 import type { Ran, Runner } from "../src/run.ts";
 
@@ -33,6 +33,24 @@ test("the rollout skips the local runner and workers already on the wanted versi
   const rows = [{ label: "local", version: "old" }, { label: "worker-a", version: "new" }, { label: "worker-b", version: "old" }, { label: "worker-c" }];
   expect(staleRunnerLabels(rows, "local", "new")).toEqual(["worker-b", "worker-c"]);
   expect(staleRunnerLabels(rows, "local", undefined)).toEqual(["worker-a", "worker-b", "worker-c"]);
+});
+
+test("the policy pass checks every runner, reports a missing config and goes on after a failed check", async () => {
+  const checked: string[] = [];
+  const log: string[] = [];
+  const codes: Record<string, number> = { local: 0, "worker-a": 2, "worker-c": 0 };
+  const result = await checkRunnerPolicies({
+    labels: ["local", "worker-a", "worker-b", "worker-c"],
+    check: async (label) => { checked.push(label); if (label === "worker-b") throw new Error("RUNNER_SETUP_REMOTE_FAILED worker-b: ssh\nrefused"); return codes[label]!; },
+    log: (line) => { log.push(line); },
+  });
+  expect(checked).toEqual(["local", "worker-a", "worker-b", "worker-c"]);
+  expect(result).toEqual({ missing: ["worker-a"], failed: ["worker-b"] });
+  expect(log).toEqual([
+    "RUNNER_POLICY_MISSING runner=worker-a; run: dori runner setup --machine worker-a",
+    "RUNNER_POLICY_CHECK_FAILED runner=worker-b RUNNER_SETUP_REMOTE_FAILED worker-b: ssh refused",
+    "RUNNER_POLICY_CHECKED runners=4 missing=worker-a failed=worker-b",
+  ]);
 });
 
 test("an up-to-date dori update still runs the runner rollout, without restarting the supervisor", async () => {
