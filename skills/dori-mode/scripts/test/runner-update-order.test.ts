@@ -51,7 +51,7 @@ test("an up-to-date dori update still runs the runner rollout, without restartin
     { packageDir: "/repo/skills/dori-mode/scripts", branch: "dev", force: false },
   );
   expect(code).toBe(0);
-  expect(log).toEqual(["UP_TO_DATE dev same"]);
+  expect(log).toEqual(["UP_TO_DATE dev same", "UPDATE_SUMMARY changed: none; failed: none"]);
   expect(order).toEqual(["runners"]);
 });
 
