@@ -7,8 +7,8 @@ import { guardText } from "./messenger/http.ts";
 /**
  * Follow-ups after a thread's work is reported (a merge result, a Toodo note) must not reopen a thread the owner closed:
  * a new post into an archived Discord thread unarchives it. So a follow-up is appended to the lane's last report by
- * editing that message, and anything addressed to a thread the owner closed goes to the owner channel as one line that
- * links the thread instead.
+ * editing that message, and anything addressed to a thread the owner closed goes to that thread's parent channel (else
+ * the owner channel) as one line that links the thread instead.
  */
 
 /** Threads the owner closed with the close-thread button, thread id -> when (epoch ms); written by `dori supervise`. */
@@ -70,25 +70,28 @@ export type FollowUpDiscord = {
   edit(channelId: string, messageId: string, content: string): Promise<void>;
   content(channelId: string, messageId: string): Promise<string>;
   threadArchived(threadId: string): Promise<boolean>;
+  threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined }>;
   setThread(threadId: string, patch: { readonly archived?: boolean }): Promise<void>;
 };
 
 /**
  * Whether the owner closed `thread` and it is still closed: a close is recorded and Discord still reports the thread
  * archived. A recorded thread that is open again (the owner wrote in it) has its record dropped and counts as open.
- * A thread with no record is open without asking Discord.
+ * A thread with no record is open without asking Discord. A closed thread comes back with its parent channel, where a
+ * line redirected from it goes (undefined when Discord names none: the caller's owner channel then); an open one is undefined.
  */
-export const closedByOwner = async (stateDir: string, discord: Pick<FollowUpDiscord, "threadArchived">, thread: string): Promise<boolean> => {
-  if (readOwnerClosed(stateDir)[thread] === undefined) return false;
-  if (await discord.threadArchived(thread)) return true;
+export const closedByOwner = async (stateDir: string, discord: Pick<FollowUpDiscord, "threadState">, thread: string): Promise<{ readonly parent: string | undefined } | undefined> => {
+  if (readOwnerClosed(stateDir)[thread] === undefined) return undefined;
+  const state = await discord.threadState(thread);
+  if (state.archived) return { parent: state.parent };
   forgetOwnerClosed(stateDir, thread);
-  return false;
+  return undefined;
 };
 
 /** Longest follow-up text the owner-channel line carries. */
 export const CLOSED_LINE_TEXT_MAX = 1500;
 
-/** The owner-channel line for a thread the owner closed: a link to the thread (`<#id>`) and the text on one line. */
+/** The redirected line for a thread the owner closed: a link to the thread (`<#id>`) and the text on one line. */
 export const closedThreadLine = (thread: string, text: string): string => {
   const flat = text.replace(/\s+/g, " ").trim();
   return `<#${thread}> ${flat.length <= CLOSED_LINE_TEXT_MAX ? flat : `${flat.slice(0, CLOSED_LINE_TEXT_MAX)}...`}`;
