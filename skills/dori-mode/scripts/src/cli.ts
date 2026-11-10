@@ -141,7 +141,7 @@ const USAGE = `dori <command> [options]
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
   setup  [--yes] [--token-file F] [--channel ID] [--autostart] [--set KEY=VALUE ...] [--unset KEY ...] [--migrate]
                                        interactive install: token, channels, herdr, autostart; --set/--unset set or delete config.json
-                                       keys as given without asking; keys config.json no longer reads are removed (backup in config.json.bak);
+                                       keys as given without asking; keys config.json no longer reads are warned about once, then removed (backup config.json.<time>.bak);
                                        --migrate only removes those and asks keys never shown before (dori setup --help)
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
   launch <key> --title T (--brief FILE | --from-message CHANNEL MESSAGE_ID ... [--note TEXT ...]) --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]

@@ -2,6 +2,7 @@ import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readF
 import { dirname, join } from "node:path";
 
 import { configureKeys, DORI_CONFIG_KEYS, doriConfigDefault, formatValue, KEY_INPUT_HINT, keyLabel, pruneDoriConfig, readSeenKeys, writeSeenKeys } from "./config-keys.ts";
+import { CONFIG_SCHEMA_KEY, CONFIG_SCHEMA_VERSION, ConfigSchemaError, migrateConfigSchema, removalReason } from "./config-schema.ts";
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
 import type { Http } from "./messenger/http.ts";
 import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
@@ -73,20 +74,52 @@ const labelOf = (key: string): string => {
   return spec ? keyLabel(spec) : "[optional]";
 };
 
+/** In `<stateDir>`: the obsolete config keys already warned about; the next run that still finds one removes it. */
+export const CONFIG_REMOVALS_FILE = "config-removals.json";
+
+const isRecord = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** `pruned` with the `pending` keys (top-level or `<key>.<sub>`) put back as `source` has them, in `source`'s order. */
+const keepPending = (source: Json, pruned: Json, pending: readonly string[]): Json => {
+  if (!pending.length) return pruned;
+  const out: Json = {};
+  for (const [key, value] of Object.entries(source)) {
+    const kept = pruned[key];
+    if (pending.includes(key)) out[key] = value;
+    else if (!(key in pruned)) continue;
+    else if (isRecord(value) && isRecord(kept)) out[key] = Object.fromEntries(Object.entries(value).filter(([sub]) => sub in kept || pending.includes(`${key}.${sub}`)));
+    else out[key] = kept;
+  }
+  return out;
+};
+
 /**
- * `config` without the keys config.json no longer reads. Legacy pane keys are migrated into `stateDir` first; when anything
- * is removed the previous file is copied to `<configPath>.bak` and each removed key logged.
+ * `config` stamped with the current schema version after the CONFIG_MIGRATIONS steps it has not had, without the keys
+ * config.json no longer reads. Legacy pane keys are migrated into `stateDir` and dropped at once. Any other key is first
+ * kept and warned about (`SETUP_KEY_REMOVAL_PENDING`, recorded in `<stateDir>/config-removals.json`); a later run that
+ * still finds it removes it (`SETUP_KEY_REMOVED`). A config written by a newer dori throws SetupError before anything is
+ * written. saveConfig keeps a timestamped copy of the file it replaces.
  */
-export const pruneObsolete = (d: Pick<SetupDeps, "configPath" | "log">, stateDir: string, config: Json): Json => {
+export const pruneObsolete = (d: Pick<SetupDeps, "log">, stateDir: string, config: Json): Json => {
+  let migrated: ReturnType<typeof migrateConfigSchema>;
+  try {
+    migrated = migrateConfigSchema(config);
+  } catch (e) {
+    throw e instanceof ConfigSchemaError ? new SetupError(e.message) : e;
+  }
   resolveManagedPanes(stateDir, config);
-  const { next, removed } = pruneDoriConfig(config);
-  if (!removed.length) return next;
-  const backup = `${d.configPath}.bak`;
-  const hasFile = existsSync(d.configPath);
-  if (hasFile) writeFileAtomic(backup, readFileSync(d.configPath, "utf8"), 0o600);
-  for (const key of removed) d.log(`SETUP_KEY_REMOVED ${key} (no longer read from config.json)`);
-  if (hasFile) d.log(`SETUP_CONFIG_BACKUP ${backup}`);
-  return next;
+  for (const [from, to] of migrated.renamed) d.log(`SETUP_KEY_RENAMED ${from} -> ${to}`);
+  const { next, removed } = pruneDoriConfig(migrated.next);
+  const removalsPath = join(stateDir, CONFIG_REMOVALS_FILE);
+  const warned = readSeenKeys(removalsPath);
+  const pending = removed.filter((key) => !(LEGACY_PANE_KEYS as readonly string[]).includes(key) && !warned.has(key));
+  for (const key of removed) {
+    d.log(pending.includes(key)
+      ? `SETUP_KEY_REMOVAL_PENDING ${key} (${removalReason(key)}): kept this time; the next dori setup removes it`
+      : `SETUP_KEY_REMOVED ${key} (${removalReason(key)})`);
+  }
+  if (pending.length !== warned.size || pending.some((key) => !warned.has(key))) writeSeenKeys(removalsPath, pending);
+  return { [CONFIG_SCHEMA_KEY]: CONFIG_SCHEMA_VERSION, ...keepPending(migrated.next, next, pending) };
 };
 
 /** Seams for `renameWithRetry`: the platform (default `process.platform`), the rename itself, and the pause between tries. */
@@ -151,8 +184,23 @@ export const mergeConfig = (existing: Json, patch: Json): Json => {
   return out;
 };
 
-export const saveConfig = (path: string, existing: Json, next: Json): boolean => {
-  if (existsSync(path) && JSON.stringify(existing) === JSON.stringify(next)) return false;
+/** `<path>.<UTC time>.bak`, or `<path>.<UTC time>-<n>.bak` when a backup from the same second exists. */
+export const configBackupPath = (path: string, now = new Date()): string => {
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  let candidate = `${path}.${stamp}.bak`;
+  for (let n = 1; existsSync(candidate); n++) candidate = `${path}.${stamp}-${n}.bak`;
+  return candidate;
+};
+
+/** Writes `next` unless the file holds `existing` unchanged; the file it replaces is first copied to configBackupPath. */
+export const saveConfig = (path: string, existing: Json, next: Json, log?: (line: string) => void): boolean => {
+  const hasFile = existsSync(path);
+  if (hasFile && JSON.stringify(existing) === JSON.stringify(next)) return false;
+  if (hasFile) {
+    const backup = configBackupPath(path);
+    writeFileAtomic(backup, readFileSync(path, "utf8"), 0o600);
+    log?.(`SETUP_CONFIG_BACKUP ${backup}`);
+  }
   writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
   return true;
 };
@@ -379,7 +427,7 @@ const runMigrate = async (d: SetupDeps, input: SetupInput): Promise<number> => {
     specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateDir, raw), patch: input.patch ?? {}, unset: input.unset ?? [],
     prompt: d.prompt, interactive: d.interactive, seen, mode: "new", defaults: doriConfigDefault(d.home), log: d.log,
   });
-  d.log(`SETUP config ${saveConfig(d.configPath, raw, configured.next) ? "written" : "unchanged"}: ${d.configPath}`);
+  d.log(`SETUP config ${saveConfig(d.configPath, raw, configured.next, d.log) ? "written" : "unchanged"}: ${d.configPath}`);
   if (d.interactive) writeSeenKeys(seenPath, [...seen, ...configured.shown]);
   if (reportMissing(d, configured.missingRequired)) {
     d.log("SETUP_MIGRATE_DONE with problems: config");
@@ -482,7 +530,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     prompt: d.prompt, interactive: d.interactive, seen, mode: "full", skip: SETUP_CORE_KEYS, defaults: doriConfigDefault(d.home), hinted: true, log: d.log,
   });
   let config = configured.next;
-  d.log(`SETUP config ${saveConfig(d.configPath, raw, config) ? "written" : "unchanged"}: ${d.configPath}`);
+  d.log(`SETUP config ${saveConfig(d.configPath, raw, config, d.log) ? "written" : "unchanged"}: ${d.configPath}`);
   if (d.interactive) writeSeenKeys(seenPath, [...seen, ...configured.shown, ...asked, ...Object.keys(patch), ...unset]);
   if (reportMissing(d, configured.missingRequired)) problems.push("config");
   const alertsChannel = str(config.alertsChannel).trim();
@@ -506,7 +554,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
         const before = config;
         // The herdr ids live in dori state; setup drops the legacy keys from the config.
         config = Object.fromEntries(Object.entries(mergeConfig(config, h.patch)).filter(([key]) => !(LEGACY_PANE_KEYS as readonly string[]).includes(key)));
-        d.log(`SETUP config ${saveConfig(d.configPath, before, config) ? "updated" : "unchanged"} for herdr`);
+        d.log(`SETUP config ${saveConfig(d.configPath, before, config, d.log) ? "updated" : "unchanged"} for herdr`);
       } catch (e) {
         problems.push("herdr");
         d.log(`SETUP herdr failed: ${e instanceof Error ? e.message : String(e)}`);

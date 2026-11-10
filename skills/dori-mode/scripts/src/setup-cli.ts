@@ -23,12 +23,13 @@ export const SETUP_USAGE = `dori setup [options]
   --issue-author LOGIN    GitHub account whose new issues start work automatically (repeatable)
   --set KEY=VALUE         set a config.json key as given, without asking (repeatable; an empty VALUE unsets it)
   --unset KEY             delete a config.json key without asking (repeatable)
-  --migrate               after an update: remove keys config.json no longer reads (backup in config.json.bak)
+  --migrate               after an update: migrate the schema, remove keys config.json no longer reads (warned once first)
                           and ask only keys never shown before; no token, Discord, herdr or autostart steps
   --no-herdr              skip the herdr lead pane and lanes workspace
   --autostart             install and enable the systemd user units (with --yes: runs every step)
 
-  Keys config.json no longer reads are removed on every run (backup in config.json.bak).`;
+  Keys config.json no longer reads are warned about on the first run that finds them and removed on the next;
+  every write first keeps the old file as config.json.<UTC time>.bak.`;
 
 class LineReader {
   private buffered = "";
