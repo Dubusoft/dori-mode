@@ -1,12 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import type { Ran } from "../src/run.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
-import { localPolicy } from "../src/runner/local-policy.ts";
-import { checkCommand } from "../src/runner/policy.ts";
+import { localPolicy, localRunnerPolicy } from "../src/runner/local-policy.ts";
+import { checkCommand, POLICY_FILE } from "../src/runner/policy.ts";
 import { fakeClock } from "./fakes.ts";
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
@@ -108,4 +108,15 @@ test("a sandboxed lane.start whose sandboxCheck fails is refused sandbox-unavail
   await lanes.start({ ...start, agentProfile: "default", sandbox: false });
   expect(calls.some((a) => a[0] === "lane-sandbox")).toBe(false);
   expect(lanes.records()["lane-a"]?.profile).toBe("default");
+});
+
+test("a local runner-config.json with reposRoot/worktreeRoot layers them and adds both roots to allowedRoots without repeats", () => {
+  const dir = scratch();
+  const cfg = { ...defaultConfig("/home/u"), defaultCwd: "/data/dori", worktreeRoot: "/data/wt" };
+  const env = { home: "/home/u", tmp: "/tmp" };
+  const local = localPolicy(cfg, env);
+  writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ reposRoot: "~/src" }));
+  expect(localRunnerPolicy(dir, cfg, env)).toEqual({ ...local, reposRoot: "/home/u/src", allowedRoots: [...local.allowedRoots, "/home/u/src", "/home/u/src/worktrees"] });
+  writeFileSync(join(dir, POLICY_FILE), JSON.stringify({ reposRoot: "/srv/src", worktreeRoot: "/data/wt" }));
+  expect(localRunnerPolicy(dir, cfg, env)).toEqual({ ...local, reposRoot: "/srv/src", worktreeRoot: "/data/wt", allowedRoots: [...local.allowedRoots, "/srv/src"] });
 });
