@@ -87,6 +87,21 @@ test("status message: the first progress posts it, later progress and milestones
   expect(world.calls.filter((c) => c[0] === "notify")).toEqual([]);
 });
 
+test("status message: every time is shown in displayTimeZone, labelled with that zone", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0 + 65 * MIN), dir, { displayTimeZone: "Asia/Seoul" });
+  await deps.registry.write(lane(dir));
+  const store = new JsonLaneReports(dir);
+  const { transport, calls } = fakeTransport();
+  store.append({ lane: "local-lane", generation: 0, kind: "milestone", text: "parser done", at: T0 + 60 * MIN });
+  await routeReports(deps, store, () => {}, "/home/test", transport);
+  expect(calls.at(-1)?.[2]).toBe([
+    "[System] 레인 local-lane 상태, 진행 1시간 5분 (갱신 2026-01-01 22:05 KST)",
+    "마지막 마일스톤 (2026-01-01 22:00 KST): parser done",
+    "마지막 진행: 아직 없음",
+  ].join("\n"));
+});
+
 test("status message: a failed edit (message deleted) posts a new one and stores its id", async () => {
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);

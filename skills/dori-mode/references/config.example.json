@@ -27,6 +27,7 @@
   "drift": { "enabled": true, "milestoneOverdueMin": 90, "ciFailStreak": 3 },
   "worktreeRoot": "/data/repos/worktrees",
   "ownerLanguage": "Korean",
+  "displayTimeZone": "Asia/Seoul",
   "laneRules": ["Open a PR into the repo's dev branch; once its CI is green, claim done and stop. Do not merge it and do not wait for the merge: the supervisor merges it.", "CI runs the typecheck only; do not add tests to CI."],
   "heavySlots": 1,
   "heavyKill": [

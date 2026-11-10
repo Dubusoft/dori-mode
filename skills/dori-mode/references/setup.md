@@ -72,7 +72,7 @@ The config is written atomically (mode 600). `references/scripts.md` explains ev
 | Key | Label |
 |---|---|
 | `discord`, `stateDir`, `leadCwd`, `defaultModel`, `discordChannels` | [required] |
-| `worktreeRoot`, `agentCommand`, `leadModel`, `leadThinking`, `leadArgs`, `alertsChannel`, `githubIssueAuthors`, `ownerLanguage`, `laneRules`, `laneSandbox`, `guardMachines`, `runners`, `placement`, `buttonHooks`, `hooks`, `ciMergeBase`, `ignorePanes` | [optional] |
+| `worktreeRoot`, `agentCommand`, `leadModel`, `leadThinking`, `leadArgs`, `alertsChannel`, `githubIssueAuthors`, `ownerLanguage`, `displayTimeZone`, `laneRules`, `laneSandbox`, `guardMachines`, `runners`, `placement`, `buttonHooks`, `hooks`, `ciMergeBase`, `ignorePanes` | [optional] |
 
 `runner-config.json` keys:
 

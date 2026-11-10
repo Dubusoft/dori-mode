@@ -14,7 +14,8 @@ import { JsonLaneReports, type LaneReportStore, SqliteLaneReports } from "../src
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind, WAKES_FILE } from "../src/store.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { healthPath } from "../src/runner/health.ts";
-import { collectStatus, kst, lookupStatus, machineLines, renderStatus, runnerViews, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
+import { displayTime } from "../src/display-time.ts";
+import { collectStatus, lookupStatus, machineLines, renderStatus, runnerViews, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
 import { unsandboxedReason } from "../src/runner-sandbox.ts";
 import { fakeClock, withState } from "./fakes.ts";
 import { builtInTunables } from "../src/tunables.ts";
@@ -39,7 +40,7 @@ const fixture = async (panes: unknown[] = [{ pane_id: "lead:p1", workspace_id: "
     return { code: 127, out: "", err: line };
   };
   const registry = new Registry(state.dir);
-  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1" }, tunables: builtInTunables("/home/test") };
+  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1", displayTimeZone: "Asia/Seoul" }, tunables: builtInTunables("/home/test") };
   return { deps, registry, calls, dir: state.dir };
 };
 const lane = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, thread: "discord:1/2", brief: "/b", done: "d", openedAt: OPENED, ...extra });
@@ -134,7 +135,7 @@ test("/status pages through 100 lanes: every page fits Discord, every lane is li
   const listed = pages.flatMap((page) => page.split("\n").filter((line) => line.startsWith("- scale-lane-")).map((line) => line.slice(2).split(" ")[0]));
   expect(listed.sort()).toEqual([...keys].sort());
   expect(pages[0]).toContain(`개 (2-${pages.length}쪽)`);
-  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`도리 레인 · 2/${pages.length}쪽 · ${kst(NOW)} KST`, "", "■ 레인 (100) 이어서"]);
+  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`도리 레인 · 2/${pages.length}쪽 · ${displayTime(NOW, "Asia/Seoul", "short")}`, "", "■ 레인 (100) 이어서"]);
   expect(pages[1]).toEndWith("\n\n다음: /status page:3");
   expect(pages.at(-1)).not.toContain("다음: /status");
   // The slash command's page option picks the page; past the end it says how many there are.
@@ -236,6 +237,7 @@ test("status splits wakes into owner, lane and noise by their triggers; a wake a
 
 const base: Status = {
   at: "2026-10-21T00:53:36.000Z",
+  timeZone: "Asia/Seoul",
   services: [
     { name: "herdr-server.service", enabled: "enabled", active: "active" },
     { name: "dori-supervisor.service", enabled: "enabled", active: "active" },
@@ -344,9 +346,10 @@ test("model names lose the provider and claude- prefix; other ids stay readable"
   expect(shortModel("openai/gpt-6.1-sol")).toBe("gpt-6.1-sol");
 });
 
-test("kst formats fixed +09:00 across a day boundary", () => {
-  expect(kst(Date.parse("2026-10-21T15:05:00Z"))).toBe("10-22 00:05");
-  expect(kst(Date.parse("2026-12-31T14:59:00Z"))).toBe("12-31 23:59");
+test("a status without a time zone (the default config, or one written before the key) shows its times in UTC", () => {
+  const { timeZone: _, ...older } = base;
+  expect(renderStatus(older).split("\n")[0]).toBe("도리 상태 · 10-21 00:53 UTC");
+  expect(renderStatus({ ...base, timeZone: "UTC" }).split("\n")[0]).toBe("도리 상태 · 10-21 00:53 UTC");
 });
 
 test("collectStatus derives a lane's repo and PR from its Done signal, with no network", async () => {

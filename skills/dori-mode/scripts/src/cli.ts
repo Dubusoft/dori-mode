@@ -9,6 +9,7 @@ import { alertsChannelOf, configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
+import { displayTime } from "./display-time.ts";
 import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
@@ -52,7 +53,6 @@ import { LaneMessageError } from "./lane-messages.ts";
 import { oneLine, openLaneReports } from "./lane-reports.ts";
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
-import { kst } from "./status.ts";
 import { updateInstall } from "./update.ts";
 import { refreshBootPrep } from "./boot-prep-install.ts";
 import { refreshLaneSandbox } from "./lane-sandbox-install.ts";
@@ -955,7 +955,7 @@ try {
         const spec = specs.list().find((s) => s.name === job);
         return spec?.type === "schedule" ? spec : die(`no schedule "${job}"`);
       };
-      const at = (ms: number | undefined): string => (ms === undefined ? "never" : `${kst(ms)} KST`);
+      const at = (ms: number | undefined): string => (ms === undefined ? "never" : displayTime(ms, config.displayTimeZone, "short"));
       if (action === "list" && name === undefined) {
         const status = readSourceStatus(config.stateDir)?.sources ?? {};
         const rows = specs.list().filter((spec): spec is ScheduleSpec => spec.type === "schedule").map((spec) => scheduleRow(spec, status[spec.name], now));
@@ -1023,7 +1023,7 @@ try {
     case "quota": {
       const read = await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(30_000));
       if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null }, null, 2));
-      else console.log(`${read.usage ? usageLine(read.usage) : NO_CLAUDE}\n\n${read.text}`);
+      else console.log(`${read.usage ? usageLine(read.usage, config.displayTimeZone) : NO_CLAUDE}\n\n${read.text}`);
       break;
     }
     case "launch": {

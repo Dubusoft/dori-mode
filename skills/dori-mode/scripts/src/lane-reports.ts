@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { fillHook } from "./config.ts";
+import { displayTime } from "./display-time.ts";
 import { claimDone, type Emit, type FlowDeps, laneMeta } from "./done-flow.ts";
 import { relayedText, scrubForThread } from "./freshness.ts";
 import { Discord } from "./messenger/discord.ts";
@@ -325,14 +326,14 @@ const elapsed = (ms: number): string => {
   const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
   return d ? `${d}일 ${h}시간` : h ? `${h}시간 ${m}분` : `${m}분`;
 };
-const stamp = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e)).slice(0, 160);
 
 /**
  * The text of a lane's status message as of `report`: its key, time since it opened, and its last milestone and last
  * progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post.
  */
-export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: LaneReport, now: number, home: string): string => {
+export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: LaneReport, now: number, home: string, timeZone?: string): string => {
+  const stamp = (at: number): string => displayTime(at, timeZone);
   const upTo = rows.filter((r) => r.seq <= report.seq && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
   const last = (kind: ReportKind): LaneReport | undefined =>
     [...upTo, ...(upTo.some((r) => r.id === report.id) ? [] : [report])].filter((r) => r.kind === kind).sort((a, b) => a.seq - b.seq).at(-1);
@@ -367,7 +368,7 @@ const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, chan
     console.error(`LANE_STATUS_REDIRECTED ${lane.key} ${report.id}: thread ${channel} was closed by the owner, so one line went to ${redirected}`);
     return;
   }
-  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home);
+  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone);
   if (lane.statusMessageId) {
     try {
       await transport.edit(channel, lane.statusMessageId, text);

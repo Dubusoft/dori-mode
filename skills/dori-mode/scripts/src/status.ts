@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import type { DoriConfig } from "./config.ts";
+import { displayTime } from "./display-time.ts";
 import { eventClass, eventKind, type EventClass, type EventPolicy } from "./event-policy.ts";
 import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./event-sources.ts";
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
@@ -48,6 +49,8 @@ export type LeadState = {
 
 export type Status = {
   readonly at: string;
+  /** The config's displayTimeZone: every time in the report is shown in it; absent (an older status) reads as UTC. */
+  readonly timeZone?: string;
   readonly services: readonly UnitState[];
   /** `laneWorkspace`: the supervisor-managed herdr workspace new local lane tabs open in ("" when none is recorded yet). */
   readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string };
@@ -399,6 +402,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   });
   return {
     at: new Date(now).toISOString(),
+    timeZone: d.config.displayTimeZone,
     services,
     lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
     lanes,
@@ -458,13 +462,8 @@ const ago = (iso: string | undefined, now: number): string => {
 /** "40초 전", "5분 전": an age in seconds. */
 const agoSec = (sec: number): string => (sec < 60 ? `${sec}초 전` : `${dur(Math.round(sec / 60))} 전`);
 
-const KST_MS = 9 * 3_600_000;
-const two = (n: number): string => String(n).padStart(2, "0");
-/** Fixed +09:00 (Asia/Seoul has no DST): "10-21 09:53". */
-export const kst = (ms: number): string => {
-  const d = new Date(ms + KST_MS);
-  return `${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}`;
-};
+/** "10-21 09:53 KST": `ms` in the status's time zone. */
+const time = (s: Status, ms: number): string => displayTime(ms, s.timeZone, "short");
 
 /** "anthropic-subscription/claude-opus-5-5" -> "opus-5-5"; other ids keep their readable tail. */
 export const shortModel = (model: string): string =>
@@ -622,7 +621,7 @@ const sourceLine = (s: Status, now: number, max: number): string[] => {
 
 /** "- brief: 다음 10-24 09:00 KST (20시간 후)", "- backup: ..., 지난 실행 failed exit 1": one line per scheduled job. */
 const scheduleLines = (s: Status, now: number): string[] => (s.schedules ?? []).map((job) => {
-  const next = job.waiting ? `${job.waiting} 기다리는 중` : job.nextRunAt === undefined ? "다음 실행 없음" : `다음 ${kst(job.nextRunAt)} KST (${left(job.nextRunAt, now)})`;
+  const next = job.waiting ? `${job.waiting} 기다리는 중` : job.nextRunAt === undefined ? "다음 실행 없음" : `다음 ${time(s, job.nextRunAt)} (${left(job.nextRunAt, now)})`;
   return clip(`- ${job.name}${job.machine ? machineMark(s, job.machine) : ""}: ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? `, 지난 실행 ${job.lastResult}` : ""}`, 200);
 });
 
@@ -680,7 +679,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const probs = problems(s, now);
   const counts = `작업 중 레인 ${s.lanes.length}개 · ${s.waits.length ? `대기 ${s.waits.length}개` : "대기 없음"}`;
   const lines = [
-    `도리 상태 · ${kst(now)} KST`,
+    `도리 상태 · ${time(s, now)}`,
     probs.length ? `⚠️ 확인 필요: ${probs.slice(0, 3).map((p) => p.label).join(", ")}${probs.length > 3 ? ` 외 ${probs.length - 3}건` : ""} · ${counts}` : `✅ 모두 정상 · ${counts}`,
   ];
   const section = (title: string, items: readonly string[]) => { if (items.length) lines.push("", `■ ${title}`, ...items); };
@@ -711,8 +710,8 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
     ...s.waits.slice(0, lim.waits).map((w) => {
       const fire = waitFireMs(w);
       const timeout = waitTimeoutMs(w);
-      const when = fire !== null ? `${kst(fire)} KST에 실행 (${left(fire, now)})`
-        : timeout !== null ? `신호 대기, ${kst(timeout)} KST 시한 (${left(timeout, now)})`
+      const when = fire !== null ? `${time(s, fire)}에 실행 (${left(fire, now)})`
+        : timeout !== null ? `신호 대기, ${time(s, timeout)} 시한 (${left(timeout, now)})`
         : `조건: ${clip(w.until, 50)}`;
       return `- ${w.key}${w.machine ? machineMark(s, w.machine) : ""}: ${when}${w.note ? ` - ${clip(w.note, lim.progress)}` : ""}`;
     }),
@@ -791,10 +790,10 @@ export const statusPages = (s: Status): string[] => {
   }
   chunks.push(chunk);
   const total = chunks.length + 1;
-  const now = kst(Date.parse(s.at));
+  const now = time(s, Date.parse(s.at));
   const first = bounded(build(s, lim, (hidden) => `외 ${hidden}개 (${total > 2 ? `2-${total}` : "2"}쪽)`));
   return [first, ...chunks.map((lines, i) => [
-    `도리 레인 · ${i + 2}/${total}쪽 · ${now} KST`,
+    `도리 레인 · ${i + 2}/${total}쪽 · ${now}`,
     "",
     `■ 레인 (${s.lanes.length}) 이어서`,
     ...lines,

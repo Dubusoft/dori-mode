@@ -29,6 +29,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("alertsChannel", "string", "Discord channel for system notices; blank means the first discordChannels entry"),
   spec("githubIssueAuthors", "list", "GitHub logins whose new or reopened issues wake the lead"),
   spec("ownerLanguage", "string", "Language the owner reads (e.g. Korean)"),
+  spec("displayTimeZone", "string", "IANA time zone owner-facing system messages show times in (e.g. Asia/Seoul, shown as KST)"),
   spec("laneRules", "list", "Owner policy lines every new lane footer carries"),
   spec("laneSandbox", "json", "Argv prefix that wraps every new local lane's agent command"),
   spec("guardMachines", "json", "Remote guard: machine label -> ssh target"),
