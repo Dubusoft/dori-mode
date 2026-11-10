@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Installs the dori-mode skill and the `dori` CLI, then runs `dori setup`.
-# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 # Needs: git, bun 1.3+. Optional env: DORI_SRC (clone dir), SKILLS_DIR (where your agent loads skills).
 set -euo pipefail
 
-repo="https://github.com/dev-bokdong/dori-mode.git"
+repo="https://github.com/Dubusoft/dori-mode.git"
 src="${DORI_SRC:-$HOME/.dori/src}"
 skills="${SKILLS_DIR:-$HOME/.agents/skills}"
 

@@ -35,7 +35,7 @@ Greet the owner through the bot before doing anything else.
 ## 4. Scripts and `dori setup`
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 The installer clones the repo, links the skill, runs `bun link` (puts `dori` on PATH) and then `dori setup` when it has a terminal. Otherwise run `dori setup` yourself, or from a checkout: `cd skills/dori-mode/scripts && bun install && bun link && dori setup`.
