@@ -155,11 +155,10 @@ const USAGE = `dori <command> [options]
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
-  autopilot candidates [--json] [--record] | approve <bundleId> --tasks 12,13 --owner-ref REF [--expires-days N] [--attempts N]
-            | revoke <bundleId> [--task N] [--reason TEXT] | bundles [--json] | schedule
-                                       lead-only, shadow mode (nothing launches): judge every member of an in-force owner-approved
-                                       bundle (LAUNCH/HOLD/REFUSE with reasons; --record writes one shadow row per task per hour),
-                                       store or revoke a bundle, list bundles, add the hourly autopilot-reconcile schedule job
+  autopilot candidates [--tasks 12,13] [--json] [--record] | schedule
+                                       lead-only, shadow mode (nothing launches): judge every planned toodo task marked for
+                                       autopilot, plus --tasks (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free
+                                       slots; --record writes one shadow row per task per hour), add the hourly autopilot-reconcile job
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
@@ -1095,7 +1094,8 @@ try {
         // The can-launch check of the default machine, without recording a launch verdict.
         host: () => within(15_000, async () => {
           const c = await checkMachine(deps.ops, config, config.placement.defaultMachine);
-          return c.verdict.ok ? { ok: true } : { ok: false, reason: c.verdict.reasons.join(" | ") };
+          const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
+          return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
         }, (why) => ({ ok: false, reason: why })),
         schedules: () => new SourceSpecs(config.stateDir),
         cliArgv: [process.execPath, join(import.meta.dir, "cli.ts")],
