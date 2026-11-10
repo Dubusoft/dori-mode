@@ -159,6 +159,10 @@ const USAGE = `dori <command> [options]
                                        lead-only, shadow mode (nothing launches): judge every planned toodo task marked for
                                        autopilot, plus --tasks (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free
                                        slots; --record writes one shadow row per task per hour), add the hourly autopilot-reconcile job
+  autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
+                                       lead-only, under a lock: re-judge the task and on LAUNCH reserve attempt <n> as lane
+                                       ap-<taskId>-<n> (planned ledger row; exit 1 with the verdict otherwise); a settle flag closes
+                                       the reservation as launched, failed or ambiguous (never retried by itself)
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
@@ -1085,6 +1089,7 @@ try {
     case "autopilot": {
       const { autopilotMain, quotaSummary, within } = await import("./autopilot-cli.ts");
       const { ToodoClient } = await import("./toodo-client.ts");
+      const { acquireStateLock } = await import("./state-lock.ts");
       const store = openOperations(config);
       const code = await autopilotMain(rest, {
         config: config.autopilot, store, now: realClock.now,
@@ -1098,6 +1103,7 @@ try {
           return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
         }, (why) => ({ ok: false, reason: why })),
         schedules: () => new SourceSpecs(config.stateDir),
+        lock: () => acquireStateLock(join(config.stateDir, "autopilot-launch.lock.sqlite")),
         cliArgv: [process.execPath, join(import.meta.dir, "cli.ts")],
         out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
       });

@@ -7,8 +7,8 @@ import { OPEN_STATES, type Operation, type OperationStore, plan, settleOperation
  * registry, quota and the host guard and pass plain data in.
  *
  * Rows:
- * - launch attempt (read only here): lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>`,
- *   data `{ laneKey }`.
+ * - launch attempt (written by `dori autopilot launch`): lane `toodo:<taskId>`, action `autopilot-launch`, target
+ *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous.
  * - shadow judgment: lane `autopilot`, action `autopilot-shadow`, target `<taskId>@<hour slot ISO>`, state `verified`,
  *   detail `<VERDICT> <reasons>`.
  */
@@ -98,7 +98,10 @@ export const ledgerRows = (store: OperationStore): Operation[] =>
 const rowsOf = (rows: readonly Operation[], taskId: number): Operation[] =>
   rows.filter((op) => op.action === LAUNCH_ACTION && op.lane === `toodo:${taskId}`);
 
-const laneKeyOf = (op: Operation): string | undefined => {
+/** The lane key of a task's launch attempt: deterministic, so the reservation names its lane before it exists. */
+export const autopilotLaneKey = (taskId: number, attempt: number): string => `ap-${taskId}-${attempt}`;
+
+export const laneKeyOf = (op: Operation): string | undefined => {
   try {
     const data = JSON.parse(op.data ?? "") as unknown;
     return isRecord(data) && typeof data.laneKey === "string" ? data.laneKey : undefined;
@@ -112,6 +115,14 @@ const rowLive = (op: Operation, openLanes: ReadonlySet<string>): boolean => {
   const key = laneKeyOf(op);
   return key !== undefined && openLanes.has(key);
 };
+
+/**
+ * Reservations of other tasks not running as a lane yet (open rows whose laneKey is no open lane): each takes one host
+ * slot that the pane count does not show.
+ */
+export const pendingReservations = (rows: readonly Operation[], openLanes: ReadonlySet<string>, exceptTaskId: number): number =>
+  rows.filter((op) => op.action === LAUNCH_ACTION && op.lane !== `toodo:${exceptTaskId}` && OPEN_STATES.includes(op.state))
+    .filter((op) => { const key = laneKeyOf(op); return key === undefined || !openLanes.has(key); }).length;
 
 export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>): LedgerState => {
   const mine = rowsOf(rows, taskId);

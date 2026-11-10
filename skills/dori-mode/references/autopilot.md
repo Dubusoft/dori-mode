@@ -1,6 +1,6 @@
 # Autopilot
 
-Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). v1 is shadow only: `dori autopilot candidates` judges and records, and nothing launches, nothing calls `dori launch`, nothing changes toodo and nothing merges.
+Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). v1 is shadow only: `dori autopilot candidates` judges and records, and nothing launches, nothing calls `dori launch`, nothing changes toodo and nothing merges. `dori autopilot launch` is the lead's reservation step for a launch it runs itself: it records the attempt in the ledger and launches nothing.
 
 ## Flag contract
 
@@ -14,7 +14,7 @@ Toodo's web RPC `list_tasks` filter has no `autopilot` key, so dori reads every 
 
 ## Ledger
 
-Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>` (1, 2, ...), data `{ "laneKey" }`. v1 never writes them; the predicate reads them:
+Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>` (1, 2, ...), data `{ "laneKey" }` with the lane key `ap-<taskId>-<attempt>`. Only `dori autopilot launch` writes them (see Commands): `planned` when reserved, then `verified` (launched), `failed` or `ambiguous` when settled. The predicate reads them:
 
 - Autopilot never retries by itself: any earlier attempt that is not running refuses `already-attempted`, for the owner to decide.
 - A row in `ambiguous` sends the task to the owner (REFUSE `ledger-ambiguous`); it is never retried.
@@ -78,6 +78,7 @@ Lead-only; inside a lane each one exits with `LANE_PERMISSION_DENIED`.
 ```
 dori autopilot candidates [--tasks 12,13] [--json] [--record]
 dori autopilot schedule
+dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
 ```
 
 - `candidates` judges every planned task marked for autopilot, plus the `--tasks` ids. It's read-only unless `--record` is given, which writes shadow rows only. Text output:
@@ -90,6 +91,8 @@ dori autopilot schedule
   ```
 
   With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ mode, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit). Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
+- `launch <taskId>` reserves the task's next launch attempt. It holds a state lock (`<stateDir>/autopilot-launch.lock.sqlite`) while it reads toodo, the ledger, open lanes, quota and the host again, and judges the task among every marked task as `candidates` does. Another task's reservation that is not running as a lane yet takes one of the host's free slots, since its pane does not exist yet. Only on LAUNCH it writes the `planned` row and prints `AUTOPILOT_RESERVED #<id> lane=ap-<id>-<n> attempt=<n>` (exit 0). Otherwise it prints `AUTOPILOT_LAUNCH_REFUSED #<id> <HOLD|REFUSE> <reasons>` and writes nothing (exit 1). A second reserve of the same task holds `lane-live`, so handling one event twice launches once.
+- `launch <taskId> --launched <laneKey>` settles the open reservation as `verified` (the key must be the reserved one, else `AUTOPILOT_LANE_MISMATCH`, exit 1). `--failed` settles it `failed` when the launch surely did not happen, and `--ambiguous` settles it `ambiguous` when that cannot be told; `--note` adds why to the row. Each prints `AUTOPILOT_SETTLED #<id> attempt=<n> <state> lane=<key>`; with no open reservation, `AUTOPILOT_NO_RESERVATION #<id>` (exit 1). A settled attempt is never retried by itself: `failed` and a closed lane refuse `already-attempted`, `ambiguous` also refuses `ledger-ambiguous`.
 - `schedule` adds, idempotently, the job `autopilot-reconcile`: cron `0 * * * *` (`Asia/Seoul`), kind `AUTOPILOT_RECONCILE`, catch-up `once`, running this same CLI as `autopilot candidates --record`. Its kind is digest under the default event policy, so it never wakes the lead by itself.
 
 ## Rules for the lead
@@ -97,7 +100,7 @@ dori autopilot schedule
 - A `TOODO_TASK_READY` event never launches by itself. Run `dori autopilot candidates --record` (add `--tasks <id>` to see why an unmarked ready task would not run). Only a marked task that judges LAUNCH may run; in v1 even LAUNCH only records "would launch #<n>". Any other ready task is recorded, not launched.
 - Reconcile at lead startup, on every `TOODO_TASK_READY` and `TOODO_TASK_RESYNC`, and hourly through `autopilot-reconcile`. Batch several ready lines into one reconcile.
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
-- Order: `start_task` with a `lane:<key>` ref first, then `dori launch`. After a restart, an in-progress task with no live lane is reported, never relaunched.
+- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (an ambiguous one goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
 - Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 
