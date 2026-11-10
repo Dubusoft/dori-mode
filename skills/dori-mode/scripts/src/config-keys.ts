@@ -281,7 +281,7 @@ export const configureKeys = async (o: ConfigureOptions): Promise<Configured> =>
     if (o.mode === "new") {
       for (const s of eligible) if (!o.seen.has(s.key) || (s.required && !hasValue(next[s.key]))) await ask(s);
     } else {
-      const first = eligible.filter((s) => s.required || !o.seen.has(s.key));
+      const first = eligible.filter((s) => (s.required && !hasValue(next[s.key])) || !o.seen.has(s.key));
       for (const s of first) await ask(s);
       const rest = eligible.filter((s) => !first.includes(s));
       if (rest.length && (await o.prompt.confirm("Edit the other optional keys too?", false))) for (const s of rest) await ask(s);

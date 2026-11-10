@@ -132,14 +132,17 @@ test("mode new asks only unseen keys and required keys without a value", async (
   expect(r.missingRequired).toEqual([]);
 });
 
-test("mode full asks required and unseen keys, then the others only after the confirm", async () => {
+test("mode full asks empty required and unseen keys, then the others only after the confirm", async () => {
   const seen = new Set(["name", "roots", "mode", "extra"]);
-  const declined = scripted([undefined, undefined, undefined], [false]);
+  const declined = scripted([undefined], [false]);
   await run(declined, { current: { name: "x", roots: ["/r"] }, seen });
-  expect(declined.s.asked).toEqual(["name", "roots", "lead"]);
+  expect(declined.s.asked).toEqual(["lead"]);
+  const empty = scripted(["/r", undefined], [false]);
+  await run(empty, { current: { name: "x" }, seen });
+  expect(empty.s.asked).toEqual(["roots", "lead"]);
   const accepted = scripted([undefined, undefined, undefined, "a", '{"k":true}'], [true]);
   const r = await run(accepted, { current: { name: "x", roots: ["/r"] }, seen });
-  expect(accepted.s.asked).toEqual(["name", "roots", "lead", "mode", "extra"]);
+  expect(accepted.s.asked).toEqual(["lead", "name", "roots", "mode", "extra"]);
   expect(r.next).toEqual({ name: "x", roots: ["/r"], mode: "a", extra: { k: true } });
   const none = scripted(Array(5).fill(undefined));
   await run(none, { current: { name: "x", roots: ["/r"] } });

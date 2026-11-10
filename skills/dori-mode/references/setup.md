@@ -59,7 +59,7 @@ The config is written atomically (mode 600). `references/scripts.md` explains ev
 `dori setup` and `dori runner setup` (a runner's `runner-config.json`) work the same way:
 
 - **By argument.** `--set key=value` and `--unset key` (both repeatable) are applied exactly as given and never asked. An empty value unsets. A list takes `a,b` or a JSON array, a JSON key takes JSON. An unknown key or a bad value stops the run before anything is written (`SETUP_FAILED` / exit 1, listing the valid keys).
-- **Interactively.** Every other key is asked with its `[required]` or `[optional]` label and its current value; Enter keeps it and `-` clears an optional key. Required keys and keys never shown before come first, then setup offers the other optional keys. Without a terminal or with `--yes` nothing is asked.
+- **Interactively.** Every other key is asked with its `[required]` or `[optional]` label and its current value; Enter keeps it and `-` clears an optional key. Required keys without a value and keys never shown before come first, then setup offers the other keys; a required key that already has a value is not asked again. Without a terminal or with `--yes` nothing is asked.
 - **Seen keys.** Each key shown or given is recorded in `<stateDir>/setup-keys.json` (runners: `<stateDir>/runner-setup-keys/<label|local>.json`). A later run in "new" mode (`dori setup --migrate`, `dori runner setup --new`) asks only keys never shown before, such as keys a `dori update` added, plus required keys that are empty.
 - **Automatic removal.** Keys the file no longer reads are deleted: unknown top-level keys, `hooks.*` other than `threadReply`/`transcribe`, `laneSandbox.default`, the old `runners` keys (`listen`, `mode`, `restartCircuit`, or a `runners` array), and in `runner-config.json` unknown keys and `guard.*` subkeys. Legacy pane keys are moved into `<stateDir>` first. The previous file is copied to `config.json.bak` / `runner-config.json.bak` before the write, and each removal is logged (`SETUP_KEY_REMOVED <key>`, `RUNNER_SETUP_KEY_REMOVED <key>`).
 - **Missing required keys** log `SETUP_KEY_MISSING <key> [required]` (`RUNNER_SETUP_KEY_MISSING`) and exit 2.
@@ -82,7 +82,7 @@ A `runner-config.json` that would not pass the runner's policy check is never wr
 
 What runs it for you:
 
-- `dori runner install` runs runner setup on the new runner afterwards (it takes `--set`, `--unset` and `--yes`).
+- `dori runner install` runs `dori runner setup --new` on the new runner afterwards (it takes `--set`, `--unset` and `--yes`).
 - `dori update` runs `dori setup --migrate`: prune (with `.bak`) and ask only new keys. With no `config.json` it prints `SETUP_MIGRATE_SKIPPED` and creates nothing.
 - `dori runner upgrade` (and so `dori update`'s rollout) runs `dori runner setup --new` for every upgraded runner.
 
