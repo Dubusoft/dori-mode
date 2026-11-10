@@ -376,7 +376,7 @@ export type RunnerConfig = { readonly allowUnsandboxed?: boolean };
  * Keys an older dori's `runners` section carried (the shadow runner's listen address, modes, restart circuit). They are
  * ignored and named in CONFIG_KEYS_IGNORED, never read as machine labels, so an old config keeps loading.
  */
-const LEGACY_RUNNER_KEYS: readonly string[] = ["listen", "mode", "restartCircuit"];
+export const LEGACY_RUNNER_KEYS: readonly string[] = ["listen", "mode", "restartCircuit"];
 
 /** The `runners` keys loadConfig ignores: the legacy ones, or the whole section when it is an (old) array. */
 const ignoredRunnerKeys = (raw: unknown): string[] =>
@@ -484,7 +484,7 @@ export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "disc
   config.alertsChannel?.trim() || config.discordChannels[0];
 
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
-const HOOK_KEYS = ["threadReply", "transcribe"] as const;
+export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
 
 let warnedIgnoredKeys = false;
 let warnedLeadArray = false;
