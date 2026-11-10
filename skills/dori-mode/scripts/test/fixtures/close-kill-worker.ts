@@ -12,7 +12,7 @@ import { Registry } from "../../src/registry.ts";
 import type { LaneOps } from "../../src/lane-ops.ts";
 import type { Ran, Runner } from "../../src/run.ts";
 import { checkDone } from "../../src/signals.ts";
-import { fakeClock, fakeLaneOps, newWorld, TEST_STORE } from "../fakes.ts";
+import { fakeClock, fakeLaneOps, newWorld, TEST_STORE, testTunables } from "../fakes.ts";
 
 const [stateDir = "", worldDir = "", killArg = "-1", mode = "watch"] = process.argv.slice(2);
 const killAt = Number(killArg);
@@ -79,7 +79,7 @@ const operations: OperationStore = {
   prune: (now) => inner.prune(now),
   close: () => inner.close(),
 };
-const deps: FlowDeps = { run: runner, clock: fakeClock(Date.parse("2026-01-01T12:00:00.000Z")), registry: new StepRegistry(stateDir), config, operations, ops: laneOps };
+const deps: FlowDeps = { run: runner, clock: fakeClock(Date.parse("2026-01-01T12:00:00.000Z")), registry: new StepRegistry(stateDir), config, tunables: testTunables(), operations, ops: laneOps };
 const lines: string[] = [];
 if (mode === "close") {
   const lane = await deps.registry.read("demo-lane");

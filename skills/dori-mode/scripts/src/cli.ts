@@ -66,6 +66,7 @@ import { readLaneIdentity } from "./runner/lane-identity.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import type { Connector, Transport } from "./runner/transport.ts";
 import { connectUnix } from "./runner/unix-transport.ts";
+import { BUILT_IN } from "./tunables.ts";
 
 /** How long the lane-mode check waits for the lane socket's whoami answer before it falls back to the runner's lane record. */
 const WHOAMI_TIMEOUT_MS = 500;
@@ -307,7 +308,7 @@ if (process.argv[2] === "status") {
   const { collectStatus, statusPage } = await import("./status.ts");
   const cfg = await loadConfig();
   setDefaultRunTimeout(cfg.runTimeoutMs);
-  const status = await collectStatus({ run, clock: realClock, config: cfg, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
+  const status = await collectStatus({ run, clock: realClock, config: cfg, tunables: BUILT_IN, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
   console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
   process.exit(0);
 }
@@ -678,7 +679,7 @@ let cliCall: CliRunnerCall | undefined;
 const relay = (): CliRunnerCall => (cliCall ??= cliRunnerCall(cliSocketPath(defaultRunnerDir())));
 let cliOps: LaneOps | undefined;
 const deps: FlowDeps = {
-  run, clock: realClock, registry: new Registry(config.stateDir), config,
+  run, clock: realClock, registry: new Registry(config.stateDir), config, tunables: BUILT_IN,
   get ops(): LaneOps { return cliOps ??= laneOps(relay(), { now: realClock.now, log: (line) => { console.error(line); } }); },
 };
 
@@ -1306,7 +1307,7 @@ try {
     case "inbox": {
       const parsed = parseArgs({ args: rest, allowPositionals: true, options: { "max-bytes": { type: "string" }, peek: { type: "boolean" } } });
       const raw = parsed.values["max-bytes"];
-      const maxBytes = raw === undefined ? config.delivery.push.takeMaxBytes : Number(raw);
+      const maxBytes = raw === undefined ? BUILT_IN.delivery.push.takeMaxBytes : Number(raw);
       if (parsed.positionals.join(" ") !== "take" || !Number.isSafeInteger(maxBytes) || maxBytes < 1) die("usage: dori inbox take [--max-bytes N (positive integer)] [--peek]");
       try {
         const result = take(config.stateDir, { maxBytes, peek: parsed.values.peek === true, now: realClock.now(), session: process.env.PI_SESSION_ID });

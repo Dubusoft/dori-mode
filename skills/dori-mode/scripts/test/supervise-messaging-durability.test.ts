@@ -74,7 +74,7 @@ test.each(["lead-digest", "engine-only"] as const)("enqueue commits a %s event i
   const f = fixture();
   const posted: string[] = [];
   const supervisor = new Supervisor({
-    ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: cls } }) },
+    ...f.deps, tunables: { ...f.deps.tunables, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: cls } }) },
   }, { announce: async (text) => { posted.push(text); } });
   cleanups.unshift(() => supervisor.close());
   const save = spyOn(supervisor["core"].store, "save");

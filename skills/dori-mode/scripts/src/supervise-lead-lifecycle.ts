@@ -185,10 +185,10 @@ export class LeadLifecycle {
 
   /** The lead's session id and file; either is empty/undefined when it cannot be resolved. */
   private async sessionFile(cwd: string): Promise<{ readonly id: string; readonly file?: string }> {
-    const hit = await resolveSession(this.deps.config.leadPane, cwd, await procTable(this.deps.run), { run: this.deps.run, sessionsDir: this.deps.config.sessionsDir });
+    const hit = await resolveSession(this.deps.config.leadPane, cwd, await procTable(this.deps.run), { run: this.deps.run, sessionsDir: this.deps.tunables.sessionsDir });
     if (!hit.id) return { id: "" };
     if (existsSync(hit.id)) return { id: hit.id, file: hit.id };
-    const dir = sessionDirFor(this.deps.config.sessionsDir, cwd);
+    const dir = sessionDirFor(this.deps.tunables.sessionsDir, cwd);
     const files = await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true }));
     return heldSession(dir, hit.pid) ?? { id: hit.id, file: files.find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`)) };
   }
@@ -200,7 +200,7 @@ export class LeadLifecycle {
    * says why nobody restarts it); the push step keeps re-pushing meanwhile.
    */
   capRefuses(what: string): boolean {
-    const { delivery } = this.deps.config;
+    const { delivery } = this.deps.tunables;
     const now = this.deps.clock.now();
     const count = this.core.forcedRestartsSince(now);
     if (count < delivery.restartMaxPerHour) return false;
@@ -223,9 +223,9 @@ export class LeadLifecycle {
    */
   async resumePaused(readPane = async (): Promise<Pane | undefined> =>
     (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<void> {
-    const { config, clock, run } = this.deps;
+    const { config, tunables, clock, run } = this.deps;
     const now = clock.now();
-    const window = config.ackTimeoutSec * 1000;
+    const window = tunables.ackTimeoutSec * 1000;
     if (now - this.resumedAt < window) return;
     if (!this.unacked(true).some((entry) => now - (entry.since ?? now) >= window)) return;
     const pane = await readPane();
@@ -234,7 +234,7 @@ export class LeadLifecycle {
     if (!PAUSED.test(screen)) return;
     this.resumedAt = now;
     if (!emptyInput(screen)) {
-      console.log(`LEAD_PAUSED_INPUT ${config.leadPane}: paused with text in its input; not typing, restart follows after ${config.delivery.push.escalateMin} min`);
+      console.log(`LEAD_PAUSED_INPUT ${config.leadPane}: paused with text in its input; not typing, restart follows after ${tunables.delivery.push.escalateMin} min`);
       return;
     }
     console.log(`LEAD_RESUMED ${config.leadPane} ${await sendVerified(run, clock, config.leadPane, "/resume")}`);
@@ -254,11 +254,11 @@ export class LeadLifecycle {
    */
   async stuckRestart(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
     (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<boolean> {
-    const { config, clock, run } = this.deps;
+    const { config, tunables, clock, run } = this.deps;
     const limit = config.leadStuckRestartMin * 60_000;
     if (!(limit > 0)) return false;
     // The push ladder owns idle leads, and one tool call is clocked by push.escalateMin (supervise-push.ts).
-    const unreadLimit = config.delivery.push.escalateMin * 60_000;
+    const unreadLimit = tunables.delivery.push.escalateMin * 60_000;
     const waiting = this.unacked();
     if (!waiting.length) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const now = clock.now();
@@ -461,20 +461,20 @@ export class LeadLifecycle {
 
   /** Why the idle lead must be cold-started for a delivery now, or undefined when it is warm and takes it in place. */
   async coldReason(cwd: string): Promise<ColdReason | undefined> {
-    const { config, clock } = this.deps;
+    const { tunables, clock } = this.deps;
     const { id, file } = await this.sessionFile(cwd);
     if (!id) throw new TransientSuperviseError("cannot resolve idle lead session; refusing an unproven cold restart");
     if (!file) throw new TransientSuperviseError(`cannot find lead session file for ${id}`);
     this.warmSession = file;
     const tokens = this.leadTokens(file);
     // Idle at delivery time (checked by the caller): a lead past the hard cap restarts even with a warm cache.
-    if (tokens >= config.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${config.leadContextHardCapTokens}` };
+    if (tokens >= tunables.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${tunables.leadContextHardCapTokens}` };
     const idleMs = clock.now() - statSync(file).mtimeMs;
     const idle = `idle ${Math.floor(idleMs / 60_000)} min`;
     // A lead at or above the context cap always restarts at this safe point (idle, its own children done), warm cache or not.
-    if (tokens >= config.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `context ${tokens} tokens at or above leadContextCapTokens ${config.leadContextCapTokens} (${idle}, cache ${idleMs < config.cacheTtlMin * 60_000 ? "warm" : "stale"})` };
-    if (idleMs < config.cacheTtlMin * 60_000) return undefined;
-    const stale = `${idle} (past cacheTtlMin ${config.cacheTtlMin})`;
+    if (tokens >= tunables.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `context ${tokens} tokens at or above leadContextCapTokens ${tunables.leadContextCapTokens} (${idle}, cache ${idleMs < tunables.cacheTtlMin * 60_000 ? "warm" : "stale"})` };
+    if (idleMs < tunables.cacheTtlMin * 60_000) return undefined;
+    const stale = `${idle} (past cacheTtlMin ${tunables.cacheTtlMin})`;
     // Pending waits and working lanes do not keep a stale lead: their events stay in the log past the take cursor, and
     // the fresh lead is reminded of open decisions and unreported lane outcomes until it settles them.
     return { kind: "stale", tokens, detail: stale };
@@ -552,7 +552,7 @@ export class LeadLifecycle {
    * and the open obligations. `[dori]` lines are transport, and the tail monitor is armed only with delivery.tailMonitor.
    */
   private startupPrompt(restart: Restart): string {
-    const { tailMonitor } = this.deps.config.delivery;
+    const { tailMonitor } = this.deps.tunables.delivery;
     const log = this.core.eventLog;
     const tail = [
       "Start exactly one persistent monitor with this command (the byte offset covers events arriving during startup):",
@@ -627,7 +627,7 @@ export class LeadLifecycle {
     if (restart.phase === "stopping" && !restart.force) {
       const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
       if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) {
-        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.defaultCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.config.sessionsDir });
+        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.defaultCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
         const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
         if (hit.pid && latest?.agent && (latest.agent_status === "idle" || latest.agent_status === "done")) {
           const old = (await this.sessionFile(pane.cwd ?? deps.config.defaultCwd)).id || hit.id;
@@ -672,7 +672,7 @@ export class LeadLifecycle {
         if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
         const table = await procTable(deps.run);
         const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.defaultCwd, table, { run: deps.run, sessionsDir: deps.config.sessionsDir });
+        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.defaultCwd, table, { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
         if (!hit.pid) throw new TransientSuperviseError("cannot identify reused lead process");
         const targets = await ownedTargets(deps, table, undefined, old);
         const protectedPids = new Set<number>();
@@ -743,9 +743,9 @@ export class LeadLifecycle {
       const executable = agent[0];
       if (!executable) throw new SuperviseError("agentCommand must name an executable");
       const argv = [
-        "env", "DORI_SUPERVISED=1", ...(deps.config.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
-        "--session-dir", sessionDirFor(deps.config.sessionsDir, deps.config.defaultCwd),
-        ...deps.config.leadArgs, ...(deps.config.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
+        "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
+        "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.defaultCwd),
+        ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
       ];
       const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.defaultCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
       if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${restart.session}`);
@@ -808,7 +808,7 @@ export class LeadLifecycle {
     // The push ladder's clock starts again for the new lead (N1): no push is outstanding to it yet.
     if (this.journal.inbox) this.journal = { ...this.journal, inbox: { ...this.journal.inbox, sessionSince: ready, push: undefined } };
     this.setRestart(undefined);
-    const policy = deps.config.eventPolicy;
+    const policy = deps.tunables.eventPolicy;
     const urgent = restart.events.filter((event) => eventClass(event.line, policy) === "lead-urgent");
     this.core.wakes.record(restart.session, restart.events, urgent.length ? urgent : restart.events);
     if (restart.request) completeLeadRestart(deps.config.stateDir, restart.request.id);
@@ -922,7 +922,7 @@ const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
 /** The new session's file once it has started and settled with its agent back, or undefined at the deadline. */
 const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
   let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
@@ -954,7 +954,7 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
 const softEvidence = async (deps: FlowDeps, old: string, markers: readonly string[], startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
   for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
@@ -1031,7 +1031,7 @@ export const STARTUP_EVIDENCE_MS = 20_000;
  * is positive evidence for that exact session and does not depend on the model replying.
  */
 export const hasStartupEvidence = (deps: FlowDeps, session: string): boolean => {
-  const dir = sessionDirFor(deps.config.sessionsDir, deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, deps.config.defaultCwd);
   const names = (path: string): readonly string[] => { try { return readdirSync(path); } catch { return []; } };
   return names(join(dir, "session-holders", session)).some((name) => name.endsWith(".json")) ||
     names(dir).some((name) => name.endsWith(`_${session}.jsonl`) || name === `${session}.jsonl`);
@@ -1097,7 +1097,8 @@ export const stopHung = async (deps: FlowDeps, session: string): Promise<void> =
 
 /** Stop the pane's exact foreground agent tree, then its detached session-owned monitors. */
 export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> => {
-  const { leadPane, sessionsDir, defaultCwd } = deps.config;
+  const { leadPane, defaultCwd } = deps.config;
+  const { sessionsDir } = deps.tunables;
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!pane) throw new TransientSuperviseError(`lead pane ${leadPane} is missing`);
   // `force` (a stuck lead) stops a working/blocked lead too.

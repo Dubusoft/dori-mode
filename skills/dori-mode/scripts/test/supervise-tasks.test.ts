@@ -94,7 +94,7 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     posts.push(body);
     changed();
     const ok = new Response(JSON.stringify({ id: "33" }), { status: 200 });
-    return stalled === "delivery" && body.includes(base.config.ownerDelayNotice) ? hang(ok) : ok;
+    return stalled === "delivery" && body.includes(base.tunables.ownerDelayNotice) ? hang(ok) : ok;
   }, { preconnect: fetch.preconnect }));
   const done = { machines: 0, gh: 0 };
   const deps = {

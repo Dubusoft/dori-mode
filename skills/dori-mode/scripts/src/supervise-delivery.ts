@@ -61,7 +61,7 @@ export class Delivery {
         this.outcomes.markDelivered();
         continue;
       }
-      const policy = this.deps.config.eventPolicy;
+      const policy = this.deps.tunables.eventPolicy;
       // engine-only events stay in the journal (dedupe, counts) but never reach the lead.
       const pending = this.journal.events.filter((event) => !this.delivered.has(event.id) && forLead(eventClass(event.line, policy)));
       const request = pendingLeadRestart(this.deps.config.stateDir);
@@ -81,7 +81,7 @@ export class Delivery {
       // event has waited digestMaxDelayMin. It survives a supervisor restart in the existing durable inbox.
       const now = this.deps.clock.now();
       // A sweep warning waits for real traffic: a failure that persists must not restart an idle lead every hour.
-      const overdue = (event: Event) => event.at !== undefined && now - event.at >= this.deps.config.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line);
+      const overdue = (event: Event) => event.at !== undefined && now - event.at >= this.deps.tunables.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line);
       // A finish event that joined its lane's record with nothing new (a merge after the claim) waits like digest.
       const urgent = pending.filter((event) => eventPriority(event.line, policy) === "urgent" && !this.outcomes.quiet(event.id));
       const due = urgent.length > 0 || pending.some(overdue);

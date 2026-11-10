@@ -2,7 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import type { DoriConfig } from "./config.ts";
-import { eventClass, eventKind, type EventClass } from "./event-policy.ts";
+import { eventClass, eventKind, type EventClass, type EventPolicy } from "./event-policy.ts";
 import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./event-sources.ts";
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { githubSummary } from "./github-events.ts";
@@ -22,6 +22,7 @@ import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { probe as probeRunner, type Verdict } from "./runner/health.ts";
 import { unsandboxedReason } from "./runner-sandbox.ts";
 import { openOperations } from "./operations.ts";
+import type { Tunables } from "./tunables.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const LEGACY_PRESENCE = "dori-presence.service";
@@ -243,9 +244,8 @@ export type EventStats = {
 
 export const STATS_HOURS = 24;
 
-const eventStats = (config: DoriConfig, now: number): EventStats => {
+const eventStats = (config: DoriConfig, policy: EventPolicy, now: number): EventStats => {
   const since = now - STATS_HOURS * 3_600_000;
-  const policy = config.eventPolicy;
   const lines = readStoreView(config.stateDir, {
     json: (journal) => (Array.isArray(journal.events) ? journal.events : []).filter((event) => (event.at ?? 0) >= since).map((event) => event.line),
     sqlite: (db) => (db.query("SELECT line FROM events WHERE at >= ?").all(since) as { line: string }[]).map((row) => row.line),
@@ -284,6 +284,7 @@ export type StatusDeps = {
   readonly run: Runner;
   readonly clock: Clock;
   readonly config: DoriConfig;
+  readonly tunables: Tunables;
   readonly registry: Registry;
   /** The runner directory whose health file tells the local runner child's state; without it no child state is shown. */
   readonly runnerDir?: string;
@@ -306,9 +307,9 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
     if (!found) return { pane, state: "missing", note: "pane not found in herdr" };
     if (!found.agent) return { pane, state: "cold", note: "no agent running in the lead pane" };
     const cwd = found.cwd ?? d.config.defaultCwd;
-    const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.config.sessionsDir });
+    const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.tunables.sessionsDir });
     if (!hit.id) return { pane, state: "unknown", note: "cannot resolve the lead session" };
-    const dir = sessionDirFor(d.config.sessionsDir, cwd);
+    const dir = sessionDirFor(d.tunables.sessionsDir, cwd);
     const files = await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true }));
     const started = existsSync(hit.id) ? hit.id :
       files.find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`));
@@ -318,7 +319,7 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
     const file = files.filter((path) => basename(path) > basename(started))
       .reduce((best, path) => statSync(path).mtimeMs > statSync(best).mtimeMs ? path : best, started);
     const idleMs = d.clock.now() - statSync(file).mtimeMs;
-    return { pane, state: idleMs < d.config.cacheTtlMin * 60_000 ? "warm" : "cold", idleMin: Math.floor(idleMs / 60_000), tokens: lastTokens(file) };
+    return { pane, state: idleMs < d.tunables.cacheTtlMin * 60_000 ? "warm" : "cold", idleMin: Math.floor(idleMs / 60_000), tokens: lastTokens(file) };
   } catch (e) {
     return { pane, state: "unknown", note: e instanceof Error ? e.message.slice(0, 80) : "lookup failed" };
   }
@@ -399,7 +400,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   return {
     at: new Date(now).toISOString(),
     services,
-    lead: { ...lead, cacheTtlMin: d.config.cacheTtlMin, capTokens: d.config.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
+    lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
     lanes,
     waits: readWaits(d.config.stateDir),
     github: {
@@ -412,7 +413,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     gateway: gatewayView(readGatewayStatus(d.config.stateDir), now),
     unacked: readUnacked(d.config.stateDir),
     unreported: readUnreported(d.config.stateDir),
-    events: eventStats(d.config, now),
+    events: eventStats(d.config, d.tunables.eventPolicy, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
     runners,

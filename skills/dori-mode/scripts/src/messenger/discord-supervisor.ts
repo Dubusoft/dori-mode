@@ -174,7 +174,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
             if (stopped) break;
             try {
               await pollDiscordInbound(deps.run, [channel], statePath, emitIn(channel),
-                (ch, after) => listDiscordInbound(discord, ch, after, deps.config.discordFirstSeenLimit), config.ownerId,
+                (ch, after) => listDiscordInbound(discord, ch, after, deps.tunables.discordFirstSeenLimit), config.ownerId,
                 watched.includes(channel) ? undefined : floor, inboundOptions);
             } catch {
               log(`INBOUND_ERROR ${channel} REST catch-up failed`);
@@ -236,7 +236,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       const channels = discordChannels(configuredChannels(), await deps.registry.open());
       if (polling) { await polling; return; }
       const newChannel = channels.some((channel) => !watched.includes(channel));
-      const interval = gateway.healthy ? deps.config.discordSafetyPollSeconds * 1_000 : 5_000;
+      const interval = gateway.healthy ? deps.tunables.discordSafetyPollSeconds * 1_000 : 5_000;
       if (newChannel || deps.clock.now() - lastPoll >= interval) await catchup();
     },
     async close(): Promise<void> {

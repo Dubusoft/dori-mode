@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { alertsChannelOf, defaultConfig, fill, leadCommand, leadModels, loadConfig, providerOf } from "../src/config.ts";
 import { withState } from "./fakes.ts";
+import { BUILT_IN } from "../src/tunables.ts";
 
 const state = withState();
 afterEach(() => {
@@ -13,15 +14,14 @@ test("the shipped example config loads, with ~ paths expanded and unset fields d
   const c = await loadConfig(join(import.meta.dir, "../../references/config.example.json"), "/home/ana");
   expect(c.stateDir).toBe("/home/ana/.dori/state");
   expect(c.defaultCwd).toBe("/home/ana/code/my-project");
-  expect(c.closeAfterMin).toBe(5);
   expect(c.guard.diskFreeMinGb).toBe(50);
-  expect(c.leadDiet).toBe(true);
 });
 
-test("leadDiet is always the built-in true: a leadDiet key in the file is ignored", async () => {
+test("leadDiet is built in: a leadDiet key in the file is ignored", async () => {
   const path = join(state.dir, "diet.json");
   await Bun.write(path, JSON.stringify({ leadDiet: false }));
-  expect((await loadConfig(path, "/home/ana")).leadDiet).toBe(true);
+  expect("leadDiet" in await loadConfig(path, "/home/ana")).toBe(false);
+  expect(BUILT_IN.leadDiet).toBe(true);
 });
 
 test("laneRules defaults to none, collapses whitespace, drops blanks, and refuses anything but an array of strings", async () => {
@@ -70,9 +70,7 @@ test("a stray leadModel key in the config file is ignored, and the default model
   await Bun.write(path, JSON.stringify({ leadModel: "old/model" }));
   const c = await loadConfig(path, "/home/ana");
   expect(c.defaultModel).toBe("anthropic-subscription/claude-opus-5-5");
-  expect(c.laneThinking).toBe("medium");
-  expect(c.launchKeywords).toBe("ulw set goal and work");
-  expect(c.massLaunchKeywords).toBe("/mass-ulw set goal and work");
+
 });
 
 test("only user and environment keys are read: unknown, removed and malformed tunable keys load as defaults, named in one CONFIG_KEYS_IGNORED line per process", async () => {
@@ -91,16 +89,17 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     const a = await loadConfig(${JSON.stringify(path)}, "/home/ana");
     const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
     const d = defaultConfig("/home/ana");
-    const same = ["closeAfterMin", "drift", "eventPolicy", "resolveKinds", "delivery", "guard", "heavyKill"].filter((k) => JSON.stringify(a[k]) === JSON.stringify(d[k]));
-    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a, store: a.store, sessionsDir: a.sessionsDir, laneThinking: a.laneThinking, toodo: a.toodoEvents.enabled, diskGuard: "diskGuardPath" in a }));`;
+    const same = ["drift", "guard", "heavyKill"].filter((k) => JSON.stringify(a[k]) === JSON.stringify(d[k]));
+    const tunables = ["closeAfterMin", "eventPolicy", "resolveKinds", "delivery", "sessionsDir", "laneThinking", "toodoEvents"].filter((k) => k in a);
+    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a, store: a.store, tunables, diskGuard: "diskGuardPath" in a }));`;
   const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   expect(code).toBe(0);
   expect(JSON.parse(out)).toEqual({
-    same: ["closeAfterMin", "drift", "eventPolicy", "resolveKinds", "delivery", "guard", "heavyKill"],
+    same: ["drift", "guard", "heavyKill"],
     model: "m/lane", base: "release", memoryCheck: { repo: "", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
     sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
-    store: "json", sessionsDir: "/home/ana/.omo/agent/sessions", laneThinking: "medium", toodo: true, diskGuard: false,
+    store: "json", tunables: [], diskGuard: false,
   });
   const ignored = "store, futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, memoryCheck, sessionsDir, diskGuardPath, laneThinking, toodoEvents, hooks.threadDone, laneSandbox.default, runners.listen, runners.mode";
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
@@ -136,8 +135,8 @@ test("a lead context cap in the file is ignored: the built-in default holds", as
   try {
     const path = join(local.dir, "cap.json");
     await Bun.write(path, JSON.stringify({ leadContextCapTokens: 42_000 }));
-    const c = await loadConfig(path, "/home/ana");
-    expect(c.leadContextCapTokens).toBe(150_000);
+    expect("leadContextCapTokens" in await loadConfig(path, "/home/ana")).toBe(false);
+    expect(BUILT_IN.leadContextCapTokens).toBe(150_000);
   } finally { local.done(); }
 });
 

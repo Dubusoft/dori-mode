@@ -13,6 +13,7 @@ import type { DoriConfig } from "../src/config.ts";
 import { applyConfigPatch, type ConfigReload, configReloader, watchConfigFiles } from "../src/config-watch.ts";
 import { eventClass } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal } from "./fakes.ts";
+import { type Tunables } from "../src/tunables.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const done of cleanups.splice(0).reverse()) await done(); });
@@ -194,7 +195,7 @@ test("a fatal close code stops reconnecting and reports once; 4014 is fatal once
   }
 });
 
-const inboundFixture = (patch: Partial<DoriConfig> = {}) => {
+const inboundFixture = (patch: Partial<DoriConfig & Tunables> = {}) => {
   const state = withState();
   cleanups.push(state.done);
   const t = timerFixture();
@@ -666,7 +667,7 @@ test("item 6: first-seen REST catch-up uses discordFirstSeenLimit", async () => 
   await f.inbound.tick();
   await f.inbound.close();
   expect(f.listed.filter((url) => url.includes("/channels/100/messages")).map((url) => new URL(url).searchParams.get("limit"))).toEqual(["40"]);
-  expect(f.deps.config.discordFirstSeenLimit).toBe(40);
+  expect(f.deps.tunables.discordFirstSeenLimit).toBe(40);
   const g = inboundFixture();
   await g.inbound.tick();
   await g.inbound.close();

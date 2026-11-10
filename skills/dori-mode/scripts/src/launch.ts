@@ -81,7 +81,7 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
   if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);
   if (input.mode === "mass-ulw") {
     // omo binds mass-ulw only when the message starts with /mass-ulw and has no "?" after it.
-    const keywords: unknown = deps.config.massLaunchKeywords;
+    const keywords: unknown = deps.tunables.massLaunchKeywords;
     if (typeof keywords !== "string" || !keywords.startsWith("/mass-ulw") || keywords.includes("?") || input.brief.includes("?")) throw new LaunchError("massLaunchKeywords must start with /mass-ulw and the prompt (keywords and brief path) must contain no '?'");
   }
   const unbindable = sandboxedCwdInDoriHome(deps, input);
@@ -514,7 +514,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     await Bun.write(input.brief, brief);
     const start: StartInput = {
       key: input.key, cmdId, briefText: brief, files: prepared.files, done: input.done, thread: draft.thread, ...(cwd !== undefined ? { cwd } : {}), sandbox, mode, model,
-      keywords: mode === "mass-ulw" ? deps.config.massLaunchKeywords : deps.config.launchKeywords,
+      keywords: mode === "mass-ulw" ? deps.tunables.massLaunchKeywords : deps.tunables.launchKeywords,
       ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
       ...(input.session !== undefined ? { session: input.session } : {}),
       ...(target ? { target: { pane: target.pane } } : {}),

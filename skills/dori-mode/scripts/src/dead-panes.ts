@@ -4,6 +4,7 @@ import type { LaneOps } from "./lane-ops.ts";
 import { appendDeadPaneReport } from "./lane-reports.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Lane } from "./registry.ts";
+import { BUILT_IN } from "./tunables.ts";
 
 /** Unrecognised ticks in a row before one alert names the pane. */
 export const UNRECOGNISED_ALERT_AFTER = 3;
@@ -50,7 +51,7 @@ const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, h
   const out: string[] = [];
   const watch = new Set([config.laneWorkspace].filter(Boolean));
   const skip = new Set([config.leadPane, ...config.ignorePanes].filter(Boolean));
-  const marked = (tail: string) => config.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
+  const marked = (tail: string) => BUILT_IN.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
   const panes = await view.panes(machine);
   const laneTabs = new Set(panes.flatMap((p) => p.tab_id && ctx.byPane.has(machine ? `${machine}/${p.pane_id}` : p.pane_id) ? [p.tab_id] : []));
   for (const pane of panes) {

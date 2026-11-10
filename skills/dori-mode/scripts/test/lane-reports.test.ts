@@ -11,6 +11,7 @@ import { type Lane, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { fakeLaneSocket } from "./fake-lane-socket.ts";
+import { BUILT_IN } from "../src/tunables.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; a loaded full run on a small host needs more than bun's default 5 s per test.
 setDefaultTimeout(30_000);
@@ -233,12 +234,13 @@ test("milestone and progress reports are digest, question and blocked stay urgen
   const dir = stateDir();
   const file = join(dir, "config.json");
   await Bun.write(file, JSON.stringify({ eventPolicy: { kinds: { "LANE_REPORT * progress": "engine-only" } } }));
-  const plain = await loadConfig(file, "/home/test");
-  expect(eventClass("LANE_REPORT demo milestone tests green", plain.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("LANE_REPORT demo progress half way", plain.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("LANE_REPORT demo question which base?", plain.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("LANE_REPORT demo blocked CI down", plain.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", plain.eventPolicy)).toBe("lead-digest");
+  expect("eventPolicy" in await loadConfig(file, "/home/test")).toBe(false);
+  const policy = BUILT_IN.eventPolicy;
+  expect(eventClass("LANE_REPORT demo milestone tests green", policy)).toBe("lead-digest");
+  expect(eventClass("LANE_REPORT demo progress half way", policy)).toBe("lead-digest");
+  expect(eventClass("LANE_REPORT demo question which base?", policy)).toBe("lead-urgent");
+  expect(eventClass("LANE_REPORT demo blocked CI down", policy)).toBe("lead-urgent");
+  expect(eventClass("GH_PR acme/app#7 checks_failing sha=x u", policy)).toBe("lead-digest");
 });
 
 const cli = async (dir: string, args: string[], env: Record<string, string> = {}, config: Record<string, unknown> = {}) => {
@@ -317,7 +319,7 @@ test("a dori-report lane's row is routed and counts as hearing from it, and an o
   const journal: [string, string][] = [];
   expect(await routeReports(deps, new JsonLaneReports(dir), (id, line) => { journal.push([id, line]); })).toEqual(["LANE_REPORT_ROUTED cli-lane:0:1 question journal"]);
   expect(journal).toEqual([["lane-report:cli-lane:0:1", "LANE_REPORT cli-lane question which base?"]]);
-  expect(eventClass("LANE_REPORT cli-lane question which base?", deps.config.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("LANE_REPORT cli-lane question which base?", deps.tunables.eventPolicy)).toBe("lead-urgent");
   // Being routed is being heard: freshness counts from it.
   expect((await deps.registry.read("cli-lane"))?.lastReplyAt).toBe(T0);
 

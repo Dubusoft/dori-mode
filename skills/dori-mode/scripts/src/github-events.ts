@@ -284,7 +284,7 @@ export class GitHubEvents {
     await Promise.all([...targets].map(async ([repo, lanes]) => {
       const old = this.state.repos[repo];
       const carried = this.partial.get(repo);
-      const api = new Api(deps.run, carried?.cache ?? old?.cache ?? {}, deps.config.githubTimeoutMs, deps.clock.now());
+      const api = new Api(deps.run, carried?.cache ?? old?.cache ?? {}, deps.tunables.githubTimeoutMs, deps.clock.now());
       const pulls: Record<string, Pull> = { ...old?.pulls, ...carried?.pulls };
       const done = new Set(carried?.done);
       try {

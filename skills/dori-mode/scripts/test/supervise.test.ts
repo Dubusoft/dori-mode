@@ -219,8 +219,8 @@ test("a lane's dori report question reaches the lead as an urgent LANE_REPORT wi
   // The question wakes the lead; the milestone is digest by the policy table and waits for the next urgent delivery.
   const delivered = f.log();
   expect(delivered.some((event: { line: string }) => event.line === "LANE_REPORT local-lane question which base branch?")).toBe(true);
-  expect(eventClass("LANE_REPORT local-lane question which base branch?", f.deps.config.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("LANE_REPORT local-lane milestone tests green", f.deps.config.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("LANE_REPORT local-lane question which base branch?", f.deps.tunables.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("LANE_REPORT local-lane milestone tests green", f.deps.tunables.eventPolicy)).toBe("lead-digest");
   // Only the pointer is typed, never the report's text: the lead reads it with dori inbox take.
   const typedTexts = f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text").map((call) => call[4] ?? "");
   expect(typedTexts).toHaveLength(1);
@@ -1932,7 +1932,7 @@ test("an old journal's Toodo chat row (toodo:chat:<n>, the removed channel) is n
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("toodo:chat:13", "INBOUND toodo 13 user plan it");
   await supervisor.flush();
-  f.clock.at += f.deps.config.handledTimeoutMin * 60_000 + 120_000;
+  f.clock.at += f.deps.tunables.handledTimeoutMin * 60_000 + 120_000;
   expect(supervisor.overdueOwnerMessages(60_000)).toEqual([]);
   expect(supervisor.ackTick(60_000)).toEqual([]);
   expect(supervisor.handledTick()).toEqual([]);
@@ -2308,8 +2308,8 @@ const typed = (f: ReturnType<typeof fixture>): string[] => f.calls.filter((call)
 // The footer omo showed on a lead the owner stopped with Esc during `gh pr checks --watch` (2026-10-23).
 const PAUSED_SCREEN = "❯ \n(😺 OmO Native by Q Kim) ◉ watching lead events (5m) Paused · 4 updates held · type to continue, /resume to resume";
 
-test("a working lead held inside one tool call (a foreground watch) with an owner message unacked is restarted after leadUnreadRestartMin, though its screen moves", async () => {
-  const f = fixture({ leadUnreadRestartMin: 5 });
+test("a working lead held inside one tool call (a foreground watch) with an owner message unacked is restarted after delivery.push.escalateMin, though its screen moves", async () => {
+  const f = fixture();
   f.pane.agent_status = "working";
   inToolCall(f, f.clock.now());
   const supervisor = new Supervisor(f.deps);
@@ -2329,7 +2329,7 @@ test("a working lead held inside one tool call (a foreground watch) with an owne
 });
 
 test("a working lead between tool calls, or one whose call started after it acked, is left alone", async () => {
-  const answered = fixture({ leadUnreadRestartMin: 5 });
+  const answered = fixture();
   answered.pane.agent_status = "working";
   inToolCall(answered, answered.clock.now(), true);
   const s1 = new Supervisor(answered.deps);
@@ -2341,7 +2341,7 @@ test("a working lead between tool calls, or one whose call started after it acke
   }
   expect(launches(answered)).toEqual([]);
 
-  const acked = fixture({ leadUnreadRestartMin: 5 });
+  const acked = fixture();
   acked.pane.agent_status = "working";
   const s2 = new Supervisor(acked.deps);
   s2.enqueue("discord:1:1", "INBOUND 1 1 hi");
@@ -2371,7 +2371,7 @@ test("an idle lead paused by Esc gets /resume typed before its pointer; still un
   f.clock.at += 60_000;
   await muted(() => supervisor.flush());
   expect(launches(f)).toEqual([]);
-  f.clock.at += (f.deps.config.delivery.push.escalateMin - 1) * 60_000;
+  f.clock.at += (f.deps.tunables.delivery.push.escalateMin - 1) * 60_000;
   await muted(() => supervisor.flush());
   expect(launches(f)).toHaveLength(1);
   expect(f.prompt()).toContain("it did not take pushed events");

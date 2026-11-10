@@ -40,7 +40,7 @@ const deliveredOutcome = async () => {
   const session = join(f.state.dir, "lead.jsonl");
   writeFileSync(session, "{}\n");
   utimesSync(session, T0 / 1000, T0 / 1000);
-  const supervisor = new Supervisor({ ...f.deps, config: { ...f.deps.config, cacheTtlMin: 60 }, run: async (argv, opts) => {
+  const supervisor = new Supervisor({ ...f.deps, tunables: { ...f.deps.tunables, cacheTtlMin: 60 }, run: async (argv, opts) => {
     if (argv[0] === "ps" && argv[1] === "-A") return { code: 0, out: `101 10 /usr/bin/omo --session-id ${session}`, err: "" };
     if (argv[0] === "herdr" && argv[2] === "process-info") return { code: 0, out: JSON.stringify({ result: { process_info: { shell_pid: 10 } } }), err: "" };
     return f.deps.run(argv, opts);
@@ -188,7 +188,7 @@ test("a report recorded before the outcome event arrives settles it, and two lan
 test("outcomes in the history at startup open nothing, and an engine-only outcome is not owed", async () => {
   const f = fixture();
   writeJournal(f.state.dir, { events: [{ id: "lane-closed:old", line: "LANE_CLOSED old x", at: T0 - 60 * MIN }] });
-  const supervisor = new Supervisor({ ...f.deps, config: { ...f.deps.config, eventPolicy: { default: "lead-digest", kinds: { ...f.deps.config.eventPolicy.kinds, LANE_CLOSED: "engine-only" } } } });
+  const supervisor = new Supervisor({ ...f.deps, tunables: { ...f.deps.tunables, eventPolicy: { default: "lead-digest", kinds: { ...f.deps.tunables.eventPolicy.kinds, LANE_CLOSED: "engine-only" } } } });
   supervisor.enqueue("lane-closed:quiet", "LANE_CLOSED quiet x");
   f.clock.at += 10 * MIN;
   await supervisor.reportTick();

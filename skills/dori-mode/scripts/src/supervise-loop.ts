@@ -591,7 +591,7 @@ export const supervisorSweeps = (
     ["snapshot", async (emit) => {
       view = passthroughView(deps.ops);
       // A bad deadline warns every round and the sweeps read per lane.
-      if (!Number.isFinite(deps.config.sweepMachineDeadlineMs) || deps.config.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
+      if (!Number.isFinite(deps.tunables.sweepMachineDeadlineMs) || deps.tunables.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
       const open = await deps.registry.open();
       const machines = new Map<string, string | undefined>([
         [machineRunner(undefined), undefined], ...open.flatMap((l) => l.machine ? [[machineRunner(l.machine), l.machine] as const] : []), ...unavailable,
@@ -603,7 +603,7 @@ export const supervisorSweeps = (
           await emit(`RUNNER_UNAVAILABLE runner=${label} no admitted connection: watch, dead-panes and freshness skip its lanes until it says hello`);
         }
       }
-      view = await sweepRound(deps.ops, cache, open, { now: deps.clock.now, deadlineMs: deps.config.sweepMachineDeadlineMs });
+      view = await sweepRound(deps.ops, cache, open, { now: deps.clock.now, deadlineMs: deps.tunables.sweepMachineDeadlineMs });
       return [];
     }],
     ["watch", async (emit) => {
@@ -812,24 +812,23 @@ export const supervise = async (
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
   const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
-  if (!Number.isFinite(deps.config.cacheTtlMin) || deps.config.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
-  if (!Number.isFinite(deps.config.leadContextCapTokens) || deps.config.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
-  if (!Number.isFinite(deps.config.leadContextHardCapTokens) || deps.config.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
-  if (!Number.isFinite(deps.config.githubPollSeconds) || deps.config.githubPollSeconds <= 0) throw new SuperviseError("githubPollSeconds must be positive");
-  if (!Number.isFinite(deps.config.githubTimeoutMs) || deps.config.githubTimeoutMs <= 0) throw new SuperviseError("githubTimeoutMs must be positive");
-  if (!Number.isFinite(deps.config.discordSafetyPollSeconds) || deps.config.discordSafetyPollSeconds <= 0) throw new SuperviseError("discordSafetyPollSeconds must be positive");
-  if (!Number.isFinite(deps.config.digestMaxDelayMin) || deps.config.digestMaxDelayMin <= 0) throw new SuperviseError("digestMaxDelayMin must be positive");
-  if (!Number.isFinite(deps.config.ackTimeoutSec) || deps.config.ackTimeoutSec <= 0) throw new SuperviseError("ackTimeoutSec must be positive");
+  if (!Number.isFinite(deps.tunables.cacheTtlMin) || deps.tunables.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
+  if (!Number.isFinite(deps.tunables.leadContextCapTokens) || deps.tunables.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
+  if (!Number.isFinite(deps.tunables.leadContextHardCapTokens) || deps.tunables.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
+  if (!Number.isFinite(deps.tunables.githubPollSeconds) || deps.tunables.githubPollSeconds <= 0) throw new SuperviseError("githubPollSeconds must be positive");
+  if (!Number.isFinite(deps.tunables.githubTimeoutMs) || deps.tunables.githubTimeoutMs <= 0) throw new SuperviseError("githubTimeoutMs must be positive");
+  if (!Number.isFinite(deps.tunables.discordSafetyPollSeconds) || deps.tunables.discordSafetyPollSeconds <= 0) throw new SuperviseError("discordSafetyPollSeconds must be positive");
+  if (!Number.isFinite(deps.tunables.digestMaxDelayMin) || deps.tunables.digestMaxDelayMin <= 0) throw new SuperviseError("digestMaxDelayMin must be positive");
+  if (!Number.isFinite(deps.tunables.ackTimeoutSec) || deps.tunables.ackTimeoutSec <= 0) throw new SuperviseError("ackTimeoutSec must be positive");
   if (!Number.isFinite(deps.config.runTimeoutMs) || deps.config.runTimeoutMs < 0) throw new SuperviseError("runTimeoutMs must be zero or positive");
-  if (!Number.isFinite(deps.config.handledTimeoutMin) || deps.config.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
-  if (!Number.isFinite(deps.config.reportTimeoutMin) || deps.config.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
-  if (!Number.isFinite(deps.config.resolveTimeoutMin) || deps.config.resolveTimeoutMin <= 0) throw new SuperviseError("resolveTimeoutMin must be positive");
+  if (!Number.isFinite(deps.tunables.handledTimeoutMin) || deps.tunables.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
+  if (!Number.isFinite(deps.tunables.reportTimeoutMin) || deps.tunables.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
+  if (!Number.isFinite(deps.tunables.resolveTimeoutMin) || deps.tunables.resolveTimeoutMin <= 0) throw new SuperviseError("resolveTimeoutMin must be positive");
   if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
   if (!Number.isFinite(deps.config.leadChildWaitMaxMin) || deps.config.leadChildWaitMaxMin <= 0) throw new SuperviseError("leadChildWaitMaxMin must be positive");
-  if (!Number.isFinite(deps.config.leadUnreadRestartMin) || deps.config.leadUnreadRestartMin <= 0) throw new SuperviseError("leadUnreadRestartMin must be positive");
-  if (!Number.isFinite(deps.config.idleEscalateMin) || deps.config.idleEscalateMin <= 0) throw new SuperviseError("idleEscalateMin must be positive");
-  if (!Number.isInteger(deps.config.waitMaxFailures) || deps.config.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
-  const deliveryProblem = deliveryConfigError(deps.config.delivery);
+  if (!Number.isFinite(deps.tunables.idleEscalateMin) || deps.tunables.idleEscalateMin <= 0) throw new SuperviseError("idleEscalateMin must be positive");
+  if (!Number.isInteger(deps.tunables.waitMaxFailures) || deps.tunables.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
+  const deliveryProblem = deliveryConfigError(deps.tunables.delivery);
   if (deliveryProblem) throw new SuperviseError(deliveryProblem);
   setDefaultRunTimeout(deps.config.runTimeoutMs);
   let release: (() => void) | undefined;
@@ -896,7 +895,7 @@ export const supervise = async (
     const home = process.env.HOME ?? "";
     const registry = sources = new EventSources({
       stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
-      policy: deps.config.eventPolicy, log: (line) => { console.error(line); }, remote: hubCall,
+      policy: deps.tunables.eventPolicy, log: (line) => { console.error(line); }, remote: hubCall,
       schedules: {
         operations: ops, journaled: (id: string) => supervisor.journaled(id),
         heavy: {
@@ -916,10 +915,10 @@ export const supervise = async (
     const enqueueGitHub = enqueueOf("github");
     const enqueueDiscord = enqueueOf("discord");
     const toodoEvents = new ToodoEvents({
-      config: deps.config.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
+      config: deps.tunables.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
       fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
     });
-    const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.config.waitMaxFailures, hubCall));
+    const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.tunables.waitMaxFailures, hubCall));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
     const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps));
     // CI follow-up reads the poll it follows, so it runs right after each GitHub tick.
@@ -1006,7 +1005,7 @@ export const supervise = async (
       for (const { channel, message } of due) {
         try {
           supervisor.noticeAttempt("delay", channel, message);
-          await ownerNotice(channel, deps.config.ownerDelayNotice, `delay:${channel}:${message}`);
+          await ownerNotice(channel, deps.tunables.ownerDelayNotice, `delay:${channel}:${message}`);
           supervisor.noticeSent("delay", channel, message);
         }
         catch (e) { console.error(`OWNER_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
@@ -1015,13 +1014,13 @@ export const supervise = async (
     // A message the lead was handed but never acked is re-pushed, and after a second window the owner gets one line.
     const noticeUnacked = async (): Promise<void> => {
       let due: ReturnType<typeof supervisor.ackTick>;
-      try { due = supervisor.ackTick(deps.config.ackTimeoutSec * 1_000); }
+      try { due = supervisor.ackTick(deps.tunables.ackTimeoutSec * 1_000); }
       catch (e) { console.error(`ACK_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
       for (const { channel, message } of due) {
         console.log(`ACK_MISSING_NOTICE ${channel}/${message}`);
         try {
           supervisor.noticeAttempt("ack", channel, message);
-          await ownerNotice(channel, deps.config.ackMissingNotice, `ack:${channel}:${message}`);
+          await ownerNotice(channel, deps.tunables.ackMissingNotice, `ack:${channel}:${message}`);
           supervisor.noticeSent("ack", channel, message);
         }
         catch (e) { console.error(`ACK_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
@@ -1030,13 +1029,13 @@ export const supervise = async (
     // A message the lead acked but never linked to lanes or a reply: UNHANDLED wakes it, then the owner gets one line.
     const noticeUnhandled = async (): Promise<void> => {
       let due: ReturnType<typeof supervisor.handledTick>;
-      try { due = supervisor.handledTick(deps.config.handledTimeoutMin * 60_000); }
+      try { due = supervisor.handledTick(deps.tunables.handledTimeoutMin * 60_000); }
       catch (e) { console.error(`HANDLED_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
       for (const { channel, message } of due) {
         console.log(`UNHANDLED_NOTICE ${channel}/${message}`);
         try {
           supervisor.noticeAttempt("unhandled", channel, message);
-          await ownerNotice(channel, deps.config.unhandledNotice, `unhandled:${channel}:${message}`);
+          await ownerNotice(channel, deps.tunables.unhandledNotice, `unhandled:${channel}:${message}`);
           supervisor.noticeSent("unhandled", channel, message);
         }
         catch (e) { console.error(`UNHANDLED_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
@@ -1253,7 +1252,7 @@ export const supervise = async (
       task("polling", 5_000, async () => {
         const polls = [watchdog.track("waits", guarded("waits", waits.tick(deps.clock.now, deps.run, enqueueWait)))
           .catch((e: unknown) => { console.error(`WAIT_ERROR ${e instanceof Error ? e.message : String(e)}`); })];
-        if (deps.clock.now() - lastGitHub >= deps.config.githubPollSeconds * 1_000) {
+        if (deps.clock.now() - lastGitHub >= deps.tunables.githubPollSeconds * 1_000) {
           lastGitHub = deps.clock.now();
           polls.push(watchdog.track("github", guarded("github", pollGithub()))
             .catch((e: unknown) => { console.error(`GITHUB_ERROR ${e instanceof Error ? e.message : String(e)}`); }));

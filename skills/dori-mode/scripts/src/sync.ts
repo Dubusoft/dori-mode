@@ -53,7 +53,7 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
   const hits = await mapLimit(plans, RESOLVE_CONCURRENCY, async ({ lane, pane }): Promise<SessionHit | Error> => {
     if (!pane) return none;
     try {
-      return (await deps.ops.inspect(lane, { session: true, sessionsDir: deps.config.sessionsDir })).session ?? none;
+      return (await deps.ops.inspect(lane, { session: true, sessionsDir: deps.tunables.sessionsDir })).session ?? none;
     } catch (e) {
       return e instanceof Error ? e : new Error(String(e));
     }

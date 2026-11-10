@@ -16,6 +16,7 @@ import { deliverLaneMessage, queueSteering } from "./ci-follow.ts";
 import { openLaneMessages } from "./lane-messages.ts";
 import { checkLaneReportText, installLaneReports, LaneFileError, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
+import type { Tunables } from "./tunables.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -24,6 +25,8 @@ export type FlowDeps = {
   readonly clock: Clock;
   readonly registry: Registry;
   readonly config: DoriConfig;
+  /** Built-in timings, notices and policies (tunables.ts); production passes BUILT_IN. */
+  readonly tunables: Tunables;
   /** Every lane operation, through the lane's runner (lane-ops.ts). */
   readonly ops: LaneOps;
   readonly exists?: (path: string) => boolean;
@@ -122,7 +125,7 @@ const cwdFallbackLine = (deps: FlowDeps, lane: Lane, read: LaneRead): string | u
     ? `SIGNAL_CWD ${lane.key}: lane cwd ${lane.cwd} no longer exists; Done signals and git ran in defaultCwd ${deps.config.defaultCwd}`
     : undefined;
 
-const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60_000;
+const windowMs = (deps: FlowDeps): number => deps.tunables.closeAfterMin * 60_000;
 
 /** Free text in an event line (evidence, reasons) is capped; the registry keeps it whole. */
 const EVENT_TEXT_MAX = 300;
@@ -149,7 +152,7 @@ const machineClose = (lane: Lane): boolean => lane.autoClose === "machine";
  * digest leaves it to the supervisor (live re-check, then close or LANE_NOT_DONE), so the window runs from the hand-over.
  */
 const claimWaitsForLead = (deps: FlowDeps, lane: Lane): boolean =>
-  !machineClose(lane) && eventClass(`LANE_DONE_CLAIMED ${lane.key}`, deps.config.eventPolicy) === "lead-urgent";
+  !machineClose(lane) && eventClass(`LANE_DONE_CLAIMED ${lane.key}`, deps.tunables.eventPolicy) === "lead-urgent";
 
 /** The journal id of a claim's announcement: stable, so a repeated announcement after a crash is the same event. */
 export const claimEventId = (key: string, claimAt: string): string => `done-claim:${key}:${claimAt}`;
@@ -226,8 +229,8 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   if (lane.pane) {
     const closesAt = new Date(deps.clock.now() + windowMs(deps)).toISOString().slice(11, 16);
     const when = claimWaitsForLead(deps, lane)
-      ? `${deps.config.closeAfterMin} minutes after the lead receives this claim`
-      : `at ${closesAt}Z (${deps.config.closeAfterMin} minutes) once its Done signals read back live`;
+      ? `${deps.tunables.closeAfterMin} minutes after the lead receives this claim`
+      : `at ${closesAt}Z (${deps.tunables.closeAfterMin} minutes) once its Done signals read back live`;
     await steerLane(deps, lane, "claim", `[LEAD] done claim recorded for ${lane.key}: this lane closes automatically ${when} unless the lead objects with reasons; a PR the claim recorded is merged by the supervisor first. Stop here and stay idle: do not watch or wait for the merge. An objection arrives here as [LEAD] not done.`);
   }
   return `LANE_DONE_CLAIMED ${lane.key} ${lane.pane ?? "-"} ${eventText(evidence)}`;
@@ -529,7 +532,7 @@ type WaitView = {
 const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], start: number): Promise<{ readonly waiting: boolean; readonly why: string[] }> => {
   const signals = failing.map((c) => { try { return parseSignal(c.signal); } catch { return undefined; } });
   if (!signals.length || signals.some((s) => s?.kind !== "merged")) return { waiting: false, why: [] };
-  const maxMin = deps.config.mergeWaitMaxMin;
+  const maxMin = deps.tunables.mergeWaitMaxMin;
   const why: string[] = [];
   for (const s of signals) {
     if (s?.kind !== "merged") continue;
@@ -561,7 +564,7 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
  * supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes the lane as before.
  */
 const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<boolean> => {
-  if (deps.clock.now() - start >= deps.config.mergeWaitMaxMin * 60_000) return false;
+  if (deps.clock.now() - start >= deps.tunables.mergeWaitMaxMin * 60_000) return false;
   for (const bound of lane.claim?.pulls ?? []) {
     const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], { timeoutMs: 20_000 });
     let view: (WaitView & { readonly baseRefName?: string }) | undefined;
