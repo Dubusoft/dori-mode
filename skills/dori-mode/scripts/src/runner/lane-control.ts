@@ -71,6 +71,12 @@ export const pause = async (deps: ControlDeps, pane: string, step: PauseStep = "
   return { ...(goal ? { goal } : {}), working, stopped };
 };
 
+/**
+ * omo's footer on a session whose turn Escape cut ("Paused · N updates held · type to continue, /resume to resume"),
+ * the same footer supervise-lead-lifecycle.ts `PAUSED` reads on the lead.
+ */
+export const ESC_PAUSED = /\bPaused\b.*\/resume\b/;
+
 /** Typed into a lane whose turn did not start after `/goal resume`: a message releases a held session. */
 export const RESUME_TEXT = "dori resume: this lane is resumed. Continue your lane work.";
 
@@ -84,13 +90,16 @@ const turnRuns = async (deps: ControlDeps, pane: string): Promise<boolean> => {
 
 /**
  * The `lane.resume` sequence: `/goal resume`, confirmed from the screen, then a turn read back. An active goal alone
- * does not prove the lane runs: a held session (an aborted turn, a human wait) stays idle after it. When no turn starts,
- * one message is typed to release the hold, and the turn is read back again; still idle is `held`.
+ * does not prove the lane runs: a held session (an aborted turn, a human wait) stays idle after it. A session whose
+ * turn the pause cut with Escape shows omo's paused footer and gets `/resume`, which continues that turn; a session
+ * without the footer (no turn was cut) gets none. When still no turn starts, one message is typed to release the hold,
+ * and the turn is read back again; still idle is `held`.
  */
 export const resume = async (deps: ControlDeps, pane: string): Promise<CommandResults["lane.resume"]> => {
   const goal = await goalCommand(deps, pane, "/goal resume", RESUMED_SHOWN);
   if (goal !== "confirmed") return { goal };
   let execution: ExecutionOutcome = "running";
+  if (ESC_PAUSED.test(await readScreen(deps.run, pane))) await sendGuarded(deps.run, pane, "/resume");
   if (!(await turnRuns(deps, pane))) {
     execution = (await sendGuarded(deps.run, pane, RESUME_TEXT)) === "sent" && (await turnRuns(deps, pane)) ? "running" : "held";
   }
