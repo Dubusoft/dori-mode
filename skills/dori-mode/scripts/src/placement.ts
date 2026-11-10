@@ -114,7 +114,7 @@ export type MachineCheck = { readonly machine: string; readonly verdict: LaunchV
 
 /**
  * A remote machine's launch verdict: canLaunch's memory/disk/pane rules; -1 metrics never hold, CPU load never holds.
- * A machine whose shell cannot run the guard agent has no metrics, so only its pane count holds.
+ * A machine with an unsupported remote shell (UNSUPPORTED_SHELL) has no metrics, so only its pane count holds.
  */
 export const machineVerdict = (result: SampleResult, panes: number, t: GuardThresholds, label: string): LaunchVerdict => {
   if (!result.ok && !result.detail.startsWith(UNSUPPORTED_SHELL)) return { ok: false, reasons: [`machine ${label} unreachable: ${result.detail}`] };
@@ -164,7 +164,7 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
   const panes = s.panes >= 0 ? seen.panes.length : -1;
   const result: SampleResult = {
     ok: true,
-    sample: { version: "runner", os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
+    sample: { os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
   };
   const guard: GuardThresholds = { ...config.guard, ...seen.guard };
   return { machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes) };

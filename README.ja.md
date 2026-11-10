@@ -129,7 +129,7 @@ watcher はレーンを閉じるときに、シェルを通さずこの確認を
 | `dori watch` | 自動クローズの watcher。常駐モニターとして動かします |
 | `dori freshness [--loop MIN]` | 静かになったレーンに声をかけ、それでも静かならリードに上げ、最後の報告をスレッドに投稿 |
 | `dori dead-panes [--loop MIN]` | 止まったエージェントの pane を報告 |
-| `dori guard [--loop MIN]` | 負荷、メモリ、ディスク、pane 数の警告、ワーカーマシンごとにも (`guard install`、`guard machines`) |
+| `dori guard [--loop MIN]` | 負荷、メモリ、ディスク、pane 数の警告、ランナーマシンごとにも (ランナーのサンプルから、`dori status` に表示) |
 | `dori heavy <label> -- <cmd>` | スロットが空いて負荷が低いときだけビルド、テスト、エミュレータを実行 (マシンごとに1つ) |
 
 pane に送る文字列は必ず引数ひとつとして渡し、シェル文字列を通しません。送信結果は「届いた」か「未確認」として報告します。

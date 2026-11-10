@@ -28,6 +28,7 @@ import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
+import { legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -363,6 +364,8 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
  */
 export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
   const checks: Check[] = [];
+  const legacyGuardFiles = legacyGuardAgentFiles(d.home);
+  if (legacyGuardFiles.length) checks.push(warn("guard agent", `${legacyGuardFiles.join(", ")} left from the old standalone guard agent; the runner reports this host now`, "the runner removes them when it starts (dori update on the lead restarts runners); or delete them"));
   try {
     const endpoints = Object.entries(readRunnerEndpoints(d.config.stateDir));
     checks.push(endpoints.length

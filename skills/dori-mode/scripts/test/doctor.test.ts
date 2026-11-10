@@ -202,6 +202,18 @@ test("doctor warns when the obsolete local runner unit is enabled", async () => 
   expect(find(await runDoctor(f.deps), "runner unit")).toMatchObject({ level: "WARN", detail: expect.stringContaining("supervisor runs the local runner itself") });
 });
 
+test("doctor warns only when standalone guard agent files remain", async () => {
+  const f = fixture();
+  expect((await runDoctor(f.deps)).find((c) => c.id === "guard agent")).toBeUndefined();
+  const path = join(f.deps.home, ".dori", "guard-agent.sh");
+  writeFileSync(path, "legacy");
+  expect(find(await runDoctor(f.deps), "guard agent")).toMatchObject({
+    level: "WARN",
+    detail: expect.stringContaining("guard-agent.sh left from the old standalone guard agent; the runner reports this host now"),
+    fix: "the runner removes them when it starts (dori update on the lead restarts runners); or delete them",
+  });
+});
+
 test("doctor warns when a lead restart is pending without consuming it or touching the warm lead", async () => {
   const f = fixture();
   const request = { id: "restart-doctor-177", at: NOW, models: [{ model: "qa/lead", thinking: "high" }, { model: "qa/fallback" }] };

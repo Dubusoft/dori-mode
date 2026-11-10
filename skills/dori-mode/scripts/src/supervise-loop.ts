@@ -44,8 +44,7 @@ import { describeLane, formatKb, type LaneMemory, laneMemoryDetail } from "./lan
 import { pauseLane, type PauseResult } from "./pause.ts";
 import type { Lane } from "./registry.ts";
 import {
-  type GuardMachine, guardAgentWants, type KillResult, loadMachineGuardState,
-  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, type SampleResult, readGuardMachines, sampleMachine, saveMachineGuardState, wantFor,
+  type GuardMachine, type KillResult, loadMachineGuardState, machineGuardTick, type MachineSample, readGuardMachines, saveMachineGuardState,
 } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -618,7 +617,7 @@ export const supervisorSweeps = (
     // the sweep says nothing, and the liveness monitor reports the runner.
     ["guard", async (emit) => {
       const board = runnerGuard();
-      const fromRunner = board?.sampleFor(LOCAL_RUNNER, () => "");
+      const fromRunner = board?.sampleFor(LOCAL_RUNNER);
       if (!board || !fromRunner) return [];
       const s = fromRunner.sample;
       const sample: HostSample = {
@@ -650,8 +649,8 @@ export const supervisorSweeps = (
       return [];
     }],
     ["memory", async () => memorySweep(deps, home)],
-    // Last, so a slow or unreachable worker machine never delays the pane reads of the sweeps before it. A machine
-    // whose sample failed waits out its backoff instead of costing an ssh timeout every round.
+    // Each worker machine with an enrolled runner is judged from its runner's guard sample; nothing is sampled over ssh.
+    // Last, so a slow herdr machine list never delays the pane reads of the sweeps before it.
     ["machine-guard", async (emit) => {
       const now = deps.clock.now();
       if (!guardMachines || now - guardMachines.at >= MACHINE_LIST_TTL_MS) {
@@ -662,51 +661,45 @@ export const supervisorSweeps = (
           await emit(`SWEEP_WARN machine-guard herdr machine list failed: ${listed.detail}`);
         }
       }
-      const due = guardMachines.list.filter((m) => machineDue(machineGuard, m.label, now));
-      if (!due.length) return [];
-      const want = guardAgentWants(await readGuardAgentScripts());
-      // A machine whose runner sent a fresh sample is judged from it. A machine with an enrolled runner is never sampled
-      // over ssh: while its runner is quiet it is skipped (the liveness monitor reports it). Only a machine without a
-      // runner, which cannot host lanes, is sampled through the ssh guard agent. The runner kills by itself, so a
-      // machine's critical stage reports the kills it sent.
+      // Only machines with an enrolled runner are guarded (a machine without one is not); each is judged from its runner's
+      // fresh sample, and one whose runner is quiet is skipped this round (the liveness monitor reports it). An enrolled
+      // label missing from the machine list is its own ssh target. The runner kills by itself, so a machine's critical
+      // stage reports the kills it sent.
       const board = runnerGuard();
-      const enrolled = new Set(readRunnerRows(deps.config.stateDir).map((row) => row.label));
-      const sampled = await Promise.all(due.map(async (machine) => {
-        const fromRunner = board?.sampleFor(machine.label, (os) => wantFor(want, os));
-        if (fromRunner) return { machine, result: fromRunner as SampleResult, fromRunner };
-        if (enrolled.has(machine.label)) return undefined;
-        return { machine, result: await sampleMachine(deps.run, machine), fromRunner: undefined };
-      }));
-      const results = sampled.filter((r) => r !== undefined);
+      if (!board) return [];
+      const listedByLabel = new Map(guardMachines.list.map((m) => [m.label, m] as const));
+      const enrolled = [...new Set(readRunnerRows(deps.config.stateDir).map((row) => row.label))].filter((label) => label !== LOCAL_RUNNER);
+      const results = enrolled.flatMap((label) => {
+        const fromRunner = board.sampleFor(label);
+        return fromRunner ? [{ machine: listedByLabel.get(label) ?? { label, target: label }, result: fromRunner, sample: fromRunner.sample, fromRunner }] : [];
+      });
+      if (!results.length) return [];
       const open = await deps.registry.open();
       // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
       // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.
       const warned = new Map<string, string>();
-      await Promise.all(results.map(async ({ machine, result }) => {
-        if (!result.ok || machineGuard.get(machine.label)?.alerting) return;
-        const note = await warnMachineLanes(deps.ops, machine, result.sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
+      await Promise.all(results.map(async ({ machine, sample }) => {
+        if (machineGuard.get(machine.label)?.alerting) return;
+        const note = await warnMachineLanes(deps.ops, machine, sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
         if (note) warned.set(machine.label, note);
       }));
       const lanesOn = (m: GuardMachine): string | undefined => {
         const keys = open.filter((l) => l.machine !== undefined && (l.machine === m.label || l.machine === m.id)).map((l) => l.key);
         return [keys.length ? `lanes on this machine: ${keys.join(", ")}` : "", warned.get(m.label) ?? ""].filter(Boolean).join("; ") || undefined;
       };
-      const lines = machineGuardTick(results, deps.config.guard, want, machineGuard, lanesOn, now);
+      const lines = machineGuardTick(results, deps.config.guard, machineGuard, lanesOn, now);
       try {
         for (const line of lines) await emit(line);
         // A machine held by `dori can-launch --machine` or a queued launch resumes the same way, from this round's pane list.
-        for (const { machine: { label }, result, fromRunner } of results) {
-          if (!result.ok || !launchHeld(deps.config.stateDir, label)) continue;
-          const panes = fromRunner?.panes ?? await view.panes(label).then((p) => p.length, () => -1);
+        for (const { machine: { label }, result, sample, fromRunner } of results) {
+          if (!launchHeld(deps.config.stateDir, label)) continue;
+          const panes = fromRunner.panes ?? await view.panes(label).then((p) => p.length, () => -1);
           if (!machineVerdict(result, panes, deps.config.guard, label).ok) continue;
-          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
+          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(sample.memFreePct, sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
           clearLaunchHold(deps.config.stateDir, label);
         }
-        const criticalLines = await Promise.all(results.map(({ machine, result, fromRunner }) =>
-          result.ok
-            ? criticalTick(deps, { kind: "machine", machine }, result.sample, open, machineCritical,
-              fromRunner && board ? board.takeKills(machine.label) : { ok: true, killed: [] }, io, fromRunner?.lanes ? laneMemoryOf(fromRunner.lanes) : [])
-            : Promise.resolve(undefined)));
+        const criticalLines = await Promise.all(results.map(({ machine, sample, fromRunner }) =>
+          criticalTick(deps, { kind: "machine", machine }, sample, open, machineCritical, board.takeKills(machine.label), io, fromRunner.lanes ? laneMemoryOf(fromRunner.lanes) : [])));
         for (const line of criticalLines) if (line) await emit(line);
       } finally {
         saveMachineGuardState(machineGuardPath, machineGuard);

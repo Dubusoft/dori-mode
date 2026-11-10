@@ -81,7 +81,7 @@ test("with no local lane the CRITICAL line says nothing could be done", async ()
 });
 
 const machine: GuardMachine = { label: "mac mini", target: "mac.local" };
-const remote: MachineSample = { version: "v1", os: "Darwin", load1: 1, memFreePct: 2, swapFreeGb: -1, swapTotalGb: -1, diskFreeGb: 100 };
+const remote: MachineSample = { os: "Darwin", load1: 1, memFreePct: 2, swapFreeGb: -1, swapTotalGb: -1, diskFreeGb: 100 };
 
 test("a critical machine reports its runner's kills and tells its lanes through that runner", async () => {
   const { w, deps } = world(["w:app-1"]);

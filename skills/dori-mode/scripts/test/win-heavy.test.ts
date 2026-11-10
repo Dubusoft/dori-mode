@@ -29,9 +29,7 @@ test("win32 claim never overwrites an owner the legacy agent wrote first", async
   expect(readFileSync(owner, "utf8")).toBe("999 legacy 2026-11-07T08:00:00Z");
 });
 
-test("win32 owner stamp has seconds precision matching guard-agent.ps1", async () => {
-  const ps1 = readFileSync(join(import.meta.dir, "..", "templates", "guard-agent.ps1"), "utf8");
-  expect(ps1).toContain("'yyyy-MM-ddTHH:mm:ssZ'");
+test("win32 owner stamp has seconds precision (yyyy-MM-ddTHH:mm:ssZ)", async () => {
   const d = deps({});
   const slot = await trySlot(d, "lane:build");
   const owner = readFileSync(join(slot ?? "", "owner"), "utf8");

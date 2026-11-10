@@ -9,7 +9,9 @@ import { enqueueLaunch, launchHeld, launchQueue, type QueuedLaunch, recordLaunch
 import type { Runner } from "../src/run.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { runSweeps, supervisorSweeps } from "../src/supervise-loop.ts";
+import { RunnerGuardBoard } from "../src/runner/guard.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState } from "./fakes.ts";
+import { enrollRunners, runnerSample } from "./runner-guard-world.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; process startup under a loaded full run outgrows bun's default 5 s.
 setDefaultTimeout(30_000);
@@ -19,30 +21,31 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const T0 = 1_800_000_000_000;
 const ok = (out = "") => ({ code: 0, out, err: "" });
-const agentLine = (memFreePct: number) => `DORI_GUARD_SAMPLE version=v0 os=linux load1=1 mem_free_pct=${memFreePct} swap_free_gb=4 disk_free_gb=200`;
 const held = (key: string, machine?: string): QueuedLaunch => ({
   key, title: key, done: "merged acme/app#1", brief: `/b/${key}.md`, queuedAt: new Date(T0).toISOString(), reasons: ["full"], ...(machine ? { machine } : {}),
 });
 
-/** Supervisor sweeps over three saved machines: big and spare have room, mini is short of memory; each has one pane. */
+/** Supervisor sweeps over three machines with runners: big and spare have room, mini is short of memory; each has one pane. */
 const machineWorld = () => {
   const state = withState();
   cleanups.push(state.done);
   const world = newWorld();
   const clock = fakeClock(T0);
   const base = depsFor(world, clock, state.dir, { guardMachines: { big: "u@big", mini: "u@mini", spare: "u@spare" } });
-  const mem: Record<string, number> = { "u@big": 60, "u@mini": 5, "u@spare": 60 };
   const run: Runner = async (argv) => {
     if (argv[0] === "df") return ok("Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200");
-    if (argv[0] === "ssh" && argv.at(-1)?.startsWith("x=6;")) return ok("DORI_POSIX_42");
-    if (argv[0] === "ssh") return ok(agentLine(mem[argv[argv.indexOf("--") + 1] ?? ""] ?? 0));
     return base.run(argv);
   };
+  enrollRunners(state.dir, "big", "mini", "spare");
+  const board = new RunnerGuardBoard(clock.now);
+  for (const [label, memFreePct] of [["big", 60], ["mini", 5], ["spare", 60]] as const) {
+    board.event(label, runnerSample({ load1: 1, memFreePct, diskFreeGb: 200, swapFreeGb: 4 }, T0, label));
+  }
   // Each machine's runner lists one pane.
   const ops = { ...base.ops, panes: async (machine?: string) => [{ pane_id: `${machine ?? "local"}:p1`, workspace_id: "w" }] };
   const deps = { ...base, run, ops };
   const queue: string[] = [];
-  const sweeps = supervisorSweeps(deps, "/home/test");
+  const sweeps = supervisorSweeps(deps, "/home/test", undefined, undefined, undefined, () => board);
   const tick = () => runSweeps(sweeps, async (line) => { queue.push(line); }, clock.now, new Map(), () => {});
   return { deps, state, queue, tick };
 };

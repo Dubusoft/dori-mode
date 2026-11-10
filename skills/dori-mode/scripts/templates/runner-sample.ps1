@@ -2,7 +2,7 @@
 # usage: runner-sample.ps1 [DISK_PATH]
 # Output: {"load1":n,"memFreePct":n,"swapFreeKb":n,"swapTotalKb":n,"diskFreeKb":n,"procs":[{"pid","ppid","rss","name","cmd","created"}]}
 # rss is the working set in KB, created the process creation time in ms since the Unix epoch (0 when unknown).
-# A metric that cannot be read is -1. The CIM reads are ported from guard-agent.ps1. ASCII only (PS 5.1 reads BOM-less files as ANSI).
+# A metric that cannot be read is -1. ASCII only (PS 5.1 reads BOM-less files as ANSI).
 
 $ErrorActionPreference = 'Continue'
 $Inv = [System.Globalization.CultureInfo]::InvariantCulture

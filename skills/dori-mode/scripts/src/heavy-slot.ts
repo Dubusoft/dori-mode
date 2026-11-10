@@ -16,7 +16,7 @@ export type SlotDeps = {
 };
 
 const ORPHAN_MS = 60_000;
-/** The slack `guard-agent.ps1` allows between the slot stamp and the owner's start time. */
+/** The slack allowed on win32 between the slot stamp (seconds precision) and the owner's start time. */
 const START_SLACK_MS = 1_000;
 
 const stamp = (ms: number, win: boolean): string => {

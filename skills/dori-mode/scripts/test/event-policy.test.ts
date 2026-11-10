@@ -54,14 +54,12 @@ test("the done claim and lane-ending events, a close after a received claim too,
   }
 });
 
-test("a worker machine going OFFLINE or OUTDATED wakes the lead; NOT_INSTALLED, CURRENT and ONLINE are digest", () => {
+test("a worker machine going OFFLINE wakes the lead; ONLINE is digest; the retired agent kinds have no entry", () => {
   expect(eventClass("HOST_GUARD OFFLINE machine=mac unreachable: timeout")).toBe("lead-urgent");
-  expect(eventClass("HOST_GUARD OUTDATED machine=mac have=a want=b; run dori update")).toBe("lead-urgent");
-  expect(eventClass("HOST_GUARD NOT_INSTALLED machine=mac guard agent not installed; run dori guard install --machine mac")).toBe("lead-digest");
-  expect(eventClass("HOST_GUARD CURRENT machine=mac abcdef012345")).toBe("lead-digest");
   expect(eventClass("HOST_GUARD ONLINE machine=mac")).toBe("lead-digest");
-  // Digest even under a config whose default is urgent.
-  expect(eventClass("HOST_GUARD NOT_INSTALLED machine=mac x", resolveEventPolicy({ default: "lead-urgent" }))).toBe("lead-digest");
+  for (const kind of ["HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT", "HOST_GUARD OUTDATED"]) {
+    expect(Object.keys(DEFAULT_EVENT_POLICY.kinds)).not.toContain(kind);
+  }
 });
 
 test("LEAD_UNRESPONSIVE (restart cap refused) wakes the lead; a leftover ACK_MISSING line is digest", () => {
