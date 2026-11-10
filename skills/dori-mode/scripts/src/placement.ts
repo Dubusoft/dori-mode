@@ -22,9 +22,17 @@ export type Placement = {
   readonly movable: boolean;
   /** source runner: the checkout the owning runner declared for the repo. */
   readonly cwd?: string;
-  /** source runner: false when the owning runner is not connected, so the launch holds for it. */
+  /** source runner: false when the owning runner (every candidate, when there are several) is not connected, so the launch holds for it. */
   readonly online?: boolean;
+  /**
+   * source runner, only when two or more runners declare the repo: every declaring runner in candidate order
+   * (placement.fallback order, then label); `machine`/`cwd`/`online` above are the preferred one, and planLaunch picks.
+   */
+  readonly candidates?: readonly PlacementCandidate[];
 };
+
+/** One runner declaring the placed repo: its machine, the checkout it declared, and whether it is connected. */
+export type PlacementCandidate = { readonly machine: string; readonly cwd: string; readonly online: boolean };
 
 /** What one runner reported about its repos (hub `workspaces` column) and whether it is connected now. */
 export type RunnerPlacement = {
@@ -32,19 +40,16 @@ export type RunnerPlacement = {
   readonly online: boolean;
   readonly declared: readonly WorkspaceEntry[];
   readonly detected: readonly WorkspaceEntry[];
+  /** The runner's lane worktree root, when it reported one. */
+  readonly worktreeRoot?: string;
 };
 
 /** The placement reports of the hub's runner rows; `online` says whether a row's runner is connected. */
 export const runnerPlacements = (rows: readonly RunnerRow[], online: (row: RunnerRow) => boolean): RunnerPlacement[] =>
-  rows.flatMap((row) => (row.workspaces ? [{ machine: row.label, online: online(row), declared: row.workspaces.declared, detected: row.workspaces.detected }] : []));
-
-/** Two or more runners declare the same repo: the launch is refused until `--machine` picks one. */
-export class PlacementConflict extends Error {
-  readonly code = "PLACEMENT_CONFLICT";
-  constructor(readonly repo: string, readonly machines: readonly string[]) {
-    super(`PLACEMENT_CONFLICT ${repo} is declared by runners ${machines.join(", ")}; pass --machine, and keep it in only one runner-config.json workspaces`);
-  }
-}
+  rows.flatMap((row) => (row.workspaces ? [{
+    machine: row.label, online: online(row), declared: row.workspaces.declared, detected: row.workspaces.detected,
+    ...(row.workspaces.worktreeRoot !== undefined ? { worktreeRoot: row.workspaces.worktreeRoot } : {}),
+  }] : []));
 
 /** Runners declare workspaces: the config table is no longer read. */
 const declaring = (reports: readonly RunnerPlacement[]): boolean => reports.some((r) => r.declared.length > 0);
@@ -53,28 +58,38 @@ export const DEPRECATED_TABLE_READ = "PLACEMENT_CONFIG_DEPRECATED placement.work
 export const DEPRECATED_TABLE_IGNORED = "PLACEMENT_CONFIG_DEPRECATED placement.workspaces is ignored because runners declare workspaces; delete it from the config";
 
 /**
- * The declared owner of a workspace task: the runner whose declared path is the longest prefix of `cwd`, else the
- * runners declaring the first Done repo any runner declares. Throws PlacementConflict when two machines tie.
+ * The declared owners of a workspace task: the runners whose declared path is the longest prefix of `cwd`, else the
+ * runners declaring the first Done repo any runner declares; one candidate per machine (its first entry).
  */
-const declaredOwner = (cwd: string | undefined, repos: readonly string[], reports: readonly RunnerPlacement[]): { report: RunnerPlacement; entry: WorkspaceEntry } | undefined => {
+const declaredOwners = (cwd: string | undefined, repos: readonly string[], reports: readonly RunnerPlacement[]): { repo: string; candidates: PlacementCandidate[] } | undefined => {
   const all = reports.flatMap((report) => report.declared.map((entry) => ({ report, entry })));
-  const pick = (found: typeof all, repo: string) => {
-    const machines = [...new Set(found.map((f) => f.report.machine))];
-    if (machines.length > 1) throw new PlacementConflict(repo, machines);
-    return found[0];
-  };
+  const owners = (found: typeof all) => ({
+    repo: found[0]!.entry.repo,
+    candidates: found.filter((f, i) => found.findIndex((g) => g.report.machine === f.report.machine) === i)
+      .map(({ report, entry }) => ({ machine: report.machine, cwd: entry.path, online: report.online })),
+  });
   if (filled(cwd)) {
     const byPath = all.filter(({ entry }) => cwd === entry.path || cwd.startsWith(entry.path.endsWith("/") ? entry.path : `${entry.path}/`));
     const longest = Math.max(-1, ...byPath.map(({ entry }) => entry.path.length));
     const found = byPath.filter(({ entry }) => entry.path.length === longest);
-    if (found.length) return pick(found, found[0]!.entry.repo);
+    if (found.length) return owners(found);
   }
   for (const repo of repos) {
     const found = all.filter(({ entry }) => entry.repo.toLowerCase() === repo.toLowerCase());
-    if (found.length) return pick(found, found[0]!.entry.repo);
+    if (found.length) return owners(found);
   }
   return undefined;
 };
+
+/** Candidate order: placement.fallback order first, then the remaining machines by label. */
+const candidateOrder = (candidates: readonly PlacementCandidate[], placement: PlacementConfig): PlacementCandidate[] => {
+  const rank = (machine: string): number => { const i = placement.fallback.indexOf(machine); return i < 0 ? Infinity : i; };
+  return [...candidates].sort((a, b) => rank(a.machine) - rank(b.machine) || a.machine.localeCompare(b.machine));
+};
+
+/** placement.defaultMachine when it is one of `candidates`, else the first. */
+const preferred = <T extends { readonly machine: string }>(candidates: readonly T[], placement: PlacementConfig): T | undefined =>
+  candidates.find((c) => c.machine === placement.defaultMachine) ?? candidates[0];
 
 const filled = (s: string | undefined): s is string => typeof s === "string" && s.trim() !== "";
 
@@ -86,7 +101,8 @@ const pathRule = (cwd: string, keys: readonly string[]): string | undefined =>
 
 /**
  * --machine wins. Once any runner declares workspaces, a workspace task goes to the runner that declares it (held while
- * that runner is offline, refused with PlacementConflict when two declare it) and an undeclared one to `defaultMachine`.
+ * that runner is offline) and an undeclared one to `defaultMachine`. When several runners declare it, all are
+ * `candidates` and the preferred online one (defaultMachine first, else candidate order) is placed; planLaunch picks.
  * Before that, a workspace task follows the deprecated `placement.workspaces` table (else local). Anything else goes to
  * `defaultMachine`.
  */
@@ -95,8 +111,12 @@ export const resolvePlacement = (input: PlacementInput, placement: PlacementConf
   const repos = doneRepos(input.done);
   const workspaceTask = filled(input.cwd) || filled(input.pane) || filled(input.workspace) || repos.length > 0;
   if (workspaceTask && declaring(reports)) {
-    const owner = declaredOwner(input.cwd, repos, reports);
-    if (owner) return { machine: owner.report.machine, source: "runner", rule: owner.entry.repo, movable: false, cwd: owner.entry.path, online: owner.report.online };
+    const owners = declaredOwners(input.cwd, repos, reports);
+    if (owners) {
+      const candidates = candidateOrder(owners.candidates, placement);
+      const lead = (preferred(candidates.filter((c) => c.online), placement) ?? preferred(candidates, placement))!;
+      return { machine: lead.machine, source: "runner", rule: owners.repo, movable: false, cwd: lead.cwd, online: lead.online, ...(candidates.length > 1 ? { candidates } : {}) };
+    }
   } else if (workspaceTask) {
     const keys = Object.keys(placement.workspaces);
     const byLower = new Map(keys.map((key) => [key.toLowerCase(), key]));
@@ -183,9 +203,10 @@ export const placementLine = (p: Placement): string =>
 export const placementWarnings = (p: Placement): string[] => (p.source === "workspace" && p.rule !== undefined ? [DEPRECATED_TABLE_READ] : []);
 
 /**
- * `dori placement`: one line per declared repo (`WORKSPACE repo=R machine=M path=P runner=online|offline`, or
- * `PLACEMENT_CONFLICT repo=R machines=a,b`), one per repo only detected (`DETECTED ...`, information: it follows
- * defaultMachine), then `DEFAULT machine=D fallback=a,b|-` and a deprecation line when config.placement.workspaces is set.
+ * `dori placement`: one line per declared repo and declaring runner (`WORKSPACE repo=R machine=M path=P
+ * runner=online|offline`, by repo then machine; several runners of one repo are launch candidates), one per repo only detected (`DETECTED ...`, information: it follows
+ * defaultMachine), one per runner that reported a lane worktree root (`WORKTREES machine=M root=P`), then
+ * `DEFAULT machine=D fallback=a,b|-` and a deprecation line when config.placement.workspaces is set.
  */
 export const placementTable = (reports: readonly RunnerPlacement[], placement: PlacementConfig): string[] => {
   const lines: string[] = [];
@@ -197,13 +218,13 @@ export const placementTable = (reports: readonly RunnerPlacement[], placement: P
     declared.set(k, row);
   }
   for (const { repo, at } of [...declared.values()].sort((a, b) => a.repo.localeCompare(b.repo))) {
-    const machines = [...new Set(at.map((a) => a.machine))];
-    if (machines.length > 1) lines.push(`PLACEMENT_CONFLICT repo=${repo} machines=${machines.join(",")}`);
-    else lines.push(`WORKSPACE repo=${repo} machine=${at[0]!.machine} path=${at[0]!.path} runner=${at[0]!.online ? "online" : "offline"}`);
+    const pairs = at.filter((a, i) => at.findIndex((b) => b.machine === a.machine) === i).sort((a, b) => a.machine.localeCompare(b.machine));
+    for (const a of pairs) lines.push(`WORKSPACE repo=${repo} machine=${a.machine} path=${a.path} runner=${a.online ? "online" : "offline"}`);
   }
   const detected = reports.flatMap((r) => r.detected.filter((e) => !declared.has(e.repo.toLowerCase())).map((e) => ({ ...e, machine: r.machine })))
     .sort((a, b) => a.repo.localeCompare(b.repo) || a.machine.localeCompare(b.machine));
   for (const d of detected) lines.push(`DETECTED repo=${d.repo} machine=${d.machine} path=${d.path} (no runner declares it)`);
+  for (const r of reports.filter((r) => r.worktreeRoot !== undefined).sort((a, b) => a.machine.localeCompare(b.machine))) lines.push(`WORKTREES machine=${r.machine} root=${r.worktreeRoot}`);
   lines.push(`DEFAULT machine=${placement.defaultMachine} fallback=${placement.fallback.length ? placement.fallback.join(",") : "-"}`);
   if (Object.keys(placement.workspaces).length) lines.push(declaring(reports) ? DEPRECATED_TABLE_IGNORED : DEPRECATED_TABLE_READ);
   return lines;
@@ -213,20 +234,46 @@ export type LaunchPlan = {
   readonly placement: Placement;
   /** The machine the launch goes to (a fallback with room, else the placed one) and its verdict. */
   readonly check: MachineCheck;
-  /** PLACEMENT, then PLACEMENT_FALLBACK when the launch moved. */
+  /** PLACEMENT, then PLACEMENT_FALLBACK when the launch moved, or PLACEMENT_CANDIDATES (and the held candidates' HOLD lines). */
   readonly lines: readonly string[];
+};
+
+/** `PLACEMENT_CANDIDATES repo=R machines=a,b chosen=M|none` for a placement with several declaring runners. */
+export const candidatesLine = (p: Placement, chosen: string): string =>
+  `PLACEMENT_CANDIDATES repo=${p.rule} machines=${(p.candidates ?? []).map((c) => c.machine).join(",")} chosen=${chosen}`;
+
+const offlineHold = (machine: string, repo: string | undefined): MachineCheck =>
+  ({ machine, verdict: { ok: false, reasons: [`runner ${machine} that owns ${repo} is offline; the launch waits for it`] }, summary: "" });
+
+/**
+ * Several runners declare the repo: every online candidate is checked; the launch goes to defaultMachine when it has room,
+ * else to the first candidate with room, in that runner's declared checkout. None with room holds on the preferred one
+ * (`p.machine`), with a HOLD line for every other candidate.
+ */
+const planCandidates = async (p: Placement, candidates: readonly PlacementCandidate[], placement: PlacementConfig, check: (machine: string) => Promise<MachineCheck>): Promise<LaunchPlan> => {
+  const checks: { c: PlacementCandidate; check: MachineCheck }[] = [];
+  for (const c of candidates) if (c.online) checks.push({ c, check: await check(c.machine) });
+  const pick = preferred(checks.filter((x) => x.check.verdict.ok).map((x) => ({ ...x, machine: x.c.machine })), placement);
+  if (pick) {
+    const placed: Placement = { ...p, machine: pick.c.machine, cwd: pick.c.cwd, online: true };
+    return { placement: placed, check: pick.check, lines: [placementLine(placed), ...placementWarnings(placed), candidatesLine(placed, pick.c.machine)] };
+  }
+  const held = candidates.filter((c) => c.machine !== p.machine)
+    .map((c) => { const x = checks.find((y) => y.c.machine === c.machine); return verdictLine(c.machine, (x?.check ?? offlineHold(c.machine, p.rule)).verdict); });
+  const lead = checks.find((x) => x.c.machine === p.machine)!.check;
+  return { placement: p, check: lead, lines: [placementLine(p), ...placementWarnings(p), candidatesLine(p, "none"), ...held] };
 };
 
 /**
  * Places a launch and checks it there; a movable placement on HOLD takes the first `fallback` machine with room. A
- * launch placed on a declaring runner that is offline holds for it unchecked: it never moves to another machine.
+ * launch placed on a declaring runner that is offline holds for it unchecked: it never moves to another machine. A repo
+ * several runners declare goes to one of those candidates (planCandidates); all of them offline holds like one.
  */
 export const planLaunch = async (input: PlacementInput, placement: PlacementConfig, check: (machine: string) => Promise<MachineCheck>, reports: readonly RunnerPlacement[] = []): Promise<LaunchPlan> => {
   const p = resolvePlacement(input, placement, reports);
   const lines = [placementLine(p), ...placementWarnings(p)];
-  if (p.online === false) {
-    return { placement: p, check: { machine: p.machine, verdict: { ok: false, reasons: [`runner ${p.machine} that owns ${p.rule} is offline; the launch waits for it`] }, summary: "" }, lines };
-  }
+  if (p.online === false) return { placement: p, check: offlineHold(p.machine, p.rule), lines: p.candidates ? [...lines, candidatesLine(p, "none")] : lines };
+  if (p.candidates) return planCandidates(p, p.candidates, placement, check);
   const first = await check(p.machine);
   if (first.verdict.ok || !p.movable) return { placement: p, check: first, lines };
   for (const machine of placement.fallback) {

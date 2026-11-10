@@ -80,6 +80,16 @@ test("recovery ships only what the launch pinned, whatever the lane later writes
   expect(recovered.notes).toEqual([notAttached(join(other, "secret.md")), notAttached(f.research)]);
 });
 
+test("the lead brief's footer names the worktree root its machine's runner reported, and none when it reported none", async () => {
+  const f = fixture(), deps = depsFor(newWorld(), fakeClock(0), f.stateDir);
+  writeFileSync(f.lane.brief, "do it");
+  const labels: string[] = [];
+  const reported = await prepareLeadLaneBrief({ ...deps, runnerWorktreeRoot: (label) => { labels.push(label); return "/srv/wt"; } }, f.lane, run.id);
+  expect(labels).toEqual(["local"]);
+  expect(reported.briefText).toContain(`- Create every git worktree this lane needs under /srv/wt, as /srv/wt/<repo name>-${f.lane.key} `);
+  expect((await prepareLeadLaneBrief(deps, f.lane, run.id)).briefText).not.toContain("Create every git worktree");
+});
+
 test("a lane with no launch pin recovers without attachments and without re-reading its declarations", async () => {
   const f = fixture(), deps = depsFor(newWorld(), fakeClock(0), f.stateDir), briefs = join(f.stateDir, "briefs");
   mkdirSync(briefs); writeFileSync(join(briefs, "big"), Buffer.alloc(FILE_LIMITS.fileBytes + 1)); symlinkSync("/etc", join(briefs, "link"));

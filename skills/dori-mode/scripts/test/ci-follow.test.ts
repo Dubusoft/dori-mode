@@ -377,6 +377,20 @@ test("a merge lane asks the runner, in order, whether the worktree exists, then 
   expect(world.calls.filter((c) => c[0] === "git" && c[1] !== "check-ref-format")).toEqual([]);
 });
 
+test("a merge lane's worktree goes under the local runner's reported worktree root, else under config.worktreeRoot", async () => {
+  const request = { key: mergeLaneKey(pull()), source: { ...claimedLane }, pull: pull(), base: "dev" };
+  const roomy = (argv: readonly string[], opts?: Parameters<typeof deps.run>[1]) =>
+    argv[0] === "df" ? Promise.resolve({ code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200", err: "" }) : deps.run(argv, opts);
+  const asked: string[] = [];
+  const present = { ...deps.ops, exists: async (_m: string | undefined, paths: readonly string[]) => { asked.push(...paths); return [true]; } };
+  const labels: string[] = [];
+  const reported = (label: string) => { labels.push(label); return "/srv/wt/"; };
+  await launchMergeLane({ ...deps, run: roomy, ops: present, runnerWorktreeRoot: reported }, request);
+  await launchMergeLane({ ...deps, run: roomy, ops: present, runnerWorktreeRoot: () => undefined }, request);
+  expect(labels).toEqual(["local"]);
+  expect(asked).toEqual([`/srv/wt/app/${request.key}`, `${deps.config.worktreeRoot}/app/${request.key}`]);
+});
+
 test("a PR with no lane is not merged", async () => {
   await follow().tick([pull({ number: 99, branch: "other", checks: "green" })], emit);
   expect(gh.merges).toEqual([]);

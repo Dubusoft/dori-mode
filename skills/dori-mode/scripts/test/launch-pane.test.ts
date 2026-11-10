@@ -352,6 +352,17 @@ test("footer puts the shared done rules first and every lane value after '### Th
   expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
 });
 
+test("footer places the lane's git worktrees under its machine's reported worktree root, and says nothing without one", () => {
+  const line = "- Create every git worktree this lane needs under /srv/wt, as /srv/wt/<repo name>-k-1 (<repo name>: the last segment of owner/repo).";
+  for (const lane of [footerLane(), footerLane({ machine: "m1", runner: "m1" })]) {
+    const text = footer(lane, "Korean", [], "/srv/wt/");
+    expect(text).toContain(line);
+    expect(text.indexOf(line)).toBeGreaterThan(text.indexOf("### This lane"));
+    expect(text.replace(`${line}\n`, "")).toBe(footer(lane, "Korean", []));
+    expect(footer(lane, "Korean", [], undefined)).not.toContain("Create every git worktree");
+  }
+});
+
 test("only a lane whose Done names a merged PR is told to claim while its CI is still running", () => {
   const line = "claim done once the PR is pushed and its CI is running or green";
   expect(footerDoneRules(footerLane({ done: "merged acme/app#1; closed acme/app#3" }))).toContain(line);

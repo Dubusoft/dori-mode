@@ -1,15 +1,19 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { defaultConfig, type GuardThresholds, type PlacementConfig } from "../src/config.ts";
 import type { HostSample } from "../src/host-guard.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
 import {
-  checkMachine, DEPRECATED_TABLE_IGNORED, DEPRECATED_TABLE_READ, LOCAL_MACHINE, machineVerdict, PlacementConflict, placementLine, placementTable,
+  checkMachine, DEPRECATED_TABLE_IGNORED, DEPRECATED_TABLE_READ, LOCAL_MACHINE, machineVerdict, placementLine, placementTable,
   placementWarnings, planLaunch, resolvePlacement, type RunnerPlacement, runnerPlacements, verdictLine,
 } from "../src/placement.ts";
 import type { MachineSample, SampleResult } from "../src/remote-guard.ts";
-import type { MachineObservation } from "../src/runner/protocol.ts";
+import { readRunnerRows, RunnerHub, runnerWorktreeRoot } from "../src/runner/hub.ts";
+import { type MachineObservation, PROTO, runnerControl, validateFrame } from "../src/runner/protocol.ts";
 
 const config = (p: Partial<PlacementConfig> = {}): PlacementConfig => ({ defaultMachine: "local", workspaces: {}, fallback: [], ...p });
 const RESEARCH = "report posted in the thread";
@@ -185,13 +189,20 @@ test("without any runner declaring, the config table decides and says it is depr
   expect(placementWarnings(resolvePlacement({ done: "merged acme/other#1" }, c, undeclared))).toEqual([]);
 });
 
-test("two runners declaring the same repo refuse the placement with PLACEMENT_CONFLICT", () => {
-  const both = [...REPORTS, runner("big", [["Acme/Blog", "/srv/blog"]])];
-  const conflict = (() => { try { resolvePlacement({ done: "merged acme/blog#1" }, config(), both); } catch (e) { return e; } })();
-  expect(conflict).toBeInstanceOf(PlacementConflict);
-  expect((conflict as PlacementConflict).machines).toEqual(["mini", "big"]);
-  expect((conflict as Error).message).toStartWith("PLACEMENT_CONFLICT acme/blog is declared by runners mini, big");
-  expect(resolvePlacement({ machine: "big", done: "merged acme/blog#1" }, config(), both).machine).toBe("big");
+test("every runner declaring the same repo is a candidate, in fallback then label order; the preferred online one is placed", () => {
+  const both = [...REPORTS, runner("big", [["Acme/Blog", "/srv/blog"]]), runner("spare", [["acme/blog", "/s/blog"]], { online: false })];
+  const candidates = [{ machine: "spare", cwd: "/s/blog", online: false }, { machine: "big", cwd: "/srv/blog", online: true }, { machine: "mini", cwd: "/Users/me/work/repos/blog", online: true }];
+  expect(resolvePlacement({ done: "merged acme/blog#1" }, config({ fallback: ["spare"] }), both))
+    .toEqual({ machine: "big", source: "runner", rule: "acme/blog", movable: false, cwd: "/srv/blog", online: true, candidates });
+  expect(resolvePlacement({ done: "merged acme/blog#1" }, config({ defaultMachine: "mini", fallback: ["spare"] }), both)).toMatchObject({ machine: "mini", cwd: "/Users/me/work/repos/blog" });
+  // An offline defaultMachine is not preferred while another candidate is online; all offline holds on the preferred one.
+  expect(resolvePlacement({ done: "merged acme/blog#1" }, config({ defaultMachine: "spare", fallback: ["spare"] }), both)).toMatchObject({ machine: "big", online: true });
+  const away = both.map((r) => ({ ...r, online: false }));
+  expect(resolvePlacement({ done: "merged acme/blog#1" }, config({ defaultMachine: "mini" }), away)).toMatchObject({ machine: "mini", online: false });
+  // A --cwd under one runner's declared path narrows to that runner alone: no candidates.
+  expect(resolvePlacement({ cwd: "/srv/blog/sub", done: "merged acme/blog#1" }, config(), both))
+    .toEqual({ machine: "big", source: "runner", rule: "Acme/Blog", movable: false, cwd: "/srv/blog", online: true });
+  expect(resolvePlacement({ machine: "spare", done: "merged acme/blog#1" }, config(), both)).toEqual({ machine: "spare", source: "flag", movable: false });
 });
 
 test("planLaunch holds a launch for its offline owning runner without checking or falling back", async () => {
@@ -207,12 +218,13 @@ test("planLaunch holds a launch for its offline owning runner without checking o
   expect(verdictLine(plan.check.machine, plan.check.verdict)).toBe("HOLD machine=mini runner mini that owns acme/blog is offline; the launch waits for it");
 });
 
-test("placementTable lists declared, conflicting and only-detected repos, the default, and the deprecated table", () => {
+test("placementTable lists declared repos per runner, only-detected repos, the default, and the deprecated table", () => {
   const rows = [...REPORTS.map((r) => (r.machine === "mini" ? { ...r, online: false } : r)), runner("big", [["acme/twice", "/a"]]), runner("spare", [["acme/twice", "/b"]])];
   expect(placementTable(rows, config({ defaultMachine: "mini", fallback: ["local"], workspaces: { "*": "local" } }))).toEqual([
     "WORKSPACE repo=acme/blog machine=mini path=/Users/me/work/repos/blog runner=offline",
     "WORKSPACE repo=acme/dori machine=local path=/data/repos/dori runner=online",
-    "PLACEMENT_CONFLICT repo=acme/twice machines=big,spare",
+    "WORKSPACE repo=acme/twice machine=big path=/a runner=online",
+    "WORKSPACE repo=acme/twice machine=spare path=/b runner=online",
     "DETECTED repo=acme/extra machine=mini path=/Users/me/work/repos/extra (no runner declares it)",
     "DEFAULT machine=mini fallback=local",
     DEPRECATED_TABLE_IGNORED,
@@ -226,6 +238,41 @@ test("runnerPlacements keeps only rows that reported workspaces", () => {
     { label: "old", eventAck: 0, cmdSeq: 0, maxGen: 1, cmdAck: 0 },
   ];
   expect(runnerPlacements(rows, (row) => row.label === "local")).toEqual([{ machine: "local", online: true, declared: [{ repo: "acme/dori", path: "/d" }], detected: [] }]);
+});
+
+test("placementTable prints one WORKTREES line per runner that reported a worktree root, by machine, before DEFAULT", () => {
+  const rows = [{ ...runner("mini", [["acme/blog", "/w/blog"]]), worktreeRoot: "/w/worktrees" }, runner("big", []), { ...runner("apple", []), worktreeRoot: "/a/wt" }];
+  expect(placementTable(rows, config())).toEqual([
+    "WORKSPACE repo=acme/blog machine=mini path=/w/blog runner=online",
+    "WORKTREES machine=apple root=/a/wt",
+    "WORKTREES machine=mini root=/w/worktrees",
+    "DEFAULT machine=local fallback=-",
+  ]);
+});
+
+test("a hello's worktreeRoot validates, is stored with its workspaces, kept across a bare hello, and read back into placement", () => {
+  const dir = mkdtempSync(join(tmpdir(), "placement-hub-"));
+  try {
+    const hub = new RunnerHub({ stateDir: dir, commit: () => true, now: () => 1000, monotonic: () => 1000, epoch: 1 });
+    const head = { runner: "mini", gen: 1, epoch: 0 };
+    const body = { proto: PROTO, gen: 1, label: "mini", hostId: "h", cmdAck: 0 };
+    const hello = runnerControl(head, "hello", { ...body, workspaces: [{ repo: "acme/app", path: "/w/app" }], worktreeRoot: "/w/worktrees" });
+    expect(validateFrame(JSON.parse(JSON.stringify(hello)), "runner").type).toBe("hello");
+    expect(() => validateFrame(JSON.parse(JSON.stringify({ ...hello, body: { ...hello.body, worktreeRoot: 7 } })), "runner")).toThrow();
+    expect(hub.hello(hello).ok).toBe(true);
+    const want = { declared: [{ repo: "acme/app", path: "/w/app" }], detected: [], worktreeRoot: "/w/worktrees" };
+    expect(hub.runner("mini")?.workspaces).toEqual(want);
+    expect(hub.hello(runnerControl({ ...head, gen: 2 }, "hello", { ...body, gen: 2 })).ok).toBe(true);
+    expect(hub.runner("mini")?.workspaces).toEqual(want);
+    expect(hub.hello(runnerControl({ ...head, gen: 3 }, "hello", { ...body, gen: 3, worktreeRoot: "/w/other" })).ok).toBe(true);
+    expect(hub.runner("mini")?.workspaces).toEqual({ declared: [], detected: [], worktreeRoot: "/w/other" });
+    hub.close();
+    expect(runnerPlacements(readRunnerRows(dir), () => true)).toEqual([{ machine: "mini", online: true, declared: [], detected: [], worktreeRoot: "/w/other" }]);
+    expect(runnerWorktreeRoot(dir, "mini")).toBe("/w/other");
+    expect(runnerWorktreeRoot(dir, "local")).toBeUndefined();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("placementLine names the machine, source and matched rule", () => {

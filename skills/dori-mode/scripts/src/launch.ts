@@ -9,6 +9,7 @@ import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
 import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
+import { runnerWorktreeRoot } from "./runner/hub.ts";
 import { runnerOs, unsandboxedReason } from "./runner-sandbox.ts";
 import { cmdRefused, paneShell } from "./runner/lane-control.ts";
 import type { StartupVerdict } from "./runner/protocol.ts";
@@ -176,7 +177,8 @@ export const prepareLeadLaneBrief = async (deps: FlowDeps, lane: Lane, runId?: s
   const requiredReport = existing ? lane.fileRun?.requiredReport ?? false : briefDeliverable(body);
   const autoClose = existing ? lane.autoClose : briefAutoClose(body), ghIssue = existing ? lane.ghIssue : briefIssue(body);
   const forFooter = { ...lane, autoClose, fileRun: { id: runId ?? deps.newFileRunId?.() ?? randomUUID(), requiredReport } };
-  const briefText = `${body.replace(/\s*$/, "")}\n${footer(forFooter, deps.config.ownerLanguage, deps.config.laneRules)}`;
+  const worktreeRoot = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(lane.machine));
+  const briefText = `${body.replace(/\s*$/, "")}\n${footer(forFooter, deps.config.ownerLanguage, deps.config.laneRules, worktreeRoot)}`;
   const prepare = (allowed?: readonly string[]) => prepareLaneBrief({
     key: lane.key, stateDir: deps.config.stateDir, briefText, rawBriefText: body, requiredReport, runId: forFooter.fileRun.id, ...(allowed ? { allowed } : {}),
   });
@@ -257,11 +259,18 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
 
 const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 
+/** The footer line placing a lane's git worktrees under its machine's reported worktree root. */
+const worktreeLine = (root: string, key: string): string =>
+  `- Create every git worktree this lane needs under ${root}, as ${root}/<repo name>-${key} (<repo name>: the last segment of owner/repo).`;
+
 /** The kinds of a `dori report` footer and where each goes. */
 const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question/blocked wake the lead.";
 
-/** The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner. */
-export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly string[]): string => [
+/**
+ * The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner.
+ * `worktreeRoot`, the lane worktree root its machine's runner reported, adds where the lane creates its git worktrees.
+ */
+export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly string[], worktreeRoot?: string): string => [
   "",
   FOOTER_HEADING.slice(1),
   footerDoneRules(lane, ownerLanguage, laneRules),
@@ -269,6 +278,7 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   "### This lane",
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}`,
+  ...(worktreeRoot ? [worktreeLine(worktreeRoot.replace(/\/+$/, ""), lane.key)] : []),
   ...(lane.fileRun?.requiredReport ? ["- This lane declares deliverable: report. Write at least one regular report file in DORI_LANE_OUT before claiming done."] : []),
   ...(lane.machine
     ? [

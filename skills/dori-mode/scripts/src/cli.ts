@@ -25,7 +25,7 @@ import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { syncRegistry } from "./sync.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import {
-  checkMachine, LOCAL_MACHINE, PlacementConflict, placementLine, placementTable, placementWarnings, planLaunch, resolvePlacement, type RunnerPlacement,
+  candidatesLine, checkMachine, LOCAL_MACHINE, placementLine, placementTable, placementWarnings, planLaunch, resolvePlacement, type RunnerPlacement,
   runnerPlacements, verdictLine,
 } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
@@ -214,9 +214,10 @@ const USAGE = `dori <command> [options]
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
   placement [--repo owner/repo] [--cwd D] [--done "..."] [--json]
-                                       without flags: the repos each runner declares (WORKSPACE, PLACEMENT_CONFLICT), the repos
-                                       only detected under its allowedRoots (DETECTED, information) and the default machine; with
-                                       flags: where a launch would go (PLACEMENT line; exit 2 on PLACEMENT_CONFLICT)
+                                       without flags: the repos each runner declares (WORKSPACE, one per runner; a repo several
+                                       runners declare launches on one of them), the repos only detected under its allowedRoots
+                                       (DETECTED, information) and the default machine; with flags: where a launch would go
+                                       (PLACEMENT line, PLACEMENT_CANDIDATES when several runners declare the repo)
   can-launch [--machine M] [--cwd D] [--done "..."] [--all]
                                        exit 0 if the machine a launch with these flags is placed on (none: placement.defaultMachine)
                                        has room for a new lane, else print why and exit 4; --all checks local and every listed machine
@@ -652,11 +653,6 @@ const placementReports = async (stateDir: string): Promise<RunnerPlacement[]> =>
   const now = Date.now();
   return runnerPlacements(readRunnerRows(stateDir), (row) => !["offline", "lost", "revoked"].includes(runnerView(row, now).state));
 };
-/** PLACEMENT_CONFLICT dies with exit 2; anything else is rethrown. */
-const conflictDie = (e: unknown): never => { if (e instanceof PlacementConflict) die(e.message, 2); throw e; };
-const placeOrDie = <T>(place: () => T): T => {
-  try { return place(); } catch (e) { return conflictDie(e); }
-};
 const offlineWarn = (machine: string, what: "wait" | "source" | "schedule"): string =>
   `WARN runner ${machine} is not connected; the ${what} is kept and runs when it reconnects`;
 
@@ -944,7 +940,7 @@ try {
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
       const reports = await placementReports(config.stateDir);
-      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine), reports).catch(conflictDie);
+      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine), reports);
       for (const line of plan.lines) console.log(line);
       const target = plan.check.machine;
       const machine = target === LOCAL_MACHINE ? undefined : target;
@@ -1148,14 +1144,15 @@ try {
     case "can-launch": {
       const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines, config.stateDir) : [];
       const reports = flags.values.all ? [] : await placementReports(config.stateDir);
-      const p = flags.values.all ? undefined
-        : placeOrDie(() => resolvePlacement({ machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" }, config.placement, reports));
+      const input = { machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" };
+      const p = flags.values.all ? undefined : resolvePlacement(input, config.placement, reports);
       for (const line of p ? placementWarnings(p) : []) console.error(line);
       const machines = p ? [p.machine] : [LOCAL_MACHINE, ...listed.map((m) => m.label)];
-      // An offline owning runner holds the launch without observing anything (planLaunch does the same).
-      const checks = p?.online === false
-        ? [{ machine: p.machine, verdict: { ok: false, reasons: [`runner ${p.machine} that owns ${p.rule} is offline; the launch waits for it`] }, summary: "" }]
-        : await Promise.all(machines.map((m) => checkMachine(deps.ops, config, m)));
+      // An offline owning runner holds the launch without observing anything, and several declaring runners are picked
+      // among exactly as a launch would: both through planLaunch.
+      const planned = p && (p.online === false || p.candidates) ? await planLaunch(input, config.placement, (m) => checkMachine(deps.ops, config, m), reports) : undefined;
+      for (const line of planned?.lines.filter((l) => l.startsWith("PLACEMENT_CANDIDATES ")) ?? []) console.error(line);
+      const checks = planned ? [planned.check] : await Promise.all(machines.map((m) => checkMachine(deps.ops, config, m)));
       const at = Date.now();
       for (const c of checks) {
         recordLaunchVerdict(config.stateDir, c.verdict, at, c.machine);
@@ -1174,10 +1171,12 @@ try {
       }
       // --repo reads as a Done line naming that repo, so it matches exactly what a launch with that repo would.
       const done = [opt("done"), repo ? `merged ${repo}#0` : undefined].filter(Boolean).join("; ");
-      const p = placeOrDie(() => resolvePlacement({ cwd: opt("cwd"), done }, config.placement, reports));
+      const p = resolvePlacement({ cwd: opt("cwd"), done }, config.placement, reports);
       if (flags.values.json) console.log(JSON.stringify(p));
       else {
         console.log(placementLine(p));
+        // Without checking room, the preferred candidate (online, defaultMachine first) stands for the pick.
+        if (p.candidates) console.log(candidatesLine(p, p.online === false ? "none" : p.machine));
         for (const line of placementWarnings(p)) console.error(line);
         if (p.online === false) console.log(`HOLD machine=${p.machine} runner ${p.machine} that owns ${p.rule} is offline; the launch waits for it`);
       }

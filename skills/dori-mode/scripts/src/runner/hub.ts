@@ -78,7 +78,8 @@ export type RunnerRow = {
   readonly workspaces?: RunnerWorkspaces;
 };
 
-export type RunnerWorkspaces = { readonly declared: readonly WorkspaceEntry[]; readonly detected: readonly WorkspaceEntry[] };
+/** `worktreeRoot`: the runner's effective lane worktree root, when its hello reported one. */
+export type RunnerWorkspaces = { readonly declared: readonly WorkspaceEntry[]; readonly detected: readonly WorkspaceEntry[]; readonly worktreeRoot?: string };
 
 const entries = (v: unknown): WorkspaceEntry[] =>
   Array.isArray(v) ? v.filter((e): e is WorkspaceEntry => typeof e?.repo === "string" && typeof e?.path === "string").map((e) => ({ repo: e.repo, path: e.path })) : [];
@@ -88,7 +89,9 @@ const parseWorkspaces = (text: string | null): RunnerWorkspaces | undefined => {
   if (text === null) return undefined;
   try {
     const v = JSON.parse(text) as Record<string, unknown> | null;
-    return v && typeof v === "object" ? { declared: entries(v.declared), detected: entries(v.detected) } : undefined;
+    return v && typeof v === "object"
+      ? { declared: entries(v.declared), detected: entries(v.detected), ...(typeof v.worktreeRoot === "string" ? { worktreeRoot: v.worktreeRoot } : {}) }
+      : undefined;
   } catch { return undefined; }
 };
 
@@ -307,10 +310,10 @@ export class RunnerHub {
          proto = excluded.proto, version = excluded.version, lastHelloAt = excluded.lastHelloAt`,
     ).run(label, body.hostId, maxGen, body.cmdAck, body.proto, body.version ?? null, this.deps.now());
     this.db.query("UPDATE runners SET lanes = ? WHERE label = ?").run(body.inventory ? body.inventory.length : null, label);
-    // A runner that predates placement reports sends neither field; its last report (if any) stays.
-    if (body.workspaces !== undefined || body.detected !== undefined) {
+    // A runner that predates placement reports sends none of these fields; its last report (if any) stays.
+    if (body.workspaces !== undefined || body.detected !== undefined || body.worktreeRoot !== undefined) {
       this.db.query("UPDATE runners SET workspaces = ? WHERE label = ?")
-        .run(JSON.stringify({ declared: body.workspaces ?? [], detected: body.detected ?? [] }), label);
+        .run(JSON.stringify({ declared: body.workspaces ?? [], detected: body.detected ?? [], ...(body.worktreeRoot !== undefined ? { worktreeRoot: body.worktreeRoot } : {}) }), label);
     }
     this.lockDown();
     this.live.set(label, { ...(this.live.get(label) ?? {}), lastSeen: this.deps.monotonic() });
@@ -481,6 +484,10 @@ export const forgetRunner = (stateDir: string, label: string): boolean => {
     db.close();
   }
 };
+
+/** The lane worktree root runner `label` last reported (hub `workspaces` column), if any. */
+export const runnerWorktreeRoot = (stateDir: string, label: string): string | undefined =>
+  readRunnerRows(stateDir).find((row) => row.label === label)?.workspaces?.worktreeRoot;
 
 /** Reads runner status rows from `<stateDir>/runners.sqlite` without a live hub (read-only; [] when absent). */
 export const readRunnerRows = (stateDir: string): RunnerRow[] => {

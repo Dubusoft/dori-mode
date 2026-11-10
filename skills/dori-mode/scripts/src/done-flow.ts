@@ -10,7 +10,8 @@ import { type Check, parseSignal, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings, type WorktreeFact } from "./branch-cleanup.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
-import { LaneOpsError, type LaneOps, type PaneRef } from "./lane-ops.ts";
+import { LaneOpsError, type LaneOps, machineRunner, type PaneRef } from "./lane-ops.ts";
+import { runnerWorktreeRoot } from "./runner/hub.ts";
 import { deliverLaneMessage, queueSteering } from "./ci-follow.ts";
 import { openLaneMessages } from "./lane-messages.ts";
 import { checkLaneReportText, installLaneReports, LaneFileError, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
@@ -30,6 +31,8 @@ export type FlowDeps = {
   readonly which?: (cmd: string) => string | null;
   /** The OS runner `label` last reported (Windows runners run lanes unsandboxed); absent reads the hub's runners table. */
   readonly runnerOs?: (label: string) => string | undefined;
+  /** The lane worktree root runner `label` last reported; absent reads the hub's runners table. */
+  readonly runnerWorktreeRoot?: (label: string) => string | undefined;
   readonly signalIo?: SignalIo;
   /** The operation rows; absent opens the configured store per call. */
   readonly operations?: OperationStore;
@@ -631,13 +634,14 @@ const keptWorktrees = (lane: Lane): string[] => {
 
 /**
  * Finish a closed lane's worktree cleanup: a worktree its close kept is removed once it is clean, only under
- * `worktreeRoot`. Open lanes (working, not-done, paused, done-claimed) are never touched: their Done signals have
+ * `worktreeRoot` or the local runner's reported worktree root (older lanes sit under the former). Open lanes (working, not-done, paused, done-claimed) are never touched: their Done signals have
  * not all read back yet, and work can continue after a merge. Failures come back as LANE_WATCH_WARN lines.
  */
 export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
-  const root = deps.config.worktreeRoot.replace(/\/+$/, "");
-  if (lane.machine || statusOf(lane) !== "closed" || !root) return [];
-  const kept = keptWorktrees(lane).filter((wt) => wt.startsWith(`${root}/`) && !wt.includes(".."));
+  if (lane.machine || statusOf(lane) !== "closed") return [];
+  const reported = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(lane.machine));
+  const roots = [deps.config.worktreeRoot, reported ?? ""].map((r) => r.replace(/\/+$/, "")).filter((r) => r !== "");
+  const kept = keptWorktrees(lane).filter((wt) => roots.some((root) => wt.startsWith(`${root}/`)) && !wt.includes(".."));
   if (!kept.length) return [];
   const [cwdThere = false, ...present] = await deps.ops.exists(undefined, [lane.cwd ?? deps.config.defaultCwd, ...kept]);
   const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.defaultCwd;
