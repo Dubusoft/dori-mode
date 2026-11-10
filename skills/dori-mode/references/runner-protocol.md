@@ -190,7 +190,7 @@ or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `in
 | Key | Meaning | Default |
 |---|---|---|
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
-| `allowedRoots` | directories every `cwd` must be under | none |
+| `allowedRoots` | directories every `cwd` must be under, besides `reposRoot` and the effective worktree root, which are always added | none |
 | `defaultCwd` | where a `lane.start` without `cwd` (`dori launch --machine M` with no `--cwd`) starts: absolute or `~/...` (the runner's home); filled before the `allowedRoots` check, and the `lane.start` result reports it as `cwd` | the runner's home |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
 | `sandboxCheck` | argv run before a `lane.start` with `sandbox: true`; a non-zero exit refuses it with `sandbox-unavailable` and its stderr. `dori runner install` sets it to `lane-sandbox --check` on Linux and macOS, where it also ships the wrapper (bubblewrap on Linux, Seatbelt `sandbox-exec` on macOS) and sets `sandbox: required`; Windows has no lane sandbox, so it gets `sandbox: optional`, only the `default` profile and no `sandboxCheck` (an older install's `lane-sandbox` profile and check are removed); the lead starts its lanes unsandboxed with `SANDBOX_SKIPPED` | none |
@@ -238,9 +238,8 @@ rescans after a runner-config reload. A report that changed is sent with a new h
 The hub stores the three in the `runners.workspaces` column at each hello that carries any of them, and keeps the last report
 while the runner is away. The local runner (no runner-config.json) reports the same way: a runner-config.json
 holding only `workspaces`, `detectWorkspaces`, `reposRoot` and `worktreeRoot` adds them to the policy derived from
-config.json, with `reposRoot` and the worktree root added to `allowedRoots`; a file with any other key is the whole
-policy, as before, and must list `reposRoot` in `allowedRoots` itself (a remote runner too), or its repos are skipped
-`cwd-outside-roots`. The fields need no protocol bump, but a supervisor older than them refuses
+config.json; a file with any other key is the whole policy, as before. Every runner-config.json (a remote runner's
+too) gets `reposRoot` and the effective worktree root added to `allowedRoots`, so they need not be listed. The fields need no protocol bump, but a supervisor older than them refuses
 the hello `unknown-field`, so update the supervisor before its runners.
 
 ## Runner-owned waits and jobs

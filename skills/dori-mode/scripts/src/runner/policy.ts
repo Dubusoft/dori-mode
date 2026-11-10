@@ -13,7 +13,7 @@ export const POLICY_FILE = "runner-config.json";
 export type RunnerPolicy = {
   /** Profile name -> argv template. Only these profiles may be started. */
   readonly agents: Readonly<Record<string, readonly string[]>>;
-  /** Directories under which every command cwd must resolve. */
+  /** Directories under which every command cwd must resolve; parsePolicy appends `reposRoot` and the effective worktree root. */
   readonly allowedRoots: readonly string[];
   /** Where a `lane.start` without `cwd` starts (absolute, a leading `~` already expanded); absent: the runner's home. */
   readonly defaultCwd?: string;
@@ -36,9 +36,9 @@ export type RunnerPolicy = {
   readonly workspaces?: Readonly<Record<string, string>>;
   /** `false` turns off the scan of allowedRoots for git checkouts (hello `detected`); default on. */
   readonly detectWorkspaces?: boolean;
-  /** Every checkout directly under it is a declared repo, keyed by its origin (absolute, `~` expanded; workspaces.ts). */
+  /** Every checkout directly under it is a declared repo, keyed by its origin (absolute, `~` expanded; workspaces.ts). Added to allowedRoots automatically. */
   readonly reposRoot?: string;
-  /** Where this host's lane worktrees live (absolute, `~` expanded); absent: `<reposRoot>/worktrees` (effectiveWorktreeRoot). */
+  /** Where this host's lane worktrees live (absolute, `~` expanded); absent: `<reposRoot>/worktrees` (effectiveWorktreeRoot). Added to allowedRoots automatically. */
   readonly worktreeRoot?: string;
 };
 
@@ -134,7 +134,10 @@ export function parsePolicy(value: unknown, home: string = homedir()): RunnerPol
     ...(reposRoot !== undefined ? { reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     agents,
-    allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
+    allowedRoots: [...new Set([
+      ...((value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots),
+      ...[reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot })].filter((r): r is string => r !== undefined),
+    ])],
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
     jobs: (value.jobs as RunnerPolicy["jobs"] | undefined) ?? DEFAULT_POLICY.jobs,
   };
