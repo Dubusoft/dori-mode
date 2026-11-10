@@ -13,7 +13,8 @@ import { type Prompter, runSetup, SetupError, type SetupInput } from "./setup.ts
 
 export const SETUP_USAGE = `dori setup [options]
 
-  Interactive by default: every question shows the current value, Enter keeps it.
+  Interactive by default: every question shows the current value in [brackets] (none shown: the default applies),
+  Enter keeps it and - clears an optional key.
   GitHub repos are optional; setup reads and saves this machine's watched list.
   --yes, -y               non-interactive: take flags, then stored values, then defaults
   --token-file FILE       read the Discord bot token from FILE ("-" for stdin); never pass it as an argument

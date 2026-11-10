@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  ConfigKeyError, configureKeys, type ConfigureOptions, DORI_CONFIG_KEYS, formatValue, type KeyPrompter, type KeySpec, parseSetArgs, parseValue,
+  ConfigKeyError, configureKeys, type ConfigureOptions, DORI_CONFIG_KEYS, doriConfigDefault, formatValue, KEY_INPUT_HINT, type KeyPrompter, type KeySpec, parseSetArgs, parseValue,
   pruneDoriConfig, pruneRunnerConfig, readSeenKeys, RUNNER_CONFIG_KEYS, writeSeenKeys,
 } from "../src/config-keys.ts";
 import { CONFIG_FILE_KEYS } from "../src/config.ts";
@@ -106,6 +106,8 @@ const SPECS: readonly KeySpec[] = [
   { key: "lead", required: false, kind: "string", describe: "Lead" },
 ];
 
+const HINT = `SETUP_KEYS_HINT ${KEY_INPUT_HINT}`;
+
 const run = (prompt: KeyPrompter, o: Partial<ConfigureOptions>) => {
   const lines: string[] = [];
   const result = configureKeys({ specs: SPECS, current: {}, patch: {}, unset: [], prompt, interactive: true, seen: new Set(), mode: "full", log: (l) => lines.push(l), ...o });
@@ -118,7 +120,7 @@ test("patch and unset keys are applied, logged and never asked", async () => {
   expect(p.s.asked).toEqual(["roots"]);
   expect(p.s.confirmed).toEqual(["Edit the other optional keys too?"]);
   expect(r.next).toEqual({ name: "y", extra: { a: 1 }, mode: "a" });
-  expect(r.lines).toEqual(["SETUP_KEY_SET name", "SETUP_KEY_SET mode", "SETUP_KEY_UNSET lead"]);
+  expect(r.lines).toEqual(["SETUP_KEY_SET name", "SETUP_KEY_SET mode", "SETUP_KEY_UNSET lead", HINT]);
   expect([...r.shown].sort()).toEqual(["lead", "mode", "name", "roots"]);
   expect(r.missingRequired).toEqual(["roots"]);
 });
@@ -152,6 +154,7 @@ test("- deletes an optional key, is refused for a required one, and an invalid a
   expect(p.s.asked).toEqual(["name", "name", "roots", "mode", "mode", "extra", "lead"]);
   expect(r.next).toEqual({ name: "x", roots: ["/a", "/b"] });
   expect(r.lines).toEqual([
+    HINT,
     "SETUP_KEY_REQUIRED name: it cannot be cleared",
     "SETUP_KEY_SET roots",
     "SETUP_KEY_INVALID mode: mode must be one of a|b",
@@ -166,7 +169,22 @@ test("Enter keeps a legacy array value byte-identical", async () => {
   const r = await run(p, { current: { name: "x", roots: ["/r"], lead: legacy }, seen: new Set(["name", "roots", "mode", "extra"]) });
   expect(p.s.asked).toContain("lead");
   expect(r.next.lead).toBe(legacy);
-  expect(r.lines).toEqual([]);
+  expect(r.lines).toEqual([HINT]);
+});
+
+test("a key without a value shows its effective default, and hinted callers get no second hint", async () => {
+  const questions: string[] = [];
+  const prompt: KeyPrompter = { ask: async (q, current) => { questions.push(q); return current; }, confirm: async () => false };
+  const lines: string[] = [];
+  await configureKeys({
+    specs: DORI_CONFIG_KEYS.filter((s) => ["worktreeRoot", "alertsChannel", "leadModel"].includes(s.key)),
+    current: { discordChannels: ["123"], defaultModel: "p/m", leadModel: "p/lead" }, patch: {}, unset: [], prompt, interactive: true,
+    seen: new Set(), mode: "full", defaults: doriConfigDefault("/h"), hinted: true, log: (l) => lines.push(l),
+  });
+  expect(questions.find((q) => q.startsWith("worktreeRoot "))).toEndWith("(default: /data/repos/worktrees)");
+  expect(questions.find((q) => q.startsWith("alertsChannel "))).toEndWith("(default: 123)");
+  expect(questions.find((q) => q.startsWith("leadModel "))).not.toContain("(default:");
+  expect(lines).toEqual([]);
 });
 
 test("non-interactive asks nothing and reports required keys without a value", async () => {

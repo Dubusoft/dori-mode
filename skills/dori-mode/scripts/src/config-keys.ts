@@ -3,8 +3,8 @@
 
 import { readFileSync } from "node:fs";
 
-import { CONFIG_FILE_KEYS, HOOK_KEYS, LEGACY_RUNNER_KEYS } from "./config.ts";
-import { GUARD_KEYS, RUNNER_POLICY_KEYS } from "./runner/policy.ts";
+import { CONFIG_FILE_KEYS, DEFAULT_LANE_SANDBOX, defaultConfig, HOOK_KEYS, LEGACY_RUNNER_KEYS } from "./config.ts";
+import { DEFAULT_POLICY, effectiveWorktreeRoot, GUARD_KEYS, RUNNER_POLICY_KEYS } from "./runner/policy.ts";
 import { writeFileAtomic } from "./setup.ts";
 
 export type Json = Record<string, unknown>;
@@ -18,7 +18,7 @@ const spec = (key: string, kind: KeyKind, describe: string, extra: { readonly re
 export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("discord", "json", "Discord applicationId, guildId and ownerId", { required: true }),
   spec("stateDir", "string", "Where dori keeps its state", { required: true }),
-  spec("defaultCwd", "string", "Working directory new lanes start in", { required: true }),
+  spec("defaultCwd", "string", "Working directory of the lead session; local lanes started without --cwd start here too", { required: true }),
   spec("worktreeRoot", "string", "Only worktrees under this directory are removed by the closed-lane cleanup; empty turns it off"),
   spec("agentCommand", "list", "Argv template that starts an agent session"),
   spec("defaultModel", "string", "Model lanes (and the lead, unless leadModel is set) run on", { required: true }),
@@ -192,6 +192,39 @@ export const formatValue = (spec: KeySpec, value: unknown): string => {
 
 export const keyLabel = (spec: KeySpec): "[required]" | "[optional]" => (spec.required ? "[required]" : "[optional]");
 
+/** Shown once before the questions: how to keep, fall back to the default, and clear. */
+export const KEY_INPUT_HINT = "Enter keeps the value in [brackets] (none shown: the default applies); type - to clear an optional key";
+
+/** The value a key falls back to when it has no value, as the prompter shows it; undefined when nothing applies. */
+export type KeyDefault = (key: string, next: Json) => string | undefined;
+
+/** config.json's effective defaults (what loadConfig uses when the key is absent). */
+export const doriConfigDefault = (home: string): KeyDefault => {
+  const base = defaultConfig(home) as unknown as Json;
+  return (key, next) => {
+    const s = DORI_CONFIG_KEYS.find((k) => k.key === key);
+    if (!s) return undefined;
+    const first = (v: unknown): unknown => (Array.isArray(v) ? v[0] : undefined);
+    const value = key === "leadModel" ? (hasValue(next.defaultModel) ? next.defaultModel : base.defaultModel)
+      : key === "alertsChannel" ? first(next.discordChannels)
+      : key === "laneSandbox" ? DEFAULT_LANE_SANDBOX
+      : base[key];
+    return hasValue(value) ? formatValue(s, value) : undefined;
+  };
+};
+
+/** runner-config.json's effective defaults (what parsePolicy and the runner use when the key is absent). */
+export const runnerConfigDefault = (home?: string): KeyDefault => (key, next) => {
+  switch (key) {
+    case "defaultCwd": return home ?? "~";
+    case "sandbox": return DEFAULT_POLICY.sandbox;
+    case "jobs": return DEFAULT_POLICY.jobs;
+    case "detectWorkspaces": return "true";
+    case "worktreeRoot": return typeof next.reposRoot === "string" && next.reposRoot ? effectiveWorktreeRoot({ reposRoot: next.reposRoot }) : undefined;
+    default: return undefined;
+  }
+};
+
 /** Structurally a Prompter (setup.ts): `ask` returns `current` on Enter. */
 export type KeyPrompter = {
   readonly ask: (question: string, current: string) => Promise<string>;
@@ -222,6 +255,10 @@ export type ConfigureOptions = {
   readonly seen: ReadonlySet<string>;
   readonly mode: "full" | "new";
   readonly skip?: readonly string[];
+  /** Shown beside a key that has no value. */
+  readonly defaults?: KeyDefault;
+  /** The caller already logged KEY_INPUT_HINT. */
+  readonly hinted?: boolean;
   readonly log: (line: string) => void;
 };
 
@@ -233,9 +270,9 @@ const hasValue = (v: unknown): boolean =>
 
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
-const question = (spec: KeySpec): string => {
+const question = (spec: KeySpec, fallback: string | undefined): string => {
   const hint = spec.kind === "enum" ? ` (one of ${(spec.values ?? []).join("|")})` : spec.kind === "list" ? " (comma separated)" : spec.kind === "json" ? " (JSON)" : "";
-  return `${spec.key} ${keyLabel(spec)} ${spec.describe}${hint}`;
+  return `${spec.key} ${keyLabel(spec)} ${spec.describe}${hint}${fallback ? ` (default: ${fallback})` : ""}`;
 };
 
 /** Applies the patch and unset list, then asks the keys `mode` selects (see ConfigureOptions); never asks patch/unset keys. */
@@ -255,11 +292,17 @@ export const configureKeys = async (o: ConfigureOptions): Promise<Configured> =>
   for (const key of o.unset) remove(key);
 
   const asked: string[] = [];
+  let hinted = o.hinted ?? false;
   const ask = async (spec: KeySpec): Promise<void> => {
     asked.push(spec.key);
+    if (!hinted) {
+      o.log(`SETUP_KEYS_HINT ${KEY_INPUT_HINT}`);
+      hinted = true;
+    }
     for (;;) {
       const shown = formatValue(spec, next[spec.key]);
-      const answer = (await o.prompt.ask(question(spec), shown)).trim();
+      const fallback = hasValue(next[spec.key]) ? undefined : o.defaults?.(spec.key, next);
+      const answer = (await o.prompt.ask(question(spec, fallback), shown)).trim();
       if (answer === shown.trim()) return;
       if (answer === "-") {
         if (!spec.required) return remove(spec.key);

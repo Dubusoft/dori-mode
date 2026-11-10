@@ -1,7 +1,7 @@
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { configureKeys, DORI_CONFIG_KEYS, formatValue, keyLabel, pruneDoriConfig, readSeenKeys, writeSeenKeys } from "./config-keys.ts";
+import { configureKeys, DORI_CONFIG_KEYS, doriConfigDefault, formatValue, KEY_INPUT_HINT, keyLabel, pruneDoriConfig, readSeenKeys, writeSeenKeys } from "./config-keys.ts";
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
 import type { Http } from "./messenger/http.ts";
 import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
@@ -377,7 +377,7 @@ const runMigrate = async (d: SetupDeps, input: SetupInput): Promise<number> => {
   const seen = readSeenKeys(seenPath);
   const configured = await configureKeys({
     specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateDir, raw), patch: input.patch ?? {}, unset: input.unset ?? [],
-    prompt: d.prompt, interactive: d.interactive, seen, mode: "new", log: d.log,
+    prompt: d.prompt, interactive: d.interactive, seen, mode: "new", defaults: doriConfigDefault(d.home), log: d.log,
   });
   d.log(`SETUP config ${saveConfig(d.configPath, raw, configured.next) ? "written" : "unchanged"}: ${d.configPath}`);
   if (d.interactive) writeSeenKeys(seenPath, [...seen, ...configured.shown]);
@@ -411,11 +411,18 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     consumed.push(key);
     return strings(patch[key]);
   };
-  const ask = async (key: string, question: string, current: string): Promise<string> => {
+  /** `-` clears an optional key; a required one is asked again. */
+  const ask = async (key: string, question: string, current: string, fallback?: string): Promise<string> => {
     if (unset.includes(key)) return "";
     asked.push(key);
-    return (await d.prompt.ask(`${question} ${labelOf(key)}`, current)).trim();
+    for (;;) {
+      const answer = (await d.prompt.ask(`${question} ${labelOf(key)}${fallback && !current ? ` (default: ${fallback})` : ""}`, current)).trim();
+      if (answer !== "-") return answer;
+      if (labelOf(key) === "[optional]") return "";
+      d.log(`SETUP_KEY_REQUIRED ${key}: it cannot be cleared`);
+    }
   };
+  if (d.interactive) d.log(`SETUP ${KEY_INPUT_HINT}`);
 
   const storedToken = envGet(envText, TOKEN_KEY) || undefined;
   const token = await askToken(d, storedToken, input.token);
@@ -435,8 +442,8 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   const leadStored = "leadModel" in patch ? patch.leadModel : raw.leadModel;
   const chain = typeof leadStored === "object" && leadStored !== null ? leadStored : undefined;
   if (chain && "leadModel" in patch) consumed.push("leadModel");
-  const leadModel = chain ? "" : given("leadModel") ?? await ask("leadModel", "Lead model (empty = same as the lane default)", str(raw.leadModel));
-  const defaultCwd = (input.cwd ?? given("defaultCwd") ?? await ask("defaultCwd", "Default working directory for new lanes", str(raw.defaultCwd) || "~")).trim();
+  const leadModel = chain ? "" : given("leadModel") ?? await ask("leadModel", "Lead model", str(raw.leadModel), defaultModel);
+  const defaultCwd = (input.cwd ?? given("defaultCwd") ?? await ask("defaultCwd", "Working directory of the lead session (local lanes started without --cwd start here too)", str(raw.defaultCwd) || "~")).trim();
   const stateDir = (input.stateDir ?? given("stateDir") ?? await ask("stateDir", "State directory", str(raw.stateDir) || "~/.dori/state")).trim() || "~/.dori/state";
   const repos = new Repos(expandHome(stateDir, d.home));
   const watchedRepos = (await d.prompt.ask("GitHub repos to watch (owner/repo, comma separated) [optional]", repos.list().join(",")))
@@ -472,7 +479,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   const configured = await configureKeys({
     specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateAbs, merged),
     patch: Object.fromEntries(Object.entries(patch).filter(([key]) => !consumed.includes(key))), unset,
-    prompt: d.prompt, interactive: d.interactive, seen, mode: "full", skip: SETUP_CORE_KEYS, log: d.log,
+    prompt: d.prompt, interactive: d.interactive, seen, mode: "full", skip: SETUP_CORE_KEYS, defaults: doriConfigDefault(d.home), hinted: true, log: d.log,
   });
   let config = configured.next;
   d.log(`SETUP config ${saveConfig(d.configPath, raw, config) ? "written" : "unchanged"}: ${d.configPath}`);
