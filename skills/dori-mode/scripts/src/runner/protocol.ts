@@ -258,10 +258,12 @@ export type RunnerControlBodies = {
   readonly hello: {
     readonly proto: number; readonly gen: number; readonly label: string; readonly hostId: string; readonly cmdAck: number;
     readonly version?: string; readonly inventory?: readonly InventoryLane[]; readonly nonce?: string; readonly dh?: string;
-    /** The repos this runner declares it owns (runner-config `workspaces`, paths checked on its host). */
+    /** The repos this runner declares it owns: those discovered under its reposRoot plus runner-config `workspaces` overrides (paths checked on its host). */
     readonly workspaces?: readonly WorkspaceEntry[];
     /** Git checkouts found under its allowedRoots whose origin names a repo it does not declare (information only). */
     readonly detected?: readonly WorkspaceEntry[];
+    /** The runner's effective lane worktree root (absolute): runner-config `worktreeRoot`, else `<reposRoot>/worktrees`. */
+    readonly worktreeRoot?: string;
   };
   /**
    * First frame of an enrollment connection. `proof` is HMAC-SHA256 keyed with the enrollment code over the label,
@@ -609,7 +611,7 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
   hello: {
     proto: req("int"), gen: req("int"), label: req("string"), hostId: req("string"), cmdAck: req("int"),
     version: opt("string"), inventory: opt({ list: INVENTORY }), nonce: opt("string"), dh: opt("string"),
-    workspaces: opt({ list: WORKSPACE }), detected: opt({ list: WORKSPACE }),
+    workspaces: opt({ list: WORKSPACE }), detected: opt({ list: WORKSPACE }), worktreeRoot: opt("string"),
   },
   enroll: { label: req("string"), hostId: req("string"), runnerPubKey: req("string"), proof: req("string") },
   "auth.proof": { sig: req("string") },

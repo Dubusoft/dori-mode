@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { existsSync, type FSWatcher, realpathSync, watch } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
@@ -226,12 +226,35 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       currentPane: async (key, panes) => { const r = runnerLanes.records()[key]; return r ? runnerLanes.currentPane(r, panes) : undefined; },
       reply: (body) => { client?.control("q.result", body); },
     });
-    // The checkout scan runs at most every 10 min, so a reconnect storm does not rescan the roots.
-    let report: { at: number; value: WorkspaceReport } | undefined;
-    const workspaces = (): WorkspaceReport => {
-      if (!report || realClock.now() - report.at > 10 * 60_000) report = { at: realClock.now(), value: workspaceReport(policy, { realpath: realpathSync, log }) };
-      return report.value;
+    // A hello reuses the last report until a rescan drops it, so a reconnect storm does not rescan the roots.
+    let report: WorkspaceReport | undefined;
+    const workspaces = (): WorkspaceReport => (report ??= workspaceReport(policy, { realpath: realpathSync, log }));
+    // New workspaces reach the supervisor only in a hello: rescan and reconnect when the report changed.
+    const rescan = (): void => {
+      const sent = report;
+      report = undefined;
+      if (!Bun.deepEquals(sent, workspaces())) client?.rehello();
     };
+    // reposRoot is watched (non-recursive) for repos added, removed or renamed; events settle for 2 s before a rescan.
+    let reposWatch: { root: string; watcher: FSWatcher } | undefined;
+    let reposDebounce: ReturnType<typeof setTimeout> | undefined;
+    const unwatchRepos = (): void => { reposWatch?.watcher.close(); reposWatch = undefined; };
+    const watchRepos = (): void => {
+      const root = policy.reposRoot;
+      if (reposWatch && (reposWatch.root !== root || !existsSync(reposWatch.root))) unwatchRepos();
+      if (reposWatch || root === undefined || !existsSync(root)) return;
+      try {
+        const watcher = watch(root, () => { clearTimeout(reposDebounce); reposDebounce = setTimeout(rescan, 2000); });
+        watcher.on("error", (e: unknown) => {
+          log(`RUNNER_REPOS_WATCH_FAILED ${e instanceof Error ? e.message : String(e)}`);
+          if (reposWatch?.watcher === watcher) unwatchRepos();
+        });
+        reposWatch = { root, watcher };
+      } catch (e) {
+        log(`RUNNER_REPOS_WATCH_FAILED ${e instanceof Error ? e.message : String(e)}`);
+      }
+    };
+    watchRepos();
     client = new RunnerClient(
       { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
       { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, workspaces, auth, log, onCommand: dispatch, onInvalidCommand: dispatch, onQuery },
@@ -250,6 +273,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const outboxTick = outboxMaintenance(outbox, realClock.now, log);
     outboxTick();
     const stopOutboxTick = realEvery(OUTBOX_MAINTENANCE_MS, outboxTick);
+    // The fallback for missed watch events, and the retry for a watch that failed or a reposRoot that did not exist.
+    const stopRescan = realEvery(5 * 60_000, () => { watchRepos(); rescan(); });
     const controller = new AbortController();
     controller.signal.addEventListener("abort", () => { accepting?.close(); }, { once: true });
     process.on("SIGINT", () => controller.abort());
@@ -279,12 +304,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         guard.reconfigure({ ...next.guard, ...reloaded.guard }, reloaded.heavyKill ?? next.heavyKill);
         return { policy: reloaded, restart: !remote && diskGuardPath(next) !== dataPath ? ["diskGuardPath"] : [] };
       },
-      applied: () => {
-        // New workspaces reach the supervisor only in a hello: rescan now and reconnect when the report changed.
-        const sent = report?.value;
-        report = undefined;
-        if (!Bun.deepEquals(sent, workspaces())) client?.rehello();
-      },
+      applied: () => { watchRepos(); rescan(); },
       publish: (body) => { client?.publish("runner.config", body); },
       log,
     });
@@ -296,6 +316,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       }, controller.signal);
     } finally {
       stopConfigWatch();
+      stopRescan();
+      clearTimeout(reposDebounce);
+      unwatchRepos();
       stopLaneSocket();
       stopGuard();
       stopPrune();

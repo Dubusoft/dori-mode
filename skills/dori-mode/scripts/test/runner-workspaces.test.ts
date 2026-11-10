@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { readRunnerRows, RunnerHub } from "../src/runner/hub.ts";
 import { localPolicy, localRunnerPolicy } from "../src/runner/local-policy.ts";
-import { parsePolicy, POLICY_FILE } from "../src/runner/policy.ts";
+import { effectiveWorktreeRoot, parsePolicy, POLICY_FILE } from "../src/runner/policy.ts";
 import { PROTO, runnerControl, validateFrame } from "../src/runner/protocol.ts";
-import { repoFromRemote, workspaceReport } from "../src/runner/workspaces.ts";
+import { discoverRepos, repoFromRemote, type ScanFs, workspaceReport } from "../src/runner/workspaces.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -94,4 +94,70 @@ test("the hub stores a hello's workspaces and keeps them across a hello that car
   expect(hub.runner("mini")?.workspaces).toEqual(want);
   hub.close();
   expect(readRunnerRows(dir).find((r) => r.label === "mini")?.workspaces).toEqual(want);
+});
+
+test("parsePolicy reads reposRoot and worktreeRoot as absolute paths, expanding ~; effectiveWorktreeRoot defaults under reposRoot", () => {
+  const p = parsePolicy({ reposRoot: "~/repos", worktreeRoot: "/srv/wt" }, "/Users/me");
+  expect(p).toMatchObject({ reposRoot: "/Users/me/repos", worktreeRoot: "/srv/wt" });
+  expect(parsePolicy({})).not.toHaveProperty("reposRoot");
+  expect(parsePolicy({})).not.toHaveProperty("worktreeRoot");
+  for (const key of ["reposRoot", "worktreeRoot"]) {
+    for (const bad of ["repos", "~user/repos", 3]) expect(() => parsePolicy({ [key]: bad }, "/Users/me")).toThrow(`runner-config: ${key} must be an absolute path or start with ~/`);
+  }
+  expect(effectiveWorktreeRoot(p)).toBe("/srv/wt");
+  expect(effectiveWorktreeRoot({ reposRoot: "/data/repos" })).toBe("/data/repos/worktrees");
+  expect(effectiveWorktreeRoot({})).toBeUndefined();
+});
+
+test("discoverRepos keys each checkout directly under reposRoot by origin, skipping worktrees, the worktree root, dot folders and repeats", () => {
+  const origin = (url: string) => `[remote "origin"]\n\turl = ${url}\n`;
+  const tree: Record<string, { dirs: string[]; files?: string[]; config?: string }> = {
+    "/r": { dirs: ["zz-dup", "app", "wt", "worktrees", ".hidden", "noorigin", "plain"], files: ["notes.txt"] },
+    "/r/app/.git": { dirs: [], config: origin("git@github.com:acme/app.git") },
+    "/r/zz-dup/.git": { dirs: [], config: origin("https://github.com/ACME/App") },
+    "/r/worktrees/.git": { dirs: [], config: origin("git@github.com:acme/wt.git") },
+    "/r/.hidden/.git": { dirs: [], config: origin("git@github.com:acme/hidden.git") },
+    "/r/noorigin/.git": { dirs: [], config: "[core]\n" },
+  };
+  const fs: ScanFs = {
+    readdir: (dir) => {
+      const node = tree[dir];
+      if (!node) throw new Error(`ENOENT ${dir}`);
+      return [...node.dirs.map((name) => ({ name, dir: true })), ...(node.files ?? []).map((name) => ({ name, dir: false }))];
+    },
+    // /r/wt holds a .git file (a linked worktree), so its .git is not a directory.
+    isDir: (path) => path in tree,
+    readFile: (path) => { const c = tree[path.replace(/\/config$/, "")]?.config; if (c === undefined) throw new Error(`ENOENT ${path}`); return c; },
+  };
+  expect(discoverRepos("/r", "/r/worktrees", fs)).toEqual({
+    repos: [{ repo: "acme/app", path: "/r/app" }],
+    duplicates: [{ repo: "ACME/App", kept: "/r/app", skipped: "/r/zz-dup" }],
+  });
+  expect(discoverRepos("/r", undefined, fs).repos).toEqual([{ repo: "acme/app", path: "/r/app" }, { repo: "acme/wt", path: "/r/worktrees" }]);
+  expect(discoverRepos("/missing", undefined, fs)).toEqual({ repos: [], duplicates: [] });
+});
+
+test("workspaceReport declares discovered repos, lets a workspaces override win, and detects neither declared repos nor worktree-root checkouts", () => {
+  const root = scratch();
+  const repos = join(root, "repos");
+  checkout(join(repos, "app"), "git@github.com:acme/app.git");
+  checkout(join(repos, "app-copy"), "git@github.com:acme/app.git");
+  checkout(join(repos, "lib"), "git@github.com:acme/lib.git");
+  checkout(join(root, "other", "lib"), "git@github.com:acme/lib.git");
+  checkout(join(root, "other", "extra"), "git@github.com:acme/extra.git");
+  checkout(join(repos, "worktrees", "wtrepo"), "git@github.com:acme/wtrepo.git");
+  mkdirSync(join(repos, "wt"), { recursive: true });
+  writeFileSync(join(repos, "wt", ".git"), "gitdir: /elsewhere\n");
+  const logs: string[] = [];
+  const policy = parsePolicy({ allowedRoots: [root], reposRoot: repos, workspaces: { "ACME/Lib": join(root, "other", "lib") } });
+  const report = workspaceReport(policy, { realpath: realpathSync, log: (l) => { logs.push(l); }, os: "linux" });
+  expect(report.workspaces).toEqual([{ repo: "acme/app", path: join(repos, "app") }, { repo: "ACME/Lib", path: join(root, "other", "lib") }]);
+  expect(logs).toEqual([`RUNNER_WORKSPACE_DUPLICATE acme/app ${join(repos, "app")} ${join(repos, "app-copy")}`]);
+  expect(report.detected).toEqual([{ repo: "acme/extra", path: join(root, "other", "extra") }]);
+  expect(report.worktreeRoot).toBe(join(repos, "worktrees"));
+  // A discovered path outside allowedRoots is skipped like a declared one; no reposRoot and no worktreeRoot: no worktreeRoot field.
+  const narrow = workspaceReport({ ...policy, allowedRoots: [join(root, "other")] }, { realpath: realpathSync, log: (l) => { logs.push(l); }, os: "linux" });
+  expect(narrow.workspaces).toEqual([{ repo: "ACME/Lib", path: join(root, "other", "lib") }]);
+  expect(logs).toContain(`RUNNER_WORKSPACE_SKIPPED acme/app cwd-outside-roots ${join(repos, "app")}`);
+  expect(workspaceReport(parsePolicy({ allowedRoots: [root] }), { realpath: realpathSync, log: () => {}, os: "linux" })).not.toHaveProperty("worktreeRoot");
 });

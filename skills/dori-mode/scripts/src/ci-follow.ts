@@ -5,6 +5,8 @@ import type { FlowDeps } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
 import { launchLane, SandboxRefusal } from "./launch.ts";
+import { machineRunner } from "./lane-ops.ts";
+import { runnerWorktreeRoot } from "./runner/hub.ts";
 import {
   type LaneMessage, type LaneMessageStore, OPEN_MESSAGE_STATES, openLaneMessages, queueLaneMessage, updateLaneMessage,
 } from "./lane-messages.ts";
@@ -649,11 +651,13 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (!valid) return { ok: false, detail: `branch name ${JSON.stringify(branch.slice(0, 80))} of ${pull.repo}#${pull.number} is not a valid branch` };
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
-  if (!deps.config.worktreeRoot) return { ok: false, detail: "worktreeRoot is not set" };
+  // The local runner's reported worktree root wins over the lead config's.
+  const root = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(undefined)) || deps.config.worktreeRoot;
+  if (!root) return { ok: false, detail: "worktreeRoot is not set" };
   const paneCount = async (): Promise<number> => deps.ops.panes().then((panes) => panes.length, () => -1); // the local runner's panes; -1 when unreadable
   const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config), paneCount), deps.config.guard);
   if (!host.ok) return { ok: false, detail: `HOLD ${host.reasons.join(" | ")}` };
-  const worktree = join(deps.config.worktreeRoot, repoName(pull.repo), key);
+  const worktree = join(root, repoName(pull.repo), key);
   if ((await deps.ops.exists(undefined, [worktree]))[0]) return { ok: false, detail: `worktree ${worktree} already exists` };
   const fetched = await deps.ops.git(source, { op: "fetch-branch", root: source.cwd, remote: "origin", branch });
   if (fetched.code !== 0) return { ok: false, detail: `git fetch failed: ${(fetched.err || fetched.out).trim()}` };
