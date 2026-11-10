@@ -17,7 +17,7 @@ afterEach(() => state.done());
 const ok = (out: string) => ({ code: 0, out, err: "" });
 
 const syncDeps = (paneIds: readonly string[], inspect?: LaneOps["inspect"]) => {
-  const base = depsFor(world, fakeClock(T0), state.dir, { sessionsDir: "/sessions", workspaces: ["w"] });
+  const base = depsFor(world, fakeClock(T0), state.dir, { sessionsDir: "/sessions", laneWorkspace: "w" });
   world.panes = paneIds.map((pane_id) => ({ pane_id, workspace_id: "w", agent: "pi", cwd: "/repo", title: pane_id }));
   const ops = fakeLaneOps(world);
   return { ...base, ops: inspect ? { ...ops, inspect } : ops };

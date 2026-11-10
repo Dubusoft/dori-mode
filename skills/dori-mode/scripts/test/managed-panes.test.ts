@@ -27,7 +27,7 @@ test("legacy config pane keys seed dori state once; later config values are igno
   const stateDir = join(s.dir, "state");
   writeFileSync(path, JSON.stringify({ stateDir, leadPane: "wA:p1", laneWorkspace: "wS", workspaces: ["wS"] }));
   const first = await loadConfig(path, s.dir);
-  expect({ leadPane: first.leadPane, laneWorkspace: first.laneWorkspace, workspaces: first.workspaces }).toEqual({ leadPane: "wA:p1", laneWorkspace: "wS", workspaces: ["wS"] });
+  expect({ leadPane: first.leadPane, laneWorkspace: first.laneWorkspace }).toEqual({ leadPane: "wA:p1", laneWorkspace: "wS" });
   expect(readManagedPanes(stateDir)).toEqual({ leadPane: "wA:p1", laneWorkspace: "wS", migrated: true });
   expect(statSync(managedPanesPath(stateDir)).mode & 0o777).toBe(0o600);
 
@@ -45,7 +45,7 @@ test("a config without pane keys and no state leaves both ids empty and writes n
   const stateDir = join(s.dir, "state");
   writeFileSync(path, JSON.stringify({ stateDir }));
   const config = await loadConfig(path, s.dir);
-  expect({ leadPane: config.leadPane, laneWorkspace: config.laneWorkspace, workspaces: config.workspaces }).toEqual({ leadPane: "", laneWorkspace: "", workspaces: [] });
+  expect({ leadPane: config.leadPane, laneWorkspace: config.laneWorkspace }).toEqual({ leadPane: "", laneWorkspace: "" });
   expect(readManagedPanes(stateDir)).toEqual({});
 });
 

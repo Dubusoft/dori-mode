@@ -334,6 +334,17 @@ test("dead-panes scopes remote reads and state independently from local IDs", as
   expect(reads.some((r) => r.pane === "w:p9")).toBe(false);
 });
 
+test("dead-panes reads a remote lane pane in any workspace, whatever the local lanes workspace is", async () => {
+  const d = deps();
+  world.panes = [{ pane_id: "w:p3", workspace_id: "w" }];
+  world.screen = "agent has stopped";
+  const config = { ...d.config, laneWorkspace: "local-only-workspace" };
+  const seen = new Set<string>();
+  const memory = newDeadPaneState();
+  expect(await deadPaneTick(d.ops, config, seen, "hour", memory, [lane()])).toEqual([]);
+  expect(await deadPaneTick(d.ops, config, seen, "hour", memory, [lane()])).toEqual([`DEAD_PANE w:p3 machine=${MACHINE}`]);
+});
+
 test("dead-panes never alerts on a remote host's own panes over several sweeps", async () => {
   const d = deps();
   // The machine's herdr lists the lane's working pane plus panes no lane owns: a plain shell and another workspace's pane.
