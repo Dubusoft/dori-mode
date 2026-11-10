@@ -2,7 +2,7 @@ import { OPEN_STATES, type Operation, type OperationStore, plan, settleOperation
 import { redactSecrets } from "./redact.ts";
 
 /**
- * Autopilot core (shadow mode): the pure selection predicate over toodo tasks the owner marked for autopilot (toodo's
+ * Autopilot core: the pure selection predicate over toodo tasks the owner marked for autopilot (toodo's
  * `autopilot` field) and the launch ledger, slot assignment against the host guard, plus the shadow judgment rows.
  * Nothing here performs I/O beyond the given OperationStore, launches a lane or mutates toodo; callers read toodo, the
  * registry, quota and the host guard and pass plain data in.
@@ -49,11 +49,22 @@ export type AutopilotConfig = {
   readonly quotaUnreadable: "hold";
   readonly mergeBase: string;
   readonly crossWorkspacePrereqs: "block";
-  readonly mode: "shadow";
+  /**
+   * off: the supervisor does not judge and nothing launches; shadow: judged and recorded, nothing launches; on: the tick
+   * wakes the lead with AUTOPILOT_READY and `dori autopilot launch` may reserve.
+   */
+  readonly mode: AutopilotMode;
+  /** Seconds between the supervisor's autopilot ticks. */
+  readonly tickSec: number;
 };
 
+export const AUTOPILOT_MODES = ["off", "shadow", "on"] as const;
+export type AutopilotMode = (typeof AUTOPILOT_MODES)[number];
+export const TICK_SEC_MIN = 30;
+export const TICK_SEC_MAX = 3600;
+
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
-  quotaMaxUsedPct: 80, quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", mode: "shadow",
+  quotaMaxUsedPct: 80, quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", mode: "shadow", tickSec: 300,
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -84,7 +95,9 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
     quotaUnreadable: pick<"hold">("quotaUnreadable", only("hold"), "\"hold\""),
     mergeBase: pick<string>("mergeBase", (v) => typeof v === "string" && v.trim() !== "" && v === v.trim(), "a branch name"),
     crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
-    mode: pick<"shadow">("mode", only("shadow"), "\"shadow\""),
+    mode: pick<AutopilotMode>("mode", (v) => (AUTOPILOT_MODES as readonly unknown[]).includes(v), "\"off\", \"shadow\" or \"on\""),
+    tickSec: pick<number>("tickSec", (v) => Number.isInteger(v) && (v as number) >= TICK_SEC_MIN && (v as number) <= TICK_SEC_MAX,
+      `an integer from ${TICK_SEC_MIN} to ${TICK_SEC_MAX}`),
   };
 };
 
@@ -295,7 +308,9 @@ export const recordShadow = (store: OperationStore, now: number, verdicts: reado
   });
 
 export type CandidatesReport = {
-  readonly mode: AutopilotConfig["mode"];
+  readonly mode: AutopilotMode;
+  /** `dori autopilot pause` is in force: nothing launches whatever the mode. */
+  readonly paused: boolean;
   /** Free host slots; null when the pane limit is off. */
   readonly slots: number | null;
   readonly verdicts: readonly Verdict[];
@@ -304,8 +319,9 @@ export type CandidatesReport = {
 /** Text output of `dori autopilot candidates`: a header line and one line per verdict, or AUTOPILOT_NO_CANDIDATES. */
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
+  const launches = report.mode === "on" && !report.paused;
   return [
-    `AUTOPILOT mode=${report.mode} record-only: nothing launches slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}`,
+    `AUTOPILOT mode=${report.mode}${report.paused ? " paused" : ""}${launches ? "" : " record-only: nothing launches"} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}`,
     ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? "would-launch" : v.reasons.join(", ")}`),
   ];
 };
@@ -313,6 +329,7 @@ export const formatCandidates = (report: CandidatesReport): string[] => {
 /** The `--json` shape of `dori autopilot candidates`. */
 export const candidatesJson = (report: CandidatesReport) => ({
   mode: report.mode,
+  paused: report.paused,
   slots: report.slots,
   candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons })),
 });

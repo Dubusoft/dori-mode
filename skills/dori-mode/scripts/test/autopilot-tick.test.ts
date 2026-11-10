@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AUTOPILOT_LANE, type CandidatesReport, SHADOW_ACTION, type Verdict } from "../src/autopilot.ts";
-import { AUTOPILOT_KICK_MIN_MS, AUTOPILOT_RENOTIFY_MS, AUTOPILOT_TICK_MS, AutopilotTick } from "../src/autopilot-tick.ts";
+import { AUTOPILOT_LANE, type AutopilotMode, type CandidatesReport, SHADOW_ACTION, type Verdict } from "../src/autopilot.ts";
+import { AUTOPILOT_KICK_MIN_MS, AUTOPILOT_RENOTIFY_MS, AutopilotTick } from "../src/autopilot-tick.ts";
 import { JsonOperations } from "../src/operations.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
+const AUTOPILOT_TICK_MS = 300_000;
 
 let dir: string;
 let store: JsonOperations;
@@ -19,16 +20,18 @@ afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); 
 
 const launch = (taskId: number): Verdict => ({ taskId, verdict: "LAUNCH", reasons: [] });
 const hold = (taskId: number): Verdict => ({ taskId, verdict: "HOLD", reasons: ["no-slot"] });
-const report = (verdicts: readonly Verdict[], slots: number | null = 1): CandidatesReport => ({ mode: "shadow", slots, verdicts });
+const report = (verdicts: readonly Verdict[], slots: number | null = 1, mode: AutopilotMode = "on", paused = false): CandidatesReport =>
+  ({ mode, paused, slots, verdicts });
 
 /** A tick over a settable clock and report; `lines` are the journaled events, `judged` counts judgments. */
-const harness = (initial: CandidatesReport | Error) => {
+const harness = (initial: CandidatesReport | Error, mode: AutopilotMode = "on", tickMs = AUTOPILOT_TICK_MS) => {
   let now = T0;
   let next: CandidatesReport | Error = initial;
   const lines: string[] = [];
   const logs: string[] = [];
   let judged = 0;
   const tick = new AutopilotTick({
+    mode: () => mode, tickMs: () => tickMs,
     judge: async () => { judged++; if (next instanceof Error) throw next; return next; },
     store, enqueue: (_id, line) => { lines.push(line); }, now: () => now, log: (line) => { logs.push(line); },
   });
@@ -101,4 +104,34 @@ test("each tick writes the hour's shadow rows; an unreadable toodo is logged onc
   await h.at(3 * AUTOPILOT_TICK_MS);
   expect(h.logs.at(-1)).toBe("AUTOPILOT_TICK_OK");
   expect(h.lines).toEqual(["AUTOPILOT_READY #12 slots=1"]);
+});
+
+test("mode off judges nothing; shadow and a pause record rows but wake no one, and lifting the pause announces the set", async () => {
+  const off = harness(report([launch(12)], 1, "off"), "off");
+  off.tick.kick();
+  await off.at(0);
+  await off.at(AUTOPILOT_TICK_MS);
+  expect([off.judged(), off.lines, store.list({ lane: AUTOPILOT_LANE }).length]).toEqual([0, [], 0]);
+
+  const shadow = harness(report([launch(12)], 1, "shadow"), "shadow");
+  await shadow.at(0);
+  await shadow.at(AUTOPILOT_RENOTIFY_MS);
+  expect([shadow.judged(), shadow.lines]).toEqual([2, []]);
+  expect(store.list({ lane: AUTOPILOT_LANE }).filter((op) => op.action === SHADOW_ACTION).length).toBe(1);
+
+  const paused = harness(report([launch(12)], 1, "on", true));
+  await paused.at(0);
+  expect(paused.lines).toEqual([]);
+  paused.set(report([launch(12)]));
+  await paused.at(AUTOPILOT_TICK_MS);
+  expect(paused.lines).toEqual(["AUTOPILOT_READY #12 slots=1"]);
+});
+
+test("the tick period is the configured tickMs", async () => {
+  const h = harness(report([]), "on", 60_000);
+  await h.at(0);
+  await h.at(59_999);
+  expect(h.judged()).toBe(1);
+  await h.at(60_000);
+  expect(h.judged()).toBe(2);
 });

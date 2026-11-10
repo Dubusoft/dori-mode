@@ -39,7 +39,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("hooks", "json", "Hook commands (threadReply, transcribe)"),
   spec("ciMergeBase", "string", "The only base branch the supervisor merges lane PRs into"),
   spec("ignorePanes", "list", "herdr panes the sweeps ignore"),
-  spec("autopilot", "json", "Autopilot: toodo workspaces it may act in, bundle expiry, WIP, attempt and quota limits (shadow mode only)"),
+  spec("autopilot", "json", "Autopilot: mode (off|shadow|on), tickSec, quota threshold, merge base"),
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
