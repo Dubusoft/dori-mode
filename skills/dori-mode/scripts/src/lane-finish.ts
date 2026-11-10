@@ -29,8 +29,8 @@ const toMain = async (discord: FinishDiscord, main: string | undefined, text: st
  * Posts an owner line: into the lane thread `thread` (a `discord:<channel>[/<thread>]` ref) when there is one, else to
  * `main`. In a thread nothing new is posted when it can be avoided: the line is appended by editing the last
  * `dori reported` post there (else the lane's `[System]` status message); only a thread with neither gets a new post.
- * A thread the owner closed (closedByOwner) is never posted into: the line goes to `main` as one line linking the thread,
- * as does a line too long to append. A thread Discord answers 403/404 for falls back to `main`; any other failure
+ * A thread the owner closed (closedByOwner) is never posted into: the line goes as one line linking the thread to the
+ * thread's parent channel (`main` when Discord names none); a line too long to append goes to `main` the same way. A thread Discord answers 403/404 for falls back to `main`; any other failure
  * throws, so the outbox retries it (the stable id keeps a retried send from duplicating, and a retried append finds its
  * text already there). An archived thread, reopened by a post, is archived again; that read-back failing is logged,
  * never retried, since the line is already posted. Returns where it went.
@@ -40,7 +40,8 @@ export const postOwnerLine = async (discord: FinishDiscord, main: string | undef
     const to = resolveTarget("discord", thread).to;
     const threadId = /^discord:[^/]+\/(\d+)$/.exec(thread)?.[1];
     try {
-      if (threadId && options.stateDir && await closedByOwner(options.stateDir, discord, threadId)) return await toMain(discord, main, closedThreadLine(threadId, text), id);
+      const closed = threadId && options.stateDir ? await closedByOwner(options.stateDir, discord, threadId) : undefined;
+      if (threadId && closed) return await toMain(discord, closed.parent ?? main, closedThreadLine(threadId, text), id);
       const archived = threadId ? await discord.threadArchived(threadId) : false;
       const report = threadId ? (options.stateDir ? lastReportIn(options.stateDir, threadId)?.message : undefined) ?? await options.statusMessage?.(threadId) : undefined;
       if (threadId && report) {

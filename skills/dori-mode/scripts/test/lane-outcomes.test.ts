@@ -349,7 +349,8 @@ test("dori status names unreported lanes as a problem", () => {
 });
 
 // A preload replacing fetch: each request is appended to $FAKE_LOG as JSON; $FAKE_STATUS (default 200) is the reply status.
-// A reply also carries $FAKE_CONTENT as a message's content and $FAKE_ARCHIVED ("true") as a thread's archived flag.
+// A reply also carries $FAKE_CONTENT as a message's content, $FAKE_ARCHIVED ("true") as a thread's archived flag and
+// $FAKE_PARENT as a thread's parent channel.
 const fakeFetch = (dir: string): string => {
   const preload = join(dir, "fake-fetch.js");
   writeFileSync(preload, [
@@ -357,7 +358,7 @@ const fakeFetch = (dir: string): string => {
     'globalThis.fetch = async (url, init) => {',
     '  appendFileSync(process.env.FAKE_LOG, JSON.stringify({ url: String(url), method: init.method, body: init.body ? JSON.parse(init.body) : undefined }) + "\\n");',
     '  const status = Number(process.env.FAKE_STATUS ?? 200);',
-    '  const ok = { id: "m-42", content: process.env.FAKE_CONTENT ?? "", thread_metadata: { archived: process.env.FAKE_ARCHIVED === "true" } };',
+    '  const ok = { id: "m-42", content: process.env.FAKE_CONTENT ?? "", thread_metadata: { archived: process.env.FAKE_ARCHIVED === "true" }, parent_id: process.env.FAKE_PARENT };',
     '  return new Response(status < 300 ? JSON.stringify(ok) : "{\\"message\\":\\"Missing Access\\"}", { status });',
     '};',
   ].join("\n"));
@@ -736,29 +737,34 @@ test("dori reported --append edits the lane's last report and posts nothing new;
   expect(pendingReported(f.state.dir).filter((r) => r.followUp).map((r) => r.message)).toEqual(["m-42"]);
 }, CLI_TIMEOUT);
 
-test("a report, an append or a send into a thread the owner closed goes to the owner channel as one line; a reopened thread is posted into again", async () => {
+test("a report, an append or a send into a thread the owner closed goes to its parent channel as one line, else the owner channel; a reopened thread is posted into again", async () => {
   const f = fixture();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   const config = join(f.state.dir, "config.json");
   writeFileSync(config, JSON.stringify({ discordChannels: ["900"] }));
   recordOwnerClosed(f.state.dir, "200", T0);
-  const env = { DORI_CONFIG: config, FAKE_ARCHIVED: "true" };
+  const env = { DORI_CONFIG: config, FAKE_ARCHIVED: "true", FAKE_PARENT: "100" };
   const report = await cli(f.state.dir, ["reported", "alpha", "--text", "alpha merged:\nacme/app#7", "--final"], env);
   expect(report.code).toBe(0);
-  expect(report.out).toContain("REPORT_REDIRECTED alpha m-42: thread 200 was closed by the owner");
-  expect(calls(report.requests)).toEqual(["GET /channels/200", "POST /channels/900/messages"]);
+  expect(report.out).toContain("REPORT_REDIRECTED alpha m-42: thread 200 was closed by the owner, so one line linking it went to its parent channel 100");
+  expect(calls(report.requests)).toEqual(["GET /channels/200", "POST /channels/100/messages"]);
   expect(report.requests[1]?.body?.content).toBe("<#200> alpha merged: acme/app#7");
   expect(pendingReported(f.state.dir).map((r) => ({ target: r.target, followUp: r.followUp, thread: r.thread, button: r.button })))
-    .toEqual([{ target: "discord:900", followUp: true, thread: undefined, button: undefined }]);
+    .toEqual([{ target: "discord:100", followUp: true, thread: undefined, button: undefined }]);
   writeFileSync(join(f.state.dir, "last-reports.json"), JSON.stringify({ alpha: { channel: "200", message: "m-1", at: T0 } }));
   const append = await cli(f.state.dir, ["reported", "alpha", "--append", "Toodo done"], env);
   expect(append.code).toBe(0);
-  expect(calls(append.requests)).toEqual(["GET /channels/200", "POST /channels/900/messages"]);
+  expect(calls(append.requests)).toEqual(["GET /channels/200", "POST /channels/100/messages"]);
   const send = await cli(f.state.dir, ["send", "--to", "discord:100/200", "--text", "follow-up"], env);
   expect(send.code).toBe(0);
-  expect(send.out).toContain("SENT_REDIRECTED m-42: thread 200 was closed by the owner");
-  expect(calls(send.requests)).toEqual(["GET /channels/200", "POST /channels/900/messages"]);
+  expect(send.out).toContain("SENT_REDIRECTED m-42: thread 200 was closed by the owner, so one line linking it went to its parent channel 100");
+  expect(calls(send.requests)).toEqual(["GET /channels/200", "POST /channels/100/messages"]);
   expect(send.requests[1]?.body?.content).toBe("<#200> follow-up");
+  // Discord names no parent: the line goes to the owner channel discordChannels[0].
+  const orphan = await cli(f.state.dir, ["send", "--to", "discord:100/200", "--text", "follow-up"], { ...env, FAKE_PARENT: "" });
+  expect(orphan.code).toBe(0);
+  expect(orphan.out).toContain("SENT_REDIRECTED m-42: thread 200 was closed by the owner, so one line linking it went to the owner channel 900");
+  expect(calls(orphan.requests)).toEqual(["GET /channels/200", "POST /channels/900/messages"]);
   // The owner wrote in the thread and Discord unarchived it: the record goes and the post lands in the thread.
   const reopened = await cli(f.state.dir, ["send", "--to", "discord:100/200", "--text", "answer"], { ...env, FAKE_ARCHIVED: "false" });
   expect(reopened.code).toBe(0);

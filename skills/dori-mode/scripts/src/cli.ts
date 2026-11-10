@@ -236,7 +236,8 @@ const USAGE = `dori <command> [options]
   reported <key> --append TEXT [--note TEXT]
                                        a follow-up after the report (merge result, Toodo done): appended to the lane's last report
                                        by editing it (else its status message), no new post (REPORT_APPENDED)
-                                       a report, append or send into a thread the owner closed goes to the owner channel instead,
+                                       a report, append or send into a thread the owner closed goes to its parent channel instead
+                                       (the owner channel when the parent is unknown),
                                        as one line linking the thread (REPORT_REDIRECTED / SENT_REDIRECTED); the thread stays closed
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
@@ -1276,19 +1277,22 @@ try {
       const receipt = (posted: { message: string; target: string; thread?: string; button?: boolean; followUp?: boolean }): void => {
         recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, posted);
       };
-      // A thread the owner closed is never posted into: one line linking it goes to the owner channel, and the thread stays archived.
-      const redirect = async (thread: string, text: string): Promise<void> => {
-        if (!owner) die(`REPORT_NOT_POSTED ${found.key}: thread ${thread} was closed by the owner and no discordChannels entry names the owner channel; nothing recorded`);
-        const message = await discord.send(owner ?? "", followUps.closedThreadLine(thread, text), randomUUID());
-        receipt({ message, target: `discord:${owner}`, followUp: true });
-        console.log(`REPORT_REDIRECTED ${found.key} ${message}: thread ${thread} was closed by the owner, so one line linking it went to the owner channel`);
+      // A thread the owner closed is never posted into: one line linking it goes to its parent channel (else the owner
+      // channel), and the thread stays archived.
+      const redirect = async (thread: string, text: string, parent: string | undefined): Promise<void> => {
+        const target = parent ?? owner;
+        if (!target) die(`REPORT_NOT_POSTED ${found.key}: thread ${thread} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel; nothing recorded`);
+        const message = await discord.send(target ?? "", followUps.closedThreadLine(thread, text), randomUUID());
+        receipt({ message, target: `discord:${target}`, followUp: true });
+        console.log(`REPORT_REDIRECTED ${found.key} ${message}: thread ${thread} was closed by the owner, so one line linking it went to ${parent ? "its parent channel" : "the owner channel"} ${target}`);
       };
       if (append !== undefined) {
         // The follow-up edits the lane's last report (else its [System] status message): nothing new lands in the thread.
         const status = found.statusMessageId && found.thread.startsWith("discord:") ? { channel: resolveTarget("discord", found.thread).to, message: found.statusMessageId } : undefined;
         const last = followUps.readLastReports(config.stateDir)[found.key] ?? status
           ?? die(`REPORT_APPEND_NO_MESSAGE ${found.key}: this lane has no report or status message to append to; post the report with --text`);
-        if (await followUps.closedByOwner(config.stateDir, discord, last.channel)) { await redirect(last.channel, append); break; }
+        const closed = await followUps.closedByOwner(config.stateDir, discord, last.channel);
+        if (closed) { await redirect(last.channel, append, closed.parent); break; }
         const archived = await discord.threadArchived(last.channel).catch(() => false);
         if (!(await followUps.appendToMessage(discord, last.channel, last.message, append, archived))) {
           die(`REPORT_APPEND_TOO_LONG ${found.key}: the report with this text would pass Discord's message limit; shorten it, or post a new report with --text`);
@@ -1310,7 +1314,8 @@ try {
       const { finalityBlockers, readCloseButtons } = await import("./thread-finality.ts");
       // `discord:<thread>` and a bare thread id count as a thread too, unless the id is a configured channel.
       const threadId = opt("thread") ?? discordThreadOf(ref, config.discordChannels);
-      if (threadId === to && await followUps.closedByOwner(config.stateDir, discord, to)) { await redirect(to, opt("text") ?? ""); break; }
+      const closed = threadId === to ? await followUps.closedByOwner(config.stateDir, discord, to) : undefined;
+      if (closed) { await redirect(to, opt("text") ?? "", closed.parent); break; }
       let withheld: string[] = [];
       if (final) {
         const { publishedDecisions } = await import("./decision-obligations.ts");
@@ -1393,11 +1398,14 @@ try {
       }
       const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
       const { closedByOwner, closedThreadLine } = await import("./thread-followup.ts");
-      // A thread the owner closed is never posted into (a post would reopen it): one line linking it goes to the owner channel.
-      if (await closedByOwner(config.stateDir, discord, to)) {
-        const owner = config.discordChannels[0] ?? die(`SEND_NOT_POSTED thread ${to} was closed by the owner and no discordChannels entry names the owner channel`);
-        const sent = await discord.send(owner, closedThreadLine(to, text), randomUUID(), components);
-        console.log(`SENT_REDIRECTED ${sent}: thread ${to} was closed by the owner, so one line linking it went to the owner channel ${owner}`);
+      // A thread the owner closed is never posted into (a post would reopen it): one line linking it goes to its parent
+      // channel, else the owner channel.
+      const closed = await closedByOwner(config.stateDir, discord, to);
+      if (closed) {
+        const target = closed.parent ?? config.discordChannels[0]
+          ?? die(`SEND_NOT_POSTED thread ${to} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel`);
+        const sent = await discord.send(target, closedThreadLine(to, text), randomUUID(), components);
+        console.log(`SENT_REDIRECTED ${sent}: thread ${to} was closed by the owner, so one line linking it went to ${closed.parent ? "its parent channel" : "the owner channel"} ${target}`);
         break;
       }
       if (!edit) {

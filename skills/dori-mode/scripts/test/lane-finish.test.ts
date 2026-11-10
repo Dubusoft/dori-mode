@@ -34,7 +34,7 @@ test("a lane-finish outbox row left by an older journal is dropped with one log 
   } finally { errors.mockRestore(); }
 });
 
-const fakeDiscord = (opts: { archived?: boolean; fail?: MessengerError | Error; content?: string } = {}) => {
+const fakeDiscord = (opts: { archived?: boolean; parent?: string; fail?: MessengerError | Error; content?: string } = {}) => {
   const calls: string[] = [];
   const discord: FinishDiscord = {
     edit: async (channel, message, text) => { calls.push(`edit ${channel} ${message} ${text}`); },
@@ -48,6 +48,11 @@ const fakeDiscord = (opts: { archived?: boolean; fail?: MessengerError | Error; 
       if (opts.fail) throw opts.fail;
       calls.push(`archived? ${thread}`);
       return opts.archived ?? false;
+    },
+    threadState: async (thread) => {
+      if (opts.fail) throw opts.fail;
+      calls.push(`archived? ${thread}`);
+      return { archived: opts.archived ?? false, parent: opts.parent };
     },
     setThread: async (thread, patch) => { calls.push(`set ${thread} ${JSON.stringify(patch)}`); },
   };
@@ -106,9 +111,12 @@ test("postOwnerLine in a lane thread appends to its last report or status messag
   const full = fakeDiscord({ content: "x".repeat(1995) });
   expect(await postOwnerLine(full.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("main");
   expect(full.calls.at(-1)).toBe("send main m:1 <#222> [System] merged");
-  // The owner closed the thread: nothing touches it, the line goes to the main channel.
+  // The owner closed the thread: nothing touches it, the line goes to its parent channel, else the main channel.
   recordOwnerClosed(state.dir, "222", T0);
-  const closed = fakeDiscord({ archived: true });
-  expect(await postOwnerLine(closed.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("main");
-  expect(closed.calls).toEqual(["archived? 222", "send main m:1 <#222> [System] merged"]);
+  const closed = fakeDiscord({ archived: true, parent: "111" });
+  expect(await postOwnerLine(closed.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("111");
+  expect(closed.calls).toEqual(["archived? 222", "send 111 m:1 <#222> [System] merged"]);
+  const orphan = fakeDiscord({ archived: true });
+  expect(await postOwnerLine(orphan.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("main");
+  expect(orphan.calls).toEqual(["archived? 222", "send main m:1 <#222> [System] merged"]);
 });

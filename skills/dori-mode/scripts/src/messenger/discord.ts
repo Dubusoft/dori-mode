@@ -177,9 +177,15 @@ export class Discord {
 
   /** Reads a thread back: whether Discord reports it archived. A channel that is not a thread is an error. */
   async threadArchived(threadId: string): Promise<boolean> {
-    const archived = (await this.call<{ thread_metadata?: { archived?: unknown } }>("GET", `/channels/${threadId}`)).thread_metadata?.archived;
+    return (await this.threadState(threadId)).archived;
+  }
+
+  /** Reads a thread back: whether it is archived and its parent channel (undefined when Discord names none). A channel that is not a thread is an error. */
+  async threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined }> {
+    const channel = await this.call<{ thread_metadata?: { archived?: unknown }; parent_id?: unknown }>("GET", `/channels/${threadId}`);
+    const archived = channel.thread_metadata?.archived;
     if (typeof archived !== "boolean") throw new Error(`discord channel ${threadId} is not a thread`);
-    return archived;
+    return { archived, parent: typeof channel.parent_id === "string" && channel.parent_id ? channel.parent_id : undefined };
   }
 }
 
