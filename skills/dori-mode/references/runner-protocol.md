@@ -647,9 +647,9 @@ runner directory, and each runner's protocol, outbox backlog and restart circuit
 
 `dori update` restarts the supervisor first. Only once it is active again does it move the runners, one at a time.
 The local runner's unit is restarted; every other runner gets the new bundle the way `dori runner install` sends it.
-The update then waits up to 2 minutes for a hello with a higher gen before it goes to the next runner. The first
-runner that fails stops the rollout with `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent), and the runners after
-it keep their version.
+The update then waits up to 2 minutes for a hello with a higher gen before it goes to the next runner. A runner
+that fails logs `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent) and keeps its version; the rollout goes on with
+the next runner.
 
 The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_FAILED`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
 `RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_ONLINE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,

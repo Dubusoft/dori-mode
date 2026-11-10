@@ -298,10 +298,12 @@ if (process.argv[2] === "status") {
 }
 
 /**
- * `dori update`'s runner rollout: each worker runner gets the new bundle through `dori runner install`'s path, one at
- * a time, each confirmed by a hello with a higher gen within 2 minutes. The local runner is the supervisor's child, so
- * the supervisor restart that `dori update` already did restarted it on the updated checkout. A runner that already
- * reports this checkout's version is skipped. Returns 1 when one failed (the rest were not touched), else 0.
+ * `dori update`'s worker migration: first the old standalone guard agent files are removed from every machine (their
+ * failures are logged and never change the exit code), then each worker runner gets the new bundle through
+ * `dori runner install`'s path, one at a time, each confirmed by a hello with a higher gen within 2 minutes. The local
+ * runner is the supervisor's child, so the supervisor restart that `dori update` already did restarted it on the
+ * updated checkout. A runner that already reports this checkout's version is skipped. Returns 1 when any runner failed
+ * (the others were still upgraded), else 0.
  */
 const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): Promise<number> => {
   const { readRunnerRows } = await import("./runner/hub.ts");
@@ -313,6 +315,7 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
   const rows = readRunnerRows(cfg.stateDir);
   const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
   const machines = await listGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+  try { await removeGuardAgents(run, machines, (line) => console.log(line)); } catch (e) { console.log(`WARN guard agents: ${e instanceof Error ? e.message : String(e)}`); }
   let bundle: string | undefined;
   const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
   const before = new Map(rows.map((r) => [r.label, r.maxGen]));
@@ -322,7 +325,7 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
       install: async (label) => {
         const machine = machines.find((m) => m.label === label);
         if (!machine) return { ok: false, detail: `no machine ${label}` };
-        bundle ??= await buildBundle(run)();
+        bundle ??= await buildBundle(run, undefined, cfg.stateDir)();
         const done = await installRunner({ run, bundle: async () => bundle as string }, {
           machine, label, listenAddress: await runnerListenAddress(machine.target), stateDir: cfg.stateDir,
           agentCommand: cfg.agentCommand,
@@ -339,7 +342,7 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
       },
       log: (line) => console.log(line),
     });
-    return result.failed ? 1 : 0;
+    return result.failed.length ? 1 : 0;
   } finally {
     auth.close();
   }
@@ -743,9 +746,8 @@ try {
       }
       const code = await updateInstall({
         run, sleep: realClock.sleep, log: (line) => console.log(line),
-        removeGuardAgents: async () => removeGuardAgents(run, await listGuardMachines(run, config.guardMachines, config.stateDir), (line) => console.log(line)),
-        // A fresh process: this one still holds the modules it loaded before the pull, which the pulled runner code may not
-        // be able to import from (a missing export throws).
+        // A fresh process: this one still holds the modules it loaded before the pull, which may refer to files the pull
+        // removed or exports the pulled code no longer has.
         upgradeRunners: async () => Bun.spawn([process.execPath, join(import.meta.dir, "cli.ts"), "runner", "upgrade"], { stdio: ["ignore", "inherit", "inherit"] }).exited,
         refreshLaneSandbox: () => refreshLaneSandbox(homedir()),
         refreshBootPrep: () => refreshBootPrep(homedir()),

@@ -643,7 +643,8 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   // A Windows pass: scp uploads the script to the profile directory, then ssh runs it from there with an empty stdin.
   // An scp failure is returned as the install's result and the ssh step is skipped.
   const installWindows = async (script: string): Promise<Ran | InstallResult> => {
-    const dir = mkdtempSync(join(tmpdir(), "dori-runner-install-"));
+    // The state dir, not /tmp: the script embeds the bundle, and a supervisor host's /tmp may be a small, quota'd tmpfs.
+    const dir = mkdtempSync(join(req.stateDir, "runner-install-"));
     try {
       const local = join(dir, "install.ps1");
       writeFileSync(local, script, { mode: 0o600 });
@@ -727,10 +728,11 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
 
 /**
  * Bundles the CLI for a remote runner. The bundle has no git checkout on the remote host, so the source's short SHA is
- * baked in as `DORI_RUNNER_VERSION` (version.ts), which the runner reports in its hello.
+ * baked in as `DORI_RUNNER_VERSION` (version.ts), which the runner reports in its hello. The bundle is written under
+ * `scratchRoot` (the supervisor passes its state dir): /tmp on a supervisor host may be a quota'd tmpfs that is full.
  */
-export const buildBundle = (run: Runner, entry: string = RUNNER_CLI_ENTRY) => async (): Promise<string> => {
-  const dir = mkdtempSync(join(tmpdir(), "dori-runner-bundle-"));
+export const buildBundle = (run: Runner, entry: string = RUNNER_CLI_ENTRY, scratchRoot: string = tmpdir()) => async (): Promise<string> => {
+  const dir = mkdtempSync(join(scratchRoot, "dori-runner-bundle-"));
   try {
     const out = join(dir, "dori.js");
     const version = await gitVersion(run, import.meta.dir);

@@ -38,8 +38,8 @@ const runner: Runner = async (argv, opts) => {
 const update = (branch: "main" | "dev", force = false) =>
   updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l) }, { packageDir: pkg, branch, force });
 
-const updateWith = (removeGuardAgents: () => Promise<number>, branch: "main" | "dev") =>
-  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), removeGuardAgents }, { packageDir: pkg, branch, force: false });
+const updateWith = (upgradeRunners: () => Promise<number>, branch: "main" | "dev") =>
+  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), upgradeRunners }, { packageDir: pkg, branch, force: false });
 
 beforeEach(async () => {
   dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "dori-update-"));
@@ -83,14 +83,14 @@ test("switches dev -> main, keeps local changes, installs on a lockfile change, 
   expect(calls).toEqual(["bun install --frozen-lockfile", "bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
 });
 
-test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or exception keeps the exit code", async () => {
+test("workers are migrated on UP_TO_DATE and on UPDATED, and a failure or exception keeps the exit code", async () => {
   let n = 0;
   expect(await updateWith(async () => { n++; return 2; }, "dev")).toBe(0);
   expect(n).toBe(1);
   await commit(origin, "notes.txt", "two\n");
   expect(await updateWith(async () => { n++; throw new Error("boom"); }, "main")).toBe(0);
   expect(n).toBe(2);
-  expect(lines).toContain("WARN guard agents: boom");
+  expect(lines).toContain("WARN runners: boom");
   expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
 });
 
@@ -116,13 +116,18 @@ test("the boot-prep script is refreshed before the restart, its line logged and 
   expect(calls.indexOf("boot")).toBeLessThan(calls.indexOf("systemctl --user restart dori-supervisor.service"));
 });
 
-test("guard agents are refreshed before the supervisor restarts", async () => {
+test("workers are migrated only after the restarted supervisor is active", async () => {
   await commit(origin, "notes.txt", "two\n");
-  expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);
-  expect(calls).toEqual(["bun update pi-quota", "refresh", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+  expect(await updateWith(async () => { calls.push("migrate"); return 0; }, "main")).toBe(0);
+  expect(calls).toEqual(["bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service", "migrate"]);
+  await commit(origin, "notes.txt", "three\n");
+  unitState = "failed";
+  calls = [];
+  expect(await updateWith(async () => { calls.push("migrate"); return 0; }, "main")).toBe(1);
+  expect(calls).not.toContain("migrate");
 });
 
-test("guard agents are not refreshed when the update fails", async () => {
+test("workers are not migrated when the update fails", async () => {
   await sh(install, "git", "checkout", "-q", "main");
   await commit(install, "mine.txt", "local commit\n");
   await commit(origin, "notes.txt", "upstream\n");
