@@ -5,7 +5,7 @@ import { DEFAULT_EVENT_POLICY, type EventPolicy } from "./event-policy.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { redactSecrets } from "./redact.ts";
-import type { StoreKind } from "./store.ts";
+import { type StoreKind, storeOnDisk } from "./store.ts";
 import type { ToodoEventsConfig } from "./toodo-events.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -234,8 +234,6 @@ export type DoriConfig = {
   readonly hooks: Hooks;
   /** Default limit in ms for every external call (herdr, git, df, ...) that sets none itself; 0 turns it off. */
   readonly runTimeoutMs: number;
-  /** The path whose filesystem the disk guard checks; blank means `stateDir`. */
-  readonly diskGuardPath: string;
   /** A wait without --timeout whose check errors or times out this many times in a row ends as WAIT_FAILED. */
   readonly waitMaxFailures: number;
   /** Minutes a working/blocked lead may leave owner messages unread before it is cold-restarted with them; 0 turns it off. */
@@ -253,7 +251,7 @@ export type DoriConfig = {
   readonly leadChildWaitMaxMin: number;
   /** Per machine, no herdr call of a sweep round starts later than this many ms after the round began. */
   readonly sweepMachineDeadlineMs: number;
-  /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`). */
+  /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`); read from `stateDir` (storeOnDisk). */
   readonly store: StoreKind;
   /** How each event kind is delivered (event-policy.ts); a config's `kinds` are laid over the default table. */
   readonly eventPolicy: EventPolicy;
@@ -287,6 +285,9 @@ export type LeadModelEntry = string | { readonly model: string; readonly thinkin
 
 export type LeadModel = { readonly model: string; readonly thinking?: string };
 
+/** omo's agent session directory; not configurable (session-id.ts depends on its layout). */
+export const omoSessionsDir = (home = homedir()): string => join(home, ".omo", "agent", "sessions");
+
 export const defaultConfig = (home = homedir()): DoriConfig => ({
   stateDir: join(home, ".dori", "state"),
   laneWorkspace: "",
@@ -311,7 +312,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   launchKeywords: "ulw set goal and work",
   massLaunchKeywords: "/mass-ulw set goal and work",
   laneThinking: "medium",
-  sessionsDir: join(home, ".omo", "agent", "sessions"),
+  sessionsDir: omoSessionsDir(home),
   nudgeAfterMin: 15,
   idleEscalateMin: 30,
   closeAfterMin: 5,
@@ -336,7 +337,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   memoryCheck: { repo: "", maxKb: 15 },
   hooks: {},
   runTimeoutMs: 60_000,
-  diskGuardPath: "",
   waitMaxFailures: 30,
   leadStuckRestartMin: 30,
   leadUnreadRestartMin: 5,
@@ -463,26 +463,10 @@ const placement = (raw: unknown): PlacementConfig => {
  * tunable is a built-in constant (defaultConfig), so a config written by any dori version loads on any other.
  */
 export const CONFIG_FILE_KEYS = [
-  "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
-  "laneThinking", "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes", "toodoEvents",
+  "discord", "stateDir", "defaultCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
+  "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
+  "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes",
 ] as const;
-
-/** The config's `toodoEvents` laid over the default: `url` (http or https), `tokenFile` (`~` expanded) and `enabled`. */
-const toodoEventsConfig = (raw: unknown, base: ToodoEventsConfig, home: string): ToodoEventsConfig => {
-  if (raw === undefined) return base;
-  const bad = (what: string) => new TypeError(`toodoEvents.${what}`);
-  if (!isRecord(raw)) throw new TypeError("toodoEvents must be an object");
-  const { url, tokenFile, enabled } = raw;
-  if (url !== undefined && (typeof url !== "string" || !/^https?:\/\/\S+$/.test(url))) throw bad("url must be an http(s) URL");
-  if (tokenFile !== undefined && (typeof tokenFile !== "string" || !tokenFile.trim())) throw bad("tokenFile must be a path");
-  if (enabled !== undefined && typeof enabled !== "boolean") throw bad("enabled must be true or false");
-  return {
-    url: url ?? base.url,
-    tokenFile: typeof tokenFile === "string" ? expandHome(tokenFile.trim(), home) : base.tokenFile,
-    enabled: enabled ?? base.enabled,
-  };
-};
 
 /** The config's `alertsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
 const alertsChannel = (raw: unknown): string | undefined => {
@@ -518,8 +502,6 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
-  const rawMemory = isRecord(raw.memoryCheck) ? raw.memoryCheck : {};
-  ignored.push(...Object.keys(rawMemory).filter((key) => key !== "repo").map((key) => `memoryCheck.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
   ignored.push(...ignoredRunnerKeys(raw.runners));
   if (ignored.length && !warnedIgnoredKeys) {
@@ -534,7 +516,6 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     raw.leadModel = modelEntries(raw.leadModel, undefined)[0];
   }
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
-  const memoryRepo = typeof rawMemory.repo === "string" ? rawMemory.repo : base.memoryCheck.repo;
   const fromFile = raw as Partial<DoriConfig>;
   const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
   const panes = resolveManagedPanes(stateDir, loaded);
@@ -556,12 +537,10 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
-    toodoEvents: toodoEventsConfig(raw.toodoEvents, base.toodoEvents, home),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
-    memoryCheck: { ...base.memoryCheck, repo: expandHome(memoryRepo, home) },
     stateDir,
+    store: storeOnDisk(stateDir),
     defaultCwd: expandHome(merged.defaultCwd, home),
-    sessionsDir: expandHome(merged.sessionsDir, home),
     leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
     laneWorkspace: panes.laneWorkspace,
     workspaces: panes.laneWorkspace ? [panes.laneWorkspace] : [],

@@ -386,14 +386,14 @@ test("tokenFrom reads the env file forms and gatewayView ages with the injected 
   expect(gatewayView(s, 1000 + 61_000).state).toBe("stale");
 });
 
-test("memory check: memoryCheck.repo or omo's repo for defaultCwd, WARN over maxKb or when nothing is found", async () => {
+test("memory check: omo's repo for defaultCwd, WARN over maxKb or when nothing is found", async () => {
   const f = fixture();
   const real = { ...f.deps, exists: existsSync };
   expect(find(await runDoctor(real), "memory check").level).toBe("OK");
   const discovered = { ...real, config: { ...real.config, memoryCheck: { ...real.config.memoryCheck, repo: "" } } };
   const missing = find(await runDoctor(discovered), "memory check");
   expect(missing.level).toBe("WARN");
-  expect(missing.fix).toContain("memoryCheck.repo");
+  expect(missing.fix).toContain("defaultCwd");
   const agent = join(f.deps.home, ".omo", "memory", "agents", `lead-${createHash("sha256").update(f.deps.config.defaultCwd).digest("hex").slice(0, 8)}`, "repo", "system");
   mkdirSync(agent, { recursive: true });
   writeFileSync(join(agent, "human.md"), "x".repeat(16 * 1024));
@@ -419,12 +419,13 @@ test("item 6: doctor fails on lanes whose recovery is exhausted and warns on lan
 });
 
 
-test("lane command keys: bad launchKeywords, massLaunchKeywords or laneThinking is WARN; the defaults say nothing", async () => {
+test("lane command keys: bad launchKeywords or massLaunchKeywords is WARN; laneThinking is ignored", async () => {
   const config = fixture().deps.config;
   expect((await runDoctor(fixture().deps)).find((c) => c.id === "lane command")).toBeUndefined();
   const bad = find(await runDoctor(fixture({ deps: { config: { ...config, launchKeywords: " ", massLaunchKeywords: "mass-ulw go?", laneThinking: 5 as unknown as string } } }).deps), "lane command");
   expect(bad).toMatchObject({ level: "WARN" });
   expect(bad.detail).toContain("launchKeywords");
   expect(bad.detail).toContain("massLaunchKeywords");
-  expect(bad.detail).toContain("laneThinking");
+  const thinking = await runDoctor(fixture({ deps: { config: { ...config, laneThinking: 5 as unknown as string } } }).deps);
+  expect(thinking.find((c) => c.id === "lane command")).toBeUndefined();
 });

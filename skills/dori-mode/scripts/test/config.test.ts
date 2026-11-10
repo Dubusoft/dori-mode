@@ -78,12 +78,13 @@ test("a stray leadModel key in the config file is ignored, and the default model
 test("only user and environment keys are read: unknown, removed and malformed tunable keys load as defaults, named in one CONFIG_KEYS_IGNORED line per process", async () => {
   const path = join(state.dir, "mixed.json");
   await Bun.write(path, JSON.stringify({
-    defaultModel: "m/lane", store: "json", ciMergeBase: "release",
+    defaultModel: "m/lane", store: "sqlite", ciMergeBase: "release",
     futureKey: { a: 1 }, operations: false, quotaGate: { pollMin: 5 }, toodo: { url: "x" }, laneFinishNotice: true,
     drift: "x", runners: { listen: "8.8.8.8:1", mode: { mini: "shadow" } }, eventPolicy: 7, resolveKinds: "x",
     delivery: { mode: "push", push: { ackSec: 1 } }, guard: { memFreeCritPct: 3 }, heavyKill: "qemu-system", closeAfterMin: 7,
     memoryCheck: { repo: "~/memory", maxKb: 9 }, hooks: { threadDone: ["x"], threadReply: ["reply", "{text}"] },
     laneSandbox: { command: ["lane-sandbox"], default: false },
+    sessionsDir: "~/sessions", diskGuardPath: "/mnt", laneThinking: "high", toodoEvents: { enabled: false },
   }));
   // A fresh process, so the once-per-process warning is not already spent by another test file.
   const script = `const { defaultConfig, loadConfig } = await import(${JSON.stringify(join(import.meta.dir, "../src/config.ts"))});
@@ -91,16 +92,17 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     const b = await loadConfig(${JSON.stringify(path)}, "/home/ana");
     const d = defaultConfig("/home/ana");
     const same = ["closeAfterMin", "drift", "eventPolicy", "resolveKinds", "delivery", "guard", "heavyKill"].filter((k) => JSON.stringify(a[k]) === JSON.stringify(d[k]));
-    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a }));`;
+    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a, store: a.store, sessionsDir: a.sessionsDir, laneThinking: a.laneThinking, toodo: a.toodoEvents.enabled, diskGuard: "diskGuardPath" in a }));`;
   const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   expect(code).toBe(0);
   expect(JSON.parse(out)).toEqual({
     same: ["closeAfterMin", "drift", "eventPolicy", "resolveKinds", "delivery", "guard", "heavyKill"],
-    model: "m/lane", base: "release", memoryCheck: { repo: "/home/ana/memory", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
+    model: "m/lane", base: "release", memoryCheck: { repo: "", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
     sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
+    store: "json", sessionsDir: "/home/ana/.omo/agent/sessions", laneThinking: "medium", toodo: true, diskGuard: false,
   });
-  const ignored = "futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, hooks.threadDone, memoryCheck.maxKb, laneSandbox.default, runners.listen, runners.mode";
+  const ignored = "store, futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, memoryCheck, sessionsDir, diskGuardPath, laneThinking, toodoEvents, hooks.threadDone, laneSandbox.default, runners.listen, runners.mode";
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
 });
 
@@ -111,7 +113,7 @@ test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ci
     ciToodoWorkspaces: { "acme/app": 3 },
   }));
   const c = await loadConfig(path, "/home/ana");
-  expect(c.memoryCheck.repo).toBe("/home/ana/memory");
+  expect(c.memoryCheck.repo).toBe("");
   expect(c.memoryCheck.maxKb).toBe(15);
   expect(c.ciMergeBase).toBe("dev");
 });

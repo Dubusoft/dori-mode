@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
@@ -132,9 +132,9 @@ export class ToodoEvents {
 
   constructor(private readonly deps: ToodoEventsDeps) {}
 
-  /** Follows the stream until `signal` aborts; never rejects. */
+  /** Follows the stream until `signal` aborts; never rejects. Without `enabled` or a token file it does not start (no failing source). */
   async run(signal: AbortSignal): Promise<void> {
-    if (!this.deps.config.enabled) return;
+    if (!this.deps.config.enabled || !existsSync(this.deps.config.tokenFile)) return;
     const min = this.deps.retryMinMs ?? TOODO_RETRY_MIN_MS;
     const max = this.deps.retryMaxMs ?? TOODO_RETRY_MAX_MS;
     let delay = min;

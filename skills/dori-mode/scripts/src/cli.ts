@@ -190,10 +190,10 @@ const USAGE = `dori <command> [options]
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always)
-  store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field),
-                                       then set "store": "sqlite" in the config
+  store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field);
+                                       the store follows the files in the state dir
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
-                                       from supervisor.sqlite (rollback), then set "store": "json" in the config
+                                       from supervisor.sqlite (rollback); the store follows the files in the state dir
   wait <key> --until SIGNAL --note TEXT [--thread REF] [--every SEC] [--timeout MIN] [--machine M --cwd DIR]
   wait --list | --cancel <key>          durable supervisor-owned follow-ups
   emit <KIND> --text T [--id ID]       journal one event (dedupe by --id); its class comes from eventPolicy
@@ -719,13 +719,13 @@ try {
         const { exportStore } = await import("./store-export.ts");
         const report = exportStore(config.stateDir, realClock.now());
         console.log(JSON.stringify(report, null, 2));
-        console.log(`STORE_EXPORTED ${config.stateDir}; set "store": "json" in ${configPath()} before starting the supervisor`);
+        console.log(`STORE_EXPORTED ${config.stateDir}; the supervisor now uses the json store`);
         break;
       }
       const { importStore } = await import("./store-import.ts");
       const report = importStore(config.stateDir, realClock.now());
       console.log(JSON.stringify(report, null, 2));
-      console.log(`STORE_IMPORTED ${report.database}; set "store": "sqlite" in ${configPath()} before starting the supervisor`);
+      console.log(`STORE_IMPORTED ${report.database}; the supervisor now uses the sqlite store`);
       break;
     }
     case "lead-restart": {

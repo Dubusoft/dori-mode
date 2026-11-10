@@ -117,8 +117,8 @@ const parseMemInfo = (text: string): Pick<HostSample, "memFreePct" | "swapFreeGb
   };
 };
 
-/** The filesystem the disk guard checks: `diskGuardPath`, else the one holding the state directory. */
-export const diskGuardPath = (config: Pick<DoriConfig, "diskGuardPath" | "stateDir">): string => config.diskGuardPath?.trim() || config.stateDir;
+/** The filesystem the disk guard checks. */
+export const diskGuardPath = (config: Pick<DoriConfig, "stateDir">): string => config.stateDir;
 
 /**
  * One host sample. `paneCount` (-1 when unreadable) is the caller's: a runner counts its own herdr panes, the

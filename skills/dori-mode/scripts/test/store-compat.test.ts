@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig, loadConfig } from "../src/config.ts";
 import { Registry } from "../src/registry.ts";
-import { SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
+import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore, type StoreKind, openStore, storeOnDisk } from "../src/store.ts";
 import { withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -69,7 +69,23 @@ test("a config with a runners section or progressTemplate loads with both ignore
     const config = await loadConfig(path, "/home/ana");
     expect("runners" in config).toBe(false);
     expect("progressTemplate" in config).toBe(false);
-    expect(config.store).toBe("json");
+    expect(config.store).toBe(storeOnDisk(config.stateDir));
   }
   expect("runners" in defaultConfig("/home/ana")).toBe(false);
+});
+
+test("the store follows the files on disk, not a store key in the config", async () => {
+  const dir = stateFor("sqlite");
+  const path = join(dir, "config.json");
+  await Bun.write(path, JSON.stringify({ stateDir: dir, store: "json" }));
+  expect((await loadConfig(path, "/home/ana")).store).toBe("sqlite");
+});
+
+test("pre-sqlite marker with no journal and no database: openStore stops with STORE_MISSING", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  writeFileSync(join(state.dir, PRE_SQLITE_FILE), "{}");
+  expect(storeOnDisk(state.dir)).toBe("sqlite");
+  expect(() => openStore(state.dir, storeOnDisk(state.dir))).toThrow("STORE_MISSING");
+  expect(existsSync(join(state.dir, SQLITE_FILE))).toBe(false);
 });

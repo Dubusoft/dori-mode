@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { eventClass } from "../src/event-policy.ts";
@@ -147,4 +147,15 @@ test("a refused token and a silent stream are failures that are retried, never a
   b.start({ idleMs: 50 });
   await b.until(() => silent.requests.length >= 2, "a reconnection after the silence");
   expect(b.logs.find((line) => line.startsWith("TOODO_EVENTS_DOWN"))).toContain("no data from toodo-server");
+});
+
+test("without a token file the stream does not start and no failing source is registered", async () => {
+  const server = fakeToodo();
+  const f = fixture(server.url);
+  rmSync(join(f.dir, "web-token"));
+  const halt = f.start();
+  await halt();
+  expect(server.requests).toHaveLength(0);
+  expect(f.logs).toEqual([]);
+  expect(f.status).toEqual([]);
 });

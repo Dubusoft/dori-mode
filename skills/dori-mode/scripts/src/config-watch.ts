@@ -95,11 +95,11 @@ export const replaceInPlace = <T extends object>(target: T, next: T): void => {
 
 /**
  * config.json keys the running supervisor cannot take without a restart: the Discord application (the gateway and the
- * slash commands are registered with it at startup), where its state lives, the Toodo event stream it opened, and the
- * button hooks its slash command handler was built with. `DORI_DISCORD_TOKEN` is not a config key: it is read once at
+ * slash commands are registered with it at startup), where its state lives, and the button hooks its slash command
+ * handler was built with. `DORI_DISCORD_TOKEN` is not a config key: it is read once at
  * startup, so a new token also needs a restart. Every other config.json key is read where it is used, so it applies live.
  */
-export const RESTART_CONFIG_KEYS: readonly string[] = ["discord", "stateDir", "store", "toodoEvents", "buttonHooks"];
+export const RESTART_CONFIG_KEYS: readonly string[] = ["discord", "stateDir", "buttonHooks"];
 
 const strings = (v: unknown): boolean => Array.isArray(v) && v.every((s) => typeof s === "string");
 
@@ -112,7 +112,7 @@ export const configReloadError = (c: DoriConfig): string | undefined => {
     if (!strings(c[key])) return `${key} must be an array of strings`;
   }
   if (!strings(c.agentCommand) || c.agentCommand.length === 0) return "agentCommand must be a non-empty array of strings";
-  for (const key of ["defaultModel", "defaultCwd", "sessionsDir", "worktreeRoot", "ciMergeBase", "diskGuardPath"] as const) {
+  for (const key of ["defaultModel", "defaultCwd", "worktreeRoot", "ciMergeBase"] as const) {
     if (typeof c[key] !== "string") return `${key} must be a string`;
   }
   if (!c.defaultModel.trim()) return "defaultModel must not be empty";

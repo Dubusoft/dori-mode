@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
-import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { platform } from "node:os";
 
+import { omoSessionsDir } from "../config.ts";
 import { type HostSample, sampleHost } from "../host-guard.ts";
 import { listPanes, type Pane, readScreen } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
@@ -50,7 +50,7 @@ export type QueryDeps = {
 };
 
 /** Default agent session directory on a host (omo's own). */
-export const defaultSessionsDir = (): string => join(homedir(), ".omo", "agent", "sessions");
+export const defaultSessionsDir = (): string => omoSessionsDir();
 
 type Body<T extends QueryType> = Omit<QueryBodies[T], "qid">;
 

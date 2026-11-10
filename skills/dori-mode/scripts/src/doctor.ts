@@ -220,7 +220,6 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
   const text = (v: unknown): v is string => typeof v === "string";
   if (!text(c.launchKeywords) || !c.launchKeywords.trim()) lane.push("launchKeywords must be a non-empty string");
   if (!text(c.massLaunchKeywords) || !c.massLaunchKeywords.startsWith("/mass-ulw") || c.massLaunchKeywords.includes("?")) lane.push("massLaunchKeywords must be a string that starts with /mass-ulw and has no '?'");
-  if ("laneThinking" in c && !text(c.laneThinking)) lane.push("laneThinking must be a string");
   if (lane.length) checks.push(warn("lane command", lane.join("; "), `fix the keys in ${d.configPath}`));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
@@ -313,7 +312,7 @@ const memory = (d: DoctorDeps): Check[] => {
   const limit = Math.round(m.maxKb * 1024);
   const checks: Check[] = [];
   if (!file || !d.exists(file)) {
-    checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.defaultCwd}; dori memory check and its sweep are off`, `set memoryCheck.repo to the lead's omo memory repo in ${d.configPath}`));
+    checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.defaultCwd}; dori memory check and its sweep are off`, `check defaultCwd in ${d.configPath}: the memory repo is omo's for that directory`));
   } else {
     const bytes = statSync(file).size;
     checks.push(bytes > limit
