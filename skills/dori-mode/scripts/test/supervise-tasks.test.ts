@@ -187,7 +187,7 @@ test("the report polling path prunes operation and report history at startup and
   } finally { await s.stop(); }
 }, 30_000);
 
-const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>) => void) =>
+const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>) => Promise<void>) =>
   test(`a stalled ${stalled} task leaves the other three working and is reported by name, then withholds the watchdog`, async () => {
     // Given the real supervise() in task mode with the work of one task hung.
     const s = setup(stalled);
@@ -201,7 +201,7 @@ const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>)
       s.clock.at += TASK_ALERT_MS;
       await s.next();
       await until(s.subscribe, () => s.errors.some((line) => line.startsWith(`TASK_STALLED ${stalled} `)), 10_000, `TASK_STALLED ${stalled}`);
-      then?.(s);
+      await then?.(s);
       // And once it is stuck past the stall budget, the watchdog is withheld in its name, so systemd restarts the supervisor.
       s.clock.at += WATCHDOG_STALL_MS;
       await s.next();
@@ -242,6 +242,7 @@ test("a runner hub that cannot open at startup wakes the lead, and the runners t
 
 stallTest("inbound");
 // A stalled delivery task cannot hand TASK_STALLED to the lead, so the owner is told in the main channel.
-stallTest("delivery", (s) => { expect(s.posts.some((body) => body.includes("TASK_STALLED delivery"))).toBe(true); });
+// The notice is posted without being awaited, so the test waits for the post itself.
+stallTest("delivery", (s) => until(s.subscribe, () => s.posts.some((body) => body.includes("TASK_STALLED delivery")), 10_000, "the TASK_STALLED delivery notice"));
 stallTest("sweeps");
 stallTest("polling");

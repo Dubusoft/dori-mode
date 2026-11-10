@@ -56,6 +56,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { closeThreadButton } from "./messenger/discord-commands.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
+import { redirectIfClosed } from "./thread-followup.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
 import { OWNER_NOTICE_AFTER_MS, RetryingDelivery, SuperviseError, Supervisor } from "./supervise.ts";
@@ -869,11 +870,17 @@ export const supervise = async (
     if (!token) throw new SuperviseError("supervise requires DORI_DISCORD_TOKEN for lossless paginated Discord polling");
     releaseGateway = probe.step("gateway-lock", () => acquireDiscordGateway(token, gatewayLockDir));
     const discord = new Discord(fetchHttp, deps.clock, token);
-    // An owner notice goes where the message came from: its Discord channel or thread.
-    const ownerNotice = async (channel: string, text: string, id: string): Promise<void> => {
-      await discord.send(channel, systemText(text), id);
-    };
     const stateDir = deps.config.stateDir;
+    // A [System] post of the supervisor's own into `channel`; a thread the owner closed gets nothing (a post would reopen
+    // it): one line linking it goes to its parent channel, else the owner channel (redirectIfClosed).
+    const systemPost = async (channel: string, text: string, id?: string): Promise<void> => {
+      const body = systemText(text);
+      const redirected = await redirectIfClosed(stateDir, discord, channel, body, deps.config.discordChannels[0], (target, line) => discord.send(target, line, id));
+      if (redirected) console.log(`SYSTEM_POST_REDIRECTED ${channel}: closed by the owner, one line went to ${redirected}`);
+      else await discord.send(channel, body, id);
+    };
+    // An owner notice goes where the message came from: its Discord channel or thread.
+    const ownerNotice = (channel: string, text: string, id: string): Promise<void> => systemPost(channel, text, id);
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(stateDir, pane); },
@@ -943,7 +950,7 @@ export const supervise = async (
       notify: async (text) => {
         const channel = alertsChannelOf(deps.config);
         if (!channel) throw new Error("no discordChannels configured");
-        await discord.send(channel, systemText(`수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`));
+        await systemPost(channel, `수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`);
       },
       log: (line) => { console.error(line); },
     }, boot);
@@ -982,7 +989,10 @@ export const supervise = async (
     // tick of being written.
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
     // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
-    const statusTransport = { post: (channel: string, text: string, id: string) => discord.send(channel, text, id), edit: (channel: string, id: string, text: string) => discord.edit(channel, id, text) };
+    const statusTransport = {
+      post: (channel: string, text: string, id: string) => discord.send(channel, text, id), edit: (channel: string, id: string, text: string) => discord.edit(channel, id, text),
+      threadState: (threadId: string) => discord.threadState(threadId),
+    };
     let nextHistoryPrune = 0;
     const routeLaneReports = (): Promise<void> => watchdog.track("reports", (async () => {
       const now = deps.clock.now();
@@ -1315,7 +1325,7 @@ export const supervise = async (
         const channel = alertsChannelOf(deps.config);
         if (which === "delivery" && channel) {
           const notice = `도리 경고: 수퍼바이저의 전달 작업이 ${Math.round(ms / 60_000)}분째 끝나지 않고 있습니다. 다른 작업은 계속 돌아가며, ${Math.round(WATCHDOG_STALL_MS / 60_000)}분까지 멈춰 있으면 수퍼바이저가 재시작됩니다. (TASK_STALLED ${which})`;
-          void discord.send(channel, systemText(scrubForThread(notice, homedir())), id)
+          void systemPost(channel, scrubForThread(notice, homedir()), id)
             .catch((e: unknown) => { console.error(`TASK_STALLED_NOTIFY_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); });
         }
       }

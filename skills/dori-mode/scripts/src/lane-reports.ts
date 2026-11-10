@@ -17,6 +17,7 @@ import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from
 import { REPORT_KINDS, type ReportKind } from "./runner/report-kinds.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import { LaneFileError } from "./lane-files.ts";
+import { ownerClosedRecorded, redirectIfClosed } from "./thread-followup.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -292,10 +293,14 @@ const failures = new WeakMap<LaneReportStore, Map<string, number>>();
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
 export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
-/** Posts and edits a lane's status message in its thread; `post` returns the new message's id. */
+/**
+ * Posts and edits a lane's status message in its thread; `post` returns the new message's id. `threadState` tells a
+ * thread the owner closed (thread-followup.ts closedByOwner) from one that is open.
+ */
 export type LaneStatusTransport = {
   post(channel: string, text: string, stableId: string): Promise<string>;
   edit(channel: string, messageId: string, text: string): Promise<void>;
+  threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined }>;
 };
 
 /**
@@ -306,7 +311,10 @@ export const discordStatusTransport = (clock: Clock, env: Readonly<Record<string
   const token = env.DORI_DISCORD_TOKEN?.trim();
   if (!token) return undefined;
   const discord = new Discord(fetchHttp, clock, token);
-  return { post: (channel, text, stableId) => discord.send(channel, text, stableId), edit: (channel, id, text) => discord.edit(channel, id, text) };
+  return {
+    post: (channel, text, stableId) => discord.send(channel, text, stableId), edit: (channel, id, text) => discord.edit(channel, id, text),
+    threadState: (threadId) => discord.threadState(threadId),
+  };
 };
 
 /** Longest report text a status message line carries. */
@@ -347,9 +355,18 @@ const statusChannel = (lane: Lane): string | undefined =>
 
 /**
  * Edits the lane's status message to the text as of `report`, or posts it when there is none yet or the edit fails (a
- * deleted message), and stores the new id on the lane (statusMessageId). A failed post throws.
+ * deleted message), and stores the new id on the lane (statusMessageId). A thread the owner closed is neither edited nor
+ * posted into (either would reopen it): the report goes as one line linking the thread to its parent channel, else the
+ * owner channel (redirectIfClosed), and the status message is left as it is. A failed post throws.
  */
 const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string): Promise<void> => {
+  const relayed = relayedText(lane.key, scrubForThread(oneLine(report.text), home));
+  const redirected = await redirectIfClosed(deps.config.stateDir, transport, channel, relayed, deps.config.discordChannels[0],
+    (target, line) => transport.post(target, line, `lane-status:${report.id}`));
+  if (redirected) {
+    console.error(`LANE_STATUS_REDIRECTED ${lane.key} ${report.id}: thread ${channel} was closed by the owner, so one line went to ${redirected}`);
+    return;
+  }
   const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home);
   if (lane.statusMessageId) {
     try {
@@ -417,7 +434,7 @@ export const routeReports = async (
           await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report))} (status message failed: ${errorText(e)})`, laneMeta(lane));
           route = "journal";
         }
-      } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none") {
+      } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none" && !ownerClosedRecorded(deps.config.stateDir, lane.thread)) {
         const posted = await deps.run(fillHook(deps.config.hooks.threadReply, { thread: lane.thread, text: relayedText(lane.key, scrubForThread(oneLine(report.text), home)), key: lane.key }));
         if (posted.code === 0) route = "thread";
         else {

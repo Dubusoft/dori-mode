@@ -98,6 +98,52 @@ export const closedThreadLine = (thread: string, text: string): string => {
 };
 
 /**
+ * The closed-thread rule for a post the supervisor makes on its own (an owner notice, an alert, a lane status update):
+ * when `channel` is a thread the owner closed (closedByOwner), nothing is posted or edited in it (either would need it
+ * reopened) and `send` gets one line linking it (closedThreadLine) for the thread's parent channel, else `owner`.
+ * Returns the channel the line went to, or undefined when `channel` is not closed by the owner (post there as usual).
+ * Throws when the thread is closed and neither a parent nor `owner` is known.
+ */
+export const redirectIfClosed = async (
+  stateDir: string, discord: Pick<FollowUpDiscord, "threadState">, channel: string, text: string, owner: string | undefined,
+  send: (target: string, line: string) => Promise<unknown>,
+): Promise<string | undefined> => {
+  const closed = await closedByOwner(stateDir, discord, channel);
+  if (!closed) return undefined;
+  const target = closed.parent ?? owner;
+  if (!target) throw new Error(`thread ${channel} was closed by the owner and neither its parent channel nor the owner channel is known`);
+  await send(target, closedThreadLine(channel, text));
+  return target;
+};
+
+/** The thread id a `discord:<channel>/<thread>` ref names, or undefined for any other ref. */
+const threadOfRef = (ref: string): string | undefined => /^discord:[^/]+\/(\d+)$/.exec(ref)?.[1];
+
+/** Whether a close by the owner is recorded for the thread lane thread ref `ref` names (no Discord read). */
+export const ownerClosedRecorded = (stateDir: string, ref: string): boolean => {
+  const thread = threadOfRef(ref);
+  return thread !== undefined && readOwnerClosed(stateDir)[thread] !== undefined;
+};
+
+/** What a redirected hook post needs: the thread's state and a plain post (returning the message id). */
+export type RedirectTransport = Pick<FollowUpDiscord, "threadState"> & { post(channel: string, text: string, stableId: string): Promise<string> };
+
+/**
+ * The closed-thread rule ahead of a post through hooks.threadReply into lane thread `ref` (the hook cannot tell a
+ * closed thread): undefined when no close is recorded for it or Discord reports it open again (post through the hook);
+ * else the channel one line linking it went to through `transport` (redirectIfClosed). Throws, posting nothing, when
+ * the thread is recorded closed and there is no transport (no DORI_DISCORD_TOKEN) to post that line with.
+ */
+export const redirectHookPost = async (
+  stateDir: string, transport: RedirectTransport | undefined, ref: string, text: string, owner: string | undefined, stableId: string,
+): Promise<string | undefined> => {
+  const thread = threadOfRef(ref);
+  if (thread === undefined || readOwnerClosed(stateDir)[thread] === undefined) return undefined;
+  if (!transport) throw new Error(`thread ${thread} was closed by the owner and there is no DORI_DISCORD_TOKEN to post one line to its parent channel`);
+  return redirectIfClosed(stateDir, transport, thread, text, owner, (target, line) => transport.post(target, line, stableId));
+};
+
+/**
  * Appends `text` on a new line to message `message` in `channel` by editing it; no new message is posted. A thread
  * Discord archived on its own (not closed by the owner; check closedByOwner first) is unarchived for the edit and archived
  * again. A message that already ends with `text` (a retried append) is left as it is. Returns false, editing nothing,

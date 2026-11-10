@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { discordStatusTransport, JsonLaneReports, type LaneStatusTransport, routeReports } from "../src/lane-reports.ts";
 import { type Lane, Registry } from "../src/registry.ts";
+import { readOwnerClosed, recordOwnerClosed } from "../src/thread-followup.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00Z");
@@ -22,7 +23,7 @@ const lane = (dir: string, patch: Partial<Lane> = {}): Lane => ({
 });
 
 type Call = readonly ["post" | "edit", ...string[]];
-const fakeTransport = (failEdit = false, failPost = false): { transport: LaneStatusTransport; calls: Call[] } => {
+const fakeTransport = (failEdit = false, failPost = false, thread: { archived: boolean; parent?: string } = { archived: false }): { transport: LaneStatusTransport; calls: Call[] } => {
   const calls: Call[] = [];
   let n = 0;
   return {
@@ -37,6 +38,7 @@ const fakeTransport = (failEdit = false, failPost = false): { transport: LaneSta
         calls.push(["edit", channel, id, text]);
         if (failEdit) throw new Error("discord PATCH: 404 Unknown Message");
       },
+      threadState: async () => ({ archived: thread.archived, parent: thread.parent }),
     },
   };
 };
@@ -97,6 +99,54 @@ test("status message: a failed edit (message deleted) posts a new one and stores
   expect(calls.map((c) => c.slice(0, 3))).toEqual([["edit", "2", "gone"], ["post", "2", calls[1]?.[2] ?? ""]]);
   expect((await deps.registry.read("local-lane"))?.statusMessageId).toBe("m1");
   expect(errors).toEqual(["LANE_STATUS_EDIT_FAILED local-lane gone discord PATCH: 404 Unknown Message; posting a new status message"]);
+});
+
+test("status message: a thread the owner closed is neither edited nor posted into; one line linking it goes to its parent channel", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir, { discordChannels: ["main-1"] });
+  await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
+  recordOwnerClosed(dir, "2", T0 - MIN);
+  const store = new JsonLaneReports(dir);
+  const { transport, calls } = fakeTransport(false, false, { archived: true, parent: "1" });
+  const errors = quietErrors();
+  store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way in /home/test/repo", at: T0 });
+  expect(await routeReports(deps, store, () => {}, "/home/test", transport)).toEqual(["LANE_REPORT_ROUTED local-lane:0:1 progress thread"]);
+  expect(calls).toEqual([["post", "1", "<#2> [System] 레인 local-lane 전달: half way in ~/repo"]]);
+  expect((await deps.registry.read("local-lane"))?.statusMessageId).toBe("s1");
+  expect(errors).toEqual(["LANE_STATUS_REDIRECTED local-lane local-lane:0:1: thread 2 was closed by the owner, so one line went to 1"]);
+
+  // Discord naming no parent: the owner channel gets the line.
+  const orphan = fakeTransport(false, false, { archived: true });
+  store.append({ lane: "local-lane", generation: 0, kind: "milestone", text: "landed", at: T0 + 1 });
+  await routeReports(deps, store, () => {}, "/home/test", orphan.transport);
+  expect(orphan.calls).toEqual([["post", "main-1", "<#2> [System] 레인 local-lane 전달: landed"]]);
+});
+
+test("status message: a recorded thread Discord reports open again is edited in place and its close record dropped", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir);
+  await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
+  recordOwnerClosed(dir, "2", T0 - MIN);
+  const store = new JsonLaneReports(dir);
+  const { transport, calls } = fakeTransport(false, false, { archived: false, parent: "1" });
+  store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
+  await routeReports(deps, store, () => {}, "/home/test", transport);
+  expect(calls.map((c) => c.slice(0, 3))).toEqual([["edit", "2", "s1"]]);
+  expect(readOwnerClosed(dir)).toEqual({});
+});
+
+test("status message: without a transport, a thread the owner closed gets no hook post; progress reaches the lead as a digest", async () => {
+  const dir = stateDir();
+  const world = newWorld();
+  const deps = depsFor(world, fakeClock(T0), dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
+  await deps.registry.write(lane(dir));
+  recordOwnerClosed(dir, "2", T0 - MIN);
+  const store = new JsonLaneReports(dir);
+  const journal: [string, string][] = [];
+  store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
+  expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); }, "/home/test", null)).toEqual(["LANE_REPORT_ROUTED local-lane:0:1 progress journal"]);
+  expect(world.calls.filter((c) => c[0] === "notify")).toEqual([]);
+  expect(journal).toEqual([["lane-report:local-lane:0:1", "LANE_REPORT local-lane progress half way"]]);
 });
 
 test("status message: the id survives a supervisor restart through the registry, so the next report edits the same message", async () => {

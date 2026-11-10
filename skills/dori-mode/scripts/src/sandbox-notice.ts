@@ -1,6 +1,7 @@
 import { fillHook } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { discordStatusTransport, type LaneStatusTransport } from "./lane-reports.ts";
+import { redirectHookPost } from "./thread-followup.ts";
 
 /** Marks every sandbox notice so the owner reads it as a warning about the lane's isolation, not as lane output. */
 export const SANDBOX_NOTICE_PREFIX = "[sandbox] ";
@@ -13,7 +14,9 @@ const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim().slice
  * or when that post fails, to the owner's main channel (discordChannels[0]) through the Discord status transport on
  * DORI_DISCORD_TOKEN (lane-reports.ts discordStatusTransport). Without either the notice cannot reach Discord, so, like a
  * lane report that has no thread, it falls back to the lead's journal: the returned SANDBOX_NOTICE_ERROR line carries the
- * text. Never throws. `transport` is for tests; absent it is discordStatusTransport.
+ * text. A lane thread the owner closed is not posted into: one line linking it goes to its parent channel (else the
+ * owner channel) through the transport instead (redirectHookPost); when that fails the notice goes to the owner channel
+ * as above. Never throws. `transport` is for tests; absent it is discordStatusTransport.
  */
 export const postSandboxNotice = async (
   deps: FlowDeps, lane: { readonly key: string; readonly thread?: string }, text: string,
@@ -22,7 +25,16 @@ export const postSandboxNotice = async (
   const body = text.startsWith(SANDBOX_NOTICE_PREFIX) ? text : `${SANDBOX_NOTICE_PREFIX}${text}`;
   const failures: string[] = [];
   const hook = deps.config.hooks.threadReply;
-  if (hook && lane.thread && lane.thread !== "none") {
+  let closed = false;
+  if (lane.thread && lane.thread !== "none") {
+    try {
+      if (await redirectHookPost(deps.config.stateDir, transport, lane.thread, body, deps.config.discordChannels[0], `sandbox-notice:${lane.key}:${deps.clock.now()}`)) return [];
+    } catch (error) {
+      closed = true;
+      failures.push(`closed thread redirect failed: ${oneLine(error instanceof Error ? error.message : String(error))}`);
+    }
+  }
+  if (hook && !closed && lane.thread && lane.thread !== "none") {
     try {
       const posted = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, text: body }));
       if (posted.code === 0) return [];
