@@ -579,6 +579,20 @@ test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and 
   expect(lines("MERGE_")).toEqual([]);
 });
 
+test("a lane checkout sitting on dev reads back none of the dev -> main release PRs merged in its repo; its own branch's PR still is", async () => {
+  // Given a review-only lane working in the main clone (on dev) next to a feature worktree, and old release PRs from dev.
+  await deps.registry.update("review-lane", () => ({ ...lane, key: "review-lane", done: "file /data/report.md", openedAt: new Date(T0 + MIN).toISOString() }));
+  world.inspection = { git: { origin: "git@github.com:acme/app.git", branch: "dev", worktrees: [{ path: "/repo", branch: "dev", exists: true }, { path: "/wt", branch: "review/fix", exists: true }] } };
+  gh.view = greenView({ state: "MERGED", baseRefName: "main", mergeCommit: { oid: "m41n" } });
+  const merged = [2, 4, 6, 9].map((number) => ({
+    repo: "acme/app", number, url: `https://github.com/acme/app/pull/${number}`, branch: number === 9 ? "review/fix" : "dev", headRepo: "acme/app",
+  }));
+  // When the poll hands them to CI follow-up.
+  await follow().tick([], emit, merged);
+  // Then only the PR of the worktree's own branch is read back.
+  expect(events.filter(([, l]) => l.startsWith("MERGE_")).map(([id]) => id)).toEqual(["merge-verified:acme/app#9"]);
+});
+
 test("a merged lane PR that cannot be read back wakes the lead once as MERGE_UNVERIFIED after MERGE_ATTEMPTS polls", async () => {
   gh.viewCode = 1;
   const ci = follow();

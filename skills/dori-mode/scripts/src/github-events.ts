@@ -87,8 +87,16 @@ const repoFromRemote = (remote: string): string | undefined =>
   /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
 
 /**
- * Registry signals carry PR identity; a lane worktree carries its branch identity. A lane whose runner could not answer
- * is added to `unresolved`: its targets may be incomplete this time, which is not evidence that it owns no PR.
+ * Long-lived integration branches. A checkout that sits on one (a review-only lane working in the main clone) has not
+ * opened the PRs whose head is that branch, such as every dev -> main release PR, so its checkout never claims them; a
+ * Done signal that names one still does.
+ */
+const INTEGRATION_BRANCHES: ReadonlySet<string> = new Set(["main", "master", "dev", "develop"]);
+
+/**
+ * Registry signals carry PR identity; a lane worktree carries its branch identity (never an integration branch). A lane
+ * whose runner could not answer is added to `unresolved`: its targets may be incomplete this time, which is not evidence
+ * that it owns no PR.
  */
 export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "inspect">, unresolved?: Set<string>): Promise<Map<string, Targets>> => {
   const targets = new Map<string, Targets>();
@@ -120,7 +128,9 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; }))?.git;
     const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
     if (!git || !repo) continue;
-    for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) if (branch) target(repo).branches.add(branch);
+    for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) {
+      if (branch && !INTEGRATION_BRANCHES.has(branch)) target(repo).branches.add(branch);
+    }
   }
   return targets;
 };

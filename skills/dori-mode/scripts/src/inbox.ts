@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { outcomeLane } from "./lane-outcomes.ts";
+import { hasColumn, readStoreView } from "./store.ts";
 import { splitChannelName } from "./messenger/discord-inbound.ts";
 
 /**
@@ -211,6 +212,29 @@ export const takeCarriedReminders = (stateDir: string, skipIds: ReadonlySet<stri
   .filter((item) => !skipIds.has(item.id)).map((item) => item.kind === "owner"
   ? `unfinished:${item.id}\tUNFINISHED ${item.id} taken and not handled (dori ack it unless acked, then handle it): ${item.line}`
   : `${item.id}\t${item.line}`);
+
+/**
+ * `dori inbox take`'s information lines for owner messages the lead parked with `dori handled --awaiting`: nothing to do
+ * until the owner answers, then a `--lane`, `--reply` or `--all` closes them. Read from the store (an unreadable store, or
+ * one the supervisor has not migrated yet, prints none).
+ */
+export const takeAwaitingReminders = (stateDir: string): string[] => {
+  type Parked = { readonly id: string; readonly at: number; readonly note?: string; readonly line?: string };
+  const parked = readStoreView<Parked[]>(stateDir, {
+    json: (journal) => (journal.awaitingAck ?? []).filter((entry) => entry.awaitingOwnerAt !== undefined && entry.handledAt === undefined &&
+      !entry.quarantined && !entry.deleted).map((entry) => ({
+      id: entry.id, at: entry.awaitingOwnerAt ?? 0, note: entry.awaitingNote,
+      line: journal.events.find((event) => event.id === (entry.revision ?? entry.id))?.line,
+    })),
+    sqlite: (db) => !hasColumn(db, "owner_messages", "awaiting_owner_at") ? [] : (db.query(`SELECT o.id, o.awaiting_owner_at AS at, o.awaiting_note AS note, e.line
+      FROM owner_messages o LEFT JOIN events e ON e.id = coalesce(o.revision, o.id)
+      WHERE o.awaiting_owner_at IS NOT NULL AND o.handled_at IS NULL AND o.state != 'quarantined' AND o.deleted IS NULL ORDER BY o.pos`)
+      .all() as { id: string; at: number; note: string | null; line: string | null }[])
+      .map((row) => ({ id: row.id, at: row.at, note: row.note ?? undefined, line: row.line ?? undefined })),
+  }) ?? [];
+  return parked.map((item) => `awaiting:${item.id}\tAWAITING_OWNER since ${new Date(item.at).toISOString()}${item.note ? ` (${item.note})` : ""}: ` +
+    `${item.line ?? item.id} - do not act until the owner answers`);
+};
 
 /** Owner chat lines: a message, an edit of one, or a visitor's message. */
 const OWNER_LINE = /^(INBOUND|INBOUND_EDIT|VISITOR)\b/;

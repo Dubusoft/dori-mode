@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import { COLD_START_EMOJI } from "./supervise.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { dropCarried } from "./inbox.ts";
-import { JOURNAL_FILE, readStoreView, SQLITE_FILE } from "./store.ts";
+import { hasColumn, JOURNAL_FILE, readStoreView, SQLITE_FILE } from "./store.ts";
+import { leadOwes } from "./supervise-journal.ts";
 
 /** The lead's read receipt, the one reaction it puts on an owner message. */
 export const EYES_EMOJI = "\u{1F440}";
@@ -27,6 +28,44 @@ export type MessageCoverage = {
   readonly reply?: boolean;
   /** The lead declares every task of the message covered (e.g. one reply answering all of them). */
   readonly all?: boolean;
+  /** `--awaiting`: the lead's reply waits on the owner (a go-ahead, a choice), so nothing is owed until the owner answers. */
+  readonly awaiting?: boolean;
+  readonly note?: string;
+};
+
+/** How much of an `--awaiting` note is kept (it is printed on every take). */
+export const AWAITING_NOTE_MAX = 200;
+
+/** A tracked message's coverage state, as the supervisor keeps it. */
+export type TrackedCoverage = Omit<MessageCoverage, "all" | "awaiting" | "note"> & {
+  readonly handledAt?: number;
+  readonly awaitingOwnerAt?: number;
+  readonly awaitingNote?: string;
+};
+
+/**
+ * Merges a tracked message's coverage with its unconsumed receipts. Each distinct lane and the reply cover one task; --all
+ * settles the task count on the coverage. An --awaiting receipt parks the message (the earliest one is the start); any
+ * --lane, --reply or --all receipt recorded after it closes the message, as the follow-up the owner's answer led to.
+ * Replaying the same receipts gives the same result.
+ */
+export const mergeCoverage = (entry: TrackedCoverage, receipts: readonly (MessageCoverage & { readonly at: number })[]): {
+  readonly tasks: number; readonly lanes: string[]; readonly reply: boolean; readonly covered: boolean;
+  readonly awaitingOwnerAt?: number; readonly awaitingNote?: string;
+} => {
+  const all = receipts.some((receipt) => receipt.all);
+  const lanes = [...new Set([...(entry.lanes ?? []), ...receipts.flatMap((receipt) => receipt.lanes ?? [])])];
+  const reply = !!(entry.reply || receipts.some((receipt) => receipt.reply) || (all && !lanes.length));
+  const tasks = all ? lanes.length + Number(reply) : Math.max(entry.tasks ?? 1, ...receipts.map((receipt) => receipt.tasks ?? 1));
+  const parked = receipts.filter((receipt) => receipt.awaiting).sort((a, b) => a.at - b.at);
+  const awaitingOwnerAt = entry.awaitingOwnerAt ?? parked[0]?.at;
+  const closes = awaitingOwnerAt !== undefined &&
+    receipts.some((receipt) => !receipt.awaiting && (receipt.lanes?.length || receipt.reply || receipt.all) && receipt.at > awaitingOwnerAt);
+  const awaitingNote = parked.findLast((receipt) => receipt.note !== undefined)?.note ?? entry.awaitingNote;
+  return {
+    tasks, lanes, reply, covered: closes || lanes.length + Number(reply) >= tasks,
+    ...(awaitingOwnerAt !== undefined ? { awaitingOwnerAt } : {}), ...(awaitingNote !== undefined ? { awaitingNote } : {}),
+  };
 };
 
 export const checkTasks = (tasks: number | undefined): void => {
@@ -79,35 +118,36 @@ export const recordAck = (stateDir: string, channel: string, message: string, at
 
 /** Each distinct lane and the optional reply cover one declared task; replaying the same link never adds coverage. */
 export const recordHandled = (stateDir: string, channel: string, message: string, at: number, coverage: MessageCoverage): void => {
-  if (!coverage.lanes?.length && !coverage.reply && !coverage.all) throw new AckError("handled needs --lane <key>, --reply and/or --all");
+  if (!coverage.lanes?.length && !coverage.reply && !coverage.all && !coverage.awaiting) throw new AckError("handled needs --lane <key>, --reply, --all and/or --awaiting");
+  if (coverage.note !== undefined && !coverage.awaiting) throw new AckError("--note goes with --awaiting");
   if (coverage.lanes?.some((lane) => !/^[\w.-]+$/.test(lane))) throw new AckError("--lane must name a lane key");
   recordReceipt(stateDir, channel, message, at, coverage);
-  // A complete message no longer needs its UNFINISHED reminder. Completeness is the supervisor's merge (consumeReceipts)
-  // of the coverage it already tracks with the receipts it has not consumed yet; an unreadable store leaves the pruning
-  // to the supervisor.
+  // A message the lead no longer owes (complete, or waiting on the owner) no longer needs its UNFINISHED reminder. That is
+  // the supervisor's merge (consumeReceipts) of the coverage it already tracks with the receipts it has not consumed yet;
+  // an unreadable store leaves the pruning to the supervisor.
   const id = ownerMessageId(channel, message);
   const tracked = trackedCoverage(stateDir, id);
   if (!tracked) return;
-  const entry = tracked.entry ?? {};
-  const receipts = pendingAcks(stateDir).filter((receipt) => receipt.id === id);
-  const all = receipts.some((receipt) => receipt.all);
-  const lanes = new Set([...(entry.lanes ?? []), ...receipts.flatMap((receipt) => receipt.lanes ?? [])]);
-  const reply = !!(entry.reply || receipts.some((receipt) => receipt.reply) || (all && !lanes.size));
-  const covered = lanes.size + Number(reply);
-  const tasks = all ? covered : Math.max(entry.tasks ?? 1, ...receipts.map((receipt) => receipt.tasks ?? 1));
-  if (covered >= tasks) dropCarried(stateDir, id);
+  const merged = mergeCoverage(tracked.entry ?? {}, pendingAcks(stateDir).filter((receipt) => receipt.id === id));
+  if (!leadOwes({ handledAt: merged.covered ? at : undefined, awaitingOwnerAt: merged.awaitingOwnerAt })) dropCarried(stateDir, id);
 };
 
 /** The coverage the supervisor tracks for owner message `id` (`entry` absent when untracked); undefined when the store cannot be read. */
-const trackedCoverage = (stateDir: string, id: string): { readonly entry?: MessageCoverage } | undefined =>
+const trackedCoverage = (stateDir: string, id: string): { readonly entry?: TrackedCoverage } | undefined =>
   !existsSync(join(stateDir, JOURNAL_FILE)) && !existsSync(join(stateDir, SQLITE_FILE)) ? {} : readStoreView(stateDir, {
   json: (journal) => {
     const entry = journal.awaitingAck?.find((tracked) => tracked.id === id);
-    return entry ? { entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply } } : {};
+    return entry ? { entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply, awaitingOwnerAt: entry.awaitingOwnerAt } } : {};
   },
   sqlite: (db) => {
-    const row = db.query("SELECT tasks, lanes, reply FROM owner_messages WHERE id = ?").get(id) as { tasks: number | null; lanes: string | null; reply: number | null } | null;
-    return row ? { entry: { tasks: row.tasks ?? undefined, lanes: row.lanes ? JSON.parse(row.lanes) as string[] : undefined, reply: row.reply === 1 } } : {};
+    // A store the supervisor has not migrated yet has no awaiting column: nothing there is parked.
+    const parked = hasColumn(db, "owner_messages", "awaiting_owner_at") ? ", awaiting_owner_at" : "";
+    const row = db.query(`SELECT tasks, lanes, reply${parked} FROM owner_messages WHERE id = ?`).get(id) as
+      { tasks: number | null; lanes: string | null; reply: number | null; awaiting_owner_at?: number | null } | null;
+    return row ? { entry: {
+      tasks: row.tasks ?? undefined, lanes: row.lanes ? JSON.parse(row.lanes) as string[] : undefined, reply: row.reply === 1,
+      awaitingOwnerAt: row.awaiting_owner_at ?? undefined,
+    } } : {};
   },
 });
 
@@ -120,7 +160,8 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
     if (!m) return [];
     const path = join(ackDir(stateDir), name);
     try {
-      const { at, tasks, lanes, reply, all } = JSON.parse(readFileSync(path, "utf8")) as { at?: unknown; tasks?: unknown; lanes?: unknown; reply?: unknown; all?: unknown };
+      const { at, tasks, lanes, reply, all, awaiting, note } = JSON.parse(readFileSync(path, "utf8")) as
+        { at?: unknown; tasks?: unknown; lanes?: unknown; reply?: unknown; all?: unknown; awaiting?: unknown; note?: unknown };
       if (tasks !== undefined && (typeof tasks !== "number" || !Number.isSafeInteger(tasks) || tasks < 1)) return [];
       if (lanes !== undefined && (!Array.isArray(lanes) || !lanes.every((lane): lane is string => typeof lane === "string" && /^[\w.-]+$/.test(lane)))) return [];
       return [{
@@ -129,6 +170,7 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
         ...(Array.isArray(lanes) ? { lanes } : {}),
         ...(reply === true ? { reply: true } : {}),
         ...(all === true ? { all: true } : {}),
+        ...(awaiting === true ? { awaiting: true, ...(typeof note === "string" ? { note } : {}) } : {}),
       }];
     } catch { return []; }
   });

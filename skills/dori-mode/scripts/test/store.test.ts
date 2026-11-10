@@ -2,6 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { recordHandled } from "../src/ack.ts";
+import { readCarried, takeAwaitingReminders, writeCarried } from "../src/inbox.ts";
 import type { Runner } from "../src/run.ts";
 import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { importStore } from "../src/store-import.ts";
@@ -245,6 +247,31 @@ test("a supervisor refuses a state dir that belongs to the other store", () => {
   expect(() => f.open("json")).toThrow("STORE_MISMATCH");
 });
 
+test("a version 8 database (no awaiting columns) is read by take and handled before the supervisor migrates it, then migrated keeping its rows", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const path = join(state.dir, SQLITE_FILE);
+  // Given a version 8 database holding one acked owner message, and its carried UNFINISHED reminder.
+  new SqliteStore(path, { create: true }).close();
+  const raw = new (await import("bun:sqlite")).Database(path);
+  raw.exec(`ALTER TABLE owner_messages DROP COLUMN awaiting_owner_at; ALTER TABLE owner_messages DROP COLUMN awaiting_note;
+    UPDATE meta SET value = '8' WHERE key = 'schema_version';
+    INSERT INTO meta (key, value) VALUES ('journal', '1');
+    INSERT INTO owner_messages (id, pos, lead, generation, state, acked_at, tasks) VALUES ('discord:11:22', 1, 'dori', 0, 'acked', ${T0}, 1);`);
+  raw.close();
+  writeCarried(state.dir, [{ kind: "owner", id: "discord:11:22", line: "INBOUND 11 22 hi" }]);
+  // When the CLI paths read it unmigrated, then this code opens it.
+  expect(takeAwaitingReminders(state.dir)).toEqual([]);
+  recordHandled(state.dir, "11", "22", T0 + 1, { reply: true });
+  expect(readCarried(state.dir)).toEqual([]);
+  const store = new SqliteStore(path);
+  try {
+    // Then it is at version 9 and the row reads back with nothing parked.
+    expect(store.meta("schema_version")).toBe("9");
+    expect(store.read(false).awaitingAck).toEqual([{ id: "discord:11:22", ackedAt: T0, tasks: 1 }]);
+  } finally { store.close(); }
+});
+
 test("a version 5 database is migrated to 6: old events read without meta, new ones keep it, deliveries record their take", async () => {
   const state = withState();
   cleanups.push(state.done);
@@ -261,7 +288,7 @@ test("a version 5 database is migrated to 6: old events read without meta, new o
   // When this code opens it, saves an event with meta and records a take of both.
   const store = new SqliteStore(path);
   const journal = store.load();
-  expect(store.meta("schema_version")).toBe("8");
+  expect(store.meta("schema_version")).toBe("9");
   expect(journal?.events).toEqual([{ id: "old", line: "LANE_REPORT old", at: T0 }]);
   const meta = { lane: "alpha", thread: "discord:42", cwd: "/repo" };
   store.save({ events: [...(journal?.events ?? []), { id: "new", line: "LANE_REPORT new", at: T0 + 2, meta }] }, "full");
