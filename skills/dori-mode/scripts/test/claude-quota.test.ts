@@ -34,7 +34,7 @@ test("the dori quota line names every account with each window's usage and reset
   expect(read.text).toBe("pi-quota text");
   expect(usageLine(read.usage ?? { at: NOW, accounts: [] }, "Asia/Seoul")).toBe("QUOTA | Claude a: 5h 85% used (resets in 3h, 10-22 15:10 KST), 7d 50% used (resets in 1d 10h, 10-23 22:00 KST) | b: 7d 10% used");
   expect(usageLine(read.usage ?? { at: NOW, accounts: [] })).toContain("(resets in 3h, 10-22 06:10 UTC)");
-  expect(await readUsage(lookupOf(openai), NOW, AbortSignal.timeout(5_000))).toEqual({ text: "pi-quota text" });
+  expect(await readUsage(lookupOf(openai), NOW, AbortSignal.timeout(5_000))).toEqual({ text: "pi-quota text", skipped: [] });
   expect(NO_CLAUDE).toBe("QUOTA | no Claude subscription usage reported");
 });
 

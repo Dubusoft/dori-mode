@@ -6,7 +6,7 @@ import {
   type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll,
   LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaSummary, type ToodoTask,
 } from "./autopilot.ts";
-import { type ClaudeUsage, lookupQuotaResults, readUsage } from "./claude-quota.ts";
+import { type ClaudeSkip, type ClaudeUsage, lookupQuotaResults, readUsage } from "./claude-quota.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
 import { checkMachine } from "./placement.ts";
@@ -89,10 +89,14 @@ export type AutopilotDeps = JudgeDeps & {
   readonly err: (line: string) => void;
 };
 
-/** Highest used percentage over every account's 5h and 7d windows; unreadable without usage or with no window at all. */
-export const quotaSummary = (usage: ClaudeUsage | undefined): QuotaSummary => {
+/**
+ * Highest used percentage over every readable account's 5h and 7d windows; unreadable without usage or with no window
+ * at all. Skipped accounts (expired, failed) do not count either way and are only named.
+ */
+export const quotaSummary = (usage: ClaudeUsage | undefined, skipped: readonly ClaudeSkip[] = []): QuotaSummary => {
   const pcts = usage?.accounts.flatMap((a) => [a.fiveHour?.usedPct, a.weekly?.usedPct]).filter((p): p is number => typeof p === "number") ?? [];
-  return pcts.length ? { readable: true, maxUsedPct: Math.max(...pcts) } : { readable: false };
+  const named = skipped.length ? { skipped: skipped.map((s) => `${s.name} (${s.reason})`) } : {};
+  return pcts.length ? { readable: true, maxUsedPct: Math.max(...pcts), ...named } : { readable: false, ...named };
 };
 
 /** `work()` or `fallback` when it throws or takes longer than `ms`. */
@@ -120,7 +124,10 @@ export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry"
   config: flow.config.autopilot, store, pauseFile: autopilotPausePath(flow.config.stateDir),
   toodo: () => new ToodoClient(flow.tunables.toodoEvents),
   openLanes: async () => new Set((await flow.registry.open()).map((l) => l.key)),
-  quota: () => within(PROBE_MS, async () => quotaSummary((await readUsage(lookupQuotaResults(), flow.clock.now(), AbortSignal.timeout(PROBE_MS))).usage), () => ({ readable: false })),
+  quota: () => within(PROBE_MS, async () => {
+    const read = await readUsage(lookupQuotaResults(), flow.clock.now(), AbortSignal.timeout(PROBE_MS));
+    return quotaSummary(read.usage, read.skipped);
+  }, () => ({ readable: false })),
   host: () => within(PROBE_MS, async () => {
     const c = await checkMachine(flow.ops, flow.config, flow.config.placement.defaultMachine);
     const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
@@ -184,7 +191,7 @@ export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number
   const pending = pendingReservations(ledger, openLanes);
   const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
   const verdicts = judgeAll({ tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, ids);
-  return { paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts };
+  return { paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts, ...(quota.skipped?.length ? { quotaSkipped: quota.skipped } : {}) };
 };
 
 /**

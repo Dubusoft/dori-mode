@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type ToodoTask } from "../src/autopilot.ts";
-import { type AutopilotDeps, autopilotMain } from "../src/autopilot-cli.ts";
+import { DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type QuotaSummary, type ToodoTask } from "../src/autopilot.ts";
+import { type AutopilotDeps, autopilotMain, quotaSummary } from "../src/autopilot-cli.ts";
+import { type QuotaResult, readUsage } from "../src/claude-quota.ts";
 import { JsonOperations } from "../src/operations.ts";
 import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
@@ -92,6 +93,7 @@ type Run = { code: number; out: string[]; err: string[] };
 /** `tasks` is toodo's whole task set; flaggedTasks returns its marked planned ones, as the real client does. */
 const harness = (
   tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set(),
+  quota: QuotaSummary = { readable: true, maxUsedPct: 10 },
 ) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
@@ -109,7 +111,7 @@ const harness = (
       },
     }),
     openLanes: async () => openLanes,
-    quota: async () => { probes.quota++; return { readable: true, maxUsedPct: 10 }; },
+    quota: async () => { probes.quota++; return quota; },
     host: async () => { probes.host++; return host; },
     lock: () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
     now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
@@ -127,6 +129,29 @@ test("no marked task prints AUTOPILOT_NO_CANDIDATES and probes neither quota nor
   expect(await h.run("candidates")).toEqual({ code: 0, out: ["AUTOPILOT_NO_CANDIDATES"], err: [] });
   expect(h.reads).toEqual(["flagged"]);
   expect(h.probes).toEqual({ quota: 0, host: 0 });
+});
+
+test("an expired Claude account is skipped and named; the readable one decides, and none readable still holds", async () => {
+  const expired: QuotaResult = { kind: "unavailable", provider: "claude-sdk-oauth", account: "default", reason: "token-expired" };
+  const readable: QuotaResult = { kind: "success", provider: "claude-sdk-oauth", account: "account-2", windows: [{ label: "Weekly", remainingPercent: 45 }] };
+  const failed: QuotaResult = { kind: "failure", provider: "claude-sdk-oauth", account: "account-2", reason: { type: "http-error", status: 429 } };
+  const summaryOf = async (...results: QuotaResult[]) => {
+    const read = await readUsage(async () => ({ results, text: "" }), T0, AbortSignal.timeout(5_000));
+    return quotaSummary(read.usage, read.skipped);
+  };
+
+  const one = await summaryOf({ kind: "unavailable", provider: "anthropic", reason: "oauth-not-configured" }, expired, readable);
+  expect(one).toEqual({ readable: true, maxUsedPct: 55, skipped: ["default (token-expired)"] });
+  const launch = await harness([task(12)], { ok: true }, T0 + 60_000, new Set(), one).run("candidates");
+  expect(launch.out).toEqual(["AUTOPILOT slots=unlimited candidates=1 quota-skipped: default (token-expired)", "AUTOPILOT_CANDIDATE #12 LAUNCH would-launch"]);
+
+  const none = await summaryOf(expired, failed);
+  expect(none).toEqual({ readable: false, skipped: ["default (token-expired)", "account-2 (http-error 429)"] });
+  const hold = await harness([task(12)], { ok: true }, T0 + 60_000, new Set(), none).run("candidates", "--json");
+  expect(JSON.parse(hold.out.join("\n"))).toEqual({
+    paused: false, slots: null, candidates: [{ taskId: 12, verdict: "HOLD", reasons: ["quota-unreadable"] }],
+    quotaSkipped: ["default (token-expired)", "account-2 (http-error 429)"],
+  });
 });
 
 test("toodo unreadable prints AUTOPILOT_TOODO_UNREADABLE and exits 1", async () => {

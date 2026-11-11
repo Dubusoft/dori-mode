@@ -69,7 +69,7 @@ HOLD is temporary; the next tick judges again:
 | --- | --- |
 | `waiting` | The task has a wait. A waiting in-progress task reads `planned` plus a wait, so it lands here too. |
 | `lane-live` | An open ledger row, a verified row whose lane is open, or a task ref `lane:<key>` naming an open lane. |
-| `quota-unreadable` | Claude quota could not be read. |
+| `quota-unreadable` | No Claude account's quota could be read. An unreadable account (expired token, failed request) is skipped while another is readable, and named in the candidates header (`quota-skipped: ...`) and JSON (`quotaSkipped`). |
 | `quota-over-threshold` | A Claude account's 5h or 7d window is at or above `quotaMaxUsedPct`. |
 | `host-hold` | `dori can-launch` holds the default machine. |
 | `no-slot` | The task would launch, but the host's free slots went to tasks ahead of it. |

@@ -195,7 +195,8 @@ export type Verdict = {
   readonly reasons: readonly Reason[];
 };
 
-export type QuotaSummary = { readonly readable: boolean; readonly maxUsedPct?: number };
+/** `skipped` names the Claude accounts left out of the judgment as "name (reason)"; the readable ones decide. */
+export type QuotaSummary = { readonly readable: boolean; readonly maxUsedPct?: number; readonly skipped?: readonly string[] };
 /**
  * The `dori can-launch` verdict for the default machine; `slots` is how many more lanes its pane limit allows
  * (absent when the pane limit is off, so nothing caps the count).
@@ -301,13 +302,15 @@ export type CandidatesReport = {
   /** Free host slots; null when the pane limit is off. */
   readonly slots: number | null;
   readonly verdicts: readonly Verdict[];
+  /** Claude accounts the quota read left out, as "name (reason)"; absent when none was. */
+  readonly quotaSkipped?: readonly string[];
 };
 
 /** Text output of `dori autopilot candidates`: a header line and one line per verdict, or AUTOPILOT_NO_CANDIDATES. */
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
   return [
-    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}`,
+    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}`,
     ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? "would-launch" : v.reasons.join(", ")}`),
   ];
 };
@@ -317,4 +320,5 @@ export const candidatesJson = (report: CandidatesReport) => ({
   paused: report.paused,
   slots: report.slots,
   candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons })),
+  ...(report.quotaSkipped?.length ? { quotaSkipped: report.quotaSkipped } : {}),
 });
