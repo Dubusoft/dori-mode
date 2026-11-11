@@ -41,7 +41,6 @@ export type ToodoTask = {
 // Config
 
 export type AutopilotConfig = {
-  readonly quotaMaxUsedPct: number;
   readonly quotaUnreadable: "hold";
   readonly mergeBase: string;
   readonly crossWorkspacePrereqs: "block";
@@ -53,16 +52,16 @@ export const TICK_SEC_MIN = 30;
 export const TICK_SEC_MAX = 3600;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
-  quotaMaxUsedPct: 80, quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300,
+  quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300,
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
- * Keys read as nothing so an older config still loads: the bundle design's, and `mode` (autopilot is always on; `dori
- * setup` removes it, see config-schema.ts).
+ * Keys read as nothing so an older config still loads: the bundle design's, `mode` (autopilot is always on; `dori
+ * setup` removes it, see config-schema.ts) and `quotaMaxUsedPct` (an account counts as spent only at 100%).
  */
-const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode"]);
+const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode", "quotaMaxUsedPct"]);
 
 /**
  * The config's `autopilot` (absent: DEFAULT_AUTOPILOT; each key optional). Throws TypeError naming the key on an
@@ -83,7 +82,6 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
   };
   const only = (value: string) => (v: unknown) => v === value;
   return {
-    quotaMaxUsedPct: pick<number>("quotaMaxUsedPct", (v) => typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 100, "a number in (0, 100]"),
     quotaUnreadable: pick<"hold">("quotaUnreadable", only("hold"), "\"hold\""),
     mergeBase: pick<string>("mergeBase", (v) => typeof v === "string" && v.trim() !== "" && v === v.trim(), "a branch name"),
     crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
@@ -195,8 +193,26 @@ export type Verdict = {
   readonly reasons: readonly Reason[];
 };
 
-/** `skipped` names the Claude accounts left out of the judgment as "name (reason)"; the readable ones decide. */
-export type QuotaSummary = { readonly readable: boolean; readonly maxUsedPct?: number; readonly skipped?: readonly string[] };
+/** One readable Claude account and the highest used percentage over its 5h and 7d windows. */
+export type QuotaAccount = { readonly name: string; readonly maxUsedPct: number };
+
+/**
+ * `accounts` are the readable Claude accounts (non-empty when `readable`); `skipped` names the accounts left out of the
+ * judgment as "name (reason)".
+ */
+export type QuotaSummary = { readonly readable: boolean; readonly accounts?: readonly QuotaAccount[]; readonly skipped?: readonly string[] };
+
+/**
+ * The readable accounts split by use: `over` has a spent window (100% used), `room` has every window below 100%. omo
+ * moves a lane off an account that hits its usage limit, so one account with room is enough to launch.
+ */
+export const quotaSplit = (quota: QuotaSummary): { over: QuotaAccount[]; room: QuotaAccount[] } => {
+  const accounts = quota.accounts ?? [];
+  return { over: accounts.filter((a) => a.maxUsedPct >= 100), room: accounts.filter((a) => a.maxUsedPct < 100) };
+};
+
+/** "default (100%)". */
+export const quotaAccountText = (a: QuotaAccount): string => `${a.name} (${a.maxUsedPct}%)`;
 /**
  * The `dori can-launch` verdict for the default machine; `slots` is how many more lanes its pane limit allows
  * (absent when the pane limit is off, so nothing caps the count).
@@ -210,7 +226,7 @@ export type JudgeContext = {
   readonly ledger: readonly Operation[];
   /** Keys of open registry lanes. */
   readonly openLanes: ReadonlySet<string>;
-  /** Highest 5h/7d used percentage over the Claude accounts. */
+  /** Each readable Claude account's highest 5h/7d use. */
   readonly quota: QuotaSummary;
   readonly host: HostSummary;
   readonly config: AutopilotConfig;
@@ -263,7 +279,7 @@ export const judge = (input: JudgeInput): Verdict => {
   if (ledger.ambiguous) found.add("ledger-ambiguous");
 
   if (!input.quota.readable) found.add("quota-unreadable");
-  else if (input.quota.maxUsedPct !== undefined && input.quota.maxUsedPct >= config.quotaMaxUsedPct) found.add("quota-over-threshold");
+  else if (quotaSplit(input.quota).room.length === 0) found.add("quota-over-threshold");
   if (!input.host.ok) found.add("host-hold");
 
   return verdictOf(taskId, found);
@@ -304,13 +320,16 @@ export type CandidatesReport = {
   readonly verdicts: readonly Verdict[];
   /** Claude accounts the quota read left out, as "name (reason)"; absent when none was. */
   readonly quotaSkipped?: readonly string[];
+  /** When an account is spent: the spent accounts and the ones with room, as "name (pct%)". */
+  readonly quotaOver?: readonly string[];
+  readonly quotaRoom?: readonly string[];
 };
 
 /** Text output of `dori autopilot candidates`: a header line and one line per verdict, or AUTOPILOT_NO_CANDIDATES. */
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
   return [
-    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}`,
+    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}${report.quotaOver?.length ? ` quota-over: ${report.quotaOver.join(", ")} quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`,
     ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? "would-launch" : v.reasons.join(", ")}`),
   ];
 };
@@ -321,4 +340,5 @@ export const candidatesJson = (report: CandidatesReport) => ({
   slots: report.slots,
   candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons })),
   ...(report.quotaSkipped?.length ? { quotaSkipped: report.quotaSkipped } : {}),
+  ...(report.quotaOver?.length ? { quotaOver: report.quotaOver, quotaRoom: report.quotaRoom ?? [] } : {}),
 });

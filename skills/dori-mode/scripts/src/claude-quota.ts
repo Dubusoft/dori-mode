@@ -22,7 +22,22 @@ export type ClaudeAccount = { readonly name: string; readonly fiveHour?: ClaudeW
 /** Claude subscription usage of every account that answered (see claudeUsage). */
 export type ClaudeUsage = { readonly at: number; readonly accounts: readonly ClaudeAccount[] };
 
-const CLAUDE_PROVIDERS = new Set(["anthropic", "claude-sdk-oauth"]);
+const CLAUDE_PROVIDERS: ReadonlySet<string> = new Set(["anthropic", "claude-sdk-oauth"]);
+
+/** pi-quota's provider id for each host provider id (pi-quota's own HOST_PROVIDER_IDS, inverted). */
+const QUOTA_PROVIDER_OF: Readonly<Record<string, string>> = {
+  "anthropic-subscription": "claude-sdk-oauth", "claude-sdk-oauth": "claude-sdk-oauth", anthropic: "anthropic",
+  "chatgpt-subscription": "openai-codex", "openai-codex": "openai-codex",
+};
+
+/**
+ * The pi-quota provider that serves `model` ("anthropic-subscription/claude-opus-5-5"): one id, or none when the
+ * model names no provider or pi-quota cannot read its quota.
+ */
+export const quotaProvidersFor = (model: string): ReadonlySet<string> => {
+  const provider = model.includes("/") ? QUOTA_PROVIDER_OF[model.slice(0, model.indexOf("/"))] : undefined;
+  return new Set(provider ? [provider] : []);
+};
 
 const windowOf = (w: NonNullable<QuotaResult["windows"]>[number]): ClaudeWindow => {
   const usedPct = Math.round(Math.min(100, Math.max(0, 100 - (Number.isFinite(w.remainingPercent) ? w.remainingPercent : 0))));
@@ -34,13 +49,13 @@ const FIVE_HOUR = /five|5\s*h/i;
 const WEEKLY = /week|7\s*d/i;
 
 /**
- * Claude usage from pi-quota results: every anthropic or claude-sdk-oauth account that answered with a 5h or 7d
- * window. Undefined when no Claude account answered.
+ * Usage from pi-quota results: every account of `providers` (default: anthropic and claude-sdk-oauth) that answered
+ * with a 5h or 7d window. Undefined when no such account answered.
  */
-export const claudeUsage = (results: readonly QuotaResult[], at: number): ClaudeUsage | undefined => {
+export const claudeUsage = (results: readonly QuotaResult[], at: number, providers = CLAUDE_PROVIDERS): ClaudeUsage | undefined => {
   const accounts: ClaudeAccount[] = [];
   for (const r of results) {
-    if (r.kind !== "success" || !CLAUDE_PROVIDERS.has(r.provider)) continue;
+    if (r.kind !== "success" || !providers.has(r.provider)) continue;
     let fiveHour: ClaudeWindow | undefined;
     let weekly: ClaudeWindow | undefined;
     for (const w of r.windows ?? []) {
@@ -69,9 +84,9 @@ const skipReason = (r: QuotaResult): string => {
  * Every Claude account claudeUsage leaves out, with why; the readable accounts alone decide the usage. A provider
  * nobody signed into (unlabelled oauth-not-configured) is not an account and is not listed.
  */
-export const skippedClaudeAccounts = (results: readonly QuotaResult[]): ClaudeSkip[] =>
+export const skippedClaudeAccounts = (results: readonly QuotaResult[], providers = CLAUDE_PROVIDERS): ClaudeSkip[] =>
   results
-    .filter((r) => CLAUDE_PROVIDERS.has(r.provider) && !(r.account === undefined && r.reason === "oauth-not-configured")
+    .filter((r) => providers.has(r.provider) && !(r.account === undefined && r.reason === "oauth-not-configured")
       && (r.kind !== "success" || !(r.windows ?? []).some((w) => FIVE_HOUR.test(w.label) || WEEKLY.test(w.label))))
     .map((r) => ({ name: r.account || r.provider, reason: skipReason(r) }));
 
@@ -127,10 +142,11 @@ export const lookupQuotaResults = (agentDir = join(homedir(), ".omo", "agent")):
 /** pi-quota's text, the Claude usage when a Claude account answered, and the Claude accounts left out. */
 export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage; readonly skipped: readonly ClaudeSkip[] };
 
-export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal): Promise<UsageRead> => {
+/** `providers` narrows which pi-quota providers count (default: the Claude ones, see claudeUsage). */
+export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal, providers = CLAUDE_PROVIDERS): Promise<UsageRead> => {
   const { results, text } = await lookup(signal);
-  const usage = claudeUsage(results, now);
-  const skipped = skippedClaudeAccounts(results);
+  const usage = claudeUsage(results, now, providers);
+  const skipped = skippedClaudeAccounts(results, providers);
   return usage ? { text, usage, skipped } : { text, skipped };
 };
 

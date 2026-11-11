@@ -29,7 +29,7 @@ const task = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => ({
 const merged = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => task(id, { status: "done", resolution: "merged", ...over });
 
 const ctx = (tasks: readonly ToodoTask[], over: Partial<JudgeContext> = {}): JudgeContext => ({
-  tasks: new Map(tasks.map((t) => [t.id, t])), ledger: [], openLanes: new Set(), quota: { readable: true, maxUsedPct: 10 },
+  tasks: new Map(tasks.map((t) => [t.id, t])), ledger: [], openLanes: new Set(), quota: { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
   host: { ok: true }, config: DEFAULT_AUTOPILOT, ...over,
 });
 
@@ -120,10 +120,12 @@ test("another task's live lane never holds this one: no autopilot WIP cap", () =
   expect(outcome(ctx([task(12)], { ledger }), 12)).toEqual(["LAUNCH", []]);
 });
 
-test("unreadable quota holds quota-unreadable; a window at the threshold holds quota-over-threshold", () => {
-  expect(outcome(ctx([task(12)], { quota: { readable: false } }), 12)).toEqual(["HOLD", ["quota-unreadable"]]);
-  expect(outcome(ctx([task(12)], { quota: { readable: true, maxUsedPct: 80 } }), 12)).toEqual(["HOLD", ["quota-over-threshold"]]);
-  expect(outcome(ctx([task(12)], { quota: { readable: true, maxUsedPct: 79.9 } }), 12)).toEqual(["LAUNCH", []]);
+test("one account with room launches; every account spent holds quota-over-threshold; none readable holds quota-unreadable", () => {
+  const spent = { name: "default", maxUsedPct: 100 };
+  expect(outcome(ctx([task(12)], { quota: { readable: true, accounts: [spent, { name: "account-2", maxUsedPct: 99 }] } }), 12)).toEqual(["LAUNCH", []]);
+  expect(outcome(ctx([task(12)], { quota: { readable: true, accounts: [spent, { name: "account-2", maxUsedPct: 100 }] } }), 12))
+    .toEqual(["HOLD", ["quota-over-threshold"]]);
+  expect(outcome(ctx([task(12)], { quota: { readable: false, skipped: ["default (token-expired)"] } }), 12)).toEqual(["HOLD", ["quota-unreadable"]]);
 });
 
 test("a host HOLD holds host-hold", () => {
@@ -216,17 +218,17 @@ test("formatCandidates prints the header and one line per verdict; none prints A
 test("parseAutopilotConfig defaults every key", () => {
   expect(parseAutopilotConfig(undefined)).toEqual(DEFAULT_AUTOPILOT);
   expect(parseAutopilotConfig({})).toEqual(DEFAULT_AUTOPILOT);
-  expect(parseAutopilotConfig({ quotaMaxUsedPct: 90, mergeBase: "develop" })).toEqual({ ...DEFAULT_AUTOPILOT, quotaMaxUsedPct: 90, mergeBase: "develop" });
+  expect(parseAutopilotConfig({ mergeBase: "develop" })).toEqual({ ...DEFAULT_AUTOPILOT, mergeBase: "develop" });
   expect(DEFAULT_AUTOPILOT.tickSec).toBe(300);
   expect(parseAutopilotConfig({ tickSec: 30 }).tickSec).toBe(30);
   expect(parseAutopilotConfig({ tickSec: 3600 }).tickSec).toBe(3600);
 });
 
-test("parseAutopilotConfig ignores the removed bundle keys and mode (any value) with one warning", () => {
+test("parseAutopilotConfig ignores the removed bundle keys, quotaMaxUsedPct and mode (any value) with one warning", () => {
   const warnings: string[] = [];
   expect(parseAutopilotConfig({ workspaces: [7], wip: 5, attemptCap: 3, quotaMaxUsedPct: 90 }, (line) => warnings.push(line)))
-    .toEqual({ ...DEFAULT_AUTOPILOT, quotaMaxUsedPct: 90 });
-  expect(warnings).toEqual(["autopilot.workspaces, autopilot.wip, autopilot.attemptCap no longer apply and are ignored"]);
+    .toEqual(DEFAULT_AUTOPILOT);
+  expect(warnings).toEqual(["autopilot.workspaces, autopilot.wip, autopilot.attemptCap, autopilot.quotaMaxUsedPct no longer apply and are ignored"]);
   for (const mode of ["off", "shadow", "on", "live", 7]) {
     const seen: string[] = [];
     expect(parseAutopilotConfig({ mode }, (line) => seen.push(line))).toEqual(DEFAULT_AUTOPILOT);
@@ -237,7 +239,6 @@ test("parseAutopilotConfig ignores the removed bundle keys and mode (any value) 
 test("parseAutopilotConfig throws TypeError naming the key on an invalid value or an unknown key", () => {
   const cases: [unknown, RegExp][] = [
     [[], /^autopilot must be an object/],
-    [{ quotaMaxUsedPct: 101 }, /^autopilot\.quotaMaxUsedPct /],
     [{ quotaUnreadable: "launch" }, /^autopilot\.quotaUnreadable /],
     [{ mergeBase: "" }, /^autopilot\.mergeBase /],
     [{ crossWorkspacePrereqs: "allow" }, /^autopilot\.crossWorkspacePrereqs /],
