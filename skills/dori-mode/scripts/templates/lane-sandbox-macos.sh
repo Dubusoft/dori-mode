@@ -124,6 +124,10 @@ build_profile() {
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
 
   # Later rules win over earlier ones in SBPL.
+  # realpath() of a directory opens it, and omo resolves every parent of its cwd: a cwd-less lane's parents are
+  # ~/.dori/runner/lanes, ~/.dori/runner and ~/.dori. Each gets file-read-data on the directory itself (the names of its
+  # entries), never on anything under it: ~/.dori/env and the other lanes' files stay refused. /bin/ps is setuid root, and a
+  # sandboxed process cannot exec a setuid binary, so ps alone runs outside the profile; it writes nothing.
   PROFILE="(version 1)
 (allow default)
 (deny file-write*)
@@ -134,6 +138,8 @@ $d_rules
 (deny file-read* (subpath (param \"DORI\")))
 (allow file-read*$r_rules)
 (allow file-read-metadata (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")) (literal (param \"DORI_LANES\")))
+(allow file-read-data (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_LANES\")))
+(allow process-exec (literal \"/bin/ps\") (with no-sandbox))
 (deny file-read* (literal (param \"DORI_ENV\")) (regex #\"/\\.ssh/id_[^/.]+\$\"))
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
 "
