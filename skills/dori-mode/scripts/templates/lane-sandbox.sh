@@ -6,6 +6,8 @@
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <leadCwd>/state/verify)
+# Host paths hidden from every lane (e.g. a backup of ~/.dori/env) are listed one per line in ~/.dori/lane-sandbox-hide
+# ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it.
 set -eu
 
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
@@ -78,11 +80,15 @@ opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state" --dir "$H/.dori/heavy")
 
 # Read-only re-binds (skipped when missing)
 for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
-  .zshrc .bashrc .profile .gitconfig .ssh/known_hosts .ssh/config .config \
+  .zshrc .bashrc .profile .gitconfig .ssh/known_hosts .ssh/config .config/gh .config/git \
   .npmrc .dori/config.json .dori/src .dori/bin; do
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
-opts+=(--ro-bind-try "$H/.dori/runner/sock" "$H/.dori/runner/sock")
+# The rest of ~/.config (other tools' credentials, herdr's control socket) stays out. The ssh agent socket may live
+# there (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent): that one path is bound on its own.
+case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac
+# Only the lane socket: the runner's control and cli sockets (sock/control, sock/cli) are not a lane's to dial.
+opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane" "$H/.dori/runner/sock/lane")
 # A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
@@ -139,6 +145,15 @@ for s in /run/docker.sock /var/run/docker.sock; do
   opts+=(--ro-bind /dev/null "$r")
 done
 
+# Hide the user's D-Bus session bus and systemd user manager sockets: through either a lane could ask the user manager
+# to start a transient unit (systemd-run --user), which runs outside the sandbox.
+U=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+for s in "$U/bus" "$U/at-spi/bus"; do
+  if [ -S "$s" ]; then opts+=(--ro-bind /dev/null "$s"); fi
+done
+if [ -d "$U/systemd" ]; then opts+=(--tmpfs "$U/systemd" --remount-ro "$U/systemd"); fi
+opts+=(--unsetenv DBUS_SESSION_BUS_ADDRESS)
+
 # Working directory
 C=$(pwd -P)
 broad=0
@@ -161,6 +176,23 @@ case "$broad" in
     ;;
 esac
 opts+=(--chdir "$C")
+
+# Hidden host paths last among the binds, so neither the cwd nor LANE_SANDBOX_RW can re-expose one.
+if [ -f "$H/.dori/lane-sandbox-hide" ]; then
+  while IFS= read -r p || [ -n "$p" ]; do
+    p=${p%%#*}
+    p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$p" ] && [ -e "$p" ] || continue
+    r=$(readlink -f "$p")
+    # ~/.dori is hidden already, and its read-only tmpfs takes no new mount point.
+    case "$r" in "$H/.dori" | "$H/.dori"/*) continue ;; esac
+    if [ -d "$r" ]; then
+      opts+=(--tmpfs "$r" --remount-ro "$r")
+    else
+      opts+=(--ro-bind /dev/null "$r")
+    fi
+  done <"$H/.dori/lane-sandbox-hide"
+fi
 
 # Private TMPDIR last, so the broad ~/.cache rw bind cannot shadow it
 opts+=(--bind "$LT" "$H/.lane-tmp" --setenv TMPDIR "$H/.lane-tmp")
