@@ -9,6 +9,9 @@
 # Host paths outside ~/.dori hidden from every lane (e.g. ~/.secrets) are listed one per line in ~/.dori/lane-sandbox-hide
 # ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it. ~/.dori/env and
 # ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
+# The raw BrowserSkill daemon (~/.bsk, its socket) is absent: $HOME is a tmpfs and nothing binds it. Only the lane's own
+# browser proxy dir (~/.dori/runner/browser/<key>) is bound, read-only. The daemon's TCP ws_port on 127.0.0.1 cannot be
+# refused without a network namespace, so on Linux it stays reachable.
 set -eu
 
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
@@ -93,6 +96,8 @@ case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH
 opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane" "$H/.dori/runner/sock/lane")
 # A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
+# The lane's own browser proxy dir (the runner's proxy socket and daemon.json), never another lane's.
+opts+=(--dir "$H/.dori/runner/browser/$key" --ro-bind-try "$H/.dori/runner/browser/$key" "$H/.dori/runner/browser/$key")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
 opts+=(--dir "$H/.dori/runner/briefs/$key.out")
 # The mount point of a lane started without --cwd, whose cwd is ~/.dori/runner/lanes/<key> (bound rw below as the cwd).

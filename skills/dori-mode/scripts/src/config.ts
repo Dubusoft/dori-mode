@@ -291,9 +291,20 @@ export type SecretRule = {
   readonly repos: readonly string[];
   readonly as?: "env" | "ssh-key";
   readonly mint?: GithubAppMint;
+  /** Page origins (`https://host[:port]`) the browser fill proxy may fill this secret into; present makes the rule browser-proxy-only (no `secret exec`/`secret run`). */
+  readonly origins?: readonly string[];
 };
 
-const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" } }`;
+const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" }, "origins"?: [non-empty list of http(s) origins like "https://host[:port]"] }`;
+
+/** Whether `entry` is exactly an http(s) origin, i.e. equals `new URL(entry).origin`. */
+const isOrigin = (entry: unknown): boolean => {
+  if (typeof entry !== "string") return false;
+  try {
+    const url = new URL(entry);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.origin === entry;
+  } catch { return false; }
+};
 
 /** A list-of-strings field; absent is empty, anything else throws `bad(path)`. */
 const stringList = (value: unknown, bad: (what: string) => TypeError, path: string): readonly string[] => {
@@ -305,7 +316,7 @@ const stringList = (value: unknown, bad: (what: string) => TypeError, path: stri
 /** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?, repos?, as?, mint? } } (see RULE_SHAPE). */
 const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
   if (raw == null) return {};
-  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`as: "ssh-key"\` and \`mint\` are exclusive`);
+  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`as: "ssh-key"\` and \`mint\` are exclusive, and \`origins\` combines with neither`);
   if (!isRecord(raw)) throw bad("");
   const mintOf = (value: unknown, path: string): GithubAppMint => {
     const nonEmpty = (v: unknown) => typeof v === "string" && v.trim() !== "";
@@ -317,15 +328,17 @@ const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
     return { kind, appId: appId as string, installationId: installationId as string, keySecret, permissions: permissions as Record<string, "read" | "write"> };
   };
   return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
-    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint"].includes(key))) throw bad(`.${name}`);
-    const { as, mint } = rule;
+    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint", "origins"].includes(key))) throw bad(`.${name}`);
+    const { as, mint, origins } = rule;
     if (as !== undefined && as !== "env" && as !== "ssh-key") throw bad(`.${name}.as`);
     if (mint !== undefined && as === "ssh-key") throw bad(`.${name}.mint`);
+    if (origins !== undefined && (!Array.isArray(origins) || origins.length === 0 || !origins.every(isOrigin) || as === "ssh-key" || mint !== undefined)) throw bad(`.${name}.origins`);
     return [name, {
       lanes: stringList(rule.lanes, bad, `.${name}.lanes`),
       repos: stringList(rule.repos, bad, `.${name}.repos`),
       ...(as !== undefined ? { as } : {}),
       ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
+      ...(origins !== undefined ? { origins: [...origins as string[]] } : {}),
     }];
   }));
 };

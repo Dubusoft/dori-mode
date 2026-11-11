@@ -8,7 +8,8 @@ import {
   decodeFrame, encodeFrame, supervisorControl,
   type AnySupervisorControl, type RunnerControl, type RunnerControlBodies, type SupervisorControlBodies, type SupervisorControlType,
 } from "../src/runner/protocol.ts";
-import { remoteSecretGranter, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
+import { remoteSecretGranter, remoteSecretHandles, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
+import { handleId } from "../src/runner/secret-handles.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { fakeClock, withState } from "./fakes.ts";
@@ -25,7 +26,7 @@ beforeEach(() => { tmp = withState(); clock.at = 1_000_000; });
 afterEach(() => { for (const done of cleanups.splice(0).reverse()) done(); tmp.done(); });
 
 /** A secret request the fake supervisor saw: `secret.get` or `secret.run`. */
-type SecretGet = RunnerControl<"secret.get"> | RunnerControl<"secret.run">;
+type SecretGet = RunnerControl<"secret.get"> | RunnerControl<"secret.run"> | RunnerControl<"secret.handle"> | RunnerControl<"secret.exchange">;
 type Reply = <T extends SupervisorControlType>(type: T, body: SupervisorControlBodies[T]) => void;
 
 /**
@@ -67,7 +68,7 @@ const supervisor = (opts: { proto?: number; auth?: boolean } = {}) => {
         return;
       }
       if (session && !session.check(frame)) { badMacs.push(frame.type); return; }
-      if (frame.type === "secret.get" || frame.type === "secret.run") { received.push(frame as SecretGet); onSecret(frame as SecretGet, session, reply); }
+      if (frame.type === "secret.get" || frame.type === "secret.run" || frame.type === "secret.handle" || frame.type === "secret.exchange") { received.push(frame as SecretGet); onSecret(frame as SecretGet, session, reply); }
     });
   });
   cleanups.push(() => { auth.close(); });
@@ -296,5 +297,81 @@ describe("remote runner secrets over the link", () => {
       "RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_FAILED",
       "RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_FAILED",
     ]);
+  });
+});
+
+describe("remoteSecretHandles over the link", () => {
+  const HANDLE = `dsh_${"Q".repeat(43)}`;
+  const ORIGIN = "https://app.example.com";
+  /** Seals `plaintext` as the answer of `type` to `frame`. */
+  const seal = (session: Session, frame: SecretGet, type: string, plaintext: string) =>
+    session.sealSecret("s2r", { runner: LABEL, gen: frame.gen, epoch: EPOCH, type, rid: frame.body.rid }, plaintext);
+
+  test("issue and exchange: frames carry key, name, repo / handle, origin; sealed answers reach the caller and the mask", async () => {
+    const { sup, run } = await connected({ proto: 7 });
+    sup.onSecret = (frame, session, reply) => {
+      const rid = frame.body.rid;
+      if (frame.type === "secret.handle") reply("secret.handle.result", { rid, ok: true, sealed: seal(session as Session, frame, "secret.handle.result", JSON.stringify({ handle: HANDLE, expiresAt: 1_300_000 })) });
+      else reply("secret.exchange.result", { rid, ok: true, sealed: seal(session as Session, frame, "secret.exchange.result", JSON.stringify({ value: VALUE })) });
+    };
+    const masked: string[] = [];
+    const logs: string[] = [];
+    const handles = remoteSecretHandles({ client: run.client, laneRepo: async () => "acme/app", log: (l) => { logs.push(l); }, onGranted: (v) => { masked.push(...v); } });
+    expect(await drive(sup, handles.issue("lane-a", "WEB_PASSWORD"))).toEqual({ ok: true, handle: HANDLE, expiresAt: 1_300_000 });
+    expect(masked).toEqual([]);
+    expect(await drive(sup, handles.exchange("lane-a", HANDLE, ORIGIN))).toEqual({ ok: true, value: VALUE });
+    expect(masked).toEqual([VALUE]);
+    expect(sup.received.map((f) => [f.type, { ...f.body, rid: "-" }])).toEqual([
+      ["secret.handle", { rid: "-", key: "lane-a", name: "WEB_PASSWORD", repo: "acme/app" }],
+      ["secret.exchange", { rid: "-", key: "lane-a", handle: HANDLE, origin: ORIGIN }],
+    ]);
+    expect(sup.badMacs).toEqual([]);
+    expect(logs).toEqual([
+      `RUNNER_SECRET_GRANTED lane=lane-a names=WEB_PASSWORD kind=handle.issue handleId=${handleId(HANDLE)}`,
+      `RUNNER_SECRET_GRANTED lane=lane-a kind=handle.exchange handleId=${handleId(HANDLE)}`,
+    ]);
+    const text = [...logs, ...run.logs].join("\n");
+    expect(text).not.toContain(VALUE);
+    expect(text).not.toContain(HANDLE);
+  });
+
+  test("a refusal passes through; a malformed or wrong-type box is FAILED; nothing is masked", async () => {
+    const { sup, run } = await connected({ proto: 7 });
+    const answers: ((frame: SecretGet, session: Session, reply: Reply) => void)[] = [
+      (f, _s, reply) => { reply("secret.exchange.result", { rid: f.body.rid, ok: false, code: "RUNNER_SECRET_DENIED", detail: "secret handle abc was already used" }); },
+      (f, s, reply) => { reply("secret.exchange.result", { rid: f.body.rid, ok: true, sealed: seal(s, f, "secret.handle.result", JSON.stringify({ value: VALUE })) }); },
+      (f, s, reply) => { reply("secret.exchange.result", { rid: f.body.rid, ok: true, sealed: seal(s, f, "secret.exchange.result", JSON.stringify({ value: 1 })) }); },
+      (f, s, reply) => { reply("secret.handle.result", { rid: f.body.rid, ok: true, sealed: seal(s, f, "secret.handle.result", JSON.stringify({ handle: "not-a-handle", expiresAt: 1 })) }); },
+    ];
+    sup.onSecret = (frame, session, reply) => { answers.shift()?.(frame, session as Session, reply); };
+    const masked: string[] = [];
+    const logs: string[] = [];
+    const handles = remoteSecretHandles({ client: run.client, laneRepo: async () => undefined, log: (l) => { logs.push(l); }, onGranted: (v) => { masked.push(...v); } });
+    expect(await drive(sup, handles.exchange("lane-a", HANDLE, ORIGIN))).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "secret handle abc was already used" });
+    expect(await drive(sup, handles.exchange("lane-a", HANDLE, ORIGIN))).toEqual({ ok: false, code: "RUNNER_SECRET_FAILED", detail: "sealed reply did not open" });
+    expect(await drive(sup, handles.exchange("lane-a", HANDLE, ORIGIN))).toMatchObject({ ok: false, code: "RUNNER_SECRET_FAILED" });
+    expect(await drive(sup, handles.issue("lane-a", "WEB_PASSWORD"))).toMatchObject({ ok: false, code: "RUNNER_SECRET_FAILED" });
+    expect(sup.received[3]?.body).not.toHaveProperty("repo");
+    expect(masked).toEqual([]);
+    const id = handleId(HANDLE);
+    expect(logs).toEqual([
+      `RUNNER_SECRET_DENIED lane=lane-a kind=handle.exchange handleId=${id} code=RUNNER_SECRET_DENIED`,
+      `RUNNER_SECRET_DENIED lane=lane-a kind=handle.exchange handleId=${id} code=RUNNER_SECRET_FAILED`,
+      `RUNNER_SECRET_DENIED lane=lane-a kind=handle.exchange handleId=${id} code=RUNNER_SECRET_FAILED`,
+      "RUNNER_SECRET_DENIED lane=lane-a names=WEB_PASSWORD kind=handle.issue code=RUNNER_SECRET_FAILED",
+    ]);
+  });
+
+  test("a supervisor at proto 6 gets no handle frame: RUNNER_SECRET_OUTDATED, while secret.get still goes out", async () => {
+    const { sup, run } = await connected({ proto: 6 });
+    const handles = remoteSecretHandles({ client: run.client, laneRepo: async () => undefined, log: () => {} });
+    const outdated = { ok: false as const, code: "RUNNER_SECRET_OUTDATED", detail: "supervisor speaks proto 6; secret handles need proto 7" };
+    expect(await handles.issue("lane-a", "WEB_PASSWORD")).toEqual(outdated);
+    expect(await handles.exchange("lane-a", HANDLE, ORIGIN)).toEqual(outdated);
+    for (const pair of sup.net.pairs) pair.pump();
+    expect(sup.received).toEqual([]);
+    void run.client.secretRequest("secret.get", { key: "lane-a", names: ["API_TOKEN"] });
+    for (const pair of sup.net.pairs) pair.pump();
+    expect(sup.received.map((f) => f.type)).toEqual(["secret.get"]);
   });
 });

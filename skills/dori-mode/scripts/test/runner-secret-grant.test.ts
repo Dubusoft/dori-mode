@@ -156,3 +156,17 @@ test("a name whose rule says ssh-key is reported in kinds, others are not", asyn
   expect(await grant("lane-a", ["DEPLOY_KEY", "NPM_TOKEN"])).toEqual({ ok: true, values: { DEPLOY_KEY: VALUE, NPM_TOKEN: VALUE }, kinds: { DEPLOY_KEY: "ssh-key" } });
   expect(await grant("lane-a", ["NPM_TOKEN"])).toEqual({ ok: true, values: { NPM_TOKEN: VALUE } });
 });
+
+test("a name whose rule has origins is browser-only: the whole request is refused before any read", async () => {
+  let reads = 0;
+  const audit: SecretAuditEntry[] = [];
+  const grant = secretGranter({
+    store: { read: async () => { reads++; return VALUE; } },
+    rules: async () => ({ SITE_PW: { lanes: ["lane-a"], repos: [], origins: ["https://a.example"] }, NPM_TOKEN: rule(["lane-a"]) }),
+    laneRepo: async () => undefined, audit: (e) => { audit.push(e); }, runner: "local", now: () => 0,
+  });
+  expect(await grant("lane-a", ["NPM_TOKEN", "SITE_PW"])).toEqual({ ok: false, code: "RUNNER_SECRET_BROWSER_ONLY", detail: "SITE_PW is only for the browser fill proxy (config secrets.SITE_PW.origins)" });
+  expect(reads).toBe(0);
+  expect(audit).toEqual([{ at: "1970-01-01T00:00:00.000Z", runner: "local", lane: "lane-a", names: ["NPM_TOKEN", "SITE_PW"], allowed: false, reason: "browser only: SITE_PW" }]);
+  expect((await grant("lane-a", ["NPM_TOKEN"])).ok).toBe(true);
+});

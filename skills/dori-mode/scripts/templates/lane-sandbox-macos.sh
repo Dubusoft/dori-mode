@@ -20,6 +20,10 @@
 # its own brief and token), and ~/.dori/env, ~/.dori/secrets and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
 # are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
+# The raw BrowserSkill daemon is refused: its home (LANE_SANDBOX_BSK_HOME, else ~/.bsk; BSK_HOME is the lane's proxy dir, so it is
+# not used) gets no reads, writes or socket connects, and the ws_port in its daemon.json (a validated 1-65535 literal) no
+# connect to localhost. The lane's own browser proxy dir (~/.dori/runner/browser/<key>) is readable and its daemon.sock
+# dialable; no other key's is. The runner's proxy there holds the real daemon's access and never shows a password.
 # Host paths outside ~/.dori listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
 # refused outright, reads, writes and socket connects alike, over every rule above. Every path is resolved first
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
@@ -66,7 +70,7 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" gcd broad kc rr
+  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" b_rules="" gcd broad kc rr bsk ws
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   param() { PARAMS+=(-D "$1=$(canon "$2")"); }
@@ -136,6 +140,8 @@ build_profile() {
   w "$H/.dori/runner/briefs/$key.out"
   # A lane started without --cwd works in ~/.dori/runner/lanes/<key>: readable here, writable as the cwd above.
   if [ -n "$key" ]; then r "$H/.dori/runner/lanes/$key"; fi
+  # The lane's own browser proxy dir, and nobody else's.
+  if [ -n "$key" ]; then r "$H/.dori/runner/browser/$key"; fi
 
   param DORI "$H/.dori"
   param DORI_RUNNER "$H/.dori/runner"
@@ -157,6 +163,33 @@ build_profile() {
       param_raw AGENT_LINK "$(canon_parent "$SSH_AUTH_SOCK")"
       a_rules="(allow file-read* (literal (param \"AGENT_SOCK\")) (literal (param \"AGENT_LINK\")))
 (allow network-outbound (remote unix-socket (path-literal (param \"AGENT_SOCK\"))) (remote unix-socket (path-literal (param \"AGENT_LINK\"))))"
+      ;;
+  esac
+  if [ -n "$key" ]; then
+    param BROWSER_SOCK "$H/.dori/runner/browser/$key/daemon.sock"
+    a_rules="$a_rules
+(allow network-outbound (remote unix-socket (path-literal (param \"BROWSER_SOCK\"))))"
+  fi
+  # The real BrowserSkill daemon: its dir (socket, daemon.json) and its loopback ws_port.
+  bsk=${LANE_SANDBOX_BSK_HOME:-$H/.bsk}
+  param BSK "$bsk"
+  b_rules="(deny file-read* (subpath (param \"BSK\")))
+(deny file-write* (subpath (param \"BSK\")))
+(deny network-outbound (remote unix-socket (subpath (param \"BSK\"))))"
+  ws=
+  if [ -f "$bsk/daemon.json" ]; then
+    ws=$(sed -n 's/.*"ws_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$bsk/daemon.json" 2>/dev/null | head -n 1)
+  fi
+  case "$ws" in
+    '' | *[!0-9]*) ;;
+    *)
+      if [ "${#ws}" -le 5 ]; then
+        ws=$((10#$ws))
+        if [ "$ws" -ge 1 ] && [ "$ws" -le 65535 ]; then
+          b_rules="$b_rules
+(deny network-outbound (remote tcp \"localhost:$ws\"))"
+        fi
+      fi
       ;;
   esac
   if [ -f "$H/.dori/lane-sandbox-hide" ]; then
@@ -199,6 +232,7 @@ $d_rules
 (allow network-outbound (remote unix-socket (path-literal (param \"LANE_SOCK\"))))
 $a_rules
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
+$b_rules
 $h_rules
 (deny file-read* (subpath (param \"DORI_SECRETS\")))
 (deny file-write* (subpath (param \"DORI_SECRETS\")))

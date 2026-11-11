@@ -83,3 +83,29 @@ test("schema 6 fills secrets into a version-5 file and setup stamps the new vers
   const pruned = pruneObsolete({ log: () => {} }, state.dir, { schemaVersion: 5, defaultModel: "a/b" });
   expect(pruned).toMatchObject({ schemaVersion: 6, secrets: {} });
 });
+
+test("origins load on a rule as exact http(s) origins", async () => {
+  const c = await load("origins", { secrets: { SITE_PW: { lanes: ["a"], origins: ["https://login.example.com", "http://localhost:8080"] }, ENV_PW: { as: "env", origins: ["https://x.example"] } } });
+  expect(c.secrets.SITE_PW).toEqual({ lanes: ["a"], repos: [], origins: ["https://login.example.com", "http://localhost:8080"] });
+  expect(c.secrets.ENV_PW).toEqual({ lanes: [], repos: [], as: "env", origins: ["https://x.example"] });
+});
+
+test("a bad origins throws TypeError", async () => {
+  const bad: unknown[] = [
+    { A: { origins: [] } },
+    { A: { origins: "https://a.example" } },
+    { A: { origins: [1] } },
+    { A: { origins: ["https://a.example/"] } },
+    { A: { origins: ["https://a.example/login"] } },
+    { A: { origins: ["https://A.example"] } },
+    { A: { origins: ["https://a.example:443"] } },
+    { A: { origins: ["ftp://a.example"] } },
+    { A: { origins: ["a.example"] } },
+    { A: { origins: ["https://u@a.example"] } },
+    { A: { as: "ssh-key", origins: ["https://a.example"] } },
+    { A: { mint: MINT, origins: ["https://a.example"] } },
+  ];
+  for (const [i, secrets] of bad.entries()) {
+    await expect(load(`bad-origins-${i}`, { secrets })).rejects.toBeInstanceOf(TypeError);
+  }
+});

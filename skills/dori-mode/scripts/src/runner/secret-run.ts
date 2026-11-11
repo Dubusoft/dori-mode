@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import type { SecretCommand, SecretRule } from "../config.ts";
 import { redactSecrets } from "../redact.ts";
-import { readSecretValue, ruleMatches, type SecretSource } from "./secret-grant.ts";
+import { browserOnlyDetail, readSecretValue, ruleMatches, type SecretSource } from "./secret-grant.ts";
 
 /**
  * Proxy execution (`dori secret run <op>`): the supervisor host runs a configured `secretCommands.<op>` argv with the
@@ -104,7 +104,8 @@ const redactOutput = (text: string, secrets: Readonly<Record<string, string>>, t
 
 /**
  * The lane socket's `secret-run` handler on the supervisor host: runs `secretCommands.<op>` for lane `key` (repo
- * `repo`, else `deps.laneRepo`), or refuses. Unknown op or a lane its lanes/repos do not match -> `RUNNER_SECRET_DENIED`;
+ * `repo`, else `deps.laneRepo`), or refuses. A secret whose rule has `origins` -> `RUNNER_SECRET_BROWSER_ONLY`;
+ * unknown op or a lane its lanes/repos do not match -> `RUNNER_SECRET_DENIED`;
  * a secret that cannot be read or minted -> the granter's code; a command that cannot start -> `RUNNER_SECRET_FAILED`.
  * The command gets env {PATH, HOME, LANG, TMPDIR (when set on the host)} + its secrets, stdin closed, cwd = `cwd` ??
  * home, and is killed after `timeoutSec` (exit 124, stderr says so). Each of stdout/stderr keeps its first 64 KiB.
@@ -127,6 +128,8 @@ export const secretCommandRunner = (deps: SecretRunnerDeps) => async (key: strin
   const command = Object.hasOwn(commands, op) ? commands[op] : undefined;
   if (!command) return refuse("RUNNER_SECRET_DENIED", `${op} is not a configured secret command (config secretCommands)`);
   names = command.secrets;
+  const browserOnly = names.find((name) => Object.hasOwn(rules, name) && rules[name]?.origins !== undefined);
+  if (browserOnly !== undefined) return refuse("RUNNER_SECRET_BROWSER_ONLY", browserOnlyDetail(browserOnly));
   let laneRepoP: Promise<string | undefined> | undefined;
   const laneRepo = (): Promise<string | undefined> => (laneRepoP ??= repo !== undefined ? Promise.resolve(repo) : (deps.laneRepo?.(key) ?? Promise.resolve(undefined)).catch(() => undefined));
   if (!await ruleMatches(command, key, laneRepo)) return refuse("RUNNER_SECRET_DENIED", `${key} may not run ${op} (config secretCommands)`);

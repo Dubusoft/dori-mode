@@ -442,8 +442,8 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     const id = `runner ${row.label}`;
     const problems: string[] = [];
     if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
-    // Lane start and recover carry lane files since proto 5: an older runner keeps its lanes but cannot start or recover any.
-    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} refuses lane start and recover (they need proto ${PROTO})`);
+    // A proto PROTO-1 runner is admitted and runs lanes (lane files since proto 5), but predates secret handles (proto 7): it refuses secret.handle / secret.exchange.
+    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} cannot issue or exchange secret handles (they need proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
     if (row.herdr === "down" || row.herdr === "hung") {
