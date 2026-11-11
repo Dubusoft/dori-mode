@@ -627,6 +627,42 @@ The probe also reads the host's herdr once and adds `herdr` (`herdr=` in the tex
 `down` when none does, and `unknown` when pgrep cannot tell. It is one reading for diagnosis; the verdict and the exit
 code stay the runner's alone.
 
+## Cleanup sweep
+
+Every runner (local, remote, Windows) sweeps its own host once a day (`src/runner/cleanup.ts`); there is no per-machine
+cron or tmpfiles rule and no dry-run mode. The first check runs 10 minutes after start and then hourly; a sweep runs when
+the last one recorded in `~/.dori/runner/logs/cleanup.json` is at least 24 hours old, so restarts neither skip nor repeat
+a day.
+
+| Target | Root (Linux/macOS; Windows) | Action |
+|---|---|---|
+| lane sandbox TMPDIRs | `~/.cache/omo-tmp/lane-sandbox/<key>`; `%USERPROFILE%\.cache\omo-tmp\lane-sandbox` | files older than 3 days, then empty dirs |
+| lane build temp | `~/.cache/omo-tmp`; `%USERPROFILE%\.cache\omo-tmp` | same, 3 days |
+| system temp | `/tmp` (macOS also `$TMPDIR`); `%TEMP%` (else `%TMP%`, `%LOCALAPPDATA%\Temp`) | the user's own files older than 2 days |
+| `/var/tmp` | Linux only | the user's own files older than 30 days |
+| browser profiles | `.<id>.bun-chrome` directly in a temp root | removed when untouched for 2 hours |
+| omo sessions | `~/.omo/agent/sessions/<cwd>/*.jsonl` | untouched 14 days: moved with their `-artifacts` dir to `~/.omo/agent/sessions-archive/<cwd>/` |
+| empty artifact dirs | empty `*-artifacts` session dirs, empty dirs under `~/.dori/runner/evidence` | removed after a day |
+| memory agents | `~/.omo/memory/agents/<slug>-<hash>` | removed when untouched for 30 days |
+| worktree records | every workspace repo the runner reports | `git worktree prune` |
+
+Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The sweep never removes: an open lane's
+sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
+`~/.dori/secrets` and `~/.secrets`; anything a process holds open or runs in (Linux `/proc`, macOS `lsof`; Windows
+refuses to delete an open file); sockets, FIFOs, symlinks, lock files and other users' files; temp entries of live
+sessions (`tmux-*`, `herdr*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the rest of `TEMP_EXCLUDES`); and any root
+that is the home dir, above it, or a secret store. When the in-use listing fails, that day's sweep skips the deleting
+targets and reports `inUse=failed`.
+
+Each sweep logs one line and rewrites the status file with the full report:
+
+```text
+RUNNER_CLEANUP at=<iso> sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> worktreePrune=<ok>/<repos> freedBytes=<n> kept=<n> inUse=ok errors=<n> ms=<n>
+```
+
+To check a host, read `~/.dori/runner/logs/cleanup.json` there (`at` is the last sweep) or find the `RUNNER_CLEANUP`
+line in the runner's log.
+
 ## Shadow mode (removed)
 
 Shadow mode is gone. The supervisor always opens the hub, `dori supervise` always spawns the local runner as its
