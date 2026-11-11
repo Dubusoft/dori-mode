@@ -1,11 +1,10 @@
-import { type AutopilotMode, type CandidatesReport, recordShadow } from "./autopilot.ts";
-import type { OperationStore } from "./operations.ts";
+import type { CandidatesReport } from "./autopilot.ts";
 
 /**
  * The supervisor's autopilot tick: every `tickMs` (config `autopilot.tickSec`) it judges the autopilot candidates (as
- * `dori autopilot candidates --record` does) and writes the hourly shadow rows. Mode off judges nothing; mode shadow
- * and a pause (`dori autopilot pause`) judge and record but never wake the lead. In mode on it wakes the lead with an
- * urgent `AUTOPILOT_READY` only when the LAUNCH set holds a task id the last wake did not name, and once more every
+ * `dori autopilot candidates` does). Autopilot is always on; only a pause (`dori autopilot pause`) keeps it from waking
+ * the lead. Otherwise it wakes the lead with an urgent `AUTOPILOT_READY` only when the LAUNCH set holds a task id the
+ * last wake did not name, and once more every
  * AUTOPILOT_RENOTIFY_MS (naming the current set) while launchable tasks stay unlaunched. A set that only shrinks or
  * changes slots wakes no one; the remembered set silently follows it. A tick that finds nothing to launch forgets the
  * set, so the same ids coming back are news again. A toodo event (kick) brings the next tick forward once the burst
@@ -22,13 +21,11 @@ export const AUTOPILOT_KICK_EVENTS: ReadonlySet<string> = new Set(["task-ready",
 
 export type AutopilotTickDeps = {
   /** Read every pass, so a config reload applies live. */
-  readonly mode: () => AutopilotMode;
   readonly tickMs: () => number;
   /** judgeCandidates over the live reads; throws when toodo cannot be read. */
   readonly judge: () => Promise<CandidatesReport>;
   /** An opaque key of supervisor-local state (reservations, lanes) that raises no toodo event; a change kicks. */
   readonly localState?: () => Promise<string>;
-  readonly store: OperationStore;
   readonly enqueue: (id: string, line: string) => void;
   readonly now: () => number;
   readonly log: (line: string) => void;
@@ -78,7 +75,6 @@ export class AutopilotTick {
 
   /** One pass: judges when due. Never throws; an unreadable toodo is logged once per distinct error and retried next tick. */
   async tick(): Promise<void> {
-    if (this.deps.mode() === "off") return;
     await this.checkLocalState();
     const now = this.deps.now();
     if (!this.due(now)) return;
@@ -87,7 +83,6 @@ export class AutopilotTick {
     let report: CandidatesReport;
     try {
       report = await this.deps.judge();
-      recordShadow(this.deps.store, now, report.verdicts);
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
       if (why !== this.lastError) this.deps.log(`AUTOPILOT_TICK_ERROR ${why}`);
@@ -97,8 +92,8 @@ export class AutopilotTick {
     if (this.lastError !== undefined) this.deps.log("AUTOPILOT_TICK_OK");
     this.lastError = undefined;
     const ids = report.verdicts.filter((v) => v.verdict === "LAUNCH").map((v) => v.taskId).sort((a, b) => a - b);
-    // Shadow and a pause wake no one; forgetting the set makes it news once launching is allowed again.
-    if (!ids.length || report.mode !== "on" || report.paused) { this.remembered = undefined; return; }
+    // A pause wakes no one; forgetting the set makes it news once the pause is lifted.
+    if (!ids.length || report.paused) { this.remembered = undefined; return; }
     const prev = this.remembered;
     if (!prev || ids.some((id) => !prev.ids.includes(id))) {
       this.remembered = { ids, slots: report.slots, at: now };

@@ -1,9 +1,10 @@
-import { OPEN_STATES, type Operation, type OperationStore, plan, settleOperation } from "./operations.ts";
+import { OPEN_STATES, type Operation, type OperationStore, settleOperation } from "./operations.ts";
 import { redactSecrets } from "./redact.ts";
 
 /**
  * Autopilot core: the pure selection predicate over toodo tasks the owner marked for autopilot (toodo's
- * `autopilot` field) and the launch ledger, slot assignment against the host guard, plus the shadow judgment rows.
+ * `autopilot` field) and the launch ledger, plus slot assignment against the host guard. Autopilot is always on: a
+ * marked task that judges LAUNCH may run unless `dori autopilot pause` is in force.
  * Nothing here performs I/O beyond the given OperationStore, launches a lane or mutates toodo; callers read toodo, the
  * registry, quota and the host guard and pass plain data in.
  *
@@ -11,14 +12,9 @@ import { redactSecrets } from "./redact.ts";
  * - launch attempt (written by `dori autopilot launch`): lane `toodo:<taskId>`, action `autopilot-launch`, target
  *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous. When its lane
  *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed).
- * - shadow judgment: lane `autopilot`, action `autopilot-shadow`, target `<taskId>@<hour slot ISO>`, state `verified`,
- *   detail `<VERDICT> <reasons>`.
  */
 
-export const AUTOPILOT_LANE = "autopilot";
 export const LAUNCH_ACTION = "autopilot-launch";
-export const SHADOW_ACTION = "autopilot-shadow";
-const HOUR_MS = 3_600_000;
 /** A task ref naming the owner's word that marked it, e.g. `owner:discord:<channel>/<message>`. */
 const OWNER_REF = /^owner:\S+$/;
 
@@ -49,28 +45,24 @@ export type AutopilotConfig = {
   readonly quotaUnreadable: "hold";
   readonly mergeBase: string;
   readonly crossWorkspacePrereqs: "block";
-  /**
-   * off: the supervisor does not judge and nothing launches; shadow: judged and recorded, nothing launches; on: the tick
-   * wakes the lead with AUTOPILOT_READY and `dori autopilot launch` may reserve.
-   */
-  readonly mode: AutopilotMode;
   /** Seconds between the supervisor's autopilot ticks. */
   readonly tickSec: number;
 };
 
-export const AUTOPILOT_MODES = ["off", "shadow", "on"] as const;
-export type AutopilotMode = (typeof AUTOPILOT_MODES)[number];
 export const TICK_SEC_MIN = 30;
 export const TICK_SEC_MAX = 3600;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
-  quotaMaxUsedPct: 80, quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", mode: "shadow", tickSec: 300,
+  quotaMaxUsedPct: 80, quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300,
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** Keys of the bundle design, read as nothing so an older config still loads. */
-const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke"]);
+/**
+ * Keys read as nothing so an older config still loads: the bundle design's, and `mode` (autopilot is always on; `dori
+ * setup` removes it, see config-schema.ts).
+ */
+const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode"]);
 
 /**
  * The config's `autopilot` (absent: DEFAULT_AUTOPILOT; each key optional). Throws TypeError naming the key on an
@@ -95,7 +87,6 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
     quotaUnreadable: pick<"hold">("quotaUnreadable", only("hold"), "\"hold\""),
     mergeBase: pick<string>("mergeBase", (v) => typeof v === "string" && v.trim() !== "" && v === v.trim(), "a branch name"),
     crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
-    mode: pick<AutopilotMode>("mode", (v) => (AUTOPILOT_MODES as readonly unknown[]).includes(v), "\"off\", \"shadow\" or \"on\""),
     tickSec: pick<number>("tickSec", (v) => Number.isInteger(v) && (v as number) >= TICK_SEC_MIN && (v as number) <= TICK_SEC_MAX,
       `an integer from ${TICK_SEC_MIN} to ${TICK_SEC_MAX}`),
   };
@@ -302,23 +293,10 @@ export const judgeAll = (ctx: JudgeContext, taskIds: readonly number[]): Verdict
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Shadow rows and output
-
-/** The current hour floored, as a UTC ISO string. */
-export const shadowSlot = (now: number): string => new Date(Math.floor(now / HOUR_MS) * HOUR_MS).toISOString();
-
-const verdictDetail = (v: Verdict): string => `${v.verdict}${v.reasons.length ? ` ${v.reasons.join(", ")}` : ""}`;
-
-/** Writes one verified shadow row per verdict for the current hour; a row already written this hour is kept as is. */
-export const recordShadow = (store: OperationStore, now: number, verdicts: readonly Verdict[]): Operation[] =>
-  verdicts.map((v) => {
-    const op = plan(store, now, { lane: AUTOPILOT_LANE, action: SHADOW_ACTION, target: `${v.taskId}@${shadowSlot(now)}` });
-    return op.state === "planned" ? settleOperation(store, now, op.id, "verified", verdictDetail(v))! : op;
-  });
+// Output
 
 export type CandidatesReport = {
-  readonly mode: AutopilotMode;
-  /** `dori autopilot pause` is in force: nothing launches whatever the mode. */
+  /** `dori autopilot pause` is in force: nothing launches. */
   readonly paused: boolean;
   /** Free host slots; null when the pane limit is off. */
   readonly slots: number | null;
@@ -328,16 +306,14 @@ export type CandidatesReport = {
 /** Text output of `dori autopilot candidates`: a header line and one line per verdict, or AUTOPILOT_NO_CANDIDATES. */
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
-  const launches = report.mode === "on" && !report.paused;
   return [
-    `AUTOPILOT mode=${report.mode}${report.paused ? " paused" : ""}${launches ? "" : " record-only: nothing launches"} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}`,
+    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}`,
     ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? "would-launch" : v.reasons.join(", ")}`),
   ];
 };
 
 /** The `--json` shape of `dori autopilot candidates`. */
 export const candidatesJson = (report: CandidatesReport) => ({
-  mode: report.mode,
   paused: report.paused,
   slots: report.slots,
   candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons })),

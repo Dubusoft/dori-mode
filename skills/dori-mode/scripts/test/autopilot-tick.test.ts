@@ -1,39 +1,28 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { expect, test } from "bun:test";
 
-import { AUTOPILOT_LANE, type AutopilotMode, type CandidatesReport, SHADOW_ACTION, type Verdict } from "../src/autopilot.ts";
+import type { CandidatesReport, Verdict } from "../src/autopilot.ts";
 import { AUTOPILOT_KICK_MAX_MS, AUTOPILOT_KICK_QUIET_MS, AUTOPILOT_RENOTIFY_MS, AutopilotTick } from "../src/autopilot-tick.ts";
-import { JsonOperations } from "../src/operations.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const AUTOPILOT_TICK_MS = 300_000;
 
-let dir: string;
-let store: JsonOperations;
-beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "dori-autopilot-tick-"));
-  store = new JsonOperations(dir);
-});
-afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
 
 const launch = (taskId: number): Verdict => ({ taskId, verdict: "LAUNCH", reasons: [] });
 const hold = (taskId: number): Verdict => ({ taskId, verdict: "HOLD", reasons: ["no-slot"] });
-const report = (verdicts: readonly Verdict[], slots: number | null = 1, mode: AutopilotMode = "on", paused = false): CandidatesReport =>
-  ({ mode, paused, slots, verdicts });
+const report = (verdicts: readonly Verdict[], slots: number | null = 1, paused = false): CandidatesReport =>
+  ({ paused, slots, verdicts });
 
 /** A tick over a settable clock and report; `lines` are the journaled events, `judged` counts judgments. */
-const harness = (initial: CandidatesReport | Error, mode: AutopilotMode = "on", tickMs = AUTOPILOT_TICK_MS, localState?: () => Promise<string>) => {
+const harness = (initial: CandidatesReport | Error, tickMs = AUTOPILOT_TICK_MS, localState?: () => Promise<string>) => {
   let now = T0;
   let next: CandidatesReport | Error = initial;
   const lines: string[] = [];
   const logs: string[] = [];
   let judged = 0;
   const tick = new AutopilotTick({
-    mode: () => mode, tickMs: () => tickMs,
+    tickMs: () => tickMs,
     judge: async () => { judged++; if (next instanceof Error) throw next; return next; },
-    localState, store, enqueue: (_id, line) => { lines.push(line); }, now: () => now, log: (line) => { logs.push(line); },
+    localState, enqueue: (_id, line) => { lines.push(line); }, now: () => now, log: (line) => { logs.push(line); },
   });
   return {
     tick, lines, logs, judged: () => judged,
@@ -146,7 +135,7 @@ test("a shrinking set or a slots change wakes no one, a new id announces, and th
 
 test("localState: the first value never kicks, a change kicks, and a throwing localState is logged once", async () => {
   let key: string | Error = "a";
-  const h = harness(report([]), "on", AUTOPILOT_TICK_MS, async () => { if (key instanceof Error) throw key; return key; });
+  const h = harness(report([]), AUTOPILOT_TICK_MS, async () => { if (key instanceof Error) throw key; return key; });
   await h.at(0);
   await h.at(AUTOPILOT_KICK_QUIET_MS + 1_000);
   expect(h.judged()).toBe(1);
@@ -164,11 +153,9 @@ test("localState: the first value never kicks, a change kicks, and a throwing lo
   expect(h.judged()).toBe(3);
 });
 
-test("each tick writes the hour's shadow rows; an unreadable toodo is logged once and keeps the announced set", async () => {
+test("an unreadable toodo is logged once and keeps the announced set", async () => {
   const h = harness(report([launch(12), hold(13)]));
   await h.at(0);
-  const shadows = () => store.list({ lane: AUTOPILOT_LANE }).filter((op) => op.action === SHADOW_ACTION).map((op) => [op.target, op.detail]);
-  expect(shadows()).toEqual([["12@2026-01-01T12:00:00.000Z", "LAUNCH"], ["13@2026-01-01T12:00:00.000Z", "HOLD no-slot"]]);
   h.set(new Error("toodo-server list_tasks answered HTTP 401"));
   await h.at(AUTOPILOT_TICK_MS);
   await h.at(2 * AUTOPILOT_TICK_MS);
@@ -179,29 +166,18 @@ test("each tick writes the hour's shadow rows; an unreadable toodo is logged onc
   expect(h.lines).toEqual(["AUTOPILOT_READY #12 slots=1"]);
 });
 
-test("mode off judges nothing; shadow and a pause record rows but wake no one, and lifting the pause announces the set", async () => {
-  const off = harness(report([launch(12)], 1, "off"), "off");
-  off.tick.kick();
-  await off.at(0);
-  await off.at(AUTOPILOT_TICK_MS);
-  expect([off.judged(), off.lines, store.list({ lane: AUTOPILOT_LANE }).length]).toEqual([0, [], 0]);
-
-  const shadow = harness(report([launch(12)], 1, "shadow"), "shadow");
-  await shadow.at(0);
-  await shadow.at(AUTOPILOT_RENOTIFY_MS);
-  expect([shadow.judged(), shadow.lines]).toEqual([2, []]);
-  expect(store.list({ lane: AUTOPILOT_LANE }).filter((op) => op.action === SHADOW_ACTION).length).toBe(1);
-
-  const paused = harness(report([launch(12)], 1, "on", true));
+test("a pause judges but wakes no one, and lifting the pause announces the set", async () => {
+  const paused = harness(report([launch(12)], 1, true));
   await paused.at(0);
-  expect(paused.lines).toEqual([]);
+  await paused.at(AUTOPILOT_RENOTIFY_MS);
+  expect([paused.judged(), paused.lines]).toEqual([2, []]);
   paused.set(report([launch(12)]));
-  await paused.at(AUTOPILOT_TICK_MS);
+  await paused.at(AUTOPILOT_RENOTIFY_MS + AUTOPILOT_TICK_MS);
   expect(paused.lines).toEqual(["AUTOPILOT_READY #12 slots=1"]);
 });
 
 test("the tick period is the configured tickMs", async () => {
-  const h = harness(report([]), "on", 60_000);
+  const h = harness(report([]), 60_000);
   await h.at(0);
   await h.at(59_999);
   expect(h.judged()).toBe(1);

@@ -964,8 +964,8 @@ export const supervise = async (
     const enqueueDiscord = enqueueOf("discord");
     // AUTOPILOT_READY counts under the toodo source: it is what toodo's marked tasks add up to.
     const autopilot = new AutopilotTick({
-      mode: () => deps.config.autopilot.mode, tickMs: () => deps.config.autopilot.tickSec * 1000,
-      judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), store: ops, enqueue: enqueueOf("toodo"), now: deps.clock.now,
+      tickMs: () => deps.config.autopilot.tickSec * 1000,
+      judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), enqueue: enqueueOf("toodo"), now: deps.clock.now,
       localState: async () => autopilotLocalStateKey(ops, new Set((await deps.registry.open()).map((l) => l.key))),
       log: (line) => { console.error(line); },
     });

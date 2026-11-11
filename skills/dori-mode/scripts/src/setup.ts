@@ -116,6 +116,7 @@ export const pruneObsolete = (d: Pick<SetupDeps, "log">, stateDir: string, confi
   resolveManagedPanes(stateDir, config);
   for (const [from, to] of migrated.renamed) d.log(`SETUP_KEY_RENAMED ${from} -> ${to}`);
   for (const key of migrated.filled) d.log(`SETUP_KEY_SET ${key} (kept the built-in default it ran with; that default changed)`);
+  for (const [key, why] of migrated.dropped) d.log(`SETUP_KEY_REMOVED ${key} (${why})`);
   const { next, removed } = pruneDoriConfig(migrated.next);
   const removalsPath = join(stateDir, CONFIG_REMOVALS_FILE);
   const warned = readSeenKeys(removalsPath);

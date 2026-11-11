@@ -1,6 +1,6 @@
 # Autopilot
 
-Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). Config `autopilot.mode` decides how far it goes: `off` (the supervisor does not judge), `shadow` (the default: judged and recorded, nothing launches) or `on` (the supervisor wakes the lead with `AUTOPILOT_READY` and the lead launches). dori code itself never calls `dori launch`, never changes toodo and never merges. `dori autopilot launch` is the lead's reservation step for a launch it runs itself: it records the attempt in the ledger and launches nothing, and it refuses unless the mode is `on` and autopilot is not paused (`dori autopilot pause`). Shadow stays the default: switching to `on` is the owner's call.
+Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). Autopilot is always on: the supervisor judges the marked tasks, wakes the lead with `AUTOPILOT_READY`, and the lead launches; the task's mark alone decides whether it may run, and `dori autopilot pause` is the emergency stop. dori code itself never calls `dori launch`, never changes toodo and never merges. `dori autopilot launch` is the lead's reservation step for a launch it runs itself: it records the attempt in the ledger and launches nothing, and it refuses while autopilot is paused (`dori autopilot pause`).
 
 ## Flag contract
 
@@ -27,11 +27,11 @@ When the lane a row names closes, the close settles the row once and adds `outco
 
 `dori close` prints the line; a close the supervisor runs journals it as an urgent event under the id `autopilot-outcome:<key>`, so it is told once. A row the launch itself settled `failed` or `ambiguous` is left as it is.
 
-Shadow records are rows too: lane `autopilot`, action `autopilot-shadow`, target `<taskId>@<slot ISO>` (slot is the current hour floored, UTC), state `verified`, detail `<VERDICT> <reasons joined by ", ">`. Only `--record` writes them, one per task per hour.
+Rows with lane `autopilot` and action `autopilot-shadow` are judgment records an older dori wrote (shadow mode, now removed); nothing reads or writes them any more.
 
 ## Configuration
 
-Key `autopilot` in `config.json`; every field is optional. An invalid value or an unknown key throws a TypeError at load naming the key. The bundle design's keys (`workspaces`, `bundleExpiryDays`, `wip`, `wipCap`, `attemptCap`, `onRevoke`) are ignored with one `CONFIG_AUTOPILOT_KEYS_IGNORED` line.
+Key `autopilot` in `config.json`; every field is optional. An invalid value or an unknown key throws a TypeError at load naming the key. The bundle design's keys (`workspaces`, `bundleExpiryDays`, `wip`, `wipCap`, `attemptCap`, `onRevoke`) and the removed `mode` (any value; autopilot is always on) are ignored with one `CONFIG_AUTOPILOT_KEYS_IGNORED` line. `dori setup` (`--migrate` included) removes `autopilot.mode` from `config.json` once, at schema version 7, logging `SETUP_KEY_REMOVED autopilot.mode (...)`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -39,7 +39,6 @@ Key `autopilot` in `config.json`; every field is optional. An invalid value or a
 | `quotaUnreadable` | `"hold"` | Only value in v1: unreadable quota holds (`quota-unreadable`). |
 | `mergeBase` | `"dev"` | Autopilot lanes merge into this branch only. |
 | `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
-| `mode` | `"shadow"` | `"off"`: the supervisor's tick does not judge and writes nothing. `"shadow"`: the tick judges and writes shadow rows, never wakes the lead, and `launch` refuses. `"on"`: the tick also wakes the lead with `AUTOPILOT_READY`, and `launch` may reserve. |
 | `tickSec` | `300` | Seconds between the supervisor's ticks, an integer from 30 to 3600. |
 
 Both apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
@@ -84,41 +83,38 @@ The default machine's free slots are `guard.panesMax` minus its panes (the runne
 Lead-only; inside a lane each one exits with `LANE_PERMISSION_DENIED`.
 
 ```
-dori autopilot candidates [--tasks 12,13] [--json] [--record]
+dori autopilot candidates [--tasks 12,13] [--json]
 dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
 dori autopilot pause [--reason TEXT]
 dori autopilot resume
 ```
 
-- `candidates` judges every planned task marked for autopilot, plus the `--tasks` ids. It's read-only unless `--record` is given, which writes shadow rows only. Text output:
+- `candidates` judges every planned task marked for autopilot, plus the `--tasks` ids. It is read-only. Text output:
 
   ```
-  AUTOPILOT mode=shadow record-only: nothing launches slots=<n|unlimited> candidates=<n>
+  AUTOPILOT slots=<n|unlimited> candidates=<n>
   AUTOPILOT_CANDIDATE #12 LAUNCH would-launch
   AUTOPILOT_CANDIDATE #13 HOLD no-slot
   AUTOPILOT_CANDIDATE #14 REFUSE owner-ref-missing, criteria-missing
   ```
 
-  The header reads `AUTOPILOT mode=on slots=<n> candidates=<n>` only in mode `on` without a pause; otherwise it says `record-only: nothing launches`, with `paused` after the mode while a pause is in force. With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ mode, paused, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit). Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
-- `launch <taskId>` reserves the task's next launch attempt. Unless the mode is `on` it prints `AUTOPILOT_LAUNCH_REFUSED #<id> mode=<mode>: nothing launches unless autopilot.mode is "on"`, and while paused `AUTOPILOT_LAUNCH_REFUSED #<id> paused since <ISO>[: <reason>] (dori autopilot resume lifts it)`; both exit 1 before reading anything. Otherwise it holds a state lock (`<stateDir>/autopilot-launch.lock.sqlite`) while it reads toodo, the ledger, open lanes, quota and the host again, and judges the task among every marked task as `candidates` does. Another task's reservation that is not running as a lane yet takes one of the host's free slots, since its pane does not exist yet. Only on LAUNCH it writes the `planned` row and prints `AUTOPILOT_RESERVED #<id> lane=ap-<id>-<n> attempt=<n>` (exit 0). Otherwise it prints `AUTOPILOT_LAUNCH_REFUSED #<id> <HOLD|REFUSE> <reasons>` and writes nothing (exit 1). A second reserve of the same task holds `lane-live`, so handling one event twice launches once.
-- `launch <taskId> --launched <laneKey>` settles the open reservation as `verified` (the key must be the reserved one, else `AUTOPILOT_LANE_MISMATCH`, exit 1). `--failed` settles it `failed` when the launch surely did not happen, and `--ambiguous` settles it `ambiguous` when that cannot be told; `--note` adds why to the row. Each prints `AUTOPILOT_SETTLED #<id> attempt=<n> <state> lane=<key>`; with no open reservation, `AUTOPILOT_NO_RESERVATION #<id>` (exit 1). A settled attempt is never retried by itself: `failed` and a closed lane refuse `already-attempted`, `ambiguous` also refuses `ledger-ambiguous`. Settling works in any mode and while paused, so a launch already under way can still be recorded.
+  While a pause is in force the header reads `AUTOPILOT paused: nothing launches slots=<n> candidates=<n>`. With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ paused, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit). Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
+- `launch <taskId>` reserves the task's next launch attempt. While paused it prints `AUTOPILOT_LAUNCH_REFUSED #<id> paused since <ISO>[: <reason>] (dori autopilot resume lifts it)` and exits 1 before reading anything. Otherwise it holds a state lock (`<stateDir>/autopilot-launch.lock.sqlite`) while it reads toodo, the ledger, open lanes, quota and the host again, and judges the task among every marked task as `candidates` does. Another task's reservation that is not running as a lane yet takes one of the host's free slots, since its pane does not exist yet. Only on LAUNCH it writes the `planned` row and prints `AUTOPILOT_RESERVED #<id> lane=ap-<id>-<n> attempt=<n>` (exit 0). Otherwise it prints `AUTOPILOT_LAUNCH_REFUSED #<id> <HOLD|REFUSE> <reasons>` and writes nothing (exit 1). A second reserve of the same task holds `lane-live`, so handling one event twice launches once.
+- `launch <taskId> --launched <laneKey>` settles the open reservation as `verified` (the key must be the reserved one, else `AUTOPILOT_LANE_MISMATCH`, exit 1). `--failed` settles it `failed` when the launch surely did not happen, and `--ambiguous` settles it `ambiguous` when that cannot be told; `--note` adds why to the row. Each prints `AUTOPILOT_SETTLED #<id> attempt=<n> <state> lane=<key>`; with no open reservation, `AUTOPILOT_NO_RESERVATION #<id>` (exit 1). A settled attempt is never retried by itself: `failed` and a closed lane refuse `already-attempted`, `ambiguous` also refuses `ledger-ambiguous`. Settling works while paused too, so a launch already under way can still be recorded.
 - `pause [--reason TEXT]` writes `<stateDir>/autopilot-pause.json` and prints `AUTOPILOT_PAUSED since <ISO>[: <reason>]` (` (already paused)` when one was in force; the first is kept). While it is in force, `launch` refuses new reservations and the tick wakes no one; lanes already running go on to their claim. A pause file that cannot be read still counts as paused. `resume` removes it (`AUTOPILOT_RESUMED`, or `AUTOPILOT_NOT_PAUSED`). Both exit 0. Use pause to stop autopilot at once without editing the config.
 
 ## Supervisor tick
 
-The supervisor judges the same candidates itself every `autopilot.tickSec` (5 minutes by default). A toodo task event (`tasks-changed` included) or a local change (a reservation, its settle, a lane opening or closing) brings the next judging forward: it runs once things are quiet for 10 s, and at most 60 s after the first change. Each judging writes the hour's shadow rows. In mode `off` it judges nothing. In mode `shadow`, or while paused, it stops there. In mode `on` it wakes the lead with urgent `AUTOPILOT_READY #12,#15 slots=<n|unlimited>` only when a task id joins the LAUNCH set; a set that only shrinks, or whose slots change, is remembered silently. Every 30 minutes after the last wake, while a LAUNCH set still waits, it sends `AUTOPILOT_READY ... again` naming the current set; a tick with nothing to launch (or in shadow, or paused) forgets the set, so it is news again when it comes back or the pause lifts. A tick that cannot read toodo logs `AUTOPILOT_TICK_ERROR <why>` once and tries again at the next tick. The tick runs only while the `toodo` event source is enabled, and it replaced the hourly `autopilot-reconcile` schedule job, which the supervisor removes at startup (`AUTOPILOT_RECONCILE_JOB_REMOVED`).
+The supervisor judges the same candidates itself every `autopilot.tickSec` (5 minutes by default). A toodo task event (`tasks-changed` included) or a local change (a reservation, its settle, a lane opening or closing) brings the next judging forward: it runs once things are quiet for 10 s, and at most 60 s after the first change. While paused it stops there. Otherwise it wakes the lead with urgent `AUTOPILOT_READY #12,#15 slots=<n|unlimited>` only when a task id joins the LAUNCH set; a set that only shrinks, or whose slots change, is remembered silently. Every 30 minutes after the last wake, while a LAUNCH set still waits, it sends `AUTOPILOT_READY ... again` naming the current set; a tick with nothing to launch (or paused) forgets the set, so it is news again when it comes back or the pause lifts. A tick that cannot read toodo logs `AUTOPILOT_TICK_ERROR <why>` once and tries again at the next tick. The tick runs only while the `toodo` event source is enabled, and it replaced the hourly `autopilot-reconcile` schedule job, which the supervisor removes at startup (`AUTOPILOT_RECONCILE_JOB_REMOVED`).
 
 ## Rules for the lead
 
-- A `TOODO_TASK_READY` event never launches by itself: the supervisor's tick judges it (`dori autopilot candidates --tasks <id>` shows why an unmarked ready task would not run). Only a marked task that judges LAUNCH may run, and only in mode `on`; in `shadow` LAUNCH only records "would launch #<n>". Any other ready task is recorded, not launched.
-- `AUTOPILOT_READY` comes only in mode `on`. Take the named tasks through the order below: `dori autopilot launch <id>` judges each again under its lock, so a task that changed since the tick is refused there. The supervisor's tick replaces any periodic reconcile of your own; there is no `autopilot-reconcile` schedule job any more.
-- Never set `autopilot.mode` to `on` yourself: that needs the owner's explicit word. When the owner says to stop autopilot, run `dori autopilot pause --reason TEXT` (and `resume` when they say to go on); `mode: "off"` is for turning it off for good.
+- A `TOODO_TASK_READY` event never launches by itself: the supervisor's tick judges it (`dori autopilot candidates --tasks <id>` shows why an unmarked ready task would not run). Only a marked task that judges LAUNCH may run, and not while paused. Any other ready task is not launched.
+- `AUTOPILOT_READY` never comes while paused. Take the named tasks through the order below: `dori autopilot launch <id>` judges each again under its lock, so a task that changed since the tick is refused there. The supervisor's tick replaces any periodic reconcile of your own; there is no `autopilot-reconcile` schedule job any more.
+- Autopilot has no mode to set. When the owner says to stop autopilot, run `dori autopilot pause --reason TEXT` (and `resume` when they say to go on).
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
 - Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
 - A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them (`report_blocker` on it). On `AUTOPILOT_LANE_DONE` complete the task (`complete_task` with the PR as a ref), which lets its dependents become ready.
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
 - Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 
-## Leaving shadow mode
-
-This is the owner's call, not code: it is the `autopilot.mode` edit from `shadow` to `on`. Shadow ends after 7 days and 20 judgments, whichever comes later, with zero wrong would-launch verdicts and a passed restart and resync drill.

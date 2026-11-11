@@ -204,7 +204,7 @@ export type DoriConfig = {
   readonly placement: PlacementConfig;
   /** Lane drift signals (LANE_DRIFT). */
   readonly drift: DriftConfig;
-  /** `dori autopilot`: which owner-approved toodo tasks may run unattended, and its limits (shadow mode: judged only). */
+  /** `dori autopilot`: which owner-approved toodo tasks may run unattended, and its limits (always on; `dori autopilot pause` stops it). */
   readonly autopilot: AutopilotConfig;
 };
 

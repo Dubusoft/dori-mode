@@ -156,15 +156,15 @@ const USAGE = `dori <command> [options]
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
-  autopilot candidates [--tasks 12,13] [--json] [--record]
+  autopilot candidates [--tasks 12,13] [--json]
                                        lead-only, read-only: judge every planned toodo task marked for autopilot, plus --tasks
-                                       (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free slots; --record writes one
-                                       shadow row per task per hour); the supervisor runs the same every autopilot.tickSec (mode shadow or on)
+                                       (LAUNCH/HOLD/REFUSE with reasons, LAUNCH capped by the host's free slots); the supervisor
+                                       runs the same every autopilot.tickSec (autopilot is always on; pause is the only stop)
   autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
                                        lead-only, under a lock: re-judge the task and on LAUNCH reserve attempt <n> as lane
                                        ap-<taskId>-<n> (planned ledger row; exit 1 with the verdict otherwise); a settle flag closes
                                        the reservation as launched, failed or ambiguous (never retried by itself); a reserve
-                                       refuses unless autopilot.mode is "on" and autopilot is not paused
+                                       refuses while autopilot is paused
   autopilot pause [--reason TEXT] | autopilot resume
                                        lead-only: stop new autopilot reservations and AUTOPILOT_READY wakes until resume (running
                                        lanes go on to claim); kept in <stateDir>/autopilot-pause.json

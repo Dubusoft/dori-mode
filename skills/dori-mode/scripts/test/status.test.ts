@@ -45,6 +45,17 @@ const fixture = async (panes: unknown[] = [{ pane_id: "lead:p1", workspace_id: "
 };
 const lane = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, thread: "discord:1/2", brief: "/b", done: "d", openedAt: OPENED, ...extra });
 
+test("status shows autopilot on, or paused with its reason while dori autopilot pause is in force", async () => {
+  const f = await fixture();
+  const on = await collectStatus(f.deps);
+  expect(on.autopilot).toEqual({ paused: false });
+  expect(renderStatus(on)).toContain("\n- 오토파일럿: 켜짐 (autopilot 표시된 작업만 실행)\n");
+  await Bun.write(join(f.dir, "autopilot-pause.json"), JSON.stringify({ since: "2026-10-21T00:00:00.000Z", reason: "deploy freeze" }));
+  const paused = await collectStatus(f.deps);
+  expect(paused.autopilot).toEqual({ paused: true, since: "2026-10-21T00:00:00.000Z", reason: "deploy freeze" });
+  expect(renderStatus(paused)).toContain("\n- 오토파일럿: 일시정지 (2026-10-21T00:00:00.000Z부터: deploy freeze; dori autopilot resume)\n");
+});
+
 test("status lists working lanes with model, age and last progress; paused and closed lanes are left out", async () => {
   const f = await fixture();
   await f.registry.write(lane("alpha", { model: "m/one", lastProgressPost: "Write the tests" }));
