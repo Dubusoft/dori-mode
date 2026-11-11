@@ -293,6 +293,22 @@ test("macOS: a lane may rewrite its own login keychain and Claude Code's lock di
   expect(sb.profile).not.toContain(root);
 });
 
+test("macOS: a cwd-less lane may list the directories above its cwd (realpath opens them), but read nothing under them", async () => {
+  const { home, runner } = macHome();
+  const cwd = join(runner, "lanes", "lane-a");
+  mkdirSync(join(runner, "lanes", "lane-b"), { recursive: true });
+  mkdirSync(cwd);
+  const sb = await seatbelt(home, cwd, { DORI_LANE_KEY: "lane-a" });
+  const read = (p: string) => allows(sb, "file-read-data", p);
+
+  for (const ok of [join(home, ".dori"), runner, join(runner, "lanes"), join(cwd, "x")]) {
+    expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
+  }
+  for (const no of [join(home, ".dori", "env"), join(runner, "lanes", "lane-b"), join(runner, "lanes", "lane-b", "x"), join(runner, "keys"), join(runner, "briefs")]) {
+    expect({ no, read: read(no) }).toEqual({ no, read: false });
+  }
+});
+
 test("refresh selects the maintained macOS or Linux template from the injected native platform", () => {
   for (const platform of ["darwin", "linux"] as const) {
     const home = tempDir(), installed = installedLaneSandbox(home);
