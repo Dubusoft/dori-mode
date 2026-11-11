@@ -7,9 +7,13 @@
 #   LANE_SANDBOX_NO_CWD  directories too broad to make writable as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, made writable
 #   DORI_LANE_TOKEN_FILE the lane's own token file, readable
+#   LANE_SANDBOX_WORKTREES the runner's lane worktree root, made writable (the runner sets it from its policy)
+#   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is made writable
+#                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
 #
 # Seatbelt cannot hide or remap paths the way bubblewrap does; it only refuses access (EPERM). So the profile allows
 # reads almost everywhere and refuses writes by default, with a whitelist: the cwd (worktree) and its git common dir,
+# the runner's worktree root and the .git directories of the repos under its repos root,
 # the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner socket and bin, its
@@ -19,6 +23,8 @@
 set -eu
 
 SBX=/usr/bin/sandbox-exec
+# macOS's own OpenSSL-format root bundle (what curl and git use by default).
+CERTS=/etc/ssl/cert.pem
 
 # The real path of $1, which need not exist (a missing tail is appended to its nearest existing parent).
 canon() {
@@ -41,6 +47,9 @@ canon() {
 # $1's parent resolved, its last component kept: the path a symlink is reached by.
 canon_parent() { printf '%s/%s\n' "$(canon "$(dirname "$1")")" "$(basename "$1")"; }
 
+# $1 with every regex metacharacter escaped.
+re_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'; }
+
 # Splits $1 on ':' into SPLIT, without globbing.
 split_paths() { local IFS=:; set -f; SPLIT=($1); set +f; }
 
@@ -53,7 +62,7 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" d_rules="" gcd broad kc
+  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" gcd broad kc rr
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   param() { PARAMS+=(-D "$1=$(canon "$2")"); }
@@ -74,7 +83,7 @@ build_profile() {
   # -shm), and nothing else in Keychains, nor another user's keychain, is opened.
   kc=$(canon "$H/Library/Keychains/login.keychain-db")
   param_raw KEYCHAIN "$kc"
-  param_raw KEYCHAIN_TMP "^$(printf '%s' "$kc" | sed 's/[][\.*^$+?(){}|]/\\&/g')[.]sb-[^/]+\$"
+  param_raw KEYCHAIN_TMP "^$(re_escape "$kc")[.]sb-[^/]+\$"
   # Per-user temp and cache dirs under /var/folders (Xcode, clang module cache and other Apple tools use these, not TMPDIR).
   for p in "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || :)" "$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || :)"; do
     if [ -n "$p" ]; then w "$p"; fi
@@ -85,6 +94,16 @@ build_profile() {
   done
   # Only the verify directory itself: the rest of its parent stays read-only.
   if [ -n "${LANE_SANDBOX_VERIFY:-}" ]; then w "$LANE_SANDBOX_VERIFY"; fi
+  # A lane started without --cwd makes its worktree from a repo under reposRoot into the worktree root: the new
+  # worktree, and the repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>), but not the repo's working tree.
+  if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then w "$LANE_SANDBOX_WORKTREES"; fi
+  if [ -n "${LANE_SANDBOX_REPOS:-}" ]; then
+    rr=$(re_escape "$(canon "$LANE_SANDBOX_REPOS")")
+    param_raw REPOS_GIT "^$rr/[^/]+/[.]git(/|\$)"
+    param_raw REPOS_HOOKS "^$rr/[^/]+/[.]git/hooks(/|\$)"
+    g_rules="(allow file-write* (regex (param \"REPOS_GIT\")))"
+    d_rules="(deny file-write* (regex (param \"REPOS_HOOKS\")))"
+  fi
 
   broad=0
   case "$C" in / | /Users | "$H") broad=1 ;; esac
@@ -100,7 +119,7 @@ build_profile() {
       w "$gcd"
       # A hook written by a lane would run outside the sandbox at the next git command on the host.
       param HOOKS "$gcd/hooks"
-      d_rules="(deny file-write* (subpath (param \"HOOKS\")))"
+      d_rules="$d_rules (deny file-write* (subpath (param \"HOOKS\")))"
     fi
   fi
 
@@ -132,6 +151,7 @@ build_profile() {
 (allow default)
 (deny file-write*)
 (allow file-write*$w_rules)
+$g_rules
 (allow file-write* (literal (param \"KEYCHAIN\")) (regex (param \"KEYCHAIN_TMP\")))
 (allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/ttys[0-9]+\$\") (regex #\"^/dev/fd/[0-9]+\$\"))
 $d_rules
@@ -182,4 +202,8 @@ C=$(pwd -P)
 build_profile
 
 export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT"
+# omo starts its engine with an empty OpenSSL bundle (SSL_CERT_FILE/SSL_CERT_DIR under ~/.omo/engine-trust/defaults)
+# and its agent shell inherits it, so curl, git and gh there fail every TLS verification. With SSL_CERT_FILE already
+# set omo keeps it and only adds its own roots for itself; the system bundle is what these tools read by default.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -f "$CERTS" ]; then export SSL_CERT_FILE="$CERTS"; fi
 exec "$SBX" -p "$PROFILE" "${PARAMS[@]}" -- "$@"

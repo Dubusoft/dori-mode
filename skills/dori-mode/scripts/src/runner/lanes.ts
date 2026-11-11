@@ -8,7 +8,7 @@ import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane 
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
-import { checkCwd, laneCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
+import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
 import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { turnStop } from "./observe.ts";
@@ -26,7 +26,8 @@ export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } 
  * `lane.start` opens a herdr tab labelled with the lane key (or takes the idle shell pane `target` names), writes the
  * brief to `~/.dori/runner/briefs/<key>.md` (not /tmp), issues the lane a fresh 32-byte token, writes it to
  * `briefs/<key>.<gen>.token` (0600, one file per launch generation) and runs the agent of the requested profile from the runner's policy with
- * `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given) in front of it,
+ * `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given, and
+ * `LANE_SANDBOX_REPOS` / `LANE_SANDBOX_WORKTREES` when the policy has a repos or worktree root) in front of it,
  * so the token itself is never on a command line (shell history, process listings). Only the token's sha256 is kept,
  * in `lanes.json` (0600) with the lane's pane, tab and cwd; that file is the hello inventory. The agent runs inside
  * the herdr pane, not as a child of the runner, so a runner restart does not end it. After the agent is admitted the
@@ -429,11 +430,15 @@ export class RunnerLanes {
         throw e;
       }
     } else {
+      const worktreeRoot = effectiveWorktreeRoot(this.deps.policy);
       const env = [
         `DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`,
         ...(input.fileRun ? [`DORI_LANE_OUT=${quote(laneFilePaths(this.deps.runnerDir, key).output)}`] : []),
         ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
         ...(input.heavyMaxLoad !== undefined ? [`DORI_HEAVY_MAX_LOAD=${input.heavyMaxLoad}`] : []),
+        // Where a lane started without --cwd makes its worktree; the macOS lane-sandbox makes them writable.
+        ...(this.deps.policy.reposRoot !== undefined ? [`LANE_SANDBOX_REPOS=${quote(this.deps.policy.reposRoot)}`] : []),
+        ...(worktreeRoot !== undefined ? [`LANE_SANDBOX_WORKTREES=${quote(worktreeRoot)}`] : []),
       ];
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = [...env, ...argv.map(quote)].join(" ");

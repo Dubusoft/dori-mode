@@ -541,6 +541,16 @@ test("lane.start carries keywords and heavy env into the launch line, and a reco
   expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --session ses_123 'ulw set goal and work.");
 });
 
+test("lane.start hands the policy's repos and worktree roots to the lane sandbox, the worktree root defaulting under the repos root", async () => {
+  const policy = { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] } as const;
+  const both = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos", worktreeRoot: "/Users/u/work/worktrees" } });
+  await both.lanes.start(START);
+  expect(both.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/worktrees omo --model m1 ");
+  const repos = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos" } });
+  await repos.lanes.start(START);
+  expect(repos.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/repos/worktrees omo --model m1 ");
+});
+
 test("lane.start with a target runs in that idle shell pane, leaves it open on a failed run, and refuses a pane another lane holds", async () => {
   const t = setup();
   t.world.paneGet.p9 = { pane_id: "p9", workspace_id: "w1", tab_id: "t9", cwd: "/repo/wt" };
