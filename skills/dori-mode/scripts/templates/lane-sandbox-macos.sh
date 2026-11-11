@@ -16,8 +16,12 @@
 # the runner's worktree root and the .git directories of the repos under its repos root,
 # the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
-# devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner socket and bin, its
-# own brief and token), and ~/.dori/env and ~/.ssh private keys are refused outright. Every path is resolved first
+# devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
+# its own brief and token), and ~/.dori/env and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
+# are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
+# but the lane socket (sock/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
+# Host paths listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
+# refused outright, reads, writes and socket connects alike, over every rule above. Every path is resolved first
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
 set -eu
@@ -62,7 +66,7 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" gcd broad kc rr
+  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" gcd broad kc rr
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   param() { PARAMS+=(-D "$1=$(canon "$2")"); }
@@ -123,7 +127,7 @@ build_profile() {
     fi
   fi
 
-  for p in .dori/config.json .dori/src .dori/bin .dori/state .dori/heavy .dori/runner/sock .dori/runner/bin "runner-brief"; do
+  for p in .dori/config.json .dori/src .dori/bin .dori/state .dori/heavy .dori/runner/sock/lane .dori/runner/bin "runner-brief"; do
     case "$p" in runner-brief) r "$H/.dori/runner/briefs/$key.md" ;; *) r "$H/$p" ;; esac
   done
   if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then r "$DORI_LANE_TOKEN_FILE"; fi
@@ -141,6 +145,33 @@ build_profile() {
   param DOCKER_HOME "$H/.docker/run/docker.sock"
   param DOCKER_VAR /var/run/docker.sock
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
+  param LANE_SOCK "$H/.dori/runner/sock/lane"
+  param CONFIG "$H/.config"
+  param CONFIG_GH "$H/.config/gh"
+  param CONFIG_GIT "$H/.config/git"
+  # herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent, a symlink to the agent's socket: both names stay usable.
+  case "${SSH_AUTH_SOCK:-}" in
+    "$H"/.config/*)
+      param AGENT_SOCK "$SSH_AUTH_SOCK"
+      param_raw AGENT_LINK "$(canon_parent "$SSH_AUTH_SOCK")"
+      a_rules="(allow file-read* (literal (param \"AGENT_SOCK\")) (literal (param \"AGENT_LINK\")))
+(allow network-outbound (remote unix-socket (path-literal (param \"AGENT_SOCK\"))) (remote unix-socket (path-literal (param \"AGENT_LINK\"))))"
+      ;;
+  esac
+  if [ -f "$H/.dori/lane-sandbox-hide" ]; then
+    while IFS= read -r p || [ -n "$p" ]; do
+      p=${p%%#*}
+      p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      if [ -n "$p" ]; then
+        param "HIDE$n" "$p"
+        h_rules="$h_rules
+(deny file-read* (subpath (param \"HIDE$n\")))
+(deny file-write* (subpath (param \"HIDE$n\")))
+(deny network-outbound (remote unix-socket (subpath (param \"HIDE$n\"))))"
+        n=$((n + 1))
+      fi
+    done <"$H/.dori/lane-sandbox-hide"
+  fi
 
   # Later rules win over earlier ones in SBPL.
   # realpath() of a directory opens it, and omo resolves every parent of its cwd: a cwd-less lane's parents are
@@ -161,7 +192,13 @@ $d_rules
 (allow file-read-data (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_LANES\")))
 (allow process-exec (literal \"/bin/ps\") (with no-sandbox))
 (deny file-read* (literal (param \"DORI_ENV\")) (regex #\"/\\.ssh/id_[^/.]+\$\"))
+(deny file-read* (subpath (param \"CONFIG\")))
+(allow file-read* (subpath (param \"CONFIG_GH\")) (subpath (param \"CONFIG_GIT\")))
+(deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))
+(allow network-outbound (remote unix-socket (path-literal (param \"LANE_SOCK\"))))
+$a_rules
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
+$h_rules
 "
 }
 
