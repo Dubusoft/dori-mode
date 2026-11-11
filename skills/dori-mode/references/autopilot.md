@@ -31,11 +31,10 @@ Rows with lane `autopilot` and action `autopilot-shadow` are judgment records an
 
 ## Configuration
 
-Key `autopilot` in `config.json`; every field is optional. An invalid value or an unknown key throws a TypeError at load naming the key. The bundle design's keys (`workspaces`, `bundleExpiryDays`, `wip`, `wipCap`, `attemptCap`, `onRevoke`) and the removed `mode` (any value; autopilot is always on) are ignored with one `CONFIG_AUTOPILOT_KEYS_IGNORED` line. `dori setup` (`--migrate` included) removes `autopilot.mode` from `config.json` once, at schema version 7, logging `SETUP_KEY_REMOVED autopilot.mode (...)`.
+Key `autopilot` in `config.json`; every field is optional. An invalid value or an unknown key throws a TypeError at load naming the key. The bundle design's keys (`workspaces`, `bundleExpiryDays`, `wip`, `wipCap`, `attemptCap`, `onRevoke`) the removed `mode` (any value; autopilot is always on) and the removed `quotaMaxUsedPct` (an account now counts as spent only at 100%) are ignored with one `CONFIG_AUTOPILOT_KEYS_IGNORED` line. `dori setup` (`--migrate` included) removes `autopilot.mode` from `config.json` once, at schema version 7, logging `SETUP_KEY_REMOVED autopilot.mode (...)`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `quotaMaxUsedPct` | `80` | Any Claude account's 5h or 7d window at or above it holds (`quota-over-threshold`). |
 | `quotaUnreadable` | `"hold"` | Only value in v1: unreadable quota holds (`quota-unreadable`). |
 | `mergeBase` | `"dev"` | Autopilot lanes merge into this branch only. |
 | `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
@@ -69,8 +68,8 @@ HOLD is temporary; the next tick judges again:
 | --- | --- |
 | `waiting` | The task has a wait. A waiting in-progress task reads `planned` plus a wait, so it lands here too. |
 | `lane-live` | An open ledger row, a verified row whose lane is open, or a task ref `lane:<key>` naming an open lane. |
-| `quota-unreadable` | No Claude account's quota could be read. An unreadable account (expired token, failed request) is skipped while another is readable, and named in the candidates header (`quota-skipped: ...`) and JSON (`quotaSkipped`). |
-| `quota-over-threshold` | A Claude account's 5h or 7d window is at or above `quotaMaxUsedPct`. |
+| `quota-unreadable` | No account of the provider serving `defaultModel` (for `anthropic-subscription/...`, every Claude subscription account) could be read. An unreadable account (expired token, failed request) is skipped while another is readable, and named in the candidates header (`quota-skipped: ...`) and JSON (`quotaSkipped`). |
+| `quota-over-threshold` | Every readable account of that provider is spent: its 5h or 7d window is at 100%. One account with room is enough, since omo moves a lane off an account that hits its limit. When an account is spent, the candidates header names it and the ones with room (`quota-over: default (100%) quota-room: account-2 (40%)`, JSON `quotaOver` / `quotaRoom`). |
 | `host-hold` | `dori can-launch` holds the default machine. |
 | `no-slot` | The task would launch, but the host's free slots went to tasks ahead of it. |
 

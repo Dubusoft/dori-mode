@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type QuotaSummary, type ToodoTask } from "../src/autopilot.ts";
 import { type AutopilotDeps, autopilotMain, quotaSummary } from "../src/autopilot-cli.ts";
-import { type QuotaResult, readUsage } from "../src/claude-quota.ts";
+import { quotaProvidersFor, type QuotaResult, readUsage } from "../src/claude-quota.ts";
 import { JsonOperations } from "../src/operations.ts";
 import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
@@ -93,7 +93,7 @@ type Run = { code: number; out: string[]; err: string[] };
 /** `tasks` is toodo's whole task set; flaggedTasks returns its marked planned ones, as the real client does. */
 const harness = (
   tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set(),
-  quota: QuotaSummary = { readable: true, maxUsedPct: 10 },
+  quota: QuotaSummary = { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
 ) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
@@ -141,7 +141,7 @@ test("an expired Claude account is skipped and named; the readable one decides, 
   };
 
   const one = await summaryOf({ kind: "unavailable", provider: "anthropic", reason: "oauth-not-configured" }, expired, readable);
-  expect(one).toEqual({ readable: true, maxUsedPct: 55, skipped: ["default (token-expired)"] });
+  expect(one).toEqual({ readable: true, accounts: [{ name: "account-2", maxUsedPct: 55 }], skipped: ["default (token-expired)"] });
   const launch = await harness([task(12)], { ok: true }, T0 + 60_000, new Set(), one).run("candidates");
   expect(launch.out).toEqual(["AUTOPILOT slots=unlimited candidates=1 quota-skipped: default (token-expired)", "AUTOPILOT_CANDIDATE #12 LAUNCH would-launch"]);
 
@@ -152,6 +152,36 @@ test("an expired Claude account is skipped and named; the readable one decides, 
     paused: false, slots: null, candidates: [{ taskId: 12, verdict: "HOLD", reasons: ["quota-unreadable"] }],
     quotaSkipped: ["default (token-expired)", "account-2 (http-error 429)"],
   });
+});
+
+test("a spent account does not hold while another of the default model's provider has room; the header names both", async () => {
+  const claude = (account: string, fiveHour: number | undefined, weekly: number): QuotaResult => ({
+    kind: "success", provider: "claude-sdk-oauth", account,
+    windows: [...(fiveHour === undefined ? [] : [{ label: "Five-hour", remainingPercent: 100 - fiveHour }]), { label: "Weekly", remainingPercent: 100 - weekly }],
+  });
+  const codex: QuotaResult = { kind: "success", provider: "openai-codex", account: "codex", windows: [{ label: "5h", remainingPercent: 90 }] };
+  const summaryOf = async (...results: QuotaResult[]) => {
+    const read = await readUsage(async () => ({ results, text: "" }), T0, AbortSignal.timeout(5_000), quotaProvidersFor("anthropic-subscription/claude-opus-5-5"));
+    return quotaSummary(read.usage, read.skipped);
+  };
+
+  // The weekly-only account-2 has room; another provider's account never counts.
+  const room = await summaryOf(claude("default", 20, 100), claude("account-2", undefined, 40), codex);
+  expect(room).toEqual({ readable: true, accounts: [{ name: "default", maxUsedPct: 100 }, { name: "account-2", maxUsedPct: 40 }] });
+  const launch = await harness([task(12)], { ok: true }, T0 + 60_000, new Set(), room).run("candidates");
+  expect(launch.out).toEqual([
+    "AUTOPILOT slots=unlimited candidates=1 quota-over: default (100%) quota-room: account-2 (40%)", "AUTOPILOT_CANDIDATE #12 LAUNCH would-launch",
+  ]);
+
+  // A spent 5h window spends the account even with weekly room.
+  const spent = await summaryOf(claude("default", 30, 100), claude("account-2", 100, 40), codex);
+  const hold = await harness([task(12)], { ok: true }, T0 + 60_000, new Set(), spent).run("candidates", "--json");
+  expect(JSON.parse(hold.out.join("\n"))).toEqual({
+    paused: false, slots: null, candidates: [{ taskId: 12, verdict: "HOLD", reasons: ["quota-over-threshold"] }],
+    quotaOver: ["default (100%)", "account-2 (100%)"], quotaRoom: [],
+  });
+
+  expect(await summaryOf(codex)).toEqual({ readable: false });
 });
 
 test("toodo unreadable prints AUTOPILOT_TOODO_UNREADABLE and exits 1", async () => {

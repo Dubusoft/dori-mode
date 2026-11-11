@@ -36,7 +36,7 @@ import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/dis
 import { closeThreadButton, DiscordCommands } from "./messenger/discord-commands.ts";
 import { buttonRow } from "./messenger/discord-buttons.ts";
 import { discordOwnerConfigured, discordThread } from "./messenger/discord-inbound.ts";
-import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, skippedText, usageLine } from "./claude-quota.ts";
+import { lookupQuotaResults, NO_CLAUDE, quotaProvidersFor, quotaReport, readUsage, skippedText, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
 import { supervise, SUPERVISE_STOP_DEADLINE_MS, watchSecretStore } from "./supervise-loop.ts";
@@ -1073,10 +1073,19 @@ try {
       process.exit(0);
     }
     case "quota": {
-      const read = await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(30_000));
+      const { quotaSummary } = await import("./autopilot-cli.ts");
+      const { quotaAccountText, quotaSplit } = await import("./autopilot.ts");
+      const signal = AbortSignal.timeout(30_000);
+      const looked = await lookupQuotaResults()(signal);
+      const read = await readUsage(async () => looked, realClock.now(), signal);
+      // Autopilot judges the accounts of the provider serving defaultModel: it launches while any of them has room.
+      const judged = quotaSummary((await readUsage(async () => looked, realClock.now(), signal, quotaProvidersFor(config.defaultModel))).usage);
+      const { over, room } = quotaSplit(judged);
+      const autopilot = { readable: judged.readable, over, room };
       const skipped = read.skipped.length ? `\nQUOTA | skipped ${skippedText(read.skipped)}` : "";
-      if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null, skipped: read.skipped }, null, 2));
-      else console.log(`${read.usage ? usageLine(read.usage, config.displayTimeZone) : NO_CLAUDE}${skipped}\n\n${read.text}`);
+      const verdict = `\nQUOTA | autopilot ${!judged.readable ? "unreadable" : `room: ${room.map(quotaAccountText).join(", ") || "none"}${over.length ? `; spent: ${over.map(quotaAccountText).join(", ")}` : ""}`}`;
+      if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null, skipped: read.skipped, autopilot }, null, 2));
+      else console.log(`${read.usage ? usageLine(read.usage, config.displayTimeZone) : NO_CLAUDE}${skipped}${verdict}\n\n${read.text}`);
       break;
     }
     case "launch": {
