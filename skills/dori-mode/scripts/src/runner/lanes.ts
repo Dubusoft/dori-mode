@@ -307,6 +307,11 @@ export class RunnerLanes {
     return Object.values(this.records()).find((r) => r.pane === pane)?.key;
   }
 
+  /** The working directory recorded for lane `key`, if the runner owns it. */
+  cwdOf(key: string): string | undefined {
+    return this.records()[key]?.cwd;
+  }
+
   reportFiles(key: string): LaneOutputFiles | undefined {
     const record = this.record(key);
     if (!record.fileRun) return undefined;

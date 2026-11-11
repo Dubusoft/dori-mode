@@ -29,6 +29,7 @@ import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
 import { legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
+import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -51,6 +52,9 @@ export type DoctorDeps = {
   readonly which?: (cmd: string) => string | null | undefined;
   /** Test seam for the config source report: the environment loadConfig read (default process.env). */
   readonly env?: Readonly<Record<string, string | undefined>>;
+  /** Test seams for the secret store check: the store (default one under `home`) and the permission-bits lookup (default fs.statSync). */
+  readonly secretStore?: Pick<SecretStore, "dir" | "list" | "encryptionAvailable">;
+  readonly modeOf?: (path: string) => number | undefined;
 };
 
 const ok = (id: string, detail: string): Check => ({ id, level: "OK", detail });
@@ -468,8 +472,59 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
   return checks;
 };
 
+const fileModeOf = (path: string): number | undefined => {
+  try { return statSync(path).mode & 0o777; } catch { return undefined; }
+};
+
+/**
+ * The secret store, inspected without reading or decrypting any value: entry names and backends through the store's
+ * list, permission bits through stat. Warns on plain entries, a missing encryption backend, loose modes and allowlisted
+ * names (config `secrets`) that are not stored.
+ */
+export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | "run" | "secretStore" | "modeOf">): Promise<Check[]> => {
+  const id = "secret store";
+  const store = d.secretStore ?? new SecretStore({ dir: join(d.home, ".dori", "secrets"), run: d.run });
+  const modeOf = d.modeOf ?? fileModeOf;
+  let entries: readonly SecretEntry[];
+  try { entries = store.list(); }
+  catch (e) { return [warn(id, e instanceof SecretStoreError ? e.message : `cannot list ${store.dir}: ${e instanceof Error ? e.message : String(e)}`, `chmod 700 ${store.dir}`)]; }
+  const problems: string[] = [];
+  const fixes: string[] = [];
+  const plain = entries.filter((entry) => entry.backend === "plain");
+  if (plain.length) {
+    problems.push(`plain (unencrypted) entries: ${plain.map((entry) => entry.name).join(", ")}`);
+    fixes.push("re-add it with dori secret update NAME on a host where systemd-creds --user works");
+  }
+  if (entries.length && !(await store.encryptionAvailable())) {
+    problems.push("systemd-creds --user is unavailable");
+    fixes.push("install or enable systemd-creds --user (systemd 250+), then re-add the secrets");
+  }
+  const dirMode = modeOf(store.dir);
+  if (entries.length && dirMode !== undefined && dirMode !== 0o700) {
+    problems.push(`${store.dir} mode is ${dirMode.toString(8)}, not 700`);
+    fixes.push(`chmod 700 ${store.dir}`);
+  }
+  for (const entry of entries) {
+    const path = join(store.dir, `${entry.name}.${entry.backend === "plain" ? "plain" : "cred"}`);
+    const mode = modeOf(path);
+    if (mode !== undefined && mode !== 0o600) {
+      problems.push(`${path} mode is ${mode.toString(8)}, not 600`);
+      fixes.push(`chmod 600 ${path}`);
+    }
+  }
+  const allowed = Object.keys((d.config as { secrets?: Record<string, unknown> }).secrets ?? {});
+  const stored = new Set(entries.map((entry) => entry.name));
+  const missing = allowed.filter((name) => !stored.has(name));
+  if (missing.length) {
+    problems.push(`config secrets not in the store: ${missing.join(", ")}`);
+    fixes.push("dori secret add NAME for each");
+  }
+  if (problems.length) return [warn(id, problems.join("; "), fixes.join("; "))];
+  return [ok(id, entries.length ? `${entries.length} secrets, encrypted (systemd-creds)` : "no secrets stored")];
+};
+
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), secretStoreChecks(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

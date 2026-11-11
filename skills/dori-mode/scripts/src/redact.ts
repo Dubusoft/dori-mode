@@ -7,6 +7,18 @@ const MASK = "[REDACTED]";
 const SECRET_NAME = /(?:TOKEN|SECRET|KEY|COOKIE|PASSWORD|PASSWD)$|WEBHOOK|CREDENTIAL/i;
 const MIN_KNOWN_SECRET = 8;
 
+let storeSecrets = new Set<string>();
+
+/** Register secret-store values read by the supervisor or local runner for masking. */
+export const addKnownSecrets = (values: Iterable<string>): void => {
+  for (const value of values) if (value.length >= MIN_KNOWN_SECRET) storeSecrets.add(value);
+};
+
+/** Replace registered secret-store values read by the supervisor or local runner. */
+export const replaceKnownSecrets = (values: Iterable<string>): void => {
+  storeSecrets = new Set([...values].filter((value) => value.length >= MIN_KNOWN_SECRET));
+};
+
 let envCache: { readonly key: string; readonly values: readonly string[] } | undefined;
 
 /** Secret values of the dori env file (`~/.dori/env`), re-read when the file changes; none when it is absent or unreadable. */
@@ -32,7 +44,7 @@ const envFileSecrets = (): readonly string[] => {
 
 /** Exact-match masking of the secret values the env file and the process environment carry, longest value first. */
 const maskKnownSecrets = (text: string): string => {
-  const known = new Set(envFileSecrets());
+  const known = new Set([...envFileSecrets(), ...storeSecrets]);
   for (const [name, value] of Object.entries(process.env)) {
     if (value && value.length >= MIN_KNOWN_SECRET && SECRET_NAME.test(name)) known.add(value);
   }

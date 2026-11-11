@@ -17,10 +17,10 @@
 # the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
-# its own brief and token), and ~/.dori/env and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
+# its own brief and token), and ~/.dori/env, ~/.dori/secrets and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
 # are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
-# Host paths listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
+# Host paths outside ~/.dori listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
 # refused outright, reads, writes and socket connects alike, over every rule above. Every path is resolved first
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
@@ -142,6 +142,7 @@ build_profile() {
   param DORI_BRIEFS "$H/.dori/runner/briefs"
   param DORI_LANES "$H/.dori/runner/lanes"
   param DORI_ENV "$H/.dori/env"
+  param DORI_SECRETS "$H/.dori/secrets"
   param DOCKER_HOME "$H/.docker/run/docker.sock"
   param DOCKER_VAR /var/run/docker.sock
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
@@ -199,6 +200,9 @@ $d_rules
 $a_rules
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
 $h_rules
+(deny file-read* (subpath (param \"DORI_SECRETS\")))
+(deny file-write* (subpath (param \"DORI_SECRETS\")))
+(deny network-outbound (remote unix-socket (subpath (param \"DORI_SECRETS\"))))
 "
 }
 

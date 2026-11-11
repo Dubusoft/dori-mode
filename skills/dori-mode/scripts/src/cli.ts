@@ -39,7 +39,8 @@ import { discordOwnerConfigured, discordThread } from "./messenger/discord-inbou
 import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
-import { supervise, SUPERVISE_STOP_DEADLINE_MS } from "./supervise-loop.ts";
+import { supervise, SUPERVISE_STOP_DEADLINE_MS, watchSecretStore } from "./supervise-loop.ts";
+import { SecretStore, SecretStoreError } from "./secret-store.ts";
 import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
@@ -122,7 +123,7 @@ const laneContext = async (env: Readonly<Record<string, string | undefined>>, ru
 };
 
 // The lane-mode gate runs before anything else (help, setup, runner *, loadConfig): inside a lane dori takes only
-// report, claim-done, report ack, lane status and heavy, all over the runner's lane socket, and opens no registry,
+// report, claim-done, report ack, lane status, heavy and secret exec, all over the runner's lane socket, and opens no registry,
 // store, journal, inbox or state-dir file.
 {
   const laneRunnerDir = defaultRunnerDir();
@@ -178,7 +179,7 @@ const USAGE = `dori <command> [options]
   close  <key> --cancelled --reason TEXT [--force]   lead-only: close a lane whose work was cancelled or whose Done can never hold;
                                        Done signals are not checked, the lane is recorded closed as cancelled with the reason
                                        inside a lane (DORI_LANE_KEY, or a pane its runner knows) dori takes only report, claim-done, report ack,
-                                       lane status and heavy (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
+                                       lane status, heavy and secret exec (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
                                        supervisor (RUNNER_UNAVAILABLE, exit 2, while it is down)
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
@@ -234,6 +235,10 @@ const USAGE = `dori <command> [options]
   schedule list [--json] | schedule remove <name> | schedule run-now <name>   jobs with their next and last run; run one now
   repos add/remove <owner/repo>        manage this machine's GitHub watched repos
   repos list                          print this machine's watched repos as JSON
+  secret add NAME | secret update NAME   store a secret for lanes to request by name; the value is read from stdin only (hidden prompt on a terminal), never argv
+  secret list [--json]                 stored secret names and backend (systemd-creds or plain); values are never printed
+  secret delete NAME                   remove a stored secret
+  secret exec NAME... -- <cmd>         inside a lane: run cmd with the allowlisted secrets in its environment only
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
@@ -886,6 +891,39 @@ try {
       console.log(JSON.stringify(repos.list(), null, 2));
       break;
     }
+    case "secret": {
+      const [action, name, ...extra] = flags.positionals;
+      const usage = "usage: dori secret add NAME | dori secret update NAME | dori secret list [--json] | dori secret delete NAME";
+      if (action === "exec") die("SECRET_EXEC_LANE_ONLY dori secret exec runs inside a lane; it asks the runner for allowlisted names", 2);
+      if (extra.length || Object.keys(flags.values).some((flag) => flag !== "json" || action !== "list")) die(usage, 2);
+      const store = new SecretStore();
+      try {
+        if (action === "list" && name === undefined) {
+          const entries = store.list();
+          if (flags.values.json) console.log(JSON.stringify(entries.map(({ name: n, backend }) => ({ name: n, backend })), null, 2));
+          else for (const entry of entries) console.log(`${entry.name} ${entry.backend}`);
+        } else if (action === "delete" && name) {
+          store.delete(name);
+          console.log(`SECRET_DELETED ${name}`);
+        } else if ((action === "add" || action === "update") && name) {
+          let value: string;
+          if (process.stdin.isTTY) {
+            const { ttyPrompter } = await import("./setup-cli.ts");
+            value = await ttyPrompter().secret(`value for ${name}`, false);
+          } else {
+            const text = await Bun.stdin.text();
+            value = text.endsWith("\n") ? text.slice(0, -1) : text;
+          }
+          const entry = action === "add" ? await store.add(name, value) : await store.update(name, value);
+          console.log(`${action === "add" ? "SECRET_ADDED" : "SECRET_UPDATED"} ${entry.name} backend=${entry.backend}`);
+          if (entry.backend === "plain") console.error(`SECRET_PLAINTEXT_FALLBACK ${entry.name} stored as a 0600 plain file: systemd-creds --user is unavailable (see dori doctor)`);
+        } else die(usage, 2);
+      } catch (e) {
+        if (e instanceof SecretStoreError) die(e.message);
+        throw e;
+      }
+      break;
+    }
     case "wait": {
       const waits = new Waits(config.stateDir);
       if (flags.values.list) {
@@ -1027,8 +1065,9 @@ try {
       // dori update runs the code it started with, so the supervisor it restarts installs the new checkout's sandbox.
       try { const line = refreshLaneSandbox(homedir()); if (line) console.log(line); }
       catch (e) { console.error(`WARN lane sandbox: ${e instanceof Error ? e.message : String(e)}`); }
+      const stopSecretWatch = await watchSecretStore();
       try { await supervise(deps, controller.signal, { configFile: configPath() }); }
-      finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
+      finally { stopSecretWatch(); process.off("SIGINT", stop); process.off("SIGTERM", stop); }
       // Shutdown is done: leftover timers, sockets or child pipes must not hold the process.
       console.log("SUPERVISOR_STOPPED");
       process.exit(0);

@@ -34,6 +34,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("laneSandbox", "json", "Argv prefix that wraps every new local lane's agent command"),
   spec("guardMachines", "json", "Remote guard: machine label -> ssh target"),
   spec("runners", "json", "Per-runner (machine label) lead-side settings"),
+  spec("secrets", "json", "Store secrets each lane or repo may receive (names only, deny by default)"),
   spec("placement", "json", "Which machine a launch runs on"),
   spec("buttonHooks", "json", "Owner-only Discord button hooks: name -> argv"),
   spec("hooks", "json", "Hook commands (threadReply, transcribe)"),
