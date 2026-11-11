@@ -32,6 +32,7 @@ import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
+import { CLEANUP_STATUS_FILE, cleanupPaths, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
@@ -295,6 +296,23 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     };
     guardTick();
     const stopGuard = realEvery(GUARD_SAMPLE_MS, guardTick);
+    // The daily cleanup sweep of this host's caches and temp (cleanup.ts); `logs/cleanup.json` holds the last report.
+    const stopCleanup = startCleanup({
+      statusFile: join(ensureRunnerSubdir(runnerDir, RUNNER_PATHS.logs), CLEANUP_STATUS_FILE),
+      now: realClock.now, every: realEvery, log,
+      delay: (ms, fn) => { const timer = setTimeout(fn, ms); return () => { clearTimeout(timer); }; },
+      sweep: () => {
+        const owned = Object.values(runnerLanes.records()).map((r) => ({ key: r.key, cwd: r.cwd }));
+        return runCleanup({
+          paths: cleanupPaths(process.platform, process.env, homedir()), now: realClock.now(), run, log,
+          repos: workspaces().workspaces.map((w) => w.path),
+          openLanes: [...owned, ...observedOnly.map((l) => ({ key: l.key }))],
+          keepAgents: [cfg.leadCwd],
+          inUse: () => inUsePaths(process.platform, run, process.getuid?.()),
+          uid: process.getuid?.(),
+        });
+      },
+    });
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
@@ -373,6 +391,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       unwatchRepos();
       stopLaneSocket();
       stopGuard();
+      stopCleanup();
       stopPrune();
       stopOutboxTick();
       stopHealth();
