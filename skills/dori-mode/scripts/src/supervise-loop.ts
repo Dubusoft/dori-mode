@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch } from "node:fs";
+import { replaceKnownSecrets } from "./redact.ts";
+import { SecretStore } from "./secret-store.ts";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { alertsChannelOf, deliveryConfigError } from "./config.ts";
@@ -807,6 +809,37 @@ const settle = async (tasks: Promise<unknown> | undefined): Promise<void> => {
  * is tracked by the watchdog. Each startup step up to READY=1 is timed by `probe` (STARTUP_TIMINGS, STARTUP_SLOW <step>),
  * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
  */
+/**
+ * Registers every secret store value with the masking registry and re-registers on changes to the store directory
+ * (debounced). Failures are logged as SECRET_STORE_WATCH_FAILED and never thrown; a missing directory is not watched.
+ * Returns the function that stops the watch.
+ */
+export const watchSecretStore = async (
+  store: Pick<SecretStore, "dir" | "readAll"> = new SecretStore(),
+  log: (line: string) => void = (line) => { console.error(line); },
+  debounceMs = 500,
+): Promise<() => void> => {
+  const load = async (): Promise<void> => {
+    try { replaceKnownSecrets((await store.readAll()).values()); }
+    catch (e) { log(`SECRET_STORE_WATCH_FAILED ${e instanceof Error ? e.message : String(e)}`); }
+  };
+  await load();
+  if (!existsSync(store.dir)) return () => {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let watcher: FSWatcher;
+  try {
+    watcher = watch(store.dir, () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { void load(); }, debounceMs);
+    });
+    watcher.on("error", (e) => { log(`SECRET_STORE_WATCH_FAILED ${e.message}`); });
+  } catch (e) {
+    log(`SECRET_STORE_WATCH_FAILED ${e instanceof Error ? e.message : String(e)}`);
+    return () => {};
+  }
+  return () => { clearTimeout(timer); watcher.close(); };
+};
+
 export const supervise = async (
   deps: FlowDeps, signal: AbortSignal,
   options: Partial<Omit<SupervisorDiscordOptions, "emit">> & {

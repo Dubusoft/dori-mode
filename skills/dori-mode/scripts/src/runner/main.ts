@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
-import { LANE_SOCKET, serveLaneSocket } from "./lane-socket.ts";
+import { LANE_SOCKET, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
+import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
+import { SecretStore } from "../secret-store.ts";
+import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
 import { laneGitEffect } from "./lane-git.ts";
 import { runnerPolicy } from "./local-policy.ts";
 import { policyReloader } from "./policy-reload.ts";
@@ -294,7 +297,30 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
-    const stopLaneServe = serveLaneSocket(laneListener, runnerLanes, publish, log);
+    // Only the local runner hands out store secrets; a remote one answers the `secret` verb RUNNER_SECRET_UNSUPPORTED.
+    let laneSocketLanes: LaneSocketLanes = runnerLanes;
+    if (!remote) {
+      const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
+      laneSocketLanes = {
+        tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
+        notice: (key) => runnerLanes.notice(key),
+        keyForPane: (pane) => runnerLanes.keyForPane(pane),
+        reportFiles: (key) => runnerLanes.reportFiles(key),
+        secrets: secretGranter({
+          store: new SecretStore(),
+          rules: async () => (await loadConfig()).secrets,
+          laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
+          audit: (entry) => {
+            auditFile(entry);
+            log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")}${entry.reason ? ` reason=${entry.reason}` : ""}`);
+          },
+          runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
+        }),
+      };
+      // Store values are masked in this runner's output from the start, not only once a lane asked for them.
+      void new SecretStore().readAll().then((m) => { replaceKnownSecrets(m.values()); }, () => {});
+    }
+    const stopLaneServe = serveLaneSocket(laneListener, laneSocketLanes, publish, log);
     const stopLaneSocket = (): void => { stopLaneServe(); laneListener.close(); };
     // runner-config.json (and, on the local runner, the config.json its policy and guard defaults come from) apply
     // without a restart: a valid edit rewrites the live policy, an invalid one keeps the last good policy.

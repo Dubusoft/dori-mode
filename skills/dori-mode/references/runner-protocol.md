@@ -760,6 +760,13 @@ with the lane's token. The runner refuses a token that is not that key's own (`R
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
 the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
 
+**Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>", "names": ["NPM_TOKEN"]}`,
+sent by the lane's `dori secret exec NAME... -- <cmd>`. `names` holds 1 to 32 unique secret names (else
+`RUNNER_LANE_BAD_REQUEST`), and the token is checked first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "..."}}`;
+a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_MISSING`,
+`RUNNER_SECRET_FAILED`). Only the local runner grants; a remote runner answers `RUNNER_SECRET_UNSUPPORTED`. The reply is
+never journaled, logged or put in the outbox, and nothing is published to the supervisor. See [secrets.md](secrets.md).
+
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not
 have) is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). A `lane.report` becomes a row of the lane

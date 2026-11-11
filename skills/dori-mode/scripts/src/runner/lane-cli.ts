@@ -6,6 +6,7 @@ import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
 import { sampleLoad1 } from "../host-guard.ts";
 import { isReportKind } from "./report-kinds.ts";
 import { realClock, run as realRun, type Clock, type Runner } from "../run.ts";
+import { SECRET_NAME } from "../secret-name.ts";
 import type { Connector, Transport } from "./transport.ts";
 
 /**
@@ -17,7 +18,7 @@ import type { Connector, Transport } from "./transport.ts";
  * the same ones `dori heavy` on the host takes, so every footer on a machine shares one slot count.
  */
 
-export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy"] as const;
+export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret"] as const;
 
 /** How long a request keeps retrying a missing or refusing lane socket (a supervisor/runner restart), and how often. */
 export const LANE_SOCKET_RETRY_MS = 60_000;
@@ -31,6 +32,8 @@ export type LaneCliDeps = {
   readonly heavyDir?: string;
   readonly clock?: Clock;
   readonly spawn?: (argv: readonly string[]) => Promise<number>;
+  /** Runs a command with exactly this environment and resolves to its exit code; default Bun.spawn with inherited stdio. */
+  readonly spawnWithEnv?: (argv: readonly string[], env: Record<string, string>) => Promise<number>;
   readonly readFile?: (path: string) => string;
   /** The runner directory holding `briefs/<key>.token`; default `~/.dori/runner`. */
   readonly runnerDir?: string;
@@ -105,7 +108,7 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
   }
 };
 
-const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy";
+const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy and secret exec";
 
 export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): Promise<number> => {
   const [sub = "", ...rest] = args;
@@ -129,6 +132,22 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     done(reply);
     return 0;
   };
+  if (sub === "secret") {
+    const sep = rest.indexOf("--");
+    const names = sep >= 0 ? rest.slice(1, sep) : rest.slice(1);
+    const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
+    if (rest[0] !== "exec") { deps.err(`DORI_CLI_LANE_ONLY ${`secret ${rest[0] ?? ""}`.trim()}: ${LANE_ONLY_TEXT}`); return 2; }
+    if (!names.length || sep < 0 || !cmd.length || !names.every((n) => SECRET_NAME.test(n))) {
+      deps.err("usage: dori secret exec NAME [NAME...] -- <command ...>");
+      return 2;
+    }
+    let values: Record<string, string> = {};
+    const code = await send({ kind: "secret", names }, (reply) => { values = (reply.values ?? {}) as Record<string, string>; });
+    if (code !== 0) return code;
+    const base: Record<string, string> = {};
+    for (const [k, v] of Object.entries(deps.env)) if (typeof v === "string") base[k] = v;
+    return (deps.spawnWithEnv ?? (async (argv, env) => Bun.spawn([...argv], { env, stdout: "inherit", stderr: "inherit", stdin: "inherit" }).exited))(cmd, { ...base, ...values });
+  }
   if (sub === "heavy") {
     const sep = rest.indexOf("--");
     const label = rest[0];

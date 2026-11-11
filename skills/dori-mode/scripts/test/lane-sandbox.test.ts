@@ -107,6 +107,19 @@ test("each existing path in ~/.dori/lane-sandbox-hide is covered after every bin
   expect(argv).not.toContain(join(home, ".dori", "env"));
 });
 
+test("~/.dori/secrets is never bound, even with no ~/.dori/lane-sandbox-hide file", async () => {
+  const home = join(tempDir(), "home");
+  const secrets = join(home, ".dori", "secrets");
+  mkdirSync(secrets, { recursive: true });
+  writeFileSync(join(secrets, "NPM_TOKEN.cred"), "x");
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+
+  expect(existsSync(join(home, ".dori", "lane-sandbox-hide"))).toBe(false);
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
+  expect(argv.filter((a) => a === secrets || a.startsWith(`${secrets}/`))).toEqual([]);
+});
+
 test("every read-write mount under ~/.dori has its mount point created before ~/.dori turns read-only", async () => {
   const home = join(tempDir(), "home");
   const dori = join(home, ".dori");
@@ -371,6 +384,23 @@ test("macOS: each path in ~/.dori/lane-sandbox-hide is refused for reads, writes
   expect(allows(sb, "network-outbound", join(backup, "s.sock"))).toBe(false);
   expect(allows(sb, "file-read-data", join(root, "other"))).toBe(true);
   expect(sb.profile).not.toContain(root);
+});
+
+test("macOS: ~/.dori/secrets is refused for reads, writes and socket connects with no hide file", async () => {
+  const { home, wt } = macHome();
+  const secrets = join(home, ".dori", "secrets");
+  mkdirSync(secrets, { recursive: true });
+  writeFileSync(join(secrets, "NPM_TOKEN.cred"), "x");
+
+  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" });
+
+  expect(sb.params.DORI_SECRETS).toBe(secrets);
+  expect(sb.profile).toContain('(deny file-read* (subpath (param "DORI_SECRETS")))');
+  expect(sb.profile).toContain('(deny file-write* (subpath (param "DORI_SECRETS")))');
+  expect(sb.profile).toContain('(deny network-outbound (remote unix-socket (subpath (param "DORI_SECRETS"))))');
+  for (const op of ["file-read-data", "file-write-data", "network-outbound"] as const) {
+    expect({ op, ok: allows(sb, op, join(secrets, "NPM_TOKEN.cred")) }).toEqual({ op, ok: false });
+  }
 });
 
 test("macOS: a lane may rewrite its own login keychain and Claude Code's lock dir, but no other keychain file", async () => {

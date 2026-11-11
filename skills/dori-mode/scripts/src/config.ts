@@ -6,6 +6,7 @@ import { DEFAULT_DISPLAY_TIME_ZONE, validTimeZone } from "./display-time.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
+import { SECRET_NAME } from "./secret-name.ts";
 import { type StoreKind, storeOnDisk } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -162,6 +163,8 @@ export type DoriConfig = {
   readonly displayTimeZone: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
+  /** Store secrets a lane may receive, by name; a secret with no rule (or an empty one) goes to no lane. */
+  readonly secrets: Readonly<Record<string, SecretRule>>;
   /**
    * Argv prefix that wraps every new local lane's agent command (e.g. ["lane-sandbox"]). Absent from the file: DEFAULT_LANE_SANDBOX.
    * The lead is never wrapped.
@@ -235,6 +238,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadArgs: [],
   discordChannels: [],
   githubIssueAuthors: [],
+  secrets: {},
   worktreeRoot: "",
   heavySlots: 1,
   heavyKill: ["qemu-system", "emulator", "expo export"],
@@ -268,6 +272,25 @@ const laneRules = (raw: unknown): readonly string[] => {
 };
 
 export type LaneSandbox = { readonly command: readonly string[] };
+
+/** Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. */
+export type SecretRule = { readonly lanes: readonly string[]; readonly repos: readonly string[] };
+
+/** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?: string[], repos?: string[] } }. */
+const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
+  if (raw == null) return {};
+  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": { "lanes": [strings], "repos": [strings] } }`);
+  if (!isRecord(raw)) throw bad("");
+  const list = (value: unknown, name: string, field: string): readonly string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw bad(`.${name}.${field}`);
+    return value as string[];
+  };
+  return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
+    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => key !== "lanes" && key !== "repos")) throw bad(`.${name}`);
+    return [name, { lanes: list(rule.lanes, name, "lanes"), repos: list(rule.repos, name, "repos") }];
+  }));
+};
 
 /** Lead-side settings for one runner (config `runners.<label>`). */
 export type RunnerConfig = { readonly allowUnsandboxed?: boolean };
@@ -364,7 +387,7 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
+  "runners", "secrets", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -453,6 +476,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...merged,
     ...(alerts ? { alertsChannel: alerts } : {}),
     laneRules: laneRules(raw.laneRules),
+    secrets: secrets(raw.secrets),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),

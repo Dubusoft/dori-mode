@@ -6,8 +6,9 @@
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <leadCwd>/state/verify)
-# Host paths hidden from every lane (e.g. a backup of ~/.dori/env) are listed one per line in ~/.dori/lane-sandbox-hide
-# ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it.
+# Host paths outside ~/.dori hidden from every lane (e.g. ~/.secrets) are listed one per line in ~/.dori/lane-sandbox-hide
+# ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it. ~/.dori/env and
+# ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
 set -eu
 
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
@@ -74,7 +75,8 @@ opts+=(
 )
 
 # ~/.dori gets its own tmpfs that is made read-only after the ro binds, so
-# rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env stays hidden.
+# rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env and ~/.dori/secrets stay hidden, since nothing
+# under ~/.dori is bound from the host and no bind below names them.
 # Every rw mount point under it is created here: bwrap cannot mkdir one once it is read-only.
 opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state" --dir "$H/.dori/heavy")
 
