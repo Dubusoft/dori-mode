@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type Ran, run as realRun, type Runner } from "../src/run.ts";
 import {
-  branchPresence, capOutput, discoverWorktrees, GIT_OUTPUT_CAP, gitFacts, gitOpArgv, LaneGitError, laneGit, laneGitEffect, listWorktrees,
+  branchPresence, capOutput, discoverWorktrees, GIT_OUTPUT_CAP, gitFacts, gitOpArgv, LaneGitError, laneGit, laneGitEffect, listWorktrees, worktreeState,
 } from "../src/runner/lane-git.ts";
 
 type Script = (argv: readonly string[]) => Ran | undefined;
@@ -176,6 +176,51 @@ for (const [name, holder] of [
   }, 30_000);
 }
 
+test("omo's config migration and its backups alone leave a worktree clean and removable; any other change keeps it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lane-git-omo-"));
+  try {
+    const repo = join(dir, "repo");
+    const config = '{\n  // lane memory\n  "memory": { "agent": "dori-mode" },\n}\n';
+    const migrated = '{\n  "memory": { "agent": "dori-mode" },\n  "_migrations": ["2026-08-reasoning-unification"]\n}\n';
+    await realGit("init", "-q", "-b", "main", repo);
+    mkdirSync(join(repo, ".omo"));
+    writeFileSync(join(repo, ".omo/omo.jsonc"), config);
+    writeFileSync(join(repo, "a"), "a");
+    await realGit("-C", repo, "add", "-A");
+    await realGit("-C", repo, "commit", "-q", "-m", "a");
+    /** A lane worktree after omo migrated its config, with `change` applied on top. */
+    const worktree = async (name: string, change: (wt: string) => Promise<void> | void = () => {}) => {
+      const wt = join(dir, name);
+      await realGit("-C", repo, "worktree", "add", "-q", "-b", name, wt);
+      writeFileSync(join(wt, ".omo/omo.jsonc"), migrated);
+      writeFileSync(join(wt, ".omo/omo.jsonc.bak.2026-11-11T21-13-59-633Z"), config);
+      await change(wt);
+      return wt;
+    };
+    const dirty = async (wt: string) => (await worktreeState(realRun, { path: wt }, existsSync)).dirty;
+    const remove = (wt: string) => laneGit(realRun, { key: "k", op: "worktree-remove", root: repo, path: wt });
+
+    const noise = await worktree("noise");
+    expect(await dirty(noise)).toBe(false);
+    expect((await remove(noise)).code).toBe(0);
+    expect(existsSync(noise)).toBe(false);
+
+    const kept: Record<string, (wt: string) => Promise<void> | void> = {
+      "another file": (wt) => writeFileSync(join(wt, "a"), "work"),
+      "another config key": (wt) => writeFileSync(join(wt, ".omo/omo.jsonc"), migrated.replace('"dori-mode"', '"other"')),
+      "a staged config": async (wt) => { await realGit("-C", wt, "add", ".omo/omo.jsonc"); },
+      "an unparseable config": (wt) => writeFileSync(join(wt, ".omo/omo.jsonc"), "{ nope"),
+    };
+    for (const [i, [why, change]] of Object.entries(kept).entries()) {
+      const wt = await worktree(`kept-${i}`, change);
+      expect({ why, dirty: await dirty(wt) }).toEqual({ why, dirty: true });
+      expect({ why, code: (await remove(wt)).code }).not.toEqual({ why, code: 0 });
+      expect({ why, backup: existsSync(join(wt, ".omo/omo.jsonc.bak.2026-11-11T21-13-59-633Z")) }).toEqual({ why, backup: true });
+      expect({ why, restored: readFileSync(join(wt, ".omo/omo.jsonc"), "utf8") === config }).toEqual({ why, restored: false });
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30_000);
+
 test("a branch delete refuses when the worktree list cannot be read, without running the delete", async () => {
   const sha = "0123456789abcdef0123456789abcdef01234567";
   const { run, calls } = recording((argv) => argv.includes("worktree") ? { code: 128, out: "", err: "fatal: permission denied" } : ok());
@@ -195,7 +240,7 @@ test("laneGit returns a git refusal as data with output capped at 4 KiB", async 
   expect(Buffer.byteLength(r.out)).toBe(GIT_OUTPUT_CAP);
   expect(Buffer.byteLength(r.err)).toBeLessThanOrEqual(GIT_OUTPUT_CAP);
   expect(r.err.startsWith("fatal: contains modified files")).toBe(true);
-  expect(calls).toEqual([["git", "-C", "/repo", "worktree", "remove", "/repo/.wt/k"]]);
+  expect(calls).toEqual([["git", "-C", "/repo/.wt/k", "diff", "--cached", "--name-only"], ["git", "-C", "/repo", "worktree", "remove", "/repo/.wt/k"]]);
   const effect = await laneGitEffect(recording(() => ok("")).run, { key: "k", op: "branch-delete", root: "/repo", branch: "k" });
   expect(effect).toEqual({ detail: "git branch-delete k exit 0", result: { code: 0, out: "", err: "" } });
 });

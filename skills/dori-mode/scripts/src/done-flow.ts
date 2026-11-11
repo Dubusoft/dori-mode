@@ -449,7 +449,7 @@ const closeSequence = async (
     return { closed: false, lines: [...lines, ...cleanup, `OPERATION_AMBIGUOUS ${step.id} ${step.detail}`,
       `REFUSED ${lane.key}: the close stopped at an operation that may or may not have happened; check it, run dori ops resolve ${step.id} --as verified|retry, then close again`] };
   };
-  if (lane.machine) cleanup.push(remoteWorktreeNote(lane));
+  if (lane.machine) cleanup.push(remoteWorktreeNote(lane), ...(await remoteWorktrees(deps, lane)));
   const root = read.root;
   // A worktree an interrupted close already removed is no longer found; its operation still has to settle.
   const pending = store.list({ lane: lane.key }).filter((op) => op.action === "worktree-remove" && op.state !== "verified").map((op) => op.target);
@@ -658,7 +658,33 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
 };
 
 const remoteWorktreeNote = (lane: Lane): string =>
-  `worktree checks (unpushed/uncommitted) and cleanup skipped on machine ${lane.machine}: remote lanes keep their worktrees (D10); remote paths were not checked`;
+  `worktree checks (unpushed/uncommitted) skipped on machine ${lane.machine}: a remote lane closes without them (D10); its worktrees under its runner's worktree root are left to the closed-lane cleanup`;
+
+/** The worktree root a lane's cleanup may remove under: its runner's reported root, else (local lanes only) `config.worktreeRoot`. */
+const cleanupRoot = (deps: FlowDeps, lane: Lane): string => {
+  const reported = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(lane.machine));
+  return (reported || (lane.machine ? "" : deps.config.worktreeRoot)).replace(/\/+$/, "");
+};
+
+const under = (root: string, path: string): boolean => Boolean(root) && path.startsWith(`${root}/`) && !path.includes("..");
+
+/**
+ * The receipt lines of a remote lane's worktrees, found by its runner by key under its reported worktree root: each
+ * `worktree <path> kept: ...`, so closedWorktreeSweep removes it once it is clean and pushed. A runner that cannot
+ * answer never holds the close up.
+ */
+const remoteWorktrees = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
+  const root = cleanupRoot(deps, lane);
+  if (!root) return [];
+  let found: readonly { readonly path: string }[];
+  try {
+    found = (await deps.ops.inspect(lane, { git: true })).git?.worktrees ?? [];
+  } catch (e) {
+    return [`remote worktrees not read on machine ${lane.machine}: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`];
+  }
+  return [...new Set(found.map((w) => w.path.replace(/\/+$/, "")))].filter((p) => under(root, p))
+    .map((p) => `worktree ${p} kept: remote lane, removed by the closed-lane cleanup once clean and pushed`);
+};
 
 /** Worktrees a lane's close had to keep (`worktree <path> kept: ...` in its receipt), usually because they were dirty then. */
 const keptWorktrees = (lane: Lane): string[] => {
@@ -673,16 +699,19 @@ const keptWorktrees = (lane: Lane): string[] => {
 
 /**
  * Finish a closed lane's worktree cleanup: a worktree its close kept is removed once it is clean, only under
- * the local runner's reported worktree root, or `config.worktreeRoot` while that runner has reported none. Open lanes (working, not-done, paused, done-claimed) are never touched: their Done signals have
+ * the lane's runner's reported worktree root, or (local lanes) `config.worktreeRoot` while that runner has reported
+ * none. A remote lane's worktree, never checked for unpushed work at its close, also needs no commit that no remote
+ * has. Open lanes (working, not-done, paused, done-claimed) are never touched: their Done signals have
  * not all read back yet, and work can continue after a merge. Failures come back as LANE_WATCH_WARN lines.
  */
 export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
-  if (lane.machine || statusOf(lane) !== "closed") return [];
-  const reported = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(lane.machine));
-  const root = (reported || deps.config.worktreeRoot).replace(/\/+$/, "");
-  const kept = root ? keptWorktrees(lane).filter((wt) => wt.startsWith(`${root}/`) && !wt.includes("..")) : [];
+  if (statusOf(lane) !== "closed") return [];
+  const root = cleanupRoot(deps, lane);
+  const kept = keptWorktrees(lane).filter((wt) => under(root, wt));
   if (!kept.length) return [];
-  const [cwdThere = false, ...present] = await deps.ops.exists(undefined, [lane.cwd ?? deps.config.leadCwd, ...kept]);
+  const [cwdThere = false, ...present] = lane.machine
+    ? [false, ...(await deps.ops.exists(lane.machine, kept))]
+    : await deps.ops.exists(undefined, [lane.cwd ?? deps.config.leadCwd, ...kept]);
   const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.leadCwd;
   const removed: string[] = [];
   const out: string[] = [];
@@ -690,9 +719,10 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
     if (!present[i]) continue;
     const fact = await probeWorktree(deps, lane, wt);
     if (!fact || fact.error !== undefined || fact.dirty === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read git status of ${wt}: ${(fact?.error ?? "git lists no worktree there").slice(0, 160)}`);
-    else if (fact.dirty) continue;
+    else if (fact.dirty || (lane.machine && fact.ahead !== 0)) continue;
     else {
-      const r = await deps.ops.git(lane, { op: "worktree-remove", root: repo, path: wt });
+      // A remote worktree is removed from inside itself: the lane's repository path on that machine is not known here.
+      const r = await deps.ops.git(lane, { op: "worktree-remove", root: lane.machine ? wt : repo, path: wt });
       if (r.code === 0) removed.push(wt);
       else out.push(`LANE_WATCH_WARN ${lane.key} worktree ${wt} not removed: ${(r.err || r.out).slice(0, 160)}`);
     }

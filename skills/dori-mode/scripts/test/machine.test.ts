@@ -12,7 +12,7 @@ import { type Lane, statusOf } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";
 import { resolveSession } from "../src/session-id.ts";
 import { syncRegistry } from "../src/sync.ts";
-import { depsFor, fakeClock, newWorld, type OpsEntry, sent, withState, type World, withSqliteStore } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, type OpsEntry, sent, withState, type World, withSqliteStore, WT } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00Z");
 const MACHINE = "build host";
@@ -376,6 +376,28 @@ test("remote worktree checks and cleanup skip explicitly and never ask for git",
   expect(opsOf("git")).toEqual([]);
   expect(opsOf("inspect").some((e) => (e.args as { want: { git?: boolean } }).want.git)).toBe(false);
   expect(world.calls.some((argv) => argv[0] === "git")).toBe(false);
+  expectRemote();
+});
+
+test("a closed remote lane's worktrees under its runner's root are recorded at the close and removed once clean and pushed", async () => {
+  const d = { ...deps(), runnerWorktreeRoot: (label: string) => (label === MACHINE ? "/repo/.wt" : undefined) };
+  world.aheadCount = "1";
+  expect((await closeLane(d, lane(), "verified")).closed).toBe(true);
+  const closed = (await d.registry.read("remote-lane")) as Lane;
+  expect(closed.receipt).toMatchObject({ worktreeCheck: { status: "skipped" } });
+  // Only the lane's worktree under the root: the checkout at /repo is outside it.
+  expect((closed.receipt as { cleanup: string[] }).cleanup.filter((l) => l.startsWith("worktree /"))).toEqual([`worktree ${WT} kept: remote lane, removed by the closed-lane cleanup once clean and pushed`]);
+  expect(opsOf("git")).toEqual([]);
+  // A commit no remote has keeps it, and so does any change.
+  expect(await closedWorktreeSweep(d, closed)).toEqual([]);
+  world.aheadCount = "0";
+  world.dirty = " M file.ts\n";
+  expect(await closedWorktreeSweep(d, closed)).toEqual([]);
+  expect(opsOf("git")).toEqual([]);
+  world.dirty = "";
+  expect(await closedWorktreeSweep(d, closed)).toEqual([`WORKTREE_CLEANED remote-lane ${WT}`]);
+  expect(opsOf("git").map((e) => e.args)).toEqual([{ op: "worktree-remove", root: WT, path: WT }]);
+  expect(opsOf("exists").every((e) => (e.args as { machine?: string }).machine === MACHINE)).toBe(true);
   expectRemote();
 });
 
