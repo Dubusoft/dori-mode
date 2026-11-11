@@ -182,6 +182,8 @@ test("handled CLI persists task count and reply coverage through the real comman
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner alpha beta");
+  // Acked first, so the command needs no Discord call.
+  recordAck(f.state.dir, "11", "22", f.clock.now());
   const config = join(f.state.dir, "config.json");
   const persisted = Object.fromEntries(Object.entries(f.deps.config).filter(([key]) => (CONFIG_FILE_KEYS as readonly string[]).includes(key)));
   writeFileSync(config, JSON.stringify(persisted));

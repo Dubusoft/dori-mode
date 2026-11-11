@@ -2,9 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { ack, AckError, EYES_EMOJI, pendingAcks, recordHandled } from "../src/ack.ts";
+import { ack, AckError, EYES_EMOJI, handled, pendingAcks, recordHandled } from "../src/ack.ts";
 import { MessengerError } from "../src/messenger/http.ts";
-import { withState } from "./fakes.ts";
+import { withState, writeJournal } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -130,4 +130,59 @@ test("receipts of a removed channel left in the acks directory are ignored, Disc
   // Then only the Discord ack is pending, and the channel name is refused for new receipts.
   expect(pendingAcks(dir).map((a) => a.id)).toEqual(["discord:11:22"]);
   expect(() => recordHandled(dir, "toodo", "12", 1_000, { reply: true })).toThrow(AckError);
+});
+
+test("handled on a message never acked runs the ack first, then records the link marked auto-acked", async () => {
+  // Given an owner message the lead never acked.
+  const dir = state();
+  const r = reactions();
+  // When the lead marks it handled.
+  const outcome = await handled(dir, () => r, "11", "22", 1_000, { reply: true });
+  // Then it gets the same ack as dori ack, and the link says the ack was missing.
+  expect(outcome).toEqual({ autoAck: "acked" });
+  expect(r.ops).toEqual(["remove 11/22 \u23F3", `add 11/22 ${EYES_EMOJI}`, "typing 11"]);
+  const receipts = pendingAcks(dir);
+  expect(receipts.filter((receipt) => receipt.reply)).toMatchObject([{ id: "discord:11:22", autoAck: "acked" }]);
+  expect(receipts.filter((receipt) => !receipt.reply)).toHaveLength(1);
+});
+
+test.each(["pending", "tracked"])("handled on a message already acked (%s) changes no reaction", async (where) => {
+  // Given an ack the supervisor has not consumed yet, or one it already tracks.
+  const dir = state();
+  if (where === "pending") await ack(dir, reactions(), "11", "22", 1_000);
+  else writeJournal(dir, { events: [], awaitingAck: [{ id: "discord:11:22", since: 500, ackedAt: 1_000 }] });
+  // When the lead marks it handled.
+  const outcome = await handled(dir, () => { throw new Error("no Discord call expected"); }, "11", "22", 2_000, { lanes: ["alpha"] });
+  // Then only the link is recorded, with no auto-ack mark.
+  expect(outcome).toEqual({});
+  const link = pendingAcks(dir).find((receipt) => receipt.lanes);
+  expect(link).toMatchObject({ id: "discord:11:22", lanes: ["alpha"] });
+  expect(link?.autoAck).toBeUndefined();
+});
+
+test("a failed auto-ack still records the link, marked failed", async () => {
+  // Given an unacked message whose eyes reaction fails.
+  const dir = state();
+  // When the lead parks it on the owner's answer.
+  const outcome = await handled(dir, () => reactions({ react: new MessengerError("discord PUT: 500", 500) }), "11", "22", 1_000, { awaiting: true });
+  // Then the warning carries the error, and only the link is recorded.
+  expect(outcome).toEqual({ autoAck: "failed", error: "discord PUT: 500" });
+  expect(pendingAcks(dir)).toMatchObject([{ id: "discord:11:22", awaiting: true, autoAck: "failed" }]);
+});
+
+test("invalid handled input fails before any reaction", async () => {
+  const dir = state();
+  const r = reactions();
+  await expect(handled(dir, () => r, "11", "22", 1_000, {})).rejects.toBeInstanceOf(AckError);
+  await expect(handled(dir, () => r, "../11", "22", 1_000, { reply: true })).rejects.toBeInstanceOf(AckError);
+  expect(r.ops).toEqual([]);
+  expect(pendingAcks(dir)).toEqual([]);
+});
+
+test("a link whose auto-ack failed does not count as an ack: the next handled tries again", async () => {
+  const dir = state();
+  await handled(dir, () => reactions({ react: new MessengerError("discord PUT: 500", 500) }), "11", "22", 1_000, { awaiting: true });
+  const r = reactions();
+  expect(await handled(dir, () => r, "11", "22", 2_000, { reply: true })).toEqual({ autoAck: "acked" });
+  expect(r.ops).toEqual(["remove 11/22 \u23F3", `add 11/22 ${EYES_EMOJI}`, "typing 11"]);
 });

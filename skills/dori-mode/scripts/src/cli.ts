@@ -44,7 +44,7 @@ import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
-import { ack, AckError, AWAITING_NOTE_MAX, recordHandled } from "./ack.ts";
+import { ack, AckError, AWAITING_NOTE_MAX, handled } from "./ack.ts";
 import { checklistLine, InboxError, take, takeAwaitingReminders, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
@@ -270,7 +270,8 @@ const USAGE = `dori <command> [options]
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
                                        hourglass off, eyes on; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--awaiting [--note TEXT]]
-                                       link what handled an owner message, or park it on the owner's answer (--awaiting)
+                                       link what handled an owner message, or park it on the owner's answer (--awaiting);
+                                       acks it first (warning HANDLED_AUTO_ACKED) when no dori ack was recorded
   send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
                                        post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN);
                                        --to alerts is config alertsChannel, else the first discordChannels entry. A new post is refused with
@@ -1496,12 +1497,18 @@ try {
         if (!(await deps.registry.read(key))) die(`no registered lane "${key}"`);
       }
       const reply = parsed.values.reply === true;
-      recordHandled(config.stateDir, channel ?? "", message ?? "", realClock.now(), {
+      // A message the lead never acked is acked here first (hourglass off, eyes on), with a warning; a failed ack never
+      // blocks the link.
+      const discord = (): Discord => new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ??
+        (() => { throw new AckError(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`); })());
+      const outcome = await handled(config.stateDir, discord, channel ?? "", message ?? "", realClock.now(), {
         tasks: parsed.values.tasks === undefined ? undefined : Number(parsed.values.tasks),
         lanes: parsed.values.lane, reply, ...(parsed.values.all ? { all: true } : {}),
         ...(parsed.values.awaiting ? { awaiting: true } : {}),
         ...(parsed.values.note !== undefined ? { note: oneLine(parsed.values.note).slice(0, AWAITING_NOTE_MAX) } : {}),
       });
+      if (outcome.autoAck === "acked") console.log(`HANDLED_AUTO_ACKED ${channel} ${message}: no dori ack before dori handled, so it was acked now; run dori ack first next time`);
+      if (outcome.autoAck === "failed") console.error(`HANDLED_AUTO_ACK_FAILED ${channel} ${message}: no dori ack before dori handled and acking it now failed (${outcome.error}); handled is recorded anyway`);
       console.log(parsed.values.awaiting ? `HANDLED_AWAITING ${channel} ${message}` : `HANDLED_LINKED ${channel} ${message}`);
       break;
     }
