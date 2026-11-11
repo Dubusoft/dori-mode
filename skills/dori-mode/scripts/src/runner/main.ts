@@ -6,6 +6,8 @@ import { type Observation, pruneCommandRecords, resolveInterrupted } from "./dur
 import { RunnerLanes } from "./lanes.ts";
 import { LANE_SOCKET, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
 import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
+import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
+import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
 import { laneGitEffect } from "./lane-git.ts";
@@ -297,17 +299,39 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
-    // Only the local runner hands out store secrets; a remote one answers the `secret` verb RUNNER_SECRET_UNSUPPORTED.
+    // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
-    if (!remote) {
-      const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
+    if (remote) {
+      const linked = client;
       laneSocketLanes = {
         tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
         notice: (key) => runnerLanes.notice(key),
         keyForPane: (pane) => runnerLanes.keyForPane(pane),
         reportFiles: (key) => runnerLanes.reportFiles(key),
+        secrets: remoteSecretGranter({
+          client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log, onGranted: addKnownSecrets,
+        }),
+        // Proxy execution runs on the supervisor host: secret.run over the link.
+        secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
+      };
+    } else {
+      const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
+      const secretStore = new SecretStore();
+      const runOp = secretCommandRunner({
+        store: secretStore,
+        commands: async () => (await loadConfig()).secretCommands,
+        rules: async () => (await loadConfig()).secrets,
+        laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
+        audit: auditFile, log, runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
+      });
+      laneSocketLanes = {
+        tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
+        notice: (key) => runnerLanes.notice(key),
+        keyForPane: (pane) => runnerLanes.keyForPane(pane),
+        reportFiles: (key) => runnerLanes.reportFiles(key),
+        secretRun: (key, op) => runOp(key, op),
         secrets: secretGranter({
-          store: new SecretStore(),
+          store: secretStore,
           rules: async () => (await loadConfig()).secrets,
           laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
           audit: (entry) => {

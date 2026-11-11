@@ -39,13 +39,13 @@ test("without recorded endpoints doctor still checks local runner basics", () =>
 
 test("missing endpoints warn; a healthy runner is OK", () => {
   const s = setup();
-  addRunner(s.stateDir, "worker-a", 5);
-  addRunner(s.stateDir, "worker-b", 4);
+  addRunner(s.stateDir, "worker-a", 6);
+  addRunner(s.stateDir, "worker-b", 5);
   const checks = runnerChecks(s.deps);
   expect(checks.find((c) => c.id === "runner endpoints")?.level).toBe("WARN");
-  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 5, gen 4, restarts1h 0" });
+  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 6, gen 4, restarts1h 0" });
   // A runner one proto behind keeps its lanes but refuses every lane start and recover until it is upgraded.
-  expect(checks.find((c) => c.id === "runner worker-b")).toMatchObject({ level: "WARN", detail: "proto 4 refuses lane start and recover (they need proto 5)", fix: expect.stringContaining("dori runner install --machine worker-b") });
+  expect(checks.find((c) => c.id === "runner worker-b")).toMatchObject({ level: "WARN", detail: "proto 5 refuses lane start and recover (they need proto 6)", fix: expect.stringContaining("dori runner install --machine worker-b") });
 });
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
@@ -59,15 +59,15 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   expect(checks.find((c) => c.id === "runner endpoints")).toMatchObject({ level: "OK", detail: "worker-a=100.101.1.2:7411" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
-  expect(row?.detail).toBe("proto 7 is not 5 or 4; restart circuit open (3 restarts in the last hour)");
+  expect(row?.detail).toBe("proto 7 is not 6 or 5; restart circuit open (3 restarts in the last hour)");
 });
 
 test("a runner whose machine's herdr is down or hung is FAIL with the herdr command for that machine; up is OK", () => {
   const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "worker-a", 5);
-  addRunner(s.stateDir, "worker-b", 5);
+  addRunner(s.stateDir, "worker-a", 6);
+  addRunner(s.stateDir, "worker-b", 6);
   addRunner(s.stateDir, "worker-c", 3);
-  addRunner(s.stateDir, "worker-d", 5);
+  addRunner(s.stateDir, "worker-d", 6);
   markHerdr(s.stateDir, "worker-a", "down", NOW - 60_000);
   markHerdr(s.stateDir, "worker-b", "hung", NOW - 60_000);
   markHerdr(s.stateDir, "worker-c", "down", NOW - 60_000);
@@ -82,5 +82,5 @@ test("a runner whose machine's herdr is down or hung is FAIL with the herdr comm
     fix: "dori runner herdr restart --machine worker-b --yes (ends every lane pane there; without --yes it lists them)",
   });
   expect(checks.find((c) => c.id === "runner worker-c")?.fix).toBe("dori runner install --machine worker-c to upgrade (proto 3 has no host.herdr), then dori runner herdr start --machine worker-c");
-  expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 5, gen 4, restarts1h 0, herdr up" });
+  expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 6, gen 4, restarts1h 0, herdr up" });
 });

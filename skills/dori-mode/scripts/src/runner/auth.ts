@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import {
-  createHash, createHmac, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, sign,
+  createCipheriv, createDecipheriv, createHash, createHmac, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, sign,
   timingSafeEqual, verify, type KeyObject,
 } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -183,6 +183,16 @@ export const frameMac = (key: Buffer, frame: Frame): string => {
   return hmac(key, canonicalJson(rest)).toString("base64");
 };
 
+/** Direction of a secret box: supervisor to runner or runner to supervisor. */
+export type SecretDirection = "s2r" | "r2s";
+
+/** An AES-256-GCM box: base64 nonce and base64 ciphertext with the 16-byte tag appended. */
+export type SealedBox = { readonly n: string; readonly c: string };
+
+const SECRET_INFO = "dori-secret-1/";
+const GCM_NONCE_BYTES = 12;
+const GCM_TAG_BYTES = 16;
+
 /** One authenticated connection: seals outgoing frames and checks incoming ones. */
 export class Session {
   constructor(private readonly key: Buffer, /** sha256 of the handshake, binding later proofs to this session */ readonly transcriptHash: Buffer) {}
@@ -196,6 +206,40 @@ export class Session {
     if (typeof frame.mac !== "string") return false;
     const { mac: _mac, ...rest } = frame;
     return macMatches(hmac(this.key, canonicalJson(rest)), frame.mac);
+  }
+
+  /** Per-direction key: HKDF-SHA256 over the session key, salted with the transcript hash. */
+  private secretKey(direction: SecretDirection): Buffer {
+    return Buffer.from(hkdfSync("sha256", this.key, this.transcriptHash, `${SECRET_INFO}${direction}`, 32));
+  }
+
+  /**
+   * Seals `plaintext` for one frame: AES-256-GCM under the direction key with a fresh random nonce. `aad` (the
+   * carrying frame's `{ runner, gen, epoch, type, rid }`) is authenticated, so a box moved elsewhere fails to open.
+   */
+  sealSecret(direction: SecretDirection, aad: Record<string, string | number>, plaintext: string): SealedBox {
+    const nonce = randomBytes(GCM_NONCE_BYTES);
+    const cipher = createCipheriv("aes-256-gcm", this.secretKey(direction), nonce);
+    cipher.setAAD(Buffer.from(canonicalJson(aad)));
+    const body = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final(), cipher.getAuthTag()]);
+    return { n: nonce.toString("base64"), c: body.toString("base64") };
+  }
+
+  /** The plaintext of a box made by `sealSecret` with the same direction and `aad`; undefined on any failure, never throws. */
+  openSecret(direction: SecretDirection, aad: Record<string, string | number>, box: SealedBox): string | undefined {
+    try {
+      if (typeof box?.n !== "string" || typeof box.c !== "string") return undefined;
+      const nonce = Buffer.from(box.n, "base64");
+      const body = Buffer.from(box.c, "base64");
+      if (nonce.length !== GCM_NONCE_BYTES || nonce.toString("base64") !== box.n) return undefined;
+      if (body.length < GCM_TAG_BYTES || body.toString("base64") !== box.c) return undefined;
+      const decipher = createDecipheriv("aes-256-gcm", this.secretKey(direction), nonce);
+      decipher.setAAD(Buffer.from(canonicalJson(aad)));
+      decipher.setAuthTag(body.subarray(body.length - GCM_TAG_BYTES));
+      return Buffer.concat([decipher.update(body.subarray(0, body.length - GCM_TAG_BYTES)), decipher.final()]).toString("utf8");
+    } catch {
+      return undefined;
+    }
   }
 }
 

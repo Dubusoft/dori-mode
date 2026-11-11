@@ -12,9 +12,9 @@ import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
   decodeFrame, encodeFrame, LABEL_PATTERN, MAX_FRAME_BYTES, ProtocolError, supervisorCommand, supervisorControl,
-  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type InventoryLane, type JsonValue, type LaneStatus,
+  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type FrameHead, type InventoryLane, type JsonValue, type LaneStatus,
   type QueryBodies, type QueryType, type RejectCode, type RunnerControl, type RunnerEventBodies, type SupervisorCommandBodies,
-  type SupervisorCommandType,
+  type SupervisorCommandType, type SupervisorControlBodies,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
@@ -121,6 +121,21 @@ export const openRunnerJournal = (stateDir: string, now: () => number): RunnerJo
   };
 };
 
+/** A runner's request for secrets (`secret.get`) or for a proxy-executed secret command (`secret.run`). */
+export type SecretFrame = RunnerControl<"secret.get"> | RunnerControl<"secret.run">;
+
+/** What `HubHooks.onSecret` gets to answer a secret frame on the connection it came in on. */
+export type SecretReplyContext = {
+  /** The connection's auth session (to seal the answer), undefined on an unauthenticated link. */
+  readonly session: Session | undefined;
+  /** The proto the connection said hello with. */
+  readonly proto: number;
+  /** The envelope head of the answer (runner, gen, epoch); with type and rid it is the sealed box's aad. */
+  readonly head: FrameHead;
+  /** Sends a supervisor control frame on that connection (MAC'd like every frame); nothing when it closed. Seals nothing. */
+  reply<T extends "secret.value" | "secret.run.result">(type: T, body: SupervisorControlBodies[T]): void;
+};
+
 export type HubHooks = {
   /** An admitted hello (the runner's label and its hello body). */
   readonly onHello?: (label: string, body: RunnerControl<"hello">["body"]) => void;
@@ -131,6 +146,11 @@ export type HubHooks = {
   readonly onControl?: (label: string, frame: RunnerControl<"q.result">) => void;
   /** Every admitted, MAC-checked `cmd.status.result` (the answer to `RunnerAccept.status`). Never journaled. */
   readonly onStatus?: (label: string, frame: RunnerControl<"cmd.status.result">) => void;
+  /**
+   * Every admitted, MAC-checked `secret.get` / `secret.run`. Never journaled, its body never logged. Absent: answered
+   * `ok:false RUNNER_SECRET_UNSUPPORTED`.
+   */
+  readonly onSecret?: (label: string, frame: SecretFrame, ctx: SecretReplyContext) => void;
   /** The label's admitted connection closed (not called for a connection a newer one replaced). */
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
@@ -197,6 +217,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
   const head = (label: string, gen: number) => ({ runner: label, gen, epoch: hub.epoch });
   const serve = (transport: Transport): void => {
     let label: string | undefined;
+    let proto = 0;
     let session: Session | undefined;
     let phase: "start" | "proof" | "ready" | "done" = "start";
     let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
@@ -224,6 +245,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
         return;
       }
       label = hello.body.label;
+      proto = hello.body.proto;
       phase = "ready";
       const previous = current.get(label);
       current.set(label, { transport, gen: hello.body.gen, proto: hello.body.proto, send: reply });
@@ -324,6 +346,17 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
         }
         if (frame.type === "cmd.status.result") {
           hooks.onStatus?.(label, frame as RunnerControl<"cmd.status.result">);
+          return;
+        }
+        if (frame.type === "secret.get" || frame.type === "secret.run") {
+          const secret = frame as SecretFrame;
+          const answer = secret.type === "secret.get" ? "secret.value" : "secret.run.result";
+          const ctx: SecretReplyContext = {
+            session, proto, head: head(label, frame.gen),
+            reply: (type, body) => { reply(supervisorControl(ctx.head, type, body) as Frame); },
+          };
+          if (hooks.onSecret) hooks.onSecret(label, secret, ctx);
+          else ctx.reply(answer, { rid: secret.body.rid, ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "this supervisor does not serve secrets" });
           return;
         }
         reply(hub.handle(frame));
