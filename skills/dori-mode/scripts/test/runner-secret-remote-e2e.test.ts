@@ -9,8 +9,8 @@ import { RunnerHub } from "../src/runner/hub.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
 import { LANE_SOCKET, serveLaneSocket } from "../src/runner/lane-socket.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { remoteSecretGranter, remoteSecretHandles } from "../src/runner/remote-secrets.ts";
-import { supervisorGranter, supervisorHandles, supervisorSecretHandler } from "../src/runner/secret-serve.ts";
+import { remoteSecretGranter } from "../src/runner/remote-secrets.ts";
+import { supervisorGranter, supervisorSecretHandler } from "../src/runner/secret-serve.ts";
 import { acceptRunners } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import type { Connector, Transport } from "../src/runner/transport.ts";
@@ -29,12 +29,8 @@ import { withState } from "./fakes.ts";
 const LABEL = "r1";
 const HOST = "host-1";
 const VALUE = "dori-test-throwaway-123";
-const ORIGIN = "https://app.example.com";
-const RULES: Record<string, SecretRule> = {
-  API_TOKEN: { lanes: ["lane-a", "lane-b"], repos: [] }, OTHER_TOKEN: { lanes: ["nobody"], repos: [] },
-  WEB_PASSWORD: { lanes: ["lane-a"], repos: [], origins: [ORIGIN] },
-};
-const STORE: Record<string, string> = { API_TOKEN: VALUE, OTHER_TOKEN: VALUE, WEB_PASSWORD: VALUE };
+const RULES: Record<string, SecretRule> = { API_TOKEN: { lanes: ["lane-a", "lane-b"], repos: [] }, OTHER_TOKEN: { lanes: ["nobody"], repos: [] } };
+const STORE: Record<string, string> = { API_TOKEN: VALUE, OTHER_TOKEN: VALUE };
 /** The supervisor's registry: lane-b exists but belongs to another runner. */
 const OWNERS: Record<string, string> = { "lane-a": LABEL, "lane-b": "r2" };
 const TOKENS: Record<string, string> = { "lane-a": "token-a-0123456789", "lane-b": "token-b-0123456789" };
@@ -70,12 +66,13 @@ const system = async () => {
   const controlPath = join(supDir, "control");
   const listener = listenUnix(controlPath);
   const handled: Promise<void>[] = [];
-  const store = { read: async (name: string) => { if (!Object.hasOwn(STORE, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`); return STORE[name] as string; } };
   const handler = supervisorSecretHandler({
     laneOwner: (key) => OWNERS[key],
     runnerUnsandboxed: () => false,
-    granter: supervisorGranter({ stateDir: supDir, rules: async () => RULES, now: realClock.now, log, store }),
-    handles: supervisorHandles({ stateDir: supDir, rules: async () => RULES, now: realClock.now, log, store }),
+    granter: supervisorGranter({
+      stateDir: supDir, rules: async () => RULES, now: realClock.now, log,
+      store: { read: async (name) => { if (!Object.hasOwn(STORE, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`); return STORE[name] as string; } },
+    }),
     log,
   });
   const stopAccept = acceptRunners(hub, listener, { auth, log, onSecret: (label, frame, ctx) => { handled.push(handler(label, frame, ctx)); } });
@@ -126,8 +123,7 @@ const system = async () => {
       if (statSync(file).isFile()) expect(readFileSync(file).includes(VALUE)).toBe(false);
     }
   };
-  const handles = remoteSecretHandles({ client, laneRepo: async () => undefined, log, onGranted: (v) => { masked.push(...v); } });
-  return { lane, leakCheck, wire, logs, masked, handled, handles, runnerDir, supDir };
+  return { lane, leakCheck, wire, logs, masked, handled, runnerDir, supDir };
 };
 
 const secretFrames = (wire: readonly string[], type: string) => wire.map((l) => JSON.parse(l) as { type: string; body: Record<string, unknown> }).filter((f) => f.type === type);
@@ -170,27 +166,6 @@ describe("remote secrets end to end", () => {
     expect(run.err).toEqual(["RUNNER_LANE_AUTH_FAILED not lane-a's lane token"]);
     expect(existsSync(marker)).toBe(false);
     expect(secretFrames(s.wire, "secret.get")).toEqual([]);
-    await s.leakCheck();
-  });
-
-  test("a browser fill handle: issued and exchanged over the link, the value only inside a sealed box, one time only", async () => {
-    const s = await system();
-    const issued = await s.handles.issue("lane-a", "WEB_PASSWORD");
-    if (!issued.ok) throw new Error(issued.detail);
-    expect(await s.handles.exchange("lane-a", issued.handle, ORIGIN)).toEqual({ ok: true, value: VALUE });
-    expect(s.masked).toEqual([VALUE]);
-    expect(secretFrames(s.wire, "secret.exchange.result")[0]?.body).toMatchObject({ ok: true, sealed: { n: expect.any(String), c: expect.any(String) } });
-    // The handle itself crosses only sealed in the issue answer.
-    expect(secretFrames(s.wire, "secret.handle.result").map((f) => JSON.stringify(f).includes(issued.handle))).toEqual([false]);
-    expect(await s.handles.exchange("lane-a", issued.handle, ORIGIN)).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
-    // A rule without origins gets no handle; another runner's lane is forged.
-    expect(await s.handles.issue("lane-a", "API_TOKEN")).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
-    expect(await s.handles.issue("lane-b", "WEB_PASSWORD")).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: `lane-b is not a lane of runner ${LABEL}` });
-    const audit = readFileSync(join(s.supDir, "secret-audit.jsonl"), "utf8");
-    expect(audit.trim().split("\n").map((l) => { const e = JSON.parse(l); return [e.kind, e.allowed]; })).toEqual([
-      ["handle.issue", true], ["handle.exchange", true], ["handle.exchange", false], ["handle.issue", false],
-    ]);
-    for (const text of [audit, ...s.logs]) expect(text).not.toContain(issued.handle);
     await s.leakCheck();
   });
 

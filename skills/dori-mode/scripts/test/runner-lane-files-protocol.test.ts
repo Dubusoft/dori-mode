@@ -183,15 +183,15 @@ describe("lane file wire types: strict structure", () => {
   });
 });
 
-describe("proto 7 window", () => {
-  test("admits 7 and 6, rejects 5 with the update hint and 8 as newer", () => {
-    expect(PROTO).toBe(7);
-    expect(checkProto(7)).toEqual({ ok: true });
+describe("proto 6 window", () => {
+  test("admits 6 and 5, rejects 4 with the update hint and 7 as newer", () => {
+    expect(PROTO).toBe(6);
     expect(checkProto(6)).toEqual({ ok: true });
-    expect(checkProto(5)).toEqual({
-      ok: false, code: "RUNNER_PROTO_MISMATCH", detail: "runner proto 5 is too old for the supervisor (accepts 6..7); run dori runner update",
+    expect(checkProto(5)).toEqual({ ok: true });
+    expect(checkProto(4)).toEqual({
+      ok: false, code: "RUNNER_PROTO_MISMATCH", detail: "runner proto 4 is too old for the supervisor (accepts 5..6); run dori runner update",
     });
-    expect(checkProto(8)).toEqual({ ok: false, code: "RUNNER_PROTO_MISMATCH", detail: "runner proto 8 is newer than the supervisor (accepts 6..7)" });
+    expect(checkProto(7)).toEqual({ ok: false, code: "RUNNER_PROTO_MISMATCH", detail: "runner proto 7 is newer than the supervisor (accepts 5..6)" });
   });
 });
 

@@ -18,7 +18,7 @@ import { RunnerGuardBoard } from "./runner/guard.ts";
 import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
 import { type Delivery, laneOps, type LaneOps, machineRunner, runnerOf } from "./lane-ops.ts";
-import { supervisorCommandRunner, supervisorGranter, supervisorHandles, supervisorSecretHandler } from "./runner/secret-serve.ts";
+import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
 import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
@@ -1172,11 +1172,6 @@ export const supervise = async (
             commandRunner: supervisorCommandRunner({
               stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets,
               commands: async () => (await loadConfig()).secretCommands, now: deps.clock.now,
-              log: (line) => { console.log(line); },
-            }),
-            // Browser fill handles for remote lanes: one in-memory table here, shared by every runner (secret-handles.ts).
-            handles: supervisorHandles({
-              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets, now: deps.clock.now,
               log: (line) => { console.log(line); },
             }),
             log: (line) => { console.log(line); },

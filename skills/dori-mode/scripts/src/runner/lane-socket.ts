@@ -47,8 +47,6 @@ export type LaneSocketLanes = {
   readonly secrets?: (key: string, names: readonly string[]) => Promise<SecretGrant>;
   /** Runs a configured secret command for a lane; absent on a runner that does not support them. */
   readonly secretRun?: (key: string, op: string) => Promise<SecretRunResult>;
-  /** Issues a one-time browser-fill secret handle for a lane; absent on a runner without a browser proxy. The lane socket has no verb that exchanges a handle. */
-  readonly secretHandle?: (key: string, name: string) => Promise<{ ok: true; handle: string; expiresAt: number } | { ok: false; code: string; detail: string }>;
 };
 
 /** A `secretCommands` op name. */
@@ -75,8 +73,8 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
         reply({ ok: true, ...(key ? { key } : {}) });
         return;
       }
-      const known = req.kind === "status" || req.kind === "ack" || req.kind === "secret" || req.kind === "secret-run" || req.kind === "secret.handle" || isReportKind(req.kind);
-      if (!str(req.key) || !str(req.token) || !known) { bad("needs key, token, and a report kind, status, ack, secret, secret-run, secret.handle or whoami"); return; }
+      const known = req.kind === "status" || req.kind === "ack" || req.kind === "secret" || req.kind === "secret-run" || isReportKind(req.kind);
+      if (!str(req.key) || !str(req.token) || !known) { bad("needs key, token, and a report kind, status, ack, secret, secret-run or whoami"); return; }
       if (req.kind === "secret-run") {
         if (!lanes.tokenFor(req.key, req.token)) {
           log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=secret-run`);
@@ -95,23 +93,6 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
               ? { ok: true, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, truncated: result.truncated }
               : { ok: false, code: result.code, detail: result.detail });
           },
-          (error: unknown) => { reply({ ok: false, code: "RUNNER_SECRET_FAILED", detail: error instanceof Error ? error.message : String(error) }); },
-        );
-        return;
-      }
-      if (req.kind === "secret.handle") {
-        const name = req.name;
-        if (!str(name) || !SECRET_NAME.test(name)) { bad("secret.handle needs a valid secret name"); return; }
-        if (!lanes.tokenFor(req.key, req.token)) {
-          log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=secret.handle name=${name}`);
-          reply({ ok: false, code: "RUNNER_LANE_AUTH_FAILED", detail: `not ${req.key}'s lane token` });
-          return;
-        }
-        if (!lanes.secretHandle) { reply({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "this runner does not issue secret handles" }); return; }
-        const issue = lanes.secretHandle;
-        const key = req.key;
-        void Promise.resolve().then(() => issue(key, name)).then(
-          (result) => { reply(result.ok ? { ok: true, handle: result.handle, expiresAt: result.expiresAt } : { ok: false, code: result.code, detail: result.detail }); },
           (error: unknown) => { reply({ ok: false, code: "RUNNER_SECRET_FAILED", detail: error instanceof Error ? error.message : String(error) }); },
         );
         return;

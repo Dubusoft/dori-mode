@@ -9,9 +9,6 @@
 # Host paths outside ~/.dori hidden from every lane (e.g. ~/.secrets) are listed one per line in ~/.dori/lane-sandbox-hide
 # ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it. ~/.dori/env and
 # ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
-# The raw BrowserSkill daemon (~/.bsk, its socket) is absent: $HOME is a tmpfs and nothing binds it. Only the lane's own
-# browser proxy dir (~/.dori/runner/browser/<key>) is bound, read-only. The daemon's TCP ws_port on 127.0.0.1 cannot be
-# refused without a network namespace, so on Linux it stays reachable.
 set -eu
 
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
@@ -89,6 +86,10 @@ for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
   .npmrc .dori/config.json .dori/src .dori/bin; do
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
+# The real BrowserSkill home (daemon.json and its daemon.sock), read-only: a lane drives bsk directly. A unix socket
+# connect needs no write mount; a lane cannot rewrite daemon.json or bsk's state.
+bsk_home=${BSK_HOME:-$H/.bsk}
+opts+=(--ro-bind-try "$bsk_home" "$bsk_home")
 # The rest of ~/.config (other tools' credentials, herdr's control socket) stays out. The ssh agent socket may live
 # there (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent): that one path is bound on its own.
 case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac
@@ -96,8 +97,6 @@ case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH
 opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane" "$H/.dori/runner/sock/lane")
 # A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
-# The lane's own browser proxy dir (the runner's proxy socket and daemon.json), never another lane's.
-opts+=(--dir "$H/.dori/runner/browser/$key" --ro-bind-try "$H/.dori/runner/browser/$key" "$H/.dori/runner/browser/$key")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
 opts+=(--dir "$H/.dori/runner/briefs/$key.out")
 # The mount point of a lane started without --cwd, whose cwd is ~/.dori/runner/lanes/<key> (bound rw below as the cwd).

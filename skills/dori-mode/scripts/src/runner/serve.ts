@@ -121,16 +121,8 @@ export const openRunnerJournal = (stateDir: string, now: () => number): RunnerJo
   };
 };
 
-/**
- * A runner's request for secrets (`secret.get`), for a proxy-executed secret command (`secret.run`), for a browser fill
- * handle (`secret.handle`) or to exchange one (`secret.exchange`).
- */
-export type SecretFrame = RunnerControl<"secret.get"> | RunnerControl<"secret.run"> | RunnerControl<"secret.handle"> | RunnerControl<"secret.exchange">;
-/** The answer type of each secret frame. */
-export const SECRET_ANSWER_TYPE = {
-  "secret.get": "secret.value", "secret.run": "secret.run.result", "secret.handle": "secret.handle.result", "secret.exchange": "secret.exchange.result",
-} as const;
-export type SecretAnswerType = (typeof SECRET_ANSWER_TYPE)[SecretFrame["type"]];
+/** A runner's request for secrets (`secret.get`) or for a proxy-executed secret command (`secret.run`). */
+export type SecretFrame = RunnerControl<"secret.get"> | RunnerControl<"secret.run">;
 
 /** What `HubHooks.onSecret` gets to answer a secret frame on the connection it came in on. */
 export type SecretReplyContext = {
@@ -141,7 +133,7 @@ export type SecretReplyContext = {
   /** The envelope head of the answer (runner, gen, epoch); with type and rid it is the sealed box's aad. */
   readonly head: FrameHead;
   /** Sends a supervisor control frame on that connection (MAC'd like every frame); nothing when it closed. Seals nothing. */
-  reply<T extends SecretAnswerType>(type: T, body: SupervisorControlBodies[T]): void;
+  reply<T extends "secret.value" | "secret.run.result">(type: T, body: SupervisorControlBodies[T]): void;
 };
 
 export type HubHooks = {
@@ -155,7 +147,7 @@ export type HubHooks = {
   /** Every admitted, MAC-checked `cmd.status.result` (the answer to `RunnerAccept.status`). Never journaled. */
   readonly onStatus?: (label: string, frame: RunnerControl<"cmd.status.result">) => void;
   /**
-   * Every admitted, MAC-checked `secret.get` / `secret.run` / `secret.handle` / `secret.exchange`. Never journaled, its body never logged. Absent: answered
+   * Every admitted, MAC-checked `secret.get` / `secret.run`. Never journaled, its body never logged. Absent: answered
    * `ok:false RUNNER_SECRET_UNSUPPORTED`.
    */
   readonly onSecret?: (label: string, frame: SecretFrame, ctx: SecretReplyContext) => void;
@@ -356,9 +348,9 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           hooks.onStatus?.(label, frame as RunnerControl<"cmd.status.result">);
           return;
         }
-        if (frame.type === "secret.get" || frame.type === "secret.run" || frame.type === "secret.handle" || frame.type === "secret.exchange") {
+        if (frame.type === "secret.get" || frame.type === "secret.run") {
           const secret = frame as SecretFrame;
-          const answer = SECRET_ANSWER_TYPE[secret.type];
+          const answer = secret.type === "secret.get" ? "secret.value" : "secret.run.result";
           const ctx: SecretReplyContext = {
             session, proto, head: head(label, frame.gen),
             reply: (type, body) => { reply(supervisorControl(ctx.head, type, body) as Frame); },

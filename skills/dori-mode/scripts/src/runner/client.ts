@@ -3,7 +3,7 @@ import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
-  MAX_FRAME_BYTES, PROTO, SECRET_PROTO, HANDLE_PROTO, decodeFrame, secretsSupported, handlesSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  MAX_FRAME_BYTES, PROTO, SECRET_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
   type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
@@ -37,11 +37,8 @@ export const HEARTBEAT_MS = 15_000;
 export const SECRET_TIMEOUT_MS = 30_000;
 
 /** The secret frames a runner sends, and the answer type each one waits for. */
-export type SecretRequestType = "secret.get" | "secret.run" | "secret.handle" | "secret.exchange";
-const SECRET_ANSWER = {
-  "secret.get": "secret.value", "secret.run": "secret.run.result", "secret.handle": "secret.handle.result", "secret.exchange": "secret.exchange.result",
-} as const;
-type SecretAnswerType = (typeof SECRET_ANSWER)[SecretRequestType];
+export type SecretRequestType = "secret.get" | "secret.run";
+const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.result" } as const;
 
 /** The outcome of `secretRequest`: the opened box's plaintext (JSON, never logged), or a refusal with its code. */
 export type SecretReply =
@@ -257,8 +254,7 @@ export class RunnerClient {
    * Asks the supervisor over the authenticated link (`secret.get` or `secret.run`, a sealed control frame with a fresh
    * 32-hex rid) and resolves with the opened `s2r` box of the matching answer, or a refusal: `RUNNER_SECRET_FAILED`
    * when not connected, on a lost connection or a box that does not open; `RUNNER_SECRET_UNSUPPORTED` without an auth
-   * session; `RUNNER_SECRET_OUTDATED` when the supervisor's `hello.ok` proto is below `SECRET_PROTO` (`HANDLE_PROTO`
-   * for `secret.handle` / `secret.exchange`);
+   * session; `RUNNER_SECRET_OUTDATED` when the supervisor's `hello.ok` proto is below `SECRET_PROTO`;
    * `RUNNER_SECRET_TIMEOUT` after `SECRET_TIMEOUT_MS`; the supervisor's own code otherwise. Never rejects and never
    * logs a body.
    */
@@ -268,9 +264,6 @@ export class RunnerClient {
     if (!this.session) return Promise.resolve({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "unauthenticated link" });
     if (!secretsSupported(this.helloProto)) {
       return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; secrets need proto ${SECRET_PROTO}` });
-    }
-    if ((type === "secret.handle" || type === "secret.exchange") && !handlesSupported(this.helloProto)) {
-      return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; secret handles need proto ${HANDLE_PROTO}` });
     }
     const rid = randomBytes(16).toString("hex");
     return new Promise<SecretReply>((resolve) => {
@@ -291,8 +284,8 @@ export class RunnerClient {
     });
   }
 
-  /** Settles the open request an (already MAC-checked) secret answer frame answers; others are dropped. */
-  private secretAnswer(frame: AnySupervisorControl & { readonly type: SecretAnswerType }): void {
+  /** Settles the open request an (already MAC-checked) `secret.value` / `secret.run.result` answers; others are dropped. */
+  private secretAnswer(frame: AnySupervisorControl & { readonly type: "secret.value" | "secret.run.result" }): void {
     const body = frame.body;
     const pending = this.secrets.get(body.rid);
     if (!pending || pending.answer !== frame.type || !this.session) return;
@@ -406,8 +399,6 @@ export class RunnerClient {
       }
       case "secret.value":
       case "secret.run.result":
-      case "secret.handle.result":
-      case "secret.exchange.result":
         this.secretAnswer(frame);
         return;
       default:

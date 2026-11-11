@@ -26,6 +26,23 @@ const sandboxArgv = async (home: string, env: Record<string, string>): Promise<s
   return readFileSync(out, "utf8").split("\n");
 };
 
+test("the real BrowserSkill home is bound read-only, including an explicit BSK_HOME", async () => {
+  const home = join(tempDir(), "home");
+  const bskHome = join(home, ".bsk");
+  mkdirSync(bskHome, { recursive: true });
+  const bind = (argv: string[], path: string) => argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === path && argv[i + 2] === path);
+  const readWriteNames = (argv: string[], path: string) => argv.some((a, i) => (a === "--bind" || a === "--bind-try") && (argv[i + 1] === path || argv[i + 2] === path));
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+  expect(bind(argv, bskHome)).toBeGreaterThan(-1);
+  expect(readWriteNames(argv, bskHome)).toBe(false);
+
+  const customBskHome = tempDir();
+  const customArgv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", BSK_HOME: customBskHome });
+  expect(bind(customArgv, customBskHome)).toBeGreaterThan(-1);
+  expect(readWriteNames(customArgv, customBskHome)).toBe(false);
+});
+
 test("a sandboxed lane gets its own token file, the runner's lane socket, its brief and the runner's bin (read-only), its own lanes/<key> mount point, and nothing else of the runner dir or the env file", async () => {
   const home = join(tempDir(), "home");
   const runner = join(home, ".dori", "runner");
@@ -43,7 +60,7 @@ test("a sandboxed lane gets its own token file, the runner's lane socket, its br
   expect(tokenBind).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "browser", "lane-a"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "lane")]);
+  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "lane")]);
   // sock itself is only a mount point (--dir); the lane socket is the one thing bound into it.
   expect(argv.flatMap((a, i) => (argv[i + 1] === join(runner, "sock") ? [a] : []))).toEqual(["--dir"]);
   const input = join(runner, "briefs", "lane-a.files"), output = join(runner, "briefs", "lane-a.out");
@@ -271,11 +288,9 @@ const parseSbpl = (text: string): Sexp[] => {
 
 /**
  * Whether the profile lets `op` reach `path`: the last matching rule wins. "network-outbound" is a connect to the unix
- * socket at `path` (Seatbelt checks it apart from file reads). A `path` of the form `tcp:localhost:<port>` is a tcp connect
- * instead, matched only by `(remote tcp "localhost:<port>")`.
+ * socket at `path` (Seatbelt checks it apart from file reads).
  */
 const allows = (sb: Seatbelt, op: "file-read-data" | "file-write-data" | "network-outbound", path: string): boolean => {
-  const tcp = path.startsWith("tcp:");
   const str = (x: Sexp): string => {
     if (Array.isArray(x) && x[0] === "param") return sb.params[(x[1] as { raw: string }).raw] ?? "\0unset";
     return (x as { raw: string }).raw;
@@ -283,9 +298,7 @@ const allows = (sb: Seatbelt, op: "file-read-data" | "file-write-data" | "networ
   const matches = (filter: Sexp): boolean => {
     if (!Array.isArray(filter)) throw new Error(`unexpected filter ${JSON.stringify(filter)}`);
     const [kind, arg] = filter;
-    if (kind === "remote" && filter[1] === "unix-socket") return !tcp && matches(filter[2] as Sexp);
-    if (kind === "remote" && filter[1] === "tcp") return tcp && path.slice(4) === str(filter[2] as Sexp);
-    if (tcp) return false;
+    if (kind === "remote" && filter[1] === "unix-socket") return matches(filter[2] as Sexp);
     if (kind === "path-literal") return path === str(arg as Sexp);
     if (kind === "subpath") return path === str(arg as Sexp) || path.startsWith(`${str(arg as Sexp)}/`);
     if (kind === "literal") return path === str(arg as Sexp);
@@ -538,77 +551,4 @@ test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a m
   expect(argv[0]).toBe("-p");
   expect(argv[1]).toContain("(deny file-write*)");
   expect(argv.at(-1)).toBe("/usr/bin/true");
-});
-
-/** A real BrowserSkill home under `dir` with a daemon.json carrying `port`, and a lane-a / lane-b proxy dir under the runner. */
-const bskFixture = (dir: string, runner: string, port: string): void => {
-  mkdirSync(join(dir, "run"), { recursive: true });
-  writeFileSync(join(dir, "daemon.json"), `{"pid":1,"sock_path":"${join(dir, "run", "daemon.sock")}","ws_port":${port}}`);
-  for (const k of ["lane-a", "lane-b"]) {
-    mkdirSync(join(runner, "browser", k), { recursive: true });
-    writeFileSync(join(runner, "browser", k, "daemon.json"), "{}");
-  }
-};
-
-test("macOS: the raw BrowserSkill daemon's socket, files and ws_port are refused, and only the lane's own proxy dir and socket are reachable", async () => {
-  const { home, runner, wt } = macHome();
-  bskFixture(join(home, ".bsk"), runner, "40123");
-  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" });
-  const dial = (p: string) => allows(sb, "network-outbound", p);
-  const read = (p: string) => allows(sb, "file-read-data", p);
-
-  expect(dial(join(home, ".bsk", "run", "daemon.sock"))).toBe(false);
-  expect(read(join(home, ".bsk", "daemon.json"))).toBe(false);
-  expect(allows(sb, "file-write-data", join(home, ".bsk", "x"))).toBe(false);
-  expect(dial("tcp:localhost:40123")).toBe(false);
-  expect(dial("tcp:localhost:40124")).toBe(true);
-
-  const own = join(runner, "browser", "lane-a");
-  expect(dial(join(own, "daemon.sock"))).toBe(true);
-  expect(read(join(own, "daemon.json"))).toBe(true);
-  expect(allows(sb, "file-write-data", join(own, "daemon.json"))).toBe(false);
-  const other = join(runner, "browser", "lane-b");
-  expect(dial(join(other, "daemon.sock"))).toBe(false);
-  expect(read(join(other, "daemon.json"))).toBe(false);
-  // The own proxy socket is reachable by its own key only, and the lane socket rule is untouched.
-  expect(dial(join(runner, "sock", "lane"))).toBe(true);
-});
-
-test("macOS: LANE_SANDBOX_BSK_HOME names the real BrowserSkill home, and a ws_port that is not 1-65535 adds no tcp rule", async () => {
-  const { root, home, runner, wt } = macHome();
-  const real = join(root, "real-bsk");
-  bskFixture(real, runner, "41000");
-  bskFixture(join(home, ".bsk"), runner, "42000");
-  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_BSK_HOME: real, BSK_HOME: join(runner, "browser", "lane-a") });
-  expect(allows(sb, "network-outbound", join(real, "run", "daemon.sock"))).toBe(false);
-  expect(allows(sb, "file-read-data", join(real, "daemon.json"))).toBe(false);
-  expect(allows(sb, "network-outbound", "tcp:localhost:41000")).toBe(false);
-  // ~/.bsk is not the real home here, and BSK_HOME (the proxy dir) is never mistaken for it.
-  expect(allows(sb, "file-read-data", join(home, ".bsk", "daemon.json"))).toBe(true);
-  expect(allows(sb, "network-outbound", "tcp:localhost:42000")).toBe(true);
-  expect(allows(sb, "file-read-data", join(runner, "browser", "lane-a", "daemon.json"))).toBe(true);
-
-  for (const bad of ["0", "65536", "123456", "\"80\""]) {
-    bskFixture(real, runner, bad);
-    const s = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_BSK_HOME: real });
-    expect(s.profile).not.toContain("remote tcp");
-    expect(Object.values(s.params).some((v) => v.includes("localhost"))).toBe(false);
-  }
-});
-
-test("Linux: only the lane's own browser proxy dir is bound (read-only, before ~/.dori turns read-only), and no ~/.bsk path is", async () => {
-  const home = join(tempDir(), "home");
-  const runner = join(home, ".dori", "runner");
-  mkdirSync(join(home, ".bsk", "run"), { recursive: true });
-  bskFixture(join(home, ".bsk"), runner, "40123");
-  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_BSK_HOME: join(home, ".bsk") });
-  const own = join(runner, "browser", "lane-a");
-  const bind = argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === own && argv[i + 2] === own);
-  const doriRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori"));
-  expect(bind).toBeGreaterThan(-1);
-  expect(argv.findIndex((a, i) => a === "--dir" && argv[i + 1] === own)).toBeLessThan(bind);
-  expect(bind).toBeLessThan(doriRo);
-  expect(argv.some((a) => a.startsWith(join(runner, "browser", "lane-b")))).toBe(false);
-  expect(argv.some((a) => a.startsWith(join(runner, "browser")) && !a.startsWith(own))).toBe(false);
-  expect(argv.some((a) => a.startsWith(join(home, ".bsk")))).toBe(false);
 });
