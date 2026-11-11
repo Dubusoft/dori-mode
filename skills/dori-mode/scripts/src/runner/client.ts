@@ -1,8 +1,9 @@
+import { randomBytes } from "node:crypto";
 import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
-  MAX_FRAME_BYTES, PROTO, decodeFrame, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  MAX_FRAME_BYTES, PROTO, SECRET_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
   type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
@@ -32,6 +33,19 @@ export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
 export const RECONNECT_JITTER = 0.2;
 export const HEARTBEAT_MS = 15_000;
+/** How long `secretRequest` waits for the supervisor's answer before `RUNNER_SECRET_TIMEOUT`. */
+export const SECRET_TIMEOUT_MS = 30_000;
+
+/** The secret frames a runner sends, and the answer type each one waits for. */
+export type SecretRequestType = "secret.get" | "secret.run";
+const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.result" } as const;
+
+/** The outcome of `secretRequest`: the opened box's plaintext (JSON, never logged), or a refusal with its code. */
+export type SecretReply =
+  | { readonly ok: true; readonly plaintext: string }
+  | { readonly ok: false; readonly code: string; readonly detail: string };
+
+type PendingSecret = { readonly answer: string; readonly transport: Transport; readonly settle: (reply: SecretReply) => void };
 
 /**
  * Waits one turn of the event loop. The reconnect loops await it after every attempt, so a sleep that resolves at
@@ -76,6 +90,13 @@ export type ClientDeps = {
   readonly auth?: RunnerAuth;
   /** Receives `RUNNER_AUTH_FAILED ...` and `RUNNER_KEY_ROTATED ...` lines. */
   readonly log?: (line: string) => void;
+  /** Arms the `secretRequest` timeout: calls `fire` after `ms` unless the returned cancel runs first. Default setTimeout. */
+  readonly timer?: (ms: number, fire: () => void) => () => void;
+};
+
+const defaultTimer = (ms: number, fire: () => void): (() => void) => {
+  const handle = setTimeout(fire, ms);
+  return () => { clearTimeout(handle); };
 };
 
 export type ConnectOutcome =
@@ -93,6 +114,10 @@ export class RunnerClient {
   /** Set once the supervisor's challenge verified; every frame after that is sealed and checked with it. */
   private session: Session | undefined;
   private pendingHello: PendingRunnerHello | undefined;
+  /** The `proto` of the current connection's `hello.ok`; undefined before it and after a close. */
+  private helloProto: number | undefined;
+  /** Open `secretRequest`s by rid, each bound to the connection it went out on. */
+  private readonly secrets = new Map<string, PendingSecret>();
 
   constructor(private readonly config: ClientConfig, private readonly deps: ClientDeps) {}
 
@@ -123,6 +148,7 @@ export class RunnerClient {
     this.ready = false;
     this.replayed = 0;
     this.session = undefined;
+    this.helloProto = undefined;
     this.pendingHello = this.deps.auth?.startHello();
     const outcome = new Promise<ConnectOutcome>((resolve) => { this.settle = resolve; });
     let markClosed: () => void = () => {};
@@ -134,8 +160,14 @@ export class RunnerClient {
         this.transport = undefined;
         this.ready = false;
         this.session = undefined;
+        this.helloProto = undefined;
         this.pendingHello = undefined;
         this.finish({ ok: false, code: isRejectCode(reason) ? reason : "RUNNER_CLOSED", detail: reason });
+      }
+      for (const [rid, pending] of [...this.secrets]) {
+        if (pending.transport !== transport) continue;
+        this.secrets.delete(rid);
+        pending.settle({ ok: false, code: "RUNNER_SECRET_FAILED", detail: "connection lost" });
       }
       markClosed();
     });
@@ -219,6 +251,57 @@ export class RunnerClient {
   }
 
   /**
+   * Asks the supervisor over the authenticated link (`secret.get` or `secret.run`, a sealed control frame with a fresh
+   * 32-hex rid) and resolves with the opened `s2r` box of the matching answer, or a refusal: `RUNNER_SECRET_FAILED`
+   * when not connected, on a lost connection or a box that does not open; `RUNNER_SECRET_UNSUPPORTED` without an auth
+   * session; `RUNNER_SECRET_OUTDATED` when the supervisor's `hello.ok` proto is below `SECRET_PROTO`;
+   * `RUNNER_SECRET_TIMEOUT` after `SECRET_TIMEOUT_MS`; the supervisor's own code otherwise. Never rejects and never
+   * logs a body.
+   */
+  secretRequest<T extends SecretRequestType>(type: T, body: Omit<RunnerControlBodies[T], "rid">): Promise<SecretReply> {
+    const transport = this.transport;
+    if (!this.connected || !transport) return Promise.resolve({ ok: false, code: "RUNNER_SECRET_FAILED", detail: "not connected" });
+    if (!this.session) return Promise.resolve({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "unauthenticated link" });
+    if (!secretsSupported(this.helloProto)) {
+      return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; secrets need proto ${SECRET_PROTO}` });
+    }
+    const rid = randomBytes(16).toString("hex");
+    return new Promise<SecretReply>((resolve) => {
+      let cancel: () => void = () => {};
+      const settle = (reply: SecretReply): void => { cancel(); resolve(reply); };
+      this.secrets.set(rid, { answer: SECRET_ANSWER[type], transport, settle });
+      cancel = (this.deps.timer ?? defaultTimer)(SECRET_TIMEOUT_MS, () => {
+        if (this.secrets.get(rid)?.settle !== settle) return;
+        this.secrets.delete(rid);
+        resolve({ ok: false, code: "RUNNER_SECRET_TIMEOUT", detail: `no answer to ${type} within ${SECRET_TIMEOUT_MS / 1000}s` });
+      });
+      try {
+        this.sendFrame(runnerControl(this.head(), type, { ...body, rid } as RunnerControlBodies[T]) as AnyRunnerControl);
+      } catch (error) {
+        this.secrets.delete(rid);
+        settle({ ok: false, code: "RUNNER_SECRET_FAILED", detail: `${type} not sent: ${error instanceof Error ? error.message : String(error)}` });
+      }
+    });
+  }
+
+  /** Settles the open request an (already MAC-checked) `secret.value` / `secret.run.result` answers; others are dropped. */
+  private secretAnswer(frame: AnySupervisorControl & { readonly type: "secret.value" | "secret.run.result" }): void {
+    const body = frame.body;
+    const pending = this.secrets.get(body.rid);
+    if (!pending || pending.answer !== frame.type || !this.session) return;
+    this.secrets.delete(body.rid);
+    if (!body.ok) {
+      pending.settle({ ok: false, code: body.code ?? "RUNNER_SECRET_FAILED", detail: body.detail ?? "refused by the supervisor" });
+      return;
+    }
+    const aad = { runner: frame.runner, gen: frame.gen, epoch: frame.epoch, type: frame.type, rid: body.rid };
+    const plaintext = body.sealed ? this.session.openSecret("s2r", aad, body.sealed) : undefined;
+    pending.settle(plaintext === undefined
+      ? { ok: false, code: "RUNNER_SECRET_FAILED", detail: "sealed reply did not open" }
+      : { ok: true, plaintext });
+  }
+
+  /**
    * Closes the live connection so `run` reconnects at once with a fresh hello (new workspaces after a config reload).
    * Nothing is lost: unacked events replay from the outbox and commands are acked by `cmdAck`, as after any reconnect.
    */
@@ -283,6 +366,7 @@ export class RunnerClient {
           this.transport?.close("RUNNER_REPLAY_FAILED");
           return;
         }
+        this.helloProto = frame.body.proto;
         this.ready = true;
         this.finish({ ok: true, eventAck: this.cursor, replayed: this.replayed });
         return;
@@ -313,6 +397,10 @@ export class RunnerClient {
         this.log(`RUNNER_KEY_ROTATED cmdId=${frame.body.cmdId}`);
         return;
       }
+      case "secret.value":
+      case "secret.run.result":
+        this.secretAnswer(frame);
+        return;
       default:
         if (isQueryType(frame.type)) {
           // A query is answered only on an admitted connection.

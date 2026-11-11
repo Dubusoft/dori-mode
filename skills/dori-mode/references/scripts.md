@@ -516,5 +516,8 @@ Runs `hooks.transcribe` and prints the transcript. A failed or empty transcripti
 ### `dori secret exec NAME [NAME...] -- <command ...>` (lane)
 Inside a lane: asks the runner for the named secrets and runs the command with them in its environment only, exiting with its code. Values are never printed. A refusal prints `<code> <detail>` and exits 1 (`RUNNER_SECRET_DENIED`, `RUNNER_SECRET_MISSING`, `RUNNER_SECRET_UNSUPPORTED` on a remote runner); outside a lane it's `SECRET_EXEC_LANE_ONLY`. See [secrets.md](secrets.md).
 
+### `dori secret run <op>` (lane)
+Inside a lane: has the supervisor host run config `secretCommands.<op>` with its secrets, outside any lane, and prints the command's stdout and stderr (64 KiB each, secret values redacted), exiting with its code (124 after `timeoutSec`). A refusal prints `<code> <detail>` and exits 1; a usage error exits 2. Config `secretCommands` is `{ "<op>": { "argv", "secrets", "lanes", "repos", "timeoutSec"?, "cwd"? } }`. See [secrets.md](secrets.md#proxy-execution).
+
 ### `dori heavy <label> -- <command ...>`
 Waits until load is under `heavyMaxLoad` and one of `heavySlots` is free, then runs the command and frees the slot when it exits. A slot held by a process that no longer exists (or a zombie) is taken over. Use it for full builds, test suites, emulators and simulators: one heavy job runs per machine at a time. Slots are `~/.dori/heavy/slot.N` on every host, shared by lane `dori heavy`, the supervisor's scheduled heavy jobs and runner lanes' `~/.dori/runner/bin/dori heavy`; `<stateDir>/heavy` is no longer used. Installs, focused tests and git do not need it.

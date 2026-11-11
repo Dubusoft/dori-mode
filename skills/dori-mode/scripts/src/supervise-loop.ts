@@ -3,7 +3,7 @@ import { replaceKnownSecrets } from "./redact.ts";
 import { SecretStore } from "./secret-store.ts";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { alertsChannelOf, deliveryConfigError } from "./config.ts";
+import { alertsChannelOf, deliveryConfigError, loadConfig } from "./config.ts";
 import { applyConfigPatch, configReloader, watchConfigFiles } from "./config-watch.ts";
 import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
@@ -17,7 +17,8 @@ import { COMMAND_RETENTION_MS } from "./runner/durability.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
-import { type Delivery, laneOps, type LaneOps, machineRunner } from "./lane-ops.ts";
+import { type Delivery, laneOps, type LaneOps, machineRunner, runnerOf } from "./lane-ops.ts";
+import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
 import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
@@ -209,7 +210,7 @@ export type RunnerHubHandle = {
   close(): void;
 };
 
-export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent"> & {
+export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent" | "onSecret"> & {
   /** Discovery and reconnect dependencies; production reads runner-endpoints.json. */
   readonly network?: Partial<DialingOptions>;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
@@ -278,6 +279,7 @@ export const openRunnerHub = (
   let calls: RunnerCalls | undefined;
   const accept = acceptRunners(hub, [listener, network], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
+    ...(options.onSecret ? { onSecret: options.onSecret } : {}),
     onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
     onEvent: (label, frame) => {
       guard.event(label, frame);
@@ -1158,6 +1160,22 @@ export const supervise = async (
         const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
           onHeartbeat: (label) => { void monitor?.heartbeat(label); },
           onHerdr: (id, line) => { enqueueSweep(id, line); },
+          // A remote runner's secret.get: decided here with the registry, config and this host's store (secret-serve.ts).
+          onSecret: supervisorSecretHandler({
+            laneOwner: async (key) => { const lane = (await deps.registry.open()).find((l) => l.key === key); return lane && runnerOf(lane); },
+            runnerUnsandboxed: (label) => deps.config.runners?.[label]?.allowUnsandboxed === true,
+            granter: supervisorGranter({
+              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets, now: deps.clock.now,
+              log: (line) => { console.log(line); },
+            }),
+            // A remote runner's secret.run: the op runs here, outside any lane; only its redacted output goes back.
+            commandRunner: supervisorCommandRunner({
+              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets,
+              commands: async () => (await loadConfig()).secretCommands, now: deps.clock.now,
+              log: (line) => { console.log(line); },
+            }),
+            log: (line) => { console.log(line); },
+          }),
           // A runner-owned wait that the runner saw met ends here (deduped with the check's own result by its event id);
           // `job.result` is kept in the runner journal only.
           onEvent: (label, frame) => {

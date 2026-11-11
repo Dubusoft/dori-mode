@@ -4,8 +4,9 @@
  *
  * - runner -> supervisor events carry `seq` (per runner, durable, never reset by a new `gen`) and go through the outbox;
  * - supervisor -> runner commands carry `cmdSeq` (per runner, issued by the supervisor) and a `cmdId` in the body;
- * - control frames (hello, heartbeat, acks, command status, the `q.*` queries and their `q.result`) carry neither and
- *   are never queued or journaled.
+ * - control frames (hello, heartbeat, acks, command status, the `q.*` queries and their `q.result`, and since proto 6
+ *   the secret frames `secret.get`/`secret.run` and `secret.value`/`secret.run.result`) carry neither and are never
+ *   queued or journaled. A secret answer carries its values only inside an AEAD `sealed` box (auth.ts), never in clear.
  *
  * Every frame is validated against a fixed per-type schema: an unknown type, a missing field, a field of the wrong
  * shape or a field the schema does not name is rejected with a `ProtocolError` naming the rule. `mac` is accepted as
@@ -20,8 +21,15 @@ import type { Pane } from "../panes.ts";
 import type { Check } from "../signals.ts";
 import type { ReportKind } from "./report-kinds.ts";
 
-/** The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. */
-export const PROTO = 5;
+/**
+ * The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. Proto 6
+ * adds the secret control frames, so the supervisor must be upgraded before its runners.
+ */
+export const PROTO = 6;
+/** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */
+export const SECRET_PROTO = 6;
+/** Whether a peer that announced `proto` understands the secret frames; an unknown version does not. */
+export const secretsSupported = (proto: number | undefined): boolean => proto !== undefined && proto >= SECRET_PROTO;
 /** The envelope layout version (`v`). */
 export const ENVELOPE_VERSION = 1;
 /** The longest line `decodeFrame` accepts; the outbox caps a single body at 256KB, so a frame stays well under this. */
@@ -279,7 +287,17 @@ export type RunnerControlBodies = {
   readonly "cmd.status.result": { readonly cmdId: string; readonly state: CommandStatusState; readonly detail?: string };
   /** The answer to the `q.*` query `qid` (since proto 3): `result` is `QueryResults[type]` when `ok`. */
   readonly "q.result": { readonly qid: string; readonly ok: boolean; readonly detail: string; readonly result?: JsonValue };
+  /**
+   * Since proto 6: ask the supervisor for secrets `names` for lane `key`. `rid` is 32 random hex chars; `repo` is the
+   * lane's owner/repo as the runner read it from the lane worktree.
+   */
+  readonly "secret.get": { readonly rid: string; readonly key: string; readonly names: readonly string[]; readonly repo?: string };
+  /** Since proto 6: have the supervisor host run the configured secret command `op` for lane `key`. */
+  readonly "secret.run": { readonly rid: string; readonly key: string; readonly op: string; readonly repo?: string };
 };
+
+/** An AEAD box (auth.ts `SealedBox`): base64 nonce and base64 ciphertext with its tag. */
+export type SealedBody = { readonly n: string; readonly c: string };
 
 export type RejectCode = "RUNNER_PROTO_MISMATCH" | "RUNNER_CONFLICT" | "RUNNER_REVOKED" | "RUNNER_AUTH_FAILED" | "RUNNER_ENROLL_REFUSED";
 
@@ -295,6 +313,17 @@ export type SupervisorControlBodies = {
   readonly "enroll.ok": { readonly supervisorPubKey: string; readonly proof: string };
   /** The new runner key from `runner.rotated` is stored; the runner may drop its old key. */
   readonly "rotate.ok": { readonly cmdId: string };
+  /**
+   * Since proto 6: the answer to `secret.get` `rid`. On `ok`, `sealed` opens (direction s2r) to the granted values; on a
+   * refusal `code` is a RUNNER_SECRET_* code and `detail` names names and lanes only, never a value.
+   */
+  readonly "secret.value": {
+    readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
+  };
+  /** Since proto 6: the answer to `secret.run` `rid`, shaped like `secret.value`; the sealed result carries exit code and capped output. */
+  readonly "secret.run.result": {
+    readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
+  };
 } & QueryBodies;
 
 /**
@@ -621,6 +650,13 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
     cmdId: req("string"), state: req({ enum: ["intent", "running", "verified", "failed", "ambiguous", "unknown"] }), detail: opt("string"),
   },
   "q.result": { qid: req("string"), ok: req("bool"), detail: req("string"), result: opt("json") },
+  "secret.get": { rid: req("string"), key: req("string"), names: req("string[]"), repo: opt("string") },
+  "secret.run": { rid: req("string"), key: req("string"), op: req("string"), repo: opt("string") },
+};
+
+const SEALED: Shape = { n: req("string"), c: req("string") };
+const SECRET_ANSWER: Shape = {
+  rid: req("string"), ok: req("bool"), code: opt("string"), detail: opt("string"), sealed: opt({ object: SEALED }),
 };
 
 const query = (shape: Shape): Shape => ({ qid: req("string"), ...shape });
@@ -649,6 +685,8 @@ const SUPERVISOR_CONTROL_SCHEMAS: { readonly [T in SupervisorControlType]: Shape
   "hello.challenge": { nonce: req("string"), dh: req("string"), sig: req("string"), keyFp: req("string") },
   "enroll.ok": { supervisorPubKey: req("string"), proof: req("string") },
   "rotate.ok": { cmdId: req("string") },
+  "secret.value": SECRET_ANSWER,
+  "secret.run.result": SECRET_ANSWER,
   ...QUERY_SCHEMAS,
 };
 

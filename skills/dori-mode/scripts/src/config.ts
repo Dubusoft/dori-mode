@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { type AutopilotConfig, DEFAULT_AUTOPILOT, parseAutopilotConfig } from "./autopilot.ts";
 import { DEFAULT_DISPLAY_TIME_ZONE, validTimeZone } from "./display-time.ts";
@@ -165,6 +165,8 @@ export type DoriConfig = {
   readonly laneRules?: readonly string[];
   /** Store secrets a lane may receive, by name; a secret with no rule (or an empty one) goes to no lane. */
   readonly secrets: Readonly<Record<string, SecretRule>>;
+  /** Proxy-execution ops (`dori secret run <op>`): the supervisor host runs argv with the listed secrets in its env, outside any lane. */
+  readonly secretCommands: Readonly<Record<string, SecretCommand>>;
   /**
    * Argv prefix that wraps every new local lane's agent command (e.g. ["lane-sandbox"]). Absent from the file: DEFAULT_LANE_SANDBOX.
    * The lead is never wrapped.
@@ -239,6 +241,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   discordChannels: [],
   githubIssueAuthors: [],
   secrets: {},
+  secretCommands: {},
   worktreeRoot: "",
   heavySlots: 1,
   heavyKill: ["qemu-system", "emulator", "expo export"],
@@ -273,22 +276,91 @@ const laneRules = (raw: unknown): readonly string[] => {
 
 export type LaneSandbox = { readonly command: readonly string[] };
 
-/** Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. */
-export type SecretRule = { readonly lanes: readonly string[]; readonly repos: readonly string[] };
+/** A GitHub App installation token minted per lane repo instead of a stored value; `keySecret` names the App private key (PEM) in the store. */
+export type GithubAppMint = {
+  readonly kind: "github-app";
+  readonly appId: string;
+  readonly installationId: string;
+  readonly keySecret: string;
+  readonly permissions: Readonly<Record<string, "read" | "write">>;
+};
 
-/** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?: string[], repos?: string[] } }. */
+/** Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. `as` absent means env; `mint` replaces the stored value with a minted token. */
+export type SecretRule = {
+  readonly lanes: readonly string[];
+  readonly repos: readonly string[];
+  readonly as?: "env" | "ssh-key";
+  readonly mint?: GithubAppMint;
+};
+
+const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" } }`;
+
+/** A list-of-strings field; absent is empty, anything else throws `bad(path)`. */
+const stringList = (value: unknown, bad: (what: string) => TypeError, path: string): readonly string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw bad(path);
+  return value as string[];
+};
+
+/** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?, repos?, as?, mint? } } (see RULE_SHAPE). */
 const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
   if (raw == null) return {};
-  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": { "lanes": [strings], "repos": [strings] } }`);
+  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`as: "ssh-key"\` and \`mint\` are exclusive`);
   if (!isRecord(raw)) throw bad("");
-  const list = (value: unknown, name: string, field: string): readonly string[] => {
-    if (value === undefined) return [];
-    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw bad(`.${name}.${field}`);
-    return value as string[];
+  const mintOf = (value: unknown, path: string): GithubAppMint => {
+    const nonEmpty = (v: unknown) => typeof v === "string" && v.trim() !== "";
+    if (!isRecord(value) || Object.keys(value).some((key) => !["kind", "appId", "installationId", "keySecret", "permissions"].includes(key))) throw bad(path);
+    const { kind, appId, installationId, keySecret, permissions } = value;
+    if (kind !== "github-app" || !nonEmpty(appId) || !nonEmpty(installationId) || typeof keySecret !== "string" || !SECRET_NAME.test(keySecret)) throw bad(path);
+    if (!isRecord(permissions) || Object.keys(permissions).length === 0) throw bad(`${path}.permissions`);
+    for (const [perm, level] of Object.entries(permissions)) if (!/^[a-z_]+$/.test(perm) || (level !== "read" && level !== "write")) throw bad(`${path}.permissions.${perm}`);
+    return { kind, appId: appId as string, installationId: installationId as string, keySecret, permissions: permissions as Record<string, "read" | "write"> };
   };
   return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
-    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => key !== "lanes" && key !== "repos")) throw bad(`.${name}`);
-    return [name, { lanes: list(rule.lanes, name, "lanes"), repos: list(rule.repos, name, "repos") }];
+    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint"].includes(key))) throw bad(`.${name}`);
+    const { as, mint } = rule;
+    if (as !== undefined && as !== "env" && as !== "ssh-key") throw bad(`.${name}.as`);
+    if (mint !== undefined && as === "ssh-key") throw bad(`.${name}.mint`);
+    return [name, {
+      lanes: stringList(rule.lanes, bad, `.${name}.lanes`),
+      repos: stringList(rule.repos, bad, `.${name}.repos`),
+      ...(as !== undefined ? { as } : {}),
+      ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
+    }];
+  }));
+};
+
+/** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match (same rules as `secrets`). */
+export type SecretCommand = {
+  readonly argv: readonly string[];
+  readonly secrets: readonly string[];
+  readonly lanes: readonly string[];
+  readonly repos: readonly string[];
+  /** Kill after this many seconds; 1..3600, default 300. */
+  readonly timeoutSec: number;
+  /** Absolute working directory; absent means the host user's home. */
+  readonly cwd?: string;
+};
+
+/** The config's `secretCommands`; throws TypeError unless absent or { <op>: { argv, secrets, lanes, repos, timeoutSec?, cwd? } }. */
+const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> => {
+  if (raw == null) return {};
+  const bad = (what: string) => new TypeError(`secretCommands${what} must be { "<op>": { "argv": [non-empty strings], "secrets": [SECRET_NAMEs], "lanes": [strings], "repos": [strings], "timeoutSec"?: 1..3600, "cwd"?: absolute path } } with op matching ^[a-z][a-z0-9-]{0,63}$`);
+  if (!isRecord(raw)) throw bad("");
+  return Object.fromEntries(Object.entries(raw).map(([op, rule]) => {
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(op) || !isRecord(rule) || Object.keys(rule).some((key) => !["argv", "secrets", "lanes", "repos", "timeoutSec", "cwd"].includes(key))) throw bad(`.${op}`);
+    const argv = stringList(rule.argv, bad, `.${op}.argv`);
+    if (argv.length === 0 || argv.some((part) => part === "")) throw bad(`.${op}.argv`);
+    const names = stringList(rule.secrets, bad, `.${op}.secrets`);
+    if (names.some((name) => !SECRET_NAME.test(name))) throw bad(`.${op}.secrets`);
+    const { timeoutSec, cwd } = rule;
+    if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600)) throw bad(`.${op}.timeoutSec`);
+    if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) throw bad(`.${op}.cwd`);
+    return [op, {
+      argv, secrets: names, lanes: stringList(rule.lanes, bad, `.${op}.lanes`), repos: stringList(rule.repos, bad, `.${op}.repos`),
+      timeoutSec: (timeoutSec as number | undefined) ?? 300,
+      ...(cwd !== undefined ? { cwd } : {}),
+    }];
   }));
 };
 
@@ -387,7 +459,7 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "secrets", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
+  "runners", "secrets", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -477,6 +549,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...(alerts ? { alertsChannel: alerts } : {}),
     laneRules: laneRules(raw.laneRules),
     secrets: secrets(raw.secrets),
+    secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),

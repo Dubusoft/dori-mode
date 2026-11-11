@@ -36,10 +36,13 @@ Control frames, used in this release:
 
 - Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, worktreeRoot?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
-  `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)).
+  `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)),
+  `secret.get {rid, key, names, repo?}` and `secret.run {rid, key, op, repo?}` (protocol 6, see [Secrets](#secrets-over-the-link)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
   `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`, and the queries `q.panes`,
-  `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3).
+  `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3), and `secret.value` and
+  `secret.run.result {rid, ok, code?, detail?, sealed?: {n, c}}` (protocol 6). The secret frames are control frames: no
+  `seq`/`cmdSeq`, never queued, journaled or logged.
 
 `hello` must be the first frame on a connection (after an `enroll` connection has closed). After the handshake
 (below) the hub applies its hello rules: `RUNNER_PROTO_MISMATCH` when the protocol version isn't accepted, then the
@@ -645,7 +648,10 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 4, so a supervisor accepts runners at 4 and 3. The runner's `state.sqlite` gained the
+The current protocol is 6, so a supervisor accepts runners at 6 and 5. Protocol 6 adds the four secret control frames
+(see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
+**Upgrade the supervisor before its runners**: a proto 5 runner still connects to a proto 6 supervisor, but a proto 6
+runner is refused by a proto 5 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
 nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
 
 ## Liveness and restarts
@@ -764,8 +770,25 @@ the supervisor's scheduled heavy jobs use, so there's one heavy count per machin
 sent by the lane's `dori secret exec NAME... -- <cmd>`. `names` holds 1 to 32 unique secret names (else
 `RUNNER_LANE_BAD_REQUEST`), and the token is checked first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "..."}}`;
 a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_MISSING`,
-`RUNNER_SECRET_FAILED`). Only the local runner grants; a remote runner answers `RUNNER_SECRET_UNSUPPORTED`. The reply is
-never journaled, logged or put in the outbox, and nothing is published to the supervisor. See [secrets.md](secrets.md).
+`RUNNER_SECRET_FAILED`). The local runner grants from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
+a protocol 5 runner answers `RUNNER_SECRET_UNSUPPORTED` and never receives a value. The lane reply is never journaled,
+logged or put in the outbox. See [secrets.md](secrets.md).
+
+### Secrets over the link
+
+Protocol 6. A remote runner sends `secret.get {rid, key, names, repo?}` (`rid`: 32 random hex chars; `repo`: the lane's
+`owner/repo` read from its worktree) and the supervisor answers `secret.value {rid, ok, code?, detail?, sealed?}`.
+`secret.run {rid, key, op, repo?}` asks the supervisor host to run the configured command `op`; the answer is
+`secret.run.result`, shaped like `secret.value`. A refusal carries `ok: false` and a `RUNNER_SECRET_*` code
+(`DENIED`, `MISSING`, `FAILED`, `UNSUPPORTED`, `OUTDATED` when either side speaks protocol < 6, `TIMEOUT` when the runner
+got no answer); `detail` names secret names and lanes, never a value.
+
+Values never cross the link in clear. `sealed {n, c}` is an AEAD box: AES-256-GCM, a fresh 12-byte nonce `n` and the
+ciphertext with its 16-byte tag `c` (both base64), under a key derived per direction from the handshake session key
+(`s2r` supervisor to runner, `r2s` runner to supervisor), with the frame's `{runner, gen, epoch, type, rid}` as
+associated data, so a box moved to another frame, rid, runner or direction fails to open. The frame also carries the
+normal `mac`. Both sides send secret frames only on an authenticated link whose peer announced protocol >= 6; the
+supervisor must therefore be upgraded before runners, and an older runner is never sent a value.
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not

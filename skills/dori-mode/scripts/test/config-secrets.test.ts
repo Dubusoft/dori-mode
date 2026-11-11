@@ -44,6 +44,37 @@ test("a bad shape or a lower-case name throws TypeError", async () => {
   }
 });
 
+const MINT = { kind: "github-app", appId: "123", installationId: "456", keySecret: "GH_APP_KEY", permissions: { contents: "write", pull_requests: "read" } } as const;
+
+test("as and mint load on a rule", async () => {
+  const c = await load("as-mint", { secrets: { DEPLOY_KEY: { lanes: ["a"], as: "ssh-key" }, PLAIN: { as: "env" }, GH_TOKEN: { repos: ["o/r"], mint: MINT } } });
+  expect(c.secrets.DEPLOY_KEY).toEqual({ lanes: ["a"], repos: [], as: "ssh-key" });
+  expect(c.secrets.PLAIN).toEqual({ lanes: [], repos: [], as: "env" });
+  expect(c.secrets.GH_TOKEN).toEqual({ lanes: [], repos: ["o/r"], mint: MINT });
+});
+
+test("a bad as or mint throws TypeError", async () => {
+  const { kind: _k, ...noKind } = MINT;
+  const bad: unknown[] = [
+    { A: { as: "file" } },
+    { A: { as: 1 } },
+    { A: { as: "ssh-key", mint: MINT } },
+    { A: { mint: "x" } },
+    { A: { mint: { ...MINT, kind: "gitlab" } } },
+    { A: { mint: noKind } },
+    { A: { mint: { ...MINT, appId: "" } } },
+    { A: { mint: { ...MINT, installationId: 456 } } },
+    { A: { mint: { ...MINT, keySecret: "lower" } } },
+    { A: { mint: { ...MINT, permissions: {} } } },
+    { A: { mint: { ...MINT, permissions: { Contents: "write" } } } },
+    { A: { mint: { ...MINT, permissions: { contents: "admin" } } } },
+    { A: { mint: { ...MINT, extra: 1 } } },
+  ];
+  for (const [i, secrets] of bad.entries()) {
+    await expect(load(`bad-mint-${i}`, { secrets })).rejects.toBeInstanceOf(TypeError);
+  }
+});
+
 test("schema 6 fills secrets into a version-5 file and setup stamps the new version", () => {
   expect(CONFIG_SCHEMA_VERSION).toBe(6);
   const migrated = migrateConfigSchema({ schemaVersion: 5, defaultModel: "a/b" });
