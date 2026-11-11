@@ -15,7 +15,7 @@ import { LANE_KEY } from "../registry.ts";
  *
  * On Windows the modes and uids give way to the owner and DACL (see win-acl.ts): every entry is owned by the runner
  * user's SID, allow ACEs name only that user, SYSTEM and Administrators (CREATOR OWNER inherit-only), the root's DACL is
- * protected, nothing is a reparse point except the AF_UNIX socket directly under `sock\`, and the directory is not on
+ * protected, nothing is a reparse point except an AF_UNIX socket directly under `sock\` or `sock\lane.d\`, and the directory is not on
  * a UNC path.
  */
 
@@ -84,6 +84,9 @@ const expectedOwner = (options: FsSafetyOptions): number | undefined =>
 
 const isWindows = (options: FsSafetyOptions): boolean => (options.platform ?? process.platform) === "win32";
 
+/** The directories an AF_UNIX socket may sit in directly: `sock/` and the lane socket's `sock/lane.d/` (lane-socket.ts). */
+const socketDirs = (root: string): readonly string[] => [join(root, RUNNER_PATHS.sock), join(root, RUNNER_PATHS.sock, "lane.d")];
+
 /** What the Windows walk checks against: the root (for `D:P` and `sock\`), the user SID and the ACL reader. */
 type WinCheck = { readonly root: string; readonly userSid: string; readonly acl: (path: string) => AclInfo };
 
@@ -114,12 +117,12 @@ const inspect = (path: string, uid: number | undefined, kind: "dir" | "file", ex
 
 /**
  * The Windows form of `inspect`: reparse points (symlinks, junctions) are refused except an AF_UNIX socket directly
- * under `sock\`, the type is checked as on POSIX, and the owner and DACL go through `evaluateSddl` instead of uid and mode.
+ * under `sock\` or `sock\lane.d\`, the type is checked as on POSIX, and the owner and DACL go through `evaluateSddl` instead of uid and mode.
  * The socket is never lstat'd: Bun on Windows fails that with EACCES once its listener is gone (a hard-killed runner).
  */
 const inspectWindows = (path: string, win: WinCheck, kind: "dir" | "file"): void => {
   const info = win.acl(path);
-  const socket = info.reparseTag === IO_REPARSE_TAG_AF_UNIX && kind === "file" && dirname(path) === join(win.root, RUNNER_PATHS.sock);
+  const socket = info.reparseTag === IO_REPARSE_TAG_AF_UNIX && kind === "file" && socketDirs(win.root).includes(dirname(path));
   if (!socket) {
     const st = lstatSync(path);
     if (st.isSymbolicLink() || info.reparseTag !== undefined) throw new RunnerDirUnsafe(path, "symlink", info.reparseTag !== undefined ? `tag=0x${info.reparseTag.toString(16)}` : "");
@@ -146,7 +149,7 @@ const walk = (dir: string, uid: number | undefined, top: boolean, executable = f
   for (const name of readdirSync(dir).sort()) {
     const path = join(dir, name);
     // A socket left under `sock\` by a killed runner can't be lstat'd on Windows (EACCES); inspectWindows reads it.
-    if (win && dir === join(win.root, RUNNER_PATHS.sock) && lstatDenied(path)) { inspectWindows(path, win, "file"); continue; }
+    if (win && socketDirs(win.root).includes(dir) && lstatDenied(path)) { inspectWindows(path, win, "file"); continue; }
     const st = lstatSync(path);
     if (dir === join(root, RUNNER_PATHS.briefs) && outputName(name)) {
       walk(path, uid, false, false, win, root);

@@ -354,10 +354,14 @@ describe("win32 rules (injected ACL reader)", () => {
     expect(reasonOf(() => checkRunnerDir(d, win(d, { "": { reparseTag: JUNCTION_TAG } })))).toBe("symlink");
   });
 
-  test("the AF_UNIX socket reparse point passes only directly under sock", () => {
+  test("the AF_UNIX socket reparse point passes only directly under sock or sock/lane.d", () => {
     const d = winDir();
     writeFileSync(join(d, "sock", "lane.sock"), "");
     checkRunnerDir(d, win(d, { "sock/lane.sock": { reparseTag: IO_REPARSE_TAG_AF_UNIX } }));
+    mkdirSync(join(d, "sock", "lane.d"), { mode: 0o700 });
+    writeFileSync(join(d, "sock", "lane.d", "lane"), "");
+    checkRunnerDir(d, win(d, { "sock/lane.d/lane": { reparseTag: IO_REPARSE_TAG_AF_UNIX } }));
+    rmSync(join(d, "sock", "lane.d"), { recursive: true });
     expect(reasonOf(() => checkRunnerDir(d, win(d, { "logs/runner.log": { reparseTag: IO_REPARSE_TAG_AF_UNIX } })))).toBe("symlink");
     expect(reasonOf(() => checkRunnerDir(d, win(d, { "runner.json": { reparseTag: IO_REPARSE_TAG_AF_UNIX } })))).toBe("symlink");
     expect(reasonOf(() => checkRunnerDir(d, win(d, { sock: { reparseTag: IO_REPARSE_TAG_AF_UNIX } })))).toBe("symlink");

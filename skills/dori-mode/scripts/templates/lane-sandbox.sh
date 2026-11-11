@@ -94,7 +94,9 @@ opts+=(--ro-bind-try "$bsk_home" "$bsk_home")
 # there (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent): that one path is bound on its own.
 case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac
 # Only the lane socket: the runner's control and cli sockets (sock/control, sock/cli) are not a lane's to dial.
-opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane" "$H/.dori/runner/sock/lane")
+# The lane socket's own directory is bound, not the socket file: a restarted runner unlinks the socket and binds a
+# new one at the same path, which a bind of the old file would never show (the lane would dial the dead inode).
+opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane.d" "$H/.dori/runner/sock/lane.d")
 # A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")

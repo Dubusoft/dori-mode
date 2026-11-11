@@ -60,9 +60,12 @@ test("a sandboxed lane gets its own token file, the runner's lane socket, its br
   expect(tokenBind).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "lane")]);
-  // sock itself is only a mount point (--dir); the lane socket is the one thing bound into it.
+  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "lane.d")]);
+  // sock itself is only a mount point (--dir); the lane socket's directory is the one thing bound into it. A directory,
+  // not the socket file: a restarted runner's new socket at the same path shows through a directory bind only.
   expect(argv.flatMap((a, i) => (argv[i + 1] === join(runner, "sock") ? [a] : []))).toEqual(["--dir"]);
+  const laneDir = join(runner, "sock", "lane.d");
+  expect(argv.flatMap((a, i) => (argv[i + 1] === laneDir && argv[i + 2] === laneDir ? [a] : []))).toEqual(["--ro-bind-try"]);
   const input = join(runner, "briefs", "lane-a.files"), output = join(runner, "briefs", "lane-a.out");
   expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === input && argv[i + 2] === input)).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--dir" && argv[i + 1] === output)).toBeLessThan(doriRo);
@@ -373,9 +376,9 @@ test("macOS: of the runner's sockets only the lane socket can be dialed, and of 
   const dial = (p: string) => allows(sb, "network-outbound", p);
   const read = (p: string) => allows(sb, "file-read-data", p);
 
-  expect(dial(join(runner, "sock", "lane"))).toBe(true);
-  expect(read(join(runner, "sock", "lane"))).toBe(true);
-  for (const no of [join(runner, "sock", "control"), join(runner, "sock", "cli"), join(home, ".config", "herdr", "herdr.sock")]) {
+  expect(dial(join(runner, "sock", "lane.d", "lane"))).toBe(true);
+  expect(read(join(runner, "sock", "lane.d", "lane"))).toBe(true);
+  for (const no of [join(runner, "sock", "lane"), join(runner, "sock", "control"), join(runner, "sock", "cli"), join(home, ".config", "herdr", "herdr.sock")]) {
     expect({ no, dial: dial(no) }).toEqual({ no, dial: false });
   }
   expect(dial(agent)).toBe(true);

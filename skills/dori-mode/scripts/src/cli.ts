@@ -62,7 +62,7 @@ import { type CliRunnerCall, cliRunnerCall, cliSocketPath } from "./runner/cli-r
 import { RunnerUnavailable } from "./runner/call.ts";
 import { defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
 import { heavyDirOf, laneCliMain } from "./runner/lane-cli.ts";
-import { LANE_SOCKET } from "./runner/lane-socket.ts";
+import { connectLaneSocket, laneSocketExists } from "./runner/lane-socket.ts";
 import { readLaneIdentity } from "./runner/lane-identity.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import type { Connector, Transport } from "./runner/transport.ts";
@@ -73,8 +73,8 @@ import { BUILT_IN } from "./tunables.ts";
 const WHOAMI_TIMEOUT_MS = 500;
 
 /** The lane socket's whoami for `pane`; `answered` only when the runner replied ok (with or without a key). */
-const whoami = async (pane: string, socketPath: string, connect: Connector): Promise<{ answered: boolean; key: string | undefined }> => {
-  if (!existsSync(socketPath)) return { answered: false, key: undefined };
+const whoami = async (pane: string, socketExists: boolean, connect: Connector): Promise<{ answered: boolean; key: string | undefined }> => {
+  if (!socketExists) return { answered: false, key: undefined };
   let link: Transport | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -106,12 +106,12 @@ const whoami = async (pane: string, socketPath: string, connect: Connector): Pro
  * that cannot be read while the socket did not answer exits 2 LANE_IDENTITY_UNKNOWN: a transport failure never grants
  * lead authority. Reads nothing but the environment, the socket and lanes.json.
  */
-const laneContext = async (env: Readonly<Record<string, string | undefined>>, runnerDir: string, socketPath: string, connect: Connector): Promise<string | undefined> => {
+const laneContext = async (env: Readonly<Record<string, string | undefined>>, runnerDir: string, connect: Connector): Promise<string | undefined> => {
   const named = env.DORI_LANE_KEY?.trim();
   if (named) return named;
   const pane = env.HERDR_PANE_ID?.trim();
   if (!pane) return undefined;
-  const asked = await whoami(pane, socketPath, connect);
+  const asked = await whoami(pane, laneSocketExists(runnerDir), connect);
   if (asked.key) return asked.key;
   const recorded = readLaneIdentity(runnerDir, pane);
   if (recorded.kind === "lane") return recorded.key;
@@ -127,11 +127,11 @@ const laneContext = async (env: Readonly<Record<string, string | undefined>>, ru
 // store, journal, inbox or state-dir file.
 {
   const laneRunnerDir = defaultRunnerDir();
-  const laneSocket = join(laneRunnerDir, RUNNER_PATHS.sock, LANE_SOCKET);
-  const laneKey = await laneContext(process.env, laneRunnerDir, laneSocket, connectUnix(laneSocket));
+  const connectLane = connectLaneSocket(laneRunnerDir, (path) => connectUnix(path));
+  const laneKey = await laneContext(process.env, laneRunnerDir, connectLane);
   if (laneKey !== undefined) {
     process.exit(await laneCliMain(process.argv.slice(2), {
-      env: process.env, laneKey, connect: connectUnix(laneSocket),
+      env: process.env, laneKey, connect: connectLane,
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     }));
   }

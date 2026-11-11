@@ -19,7 +19,7 @@
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
 # its own brief and token), and ~/.dori/env, ~/.dori/secrets and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
 # are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
-# but the lane socket (sock/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
+# but the lane socket (sock/lane.d/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
 # Host paths outside ~/.dori listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
 # refused outright, reads, writes and socket connects alike, over every rule above. Every path is resolved first
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
@@ -127,7 +127,7 @@ build_profile() {
     fi
   fi
 
-  for p in .dori/config.json .dori/src .dori/bin .dori/state .dori/heavy .dori/runner/sock/lane .dori/runner/bin "runner-brief"; do
+  for p in .dori/config.json .dori/src .dori/bin .dori/state .dori/heavy .dori/runner/sock/lane.d .dori/runner/bin "runner-brief"; do
     case "$p" in runner-brief) r "$H/.dori/runner/briefs/$key.md" ;; *) r "$H/$p" ;; esac
   done
   if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then r "$DORI_LANE_TOKEN_FILE"; fi
@@ -146,7 +146,7 @@ build_profile() {
   param DOCKER_HOME "$H/.docker/run/docker.sock"
   param DOCKER_VAR /var/run/docker.sock
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
-  param LANE_SOCK "$H/.dori/runner/sock/lane"
+  param LANE_SOCK "$H/.dori/runner/sock/lane.d/lane"
   param CONFIG "$H/.config"
   param CONFIG_GH "$H/.config/gh"
   param CONFIG_GIT "$H/.config/git"

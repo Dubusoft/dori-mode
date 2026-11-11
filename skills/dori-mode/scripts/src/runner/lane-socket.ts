@@ -1,14 +1,18 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+import { RUNNER_PATHS } from "./fs-safety.ts";
 import { isReportKind } from "./report-kinds.ts";
 import type { LaneNotice } from "./lanes.ts";
 import type { RunnerEventBodies, RunnerEventType } from "./protocol.ts";
-import type { Listener, Transport } from "./transport.ts";
+import type { Connector, Listener, Transport } from "./transport.ts";
 import { LaneFileError } from "./lane-files.ts";
 import type { LaneOutputFiles } from "./protocol.ts";
 import { SECRET_NAME } from "../secret-name.ts";
 import type { SecretRunResult } from "./secret-run.ts";
 
 /**
- * The lane socket `<runnerDir>/sock/lane` (design 2.5): one JSON request line in, one JSON reply line out, many per
+ * The lane socket `<runnerDir>/sock/lane.d/lane` (design 2.5): one JSON request line in, one JSON reply line out, many per
  * connection. Verbs:
  * - `{kind: <report kind>, key, token, text, evidence?}`: the report goes to the outbox as `lane.report`; `{ok}`.
  * - `{kind: "status", key, token}`: the lane's status as the supervisor last pushed it with `lane.notify`
@@ -24,6 +28,41 @@ import type { SecretRunResult } from "./secret-run.ts";
  */
 
 export const LANE_SOCKET = "lane";
+
+/**
+ * The lane socket's own 0700 directory under `sock/`. A Linux lane sandbox binds this directory, not the socket file: a
+ * restarted runner unlinks the socket and binds a new one at the same path, and a bind of the old file would keep the
+ * lane on the dead inode. The control and cli sockets stay outside it, so a lane still cannot dial them.
+ */
+export const LANE_SOCKET_DIR = "lane.d";
+
+/** `<runnerDir>/sock/lane.d/lane`, where the runner serves the lane socket. */
+export const laneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET_DIR, LANE_SOCKET);
+
+/**
+ * `<runnerDir>/sock/lane`, where runners before `lane.d` served it. The runner serves it too, for lanes whose sandbox
+ * was set up for that path (a macOS profile that allows only it, or a lane started before the update).
+ */
+export const legacyLaneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET);
+
+/** Whether either lane socket path exists as seen from here (inside a lane: through its sandbox). */
+export const laneSocketExists = (runnerDir: string): boolean =>
+  existsSync(laneSocketPath(runnerDir)) || existsSync(legacyLaneSocketPath(runnerDir));
+
+/**
+ * How a lane's `dori` dials the lane socket: the `lane.d` path, and when that connect fails the legacy path. Existence
+ * does not decide it: an older macOS profile lets a lane stat `lane.d` but refuses the connect. Rejects with the
+ * `lane.d` error when neither connects.
+ */
+export const connectLaneSocket = (runnerDir: string, connect: (path: string) => Connector): Connector => {
+  const current = connect(laneSocketPath(runnerDir));
+  const legacy = connect(legacyLaneSocketPath(runnerDir));
+  return async () => {
+    try { return await current(); } catch (error) {
+      try { return await legacy(); } catch { throw error; }
+    }
+  };
+};
 
 type Publish = <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
 

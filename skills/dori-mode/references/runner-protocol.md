@@ -797,8 +797,11 @@ does not end a lane.
 
 **Reporting.** A runner lane's footer has it report with `~/.dori/runner/bin/dori` (a wrapper the installer puts there
 for the bundle). In a lane that CLI takes only `report`, `claim-done` and `heavy`, and only for the lane's own key; any
-other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane`
-with the lane's token. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
+other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane.d/lane`
+with the lane's token. The socket has a directory of its own so the Linux lane sandbox can bind the directory rather
+than the socket file: a restarted runner binds a new socket at the same path, and a lane started before the restart
+reaches it. The runner also serves the older `~/.dori/runner/sock/lane`, and a lane's CLI falls back to it when the
+`lane.d` connect fails (a sandbox set up before the move). The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
 the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
 

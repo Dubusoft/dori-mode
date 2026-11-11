@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
-import { LANE_SOCKET, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
+import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
 import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
@@ -316,7 +316,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.sock);
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
-    const laneListener = listenUnix(join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET));
+    ensureRunnerSubdir(join(runnerDir, RUNNER_PATHS.sock), LANE_SOCKET_DIR);
+    const laneListeners = [listenUnix(laneSocketPath(runnerDir)), listenUnix(legacyLaneSocketPath(runnerDir))];
     // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
     if (remote) {
@@ -362,8 +363,11 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.
       void new SecretStore().readAll().then((m) => { replaceKnownSecrets(m.values()); }, () => {});
     }
-    const stopLaneServe = serveLaneSocket(laneListener, laneSocketLanes, publish, log);
-    const stopLaneSocket = (): void => { stopLaneServe(); laneListener.close(); };
+    const stopLaneServes = laneListeners.map((listener) => serveLaneSocket(listener, laneSocketLanes, publish, log));
+    const stopLaneSocket = (): void => {
+      for (const stop of stopLaneServes) stop();
+      for (const listener of laneListeners) listener.close();
+    };
     // runner-config.json (and, on the local runner, the config.json its policy and guard defaults come from) apply
     // without a restart: a valid edit rewrites the live policy, an invalid one keeps the last good policy.
     const reloadPolicy = policyReloader({
@@ -411,7 +415,7 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
   // Inside a lane this bundle is the lane-mode `dori`: report, claim-done and heavy for the lane's own key, nothing else.
   if (process.env.DORI_LANE_KEY) {
     return laneCliMain(args, {
-      env: process.env, connect: connectLane(join(defaultRunnerDir(), RUNNER_PATHS.sock, LANE_SOCKET)),
+      env: process.env, connect: connectLaneSocket(defaultRunnerDir(), (path) => connectLane(path)),
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     });
   }
