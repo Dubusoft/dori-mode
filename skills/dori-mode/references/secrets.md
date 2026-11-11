@@ -50,8 +50,6 @@ A lane may receive a name when any of these holds:
 
 A rule may also carry `as` (`"env"`, the default, or `"ssh-key"`, see [Deploy keys](#deploy-keys)) or `mint` (see [Minted GitHub tokens](#minted-github-tokens)). The two can't be combined.
 
-- `origins`: a non-empty list of `http(s)` page origins such as `"https://login.example.com"`. It makes the rule browser-proxy-only: the value is filled into a page by the browser fill proxy and never handed to the lane, so `dori secret exec` and `dori secret run` refuse the name with `RUNNER_SECRET_BROWSER_ONLY`. It combines with neither `as: "ssh-key"` nor `mint`. See [Browser fill](#browser-fill).
-
 A request names one or more secrets, and it's all or nothing: if any one name is denied, the whole request is refused with `RUNNER_SECRET_DENIED` and no value is sent. The config is re-read on every request, so an edit takes effect without a restart.
 
 ## Lane usage
@@ -61,13 +59,7 @@ dori secret exec NPM_TOKEN -- npm publish
 dori secret exec NPM_TOKEN GH_TOKEN -- ./release.sh
 ```
 
-The lane CLI sends the names to the runner over the lane socket with the lane's token. On a grant it runs the command with the values added to its environment, under the secret names, and exits with the command's exit code. Values are never printed and never put in argv. A refusal prints `<code> <detail>` to stderr and exits 1; a usage error exits 2. A name whose rule has `origins` is refused with `RUNNER_SECRET_BROWSER_ONLY` before any other check, and no value is read. Any other `dori secret` subcommand in a lane is `DORI_CLI_LANE_ONLY`.
-
-For a web login, ask for a handle instead and fill it through the browser skill (see [Browser fill](#browser-fill)):
-
-```sh
-h=$(dori secret handle SITE_PASSWORD)
-```
+The lane CLI sends the names to the runner over the lane socket with the lane's token. On a grant it runs the command with the values added to its environment, under the secret names, and exits with the command's exit code. Values are never printed and never put in argv. A refusal prints `<code> <detail>` to stderr and exits 1; a usage error exits 2. Any other `dori secret` subcommand in a lane is `DORI_CLI_LANE_ONLY`.
 
 A lane should pass the variable to the tool that needs it, not echo it, write it to a file or put it in a report. Keep the value itself off command lines too (for example `test "$NAME" = <value>`): argv shows in `ps`, shell history and the pane.
 
@@ -80,10 +72,6 @@ dori secret run deploy-prod
 ```
 
 See [Proxy execution](#proxy-execution). The lane gets the command's output and exit code; a refusal prints `<code> <detail>` to stderr and exits 1, and a missing, extra or malformed op prints `usage: dori secret run <op>` and exits 2.
-
-## Browser fill
-
-A rule with `origins` is for web logins. The lane runs `dori secret handle NAME` and gets an opaque one-time handle (`dsh_...`), valid for 5 minutes, for its own lane and the rule's origins only. It passes the handle as the value of a password fill, and the runner's per-lane browser proxy exchanges it for the value and fills the page. The lane never sees the value. See [browser.md](browser.md) for the checks, the refusals and the residual risks.
 
 ## Minted GitHub tokens
 
@@ -144,7 +132,7 @@ A lane runs `dori secret run <op>`. The command runs on the supervisor host, out
 
 The lane sees only the exit code and the output. Each of stdout and stderr keeps its first 64 KiB, and the lane CLI adds `dori: <op> output was truncated at 64 KiB per stream` when either was cut. Every secret value in the output becomes `[REDACTED:<NAME>]`, including a value cut off at the end of truncated output, and then the usual masking runs. A command still running after `timeoutSec` is killed and exits 124, with `dori: <op> killed after <n>s (timeoutSec)` on stderr.
 
-The runner log (the supervisor's for a remote runner, tagged `runner=<label>`) gets `RUNNER_SECRET_RUN lane=<key> op=<op> exit=<n>`, or `RUNNER_SECRET_DENIED lane=<key> op=<op> code=<code>` for a refusal. An unknown op or a lane the op doesn't allow is `RUNNER_SECRET_DENIED`, and a command that can't start is `RUNNER_SECRET_FAILED`. An op whose `secrets` include a name with an `origins` rule is refused with `RUNNER_SECRET_BROWSER_ONLY` before the lane match, any read or the spawn.
+The runner log (the supervisor's for a remote runner, tagged `runner=<label>`) gets `RUNNER_SECRET_RUN lane=<key> op=<op> exit=<n>`, or `RUNNER_SECRET_DENIED lane=<key> op=<op> code=<code>` for a refusal. An unknown op or a lane the op doesn't allow is `RUNNER_SECRET_DENIED`, and a command that can't start is `RUNNER_SECRET_FAILED`.
 
 Use this for the most sensitive operational credentials: production deploys, cloud admin keys, anything a lane shouldn't hold even for one command. The lane can still choose when to run the op, so keep the op narrow (a fixed argv, not a shell that takes input) and its output free of anything you wouldn't show the lane.
 
@@ -161,9 +149,7 @@ Each side checks different things:
 
 A request for a lane the runner doesn't own also logs `RUNNER_FORGED_SECRET runner=<label> key=<key>` in the supervisor log. An honest runner never sends one, so treat it as a sign the runner host is compromised.
 
-Secret handles use two more pairs of control frames. `secret.handle` asks the supervisor to issue a handle for a lane and is answered by `secret.handle.result`, whose sealed box holds the handle and its expiry. `secret.exchange` comes from the lane's browser proxy on the runner with the lane key, the handle and the page origin, and is answered by `secret.exchange.result`, whose sealed box holds the value. The supervisor keeps one handle table for all its runners and checks ownership and `allowUnsandboxed` as for `secret.get`. The `secret.exchange` request carries the handle unsealed, under the frame's `mac`; only the answers are sealed. Handle frames need protocol 7 on both sides: an older peer gets `RUNNER_SECRET_OUTDATED`, and a supervisor without handles enabled answers `RUNNER_SECRET_UNSUPPORTED`.
-
-Remote secrets need protocol 6 on both sides. Upgrade the supervisor first: a protocol 7 supervisor accepts runners at 7 and 6, and refuses protocol 5 at hello. An old runner keeps answering its lanes `RUNNER_SECRET_UNSUPPORTED` and never receives a value. When either side speaks a protocol older than 6, the lane gets `RUNNER_SECRET_OUTDATED`. With no answer in 30 seconds the lane gets `RUNNER_SECRET_TIMEOUT`.
+Remote secrets need protocol 6 on both sides. Upgrade the supervisor first: it still accepts protocol 5 runners. An old runner keeps answering its lanes `RUNNER_SECRET_UNSUPPORTED` and never receives a value. When either side speaks a protocol older than 6, the lane gets `RUNNER_SECRET_OUTDATED`. With no answer in 30 seconds the lane gets `RUNNER_SECRET_TIMEOUT`.
 
 ## Audit log
 
@@ -173,7 +159,7 @@ The granting side appends one JSON line per request to `<stateDir>/secret-audit.
 {"at":"2026-11-11T07:00:00.000Z","runner":"local","lane":"release-npm","names":["NPM_TOKEN"],"allowed":true}
 ```
 
-Fields: `at`, `runner`, `lane`, `names`, `allowed`, `minted` (names whose value was a minted token, only when there are any), and on a refusal `reason` (`not allowed: A,B`, `missing: A`, `read failed: A`, `no repo: A` or `mint failed: A`, and `browser only: A,B` for a browser-only name). Issue and exchange lines of [secret handles](browser.md) also carry `kind` (`handle.issue` or `handle.exchange`) and `handleId` (the first 12 hex chars of the handle's sha256), and an exchange carries the page `origin`. Their refusal reasons are `bad name`, `not allowed: A`, `no origins: A` and `too many handles` at issue, and `unknown`, `expired`, `used`, `wrong lane`, `rule gone` and `origin not allowed` at exchange, besides the read reasons above. A `dori secret run` line has `op` instead of `reason`, `names` is the op's secrets (empty for an unknown op), and `exitCode` is set when the command ran. No value or hash of one is ever written. A failed write logs `RUNNER_SECRET_AUDIT_FAILED <path>: ...` and doesn't block the grant. The runner log also gets `RUNNER_SECRET_GRANTED lane=<key> names=<A,B>`, or `RUNNER_SECRET_DENIED` for any refusal; a handle line adds `kind=<kind>` and `handleId=<id>`. No line carries a full handle.
+Fields: `at`, `runner`, `lane`, `names`, `allowed`, `minted` (names whose value was a minted token, only when there are any), and on a refusal `reason` (`not allowed: A,B`, `missing: A`, `read failed: A`, `no repo: A` or `mint failed: A`). A `dori secret run` line has `op` instead of `reason`, `names` is the op's secrets (empty for an unknown op), and `exitCode` is set when the command ran. No value or hash of one is ever written. A failed write logs `RUNNER_SECRET_AUDIT_FAILED <path>: ...` and doesn't block the grant. The runner log also gets `RUNNER_SECRET_GRANTED lane=<key> names=<A,B>`, or `RUNNER_SECRET_DENIED` for any refusal.
 
 ## Masking
 
@@ -194,7 +180,6 @@ Stored values are registered with dori's output masking, so a value that turns u
 | `RUNNER_SECRET_OUTDATED` | The runner or the supervisor speaks a protocol older than 6. |
 | `RUNNER_SECRET_TIMEOUT` | A remote runner got no answer from the supervisor within 30 seconds. |
 | `RUNNER_SECRET_DENIED` | At least one name isn't allowed for this lane by config `secrets`, a minted name was asked for by a lane with no repo, or `dori secret run` named an op that isn't configured or doesn't allow this lane. |
-| `RUNNER_SECRET_BROWSER_ONLY` | `dori secret exec` named, or a `dori secret run` op uses, a secret whose rule has `origins`. Such a secret is only for the browser fill proxy. |
 | `RUNNER_SECRET_MISSING` | A name is allowed but not in the store, or a mint rule's `keySecret` isn't. |
 | `RUNNER_SECRET_FAILED` | Reading the store or the config failed, a mint failed (detail `GITHUB_MINT_FAILED ...`), a secret command couldn't start, or a remote runner lost its connection or got a reply it couldn't open. |
 | `RUNNER_LANE_BAD_REQUEST` | The request had no names, more than 32, duplicates or an invalid name, or an op that doesn't match the op rule. |
@@ -203,8 +188,6 @@ Stored values are registered with dori's output masking, so a value that turns u
 ## Lane sandbox hiding
 
 Both lane sandbox scripts hide dori's own sensitive paths, `~/.dori/env` and `~/.dori/secrets`, by default. No file or setting is needed. On Linux `~/.dori` is a fresh tmpfs inside the sandbox with nothing bound from the host below it; on macOS the profile denies reads, writes and socket connects under both paths.
-
-They also hide the real BrowserSkill daemon (`~/.bsk`, or the host's `BSK_HOME`, passed to the sandbox as `LANE_SANDBOX_BSK_HOME`), so a lane reaches the browser only through its own proxy at `~/.dori/runner/browser/<key>`. On Linux `~/.bsk` is absent because `$HOME` is a tmpfs, and only the lane's own proxy directory is bound, read-only. On macOS the profile denies reads, writes and socket connects under the daemon's home and TCP connects to the daemon's `ws_port`, and allows only the lane's own proxy directory and socket. Linux can't refuse that TCP port; see [browser.md](browser.md#residual-risks).
 
 `~/.dori/lane-sandbox-hide` is an optional per-machine list for paths unrelated to dori, such as `~/.secrets`: one host path per line, `#` starts a comment. Don't list `~/.dori/env` or `~/.dori/secrets` there; they're already covered.
 

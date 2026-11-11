@@ -151,12 +151,6 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (result.truncated === true) deps.err(`dori: ${op} output was truncated at 64 KiB per stream`);
     return typeof result.exitCode === "number" && Number.isInteger(result.exitCode) ? result.exitCode : 1;
   }
-  if (sub === "secret" && rest[0] === "handle") {
-    const [, name, ...extra] = rest;
-    if (!name || extra.length || !SECRET_NAME.test(name)) { deps.err("usage: dori secret handle NAME"); return 2; }
-    const write = deps.write ?? ((stream, text) => { (stream === "stdout" ? process.stdout : process.stderr).write(text); });
-    return send({ kind: "secret.handle", name }, (reply) => { write("stdout", `${String(reply.handle)}\n`); });
-  }
   if (sub === "secret") {
     const sep = rest.indexOf("--");
     const names = sep >= 0 ? rest.slice(1, sep) : rest.slice(1);

@@ -36,8 +36,6 @@ export const RUNNER_PATHS = {
   bin: "bin",
   bun: "bun",
   lanes: "lanes",
-  /** Per-lane browser fill proxies: `browser/<key>/{daemon.sock,daemon.json}` (browser-proxy.ts). */
-  browser: "browser",
 } as const;
 
 /** The lock `runner serve` holds for its whole life (0600, inside the runner directory). */
@@ -93,7 +91,7 @@ type WinCheck = { readonly root: string; readonly userSid: string; readonly acl:
 const isUncPath = (path: string): boolean => /^[\\/]{2}(?![?.][\\/][A-Za-z]:)/.test(path);
 
 const DIRECTORY_ENTRIES: ReadonlySet<string> = new Set([
-  RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs, RUNNER_PATHS.bin, RUNNER_PATHS.bun, RUNNER_PATHS.lanes, RUNNER_PATHS.browser,
+  RUNNER_PATHS.bodies, RUNNER_PATHS.briefs, RUNNER_PATHS.keys, RUNNER_PATHS.sock, RUNNER_PATHS.logs, RUNNER_PATHS.bin, RUNNER_PATHS.bun, RUNNER_PATHS.lanes,
 ]);
 /** Directories holding executables: their files may also be 0700, still owner-only. */
 const EXECUTABLE_DIRS: ReadonlySet<string> = new Set([RUNNER_PATHS.bin, RUNNER_PATHS.bun]);

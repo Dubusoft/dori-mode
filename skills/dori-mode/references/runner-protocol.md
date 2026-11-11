@@ -37,13 +37,11 @@ Control frames, used in this release:
 - Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, worktreeRoot?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
   `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)),
-  `secret.get {rid, key, names, repo?}` and `secret.run {rid, key, op, repo?}` (protocol 6, see [Secrets](#secrets-over-the-link)),
-  `secret.handle {rid, key, name, repo?}` and `secret.exchange {rid, key, handle, origin}` (protocol 7, see [Secret handles](#secret-handles-over-the-link)).
+  `secret.get {rid, key, names, repo?}` and `secret.run {rid, key, op, repo?}` (protocol 6, see [Secrets](#secrets-over-the-link)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
   `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`, and the queries `q.panes`,
   `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3), and `secret.value` and
-  `secret.run.result {rid, ok, code?, detail?, sealed?: {n, c}}` (protocol 6), and `secret.handle.result` and
-  `secret.exchange.result`, shaped like `secret.value` (protocol 7). The secret frames are control frames: no
+  `secret.run.result {rid, ok, code?, detail?, sealed?: {n, c}}` (protocol 6). The secret frames are control frames: no
   `seq`/`cmdSeq`, never queued, journaled or logged.
 
 `hello` must be the first frame on a connection (after an `enroll` connection has closed). After the handshake
@@ -650,13 +648,10 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 7, so a supervisor accepts runners at 7 and 6; a proto 5 runner is refused at hello. Protocol 6
-adds the four secret control frames (see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)`
-(`proto >= SECRET_PROTO`) is the gate. Protocol 7 adds the four secret handle frames (see
-[Secret handles over the link](#secret-handles-over-the-link)), gated by `handlesSupported(proto)` (`proto >= HANDLE_PROTO`);
-a proto 6 runner keeps everything else, `secret.get` and `secret.run` included.
-**Upgrade the supervisor before its runners**: a proto 6 runner still connects to a proto 7 supervisor, but a proto 7
-runner is refused by a proto 6 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
+The current protocol is 6, so a supervisor accepts runners at 6 and 5. Protocol 6 adds the four secret control frames
+(see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
+**Upgrade the supervisor before its runners**: a proto 5 runner still connects to a proto 6 supervisor, but a proto 6
+runner is refused by a proto 5 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
 nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
 
 ## Liveness and restarts
@@ -794,27 +789,6 @@ ciphertext with its 16-byte tag `c` (both base64), under a key derived per direc
 associated data, so a box moved to another frame, rid, runner or direction fails to open. The frame also carries the
 normal `mac`. Both sides send secret frames only on an authenticated link whose peer announced protocol >= 6; the
 supervisor must therefore be upgraded before runners, and an older runner is never sent a value.
-
-### Secret handles over the link
-
-Protocol 7. These frames back the browser fill proxy (see [browser.md](browser.md)) for a remote runner's lanes. The
-supervisor holds the only handle table, shared by every runner.
-
-| Request (runner to supervisor) | Answer | Sealed plaintext |
-|---|---|---|
-| `secret.handle {rid, key, name, repo?}` | `secret.handle.result {rid, ok, code?, detail?, sealed?}` | `{handle, expiresAt}` |
-| `secret.exchange {rid, key, handle, origin}` | `secret.exchange.result {rid, ok, code?, detail?, sealed?}` | `{value}` |
-
-The runner sends `secret.handle` when a lane runs `dori secret handle NAME`, with the lane's repo so `repos` rules match.
-It sends `secret.exchange` from the lane's browser proxy, with that proxy's lane key and the page origin; no lane can
-send one. The answers are sealed `s2r` exactly as `secret.value`. The `secret.exchange` request carries the handle
-unsealed, protected by the frame's `mac` only.
-
-The supervisor checks in order: no authenticated session gives `RUNNER_SECRET_UNSUPPORTED`; a runner below protocol 7
-gives `RUNNER_SECRET_OUTDATED`; a lane the runner doesn't own gives `RUNNER_SECRET_DENIED` and logs `RUNNER_FORGED_SECRET`;
-an unsandboxed runner gives `RUNNER_SECRET_DENIED`; then the handle table decides. A supervisor without handles enabled
-answers `RUNNER_SECRET_UNSUPPORTED` (`secret handles are not enabled`). A runner whose supervisor said hello below protocol 7
-sends nothing and answers `RUNNER_SECRET_OUTDATED` itself.
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not
