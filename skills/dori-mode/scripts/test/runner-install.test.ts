@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DORI_SECRET_TEMPLATE, INSTALL_EXIT, buildBundle, bundleVersion, herdrInstallNote, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
+import { INSTALL_EXIT, buildBundle, bundleVersion, herdrInstallNote, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
 import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
 import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
@@ -377,9 +377,6 @@ test("on Darwin the script installs the seatbelt lane-sandbox and a starter poli
   expect(readFileSync(wrapperPath, "utf8")).toContain('w "$H/.dori/runner/briefs/$key.out"');
   expect(readFileSync(wrapperPath, "utf8")).toContain('echo "DORI_LANE_FILES=1"');
   expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
-  const secretPath = join(host.home, ".dori/runner/bin/dori-secret");
-  expect(readFileSync(secretPath, "utf8")).toBe(readFileSync(DORI_SECRET_TEMPLATE, "utf8"));
-  expect(statSync(secretPath).mode & 0o777).toBe(0o700);
   expect(result.out).not.toContain("RUNNER_CONFIG_SANDBOX_MISSING");
   // A reinstall over an operator's file names every key it lacks for sandboxed lanes, and leaves the file alone.
   writeFileSync(policyFile, '{"agents":{"default":["claude"]}}\n', { mode: 0o600 });
@@ -396,7 +393,6 @@ test("a Linux reinstall over a complete sandbox policy prints no missing-key lin
   expect(wrapper).toContain('--ro-bind "$H/.dori/runner/briefs/$key.files"');
   expect(wrapper).toContain('--bind "$H/.dori/runner/briefs/$key.out"');
   expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
-  expect(existsSync(join(host.home, ".dori/runner/bin/dori-secret"))).toBe(false);
   const again = await runScript(host, linuxScript());
   expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
   const p = Bun.spawn(["/bin/sh", "-n"], { stdin: new TextEncoder().encode(linuxScript()), stdout: "pipe", stderr: "pipe" });

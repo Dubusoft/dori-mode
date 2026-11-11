@@ -361,26 +361,9 @@ Everything lives under `~/.dori/runner`:
 | `runner-config.json` | the command policy (optional) |
 | `health` | `{pid, gen, monotonicMs, wallAt}`, rewritten every 15 s |
 | `bin/dori.js` | the runner bundle, on workers installed by `dori runner install` |
-| `bin/dori-secret` | macOS workers only: the login-keychain wrapper from `templates/dori-secret.sh` (see below) |
 | `sock/control` | the unix socket the supervisor listens on and the runner connects to |
 
 The hub's table is `<stateDir>/runners.sqlite` on the supervisor side.
-
-`bin/dori-secret` is how a lane on a Mac uses a secret the owner keeps in their login keychain without ever seeing it.
-The owner registers each one in a terminal on that Mac, as a generic password whose service name is `dori.<name>`
-(lower-case letters, digits, `.`, `_`, `-`); `-w` goes last with no value, so `security` prompts for it, and `-A` is
-never used, since it would let any app read the item without asking:
-
-```sh
-security add-generic-password -U -a "$USER" -s dori.<name> -w
-```
-
-A lane then runs `~/.dori/runner/bin/dori-secret run [ENV=]dori.<name> ... -- <cmd> [args...]`: each value goes only
-into the environment of the command it execs (without `ENV=` the variable is the name upper-cased with `.` and `-` as
-`_`, so `dori.gh-token` becomes `DORI_GH_TOKEN`). `has dori.<name>` and `list` print names, never values, and no
-subcommand prints one. Any other service name is refused (exit 2) before the keychain is asked; a missing item exits 3
-and a keychain that refuses (locked, or `security` not on the item's access list) exits 4. Only the login keychain is
-searched. A lane must keep the values out of its output, logs and reports as well, e.g. by not echoing the variable.
 
 Directories must be 0700 and files 0600 (under `bin/` and `bun/`, where `dori runner install` puts the wrapper and
 bun, 0600 or 0700), owned by the runner's uid, with no symlinks anywhere. `dori runner serve`
