@@ -132,4 +132,16 @@ describe("secretCommandRunner", () => {
     expect(result).toMatchObject({ ok: false, code: "RUNNER_SECRET_FAILED" });
     broken.clean(result);
   });
+
+  test("an op whose secrets include an origins rule is BROWSER_ONLY before anything is read or run", async () => {
+    let reads = 0;
+    const seen: { argv?: readonly string[] } = {};
+    const h = harness({ login: command(["x"], { secrets: ["SITE_PW"] }) }, { spawn: fakeSpawn(seen), store: { read: async () => { reads++; return VALUE; } } },
+      { SITE_PW: { lanes: ["lane-a"], repos: [], origins: ["https://a.example"] } });
+    expect(await h.run("lane-a", "login")).toEqual({ ok: false, code: "RUNNER_SECRET_BROWSER_ONLY", detail: "SITE_PW is only for the browser fill proxy (config secrets.SITE_PW.origins)" });
+    expect(reads).toBe(0);
+    expect(seen.argv).toBeUndefined();
+    expect(h.audit).toEqual([{ at: "1970-01-01T00:00:00.000Z", runner: "local", lane: "lane-a", op: "login", names: ["SITE_PW"], allowed: false }]);
+    expect(h.logs).toEqual(["RUNNER_SECRET_DENIED lane=lane-a op=login code=RUNNER_SECRET_BROWSER_ONLY"]);
+  });
 });

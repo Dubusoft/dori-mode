@@ -5,8 +5,10 @@ import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
 import { LANE_SOCKET, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
-import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
-import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
+import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter, type SecretAuditEntry } from "./secret-grant.ts";
+import { remoteSecretGranter, remoteSecretHandles, remoteSecretRunner } from "./remote-secrets.ts";
+import { type HandleExchange, SecretHandles } from "./secret-handles.ts";
+import { BrowserProxies, browserProxiesEnabled, realBskHome } from "./browser-proxies.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
@@ -195,8 +197,18 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       if (!client) throw new Error("runner client is not initialized");
       client.publish(type, body);
     };
+    // One browser fill proxy per owned lane when this host has a real bsk home. The exchange is bound below, once the
+    // granting side (this runner's handle table, or the supervisor's) exists; a proxy asked before that refuses.
+    const bskHome = realBskHome(process.env, homedir());
+    let exchangeHandle = async (_key: string, _handle: string, _origin: string): Promise<HandleExchange> =>
+      ({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "secret handles are not ready" });
+    const proxies = browserProxiesEnabled(process.platform, bskHome)
+      ? new BrowserProxies({ runnerDir, bskHome, exchange: (key, handle, origin) => exchangeHandle(key, handle, origin), log, pid: process.pid })
+      : undefined;
     // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
-    const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}) });
+    const runnerLanes = new RunnerLanes({
+      runnerDir, run, clock: realClock, policy, publish, remote, log, ...(winSample ? { procs: hostProcs } : {}), ...(proxies ? { browser: proxies } : {}),
+    });
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
     // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
     const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir) });
@@ -303,6 +315,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
     if (remote) {
       const linked = client;
+      // Handles are issued and exchanged by the supervisor's one handle table, over sealed frames.
+      const handles = remoteSecretHandles({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log, onGranted: addKnownSecrets });
+      exchangeHandle = handles.exchange;
       laneSocketLanes = {
         tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
         notice: (key) => runnerLanes.notice(key),
@@ -313,10 +328,23 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         }),
         // Proxy execution runs on the supervisor host: secret.run over the link.
         secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
+        ...(proxies ? { secretHandle: handles.issue } : {}),
       };
     } else {
       const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
+      const audit = (entry: SecretAuditEntry): void => {
+        auditFile(entry);
+        log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")}${entry.kind ? ` kind=${entry.kind}` : ""}${entry.handleId ? ` handleId=${entry.handleId}` : ""}${entry.reason ? ` reason=${entry.reason}` : ""}`);
+      };
       const secretStore = new SecretStore();
+      // This runner's own handle table: its lanes' socket issues, their proxies exchange with the proxy's key.
+      const handles = new SecretHandles({
+        store: secretStore,
+        rules: async () => (await loadConfig()).secrets,
+        laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
+        audit, runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
+      });
+      exchangeHandle = (key, handle, origin) => handles.exchange(key, handle, origin);
       const runOp = secretCommandRunner({
         store: secretStore,
         commands: async () => (await loadConfig()).secretCommands,
@@ -330,14 +358,12 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         keyForPane: (pane) => runnerLanes.keyForPane(pane),
         reportFiles: (key) => runnerLanes.reportFiles(key),
         secretRun: (key, op) => runOp(key, op),
+        ...(proxies ? { secretHandle: (key: string, name: string) => handles.issue(key, name) } : {}),
         secrets: secretGranter({
           store: secretStore,
           rules: async () => (await loadConfig()).secrets,
           laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
-          audit: (entry) => {
-            auditFile(entry);
-            log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")}${entry.reason ? ` reason=${entry.reason}` : ""}`);
-          },
+          audit,
           runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
         }),
       };
@@ -346,6 +372,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     }
     const stopLaneServe = serveLaneSocket(laneListener, laneSocketLanes, publish, log);
     const stopLaneSocket = (): void => { stopLaneServe(); laneListener.close(); };
+    // Lanes that outlived a runner restart get their proxy back; adopted lanes were not launched with BSK_HOME.
+    await proxies?.startAll(Object.values(runnerLanes.records()).filter((r) => !r.adopted).map((r) => r.key));
     // runner-config.json (and, on the local runner, the config.json its policy and guard defaults come from) apply
     // without a restart: a valid edit rewrites the live policy, an invalid one keeps the last good policy.
     const reloadPolicy = policyReloader({
@@ -372,6 +400,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       clearTimeout(reposDebounce);
       unwatchRepos();
       stopLaneSocket();
+      await proxies?.stopAll();
       stopGuard();
       stopPrune();
       stopOutboxTick();

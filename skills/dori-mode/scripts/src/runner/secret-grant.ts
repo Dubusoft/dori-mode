@@ -19,7 +19,16 @@ export type SecretAuditEntry = {
   readonly allowed: boolean; readonly reason?: string;
   /** Names whose value was minted (a GitHub App token) rather than read from the store. */
   readonly minted?: readonly string[];
+  /** Set on a secret handle's issue or exchange (secret-handles.ts); absent on a `secret` verb grant. */
+  readonly kind?: "handle.issue" | "handle.exchange";
+  /** The first 12 hex chars of sha256(handle), to correlate an issue with its exchange; never the handle itself. */
+  readonly handleId?: string;
+  /** The page origin an exchange named. */
+  readonly origin?: string;
 };
+
+/** The refusal detail for a browser-proxy-only name (a rule with `origins`) asked for outside the fill proxy. */
+export const browserOnlyDetail = (name: string): string => `${name} is only for the browser fill proxy (config secrets.${name}.origins)`;
 
 export type SecretGranterDeps = {
   readonly store: Pick<SecretStore, "read">;
@@ -104,6 +113,8 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
   }
   let repo: Promise<string | undefined> | undefined;
   const laneRepo = (): Promise<string | undefined> => (repo ??= deps.laneRepo(key).catch(() => undefined));
+  const browserOnly = names.filter((name) => Object.hasOwn(rules, name) && rules[name]?.origins !== undefined);
+  if (browserOnly.length) return refuse("RUNNER_SECRET_BROWSER_ONLY", browserOnlyDetail(browserOnly[0] as string), `browser only: ${browserOnly.join(",")}`);
   const denied: string[] = [];
   for (const name of names) {
     const rule = Object.hasOwn(rules, name) ? rules[name] : undefined;

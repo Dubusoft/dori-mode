@@ -5,8 +5,8 @@
  * - runner -> supervisor events carry `seq` (per runner, durable, never reset by a new `gen`) and go through the outbox;
  * - supervisor -> runner commands carry `cmdSeq` (per runner, issued by the supervisor) and a `cmdId` in the body;
  * - control frames (hello, heartbeat, acks, command status, the `q.*` queries and their `q.result`, and since proto 6
- *   the secret frames `secret.get`/`secret.run` and `secret.value`/`secret.run.result`) carry neither and are never
- *   queued or journaled. A secret answer carries its values only inside an AEAD `sealed` box (auth.ts), never in clear.
+ *   the secret frames `secret.get`/`secret.run` and `secret.value`/`secret.run.result`, since proto 7 the handle frames
+ *   `secret.handle`/`secret.exchange` and their `.result`s) carry neither and are never queued or journaled. A secret answer carries its values only inside an AEAD `sealed` box (auth.ts), never in clear.
  *
  * Every frame is validated against a fixed per-type schema: an unknown type, a missing field, a field of the wrong
  * shape or a field the schema does not name is rejected with a `ProtocolError` naming the rule. `mac` is accepted as
@@ -23,13 +23,18 @@ import type { ReportKind } from "./report-kinds.ts";
 
 /**
  * The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. Proto 6
- * adds the secret control frames, so the supervisor must be upgraded before its runners.
+ * adds the secret control frames and proto 7 the secret handle frames, so the supervisor must be upgraded before its
+ * runners: an older peer rejects an unknown frame type and drops the link.
  */
-export const PROTO = 6;
+export const PROTO = 7;
 /** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */
 export const SECRET_PROTO = 6;
 /** Whether a peer that announced `proto` understands the secret frames; an unknown version does not. */
 export const secretsSupported = (proto: number | undefined): boolean => proto !== undefined && proto >= SECRET_PROTO;
+/** The first protocol version with the secret handle frames (`secret.handle`, `secret.exchange` and their `.result`). */
+export const HANDLE_PROTO = 7;
+/** Whether a peer that announced `proto` understands the secret handle frames. */
+export const handlesSupported = (proto: number | undefined): boolean => proto !== undefined && proto >= HANDLE_PROTO;
 /** The envelope layout version (`v`). */
 export const ENVELOPE_VERSION = 1;
 /** The longest line `decodeFrame` accepts; the outbox caps a single body at 256KB, so a frame stays well under this. */
@@ -294,6 +299,10 @@ export type RunnerControlBodies = {
   readonly "secret.get": { readonly rid: string; readonly key: string; readonly names: readonly string[]; readonly repo?: string };
   /** Since proto 6: have the supervisor host run the configured secret command `op` for lane `key`. */
   readonly "secret.run": { readonly rid: string; readonly key: string; readonly op: string; readonly repo?: string };
+  /** Since proto 7: issue lane `key` a one-time browser fill handle for secret `name` (the lane's `dori secret handle`). */
+  readonly "secret.handle": { readonly rid: string; readonly key: string; readonly name: string; readonly repo?: string };
+  /** Since proto 7: lane `key`'s browser proxy exchanges `handle` for its value to fill on page `origin`. */
+  readonly "secret.exchange": { readonly rid: string; readonly key: string; readonly handle: string; readonly origin: string };
 };
 
 /** An AEAD box (auth.ts `SealedBox`): base64 nonce and base64 ciphertext with its tag. */
@@ -322,6 +331,14 @@ export type SupervisorControlBodies = {
   };
   /** Since proto 6: the answer to `secret.run` `rid`, shaped like `secret.value`; the sealed result carries exit code and capped output. */
   readonly "secret.run.result": {
+    readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
+  };
+  /** Since proto 7: the answer to `secret.handle`, shaped like `secret.value`; the sealed box opens to `{handle, expiresAt}`. */
+  readonly "secret.handle.result": {
+    readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
+  };
+  /** Since proto 7: the answer to `secret.exchange`, shaped like `secret.value`; the sealed box opens to `{value}`. */
+  readonly "secret.exchange.result": {
     readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
   };
 } & QueryBodies;
@@ -652,6 +669,8 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
   "q.result": { qid: req("string"), ok: req("bool"), detail: req("string"), result: opt("json") },
   "secret.get": { rid: req("string"), key: req("string"), names: req("string[]"), repo: opt("string") },
   "secret.run": { rid: req("string"), key: req("string"), op: req("string"), repo: opt("string") },
+  "secret.handle": { rid: req("string"), key: req("string"), name: req("string"), repo: opt("string") },
+  "secret.exchange": { rid: req("string"), key: req("string"), handle: req("string"), origin: req("string") },
 };
 
 const SEALED: Shape = { n: req("string"), c: req("string") };
@@ -687,6 +706,8 @@ const SUPERVISOR_CONTROL_SCHEMAS: { readonly [T in SupervisorControlType]: Shape
   "rotate.ok": { cmdId: req("string") },
   "secret.value": SECRET_ANSWER,
   "secret.run.result": SECRET_ANSWER,
+  "secret.handle.result": SECRET_ANSWER,
+  "secret.exchange.result": SECRET_ANSWER,
   ...QUERY_SCHEMAS,
 };
 

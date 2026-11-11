@@ -1,5 +1,6 @@
 import type { RunnerClient } from "./client.ts";
 import type { SecretGrant } from "./lane-socket.ts";
+import { handleId, SECRET_HANDLE_PATTERN, type HandleExchange, type HandleIssue } from "./secret-handles.ts";
 import type { SecretRunResult } from "./secret-run.ts";
 
 /**
@@ -95,3 +96,50 @@ export const remoteSecretRunner = (deps: RemoteSecretRunDeps) => async (key: str
   deps.log(`RUNNER_SECRET_RUN lane=${key} op=${op} exit=${outcome.exitCode}`);
   return outcome;
 };
+
+/** The parsed JSON of `plaintext` when it is an object; else undefined. */
+const parseRecord = (plaintext: string): Record<string, unknown> | undefined => {
+  try { const parsed: unknown = JSON.parse(plaintext); return isRecord(parsed) ? parsed : undefined; } catch { return undefined; }
+};
+
+/**
+ * Browser fill handles on a remote runner, granted by the supervisor's one handle table: `issue` (the lane socket's
+ * `secret.handle` verb) sends `secret.handle` with the lane's repo and opens `{handle, expiresAt}`; `exchange` (the
+ * lane's browser proxy, never the lane) sends `secret.exchange` and opens `{value}`, which is registered through
+ * `onGranted` for log masking. Logs lane, name or `handleId`, and codes only: never a handle or a value.
+ */
+export const remoteSecretHandles = (deps: RemoteSecretDeps): {
+  readonly issue: (key: string, name: string) => Promise<HandleIssue>;
+  readonly exchange: (key: string, handle: string, origin: string) => Promise<HandleExchange>;
+} => ({
+  issue: async (key, name) => {
+    const refuse = (code: string, detail: string): HandleIssue => {
+      deps.log(`RUNNER_SECRET_DENIED lane=${key} names=${name} kind=handle.issue code=${code}`);
+      return { ok: false, code, detail };
+    };
+    const repo = await deps.laneRepo(key).catch(() => undefined);
+    const reply = await deps.client.secretRequest("secret.handle", { key, name, ...(repo !== undefined ? { repo } : {}) });
+    if (!reply.ok) return refuse(reply.code, reply.detail);
+    const parsed = parseRecord(reply.plaintext);
+    const { handle, expiresAt } = parsed ?? {};
+    if (typeof handle !== "string" || !SECRET_HANDLE_PATTERN.test(handle) || typeof expiresAt !== "number" || !Number.isInteger(expiresAt)) {
+      return refuse("RUNNER_SECRET_FAILED", "the supervisor's secret.handle.result is not {handle, expiresAt}");
+    }
+    deps.log(`RUNNER_SECRET_GRANTED lane=${key} names=${name} kind=handle.issue handleId=${handleId(handle)}`);
+    return { ok: true, handle, expiresAt };
+  },
+  exchange: async (key, handle, origin) => {
+    const id = handleId(handle);
+    const refuse = (code: string, detail: string): HandleExchange => {
+      deps.log(`RUNNER_SECRET_DENIED lane=${key} kind=handle.exchange handleId=${id} code=${code}`);
+      return { ok: false, code, detail };
+    };
+    const reply = await deps.client.secretRequest("secret.exchange", { key, handle, origin });
+    if (!reply.ok) return refuse(reply.code, reply.detail);
+    const value = parseRecord(reply.plaintext)?.value;
+    if (typeof value !== "string") return refuse("RUNNER_SECRET_FAILED", "the supervisor's secret.exchange.result is not {value}");
+    deps.onGranted?.([value]);
+    deps.log(`RUNNER_SECRET_GRANTED lane=${key} kind=handle.exchange handleId=${id}`);
+    return { ok: true, value };
+  },
+});

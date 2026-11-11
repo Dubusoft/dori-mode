@@ -12,6 +12,7 @@ import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, type RunnerPol
 import { herdrProcess } from "./herdr-watch.ts";
 import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { turnStop } from "./observe.ts";
+import type { LaneBrowser } from "./browser-proxies.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
   CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, ProcessInfo, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
@@ -113,6 +114,13 @@ export type RunnerLanesDeps = {
   readonly legacyMcp?: (cwd: string) => Promise<boolean>;
   /** Resolves a pane's directory for the allowedRoots check (default `fs.realpathSync`). */
   readonly realpath?: (path: string) => string;
+  /**
+   * The lanes' browser fill proxies (browser-proxies.ts), when this host runs them: a POSIX launch line gets their env
+   * (`BSK_HOME`, `LANE_SANDBOX_BSK_HOME`), the lane's proxy starts before its pane command runs and stops on close.
+   */
+  readonly browser?: LaneBrowser;
+  /** Where a proxy start failure is logged (default `console.log`). */
+  readonly log?: (line: string) => void;
 };
 
 export type Effect<T extends keyof CommandResults> = { readonly detail: string; readonly result: CommandResults[T] };
@@ -444,14 +452,24 @@ export class RunnerLanes {
         // Where a lane started without --cwd makes its worktree; the macOS lane-sandbox makes them writable.
         ...(this.deps.policy.reposRoot !== undefined ? [`LANE_SANDBOX_REPOS=${quote(this.deps.policy.reposRoot)}`] : []),
         ...(worktreeRoot !== undefined ? [`LANE_SANDBOX_WORKTREES=${quote(worktreeRoot)}`] : []),
+        // The lane's browser client finds its own proxy, never the real daemon; the sandbox may still need the real home.
+        ...(this.deps.browser?.env(key) ?? []).map(([name, value]) => `${name}=${quote(value)}`),
       ];
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = [...env, ...argv.map(quote)].join(" ");
+    }
+    // A proxy that fails to start leaves the lane without secret fills; it does not hold up the lane.
+    const browser = shell === "posix" ? this.deps.browser : undefined;
+    if (browser) {
+      await browser.start(key).catch((e: unknown) => {
+        (this.deps.log ?? console.log)(`RUNNER_BROWSER_PROXY_FAILED lane=${key} ${e instanceof Error ? e.message : String(e)}`);
+      });
     }
     input.mayStart?.(true);
     const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
     if (ran.code !== 0) {
       input.mayStart?.(false);
+      await browser?.stop(key).catch(() => {});
       rmSync(tokenFile, { force: true });
       await rollback();
       throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
@@ -544,6 +562,9 @@ export class RunnerLanes {
     }
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
+    await this.deps.browser?.stop(key).catch((e: unknown) => {
+      (this.deps.log ?? console.log)(`RUNNER_BROWSER_PROXY_STOP_FAILED lane=${key} ${e instanceof Error ? e.message : String(e)}`);
+    });
     let gone = !current;
     try { if (current) gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
     catch { gone = false; }
