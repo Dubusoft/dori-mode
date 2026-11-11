@@ -66,6 +66,8 @@ export const RUNNER_LAUNCHD_LABEL = "com.dori.runner";
 export const HERDR_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "herdr-runner-remote.service");
 export const HERDR_LAUNCHD_PLIST_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-herdr-launchd.plist");
 export const HERDR_LAUNCHD_LABEL = "com.dori.herdr";
+/** The keychain wrapper a macOS host gets as `~/.dori/runner/bin/dori-secret`. */
+export const DORI_SECRET_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-secret.sh");
 export const HERDR_UNIT = "herdr-server.service";
 export const RUNNER_CLI_ENTRY = join(import.meta.dir, "bin.ts");
 export const INSTALL_TIMEOUT_MS = 180_000;
@@ -163,8 +165,9 @@ export const installScript = (
   herdr: HerdrTemplates = herdrTemplates(),
   laneSandbox: string = readFileSync(LANE_SANDBOX_TEMPLATE, "utf8"),
   laneSandboxMacos: string = readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"),
+  doriSecret: string = readFileSync(DORI_SECRET_TEMPLATE, "utf8"),
 ): string => {
-  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, laneSandbox, laneSandboxMacos]) {
+  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, laneSandbox, laneSandboxMacos, doriSecret]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
   }
   const body = (text: string): string => (text.endsWith("\n") ? text : `${text}\n`);
@@ -224,6 +227,13 @@ export const installScript = (
     "fi",
     // 0700 like `dori`: the runner refuses to start on a runner directory holding anything wider (fs-safety.ts).
     'chmod 700 "$R/bin/lane-sandbox.tmp" && mv -f "$R/bin/lane-sandbox.tmp" "$R/bin/lane-sandbox" || exit 1',
+    // On macOS, lanes read the owner's dori.<name> login-keychain items only through dori-secret, which hands a value to
+    // one command's environment and never prints it.
+    'if [ "$OS" = Darwin ]; then',
+    `cat > "$R/bin/dori-secret.tmp" <<'${HEREDOC}' || exit 1`,
+    `${body(doriSecret)}${HEREDOC}`,
+    '  chmod 700 "$R/bin/dori-secret.tmp" && mv -f "$R/bin/dori-secret.tmp" "$R/bin/dori-secret" || exit 1',
+    "fi",
     // A starter command policy, only when the host has none: without an agent profile and a root every lane.start is
     // refused. Sandboxing is required: the `sandboxed` profile runs the agent behind the wrapper, and its `--check` runs
     // before each sandboxed start. An existing runner-config.json is the operator's and is never rewritten; what it
