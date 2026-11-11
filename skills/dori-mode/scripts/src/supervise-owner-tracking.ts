@@ -298,7 +298,10 @@ export class OwnerTracking {
     this.persist();
     const tracked = new Set(awaiting.map((entry) => entry.id));
     for (const receipt of receipts) {
-      if (tracked.has(receipt.id) || this.deps.clock.now() - receipt.at >= ACK_KEEP_MS) dropAck(receipt.path);
+      if (!tracked.has(receipt.id) && this.deps.clock.now() - receipt.at < ACK_KEEP_MS) continue;
+      // Logged once, as the receipt is consumed: `dori handled` found no ack and ran (or failed to run) it itself.
+      if (receipt.autoAck) console.error(`HANDLED_${receipt.autoAck === "acked" ? "AUTO_ACKED" : "AUTO_ACK_FAILED"} ${receipt.id}: handled with no prior dori ack`);
+      dropAck(receipt.path);
     }
   }
 

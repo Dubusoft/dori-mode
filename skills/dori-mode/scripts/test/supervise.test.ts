@@ -2129,6 +2129,27 @@ test("handled owner work is excluded from a fresh lead handoff", async () => {
   expect(handed(f)).not.toContain("discord:11:22");
 });
 
+test("a link recorded with an auto-ack is logged once as the supervisor consumes it", async () => {
+  // Given an owner message that dori handled had to ack itself.
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner project-alpha");
+  await supervisor.flush();
+  recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true, autoAck: "acked" });
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    // When the supervisor consumes receipts twice.
+    supervisor.ackTick(60_000);
+    supervisor.ackTick(60_000);
+  } finally {
+    console.error = originalError;
+  }
+  // Then the missing ack is logged exactly once.
+  expect(errors.filter((line) => line.startsWith("HANDLED_"))).toEqual(["HANDLED_AUTO_ACKED discord:11:22: handled with no prior dori ack"]);
+});
+
 test("acked but unhandled work wakes the lead with its body and escalates once after another window", async () => {
   // Given an owner request with a persisted read receipt.
   const f = fixture();
