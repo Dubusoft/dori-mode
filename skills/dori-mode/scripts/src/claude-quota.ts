@@ -8,6 +8,8 @@ export type QuotaResult = {
   readonly kind: string;
   readonly provider: string;
   readonly account?: string;
+  /** Why an unavailable or failed result has no usage: a string, or `{ type, status? }` for a failure. */
+  readonly reason?: unknown;
   readonly windows?: readonly { readonly label: string; readonly remainingPercent: number; readonly resetAt?: Date | string }[];
 };
 
@@ -51,6 +53,30 @@ export const claudeUsage = (results: readonly QuotaResult[], at: number): Claude
   return accounts.length ? { at, accounts } : undefined;
 };
 
+/** A Claude account whose usage could not be read (expired token, failed request, no window), so it is left out. */
+export type ClaudeSkip = { readonly name: string; readonly reason: string };
+
+const skipReason = (r: QuotaResult): string => {
+  if (typeof r.reason === "string") return r.reason;
+  if (typeof r.reason === "object" && r.reason !== null) {
+    const { type, status } = r.reason as { type?: unknown; status?: unknown };
+    if (typeof type === "string") return typeof status === "number" ? `${type} ${status}` : type;
+  }
+  return r.kind === "success" ? "no-quota-windows" : r.kind;
+};
+
+/**
+ * Every Claude account claudeUsage leaves out, with why; the readable accounts alone decide the usage. A provider
+ * nobody signed into (unlabelled oauth-not-configured) is not an account and is not listed.
+ */
+export const skippedClaudeAccounts = (results: readonly QuotaResult[]): ClaudeSkip[] =>
+  results
+    .filter((r) => CLAUDE_PROVIDERS.has(r.provider) && !(r.account === undefined && r.reason === "oauth-not-configured")
+      && (r.kind !== "success" || !(r.windows ?? []).some((w) => FIVE_HOUR.test(w.label) || WEEKLY.test(w.label))))
+    .map((r) => ({ name: r.account || r.provider, reason: skipReason(r) }));
+
+/** "default (token-expired), account-3 (http-error 429)". */
+export const skippedText = (skipped: readonly ClaudeSkip[]): string => skipped.map((s) => `${s.name} (${s.reason})`).join(", ");
 
 /**
  * Time left until a reset, in pi-quota's format: whole days plus whole hours ("2d 6h", days alone when no hour
@@ -98,13 +124,14 @@ export const lookupQuotaResults = (agentDir = join(homedir(), ".omo", "agent")):
   return lookupQuota(new ModelRegistry(runtime, runtime.authStorage), signal);
 };
 
-/** pi-quota's text, and the Claude usage when a Claude account answered. */
-export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage };
+/** pi-quota's text, the Claude usage when a Claude account answered, and the Claude accounts left out. */
+export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage; readonly skipped: readonly ClaudeSkip[] };
 
 export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal): Promise<UsageRead> => {
   const { results, text } = await lookup(signal);
   const usage = claudeUsage(results, now);
-  return usage ? { text, usage } : { text };
+  const skipped = skippedClaudeAccounts(results);
+  return usage ? { text, usage, skipped } : { text, skipped };
 };
 
 /** The `/quota` text: pi-quota's own usage block only (it already shows reset times). */

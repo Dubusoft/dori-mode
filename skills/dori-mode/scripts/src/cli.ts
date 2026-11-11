@@ -36,7 +36,7 @@ import { acquireDiscordGateway, DiscordGatewayOwnedError } from "./messenger/dis
 import { closeThreadButton, DiscordCommands } from "./messenger/discord-commands.ts";
 import { buttonRow } from "./messenger/discord-buttons.ts";
 import { discordOwnerConfigured, discordThread } from "./messenger/discord-inbound.ts";
-import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, usageLine } from "./claude-quota.ts";
+import { lookupQuotaResults, NO_CLAUDE, quotaReport, readUsage, skippedText, usageLine } from "./claude-quota.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
 import { supervise, SUPERVISE_STOP_DEADLINE_MS, watchSecretStore } from "./supervise-loop.ts";
@@ -1074,8 +1074,9 @@ try {
     }
     case "quota": {
       const read = await readUsage(lookupQuotaResults(), realClock.now(), AbortSignal.timeout(30_000));
-      if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null }, null, 2));
-      else console.log(`${read.usage ? usageLine(read.usage, config.displayTimeZone) : NO_CLAUDE}\n\n${read.text}`);
+      const skipped = read.skipped.length ? `\nQUOTA | skipped ${skippedText(read.skipped)}` : "";
+      if (flags.values.json) console.log(JSON.stringify({ usage: read.usage ?? null, skipped: read.skipped }, null, 2));
+      else console.log(`${read.usage ? usageLine(read.usage, config.displayTimeZone) : NO_CLAUDE}${skipped}\n\n${read.text}`);
       break;
     }
     case "launch": {
