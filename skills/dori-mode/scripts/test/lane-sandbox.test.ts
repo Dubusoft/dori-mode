@@ -155,7 +155,7 @@ type Seatbelt = { profile: string; params: Record<string, string>; command: stri
 /** Runs the macOS template with `sbx` as its sandbox-exec, in `cwd`, with only `env` (plus PATH and HOME). */
 const runMacos = async (home: string, cwd: string, args: string[], env: Record<string, string>, sbx: string) => {
   const script = join(home, "..", "lane-sandbox-macos.sh");
-  writeFileSync(script, readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8").replace(/^SBX=.*$/m, `SBX=${sbx}`));
+  writeFileSync(script, readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8").replace(/^SBX=.*$/m, `SBX=${sbx}`).replace(/^CERTS=.*$/m, `CERTS=${join(home, "..", "cert.pem")}`));
   const child = Bun.spawn(["bash", script, ...args], { cwd, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
   const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   return { code, out, err };
@@ -165,7 +165,7 @@ const runMacos = async (home: string, cwd: string, args: string[], env: Record<s
 const seatbelt = async (home: string, cwd: string, env: Record<string, string>): Promise<Seatbelt> => {
   const out = join(home, "..", "sbx-argv");
   const sbx = join(home, "..", "fake-sandbox-exec");
-  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" > "${out}.env"\n`);
+  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" > "${out}.env"\n`);
   chmodSync(sbx, 0o755);
   const r = await runMacos(home, cwd, ["omo", "--model", "m"], env, sbx);
   expect(r.code).toBe(0);
@@ -252,7 +252,7 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   const lt = join(home, ".cache", "omo-tmp", "lane-sandbox", "lane-a");
 
   expect(sb.command).toEqual(["omo", "--model", "m"]);
-  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1" });
+  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "" });
   expect(statSync(lt).mode & 0o777).toBe(0o700);
   expect(sb.err).toBe("");
 
@@ -291,6 +291,32 @@ test("macOS: a lane may rewrite its own login keychain and Claude Code's lock di
     expect({ no, write: write(no) }).toEqual({ no, write: false });
   }
   expect(sb.profile).not.toContain(root);
+});
+
+test("macOS: a cwd-less lane may write the worktree root and each repo's .git under the repos root, but no repo's hooks or working tree", async () => {
+  const { root, home, runner } = macHome();
+  const cwd = join(runner, "lanes", "lane-a");
+  mkdirSync(cwd, { recursive: true });
+  const repos = join(root, "work.repos"), worktrees = join(root, "worktrees");
+  mkdirSync(join(repos, "app", ".git"), { recursive: true });
+  const sb = await seatbelt(home, cwd, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_REPOS: repos, LANE_SANDBOX_WORKTREES: worktrees });
+  const write = (p: string) => allows(sb, "file-write-data", p);
+
+  for (const ok of [join(worktrees, "app-lane-a", "src", "a.ts"), join(repos, "app", ".git"), join(repos, "app", ".git", "FETCH_HEAD"), join(repos, "app", ".git", "refs", "heads", "feat", "x"), join(repos, "app", ".git", "worktrees", "app-lane-a", "HEAD")]) {
+    expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
+  }
+  for (const no of [join(repos, "app", "src", "a.ts"), join(repos, "app", ".git", "hooks"), join(repos, "app", ".git", "hooks", "pre-commit"), join(repos, "app", ".gitignore"), join(repos, "app", "vendor", ".git", "x"), join(repos, "probe"), join(`${repos}x`, "app", ".git", "x"), join(root, "workXrepos", "app", ".git", "x")]) {
+    expect({ no, write: write(no) }).toEqual({ no, write: false });
+  }
+  expect(allows(sb, "file-read-data", join(home, ".dori", "env"))).toBe(false);
+  expect(sb.profile).not.toContain(root);
+});
+
+test("macOS: a lane's tools get the system root bundle as SSL_CERT_FILE, and one already set is kept", async () => {
+  const { root, home, wt } = macHome();
+  writeFileSync(join(root, "cert.pem"), "");
+  expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" })).env.SSL_CERT_FILE).toBe(join(root, "cert.pem"));
+  expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", SSL_CERT_FILE: "/opt/corp.pem" })).env.SSL_CERT_FILE).toBe("/opt/corp.pem");
 });
 
 test("macOS: a cwd-less lane may list the directories above its cwd (realpath opens them), but read nothing under them", async () => {
