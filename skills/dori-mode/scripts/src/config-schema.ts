@@ -6,7 +6,7 @@ type Json = Record<string, unknown>;
 /** The top-level key that holds a file's schema version; absent means version 0 (written before versions existed). */
 export const CONFIG_SCHEMA_KEY = "schemaVersion";
 /** The version this dori writes. Raise it together with a new CONFIG_MIGRATIONS entry. */
-export const CONFIG_SCHEMA_VERSION = 6;
+export const CONFIG_SCHEMA_VERSION = 7;
 
 export type ConfigMigration = {
   /** The version a file has after this step. */
@@ -15,6 +15,11 @@ export type ConfigMigration = {
   readonly renames?: Readonly<Record<string, string>>;
   /** Key -> why config.json no longer reads it. Removal itself is warned about once first (pruneObsolete). */
   readonly removes?: Readonly<Record<string, string>>;
+  /**
+   * Key (top-level or `<key>.<sub>`) -> why: removed by this step at once, for a key whose value no longer means
+   * anything, so there is nothing to keep it for. The step runs once per file, so its warning is printed once.
+   */
+  readonly drops?: Readonly<Record<string, string>>;
   /**
    * Key -> the built-in default a file written before this step got for it. A file without the key gets this value
    * written, so a changed default never changes what an existing install does.
@@ -47,6 +52,8 @@ export const CONFIG_MIGRATIONS: readonly ConfigMigration[] = [
   { to: 5, removes: { "placement.workspaces": "each runner declares its repos (reposRoot discovery or its runner-config.json workspaces)" } },
   // secrets became the allowlist of store secrets a lane may receive; empty denies every lane.
   { to: 6, fills: { secrets: {} } },
+  // Autopilot is always on: a task runs when it is marked for autopilot in toodo, and `dori autopilot pause` stops it.
+  { to: 7, drops: { "autopilot.mode": "autopilot is always on; a task's toodo autopilot mark decides, and dori autopilot pause stops it" } },
 ];
 
 export class ConfigSchemaError extends Error {}
@@ -75,7 +82,11 @@ export type SchemaMigrated = {
   readonly renamed: readonly (readonly [string, string])[];
   /** The keys a step's `fills` wrote. */
   readonly filled: readonly string[];
+  /** The keys a step's `drops` removed, each with why. */
+  readonly dropped: readonly (readonly [string, string])[];
 };
+
+const isRecord = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Applies every CONFIG_MIGRATIONS step newer than `raw`'s version. Removals are left to the caller (they are not in
@@ -91,6 +102,7 @@ export const migrateConfigSchema = (raw: Json): SchemaMigrated => {
   delete next[CONFIG_SCHEMA_KEY];
   const renamed: [string, string][] = [];
   const filled: string[] = [];
+  const dropped: [string, string][] = [];
   for (const m of CONFIG_MIGRATIONS) {
     if (m.to <= from) continue;
     for (const [key, value] of Object.entries(m.fills ?? {})) {
@@ -104,6 +116,20 @@ export const migrateConfigSchema = (raw: Json): SchemaMigrated => {
       delete next[old];
       renamed.push([old, now]);
     }
+    for (const [key, why] of Object.entries(m.drops ?? {})) {
+      const [top, sub] = key.split(".", 2) as [string, string | undefined];
+      if (sub === undefined) {
+        if (!(top in next)) continue;
+        delete next[top];
+      } else {
+        const parent = next[top];
+        if (!isRecord(parent) || !(sub in parent)) continue;
+        const rest: Json = { ...parent };
+        delete rest[sub];
+        next[top] = rest;
+      }
+      dropped.push([key, why]);
+    }
   }
-  return { next, from, renamed, filled };
+  return { next, from, renamed, filled, dropped };
 };

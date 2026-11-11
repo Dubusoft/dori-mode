@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import {
   autopilotLocalStateKey, candidatesJson, DEFAULT_AUTOPILOT, formatCandidates, type JudgeContext, judge, judgeAll, ledgerRows, ledgerState,
-  parseAutopilotConfig, recordShadow, type ToodoTask,
+  parseAutopilotConfig, type ToodoTask,
 } from "../src/autopilot.ts";
 import { JsonOperations, type Operation, type OperationState } from "../src/operations.ts";
 
@@ -158,15 +158,21 @@ test("a HOLD or REFUSE task takes no slot", () => {
 
 // Rows and output
 
+/** A judgment row an older dori wrote (shadow mode is gone); autopilot ignores it. */
+const oldShadowRow = (taskId: number): Operation => ({
+  id: `autopilot/autopilot-shadow/${taskId}@2026-01-01T12:00:00.000Z`, lane: "autopilot", action: "autopilot-shadow",
+  target: `${taskId}@2026-01-01T12:00:00.000Z`, state: "verified", detail: "LAUNCH", attempts: 1, at: T0, updatedAt: T0,
+});
+
 test("ledgerRows reads only launch-attempt rows", () => {
   store.put(attempt(12, 1, "failed"));
-  recordShadow(store, T0, [{ taskId: 12, verdict: "LAUNCH", reasons: [] }]);
+  store.put(oldShadowRow(12));
   expect(ledgerRows(store).map((op) => op.id)).toEqual(["toodo:12/autopilot-launch/1"]);
 });
 
-test("autopilotLocalStateKey tracks open lanes and open launch rows, ignoring shadow rows", () => {
+test("autopilotLocalStateKey tracks open lanes and open launch rows, ignoring an older dori's shadow rows", () => {
   const empty = autopilotLocalStateKey(store, new Set());
-  const shadow = recordShadow(store, T0, [{ taskId: 12, verdict: "LAUNCH", reasons: [] }]);
+  store.put(oldShadowRow(12));
   expect(autopilotLocalStateKey(store, new Set())).toBe(empty);
   store.put(attempt(12, 1, "planned"));
   const planned = autopilotLocalStateKey(store, new Set());
@@ -174,24 +180,11 @@ test("autopilotLocalStateKey tracks open lanes and open launch rows, ignoring sh
   store.put(attempt(12, 1, "verified"));
   expect(autopilotLocalStateKey(store, new Set())).toBe(empty);
   expect(autopilotLocalStateKey(store, new Set(["lane-a"]))).not.toBe(empty);
-  expect(shadow).toHaveLength(1);
-});
-
-test("recordShadow writes one verified row per task per hour", () => {
-  const now = T0 + 25 * 60_000;
-  const first = recordShadow(store, now, [{ taskId: 12, verdict: "REFUSE", reasons: ["owner-ref-missing", "criteria-missing"] }]);
-  expect(first.map((op) => [op.id, op.state, op.detail])).toEqual([["autopilot/autopilot-shadow/12@2026-01-01T12:00:00.000Z", "verified", "REFUSE owner-ref-missing, criteria-missing"]]);
-  recordShadow(store, now + 10 * 60_000, [{ taskId: 12, verdict: "LAUNCH", reasons: [] }]);
-  recordShadow(store, T0 + HOUR, [{ taskId: 12, verdict: "LAUNCH", reasons: [] }]);
-  expect(store.list({ lane: "autopilot" }).map((op) => [op.target, op.detail])).toEqual([
-    ["12@2026-01-01T12:00:00.000Z", "REFUSE owner-ref-missing, criteria-missing"],
-    ["12@2026-01-01T13:00:00.000Z", "LAUNCH"],
-  ]);
 });
 
 test("formatCandidates prints the header and one line per verdict; none prints AUTOPILOT_NO_CANDIDATES", () => {
   const report = {
-    mode: "shadow" as const, paused: false, slots: 1,
+    paused: false, slots: 1,
     verdicts: [
       { taskId: 12, verdict: "LAUNCH" as const, reasons: [] },
       { taskId: 13, verdict: "HOLD" as const, reasons: ["no-slot" as const] },
@@ -199,19 +192,17 @@ test("formatCandidates prints the header and one line per verdict; none prints A
     ],
   };
   expect(formatCandidates(report)).toEqual([
-    "AUTOPILOT mode=shadow record-only: nothing launches slots=1 candidates=3",
+    "AUTOPILOT slots=1 candidates=3",
     "AUTOPILOT_CANDIDATE #12 LAUNCH would-launch",
     "AUTOPILOT_CANDIDATE #13 HOLD no-slot",
     "AUTOPILOT_CANDIDATE #30 REFUSE not-flagged, criteria-missing",
   ]);
-  expect(formatCandidates({ ...report, slots: null })[0]).toBe("AUTOPILOT mode=shadow record-only: nothing launches slots=unlimited candidates=3");
+  expect(formatCandidates({ ...report, slots: null })[0]).toBe("AUTOPILOT slots=unlimited candidates=3");
   expect(formatCandidates({ ...report, verdicts: [] })).toEqual(["AUTOPILOT_NO_CANDIDATES"]);
-  // Only mode on without a pause launches; a pause is named in any mode.
-  expect(formatCandidates({ ...report, mode: "on" })[0]).toBe("AUTOPILOT mode=on slots=1 candidates=3");
-  expect(formatCandidates({ ...report, mode: "on", paused: true })[0]).toBe("AUTOPILOT mode=on paused record-only: nothing launches slots=1 candidates=3");
-  expect(formatCandidates({ ...report, mode: "off" })[0]).toBe("AUTOPILOT mode=off record-only: nothing launches slots=1 candidates=3");
+  // Autopilot is always on: only a pause keeps it from launching.
+  expect(formatCandidates({ ...report, paused: true })[0]).toBe("AUTOPILOT paused: nothing launches slots=1 candidates=3");
   expect(candidatesJson(report)).toEqual({
-    mode: "shadow", paused: false, slots: 1,
+    paused: false, slots: 1,
     candidates: [
       { taskId: 12, verdict: "LAUNCH", reasons: [] },
       { taskId: 13, verdict: "HOLD", reasons: ["no-slot"] },
@@ -226,17 +217,21 @@ test("parseAutopilotConfig defaults every key", () => {
   expect(parseAutopilotConfig(undefined)).toEqual(DEFAULT_AUTOPILOT);
   expect(parseAutopilotConfig({})).toEqual(DEFAULT_AUTOPILOT);
   expect(parseAutopilotConfig({ quotaMaxUsedPct: 90, mergeBase: "develop" })).toEqual({ ...DEFAULT_AUTOPILOT, quotaMaxUsedPct: 90, mergeBase: "develop" });
-  expect([DEFAULT_AUTOPILOT.mode, DEFAULT_AUTOPILOT.tickSec]).toEqual(["shadow", 300]);
-  for (const mode of ["off", "shadow", "on"] as const) expect(parseAutopilotConfig({ mode }).mode).toBe(mode);
+  expect(DEFAULT_AUTOPILOT.tickSec).toBe(300);
   expect(parseAutopilotConfig({ tickSec: 30 }).tickSec).toBe(30);
   expect(parseAutopilotConfig({ tickSec: 3600 }).tickSec).toBe(3600);
 });
 
-test("parseAutopilotConfig ignores the removed bundle keys with one warning", () => {
+test("parseAutopilotConfig ignores the removed bundle keys and mode (any value) with one warning", () => {
   const warnings: string[] = [];
   expect(parseAutopilotConfig({ workspaces: [7], wip: 5, attemptCap: 3, quotaMaxUsedPct: 90 }, (line) => warnings.push(line)))
     .toEqual({ ...DEFAULT_AUTOPILOT, quotaMaxUsedPct: 90 });
   expect(warnings).toEqual(["autopilot.workspaces, autopilot.wip, autopilot.attemptCap no longer apply and are ignored"]);
+  for (const mode of ["off", "shadow", "on", "live", 7]) {
+    const seen: string[] = [];
+    expect(parseAutopilotConfig({ mode }, (line) => seen.push(line))).toEqual(DEFAULT_AUTOPILOT);
+    expect(seen).toEqual(["autopilot.mode no longer apply and are ignored"]);
+  }
 });
 
 test("parseAutopilotConfig throws TypeError naming the key on an invalid value or an unknown key", () => {
@@ -246,7 +241,6 @@ test("parseAutopilotConfig throws TypeError naming the key on an invalid value o
     [{ quotaUnreadable: "launch" }, /^autopilot\.quotaUnreadable /],
     [{ mergeBase: "" }, /^autopilot\.mergeBase /],
     [{ crossWorkspacePrereqs: "allow" }, /^autopilot\.crossWorkspacePrereqs /],
-    [{ mode: "live" }, /^autopilot\.mode /],
     [{ tickSec: 29 }, /^autopilot\.tickSec /],
     [{ tickSec: 3601 }, /^autopilot\.tickSec /],
     [{ tickSec: 60.5 }, /^autopilot\.tickSec /],

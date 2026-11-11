@@ -52,7 +52,6 @@
     "quotaUnreadable": "hold",
     "mergeBase": "dev",
     "crossWorkspacePrereqs": "block",
-    "mode": "shadow",
     "tickSec": 300
   },
   "guardMachines": {},

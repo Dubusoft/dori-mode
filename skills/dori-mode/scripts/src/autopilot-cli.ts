@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 
 import {
   type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll,
-  LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaSummary, recordShadow, type ToodoTask,
+  LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaSummary, type ToodoTask,
 } from "./autopilot.ts";
 import { type ClaudeUsage, lookupQuotaResults, readUsage } from "./claude-quota.ts";
 import type { FlowDeps } from "./done-flow.ts";
@@ -14,14 +14,13 @@ import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
 
 /**
  * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
- * launches a lane, writes to toodo or merges: candidates only reads (and with --record writes shadow rows), launch
- * writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
+ * launches a lane, writes to toodo or merges: candidates only reads, launch writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
  * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every `autopilot.tickSec`.
- * A reservation needs `autopilot.mode` "on" and no pause; `pause` / `resume` set and clear the pause file.
+ * Autopilot is always on: a reservation needs only no pause; `pause` / `resume` set and clear the pause file.
  */
 
 export const AUTOPILOT_USAGE = [
-  "usage: dori autopilot candidates [--tasks 12,13] [--json] [--record]",
+  "usage: dori autopilot candidates [--tasks 12,13] [--json]",
   "       dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]",
   "       dori autopilot pause [--reason TEXT]",
   "       dori autopilot resume",
@@ -132,12 +131,12 @@ export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry"
 class UsageError extends Error {}
 
 const FLAGS = {
-  json: { type: "boolean" }, record: { type: "boolean" }, tasks: { type: "string" },
+  json: { type: "boolean" }, tasks: { type: "string" },
   launched: { type: "string" }, failed: { type: "boolean" }, ambiguous: { type: "boolean" }, note: { type: "string" },
   reason: { type: "string" },
 } as const;
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  candidates: ["json", "record", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], pause: ["reason"], resume: [],
+  candidates: ["json", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], pause: ["reason"], resume: [],
 };
 
 const taskIds = (value: string | undefined): number[] => {
@@ -179,28 +178,25 @@ const readTasks = async (deps: AutopilotDeps, extraIds: readonly number[]): Prom
 export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number[] = []): Promise<CandidatesReport> => {
   const { tasks, ids } = await loadTasks(deps, extraIds);
   const paused = readPause(deps.pauseFile) !== undefined;
-  if (!ids.length) return { mode: deps.config.mode, paused, slots: null, verdicts: [] };
+  if (!ids.length) return { paused, slots: null, verdicts: [] };
   const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
   const ledger = ledgerRows(deps.store);
   const pending = pendingReservations(ledger, openLanes);
   const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
   const verdicts = judgeAll({ tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, ids);
-  return { mode: deps.config.mode, paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts };
+  return { paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts };
 };
 
 /**
- * Judges every planned task marked for autopilot plus `extraIds` and prints the report; --record writes one shadow row
- * per task this hour. Exit 1 with AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read, since nothing can be judged.
+ * Judges every planned task marked for autopilot plus `extraIds` and prints the report. Exit 1 with AUTOPILOT_TOODO_UNREADABLE when toodo cannot be read, since nothing can be judged.
  */
-const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, extraIds: readonly number[]): Promise<number> => {
-  const now = deps.now();
+const candidates = async (deps: AutopilotDeps, json: boolean, extraIds: readonly number[]): Promise<number> => {
   let report: CandidatesReport;
   try { report = await judgeCandidates(deps, extraIds); } catch (e) {
     if (!(e instanceof ToodoUnreadable)) throw e;
     deps.err(`AUTOPILOT_TOODO_UNREADABLE ${e.message}`);
     return 1;
   }
-  if (record) recordShadow(deps.store, now, report.verdicts);
   if (json) deps.out(JSON.stringify(candidatesJson(report), null, 2));
   else for (const line of formatCandidates(report)) deps.out(line);
   return 0;
@@ -210,13 +206,9 @@ const candidates = async (deps: AutopilotDeps, json: boolean, record: boolean, e
  * Reserves the next launch attempt of `taskId` under the launch lock: re-reads toodo, the ledger, open lanes, quota and
  * the host, judges the task among every marked one (other tasks' reservations not running yet take a host slot each),
  * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH, and before
- * reading anything when the mode is not "on" or a pause is in force.
+ * reading anything when a pause is in force.
  */
 const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
-  if (deps.config.mode !== "on") {
-    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} mode=${deps.config.mode}: nothing launches unless autopilot.mode is "on"`);
-    return 1;
-  }
   const pause = readPause(deps.pauseFile);
   if (pause) {
     deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} paused ${pauseText(pause)} (dori autopilot resume lifts it)`);
@@ -314,7 +306,7 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     if (sub === "pause") return pause(deps, v.reason as string | undefined);
     if (sub === "resume") return resume(deps);
     const extraIds = v.tasks === undefined ? [] : taskIds(v.tasks as string);
-    return await candidates(deps, v.json === true, v.record === true, extraIds);
+    return await candidates(deps, v.json === true, extraIds);
   } catch (e) {
     if (e instanceof UsageError) { deps.err(`${e.message}\n${AUTOPILOT_USAGE}`); return 2; }
     if (e instanceof TypeError || e instanceof ToodoUnreadable) { deps.err(`AUTOPILOT_FAILED ${e.message}`); return 1; }

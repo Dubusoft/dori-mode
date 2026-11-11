@@ -550,6 +550,24 @@ test("a config with a newer schemaVersion is refused before anything is written"
   expect(existsSync(join(d.home, ".dori", "state", CONFIG_REMOVALS_FILE))).toBe(false);
 });
 
+test("migrate removes autopilot.mode (any value) at once with one warning; a second migrate says nothing of it", async () => {
+  const core = { discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", leadCwd: "~", stateDir: "~/.dori/state" };
+  for (const mode of ["on", "shadow", "off"]) {
+    const d = deps({ home: join(state.dir, mode), configPath: join(state.dir, mode, "config.json") });
+    log = [];
+    await Bun.write(d.configPath, JSON.stringify({ schemaVersion: 6, ...core, autopilot: { mode, tickSec: 120 } }));
+    expect(await runSetup(d, { migrate: true })).toBe(0);
+    expect(readJson(d.configPath)).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, autopilot: { tickSec: 120 } });
+    expect(readJson(d.configPath).autopilot).toEqual({ tickSec: 120 });
+    expect(log.filter((l) => l.startsWith("SETUP_KEY_REMOVED autopilot.mode ("))).toHaveLength(1);
+    expect(log.some((l) => l.startsWith("SETUP_KEY_REMOVAL_PENDING autopilot"))).toBe(false);
+    log = [];
+    expect(await runSetup(d, { migrate: true })).toBe(0);
+    expect(log.some((l) => l.includes("autopilot.mode"))).toBe(false);
+    expect(readJson(d.configPath).autopilot).toEqual({ tickSec: 120 });
+  }
+});
+
 test("a pre-v2 config without worktreeRoot gets its old default written; a set value and a new file are left alone", async () => {
   const d = deps();
   const core = { discord: { applicationId: APPLICATION, guildId: GUILD, ownerId: OWNER }, discordChannels: [CHANNEL], defaultModel: "a/b", defaultCwd: "~", stateDir: "~/.dori/state" };

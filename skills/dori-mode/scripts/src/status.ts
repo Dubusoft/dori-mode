@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
+import { autopilotPausePath, readPause } from "./autopilot-cli.ts";
 import type { DoriConfig } from "./config.ts";
 import { displayTime } from "./display-time.ts";
 import { eventClass, eventKind, type EventClass, type EventPolicy } from "./event-policy.ts";
@@ -54,6 +55,8 @@ export type Status = {
   readonly services: readonly UnitState[];
   /** `laneWorkspace`: the supervisor-managed herdr workspace new local lane tabs open in ("" when none is recorded yet). */
   readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string };
+  /** Autopilot is always on; `paused` while `dori autopilot pause` is in force. Absent in an older status. */
+  readonly autopilot?: { readonly paused: false } | { readonly paused: true; readonly since: string; readonly reason: string | null };
   readonly lanes: readonly {
     readonly key: string; readonly model?: string; readonly ageMin: number; readonly progress?: string; readonly repo?: string; readonly pr?: number;
     /** The runner the lane runs on (its owning runner, else its machine, else "local"); absent in an older status reads as "local". */
@@ -383,6 +386,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   ]);
   const gh = githubSummary(d.config.stateDir);
   const pendingRestart = pendingLeadRestart(d.config.stateDir);
+  const pause = readPause(autopilotPausePath(d.config.stateDir));
   let repos: string[] = [];
   try { repos = new Repos(d.config.stateDir).list(); } catch { /* unreadable list: show none */ }
   const reports = latestLaneReports(d.config);
@@ -405,6 +409,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     timeZone: d.config.displayTimeZone,
     services,
     lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
+    autopilot: pause ? { paused: true, ...pause } : { paused: false },
     lanes,
     waits: readWaits(d.config.stateDir),
     github: {
@@ -691,6 +696,9 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   section("리드", [
     leadLine(l),
     `- 새 레인 워크스페이스: ${l.laneWorkspace || "아직 없음 (수퍼바이저가 만듦)"}`,
+    ...(s.autopilot ? [s.autopilot.paused
+      ? clip(`- 오토파일럿: 일시정지 (${s.autopilot.since}부터${s.autopilot.reason ? `: ${s.autopilot.reason}` : ""}; dori autopilot resume)`, 200)
+      : "- 오토파일럿: 켜짐 (autopilot 표시된 작업만 실행)"] : []),
     ...(l.pendingRestart ? [clip(`- 재시작 ${l.pendingRestart.id} 대기 중: ${l.pendingRestart.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}, 다음 유휴 때`, 300)] : []),
   ]);
 

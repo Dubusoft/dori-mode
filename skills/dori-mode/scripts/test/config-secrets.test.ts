@@ -76,10 +76,9 @@ test("a bad as or mint throws TypeError", async () => {
 });
 
 test("schema 6 fills secrets into a version-5 file and setup stamps the new version", () => {
-  expect(CONFIG_SCHEMA_VERSION).toBe(6);
   const migrated = migrateConfigSchema({ schemaVersion: 5, defaultModel: "a/b" });
   expect(migrated.next.secrets).toEqual({});
   expect(migrated.filled).toEqual(["secrets"]);
   const pruned = pruneObsolete({ log: () => {} }, state.dir, { schemaVersion: 5, defaultModel: "a/b" });
-  expect(pruned).toMatchObject({ schemaVersion: 6, secrets: {} });
+  expect(pruned).toMatchObject({ schemaVersion: CONFIG_SCHEMA_VERSION, secrets: {} });
 });
