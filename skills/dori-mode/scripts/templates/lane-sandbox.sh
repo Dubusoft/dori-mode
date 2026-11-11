@@ -86,6 +86,10 @@ for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
   .npmrc .dori/config.json .dori/src .dori/bin; do
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
+# The real BrowserSkill home (daemon.json and its daemon.sock), read-only: a lane drives bsk directly. A unix socket
+# connect needs no write mount; a lane cannot rewrite daemon.json or bsk's state.
+bsk_home=${BSK_HOME:-$H/.bsk}
+opts+=(--ro-bind-try "$bsk_home" "$bsk_home")
 # The rest of ~/.config (other tools' credentials, herdr's control socket) stays out. The ssh agent socket may live
 # there (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent): that one path is bound on its own.
 case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac

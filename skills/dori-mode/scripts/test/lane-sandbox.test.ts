@@ -26,6 +26,23 @@ const sandboxArgv = async (home: string, env: Record<string, string>): Promise<s
   return readFileSync(out, "utf8").split("\n");
 };
 
+test("the real BrowserSkill home is bound read-only, including an explicit BSK_HOME", async () => {
+  const home = join(tempDir(), "home");
+  const bskHome = join(home, ".bsk");
+  mkdirSync(bskHome, { recursive: true });
+  const bind = (argv: string[], path: string) => argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === path && argv[i + 2] === path);
+  const readWriteNames = (argv: string[], path: string) => argv.some((a, i) => (a === "--bind" || a === "--bind-try") && (argv[i + 1] === path || argv[i + 2] === path));
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+  expect(bind(argv, bskHome)).toBeGreaterThan(-1);
+  expect(readWriteNames(argv, bskHome)).toBe(false);
+
+  const customBskHome = tempDir();
+  const customArgv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", BSK_HOME: customBskHome });
+  expect(bind(customArgv, customBskHome)).toBeGreaterThan(-1);
+  expect(readWriteNames(customArgv, customBskHome)).toBe(false);
+});
+
 test("a sandboxed lane gets its own token file, the runner's lane socket, its brief and the runner's bin (read-only), its own lanes/<key> mount point, and nothing else of the runner dir or the env file", async () => {
   const home = join(tempDir(), "home");
   const runner = join(home, ".dori", "runner");
