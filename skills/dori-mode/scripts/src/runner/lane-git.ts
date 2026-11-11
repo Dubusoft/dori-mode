@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { basename } from "node:path";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { basename, join } from "node:path";
 
 import type { Runner } from "../run.ts";
 import type { CommandResults, LaneInspection, SupervisorCommandBodies } from "./protocol.ts";
@@ -58,11 +58,56 @@ export const discoverWorktrees = async (run: Runner, key: string, roots: readonl
   return [...found.values()];
 };
 
+/** omo's project config, which omo's config migrations rewrite in place at startup. */
+const OMO_CONFIG = ".omo/omo.jsonc";
+/** The backup omo writes beside its config before a migration. */
+const OMO_BACKUP = /^\.omo\/omo\.jsonc\.bak\.[^/\s"]+$/;
+
+/** A JSONC config as an object without its top-level `_migrations` key, or undefined when it is not a JSONC object. */
+const withoutMigrations = (text: string): Record<string, unknown> | undefined => {
+  let parsed: unknown;
+  try { parsed = Bun.JSONC.parse(text); } catch { return undefined; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const { _migrations: _, ...rest } = parsed as Record<string, unknown>;
+  return rest;
+};
+
+/**
+ * What omo itself left in worktree `path` when that is all of its changes, else undefined: untracked
+ * `.omo/omo.jsonc.bak.*` backups (gitignored ones are not changes), and `.omo/omo.jsonc` modified in the worktree only
+ * (nothing staged) while it equals HEAD's once the top-level `_migrations` key is dropped from both. Any other change, a
+ * staged one, a config HEAD lacks or one that does not parse is real work, and so is any git read that fails.
+ */
+export const omoNoise = async (run: Runner, path: string): Promise<{ readonly config: boolean; readonly backups: readonly string[] } | undefined> => {
+  const names = async (...args: string[]): Promise<string[] | undefined> => {
+    const r = await run(["git", "-C", path, ...args], { timeoutMs: GIT_TIMEOUT_MS });
+    return r.code === 0 ? r.out.split("\n").filter((line) => line !== "") : undefined;
+  };
+  const staged = await names("diff", "--cached", "--name-only");
+  if (!staged || staged.length) return undefined;
+  const changed = await names("diff", "--name-only");
+  if (!changed || changed.some((p) => p !== OMO_CONFIG)) return undefined;
+  const untracked = await names("ls-files", "--others", "--exclude-standard");
+  if (!untracked || !untracked.every((p) => OMO_BACKUP.test(p))) return undefined;
+  const config = changed.length > 0;
+  if (!config && !untracked.length) return undefined;
+  if (config) {
+    const head = await run(["git", "-C", path, "show", `HEAD:${OMO_CONFIG}`], { timeoutMs: GIT_TIMEOUT_MS });
+    if (head.code !== 0) return undefined;
+    let work: string;
+    try { work = readFileSync(join(path, OMO_CONFIG), "utf8"); } catch { return undefined; }
+    const committed = withoutMigrations(head.out);
+    const current = withoutMigrations(work);
+    if (!committed || !current || !Bun.deepEquals(committed, current)) return undefined;
+  }
+  return { config, backups: untracked };
+};
+
 export type WorktreeFacts = LaneInspection extends { readonly git?: infer G } ? G extends { readonly worktrees: readonly (infer W)[] } ? W : never : never;
 
 /**
  * One worktree's state: `dirty` (tracked changes or untracked files, gitignored ones excluded: a close would delete
- * them with the worktree) and `ahead` (commits on HEAD that no remote has). A missing worktree is `exists: false`; an
+ * them with the worktree; omo's own config migration and its backups (`omoNoise`) are not work) and `ahead` (commits on HEAD that no remote has). A missing worktree is `exists: false`; an
  * unreadable one carries `error`.
  */
 export const worktreeState = async (run: Runner, wt: ListedWorktree, exists: (path: string) => boolean): Promise<WorktreeFacts> => {
@@ -75,7 +120,8 @@ export const worktreeState = async (run: Runner, wt: ListedWorktree, exists: (pa
     const why = (dirty.code !== 0 ? dirty.err || dirty.out : ahead.err || ahead.out).trim().slice(0, 160) || "git state unreadable";
     return { ...base, exists: true, error: why };
   }
-  return { ...base, exists: true, dirty: dirty.out.trim() !== "", ahead: count };
+  const changed = dirty.out.trim() !== "" && !(await omoNoise(run, wt.path));
+  return { ...base, exists: true, dirty: changed, ahead: count };
 };
 
 const gitLine = async (run: Runner, cwd: string, args: readonly string[]): Promise<string | undefined> => {
@@ -210,16 +256,26 @@ const branchHeld = async (run: Runner, root: string, branch: string): Promise<st
  * Runs one `lane.git` op and returns its exit code and capped output as data: a git that refuses (a dirty worktree,
  * an unknown branch) is `code != 0`, not a throw, so the supervisor's read-back decides. Only an unusable body throws.
  * A branch delete (local or remote) first reads the repository's complete worktree list and is refused, as data, while
- * the branch is checked out anywhere or the list is unreadable.
+ * the branch is checked out anywhere or the list is unreadable. A worktree remove first undoes what omo alone left in
+ * the worktree (`omoNoise`); git's own refusal of any other change still decides.
  */
 export const laneGit = async (run: Runner, body: GitBody): Promise<CommandResults["lane.git"]> => {
   const argv = gitOpArgv(body);
+  if (body.op === "worktree-remove" && body.path) await dropOmoNoise(run, body.path);
   if ((body.op === "branch-delete" || body.op === "remote-branch-delete") && body.branch) {
     const held = await branchHeld(run, body.root, body.branch);
     if (held) return { code: 1, out: "", err: capOutput(held) };
   }
   const r = await run(argv, { timeoutMs: body.op === "remote-branch-delete" ? GIT_PUSH_TIMEOUT_MS : GIT_TIMEOUT_MS });
   return { code: r.code, out: capOutput(r.out), err: capOutput(r.err) };
+};
+
+/** Restores omo's migrated config to HEAD and deletes its backups in worktree `path`, when they are its only changes. */
+const dropOmoNoise = async (run: Runner, path: string): Promise<void> => {
+  const noise = await omoNoise(run, path);
+  if (!noise) return;
+  for (const backup of noise.backups) rmSync(join(path, backup), { force: true });
+  if (noise.config) await run(["git", "-C", path, "checkout", "--", OMO_CONFIG], { timeoutMs: GIT_TIMEOUT_MS });
 };
 
 /** The `lane.git` effect output: the detail line for the command record, with the structured result. */
