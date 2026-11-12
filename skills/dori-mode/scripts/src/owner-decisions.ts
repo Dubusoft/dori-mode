@@ -365,6 +365,20 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
   return { decision: readDecisions(stateDir).decisions.find((x) => x.id === d.id) ?? d, channel: chosen, link, ...(noticeKept ? { noticeKept } : {}) };
 };
 
+/**
+ * Renames a closed decision's thread to its short closed name, then archives it, then reads it back. Two PATCHes, in that
+ * order: Discord posts a "changed the channel name" message into a renamed thread, which reopens it, so a rename sent with
+ * the archive (or after it) leaves the thread open. A thread still open on read-back is archived once more; still open
+ * after that throws, so the caller records the archive as pending.
+ */
+const renameAndArchive = async (transport: Pick<DecisionTransport, "setThread" | "threadArchived">, d: OwnerDecision & { readonly thread: string }): Promise<void> => {
+  await transport.setThread(d.thread, { name: decisionThreadName(d, true) });
+  await transport.setThread(d.thread, { archived: true });
+  if (await transport.threadArchived(d.thread)) return;
+  await transport.setThread(d.thread, { archived: true });
+  if (!await transport.threadArchived(d.thread)) throw new Error(`thread ${d.thread} is still open after archiving it`);
+};
+
 export type CloseResult = {
   readonly decision: OwnerDecision;
   /** Why archiving failed (the decision is closed; the tick retries the archive). */
@@ -376,7 +390,7 @@ export type CloseResult = {
 
 /**
  * Closes a decision: posts the `[System]` confirmation into its thread (stable nonce `decision-close:<id>`, so two closes
- * post it once), renames and archives the thread in one PATCH, records it closed, appends the outcome to the origin link
+ * post it once), renames the thread and then archives it (renameAndArchive), records it closed, appends the outcome to the origin link
  * line, and resolves its OWNER_DECISION_ANSWERED obligation. Throws OwnerDecisionError DECISION_UNKNOWN,
  * DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, or DECISION_NOT_CLOSED (the confirmation could not be posted; nothing changed).
  */
@@ -392,7 +406,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   if (d.thread) {
     try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home), `decision-close:${d.id}`); }
     catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
-    try { await ctx.transport.setThread(d.thread, { name: decisionThreadName(d, true), archived: true }); }
+    try { await renameAndArchive(ctx.transport, { ...d, thread: d.thread }); }
     catch (e) { archivePending = errorText(e); }
   }
   const at = ctx.now();
@@ -547,7 +561,7 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
     }
     if (d.state === "closed" && d.archivePending && d.thread && d.goneAt === undefined) {
       try {
-        await deps.transport.setThread(d.thread, { name: decisionThreadName(d, true), archived: true });
+        await renameAndArchive(deps.transport, { ...d, thread: d.thread });
         patchOne(stateDir, d.id, (x) => { const { archivePending: _, ...rest } = x; return rest; });
       } catch (e) {
         if (isGone(e)) {

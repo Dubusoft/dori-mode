@@ -42,6 +42,7 @@ const choices: DecisionChoices = {
 const fakeTransport = () => {
   let sequence = 0;
   const calls: { method: string; args: unknown[] }[] = [];
+  const archived = new Map<string, boolean>();
   const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
   const transport: DecisionTransport = {
     send: async (channel, content, stableId) => {
@@ -61,11 +62,17 @@ const fakeTransport = () => {
       record("startThread", channel, messageId, name, memberId, autoArchiveMin);
       return { id: messageId ?? "thread" };
     },
-    setThread: async (...args) => { record("setThread", ...args); },
+    // Like Discord: a rename posts a "changed the channel name" message into the thread, which reopens it, even when the
+    // same PATCH archives it.
+    setThread: async (threadId, patch) => {
+      record("setThread", threadId, patch);
+      if (patch.archived !== undefined) archived.set(threadId, patch.archived);
+      if (patch.name !== undefined) archived.set(threadId, false);
+    },
     threadState: async (threadId) => { record("threadState", threadId); return { archived: false, parent: "111" }; },
-    threadArchived: async (threadId) => { record("threadArchived", threadId); return false; },
+    threadArchived: async (threadId) => { record("threadArchived", threadId); return archived.get(threadId) ?? false; },
   };
-  return { transport, calls };
+  return { transport, calls, archived };
 };
 
 const context = (
@@ -215,12 +222,32 @@ test("closing an answered decision posts confirmation, archives, resolves, and r
   const answer = recordOwnerAnswer(dir, decision.thread as string, "answer-1", 1_800_000_000_100);
   const closed = await closeOwnerDecision(ctx, decision.id, { text: "Proceed with option one.", choice: 1 });
   expect(fake.calls.some((call) => call.method === "send" && call.args[0] === decision.thread)).toBe(true);
-  expect(fake.calls.some((call) => call.method === "setThread" && call.args[1] && (call.args[1] as { archived?: boolean }).archived === true && String((call.args[1] as { name?: string }).name).startsWith("결정됨 d1"))).toBe(true);
+  const patches = fake.calls.filter((call) => call.method === "setThread").map((call) => call.args[1] as { name?: string; archived?: boolean });
+  expect(patches.map((p) => Object.keys(p))).toEqual([["name"], ["archived"]]);
+  expect(patches[0]?.name).toStartWith("결정됨 d1");
+  expect(fake.archived.get(decision.thread as string)).toBe(true);
+  expect(closed.archivePending).toBeUndefined();
   expect(closed.decision.state).toBe("closed");
   expect(closed.resolved).toBe(answer?.decision.answerEvent);
   expect(readdirSync(join(dir, "resolved")).length).toBeGreaterThan(0);
   expect(JSON.parse(readFileSync(join(dir, "resolved", readdirSync(join(dir, "resolved"))[0] as string), "utf8"))).toMatchObject({ id: answer?.decision.answerEvent });
   await expect(closeOwnerDecision(ctx, decision.id, { text: "Again" })).rejects.toMatchObject({ code: "DECISION_ALREADY_CLOSED" });
+});
+
+test("a thread that stays open after archiving is recorded as a pending archive, and the tick archives it", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const { decision } = await open(ctx);
+  const setThread = fake.transport.setThread;
+  fake.transport.setThread = async (threadId, patch) => { await setThread(threadId, patch.archived ? { ...patch, archived: false } : patch); };
+  const closed = await closeOwnerDecision(ctx, decision.id, { text: "Done.", choice: 1 });
+  expect(closed.archivePending).toContain("still open");
+  expect(readDecisions(dir).decisions[0]?.archivePending).toBe(true);
+  fake.transport.setThread = setThread;
+  await ownerDecisionTick({ ...ctx, enqueue: () => {}, log: () => {} });
+  expect(fake.archived.get(decision.thread as string)).toBe(true);
+  expect(readDecisions(dir).decisions[0]?.archivePending).toBeUndefined();
 });
 
 test("tick sends one daily digest and enqueues a posting-stuck event once", async () => {
