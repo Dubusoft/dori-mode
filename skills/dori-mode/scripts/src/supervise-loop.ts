@@ -39,7 +39,8 @@ import { Database } from "bun:sqlite";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
 import { freshnessTick, scrubForThread } from "./freshness.ts";
-import { lookupQuotaResults, quotaReport } from "./claude-quota.ts";
+import { quotaReport } from "./claude-quota.ts";
+import { sharedQuotaLookup } from "./quota-cache.ts";
 import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
 import { memorySweep } from "./memory-check.ts";
 import { alertReasons, criticalReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
@@ -1014,7 +1015,7 @@ export const supervise = async (
       http: discordOptions.http ?? ((request) => fetchHttp({
         ...request, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
       })),
-      lookup: discordOptions.lookup ?? quotaReport(lookupQuotaResults()),
+      lookup: discordOptions.lookup ?? quotaReport(sharedQuotaLookup(deps.config), deps.config.displayTimeZone),
       // The lead pane is read per request: a pane recreated after startup is in the supervisor, not in deps.
       statusLookup: discordOptions.statusLookup ?? ((lookupSignal, page) =>
         lookupStatus({ ...deps, config: { ...deps.config, leadPane: supervisor.leadPane } })(lookupSignal, page)),
