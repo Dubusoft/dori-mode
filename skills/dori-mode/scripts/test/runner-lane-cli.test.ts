@@ -118,6 +118,36 @@ test("any other command exits 2 with DORI_CLI_LANE_ONLY", async () => {
   expect(other.err[0]).toStartWith("DORI_CLI_LANE_ONLY lane list:");
 });
 
+test("--help prints each lane command's usage with exit 0 and sends nothing; after -- it belongs to the command", async () => {
+  const sock = laneSocket();
+  for (const [args, first] of [
+    [["report", "--help"], "usage: dori report <key>"],
+    [["report", "lane-a", "-h"], "usage: dori report <key>"],
+    [["report", "lane-a", "question", "--help"], "usage: dori report <key>"],
+    [["claim-done", "--help"], "usage: dori claim-done <key>"],
+    [["lane", "status", "--help"], "usage: dori lane status"],
+    [["heavy", "--help"], "usage: dori heavy <label>"],
+    [["secret", "exec", "--help"], "usage: dori secret exec"],
+  ] as const) {
+    const r = io();
+    expect(await laneCliMain([...args], { env, connect: sock.connect, ...r.deps })).toBe(0);
+    expect(r.err).toEqual([]);
+    expect(r.out[0]).toStartWith(first);
+  }
+  const report = io();
+  await laneCliMain(["report", "--help"], { env, connect: sock.connect, ...report.deps });
+  for (const flag of ["--option", "--recommend", "--reason", "--waiting", "--nonblocking"]) expect(report.out[0]).toContain(flag);
+  expect(sock.requests).toEqual([]);
+  let ran: readonly string[] = [];
+  const heavy = io();
+  const home = mkdtempSync(join(tmpdir(), "runner-lane-help-"));
+  dirs.push(home);
+  expect(await laneCliMain(["heavy", "build", "--", "gradle", "--help"], {
+    env, connect: sock.connect, ...heavy.deps, heavyDir: heavyDirOf(home), spawn: async (argv) => { ran = argv; return 0; },
+  })).toBe(0);
+  expect(ran).toEqual(["gradle", "--help"]);
+});
+
 /** A connector over a scripted reply: records each request body the lane CLI sends. */
 const scripted = (reply: object, requests: object[]): Connector => async () => {
   const lines = new Set<(l: string) => void>();
