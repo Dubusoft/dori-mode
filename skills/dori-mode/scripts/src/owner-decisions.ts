@@ -191,12 +191,9 @@ const cut = (text: string, max: number): string => (text.length <= max ? text : 
 
 export const DECISION_THREAD_NAME_MAX = 40;
 
-/**
- * The thread's name: `결정 d12 · #889 · <question>`, cut to DECISION_THREAD_NAME_MAX characters; once closed only the first
- * word changes (`결정됨 d12 · ...`), so the close rename keeps it as short.
- */
-export const decisionThreadName = (d: Pick<OwnerDecision, "id" | "task" | "question">, closed = false): string => {
-  const chars = Array.from(`${closed ? "결정됨" : "결정"} ${d.id}${d.task !== undefined ? ` · #${d.task}` : ""} · ${d.question.replace(/\s+/g, " ").trim()}`);
+/** The thread's name: `결정 d12 · #889 · <question>`, cut to DECISION_THREAD_NAME_MAX characters. */
+export const decisionThreadName = (d: Pick<OwnerDecision, "id" | "task" | "question">): string => {
+  const chars = Array.from(`결정 ${d.id}${d.task !== undefined ? ` · #${d.task}` : ""} · ${d.question.replace(/\s+/g, " ").trim()}`);
   return chars.length <= DECISION_THREAD_NAME_MAX ? chars.join("") : `${chars.slice(0, DECISION_THREAD_NAME_MAX - 1).join("").trimEnd()}…`;
 };
 
@@ -366,17 +363,14 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
 };
 
 /**
- * Renames a closed decision's thread to its short closed name, then archives it, then reads it back. Two PATCHes, in that
- * order: Discord posts a "changed the channel name" message into a renamed thread, which reopens it, so a rename sent with
- * the archive (or after it) leaves the thread open. A thread still open on read-back is archived once more; still open
- * after that throws, so the caller records the archive as pending.
+ * Archives a closed decision's thread (its name stays as opened), then reads it back. A thread still open on read-back is
+ * archived once more; still open after that throws, so the caller records the archive as pending.
  */
-const renameAndArchive = async (transport: Pick<DecisionTransport, "setThread" | "threadArchived">, d: OwnerDecision & { readonly thread: string }): Promise<void> => {
-  await transport.setThread(d.thread, { name: decisionThreadName(d, true) });
-  await transport.setThread(d.thread, { archived: true });
-  if (await transport.threadArchived(d.thread)) return;
-  await transport.setThread(d.thread, { archived: true });
-  if (!await transport.threadArchived(d.thread)) throw new Error(`thread ${d.thread} is still open after archiving it`);
+const archiveThread = async (transport: Pick<DecisionTransport, "setThread" | "threadArchived">, thread: string): Promise<void> => {
+  await transport.setThread(thread, { archived: true });
+  if (await transport.threadArchived(thread)) return;
+  await transport.setThread(thread, { archived: true });
+  if (!await transport.threadArchived(thread)) throw new Error(`thread ${thread} is still open after archiving it`);
 };
 
 export type CloseResult = {
@@ -390,7 +384,7 @@ export type CloseResult = {
 
 /**
  * Closes a decision: posts the `[System]` confirmation into its thread (stable nonce `decision-close:<id>`, so two closes
- * post it once), renames the thread and then archives it (renameAndArchive), records it closed, appends the outcome to the origin link
+ * post it once), archives the thread and reads it back (archiveThread), records it closed, appends the outcome to the origin link
  * line, and resolves its OWNER_DECISION_ANSWERED obligation. Throws OwnerDecisionError DECISION_UNKNOWN,
  * DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, or DECISION_NOT_CLOSED (the confirmation could not be posted; nothing changed).
  */
@@ -406,7 +400,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   if (d.thread) {
     try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home), `decision-close:${d.id}`); }
     catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
-    try { await renameAndArchive(ctx.transport, { ...d, thread: d.thread }); }
+    try { await archiveThread(ctx.transport, d.thread); }
     catch (e) { archivePending = errorText(e); }
   }
   const at = ctx.now();
@@ -561,7 +555,7 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
     }
     if (d.state === "closed" && d.archivePending && d.thread && d.goneAt === undefined) {
       try {
-        await renameAndArchive(deps.transport, { ...d, thread: d.thread });
+        await archiveThread(deps.transport, d.thread);
         patchOne(stateDir, d.id, (x) => { const { archivePending: _, ...rest } = x; return rest; });
       } catch (e) {
         if (isGone(e)) {
