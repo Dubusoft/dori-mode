@@ -39,6 +39,7 @@ Key `autopilot` in `config.json`; every field is optional. An invalid value or a
 | `mergeBase` | `"dev"` | Autopilot lanes merge into this branch only. |
 | `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
 | `tickSec` | `300` | Seconds between the supervisor's ticks, an integer from 30 to 3600. |
+| `quotaCacheSec` | `90` | Seconds a quota read is reused before the usage endpoints are read again, an integer from 30 to 900. It applies to every quota caller (the judge, `dori quota`, Discord `/quota`); see Quota reads. |
 
 Both apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
 
@@ -68,10 +69,19 @@ HOLD is temporary; the next tick judges again:
 | --- | --- |
 | `waiting` | The task has a wait. A waiting in-progress task reads `planned` plus a wait, so it lands here too. |
 | `lane-live` | An open ledger row, a verified row whose lane is open, or a task ref `lane:<key>` naming an open lane. |
-| `quota-unreadable` | No account of the provider serving `defaultModel` (for `anthropic-subscription/...`, every Claude subscription account) could be read. An unreadable account (expired token, failed request) is skipped while another is readable, and named in the candidates header (`quota-skipped: ...`) and JSON (`quotaSkipped`). |
+| `quota-unreadable` | No account of the provider serving `defaultModel` (for `anthropic-subscription/...`, every Claude subscription account) has a usable read. An unreadable account (expired token, failed request, a last good read older than 30 minutes: `stale-read`) is skipped while another is readable, and named in the candidates header (`quota-skipped: ...`) and JSON (`quotaSkipped`). An account judged on a cached read older than `quotaCacheSec` (rate-limited, or no lookup during a backoff) still counts, and is named with its age (`quota-stale: default (12m)`, JSON `quotaStale`). |
 | `quota-over-threshold` | Every readable account of that provider is spent: its 5h or 7d window is at 100%. One account with room is enough, since omo moves a lane off an account that hits its limit. When an account is spent, the candidates header names it and the ones with room (`quota-over: default (100%) quota-room: account-2 (40%)`, JSON `quotaOver` / `quotaRoom`). |
 | `host-hold` | `dori can-launch` holds the default machine. |
 | `no-slot` | The task would launch, but the host's free slots went to tasks ahead of it. |
+
+## Quota reads
+
+Every quota caller (the judge, `dori quota`, Discord `/quota`) reads through one cache file, `<stateDir>/quota-cache.json`, so the supervisor and CLI invocations together call the usage endpoints at most once per `quotaCacheSec`:
+
+- A read younger than `quotaCacheSec` is served from the file without calling the endpoints.
+- An expired read is refreshed by one caller under a state lock (`quota-cache.json.lock`); concurrent callers wait for it and reuse its answer, or serve the old file when the lock is still held after 10 s.
+- An account that answers HTTP 429 backs off for its `Retry-After` (5 minutes when absent). pi-quota reads every account in one lookup, so no lookup runs until every backoff has passed; meanwhile each account is served from its last answer, and the rate-limited one from its last good read.
+- A last good read is used for at most 30 minutes; after that the account is skipped as `stale-read`, and with no other readable account the judge holds `quota-unreadable`.
 
 ## Slots
 

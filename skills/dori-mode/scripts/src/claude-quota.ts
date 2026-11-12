@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { displayTime } from "./display-time.ts";
+import { cacheNoteLines, type QuotaCacheNote } from "./quota-cache.ts";
 
 /** The subset of pi-quota's ProviderResult this module reads. */
 export type QuotaResult = {
@@ -10,6 +11,8 @@ export type QuotaResult = {
   readonly account?: string;
   /** Why an unavailable or failed result has no usage: a string, or `{ type, status? }` for a failure. */
   readonly reason?: unknown;
+  /** A failed request's Retry-After, in seconds. */
+  readonly retryAfterSeconds?: number;
   readonly windows?: readonly { readonly label: string; readonly remainingPercent: number; readonly resetAt?: Date | string }[];
 };
 
@@ -121,8 +124,8 @@ export const usageLine = (usage: ClaudeUsage, timeZone?: string): string =>
 
 export const NO_CLAUDE = "QUOTA | no Claude subscription usage reported";
 
-/** A Claude usage read: pi-quota's results plus its formatted text. */
-export type UsageLookup = (signal: AbortSignal) => Promise<{ readonly results: readonly QuotaResult[]; readonly text: string }>;
+/** A Claude usage read: pi-quota's results plus its formatted text, and where a cached read came from (quota-cache.ts). */
+export type UsageLookup = (signal: AbortSignal) => Promise<{ readonly results: readonly QuotaResult[]; readonly text: string; readonly cache?: QuotaCacheNote }>;
 
 /** pi-quota through senpi's native auth storage (omo's accounts, no session or model turn). */
 export const lookupQuotaResults = (agentDir = join(homedir(), ".omo", "agent")): UsageLookup => async (signal) => {
@@ -140,15 +143,22 @@ export const lookupQuotaResults = (agentDir = join(homedir(), ".omo", "agent")):
 };
 
 /** pi-quota's text, the Claude usage when a Claude account answered, and the Claude accounts left out. */
-export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage; readonly skipped: readonly ClaudeSkip[] };
+export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage; readonly skipped: readonly ClaudeSkip[]; readonly cache?: QuotaCacheNote };
 
 /** `providers` narrows which pi-quota providers count (default: the Claude ones, see claudeUsage). */
 export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal, providers = CLAUDE_PROVIDERS): Promise<UsageRead> => {
-  const { results, text } = await lookup(signal);
+  const { results, text, cache } = await lookup(signal);
   const usage = claudeUsage(results, now, providers);
   const skipped = skippedClaudeAccounts(results, providers);
-  return usage ? { text, usage, skipped } : { text, skipped };
+  return { text, ...(usage ? { usage } : {}), skipped, ...(cache ? { cache } : {}) };
 };
 
-/** The `/quota` text: pi-quota's own usage block only (it already shows reset times). */
-export const quotaReport = (lookup: UsageLookup) => async (signal: AbortSignal): Promise<string> => (await lookup(signal)).text;
+/**
+ * The `/quota` text: pi-quota's own usage block (it already shows reset times), after lines saying when it came from
+ * the cache, which accounts are stale and which back off after a 429.
+ */
+export const quotaReport = (lookup: UsageLookup, timeZone?: string, now: () => number = Date.now) => async (signal: AbortSignal): Promise<string> => {
+  const { text, cache } = await lookup(signal);
+  const notes = cacheNoteLines(cache, now(), timeZone);
+  return notes.length ? `${notes.join("\n")}\n\n${text}` : text;
+};

@@ -7,7 +7,8 @@ import {
   LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaAccount, quotaAccountText, quotaSplit,
   type QuotaSummary, type ToodoTask,
 } from "./autopilot.ts";
-import { type ClaudeSkip, type ClaudeUsage, lookupQuotaResults, quotaProvidersFor, readUsage } from "./claude-quota.ts";
+import { type ClaudeSkip, type ClaudeUsage, quotaProvidersFor, readUsage } from "./claude-quota.ts";
+import { ageText, type QuotaCacheNote, sharedQuotaLookup } from "./quota-cache.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
 import { checkMachine } from "./placement.ts";
@@ -95,16 +96,19 @@ export type AutopilotDeps = JudgeDeps & {
 
 /**
  * Each readable account with the highest used percentage over its 5h and 7d windows; unreadable without usage or with
- * no window at all. Skipped accounts (expired, failed) do not count either way and are only named.
+ * no window at all. Skipped accounts (expired, failed, a read past the stale bound) do not count either way and are
+ * only named. An account served from an older cached read (`cache.stale`) still counts and is named with its age.
  */
-export const quotaSummary = (usage: ClaudeUsage | undefined, skipped: readonly ClaudeSkip[] = []): QuotaSummary => {
+export const quotaSummary = (usage: ClaudeUsage | undefined, skipped: readonly ClaudeSkip[] = [], cache?: QuotaCacheNote, now = Date.now()): QuotaSummary => {
   const accounts: QuotaAccount[] = [];
   for (const a of usage?.accounts ?? []) {
     const pcts = [a.fiveHour?.usedPct, a.weekly?.usedPct].filter((p): p is number => typeof p === "number");
     if (pcts.length) accounts.push({ name: a.name, maxUsedPct: Math.max(...pcts) });
   }
   const named = skipped.length ? { skipped: skipped.map((s) => `${s.name} (${s.reason})`) } : {};
-  return accounts.length ? { readable: true, accounts, ...named } : { readable: false, ...named };
+  const judged = new Set(accounts.map((a) => a.name));
+  const stale = (cache?.stale ?? []).filter((s) => judged.has(s.name)).map((s) => `${s.name} (${ageText(now - s.at)})`);
+  return accounts.length ? { readable: true, accounts, ...named, ...(stale.length ? { stale } : {}) } : { readable: false, ...named };
 };
 
 /** `work()` or `fallback` when it throws or takes longer than `ms`. */
@@ -133,8 +137,8 @@ export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry"
   toodo: () => new ToodoClient(flow.tunables.toodoEvents),
   openLanes: async () => new Set((await flow.registry.open()).map((l) => l.key)),
   quota: () => within(PROBE_MS, async () => {
-    const read = await readUsage(lookupQuotaResults(), flow.clock.now(), AbortSignal.timeout(PROBE_MS), quotaProvidersFor(flow.config.defaultModel));
-    return quotaSummary(read.usage, read.skipped);
+    const read = await readUsage(sharedQuotaLookup(flow.config), flow.clock.now(), AbortSignal.timeout(PROBE_MS), quotaProvidersFor(flow.config.defaultModel));
+    return quotaSummary(read.usage, read.skipped, read.cache, flow.clock.now());
   }, () => ({ readable: false })),
   host: () => within(PROBE_MS, async () => {
     const c = await checkMachine(flow.ops, flow.config, flow.config.placement.defaultMachine);
@@ -203,6 +207,7 @@ export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number
   return {
     paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts,
     ...(quota.skipped?.length ? { quotaSkipped: quota.skipped } : {}),
+    ...(quota.stale?.length ? { quotaStale: quota.stale } : {}),
     ...(over.length ? { quotaOver: over.map(quotaAccountText), quotaRoom: room.map(quotaAccountText) } : {}),
   };
 };

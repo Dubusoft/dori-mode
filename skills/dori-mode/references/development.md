@@ -30,6 +30,7 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/doctor.ts` | `runDoctor`: read-only checks (units, herdr, paths, config, Discord, gateway, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
 | `src/status.ts` | `collectStatus` / `renderStatus`: the no-LLM one-screen summary behind `dori status` and `/status` |
 | `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |
+| `src/quota-cache.ts` | `sharedQuotaLookup(config)`: the quota read every caller shares; `cachedQuotaLookup` keeps it in `<stateDir>/quota-cache.json` for `autopilot.quotaCacheSec`, refreshes it once under a state lock, backs an account off after a 429 (Retry-After) and serves its last good read for up to 30 minutes; `cacheNoteLines` says so in `dori quota` and `/quota` |
 | `src/claude-quota.ts` | `lookupQuotaResults(agentDir?)`: pi-quota through senpi's native auth storage (defaults to `~/.omo/agent`); `claudeUsage` and the usage report behind `dori quota` and `/quota`: Claude 5h/7d usage and reset times for every account |
 | `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
 | `src/placement.ts` | `resolvePlacement`, `checkMachine`, `planLaunch`, `placementTable`: which machine a launch runs on (the runner declaring its repo, else the default), its per-machine launch verdict, and the fallback |

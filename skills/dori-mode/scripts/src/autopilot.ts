@@ -46,13 +46,17 @@ export type AutopilotConfig = {
   readonly crossWorkspacePrereqs: "block";
   /** Seconds between the supervisor's autopilot ticks. */
   readonly tickSec: number;
+  /** Seconds a quota read is reused by every caller (judge, `dori quota`, `/quota`) before the endpoints are read again. */
+  readonly quotaCacheSec: number;
 };
 
 export const TICK_SEC_MIN = 30;
 export const TICK_SEC_MAX = 3600;
+export const QUOTA_CACHE_SEC_MIN = 30;
+export const QUOTA_CACHE_SEC_MAX = 900;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
-  quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300,
+  quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300, quotaCacheSec: 90,
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -87,6 +91,8 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
     crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
     tickSec: pick<number>("tickSec", (v) => Number.isInteger(v) && (v as number) >= TICK_SEC_MIN && (v as number) <= TICK_SEC_MAX,
       `an integer from ${TICK_SEC_MIN} to ${TICK_SEC_MAX}`),
+    quotaCacheSec: pick<number>("quotaCacheSec", (v) => Number.isInteger(v) && (v as number) >= QUOTA_CACHE_SEC_MIN && (v as number) <= QUOTA_CACHE_SEC_MAX,
+      `an integer from ${QUOTA_CACHE_SEC_MIN} to ${QUOTA_CACHE_SEC_MAX}`),
   };
 };
 
@@ -200,7 +206,13 @@ export type QuotaAccount = { readonly name: string; readonly maxUsedPct: number 
  * `accounts` are the readable Claude accounts (non-empty when `readable`); `skipped` names the accounts left out of the
  * judgment as "name (reason)".
  */
-export type QuotaSummary = { readonly readable: boolean; readonly accounts?: readonly QuotaAccount[]; readonly skipped?: readonly string[] };
+export type QuotaSummary = {
+  readonly readable: boolean;
+  readonly accounts?: readonly QuotaAccount[];
+  readonly skipped?: readonly string[];
+  /** Accounts judged on a read older than the quota cache TTL, as "name (age)"; still readable up to STALE_READ_MAX_MS. */
+  readonly stale?: readonly string[];
+};
 
 /**
  * The readable accounts split by use: `over` has a spent window (100% used), `room` has every window below 100%. omo
@@ -320,6 +332,8 @@ export type CandidatesReport = {
   readonly verdicts: readonly Verdict[];
   /** Claude accounts the quota read left out, as "name (reason)"; absent when none was. */
   readonly quotaSkipped?: readonly string[];
+  /** Accounts judged on a stale read (a 429 fallback or a backoff), as "name (age)"; absent when none was. */
+  readonly quotaStale?: readonly string[];
   /** When an account is spent: the spent accounts and the ones with room, as "name (pct%)". */
   readonly quotaOver?: readonly string[];
   readonly quotaRoom?: readonly string[];
@@ -329,7 +343,7 @@ export type CandidatesReport = {
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
   return [
-    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}${report.quotaOver?.length ? ` quota-over: ${report.quotaOver.join(", ")} quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`,
+    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}${report.quotaStale?.length ? ` quota-stale: ${report.quotaStale.join(", ")}` : ""}${report.quotaOver?.length ? ` quota-over: ${report.quotaOver.join(", ")} quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`,
     ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? "would-launch" : v.reasons.join(", ")}`),
   ];
 };
@@ -340,5 +354,6 @@ export const candidatesJson = (report: CandidatesReport) => ({
   slots: report.slots,
   candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons })),
   ...(report.quotaSkipped?.length ? { quotaSkipped: report.quotaSkipped } : {}),
+  ...(report.quotaStale?.length ? { quotaStale: report.quotaStale } : {}),
   ...(report.quotaOver?.length ? { quotaOver: report.quotaOver, quotaRoom: report.quotaRoom ?? [] } : {}),
 });
