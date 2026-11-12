@@ -170,13 +170,14 @@ export class Discord {
    * (the owner) a thread member so the thread shows up in their list. When the starter message mentions them, Discord has
    * already joined them as the thread starts: that reads back as "already", and Discord shows no "added" line for it.
    * A failed add never fails the thread; it comes back as `failed` for the caller to surface. A non-numeric or absent id
-   * is "skipped".
+   * is "skipped". `autoArchiveMin` sets how long the thread stays open without activity (Discord's default when absent).
    */
-  async startThread(channelId: string, messageId: string | undefined, name: string, memberId?: string): Promise<{ readonly id: string; readonly member: ThreadMember }> {
+  async startThread(channelId: string, messageId: string | undefined, name: string, memberId?: string, autoArchiveMin?: 60 | 1440 | 4320 | 10080): Promise<{ readonly id: string; readonly member: ThreadMember }> {
     const title = guardText(name).slice(0, 100);
+    const archive = autoArchiveMin ? { auto_archive_duration: autoArchiveMin } : {};
     const id = (messageId
-      ? await this.call<{ id: string }>("POST", `/channels/${channelId}/messages/${messageId}/threads`, { name: title })
-      : await this.call<{ id: string }>("POST", `/channels/${channelId}/threads`, { name: title, type: 11 })).id;
+      ? await this.call<{ id: string }>("POST", `/channels/${channelId}/messages/${messageId}/threads`, { name: title, ...archive })
+      : await this.call<{ id: string }>("POST", `/channels/${channelId}/threads`, { name: title, type: 11, ...archive })).id;
     if (memberId === undefined || !/^\d+$/.test(memberId)) return { id, member: "skipped" };
     try {
       if (await this.isThreadMember(id, memberId)) return { id, member: "already" };

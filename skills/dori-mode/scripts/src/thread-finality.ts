@@ -38,8 +38,11 @@ export type FinalityInput = {
   readonly open: readonly Lane[];
   /** Registered waits (only `key` and `thread` are read). */
   readonly waits: readonly { readonly key: string; readonly thread?: string }[];
-  /** Open decision obligations as published by the supervisor (their event line names the lane second). */
-  readonly decisions: readonly { readonly id: string; readonly line?: string }[];
+  /**
+   * Open decision obligations as published by the supervisor (their event line names the lane second), and open owner
+   * decisions (owner-decisions.ts ownerDecisionBlockers), which name their lane directly.
+   */
+  readonly decisions: readonly { readonly id: string; readonly line?: string; readonly lane?: string }[];
 };
 
 /**
@@ -57,7 +60,7 @@ export const finalityBlockers = ({ lane, thread, open, waits, decisions }: Final
   for (const wait of waits) if (onThread(wait.thread)) reasons.push(`wait ${wait.key} is registered on this thread`);
   const keys = new Set([lane.key, ...others.map((other) => other.key)]);
   for (const decision of decisions) {
-    const named = decision.line?.split(" ")[1];
+    const named = decision.lane ?? decision.line?.split(" ")[1];
     if (named !== undefined && keys.has(named)) reasons.push(`decision ${decision.id} for lane ${named} is unresolved`);
   }
   return reasons;
@@ -89,7 +92,7 @@ export const threadBlockers = ({ thread, lanes, open, unreported, waits, decisio
   for (const wait of waits) if (onThread(wait.thread)) reasons.push(`wait ${wait.key} is registered on this thread`);
   const keys = new Set([...lanes, ...unreported, ...live.map((lane) => lane.key)]);
   for (const decision of decisions) {
-    const named = decision.line?.split(" ")[1];
+    const named = decision.lane ?? decision.line?.split(" ")[1];
     if (named !== undefined && keys.has(named)) reasons.push(`decision ${decision.id} for lane ${named} is unresolved`);
   }
   return reasons;

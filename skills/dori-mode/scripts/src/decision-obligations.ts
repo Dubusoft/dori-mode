@@ -30,6 +30,7 @@ export const DEFAULT_RESOLVE_KINDS: readonly string[] = [
   "LANE_REPORT * question", "LANE_REPORT * blocked", "LANE_ASKING",
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "LANE_NOT_DONE", "WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED", "DEAD_PANE",
+  "OWNER_DECISION_ANSWERED",
 ];
 
 /** One word without control characters: an event id as a receipt and the UNRESOLVED line can carry it. */

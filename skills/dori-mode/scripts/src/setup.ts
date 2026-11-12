@@ -561,6 +561,10 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   d.log(alertsChannel
     ? `SETUP alertsChannel ${alertsChannel}: system notices go there`
     : `SETUP alertsChannel unset: system notices go to the first discordChannels entry; optional, add "alertsChannel": "<channel id>" to ${d.configPath} to send them elsewhere`);
+  const decisionsChannel = str(config.decisionsChannel).trim();
+  d.log(decisionsChannel
+    ? `SETUP decisionsChannel ${decisionsChannel}: owner decisions open one thread each there`
+    : `SETUP decisionsChannel unset: owner decisions go to the requesting channel; optional, add "decisionsChannel": "<channel id>" to ${d.configPath} to open them in one channel`);
 
   let serverUp = false;
   const herdrStep = input.herdr ?? true;

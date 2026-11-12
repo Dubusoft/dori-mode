@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
 import { sampleLoad1 } from "../host-guard.ts";
+import { decisionChoicesProblem, serializeDecisionText } from "./decision-text.ts";
 import { isReportKind } from "./report-kinds.ts";
 import { realClock, run as realRun, type Clock, type Runner } from "../run.ts";
 import { SECRET_NAME } from "../secret-name.ts";
@@ -217,11 +218,14 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (!id || extra.length) { deps.err("usage: dori report ack <id>"); return 2; }
     return send({ kind: "ack", id }, () => { deps.out(`LANE_ACKED ${own} ${id}`); });
   }
-  const parsed = parseArgs({ args: [...rest], allowPositionals: true, options: { text: { type: "string" }, evidence: { type: "string" } } });
+  const parsed = parseArgs({ args: [...rest], allowPositionals: true, options: {
+    text: { type: "string" }, evidence: { type: "string" },
+    option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" }, waiting: { type: "string" }, nonblocking: { type: "boolean" },
+  } });
   const [key, kindArg, ...extra] = parsed.positionals;
   const kind = sub === "claim-done" ? "done" : kindArg;
   if (!key || extra.length || (sub === "claim-done" && kindArg !== undefined) || !isReportKind(kind)) {
-    deps.err(sub === "claim-done" ? "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"" : "usage: dori report <key> <progress|question|blocked|milestone|done> --text \"...\" [--evidence \"...\"]");
+    deps.err(sub === "claim-done" ? "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"" : "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking]");
     return 2;
   }
   if (key !== own) {
@@ -230,5 +234,21 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
   }
   const text = parsed.values.text ?? (kind === "done" ? parsed.values.evidence ?? "" : "");
   if (!text) { deps.err("--text is required"); return 2; }
-  return send({ kind, text, ...(parsed.values.evidence ? { evidence: parsed.values.evidence } : {}) }, () => { deps.out(`LANE_REPORTED ${key} ${kind} (through the runner)`); });
+  const { option, recommend, reason, waiting, nonblocking } = parsed.values;
+  let sentText = text;
+  if (kind !== "question") {
+    if (option !== undefined || recommend !== undefined || reason !== undefined || waiting !== undefined || nonblocking !== undefined) {
+      deps.err("usage: --option, --recommend, --reason, --waiting and --nonblocking go only with the question kind");
+      return 2;
+    }
+  } else {
+    const choices = { question: text, options: option ?? [], recommend, reason, waiting: waiting ?? `레인 ${key} 진행` };
+    const problem = decisionChoicesProblem(choices);
+    if (problem) {
+      deps.err(`REPORT_REFUSED question needs --option (2-9), --recommend N and --reason; a question without choices is not sent (${problem}). For an open-ended blocker use: dori report ${key} blocked --text ...`);
+      return 2;
+    }
+    sentText = serializeDecisionText({ ...choices, recommend: Number((recommend as string).trim()), reason: reason as string, blocking: !nonblocking });
+  }
+  return send({ kind, text: sentText, ...(parsed.values.evidence ? { evidence: parsed.values.evidence } : {}) }, () => { deps.out(`LANE_REPORTED ${key} ${kind} (through the runner)`); });
 };

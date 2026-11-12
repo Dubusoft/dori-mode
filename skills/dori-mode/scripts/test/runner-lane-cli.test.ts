@@ -7,6 +7,7 @@ import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { connectUnix, listenUnix } from "../src/runner/unix-transport.ts";
+import { parseDecisionText } from "../src/runner/decision-text.ts";
 import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
@@ -210,4 +211,30 @@ test("dori heavy waits for ~/.dori/heavy/slot.1 that another live footer holds, 
   expect(waited).toBe(1);
   expect(ownerWhileRunning).toContain("lane-a:build");
   expect(existsSync(slot)).toBe(false);
+});
+
+test("a question without choices is refused with exit 2 and sends nothing", async () => {
+  const sock = laneSocket();
+  const refused = io();
+  expect(await laneCliMain(["report", "lane-a", "question", "--text", "A or B?"], { env, connect: sock.connect, ...refused.deps })).toBe(2);
+  expect(refused.err[0]).toMatch(/^REPORT_REFUSED question needs --option/);
+  expect(sock.requests).toEqual([]);
+});
+
+test("choice options are refused for any kind but question", async () => {
+  const sock = laneSocket();
+  const refused = io();
+  expect(await laneCliMain(["report", "lane-a", "blocked", "--text", "x", "--option", "a"], { env, connect: sock.connect, ...refused.deps })).toBe(2);
+  expect(sock.requests).toEqual([]);
+});
+
+test("a valid question is sent in the fixed DECISION v1 text and round-trips", async () => {
+  const sock = laneSocket();
+  const ok = io();
+  const args = ["report", "lane-a", "question", "--text", "Which db?", "--option", "sqlite", "--option", "postgres", "--recommend", "2", "--reason", "scales", "--nonblocking"];
+  expect(await laneCliMain(args, { env, connect: sock.connect, ...ok.deps })).toBe(0);
+  expect(ok.out).toEqual(["LANE_REPORTED lane-a question (through the runner)"]);
+  const sent = String(sock.requests[0]?.text);
+  expect(sent.startsWith("DECISION v1")).toBe(true);
+  expect(parseDecisionText(sent)).toEqual({ question: "Which db?", options: ["sqlite", "postgres"], recommend: 2, reason: "scales", waiting: "레인 lane-a 진행", blocking: false });
 });

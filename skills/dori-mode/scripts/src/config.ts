@@ -147,6 +147,11 @@ export type DoriConfig = {
    * Read where it is used, so a config reload applies it live.
    */
   readonly alertsChannel?: string;
+  /**
+   * The Discord channel where each owner decision (owner-decisions.ts) opens one thread. Absent: a decision goes to the
+   * channel it was asked from, else `discordChannels[0]`. Watched like a configured channel; read where it is used.
+   */
+  readonly decisionsChannel?: string;
   /** Owner-only Discord button hooks: name ([a-z0-9-]{1,20}) -> argv run on a `dori:hook:<name>:...` click. */
   readonly buttonHooks?: Readonly<Record<string, ArgvTemplate>>;
   /** GitHub logins whose new or reopened issues wake the lead as GH_ISSUE; anyone else is digest only. */
@@ -458,7 +463,7 @@ const placement = (raw: unknown): PlacementConfig => {
  */
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
-  "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
+  "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "secrets", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
 ] as const;
 
@@ -473,6 +478,13 @@ const displayTimeZone = (raw: unknown): string => {
 const alertsChannel = (raw: unknown): string | undefined => {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "string") throw new TypeError("alertsChannel must be a Discord channel id string");
+  return raw.trim() || undefined;
+};
+
+/** The config's `decisionsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
+const decisionsChannel = (raw: unknown): string | undefined => {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") throw new TypeError("decisionsChannel must be a Discord channel id string");
   return raw.trim() || undefined;
 };
 
@@ -541,12 +553,14 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   }
   const { runners: rawRunners, ...rest } = fromFile;
   const machineRunners = runners(rawRunners);
-  const { alertsChannel: rawAlerts, ...fileValues } = rest;
+  const { alertsChannel: rawAlerts, decisionsChannel: rawDecisions, ...fileValues } = rest;
   const alerts = alertsChannel(rawAlerts);
+  const decisions = decisionsChannel(rawDecisions);
   const merged: DoriConfig = { ...base, ...fileValues, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
     ...(alerts ? { alertsChannel: alerts } : {}),
+    ...(decisions ? { decisionsChannel: decisions } : {}),
     laneRules: laneRules(raw.laneRules),
     secrets: secrets(raw.secrets),
     secretCommands: secretCommands(raw.secretCommands),

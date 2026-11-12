@@ -115,6 +115,9 @@ export const configReloadError = (c: DoriConfig): string | undefined => {
   for (const key of ["defaultModel", "leadCwd", "worktreeRoot", "ciMergeBase"] as const) {
     if (typeof c[key] !== "string") return `${key} must be a string`;
   }
+  for (const key of ["alertsChannel", "decisionsChannel"] as const) {
+    if (c[key] !== undefined && typeof c[key] !== "string") return `${key} must be a string`;
+  }
   if (!c.defaultModel.trim()) return "defaultModel must not be empty";
   if (!c.ciMergeBase.trim()) return "ciMergeBase must not be empty";
   for (const [name, argv] of Object.entries(c.hooks ?? {})) if (argv !== undefined && !strings(argv)) return `hooks.${name} must be an array of strings`;

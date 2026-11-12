@@ -54,6 +54,13 @@ test("the done claim and lane-ending events, a close after a received claim too,
   }
 });
 
+test("owner decision answers and failures are urgent; opening a decision stays digest", () => {
+  for (const kind of ["OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE"]) {
+    expect(eventClass(`${kind} d3 lane ap-1-1 details`)).toBe("lead-urgent");
+  }
+  expect(eventClass("OWNER_DECISION_OPENED d3 lane ap-1-1 question")).toBe("lead-digest");
+});
+
 test("a worker machine going OFFLINE wakes the lead; ONLINE is digest; the retired agent kinds have no entry", () => {
   expect(eventClass("HOST_GUARD OFFLINE machine=mac unreachable: timeout")).toBe("lead-urgent");
   expect(eventClass("HOST_GUARD ONLINE machine=mac")).toBe("lead-digest");

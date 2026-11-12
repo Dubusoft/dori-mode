@@ -1,7 +1,9 @@
 /**
  * The event policy table (design 1.7): every event kind is delivered by class. `lead-urgent` wakes the lead,
  * `lead-digest` waits for the next urgent delivery (or `digestMaxDelayMin`), `engine-only` is journaled for the engine and
- * the counts only. The supervisor never posts an event to the owner itself: everything the owner hears goes through the lead.
+ * the counts only. The supervisor never posts an event to the owner itself: everything the owner hears goes through the lead,
+ * except the close-thread button and failed-delivery notices, owner decision threads (a lane question with choices becomes
+ * a decision thread), and the daily 09:00 reminder of waiting decisions.
  * The removed `owner-only` class still loads from an old config, as `lead-digest`, with one warning per process.
  *
  * A kind is the event line's first word, optionally followed by more words that must match the line's next words in
@@ -68,6 +70,8 @@ const URGENT_KINDS = [
   // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched), a done one
   // has its Toodo task completed by the lead.
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
+  // Owner decision answers, stuck posts, and missing threads require the lead to act or check state.
+  "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
@@ -90,6 +94,8 @@ const DIGEST_KINDS = [
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED",
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
+  // OWNER_DECISION_OPENED is digest: opening a thread needs no immediate lead action.
+  "OWNER_DECISION_OPENED",
 ] as const;
 
 /** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */
