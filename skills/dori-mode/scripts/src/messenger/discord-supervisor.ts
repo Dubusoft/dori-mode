@@ -1,7 +1,7 @@
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FlowDeps } from "../done-flow.ts";
-import { answeredEventId, answeredLine, recordOwnerAnswer } from "../owner-decisions.ts";
+import { answeredEventId, answeredLine, recordChannelAnswer, recordOwnerAnswer } from "../owner-decisions.ts";
 import { recordOwnerClosed } from "../thread-followup.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
 import {
@@ -107,7 +107,9 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       ownerMessages.set(id, channel);
       if (ownerMessages.size > 1_000) ownerMessages.delete(ownerMessages.keys().next().value ?? "");
       try {
-        const answer = recordOwnerAnswer(deps.config.stateDir, channel, id, deps.clock.now());
+        // An answer in the decisions channel body (not in a thread) counts when exactly one decision there is waiting.
+        const answer = recordOwnerAnswer(deps.config.stateDir, channel, id, deps.clock.now())
+          ?? (channel === decisionsChannel() ? recordChannelAnswer(deps.config.stateDir, channel, id, deps.clock.now()) : undefined);
         if (answer?.first) {
           options.emit(answeredEventId(answer.decision.id), answeredLine(answer.decision)).catch(() => { log(`DECISION_ERROR cannot queue OWNER_DECISION_ANSWERED ${answer.decision.id}`); });
         }

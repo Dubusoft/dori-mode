@@ -9,6 +9,7 @@ import {
   openOwnerDecisions,
   ownerDecisionTick,
   readDecisions,
+  recordChannelAnswer,
   recordOwnerAnswer,
   type DecisionContext,
   type DecisionTransport,
@@ -51,6 +52,11 @@ const fakeTransport = () => {
     edit: async (...args) => { record("edit", ...args); },
     content: async (...args) => { record("content", ...args); return ""; },
     deleteMessage: async (...args) => { record("deleteMessage", ...args); },
+    // Discord's "started a thread" notice for the thread the fake starts, after an unrelated message.
+    messagesAfter: async (...args) => {
+      record("messagesAfter", ...args);
+      return [{ id: "other", type: 0 }, { id: "notice", type: 18, reference: "thread" }];
+    },
     startThread: async (channel, messageId, name, memberId, autoArchiveMin) => {
       record("startThread", channel, messageId, name, memberId, autoArchiveMin);
       return { id: messageId ?? "thread" };
@@ -99,9 +105,17 @@ test("opens in decisionsChannel, starts a thread, records open, and links the or
   expect(result.channel.channel).toBe("555");
   expect(result.decision.state).toBe("open");
   expect(result.link).toMatchObject({ kind: "linked", origin: "222" });
-  expect(fake.calls.find((call) => call.method === "send")?.args[0]).toBe("555");
-  expect(fake.calls.some((call) => call.method === "startThread")).toBe(true);
-  expect(fake.calls.some((call) => call.method === "send" && call.args[0] === "222")).toBe(true);
+  // A thread without a starter message, its channel notice deleted, then the question as the thread's first message.
+  expect(fake.calls.map((call) => call.method).filter((method) => method !== "threadState" && method !== "messagesAfter"))
+    .toEqual(["startThread", "deleteMessage", "send", "send"]);
+  expect(fake.calls.find((call) => call.method === "startThread")?.args.slice(0, 2)).toEqual(["555", undefined]);
+  expect(fake.calls.find((call) => call.method === "deleteMessage")?.args).toEqual(["555", "notice"]);
+  expect(fake.calls.filter((call) => call.method === "send").map((call) => call.args[0])).toEqual(["thread", "222"]);
+  expect(String(fake.calls.find((call) => call.method === "send")?.args[1])).toContain(choices.question);
+  // The origin thread gets one link line, not the question.
+  const link = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "222")?.args[1]);
+  expect(link).toBe("[System] 오너 결정 d1: <#thread>");
+  expect(result.noticeKept).toBeUndefined();
   expect(readDecisions(dir).decisions[0]).toMatchObject({ state: "open", linkMessage: result.link.kind === "linked" ? result.link.message : undefined });
 });
 
@@ -113,14 +127,61 @@ test("uses the requesting channel and reports unset decisionsChannel", async () 
   expect(result.decision.channel).toBe("111");
 });
 
-test("removes the starter and reservation when starting its thread fails", async () => {
+test("drops the reservation when starting its thread fails", async () => {
   const dir = stateDir();
   const fake = fakeTransport();
   fake.transport.startThread = async () => { throw new Error("thread creation failed"); };
-  fake.transport.threadState = async () => { throw new Error("message has no thread"); };
   await expect(open(context(dir, fake.transport))).rejects.toMatchObject({ code: "DECISION_NOT_POSTED" });
-  expect(fake.calls.some((call) => call.method === "deleteMessage")).toBe(true);
+  expect(fake.calls.some((call) => call.method === "send")).toBe(false);
   expect(readDecisions(dir).decisions).toEqual([]);
+});
+
+test("archives the thread and drops the reservation when the question cannot be posted in it", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  fake.transport.send = async () => { throw new Error("send failed"); };
+  await expect(open(context(dir, fake.transport))).rejects.toMatchObject({ code: "DECISION_NOT_POSTED" });
+  expect(fake.calls.find((call) => call.method === "setThread")?.args).toEqual(["thread", { archived: true }]);
+  expect(readDecisions(dir).decisions).toEqual([]);
+});
+
+test("a notice that cannot be deleted is reported and recorded, and the decision still opens", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  fake.transport.deleteMessage = async () => { throw new Error("missing access"); };
+  const result = await open(context(dir, fake.transport));
+  expect(result.decision.state).toBe("open");
+  expect(result.noticeKept).toBe("missing access");
+  expect(readDecisions(dir).decisions[0]?.noticeKept).toBe("missing access");
+});
+
+test("thread names stay within 40 characters, open and closed", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const question = "이 결정 스레드의 제목이 너무 길어서 오너가 헷갈려 하므로 짧게 줄여야 하는데 어떤 규칙을 쓸까요?";
+  const { decision } = await open(ctx, { question, task: 904 });
+  await closeOwnerDecision(ctx, decision.id, { text: "Done.", choice: 1 });
+  const opened = String(fake.calls.find((call) => call.method === "startThread")?.args[2]);
+  const closed = String((fake.calls.find((call) => call.method === "setThread")?.args[1] as { name?: string }).name);
+  expect(opened).toStartWith("결정 d1 · #904 · 이 결정");
+  expect(closed).toStartWith("결정됨 d1 · #904 · 이 결정");
+  expect(Array.from(opened).length).toBeLessThanOrEqual(40);
+  expect(Array.from(closed).length).toBeLessThanOrEqual(40);
+});
+
+test("an owner message in the channel body answers the only waiting decision there, and nothing when two wait", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const { decision } = await open(ctx);
+  const answer = recordChannelAnswer(dir, "555", "body-1", 1_800_000_000_100);
+  expect(answer?.first).toBe(true);
+  expect(answer?.decision).toMatchObject({ id: decision.id, state: "answered", answers: [{ channel: "555", message: "body-1" }] });
+  expect(recordChannelAnswer(dir, "999", "elsewhere", 1_800_000_000_150)).toBeUndefined();
+  await open(ctx, { question: "A second question?" });
+  expect(recordChannelAnswer(dir, "555", "body-2", 1_800_000_000_200)).toBeUndefined();
+  expect(readDecisions(dir).decisions.find((d) => d.id === decision.id)?.answers).toHaveLength(1);
 });
 
 test("a repeated lane sourceRef returns its original decision without posting", async () => {
@@ -154,7 +215,7 @@ test("closing an answered decision posts confirmation, archives, resolves, and r
   const answer = recordOwnerAnswer(dir, decision.thread as string, "answer-1", 1_800_000_000_100);
   const closed = await closeOwnerDecision(ctx, decision.id, { text: "Proceed with option one.", choice: 1 });
   expect(fake.calls.some((call) => call.method === "send" && call.args[0] === decision.thread)).toBe(true);
-  expect(fake.calls.some((call) => call.method === "setThread" && call.args[1] && (call.args[1] as { archived?: boolean }).archived === true && String((call.args[1] as { name?: string }).name).startsWith("[결정됨"))).toBe(true);
+  expect(fake.calls.some((call) => call.method === "setThread" && call.args[1] && (call.args[1] as { archived?: boolean }).archived === true && String((call.args[1] as { name?: string }).name).startsWith("결정됨 d1"))).toBe(true);
   expect(closed.decision.state).toBe("closed");
   expect(closed.resolved).toBe(answer?.decision.answerEvent);
   expect(readdirSync(join(dir, "resolved")).length).toBeGreaterThan(0);

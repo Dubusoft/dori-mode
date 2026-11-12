@@ -1622,6 +1622,7 @@ try {
         const d = opened.decision;
         console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}`);
         if (opened.channel.unset) console.log(od.channelUnsetLine(opened.channel));
+        if (opened.noticeKept) console.log(`DECISION_NOTICE_KEPT ${d.id}: the channel's "started a thread" notice could not be deleted: ${opened.noticeKept}`);
         const link = opened.link;
         if (link.kind === "linked") {
           const ids = od.refIds(d.origin);
