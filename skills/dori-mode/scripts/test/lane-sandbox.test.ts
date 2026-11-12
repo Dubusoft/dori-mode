@@ -183,6 +183,32 @@ test("LANE_SANDBOX_VERIFY is bound read-write on its own, leaving its parent dir
   expect(rw(await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" }))).not.toContain(verify);
 });
 
+test("a cwd-less lane gets the worktree root and each repo's .git under the repos root read-write, but no repo's hooks, working tree or the repos root itself", async () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const repos = join(root, "repos"), worktrees = join(root, "worktrees");
+  for (const d of [join(repos, "app", ".git", "hooks"), join(repos, "lib", ".git"), join(repos, "plain"), join(repos, "wt"), worktrees]) mkdirSync(d, { recursive: true });
+  // A worktree checked out under the repos root has a .git file, not a directory: nothing to bind there.
+  writeFileSync(join(repos, "wt", ".git"), "gitdir: elsewhere\n");
+  mkdirSync(join(home, ".dori"), { recursive: true });
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${join(repos, "lib", ".git")}\n`);
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_REPOS: `${repos}/`, LANE_SANDBOX_WORKTREES: worktrees });
+
+  const rw = argv.flatMap((a, i) => (a === "--bind" || a === "--bind-try" ? [argv[i + 2] ?? ""] : []));
+  expect(rw).toContain(worktrees);
+  expect(rw.filter((p) => p.startsWith(`${repos}/`) || p === repos).sort()).toEqual([join(repos, "app", ".git"), join(repos, "lib", ".git")]);
+  const at = (flag: string, p: string) => argv.findIndex((a, i) => a === flag && argv[i + 1] === p && argv[i + 2] === p);
+  const hooks = join(repos, "app", ".git", "hooks");
+  expect(at("--ro-bind-try", hooks)).toBeGreaterThan(at("--bind", join(repos, "app", ".git")));
+  expect(at("--ro-bind-try", hooks)).toBeGreaterThan(at("--bind", join(repos, "lib", ".git")));
+  // A hidden .git stays hidden: the hide list comes after the repos binds.
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(repos, "lib", ".git"))).toBeGreaterThan(at("--bind", join(repos, "lib", ".git")));
+
+  const without = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+  expect(without.flatMap((a, i) => (a === "--bind" || a === "--bind-try" ? [without[i + 2] ?? ""] : [])).filter((p) => p.startsWith(repos) || p.startsWith(worktrees))).toEqual([]);
+});
+
 test("refreshLaneSandbox replaces an outdated install, keeps the old copy, and leaves a current or missing one alone", () => {
   const home = tempDir();
   const installed = installedLaneSandbox(home);
