@@ -1,12 +1,13 @@
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FlowDeps } from "../done-flow.ts";
+import { answeredEventId, answeredLine, recordOwnerAnswer } from "../owner-decisions.ts";
 import { recordOwnerClosed } from "../thread-followup.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
 import {
   channelNameToken, type DiscordChannelInfo, discordChannelInfo, type DiscordInboundOptions, discordChannels, discordDispatchChannels,
   discordMessageChannel, discordOwnerConfigured, discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound, listDiscordThreads,
-  parseDiscordMessage, pollDiscordInbound,
+  parseDiscordMessage, pollDiscordInbound, seedDiscordCursor,
 } from "./discord-inbound.ts";
 import { Discord, discordPresence, type GatewaySession, openDiscordGateway, type GatewaySocket } from "./discord.ts";
 import { type Http, MessengerError } from "./http.ts";
@@ -79,7 +80,12 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   const statePath = join(deps.config.stateDir, "discord-inbound.json");
   // Read on every use: a config reload (config-watch.ts) replaces discordChannels in place, and the next tick catches
   // a newly added channel up like a restart would, on the same gateway connection.
-  const configuredChannels = (): readonly string[] => deps.config.discordChannels;
+  // The decisions channel is watched like a configured channel (its threads included), but never gets slash commands.
+  const decisionsChannel = (): string => deps.config.decisionsChannel?.trim() ?? "";
+  const configuredChannels = (): readonly string[] => {
+    const decisions = decisionsChannel();
+    return decisions === "" || deps.config.discordChannels.includes(decisions) ? deps.config.discordChannels : [...deps.config.discordChannels, decisions];
+  };
   const configured = () => discordChannels(configuredChannels(), []);
   if (!discordOwnerConfigured(config.ownerId)) {
     log("DISCORD_INBOUND_WARNING discord.ownerId is not configured; every Discord author is treated as a VISITOR, never the owner (run dori setup)");
@@ -100,6 +106,14 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       ownerMessages.delete(id);
       ownerMessages.set(id, channel);
       if (ownerMessages.size > 1_000) ownerMessages.delete(ownerMessages.keys().next().value ?? "");
+      try {
+        const answer = recordOwnerAnswer(deps.config.stateDir, channel, id, deps.clock.now());
+        if (answer?.first) {
+          options.emit(answeredEventId(answer.decision.id), answeredLine(answer.decision)).catch(() => { log(`DECISION_ERROR cannot queue OWNER_DECISION_ANSWERED ${answer.decision.id}`); });
+        }
+      } catch {
+        log(`DECISION_ERROR cannot record the owner's answer in ${channel}`);
+      }
     },
   };
   const watches = async (channel: string): Promise<boolean> =>
@@ -173,6 +187,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
           for (const channel of [...watched, ...threads]) {
             if (stopped) break;
             try {
+              if (channel === decisionsChannel()) await seedDiscordCursor(statePath, channel, deps.clock.now(), log);
               await pollDiscordInbound(deps.run, [channel], statePath, emitIn(channel),
                 (ch, after) => listDiscordInbound(discord, ch, after, deps.tunables.discordFirstSeenLimit), config.ownerId,
                 watched.includes(channel) ? undefined : floor, inboundOptions);

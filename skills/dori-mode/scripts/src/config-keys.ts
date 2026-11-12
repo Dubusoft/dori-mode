@@ -27,6 +27,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("leadArgs", "list", "Extra argv for the lead session only"),
   spec("discordChannels", "list", "Discord channel ids dori listens and reports in", { required: true }),
   spec("alertsChannel", "string", "Discord channel for system notices; blank means the first discordChannels entry"),
+  spec("decisionsChannel", "string", "Discord channel where owner decisions open one thread each; blank posts them in the requesting channel"),
   spec("githubIssueAuthors", "list", "GitHub logins whose new or reopened issues wake the lead"),
   spec("ownerLanguage", "string", "Language the owner reads (e.g. Korean)"),
   spec("displayTimeZone", "string", "IANA time zone owner-facing system messages show times in (e.g. Asia/Seoul, shown as KST)"),
@@ -214,6 +215,7 @@ export const doriConfigDefault = (home: string): KeyDefault => {
     const first = (v: unknown): unknown => (Array.isArray(v) ? v[0] : undefined);
     const value = key === "leadModel" ? (hasValue(next.defaultModel) ? next.defaultModel : base.defaultModel)
       : key === "alertsChannel" ? first(next.discordChannels)
+      : key === "decisionsChannel" ? undefined
       : key === "laneSandbox" ? DEFAULT_LANE_SANDBOX
       : base[key];
     return hasValue(value) ? formatValue(s, value) : undefined;

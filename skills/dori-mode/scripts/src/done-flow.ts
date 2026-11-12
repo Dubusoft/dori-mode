@@ -756,6 +756,15 @@ export const laneSendRefusal = (caller: string | undefined): string | undefined 
     ? undefined
     : `LANE_PERMISSION_DENIED lane ${caller} may not run send; it is lead-only. Ask the lead instead: dori report ${caller} question --text "..."`;
 
+/**
+ * Why `caller` may not run `dori decision`, or undefined for the lead. Only the lead opens, closes and lists owner
+ * decisions: a lane asks with a question report carrying choices, which the supervisor opens as a decision.
+ */
+export const laneDecisionRefusal = (caller: string | undefined): string | undefined =>
+  caller === undefined
+    ? undefined
+    : `LANE_PERMISSION_DENIED lane ${caller} may not run decision; it is lead-only. Ask with dori report ${caller} question --option ... --recommend N --reason ...`;
+
 /** Hands a line over; `id` is its journal id when the line has a stable one (else the supervisor assigns one). */
 export type Emit = (line: string, id?: string, meta?: EventMeta) => Promise<void>;
 

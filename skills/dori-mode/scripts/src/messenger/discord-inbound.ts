@@ -101,6 +101,17 @@ export const discordThreadFloor = async (statePath: string, now: number, log?: (
   return floor;
 };
 
+/**
+ * Starts `channel` at the snowflake of `now` when it has no saved cursor, so its older history never arrives as live
+ * INBOUND; a channel that already has a cursor is left untouched. Returns whether a cursor was written.
+ */
+export const seedDiscordCursor = async (statePath: string, channel: string, now: number, log?: (line: string) => void): Promise<boolean> => {
+  const state = await readCursors(statePath, log);
+  if (state[channel] !== undefined) return false;
+  await writeCursors(statePath, { ...state, [channel]: discordSnowflakeAt(now) });
+  return true;
+};
+
 export type DiscordThread = { readonly id: string; readonly parent: string; readonly name?: string };
 const THREAD_TYPES: readonly unknown[] = [10, 11, 12];
 const named = (value: Record<string, unknown>): { readonly name?: string } =>

@@ -78,6 +78,7 @@ import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, openLaneReports, routeReports, statusTransportOf } from "./lane-reports.ts";
+import { type DecisionContext, openLaneDecision, ownerDecisionTick } from "./owner-decisions.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -1043,6 +1044,9 @@ export const supervise = async (
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
     // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
     const statusTransport = statusTransportOf(discord);
+    // Owner decision threads ride the same client: a lane question with choices opens one (owner-approved exception to
+    // the supervisor never talking to the owner), and the decision tick runs with the report checks.
+    const decisionCtx: DecisionContext = { config: deps.config, transport: discord, now: deps.clock.now, home };
     let nextHistoryPrune = 0;
     const routeLaneReports = (): Promise<void> => watchdog.track("reports", (async () => {
       const now = deps.clock.now();
@@ -1051,7 +1055,7 @@ export const supervise = async (
         reportStore.prune(now);
         nextHistoryPrune = now + 60 * 60_000;
       }
-      return routeReports(deps, reportStore, enqueueSweep, home, statusTransport);
+      return routeReports(deps, reportStore, enqueueSweep, home, statusTransport, (lane, report) => openLaneDecision(decisionCtx, lane, report));
     })())
       .then((lines) => { for (const line of lines) console.log(line); })
       .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
@@ -1109,6 +1113,9 @@ export const supervise = async (
       // A decision event the lead did not close (dori resolved) in time: UNRESOLVED wakes the lead.
       try { supervisor.resolveTick(); }
       catch (e) { console.error(`RESOLVE_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      // Owner decisions: a stuck post, a missing link line, a pending archive, the daily reminder.
+      try { await ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }); }
+      catch (e) { console.error(`OWNER_DECISION_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
       // A thread whose work is all finished and reported gets the owner's close-thread button once, --final or not.
       try { await supervisor.closeButtonTick(async (thread, id) => { await discord.send(thread, systemText(CLOSE_BUTTON_TEXT), id, closeThreadButton(thread)); }); }
       catch (e) { console.error(`CLOSE_BUTTON_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }

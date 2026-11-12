@@ -24,6 +24,7 @@ import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { probe as probeRunner, type Verdict } from "./runner/health.ts";
 import { unsandboxedReason } from "./runner-sandbox.ts";
 import { openOperations } from "./operations.ts";
+import { openOwnerDecisions } from "./owner-decisions.ts";
 import type { Tunables } from "./tunables.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
@@ -80,6 +81,8 @@ export type Status = {
   readonly unacked: number;
   /** Finished lanes (LANE_CLOSED, CI_MERGED) the lead has not reported to the owner with dori reported, oldest first. */
   readonly unreported?: readonly { readonly lane: string; readonly since: string }[];
+  /** Owner decisions not yet closed, including answered decisions awaiting lead action. */
+  readonly decisions?: readonly { readonly id: string; readonly state: string; readonly blocking: boolean; readonly lane?: string; readonly task?: number; readonly since: string }[];
   readonly events: EventStats;
   /** Every event source with its last event and error, and a sources.json that does not read. */
   readonly sources?: { readonly sources: readonly SourceView[]; readonly error?: string };
@@ -390,6 +393,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   let repos: string[] = [];
   try { repos = new Repos(d.config.stateDir).list(); } catch { /* unreadable list: show none */ }
   const reports = latestLaneReports(d.config);
+  const decisions = openOwnerDecisions(d.config.stateDir);
   const lanes = open.filter((l) => statusOf(l) === "working").map((l) => ({
     key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
     ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
@@ -422,6 +426,12 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     gateway: gatewayView(readGatewayStatus(d.config.stateDir), now),
     unacked: readUnacked(d.config.stateDir),
     unreported: readUnreported(d.config.stateDir),
+    decisions: decisions.map((decision) => ({
+      id: decision.id, state: decision.state, blocking: decision.blocking,
+      ...(decision.lane ? { lane: decision.lane } : {}),
+      ...(decision.task !== undefined ? { task: decision.task } : {}),
+      since: new Date(decision.openedAt).toISOString(),
+    })),
     events: eventStats(d.config, d.tunables.eventPolicy, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
@@ -582,6 +592,17 @@ const problems = (s: Status, now: number): Problem[] => {
       line: `끝났지만 오너에게 아직 보고 안 한 레인 (dori reported <key> --text TEXT): ${list(owed.map((o) => `${o.lane} ${ago(o.since, now)}`), 6, 300)}`,
     });
   }
+  const decisions = s.decisions ?? [];
+  const answered = decisions.filter((decision) => decision.state === "answered");
+  if (answered.length) out.push({ label: `결정 반영 대기 ${answered.length}`, line: `오너가 답한 결정 ${answered.length}개를 아직 닫지 않음 (dori decision close)` });
+  const waiting = decisions.filter((decision) => decision.state === "open");
+  if (waiting.length) out.push({
+    label: `오너 답 대기 결정 ${waiting.length}개`,
+    line: `오너 답 대기 결정 ${waiting.length}개: ${waiting.map((decision) => {
+      const days = Math.floor(Math.max(0, now - Date.parse(decision.since)) / 86_400_000);
+      return `${decision.id}${decision.task !== undefined ? ` #${decision.task}` : ""} ${days}일`;
+    }).join(", ")}`,
+  });
   const recovering = (kind: "pending" | "exhausted") => s.lanes.filter((lane) => lane.recovery === kind).map((lane) => lane.key);
   const exhausted = recovering("exhausted");
   const pending = recovering("pending");

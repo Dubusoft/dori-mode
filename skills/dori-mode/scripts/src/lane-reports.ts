@@ -19,6 +19,7 @@ import { REPORT_KINDS, type ReportKind } from "./runner/report-kinds.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import { LaneFileError } from "./lane-files.ts";
 import { ownerClosedRecorded, redirectIfClosed } from "./thread-followup.ts";
+import { type OpenResult, openedLine } from "./owner-decisions.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -27,9 +28,10 @@ export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kin
  */
 /**
  * Where a routed row went: the lead's journal, the lane's thread, a done claim, a late notice in the journal (its lane
- * was closed or gone), or nowhere (`dropped`: rows written before late notices existed).
+ * was closed or gone), an owner decision thread (`decision`: a question with choices), or nowhere (`dropped`: rows
+ * written before late notices existed).
  */
-export type ReportRoute = "journal" | "thread" | "claim" | "dropped" | "late";
+export type ReportRoute = "journal" | "thread" | "claim" | "dropped" | "late" | "decision";
 
 export type LaneReport = {
   readonly fileReceipt?: LaneFileReceipt;
@@ -291,6 +293,12 @@ export const reportLine = (report: LaneReport, body?: string, kind = "LANE_REPOR
 export const POISON_ALERT_AFTER = 3;
 const failures = new WeakMap<LaneReportStore, Map<string, number>>();
 
+/**
+ * Opens the owner decision a lane question carries (owner-decisions.ts openLaneDecision); undefined for a free-text
+ * question, which is routed to the journal as before.
+ */
+export type DecisionOpener = (lane: Lane, report: LaneReport) => Promise<OpenResult | undefined>;
+
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
 export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
@@ -445,13 +453,17 @@ const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, chan
  * saved to a file and its event carries the path (reportLine). Progress posted to the thread is marked `[System]`
  * relayed (freshness.ts relayedText), so the owner never reads it as the lane speaking. The consumed row records the
  * event it became (eventId), the done claim's `done-claim:<key>:<at>` included.
+ * With `openDecision`, a question of an open lane is first offered to it: a question with choices opens (or finds, the
+ * row id being its sourceRef) one owner decision thread and becomes a digest `OWNER_DECISION_OPENED` event under
+ * `owner-decision-opened:<decision id>` (route `decision`); a free-text question (undefined) is journaled as above, and
+ * a throw is a failed routing pass like any other.
  * A row whose routing throws is logged and left pending (retried next pass); the rest are still routed. After
  * POISON_ALERT_AFTER failed passes in a row it raises one urgent `LANE_REPORT <key> blocked REPORT_STUCK ...` event
  * under `lane-report-stuck:<row id>`. Returns one log line per routed row.
  */
 export const routeReports = async (
   deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? "",
-  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null,
+  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener,
 ): Promise<string[]> => {
   const out: string[] = [];
   const failed = failures.get(store) ?? new Map<string, number>();
@@ -462,11 +474,17 @@ export const routeReports = async (
       let route: ReportRoute;
       let eventId: string | undefined;
       const stale = lane && report.generation !== UNFENCED_GENERATION && report.generation < laneGeneration(lane);
-      if (!lane || statusOf(lane) === "closed" || stale) {
+      const late = !lane || statusOf(lane) === "closed" || stale;
+      const opened = !late && report.kind === "question" && openDecision ? await openDecision(lane, report) : undefined;
+      if (late || !lane) {
         eventId = `lane-report-late:${report.id}`;
         const line = reportLine(report, saveReportBody(deps.config.stateDir, report), "LANE_REPORT_LATE");
         await enqueue(eventId, stale ? `${line} (from a replaced session)` : line, lane ? laneMeta(lane) : { lane: report.lane });
         route = "late";
+      } else if (opened) {
+        eventId = `owner-decision-opened:${opened.decision.id}`;
+        await enqueue(eventId, openedLine(opened.decision, opened.duplicateOf), laneMeta(lane));
+        route = "decision";
       } else if (report.kind === "done") {
         if (lane.fileRun && !report.fileReceipt) throw new LaneFileError("LANE_REPORT_FILES_MISSING", lane.key, "this managed lane's done report has no file snapshot; claim done again through its runner");
         await claimDone(deps, lane, oneLine(report.evidence ?? report.text), report.fileReceipt);

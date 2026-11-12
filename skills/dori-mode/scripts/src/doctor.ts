@@ -257,6 +257,7 @@ export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "con
     const inFile = raw[key] !== undefined && raw[key] !== null;
     if (key === "stateDir" && env.DORI_STATE_DIR) checks.push(line(key, "env DORI_STATE_DIR", c.stateDir));
     else if (key === "alertsChannel" && !c.alertsChannel) checks.push(line(key, "derived from discordChannels[0]", alertsChannelOf(c)));
+    else if (key === "decisionsChannel" && !c.decisionsChannel) checks.push(warn(`config.${key}`, "decisionsChannel: unset (decisions go to the requesting channel)", `add "decisionsChannel": "<channel id>" to ${d.configPath}`));
     else if (key === "leadModel" && !inFile) checks.push(line(key, "derived from defaultModel", c.defaultModel));
     else checks.push(line(key, inFile ? "file" : values[key] === undefined ? "unset" : "default", values[key]));
   }

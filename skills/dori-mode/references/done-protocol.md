@@ -26,6 +26,8 @@ The key is in your brief's lane footer. With `claim-done`, if you leave it out, 
 
 Follow your footer. A footer that names `dori report` means: report only with `dori report <key> <milestone|progress|question|blocked> --text "..."`, and never type into the Dori's pane. `question` and `blocked` wake the Dori, `milestone` reaches it with its next update, and `progress` (1-2 sentences: done since last, and next) updates your work thread's status message. A `milestone` is a state change the owner would care about: what now works or landed, where you stand against your Done condition, and whether scope changed. No pane is read for a report: text printed in your pane or typed into the Dori's pane reaches no one. Thread posts the supervisor makes for you (`dori report progress`) read `[System] relayed from lane <key>: ...`. A lane on a footer an older dori wrote is moved onto `dori report` (footer rewritten) when recovery relaunches it.
 
+To ask the owner, use only `dori report <key> question --text "<question>" --option A --option B --recommend N --reason "..." [--waiting "..."]` (2-9 options; add `--nonblocking` when you go ahead on your pick). It opens a decision thread for the owner. A question without choices is refused: report an open-ended blocker with `blocked`. The owner's answer comes back through the Dori.
+
 A lane on another machine (`dori launch --machine`) reports the same way with its runner's `~/.dori/runner/bin/dori report <key> ...`, so everything below applies unchanged (remote worktree checks are skipped and say so in the close receipt).
 
 ## What happens next
