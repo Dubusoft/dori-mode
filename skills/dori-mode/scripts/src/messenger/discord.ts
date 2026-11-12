@@ -18,8 +18,11 @@ export const DISCORD_SUPPRESS_NOTIFICATIONS = 1 << 12;
 /** Most messages one `GET /channels/{id}/messages` returns. */
 export const DISCORD_MESSAGES_PAGE = 100;
 
-/** A message as `Discord.messagesAfter` reads it: its id, Discord message type (0 is a plain message), author and text. */
-export type DiscordMessage = { readonly id: string; readonly type: number; readonly authorId: string; readonly content: string };
+/**
+ * A message as `Discord.messagesAfter` reads it: its id, Discord message type (0 is a plain message), author, text, and the
+ * channel its message reference names (a THREAD_CREATED notice names its thread).
+ */
+export type DiscordMessage = { readonly id: string; readonly type: number; readonly authorId: string; readonly content: string; readonly reference?: string };
 const FENCE = /^\s*(```+|~~~+)/;
 
 /** The fence opener still open at the end of `text` (starting with `open`), or undefined when balanced. */
@@ -129,10 +132,11 @@ export class Discord {
 
   /** Up to DISCORD_MESSAGES_PAGE messages posted in `channelId` after message `afterId`, as Discord returns them. */
   async messagesAfter(channelId: string, afterId: string): Promise<DiscordMessage[]> {
-    const raw = await this.call<readonly { id?: unknown; type?: unknown; content?: unknown; author?: { id?: unknown } }[]>("GET", `/channels/${channelId}/messages?after=${afterId}&limit=${DISCORD_MESSAGES_PAGE}`);
+    const raw = await this.call<readonly { id?: unknown; type?: unknown; content?: unknown; author?: { id?: unknown }; message_reference?: { channel_id?: unknown } }[]>("GET", `/channels/${channelId}/messages?after=${afterId}&limit=${DISCORD_MESSAGES_PAGE}`);
     return raw.map((m) => ({
       id: String(m.id), type: typeof m.type === "number" ? m.type : -1,
       authorId: typeof m.author?.id === "string" ? m.author.id : "", content: typeof m.content === "string" ? m.content : "",
+      ...(typeof m.message_reference?.channel_id === "string" ? { reference: m.message_reference.channel_id } : {}),
     }));
   }
 
