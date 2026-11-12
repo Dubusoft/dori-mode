@@ -420,43 +420,54 @@ export class LeadLifecycle {
     return pane;
   }
 
-  /** The lead pane's last 80 lines, saved to the state dir: the only evidence of why a start failed once the pane is gone. */
-  private async saveLeadScreen(): Promise<void> {
+  /**
+   * The lead pane's last 80 lines, saved to the state dir: the only evidence of why a start failed once the pane is gone.
+   * Returns the saved file, or undefined when the pane could not be read (logged).
+   */
+  private async saveLeadScreen(): Promise<string | undefined> {
     const { run, config, clock } = this.deps;
     const pane = config.leadPane;
     const screen = await run(["herdr", "pane", "read", pane, "--source", "recent", "--lines", "80"]);
     if (screen.code !== 0) {
       console.error(`LEAD_PANE_SCREEN_UNREADABLE ${pane}: ${screen.err || screen.out}`);
-      return;
+      return undefined;
     }
     const path = join(config.stateDir, `lead-pane-${pane.replace(/[^\w.-]/g, "_")}-${clock.now()}.txt`);
     const fd = openSync(path, "w", 0o600);
     try { writeFileSync(fd, redactSecrets(screen.out)); fsyncSync(fd); } finally { closeSync(fd); }
     console.log(`LEAD_PANE_SCREEN_SAVED ${pane} ${path}`);
+    return path;
   }
 
   /**
-   * Replace an existing lead pane whose launch never confirmed (its screen is saved first by the caller). Only a pane
-   * left with a plain shell is closed, after the new tab exists; any other foreground process is not the supervisor's
-   * and the pane is kept. Returns the new pane id.
+   * Move the lead to a new pane after its old one failed to stop or start a lead (its screen is saved first by the
+   * caller). A terminal left behind by a lead killed mid-draw can keep answering escape-sequence queries into its own
+   * input, so the old pane is not trusted with another launch. It is closed after the new tab exists only when nothing
+   * but its shell or a lead the supervisor launched (`--session-id`) holds its foreground; anything else there is not
+   * the supervisor's, so that pane is left open untouched. Returns the new pane id.
    */
   private async replaceLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
     const old = config.leadPane;
-    const info = await processInfo(this.deps);
-    if (!info || !plainShell(info)) {
-      console.log(`LEAD_PANE_KEPT ${old}: foreground is not a plain shell`);
-      return undefined;
-    }
     const pane = await this.createLeadPane();
     if (!pane) {
       console.error(`LEAD_PANE_RECREATE_FAILED ${old}`);
       return undefined;
     }
-    const closed = await run(["herdr", "pane", "close", old]);
-    if (closed.code !== 0) console.error(`LEAD_PANE_CLOSE_FAILED ${old}: ${closed.err || closed.out}`);
+    const info = await processInfo({ ...this.deps, config: { ...this.deps.config, leadPane: old } });
+    const others = (info?.foreground_processes ?? []).filter((p) => p.pid !== info?.shell_pid);
+    if (info && (plainShell(info) || (others.length > 0 && others.every(supervisorLaunch)))) {
+      const closed = await run(["herdr", "pane", "close", old]);
+      if (closed.code !== 0) console.error(`LEAD_PANE_CLOSE_FAILED ${old}: ${closed.err || closed.out}`);
+    } else console.log(`LEAD_PANE_LEFT ${old}: its foreground is not the supervisor's; left open, nothing in it stopped`);
     console.log(`LEAD_PANE_RECREATED ${old} -> ${pane}`);
     return pane;
+  }
+
+  /** Tells the owner once per restart session that the lead moved to a new pane, and where the old screen is. */
+  private announceMoved(session: string, why: string, pane: string, saved: string | undefined): void {
+    this.owners.announce(`lead-pane-replaced:${session}`,
+      `리드가 응답하지 않아(${why}) 리드 프로세스를 멈추고 새 pane ${pane}에서 다시 시작합니다. ${saved ? `이전 화면은 ${saved}에 저장했습니다.` : "이전 화면은 읽지 못해 저장하지 못했습니다."}`);
   }
 
   /** The session file the last coldReason() resolved: a warm wake is recorded against it. */
@@ -702,7 +713,24 @@ export class LeadLifecycle {
     }
     if (restart.phase === "stopping" || restart.phase === "soft-failed") {
       const softFailed = restart.phase === "soft-failed";
-      if (!(await stopLead(deps, softFailed || restart.force))) {
+      let moved: string | undefined;
+      let stopped: boolean;
+      try { stopped = await stopLead(deps, softFailed || restart.force); }
+      catch (e) {
+        if (!(e instanceof TransientSuperviseError) || !LEAD_STAYS.test(e.message)) throw e;
+        // The old lead's tree was killed but stays in the pane (e.g. a TUI that broke mid-draw keeps the terminal busy).
+        // After the limit the lead moves to a new pane instead of waiting on this one forever.
+        const failures = (restart.unconfirmed ?? 0) + 1;
+        restart = { ...restart, unconfirmed: failures };
+        this.setRestart(restart);
+        if (failures < UNCONFIRMED_LIMIT) throw e;
+        const saved = await this.saveLeadScreen();
+        moved = await this.replaceLeadPane();
+        if (!moved) throw e;
+        this.announceMoved(restart.session, `이전 리드가 ${failures}번의 종료 시도에도 끝나지 않음`, moved, saved);
+        stopped = true;
+      }
+      if (!stopped) {
         // The lead woke while identity/ownership was being resolved. Deliver
         // warm rather than interrupting it or abandoning the queued event.
         if (!softFailed) this.owners.record(restart.events);
@@ -721,9 +749,11 @@ export class LeadLifecycle {
         this.owners.record(restart.events);
         restart = { ...restart, offset: statSync(this.core.eventLog).size };
       }
-      restart = { ...restart, phase: "starting" };
+      restart = { ...restart, phase: "starting", ...(restart.unconfirmed ? { unconfirmed: 0 } : {}) };
       this.setRestart(restart);
       if (!softFailed) this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
+      // The next attempt launches into the new pane with the supervisor's updated lead pane.
+      if (moved) throw new TransientSuperviseError(`LEAD_PANE_REPLACED the old lead did not exit; lead pane recreated as ${moved}, relaunching as ${restart.session}`);
     }
     if (restart.phase === "starting") {
       this.carryOver(restart);
@@ -777,11 +807,15 @@ export class LeadLifecycle {
         throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session}; events retained, inspect the lead before retrying`);
       }
       // This session never initialised and will not confirm. Save the screen while the failure is still on it, stop
-      // exactly its tree, replace the pane when only a shell is left, and give the same events and offset a fresh
-      // session, as a hung start does. The launch guard protects a kept pane.
-      await this.saveLeadScreen();
-      await stopHung(deps, restart.session);
+      // exactly its tree, move the lead to a new pane, and give the same events and offset a fresh session, as a hung
+      // start does. A process that will not stop does not hold the lead in this pane.
+      const saved = await this.saveLeadScreen();
+      try { await stopHung(deps, restart.session); } catch (e) {
+        if (!(e instanceof TransientSuperviseError)) throw e;
+        console.error(`LEAD_STOP_FAILED ${restart.session}: ${e.message}`);
+      }
       const pane = await this.replaceLeadPane();
+      if (pane) this.announceMoved(restart.session, `새 리드가 ${unconfirmed}번 확인하는 동안 시작되지 않음`, pane, saved);
       const next = this.abandon(restart);
       console.log(`LEAD_STARTUP_ABANDONED ${restart.session} -> ${next.session}`);
       throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session} after ${unconfirmed} checks; ${pane ? `lead pane recreated as ${pane}` : "lead pane kept"}, relaunching as ${next.session}`);
@@ -996,6 +1030,23 @@ const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> => 
   catch (e) { if (e instanceof SyntaxError) return undefined; throw e; }
 };
 
+/** The old lead's tree was killed but is still listed: it is stuck in its pane, not refused. */
+const LEAD_STAYS = /old lead has not exited|cannot stop owned lead process/;
+
+/** A lead process the supervisor launched: its lead command always carries `--session-id`. Entries without argv never match. */
+const supervisorLaunch = (p: ForegroundProcess): boolean => Array.isArray(p.argv) && p.argv.includes("--session-id");
+
+/**
+ * The part of a pane's screen written since the launch of `session`: the lines after the last one naming it. A reused
+ * pane still shows what its old occupant printed above (the previous lead's own words, or the escape-sequence replies a
+ * broken terminal typed), which says nothing about the new process. The whole screen when the launch line is not on it.
+ */
+export const screenSinceLaunch = (screen: string, session: string): string => {
+  const lines = screen.split("\n");
+  const at = lines.findLastIndex((line) => line.includes(session));
+  return at < 0 ? screen : lines.slice(at + 1).join("\n");
+};
+
 /** A short-lived or partly read entry can lack argv; it never matches. */
 const launchedAs = (p: ForegroundProcess, session: string): boolean =>
   Array.isArray(p.argv) && p.argv.some((arg, i, argv) => arg === "--session-id" && argv[i + 1] === session);
@@ -1026,7 +1077,7 @@ export const confirmLead = async (deps: FlowDeps, session: string): Promise<bool
     const identity = processes.some((p) => launchedAs(p, session));
     if (identity && pane && (pane.agent_status === "idle" || pane.agent_status === "working" || pane.agent_status === "done")) {
       const screen = await readScreen(deps.run, deps.config.leadPane, 40);
-      return !STARTUP_ERROR.test(screen);
+      return !STARTUP_ERROR.test(screenSinceLaunch(screen, session));
     }
     await deps.clock.sleep(500);
   }
