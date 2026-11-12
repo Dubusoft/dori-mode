@@ -5,7 +5,7 @@ import type { EventMeta } from "../supervise-journal.ts";
 import { decideHello, recordHello, resetGen, type StoredRunner } from "./fencing.ts";
 import {
   PROTO, checkProto, journalId, supervisorControl,
-  type AnyRunnerEvent, type RunnerControl, type RunnerEventBodies, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
+  type AnyRunnerEvent, type HerdrHealth, type RunnerControl, type RunnerEventBodies, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
   type WorkspaceEntry,
 } from "./protocol.ts";
 
@@ -69,7 +69,7 @@ export type RunnerRow = {
   /** How many lanes the last hello's inventory listed. */
   readonly lanes?: number;
   /** The runner's machine's herdr as its guard samples showed it (herdr-down.ts); absent until a sample carried a pane count. */
-  readonly herdr?: "up" | "down" | "hung";
+  readonly herdr?: HerdrHealth["state"];
   /** Supervisor wall time `herdr` was entered. */
   readonly herdrSince?: number;
   /** The machine readings of the runner's last `guard.sample` (absent until one arrived). */
@@ -185,7 +185,7 @@ const toRow = (r: DbRow): RunnerRow => ({
   ...(r.disconnectedAt !== null ? { disconnectedAt: r.disconnectedAt } : {}),
   ...(r.outboxUnacked !== null && r.outboxOldestAgeMs !== null ? { outbox: { unacked: r.outboxUnacked, oldestAgeMs: r.outboxOldestAgeMs } } : {}),
   ...(r.lanes !== null ? { lanes: r.lanes } : {}),
-  ...(r.herdr === "up" || r.herdr === "down" || r.herdr === "hung" ? { herdr: r.herdr } : {}),
+  ...(r.herdr === "up" || r.herdr === "down" || r.herdr === "hung" || r.herdr === "elevated" ? { herdr: r.herdr } : {}),
   ...(r.herdrSince !== null ? { herdrSince: r.herdrSince } : {}),
   ...(() => { const machine = parseMachine(r.machine); return machine ? { machine } : {}; })(),
   ...(() => { const workspaces = parseWorkspaces(r.workspaces); return workspaces ? { workspaces } : {}; })(),
@@ -372,7 +372,7 @@ export class RunnerHub {
   }
 
   /** Saves the runner's machine's herdr state (herdr-down.ts) and when it was entered. */
-  setHerdr(label: string, state: "up" | "down" | "hung", since: number): void {
+  setHerdr(label: string, state: HerdrHealth["state"], since: number): void {
     this.db.query("UPDATE runners SET herdr = ?, herdrSince = ? WHERE label = ?").run(state, since, label);
   }
 

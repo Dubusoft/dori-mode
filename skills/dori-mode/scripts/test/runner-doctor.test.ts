@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { runnerChecks } from "../src/doctor.ts";
 import { openOperations, plan } from "../src/operations.ts";
+import { herdrDownSince } from "../src/runner/herdr-down.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { writeRunnerEndpoint } from "../src/runner/endpoints.ts";
 import { markHerdr } from "./herdr-world.ts";
@@ -83,4 +84,16 @@ test("a runner whose machine's herdr is down or hung is FAIL with the herdr comm
   });
   expect(checks.find((c) => c.id === "runner worker-c")?.fix).toBe("dori runner install --machine worker-c to upgrade (proto 3 has no host.herdr), then dori runner herdr start --machine worker-c");
   expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 6, gen 4, restarts1h 0, herdr up" });
+});
+
+test("a runner whose herdr server runs elevated is FAIL with the elevated-server fix, never the restart the runner would refuse", () => {
+  const s = setup("100.101.1.2:7411");
+  addRunner(s.stateDir, "windows-pc", 6);
+  markHerdr(s.stateDir, "windows-pc", "elevated", NOW - 60_000);
+  const row = runnerChecks(s.deps).find((c) => c.id === "runner windows-pc");
+  expect(row).toMatchObject({ level: "FAIL", detail: `herdr elevated since ${new Date(NOW - 60_000).toISOString()} (the server runs as administrator and refuses the unelevated runner)` });
+  expect(row?.fix).toContain("allow_unelevated_clients = true");
+  expect(row?.fix).not.toContain("dori runner herdr restart");
+  // Lane recovery and launches on that machine stay held while it is elevated, as for down and hung.
+  expect(herdrDownSince(s.stateDir).has("windows-pc")).toBe(true);
 });

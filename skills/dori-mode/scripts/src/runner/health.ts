@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Runner } from "../run.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import { winHerdrServers } from "./herdr-watch.ts";
+import { herdrElevatedError, winHerdrServers } from "./herdr-watch.ts";
 
 /**
  * The runner's health file and the probe that reads it. The runner rewrites `<runnerDir>/health` every 15 s with
@@ -96,8 +96,11 @@ export const probe = (deps: ProbeDeps): ProbeResult => {
   return { process: "alive", verdict, ...base };
 };
 
-/** herdr on this host: answering, no `herdr server` process, a server process that does not answer, or unknown (pgrep failed). */
-export type HerdrProbe = "up" | "down" | "hung" | "unknown";
+/**
+ * herdr on this host: answering, no `herdr server` process, a server process that does not answer, a server that runs
+ * elevated and refuses this unelevated client (Windows), or unknown (pgrep failed).
+ */
+export type HerdrProbe = "up" | "down" | "hung" | "elevated" | "unknown";
 export const HERDR_PROBE_TIMEOUT_MS = 5_000;
 
 /**
@@ -105,8 +108,10 @@ export const HERDR_PROBE_TIMEOUT_MS = 5_000;
  * `herdr server` process (pgrep) means hung and none means down. A single reading, with no retry or debounce.
  */
 export const probeHerdr = async (run: Runner, opts: { platform?: string; user?: string } = {}): Promise<HerdrProbe> => {
-  if ((await run(["herdr", "workspace", "list"], { timeoutMs: HERDR_PROBE_TIMEOUT_MS })).code === 0) return "up";
+  const list = await run(["herdr", "workspace", "list"], { timeoutMs: HERDR_PROBE_TIMEOUT_MS });
+  if (list.code === 0) return "up";
   if ((opts.platform ?? process.platform) === "win32") {
+    if (herdrElevatedError(`${list.err}\n${list.out}`, "win32")) return "elevated";
     const ids = await winHerdrServers(run, opts.user);
     return ids ? (ids.length ? "hung" : "down") : "unknown";
   }
