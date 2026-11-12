@@ -1830,36 +1830,104 @@ test("a submitted launch that never confirms is abandoned after the limit: scree
   expect(restartSession(f)).toBeUndefined();
 });
 
-test("argv-less foreground entries never crash, and a pane held by a process the supervisor did not start is kept", async () => {
+test("argv-less foreground entries never crash, and a pane held by a process the supervisor did not start is left open while the lead moves to a new pane", async () => {
   const f = fixture();
   f.cold();
   f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(1);
   let foreign = false;
-  // After the launch the pane runs something else (the owner's own omo); herdr lists its entries without argv.
+  // After the launch the old pane runs something else (the owner's own omo); herdr lists its entries without argv.
   const run: Runner = async (argv, options) => {
-    if (argv[2] === "process-info" && foreign) return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_process_group_id: 300, foreground_processes: [{ pid: 300 }, { pid: 301, name: "node" }] } } }) };
+    if (argv[2] === "process-info" && argv[4] === "lead:p1" && foreign) return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_process_group_id: 300, foreground_processes: [{ pid: 300 }, { pid: 301, name: "node" }] } } }) };
     const out = await f.deps.run(argv, options);
     if (argv[2] === "run") foreign = true;
     return out;
   };
-  const deps = { ...f.deps, run: recreating(f, run) };
-  const first = new Supervisor(deps);
-  first.enqueue("owner", "INBOUND owner");
+  const deps = { ...f.deps, run: recreating(f, run), config: { ...f.deps.config } };
+  const supervisor = new Supervisor(deps);
+  supervisor.enqueue("owner", "INBOUND owner");
   const lines = await quiet(async () => {
     for (let i = 1; i <= UNCONFIRMED_LIMIT; i++) {
-      const flushed = (i === 1 ? first : new Supervisor(deps)).flush();
-      await expect(flushed).rejects.toThrow(i < UNCONFIRMED_LIMIT ? "STARTUP_UNCONFIRMED" : "lead pane kept");
+      await expect(supervisor.flush()).rejects.toThrow(i < UNCONFIRMED_LIMIT ? "STARTUP_UNCONFIRMED" : "lead pane recreated as w7:p9");
     }
-    // the fresh session is refused at the launch guard instead of being typed into that process
-    await expect(new Supervisor(deps).flush()).rejects.toThrow("LEAD_PANE_BUSY lead:p1: foreground is not a plain shell (pid 300, pid 301)");
   });
-  expect(lines).toContain("LEAD_PANE_KEPT lead:p1: foreground is not a plain shell");
-  expect(f.calls.some((call) => call[2] === "close" || call[1] === "tab")).toBe(false);
-  expect(launchedSessions(f)).toHaveLength(1);
+  expect(lines).toContain("LEAD_PANE_LEFT lead:p1: its foreground is not the supervisor's; left open, nothing in it stopped");
+  expect(lines).toContain("LEAD_PANE_RECREATED lead:p1 -> w7:p9");
+  expect(f.calls.some((call) => call[2] === "close")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" && (call[2] === "300" || call[2] === "301"))).toBe(false);
   const pending = restartSession(f);
   expect(pending.phase).toBe("starting");
   expect(pending.session).not.toBe(launchedSessions(f)[0]);
+  // the fresh session launches into the new pane's shell, never into the process left in the old one
+  f.noAgent();
+  await quiet(() => supervisor.flush());
+  expect(launchedSessions(f)).toEqual([expect.any(String), pending.session]);
+  expect(f.calls.filter((call) => call[2] === "run").map((call) => call[3])).toEqual(["lead:p1", "w7:p9"]);
+  expect(restartSession(f)).toBeUndefined();
+});
+
+test("an old lead that never leaves its pane is moved to a new pane after the limit: screen saved, only its own tree killed, owner told once", async () => {
+  const f = fixture();
+  // A stuck lead whose terminal broke mid-draw: SIGKILL is sent but the process stays in the pane's foreground.
+  writeJournal(f.state.dir, { events: [{ id: "x", line: "INBOUND x" }], restart: { session: "22222222-2222-4222-8222-222222222222", events: [{ id: "x", line: "INBOUND x" }], offset: 0, phase: "stopping", force: true } });
+  f.world.screen = "0;276;0c11;rgb:1e1e/1e1e/2e2e\\0;276;0c11;rgb:1e1e/1e1e/2e2e";
+  let stuck = true;
+  const recreate = recreating(f, f.deps.run);
+  const run: Runner = async (argv, options) => {
+    if (argv[0] === "kill" && argv[2] === "101" && stuck) { f.calls.push([...argv]); return { code: 0, out: "", err: "" }; }
+    // closing the pane ends what the kill could not
+    if (argv[0] === "herdr" && argv[2] === "close" && argv[3] === "lead:p1") { stuck = false; f.noAgent(); }
+    return recreate(argv, options);
+  };
+  const posted: string[] = [];
+  const supervisor = new Supervisor({ ...f.deps, run, config: { ...f.deps.config } }, { announce: async (text) => { posted.push(text); } });
+  const lines = await quiet(async () => {
+    for (let i = 1; i < UNCONFIRMED_LIMIT; i++) {
+      await expect(supervisor.flush()).rejects.toThrow("old lead has not exited");
+      expect(restartSession(f)).toMatchObject({ phase: "stopping", unconfirmed: i });
+    }
+    await expect(supervisor.flush()).rejects.toThrow("LEAD_PANE_REPLACED");
+    expect(restartSession(f)).toMatchObject({ phase: "starting", unconfirmed: 0 });
+    // the next retry starts a fresh lead in the new pane
+    await supervisor.flush();
+  });
+  const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-pane-lead_p1-"));
+  expect(saved).toHaveLength(1);
+  expect(readFileSync(join(f.state.dir, saved[0] ?? ""), "utf8")).toBe(f.world.screen);
+  const read = f.calls.findIndex((call) => call.join(" ") === "herdr pane read lead:p1 --source recent --lines 80");
+  const created = f.calls.findIndex((call) => call[1] === "tab" && call[2] === "create");
+  const closed = f.calls.findIndex((call) => call.join(" ") === "herdr pane close lead:p1");
+  expect(read).toBeGreaterThanOrEqual(0);
+  expect(created).toBeGreaterThan(read);
+  expect(closed).toBeGreaterThan(created);
+  // only the lead's own tree (process, child, detached session-owned monitor): never the shell or another agent
+  expect(new Set(f.calls.filter((call) => call[0] === "kill" && call[1] === "-KILL").map((call) => call[2]))).toEqual(new Set(["101", "102", "103"]));
+  expect(f.calls.filter((call) => call[2] === "run").map((call) => call[3])).toEqual(["w7:p9"]);
+  expect(lines).toContain(`LEAD_RESTARTED w7:p9 22222222-2222-4222-8222-222222222222`);
+  expect(restartSession(f)).toBeUndefined();
+  await supervisor.reactionsSettled();
+  expect(posted.filter((text) => text.includes("w7:p9"))).toHaveLength(1);
+  expect(posted.find((text) => text.includes("w7:p9"))).toContain(join(f.state.dir, saved[0] ?? ""));
+});
+
+test("what an old occupant left above the launch line (its own words, a broken terminal's escape replies) cannot block readiness; a startup error after it still does", async () => {
+  for (const [after, ready] of [["❯ ", true], ["Error: No API key found for anthropic", false]] as const) {
+    const f = fixture();
+    f.cold();
+    f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
+    const run: Runner = async (argv, options) => {
+      const out = await f.deps.run(argv, options);
+      if (argv[2] === "run") f.world.screen = `the previous lead: the quota cache hit its rate limit\n0;276;0c11;rgb:1e1e/1e1e/2e2e\n$ ${argv[4]}\n${after}`;
+      return out;
+    };
+    const supervisor = new Supervisor({ ...f.deps, run });
+    supervisor.enqueue("x", "INBOUND x");
+    const flushed = quiet(() => supervisor.flush());
+    if (ready) {
+      const lines = await flushed;
+      expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${launchedSessions(f)[0]}`);
+    } else await expect(flushed).rejects.toThrow("STARTUP_UNCONFIRMED");
+  }
 });
 
 test("an unconfirmed session that did initialise is never killed or relaunched past the limit", async () => {
