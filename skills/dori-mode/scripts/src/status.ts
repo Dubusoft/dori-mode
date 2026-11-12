@@ -139,7 +139,7 @@ export type RunnerView = {
   /** Open registry lanes on the runner's machine (see runnerLaneCount). */
   readonly lanes?: number;
   /** The machine's herdr as the runner's guard samples showed it, and since when (wall ms); absent: unknown. */
-  readonly herdr?: "up" | "down" | "hung";
+  readonly herdr?: "up" | "down" | "hung" | "elevated";
   readonly herdrSince?: number;
   /** The machine's readings from the runner's last guard sample (CPU load, free memory, disk, swap), and how old they are. */
   readonly machine?: Omit<RunnerMachine, "at"> & { readonly sampledAt: string; readonly ageSec: number };
@@ -524,7 +524,7 @@ const gatewayDetail = (g: GatewayView): string => {
 };
 
 const RUNNER_WORDS: Readonly<Record<RunnerView["state"], string>> = { connected: "연결됨", stale: "응답 늦음", offline: "오프라인", lost: "끊김", revoked: "해지됨" };
-const HERDR_WORDS: Readonly<Record<NonNullable<RunnerView["herdr"]>, string>> = { up: "정상", down: "다운", hung: "멈춤" };
+const HERDR_WORDS: Readonly<Record<NonNullable<RunnerView["herdr"]>, string>> = { up: "정상", down: "다운", hung: "멈춤", elevated: "관리자 권한 서버" };
 const CHILD_WORDS: Readonly<Record<Verdict, string>> = { healthy: "정상", stalled: "멈춤", dead: "없음" };
 const LEVEL_WORDS: Readonly<Record<RunnerMachine["level"], string>> = { ok: "정상", alert: "경고", critical: "위험" };
 

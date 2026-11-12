@@ -45,7 +45,8 @@ export const LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export type LaneStatus = "working" | "idle" | "dead" | "missing";
 export type WaitOutcome = "WAIT_DONE" | "WAIT_TIMEOUT" | "WAIT_FAILED";
 export type GuardLevel = "ok" | "alert" | "critical";
-export type HerdrHealth = { readonly state: "up" | "down" | "hung"; readonly instance?: string; readonly since: number };
+/** `elevated`: the server runs as administrator and refuses this unelevated runner (Windows; herdr-watch.ts herdrElevatedError). */
+export type HerdrHealth = { readonly state: "up" | "down" | "hung" | "elevated"; readonly instance?: string; readonly since: number };
 export type CommandOutcome = "verified" | "failed" | "ambiguous";
 /** What a runner knows of a command when asked (`cmd.status`): `unknown` means it holds no record of it. */
 export type CommandStatusState = "intent" | "running" | "verified" | "failed" | "ambiguous" | "unknown";
@@ -552,7 +553,7 @@ const laneKey: Shape = { key: req("string") };
 const BODY_REF: Shape = { sha256: req("string"), bytes: req("int"), truncated: req("bool") };
 const INVENTORY: Shape = { key: req("string"), pane: req("string"), tab: req("string"), session: opt("string") };
 const WORKSPACE: Shape = { repo: req("string"), path: req("string") };
-const HERDR: Shape = { state: req({ enum: ["up", "down", "hung"] }), instance: opt("string") };
+const HERDR: Shape = { state: req({ enum: ["up", "down", "hung", "elevated"] }), instance: opt("string") };
 // Lane file transfer (since proto 5). Structure only: limits, digests, base64, names and ordering are checked by the
 // producing/consuming endpoint, so a semantically bad snapshot is a refusal there, not an undecodable frame.
 const LANE_FILE: Shape = { path: req("string"), bytes: req("int"), sha256: req("string"), base64: req("string") };

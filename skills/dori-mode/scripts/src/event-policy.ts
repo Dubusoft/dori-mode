@@ -48,6 +48,8 @@ const URGENT_KINDS = [
   // stays digest (the default): held recovery resumes by itself.
   "HERDR_DOWN",
   "HERDR_HUNG",
+  // The server runs as administrator and refuses the unelevated runner (Windows): someone must end it or allow it.
+  "HERDR_ELEVATED",
   // The supervisor could not open its runner hub: every lane operation fails until a retry opens it. RUNNER_HUB_OPENED
   // stays digest (the default).
   "RUNNER_HUB_DISABLED",

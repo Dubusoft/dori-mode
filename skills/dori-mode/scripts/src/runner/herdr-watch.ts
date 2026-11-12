@@ -80,14 +80,44 @@ export const herdrProcess = async (run: Runner, opts: WinHerdrOptions = {}): Pro
   return { running: true, ...(ps.code === 0 && rows.length === ids.length && rows.every((s) => /^\d+ .+/.test(s)) ? { instance: rows.join(";") } : {}) };
 };
 
+/**
+ * Whether a failed herdr client call was refused by a server that runs elevated. On Windows a server started from an
+ * administrator session (an ssh login of an administrator account gets a full administrator token) refuses unelevated
+ * clients such as the runner's logon task with PermissionDenied (os error 5) and a hint to use an administrator
+ * terminal. That server answers, so it is not hung, and ending it from the runner fails the same way.
+ */
+export const herdrElevatedError = (text: string, platform: string = process.platform): boolean =>
+  platform === "win32" && /PermissionDenied|permission denied|access is denied|os error 5\b|elevated server|administrator terminal/i.test(text);
+
+/** What fixes an elevated herdr server, for the HERDR_ELEVATED refusals and `dori doctor`. */
+export const HERDR_ELEVATED_FIX = "end that server from an administrator terminal on the host (herdr server stop) and the runner starts an unelevated one, "
+  + "or add [server] allow_unelevated_clients = true to %APPDATA%\\herdr\\config.toml there and restart the server from an administrator terminal";
+
+/**
+ * Starts `herdr server` on Windows through WMI (Win32_Process.Create) with the runner's own, unelevated token and no
+ * window. The new server's parent is the WMI provider host, so it is outside the runner's process tree and its
+ * scheduled task: a runner restart (`taskkill /T`) or a stopped task leaves herdr and its lane panes running.
+ */
+export const WIN_HERDR_START_SCRIPT = [
+  "$h = (Get-Command herdr.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source;",
+  "$s = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 };",
+  "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ('\"' + $h + '\" server'); CurrentDirectory = $env:USERPROFILE; ProcessStartupInformation = $s };",
+  "if ($r.ReturnValue -ne 0) { Write-Output ('Win32_Process.Create returned ' + $r.ReturnValue); exit 1 };",
+  "Write-Output ('started herdr server pid ' + $r.ProcessId)",
+].join(" ");
+
 export type HerdrUnitDeps = { run: Runner; os?: string; home?: string; exists?: (path: string) => boolean; read?: (path: string) => string };
 
 export const HERDR_SYSTEMD_UNIT = ".config/systemd/user/herdr-server.service";
 export const HERDR_LAUNCHD_PLIST = "Library/LaunchAgents/com.dori.herdr.plist";
 
-/** Whether a herdr unit (`dori setup` or `dori runner install`) is installed on this host. */
+/**
+ * Whether this host's herdr server is the runner's to start: a herdr unit (`dori setup` or `dori runner install`) is
+ * installed on Linux and macOS; on Windows the runner itself starts it (WIN_HERDR_START_SCRIPT), so always.
+ */
 export const herdrUnitInstalled = (deps: Omit<HerdrUnitDeps, "run">): boolean => {
   const os = deps.os ?? process.platform;
+  if (os === "win32") return true;
   const exists = deps.exists ?? existsSync;
   const home = deps.home ?? homedir();
   if (os === "linux") return exists(join(home, HERDR_SYSTEMD_UNIT));
@@ -105,8 +135,9 @@ export const launchdDomain = (deps: Omit<HerdrUnitDeps, "run" | "os">): string |
 };
 
 /**
- * Only starts an installed unit. It never stops, restarts or spawns a herdr child. On macOS a unit that is not loaded
- * (`dori runner herdr stop` boots it out) is bootstrapped again before the kickstart is retried.
+ * Only starts an installed unit, or on Windows a `herdr server` outside the runner's tree (WIN_HERDR_START_SCRIPT). It
+ * never stops, restarts or spawns a herdr child. On macOS a unit that is not loaded (`dori runner herdr stop` boots it
+ * out) is bootstrapped again before the kickstart is retried.
  */
 export const startManagedHerdr = async (deps: HerdrUnitDeps): Promise<{ ok: boolean; detail: string } | undefined> => {
   const os = deps.os ?? process.platform;
@@ -114,7 +145,9 @@ export const startManagedHerdr = async (deps: HerdrUnitDeps): Promise<{ ok: bool
   if (!herdrUnitInstalled(deps)) return undefined;
   let argv: string[];
   let domain: string | undefined;
-  if (os === "linux") {
+  if (os === "win32") {
+    argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WIN_HERDR_START_SCRIPT];
+  } else if (os === "linux") {
     argv = ["systemctl", "--user", "start", "herdr-server.service"];
   } else if (os === "darwin") {
     domain = launchdDomain(deps);
@@ -139,6 +172,8 @@ export type HerdrWatchDeps = {
   readonly start?: () => ReturnType<typeof startManagedHerdr>;
   /** The watch pause marker (`dori runner herdr stop`): while set, a down herdr is reported but not started. */
   readonly paused?: () => boolean;
+  /** The host OS (default process.platform): an elevated-server refusal is read only on win32. */
+  readonly platform?: string;
 };
 
 export class HerdrWatch {
@@ -153,13 +188,30 @@ export class HerdrWatch {
 
   snapshot(): HerdrHealth | undefined { return this.health; }
 
+  /**
+   * Once at runner start on Windows: start the server right away when none runs, unless `dori runner herdr stop` holds
+   * it down. The first herdr client to reach a stopped server starts it with its own token, so an unelevated runner
+   * that starts it first keeps an administrator ssh session (herdr's remote bridge) from starting an elevated one. The
+   * regular watch only starts it after failures spanning 30 s. Elsewhere the herdr unit's manager starts it at boot.
+   */
+  async boot(): Promise<void> {
+    if ((this.deps.platform ?? process.platform) !== "win32" || (this.deps.paused?.() ?? false)) return;
+    try { await listPanes(this.deps.run); return; } catch { /* not answering: is there a server at all? */ }
+    if ((await (this.deps.process ?? (() => herdrProcess(this.deps.run)))()).running) return;
+    const result = await (this.deps.start ?? (() => startManagedHerdr({ run: this.deps.run })))();
+    if (!result) return;
+    this.nextStart = this.deps.monotonic() + this.backoff;
+    this.deps.publish("herdr.start", result);
+  }
+
   /** Called by the guard's existing pane count read, so the watch adds no pane-list requests. */
   async sample(): Promise<number> {
     const at = this.deps.monotonic();
     const waking = this.lastTick !== undefined && at - this.lastTick > 3 * GUARD_SAMPLE_MS;
     this.lastTick = at;
     let panes: number;
-    try { panes = (await listPanes(this.deps.run)).length; } catch { panes = -1; }
+    let failure = "";
+    try { panes = (await listPanes(this.deps.run)).length; } catch (e) { panes = -1; failure = e instanceof Error ? e.message : String(e); }
     if (panes >= 0) {
       this.misses = 0;
       this.failedAt = undefined;
@@ -172,6 +224,10 @@ export class HerdrWatch {
     if (waking) { this.misses = 0; this.failedAt = undefined; return panes; }
     this.failedAt ??= at;
     if (++this.misses < 2 || at - this.failedAt < 30_000) return panes;
+    if (herdrElevatedError(failure, this.deps.platform)) {
+      this.transition("elevated", undefined, `pane list refused: the herdr server runs elevated and refuses this unelevated runner; ${HERDR_ELEVATED_FIX}`);
+      return panes;
+    }
     const proc = await (this.deps.process ?? (() => herdrProcess(this.deps.run)))();
     const state = proc.running ? "hung" : "down";
     const paused = !proc.running && (this.deps.paused?.() ?? false);
