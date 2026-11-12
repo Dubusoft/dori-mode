@@ -162,7 +162,7 @@ test("a notice that cannot be deleted is reported and recorded, and the decision
   expect(readDecisions(dir).decisions[0]?.noticeKept).toBe("missing access");
 });
 
-test("thread names stay within 40 characters, open and closed", async () => {
+test("thread names stay within 40 characters, and closing keeps the name", async () => {
   const dir = stateDir();
   const fake = fakeTransport();
   const ctx = context(dir, fake.transport);
@@ -170,11 +170,9 @@ test("thread names stay within 40 characters, open and closed", async () => {
   const { decision } = await open(ctx, { question, task: 904 });
   await closeOwnerDecision(ctx, decision.id, { text: "Done.", choice: 1 });
   const opened = String(fake.calls.find((call) => call.method === "startThread")?.args[2]);
-  const closed = String((fake.calls.find((call) => call.method === "setThread")?.args[1] as { name?: string }).name);
   expect(opened).toStartWith("결정 d1 · #904 · 이 결정");
-  expect(closed).toStartWith("결정됨 d1 · #904 · 이 결정");
   expect(Array.from(opened).length).toBeLessThanOrEqual(40);
-  expect(Array.from(closed).length).toBeLessThanOrEqual(40);
+  expect(fake.calls.filter((call) => call.method === "setThread").some((call) => "name" in (call.args[1] as object))).toBe(false);
 });
 
 test("an owner message in the channel body answers the only waiting decision there, and nothing when two wait", async () => {
@@ -223,8 +221,7 @@ test("closing an answered decision posts confirmation, archives, resolves, and r
   const closed = await closeOwnerDecision(ctx, decision.id, { text: "Proceed with option one.", choice: 1 });
   expect(fake.calls.some((call) => call.method === "send" && call.args[0] === decision.thread)).toBe(true);
   const patches = fake.calls.filter((call) => call.method === "setThread").map((call) => call.args[1] as { name?: string; archived?: boolean });
-  expect(patches.map((p) => Object.keys(p))).toEqual([["name"], ["archived"]]);
-  expect(patches[0]?.name).toStartWith("결정됨 d1");
+  expect(patches).toEqual([{ archived: true }]);
   expect(fake.archived.get(decision.thread as string)).toBe(true);
   expect(closed.archivePending).toBeUndefined();
   expect(closed.decision.state).toBe("closed");
