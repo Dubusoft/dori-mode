@@ -3,7 +3,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
-  discordChannels, discordDispatchThreads, discordSnowflakeAt, discordThreadFloor, listDiscordInbound, pollDiscordInbound,
+  discordChannels, discordDispatchThreads, discordSnowflakeAt, discordThreadFloor, listDiscordInbound, pollDiscordInbound, seedDiscordCursor,
 } from "../src/messenger/discord-inbound.ts";
 import { Discord } from "../src/messenger/discord.ts";
 import { type Lane, Registry } from "../src/registry.ts";
@@ -284,4 +284,12 @@ test("supervised polling drains a backlog larger than one API page without losin
   expect(paths).toHaveLength(2);
   expect(new URL(paths[1] ?? "").searchParams.get("before")).toBe("36");
   expect(await s.cursors()).toEqual({ "100": "135" });
+});
+
+test("seedDiscordCursor writes a cursor only when the channel has none", async () => {
+  const s = setup();
+  expect(await seedDiscordCursor(s.statePath, "200", 1_700_000_000_000)).toBe(true);
+  expect(await s.cursors()).toEqual({ "200": discordSnowflakeAt(1_700_000_000_000) });
+  expect(await seedDiscordCursor(s.statePath, "200", 1_800_000_000_000)).toBe(false);
+  expect(await s.cursors()).toEqual({ "200": discordSnowflakeAt(1_700_000_000_000) });
 });

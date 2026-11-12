@@ -273,6 +273,19 @@ const USAGE = `dori <command> [options]
                                        as one line linking the thread (REPORT_REDIRECTED / SENT_REDIRECTED); the thread stays closed
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
+  decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT
+                [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]
+                                       lead-only: ask the owner one question with 2-9 numbered options, a recommendation and its
+                                       reason in its own thread in decisionsChannel (else the asking thread's channel, else the
+                                       first discordChannels entry); a link line goes into --thread (else --lane's thread);
+                                       --task defaults to the ap-<task>-<n> lane's task; --nonblocking: work goes ahead on the
+                                       recommendation; --from-event resolves that decision event (DECISION_SOURCE_RESOLVED);
+                                       a bad or missing field exits 2 DECISION_REFUSED
+  decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel]
+                                       lead-only: post the outcome into the decision's thread, archive it and resolve its
+                                       OWNER_DECISION_ANSWERED event; --from names an answer given outside the thread
+  decision list [--all] [--json]       lead-only: decisions not closed, oldest first (DECISION_NONE when none); --all adds those
+                                       closed in the last 7 days
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
                                        hourglass off, eyes on; the ack is recorded for the supervisor
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--awaiting [--note TEXT]]
@@ -1249,6 +1262,10 @@ try {
       await needSupervisor();
       const r = await closeLane(deps, target, note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
       for (const line of r.lines) console.log(line);
+      // Owner decisions still open for this lane never block the close; they are named so the lead closes or keeps them.
+      const { openOwnerDecisions } = await import("./owner-decisions.ts");
+      const pending = openOwnerDecisions(config.stateDir).filter((d) => d.lane === target.key).map((d) => d.id);
+      if (pending.length) console.log(`CLOSE_NOTE open decisions: ${pending.join(" ")}`);
       process.exit(r.closed ? 0 : 2);
     }
     case "pause":
@@ -1404,7 +1421,10 @@ try {
         // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
         const checklist = checklistLine([...result.events.map((event) => `${event.id}\t${event.line}`), ...reminders]);
         // Messages parked on the owner's answer are information, not work: listed last and kept out of the checklist.
-        for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...takeAwaitingReminders(config.stateDir), ...sentinel]) console.log(line);
+        // Owner decisions still open are information too: the owner has not answered, or the answer is an UNRESOLVED reminder.
+        const { takeOwnerDecisionLines } = await import("./owner-decisions.ts");
+        const decisionLines = takeOwnerDecisionLines(config.stateDir, realClock.now());
+        for (const line of [...(checklist ? [checklist] : []), ...lines, ...reminders, ...takeAwaitingReminders(config.stateDir), ...decisionLines, ...sentinel]) console.log(line);
       } catch (e) {
         if (e instanceof InboxError) die(e.message, 2);
         throw e;
@@ -1498,8 +1518,10 @@ try {
       let withheld: string[] = [];
       if (final) {
         const { publishedDecisions } = await import("./decision-obligations.ts");
+        const { ownerDecisionBlockers } = await import("./owner-decisions.ts");
         withheld = threadId !== to ? ["the report is not posted into a thread"] : finalityBlockers({
-          lane: found, thread: to, open: await deps.registry.open(), waits: new Waits(config.stateDir).list(), decisions: publishedDecisions(config.stateDir),
+          lane: found, thread: to, open: await deps.registry.open(), waits: new Waits(config.stateDir).list(),
+          decisions: [...publishedDecisions(config.stateDir), ...ownerDecisionBlockers(config.stateDir)],
         });
         const posted = readCloseButtons(config.stateDir)[to];
         if (!withheld.length && posted !== undefined && found.closedAt && posted >= Date.parse(found.closedAt)) withheld = ["the close button is already posted on this thread"];
@@ -1532,6 +1554,132 @@ try {
       const at = realClock.now();
       for (const id of ids) recordResolved(config.stateDir, id, at, note ? oneLine(note) : undefined);
       for (const id of ids) console.log(open.has(id) ? `RESOLVED_RECORDED ${id}` : `RESOLVED_UNMATCHED ${id}: no open decision has this id; recorded anyway`);
+      break;
+    }
+    case "decision": {
+      // `dori decision open|close|list`: owner decisions (owner-decisions.ts), lead-only.
+      const { callerLane, laneDecisionRefusal } = await import("./done-flow.ts");
+      const refusal = laneDecisionRefusal(await callerLane(deps));
+      if (refusal) die(refusal);
+      const od = await import("./owner-decisions.ts");
+      const { decisionChoicesProblem } = await import("./runner/decision-text.ts");
+      const [sub, ...subArgs] = rest;
+      const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
+      /** Discord is reached only when a call needs it; `token` already resolved, else read on first use. */
+      const decisionContext = (token?: string): import("./owner-decisions.ts").DecisionContext => {
+        let transport: Discord | undefined;
+        return {
+          config, now: realClock.now, home: homedir(),
+          get transport() { return transport ??= new Discord(fetchHttp, realClock, token ?? messengerToken("DORI_DISCORD_TOKEN")); },
+        };
+      };
+      if (sub === "open") {
+        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]";
+        const refuse = (reason: string): never => {
+          console.error(`DECISION_REFUSED ${reason}`);
+          return die(usage, 2);
+        };
+        const parsed = (() => {
+          try {
+            return parseArgs({
+              args: subArgs, allowPositionals: false, strict: true,
+              options: {
+                question: { type: "string" }, option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" },
+                waiting: { type: "string" }, task: { type: "string" }, lane: { type: "string" }, thread: { type: "string" },
+                nonblocking: { type: "boolean" }, "from-event": { type: "string" },
+              },
+            });
+          } catch (e) { return refuse(e instanceof Error ? e.message : String(e)); }
+        })();
+        const v = parsed.values;
+        const problem = decisionChoicesProblem({ question: v.question, options: v.option, recommend: v.recommend, reason: v.reason, waiting: v.waiting });
+        if (problem) refuse(problem);
+        let task: number | undefined;
+        if (v.task !== undefined) {
+          if (!/^[1-9]\d*$/.test(v.task.trim())) refuse(`--task must be a positive integer, got "${v.task}"`);
+          task = Number(v.task.trim());
+        }
+        const laneKey = v.lane?.trim() || undefined;
+        const found = laneKey === undefined ? undefined : await deps.registry.read(laneKey);
+        if (laneKey !== undefined && !found) refuse(`unknown --lane ${laneKey}: no registered lane has this key`);
+        task ??= od.taskOfLane(laneKey);
+        const thread = v.thread?.trim();
+        if (thread !== undefined && !od.refIds(thread)) refuse(`--thread ${thread} is not a thread ref such as discord:<channel>/<thread>`);
+        const laneThread = found?.thread && found.thread !== "none" ? found.thread : undefined;
+        const origin = thread ?? laneThread;
+        const fromEvent = v["from-event"]?.trim();
+        const { recordResolved, validEventId } = await import("./decision-obligations.ts");
+        if (fromEvent !== undefined && !validEventId(fromEvent)) refuse(`--from-event ${fromEvent} is not an event id`);
+        const token = messengerToken("DORI_DISCORD_TOKEN");
+        const opened = await od.openOwnerDecision(decisionContext(token), {
+          question: flat(v.question ?? ""), options: (v.option ?? []).map(flat), recommend: Number((v.recommend ?? "").trim()),
+          reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true, source: "lead",
+          ...(task !== undefined ? { task } : {}), ...(laneKey ? { lane: laneKey } : {}), ...(origin ? { origin } : {}),
+        }).catch((e: unknown) => {
+          if (e instanceof od.OwnerDecisionError) die(e.message, 1);
+          throw e;
+        });
+        const d = opened.decision;
+        console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}`);
+        if (opened.channel.unset) console.log(od.channelUnsetLine(opened.channel));
+        if (opened.noticeKept) console.log(`DECISION_NOTICE_KEPT ${d.id}: the channel's "started a thread" notice could not be deleted: ${opened.noticeKept}`);
+        const link = opened.link;
+        if (link.kind === "linked") {
+          const ids = od.refIds(d.origin);
+          console.log(`DECISION_LINKED ${d.id} discord:${ids?.channel ? `${ids.channel}/` : ""}${link.origin} ${link.message}`);
+        } else if (link.kind === "skipped") console.log(`DECISION_LINK_SKIPPED ${d.id}: ${link.reason}`);
+        else if (link.kind === "failed") console.log(`DECISION_LINK_FAILED ${d.id} ${link.reason}`);
+        if (fromEvent !== undefined) {
+          recordResolved(config.stateDir, fromEvent, realClock.now(), `decision ${d.id}`);
+          console.log(`DECISION_SOURCE_RESOLVED ${d.id} ${fromEvent}`);
+        }
+        break;
+      }
+      if (sub === "close") {
+        const usage = "usage: dori decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel]";
+        const parsed = (() => {
+          try {
+            return parseArgs({
+              args: subArgs, allowPositionals: true, strict: true,
+              options: { text: { type: "string" }, choice: { type: "string" }, from: { type: "string" }, cancel: { type: "boolean" } },
+            });
+          } catch (e) { return die(`${e instanceof Error ? e.message : String(e)}\n${usage}`, 2); }
+        })();
+        const [id, ...extra] = parsed.positionals;
+        const { text, choice, from, cancel } = parsed.values;
+        if (!id || extra.length || !text?.trim() || (choice !== undefined && !/^\d+$/.test(choice.trim()))
+          || (from !== undefined && !/^\d+\/\d+$/.test(from.trim())) || (cancel && choice !== undefined)) die(usage, 2);
+        const closed = await od.closeOwnerDecision(decisionContext(), id ?? "", {
+          text: (text ?? "").trim(), ...(choice !== undefined ? { choice: Number(choice.trim()) } : {}),
+          ...(from !== undefined ? { from: from.trim() } : {}), ...(cancel ? { cancel: true } : {}),
+        }).catch((e: unknown) => {
+          if (e instanceof od.OwnerDecisionError) die(e.message, e.code === "DECISION_NOT_CLOSED" ? 1 : 2);
+          throw e;
+        });
+        const did = closed.decision.id;
+        console.log(`DECISION_CLOSED ${did}`);
+        if (closed.archivePending) console.log(`DECISION_ARCHIVE_PENDING ${did}: ${closed.archivePending}`);
+        if (closed.resolved) console.log(`DECISION_RESOLVED_EVENT ${did} ${closed.resolved}`);
+        if (closed.linkNote) console.log(`DECISION_LINK_NOTE ${did}: ${closed.linkNote}`);
+        break;
+      }
+      if (sub === "list") {
+        const usage = "usage: dori decision list [--all] [--json]";
+        const parsed = (() => {
+          try {
+            return parseArgs({ args: subArgs, allowPositionals: false, strict: true, options: { all: { type: "boolean" }, json: { type: "boolean" } } });
+          } catch (e) { return die(`${e instanceof Error ? e.message : String(e)}\n${usage}`, 2); }
+        })();
+        const now = realClock.now();
+        const listed = od.readDecisions(config.stateDir).decisions
+          .filter((d) => d.state !== "closed" || (parsed.values.all === true && d.closedAt !== undefined && now - d.closedAt <= od.DECISION_LIST_CLOSED_MS))
+          .sort((a, b) => a.openedAt - b.openedAt);
+        if (parsed.values.json) console.log(JSON.stringify(listed, null, 2));
+        else if (!listed.length) console.log("DECISION_NONE");
+        else for (const d of listed) console.log(od.decisionListLine(d, now));
+        break;
+      }
+      die("usage: dori decision open|close|list (dori decision open --help)", 2);
       break;
     }
     case "handled": {

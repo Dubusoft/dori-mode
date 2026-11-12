@@ -91,6 +91,22 @@ test("status shows services, pending waits, watched repos with poll time and fai
   expect(trusted).toContain("- 이슈: 저장소 1개 감시");
 });
 
+test("status shows open owner decisions and answered decisions awaiting close", async () => {
+  const f = await fixture();
+  writeFileSync(join(f.dir, "decisions.json"), JSON.stringify({ nextSeq: 3, decisions: [
+    { id: "d1", state: "open", blocking: true, task: 889, openedAt: NOW - 2 * 86_400_000 },
+    { id: "d2", state: "answered", blocking: false, lane: "alpha", openedAt: NOW - 60_000 },
+  ] }));
+  const s = await collectStatus(f.deps);
+  expect(s.decisions).toEqual([
+    { id: "d1", state: "open", blocking: true, task: 889, since: new Date(NOW - 2 * 86_400_000).toISOString() },
+    { id: "d2", state: "answered", blocking: false, lane: "alpha", since: new Date(NOW - 60_000).toISOString() },
+  ]);
+  const text = renderStatus(s);
+  expect(text).toContain("오너 답 대기 결정 1개: d1 #889 2일");
+  expect(text).toContain("오너가 답한 결정 1개를 아직 닫지 않음 (dori decision close)");
+});
+
 test("lead state: missing pane, and a pane with no agent is cold; cap and ttl come from config", async () => {
   const missing = await fixture([]);
   expect((await collectStatus(missing.deps)).lead).toMatchObject({ pane: "lead:p1", state: "missing", cacheTtlMin: 5, capTokens: 150_000 });

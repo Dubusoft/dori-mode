@@ -31,10 +31,10 @@ test("dori report inside a lane sends {kind} over the lane socket and never crea
   const h = home();
   const sock = fakeLaneSocket(h.dir);
   cleanups.push(sock.close);
-  const r = await cli(h, ["report", "demo-lane", "question", "--text", "which base?"], inLane);
+  const r = await cli(h, ["report", "demo-lane", "blocked", "--text", "which base?"], inLane);
   expect(r.code, r.err).toBe(0);
-  expect(r.out).toBe("LANE_REPORTED demo-lane question (through the runner)\n");
-  expect(sock.requests).toEqual([{ kind: "question", text: "which base?", key: "demo-lane", token: "tok-demo" }]);
+  expect(r.out).toBe("LANE_REPORTED demo-lane blocked (through the runner)\n");
+  expect(sock.requests).toEqual([{ kind: "blocked", text: "which base?", key: "demo-lane", token: "tok-demo" }]);
   // Nothing but the runner's socket directory exists under HOME (and bun's own ~/.bun): no state dir, no config, no
   // ~/.dori/state.
   expect(existsSync(h.state)).toBe(false);

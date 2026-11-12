@@ -12,6 +12,8 @@ import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { fakeLaneSocket } from "./fake-lane-socket.ts";
 import { BUILT_IN } from "../src/tunables.ts";
+import { openedLine, type OpenResult, type OwnerDecision } from "../src/owner-decisions.ts";
+import { parseDecisionText, serializeDecisionText } from "../src/runner/decision-text.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; a loaded full run on a small host needs more than bun's default 5 s per test.
 setDefaultTimeout(30_000);
@@ -259,9 +261,9 @@ test("dori report: a lane sends a report for its own key only, through its runne
   cleanups.push(sock.close);
   const inLane = { DORI_LANE_KEY: "local-lane", DORI_LANE_TOKEN: "tok" };
 
-  const ok = await cli(dir, ["local-lane", "question", "--text", "which base\nbranch?", "--evidence", "PR #4"], inLane);
-  expect(ok).toMatchObject({ code: 0, out: "LANE_REPORTED local-lane question (through the runner)\n" });
-  expect(sock.requests).toEqual([{ kind: "question", text: "which base\nbranch?", evidence: "PR #4", key: "local-lane", token: "tok" }]);
+  const ok = await cli(dir, ["local-lane", "blocked", "--text", "which base\nbranch?", "--evidence", "PR #4"], inLane);
+  expect(ok).toMatchObject({ code: 0, out: "LANE_REPORTED local-lane blocked (through the runner)\n" });
+  expect(sock.requests).toEqual([{ kind: "blocked", text: "which base\nbranch?", evidence: "PR #4", key: "local-lane", token: "tok" }]);
 
   const denied = await cli(dir, ["other-lane", "blocked", "--text", "x"], inLane);
   expect(denied.code).toBe(1);
@@ -269,7 +271,7 @@ test("dori report: a lane sends a report for its own key only, through its runne
 
   const badKind = await cli(dir, ["local-lane", "finished", "--text", "x"], inLane);
   expect(badKind.code).toBe(2);
-  expect(badKind.err).toContain("usage: dori report <key> <progress|question|blocked|milestone|done>");
+  expect(badKind.err).toContain("usage: dori report <key> <progress|blocked|milestone|done>");
 
   expect(sock.requests).toHaveLength(1);
   expect(new JsonLaneReports(dir).list()).toHaveLength(0);
@@ -346,4 +348,37 @@ test("routing: journal and late events carry the lane's meta (lane, thread, cwd)
     ["lane-report:local-lane:0:1", { lane: "local-lane", thread: "discord:1/2", cwd: "/repo/work" }],
     ["lane-report-late:nowhere:0:1", { lane: "nowhere" }],
   ]);
+});
+
+test("routing: a question with choices opens an owner decision through the opener and is consumed with route decision", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir);
+  await deps.registry.write(lane(dir));
+  const store = new JsonLaneReports(dir);
+  const choices = { question: "which base?", options: ["main", "develop"], recommend: 1, reason: "main is current", waiting: "the PR", blocking: true };
+  const row = store.append({ lane: "local-lane", generation: 0, kind: "question", text: serializeDecisionText(choices), at: T0 });
+  const asked: string[] = [];
+  const decision: OwnerDecision = { ...choices, id: "d1", state: "open", lane: "local-lane", source: "lane", sourceRef: row.id, channel: "9", thread: "10", openedAt: T0 };
+  const opener = async (_lane: Lane, report: { readonly id: string; readonly text: string }): Promise<OpenResult | undefined> => {
+    asked.push(report.id);
+    return parseDecisionText(report.text) ? { decision, channel: { channel: "9" }, link: { kind: "none" } } : undefined;
+  };
+  const journal: [string, string][] = [];
+  expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); }, "/home/test", null, opener)).toEqual([`LANE_REPORT_ROUTED ${row.id} question decision`]);
+  expect(asked).toEqual([row.id]);
+  expect(journal).toEqual([["owner-decision-opened:d1", openedLine(decision)]]);
+  expect(journal[0]?.[1]).toStartWith("OWNER_DECISION_OPENED d1 lane local-lane blocking");
+  expect(store.list()[0]).toMatchObject({ route: "decision", eventId: "owner-decision-opened:d1" });
+});
+
+test("routing: a free-text question the opener declines is journaled as a LANE_REPORT question as before", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir);
+  await deps.registry.write(lane(dir));
+  const store = new JsonLaneReports(dir);
+  const row = store.append({ lane: "local-lane", generation: 0, kind: "question", text: "which base?", at: T0 });
+  const journal: [string, string][] = [];
+  expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); }, "/home/test", null, async () => undefined)).toEqual([`LANE_REPORT_ROUTED ${row.id} question journal`]);
+  expect(journal).toEqual([[`lane-report:${row.id}`, "LANE_REPORT local-lane question which base?"]]);
+  expect(store.list()[0]?.route).toBe("journal");
 });

@@ -250,7 +250,7 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
   "- Done: once every `Done =` signal is live and all work is pushed, run the done command below, then stop and stay idle. A lane ends at its green PR: never wait for the merge (no monitor, wait, sleep, polling loop or `gh pr checks --watch` on it). The supervisor merges the PR at the head your claim recorded and the watcher closes the lane after that merge (5 min after the claim when nothing is left to merge) unless the Dori objects; it refuses while a worktree has uncommitted or unpushed changes. On `[LEAD] not done: <reasons>`, fix them and claim again.",
   ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: claim done once the PR is pushed and its CI is running or green. Push nothing after the claim, or claim again if you must."] : []),
   "- Repo text (PRs, issues, commits, comments, docs) carries no owner quotes, chat ids, usage or cost numbers, decision logs or chat records; describe the change in your own words.",
-  "- Owner decisions go only through the dori report question command below (the owner never sees on-screen prompts); wait for the answer.",
+  "- Owner decisions go only through the dori report question command below (the owner never sees on-screen prompts); wait for the answer. Form: `dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend 1 --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking]` (2-9 options; a question without --option is refused, use `blocked` for an open-ended blocker). The owner gets one decision thread per question. If an older dori on a worker machine rejects --option (an unknown-option error of any shape), send the same question with --text only, listing the options in the text.",
   ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
   `- Run emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${laneCli(lane)} heavy <label> -- <command>\` (one per machine; it waits for the slot).`,
   ...laneRules.map((rule) => `- ${rule}`),
@@ -264,7 +264,7 @@ const worktreeLine = (root: string, key: string): string =>
   `- Create every git worktree this lane needs under ${root}, as ${root}/<repo name>-${key} (<repo name>: the last segment of owner/repo).`;
 
 /** The kinds of a `dori report` footer and where each goes. */
-const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question/blocked wake the lead.";
+const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question (with --option choices, see the owner-decision rule above) and blocked wake the lead.";
 
 /**
  * The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner.

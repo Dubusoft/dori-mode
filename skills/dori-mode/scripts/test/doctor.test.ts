@@ -91,7 +91,7 @@ const fixture = (patch: Patch = {}) => {
     config: {
       ...defaultConfig("/home/test"), stateDir: state.dir, leadCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
       memoryCheck: { ...defaultConfig("/home/test").memoryCheck, repo: join(state.dir, "memory") },
-      discordChannels: ["500"], discord: { applicationId: "100", guildId: "200", ownerId: "300" },
+      discordChannels: ["500"], decisionsChannel: "500", discord: { applicationId: "100", guildId: "200", ownerId: "300" },
     },
     ...patch.deps,
   };
@@ -429,6 +429,7 @@ test("doctor names each config value's source: file, default, env or derived, an
   expect(find(checks, "config.worktreeRoot").detail).toBe('default: ""');
   expect(find(checks, "config.stateDir").detail).toStartWith("env DORI_STATE_DIR: ");
   expect(find(checks, "config.alertsChannel").detail).toBe('derived from discordChannels[0]: "500"');
+  expect(find(checks, "config.decisionsChannel")).toMatchObject({ level: "WARN", detail: "decisionsChannel: unset (decisions go to the requesting channel)" });
   expect(find(checks, "config.store").detail).toStartWith("derived from ");
   expect(find(checks, "config.leadThinking").detail).toBe("unset: (none)");
   expect(find(checks, "config ignored keys")).toMatchObject({ level: "WARN", detail: expect.stringContaining("laneThinking") });

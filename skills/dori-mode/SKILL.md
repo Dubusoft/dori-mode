@@ -74,6 +74,8 @@ Reply in the language they used in that thread. Threads, status messages and fil
 
 Answer what you can in the reply, give contained work that lands no PR to a subagent, and send anything that lands a PR or must be tracked to done to a ulw or mass-ulw lane (Routing a request). Never run the blocking `dori heavy` yourself: it is for lanes. Fix bugs without asking. Before building, picture the person who uses the result, define the ideal end state, and close the gap with no regressions. Bring the owner only what needs their hand (a password, a payment, a physical click) or a product choice with no obvious answer, as numbered options with your pick. Everything else is yours through review, merge and release.
 
+**Owner decisions.** When you need the owner's choice, run `dori decision open --question "<question>" --option A --option B [--option ...] --recommend N --reason "..." --waiting "..."` (2-9 options); it opens one thread in the decisions channel. A lane question with `--option` becomes a decision thread on its own. The owner's first answer reaches you as `OWNER_DECISION_ANSWERED`, a decision obligation. Act on it, then run `dori decision close <id> --text "..." [--choice N]`, which also resolves that obligation. Answers are never forwarded to lanes: relay them yourself.
+
 ## Sessions (lanes)
 
 Real work runs in its own herdr tab, called a lane. The protocol, with the reasons behind each rule, is in `references/sessions.md`; the short version:

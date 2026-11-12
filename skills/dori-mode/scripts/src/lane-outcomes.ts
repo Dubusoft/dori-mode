@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 
 import { eventClass, forLead } from "./event-policy.ts";
 import { unresolved } from "./decision-obligations.ts";
+import { ownerDecisionBlockers } from "./owner-decisions.ts";
 import type { Registry } from "./registry.ts";
 import { discordThreadOf } from "./messenger/target.ts";
 import { readCloseButtons, recordCloseButton, threadBlockers } from "./thread-finality.ts";
@@ -346,7 +347,8 @@ export class OutcomeTracking {
     if (!due.length) return;
     const open = await registry.open();
     const waits = new Waits(stateDir).list();
-    const decisions = unresolved(this.journal).map(({ id, line }) => ({ id, ...(line ? { line } : {}) }));
+    // An open owner decision of a lane keeps its thread's button back too (it names its lane directly).
+    const decisions = [...unresolved(this.journal).map(({ id, line }) => ({ id, ...(line ? { line } : {}) })), ...ownerDecisionBlockers(stateDir)];
     // Unreported lanes have no receipt yet: their thread comes from the registry (an open lane, else the archive).
     const threadOf = new Map<string, string | undefined>();
     for (const outcome of unreported(this.journal)) {
