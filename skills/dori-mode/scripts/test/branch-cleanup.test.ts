@@ -86,7 +86,7 @@ const runnerGitOps = (run: Runner, base: LaneOps, w: World): LaneOps => {
 };
 /** Lane git (facts, worktree removal, branch deletes) runs through runnerGitOps over `run`; gh and the World fakes stay as they are. */
 const deps = (patch: Parameters<typeof depsFor>[3] = {}, run: Runner = runner()) => {
-  const base = depsFor(world, fakeClock(T0), state.dir, { defaultCwd: repo, worktreeRoot: state.dir, ...patch });
+  const base = depsFor(world, fakeClock(T0), state.dir, { leadCwd: repo, worktreeRoot: state.dir, ...patch });
   return { ...base, run, exists: undefined, ops: runnerGitOps(run, base.ops, world) };
 };
 const lane = (): Lane => ({ key: "demo-lane", title: "demo", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#7", cwd: wt, worktrees: [wt], openedAt: new Date(T0).toISOString() });

@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { treeDigest } from "../src/lane-files.ts";
+import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
-import { type Lane, statusOf } from "../src/registry.ts";
+import { type Lane, statusOf, withStatus } from "../src/registry.ts";
+import { LAUNCH_ACTION, ledgerRows, ledgerState } from "../src/autopilot.ts";
+import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World, WT, withSqliteStore } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -28,6 +35,49 @@ beforeEach(async () => {
   await at(T0).registry.write(lane);
 });
 afterEach(() => state.done());
+
+test("managed direct claims query before admission and repeated evidence updates bytes without moving the claim window", async () => {
+  const d = depsFor(world, fakeClock(T0), join(state.dir, "state"));
+  const run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  const managed = { ...lane, fileRun: run };
+  await d.registry.write(managed);
+  const snapshot = (text: string, revision: number): LaneOutputFiles => {
+    const data = Buffer.from(text);
+    const tree = { directories: [], files: [{ path: "report", bytes: data.length, base64: data.toString("base64"), sha256: createHash("sha256").update(data).digest("hex") }] };
+    return { run, revision, tree, sha256: treeDigest(tree) };
+  };
+  world.files = snapshot("first", 1);
+  expect(await claimDone(d, managed, "same")).toStartWith("LANE_DONE_CLAIMED");
+  const first = (await d.registry.read(lane.key))!.claim!;
+  world.files = snapshot("changed", 2);
+  expect(await claimDone({ ...d, clock: fakeClock(T0 + MIN) }, managed, "same")).toContain(`LANE_DONE_ALREADY_CLAIMED ${lane.key} ${first.at}`);
+  expect(readFileSync(join(state.dir, "research", lane.key, "report"), "utf8")).toBe("changed");
+  expect((await d.registry.read(lane.key))!.claim).toEqual(first);
+  expect(world.ops.filter((op) => op.op === "files")).toHaveLength(2);
+  // A saved older row verifies the newer local revision, without querying an offline runner.
+  world.runnerDown = true;
+  expect(await claimDone(d, managed, "same", snapshot("first", 1))).toStartWith("LANE_DONE_ALREADY_CLAIMED");
+});
+
+test("required-empty, missing, stale and unsafe direct collections never claim or close a managed lane", async () => {
+  const d = depsFor(world, fakeClock(T0), join(state.dir, "state"));
+  const run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: true };
+  const managed = { ...lane, fileRun: run, autoClose: "machine" as const };
+  await d.registry.write(managed);
+  const tree = { directories: [], files: [] };
+  world.files = { run, revision: 1, tree, sha256: treeDigest(tree) };
+  await expect(claimDone(d, managed, "x")).rejects.toThrow(`LANE_FILES_INVALID ${lane.key}: invalid file payload (run-requirement)`);
+  world.files = undefined;
+  await expect(claimDone(d, managed, "x")).rejects.toThrow("LANE_REPORT_FILES_MISSING");
+  world.files = { run: { ...run, id: "00000000-0000-4000-8000-000000000002" }, revision: 1, tree, sha256: treeDigest(tree) };
+  await expect(claimDone(d, managed, "x")).rejects.toThrow("LANE_REPORT_STALE");
+  await d.registry.patch(lane.key, { fileRun: { ...run, requiredReport: false } });
+  world.files = { run: { ...run, requiredReport: false }, revision: 1, tree, sha256: treeDigest(tree) };
+  mkdirSync(join(state.dir, "research")); symlinkSync(join(state.dir, "state"), join(state.dir, "research", lane.key));
+  await expect(claimDone(d, managed, "x")).rejects.toThrow("LANE_REPORT_DESTINATION_UNSAFE");
+  expect((await d.registry.read(lane.key))?.claim).toBeUndefined();
+  expect(closedVia()).toEqual([]);
+});
 
 test("an objection inside the window keeps the lane open; the lane hears a fixed sentence and reads the reasons from its status", async () => {
   livePane();
@@ -193,6 +243,72 @@ test("cancelling a runner lane whose start never reported a pane still sends lan
   expect((await at(T0).registry.read("reserved-lane"))?.receipt).toMatchObject({ cleanup: expect.arrayContaining(["runner lane reserved-lane closed none"]) });
 });
 
+/** An autopilot launch attempt of task 12 reserved for lane `ap-12-1`: planned, or settled verified when `launched`. */
+const reserveAutopilot = (launched: boolean): void => {
+  const store = openOperations(at(T0).config);
+  try {
+    const op = plan(store, T0, { lane: "toodo:12", action: LAUNCH_ACTION, target: "1", data: JSON.stringify({ laneKey: "ap-12-1" }) });
+    if (launched) settleOperation(store, T0, op.id, "verified", "launched ap-12-1");
+  } finally { store.close(); }
+};
+const autopilotRow = () => {
+  const store = openOperations(at(T0).config);
+  try { return ledgerRows(store)[0]; } finally { store.close(); }
+};
+const apLane: Lane = { ...lane, key: "ap-12-1", pane: undefined, runner: "local" };
+
+test("a cancelled close of an autopilot lane settles its attempt failed once and tells the lead; the task is never relaunched", async () => {
+  await at(T0).registry.write(apLane);
+  reserveAutopilot(true);
+  const r = await closeLane(at(T0), apLane, "cancelled", { cancelled: { reason: "lane start failed on the runner" } });
+  expect(r.closed).toBe(true);
+  expect(r.lines.filter((l) => l.startsWith("AUTOPILOT_"))).toEqual([
+    "AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1 cancelled: lane start failed on the runner: tell the owner; autopilot does not launch it again",
+  ]);
+  const row = autopilotRow()!;
+  expect([row.state, JSON.parse(row.data!)]).toEqual(["failed", { laneKey: "ap-12-1", outcome: "failed" }]);
+  expect(ledgerState([row], 12, new Set()).attempts).toBe(1);
+  // Closing it again says nothing new.
+  expect((await closeLane(at(T0 + MIN), apLane, "again")).lines).toEqual(["CLOSED ap-12-1 already closed"]);
+  expect(autopilotRow()!.updatedAt).toBe(row.updatedAt);
+});
+
+test("a done close of an autopilot lane marks its attempt done; a lane no attempt names settles nothing", async () => {
+  await at(T0).registry.write(apLane);
+  reserveAutopilot(false);
+  const r = await closeLane(at(T0), apLane, "Done: merged acme/app#1", { pre: { checks: [] } });
+  expect(r.lines.at(-1)).toBe("AUTOPILOT_LANE_DONE #12 lane=ap-12-1 attempt=1: complete toodo task #12");
+  const row = autopilotRow()!;
+  expect([row.state, JSON.parse(row.data!).outcome]).toEqual(["verified", "done"]);
+  const other = await closeLane(at(T0), { ...lane, pane: undefined, runner: "local" }, "manual", { pre: { checks: [] } });
+  expect(other.lines.some((l) => l.startsWith("AUTOPILOT_"))).toBe(false);
+});
+
+test("a supervisor-resumed cancelled close of an autopilot lane hands the lead its outcome under the lane's stable id", async () => {
+  await at(T0).registry.write(apLane);
+  reserveAutopilot(true);
+  const store = openOperations(at(T0).config);
+  try {
+    plan(store, T0, { lane: "ap-12-1", action: "close", target: "ap-12-1", data: JSON.stringify({ note: "cancelled", force: false, cancelled: { reason: "start failed" } }) });
+  } finally { store.close(); }
+  const emitted: [string, string | undefined][] = [];
+  await watchTick(at(T0), async (line, id) => { emitted.push([line, id]); });
+  expect(emitted.filter(([line]) => line.startsWith("LANE_CLOSED") || line.startsWith("AUTOPILOT_"))).toEqual([
+    ["LANE_CLOSED ap-12-1 closed", undefined],
+    ["AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1 cancelled: start failed: tell the owner; autopilot does not launch it again", "autopilot-outcome:ap-12-1"],
+  ]);
+});
+
+test("an autopilot close that recorded the lane closed before settling its attempt settles it from the receipt on the next close", async () => {
+  reserveAutopilot(true);
+  const at0 = new Date(T0).toISOString();
+  await at(T0).registry.write(withStatus(apLane, "closed", "cancelled", at0, { closedAt: at0, receipt: { cancelled: { reason: "owner dropped it" } } }));
+  const r = await closeLane(at(T0), apLane, "again");
+  expect(r.lines).toEqual(["CLOSED ap-12-1 already closed", "AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1 cancelled: owner dropped it: tell the owner; autopilot does not launch it again"]);
+  expect(eventClass("AUTOPILOT_LANE_FAILED #12 lane=ap-12-1 attempt=1", resolveEventPolicy(undefined))).toBe("lead-urgent");
+  expect(eventClass("AUTOPILOT_LANE_DONE #12 lane=ap-12-1 attempt=1", resolveEventPolicy(undefined))).toBe("lead-urgent");
+});
+
 test("with the lane's runner down a close is refused RUNNER_UNAVAILABLE and the lane stays open, its worktree and pane untouched", async () => {
   livePane();
   world.runnerDown = true;
@@ -304,6 +420,61 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
   expect((await objection())?.[1]).toStartWith("not merged within 60 min of the claim");
 });
 
+/** A lane whose Done is `pr acme/app feat/x`: its green PR #7 (into `base`) reads live while open; the claim binds it at HEAD. */
+const greenPrLane = (pr: { state: string; base: string }) => {
+  const HEAD = "c".repeat(40);
+  const bound: Lane = { ...lane, done: "pr acme/app feat/x" };
+  const green = [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }];
+  const deps = (ms: number): FlowDeps => {
+    const base = at(ms);
+    // The signal is read through the lane's runner (the fake world); the claim's bindings and the merge wait through `run`.
+    world.prList = [{ number: 7, state: pr.state, isDraft: false, isCrossRepository: false, statusCheckRollup: green, url: "https://github.com/acme/app/pull/7", createdAt: "2026-01-01T11:00:00Z" }];
+    const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
+      const json = (body: unknown) => ({ code: 0, out: JSON.stringify(body), err: "" });
+      if (argv[0] === "gh" && argv[2] === "list" && argv.includes("open")) return json(pr.state === "OPEN" ? [{ number: 7, state: "OPEN", headRefOid: HEAD, isCrossRepository: false }] : []);
+      if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "7") return json({ state: pr.state, baseRefName: pr.base, headRefOid: HEAD, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: green });
+      return base.run(argv, opts);
+    };
+    return { ...base, run };
+  };
+  return { bound, deps, HEAD };
+};
+
+test("a lane that stops at its green PR into the merge base stays claimed past the window until the supervisor merges it, then closes", async () => {
+  livePane();
+  const pr = { state: "OPEN", base: "dev" };
+  const { bound, deps, HEAD } = greenPrLane(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "https://github.com/acme/app/pull/7 green");
+  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 https://github.com/acme/app/pull/7 green"]);
+  // Its `pr` signal reads live, but closing now would leave the PR unmerged: the claim (and its bound head) stands.
+  expect(await watchTick(deps(T0 + 6 * MIN))).toEqual([]);
+  expect(await watchTick(deps(T0 + 30 * MIN))).toEqual([]);
+  const waiting = (await at(T0).registry.read("demo-lane")) ?? bound;
+  expect(statusOf(waiting)).toBe("done-claimed");
+  expect(claimGate(waiting, { repo: "acme/app", number: 7, sha: HEAD })).toEqual({ ok: true, why: "claimed at this head" });
+  expect(closedVia()).toHaveLength(0);
+  pr.state = "MERGED";
+  expect((await watchTick(deps(T0 + 31 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane closed seen-claim");
+  expect(closedVia()).toEqual(["demo-lane"]);
+});
+
+test("a green PR the supervisor never merges (another base) does not hold the close, nor does one past mergeWaitMaxMin", async () => {
+  livePane();
+  const pr = { state: "OPEN", base: "main" };
+  const { bound, deps } = greenPrLane(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "PR into main green");
+  await watchTick(deps(T0));
+  expect((await watchTick(deps(T0 + 6 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+  pr.base = "dev";
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0 + 10 * MIN), bound, "PR into dev green");
+  await watchTick(deps(T0 + 10 * MIN));
+  expect(await watchTick(deps(T0 + 69 * MIN))).toEqual([]);
+  expect((await watchTick(deps(T0 + 70 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+});
+
 test("a watcher restarted inside the window keeps the original deadline and announces the claim once", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1");
@@ -405,6 +576,15 @@ test("the root comes from config, a path outside it is never removed, and a fail
   const failing = { ...custom, ops: { ...custom.ops, git: async () => ({ code: 128, out: "", err: "fatal: locked" }) } };
   expect(await watchTick(failing)).toEqual(["LANE_WATCH_WARN demo-lane worktree /repo/.wt/other not removed: fatal: locked"]);
   expect(await watchTick(custom)).toEqual(["WORKTREE_CLEANED demo-lane /repo/.wt/other"]);
+});
+
+test("the local runner's reported worktree root replaces config.worktreeRoot for the sweep; the config's is used only before a report", async () => {
+  const reportedWt = "/srv/wt/app-demo-lane";
+  facts([reportedWt, KEPT_WT], false);
+  await at(T0).registry.write(closedKept([reportedWt, KEPT_WT]));
+  const reported = { ...at(T0), runnerWorktreeRoot: (label: string) => (label === "local" ? "/srv/wt/" : undefined) };
+  expect(await watchTick(reported)).toEqual([`WORKTREE_CLEANED demo-lane ${reportedWt}`]);
+  expect(await watchTick({ ...at(T0), runnerWorktreeRoot: () => undefined })).toEqual([`WORKTREE_CLEANED demo-lane ${KEPT_WT}`]);
 });
 
 test("LANE_DONE_CLAIMED is handed over before the claim is marked announced, and a failed hand-over keeps it unannounced", async () => {

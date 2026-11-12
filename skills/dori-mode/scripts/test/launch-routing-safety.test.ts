@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src/launch.ts";
+import { readLaneAttachmentPin, writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { type LaneOps, LaneOpsError, laneOps } from "../src/lane-ops.ts";
-import { type RunnerCall, RunnerUnavailable } from "../src/runner/call.ts";
+import { type RunnerCall, RunnerCalls, RunnerUnavailable } from "../src/runner/call.ts";
 import type { Lane } from "../src/registry.ts";
 import {
   clearLaunchHold, dequeueLaunch, enqueueLaunch, launchGate, launchHeld, launchQueue, launchQueueText,
@@ -101,6 +102,63 @@ const deps = (repos: Record<string, readonly [string, string]> = {}) => {
 const brief = () => { const b = join(state.dir, `brief-${Math.random()}.md`); writeFileSync(b, "goal\n"); return b; };
 const input = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, brief: brief(), done: "merged acme/app#1", ...extra });
 const tabs = () => world.ops.filter((e) => e.op === "start");
+
+test("attachment preparation refuses before reservation, workspace creation, start or lead brief rewrite", async () => {
+  const base = deps();
+  const entry = input("bad-files", { cwd: "/scratch" });
+  writeFileSync(entry.brief, "x".repeat(70_000));
+  await expect(launchLane(base, entry)).rejects.toThrow("LANE_FILES_LIMIT bad-files:");
+  expect(readFileSync(entry.brief, "utf8")).toBe("x".repeat(70_000));
+  expect(await base.registry.open()).toEqual([]);
+  expect(tabs()).toEqual([]);
+  expect(world.calls.filter((c) => c.slice(0, 3).join(" ") === "herdr workspace create")).toEqual([]);
+});
+
+test.each([undefined, 4])("real RunnerCalls proto %s refusal releases the launch reservation with no attempt or send", async (proto) => {
+  const base = deps(), entry = input("old-runner", { cwd: "/scratch" });
+  let sends = 0, attempts = 0, timers = 0;
+  const calls = new RunnerCalls({ proto: () => proto, now: () => T0, log: () => {},
+    timers: { set: () => { timers++; }, clear: () => {} }, attempts: { record: () => { attempts++; }, settle: () => {} },
+    accept: { connected: () => true, command: () => { sends++; return 1; }, control: () => { sends++; return true; } },
+  });
+  const facade = laneOps(calls, { now: () => T0 });
+  const d = { ...base, ops: { ...base.ops, start: facade.start } };
+  const detail = proto === undefined
+    ? "lane files require proto 5 (runner proto unknown); run dori runner update, wait for its hello, and retry"
+    : "lane files require proto 5 (runner proto 4); run dori runner update";
+  await expect(launchLane(d, entry)).rejects.toThrow(`old-runner: RUNNER_OUTDATED runner=local outdated: ${detail}`);
+  expect([sends, attempts, timers, calls.pending()]).toEqual([0, 0, 0, 0]);
+  expect(await base.registry.read(entry.key)).toBeNull();
+});
+
+test.each(["LANE_FILES_INPUT_REQUIRED", "LANE_REPORT_STORE_FAILED"])("runner wrapper chain surfaces exact %s leaf and releases its reservation", async (code) => {
+  const base = deps(), entry = input("leaf", { cwd: "/scratch" });
+  const leaf = `${code} leaf: ${"complete detail ".repeat(30)}retry`;
+  const start = async (): Promise<never> => { throw new LaneOpsError("LANE_OP_FAILED", "local", `lane.start RUNNER_CMD_FAILED ${leaf}`); };
+  const error = await launchLane({ ...base, ops: { ...base.ops, start } }, entry).catch((e) => e);
+  expect(error.message).toBe(leaf);
+  expect(await base.registry.read(entry.key)).toBeNull();
+});
+
+test("local and remote launch carry the same binary attachment tree and retain lead paths", async () => {
+  const base = deps(); mkdirSync(join(state.dir, "briefs"));
+  const source = join(state.dir, "briefs", "data");
+  writeFileSync(source, Buffer.from([0, 255]));
+  const entries = [input("payload-local", { cwd: "/scratch" }), input("payload-remote", { cwd: "/srv", machine: "box" })];
+  for (const entry of entries) { writeFileSync(entry.brief, `deliverable: report\nupdate ${source}:12`); await launchLane(base, entry); }
+  const starts = tabs().map((e) => e.args as Parameters<LaneOps["start"]>[0]);
+  expect(starts[0]!.files!.tree).toEqual(starts[1]!.files!.tree);
+  expect(starts[0]!.files!.references).toEqual(starts[1]!.files!.references);
+  // A fresh launch pins what it shipped where no lane can write; recovery ships only that set.
+  for (const entry of entries) {
+    expect(readLaneAttachmentPin(state.dir, entry.key)).toEqual([realpathSync(source)]);
+    writeLaneAttachmentPin(state.dir, entry.key, []);
+  }
+  for (const entry of entries) {
+    expect(readFileSync(entry.brief, "utf8")).toContain(`update ${source}:12`);
+    expect((await base.registry.read(entry.key))?.fileRun?.requiredReport).toBe(true);
+  }
+});
 
 test("git remote URLs of every common form name their owner/repo", () => {
   expect(remoteRepo("git@github.com:Acme/App.git")).toBe("acme/app");

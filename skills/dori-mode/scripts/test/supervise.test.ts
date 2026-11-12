@@ -19,7 +19,7 @@ import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import { importStore } from "../src/store-import.ts";
-import { take, takeCarriedReminders, takeOutput } from "../src/inbox.ts";
+import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCarried } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 import { recordReported } from "../src/lane-outcomes.ts";
 import { TransientSuperviseError } from "../src/supervise-journal.ts";
@@ -56,7 +56,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const clock: ReturnType<typeof fakeClock> = { at: 1_800_000_000_000, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; startPending(); syncRelease(); } };
   const world = newWorld();
   const session = "11111111-1111-4111-8111-111111111111";
-  const config = { sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo", ...extra };
+  const config = { sessionsDir: join(state.dir, "sessions"), leadCwd: "/repo", ...extra };
   const dir = sessionDirFor(config.sessionsDir, "/repo");
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `2027-01-15T08-00-00-000Z_${session}.jsonl`);
@@ -219,8 +219,8 @@ test("a lane's dori report question reaches the lead as an urgent LANE_REPORT wi
   // The question wakes the lead; the milestone is digest by the policy table and waits for the next urgent delivery.
   const delivered = f.log();
   expect(delivered.some((event: { line: string }) => event.line === "LANE_REPORT local-lane question which base branch?")).toBe(true);
-  expect(eventClass("LANE_REPORT local-lane question which base branch?", f.deps.config.eventPolicy)).toBe("lead-urgent");
-  expect(eventClass("LANE_REPORT local-lane milestone tests green", f.deps.config.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("LANE_REPORT local-lane question which base branch?", f.deps.tunables.eventPolicy)).toBe("lead-urgent");
+  expect(eventClass("LANE_REPORT local-lane milestone tests green", f.deps.tunables.eventPolicy)).toBe("lead-digest");
   // Only the pointer is typed, never the report's text: the lead reads it with dori inbox take.
   const typedTexts = f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text").map((call) => call[4] ?? "");
   expect(typedTexts).toHaveLength(1);
@@ -348,6 +348,29 @@ test("a merge that brings something new still wakes the lead: before the claim, 
   // A second PR merged at a head the record has not seen.
   expect((await finishSteps([[claim], [["ci-merged:acme/app#7", MERGED_7]],
     [["ci-merged:acme/app#8", "CI_MERGED acme/app#8 into dev lane=alpha head=fed merge=cba https://x/8"]]])).map((step) => step.pointers)).toEqual([1, 0, 1]);
+});
+
+test("a cold lead's prompt names SKILL.md and human.md by absolute path, or says human.md could not be resolved", async () => {
+  const home = withState();
+  cleanups.push(home.done);
+  const repo = join(home.dir, "memory");
+  const before = process.env.HOME;
+  // An empty home has no omo memory repo for the lead's cwd.
+  process.env.HOME = home.dir;
+  cleanups.push(() => { process.env.HOME = before; });
+  for (const [memoryCheck, memory] of [
+    [{ repo, maxKb: 15 }, `then your memory file ${join(repo, "system", "human.md")} in full`],
+    [{ repo: "", maxKb: 15 }, `its path could not be resolved (memoryCheck.repo is unset and no omo memory repo exists for /repo under ${join(home.dir, ".omo", "memory", "agents")})`],
+  ] as const) {
+    const f = fixture({ memoryCheck });
+    f.cold();
+    const supervisor = new Supervisor(f.deps);
+    supervisor.enqueue("cold", "INBOUND cold");
+    await supervisor.flush();
+    const first = (f.prompt() ?? "").split("\n")[0] ?? "";
+    expect(first).toContain(`read ${LEAD_SKILL} in full`);
+    expect(first).toContain(memory);
+  }
 });
 
 test("an unseen newly idle agent reported as done is positive startup evidence", async () => {
@@ -1932,7 +1955,7 @@ test("an old journal's Toodo chat row (toodo:chat:<n>, the removed channel) is n
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("toodo:chat:13", "INBOUND toodo 13 user plan it");
   await supervisor.flush();
-  f.clock.at += f.deps.config.handledTimeoutMin * 60_000 + 120_000;
+  f.clock.at += f.deps.tunables.handledTimeoutMin * 60_000 + 120_000;
   expect(supervisor.overdueOwnerMessages(60_000)).toEqual([]);
   expect(supervisor.ackTick(60_000)).toEqual([]);
   expect(supervisor.handledTick()).toEqual([]);
@@ -2104,6 +2127,27 @@ test("handled owner work is excluded from a fresh lead handoff", async () => {
   await supervisor.flush();
   // Then the old request is not replayed.
   expect(handed(f)).not.toContain("discord:11:22");
+});
+
+test("a link recorded with an auto-ack is logged once as the supervisor consumes it", async () => {
+  // Given an owner message that dori handled had to ack itself.
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner project-alpha");
+  await supervisor.flush();
+  recordHandled(f.state.dir, "11", "22", f.clock.now(), { reply: true, autoAck: "acked" });
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    // When the supervisor consumes receipts twice.
+    supervisor.ackTick(60_000);
+    supervisor.ackTick(60_000);
+  } finally {
+    console.error = originalError;
+  }
+  // Then the missing ack is logged exactly once.
+  expect(errors.filter((line) => line.startsWith("HANDLED_"))).toEqual(["HANDLED_AUTO_ACKED discord:11:22: handled with no prior dori ack"]);
 });
 
 test("acked but unhandled work wakes the lead with its body and escalates once after another window", async () => {
@@ -2308,8 +2352,8 @@ const typed = (f: ReturnType<typeof fixture>): string[] => f.calls.filter((call)
 // The footer omo showed on a lead the owner stopped with Esc during `gh pr checks --watch` (2026-10-23).
 const PAUSED_SCREEN = "❯ \n(😺 OmO Native by Q Kim) ◉ watching lead events (5m) Paused · 4 updates held · type to continue, /resume to resume";
 
-test("a working lead held inside one tool call (a foreground watch) with an owner message unacked is restarted after leadUnreadRestartMin, though its screen moves", async () => {
-  const f = fixture({ leadUnreadRestartMin: 5 });
+test("a working lead held inside one tool call (a foreground watch) with an owner message unacked is restarted after delivery.push.escalateMin, though its screen moves", async () => {
+  const f = fixture();
   f.pane.agent_status = "working";
   inToolCall(f, f.clock.now());
   const supervisor = new Supervisor(f.deps);
@@ -2329,7 +2373,7 @@ test("a working lead held inside one tool call (a foreground watch) with an owne
 });
 
 test("a working lead between tool calls, or one whose call started after it acked, is left alone", async () => {
-  const answered = fixture({ leadUnreadRestartMin: 5 });
+  const answered = fixture();
   answered.pane.agent_status = "working";
   inToolCall(answered, answered.clock.now(), true);
   const s1 = new Supervisor(answered.deps);
@@ -2341,7 +2385,7 @@ test("a working lead between tool calls, or one whose call started after it acke
   }
   expect(launches(answered)).toEqual([]);
 
-  const acked = fixture({ leadUnreadRestartMin: 5 });
+  const acked = fixture();
   acked.pane.agent_status = "working";
   const s2 = new Supervisor(acked.deps);
   s2.enqueue("discord:1:1", "INBOUND 1 1 hi");
@@ -2371,7 +2415,7 @@ test("an idle lead paused by Esc gets /resume typed before its pointer; still un
   f.clock.at += 60_000;
   await muted(() => supervisor.flush());
   expect(launches(f)).toEqual([]);
-  f.clock.at += (f.deps.config.delivery.push.escalateMin - 1) * 60_000;
+  f.clock.at += (f.deps.tunables.delivery.push.escalateMin - 1) * 60_000;
   await muted(() => supervisor.flush());
   expect(launches(f)).toHaveLength(1);
   expect(f.prompt()).toContain("it did not take pushed events");
@@ -2705,4 +2749,40 @@ test("a quarantined message the lead acks, or the owner edits, is tracked like a
   expect((journal(f).awaitingAck as { quarantined?: true }[]).filter((entry) => entry.quarantined)).toEqual([]);
   expect(reminded(f)).toEqual(["discord:11:2"]);
   expect(ackMissing(f)).toEqual([]);
+});
+
+test.each(["json", "sqlite"] as const)("a message parked with handled --awaiting on the %s store is owed nothing and prints AWAITING_OWNER on take; a later --lane closes it", async (store) => {
+  // Given an owner question the lead took, acked and answered with a question back to the owner.
+  const f = fixture({ store, handledTimeoutMin: 1 });
+  let supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner shall I start the migration?");
+  await supervisor.flush();
+  take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
+  recordAck(f.state.dir, "11", "22", f.clock.now());
+  f.clock.at += 1;
+  const parkedAt = f.clock.now();
+  recordHandled(f.state.dir, "11", "22", parkedAt, { awaiting: true, note: "asked for a go-ahead" });
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
+  // A carried line left by an older cold start is pruned too.
+  writeCarried(f.state.dir, [{ kind: "owner", id: "discord:11:22", line: "INBOUND 11 22 owner shall I start the migration?" }]);
+  supervisor.ackTick(60_000);
+  expect(takeCarriedReminders(f.state.dir)).toEqual([]);
+  expect(takeAwaitingReminders(f.state.dir)).toEqual([`awaiting:discord:11:22\tAWAITING_OWNER since ${new Date(parkedAt).toISOString()} ` +
+    "(asked for a go-ahead): INBOUND 11 22 owner shall I start the migration? - do not act until the owner answers"]);
+  // When windows pass, across a supervisor restart.
+  f.clock.at += 10 * 60_000;
+  expect(supervisor.handledTick()).toEqual([]);
+  supervisor.close();
+  supervisor = new Supervisor(f.deps);
+  f.clock.at += 10 * 60_000;
+  expect(supervisor.handledTick()).toEqual([]);
+  // Then nothing came back as UNHANDLED.
+  expect(lines(f.state.dir, store, "UNHANDLED ")).toEqual([]);
+  // When the owner answers and the lead links the lane it launched.
+  recordHandled(f.state.dir, "11", "22", f.clock.now(), { lanes: ["alpha"] });
+  supervisor.handledTick();
+  supervisor.close();
+  // Then the message is handled and the awaiting line is gone.
+  expect(takeAwaitingReminders(f.state.dir)).toEqual([]);
+  expect(stored(f.state.dir, store).awaitingAck?.[0]).toMatchObject({ handledAt: f.clock.now(), awaitingOwnerAt: parkedAt, lanes: ["alpha"] });
 });

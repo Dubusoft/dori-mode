@@ -1,16 +1,19 @@
 import { afterEach, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DiscordCommands } from "../src/messenger/discord-commands.ts";
 import { acquireDiscordGateway } from "../src/messenger/discord-lock.ts";
-import { supervisorDiscord } from "../src/messenger/discord-supervisor.ts";
+import { GATEWAY_SESSION_FILE, GATEWAY_SESSION_MAX_AGE_MS, saveGatewaySession, supervisorDiscord, takeGatewaySession } from "../src/messenger/discord-supervisor.ts";
 import { discordSnowflakeAt } from "../src/messenger/discord-inbound.ts";
 import { discordPresence, type GatewaySocket } from "../src/messenger/discord.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Supervisor } from "../src/supervise.ts";
+import { readOwnerClosed } from "../src/thread-followup.ts";
 import type { DoriConfig } from "../src/config.ts";
+import { applyConfigPatch, type ConfigReload, configReloader, watchConfigFiles } from "../src/config-watch.ts";
 import { eventClass } from "../src/event-policy.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal } from "./fakes.ts";
+import { type Tunables } from "../src/tunables.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const done of cleanups.splice(0).reverse()) await done(); });
@@ -192,7 +195,7 @@ test("a fatal close code stops reconnecting and reports once; 4014 is fatal once
   }
 });
 
-const inboundFixture = (patch: Partial<DoriConfig> = {}) => {
+const inboundFixture = (patch: Partial<DoriConfig & Tunables> = {}) => {
   const state = withState();
   cleanups.push(state.done);
   const t = timerFixture();
@@ -245,6 +248,75 @@ const inboundFixture = (patch: Partial<DoriConfig> = {}) => {
     queue: () => readJournal(state.dir),
   };
 };
+
+test("a restarted supervisor resumes the stopped one's gateway session and carries out a close click Discord replays past its answer window", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const clock = fakeClock(1_000);
+  const deps = depsFor(newWorld(), clock, state.dir, { discord: { applicationId: "1", guildId: "2", ownerId: "300" }, discordChannels: ["100"] });
+  const writes: HttpRequest[] = [];
+  const http: Http = async (request) => {
+    if (request.method === "GET") return { status: 200, headers: {}, body: request.url.includes("/threads/active") ? '{"threads":[]}' : "[]" };
+    writes.push(request);
+    // The click's interaction token expired while no supervisor was connected.
+    if (request.url.includes("/interactions/")) return { status: 404, headers: {}, body: '{"code":10062}' };
+    return { status: 200, headers: {}, body: "{}" };
+  };
+  const emitted = new Map<string, string>();
+  const closedEvent = Promise.withResolvers<void>();
+  const start = () => {
+    const t = timerFixture();
+    const s = socketsFixture();
+    const inbound = supervisorDiscord(deps, {
+      token: "test-token", http, open: s.open, timers: t.timers, lookup: async () => "", log: () => {},
+      emit: async (id, line) => { emitted.set(id, line); if (line.startsWith("THREAD_CLOSED_BY_OWNER")) closedEvent.resolve(); },
+    });
+    cleanups.push(() => inbound.close());
+    return { s, inbound };
+  };
+  const first = start();
+  first.s.socket().receive(hello);
+  first.s.socket().receive(ready);
+  first.s.socket().receive({ op: 0, t: "MESSAGE_CREATE", s: 7, d: rawMessage("11", "999") });
+  await first.inbound.close();
+  // The stop closed with a resumable code and left the session: the next supervisor RESUMEs instead of identifying.
+  clock.at += 30_000;
+  const second = start();
+  expect(second.s.urls[0]).toBe("wss://resume.example/?v=10&encoding=json");
+  second.s.socket().receive(hello);
+  expect(second.s.socket().sent[0]).toEqual({ op: 6, d: { token: "test-token", session_id: "session", seq: 7 } });
+  writes.length = 0;
+  second.s.socket().receive({ op: 0, t: "INTERACTION_CREATE", s: 8, d: {
+    type: 3, id: "900", token: "expired", application_id: "1", guild_id: "2", member: { user: { id: "300" } },
+    message: { id: "555" }, data: { component_type: 2, custom_id: "dori:close-thread:777" },
+  } });
+  second.s.socket().receive({ op: 0, t: "RESUMED", s: 9, d: {} });
+  await closedEvent.promise;
+  expect(writes.map((request) => `${request.method} ${new URL(request.url).pathname}`)).toEqual([
+    "POST /api/v10/interactions/900/expired/callback",
+    "PATCH /api/v10/channels/777/messages/555",
+    "PATCH /api/v10/channels/777",
+  ]);
+  expect(writes[1]?.headers).toMatchObject({ Authorization: "Bot test-token" });
+  expect(String(writes[1]?.body)).toContain('"disabled":true');
+  expect(JSON.parse(String(writes[2]?.body))).toEqual({ archived: true });
+  expect(emitted.get("discord:777:close:900")).toBe("THREAD_CLOSED_BY_OWNER 777");
+  // Recorded, so later posts addressed to the thread go to the owner channel instead of reopening it.
+  expect(readOwnerClosed(state.dir)).toEqual({ "777": clock.at });
+});
+
+test("a stopped supervisor's session older than the resume window, or malformed, is dropped and the next one identifies", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  saveGatewaySession(state.dir, { session: "old", seq: 3, url: "wss://resume.example/?v=10&encoding=json" }, 0);
+  expect(takeGatewaySession(state.dir, GATEWAY_SESSION_MAX_AGE_MS + 1)).toBeUndefined();
+  // Taken once: the file is gone, so a refused RESUME is never retried by a later start.
+  saveGatewaySession(state.dir, { session: "s", seq: 3, url: "wss://resume.example/?v=10&encoding=json" }, 0);
+  expect(takeGatewaySession(state.dir, 1_000)).toEqual({ session: "s", seq: 3, url: "wss://resume.example/?v=10&encoding=json" });
+  expect(takeGatewaySession(state.dir, 1_000)).toBeUndefined();
+  writeFileSync(join(state.dir, GATEWAY_SESSION_FILE), '{"session":"s","seq":3,"url":"http://elsewhere","at":0}');
+  expect(takeGatewaySession(state.dir, 1_000)).toBeUndefined();
+});
 
 test("MESSAGE_CREATE and REST catch-up dedupe owner inbound while filtering foreign channels and bots", async () => {
   const f = inboundFixture();
@@ -323,6 +395,35 @@ test("a newly watched lane thread is caught up and receives gateway inbound with
   expect(f.emitted.get("discord:200:20")).toBe("INBOUND 200 20 Owner message 20");
 });
 
+test("a discordChannels id added to config.json while the supervisor runs is caught up and receives gateway inbound on the same connection", async () => {
+  const f = inboundFixture();
+  await f.inbound.tick();
+  f.socket().receive(hello);
+  f.socket().receive(ready);
+  await f.inbound.tick();
+  expect(f.listed.some((url) => url.includes("/channels/500/messages"))).toBe(false);
+  const path = join(f.dir, "config.json");
+  writeFileSync(path, JSON.stringify({ discord: { applicationId: "1", guildId: "2", ownerId: "300" }, discordChannels: ["100", "500"], stateDir: f.dir }));
+  const reload = configReloader({
+    path, current: () => f.deps.config, apply: (patch) => { applyConfigPatch([f.deps.config], patch); },
+    enqueue: () => {}, log: () => {},
+  });
+  const reloaded = Promise.withResolvers<ConfigReload>();
+  cleanups.push(watchConfigFiles([path], async () => { reloaded.resolve(await reload()); }, { debounceMs: 10, pollMs: 60_000 }));
+  writeFileSync(path, JSON.stringify({ discord: { applicationId: "1", guildId: "2", ownerId: "300" }, discordChannels: ["100", "500", "600"], stateDir: f.dir }));
+  const result = await reloaded.promise;
+  expect(result.state === "applied" && result.live.includes("discordChannels")).toBe(true);
+  expect(result.state === "applied" ? result.restart.filter((key) => key === "discord" || key === "stateDir") : undefined).toEqual([]);
+  f.batches.set("500", [rawMessage("50", "500")]);
+  await f.inbound.tick();
+  expect(f.listed.some((url) => url.includes("/channels/500/messages"))).toBe(true);
+  expect(f.emitted.get("discord:500:50")).toBe("INBOUND 500 50 Owner message 50");
+  const live = f.waitFor("discord:600:60");
+  f.socket().receive({ op: 0, t: "MESSAGE_CREATE", s: 2, d: rawMessage("60", "600") });
+  await live;
+  expect(f.sockets).toHaveLength(1);
+});
+
 const thread = (id: string, parent_id = "100", archived = false) => ({
   id, type: 11, parent_id, guild_id: "2", thread_metadata: { archived, locked: false },
 });
@@ -366,6 +467,32 @@ test("MESSAGE_CREATE in any thread under a watched channel is inbound, parents f
   // Thread events and REST-known threads need no lookup; unknown ids are fetched once, including foreign and missing ones.
   expect(["201", "202", "204", "206"].map((id) => lookups(f, id))).toEqual([0, 0, 0, 0]);
   expect(["203", "999", "207", "208"].map((id) => lookups(f, id))).toEqual([1, 1, 1, 1]);
+});
+
+test("owner lines end with the channel name from gateway channel and thread events, renames included, else one cached lookup", async () => {
+  const f = inboundFixture();
+  await f.inbound.tick();
+  f.channelObjects.set("203", { ...thread("203"), name: "rest thread" });
+  f.socket().receive(hello);
+  f.socket().receive(ready);
+  f.socket().receive({ op: 0, t: "GUILD_CREATE", s: 2, d: { id: "2", channels: [{ id: "100", type: 0, name: "일반" }], threads: [{ ...thread("201"), name: "작업 스레드" }] } });
+  let s = 3;
+  const deliver = async (id: string, d: unknown) => {
+    const done = f.waitFor(id);
+    f.socket().receive({ op: 0, t: "MESSAGE_CREATE", s: s++, d });
+    await done;
+  };
+  await deliver("discord:100:41", rawMessage("41", "100"));
+  await deliver("discord:201:42", rawMessage("42", "201"));
+  await deliver("discord:203:43", rawMessage("43", "203"));
+  f.socket().receive({ op: 0, t: "CHANNEL_UPDATE", s: s++, d: { id: "100", type: 0, name: "공지" } });
+  f.socket().receive({ op: 0, t: "THREAD_UPDATE", s: s++, d: { ...thread("201"), name: "새 이름" } });
+  await deliver("discord:201:44", rawMessage("44", "201"));
+  expect(f.emitted.get("discord:100:41")).toBe("INBOUND 100 41 Owner message 41 channel=#일반");
+  expect(f.emitted.get("discord:201:42")).toBe("INBOUND 201 42 Owner message 42 channel=#일반/작업_스레드");
+  expect(f.emitted.get("discord:203:43")).toBe("INBOUND 203 43 Owner message 43 channel=#일반/rest_thread");
+  expect(f.emitted.get("discord:201:44")).toBe("INBOUND 201 44 Owner message 44 channel=#공지/새_이름");
+  expect(["201", "203"].map((id) => lookups(f, id))).toEqual([0, 1]);
 });
 
 test("an archived thread the owner reopens by posting reaches the lead over the gateway and REST catch-up", async () => {
@@ -540,7 +667,7 @@ test("item 6: first-seen REST catch-up uses discordFirstSeenLimit", async () => 
   await f.inbound.tick();
   await f.inbound.close();
   expect(f.listed.filter((url) => url.includes("/channels/100/messages")).map((url) => new URL(url).searchParams.get("limit"))).toEqual(["40"]);
-  expect(f.deps.config.discordFirstSeenLimit).toBe(40);
+  expect(f.deps.tunables.discordFirstSeenLimit).toBe(40);
   const g = inboundFixture();
   await g.inbound.tick();
   await g.inbound.close();

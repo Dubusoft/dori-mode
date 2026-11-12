@@ -1,7 +1,10 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch } from "node:fs";
+import { replaceKnownSecrets } from "./redact.ts";
+import { SecretStore } from "./secret-store.ts";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { deliveryConfigError } from "./config.ts";
+import { alertsChannelOf, deliveryConfigError, loadConfig } from "./config.ts";
+import { applyConfigPatch, configReloader, watchConfigFiles } from "./config-watch.ts";
 import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
@@ -14,7 +17,8 @@ import { COMMAND_RETENTION_MS } from "./runner/durability.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
 import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
-import { type Delivery, laneOps, type LaneOps, machineRunner } from "./lane-ops.ts";
+import { type Delivery, laneOps, type LaneOps, machineRunner, runnerOf } from "./lane-ops.ts";
+import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
 import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
@@ -43,8 +47,7 @@ import { describeLane, formatKb, type LaneMemory, laneMemoryDetail } from "./lan
 import { pauseLane, type PauseResult } from "./pause.ts";
 import type { Lane } from "./registry.ts";
 import {
-  type GuardMachine, guardAgentWants, type KillResult, loadMachineGuardState,
-  machineDue, machineGuardTick, type MachineSample, readGuardAgentScripts, type SampleResult, readGuardMachines, sampleMachine, saveMachineGuardState, wantFor,
+  type GuardMachine, type KillResult, loadMachineGuardState, machineGuardTick, type MachineSample, readGuardMachines, saveMachineGuardState,
 } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -56,6 +59,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { closeThreadButton } from "./messenger/discord-commands.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
+import { redirectIfClosed } from "./thread-followup.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
 import { OWNER_NOTICE_AFTER_MS, RetryingDelivery, SuperviseError, Supervisor } from "./supervise.ts";
@@ -65,10 +69,14 @@ import { driftTick, pullOwners } from "./drift.ts";
 import { CiFollowUp } from "./ci-follow.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
-import { type BuiltinSource, EventSources, type SourceEnqueue } from "./event-sources.ts";
+import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
+import { autopilotLocalStateKey } from "./autopilot.ts";
+import { judgeCandidates, liveJudgeDeps, RECONCILE_JOB } from "./autopilot-cli.ts";
+import { AUTOPILOT_KICK_EVENTS, AutopilotTick } from "./autopilot-tick.ts";
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
+import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
-import { type LaneReportStore, openLaneReports, routeReports } from "./lane-reports.ts";
+import { type LaneReportStore, openLaneReports, routeReports, statusTransportOf } from "./lane-reports.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -170,6 +178,9 @@ export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as 
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
 /** The fifth task: liveness, lane events, runner admin, legacy adoption, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
+/** The autopilot tick's task (autopilot-tick.ts); it judges only while the toodo source is enabled. */
+export const AUTOPILOT_TASK = "autopilot";
+export const AUTOPILOT_PASS_MS = 5_000;
 /** How often the runners task tries to adopt open lanes that have no runner yet. */
 export const LEGACY_ADOPT_MS = 60_000;
 /** How often the runners task runs; the hub itself answers frames as they arrive. */
@@ -199,7 +210,7 @@ export type RunnerHubHandle = {
   close(): void;
 };
 
-export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent"> & {
+export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent" | "onSecret"> & {
   /** Discovery and reconnect dependencies; production reads runner-endpoints.json. */
   readonly network?: Partial<DialingOptions>;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
@@ -268,6 +279,7 @@ export const openRunnerHub = (
   let calls: RunnerCalls | undefined;
   const accept = acceptRunners(hub, [listener, network], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
+    ...(options.onSecret ? { onSecret: options.onSecret } : {}),
     onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
     onEvent: (label, frame) => {
       guard.event(label, frame);
@@ -590,7 +602,7 @@ export const supervisorSweeps = (
     ["snapshot", async (emit) => {
       view = passthroughView(deps.ops);
       // A bad deadline warns every round and the sweeps read per lane.
-      if (!Number.isFinite(deps.config.sweepMachineDeadlineMs) || deps.config.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
+      if (!Number.isFinite(deps.tunables.sweepMachineDeadlineMs) || deps.tunables.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
       const open = await deps.registry.open();
       const machines = new Map<string, string | undefined>([
         [machineRunner(undefined), undefined], ...open.flatMap((l) => l.machine ? [[machineRunner(l.machine), l.machine] as const] : []), ...unavailable,
@@ -602,7 +614,7 @@ export const supervisorSweeps = (
           await emit(`RUNNER_UNAVAILABLE runner=${label} no admitted connection: watch, dead-panes and freshness skip its lanes until it says hello`);
         }
       }
-      view = await sweepRound(deps.ops, cache, open, { now: deps.clock.now, deadlineMs: deps.config.sweepMachineDeadlineMs });
+      view = await sweepRound(deps.ops, cache, open, { now: deps.clock.now, deadlineMs: deps.tunables.sweepMachineDeadlineMs });
       return [];
     }],
     ["watch", async (emit) => {
@@ -616,7 +628,7 @@ export const supervisorSweeps = (
     // the sweep says nothing, and the liveness monitor reports the runner.
     ["guard", async (emit) => {
       const board = runnerGuard();
-      const fromRunner = board?.sampleFor(LOCAL_RUNNER, () => "");
+      const fromRunner = board?.sampleFor(LOCAL_RUNNER);
       if (!board || !fromRunner) return [];
       const s = fromRunner.sample;
       const sample: HostSample = {
@@ -648,8 +660,8 @@ export const supervisorSweeps = (
       return [];
     }],
     ["memory", async () => memorySweep(deps, home)],
-    // Last, so a slow or unreachable worker machine never delays the pane reads of the sweeps before it. A machine
-    // whose sample failed waits out its backoff instead of costing an ssh timeout every round.
+    // Each worker machine with an enrolled runner is judged from its runner's guard sample; nothing is sampled over ssh.
+    // Last, so a slow herdr machine list never delays the pane reads of the sweeps before it.
     ["machine-guard", async (emit) => {
       const now = deps.clock.now();
       if (!guardMachines || now - guardMachines.at >= MACHINE_LIST_TTL_MS) {
@@ -660,51 +672,45 @@ export const supervisorSweeps = (
           await emit(`SWEEP_WARN machine-guard herdr machine list failed: ${listed.detail}`);
         }
       }
-      const due = guardMachines.list.filter((m) => machineDue(machineGuard, m.label, now));
-      if (!due.length) return [];
-      const want = guardAgentWants(await readGuardAgentScripts());
-      // A machine whose runner sent a fresh sample is judged from it. A machine with an enrolled runner is never sampled
-      // over ssh: while its runner is quiet it is skipped (the liveness monitor reports it). Only a machine without a
-      // runner, which cannot host lanes, is sampled through the ssh guard agent. The runner kills by itself, so a
-      // machine's critical stage reports the kills it sent.
+      // Only machines with an enrolled runner are guarded (a machine without one is not); each is judged from its runner's
+      // fresh sample, and one whose runner is quiet is skipped this round (the liveness monitor reports it). An enrolled
+      // label missing from the machine list is its own ssh target. The runner kills by itself, so a machine's critical
+      // stage reports the kills it sent.
       const board = runnerGuard();
-      const enrolled = new Set(readRunnerRows(deps.config.stateDir).map((row) => row.label));
-      const sampled = await Promise.all(due.map(async (machine) => {
-        const fromRunner = board?.sampleFor(machine.label, (os) => wantFor(want, os));
-        if (fromRunner) return { machine, result: fromRunner as SampleResult, fromRunner };
-        if (enrolled.has(machine.label)) return undefined;
-        return { machine, result: await sampleMachine(deps.run, machine), fromRunner: undefined };
-      }));
-      const results = sampled.filter((r) => r !== undefined);
+      if (!board) return [];
+      const listedByLabel = new Map(guardMachines.list.map((m) => [m.label, m] as const));
+      const enrolled = [...new Set(readRunnerRows(deps.config.stateDir).map((row) => row.label))].filter((label) => label !== LOCAL_RUNNER);
+      const results = enrolled.flatMap((label) => {
+        const fromRunner = board.sampleFor(label);
+        return fromRunner ? [{ machine: listedByLabel.get(label) ?? { label, target: label }, result: fromRunner, sample: fromRunner.sample, fromRunner }] : [];
+      });
+      if (!results.length) return [];
       const open = await deps.registry.open();
       // Lane memory is read from this host's /proc, so a machine's ALERT names the lanes running there instead.
       // A machine newly in ALERT for low memory warns its lanes first, so its ALERT line can say so.
       const warned = new Map<string, string>();
-      await Promise.all(results.map(async ({ machine, result }) => {
-        if (!result.ok || machineGuard.get(machine.label)?.alerting) return;
-        const note = await warnMachineLanes(deps.ops, machine, result.sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
+      await Promise.all(results.map(async ({ machine, sample }) => {
+        if (machineGuard.get(machine.label)?.alerting) return;
+        const note = await warnMachineLanes(deps.ops, machine, sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
         if (note) warned.set(machine.label, note);
       }));
       const lanesOn = (m: GuardMachine): string | undefined => {
         const keys = open.filter((l) => l.machine !== undefined && (l.machine === m.label || l.machine === m.id)).map((l) => l.key);
         return [keys.length ? `lanes on this machine: ${keys.join(", ")}` : "", warned.get(m.label) ?? ""].filter(Boolean).join("; ") || undefined;
       };
-      const lines = machineGuardTick(results, deps.config.guard, want, machineGuard, lanesOn, now);
+      const lines = machineGuardTick(results, deps.config.guard, machineGuard, lanesOn, now);
       try {
         for (const line of lines) await emit(line);
         // A machine held by `dori can-launch --machine` or a queued launch resumes the same way, from this round's pane list.
-        for (const { machine: { label }, result, fromRunner } of results) {
-          if (!result.ok || !launchHeld(deps.config.stateDir, label)) continue;
-          const panes = fromRunner?.panes ?? await view.panes(label).then((p) => p.length, () => -1);
+        for (const { machine: { label }, result, sample, fromRunner } of results) {
+          if (!launchHeld(deps.config.stateDir, label)) continue;
+          const panes = fromRunner.panes ?? await view.panes(label).then((p) => p.length, () => -1);
           if (!machineVerdict(result, panes, deps.config.guard, label).ok) continue;
-          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(result.sample.memFreePct, result.sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
+          await emit(`LAUNCH_READY machine=${label} the machine has room again (${summaryOf(sample.memFreePct, sample.diskFreeGb, panes)}); start the held work after dori can-launch --machine ${label}`);
           clearLaunchHold(deps.config.stateDir, label);
         }
-        const criticalLines = await Promise.all(results.map(({ machine, result, fromRunner }) =>
-          result.ok
-            ? criticalTick(deps, { kind: "machine", machine }, result.sample, open, machineCritical,
-              fromRunner && board ? board.takeKills(machine.label) : { ok: true, killed: [] }, io, fromRunner?.lanes ? laneMemoryOf(fromRunner.lanes) : [])
-            : Promise.resolve(undefined)));
+        const criticalLines = await Promise.all(results.map(({ machine, sample, fromRunner }) =>
+          criticalTick(deps, { kind: "machine", machine }, sample, open, machineCritical, board.takeKills(machine.label), io, fromRunner.lanes ? laneMemoryOf(fromRunner.lanes) : [])));
         for (const line of criticalLines) if (line) await emit(line);
       } finally {
         saveMachineGuardState(machineGuardPath, machineGuard);
@@ -766,13 +772,36 @@ const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promi
     console.error(`LEAD_PANE_ENSURE_FAILED ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
-    const laneWorkspace = await ensureLaneWorkspace(deps.run, config.stateDir, config.defaultCwd, (line) => { console.log(line); });
-    config = { ...config, laneWorkspace, workspaces: [laneWorkspace] };
+    const laneWorkspace = await ensureLaneWorkspace(deps.run, config.stateDir, config.leadCwd, (line) => { console.log(line); });
+    config = { ...config, laneWorkspace };
   } catch (error) {
     if (!(error instanceof ManagedPanesError)) throw error;
     console.error(`LANE_WORKSPACE_ENSURE_FAILED ${error.message}`);
   }
   return { ...deps, config };
+};
+
+/**
+ * How long a stop waits for the task passes in flight. A pass ends at its next pause, but one inside a slow command or
+ * request runs on to that call's own timeout (up to runTimeoutMs); the stop goes on without it, so systemd's stop and
+ * with it a restart never wait on a pass.
+ */
+export const STOP_TASKS_GRACE_MS = 3_000;
+
+/**
+ * `dori supervise` exits this long after SIGTERM/SIGINT however far shutdown got: past the task grace and the local
+ * runner's own stop grace (LOCAL_STOP_GRACE_MS), well inside systemd's stop timeout.
+ */
+export const SUPERVISE_STOP_DEADLINE_MS = 15_000;
+
+/** Waits for `tasks` up to STOP_TASKS_GRACE_MS. */
+const settle = async (tasks: Promise<unknown> | undefined): Promise<void> => {
+  if (!tasks) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<boolean>((resolve) => { timer = setTimeout(() => { resolve(true); }, STOP_TASKS_GRACE_MS); });
+  const pending = await Promise.race([tasks.then(() => false, () => false), late]);
+  clearTimeout(timer);
+  if (pending) console.error(`SUPERVISOR_STOP_TASKS_PENDING a task pass still running ${STOP_TASKS_GRACE_MS} ms after the stop; stopping without it`);
 };
 
 /**
@@ -782,34 +811,66 @@ const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promi
  * is tracked by the watchdog. Each startup step up to READY=1 is timed by `probe` (STARTUP_TIMINGS, STARTUP_SLOW <step>),
  * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
  */
+/**
+ * Registers every secret store value with the masking registry and re-registers on changes to the store directory
+ * (debounced). Failures are logged as SECRET_STORE_WATCH_FAILED and never thrown; a missing directory is not watched.
+ * Returns the function that stops the watch.
+ */
+export const watchSecretStore = async (
+  store: Pick<SecretStore, "dir" | "readAll"> = new SecretStore(),
+  log: (line: string) => void = (line) => { console.error(line); },
+  debounceMs = 500,
+): Promise<() => void> => {
+  const load = async (): Promise<void> => {
+    try { replaceKnownSecrets((await store.readAll()).values()); }
+    catch (e) { log(`SECRET_STORE_WATCH_FAILED ${e instanceof Error ? e.message : String(e)}`); }
+  };
+  await load();
+  if (!existsSync(store.dir)) return () => {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let watcher: FSWatcher;
+  try {
+    watcher = watch(store.dir, () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { void load(); }, debounceMs);
+    });
+    watcher.on("error", (e) => { log(`SECRET_STORE_WATCH_FAILED ${e.message}`); });
+  } catch (e) {
+    log(`SECRET_STORE_WATCH_FAILED ${e instanceof Error ? e.message : String(e)}`);
+    return () => {};
+  }
+  return () => { clearTimeout(timer); watcher.close(); };
+};
+
 export const supervise = async (
   deps: FlowDeps, signal: AbortSignal,
   options: Partial<Omit<SupervisorDiscordOptions, "emit">> & {
     readonly gatewayLockDir?: string;
     /** Starts the local runner child (default Bun.spawn); tests inject one that starts nothing. */
     readonly spawnRunner?: LocalChildDeps["spawn"];
+    /** The config.json to hot-reload (cli.ts: configPath()); without it nothing is watched. */
+    readonly configFile?: string;
   } = {},
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
-  const { gatewayLockDir, spawnRunner, ...discordOptions } = options;
-  if (!Number.isFinite(deps.config.cacheTtlMin) || deps.config.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
-  if (!Number.isFinite(deps.config.leadContextCapTokens) || deps.config.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
-  if (!Number.isFinite(deps.config.leadContextHardCapTokens) || deps.config.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
-  if (!Number.isFinite(deps.config.githubPollSeconds) || deps.config.githubPollSeconds <= 0) throw new SuperviseError("githubPollSeconds must be positive");
-  if (!Number.isFinite(deps.config.githubTimeoutMs) || deps.config.githubTimeoutMs <= 0) throw new SuperviseError("githubTimeoutMs must be positive");
-  if (!Number.isFinite(deps.config.discordSafetyPollSeconds) || deps.config.discordSafetyPollSeconds <= 0) throw new SuperviseError("discordSafetyPollSeconds must be positive");
-  if (!Number.isFinite(deps.config.digestMaxDelayMin) || deps.config.digestMaxDelayMin <= 0) throw new SuperviseError("digestMaxDelayMin must be positive");
-  if (!Number.isFinite(deps.config.ackTimeoutSec) || deps.config.ackTimeoutSec <= 0) throw new SuperviseError("ackTimeoutSec must be positive");
+  const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
+  if (!Number.isFinite(deps.tunables.cacheTtlMin) || deps.tunables.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
+  if (!Number.isFinite(deps.tunables.leadContextCapTokens) || deps.tunables.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
+  if (!Number.isFinite(deps.tunables.leadContextHardCapTokens) || deps.tunables.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
+  if (!Number.isFinite(deps.tunables.githubPollSeconds) || deps.tunables.githubPollSeconds <= 0) throw new SuperviseError("githubPollSeconds must be positive");
+  if (!Number.isFinite(deps.tunables.githubTimeoutMs) || deps.tunables.githubTimeoutMs <= 0) throw new SuperviseError("githubTimeoutMs must be positive");
+  if (!Number.isFinite(deps.tunables.discordSafetyPollSeconds) || deps.tunables.discordSafetyPollSeconds <= 0) throw new SuperviseError("discordSafetyPollSeconds must be positive");
+  if (!Number.isFinite(deps.tunables.digestMaxDelayMin) || deps.tunables.digestMaxDelayMin <= 0) throw new SuperviseError("digestMaxDelayMin must be positive");
+  if (!Number.isFinite(deps.tunables.ackTimeoutSec) || deps.tunables.ackTimeoutSec <= 0) throw new SuperviseError("ackTimeoutSec must be positive");
   if (!Number.isFinite(deps.config.runTimeoutMs) || deps.config.runTimeoutMs < 0) throw new SuperviseError("runTimeoutMs must be zero or positive");
-  if (!Number.isFinite(deps.config.handledTimeoutMin) || deps.config.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
-  if (!Number.isFinite(deps.config.reportTimeoutMin) || deps.config.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
-  if (!Number.isFinite(deps.config.resolveTimeoutMin) || deps.config.resolveTimeoutMin <= 0) throw new SuperviseError("resolveTimeoutMin must be positive");
+  if (!Number.isFinite(deps.tunables.handledTimeoutMin) || deps.tunables.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
+  if (!Number.isFinite(deps.tunables.reportTimeoutMin) || deps.tunables.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
+  if (!Number.isFinite(deps.tunables.resolveTimeoutMin) || deps.tunables.resolveTimeoutMin <= 0) throw new SuperviseError("resolveTimeoutMin must be positive");
   if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
   if (!Number.isFinite(deps.config.leadChildWaitMaxMin) || deps.config.leadChildWaitMaxMin <= 0) throw new SuperviseError("leadChildWaitMaxMin must be positive");
-  if (!Number.isFinite(deps.config.leadUnreadRestartMin) || deps.config.leadUnreadRestartMin <= 0) throw new SuperviseError("leadUnreadRestartMin must be positive");
-  if (!Number.isFinite(deps.config.idleEscalateMin) || deps.config.idleEscalateMin <= 0) throw new SuperviseError("idleEscalateMin must be positive");
-  if (!Number.isInteger(deps.config.waitMaxFailures) || deps.config.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
-  const deliveryProblem = deliveryConfigError(deps.config.delivery);
+  if (!Number.isFinite(deps.tunables.idleEscalateMin) || deps.tunables.idleEscalateMin <= 0) throw new SuperviseError("idleEscalateMin must be positive");
+  if (!Number.isInteger(deps.tunables.waitMaxFailures) || deps.tunables.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
+  const deliveryProblem = deliveryConfigError(deps.tunables.delivery);
   if (deliveryProblem) throw new SuperviseError(deliveryProblem);
   setDefaultRunTimeout(deps.config.runTimeoutMs);
   let release: (() => void) | undefined;
@@ -824,6 +885,7 @@ export const supervise = async (
   let stopRelay: (() => void) | undefined;
   let relayListener: Listener | undefined;
   let laneMessages: LaneMessageStore | undefined;
+  let stopConfigWatch: (() => void) | undefined;
   // Lane operations go through the hub's RunnerCalls; until the hub is open every call fails closed.
   const hubCall: RunnerCall = {
     call: (label, type, body, opts) => {
@@ -849,15 +911,28 @@ export const supervise = async (
     if (!token) throw new SuperviseError("supervise requires DORI_DISCORD_TOKEN for lossless paginated Discord polling");
     releaseGateway = probe.step("gateway-lock", () => acquireDiscordGateway(token, gatewayLockDir));
     const discord = new Discord(fetchHttp, deps.clock, token);
-    // An owner notice goes where the message came from: its Discord channel or thread.
-    const ownerNotice = async (channel: string, text: string, id: string): Promise<void> => {
-      await discord.send(channel, systemText(text), id);
-    };
     const stateDir = deps.config.stateDir;
+    // A [System] post of the supervisor's own into `channel`; a thread the owner closed gets nothing (a post would reopen
+    // it): one line linking it goes to its parent channel, else the owner channel (redirectIfClosed).
+    const systemPost = async (channel: string, text: string, id?: string): Promise<void> => {
+      const body = systemText(text);
+      const redirected = await redirectIfClosed(stateDir, discord, channel, body, deps.config.discordChannels[0], (target, line) => discord.send(target, line, id));
+      if (redirected) console.log(`SYSTEM_POST_REDIRECTED ${channel}: closed by the owner, one line went to ${redirected}`);
+      else await discord.send(channel, body, id);
+    };
+    // An owner notice goes where the message came from: its Discord channel or thread.
+    const ownerNotice = (channel: string, text: string, id: string): Promise<void> => systemPost(channel, text, id);
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(stateDir, pane); },
-      announce: async (text, id, thread) => { await postOwnerLine(discord, deps.config.discordChannels[0], thread, systemText(text), id); },
+      // A line into a lane thread is appended to its last report (or status message), never a new post into a thread the owner closed.
+      // A line with no thread (lead stuck, restarts capped) is a system notice: config alertsChannel, else the main channel.
+      announce: async (text, id, thread) => {
+        await postOwnerLine(discord, thread ? deps.config.discordChannels[0] : alertsChannelOf(deps.config), thread, systemText(text), id, {
+          stateDir,
+          statusMessage: async (threadId) => (await deps.registry.open()).find((lane) => lane.thread.endsWith(`/${threadId}`))?.statusMessageId,
+        });
+      },
     }));
     deps = await ensureManagedPanes(deps, supervisor);
     // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
@@ -868,7 +943,7 @@ export const supervise = async (
     const home = process.env.HOME ?? "";
     const registry = sources = new EventSources({
       stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
-      policy: deps.config.eventPolicy, log: (line) => { console.error(line); },
+      policy: deps.tunables.eventPolicy, log: (line) => { console.error(line); }, remote: hubCall,
       schedules: {
         operations: ops, journaled: (id: string) => supervisor.journaled(id),
         heavy: {
@@ -887,7 +962,22 @@ export const supervise = async (
     const enqueueWait = enqueueOf("waits");
     const enqueueGitHub = enqueueOf("github");
     const enqueueDiscord = enqueueOf("discord");
-    const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.config.waitMaxFailures));
+    // AUTOPILOT_READY counts under the toodo source: it is what toodo's marked tasks add up to.
+    const autopilot = new AutopilotTick({
+      tickMs: () => deps.config.autopilot.tickSec * 1000,
+      judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), enqueue: enqueueOf("toodo"), now: deps.clock.now,
+      localState: async () => autopilotLocalStateKey(ops, new Set((await deps.registry.open()).map((l) => l.key))),
+      log: (line) => { console.error(line); },
+    });
+    // The tick replaced the hourly autopilot-reconcile schedule job; one left from an earlier version is removed.
+    try { if (new SourceSpecs(deps.config.stateDir).remove(RECONCILE_JOB)) console.log(`AUTOPILOT_RECONCILE_JOB_REMOVED ${RECONCILE_JOB}: the supervisor's autopilot tick replaces it`); }
+    catch (e) { console.error(`AUTOPILOT_RECONCILE_JOB_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+    const toodoEvents = new ToodoEvents({
+      config: deps.tunables.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
+      fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
+      onEvent: (event) => { if (AUTOPILOT_KICK_EVENTS.has(event)) autopilot.kick(); },
+    });
+    const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.tunables.waitMaxFailures, hubCall));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
     const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps));
     // CI follow-up reads the poll it follows, so it runs right after each GitHub tick.
@@ -910,9 +1000,9 @@ export const supervise = async (
       repair: () => supervisor.repairLeadPane(),
       enqueue: (id, line) => supervisor.enqueue(id, line),
       notify: async (text) => {
-        const channel = deps.config.discordChannels[0];
+        const channel = alertsChannelOf(deps.config);
         if (!channel) throw new Error("no discordChannels configured");
-        await discord.send(channel, systemText(`수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`));
+        await systemPost(channel, `수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`);
       },
       log: (line) => { console.error(line); },
     }, boot);
@@ -951,7 +1041,7 @@ export const supervise = async (
     // tick of being written.
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
     // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
-    const statusTransport = { post: (channel: string, text: string, id: string) => discord.send(channel, text, id), edit: (channel: string, id: string, text: string) => discord.edit(channel, id, text) };
+    const statusTransport = statusTransportOf(discord);
     let nextHistoryPrune = 0;
     const routeLaneReports = (): Promise<void> => watchdog.track("reports", (async () => {
       const now = deps.clock.now();
@@ -974,7 +1064,7 @@ export const supervise = async (
       for (const { channel, message } of due) {
         try {
           supervisor.noticeAttempt("delay", channel, message);
-          await ownerNotice(channel, deps.config.ownerDelayNotice, `delay:${channel}:${message}`);
+          await ownerNotice(channel, deps.tunables.ownerDelayNotice, `delay:${channel}:${message}`);
           supervisor.noticeSent("delay", channel, message);
         }
         catch (e) { console.error(`OWNER_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
@@ -983,13 +1073,13 @@ export const supervise = async (
     // A message the lead was handed but never acked is re-pushed, and after a second window the owner gets one line.
     const noticeUnacked = async (): Promise<void> => {
       let due: ReturnType<typeof supervisor.ackTick>;
-      try { due = supervisor.ackTick(deps.config.ackTimeoutSec * 1_000); }
+      try { due = supervisor.ackTick(deps.tunables.ackTimeoutSec * 1_000); }
       catch (e) { console.error(`ACK_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
       for (const { channel, message } of due) {
         console.log(`ACK_MISSING_NOTICE ${channel}/${message}`);
         try {
           supervisor.noticeAttempt("ack", channel, message);
-          await ownerNotice(channel, deps.config.ackMissingNotice, `ack:${channel}:${message}`);
+          await ownerNotice(channel, deps.tunables.ackMissingNotice, `ack:${channel}:${message}`);
           supervisor.noticeSent("ack", channel, message);
         }
         catch (e) { console.error(`ACK_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
@@ -998,13 +1088,13 @@ export const supervise = async (
     // A message the lead acked but never linked to lanes or a reply: UNHANDLED wakes it, then the owner gets one line.
     const noticeUnhandled = async (): Promise<void> => {
       let due: ReturnType<typeof supervisor.handledTick>;
-      try { due = supervisor.handledTick(deps.config.handledTimeoutMin * 60_000); }
+      try { due = supervisor.handledTick(deps.tunables.handledTimeoutMin * 60_000); }
       catch (e) { console.error(`HANDLED_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
       for (const { channel, message } of due) {
         console.log(`UNHANDLED_NOTICE ${channel}/${message}`);
         try {
           supervisor.noticeAttempt("unhandled", channel, message);
-          await ownerNotice(channel, deps.config.unhandledNotice, `unhandled:${channel}:${message}`);
+          await ownerNotice(channel, deps.tunables.unhandledNotice, `unhandled:${channel}:${message}`);
           supervisor.noticeSent("unhandled", channel, message);
         }
         catch (e) { console.error(`UNHANDLED_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
@@ -1037,9 +1127,18 @@ export const supervise = async (
         // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
         let laneWork: Promise<void> = Promise.resolve();
         const laneDeps: LaneHubDeps = {
+          stateDir: deps.config.stateDir,
           registry: deps.registry, reports: () => reports, now: deps.clock.now,
           emit: (id, line) => { enqueueSweep(id, line); },
-          recover: (label, key) => runnerHub?.accept.command(label, "lane.recover", { cmdId: `recover:${key}:${deps.clock.now()}`, key }),
+          prepareRecovery: async (label, key) => {
+            // Inventory absence means RUNNER_LANE_UNKNOWN; only ordinary recovery scans for a relaunch.
+            runnerHub?.accept.checkFileCapability(label, "lane.recover");
+            return { cmdId: `recover:${key}:${deps.clock.now()}`, notes: [] };
+          },
+          recover: (label, key, prepared) => runnerHub?.accept.command(label, "lane.recover", {
+            cmdId: prepared.cmdId, key, ...(prepared.briefText !== undefined ? { briefText: prepared.briefText } : {}),
+            ...(prepared.files ? { files: prepared.files } : {}),
+          }),
           close: (label, key, cmdId) => runnerHub?.accept.command(label, "lane.close", { cmdId, key, worktreeChecks: false }),
           journalHead: () => runnerJournalHead(deps.config.stateDir),
           // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
@@ -1061,6 +1160,35 @@ export const supervise = async (
         const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
           onHeartbeat: (label) => { void monitor?.heartbeat(label); },
           onHerdr: (id, line) => { enqueueSweep(id, line); },
+          // A remote runner's secret.get: decided here with the registry, config and this host's store (secret-serve.ts).
+          onSecret: supervisorSecretHandler({
+            laneOwner: async (key) => { const lane = (await deps.registry.open()).find((l) => l.key === key); return lane && runnerOf(lane); },
+            runnerUnsandboxed: (label) => deps.config.runners?.[label]?.allowUnsandboxed === true,
+            granter: supervisorGranter({
+              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets, now: deps.clock.now,
+              log: (line) => { console.log(line); },
+            }),
+            // A remote runner's secret.run: the op runs here, outside any lane; only its redacted output goes back.
+            commandRunner: supervisorCommandRunner({
+              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets,
+              commands: async () => (await loadConfig()).secretCommands, now: deps.clock.now,
+              log: (line) => { console.log(line); },
+            }),
+            log: (line) => { console.log(line); },
+          }),
+          // A runner-owned wait that the runner saw met ends here (deduped with the check's own result by its event id);
+          // `job.result` is kept in the runner journal only.
+          onEvent: (label, frame) => {
+            // A runner's own config reload (runner-config.json): reloaded, kept the last good one, or needs a restart.
+            if (frame.type === "runner.config") {
+              const kind = { reloaded: "RUNNER_CONFIG_RELOADED", invalid: "RUNNER_CONFIG_INVALID", restart: "RUNNER_CONFIG_RESTART_NEEDED" }[frame.body.state];
+              enqueueSweep(`runner-config:${label}:${frame.gen}:${frame.seq}`, `${kind} runner=${label} ${frame.body.detail}`);
+              return;
+            }
+            if (frame.type !== "wait.result" || frame.body.outcome !== "WAIT_DONE") return;
+            try { waits.settleRemote(label, frame.body.waitId, enqueueWait); }
+            catch (e) { console.error(`WAIT_ERROR runner=${label} wait=${frame.body.waitId} ${e instanceof Error ? e.message : String(e)}`); }
+          },
           onHello: (label, body) => {
             void monitor?.hello(label, body.gen);
             inOrder(`hello ${label}`, async () => {
@@ -1139,6 +1267,16 @@ export const supervise = async (
       }
     };
     await tryOpenRunners((name, work) => probe.step(name, work));
+    // config.json edits apply without a restart: the live keys are written into the config objects every part holds
+    // (this loop's and the supervisor core's), so in-flight events, waits, lanes and the gateway are untouched.
+    if (configFile) {
+      const reload = configReloader({
+        path: configFile, current: () => deps.config,
+        apply: (patch) => { applyConfigPatch([deps.config, supervisor.config], patch); },
+        enqueue: (id, line) => { enqueueSweep(id, line); }, log: (line) => { console.error(line); },
+      });
+      stopConfigWatch = watchConfigFiles([configFile], reload);
+    }
     let lastJournalPrune = -Infinity;
     let lastAdoption = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
@@ -1149,7 +1287,7 @@ export const supervise = async (
     // Each task is its own loop, so one stuck pass costs only that task. Every pass is tracked as task:<name>: the
     // loop below reports one running past TASK_ALERT_MS by name, and past WATCHDOG_STALL_MS it withholds the watchdog.
     const halted = AbortSignal.any([signal, stop.signal]);
-    const task = (name: SupervisorTask | typeof RUNNERS_TASK, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
+    const task = (name: SupervisorTask | typeof RUNNERS_TASK | typeof AUTOPILOT_TASK, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
       const span = name === "sweeps" ? undefined : probe.span();
       while (!halted.aborted) {
         // The pass starts only once task:<name> is tracked, so the watchdog names the task before any work it tracks inside.
@@ -1163,6 +1301,8 @@ export const supervise = async (
       }
     })();
     tasks = Promise.all([
+      // A long-lived stream, not a pass: it reconnects on its own and is not tracked by the watchdog.
+      toodoEvents.run(halted),
       task("inbound", 5_000, async () => {
         try { await guarded("discord", discordInbound.tick()); } catch (e) { console.error(`INBOUND_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         heartbeat();
@@ -1187,7 +1327,7 @@ export const supervise = async (
       task("polling", 5_000, async () => {
         const polls = [watchdog.track("waits", guarded("waits", waits.tick(deps.clock.now, deps.run, enqueueWait)))
           .catch((e: unknown) => { console.error(`WAIT_ERROR ${e instanceof Error ? e.message : String(e)}`); })];
-        if (deps.clock.now() - lastGitHub >= deps.config.githubPollSeconds * 1_000) {
+        if (deps.clock.now() - lastGitHub >= deps.tunables.githubPollSeconds * 1_000) {
           lastGitHub = deps.clock.now();
           polls.push(watchdog.track("github", guarded("github", pollGithub()))
             .catch((e: unknown) => { console.error(`GITHUB_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
@@ -1199,6 +1339,9 @@ export const supervise = async (
         }
         polls.push(tickSources(), routeLaneReports());
         await Promise.all(polls);
+      }),
+      task(AUTOPILOT_TASK, AUTOPILOT_PASS_MS, async () => {
+        if (deps.tunables.toodoEvents.enabled) await autopilot.tick();
       }),
       task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
         if (!runnerHub && deps.clock.now() - lastHubAttempt >= RUNNER_HUB_RETRY_MS) await tryOpenRunners((_name, work) => work());
@@ -1219,7 +1362,12 @@ export const supervise = async (
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
           lastJournalPrune = deps.clock.now();
-          handle.journal.prune(lastJournalPrune);
+          let cursor = 0;
+          try {
+            const value: unknown = JSON.parse(readFileSync(join(deps.config.stateDir, RUNNER_LANE_CURSOR_FILE), "utf8"));
+            if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) cursor = value;
+          } catch {}
+          handle.journal.prune(lastJournalPrune, cursor);
         }
       }),
     ]);
@@ -1240,12 +1388,12 @@ export const supervise = async (
         const id = `task-stalled:${boot}:${which}:${deps.clock.now() - ms}`;
         console.error(line);
         try { supervisor.enqueue(id, line); } catch (e) { console.error(`TASK_STALLED_ENQUEUE_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); }
-        // A stuck delivery task cannot hand the line to the lead, so the owner hears it in the main channel. Not awaited:
-        // a hung post must not stop this loop.
-        const channel = deps.config.discordChannels[0];
+        // A stuck delivery task cannot hand the line to the lead, so the owner hears it in the alerts channel (else the
+        // main channel). Not awaited: a hung post must not stop this loop.
+        const channel = alertsChannelOf(deps.config);
         if (which === "delivery" && channel) {
           const notice = `도리 경고: 수퍼바이저의 전달 작업이 ${Math.round(ms / 60_000)}분째 끝나지 않고 있습니다. 다른 작업은 계속 돌아가며, ${Math.round(WATCHDOG_STALL_MS / 60_000)}분까지 멈춰 있으면 수퍼바이저가 재시작됩니다. (TASK_STALLED ${which})`;
-          void discord.send(channel, systemText(scrubForThread(notice, homedir())), id)
+          void systemPost(channel, scrubForThread(notice, homedir()), id)
             .catch((e: unknown) => { console.error(`TASK_STALLED_NOTIFY_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); });
         }
       }
@@ -1254,7 +1402,9 @@ export const supervise = async (
       await wait(5_000, halted);
     }
     stop.abort();
-    await tasks;
+    await settle(tasks);
+    // Waited for once: the finally below does not spend a second grace on a pass still running.
+    tasks = undefined;
     if (deliveryError) throw deliveryError;
   } finally {
     // A startup that failed or was stopped early still logs how far it got.
@@ -1263,8 +1413,9 @@ export const supervise = async (
       probe.close();
     }
     if (petting !== undefined) clearInterval(petting);
+    stopConfigWatch?.();
     stop.abort();
-    await tasks;
+    await settle(tasks);
     await inbound?.close();
     if (inbound) writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, messageContent: false });
     reports?.close();

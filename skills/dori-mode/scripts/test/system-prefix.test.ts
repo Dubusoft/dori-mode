@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { defaultConfig, type DoriConfig } from "../src/config.ts";
 import { SYSTEM_PREFIX, systemText } from "../src/supervise-loop.ts";
+import { BUILT_IN } from "../src/tunables.ts";
 
 test("systemText prefixes once and never doubles", () => {
   expect(SYSTEM_PREFIX).toBe("[System] ");
@@ -9,8 +9,7 @@ test("systemText prefixes once and never doubles", () => {
 });
 
 test("owner notice text carries the System prefix when posted", () => {
-  const config: DoriConfig = defaultConfig();
-  for (const notice of [config.ownerDelayNotice, config.ackMissingNotice, config.unhandledNotice, "Lead restart queued"]) {
+  for (const notice of [BUILT_IN.ownerDelayNotice, BUILT_IN.ackMissingNotice, BUILT_IN.unhandledNotice, "Lead restart queued"]) {
     expect(systemText(notice)).toStartWith(SYSTEM_PREFIX);
   }
 });

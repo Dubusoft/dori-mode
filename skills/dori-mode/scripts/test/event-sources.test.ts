@@ -43,7 +43,7 @@ const fixture = (kinds: Record<string, string>, run: Runner = async () => ok()) 
   cleanups.push(() => { supervisor.close(); });
   const logs: string[] = [];
   const sources = new EventSources({
-    stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.config.eventPolicy,
+    stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.tunables.eventPolicy,
     log: (line) => { logs.push(line); },
   });
   cleanups.push(() => { sources.close(); });
@@ -139,8 +139,8 @@ test("a poll source runs its command every everySec and journals each matching l
   await f.sources.tick();
   expect(f.events().filter((event) => event.line.startsWith("BUILD ")).map((event) => event.line)).toEqual(["BUILD 101 green", "BUILD 102 red"]);
   // The policy table decides per kind: `BUILD * red` reaches the lead, plain BUILD stays engine-only.
-  expect(eventClass("BUILD 102 red", f.deps.config.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("BUILD 101 green", f.deps.config.eventPolicy)).toBe("engine-only");
+  expect(eventClass("BUILD 102 red", f.deps.tunables.eventPolicy)).toBe("lead-digest");
+  expect(eventClass("BUILD 101 green", f.deps.tunables.eventPolicy)).toBe("engine-only");
   expect(await f.settled()).toEqual([]);
   // Not due yet: no second run.
   await f.sources.tick();
@@ -245,7 +245,7 @@ test("a failing source is isolated: the others keep delivering, it is reported o
   const status = await collectStatus({ ...f.deps, run: async () => ok("active") });
   const text = renderStatus(status);
   expect(text).toContain("- 소스 bad 실패 (방금부터): bad exited 2: boom: no such host");
-  expect(text).toContain("- 이벤트 소스: discord 이벤트 없음, github 이벤트 없음, sweeps 이벤트 없음, waits 이벤트 없음, emit 이벤트 없음, bad (poll) 이벤트 없음 실패, good (poll) GOOD 방금, missing (file) 이벤트 없음 실패");
+  expect(text).toContain("- 이벤트 소스: discord 이벤트 없음, github 이벤트 없음, sweeps 이벤트 없음, waits 이벤트 없음, emit 이벤트 없음, toodo 이벤트 없음, bad (poll) 이벤트 없음 실패, good (poll) GOOD 방금, missing (file) 이벤트 없음 실패");
   // Recovered: no longer failing, and its last error stays visible.
   broken = false;
   f.clock.at += 5_000;

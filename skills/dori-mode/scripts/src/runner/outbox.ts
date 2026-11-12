@@ -4,6 +4,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rm
 import { join } from "node:path";
 import { writeFileAtomic } from "../setup.ts";
 import { MAX_FRAME_BYTES, type BodyRef, type RunnerEventBodies, type RunnerEventType } from "./protocol.ts";
+import { checkManagedReport } from "./lane-files.ts";
 
 /**
  * The runner outbox (`<runnerDir>/outbox.sqlite`, WAL): every runner event is appended here before it is sent, with
@@ -167,16 +168,24 @@ export class Outbox {
    * `OutboxEventTooLarge`, appending nothing, when the body cannot be cut to fit a frame.
    */
   append<T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]): OutboxRow<T> {
+    const managed = type === "lane.report" && (body as RunnerEventBodies["lane.report"]).files !== undefined;
+    if (managed) {
+      const report = body as RunnerEventBodies["lane.report"];
+      checkManagedReport(report);
+      const text = report.text;
+      // Hydration adds this metadata to the complete wire body.
+      if (Buffer.byteLength(text) > OUTBOX_INLINE_MAX) checkManagedReport({ ...report, bodyRef: bodyRefFor(text, false) });
+    }
     const at = this.now();
     const field = TEXT_FIELD[type];
     let input = body as Record<string, unknown>;
     let truncated = false;
     const original = field ? input[field] : undefined;
-    if (field && typeof original === "string") {
+    if (!managed && field && typeof original === "string") {
       const capped = capText(original);
       if (capped.truncated) { input = { ...input, [field]: capped.text }; truncated = true; }
     }
-    const fitted = fitEventBody(input);
+    const fitted = managed ? { body: input, cut: false } : fitEventBody(input);
     if (!fitted) throw new OutboxEventTooLarge(type, encodedBytes(input));
     if (fitted.cut && field && fitted.body[field] !== input[field]) truncated = true;
     input = fitted.body;
@@ -249,7 +258,9 @@ export class Outbox {
       if (row.type === "lane.report") body.bodyRef = { sha256: row.body_sha!, bytes: row.body_bytes!, truncated: row.body_cut === 1 };
     }
     // A row stored before every event was fitted at append is cut here, so its replay still fits a frame.
-    const fitted = fitEventBody(body);
+    const managed = row.type === "lane.report" && body.files !== undefined;
+    if (managed) checkManagedReport(body as RunnerEventBodies["lane.report"]);
+    const fitted = managed ? undefined : fitEventBody(body);
     if (fitted?.cut) body = fitted.body;
     return {
       seq: row.seq, type: row.type as RunnerEventType, body: body as never, at: row.at,

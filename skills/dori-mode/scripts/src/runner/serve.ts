@@ -11,13 +11,15 @@ import { fingerprint, type PendingHello, type Session, type SupervisorAuth } fro
 import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
-  decodeFrame, encodeFrame, LABEL_PATTERN, ProtocolError, supervisorCommand, supervisorControl,
-  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type InventoryLane, type JsonValue, type LaneStatus,
+  decodeFrame, encodeFrame, LABEL_PATTERN, MAX_FRAME_BYTES, ProtocolError, supervisorCommand, supervisorControl,
+  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type FrameHead, type InventoryLane, type JsonValue, type LaneStatus,
   type QueryBodies, type QueryType, type RejectCode, type RunnerControl, type RunnerEventBodies, type SupervisorCommandBodies,
-  type SupervisorCommandType,
+  type SupervisorCommandType, type SupervisorControlBodies,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
+import { fileCapabilityDetail, isFileOperation, RunnerUnavailable } from "./call.ts";
+import { checkLaneFilesBody } from "../lane-files.ts";
 
 /**
  * The P1 wiring between the runner modules and the product: the runner's identity file, the supervisor epoch, the hub's
@@ -101,7 +103,7 @@ export const nextEpoch = (stateDir: string): number => {
   }
 };
 
-export type RunnerJournal = { readonly commit: CommitFn; prune(now: number): number; close(): void };
+export type RunnerJournal = { readonly commit: CommitFn; prune(now: number, cursor?: number): number; close(): void };
 
 /**
  * The hub's own journal: the hub commits runner events into `runner_events` of `runners.sqlite` instead of the lead's
@@ -113,9 +115,25 @@ export const openRunnerJournal = (stateDir: string, now: () => number): RunnerJo
   const insert = db.query("INSERT OR IGNORE INTO runner_events (id, line, at) VALUES (?, ?, ?)");
   return {
     commit: (id, line) => insert.run(id, line, now()).changes > 0,
-    prune: (at) => db.query("DELETE FROM runner_events WHERE at < ?").run(at - RUNNER_JOURNAL_RETENTION_MS).changes,
+    // Missing/invalid cursor fails closed: unprocessed durable file bytes never age out.
+    prune: (at, cursor = 0) => db.query("DELETE FROM runner_events WHERE at < ? AND position < ?").run(at - RUNNER_JOURNAL_RETENTION_MS, cursor).changes,
     close: () => { db.close(); },
   };
+};
+
+/** A runner's request for secrets (`secret.get`) or for a proxy-executed secret command (`secret.run`). */
+export type SecretFrame = RunnerControl<"secret.get"> | RunnerControl<"secret.run">;
+
+/** What `HubHooks.onSecret` gets to answer a secret frame on the connection it came in on. */
+export type SecretReplyContext = {
+  /** The connection's auth session (to seal the answer), undefined on an unauthenticated link. */
+  readonly session: Session | undefined;
+  /** The proto the connection said hello with. */
+  readonly proto: number;
+  /** The envelope head of the answer (runner, gen, epoch); with type and rid it is the sealed box's aad. */
+  readonly head: FrameHead;
+  /** Sends a supervisor control frame on that connection (MAC'd like every frame); nothing when it closed. Seals nothing. */
+  reply<T extends "secret.value" | "secret.run.result">(type: T, body: SupervisorControlBodies[T]): void;
 };
 
 export type HubHooks = {
@@ -128,6 +146,11 @@ export type HubHooks = {
   readonly onControl?: (label: string, frame: RunnerControl<"q.result">) => void;
   /** Every admitted, MAC-checked `cmd.status.result` (the answer to `RunnerAccept.status`). Never journaled. */
   readonly onStatus?: (label: string, frame: RunnerControl<"cmd.status.result">) => void;
+  /**
+   * Every admitted, MAC-checked `secret.get` / `secret.run`. Never journaled, its body never logged. Absent: answered
+   * `ok:false RUNNER_SECRET_UNSUPPORTED`.
+   */
+  readonly onSecret?: (label: string, frame: SecretFrame, ctx: SecretReplyContext) => void;
   /** The label's admitted connection closed (not called for a connection a newer one replaced). */
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
@@ -137,6 +160,7 @@ export type HubHooks = {
 
 /** `acceptRunners`' stop function, with the operations on live connections. */
 export type RunnerAccept = (() => void) & {
+  checkFileCapability(label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void;
   /** Deletes the label's key, sends `hello.reject RUNNER_REVOKED` and closes its connection; false when it held no key. */
   revoke(label: string): boolean;
   /** Sends `runner.rotate` to the label's connection; returns the cmdId, or undefined when it is not connected. */
@@ -155,6 +179,7 @@ export type RunnerAccept = (() => void) & {
 };
 
 type Connection = {
+  readonly proto: number;
   readonly transport: Transport;
   readonly gen: number;
   readonly send: (frame: Frame) => void;
@@ -183,15 +208,25 @@ type Connection = {
  */
 export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Listener[], hooks: HubHooks): RunnerAccept => {
   const current = new Map<string, Connection>();
+  const checkFileCapability = (label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void => {
+    const connection = current.get(label);
+    if (!connection?.transport.open) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for ${type}`);
+    if (connection.proto === undefined || connection.proto < 5) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(connection.proto));
+  };
   const auth = hooks.auth;
   const head = (label: string, gen: number) => ({ runner: label, gen, epoch: hub.epoch });
   const serve = (transport: Transport): void => {
     let label: string | undefined;
+    let proto = 0;
     let session: Session | undefined;
     let phase: "start" | "proof" | "ready" | "done" = "start";
     let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
     const reply = (frame: Frame | undefined): void => {
-      if (frame && transport.open) transport.send(encodeFrame(session ? session.seal(frame) : frame));
+      if (frame && transport.open) {
+        const encoded = encodeFrame(session ? session.seal(frame) : frame);
+        if (Buffer.byteLength(encoded) > MAX_FRAME_BYTES) throw new ProtocolError("frame-too-large", "encoded frame exceeds MAX_FRAME_BYTES");
+        transport.send(encoded);
+      }
     };
     const refuse = (code: RejectCode, detail: string, who: string, gen: number): void => {
       reply(supervisorControl(head(who, gen), "hello.reject", { code, detail }));
@@ -210,9 +245,10 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
         return;
       }
       label = hello.body.label;
+      proto = hello.body.proto;
       phase = "ready";
       const previous = current.get(label);
-      current.set(label, { transport, gen: hello.body.gen, send: reply });
+      current.set(label, { transport, gen: hello.body.gen, proto: hello.body.proto, send: reply });
       if (previous) {
         previous.transport.close("replaced by a newer connection");
         hooks.log(`RUNNER_REPLACED runner=${label} gen=${previous.gen}->${hello.body.gen}`);
@@ -312,6 +348,17 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           hooks.onStatus?.(label, frame as RunnerControl<"cmd.status.result">);
           return;
         }
+        if (frame.type === "secret.get" || frame.type === "secret.run") {
+          const secret = frame as SecretFrame;
+          const answer = secret.type === "secret.get" ? "secret.value" : "secret.run.result";
+          const ctx: SecretReplyContext = {
+            session, proto, head: head(label, frame.gen),
+            reply: (type, body) => { reply(supervisorControl(ctx.head, type, body) as Frame); },
+          };
+          if (hooks.onSecret) hooks.onSecret(label, secret, ctx);
+          else ctx.reply(answer, { rid: secret.body.rid, ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "this supervisor does not serve secrets" });
+          return;
+        }
         reply(hub.handle(frame));
         if (frame.type === "heartbeat") hooks.onHeartbeat?.(label);
       } catch (error) {
@@ -323,8 +370,13 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
   };
   const stops = (Array.isArray(listeners) ? listeners : [listeners as Listener]).map((listener) => listener.onConnection(serve));
   return Object.assign(() => { for (const stop of stops) stop(); }, {
+    checkFileCapability,
     connected: (name: string): boolean => current.get(name)?.transport.open === true,
     command<T extends SupervisorCommandType>(name: string, type: T, body: SupervisorCommandBodies[T]): number | undefined {
+      if (type === "lane.start" || type === "lane.recover") {
+        checkFileCapability(name, type);
+        checkLaneFilesBody((body as { key: string }).key, body);
+      }
       const connection = current.get(name);
       if (!connection?.transport.open) return undefined;
       const cmdSeq = hub.nextCmdSeq(name);
@@ -332,6 +384,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       return cmdSeq;
     },
     control<T extends QueryType>(name: string, type: T, body: QueryBodies[T]): boolean {
+      if (isFileOperation(type)) checkFileCapability(name, type);
       const connection = current.get(name);
       if (!connection?.transport.open) return false;
       connection.send(supervisorControl(head(name, connection.gen), type, body as never) as Frame);
@@ -427,8 +480,12 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
       } else if (row.op === "lane.start" && row.body) {
         // Not connected now: the request stays open and is tried again on the next pass until it expires.
         if (!accept.connected(row.label)) return `RUNNER_ADMIN op=${row.op} runner=${row.label} waiting for the runner`;
-        const cmdSeq = accept.command(row.label, "lane.start", JSON.parse(row.body) as SupervisorCommandBodies["lane.start"]);
-        result = cmdSeq ? `sent cmdSeq=${cmdSeq}` : "not-connected";
+        try {
+          const cmdSeq = accept.command(row.label, "lane.start", JSON.parse(row.body) as SupervisorCommandBodies["lane.start"]);
+          result = cmdSeq ? `sent cmdSeq=${cmdSeq}` : "not-connected";
+        } catch (e) {
+          result = `failed ${e instanceof Error ? e.message : String(e)}`;
+        }
       } else result = `unknown op ${row.op}`;
       db.query("UPDATE runner_admin SET doneAt = ?, result = ? WHERE id = ?").run(now, result, row.id);
       return `RUNNER_ADMIN op=${row.op} runner=${row.label} result=${result}`;
@@ -583,6 +640,8 @@ export type DispatchDeps = {
   readonly policy: RunnerPolicy;
   /** `fs.realpathSync` in production: resolves symlinks and throws for a missing path. */
   readonly realpath: (path: string) => string;
+  /** Where a `lane.start` without `cwd` gets its directory (`<runnerDir>/lanes/<key>`); absent: `~/.dori/runner`. */
+  readonly runnerDir?: string;
   /** Publishes the `cmd.result` event (through the outbox). */
   readonly publish: (body: RunnerEventBodies["cmd.result"]) => void;
   readonly log: (line: string) => void;
@@ -626,7 +685,7 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
     deps.log(`${outcome === "verified" ? "RUNNER_CMD_DONE" : "RUNNER_CMD_FAILED"} cmdId=${cmdId} type=${type} ${detail}`);
   };
   const intent = { cmdId, cmdSeq: seq, type: type as SupervisorCommandType, epoch, ...(key !== undefined ? { key } : {}) };
-  const checked = checkCommand(deps.policy, raw, deps.realpath);
+  const checked = checkCommand(deps.policy, raw, deps.realpath, deps.runnerDir);
   const recorded = deps.state.recordIntent(intent);
   if (!recorded.fresh) {
     const record = recorded.existing;

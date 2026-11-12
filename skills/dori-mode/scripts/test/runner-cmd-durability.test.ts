@@ -11,6 +11,8 @@ import { commandDispatcher } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { fakeClock } from "./fakes.ts";
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const runnerDir = (): string => {
@@ -21,7 +23,7 @@ const runnerDir = (): string => {
   return dir;
 };
 
-const START = { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0 };
+const START = { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES };
 
 const fakeHerdr = () => {
   const tabs: string[] = [];

@@ -101,14 +101,47 @@ export const discordThreadFloor = async (statePath: string, now: number, log?: (
   return floor;
 };
 
-export type DiscordThread = { readonly id: string; readonly parent: string };
+export type DiscordThread = { readonly id: string; readonly parent: string; readonly name?: string };
 const THREAD_TYPES: readonly unknown[] = [10, 11, 12];
+const named = (value: Record<string, unknown>): { readonly name?: string } =>
+  typeof value.name === "string" && value.name.trim() ? { name: value.name } : {};
 
 /** A thread channel object (announcement, public or private thread) with its parent; undefined for any other channel. */
 export const discordThread = (value: unknown): DiscordThread | undefined =>
   record(value) && snowflake(value.id) && THREAD_TYPES.includes(value.type) && snowflake(value.parent_id)
-    ? { id: value.id, parent: value.parent_id }
+    ? { id: value.id, parent: value.parent_id, ...named(value) }
     : undefined;
+
+/** What the supervisor knows of a channel: its parent when it is a thread (null otherwise) and its name when seen. */
+export type DiscordChannelInfo = { readonly parent: string | null; readonly name?: string };
+
+/** Any channel object: a thread keeps its parent, every other channel (a category parent included) has none. */
+export const discordChannelInfo = (value: unknown): (DiscordChannelInfo & { readonly id: string }) | undefined =>
+  discordThread(value) ?? (record(value) && snowflake(value.id) ? { id: value.id, parent: null, ...named(value) } : undefined);
+
+/** Channel objects carried by a gateway dispatch: GUILD_CREATE channels and threads, CHANNEL_CREATE/UPDATE, the thread events. */
+export const discordDispatchChannels = (type: string, data: unknown): (DiscordChannelInfo & { readonly id: string })[] => {
+  const channels = type === "GUILD_CREATE" && record(data) && Array.isArray(data.channels) ? data.channels
+    : type === "CHANNEL_CREATE" || type === "CHANNEL_UPDATE" ? [data] : [];
+  return [...channels.flatMap((value) => discordChannelInfo(value) ?? []), ...discordDispatchThreads(type, data)];
+};
+
+const namePart = (name: string): string => name.trim().replace(/\s+/g, "_");
+
+/**
+ * The name token appended to an owner event line: ` channel=#<name>`, or ` channel=#<parent>/<thread>` for a thread
+ * (whitespace in a name becomes `_`, so the token stays one word). It is always last, so every earlier field keeps its place.
+ */
+export const channelNameToken = (name: string, parent?: string): string =>
+  ` channel=#${parent === undefined ? "" : `${namePart(parent)}/`}${namePart(name)}`;
+
+const CHANNEL_NAME_TOKEN = / channel=#\S+$/;
+
+/** Splits a trailing channel name token off an event line or its tail; `token` is "" when there is none. */
+export const splitChannelName = (text: string): { readonly text: string; readonly token: string } => {
+  const m = CHANNEL_NAME_TOKEN.exec(text);
+  return m ? { text: text.slice(0, m.index), token: m[0] } : { text, token: "" };
+};
 
 /** Thread channel objects carried by a gateway dispatch: GUILD_CREATE and THREAD_LIST_SYNC lists, THREAD_CREATE and THREAD_UPDATE. */
 export const discordDispatchThreads = (type: string, data: unknown): DiscordThread[] => {

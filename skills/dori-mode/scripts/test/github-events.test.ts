@@ -306,6 +306,15 @@ test("lane targets include merged PRs, pr and command head branches and git work
   expect([...targets.get("git/repo")?.branches ?? []]).toEqual(["working-branch", "side-branch"]);
 });
 
+test("a checkout on an integration branch establishes no branch target; a Done signal naming that branch still does", async () => {
+  const w = newWorld();
+  w.inspection = { git: { origin: "git@github.com:git/repo.git", branch: "dev", worktrees: [{ path: "/main", branch: "main", exists: true }, { path: "/wt", branch: "lane/feature", exists: true }] } };
+  const lane = { key: "lane", title: "", thread: "none", brief: "", openedAt: "", cwd: "/repo", done: "file /data/report.md" };
+  expect([...(await githubTargets([lane], fakeLaneOps(w))).get("git/repo")?.branches ?? []]).toEqual(["lane/feature"]);
+  const release = { ...lane, done: "pr git/repo dev" };
+  expect([...(await githubTargets([release], fakeLaneOps(w))).get("git/repo")?.branches ?? []]).toEqual(["dev", "lane/feature"]);
+});
+
 test("closing a reopened PR produces a new stable event identity", async () => {
   const f = await fixture();
   for (const [state, updated_at] of [

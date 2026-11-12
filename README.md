@@ -13,7 +13,7 @@ It ships as a skill (`skills/dori-mode/SKILL.md` plus references) and a small bu
 ## Install
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 This clones the repo to `~/.dori/src`, links the skill into `~/.agents/skills/dori-mode`, puts `dori` on your PATH with `bun link`, and starts `dori setup`. Set `SKILLS_DIR` if your agent loads skills from somewhere else.
@@ -58,9 +58,9 @@ Everything lives in `~/.dori/config.json`, and every field is optional. The ones
 
 | Field | What it is |
 |---|---|
-| `defaultCwd` | where lanes start, and the repo whose worktrees they own |
+| `leadCwd` | the lead session's working directory; also where local lanes started without `--cwd` start, and the repo whose worktrees they own |
 | `agentCommand` | how to start an agent, as an argv list with `{model}` and `{prompt}` |
-| `laneSandbox` | `{ "command": ["lane-sandbox"] }` when unset: every new local lane's agent (never the lead's) runs behind `command`; there is no setting or flag that turns it off. A `--machine` lane, a `--pane` lane, or a missing `command` on PATH passes through and the launch prints `SANDBOX_SKIPPED <key>: <why>`; `dori launch --sandbox` wraps a `--pane` lane anyway, and remote lanes refuse it. A bubblewrap wrapper ships as [`scripts/templates/lane-sandbox.sh`](skills/dori-mode/scripts/templates/lane-sandbox.sh); install it on PATH as `lane-sandbox`; once it is in `~/.local/bin`, `dori update` and the supervisor's start keep it in step with the template. It takes extra read-write paths from `LANE_SANDBOX_RW`, and the local runner has it bind `<defaultCwd>/state/verify` read-write through `LANE_SANDBOX_VERIFY`, so review it before use |
+| `laneSandbox` | `{ "command": ["lane-sandbox"] }` when unset: every new local lane's agent (never the lead's) runs behind `command`; there is no setting or flag that turns it off. `--pane` lanes are wrapped too. Before anything is reserved, a local launch runs `<command> --check`: a wrapper missing from PATH refuses the launch with `SANDBOX_MISSING`, and a failed check (no `bwrap`, or bubblewrap can't start) with `SANDBOX_BROKEN` and the check's stderr. `dori runner install` puts the wrapper on Linux runners (bubblewrap) and macOS runners (Seatbelt `sandbox-exec`) and makes it required there. Windows has no lane sandbox: a runner whose machine reports Windows runs its lanes without one by design (`dori runner install` gives it a `"sandbox": "optional"` policy with only the default profile), and `dori doctor` and `dori status` (`샌드박스 없음`) show it. Any other machine runs lanes unsandboxed only when the `runners.<label>.allowUnsandboxed: true` key below opts it in and its `runner-config.json` says `"sandbox": "optional"`. Every unsandboxed launch prints `SANDBOX_SKIPPED <key>: <why>` and warns on Discord. Every refusal is posted to the lane's thread (or the owner channel), and `dori doctor` fails when the wrapper or `bwrap` is missing; on a Mac runner it checks the Seatbelt wrapper and reports `seatbelt`. A bubblewrap wrapper ships as [`scripts/templates/lane-sandbox.sh`](skills/dori-mode/scripts/templates/lane-sandbox.sh); install it on PATH as `lane-sandbox`; once it is in `~/.local/bin`, `dori update` and the supervisor's start keep it in step with the template. The macOS wrapper, [`scripts/templates/lane-sandbox-macos.sh`](skills/dori-mode/scripts/templates/lane-sandbox-macos.sh), takes the same inputs and runs the agent under `sandbox-exec`. Seatbelt cannot hide paths, only refuse them (EPERM), so reads stay broadly allowed; writes are refused outside the worktree and its git dir (hooks excluded), the lane's TMPDIR, `~/.omo`, `~/.cache`, `~/.dori/state`, `~/.dori/heavy`, package and Xcode caches and `/tmp`, and reads of `~/.dori/env`, `~/.ssh` private keys and the rest of `~/.dori` (other lanes' briefs and tokens included) are refused; only the entry names of `~/.dori`, `~/.dori/runner` and `~/.dori/runner/lanes` stay listable, because omo resolves every parent of a cwd-less lane's directory, and `/bin/ps`, which is setuid root and cannot run under a sandbox, runs outside the profile. It takes extra read-write paths from `LANE_SANDBOX_RW`, and the local runner has it bind `<leadCwd>/state/verify` read-write through `LANE_SANDBOX_VERIFY`, so review it before use |
 | `hooks.threadReply` | your messenger CLI, as an argv list with `{thread}` and `{text}`, so lanes can post progress |
 
 The rest (timings, thresholds, heavy-slot count) has sensible defaults. The full table is in [`references/scripts.md`](skills/dori-mode/references/scripts.md). `DORI_CONFIG`, `DORI_STATE_DIR` and `DORI_LEAD_PANE` override the file.
@@ -130,7 +130,7 @@ The watcher runs each check itself when it closes the lane, with no shell, and n
 | `dori watch` | the auto-close watcher; run it as a persistent monitor |
 | `dori freshness [--loop MIN]` | nudge lanes that went quiet, escalate to the lead when one stays silent after the nudge, then post their last report to their thread |
 | `dori dead-panes [--loop MIN]` | report agent panes that stopped |
-| `dori guard [--loop MIN]` | alert on load, memory, disk and pane count, per worker machine too (`guard install`, `guard machines`) |
+| `dori guard [--loop MIN]` | alert on load, memory, disk and pane count, per runner machine too (from its samples, shown in `dori status`) |
 | `dori heavy <label> -- <cmd>` | run a build, test suite or emulator only when a slot is free and load is low (one per machine) |
 
 Text sent to a pane always goes as one argument, never through a shell string, and the CLI reports each send as delivered or unconfirmed.

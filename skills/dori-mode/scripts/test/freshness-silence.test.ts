@@ -39,6 +39,15 @@ for (const [name, screen, hooks] of [
   });
 }
 
+test("a done-claimed lane idle and silent while its PR waits for the supervisor's merge is never nudged, flagged or escalated", async () => {
+  const at = new Date(T0).toISOString();
+  await deps(T0).registry.write({ ...lane, status: "done-claimed", claim: { at, evidence: "PR green", emitted: true, pulls: [] } });
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "idle" }];
+  for (const min of [16, 50, 120, 300]) expect(await freshnessTick(deps(T0 + min * MIN))).toEqual([]);
+  expect(sent(world)).toEqual([]);
+  expect(posts()).toEqual([]);
+});
+
 test("an idle silent lane is still nudged, and nothing is posted from its pane", async () => {
   await deps(T0).registry.write(lane);
   world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "idle" }];

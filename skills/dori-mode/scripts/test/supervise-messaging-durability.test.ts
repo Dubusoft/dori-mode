@@ -74,7 +74,7 @@ test.each(["lead-digest", "engine-only"] as const)("enqueue commits a %s event i
   const f = fixture();
   const posted: string[] = [];
   const supervisor = new Supervisor({
-    ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: cls } }) },
+    ...f.deps, tunables: { ...f.deps.tunables, eventPolicy: resolveEventPolicy({ kinds: { CUSTOM: cls } }) },
   }, { announce: async (text) => { posted.push(text); } });
   cleanups.unshift(() => supervisor.close());
   const save = spyOn(supervisor["core"].store, "save");
@@ -182,8 +182,10 @@ test("handled CLI persists task count and reply coverage through the real comman
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner alpha beta");
+  // Acked first, so the command needs no Discord call.
+  recordAck(f.state.dir, "11", "22", f.clock.now());
   const config = join(f.state.dir, "config.json");
-  const persisted = { ...Object.fromEntries(Object.entries(f.deps.config).filter(([key]) => (CONFIG_FILE_KEYS as readonly string[]).includes(key))), memoryCheck: { repo: f.deps.config.memoryCheck.repo } };
+  const persisted = Object.fromEntries(Object.entries(f.deps.config).filter(([key]) => (CONFIG_FILE_KEYS as readonly string[]).includes(key)));
   writeFileSync(config, JSON.stringify(persisted));
   // When the lead declares two tasks and links one reply through the CLI.
   const child = Bun.spawn([process.execPath, "src/cli.ts", "handled", "11", "22", "--tasks", "2", "--reply"], {

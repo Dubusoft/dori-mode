@@ -38,8 +38,8 @@ const runner: Runner = async (argv, opts) => {
 const update = (branch: "main" | "dev", force = false) =>
   updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l) }, { packageDir: pkg, branch, force });
 
-const updateWith = (refreshGuardAgents: () => Promise<number>, branch: "main" | "dev") =>
-  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), refreshGuardAgents }, { packageDir: pkg, branch, force: false });
+const updateWith = (upgradeRunners: () => Promise<number>, branch: "main" | "dev") =>
+  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), upgradeRunners }, { packageDir: pkg, branch, force: false });
 
 beforeEach(async () => {
   dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "dori-update-"));
@@ -62,7 +62,8 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 test("nothing new: UP_TO_DATE, no restart; --force restarts anyway", async () => {
   expect(await update("dev")).toBe(0);
-  expect(lines.at(-1)).toMatch(/^UP_TO_DATE dev [0-9a-f]{7}$/);
+  expect(lines.at(-2)).toMatch(/^UP_TO_DATE dev [0-9a-f]{7}$/);
+  expect(lines.at(-1)).toBe("UPDATE_SUMMARY changed: none; failed: none");
   expect(calls).toEqual(["bun update pi-quota"]);
   expect(await update("dev", true)).toBe(0);
   expect(calls).toContain("systemctl --user restart dori-supervisor.service");
@@ -77,20 +78,22 @@ test("switches dev -> main, keeps local changes, installs on a lockfile change, 
   expect(await update("main")).toBe(0);
   const now = (await sh(install, "git", "rev-parse", "HEAD")).slice(0, 7);
   expect(lines).toContain("BRANCH_SWITCH dev -> main");
-  expect(lines.at(-1)).toBe(`UPDATED main ${old}..${now} supervisor=active`);
+  expect(lines.at(-2)).toBe(`UPDATED main ${old}..${now} supervisor=active`);
+  expect(lines.at(-1)).toBe(`UPDATE_SUMMARY changed: checkout ${old}..${now}, dependencies, supervisor restarted; failed: none`);
   expect(readFileSync(join(install, "local.txt"), "utf8")).toBe("untracked\n");
   expect(await sh(install, "git", "stash", "list")).toBe("");
   expect(calls).toEqual(["bun install --frozen-lockfile", "bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
 });
 
-test("guard agents are refreshed on UP_TO_DATE and on UPDATED, and a failure or exception keeps the exit code", async () => {
+test("workers are migrated on UP_TO_DATE and on UPDATED, and a failure or exception is summarized and exits 2", async () => {
   let n = 0;
-  expect(await updateWith(async () => { n++; return 2; }, "dev")).toBe(0);
+  expect(await updateWith(async () => { n++; return 1; }, "dev")).toBe(2);
   expect(n).toBe(1);
+  expect(lines.at(-1)).toBe("UPDATE_SUMMARY changed: none; failed: runners exit 1");
   await commit(origin, "notes.txt", "two\n");
-  expect(await updateWith(async () => { n++; throw new Error("boom"); }, "main")).toBe(0);
+  expect(await updateWith(async () => { n++; throw new Error("boom"); }, "main")).toBe(2);
   expect(n).toBe(2);
-  expect(lines).toContain("WARN guard agents: boom");
+  expect(lines).toContain("WARN runners: boom");
   expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
 });
 
@@ -99,8 +102,9 @@ test("the lane sandbox is refreshed on UP_TO_DATE and on UPDATED, its line logge
     updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), refreshLaneSandbox }, { packageDir: pkg, branch, force: false });
   expect(await sandbox(() => "LANE_SANDBOX_UPDATED x", "dev")).toBe(0);
   expect(lines).toContain("LANE_SANDBOX_UPDATED x");
+  expect(lines.at(-1)).toBe("UPDATE_SUMMARY changed: lane sandbox; failed: none");
   await commit(origin, "notes.txt", "two\n");
-  expect(await sandbox(() => { throw new Error("EACCES"); }, "main")).toBe(0);
+  expect(await sandbox(() => { throw new Error("EACCES"); }, "main")).toBe(2);
   expect(lines).toContain("WARN lane sandbox: EACCES");
   expect(lines.some((l) => l.startsWith("UPDATED main "))).toBe(true);
 });
@@ -111,18 +115,50 @@ test("the boot-prep script is refreshed before the restart, its line logged and 
   expect(await boot(() => "BOOT_PREP_UPDATED x", "dev")).toBe(0);
   expect(lines).toContain("BOOT_PREP_UPDATED x");
   await commit(origin, "notes.txt", "two\n");
-  expect(await boot(() => { calls.push("boot"); throw new Error("EACCES"); }, "main")).toBe(0);
+  expect(await boot(() => { calls.push("boot"); throw new Error("EACCES"); }, "main")).toBe(2);
   expect(lines).toContain("WARN boot prep: EACCES");
   expect(calls.indexOf("boot")).toBeLessThan(calls.indexOf("systemctl --user restart dori-supervisor.service"));
 });
 
-test("guard agents are refreshed before the supervisor restarts", async () => {
+const migrate = (migrateConfig: () => Promise<{ code: number; output: string }>, branch: "main" | "dev") =>
+  updateInstall({ run: runner, sleep: async () => undefined, log: (l) => lines.push(l), migrateConfig }, { packageDir: pkg, branch, force: false });
+
+test("config.json is migrated once on UP_TO_DATE, before the restart on UPDATED, and a throw kept as a WARN that exits 2", async () => {
+  let n = 0;
+  expect(await migrate(async () => { n++; return { code: 0, output: "SETUP_MIGRATE_DONE\n" }; }, "dev")).toBe(0);
+  expect(n).toBe(1);
   await commit(origin, "notes.txt", "two\n");
-  expect(await updateWith(async () => { calls.push("refresh"); return 0; }, "main")).toBe(0);
-  expect(calls).toEqual(["bun update pi-quota", "refresh", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
+  expect(await migrate(async () => { calls.push("migrate"); return { code: 0, output: "" }; }, "main")).toBe(0);
+  expect(calls.filter((c) => c === "migrate")).toHaveLength(1);
+  expect(calls.indexOf("migrate")).toBeLessThan(calls.indexOf("systemctl --user restart dori-supervisor.service"));
+  await commit(origin, "notes.txt", "three\n");
+  expect(await migrate(async () => { throw new Error("boom"); }, "main")).toBe(2);
+  expect(lines).toContain("WARN config migrate: boom");
+  expect(lines.at(-2)).toMatch(/^UPDATED main /);
+  expect(lines.at(-1)).toMatch(/; failed: config migrate$/);
 });
 
-test("guard agents are not refreshed when the update fails", async () => {
+test("a degraded migrate (exit 2) still restarts, lists the changed and missing keys, and exits 2", async () => {
+  await commit(origin, "notes.txt", "two\n");
+  const output = "SETUP_KEY_REMOVED laneThinking (no longer read from config.json)\nSETUP_CONFIG_BACKUP /c.json.bak\n" +
+    "SETUP_KEY_SET stateDir\nSETUP_KEY_MISSING botToken [required]\nSETUP_MIGRATE_DONE with problems: config\n";
+  expect(await migrate(async () => ({ code: 2, output }), "main")).toBe(2);
+  expect(calls).toContain("systemctl --user restart dori-supervisor.service");
+  expect(lines.at(-1)).toMatch(/^UPDATE_SUMMARY changed: checkout [0-9a-f]{7}\.\.[0-9a-f]{7}, config laneThinking removed, config stateDir set, supervisor restarted; failed: config migrate exit 2 \(botToken missing\)$/);
+});
+
+test("workers are migrated only after the restarted supervisor is active", async () => {
+  await commit(origin, "notes.txt", "two\n");
+  expect(await updateWith(async () => { calls.push("migrate"); return 0; }, "main")).toBe(0);
+  expect(calls).toEqual(["bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service", "migrate"]);
+  await commit(origin, "notes.txt", "three\n");
+  unitState = "failed";
+  calls = [];
+  expect(await updateWith(async () => { calls.push("migrate"); return 0; }, "main")).toBe(1);
+  expect(calls).not.toContain("migrate");
+});
+
+test("workers are not migrated when the update fails", async () => {
   await sh(install, "git", "checkout", "-q", "main");
   await commit(install, "mine.txt", "local commit\n");
   await commit(origin, "notes.txt", "upstream\n");
@@ -137,7 +173,8 @@ test("a newer pi-quota restarts the supervisor without a new commit and leaves t
   const head = (await sh(install, "git", "rev-parse", "HEAD")).slice(0, 7);
   expect(await update("dev")).toBe(0);
   expect(lines).toContain(`PI_QUOTA_UPDATED ${pkg}`);
-  expect(lines.at(-1)).toBe(`UPDATED dev ${head}..${head} supervisor=active`);
+  expect(lines.at(-2)).toBe(`UPDATED dev ${head}..${head} supervisor=active`);
+  expect(lines.at(-1)).toBe("UPDATE_SUMMARY changed: pi-quota, supervisor restarted; failed: none");
   expect(calls).toEqual(["bun update pi-quota", "systemctl --user restart dori-supervisor.service", "systemctl --user is-active dori-supervisor.service"]);
   expect(await sh(install, "git", "status", "--porcelain")).toBe("");
 });
@@ -146,7 +183,8 @@ test("a supervisor that is not active afterwards exits 1", async () => {
   unitState = "failed";
   await commit(origin, "notes.txt", "two\n");
   expect(await update("main")).toBe(1);
-  expect(lines.at(-1)).toMatch(/ supervisor=failed$/);
+  expect(lines.at(-2)).toMatch(/ supervisor=failed$/);
+  expect(lines.at(-1)).toMatch(/; failed: supervisor=failed$/);
 });
 
 test("a stash that does not reapply stops, keeps the stash and does not restart", async () => {

@@ -54,6 +54,8 @@ type CloseInteraction = {
   readonly guild_id: string;
   readonly userId: string;
   readonly threadId: string;
+  /** The message carrying the button, when Discord sent it: a late click disables the button through it. */
+  readonly messageId?: string;
 };
 
 const closeInteraction = (value: unknown): CloseInteraction | undefined => {
@@ -61,7 +63,8 @@ const closeInteraction = (value: unknown): CloseInteraction | undefined => {
   const threadId = CLOSE_THREAD.exec(value.data.custom_id)?.[1];
   if (!threadId || typeof value.id !== "string" || typeof value.token !== "string" || typeof value.application_id !== "string" || typeof value.guild_id !== "string") return;
   if (!record(value.member) || !record(value.member.user) || typeof value.member.user.id !== "string") return;
-  return { id: value.id, token: value.token, application_id: value.application_id, guild_id: value.guild_id, userId: value.member.user.id, threadId };
+  const messageId = record(value.message) && typeof value.message.id === "string" ? value.message.id : undefined;
+  return { id: value.id, token: value.token, application_id: value.application_id, guild_id: value.guild_id, userId: value.member.user.id, threadId, ...(messageId ? { messageId } : {}) };
 };
 
 const commandInteraction = (value: unknown): Interaction | undefined => {
@@ -92,8 +95,8 @@ export class DiscordCommands {
     private readonly config: DiscordConfig,
     private readonly lookup: QuotaLookup,
     private readonly deadline: () => AbortSignal = () => AbortSignal.timeout(20_000),
-    /** Channels this Dori owns; empty answers everywhere. */
-    private readonly channels: readonly string[] = [],
+    /** Channels this Dori owns, or a function read per interaction (the supervisor's live config); empty answers everywhere. */
+    private readonly ownChannels: readonly string[] | (() => readonly string[]) = [],
     /** The /status text source; without it /status is ignored. */
     private readonly statusLookup?: StatusLookup,
     /** Told about each thread the owner's close button archived; without it the close is only logged. */
@@ -123,26 +126,41 @@ export class DiscordCommands {
    * A close-thread button click, handled in code: a non-owner gets an ephemeral refusal; the owner's click is answered
    * at once by updating the message (button disabled), then the thread is archived and `threadClosed` is told. A failed
    * archive re-enables the button so the owner can retry.
+   *
+   * An owner click whose acknowledgement fails is still carried out: a click made while the supervisor was restarting
+   * reaches the next process when it resumes the gateway session, past Discord's 3 s answer window. Then the button
+   * message is disabled with the bot's own token and the thread archived, so the click takes effect late instead of
+   * being lost.
    */
   private async closeThread(interaction: CloseInteraction): Promise<void> {
     if (interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId) return;
     const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
+    if (interaction.userId !== this.config.ownerId) {
+      await this.request("POST", callback, { type: 4, data: { flags: 64, content: "스레드 닫기는 오너만 할 수 있습니다." } })
+        .catch(() => { console.error("Discord close-thread acknowledgement failed"); });
+      return;
+    }
+    let late = false;
     try {
-      if (interaction.userId !== this.config.ownerId) {
-        await this.request("POST", callback, { type: 4, data: { flags: 64, content: "스레드 닫기는 오너만 할 수 있습니다." } });
-        return;
-      }
       await this.request("POST", callback, { type: 7, data: { components: closeRow(interaction.threadId, true) } });
     } catch {
-      console.error("Discord close-thread acknowledgement failed");
-      return;
+      late = true;
+      console.error(`Discord close-thread acknowledgement failed ${interaction.threadId}; closing it anyway`);
+    }
+    const message = interaction.messageId ? `/channels/${interaction.threadId}/messages/${interaction.messageId}` : undefined;
+    // A late click edits the bot's own message before the archive: an archived thread's messages cannot be edited.
+    if (late && message) {
+      await this.request("PATCH", message, { components: closeRow(interaction.threadId, true) }, true)
+        .catch(() => { console.error(`Discord close-thread button disable failed ${interaction.threadId}`); });
     }
     try {
       await this.request("PATCH", `/channels/${interaction.threadId}`, { archived: true }, true);
     } catch {
       console.error(`Discord close-thread archive failed ${interaction.threadId}`);
-      await this.request("PATCH", `/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`, { components: closeRow(interaction.threadId, false) })
-        .catch(() => { console.error("Discord close-thread button restore failed"); });
+      const restore = !late
+        ? this.request("PATCH", `/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`, { components: closeRow(interaction.threadId, false) })
+        : message ? this.request("PATCH", message, { components: closeRow(interaction.threadId, false) }, true) : Promise.resolve();
+      await restore.catch(() => { console.error("Discord close-thread button restore failed"); });
       return;
     }
     await this.threadClosed?.(interaction.threadId, interaction.id).catch(() => { console.error(`Discord close-thread event failed ${interaction.threadId}`); });
@@ -190,7 +208,8 @@ export class DiscordCommands {
     const label = interaction.command === "status" ? "Status" : "Quota";
     const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
     try {
-      if (this.channels.length > 0 && !interaction.channelIds.some((id) => this.channels.includes(id))) {
+      const channels = typeof this.ownChannels === "function" ? this.ownChannels() : this.ownChannels;
+      if (channels.length > 0 && !interaction.channelIds.some((id) => channels.includes(id))) {
         await this.request("POST", callback, { type: 4, data: { flags: 64, content: `이 채널은 다른 Dori의 채널입니다. 해당 Dori 봇의 /${interaction.command}를 사용해 주세요.` } });
         return;
       }

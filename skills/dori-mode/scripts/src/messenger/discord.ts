@@ -13,6 +13,13 @@ const retryAfter = (body: string): number | undefined => {
 };
 
 export const DISCORD_MESSAGE_LIMIT = 2000;
+/** Message flag that posts without a push or desktop notification (Discord's SUPPRESS_NOTIFICATIONS). */
+export const DISCORD_SUPPRESS_NOTIFICATIONS = 1 << 12;
+/** Most messages one `GET /channels/{id}/messages` returns. */
+export const DISCORD_MESSAGES_PAGE = 100;
+
+/** A message as `Discord.messagesAfter` reads it: its id, Discord message type (0 is a plain message), author and text. */
+export type DiscordMessage = { readonly id: string; readonly type: number; readonly authorId: string; readonly content: string };
 const FENCE = /^\s*(```+|~~~+)/;
 
 /** The fence opener still open at the end of `text` (starting with `open`), or undefined when balanced. */
@@ -82,14 +89,14 @@ export class Discord {
    * Ordered chunks; returns the first id. Retries reuse nonces within Discord's few-minute dedupe window.
    * Without a stable id, identical content in the same channel is treated as a retry; use distinct ids for repeats.
    */
-  async send(channelId: string, content: string, stableId?: string, components?: readonly unknown[]): Promise<string> {
+  async send(channelId: string, content: string, stableId?: string, components?: readonly unknown[], flags?: number): Promise<string> {
     let first: string | undefined;
     const chunks = splitDiscordMessage(guardText(content));
     for (const [index, chunk] of chunks.entries()) {
       const nonce = createHash("sha256").update(JSON.stringify([channelId, stableId ?? content, index])).digest("hex").slice(0, 25);
       // Components (buttons) ride on the last chunk, under the whole text.
       const extra = components && index === chunks.length - 1 ? { components } : {};
-      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true, ...extra })).id;
+      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true, ...extra, ...(flags ? { flags } : {}) })).id;
       first ??= id;
     }
     return first ?? "";
@@ -114,6 +121,36 @@ export class Discord {
 
   async edit(channelId: string, messageId: string, content: string): Promise<void> {
     await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(content) });
+  }
+
+  async deleteMessage(channelId: string, messageId: string): Promise<void> {
+    await this.call("DELETE", `/channels/${channelId}/messages/${messageId}`);
+  }
+
+  /** Up to DISCORD_MESSAGES_PAGE messages posted in `channelId` after message `afterId`, as Discord returns them. */
+  async messagesAfter(channelId: string, afterId: string): Promise<DiscordMessage[]> {
+    const raw = await this.call<readonly { id?: unknown; type?: unknown; content?: unknown; author?: { id?: unknown } }[]>("GET", `/channels/${channelId}/messages?after=${afterId}&limit=${DISCORD_MESSAGES_PAGE}`);
+    return raw.map((m) => ({
+      id: String(m.id), type: typeof m.type === "number" ? m.type : -1,
+      authorId: typeof m.author?.id === "string" ? m.author.id : "", content: typeof m.content === "string" ? m.content : "",
+    }));
+  }
+
+  private self: Promise<string> | undefined;
+
+  /** The bot's own user id (GET /users/@me), read once per client; a failed read is retried on the next call. */
+  selfId(): Promise<string> {
+    this.self ??= this.call<{ id?: unknown }>("GET", "/users/@me").then((me) => {
+      if (typeof me.id !== "string") throw new Error("discord /users/@me: no id");
+      return me.id;
+    }).catch((e: unknown) => { this.self = undefined; throw e; });
+    return this.self;
+  }
+
+  /** A message's current text. */
+  async content(channelId: string, messageId: string): Promise<string> {
+    const content = (await this.call<{ content?: unknown }>("GET", `/channels/${channelId}/messages/${messageId}`)).content;
+    return typeof content === "string" ? content : "";
   }
 
   async react(channelId: string, messageId: string, emoji: string): Promise<void> {
@@ -171,9 +208,22 @@ export class Discord {
 
   /** Reads a thread back: whether Discord reports it archived. A channel that is not a thread is an error. */
   async threadArchived(threadId: string): Promise<boolean> {
-    const archived = (await this.call<{ thread_metadata?: { archived?: unknown } }>("GET", `/channels/${threadId}`)).thread_metadata?.archived;
+    return (await this.threadState(threadId)).archived;
+  }
+
+  /**
+   * Reads a thread back: whether it is archived, its parent channel (undefined when Discord names none) and the id of its
+   * last message (`last_message_id`, which may name a deleted message; undefined when Discord gives none). A channel that
+   * is not a thread is an error.
+   */
+  async threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined; readonly lastMessageId?: string | undefined }> {
+    const channel = await this.call<{ thread_metadata?: { archived?: unknown }; parent_id?: unknown; last_message_id?: unknown }>("GET", `/channels/${threadId}`);
+    const archived = channel.thread_metadata?.archived;
     if (typeof archived !== "boolean") throw new Error(`discord channel ${threadId} is not a thread`);
-    return archived;
+    return {
+      archived, parent: typeof channel.parent_id === "string" && channel.parent_id ? channel.parent_id : undefined,
+      lastMessageId: typeof channel.last_message_id === "string" && channel.last_message_id ? channel.last_message_id : undefined,
+    };
   }
 }
 
@@ -214,7 +264,12 @@ type GatewayOptions = {
   readonly random?: () => number;
   /** A close code no reconnect can fix (see DISCORD_FATAL_CLOSE): the gateway stops reconnecting and calls this once. */
   readonly onFatal?: (code: number, reason: string) => void;
+  /** A session an earlier process left (see GatewaySession): the first connect RESUMEs it, so Discord replays what it missed. */
+  readonly resume?: GatewaySession;
 };
+
+/** What RESUME needs: the session id, the last sequence number seen and the session's resume gateway URL. */
+export type GatewaySession = { readonly session: string; readonly seq: number; readonly url: string };
 
 /**
  * Close codes Discord documents as not to be reconnected after: retrying only burns the daily IDENTIFY budget until
@@ -240,9 +295,9 @@ export const discordPresence = (
   options: GatewayOptions = {},
 ) => {
   let ws: GatewaySocket | undefined;
-  let seq: number | null = null;
-  let session: string | undefined;
-  let resumeUrl: string | undefined;
+  let seq: number | null = options.resume?.seq ?? null;
+  let session: string | undefined = options.resume?.session;
+  let resumeUrl: string | undefined = options.resume?.url;
   let beat: unknown;
   let firstBeat: unknown;
   let retry: unknown;
@@ -404,6 +459,10 @@ export const discordPresence = (
     /** The fatal close code that stopped reconnecting, if any. */
     get fatal() { return fatal; },
     async settled() { await Promise.all(handlers); },
+    /** The session a later process can resume, when this one has a READY session. */
+    session(): GatewaySession | undefined {
+      return session !== undefined && seq !== null && resumeUrl !== undefined ? { session, seq, url: resumeUrl } : undefined;
+    },
     close() {
       stopped = true;
       clearConnection();

@@ -61,14 +61,14 @@ export class Delivery {
         this.outcomes.markDelivered();
         continue;
       }
-      const policy = this.deps.config.eventPolicy;
+      const policy = this.deps.tunables.eventPolicy;
       // engine-only events stay in the journal (dedupe, counts) but never reach the lead.
       const pending = this.journal.events.filter((event) => !this.delivered.has(event.id) && forLead(eventClass(event.line, policy)));
       const request = pendingLeadRestart(this.deps.config.stateDir);
       if (request) {
         const pane = await readPane();
         if (!pane) throw new TransientSuperviseError(`lead pane ${this.deps.config.leadPane} does not exist`);
-        const cwd = pane.cwd ?? this.deps.config.defaultCwd;
+        const cwd = pane.cwd ?? this.deps.config.leadCwd;
         const models = request.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ");
         if ((!pane.agent || pane.agent_status === "idle" || pane.agent_status === "done") &&
             !(pane.agent && await this.lead.deferForChildren(cwd, "request", `${request.id} ${models}`))) {
@@ -81,7 +81,7 @@ export class Delivery {
       // event has waited digestMaxDelayMin. It survives a supervisor restart in the existing durable inbox.
       const now = this.deps.clock.now();
       // A sweep warning waits for real traffic: a failure that persists must not restart an idle lead every hour.
-      const overdue = (event: Event) => event.at !== undefined && now - event.at >= this.deps.config.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line);
+      const overdue = (event: Event) => event.at !== undefined && now - event.at >= this.deps.tunables.digestMaxDelayMin * 60_000 && !/^\S*_WARN\b/.test(event.line);
       // A finish event that joined its lane's record with nothing new (a merge after the claim) waits like digest.
       const urgent = pending.filter((event) => eventPriority(event.line, policy) === "urgent" && !this.outcomes.quiet(event.id));
       const due = urgent.length > 0 || pending.some(overdue);
@@ -110,7 +110,7 @@ export class Delivery {
         this.outcomes.markDelivered();
         continue;
       }
-      const cwd = pane.cwd ?? this.deps.config.defaultCwd;
+      const cwd = pane.cwd ?? this.deps.config.leadCwd;
       // A LEAD_UNRESPONSIVE alone says the restart cap holds: it must not cold-start the lead the cap spares.
       const capped = pending.every((event) => event.line.startsWith("LEAD_UNRESPONSIVE "));
       const cold = pane.agent ? (capped ? undefined : await this.lead.coldReason(cwd)) : { kind: "no-agent", detail: `no agent runs in lead pane ${pane.pane_id}`, tokens: 0 };

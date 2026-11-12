@@ -13,7 +13,7 @@ Dori 모드는 코딩 에이전트 세션 하나를 늘 켜져 있는 메신저 
 ## 설치
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 저장소를 `~/.dori/src`에 받고, 스킬을 `~/.agents/skills/dori-mode`에 링크하고, `bun link`로 `dori`를 PATH에 올린 뒤 `dori setup`을 실행합니다. 에이전트가 다른 곳에서 스킬을 읽는다면 `SKILLS_DIR`를 지정하세요.
@@ -58,7 +58,7 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 
 | 항목 | 뜻 |
 |---|---|
-| `defaultCwd` | 레인이 시작하는 디렉터리이자, 레인이 worktree를 만드는 저장소 |
+| `leadCwd` | 레인이 시작하는 디렉터리이자, 레인이 worktree를 만드는 저장소 |
 | `agentCommand` | 에이전트 실행 명령. `{model}`, `{prompt}`가 들어간 argv 목록 |
 | `hooks.threadReply` | 메신저 CLI를 `{thread}`, `{text}`가 들어간 argv 목록으로. 레인 진행 상황을 올릴 때 씁니다. |
 
@@ -129,7 +129,7 @@ watcher는 레인을 닫을 때 셸 없이 이 확인을 직접 다시 돌리고
 | `dori watch` | 자동 닫기 watcher. 지속 모니터로 돌립니다 |
 | `dori freshness [--loop MIN]` | 조용해진 레인을 깨우고, 깨운 뒤에도 조용하면 리드에게 올리고, 마지막 보고를 스레드에 올림 |
 | `dori dead-panes [--loop MIN]` | 멈춘 에이전트 pane 보고 |
-| `dori guard [--loop MIN]` | 부하, 메모리, 디스크, pane 수 경고, 작업 머신별로도 (`guard install`, `guard machines`) |
+| `dori guard [--loop MIN]` | 부하, 메모리, 디스크, pane 수 경고, 러너 머신별로도 (러너 샘플 기준, `dori status`에 표시) |
 | `dori heavy <label> -- <cmd>` | 슬롯이 비고 부하가 낮을 때만 빌드, 테스트, 에뮬레이터 실행 (머신당 하나) |
 
 pane에 보내는 글은 항상 인자 하나로 넘기고 셸 문자열을 거치지 않습니다. 전송 결과는 전달됨 또는 미확인으로 보고합니다.

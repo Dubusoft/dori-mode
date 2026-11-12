@@ -8,6 +8,7 @@ import { checklistLine, EVENT_LOG, InboxError, readCarried, readCursorFile, take
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { BUILT_IN } from "../src/tunables.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -88,7 +89,7 @@ test("the supervisor consumes take receipts in every mode: cursor file first, th
 });
 
 test("delivery config: the defaults are safe, unsafe timings are refused, and a delivery key in the file is ignored", async () => {
-  const base = defaultConfig().delivery;
+  const base = BUILT_IN.delivery;
   expect("mode" in base).toBe(false);
   expect(deliveryConfigError(base)).toBeUndefined();
   expect(deliveryConfigError({ ...base, push: { ...base.push, ackSec: 5 } })).toContain("ackSec");
@@ -97,8 +98,7 @@ test("delivery config: the defaults are safe, unsafe timings are refused, and a 
   const dir = state();
   const path = join(dir, "config.json");
   writeFileSync(path, JSON.stringify({ delivery: { mode: "shadow", push: { ackSec: 60, debounceMs: 2000 } } }));
-  const loaded = await loadConfig(path, dir);
-  expect(loaded.delivery).toEqual(base);
+  expect("delivery" in await loadConfig(path, dir)).toBe(false);
 });
 
 test("the sqlite store keeps inbox and forcedRestarts, and a version 3 database is migrated to hold them", () => {
@@ -245,6 +245,15 @@ test("unreadAfterAck caps each channel and counts the overflow, prints each chan
     "UNREAD_MORE 11 2",
     "UNREAD_NONE 44",
   ]);
+});
+
+test("unreadAfterAck keeps the channel name token last, outside the cut preview, and on UNREAD_MORE", () => {
+  const dir = state();
+  log(dir, line("discord:11:2", `INBOUND 11 2 owner ${"x".repeat(400)} channel=#일반/작업`)
+    + line("discord:11:3", "INBOUND 11 3 owner short channel=#일반/작업"));
+  const [first, more] = unreadAfterAck(dir, [{ channel: "11", message: "1" }], 1);
+  expect(first).toEndWith("x... channel=#일반/작업");
+  expect(more).toBe("UNREAD_MORE 11 1 channel=#일반/작업");
 });
 
 test("unreadAfterAck cuts a long preview and reports UNREAD_UNAVAILABLE instead of throwing without a cursor or on a read failure", () => {

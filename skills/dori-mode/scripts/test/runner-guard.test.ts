@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { RunnerGuardBoard } from "../src/runner/guard.ts";
 import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
-import { agentLine, guardWorld as world, type Reading, runnerSample } from "./runner-guard-world.ts";
+import { guardWorld as world, type Reading, runnerSample } from "./runner-guard-world.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
-const guardWorld = (withBoard: boolean) => world(withBoard, cleanups);
+const guardWorld = () => world(cleanups);
 
 const READINGS: readonly Reading[] = [
   { load1: 200, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 2 },
@@ -13,29 +13,23 @@ const READINGS: readonly Reading[] = [
   { load1: 3, memFreePct: 60, diskFreeGb: 120, swapFreeGb: 2.5 },
 ];
 
-test("HOST_GUARD lines built from runner samples are the lines the ssh path writes", async () => {
-  const legacy = guardWorld(false);
-  const viaRunner = guardWorld(true);
-  const legacyLines: string[] = [];
-  const runnerLines: string[] = [];
+test("HOST_GUARD ALERT and CLEAR lines come from the runner's samples", async () => {
+  const w = guardWorld();
+  const lines: string[] = [];
   for (const r of READINGS) {
-    legacy.setSsh(() => agentLine(r));
-    legacyLines.push(...await legacy.tick());
-    viaRunner.board.event("mac", runnerSample(r, viaRunner.clock.now()));
-    runnerLines.push(...await viaRunner.tick());
-    legacy.clock.at += 30_000;
-    viaRunner.clock.at += 30_000;
+    w.board.event("mac", runnerSample(r, w.clock.now()));
+    lines.push(...await w.tick());
+    w.clock.at += 30_000;
   }
-  expect(runnerLines).toEqual(legacyLines);
-  expect(runnerLines).toEqual([
+  expect(lines).toEqual([
     "HOST_GUARD ALERT machine=mac load 200 > 150",
     "HOST_GUARD CLEAR machine=mac load 3, memory free 60%, disk free 120 GB, swap free 2.5 GB",
   ]);
-  expect(viaRunner.sshCalls()).toBe(0);
+  expect(w.sshCalls()).toBe(0);
 });
 
 test("a runner's own kill becomes the HOST_GUARD CRITICAL line, with nothing killed over ssh", async () => {
-  const w = guardWorld(true);
+  const w = guardWorld();
   const crit = { load1: 4, memFreePct: 3, diskFreeGb: 100, swapFreeGb: 1 };
   w.board.event("mac", runnerSample(crit, w.clock.now()));
   w.board.event("mac", {
@@ -47,32 +41,6 @@ test("a runner's own kill becomes the HOST_GUARD CRITICAL line, with nothing kil
   expect(w.sshCalls()).toBe(0);
 });
 
-test("OFFLINE and ONLINE read the same when the runner goes quiet and comes back", async () => {
-  const legacy = guardWorld(false);
-  const viaRunner = guardWorld(true);
-  const lines = { legacy: [] as string[], runner: [] as string[] };
-  for (const w of [legacy, viaRunner]) w.setSsh(() => ({ code: 255, out: "", err: "ssh: connect to host mac port 22: No route to host" }));
-  for (let i = 0; i < 2; i++) {
-    lines.legacy.push(...await legacy.tick());
-    lines.runner.push(...await viaRunner.tick());
-    legacy.clock.at += 120_000;
-    viaRunner.clock.at += 120_000;
-  }
-  // Past the 4 min backoff that the second failure set.
-  legacy.clock.at += 240_000;
-  viaRunner.clock.at += 240_000;
-  const back = READINGS[2] as Reading;
-  legacy.setSsh(() => agentLine(back));
-  lines.legacy.push(...await legacy.tick());
-  viaRunner.board.event("mac", runnerSample(back, viaRunner.clock.now()));
-  lines.runner.push(...await viaRunner.tick());
-  expect(lines.runner).toEqual(lines.legacy);
-  expect(lines.runner).toEqual([
-    "HOST_GUARD OFFLINE machine=mac unreachable: ssh: connect to host mac port 22: No route to host",
-    "HOST_GUARD ONLINE machine=mac",
-  ]);
-});
-
 test("the board hands out a runner sample's pane count and per-lane memory with the sample", () => {
   let now = 1_000;
   const board = new RunnerGuardBoard(() => now);
@@ -81,9 +49,9 @@ test("the board hands out a runner sample's pane count and per-lane memory with 
     v: 1, runner: "local", gen: 1, epoch: 1, seq: 1, type: "guard.sample",
     body: { level: "ok", reasons: [], sampledAt: now, load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2, os: "linux", panes: 4, lanes },
   } as unknown as AnyRunnerEvent);
-  expect(board.sampleFor("local", () => "v1")).toEqual({
-    ok: true, sample: { version: "v1", os: "linux", load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2 }, panes: 4, lanes,
+  expect(board.sampleFor("local")).toEqual({
+    ok: true, sample: { os: "linux", load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 1, swapTotalGb: 2 }, panes: 4, lanes,
   });
   now += 100_000;
-  expect(board.sampleFor("local", () => "v1")).toBeUndefined();
+  expect(board.sampleFor("local")).toBeUndefined();
 });

@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultConfig } from "../src/config.ts";
-import { type Check, type DoctorDeps, doctorExit, renderDoctor, runDoctor, tokenFrom } from "../src/doctor.ts";
+import { defaultConfig, loadConfig } from "../src/config.ts";
+import { type Check, configSources, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks, tokenFrom } from "../src/doctor.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
+import { defaultRunnerDir, RUNNER_PATHS } from "../src/runner/fs-safety.ts";
 import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
 import { pendingLeadRestart } from "../src/lead-restart.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
@@ -20,6 +22,8 @@ const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); process.env.PATH = PATH; });
 
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
+/** A current wrapper's successful --check. */
+const checked = (): Ran => ok("DORI_LANE_FILES=1\n");
 const no = (out = "", code = 1): Ran => ({ code, out, err: "" });
 const pane = JSON.stringify({ result: { panes: [{ pane_id: "lead:p1", workspace_id: "w" }] } });
 const happyRun: Record<string, Ran> = {
@@ -54,7 +58,11 @@ const fixture = (patch: Patch = {}) => {
   mkdirSync(join(state.dir, ".dori", "runner"), { recursive: true });
   chmodSync(join(state.dir, ".dori", "runner"), 0o700);
   chmodSync(join(state.dir, ".dori"), 0o700);
-  const table = { ...happyRun, ...patch.run };
+  // A healthy Linux host: the current wrapper installed, bwrap on PATH, --check passing.
+  const wrapper = join(state.dir, ".local", "bin", "lane-sandbox");
+  mkdirSync(join(state.dir, ".local", "bin"), { recursive: true });
+  copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);
+  const table = { ...happyRun, [`${wrapper} --check`]: checked(), ...patch.run };
   const routes = { ...happyHttp, ...patch.http };
   const calls: string[] = [];
   const requests: HttpRequest[] = [];
@@ -79,9 +87,9 @@ const fixture = (patch: Patch = {}) => {
   mkdirSync(join(state.dir, "memory", "system"), { recursive: true });
   writeFileSync(join(state.dir, "memory", "system", "human.md"), "## Open\n- one item\n");
   const deps: DoctorDeps = {
-    run, http, clock, configPath: "/home/test/config.json", envPath: "/home/test/.dori/env", token: TOKEN, tokenSource: "file", exists: () => true, home: state.dir,
+    run, http, clock, configPath: "/home/test/config.json", envPath: "/home/test/.dori/env", token: TOKEN, tokenSource: "file", exists: () => true, home: state.dir, platform: "linux", which: () => "/usr/bin/bwrap",
     config: {
-      ...defaultConfig("/home/test"), stateDir: state.dir, defaultCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
+      ...defaultConfig("/home/test"), stateDir: state.dir, leadCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
       memoryCheck: { ...defaultConfig("/home/test").memoryCheck, repo: join(state.dir, "memory") },
       discordChannels: ["500"], discord: { applicationId: "100", guildId: "200", ownerId: "300" },
     },
@@ -114,23 +122,96 @@ test("doctor only reads: no unit changes and Discord is GET only", async () => {
 
 test("doctor warns when the installed lane sandbox differs from the template", async () => {
   const f = fixture();
-  const installed = join(f.deps.home, ".local", "bin", "lane-sandbox");
-  mkdirSync(join(f.deps.home, ".local", "bin"), { recursive: true });
-  mkdirSync(join(f.deps.home, ".dori", "runner"), { recursive: true });
-  chmodSync(join(f.deps.home, ".dori", "runner"), 0o700);
-  chmodSync(join(f.deps.home, ".dori"), 0o700);
-  writeFileSync(installed, "old sandbox");
-  const path = process.env.PATH;
-  process.env.PATH = `${join(f.deps.home, ".local", "bin")}:${path ?? ""}`;
-  const check = find(await runDoctor(f.deps), "lane sandbox");
+  writeFileSync(join(f.deps.home, ".local", "bin", "lane-sandbox"), "old sandbox");
+  const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? checked() : f.deps.run(argv, {})) }), "lane sandbox");
   expect(check).toMatchObject({ level: "WARN" });
   expect(check.detail).toContain("LANE_SANDBOX_OUTDATED");
-  process.env.PATH = path;
+});
+
+test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {
+  const f = fixture();
+  const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? ok() : f.deps.run(argv, {})) }), "lane sandbox");
+  expect(check).toMatchObject({ level: "FAIL", detail: expect.stringContaining("LANE_FILES_SANDBOX_OLD"), fix: expect.stringContaining("dori update") });
+});
+
+test("doctor fails when the lane-sandbox wrapper is not installed", async () => {
+  const f = fixture();
+  rmSync(join(f.deps.home, ".local", "bin", "lane-sandbox"));
+  const checks = await runDoctor(f.deps);
+  expect(find(checks, "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining("SANDBOX_MISSING"), fix: expect.stringContaining("dori update") });
+  expect(doctorExit(checks)).toBe(1);
+});
+
+test("doctor fails when bwrap is not on PATH", async () => {
+  const f = fixture({ deps: { which: () => undefined } });
+  const checks = await runDoctor(f.deps);
+  expect(find(checks, "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining("bwrap is not on PATH") });
+  expect(doctorExit(checks)).toBe(1);
+});
+
+test("doctor fails with the wrapper's stderr when lane-sandbox --check fails", async () => {
+  const f = fixture();
+  const wrapper = join(f.deps.home, ".local", "bin", "lane-sandbox");
+  const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? { code: 3, out: "", err: "lane-sandbox: bwrap cannot create a sandbox\n" } : f.deps.run(argv, {})) }), "lane sandbox");
+  expect(check).toMatchObject({ level: "FAIL", detail: expect.stringContaining(`${wrapper} --check failed: lane-sandbox: bwrap cannot create a sandbox`) });
+});
+
+test("on a Linux worker runner host doctor checks the wrapper dori runner install put in the runner's bin", async () => {
+  const f = fixture();
+  const runnerDir = defaultRunnerDir(f.deps.home);
+  writeFileSync(join(runnerDir, RUNNER_PATHS.identity), JSON.stringify({ label: "worker" }));
+  rmSync(join(f.deps.home, ".local", "bin", "lane-sandbox"));
+  expect(find(await runDoctor(f.deps), "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining(join(runnerDir, "bin", "lane-sandbox")), fix: expect.stringContaining("dori runner install") });
+  mkdirSync(join(runnerDir, "bin"), { recursive: true });
+  copyFileSync(LANE_SANDBOX_TEMPLATE, join(runnerDir, "bin", "lane-sandbox"));
+  const run = async (argv: readonly string[]) => (argv.join(" ") === `${join(runnerDir, "bin", "lane-sandbox")} --check` ? checked() : f.deps.run(argv, {}));
+  expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "OK" });
+});
+
+test("on a macOS worker runner host doctor checks the seatbelt wrapper in the runner's bin, without bwrap", async () => {
+  const f = fixture({ deps: { platform: "darwin", which: () => undefined } });
+  const runnerDir = defaultRunnerDir(f.deps.home);
+  const wrapper = join(runnerDir, "bin", "lane-sandbox");
+  writeFileSync(join(runnerDir, RUNNER_PATHS.identity), JSON.stringify({ label: "mini" }));
+  expect(find(await runDoctor(f.deps), "lane sandbox")).toMatchObject({ level: "FAIL", detail: expect.stringContaining(wrapper), fix: expect.stringContaining("dori runner install") });
+  mkdirSync(join(runnerDir, "bin"), { recursive: true });
+  copyFileSync(LANE_SANDBOX_MACOS_TEMPLATE, wrapper);
+  const run = async (argv: readonly string[]) => (argv.join(" ") === `${wrapper} --check` ? checked() : f.deps.run(argv, {}));
+  expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "OK", detail: expect.stringContaining("seatbelt") });
+  // The Linux wrapper on a Mac is outdated, not current.
+  copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);
+  expect(find(await runDoctor({ ...f.deps, run }), "lane sandbox")).toMatchObject({ level: "WARN", detail: expect.stringContaining("templates/lane-sandbox-macos.sh (LANE_SANDBOX_OUTDATED)"), fix: expect.stringContaining("dori runner install") });
+});
+
+test("doctor warns, without failing, that a Windows host's lanes run without a sandbox", async () => {
+  const f = fixture({ deps: { platform: "win32", which: () => undefined } });
+  rmSync(join(f.deps.home, ".local", "bin", "lane-sandbox"));
+  const check = find(await runDoctor(f.deps), "lane sandbox");
+  expect(check).toMatchObject({ level: "WARN", detail: expect.stringContaining("Windows has no lane sandbox") });
+});
+
+test("doctor names each runner opted into lanes without a sandbox", async () => {
+  const f = fixture({});
+  const checks = runnerChecks({ ...f.deps, config: { ...f.deps.config, runners: { mini: { allowUnsandboxed: true }, box: {} } } });
+  expect(checks.find((c) => c.id === "runner mini sandbox")).toMatchObject({ level: "WARN", detail: expect.stringContaining("runner mini is opted in with runners.mini.allowUnsandboxed, so its lanes run WITHOUT a sandbox") });
+  expect(checks.find((c) => c.id === "runner box sandbox")).toBeUndefined();
 });
 
 test("doctor warns when the obsolete local runner unit is enabled", async () => {
   const f = fixture({ run: { "systemctl --user is-enabled dori-runner.service": ok("enabled") } });
   expect(find(await runDoctor(f.deps), "runner unit")).toMatchObject({ level: "WARN", detail: expect.stringContaining("supervisor runs the local runner itself") });
+});
+
+test("doctor warns only when standalone guard agent files remain", async () => {
+  const f = fixture();
+  expect((await runDoctor(f.deps)).find((c) => c.id === "guard agent")).toBeUndefined();
+  const path = join(f.deps.home, ".dori", "guard-agent.sh");
+  writeFileSync(path, "legacy");
+  expect(find(await runDoctor(f.deps), "guard agent")).toMatchObject({
+    level: "WARN",
+    detail: expect.stringContaining("guard-agent.sh left from the old standalone guard agent; the runner reports this host now"),
+    fix: "the runner removes them when it starts (dori update on the lead restarts runners); or delete them",
+  });
 });
 
 test("doctor warns when a lead restart is pending without consuming it or touching the warm lead", async () => {
@@ -205,7 +286,7 @@ test("missing WorkingDirectory, missing dirs, missing config keys and a missing 
   const dirs = fixture({ deps: { exists: (p) => p === "/work" } });
   const c = await runDoctor(dirs.deps);
   expect(find(c, "stateDir")).toMatchObject({ level: "FAIL" });
-  expect(find(c, "defaultCwd").fix).toStartWith("mkdir -p ");
+  expect(find(c, "leadCwd").fix).toStartWith("mkdir -p ");
   const keys = fixture({ deps: { config: { ...fixture().deps.config, laneWorkspace: "", discordChannels: [], discord: { applicationId: "x", guildId: "200", ownerId: "300" } } } });
   const kc = await runDoctor(keys.deps);
   const k = find(kc, "config");
@@ -305,15 +386,15 @@ test("tokenFrom reads the env file forms and gatewayView ages with the injected 
   expect(gatewayView(s, 1000 + 61_000).state).toBe("stale");
 });
 
-test("memory check: memoryCheck.repo or omo's repo for defaultCwd, WARN over maxKb or when nothing is found", async () => {
+test("memory check: omo's repo for leadCwd, WARN over maxKb or when nothing is found", async () => {
   const f = fixture();
   const real = { ...f.deps, exists: existsSync };
   expect(find(await runDoctor(real), "memory check").level).toBe("OK");
   const discovered = { ...real, config: { ...real.config, memoryCheck: { ...real.config.memoryCheck, repo: "" } } };
   const missing = find(await runDoctor(discovered), "memory check");
   expect(missing.level).toBe("WARN");
-  expect(missing.fix).toContain("memoryCheck.repo");
-  const agent = join(f.deps.home, ".omo", "memory", "agents", `lead-${createHash("sha256").update(f.deps.config.defaultCwd).digest("hex").slice(0, 8)}`, "repo", "system");
+  expect(missing.fix).toContain("leadCwd");
+  const agent = join(f.deps.home, ".omo", "memory", "agents", `lead-${createHash("sha256").update(f.deps.config.leadCwd).digest("hex").slice(0, 8)}`, "repo", "system");
   mkdirSync(agent, { recursive: true });
   writeFileSync(join(agent, "human.md"), "x".repeat(16 * 1024));
   const over = find(await runDoctor(discovered), "memory check");
@@ -338,12 +419,17 @@ test("item 6: doctor fails on lanes whose recovery is exhausted and warns on lan
 });
 
 
-test("lane command keys: bad launchKeywords, massLaunchKeywords or laneThinking is WARN; the defaults say nothing", async () => {
-  const config = fixture().deps.config;
-  expect((await runDoctor(fixture().deps)).find((c) => c.id === "lane command")).toBeUndefined();
-  const bad = find(await runDoctor(fixture({ deps: { config: { ...config, launchKeywords: " ", massLaunchKeywords: "mass-ulw go?", laneThinking: 5 as unknown as string } } }).deps), "lane command");
-  expect(bad).toMatchObject({ level: "WARN" });
-  expect(bad.detail).toContain("launchKeywords");
-  expect(bad.detail).toContain("massLaunchKeywords");
-  expect(bad.detail).toContain("laneThinking");
+test("doctor names each config value's source: file, default, env or derived, and warns on keys it does not read", async () => {
+  const f = fixture();
+  const path = join(f.deps.home, "config.json");
+  writeFileSync(path, JSON.stringify({ defaultModel: "p/m", discordChannels: ["500"], laneThinking: "high" }));
+  const config = await loadConfig(path, f.deps.home);
+  const checks = configSources({ ...f.deps, config, configPath: path, env: { DORI_STATE_DIR: config.stateDir } });
+  expect(find(checks, "config.defaultModel").detail).toStartWith("file: ");
+  expect(find(checks, "config.worktreeRoot").detail).toBe('default: ""');
+  expect(find(checks, "config.stateDir").detail).toStartWith("env DORI_STATE_DIR: ");
+  expect(find(checks, "config.alertsChannel").detail).toBe('derived from discordChannels[0]: "500"');
+  expect(find(checks, "config.store").detail).toStartWith("derived from ");
+  expect(find(checks, "config.leadThinking").detail).toBe("unset: (none)");
+  expect(find(checks, "config ignored keys")).toMatchObject({ level: "WARN", detail: expect.stringContaining("laneThinking") });
 });

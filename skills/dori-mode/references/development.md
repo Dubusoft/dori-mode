@@ -12,7 +12,7 @@ bun test             # behavior tests with fake herdr/git/gh; nothing real is to
 bunx tsc --noEmit    # typecheck
 ```
 
-Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` signals (npm for `published`). The `command`, `file` and `url` signals need nothing extra. The full list of signal kinds is in [sessions.md](sessions.md). The host guard reads `sysctl`, `memory_pressure` and `df` on macOS; on Linux it reads the load average, `/proc/meminfo` (memory and swap) and `df`. The machine guard agent (`templates/guard-agent.sh`) reads the same sources on each worker over ssh: `sysctl`, `memory_pressure` and `df` on macOS, `/proc/loadavg`, `/proc/meminfo` and `df` on Linux. On a Windows worker the PowerShell agent (`templates/guard-agent.ps1`) reads CIM: `Win32_Processor`, `Win32_OperatingSystem`, `Win32_PageFileUsage`, plus `DriveInfo` for disk.
+Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` signals (npm for `published`). The `command`, `file` and `url` signals need nothing extra. The full list of signal kinds is in [sessions.md](sessions.md). The host guard reads `sysctl`, `memory_pressure` and `df` on macOS; on Linux it reads the load average, `/proc/meminfo` (memory and swap) and `df`. Each worker's runner reads the same sources on its own host: `sysctl`, `memory_pressure` and `df` on macOS, `/proc/loadavg`, `/proc/meminfo` and `df` on Linux. On a Windows worker the runner's `runner-sample.ps1` reads CIM: `Win32_Processor`, `Win32_OperatingSystem`, `Win32_PageFileUsage`, plus `DriveInfo` for disk.
 
 ## Library modules
 
@@ -32,13 +32,14 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |
 | `src/claude-quota.ts` | `lookupQuotaResults(agentDir?)`: pi-quota through senpi's native auth storage (defaults to `~/.omo/agent`); `claudeUsage` and the usage report behind `dori quota` and `/quota`: Claude 5h/7d usage and reset times for every account |
 | `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
-| `src/placement.ts` | `resolvePlacement`, `checkMachine`, `planLaunch`: which machine a launch runs on, its per-machine launch verdict, and the fallback |
+| `src/placement.ts` | `resolvePlacement`, `checkMachine`, `planLaunch`, `placementTable`: which machine a launch runs on (the runner declaring its repo, else the default), its per-machine launch verdict, and the fallback |
+| `src/runner/workspaces.ts` | `discoverRepos`, `workspaceReport`: the repos found under `reposRoot` plus `workspaces` overrides (declared), the detected checkouts and the worktree root a runner sends in its hello |
 | `src/repos.ts` | `Repos(stateDir)`: synchronous `list`, `add`, `remove`, `replace`; atomic machine-local GitHub watched list |
 | `src/registry.ts`, `src/store.ts` | the lane registry and its store |
 | `src/launch.ts`, `src/done-flow.ts` | launching lanes and the done flow |
 | `src/lane-finish.ts` | `postOwnerLine`, which posts the supervisor's lead-status announcements |
 | `src/freshness.ts`, `src/host-guard.ts`, `src/dead-panes.ts` | the sweeps behind `freshness`, `guard` and `dead-panes` |
-| `src/remote-guard.ts`, `templates/guard-agent.sh`, `templates/guard-agent.ps1` | the machine guard: per-machine shell detection, machine list, ssh sample and install, per-machine events, agent refresh on `update` |
+| `src/remote-guard.ts` | the machine list, ssh and shell-kind helpers, machine guard state and events, and the guard agent cleanup on `update` |
 | `src/pause.ts` | `pause` and `resume` |
 | `src/inbox.ts` | the lead's event inbox (`dori inbox take`) |
 | `src/supervise.ts` and `src/supervise-*.ts` | `dori supervise` and its loop, delivery and lead lifecycle |

@@ -27,11 +27,17 @@ const URGENT_KINDS = [
   "IDLE-ESCALATE",
   // A working lane that drifted: milestones overdue or its PR failing CI again and again (drift.ts). No periodic summaries.
   "LANE_DRIFT",
-  "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "HOST_GUARD OUTDATED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
+  "HOST_GUARD ALERT", "HOST_GUARD CLEAR", "HOST_GUARD OFFLINE", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   // The supervisor killed or paused something because memory ran critically low; the lead relays it to the owner.
   "HOST_GUARD CRITICAL",
   "WAIT_DONE", "WAIT_TIMEOUT", "SUPERVISOR_STUCK", "UNHANDLED", "UNREPORTED", "UNRESOLVED",
   "LANE_RECOVERY_EXHAUSTED",
+  // Sandbox (launch.ts SandboxRefusal): a lane its sandbox refused to relaunch stays down until someone fixes the sandbox,
+  // a lane allowed to run unsandboxed (runners.<label>.allowUnsandboxed, or a relaunch recorded without one) runs
+  // without isolation, and a sandbox notice that reached no Discord channel (sandbox-notice.ts) carries the owner's warning.
+  // Other LANE_RECOVERY_ERROR lines stay digest (the default); SANDBOX_NOTICE_FALLBACK did reach the owner and stays digest.
+  "LANE_RECOVERY_ERROR * sandbox-missing:", "LANE_RECOVERY_ERROR * sandbox-broken:", "LANE_RECOVERY_ERROR * sandbox-unavailable:",
+  "SANDBOX_MISSING", "SANDBOX_BROKEN", "SANDBOX_UNAVAILABLE", "SANDBOX_SKIPPED", "SANDBOX_NOTICE_ERROR",
   // Runners: a lane whose runner is gone or unknown, a forged or unauthenticated frame, a backed-up outbox, and a
   // failed runner upgrade need the lead. RUNNER_STALE, RUNNER_UNREACHABLE, RUNNER_RESTARTED, RUNNER_RESTART_FAILED,
   // RUNNER_PROTO_MISMATCH and RUNNER_CONFLICT stay digest (the default).
@@ -59,10 +65,18 @@ const URGENT_KINDS = [
   // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
   // waits on the close itself, so it must not sit in the digest.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
+  // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched), a done one
+  // has its Toodo task completed by the lead.
+  "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
   "GH_ISSUE * opened", "GH_ISSUE * reopened",
+  // A Toodo task whose last unfinished dependency was just done: the lead may launch it. Plain status changes stay digest,
+  // so the lead's own MCP calls never wake it.
+  "TOODO_TASK_READY",
+  // The supervisor's autopilot tick found a new set of tasks it may launch, or the same set still waiting after 30 min.
+  "AUTOPILOT_READY",
 ] as const;
 
 /**
@@ -75,9 +89,7 @@ const DIGEST_KINDS = [
   "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
   "MERGE_VERIFIED",
-  // A worker machine without the guard agent, one whose shell cannot run it, or one whose agent is current again,
-  // needs no action now.
-  "HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT",
+  "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
 ] as const;
 
 /** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */

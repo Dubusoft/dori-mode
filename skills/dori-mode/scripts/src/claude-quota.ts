@@ -1,11 +1,15 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { displayTime } from "./display-time.ts";
+
 /** The subset of pi-quota's ProviderResult this module reads. */
 export type QuotaResult = {
   readonly kind: string;
   readonly provider: string;
   readonly account?: string;
+  /** Why an unavailable or failed result has no usage: a string, or `{ type, status? }` for a failure. */
+  readonly reason?: unknown;
   readonly windows?: readonly { readonly label: string; readonly remainingPercent: number; readonly resetAt?: Date | string }[];
 };
 
@@ -18,7 +22,22 @@ export type ClaudeAccount = { readonly name: string; readonly fiveHour?: ClaudeW
 /** Claude subscription usage of every account that answered (see claudeUsage). */
 export type ClaudeUsage = { readonly at: number; readonly accounts: readonly ClaudeAccount[] };
 
-const CLAUDE_PROVIDERS = new Set(["anthropic", "claude-sdk-oauth"]);
+const CLAUDE_PROVIDERS: ReadonlySet<string> = new Set(["anthropic", "claude-sdk-oauth"]);
+
+/** pi-quota's provider id for each host provider id (pi-quota's own HOST_PROVIDER_IDS, inverted). */
+const QUOTA_PROVIDER_OF: Readonly<Record<string, string>> = {
+  "anthropic-subscription": "claude-sdk-oauth", "claude-sdk-oauth": "claude-sdk-oauth", anthropic: "anthropic",
+  "chatgpt-subscription": "openai-codex", "openai-codex": "openai-codex",
+};
+
+/**
+ * The pi-quota provider that serves `model` ("anthropic-subscription/claude-opus-5-5"): one id, or none when the
+ * model names no provider or pi-quota cannot read its quota.
+ */
+export const quotaProvidersFor = (model: string): ReadonlySet<string> => {
+  const provider = model.includes("/") ? QUOTA_PROVIDER_OF[model.slice(0, model.indexOf("/"))] : undefined;
+  return new Set(provider ? [provider] : []);
+};
 
 const windowOf = (w: NonNullable<QuotaResult["windows"]>[number]): ClaudeWindow => {
   const usedPct = Math.round(Math.min(100, Math.max(0, 100 - (Number.isFinite(w.remainingPercent) ? w.remainingPercent : 0))));
@@ -30,13 +49,13 @@ const FIVE_HOUR = /five|5\s*h/i;
 const WEEKLY = /week|7\s*d/i;
 
 /**
- * Claude usage from pi-quota results: every anthropic or claude-sdk-oauth account that answered with a 5h or 7d
- * window. Undefined when no Claude account answered.
+ * Usage from pi-quota results: every account of `providers` (default: anthropic and claude-sdk-oauth) that answered
+ * with a 5h or 7d window. Undefined when no such account answered.
  */
-export const claudeUsage = (results: readonly QuotaResult[], at: number): ClaudeUsage | undefined => {
+export const claudeUsage = (results: readonly QuotaResult[], at: number, providers = CLAUDE_PROVIDERS): ClaudeUsage | undefined => {
   const accounts: ClaudeAccount[] = [];
   for (const r of results) {
-    if (r.kind !== "success" || !CLAUDE_PROVIDERS.has(r.provider)) continue;
+    if (r.kind !== "success" || !providers.has(r.provider)) continue;
     let fiveHour: ClaudeWindow | undefined;
     let weekly: ClaudeWindow | undefined;
     for (const w of r.windows ?? []) {
@@ -49,13 +68,30 @@ export const claudeUsage = (results: readonly QuotaResult[], at: number): Claude
   return accounts.length ? { at, accounts } : undefined;
 };
 
-const KST_MS = 9 * 3_600_000;
-const two = (n: number): string => String(n).padStart(2, "0");
-/** "MM-DD HH:MM" in KST, the owner's time zone. */
-export const kst = (ms: number): string => {
-  const d = new Date(ms + KST_MS);
-  return `${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}`;
+/** A Claude account whose usage could not be read (expired token, failed request, no window), so it is left out. */
+export type ClaudeSkip = { readonly name: string; readonly reason: string };
+
+const skipReason = (r: QuotaResult): string => {
+  if (typeof r.reason === "string") return r.reason;
+  if (typeof r.reason === "object" && r.reason !== null) {
+    const { type, status } = r.reason as { type?: unknown; status?: unknown };
+    if (typeof type === "string") return typeof status === "number" ? `${type} ${status}` : type;
+  }
+  return r.kind === "success" ? "no-quota-windows" : r.kind;
 };
+
+/**
+ * Every Claude account claudeUsage leaves out, with why; the readable accounts alone decide the usage. A provider
+ * nobody signed into (unlabelled oauth-not-configured) is not an account and is not listed.
+ */
+export const skippedClaudeAccounts = (results: readonly QuotaResult[], providers = CLAUDE_PROVIDERS): ClaudeSkip[] =>
+  results
+    .filter((r) => providers.has(r.provider) && !(r.account === undefined && r.reason === "oauth-not-configured")
+      && (r.kind !== "success" || !(r.windows ?? []).some((w) => FIVE_HOUR.test(w.label) || WEEKLY.test(w.label))))
+    .map((r) => ({ name: r.account || r.provider, reason: skipReason(r) }));
+
+/** "default (token-expired), account-3 (http-error 429)". */
+export const skippedText = (skipped: readonly ClaudeSkip[]): string => skipped.map((s) => `${s.name} (${s.reason})`).join(", ");
 
 /**
  * Time left until a reset, in pi-quota's format: whole days plus whole hours ("2d 6h", days alone when no hour
@@ -73,14 +109,14 @@ export const resetIn = (resetAt: number, now: number): string => {
   return `${Math.floor(totalMinutes / 30) / 2}h`;
 };
 
-const windowText = (name: string, w: ClaudeWindow, now: number): string =>
-  `${name} ${w.usedPct}% used${w.resetAt !== undefined ? ` (resets in ${resetIn(w.resetAt, now)}, ${kst(w.resetAt)} KST)` : ""}`;
+const windowText = (name: string, w: ClaudeWindow, now: number, timeZone: string | undefined): string =>
+  `${name} ${w.usedPct}% used${w.resetAt !== undefined ? ` (resets in ${resetIn(w.resetAt, now)}, ${displayTime(w.resetAt, timeZone, "short")})` : ""}`;
 
 /** One line: "QUOTA | Claude default: 5h 85% used (resets in 3h, ...), 7d 40% used | login-2: 7d 10% used". Usage only, no verdict. */
-export const usageLine = (usage: ClaudeUsage): string =>
+export const usageLine = (usage: ClaudeUsage, timeZone?: string): string =>
   `QUOTA | Claude ${usage.accounts.map((a) => `${a.name}: ${[
-    ...(a.fiveHour ? [windowText("5h", a.fiveHour, usage.at)] : []),
-    ...(a.weekly ? [windowText("7d", a.weekly, usage.at)] : []),
+    ...(a.fiveHour ? [windowText("5h", a.fiveHour, usage.at, timeZone)] : []),
+    ...(a.weekly ? [windowText("7d", a.weekly, usage.at, timeZone)] : []),
   ].join(", ")}`).join(" | ")}`;
 
 export const NO_CLAUDE = "QUOTA | no Claude subscription usage reported";
@@ -103,13 +139,15 @@ export const lookupQuotaResults = (agentDir = join(homedir(), ".omo", "agent")):
   return lookupQuota(new ModelRegistry(runtime, runtime.authStorage), signal);
 };
 
-/** pi-quota's text, and the Claude usage when a Claude account answered. */
-export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage };
+/** pi-quota's text, the Claude usage when a Claude account answered, and the Claude accounts left out. */
+export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage; readonly skipped: readonly ClaudeSkip[] };
 
-export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal): Promise<UsageRead> => {
+/** `providers` narrows which pi-quota providers count (default: the Claude ones, see claudeUsage). */
+export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal, providers = CLAUDE_PROVIDERS): Promise<UsageRead> => {
   const { results, text } = await lookup(signal);
-  const usage = claudeUsage(results, now);
-  return usage ? { text, usage } : { text };
+  const usage = claudeUsage(results, now, providers);
+  const skipped = skippedClaudeAccounts(results, providers);
+  return usage ? { text, usage, skipped } : { text, skipped };
 };
 
 /** The `/quota` text: pi-quota's own usage block only (it already shows reset times). */

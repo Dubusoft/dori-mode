@@ -14,6 +14,7 @@ import { sessionDirFor } from "../src/session-id.ts";
 import { RETENTION, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
+import { BUILT_IN, builtInTunables } from "../src/tunables.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -168,7 +169,7 @@ test("a version 6 database is migrated to 7 and keeps decision obligations", asy
   raw.exec("ALTER TABLE lead_state DROP COLUMN pending; UPDATE meta SET value = '6' WHERE key = 'schema_version'");
   raw.close();
   const store = new SqliteStore(path);
-  expect(store.meta("schema_version")).toBe("8");
+  expect(store.meta("schema_version")).toBe("9");
   const pending = [{ id: "wait:1", since: T0, line: "WAIT_DONE x" }];
   store.save({ events: [], pending }, "full");
   store.close();
@@ -180,15 +181,15 @@ test("a version 6 database is migrated to 7 and keeps decision obligations", asy
 test("config: resolveKinds and resolveTimeoutMin are built in; file values, even malformed ones, are ignored", async () => {
   const state = withState();
   cleanups.push(state.done);
-  expect(defaultConfig("/h").resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
-  expect(defaultConfig("/h").resolveTimeoutMin).toBe(15);
+  expect(builtInTunables("/h").resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
+  expect(builtInTunables("/h").resolveTimeoutMin).toBe(15);
   const path = join(state.dir, "c.json");
   writeFileSync(path, JSON.stringify({ resolveKinds: ["WAIT_DONE", "GH_PR * review"], resolveTimeoutMin: 3 }));
   const c = await loadConfig(path, "/h");
-  expect([c.resolveKinds, c.resolveTimeoutMin]).toEqual([DEFAULT_RESOLVE_KINDS, 15]);
+  expect(["resolveKinds" in c, "resolveTimeoutMin" in c]).toEqual([false, false]);
   for (const bad of ["WAIT_DONE", ["* x"], ["A  B"], [7]]) {
     writeFileSync(path, JSON.stringify({ resolveKinds: bad }));
-    expect((await loadConfig(path, "/h")).resolveKinds).toEqual(DEFAULT_RESOLVE_KINDS);
+    expect("resolveKinds" in await loadConfig(path, "/h")).toBe(false);
   }
 });
 
@@ -230,8 +231,8 @@ const pushFixture = () => {
   world.screen = `\u2500\u2500 \u2022 Working ${"\u2500".repeat(40)}\n\u276f \n${"\u2500".repeat(80)}\n/repo\n(\u{1F63A} OmO Native by Q Kim)`;
   const session = "11111111-1111-4111-8111-111111111111";
   const config = {
-    sessionsDir: join(state.dir, "sessions"), defaultCwd: "/repo",
-    delivery: { ...defaultConfig().delivery, tailMonitor: false },
+    sessionsDir: join(state.dir, "sessions"), leadCwd: "/repo",
+    delivery: { ...BUILT_IN.delivery, tailMonitor: false },
     eventPolicy: resolveEventPolicy({ kinds: { UNRESOLVED: "lead-urgent" } }),
   };
   const dir = sessionDirFor(config.sessionsDir, "/repo");

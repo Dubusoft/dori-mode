@@ -54,7 +54,8 @@ test("dori typing keeps the explicit Discord platform form", () => inState(async
 test("dori setup --help prints setup-specific help and exits successfully", () => inState(async (dir) => {
   const r = await cli(dir, ["setup", "--help"]);
   expect(r.code).toBe(0);
-  expect(r.out).toContain("GitHub repos are optional; setup reads and saves this machine's watched list.");
+  expect(r.out).toStartWith("dori setup [options]");
+  expect(r.out).toContain("--advanced");
   expect(r.err).toBe("");
 }));
 

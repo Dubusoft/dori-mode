@@ -11,11 +11,12 @@ import { Database } from "bun:sqlite";
 import { GITHUB_FILE, loadGithub } from "../src/github-events.ts";
 import { LaneOpsError, type Delivery, type LaneOps, type LaneRef, runnerOf, machineRunner } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
-import type { CommandResults, LaneInspection, TurnEvidence } from "../src/runner/protocol.ts";
+import type { CommandResults, LaneInspection, TurnEvidence, LaneOutputFiles } from "../src/runner/protocol.ts";
 import { laneStatus } from "../src/runner/serve.ts";
 import { checkDone } from "../src/signals.ts";
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
 import type { Journal } from "../src/supervise.ts";
+import { BUILT_IN, builtInTunables, type Tunables } from "../src/tunables.ts";
 
 /** The journal store the suite runs against: DORI_TEST_STORE=sqlite runs every supervisor test on supervisor.sqlite. */
 export const TEST_STORE: StoreKind = process.env.DORI_TEST_STORE === "sqlite" ? "sqlite" : "json";
@@ -47,7 +48,10 @@ export const journalBytes = (stateDir: string): string => (TEST_STORE === "json"
   .filter((name) => existsSync(join(stateDir, name))).map((name) => readFileSync(join(stateDir, name), "latin1")).join("");
 
 export type World = {
+  files?: LaneOutputFiles;
   prState: string;
+  /** What `gh pr list` answers (a `pr <repo> <branch>` signal read); unset, it answers like `gh pr view`. */
+  prList?: unknown[];
   issueState: string;
   aheadCount: string;
   dirty: string;
@@ -74,6 +78,8 @@ export type World = {
   /** Merged over the inspection fakeLaneOps derives from the World. */
   inspection?: Partial<LaneInspection>;
   startResult?: CommandResults["lane.start"];
+  /** What `lane-sandbox --check` answers (default exit 0: the local sandbox works). */
+  sandboxCheck?: Ran;
   /** Every runner is down: reads and effects throw RUNNER_UNAVAILABLE, send answers "failed", status an error. */
   runnerDown?: boolean;
   /** The herdr workspaces `herdr workspace list` answers; `workspace create` adds one (`w<n>`). */
@@ -124,9 +130,11 @@ export const fakeRunner = (w: World): Runner => async (argv) => {
   if (cmd === "git" && argv.includes("status")) return ok(w.dirty);
   if (cmd === "git" && argv.includes("rev-list")) return ok(w.aheadCount);
   if (cmd === "git") return ok();
+  if (cmd === "gh" && a1 === "pr" && a2 === "list" && w.prList) return ok(JSON.stringify(w.prList));
   if (cmd === "gh" && a1 === "pr") return ok(JSON.stringify({ state: w.prState, mergeCommit: w.prState === "MERGED" ? { oid: "abc1234567890" } : null }));
   if (cmd === "gh" && a1 === "issue") return ok(JSON.stringify({ state: w.issueState }));
   if (cmd === "notify") return ok();
+  if (cmd === "lane-sandbox" && a1 === "--check") return w.sandboxCheck ?? ok();
   return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` };
 };
 
@@ -182,6 +190,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
   };
   const statusOf = (lane: LaneRef) => laneStatus(paneOf(lane.pane) as Pane | undefined);
   return {
+    files: async (lane) => { record("files", lane.key, {}); down(runnerOf(lane)); return w.files; },
     panes: async (machine) => { record("panes", undefined, { machine }); down(machineRunner(machine)); return w.panes.map((p) => ({ ...p })); },
     screen: async (ref, lines) => {
       record("screen", undefined, { ...ref, lines }); down(machineRunner(ref.machine));
@@ -275,9 +284,34 @@ export const fakeLaneOps = (w: World): LaneOps => {
 };
 
 /** FlowDeps over the World, plus `ops` (a fakeLaneOps over the same World) for modules that reach lanes through the facade. */
-export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig> = {}): FlowDeps & { readonly ops: LaneOps } => {
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, defaultCwd: "/repo", leadPane: "lead:p1", store: TEST_STORE, ...patch };
-  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w) };
+const fileRunCounters = new WeakMap<World, number>();
+/** BUILT_IN for a /home/test home, with the toodo event stream off. */
+export const testTunables = (patch: Partial<Tunables> = {}): Tunables => {
+  const base = builtInTunables("/home/test");
+  return { ...base, toodoEvents: { ...base.toodoEvents, enabled: false }, ...patch };
+};
+
+/** A fixture patch split into its config part and its tunables part (keys of BUILT_IN). */
+export const splitTunables = (patch: Partial<DoriConfig & Tunables>): { readonly config: Partial<DoriConfig>; readonly tunables: Partial<Tunables> } => {
+  const keys = Object.keys(BUILT_IN);
+  const entries = Object.entries(patch);
+  return {
+    config: Object.fromEntries(entries.filter(([key]) => !keys.includes(key))) as Partial<DoriConfig>,
+    tunables: Object.fromEntries(entries.filter(([key]) => keys.includes(key))) as Partial<Tunables>,
+  };
+};
+
+export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig & Tunables> = {}): FlowDeps & { readonly ops: LaneOps } => {
+  const split = splitTunables(patch);
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, leadCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "lead:p1", store: TEST_STORE, ...split.config };
+  const tunables = testTunables(split.tunables);
+  // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
+  return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, tunables, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),
+    newFileRunId: () => {
+      const n = (fileRunCounters.get(w) ?? 0) + 1; fileRunCounters.set(w, n);
+      return `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    },
+    which: (cmd) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null) };
 };
 
 /** The texts sent to lanes: through the facade (`w.ops` sends), and through herdr `send-text` by modules not yet moved onto it. */

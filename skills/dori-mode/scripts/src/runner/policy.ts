@@ -2,7 +2,10 @@
 // Pure apart from the optional config read in `loadPolicy`; path resolution is injected into `checkCommand`.
 
 import { readFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep, win32 } from "node:path";
+import { defaultRunnerDir, RUNNER_PATHS } from "./fs-safety.ts";
+import { validateFileKey } from "./lane-files.ts";
 import {
   isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
 } from "./protocol.ts";
@@ -12,25 +15,76 @@ export const POLICY_FILE = "runner-config.json";
 export type RunnerPolicy = {
   /** Profile name -> argv template. Only these profiles may be started. */
   readonly agents: Readonly<Record<string, readonly string[]>>;
-  /** Directories under which every command cwd must resolve. */
+  /**
+   * Directories under which every command cwd must resolve; parsePolicy appends the lanes directory, `reposRoot` and
+   * the effective worktree root, and derives the rest when the file lists none (derivedRoots).
+   */
   readonly allowedRoots: readonly string[];
   readonly sandbox: "required" | "optional";
+  /**
+   * Argv run before every `lane.start` with `sandbox: true` (e.g. `["lane-sandbox", "--check"]`); a non-zero exit refuses
+   * the start `sandbox-unavailable` with its stderr, so a host whose wrapper cannot sandbox never opens the lane's pane.
+   */
+  readonly sandboxCheck?: readonly string[];
   /** `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with a `done` section. */
   readonly jobs: "allow" | "deny";
   /** Guard thresholds for this host; each one absent falls back to the runner's config defaults. */
   readonly guard?: Readonly<Partial<Record<GuardKey, number>>>;
   /** Command-line patterns killed under critical memory pressure; absent falls back to the config's `heavyKill`. */
   readonly heavyKill?: readonly string[];
+  /**
+   * The repos this host owns for placement: owner/repo -> its checkout (absolute, a leading `~` already expanded). The
+   * runner checks each path against allowedRoots and sends the valid ones in its hello (workspaces.ts).
+   */
+  readonly workspaces?: Readonly<Record<string, string>>;
+  /** `false` turns off the scan of allowedRoots for git checkouts (hello `detected`); default on. */
+  readonly detectWorkspaces?: boolean;
+  /** Every checkout directly under it is a declared repo, keyed by its origin (absolute, `~` expanded; workspaces.ts). Added to allowedRoots automatically. */
+  readonly reposRoot?: string;
+  /** Where this host's lane worktrees live (absolute, `~` expanded); absent: `<reposRoot>/worktrees` (effectiveWorktreeRoot). Added to allowedRoots automatically. */
+  readonly worktreeRoot?: string;
 };
 
-const GUARD_KEYS = ["loadAlert", "loadOk", "memFreeMinPct", "memFreeCritPct", "swapFreeCritPct", "diskFreeMinGb", "panesMax"] as const;
+/**
+ * The path rules of the runner host's platform: a runner-config.json is judged by them, not by the machine reading it
+ * (`dori runner setup` on a Linux lead checks a Windows runner's `C:\...` paths with win32 rules).
+ */
+export const runnerPaths = (platform: NodeJS.Platform = process.platform): typeof posix => (platform === "win32" ? win32 : posix);
+
+/** `worktreeRoot`, else `<reposRoot>/worktrees` when `reposRoot` is set, else undefined; joined by `platform`'s rules. */
+export const effectiveWorktreeRoot = (policy: Pick<RunnerPolicy, "reposRoot" | "worktreeRoot">, platform?: NodeJS.Platform): string | undefined =>
+  policy.worktreeRoot ?? (policy.reposRoot !== undefined ? runnerPaths(platform).join(policy.reposRoot, "worktrees") : undefined);
+
+/** owner/repo as GitHub spells it. */
+export const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** `<runnerDir>/lanes`: every lane started without `cwd` gets its own directory here (laneCwd). */
+export const lanesDir = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.lanes);
+
+/** Where a `lane.start` without `cwd` starts: `<runnerDir>/lanes/<key>`, created by the start (lanes.ts). */
+export const laneCwd = (runnerDir: string, key: string): string => join(lanesDir(runnerDir), key);
+
+/** The top-level keys runner-config.json may hold; parsePolicy throws on any other (RETIRED_POLICY_KEYS aside). */
+export const RUNNER_POLICY_KEYS = [
+  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot",
+] as const;
+
+/**
+ * Keys an older runner-config.json may still hold: parsePolicy ignores them with one `RUNNER_CONFIG_KEY_IGNORED` warning
+ * instead of refusing the file, and `dori runner setup` removes them (with a backup).
+ */
+export const RETIRED_POLICY_KEYS: Readonly<Record<string, string>> = {
+  defaultCwd: "a lane.start without cwd now starts in its own directory under <runnerDir>/lanes",
+};
+
+export const GUARD_KEYS = ["loadAlert", "loadOk", "memFreeMinPct", "memFreeCritPct", "swapFreeCritPct", "diskFreeMinGb", "panesMax"] as const;
 type GuardKey = (typeof GUARD_KEYS)[number];
 
 export const DEFAULT_POLICY: RunnerPolicy = { agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow" };
 
 /** Rules beyond the protocol schema rules (which pass through under their own names, e.g. `unknown-field`). */
 export type PolicyRule =
-  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "command-not-argv" | "jobs-denied";
+  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "sandbox-unavailable" | "command-not-argv" | "jobs-denied";
 
 export type CheckResult = { readonly ok: true; readonly command: AnySupervisorCommand } | { readonly ok: false; readonly rule: string; readonly detail: string };
 
@@ -39,11 +93,40 @@ export const rejectionText = (rule: string): string => `RUNNER_CMD_REJECTED ${ru
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** Reads a policy from parsed JSON; unknown keys or wrong types throw. */
-export function parsePolicy(value: unknown): RunnerPolicy {
+/** `~` or `~/...` (also `~\...` on win32) under `home`; any other path unchanged. */
+const expandHome = (path: string, home: string, p: typeof posix): string =>
+  path === "~" ? home : path.startsWith("~/") || (p === win32 && path.startsWith("~\\")) ? p.join(home, path.slice(2)) : path;
+
+/**
+ * The allowed roots of a runner-config.json without `allowedRoots` (or with `[]`), before the lanes directory,
+ * `reposRoot` and the effective worktree root are appended: the runner's temp directory, and the runner's home only
+ * when the file names neither `reposRoot` nor `worktreeRoot`, which leaves the host no other place to work. Home is
+ * left out otherwise because it would widen the boundary to every file the runner's user owns.
+ */
+const derivedRoots = (o: { readonly tmp: string; readonly home: string; readonly hasRepoRoots: boolean }): string[] =>
+  [...new Set([o.tmp, o.hasRepoRoots ? undefined : o.home].filter((r): r is string => r !== undefined && r !== ""))];
+
+export type ParsePolicyOptions = {
+  /** The runner directory whose `lanes` directory joins allowedRoots; absent: `~/.dori/runner` under `home`. */
+  readonly runnerDir?: string;
+  /** Receives one `RUNNER_CONFIG_KEY_IGNORED <key>: <why>` line per retired key the file still holds. */
+  readonly warn?: (line: string) => void;
+  /** The runner host's platform, whose path rules judge the file (runnerPaths); absent: this process's. */
+  readonly platform?: NodeJS.Platform;
+};
+
+/**
+ * Reads a policy from parsed JSON (`home` expands a leading `~`; `home` and `tmp` feed derivedRoots); unknown keys or
+ * wrong types throw, a retired key (RETIRED_POLICY_KEYS) is ignored with a warning.
+ */
+export function parsePolicy(value: unknown, home: string = homedir(), tmp: string = tmpdir(), options: ParsePolicyOptions = {}): RunnerPolicy {
   if (!isRecord(value)) throw new Error("runner-config must be a JSON object");
-  const known = new Set(["agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill"]);
-  for (const key of Object.keys(value)) if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
+  const p = runnerPaths(options.platform);
+  const known = new Set<string>(RUNNER_POLICY_KEYS);
+  for (const key of Object.keys(value)) {
+    if (Object.hasOwn(RETIRED_POLICY_KEYS, key)) options.warn?.(`RUNNER_CONFIG_KEY_IGNORED ${key}: ${RETIRED_POLICY_KEYS[key]}; remove it from runner-config.json (dori runner setup does)`);
+    else if (!known.has(key)) throw new Error(`runner-config: unknown key ${key}`);
+  }
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
   const agents: Record<string, readonly string[]> = {};
   if (value.agents !== undefined) {
@@ -57,6 +140,40 @@ export function parsePolicy(value: unknown): RunnerPolicy {
   if (value.sandbox !== undefined && value.sandbox !== "required" && value.sandbox !== "optional") throw new Error("runner-config: sandbox must be required|optional");
   if (value.jobs !== undefined && value.jobs !== "allow" && value.jobs !== "deny") throw new Error("runner-config: jobs must be allow|deny");
   if (value.heavyKill !== undefined && !strings(value.heavyKill)) throw new Error("runner-config: heavyKill must be a string array");
+  if (value.sandboxCheck !== undefined && (!strings(value.sandboxCheck) || value.sandboxCheck.length === 0 || value.sandboxCheck[0] === "")) {
+    throw new Error("runner-config: sandboxCheck must be a non-empty string array");
+  }
+  let workspaces: Record<string, string> | undefined;
+  if (value.workspaces !== undefined) {
+    if (!isRecord(value.workspaces)) throw new Error("runner-config: workspaces must be an object of owner/repo -> path");
+    workspaces = {};
+    for (const [repo, path] of Object.entries(value.workspaces)) {
+      if (!REPO_PATTERN.test(repo)) throw new Error(`runner-config: workspaces key ${repo} must be owner/repo`);
+      const full = typeof path === "string" ? expandHome(path, home, p) : undefined;
+      if (full === undefined || !p.isAbsolute(full)) throw new Error(`runner-config: workspaces.${repo} must be an absolute path or start with ~/`);
+      workspaces[repo] = full;
+    }
+  }
+  if (value.detectWorkspaces !== undefined && typeof value.detectWorkspaces !== "boolean") throw new Error("runner-config: detectWorkspaces must be true|false");
+  const rootPath = (key: "reposRoot" | "worktreeRoot"): string | undefined => {
+    const raw = value[key];
+    if (raw === undefined) return undefined;
+    const full = typeof raw === "string" ? expandHome(raw, home, p) : undefined;
+    if (full === undefined || !p.isAbsolute(full)) throw new Error(`runner-config: ${key} must be an absolute path or start with ~/`);
+    return full;
+  };
+  const reposRoot = rootPath("reposRoot");
+  const worktreeRoot = rootPath("worktreeRoot");
+  // Explicit roots stay as written (none listed: derivedRoots); the lanes directory is appended unless a root already
+  // holds it, then reposRoot and the effective worktree root unless one already names the same directory.
+  const explicit = (value.allowedRoots as string[] | undefined) ?? [];
+  const base = explicit.length ? explicit : derivedRoots({ tmp, home, hasRepoRoots: reposRoot !== undefined || worktreeRoot !== undefined });
+  const allowedRoots = [...base];
+  const lanes = p.join(options.runnerDir ?? p.join(home, ".dori", "runner"), RUNNER_PATHS.lanes);
+  if (!allowedRoots.some((r) => underRoot(p.resolve(r), p.resolve(lanes), p))) allowedRoots.push(lanes);
+  for (const root of [reposRoot, effectiveWorktreeRoot({ reposRoot, worktreeRoot }, options.platform)]) {
+    if (root !== undefined && !allowedRoots.some((r) => p.resolve(r) === p.resolve(root))) allowedRoots.push(root);
+  }
   let guard: Partial<Record<GuardKey, number>> | undefined;
   if (value.guard !== undefined) {
     if (!isRecord(value.guard)) throw new Error("runner-config: guard must be an object");
@@ -70,15 +187,20 @@ export function parsePolicy(value: unknown): RunnerPolicy {
   return {
     ...(guard ? { guard } : {}),
     ...(value.heavyKill !== undefined ? { heavyKill: value.heavyKill as string[] } : {}),
+    ...(value.sandboxCheck !== undefined ? { sandboxCheck: value.sandboxCheck as string[] } : {}),
+    ...(workspaces ? { workspaces } : {}),
+    ...(value.detectWorkspaces !== undefined ? { detectWorkspaces: value.detectWorkspaces as boolean } : {}),
+    ...(reposRoot !== undefined ? { reposRoot } : {}),
+    ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     agents,
-    allowedRoots: (value.allowedRoots as string[] | undefined) ?? DEFAULT_POLICY.allowedRoots,
+    allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
     jobs: (value.jobs as RunnerPolicy["jobs"] | undefined) ?? DEFAULT_POLICY.jobs,
   };
 }
 
 /** Loads `<runnerDir>/runner-config.json`; an absent file yields the defaults (no agents, no roots). */
-export function loadPolicy(runnerDir: string): RunnerPolicy {
+export function loadPolicy(runnerDir: string, warn?: (line: string) => void): RunnerPolicy {
   let text: string;
   try {
     text = readFileSync(join(runnerDir, POLICY_FILE), "utf8");
@@ -86,17 +208,32 @@ export function loadPolicy(runnerDir: string): RunnerPolicy {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return DEFAULT_POLICY;
     throw error;
   }
-  return parsePolicy(JSON.parse(text));
+  return parsePolicy(JSON.parse(text), homedir(), tmpdir(), { runnerDir, ...(warn ? { warn } : {}) });
 }
 
-const underRoot = (root: string, path: string): boolean => {
-  const rel = relative(root, path);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+const underRoot = (root: string, path: string, p: typeof posix = runnerPaths()): boolean => {
+  const rel = p.relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${p.sep}`) && !p.isAbsolute(rel));
 };
 
-/** `cwd-missing` / `cwd-outside-roots` for `path` (absolute, resolving, under an allowed root), else undefined. */
+/**
+ * `cwd-missing` / `cwd-outside-roots` for `path` (absolute, resolving, under an allowed root), else undefined.
+ * A lexical pre-check runs first: a path whose `path.resolve` form is under neither a root's normalized nor its
+ * real form is refused with no filesystem access, because `realpath` on a macOS TCC-protected folder (~/Documents)
+ * blocks the launchd-run runner instead of failing. Only a lexically admitted path is then realpath'd and re-checked
+ * against the real roots, so a symlink inside a root that escapes it is still refused.
+ */
 const checkRootedPath = (policy: RunnerPolicy, path: string, realpath: (path: string) => string, missingOk = false): { readonly rule: string; readonly detail: string } | undefined => {
   if (!isAbsolute(path)) return { rule: "cwd-missing", detail: `${path} is not absolute` };
+  // Roots are safe to resolve (the operator chose them); $TMPDIR-style roots resolve elsewhere (/var -> /private/var) and a path may use either form.
+  const roots: string[] = [];
+  const lexicalRoots: string[] = [];
+  for (const root of policy.allowedRoots) {
+    lexicalRoots.push(resolvePath(root));
+    try { const real = realpath(root); roots.push(real); lexicalRoots.push(real); } catch { /* a root that does not exist admits nothing */ }
+  }
+  const normalized = resolvePath(path);
+  if (!lexicalRoots.some((root) => underRoot(root, normalized))) return { rule: "cwd-outside-roots", detail: normalized };
   let resolved: string;
   try {
     resolved = realpath(path);
@@ -114,17 +251,14 @@ const checkRootedPath = (policy: RunnerPolicy, path: string, realpath: (path: st
       }
     }
   }
-  const roots: string[] = [];
-  for (const root of policy.allowedRoots) {
-    try { roots.push(realpath(root)); } catch { /* a root that does not exist admits nothing */ }
-  }
   if (!roots.some((root) => underRoot(root, resolved))) return { rule: "cwd-outside-roots", detail: resolved };
   return undefined;
 };
 
 /**
  * The same root check for a directory the runner learns only on its host, such as an adopted or target pane's
- * `foreground_cwd`/`cwd`: `cwd-missing` / `cwd-outside-roots` (symlinks resolved, path segments compared), else undefined.
+ * `foreground_cwd`/`cwd`: `cwd-missing` / `cwd-outside-roots` (lexical pre-check without touching the path, then symlinks
+ * resolved, path segments compared), else undefined.
  */
 export const checkCwd = (policy: RunnerPolicy, path: string, realpath: (path: string) => string): { readonly rule: string; readonly detail: string } | undefined =>
   checkRootedPath(policy, path, realpath);
@@ -132,9 +266,11 @@ export const checkCwd = (policy: RunnerPolicy, path: string, realpath: (path: st
 /**
  * Checks a parsed supervisor command frame against the policy. `realpath` resolves symlinks and throws when the
  * path does not exist (as `fs.realpathSync` does). Every `cwd` (`lane.start`, `lane.adopt`, `job.run`,
- * `wait.check`) and `lane.git.root` must be absolute, resolve and lie under `allowedRoots`.
+ * `wait.check`) and `lane.git.root` must be absolute, resolve and lie under `allowedRoots`. A `lane.start` without
+ * `cwd` gets its own `laneCwd(runnerDir, key)` before that check, which may not exist yet (the start creates it); the
+ * returned command carries the filled `cwd`.
  */
-export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (path: string) => string): CheckResult {
+export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (path: string) => string, runnerDir: string = defaultRunnerDir()): CheckResult {
   const reject = (rule: string, detail: string): CheckResult => ({ ok: false, rule, detail });
   // A shell string is reported by its own rule rather than as a generic type error.
   if (isRecord(command) && command.type === "job.run" && isRecord(command.body) && command.body.command !== undefined) {
@@ -151,6 +287,12 @@ export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (
     throw error;
   }
 
+  let laneDir: string | undefined;
+  if (frame.type === "lane.start" && frame.body.cwd === undefined) {
+    try { validateFileKey(frame.body.key); } catch { return reject("cwd-missing", `lane key ${frame.body.key} cannot name a directory`); }
+    laneDir = laneCwd(runnerDir, frame.body.key);
+    frame = { ...frame, body: { ...frame.body, cwd: laneDir } };
+  }
   const body = frame.body as Record<string, unknown>;
   if ((frame.type === "job.run" || frame.type === "wait.check" || frame.type === "lane.git") && policy.jobs === "deny") return reject("jobs-denied", frame.type);
   if (frame.type === "lane.start") {
@@ -159,7 +301,7 @@ export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (
   }
   const paths = [body.cwd, frame.type === "lane.git" ? body.root : undefined].filter((p): p is string => typeof p === "string");
   for (const path of paths) {
-    const refused = checkRootedPath(policy, path, realpath);
+    const refused = checkRootedPath(policy, path, realpath, path === laneDir);
     if (refused) return reject(refused.rule, refused.detail);
   }
   // A lane.git path is under the allowed roots too; worktree-add's does not exist yet.

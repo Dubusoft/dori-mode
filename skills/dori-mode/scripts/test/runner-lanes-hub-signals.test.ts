@@ -8,6 +8,7 @@ import type { Lane } from "../src/registry.ts";
 import { queueLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import type { AnyRunnerEvent, RunnerEventType } from "../src/runner/protocol.ts";
+import { RunnerUnavailable } from "../src/runner/call.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const T0 = 1_800_000_000_000;
@@ -29,7 +30,8 @@ const setup = async (extra: Partial<Lane> = {}) => {
   const emitted: [string, string][] = [];
   const recovers: string[] = [];
   const hub: LaneHubDeps = {
-    registry: deps.registry, reports: () => store, now: clock.now,
+    stateDir: s.dir, registry: deps.registry, reports: () => store, now: clock.now,
+    prepareRecovery: async (_label, key) => ({ cmdId: `recover:${key}:${clock.now()}`, notes: [] }),
     emit: (id, line) => { emitted.push([id, line]); }, recover: (label, key) => { recovers.push(`${label}/${key}`); return 1; },
   };
   let seq = 0;
@@ -50,6 +52,107 @@ test("P1: the owner's lane.started after a hello recovery clears recoveryPending
   expect(lane?.recoveryPending).toBeUndefined();
   expect(lane?.recoveryPreviousPane).toBeUndefined();
   expect(lane?.recoveryExhausted).toBeUndefined();
+});
+
+test.each(["preparation", "capability"])("one hello %s refusal leaves fields untouched and still dispatches the next owned lane", async (failure) => {
+  const t = await setup({ recoveryAfter: 7, recoveryPreviousPane: "old", recoveryExhausted: true } as Partial<Lane>);
+  const before = (await t.read())!;
+  await t.deps.registry.write({ ...before, key: "lane-b", pane: "pb" });
+  const notified: string[] = [], prepared: string[] = [], dispatched: string[] = [];
+  let id = 0;
+  const refusal = failure === "capability"
+    ? new RunnerUnavailable("worker-a", "outdated", "lane files require proto 5 (runner proto 4); run dori runner update")
+    : new Error("LANE_FILE_READ_FAILED lane-a: cannot read attachment");
+  await reconcileInventory({ ...t.hub, newFileRunId: () => `run-${++id}`,
+    registry: { read: t.deps.registry.read.bind(t.deps.registry), update: t.deps.registry.update.bind(t.deps.registry),
+      open: async () => [(await t.deps.registry.read("lane-a"))!, (await t.deps.registry.read("lane-b"))!],
+    },
+    notify: (_label, lane) => { notified.push(lane.key); },
+    prepareRecovery: async (_label, key) => {
+      prepared.push(key);
+      if (key === "lane-a") throw refusal;
+      return { cmdId: `recover:${key}:1`, notes: [] };
+    },
+    recover: (_label, key, body) => {
+      dispatched.push(key);
+      expect(body).toEqual({ cmdId: "recover:lane-b:1", notes: [] });
+      return 1;
+    },
+  }, "worker-a", []);
+  expect(notified).toEqual(["lane-a", "lane-b"]);
+  expect(prepared).toEqual(["lane-a", "lane-b"]);
+  expect(dispatched).toEqual(["lane-b"]);
+  expect(await t.read()).toEqual(before);
+  expect(t.emitted).toEqual([["lane-recover-refused:worker-a:lane-a:run-1", refusal.message]]);
+  expect((await t.deps.registry.read("lane-b"))?.recoveryPending).toBe(true);
+});
+
+test.each([false, true])("a final hello gate refusal restores only its proposal; newer pending writer = %s", async (newer) => {
+  const t = await setup({ recoveryAfter: 3, recoveryPreviousPane: "prior" });
+  const before = (await t.read())!;
+  let dispatched = false;
+  const pending = { id: "00000000-0000-4000-8000-000000000099", requiredReport: false };
+  await reconcileInventory({ ...t.hub, newFileRunId: () => "proposal", journalHead: () => 10,
+    registry: { read: t.deps.registry.read.bind(t.deps.registry), open: t.deps.registry.open.bind(t.deps.registry),
+      update: async (key, mutate) => {
+        if (dispatched && newer) await t.deps.registry.patch(key, { pendingFileRun: pending, title: "newer writer" });
+        return t.deps.registry.update(key, mutate);
+      },
+    },
+    recover: () => {
+      dispatched = true;
+      throw new RunnerUnavailable("worker-a", "outdated", "changed gate");
+    },
+  }, "worker-a", []);
+  const after = await t.read();
+  if (newer) expect(after).toMatchObject({ pendingFileRun: pending, title: "newer writer", recoveryAfter: 10 });
+  else expect(after).toMatchObject({ recoveryAfter: before.recoveryAfter, recoveryPreviousPane: before.recoveryPreviousPane });
+  expect(after?.recoveryPending).toBe(newer ? true : undefined);
+  expect(t.emitted[0]?.[0]).toBe("lane-recover-refused:worker-a:lane-a:proposal");
+});
+
+test("managed started events accept only current/pending runs even when the pane id is reused", async () => {
+  const active = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  const pending = { ...active, id: "00000000-0000-4000-8000-000000000002" };
+  const t = await setup({ fileRun: active, pendingFileRun: pending, recoveryPending: true });
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "", fileRun: { ...active, id: "00000000-0000-4000-8000-000000000003" } }));
+  expect((await t.read())?.pendingFileRun).toEqual(pending);
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "", fileRun: active }));
+  expect((await t.read())?.fileRun).toEqual(active);
+  expect((await t.read())?.pendingFileRun).toBeUndefined();
+});
+
+test.each(["recover", "lane-start"])("failed %s results restore only their matching proposal and survive registry reload", async (prefix) => {
+  const active = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  const pending = { ...active, id: "00000000-0000-4000-8000-000000000002" };
+  const t = await setup({ fileRun: active, pendingFileRun: pending, recoveryPending: true, recoveryAfter: 10 });
+  const prior = { recoveryAfter: 3, recoveryPreviousPane: "prior", recoveryExhausted: true };
+  const cmdId = `${prefix}:lane-a:7`;
+  await t.deps.registry.patch<RecoveryLane>("lane-a", { fileProposal: { cmdId, runId: pending.id, prior } });
+  await acceptLaneEvent(t.hub, "worker-a", t.event("cmd.result", { cmdId: `${prefix}:lane-a:6`, cmdSeq: 1, state: "failed", detail: "old failure" }), 11);
+  expect((await t.read())?.pendingFileRun).toEqual(pending);
+  await acceptLaneEvent(t.hub, "worker-a", t.event("cmd.result", { cmdId, cmdSeq: 2, state: "failed", detail: "failed" }), 12);
+  expect(await t.read()).toMatchObject({ fileRun: active, pane: "p1", ...prior });
+  expect((await t.read())?.pendingFileRun).toBeUndefined();
+  expect((await t.read())?.recoveryPending).toBeUndefined();
+  expect((await t.read())?.fileProposal).toBeUndefined();
+});
+
+test("a failed result cannot retire a newer pending run even if the command metadata is stale", async () => {
+  const pending = { id: "00000000-0000-4000-8000-000000000002", requiredReport: false };
+  const t = await setup({ pendingFileRun: pending, recoveryPending: true });
+  await t.deps.registry.patch<RecoveryLane>("lane-a", { fileProposal: { cmdId: "recover:lane-a:7", runId: "older-run", prior: {} } });
+  await acceptLaneEvent(t.hub, "worker-a", t.event("cmd.result", { cmdId: "recover:lane-a:7", cmdSeq: 1, state: "failed", detail: "failed" }), 12);
+  expect(await t.read()).toMatchObject({ pendingFileRun: pending, recoveryPending: true });
+});
+
+test("the longest runner refusal leaf is preserved in full after whitespace collapse", async () => {
+  const t = await setup();
+  const leaf = "LANE_FILES_SANDBOX_OLD lane-a: sandboxCheck succeeded without DORI_LANE_FILES=1; run dori runner update and refresh the maintained lane-sandbox wrapper, or update the configured custom wrapper to grant own-key .files read-only and .out read-write and print DORI_LANE_FILES=1 after its successful --check; then retry";
+  await acceptLaneEvent(t.hub, "worker-a", t.event("cmd.result", {
+    cmdId: "recover:lane-a:1", cmdSeq: 1, state: "failed", detail: `RUNNER_CMD_FAILED\n${leaf}`,
+  }));
+  expect(t.emitted[0]?.[1]).toBe(`RUNNER_RECOVER_FAILED lane-a runner=worker-a RUNNER_CMD_FAILED ${leaf}; the lane was not recovered: fix the runner and let it reconnect, or dori close lane-a --cancelled and launch again`);
 });
 
 test("P3: a lane with no pane yet (its lane.start still queued) is not recovered by the hello", async () => {

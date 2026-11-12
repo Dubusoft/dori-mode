@@ -111,9 +111,9 @@ const setup = () => {
   const onError = (signal: () => void) => { errorListeners.add(signal); return () => { errorListeners.delete(signal); }; };
   const onStall = (signal: () => void) => { stallListeners.add(signal); return () => { stallListeners.delete(signal); }; };
   const onPark = (signal: () => void) => { parkListeners.add(signal); return () => { parkListeners.delete(signal); }; };
-  // Once the three working tasks, the runners task (the hub always opens) and the stall check are parked (the sweeps task is stuck), each takes its next pass.
+  // Once the three working tasks, the runners and autopilot tasks (the hub always opens) and the stall check are parked (the sweeps task is stuck), each takes its next pass.
   const next = async () => {
-    await until(onPark, () => pauses.parked() === 5, 10_000, "the three working tasks, the runners task and the stall check parked");
+    await until(onPark, () => pauses.parked() === 6, 10_000, "the three working tasks, the runners and autopilot tasks and the stall check parked");
     pauses.tick();
   };
   const stop = async () => { controller.abort(); stall.release(); await running; };

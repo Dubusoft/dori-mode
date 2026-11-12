@@ -6,6 +6,7 @@ import * as quota from "../src/claude-quota.ts";
 import type { Http } from "../src/messenger/http.ts";
 import type { OwnerNoticeKind } from "../src/supervise.ts";
 import { sdNotify, supervise } from "../src/supervise-loop.ts";
+import { recordOwnerClosed } from "../src/thread-followup.ts";
 import { depsFor, fakeClock, newWorld, withState, readJournal, writeJournal } from "./fakes.ts";
 
 /** The local runner child supervise() starts: here one that runs nothing and exits when killed. */
@@ -31,9 +32,12 @@ type JournalView = {
   readonly notifications?: Readonly<Record<string, Notification>>;
 };
 
-const fixture = (kind: OwnerNoticeKind, reminded = true) => {
+/** `closed`: the owner closed thread 11 (archived, parent channel 9), so a notice for it must go to channel 9. */
+const fixture = (kind: OwnerNoticeKind, reminded = true, closed = false) => {
   const state = withState();
   cleanups.push(state.done);
+  if (closed) recordOwnerClosed(state.dir, "11", T0 - MINUTE);
+  const postPath = closed ? "/channels/9/messages" : "/channels/11/messages";
   const home = process.env.HOME;
   const socket = process.env.NOTIFY_SOCKET;
   process.env.HOME = state.dir;
@@ -83,7 +87,10 @@ const fixture = (kind: OwnerNoticeKind, reminded = true) => {
     };
     const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (input: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (options?.method !== "POST" || !url.endsWith("/channels/11/messages")) throw new Error(`unexpected fetch ${url}`);
+      if (closed && (options?.method ?? "GET") === "GET" && url.endsWith("/channels/11")) {
+        return new Response(JSON.stringify({ id: "11", parent_id: "9", thread_metadata: { archived: true } }), { status: 200 });
+      }
+      if (options?.method !== "POST" || !url.endsWith(postPath)) throw new Error(`unexpected fetch ${options?.method ?? "GET"} ${url}`);
       if (typeof options.body !== "string") throw new Error("expected a JSON notification body");
       const body: { content: string } = JSON.parse(options.body);
       posts.push({ content: body.content, notification: journal().notifications?.[`${kind}:${id}`] });
@@ -126,6 +133,13 @@ test.each(["delay", "ack", "unhandled"] as const)("the production loop retries a
   // A further complete loop pass must not send again after its success marker is loaded.
   await f.tick(true, true);
   expect(f.posts).toHaveLength(2);
+});
+
+test.each(["delay", "ack", "unhandled"] as const)("the production loop sends a %s notice for a thread the owner closed to its parent channel as one line linking it", async (kind) => {
+  const f = fixture(kind, true, true);
+  await f.tick(true);
+  expect(f.posts.map((post) => post.content)).toEqual([`<#11> [System] ${kind}-notice`]);
+  expect(f.journal().notifications?.[`${kind}:${id}`]).toEqual({ attempts: 1, sent: true });
 });
 
 test("the production loop runs handledTick and journals UNHANDLED before an owner notice is due", async () => {

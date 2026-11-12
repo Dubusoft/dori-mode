@@ -76,6 +76,30 @@ test("claim-done, report ack and lane status inside a lane are lane socket verbs
   expect(existsSync(h.state)).toBe(false);
 });
 
+test("a lane's report and claim-done reach a runner restarted under it: the new socket at the same path answers", async () => {
+  const h = home();
+  const before = fakeLaneSocket(h.dir);
+  expect((await cli(h, ["report", "demo-lane", "progress", "--text", "before"], inLane)).code).toBe(0);
+  // A restart: the old listener goes away with its socket file, and the new runner binds a fresh one at the same path.
+  before.close();
+  const after = fakeLaneSocket(h.dir);
+  cleanups.push(after.close);
+  const report = await cli(h, ["report", "demo-lane", "progress", "--text", "after"], inLane);
+  expect(report.code, report.err).toBe(0);
+  const claim = await cli(h, ["claim-done", "demo-lane", "--evidence", "merged acme/app#1"], inLane);
+  expect(claim.code, claim.err).toBe(0);
+  expect(after.requests.map((r) => r.kind)).toEqual(["progress", "done"]);
+});
+
+test("a lane that cannot connect to sock/lane.d/lane (a sandbox set up before lane.d) reports over the pre-lane.d sock/lane", async () => {
+  const h = home();
+  const sock = fakeLaneSocket(h.dir, undefined, true);
+  cleanups.push(sock.close);
+  const r = await cli(h, ["report", "demo-lane", "progress", "--text", "old sandbox"], inLane);
+  expect(r.code, r.err).toBe(0);
+  expect(sock.requests.map((q) => q.text)).toEqual(["old sandbox"]);
+});
+
 test("a multi-line --text keeps its newlines on the way to the runner", async () => {
   const h = home();
   const sock = fakeLaneSocket(h.dir);

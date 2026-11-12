@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { footer, footerDoneRules, LaunchError, launchLane, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
+import { footer, footerDoneRules, LaunchError, launchLane, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
 import { LaneOpsError, laneOps, type StartInput } from "../src/lane-ops.ts";
 import type { Lane } from "../src/registry.ts";
 import type { RunnerCall } from "../src/runner/call.ts";
@@ -54,7 +54,7 @@ test("--pane starts the lane through its runner in that pane and registers the p
   const r = await launchLane(d, input({ pane: "w:p3" }));
   expect(starts()).toHaveLength(1);
   const start = starts()[0]!;
-  expect(start).toMatchObject({ key: "pane-lane", target: { pane: "w:p3" }, keywords: "ulw set goal and work", sandbox: false, cwd: wt, done: "closed acme/app#3" });
+  expect(start).toMatchObject({ key: "pane-lane", target: { pane: "w:p3" }, keywords: "ulw set goal and work", sandbox: true, cwd: wt, done: "closed acme/app#3" });
   expect(start.machine).toBeUndefined();
   expect(start.briefText).toContain("## Lane footer (written by dori launch)");
   expect(r.lane).toMatchObject({ pane: "w:p3", tab: "w:t7", runner: "local", reportVia: "cli" });
@@ -89,6 +89,7 @@ test("a sandboxed local lane reaches the runner as lane.start with agentProfile 
   expect(stored).toMatchObject({ pane: "w:p9", tab: "w:t9" });
   expect(stored?.status).toBeUndefined();
   expect(stored?.launchReservation).toBeUndefined();
+  expect(calls[0]?.body.files).toEqual({ run: stored!.fileRun, tree: { directories: [], files: [] }, references: [] });
 });
 
 test("--mode mass-ulw opens with massLaunchKeywords and records the mode; the default is ulw", async () => {
@@ -113,58 +114,112 @@ test("the lane's model reaches the runner: defaultModel unless the launch names 
   expect(starts()[1]?.model).toBe("test/picked");
 });
 
-test("laneSandbox wraps every local lane, passes a --pane lane through unless --sandbox, and records it", async () => {
+test("every local lane, --pane too, runs in laneSandbox once its --check passes, and records it; --sandbox changes nothing", async () => {
   const base = deps({});
-  const laneSandbox = { command: ["lane-sandbox"] };
   let n = 0;
-  const launch = async (config: typeof base.config, target: Record<string, string>, sandbox?: true, which: (cmd: string) => string | null = () => null) => {
+  const launch = async (target: Record<string, string>, sandbox?: true) => {
     await writeBrief();
     world.panes = [{ pane_id: "w:p3", workspace_id: target.workspace ?? "w", tab_id: "w:t7", cwd: wt }];
     const key = `sandbox-lane-${++n}`;
-    const r = await launchLane({ ...base, config, which }, { ...input({ key, ...target }), ...(sandbox ? { sandbox } : {}) });
+    const r = await launchLane(base, { ...input({ key, ...target }), ...(sandbox ? { sandbox } : {}) });
     await base.registry.update(key, (lane) => ({ ...lane!, status: "closed", pane: undefined }));
     return { start: starts().at(-1)!, lane: r.lane, notes: r.notes };
   };
-  const onPath = (cmd: string) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null);
-  // No flag and no setting: a lane in a workspace pane is wrapped.
-  const always = await launch({ ...base.config, laneSandbox }, { workspace: "w" }, undefined, onPath);
-  expect(always.start.sandbox).toBe(true);
-  expect(always.lane.sandbox).toBe(true);
-  expect(always.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
-  const forced = await launch({ ...base.config, laneSandbox }, { pane: "w:p3" }, true);
-  expect(forced.start.sandbox).toBe(true);
-  expect(forced.lane.sandbox).toBe(true);
-  // A --pane lane runs unwrapped and says why.
-  const reused = await launch({ ...base.config, laneSandbox }, { pane: "w:p3" }, undefined, onPath);
-  expect(reused.start.sandbox).toBe(false);
-  expect(reused.lane.sandbox).toBeUndefined();
-  expect(reused.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-3: --pane w:p3 /));
-  // A wrapper missing from PATH passes through and says why.
-  const missing = await launch({ ...base.config, laneSandbox }, { workspace: "w" });
-  expect(missing.start.sandbox).toBe(false);
-  expect(missing.notes).toContainEqual(expect.stringMatching(/^SANDBOX_SKIPPED sandbox-lane-4: lane-sandbox is not on PATH/));
-  expect((await launch(base.config, { pane: "w:p3" })).start.sandbox).toBe(false);
+  for (const run of [await launch({ workspace: "w" }), await launch({ pane: "w:p3" }), await launch({ pane: "w:p3" }, true)]) {
+    expect(run.start.sandbox).toBe(true);
+    expect(run.lane.sandbox).toBe(true);
+    expect(run.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
+  }
+  expect(world.calls.filter((c) => c[0] === "lane-sandbox")).toEqual([["lane-sandbox", "--check"], ["lane-sandbox", "--check"], ["lane-sandbox", "--check"]]);
 });
 
-test("--sandbox is refused without laneSandbox and for a remote lane, before anything is written", async () => {
+test("a local lane whose wrapper is missing (SANDBOX_MISSING) or whose --check fails (SANDBOX_BROKEN) is refused before anything is written", async () => {
+  const base = deps({});
+  await expectRefused({ ...base, which: () => null }, { pane: "w:p3" }, /^SANDBOX_MISSING pane-lane: lane-sandbox is not on PATH; install scripts\/templates\/lane-sandbox\.sh as lane-sandbox or set laneSandbox\.command/);
+  await expect(launchLane({ ...base, which: () => null }, input({ cwd: wt }))).rejects.toMatchObject({ code: "SANDBOX_MISSING" });
+  world.sandboxCheck = { code: 3, out: "", err: "lane-sandbox: bwrap cannot create a user namespace\n" };
+  await expectRefused(base, { pane: "w:p3" }, /^SANDBOX_BROKEN pane-lane: lane-sandbox --check failed \(exit 3\): lane-sandbox: bwrap cannot create a user namespace;/);
+  const broken = launchLane(base, input({ cwd: wt }));
+  await expect(broken).rejects.toBeInstanceOf(SandboxRefusal);
+  await expect(broken).rejects.toMatchObject({ code: "SANDBOX_BROKEN" });
+});
+
+test("a remote lane is sandboxed by default; a machine opted in with runners.<label>.allowUnsandboxed runs without one and says so", async () => {
   await writeBrief();
   const base = deps({});
-  await expect(launchLane(base, { ...input({ pane: "w:p3" }), sandbox: true })).rejects.toThrow(/needs laneSandbox/);
-  const remote = launchLane({ ...base, config: { ...base.config, laneSandbox: { command: ["lane-sandbox"] } } }, { ...input({ machine: "m1" }), sandbox: true });
-  await expect(remote).rejects.toThrow(/local lanes only/);
-  expect(await base.registry.read("pane-lane")).toBeNull();
-  expect(starts()).toEqual([]);
+  const remote = await launchLane(base, { ...input({ machine: "m1", cwd: "/home/u/app" }), sandbox: true });
+  expect(starts()[0]).toMatchObject({ machine: "m1", sandbox: true });
+  expect(remote.lane.sandbox).toBe(true);
+  expect(remote.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
+  // The remote runner checks its own sandbox; the lead's wrapper is neither looked up nor run.
+  expect(world.calls.filter((c) => c[0] === "lane-sandbox")).toEqual([]);
+  const opted = { ...base, which: () => null, config: { ...base.config, runners: { m2: { allowUnsandboxed: true } } } };
+  const r = await launchLane(opted, input({ key: "pane-lane-2", machine: "m2", cwd: "/home/u/app" }));
+  expect(starts()[1]).toMatchObject({ machine: "m2", sandbox: false });
+  expect(r.lane.sandbox).toBeUndefined();
+  expect(r.notes).toContain("SANDBOX_SKIPPED pane-lane-2: machine m2 is opted in with runners.m2.allowUnsandboxed; this lane runs WITHOUT a sandbox");
 });
 
-test("a remote lane goes to its machine's runner with its remote directory and no heavy-slot settings; without a directory it is refused", async () => {
+test("a lane on a Windows runner runs without a sandbox and says so; a runner reporting another OS stays sandboxed", async () => {
+  await writeBrief();
+  const base = { ...deps({}), runnerOs: (label: string) => (label === "win" ? "win32" : label === "box" ? "linux" : undefined) };
+  const win = await launchLane(base, input({ machine: "win", cwd: "C:\\work\\app" }));
+  expect(starts()[0]).toMatchObject({ machine: "win", sandbox: false });
+  expect(win.lane.sandbox).toBeUndefined();
+  expect(win.notes).toContain("SANDBOX_SKIPPED pane-lane: machine win is a Windows runner (Windows has no lane sandbox); this lane runs WITHOUT a sandbox");
+  const box = await launchLane(base, input({ key: "pane-lane-2", machine: "box", cwd: "/home/u/app" }));
+  expect(starts()[1]).toMatchObject({ machine: "box", sandbox: true });
+  expect(box.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
+});
+
+test("a runner that refuses the sandboxed start is SANDBOX_UNAVAILABLE with the fix, and the reservation is released", async () => {
+  await writeBrief();
+  const base = deps({});
+  // The policy refusals, and the async sandbox check's failure as the runner's lanes.ts reports it.
+  for (const detail of ["lane.start RUNNER_CMD_REJECTED agent-profile sandboxed", "lane.start RUNNER_CMD_REJECTED sandbox-required sandbox:false", "lane.start RUNNER_CMD_FAILED RUNNER_CMD_REJECTED sandbox-unavailable lane-sandbox: bwrap is not installed"]) {
+    const refusing = { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "m1", detail); } };
+    const attempt = launchLane({ ...base, ops: refusing }, input({ machine: "m1", cwd: "/home/u/app" }));
+    await expect(attempt).rejects.toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+    await expect(attempt).rejects.toThrow(`SANDBOX_UNAVAILABLE pane-lane: machine m1 refused the sandboxed start (${detail}); install lane-sandbox on that runner (dori runner install), or opt the machine in with runners.m1.allowUnsandboxed`);
+    expect(await base.registry.read("pane-lane")).toBeNull();
+  }
+});
+
+test("a relaunch keeps the recorded choice: a sandboxed record is checked again, one recorded without a sandbox starts unsandboxed with a note", async () => {
+  await writeBrief();
+  const base = deps({});
+  const record = (patch: Partial<Lane>): Lane => ({ key: "pane-lane", title: "t", thread: "none", brief: join(state.dir, "brief.md"), done: "closed acme/app#3", openedAt: "x", cwd: wt, reportVia: "cli", runner: "local", ...patch });
+  const plain = record({});
+  await base.registry.write(plain);
+  const r = await launchLane(base, input({ cwd: wt }), plain);
+  expect(starts()[0]?.sandbox).toBe(false);
+  expect(r.notes).toContain("SANDBOX_SKIPPED pane-lane: relaunch of a lane recorded without a sandbox");
+  expect(world.calls.filter((c) => c[0] === "lane-sandbox")).toEqual([]);
+  const boxed = { ...r.lane, sandbox: true as const };
+  await base.registry.write(boxed);
+  await expect(launchLane({ ...base, which: () => null }, { ...input({ cwd: wt }), sandbox: true }, boxed)).rejects.toMatchObject({ code: "SANDBOX_MISSING" });
+  const again = await launchLane(base, { ...input({ cwd: wt }), sandbox: true }, boxed);
+  expect(starts().at(-1)?.sandbox).toBe(true);
+  expect(again.notes.filter((note) => note.startsWith("SANDBOX_SKIPPED"))).toEqual([]);
+});
+
+test("a remote lane without --cwd sends no cwd (its runner uses its defaultCwd) and records the directory the runner reports", async () => {
   await writeBrief();
   const d = deps({});
-  await expect(launchLane(d, input({ machine: "m1" }))).rejects.toThrow("a lane on machine m1 needs --cwd");
-  expect(starts()).toEqual([]);
-  expect(await d.registry.read("pane-lane")).toBeNull();
+  world.startResult = { pane: "w:p3", tab: "w:t7", startup: { verdict: "ok", detail: "ready" }, cwd: "/Users/u/work" };
+  const r = await launchLane(d, input({ machine: "m1" }));
+  expect(starts()[0]).toMatchObject({ machine: "m1", sandbox: true });
+  expect(starts()[0]).not.toHaveProperty("cwd");
+  expect(r.lane).toMatchObject({ machine: "m1", runner: "m1", remoteCwd: "/Users/u/work" });
+  expect(r.lane.cwd).toBeUndefined();
+});
+
+test("a remote lane goes to its machine's runner with its remote directory and no heavy-slot settings", async () => {
+  await writeBrief();
+  const d = deps({});
   const r = await launchLane(d, input({ machine: "m1", cwd: "/home/u/app" }));
   const start = starts()[0]!;
-  expect(start).toMatchObject({ machine: "m1", cwd: "/home/u/app", sandbox: false });
+  expect(start).toMatchObject({ machine: "m1", cwd: "/home/u/app", sandbox: true });
   expect(start.heavySlots).toBeUndefined();
   expect(start.briefText).toContain("~/.dori/runner/bin/dori report pane-lane done");
   expect(r.lane).toMatchObject({ machine: "m1", runner: "m1", remoteCwd: "/home/u/app", reportVia: "cli" });
@@ -297,8 +352,19 @@ test("footer puts the shared done rules first and every lane value after '### Th
   expect(footerDoneRules(footerLane({ reportVia: "cli", autoClose: "machine" }))).toContain("autoClose: machine");
 });
 
-test("only a lane whose Done names a merged PR is told to claim without waiting for the merge", () => {
-  const line = "claim done without waiting for the merge";
+test("footer places the lane's git worktrees under its machine's reported worktree root, and says nothing without one", () => {
+  const line = "- Create every git worktree this lane needs under /srv/wt, as /srv/wt/<repo name>-k-1 (<repo name>: the last segment of owner/repo).";
+  for (const lane of [footerLane(), footerLane({ machine: "m1", runner: "m1" })]) {
+    const text = footer(lane, "Korean", [], "/srv/wt/");
+    expect(text).toContain(line);
+    expect(text.indexOf(line)).toBeGreaterThan(text.indexOf("### This lane"));
+    expect(text.replace(`${line}\n`, "")).toBe(footer(lane, "Korean", []));
+    expect(footer(lane, "Korean", [], undefined)).not.toContain("Create every git worktree");
+  }
+});
+
+test("only a lane whose Done names a merged PR is told to claim while its CI is still running", () => {
+  const line = "claim done once the PR is pushed and its CI is running or green";
   expect(footerDoneRules(footerLane({ done: "merged acme/app#1; closed acme/app#3" }))).toContain(line);
   expect(footerDoneRules(footerLane())).not.toContain(line);
 });
@@ -307,7 +373,7 @@ test("a mass-ulw launch refuses keywords or a brief path that omo would not bind
   await writeBrief();
   const base = deps({});
   const mass = (massLaunchKeywords: string, extra: Record<string, string> = {}) =>
-    validateLaunch({ ...base, config: { ...base.config, massLaunchKeywords } }, { ...input({ pane: "w:p3", ...extra }), mode: "mass-ulw" });
+    validateLaunch({ ...base, tunables: { ...base.tunables, massLaunchKeywords } }, { ...input({ pane: "w:p3", ...extra }), mode: "mass-ulw" });
   await expect(mass("mass-ulw set goal and work")).rejects.toThrow(LaunchError);
   await expect(mass("/mass-ulw set goal and work?")).rejects.toThrow(LaunchError);
   await expect(mass("/mass-ulw set goal and work", { brief: join(state.dir, "what?.md") })).rejects.toThrow(LaunchError);

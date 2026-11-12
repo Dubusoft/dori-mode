@@ -7,6 +7,7 @@ import {
   runStartupCheck, SERVE_LOCK, writeRunnerFile, type FsSafetyOptions,
 } from "../src/runner/fs-safety.ts";
 import { IO_REPARSE_TAG_AF_UNIX, type AclInfo } from "../src/runner/win-acl.ts";
+import { captureOutput } from "../src/runner/lane-files.ts";
 
 const roots: string[] = [];
 const temp = (): string => { const d = mkdtempSync(join(tmpdir(), "dori-fs-safety-")); roots.push(d); return d; };
@@ -18,6 +19,66 @@ const reasonOf = (fn: () => void): string | undefined => {
   return undefined;
 };
 const goodDir = (): string => { const d = join(temp(), "runner"); ensureRunnerDir(d); return d; };
+
+test("only exact own-key .out roots exempt untrusted children; capture still refuses links", () => {
+  const dir = goodDir(), briefs = ensureRunnerSubdir(dir, "briefs"), out = join(briefs, "lane-a.out");
+  mkdirSync(out, { mode: 0o700 });
+  writeFileSync(join(out, "report.md"), "ordinary 0644 file", { mode: 0o644 });
+  symlinkSync(join(dir, "missing"), join(out, "bad"));
+  checkRunnerDir(dir);
+  expect(() => captureOutput(dir, "lane-a", { id: "00000000-0000-4000-8000-000000000001", requiredReport: false })).toThrow("(symlink)");
+  chmodSync(out, 0o755);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+  chmodSync(out, 0o700);
+  for (const name of ["lane-a.files", "lane-a.out-extra", "con.out", "bad..out"]) {
+    const control = join(briefs, name);
+    mkdirSync(control, { mode: 0o700 });
+    writeFileSync(join(control, "bad"), "", { mode: 0o644 });
+    expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+    rmSync(control, { recursive: true });
+  }
+  const elsewhere = ensureRunnerSubdir(dir, "lane-b.out");
+  writeFileSync(join(elsewhere, "bad"), "", { mode: 0o644 });
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+  rmSync(elsewhere, { recursive: true });
+  rmSync(out, { recursive: true });
+  symlinkSync(briefs, out);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("symlink");
+  rmSync(out); writeFileSync(out, "", { mode: 0o600 });
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("not-directory");
+});
+
+test("a lane's own lanes/<key> directory is audited itself, never what the lane put in it", () => {
+  const dir = goodDir(), lanes = ensureRunnerSubdir(dir, "lanes"), lane = ensureRunnerSubdir(dir, join("lanes", "lane-a"));
+  mkdirSync(join(lane, "repo"), { mode: 0o755 });
+  writeFileSync(join(lane, "repo", "README.md"), "", { mode: 0o644 });
+  symlinkSync("/etc", join(lane, "link"));
+  checkRunnerDir(dir);
+  chmodSync(lane, 0o755);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+  rmSync(lane, { recursive: true });
+  symlinkSync("/etc", lane);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("symlink");
+  rmSync(lane);
+  chmodSync(lanes, 0o755);
+  expect(reasonOf(() => checkRunnerDir(dir))).toBe("mode");
+});
+
+test("Windows output root ACL/reparse checks remain strict without reading descendants", () => {
+  const dir = goodDir(), briefs = ensureRunnerSubdir(dir, "briefs"), out = join(briefs, "lane-a.out");
+  mkdirSync(out, { mode: 0o700 });
+  writeFileSync(join(out, "untrusted"), "");
+  const sid = "S-1-5-21-1";
+  const calls: string[] = [];
+  const options = { platform: "win32" as const, userSid: sid, acl: (path: string) => {
+    calls.push(path); return { owner: sid, sddl: `O:${sid}D:P(A;;FA;;;${sid})` };
+  } };
+  checkRunnerDir(dir, options);
+  expect(calls).toContain(out);
+  expect(calls).not.toContain(join(out, "untrusted"));
+  expect(reasonOf(() => checkRunnerDir(dir, { ...options, acl: (path) => ({ ...options.acl(path), ...(path === out ? { reparseTag: 0xa000000c } : {}) }) }))).toBe("symlink");
+  expect(reasonOf(() => checkRunnerDir(dir, { ...options, acl: (path) => ({ owner: path === out ? "S-1-5-21-2" : sid, sddl: path === out ? "O:S-1-5-21-2D:P(A;;FA;;;S-1-5-21-2)" : options.acl(path).sddl }) }))).toBe("owner");
+});
 
 describe("runner dir checks", () => {
   test("default dir is under the home", () => {
@@ -293,10 +354,14 @@ describe("win32 rules (injected ACL reader)", () => {
     expect(reasonOf(() => checkRunnerDir(d, win(d, { "": { reparseTag: JUNCTION_TAG } })))).toBe("symlink");
   });
 
-  test("the AF_UNIX socket reparse point passes only directly under sock", () => {
+  test("the AF_UNIX socket reparse point passes only directly under sock or sock/lane.d", () => {
     const d = winDir();
     writeFileSync(join(d, "sock", "lane.sock"), "");
     checkRunnerDir(d, win(d, { "sock/lane.sock": { reparseTag: IO_REPARSE_TAG_AF_UNIX } }));
+    mkdirSync(join(d, "sock", "lane.d"), { mode: 0o700 });
+    writeFileSync(join(d, "sock", "lane.d", "lane"), "");
+    checkRunnerDir(d, win(d, { "sock/lane.d/lane": { reparseTag: IO_REPARSE_TAG_AF_UNIX } }));
+    rmSync(join(d, "sock", "lane.d"), { recursive: true });
     expect(reasonOf(() => checkRunnerDir(d, win(d, { "logs/runner.log": { reparseTag: IO_REPARSE_TAG_AF_UNIX } })))).toBe("symlink");
     expect(reasonOf(() => checkRunnerDir(d, win(d, { "runner.json": { reparseTag: IO_REPARSE_TAG_AF_UNIX } })))).toBe("symlink");
     expect(reasonOf(() => checkRunnerDir(d, win(d, { sock: { reparseTag: IO_REPARSE_TAG_AF_UNIX } })))).toBe("symlink");

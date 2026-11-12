@@ -7,10 +7,12 @@ import { paneShell } from "../src/runner/lane-control.ts";
 import { powershellLaunchLine, RunnerLanes } from "../src/runner/lanes.ts";
 import { fakeClock } from "./fakes.ts";
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0 };
+const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES };
 
 const decode = (line: string, shell: string): string => {
   const m = new RegExp(`^${shell} -NoLogo -EncodedCommand ([A-Za-z0-9+/=]+)$`).exec(line);
@@ -28,10 +30,11 @@ const setup = (shellName: string, agent = ["omo", "--model", "{model}", "{prompt
   const lanes = new RunnerLanes({
     instance: async () => "server-1", runnerDir, clock: fakeClock(1_800_000_000_000), token: () => "tok", realpath: (p: string) => p,
     legacyMcp: async () => false, startup: async () => ({ verdict: "ok", detail: "ready" }),
-    policy: { agents: { omo: agent }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
+    policy: { agents: { omo: agent }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] },
     publish: () => {},
     run: async (argv) => {
       calls.push([...argv]);
+      if (argv[0] === "lane-sandbox" && argv.includes("--check")) return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
       const verb = argv.slice(0, 3).join(" ");
       if (verb === "herdr tab create") return ok(JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }));
       if (verb === "herdr pane get") return ok(JSON.stringify({ result: { pane: { pane_id: "p1", cwd: "C:\\repo" } } }));
@@ -52,7 +55,7 @@ test("a pwsh pane gets a nested encoded command with env, quoting and argv order
   const line = typed(t.calls);
   const tokenFile = t.lanes.tokenPath("lane-a");
   const script = decode(line, "pwsh");
-  expect(script).toStartWith(`$env:DORI_LANE_KEY='lane-a'; $env:DORI_LANE_TOKEN_FILE='${tokenFile.replace(/'/g, "''")}'; $env:DORI_HEAVY_SLOTS='2'; $env:DORI_HEAVY_MAX_LOAD='3'; $env:PSExecutionPolicyPreference='Bypass'; & 'omo' '--model' 'm1' '`);
+  expect(script).toStartWith(`$env:DORI_LANE_KEY='lane-a'; $env:DORI_LANE_TOKEN_FILE='${tokenFile.replace(/'/g, "''")}'; $env:DORI_LANE_OUT='${join(tokenFile, "..", "lane-a.out").replace(/'/g, "''")}'; $env:DORI_HEAVY_SLOTS='2'; $env:DORI_HEAVY_MAX_LOAD='3'; $env:PSExecutionPolicyPreference='Bypass'; & 'omo' '--model' 'm1' '`);
   expect(script).toEndWith("'; exit $LASTEXITCODE");
   expect(script).not.toContain("DORI_LANE_TOKEN='");
   expect(t.calls.some((a) => a.join(" ").includes("-NoProfile"))).toBe(false);

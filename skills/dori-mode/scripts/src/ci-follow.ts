@@ -4,7 +4,9 @@ import { join } from "node:path";
 import type { FlowDeps } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
-import { launchLane } from "./launch.ts";
+import { launchLane, SandboxRefusal } from "./launch.ts";
+import { machineRunner } from "./lane-ops.ts";
+import { runnerWorktreeRoot } from "./runner/hub.ts";
 import {
   type LaneMessage, type LaneMessageStore, OPEN_MESSAGE_STATES, openLaneMessages, queueLaneMessage, updateLaneMessage,
 } from "./lane-messages.ts";
@@ -15,6 +17,7 @@ import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import { canLaunch } from "./routing.ts";
+import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { parseSignal, splitDone } from "./signals.ts";
 
 /**
@@ -185,10 +188,10 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
     }
     if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, panesOf);
     if (message.state === "acked" || message.escalatedAt !== undefined) continue;
-    if (deps.clock.now() - message.at < deps.config.ciConfirmMin * 60_000) continue;
+    if (deps.clock.now() - message.at < deps.tunables.ciConfirmMin * 60_000) continue;
     const why = message.state === "delivered" ? "delivered but not confirmed" : `not delivered: ${message.blocked ?? "waiting"}`;
     // Journaled before escalatedAt is saved: a crash in between re-emits the same id, which the journal dedupes.
-    emit(`lane-message-unconfirmed:${message.id}`, `LANE_MESSAGE_UNCONFIRMED ${message.lane} ${message.id} ${why} after ${deps.config.ciConfirmMin} min; about ${message.subject}`);
+    emit(`lane-message-unconfirmed:${message.id}`, `LANE_MESSAGE_UNCONFIRMED ${message.lane} ${message.id} ${why} after ${deps.tunables.ciConfirmMin} min; about ${message.subject}`);
     updateLaneMessage(messages, message, { escalatedAt: deps.clock.now() }, deps.clock.now());
   }
 };
@@ -566,7 +569,7 @@ export class CiFollowUp {
     const now = this.deps.clock.now();
     const seen = this.stalls.get(subject) ?? { since: now, alerted: false };
     this.stalls.set(subject, seen);
-    const min = this.deps.config.mergeStallMin;
+    const min = this.deps.tunables.mergeStallMin;
     if (seen.alerted || now - seen.since < min * 60_000) return;
     seen.alerted = true;
     emit(`merge-stalled:${subject}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} ${why} for ${min}+ min: ${hint} ${pull.url}`);
@@ -648,11 +651,14 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (!valid) return { ok: false, detail: `branch name ${JSON.stringify(branch.slice(0, 80))} of ${pull.repo}#${pull.number} is not a valid branch` };
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
-  if (!deps.config.worktreeRoot) return { ok: false, detail: "worktreeRoot is not set" };
+  // The local runner's reported worktree root (it reports config.worktreeRoot unless its runner-config sets one); the
+  // config's only while that runner has reported none. The closed-lane sweep (done-flow.ts) uses the same root.
+  const root = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(undefined)) || deps.config.worktreeRoot;
+  if (!root) return { ok: false, detail: "worktreeRoot is not set" };
   const paneCount = async (): Promise<number> => deps.ops.panes().then((panes) => panes.length, () => -1); // the local runner's panes; -1 when unreadable
   const host = canLaunch(await sampleHost(deps.run, diskGuardPath(deps.config), paneCount), deps.config.guard);
   if (!host.ok) return { ok: false, detail: `HOLD ${host.reasons.join(" | ")}` };
-  const worktree = join(deps.config.worktreeRoot, repoName(pull.repo), key);
+  const worktree = join(root, repoName(pull.repo), key);
   if ((await deps.ops.exists(undefined, [worktree]))[0]) return { ok: false, detail: `worktree ${worktree} already exists` };
   const fetched = await deps.ops.git(source, { op: "fetch-branch", root: source.cwd, remote: "origin", branch });
   if (fetched.code !== 0) return { ok: false, detail: `git fetch failed: ${(fetched.err || fetched.out).trim()}` };
@@ -662,11 +668,22 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   mkdirSync(briefs, { recursive: true });
   const brief = join(briefs, `${key}.md`);
   await Bun.write(brief, mergeLaneBrief(request, worktree));
-  const { startup } = await launchLane(deps, {
-    key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `merged ${pull.repo}#${pull.number}`,
-    thread: source.thread, cwd: worktree, shareThread: true,
-  });
-  return { ok: true, detail: startup };
+  // A refused sandbox (or an allowed unsandboxed run) reaches the owner in the source lane's thread; a notice that could
+  // not be posted is logged, since this path returns only a detail line.
+  const notice = { key, thread: source.thread };
+  const logged = (lines: readonly string[]): void => { for (const line of lines) console.error(line); };
+  try {
+    const { startup, notes } = await launchLane(deps, {
+      key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `merged ${pull.repo}#${pull.number}`,
+      thread: source.thread, cwd: worktree, shareThread: true,
+    });
+    logged(await postSkippedNotices(deps, notice, notes));
+    return { ok: true, detail: startup };
+  } catch (error) {
+    if (!(error instanceof SandboxRefusal)) throw error;
+    logged(await postSandboxNotice(deps, notice, error.message));
+    return { ok: false, detail: error.message };
+  }
 };
 
 export const defaultCiIo: CiIo = { launch: launchMergeLane };

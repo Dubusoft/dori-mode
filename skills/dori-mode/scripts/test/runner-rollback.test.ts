@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { treeDigest } from "../src/lane-files.ts";
 import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { evacuate } from "../src/runner/evacuate.ts";
@@ -15,11 +17,12 @@ const setup = async () => {
   const s = withState();
   cleanups.push(s.done);
   const clock = fakeClock(T0);
-  const deps = depsFor(newWorld(), clock, s.dir, {});
+  const deps = depsFor(newWorld(), clock, join(s.dir, "state"), {});
   await deps.registry.write({ key: "lane-a", title: "a", thread: "none", brief: join(s.dir, "a.md"), done: "x", openedAt: new Date(T0).toISOString(), status: "working", machine: "worker-a", runner: "worker-a", pane: "pa" } as unknown as Lane);
   const store = openLaneReports(deps.config);
   cleanups.push(() => { store.close(); });
-  const hub: LaneHubDeps = { registry: deps.registry, reports: () => store, now: clock.now, emit: () => {}, recover: () => undefined };
+  const hub: LaneHubDeps = { stateDir: deps.config.stateDir, registry: deps.registry, reports: () => store, now: clock.now, emit: () => {},
+    prepareRecovery: async (_label, key) => ({ cmdId: `recover:${key}:${clock.now()}`, notes: [] }), recover: () => undefined };
   return { deps, store, hub };
 };
 const report = (seq: number, kind: string, text: string, evidence?: string): AnyRunnerEvent =>
@@ -29,6 +32,17 @@ test("a done from a lane the runner owns arrives as a claim", async () => {
   const t = await setup();
   await acceptLaneEvent(t.hub, "worker-a", report(1, "done", "merged", "abc123"));
   expect(await routeReports(t.deps, t.store, () => {})).toEqual([expect.stringMatching(/ done claim$/)]);
+  expect((await t.deps.registry.read("lane-a"))?.status).toBe("done-claimed");
+});
+
+test("evacuation imports managed snapshots using the configured central collection context", async () => {
+  const t = await setup(), run = { id: "00000000-0000-4000-8000-000000000001", requiredReport: false };
+  await t.deps.registry.patch("lane-a", { fileRun: run });
+  const tree = { directories: [], files: [] }, files = { run, revision: 1, tree, sha256: treeDigest(tree) };
+  const frame = { ...report(1, "done", "done", "saved"), body: { key: "lane-a", kind: "done" as const, text: "done", evidence: "saved", files } } as AnyRunnerEvent;
+  await evacuate({ hub: t.hub, exportOutbox: async () => [frame], tellLane: async () => true, stopRunner: async () => ({ ok: true, detail: "stopped" }) }, "worker-a");
+  expect(JSON.parse(readFileSync(join(t.deps.config.stateDir, "..", "research", "lane-a", ".dori-lane-files.json"), "utf8"))).toMatchObject({ key: "lane-a", run });
+  await routeReports(t.deps, t.store, () => {});
   expect((await t.deps.registry.read("lane-a"))?.status).toBe("done-claimed");
 });
 

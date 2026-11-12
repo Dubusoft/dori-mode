@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { outcomeLane } from "./lane-outcomes.ts";
+import { hasColumn, readStoreView } from "./store.ts";
+import { splitChannelName } from "./messenger/discord-inbound.ts";
 
 /**
  * The lead's read path for delivered events (`dori inbox take`). It prints lead-events.log from the take cursor to the
@@ -211,6 +213,29 @@ export const takeCarriedReminders = (stateDir: string, skipIds: ReadonlySet<stri
   ? `unfinished:${item.id}\tUNFINISHED ${item.id} taken and not handled (dori ack it unless acked, then handle it): ${item.line}`
   : `${item.id}\t${item.line}`);
 
+/**
+ * `dori inbox take`'s information lines for owner messages the lead parked with `dori handled --awaiting`: nothing to do
+ * until the owner answers, then a `--lane`, `--reply` or `--all` closes them. Read from the store (an unreadable store, or
+ * one the supervisor has not migrated yet, prints none).
+ */
+export const takeAwaitingReminders = (stateDir: string): string[] => {
+  type Parked = { readonly id: string; readonly at: number; readonly note?: string; readonly line?: string };
+  const parked = readStoreView<Parked[]>(stateDir, {
+    json: (journal) => (journal.awaitingAck ?? []).filter((entry) => entry.awaitingOwnerAt !== undefined && entry.handledAt === undefined &&
+      !entry.quarantined && !entry.deleted).map((entry) => ({
+      id: entry.id, at: entry.awaitingOwnerAt ?? 0, note: entry.awaitingNote,
+      line: journal.events.find((event) => event.id === (entry.revision ?? entry.id))?.line,
+    })),
+    sqlite: (db) => !hasColumn(db, "owner_messages", "awaiting_owner_at") ? [] : (db.query(`SELECT o.id, o.awaiting_owner_at AS at, o.awaiting_note AS note, e.line
+      FROM owner_messages o LEFT JOIN events e ON e.id = coalesce(o.revision, o.id)
+      WHERE o.awaiting_owner_at IS NOT NULL AND o.handled_at IS NULL AND o.state != 'quarantined' AND o.deleted IS NULL ORDER BY o.pos`)
+      .all() as { id: string; at: number; note: string | null; line: string | null }[])
+      .map((row) => ({ id: row.id, at: row.at, note: row.note ?? undefined, line: row.line ?? undefined })),
+  }) ?? [];
+  return parked.map((item) => `awaiting:${item.id}\tAWAITING_OWNER since ${new Date(item.at).toISOString()}${item.note ? ` (${item.note})` : ""}: ` +
+    `${item.line ?? item.id} - do not act until the owner answers`);
+};
+
 /** Owner chat lines: a message, an edit of one, or a visitor's message. */
 const OWNER_LINE = /^(INBOUND|INBOUND_EDIT|VISITOR)\b/;
 
@@ -258,7 +283,8 @@ const UNREAD_KIND = /^(INBOUND|INBOUND_EDIT|INBOUND_DELETE) (\d+) (\d+)(?: (.*))
  * each acked channel, so a follow-up that arrived with or after the acked message is seen before the reply. It never
  * writes a take receipt or carried owner text, so the next `dori inbox take` still prints these events. Only the acked
  * originals are left out: their edits and deletes stay. Per channel (first-acked order, each once) it prints at most
- * `max` lines `UNREAD <channel> <kind> <eventId> <preview>`, then `UNREAD_MORE <channel> <n>` for the rest, or
+ * `max` lines `UNREAD <channel> <kind> <eventId> <preview>`, then `UNREAD_MORE <channel> <n>` for the rest (both end with
+ * the event's ` channel=#<name>` token when the supervisor knew the name), or
  * `UNREAD_NONE <channel>`. A missing cursor or a failed read prints one `UNREAD_UNAVAILABLE` line instead of throwing:
  * the ack is already recorded and must not fail because of the preview.
  */
@@ -278,7 +304,7 @@ export const unreadAfterAck = (stateDir: string, acked: readonly { readonly chan
       const events = byChannel.get(channel) ?? [];
       if (!events.length) return [`UNREAD_NONE ${channel}`];
       shown.push(...events.slice(0, max).map((event) => event.id));
-      return [...events.slice(0, max).map((event) => event.text), ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}`] : [])];
+      return previewLines(channel, events, max);
     });
     recordSeen(stateDir, shown);
     return out;
@@ -300,10 +326,15 @@ export const staleOwnerEvents = (stateDir: string, channel: string, max = UNREAD
   const events = ownerEventsPast(stateDir, from).filter((event) => event.channel === channel && !seen.has(event.id));
   if (!events.length) return { count: 0, lines: [] };
   recordSeen(stateDir, events.slice(0, max).map((event) => event.id));
-  return { count: events.length, lines: [...events.slice(0, max).map((event) => event.text), ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}`] : [])] };
+  return { count: events.length, lines: previewLines(channel, events, max) };
 };
 
-type OwnerEvent = { readonly channel: string; readonly id: string; readonly text: string };
+type OwnerEvent = { readonly channel: string; readonly id: string; readonly text: string; readonly token: string };
+
+const previewLines = (channel: string, events: readonly OwnerEvent[], max: number): string[] => [
+  ...events.slice(0, max).map((event) => event.text),
+  ...(events.length > max ? [`UNREAD_MORE ${channel} ${events.length - max}${events.findLast((event) => event.token)?.token ?? ""}`] : []),
+];
 
 /** Owner events (INBOUND, INBOUND_EDIT, INBOUND_DELETE) of the Discord log past `from`, as `UNREAD ...` preview lines. */
 const ownerEventsPast = (stateDir: string, from: number): OwnerEvent[] => {
@@ -312,9 +343,11 @@ const ownerEventsPast = (stateDir: string, from: number): OwnerEvent[] => {
     const event = parseLogLine(text);
     const m = UNREAD_KIND.exec(event.line);
     if (!m || !event.id.startsWith(`discord:${m[2]}:`)) continue;
-    const body = (m[4] ?? "").replace(/\s+/g, " ").trim();
+    // The channel name token is kept out of the cut preview and goes last again.
+    const { text: rest, token } = splitChannelName(m[4] ?? "");
+    const body = rest.replace(/\s+/g, " ").trim();
     const preview = body.length > UNREAD_PREVIEW_CHARS ? `${body.slice(0, UNREAD_PREVIEW_CHARS)}...` : body;
-    out.push({ channel: m[2] ?? "", id: event.id, text: `UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}` });
+    out.push({ channel: m[2] ?? "", id: event.id, token, text: `UNREAD ${m[2]} ${m[1]} ${event.id}${preview ? ` ${preview}` : ""}${token}` });
   }
   return out;
 };

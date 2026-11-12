@@ -71,6 +71,9 @@ export class Supervisor {
   /** The lead pane in use now: repairLeadPane replaces the configured one when it recreates the pane. */
   get leadPane(): string { return this.core.deps.config.leadPane; }
 
+  /** The config object the supervisor core reads now (a recreated lead pane replaces it with a copy). */
+  get config(): FlowDeps["config"] { return this.core.deps.config; }
+
   /** Releases the store (tests and shutdown); the supervisor must not be used afterwards. */
   close(): void { this.core.close(); }
 
@@ -172,7 +175,7 @@ export class Supervisor {
   }
 
   /**
-   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at defaultCwd.
+   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at leadCwd.
    * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
    * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
    */

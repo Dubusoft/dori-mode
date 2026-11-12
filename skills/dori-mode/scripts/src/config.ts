@@ -1,11 +1,13 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
-import { DEFAULT_EVENT_POLICY, type EventPolicy } from "./event-policy.ts";
-import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
+import { type AutopilotConfig, DEFAULT_AUTOPILOT, parseAutopilotConfig } from "./autopilot.ts";
+import { DEFAULT_DISPLAY_TIME_ZONE, validTimeZone } from "./display-time.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
+import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
-import type { StoreKind } from "./store.ts";
+import { SECRET_NAME } from "./secret-name.ts";
+import { type StoreKind, storeOnDisk } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
 
@@ -28,7 +30,7 @@ export type GuardThresholds = {
 
 /** `dori memory check` and the supervisor's daily memory sweep. Read-only: the memory repo is never written. */
 export type MemoryCheckConfig = {
-  /** The lead's omo memory repo (holds system/human.md); blank finds omo's repo for `defaultCwd` under ~/.omo/memory/agents. */
+  /** The lead's omo memory repo (holds system/human.md); blank finds omo's repo for `leadCwd` under ~/.omo/memory/agents. */
   readonly repo: string;
   /** human.md above this many KB (1024 bytes) needs condensing. */
   readonly maxKb: number;
@@ -111,8 +113,6 @@ export const MAX_POINTER_CHARS = 800;
 export type PlacementConfig = {
   /** Machine for workspace-less launches: "local" (default) or a machine label. */
   readonly defaultMachine: string;
-  /** Workspace -> machine. Key: an absolute path prefix matched against --cwd, an owner/repo matched (case-insensitive) against the Done line's repos, or "*" for every other workspace task. Value: "local" or a machine label. */
-  readonly workspaces: Readonly<Record<string, string>>;
   /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
   readonly fallback: readonly string[];
 };
@@ -128,12 +128,11 @@ export type DoriConfig = {
   readonly stateDir: string;
   /** The herdr workspace new local lane tabs open in, from dori state (managed-panes.ts); never read from the config file after migration. */
   readonly laneWorkspace: string;
-  /** The workspaces the sweeps watch: the lanes workspace (empty: every workspace). Derived, not configured. */
-  readonly workspaces: readonly string[];
   readonly ignorePanes: readonly string[];
   /** The lead's herdr pane, from dori state (managed-panes.ts) or DORI_LEAD_PANE; the supervisor creates and records it. */
   readonly leadPane: string;
-  readonly defaultCwd: string;
+  /** The lead session's working directory (config key `leadCwd`, formerly `defaultCwd`); local lanes started without --cwd start here too. */
+  readonly leadCwd: string;
   readonly agentCommand: ArgvTemplate;
   readonly defaultModel: string;
   /** Model for the lead only; absent or blank means `defaultModel`. */
@@ -142,118 +141,71 @@ export type DoriConfig = {
   readonly leadThinking?: string;
   /** Extra argv for the lead session only (after the executable), e.g. ["--approve"]. */
   readonly leadArgs: ArgvTemplate;
-  /** Start the lead with a slimmer omo context (no skills list, LEAD_DIET_EXCLUDED_TOOLS removed, chat prompt surface). Lanes are unaffected. */
-  readonly leadDiet: boolean;
-  readonly cacheTtlMin: number;
-  readonly leadContextCapTokens: number;
-  readonly leadContextHardCapTokens: number;
   readonly discordChannels: readonly string[];
+  /**
+   * The Discord channel for the supervisor's system notices (alertsChannelOf). Absent: those go to `discordChannels[0]`.
+   * Read where it is used, so a config reload applies it live.
+   */
+  readonly alertsChannel?: string;
   /** Owner-only Discord button hooks: name ([a-z0-9-]{1,20}) -> argv run on a `dori:hook:<name>:...` click. */
   readonly buttonHooks?: Readonly<Record<string, ArgvTemplate>>;
-  readonly discordSafetyPollSeconds: number;
-  /** Messages fetched (one REST page, 1-100) the first time a Discord channel is caught up with no saved cursor. */
-  readonly discordFirstSeenLimit: number;
-  readonly githubPollSeconds: number;
-  readonly githubTimeoutMs: number;
   /** GitHub logins whose new or reopened issues wake the lead as GH_ISSUE; anyone else is digest only. */
   readonly githubIssueAuthors: readonly string[];
-  /** Opening keywords of a `--mode ulw` lane (the default): clear, contained work. */
-  readonly launchKeywords: string;
-  /** Opening keywords of a `--mode mass-ulw` lane: wide changes or vague instructions that need investigation first. */
-  readonly massLaunchKeywords: string;
-  /** `--thinking` level for lanes; absent or blank keeps whatever `agentCommand` carries. The lead never reads it. */
-  readonly laneThinking?: string;
-  readonly sessionsDir: string;
-  readonly nudgeAfterMin: number;
   /**
-   * Minutes an idle lane may stay silent after its freshness nudge before the lead hears urgent IDLE-ESCALATE; each
-   * further one for the same silence waits twice as long. Must be positive.
+   * Only worktrees under this directory are removed by the closed-lane cleanup sweep. Empty (the default): the local
+   * runner's reported root (runner-config `worktreeRoot`, else `<reposRoot>/worktrees`) is used, and without one the
+   * sweep is off.
    */
-  readonly idleEscalateMin: number;
-  readonly closeAfterMin: number;
-  /**
-   * Minutes after a claim's window starts that the claim keeps waiting for the supervisor's merge, when its only failing
-   * Done signals are `merged` PRs it bound at their still-current head with no failed check and no conflict.
-   */
-  readonly mergeWaitMaxMin: number;
-  /**
-   * Minutes an open lane PR may stay unmergeable for a reason only a person fixes (claimed but no checks, review or
-   * draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
-   */
-  readonly mergeStallMin: number;
-  /** Only worktrees under this directory are removed by the closed-lane cleanup sweep; empty turns the sweep off. */
   readonly worktreeRoot: string;
   /** Free-text language the owner reads (e.g. "Korean"). Unset or blank: lanes get no language instruction. */
   readonly ownerLanguage?: string;
+  /** IANA time zone owner-facing system messages show times in, labelled with its abbreviation (display-time.ts). */
+  readonly displayTimeZone: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
+  /** Store secrets a lane may receive, by name; a secret with no rule (or an empty one) goes to no lane. */
+  readonly secrets: Readonly<Record<string, SecretRule>>;
+  /** Proxy-execution ops (`dori secret run <op>`): the supervisor host runs argv with the listed secrets in its env, outside any lane. */
+  readonly secretCommands: Readonly<Record<string, SecretCommand>>;
   /**
    * Argv prefix that wraps every new local lane's agent command (e.g. ["lane-sandbox"]). Absent from the file: DEFAULT_LANE_SANDBOX.
    * The lead is never wrapped.
    */
   readonly laneSandbox?: LaneSandbox;
-  /** Digest events wait for an urgent one, but never longer than this. */
-  readonly digestMaxDelayMin: number;
-  /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
-  readonly ownerDelayNotice: string;
-  /** Seconds the lead has to ack (`dori ack`) an owner message it was handed before it is reminded (push delivery re-pushes it); twice this posts `ackMissingNotice`. */
-  readonly ackTimeoutSec: number;
-  /** Posted once in the owner's channel or thread when the lead got their message but has not acked it after two windows. */
-  readonly ackMissingNotice: string;
-  /** Minutes after reading an owner message to link all tasks with dori handled; a second window notifies the owner. */
-  readonly handledTimeoutMin: number;
-  readonly unhandledNotice: string;
-  /** Minutes after a lane claimed done or finished (LANE_DONE_CLAIMED, LANE_CLOSED, CI_MERGED) for the lead to tell the owner and run dori reported before UNREPORTED. */
-  readonly reportTimeoutMin: number;
-  /** Event kinds (eventPolicy syntax) that open a decision obligation, closed by dori resolved <eventId> (decision-obligations.ts). */
-  readonly resolveKinds: readonly string[];
-  /** Minutes after a decision event for the lead to run dori resolved <eventId> before UNRESOLVED. */
-  readonly resolveTimeoutMin: number;
+  /**
+   * Per-runner (machine label) lead-side settings. `allowUnsandboxed: true` is the only way a lane runs without a sandbox:
+   * remote lanes on that machine start unsandboxed (SANDBOX_SKIPPED, posted to the owner) instead of being refused.
+   */
+  readonly runners?: Readonly<Record<string, RunnerConfig>>;
   readonly heavySlots: number;
   /** Critical memory pressure kills processes whose full command line contains any of these substrings. */
   readonly heavyKill: readonly string[];
   readonly heavyMaxLoad: number;
   /** Remote guard: machine label -> ssh target, for machines herdr does not list (overrides a herdr entry of the same label). */
   readonly guardMachines: Readonly<Record<string, string>>;
-  readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly memoryCheck: MemoryCheckConfig;
   readonly hooks: Hooks;
   /** Default limit in ms for every external call (herdr, git, df, ...) that sets none itself; 0 turns it off. */
   readonly runTimeoutMs: number;
-  /** The path whose filesystem the disk guard checks; blank means `stateDir`. */
-  readonly diskGuardPath: string;
-  /** A wait without --timeout whose check errors or times out this many times in a row ends as WAIT_FAILED. */
-  readonly waitMaxFailures: number;
   /** Minutes a working/blocked lead may leave owner messages unread before it is cold-restarted with them; 0 turns it off. */
   readonly leadStuckRestartMin: number;
-  /**
-   * Minutes an owner message may stay unacked while the lead sits inside one tool call, or idle (an Esc-paused session
-   * holds its monitor events), before the lead is cold-restarted with it. Must be positive.
-   */
-  readonly leadUnreadRestartMin: number;
   /**
    * Minutes an idle lead whose omo session still waits on its own children (subagents, child tasks, background cells)
    * keeps a lead-restart request or a cold/context-cap restart deferred, counted from when it began waiting. Must be positive.
    * 60 is kept: a deferred lead still gets its events in place, and push-ladder and stuck restarts never wait for it.
    */
   readonly leadChildWaitMaxMin: number;
-  /** Per machine, no herdr call of a sweep round starts later than this many ms after the round began. */
-  readonly sweepMachineDeadlineMs: number;
-  /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`). */
+  /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`); read from `stateDir` (storeOnDisk). */
   readonly store: StoreKind;
-  /** How each event kind is delivered (event-policy.ts); a config's `kinds` are laid over the default table. */
-  readonly eventPolicy: EventPolicy;
-  /** Minutes a lane message may stay unconfirmed (queued or delivered without an ack) before the lead hears of it. */
-  readonly ciConfirmMin: number;
   /** The only base branch the supervisor merges lane PRs into; `main` is refused whatever this says. */
   readonly ciMergeBase: string;
-  /** How events reach the lead: pushed pointers with take receipts. */
-  readonly delivery: DeliveryConfig;
   /** Which machine a launch runs on. */
   readonly placement: PlacementConfig;
   /** Lane drift signals (LANE_DRIFT). */
   readonly drift: DriftConfig;
+  /** `dori autopilot`: which owner-approved toodo tasks may run unattended, and its limits (always on; `dori autopilot pause` stops it). */
+  readonly autopilot: AutopilotConfig;
 };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
@@ -274,70 +226,39 @@ export type LeadModelEntry = string | { readonly model: string; readonly thinkin
 
 export type LeadModel = { readonly model: string; readonly thinking?: string };
 
+/** omo's agent session directory; not configurable (session-id.ts depends on its layout). */
+export const omoSessionsDir = (home = homedir()): string => join(home, ".omo", "agent", "sessions");
+
 export const defaultConfig = (home = homedir()): DoriConfig => ({
   stateDir: join(home, ".dori", "state"),
   laneWorkspace: "",
-  workspaces: [],
   ignorePanes: [],
   leadPane: "",
-  defaultCwd: home,
+  leadCwd: join(home, ".dori", "lead"),
   agentCommand: ["omo", "--model", "{model}", "{prompt}"],
   defaultModel: "anthropic-subscription/claude-opus-5-5",
   leadArgs: [],
-  leadDiet: true,
-  cacheTtlMin: 5,
-  leadContextCapTokens: 150_000,
-  leadContextHardCapTokens: 300_000,
   discordChannels: [],
-  discordSafetyPollSeconds: 300,
-  discordFirstSeenLimit: 100,
-  githubPollSeconds: 90,
-  githubTimeoutMs: 30_000,
   githubIssueAuthors: [],
-  launchKeywords: "ulw set goal and work",
-  massLaunchKeywords: "/mass-ulw set goal and work",
-  laneThinking: "medium",
-  sessionsDir: join(home, ".omo", "agent", "sessions"),
-  nudgeAfterMin: 15,
-  idleEscalateMin: 30,
-  closeAfterMin: 5,
-  mergeWaitMaxMin: 60,
-  mergeStallMin: 15,
-  worktreeRoot: "/data/repos/worktrees",
-  digestMaxDelayMin: 60,
-  ownerDelayNotice: "메시지를 받았습니다. 리드 세션이 아직 메시지를 받지 못하고 있어 대기열에 보관해 두었고, 리드가 돌아오는 대로 답변드립니다.",
-  ackTimeoutSec: 60,
-  ackMissingNotice: "메시지가 리드 세션에 전달됐지만 아직 읽었다는 확인이 없습니다. 리드에게 다시 알렸고, 이곳으로 답변드립니다.",
-  handledTimeoutMin: 30,
-  unhandledNotice: "메시지는 읽혔지만 요청하신 일 가운데 아직 작업이나 답변으로 이어지지 않은 것이 있습니다. 리드에게 처리하라고 다시 알렸습니다.",
-  reportTimeoutMin: 5,
-  resolveKinds: DEFAULT_RESOLVE_KINDS,
-  resolveTimeoutMin: 15,
+  secrets: {},
+  secretCommands: {},
+  worktreeRoot: "",
   heavySlots: 1,
   heavyKill: ["qemu-system", "emulator", "expo export"],
   heavyMaxLoad: 80,
   guardMachines: {},
-  deadPanePatterns: ["has stopped", "no suitable jobs"],
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 },
   memoryCheck: { repo: "", maxKb: 15 },
   hooks: {},
   runTimeoutMs: 60_000,
-  diskGuardPath: "",
-  waitMaxFailures: 30,
   leadStuckRestartMin: 30,
-  leadUnreadRestartMin: 5,
   leadChildWaitMaxMin: 60,
-  sweepMachineDeadlineMs: 20_000,
   store: "json",
-  eventPolicy: DEFAULT_EVENT_POLICY,
-  ciConfirmMin: 20,
   ciMergeBase: "dev",
-  delivery: {
-    tailMonitor: true, restartMaxPerHour: 3,
-    push: { ackSec: 45, retries: 2, escalateMin: 5, maxChars: 200, pasteCheckMs: 3_000, toWorking: true, takeMaxBytes: 16_384 },
-  },
-  placement: { defaultMachine: "local", workspaces: {}, fallback: [] },
+  displayTimeZone: DEFAULT_DISPLAY_TIME_ZONE,
+  placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
+  autopilot: DEFAULT_AUTOPILOT,
 });
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
@@ -355,7 +276,124 @@ const laneRules = (raw: unknown): readonly string[] => {
 
 export type LaneSandbox = { readonly command: readonly string[] };
 
-/** Used when the config has no `laneSandbox`: new local lanes run behind `lane-sandbox` on PATH, and pass through when it is missing. */
+/** A GitHub App installation token minted per lane repo instead of a stored value; `keySecret` names the App private key (PEM) in the store. */
+export type GithubAppMint = {
+  readonly kind: "github-app";
+  readonly appId: string;
+  readonly installationId: string;
+  readonly keySecret: string;
+  readonly permissions: Readonly<Record<string, "read" | "write">>;
+};
+
+/** Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. `as` absent means env; `mint` replaces the stored value with a minted token. */
+export type SecretRule = {
+  readonly lanes: readonly string[];
+  readonly repos: readonly string[];
+  readonly as?: "env" | "ssh-key";
+  readonly mint?: GithubAppMint;
+};
+
+const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" } }`;
+
+/** A list-of-strings field; absent is empty, anything else throws `bad(path)`. */
+const stringList = (value: unknown, bad: (what: string) => TypeError, path: string): readonly string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw bad(path);
+  return value as string[];
+};
+
+/** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?, repos?, as?, mint? } } (see RULE_SHAPE). */
+const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
+  if (raw == null) return {};
+  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`as: "ssh-key"\` and \`mint\` are exclusive`);
+  if (!isRecord(raw)) throw bad("");
+  const mintOf = (value: unknown, path: string): GithubAppMint => {
+    const nonEmpty = (v: unknown) => typeof v === "string" && v.trim() !== "";
+    if (!isRecord(value) || Object.keys(value).some((key) => !["kind", "appId", "installationId", "keySecret", "permissions"].includes(key))) throw bad(path);
+    const { kind, appId, installationId, keySecret, permissions } = value;
+    if (kind !== "github-app" || !nonEmpty(appId) || !nonEmpty(installationId) || typeof keySecret !== "string" || !SECRET_NAME.test(keySecret)) throw bad(path);
+    if (!isRecord(permissions) || Object.keys(permissions).length === 0) throw bad(`${path}.permissions`);
+    for (const [perm, level] of Object.entries(permissions)) if (!/^[a-z_]+$/.test(perm) || (level !== "read" && level !== "write")) throw bad(`${path}.permissions.${perm}`);
+    return { kind, appId: appId as string, installationId: installationId as string, keySecret, permissions: permissions as Record<string, "read" | "write"> };
+  };
+  return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
+    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint"].includes(key))) throw bad(`.${name}`);
+    const { as, mint } = rule;
+    if (as !== undefined && as !== "env" && as !== "ssh-key") throw bad(`.${name}.as`);
+    if (mint !== undefined && as === "ssh-key") throw bad(`.${name}.mint`);
+    return [name, {
+      lanes: stringList(rule.lanes, bad, `.${name}.lanes`),
+      repos: stringList(rule.repos, bad, `.${name}.repos`),
+      ...(as !== undefined ? { as } : {}),
+      ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
+    }];
+  }));
+};
+
+/** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match (same rules as `secrets`). */
+export type SecretCommand = {
+  readonly argv: readonly string[];
+  readonly secrets: readonly string[];
+  readonly lanes: readonly string[];
+  readonly repos: readonly string[];
+  /** Kill after this many seconds; 1..3600, default 300. */
+  readonly timeoutSec: number;
+  /** Absolute working directory; absent means the host user's home. */
+  readonly cwd?: string;
+};
+
+/** The config's `secretCommands`; throws TypeError unless absent or { <op>: { argv, secrets, lanes, repos, timeoutSec?, cwd? } }. */
+const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> => {
+  if (raw == null) return {};
+  const bad = (what: string) => new TypeError(`secretCommands${what} must be { "<op>": { "argv": [non-empty strings], "secrets": [SECRET_NAMEs], "lanes": [strings], "repos": [strings], "timeoutSec"?: 1..3600, "cwd"?: absolute path } } with op matching ^[a-z][a-z0-9-]{0,63}$`);
+  if (!isRecord(raw)) throw bad("");
+  return Object.fromEntries(Object.entries(raw).map(([op, rule]) => {
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(op) || !isRecord(rule) || Object.keys(rule).some((key) => !["argv", "secrets", "lanes", "repos", "timeoutSec", "cwd"].includes(key))) throw bad(`.${op}`);
+    const argv = stringList(rule.argv, bad, `.${op}.argv`);
+    if (argv.length === 0 || argv.some((part) => part === "")) throw bad(`.${op}.argv`);
+    const names = stringList(rule.secrets, bad, `.${op}.secrets`);
+    if (names.some((name) => !SECRET_NAME.test(name))) throw bad(`.${op}.secrets`);
+    const { timeoutSec, cwd } = rule;
+    if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600)) throw bad(`.${op}.timeoutSec`);
+    if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) throw bad(`.${op}.cwd`);
+    return [op, {
+      argv, secrets: names, lanes: stringList(rule.lanes, bad, `.${op}.lanes`), repos: stringList(rule.repos, bad, `.${op}.repos`),
+      timeoutSec: (timeoutSec as number | undefined) ?? 300,
+      ...(cwd !== undefined ? { cwd } : {}),
+    }];
+  }));
+};
+
+/** Lead-side settings for one runner (config `runners.<label>`). */
+export type RunnerConfig = { readonly allowUnsandboxed?: boolean };
+
+/**
+ * Keys an older dori's `runners` section carried (the shadow runner's listen address, modes, restart circuit). They are
+ * ignored and named in CONFIG_KEYS_IGNORED, never read as machine labels, so an old config keeps loading.
+ */
+export const LEGACY_RUNNER_KEYS: readonly string[] = ["listen", "mode", "restartCircuit"];
+
+/** The `runners` keys loadConfig ignores: the legacy ones, or the whole section when it is an (old) array. */
+const ignoredRunnerKeys = (raw: unknown): string[] =>
+  Array.isArray(raw) ? ["runners"] : isRecord(raw) ? Object.keys(raw).filter((key) => LEGACY_RUNNER_KEYS.includes(key)).map((key) => `runners.${key}`) : [];
+
+/**
+ * The config's `runners` without its legacy keys; undefined when no machine entry is left. Throws TypeError unless absent,
+ * an old array, or { <label>: { allowUnsandboxed?: boolean } }.
+ */
+const runners = (raw: unknown): Readonly<Record<string, RunnerConfig>> | undefined => {
+  if (raw == null || Array.isArray(raw)) return undefined;
+  const bad = (what: string) => new TypeError(`runners${what} must be { "<machine label>": { "allowUnsandboxed": true|false } }`);
+  if (!isRecord(raw)) throw bad("");
+  const entries = Object.entries(raw).filter(([label]) => !LEGACY_RUNNER_KEYS.includes(label));
+  if (!entries.length) return undefined;
+  return Object.fromEntries(entries.map(([label, entry]) => {
+    if (!isRecord(entry) || (entry.allowUnsandboxed !== undefined && typeof entry.allowUnsandboxed !== "boolean")) throw bad(`.${label}`);
+    return [label, entry.allowUnsandboxed === undefined ? {} : { allowUnsandboxed: entry.allowUnsandboxed }];
+  }));
+};
+
+/** Used when the config has no `laneSandbox`: new local lanes run behind `lane-sandbox` on PATH, and are refused (SANDBOX_MISSING) when it is missing. */
 export const DEFAULT_LANE_SANDBOX: LaneSandbox = { command: ["lane-sandbox"] };
 
 /**
@@ -369,6 +407,14 @@ const laneSandbox = (raw: unknown): LaneSandbox => {
   const { command } = raw as Record<string, unknown>;
   if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string" || !part.trim())) throw bad();
   return { command: command as string[] };
+};
+
+/**
+ * Writes `patch` into `config` in place. The supervisor holds one config object per role and hands it to every part, so
+ * a hot reload (config-watch.ts) and a recreated lead pane reach all of them through this one write.
+ */
+export const assignConfig = (config: DoriConfig, patch: Partial<DoriConfig>): void => {
+  Object.assign(config as { -readonly [K in keyof DoriConfig]: DoriConfig[K] }, patch);
 };
 
 export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
@@ -395,34 +441,60 @@ const buttonHooks = (raw: unknown, path: string): Readonly<Record<string, ArgvTe
 
 /** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
 const placement = (raw: unknown): PlacementConfig => {
-  if (raw === undefined) return { defaultMachine: "local", workspaces: {}, fallback: [] };
+  if (raw === undefined) return { defaultMachine: "local", fallback: [] };
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("placement must be an object");
   const o = raw as Record<string, unknown>;
   const fallback = o.fallback ?? [];
   if (!Array.isArray(fallback) || fallback.some((m) => typeof m !== "string" || !m.trim())) throw new TypeError("placement.fallback must be an array of machine names");
   return {
     defaultMachine: typeof o.defaultMachine === "string" && o.defaultMachine.trim() ? o.defaultMachine.trim() : "local",
-    workspaces: Object.fromEntries(Object.entries(stringRecord(o.workspaces)).map(([key, machine]) => [key, machine.trim()])),
     fallback: (fallback as string[]).map((m) => m.trim()),
   };
 };
 
 /**
  * The only top-level keys read from config.json: who the owner is and where things live on this machine. Every other
- * tunable is a built-in constant (defaultConfig), so a config written by any dori version loads on any other.
+ * tunable is a built-in constant (BUILT_IN in tunables.ts), so a config written by any dori version loads on any other.
  */
 export const CONFIG_FILE_KEYS = [
-  "discord", "stateDir", "defaultCwd", "sessionsDir", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
-  "laneThinking", "leadArgs", "discordChannels", "githubIssueAuthors", "ownerLanguage", "laneRules", "laneSandbox", "guardMachines",
-  "placement", "buttonHooks", "hooks", "ciMergeBase", "memoryCheck", "store", "diskGuardPath", "ignorePanes",
+  "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
+  "leadArgs", "discordChannels", "alertsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
+  "runners", "secrets", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
 ] as const;
 
+/** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
+const displayTimeZone = (raw: unknown): string => {
+  if (raw == null || (typeof raw === "string" && !raw.trim())) return DEFAULT_DISPLAY_TIME_ZONE;
+  if (typeof raw !== "string" || !validTimeZone(raw.trim())) throw new TypeError(`displayTimeZone must be an IANA time zone name such as Asia/Seoul or UTC, not ${JSON.stringify(raw)}`);
+  return raw.trim();
+};
+
+/** The config's `alertsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
+const alertsChannel = (raw: unknown): string | undefined => {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") throw new TypeError("alertsChannel must be a Discord channel id string");
+  return raw.trim() || undefined;
+};
+
+/**
+ * Where the supervisor's system notices go (lead stuck or restart-capped, SUPERVISOR_STUCK, TASK_STALLED, a failed
+ * unit, and what the lead posts with `dori send --to alerts`): `alertsChannel` when set, else `discordChannels[0]`.
+ * Lane reports, owner replies, close buttons and closed-thread redirects keep using `discordChannels[0]`.
+ */
+export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "discordChannels">): string | undefined =>
+  config.alertsChannel?.trim() || config.discordChannels[0];
+
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
-const HOOK_KEYS = ["threadReply", "transcribe"] as const;
+export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
+
+/** `leadCwd`'s former name: still read while a file has no `leadCwd`, until `dori setup` renames it. */
+export const LEGACY_LEAD_CWD_KEY = "defaultCwd";
 
 let warnedIgnoredKeys = false;
+let warnedLegacyLeadCwd = false;
 let warnedLeadArray = false;
 let warnedPaneKeys = false;
+let warnedAutopilot = false;
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -432,13 +504,20 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const loaded = (await file.exists()) ? ((await file.json()) as Record<string, unknown>) : {};
   const paneKeys = legacyPaneKeys(loaded);
   const kept = CONFIG_FILE_KEYS as readonly string[];
-  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key));
+  const ignored = Object.keys(loaded).filter((key) => !kept.includes(key) && !paneKeys.includes(key) && key !== CONFIG_SCHEMA_KEY && key !== LEGACY_LEAD_CWD_KEY);
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
+  if (LEGACY_LEAD_CWD_KEY in loaded) {
+    if (!("leadCwd" in loaded)) raw.leadCwd = loaded[LEGACY_LEAD_CWD_KEY];
+    if (!warnedLegacyLeadCwd) {
+      warnedLegacyLeadCwd = true;
+      console.error(`CONFIG_KEY_RENAMED ${LEGACY_LEAD_CWD_KEY} -> leadCwd in ${path}: ${"leadCwd" in loaded ? "leadCwd is set, so defaultCwd is ignored" : "still read as leadCwd for now"}; run dori setup to rename it`);
+    }
+  }
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
-  const rawMemory = isRecord(raw.memoryCheck) ? raw.memoryCheck : {};
-  ignored.push(...Object.keys(rawMemory).filter((key) => key !== "repo").map((key) => `memoryCheck.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
+  if (isRecord(raw.placement) && "workspaces" in raw.placement) ignored.push("placement.workspaces");
+  ignored.push(...ignoredRunnerKeys(raw.runners));
   if (ignored.length && !warnedIgnoredKeys) {
     warnedIgnoredKeys = true;
     console.error(`CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
@@ -451,7 +530,6 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     raw.leadModel = modelEntries(raw.leadModel, undefined)[0];
   }
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
-  const memoryRepo = typeof rawMemory.repo === "string" ? rawMemory.repo : base.memoryCheck.repo;
   const fromFile = raw as Partial<DoriConfig>;
   const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
   const panes = resolveManagedPanes(stateDir, loaded);
@@ -461,21 +539,32 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
       ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
       : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
   }
-  const merged: DoriConfig = { ...base, ...fromFile, hooks: { ...base.hooks, ...hooks } };
+  const { runners: rawRunners, ...rest } = fromFile;
+  const machineRunners = runners(rawRunners);
+  const { alertsChannel: rawAlerts, ...fileValues } = rest;
+  const alerts = alertsChannel(rawAlerts);
+  const merged: DoriConfig = { ...base, ...fileValues, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
+    ...(alerts ? { alertsChannel: alerts } : {}),
     laneRules: laneRules(raw.laneRules),
+    secrets: secrets(raw.secrets),
+    secretCommands: secretCommands(raw.secretCommands),
+    displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
+    autopilot: parseAutopilotConfig(raw.autopilot, (line) => {
+      if (warnedAutopilot) return;
+      warnedAutopilot = true;
+      console.error(`CONFIG_AUTOPILOT_KEYS_IGNORED ${line} in ${path}`);
+    }),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
-    memoryCheck: { ...base.memoryCheck, repo: expandHome(memoryRepo, home) },
     stateDir,
-    defaultCwd: expandHome(merged.defaultCwd, home),
-    sessionsDir: expandHome(merged.sessionsDir, home),
+    store: storeOnDisk(stateDir),
+    leadCwd: expandHome(merged.leadCwd, home),
     leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
     laneWorkspace: panes.laneWorkspace,
-    workspaces: panes.laneWorkspace ? [panes.laneWorkspace] : [],
   };
 };
 

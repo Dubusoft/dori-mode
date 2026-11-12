@@ -1,9 +1,9 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
-import { configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
+import { alertsChannelOf, CONFIG_FILE_KEYS, configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
@@ -26,7 +26,10 @@ import { readRunnerEndpoints } from "./runner/endpoints.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
-import { installedLaneSandbox, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
+import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
+import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
+import { legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
+import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
 export type Check = { readonly id: string; readonly level: Level; readonly detail: string; readonly fix?: string };
@@ -44,6 +47,14 @@ export type DoctorDeps = {
   readonly exists: (path: string) => boolean;
   /** Where omo memory is looked for when memoryCheck.repo is blank. */
   readonly home: string;
+  /** Test seams for the sandbox check: the host platform (default process.platform) and the PATH lookup (default Bun.which). */
+  readonly platform?: string;
+  readonly which?: (cmd: string) => string | null | undefined;
+  /** Test seam for the config source report: the environment loadConfig read (default process.env). */
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  /** Test seams for the secret store check: the store (default one under `home`) and the permission-bits lookup (default fs.statSync). */
+  readonly secretStore?: Pick<SecretStore, "dir" | "list" | "encryptionAvailable">;
+  readonly modeOf?: (path: string) => number | undefined;
 };
 
 const ok = (id: string, detail: string): Check => ({ id, level: "OK", detail });
@@ -84,13 +95,32 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
   return checks;
 };
 
-const sandbox = (d: Pick<DoctorDeps, "home">): Check[] => {
-  const installed = installedLaneSandbox(d.home);
-  if (!existsSync(installed)) return [];
-  const templatePath = LANE_SANDBOX_TEMPLATE;
+/**
+ * Lanes on a Linux host run inside bwrap and on a macOS host inside Seatbelt (sandbox-exec), via the installed
+ * lane-sandbox wrapper, so a missing wrapper, a missing bwrap or a wrapper whose --check fails is a FAIL (lanes there are
+ * refused, not run bare). Windows has no lane sandbox: its lanes run without one by design, a WARN so it stays in view.
+ * Other platforms have no wrapper: lanes there need runners.<label>.allowUnsandboxed.
+ */
+const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which">): Promise<Check[]> => {
+  const platform = d.platform ?? process.platform;
+  if (platform === "win32") return [warn("lane sandbox", "none: Windows has no lane sandbox, so lanes on this machine run WITHOUT one (each launch says SANDBOX_SKIPPED)", "none needed: Windows runners run lanes unsandboxed by design")];
+  if (platform !== "linux" && platform !== "darwin") return [ok("lane sandbox", `not available on ${platform}; lanes on this machine need runners.<label>.allowUnsandboxed in the lead config`)];
+  const mac = platform === "darwin";
+  // A worker runner host runs its lanes behind the copy `dori runner install` puts in the runner's bin; the lead host uses ~/.local/bin.
+  const worker = workerLabel(d) !== undefined;
+  const installed = worker ? join(defaultRunnerDir(d.home), "bin", "lane-sandbox") : installedLaneSandbox(d.home);
+  if (!existsSync(installed)) return [fail("lane sandbox", `${installed} is missing; lanes are refused (SANDBOX_MISSING)`, worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs it")];
+  if (!mac && !(d.which ?? Bun.which)("bwrap")) return [fail("lane sandbox", "bwrap is not on PATH; lanes are refused", "install bubblewrap: sudo apt install bubblewrap")];
+  const probe = await d.run([installed, "--check"], T);
+  if (probe.code !== 0) return [fail("lane sandbox", `${installed} --check failed: ${probe.err.trim() || probe.out.trim() || `exit ${probe.code}`}`, mac ? "check that /usr/bin/sandbox-exec runs (sandbox-exec -p '(version 1)(allow default)' /usr/bin/true), then rerun dori doctor" : "fix bubblewrap (user namespaces enabled, AppArmor profile), then rerun dori doctor")];
+  const template = mac ? LANE_SANDBOX_MACOS_TEMPLATE : LANE_SANDBOX_TEMPLATE;
+  const refresh = worker ? "rerun dori runner install for this machine from the lead" : "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak";
+  // A runner refuses every sandboxed lane start and recovery behind a wrapper that does not grant the lane-file directories.
+  if (!probe.out.split(/\r?\n/).includes("DORI_LANE_FILES=1")) return [fail("lane sandbox", `${installed} --check does not print DORI_LANE_FILES=1; sandboxed lane starts and recoveries are refused (LANE_FILES_SANDBOX_OLD)`, refresh)];
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
-  const templateHash = createHash("sha256").update(readFileSync(templatePath)).digest("hex");
-  return installedHash === templateHash ? [] : [warn("lane sandbox", `${installed} differs from templates/lane-sandbox.sh (LANE_SANDBOX_OUTDATED)`, "dori update (or restart the supervisor) installs the template and keeps the old copy as lane-sandbox.bak")];
+  const templateHash = createHash("sha256").update(readFileSync(template)).digest("hex");
+  if (installedHash === templateHash) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`)];
+  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh)];
 };
 
 /** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */
@@ -131,7 +161,7 @@ const paths = async (d: DoctorDeps): Promise<Check[]> => {
   const checks: Check[] = [];
   if (wd.code !== 0 || !dir) checks.push(fail("supervisor WorkingDirectory", "unit has no WorkingDirectory (status 200/CHDIR)", "dori setup --autostart"));
   else checks.push(d.exists(dir) ? ok("supervisor WorkingDirectory", dir) : fail("supervisor WorkingDirectory", `${dir} does not exist`, `mkdir -p ${dir}`));
-  for (const [name, path] of [["defaultCwd", d.config.defaultCwd], ["stateDir", d.config.stateDir]] as const) {
+  for (const [name, path] of [["leadCwd", d.config.leadCwd], ["stateDir", d.config.stateDir]] as const) {
     checks.push(d.exists(path) ? ok(name, path) : fail(name, `${path} does not exist`, `mkdir -p ${path}`));
   }
   return checks;
@@ -192,15 +222,52 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
     return k in c && !(typeof value === "string" && value.trim()) && !(k === "leadModel" && typeof value === "object" && value !== null && "model" in value && typeof value.model === "string" && value.model.trim());
   });
   if (blank.length) checks.push(warn("lead command", `${blank.join(", ")} set but blank; the lead uses the lane default`, `set a value or remove ${blank.join(", ")} from ${d.configPath}`));
-  const lane: string[] = [];
-  const text = (v: unknown): v is string => typeof v === "string";
-  if (!text(c.launchKeywords) || !c.launchKeywords.trim()) lane.push("launchKeywords must be a non-empty string");
-  if (!text(c.massLaunchKeywords) || !c.massLaunchKeywords.startsWith("/mass-ulw") || c.massLaunchKeywords.includes("?")) lane.push("massLaunchKeywords must be a string that starts with /mass-ulw and has no '?'");
-  if ("laneThinking" in c && !text(c.laneThinking)) lane.push("laneThinking must be a string");
-  if (lane.length) checks.push(warn("lane command", lane.join("; "), `fix the keys in ${d.configPath}`));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
   checks.push(...await managedPanes(d));
+  return checks;
+};
+
+/** A value for one report line: objects show only their key names, so ids and argv stay short and secrets stay out. */
+const shown = (v: unknown): string => {
+  const s = v === undefined ? "(none)"
+    : typeof v === "object" && v !== null && !Array.isArray(v) ? `{${Object.keys(v).join(", ")}}`
+    : JSON.stringify(v);
+  return s.length > 80 ? `${s.slice(0, 77)}...` : s;
+};
+
+/**
+ * Where each config value came from, following loadConfig (config.ts): `file` (config.json), `default` (defaultConfig),
+ * `env` (DORI_CONFIG, DORI_STATE_DIR, DORI_LEAD_PANE) or `derived` (state on disk or another key). Keys in config.json
+ * that loadConfig does not read are a WARN; the legacy pane keys are reported by the config check.
+ */
+export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "configError" | "env">): Check[] => {
+  if (d.configError) return [];
+  const env = d.env ?? process.env;
+  let raw: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(d.configPath, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>;
+  } catch { /* no file: every value is a default, and the config check reports the missing file */ }
+  const c = d.config;
+  const values = c as Readonly<Record<string, unknown>>;
+  const line = (key: string, source: string, value: unknown): Check => ok(`config.${key}`, `${source}: ${shown(value)}`);
+  const checks: Check[] = [ok("config file", `${d.configPath} (${env.DORI_CONFIG ? "env DORI_CONFIG" : "default path"})`)];
+  for (const key of CONFIG_FILE_KEYS) {
+    const inFile = raw[key] !== undefined && raw[key] !== null;
+    if (key === "stateDir" && env.DORI_STATE_DIR) checks.push(line(key, "env DORI_STATE_DIR", c.stateDir));
+    else if (key === "alertsChannel" && !c.alertsChannel) checks.push(line(key, "derived from discordChannels[0]", alertsChannelOf(c)));
+    else if (key === "leadModel" && !inFile) checks.push(line(key, "derived from defaultModel", c.defaultModel));
+    else checks.push(line(key, inFile ? "file" : values[key] === undefined ? "unset" : "default", values[key]));
+  }
+  checks.push(
+    line("store", `derived from ${c.stateDir}`, c.store),
+    line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
+    line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
+  );
+  const kept = CONFIG_FILE_KEYS as readonly string[];
+  const ignored = Object.keys(raw).filter((key) => !kept.includes(key) && !legacyPaneKeys(raw).includes(key));
+  if (ignored.length) checks.push(warn("config ignored keys", `${ignored.join(", ")} in ${d.configPath}: not read from config.json, the built-in values apply`, `delete ${ignored.join(", ")} from ${d.configPath} (dori setup --migrate)`));
   return checks;
 };
 
@@ -289,7 +356,7 @@ const memory = (d: DoctorDeps): Check[] => {
   const limit = Math.round(m.maxKb * 1024);
   const checks: Check[] = [];
   if (!file || !d.exists(file)) {
-    checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.defaultCwd}; dori memory check and its sweep are off`, `set memoryCheck.repo to the lead's omo memory repo in ${d.configPath}`));
+    checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.leadCwd}; dori memory check and its sweep are off`, `check leadCwd in ${d.configPath}: the memory repo is omo's for that directory`));
   } else {
     const bytes = statSync(file).size;
     checks.push(bytes > limit
@@ -302,7 +369,7 @@ const memory = (d: DoctorDeps): Check[] => {
 const tools = async (d: DoctorDeps): Promise<Check[]> => {
   const [gh, auth, jq, bun, df] = await Promise.all([
     d.run(["gh", "--version"], T), d.run(["gh", "auth", "status"], T), d.run(["jq", "--version"], T), d.run(["bun", "--version"], T),
-    d.run(["df", "-Pk", [d.config.stateDir, d.config.defaultCwd].find((p) => d.exists(p)) ?? "/"], T),
+    d.run(["df", "-Pk", [d.config.stateDir, d.config.leadCwd].find((p) => d.exists(p)) ?? "/"], T),
   ]);
   const checks: Check[] = [
     gh.code !== 0 ? fail("gh", "not installed", "install gh: https://cli.github.com")
@@ -340,6 +407,8 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
  */
 export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
   const checks: Check[] = [];
+  const legacyGuardFiles = legacyGuardAgentFiles(d.home);
+  if (legacyGuardFiles.length) checks.push(warn("guard agent", `${legacyGuardFiles.join(", ")} left from the old standalone guard agent; the runner reports this host now`, "the runner removes them when it starts (dori update on the lead restarts runners); or delete them"));
   try {
     const endpoints = Object.entries(readRunnerEndpoints(d.config.stateDir));
     checks.push(endpoints.length
@@ -352,7 +421,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
   const rootsFile = join(dir, "runner-config.json");
   const roots = d.exists(rootsFile)
     ? "runner-config.json"
-    : [d.home, tmpdir(), dirname(d.config.defaultCwd), d.config.worktreeRoot].join(", ");
+    : [d.home, tmpdir(), dirname(d.config.leadCwd), d.config.worktreeRoot].join(", ");
   checks.push(ok("runner policy", `effective allowedRoots: ${roots}`));
   if (d.exists(dir)) {
     try { checkRunnerDir(dir); checks.push(ok("runner dir", `${dir} 0700, files 0600, no symlinks`)); }
@@ -368,10 +437,13 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
   } catch (e) {
     checks.push(warn("runner restarts", `cannot read the operations store: ${e instanceof Error ? e.message : String(e)}`, "dori doctor again once the supervisor has started"));
   }
-  for (const row of readRunnerRows(d.config.stateDir)) {
+  const rows = readRunnerRows(d.config.stateDir);
+  for (const row of rows) {
     const id = `runner ${row.label}`;
     const problems: string[] = [];
     if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
+    // Lane start and recover carry lane files since proto 5: an older runner keeps its lanes but cannot start or recover any.
+    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} refuses lane start and recover (they need proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
     if (row.herdr === "down" || row.herdr === "hung") {
@@ -389,11 +461,70 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
       ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
       : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}${row.herdr ? `, herdr ${row.herdr}` : ""}`));
   }
+  // Runners whose lanes run without a sandbox (launch.ts sandboxChoice): Windows by design, others by opt-in.
+  for (const label of new Set([...rows.map((row) => row.label), ...Object.keys(d.config.runners ?? {})])) {
+    const os = rows.find((row) => row.label === label)?.machine?.os;
+    const why = unsandboxedReason(d.config, label, os);
+    if (!why) continue;
+    checks.push(warn(`runner ${label} sandbox`, `none: runner ${label} ${why}, so its lanes run WITHOUT a sandbox (each launch says SANDBOX_SKIPPED)`,
+      isWindowsOs(os) ? "none needed: Windows runners run lanes unsandboxed by design" : `remove runners.${label}.allowUnsandboxed from the lead config once that machine can sandbox`));
+  }
   return checks;
 };
 
+const fileModeOf = (path: string): number | undefined => {
+  try { return statSync(path).mode & 0o777; } catch { return undefined; }
+};
+
+/**
+ * The secret store, inspected without reading or decrypting any value: entry names and backends through the store's
+ * list, permission bits through stat. Warns on plain entries, a missing encryption backend, loose modes and allowlisted
+ * names (config `secrets`) that are not stored.
+ */
+export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | "run" | "secretStore" | "modeOf">): Promise<Check[]> => {
+  const id = "secret store";
+  const store = d.secretStore ?? new SecretStore({ dir: join(d.home, ".dori", "secrets"), run: d.run });
+  const modeOf = d.modeOf ?? fileModeOf;
+  let entries: readonly SecretEntry[];
+  try { entries = store.list(); }
+  catch (e) { return [warn(id, e instanceof SecretStoreError ? e.message : `cannot list ${store.dir}: ${e instanceof Error ? e.message : String(e)}`, `chmod 700 ${store.dir}`)]; }
+  const problems: string[] = [];
+  const fixes: string[] = [];
+  const plain = entries.filter((entry) => entry.backend === "plain");
+  if (plain.length) {
+    problems.push(`plain (unencrypted) entries: ${plain.map((entry) => entry.name).join(", ")}`);
+    fixes.push("re-add it with dori secret update NAME on a host where systemd-creds --user works");
+  }
+  if (entries.length && !(await store.encryptionAvailable())) {
+    problems.push("systemd-creds --user is unavailable");
+    fixes.push("install or enable systemd-creds --user (systemd 250+), then re-add the secrets");
+  }
+  const dirMode = modeOf(store.dir);
+  if (entries.length && dirMode !== undefined && dirMode !== 0o700) {
+    problems.push(`${store.dir} mode is ${dirMode.toString(8)}, not 700`);
+    fixes.push(`chmod 700 ${store.dir}`);
+  }
+  for (const entry of entries) {
+    const path = join(store.dir, `${entry.name}.${entry.backend === "plain" ? "plain" : "cred"}`);
+    const mode = modeOf(path);
+    if (mode !== undefined && mode !== 0o600) {
+      problems.push(`${path} mode is ${mode.toString(8)}, not 600`);
+      fixes.push(`chmod 600 ${path}`);
+    }
+  }
+  const allowed = Object.keys((d.config as { secrets?: Record<string, unknown> }).secrets ?? {});
+  const stored = new Set(entries.map((entry) => entry.name));
+  const missing = allowed.filter((name) => !stored.has(name));
+  if (missing.length) {
+    problems.push(`config secrets not in the store: ${missing.join(", ")}`);
+    fixes.push("dori secret add NAME for each");
+  }
+  if (problems.length) return [warn(id, problems.join("; "), fixes.join("; "))];
+  return [ok(id, entries.length ? `${entries.length} secrets, encrypted (systemd-creds)` : "no secrets stored")];
+};
+
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), Promise.resolve(sandbox(d))])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), secretStoreChecks(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

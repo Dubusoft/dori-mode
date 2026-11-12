@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { HerdrWatch, herdrProcess, startManagedHerdr } from "../src/runner/herdr-watch.ts";
 import { HerdrDownInference, type HerdrRecord } from "../src/runner/herdr-down.ts";
-import { PROTO, checkProto, decodeFrame, encodeFrame, runnerEvent, type RunnerEventType } from "../src/runner/protocol.ts";
+import { decodeFrame, encodeFrame, runnerEvent, type RunnerEventType } from "../src/runner/protocol.ts";
 import { eventClass } from "../src/event-policy.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { RunnerGuard } from "../src/runner/guard.ts";
@@ -138,10 +138,7 @@ test("server identity combines sorted pids and start times; unreadable process t
   expect(await herdrProcess(async (argv) => argv[0] === "pgrep" ? ok("42") : bad())).toEqual({ running: true });
 });
 
-test("proto 4 health schemas are strict and supervisor accepts proto 3, but not proto 2", () => {
-  expect(PROTO).toBe(4);
-  expect(checkProto(3)).toMatchObject({ ok: true });
-  expect(checkProto(2)).toMatchObject({ ok: false });
+test("health schemas are strict throughout the supported protocol window", () => {
   const head = { runner: "lab", gen: 1, epoch: 1 };
   const event = runnerEvent(head, 1, "guard.sample", { level: "ok", reasons: [], sampledAt: 0, herdr: { state: "hung", since: 0 } });
   expect(decodeFrame(encodeFrame(event), "runner")).toEqual(event);

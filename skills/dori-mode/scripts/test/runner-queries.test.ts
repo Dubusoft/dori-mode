@@ -2,12 +2,44 @@ import { expect, test } from "bun:test";
 
 import type { Ran, Runner } from "../src/run.ts";
 import type { RunnerControlBodies } from "../src/runner/protocol.ts";
+import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
 import {
   laneInspect, observeMachine, queryDispatcher, type QueryDeps, queryProcess, queryScreen, queryStat, SCREEN_MAX_LINES,
+  answerQuery,
 } from "../src/runner/queries.ts";
 import { fakeClock, fakeRunner, newWorld, WT } from "./fakes.ts";
 
 const T0 = 1_800_000_000_000;
+
+test("q.lane.files uses the injected synchronous capture for managed and legacy lanes; unknown or absent readers refuse", async () => {
+  const tree = { directories: [], files: [] }, files = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, revision: 1, tree, sha256: treeDigest(tree) };
+  const calls: string[] = [];
+  const deps = depsOf(fakeRunner(newWorld()), { files: (key) => {
+    calls.push(key);
+    if (key === "unknown") throw new Error("RUNNER_LANE_UNKNOWN unknown");
+    return key === "managed" ? files : undefined;
+  } });
+  const query = (key: string) => frame("q.lane.files", { qid: "q1", key }) as Parameters<typeof answerQuery>[1];
+  expect(await answerQuery(deps, query("managed"))).toEqual({ files });
+  expect(await answerQuery(deps, query("legacy"))).toEqual({});
+  await expect(answerQuery(deps, query("unknown"))).rejects.toThrow("RUNNER_LANE_UNKNOWN");
+  await expect(answerQuery({ ...deps, files: undefined }, query("managed"))).rejects.toThrow("RUNNER_QUERY_UNSUPPORTED");
+  expect(calls).toEqual(["managed", "legacy", "unknown"]);
+});
+
+test("q.lane.files preserves complete typed errors and sizes the complete successful q.result", async () => {
+  const detail = "unsafe " + "x".repeat(500);
+  let reply: (body: RunnerControlBodies["q.result"]) => void = () => {};
+  const ask = (files: NonNullable<QueryDeps["files"]>, qid = "q") => new Promise<RunnerControlBodies["q.result"]>((resolve) => {
+    reply = resolve;
+    queryDispatcher({ ...depsOf(fakeRunner(newWorld())), files, policy: { jobs: "allow" }, log: () => {}, reply: (body) => reply(body) })(frame("q.lane.files", { qid, key: "lane-a" }));
+  });
+  expect(await ask(() => { throw new LaneFileError("LANE_REPORT_UNSAFE", "lane-a", detail); })).toEqual({
+    qid: "q", ok: false, detail: `LANE_REPORT_UNSAFE lane-a: ${detail}`,
+  });
+  const tree = { directories: [], files: [] }, files = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, revision: 1, tree, sha256: treeDigest(tree) };
+  expect((await ask(() => files, "x".repeat(786432))).detail).toStartWith("LANE_FILES_FRAME_TOO_LARGE lane-a:");
+});
 
 const inspectWorld = () => {
   const w = newWorld();
@@ -108,6 +140,26 @@ test("observeMachine fills the pane count from the pane list, -1 when it is unre
   const blind = await observeMachine(depsOf(down, { os: "linux", readMemInfo: mem }));
   expect(blind.panes).toEqual([]);
   expect(blind.sample.panes).toBe(-1);
+  expect("guard" in got).toBe(false);
+});
+
+test("q.machine.observe reports the guard thresholds runner-config.json sets (policy.guard), none when it sets none", async () => {
+  const w = newWorld();
+  const run: Runner = async (argv, opts) => (argv[0] === "df" ? { code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 100 50 10485760", err: "" } : fakeRunner(w)(argv, opts));
+  const mem = async () => "MemTotal: 1000 kB\nMemAvailable: 250 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+  const ask = async (guard?: { readonly panesMax: number }) => {
+    const replies: RunnerControlBodies["q.result"][] = [];
+    let settle: () => void = () => {};
+    const answered = new Promise<void>((r) => { settle = r; });
+    queryDispatcher({
+      ...depsOf(run, { os: "linux", readMemInfo: mem }), policy: { jobs: "allow", ...(guard ? { guard } : {}) },
+      reply: (body) => { replies.push(body); settle(); }, log: () => {},
+    })(frame("q.machine.observe", { qid: "m1" }));
+    await answered;
+    return replies[0]?.result as { guard?: object };
+  };
+  expect((await ask({ panesMax: 6 })).guard).toEqual({ panesMax: 6 });
+  expect("guard" in (await ask())).toBe(false);
 });
 
 // ---------------------------------------------------------------------------------------------------------------

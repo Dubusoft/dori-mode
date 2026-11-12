@@ -4,8 +4,9 @@
  *
  * - runner -> supervisor events carry `seq` (per runner, durable, never reset by a new `gen`) and go through the outbox;
  * - supervisor -> runner commands carry `cmdSeq` (per runner, issued by the supervisor) and a `cmdId` in the body;
- * - control frames (hello, heartbeat, acks, command status, the `q.*` queries and their `q.result`) carry neither and
- *   are never queued or journaled.
+ * - control frames (hello, heartbeat, acks, command status, the `q.*` queries and their `q.result`, and since proto 6
+ *   the secret frames `secret.get`/`secret.run` and `secret.value`/`secret.run.result`) carry neither and are never
+ *   queued or journaled. A secret answer carries its values only inside an AEAD `sealed` box (auth.ts), never in clear.
  *
  * Every frame is validated against a fixed per-type schema: an unknown type, a missing field, a field of the wrong
  * shape or a field the schema does not name is rejected with a `ProtocolError` naming the rule. `mac` is accepted as
@@ -14,13 +15,21 @@
  * are the only frames without one).
  */
 
+import type { GuardThresholds } from "../config.ts";
 import type { HostSample } from "../host-guard.ts";
 import type { Pane } from "../panes.ts";
 import type { Check } from "../signals.ts";
 import type { ReportKind } from "./report-kinds.ts";
 
-/** The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. */
-export const PROTO = 4;
+/**
+ * The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. Proto 6
+ * adds the secret control frames, so the supervisor must be upgraded before its runners.
+ */
+export const PROTO = 6;
+/** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */
+export const SECRET_PROTO = 6;
+/** Whether a peer that announced `proto` understands the secret frames; an unknown version does not. */
+export const secretsSupported = (proto: number | undefined): boolean => proto !== undefined && proto >= SECRET_PROTO;
 /** The envelope layout version (`v`). */
 export const ENVELOPE_VERSION = 1;
 /** The longest line `decodeFrame` accepts; the outbox caps a single body at 256KB, so a frame stays well under this. */
@@ -47,6 +56,9 @@ export type BodyRef = { readonly sha256: string; readonly bytes: number; readonl
 /** One lane the runner sees on its host (hello inventory). */
 export type InventoryLane = { readonly key: string; readonly pane: string; readonly tab: string; readonly session?: string };
 
+/** One repository checkout on the runner's host (hello `workspaces` and `detected`): `repo` is owner/repo, `path` absolute. */
+export type WorkspaceEntry = { readonly repo: string; readonly path: string };
+
 /** Any JSON value; the `json` schema spec accepts one without walking its content. */
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [k: string]: JsonValue };
 
@@ -58,10 +70,79 @@ export type LaneMemoryBody = {
   readonly top: readonly { readonly comm: string; readonly rssKb: number; readonly count: number }[];
 };
 
+/**
+ * Lane file transfer limits (since proto 5). Numeric literal types: each endpoint defines its own constant object with
+ * `satisfies LaneFileLimits`, so lead and runner agree on the values without sharing a runtime helper.
+ */
+export type LaneFileLimits = {
+  readonly fileBytes: 262144;
+  readonly totalBytes: 393216;
+  readonly files: 64;
+  readonly directories: 128;
+  readonly references: 256;
+  readonly depth: 16;
+  readonly relativePathBytes: 240;
+  readonly componentBytes: 120;
+  readonly sourcePathBytes: 4096;
+  readonly briefBytes: 65536;
+  readonly reportTextBytes: 65536;
+  readonly evidenceBytes: 16384;
+  readonly wireBodyBytes: 786432;
+};
+
+/** One regular file of a snapshot: relative `/`-separated path, decoded size, lowercase hex SHA-256, padded base64. */
+export type LaneFile = {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly base64: string;
+};
+
+/** A complete directory snapshot; directories (including empty ones) and files sorted by raw UTF-8 byte order. */
+export type LaneFileTree = {
+  readonly directories: readonly string[];
+  readonly files: readonly LaneFile[];
+};
+
+/** One lead-proposed launch/relaunch: `id` is a lowercase UUID; `requiredReport` says the done report must carry files. */
+export type LaneFileRun = {
+  readonly id: string;
+  readonly requiredReport: boolean;
+};
+
+/** One rewritten absolute-path occurrence: UTF-16 offsets into the final `briefText`, and its target in the tree. */
+export type LaneFileReference = {
+  readonly start: number;
+  readonly end: number;
+  readonly target: string;
+};
+
+/** The input snapshot a `lane.start`/`lane.recover` carries. */
+export type LaneBriefFiles = {
+  readonly run: LaneFileRun;
+  readonly tree: LaneFileTree;
+  readonly references: readonly LaneFileReference[];
+};
+
+/** Identifies one captured output snapshot: its run, revision (>= 1) and tree digest. */
+export type LaneFileReceipt = {
+  readonly run: LaneFileRun;
+  readonly revision: number;
+  readonly sha256: string;
+};
+
+/** The output snapshot a done `lane.report` (or `q.lane.files`) carries. */
+export type LaneOutputFiles = LaneFileReceipt & {
+  readonly tree: LaneFileTree;
+};
+
 export type RunnerEventBodies = {
   readonly "herdr.state": { readonly state: HerdrHealth["state"]; readonly instance?: string; readonly detail: string };
   readonly "herdr.start": { readonly ok: boolean; readonly detail: string };
-  readonly "lane.started": { readonly key: string; readonly pane: string; readonly tab: string; readonly session: string };
+  /** `fileRun` (since proto 5): the file run the started pane belongs to; absent from older runners and journals. */
+  readonly "lane.started": {
+    readonly key: string; readonly pane: string; readonly tab: string; readonly session: string; readonly fileRun?: LaneFileRun;
+  };
   /**
    * `pane` (since proto 2) is the lane's pane id as the runner sees it; a proto 1 runner never sends it. `reason`
    * (since proto 3) says why a lane is `dead`.
@@ -69,12 +150,20 @@ export type RunnerEventBodies = {
   readonly "lane.state": { readonly key: string; readonly status: LaneStatus; readonly pane?: string; readonly reason?: LaneDeadReason };
   readonly "lane.report": {
     readonly key: string; readonly kind: ReportKind; readonly text: string; readonly evidence?: string; readonly bodyRef?: BodyRef;
+    /** Since proto 5, only on `done`: the complete DORI_LANE_OUT snapshot captured with this report. */
+    readonly files?: LaneOutputFiles;
   };
   readonly "lane.asking": { readonly key: string; readonly text: string };
   /** No runner sends `reportHash` any more (a pane is never read for a report); kept so an older runner's frame still validates. */
   readonly "lane.progress": { readonly key: string; readonly reportHash?: string; readonly text?: string };
   /** The lane confirmed the supervisor's lane message `id` (`dori report ack <id>`, since proto 3). */
   readonly "lane.ack": { readonly key: string; readonly id: string };
+  /**
+   * The runner reloaded its policy after runner-config.json (or, on the local runner, config.json) changed: `reloaded`
+   * (applied; `detail` names what changed), `invalid` (the last good policy is kept; `detail` says why) or `restart`
+   * (`detail` names settings that apply only after the runner restarts).
+   */
+  readonly "runner.config": { readonly state: "reloaded" | "invalid" | "restart"; readonly detail: string };
   readonly "wait.result": { readonly waitId: string; readonly outcome: WaitOutcome; readonly detail: string };
   readonly "job.result": { readonly opKey: string; readonly state: "verified" | "failed"; readonly exitCode: number; readonly output: string };
   /** The level with its reasons, plus the readings the supervisor's HOST_GUARD lines quote (-1 when unreadable). */
@@ -115,10 +204,13 @@ export type SupervisorCommandBodies = {
    * (the herdr workspace a new tab opens in; absent on remote runners: find or create `lanes`).
    */
   readonly "lane.start": Cmd<{
-    readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd: string;
+    /** `cwd` absent (a `--machine` launch without `--cwd`): the runner fills `<runnerDir>/lanes/<key>`, created by the start. */
+    readonly key: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd?: string;
     readonly agentProfile: string; readonly mode: string; readonly model: string; readonly sandbox: boolean; readonly expectedLaneGen: number;
     readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
     readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
+    /** Since proto 5: the input snapshot and its file run (optional only so historical bodies decode). */
+    readonly files?: LaneBriefFiles;
   }>;
   /** Since proto 3: take the existing pane `pane` as lane `key`; issues a token file. */
   readonly "lane.adopt": Cmd<{ readonly key: string; readonly pane: string; readonly cwd?: string; readonly mode: string; readonly model: string }>;
@@ -130,7 +222,10 @@ export type SupervisorCommandBodies = {
    * `session` (since proto 3): resume that agent session when relaunching. `tabWorkspace`: the herdr workspace the
    * relaunch's new tab opens in (absent: the one the lane was started in).
    */
-  readonly "lane.recover": Cmd<{ readonly key: string; readonly session?: string; readonly tabWorkspace?: string }>;
+  /** `briefText` and `files` (since proto 5) are a fresh lead brief and input snapshot: both present or both absent. */
+  readonly "lane.recover": Cmd<{
+    readonly key: string; readonly session?: string; readonly tabWorkspace?: string; readonly briefText?: string; readonly files?: LaneBriefFiles;
+  }>;
   /** `mode` and `refuseWhileAsking` since proto 3. */
   readonly "lane.send": Cmd<{ readonly key: string; readonly text: string; readonly verify: boolean; readonly mode?: SendMode; readonly refuseWhileAsking?: boolean }>;
   /** Since proto 3: the lane's status as the supervisor holds it, answered to the lane's `dori lane status`. */
@@ -171,6 +266,12 @@ export type RunnerControlBodies = {
   readonly hello: {
     readonly proto: number; readonly gen: number; readonly label: string; readonly hostId: string; readonly cmdAck: number;
     readonly version?: string; readonly inventory?: readonly InventoryLane[]; readonly nonce?: string; readonly dh?: string;
+    /** The repos this runner declares it owns: those discovered under its reposRoot plus runner-config `workspaces` overrides (paths checked on its host). */
+    readonly workspaces?: readonly WorkspaceEntry[];
+    /** Git checkouts found under its allowedRoots whose origin names a repo it does not declare (information only). */
+    readonly detected?: readonly WorkspaceEntry[];
+    /** The runner's effective lane worktree root (absolute): runner-config `worktreeRoot`, else `<reposRoot>/worktrees`. */
+    readonly worktreeRoot?: string;
   };
   /**
    * First frame of an enrollment connection. `proof` is HMAC-SHA256 keyed with the enrollment code over the label,
@@ -186,7 +287,17 @@ export type RunnerControlBodies = {
   readonly "cmd.status.result": { readonly cmdId: string; readonly state: CommandStatusState; readonly detail?: string };
   /** The answer to the `q.*` query `qid` (since proto 3): `result` is `QueryResults[type]` when `ok`. */
   readonly "q.result": { readonly qid: string; readonly ok: boolean; readonly detail: string; readonly result?: JsonValue };
+  /**
+   * Since proto 6: ask the supervisor for secrets `names` for lane `key`. `rid` is 32 random hex chars; `repo` is the
+   * lane's owner/repo as the runner read it from the lane worktree.
+   */
+  readonly "secret.get": { readonly rid: string; readonly key: string; readonly names: readonly string[]; readonly repo?: string };
+  /** Since proto 6: have the supervisor host run the configured secret command `op` for lane `key`. */
+  readonly "secret.run": { readonly rid: string; readonly key: string; readonly op: string; readonly repo?: string };
 };
+
+/** An AEAD box (auth.ts `SealedBox`): base64 nonce and base64 ciphertext with its tag. */
+export type SealedBody = { readonly n: string; readonly c: string };
 
 export type RejectCode = "RUNNER_PROTO_MISMATCH" | "RUNNER_CONFLICT" | "RUNNER_REVOKED" | "RUNNER_AUTH_FAILED" | "RUNNER_ENROLL_REFUSED";
 
@@ -202,6 +313,17 @@ export type SupervisorControlBodies = {
   readonly "enroll.ok": { readonly supervisorPubKey: string; readonly proof: string };
   /** The new runner key from `runner.rotated` is stored; the runner may drop its old key. */
   readonly "rotate.ok": { readonly cmdId: string };
+  /**
+   * Since proto 6: the answer to `secret.get` `rid`. On `ok`, `sealed` opens (direction s2r) to the granted values; on a
+   * refusal `code` is a RUNNER_SECRET_* code and `detail` names names and lanes only, never a value.
+   */
+  readonly "secret.value": {
+    readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
+  };
+  /** Since proto 6: the answer to `secret.run` `rid`, shaped like `secret.value`; the sealed result carries exit code and capped output. */
+  readonly "secret.run.result": {
+    readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly sealed?: SealedBody;
+  };
 } & QueryBodies;
 
 /**
@@ -224,6 +346,8 @@ export type QueryBodies = {
   };
   /** The host's guard sample and pane list. */
   readonly "q.machine.observe": { readonly qid: string };
+  /** Since proto 5: the runner's current DORI_LANE_OUT snapshot of lane `key`. */
+  readonly "q.lane.files": { readonly qid: string; readonly key: string };
 };
 export type QueryType = keyof QueryBodies;
 
@@ -258,7 +382,8 @@ export type StartupVerdict = { readonly verdict: "ok" | "error" | "unconfirmed";
 
 /** The `result` of a verified `cmd.result`, per command type. */
 export type CommandResults = {
-  readonly "lane.start": { readonly pane: string; readonly tab: string; readonly startup: StartupVerdict };
+  /** `cwd`: the directory the lane started in (the filled default, or a target pane's own). */
+  readonly "lane.start": { readonly pane: string; readonly tab: string; readonly startup: StartupVerdict; readonly cwd?: string };
   readonly "lane.adopt": { readonly pane: string; readonly tab: string; readonly tokenFile: string };
   readonly "lane.stop": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
   readonly "lane.close": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
@@ -273,6 +398,16 @@ export type CommandResults = {
   /** `turn` (an idle lane's last stopped turn) comes only from a runner that records it. */
   readonly "lane.observe": { readonly status: LaneStatus; readonly turn?: TurnEvidence };
   readonly "guard.kill": { readonly killed: readonly { readonly pid: number; readonly lane?: string; readonly comm: string; readonly rssKb: number }[] };
+  /**
+   * One check of a wait signal on the runner's host: `met` when it held, `error` when the check itself could not run
+   * (it counts as a failed check, as a local one does). A met check also goes out as `wait.result WAIT_DONE`.
+   */
+  readonly "wait.check": { readonly met: boolean; readonly error?: string };
+  /**
+   * One run of an argv on the runner's host: `output` is its stdout (trimmed, at most 64 KiB) and `err` its stderr (at
+   * most 4 KiB). The same run also goes out as a `job.result` event.
+   */
+  readonly "job.run": { readonly exitCode: number; readonly timedOut: boolean; readonly output: string; readonly err: string };
   /**
    * herdr as read after the action: `managed` when a herdr unit is installed on the host, `paused` when the watch
    * pause marker is set (`dori runner herdr stop`).
@@ -315,7 +450,14 @@ export type LaneInspection = {
 };
 
 /** `sample.panes` is filled with the pane count. */
-export type MachineObservation = { readonly os: string; readonly sampledAt: number; readonly sample: HostSample; readonly panes: readonly Pane[] };
+/**
+ * `guard`: the guard thresholds this runner's runner-config.json sets (only the keys it sets); absent from a runner that
+ * sets none or predates the field. Placement judges the machine at these keys, the supervisor's config.guard for the rest.
+ */
+export type MachineObservation = {
+  readonly os: string; readonly sampledAt: number; readonly sample: HostSample; readonly panes: readonly Pane[];
+  readonly guard?: Readonly<Partial<GuardThresholds>>;
+};
 
 /** The `result` of an `ok` `q.result`, per query type. */
 export type QueryResults = {
@@ -325,6 +467,8 @@ export type QueryResults = {
   readonly "q.stat": { readonly exists: readonly boolean[] };
   readonly "q.lane.inspect": LaneInspection;
   readonly "q.machine.observe": MachineObservation;
+  /** `files` is absent for a lane without a file run (a legacy lane). */
+  readonly "q.lane.files": { readonly files?: LaneOutputFiles };
 };
 
 export type RunnerEventType = keyof RunnerEventBodies;
@@ -407,23 +551,37 @@ const laneKey: Shape = { key: req("string") };
 
 const BODY_REF: Shape = { sha256: req("string"), bytes: req("int"), truncated: req("bool") };
 const INVENTORY: Shape = { key: req("string"), pane: req("string"), tab: req("string"), session: opt("string") };
+const WORKSPACE: Shape = { repo: req("string"), path: req("string") };
 const HERDR: Shape = { state: req({ enum: ["up", "down", "hung"] }), instance: opt("string") };
+// Lane file transfer (since proto 5). Structure only: limits, digests, base64, names and ordering are checked by the
+// producing/consuming endpoint, so a semantically bad snapshot is a refusal there, not an undecodable frame.
+const LANE_FILE: Shape = { path: req("string"), bytes: req("int"), sha256: req("string"), base64: req("string") };
+const LANE_FILE_TREE: Shape = { directories: req("string[]"), files: req({ list: LANE_FILE }) };
+const LANE_FILE_RUN: Shape = { id: req("string"), requiredReport: req("bool") };
+const LANE_FILE_REFERENCE: Shape = { start: req("int"), end: req("int"), target: req("string") };
+const LANE_BRIEF_FILES: Shape = {
+  run: req({ object: LANE_FILE_RUN }), tree: req({ object: LANE_FILE_TREE }), references: req({ list: LANE_FILE_REFERENCE }),
+};
+const LANE_OUTPUT_FILES: Shape = {
+  run: req({ object: LANE_FILE_RUN }), revision: req("int"), sha256: req("string"), tree: req({ object: LANE_FILE_TREE }),
+};
 
 const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
   "herdr.state": { ...HERDR, detail: req("string") },
   "herdr.start": { ok: req("bool"), detail: req("string") },
-  "lane.started": { key: req("string"), pane: req("string"), tab: req("string"), session: req("string") },
+  "lane.started": { key: req("string"), pane: req("string"), tab: req("string"), session: req("string"), fileRun: opt({ object: LANE_FILE_RUN }) },
   "lane.state": {
     key: req("string"), status: req({ enum: ["working", "idle", "dead", "missing"] }), pane: opt("string"),
     reason: opt({ enum: ["pane-missing", "agent-gone"] }),
   },
   "lane.report": {
     key: req("string"), kind: req({ enum: ["progress", "question", "blocked", "milestone", "done"] }), text: req("string"),
-    evidence: opt("string"), bodyRef: opt({ object: BODY_REF }),
+    evidence: opt("string"), bodyRef: opt({ object: BODY_REF }), files: opt({ object: LANE_OUTPUT_FILES }),
   },
   "lane.asking": { key: req("string"), text: req("string") },
   "lane.progress": { key: req("string"), reportHash: opt("string"), text: opt("string") },
   "lane.ack": { key: req("string"), id: req("string") },
+  "runner.config": { state: req({ enum: ["reloaded", "invalid", "restart"] }), detail: req("string") },
   "wait.result": { waitId: req("string"), outcome: req({ enum: ["WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED"] }), detail: req("string") },
   "job.result": { opKey: req("string"), state: req({ enum: ["verified", "failed"] }), exitCode: req("int"), output: req("string") },
   "guard.sample": {
@@ -444,16 +602,18 @@ const EVENT_SCHEMAS: { readonly [T in RunnerEventType]: Shape } = {
 
 const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
   "lane.start": cmd({
-    key: req("string"), briefText: req("string"), done: req("string"), thread: req("string"), cwd: req("string"),
+    key: req("string"), briefText: req("string"), done: req("string"), thread: req("string"), cwd: opt("string"),
     agentProfile: req("string"), mode: req("string"), model: req("string"), sandbox: req("bool"), expectedLaneGen: req("int"),
     keywords: opt("string"), session: opt("string"), target: opt({ object: { pane: opt("string"), workspace: opt("string") } }),
-    heavySlots: opt("int"), heavyMaxLoad: opt("number"), tabWorkspace: opt("string"),
+    heavySlots: opt("int"), heavyMaxLoad: opt("number"), tabWorkspace: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),
   }),
   "lane.adopt": cmd({ key: req("string"), pane: req("string"), cwd: opt("string"), mode: req("string"), model: req("string") }),
   "lane.stop": cmd(laneKey),
   "lane.pause": cmd({ key: req("string"), step: opt({ enum: ["goal", "stop", "both"] }) }),
   "lane.resume": cmd(laneKey),
-  "lane.recover": cmd({ key: req("string"), session: opt("string"), tabWorkspace: opt("string") }),
+  "lane.recover": cmd({
+    key: req("string"), session: opt("string"), tabWorkspace: opt("string"), briefText: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),
+  }),
   "lane.send": cmd({
     key: req("string"), text: req("string"), verify: req("bool"), mode: opt({ enum: ["verified", "guarded"] }), refuseWhileAsking: opt("bool"),
   }),
@@ -480,6 +640,7 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
   hello: {
     proto: req("int"), gen: req("int"), label: req("string"), hostId: req("string"), cmdAck: req("int"),
     version: opt("string"), inventory: opt({ list: INVENTORY }), nonce: opt("string"), dh: opt("string"),
+    workspaces: opt({ list: WORKSPACE }), detected: opt({ list: WORKSPACE }), worktreeRoot: opt("string"),
   },
   enroll: { label: req("string"), hostId: req("string"), runnerPubKey: req("string"), proof: req("string") },
   "auth.proof": { sig: req("string") },
@@ -489,6 +650,13 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
     cmdId: req("string"), state: req({ enum: ["intent", "running", "verified", "failed", "ambiguous", "unknown"] }), detail: opt("string"),
   },
   "q.result": { qid: req("string"), ok: req("bool"), detail: req("string"), result: opt("json") },
+  "secret.get": { rid: req("string"), key: req("string"), names: req("string[]"), repo: opt("string") },
+  "secret.run": { rid: req("string"), key: req("string"), op: req("string"), repo: opt("string") },
+};
+
+const SEALED: Shape = { n: req("string"), c: req("string") };
+const SECRET_ANSWER: Shape = {
+  rid: req("string"), ok: req("bool"), code: opt("string"), detail: opt("string"), sealed: opt({ object: SEALED }),
 };
 
 const query = (shape: Shape): Shape => ({ qid: req("string"), ...shape });
@@ -503,6 +671,7 @@ const QUERY_SCHEMAS: { readonly [T in QueryType]: Shape } = {
     done: opt("string"), doneCwd: opt("string"), session: opt("bool"), sessionsDir: opt("string"),
   }),
   "q.machine.observe": query({}),
+  "q.lane.files": query({ key: req("string") }),
 };
 
 const SUPERVISOR_CONTROL_SCHEMAS: { readonly [T in SupervisorControlType]: Shape } = {
@@ -516,6 +685,8 @@ const SUPERVISOR_CONTROL_SCHEMAS: { readonly [T in SupervisorControlType]: Shape
   "hello.challenge": { nonce: req("string"), dh: req("string"), sig: req("string"), keyFp: req("string") },
   "enroll.ok": { supervisorPubKey: req("string"), proof: req("string") },
   "rotate.ok": { cmdId: req("string") },
+  "secret.value": SECRET_ANSWER,
+  "secret.run.result": SECRET_ANSWER,
   ...QUERY_SCHEMAS,
 };
 
@@ -688,6 +859,9 @@ export type ProtoCheck =
  */
 export const checkProto = (runnerProto: number, supervisorProto: number = PROTO): ProtoCheck => {
   if (runnerProto === supervisorProto || runnerProto === supervisorProto - 1) return { ok: true };
-  const why = runnerProto > supervisorProto ? "newer than the supervisor" : "too old for the supervisor";
-  return { ok: false, code: "RUNNER_PROTO_MISMATCH", detail: `runner proto ${runnerProto} is ${why} (accepts ${supervisorProto - 1}..${supervisorProto})` };
+  const window = `(accepts ${supervisorProto - 1}..${supervisorProto})`;
+  const detail = runnerProto > supervisorProto
+    ? `runner proto ${runnerProto} is newer than the supervisor ${window}`
+    : `runner proto ${runnerProto} is too old for the supervisor ${window}; run dori runner update`;
+  return { ok: false, code: "RUNNER_PROTO_MISMATCH", detail };
 };

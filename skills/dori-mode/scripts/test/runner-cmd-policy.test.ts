@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkCommand, checkCwd, checkQuery, loadPolicy, rejection, type RunnerPolicy } from "../src/runner/policy.ts";
+import { checkCommand, checkCwd, checkQuery, loadPolicy, parsePolicy, rejection, type RunnerPolicy } from "../src/runner/policy.ts";
 
 const policy: RunnerPolicy = { agents: { omo: ["omo", "run"] }, allowedRoots: ["/data/repos"], sandbox: "required", jobs: "allow" };
 
@@ -104,6 +104,36 @@ describe("runner command policy", () => {
     expect(checkCwd(policy, "relative", realpath)?.rule).toBe("cwd-missing");
   });
 
+  test("a cwd lexically outside every root is refused without any realpath call on it (TCC folders block realpath)", () => {
+    const seen: string[] = [];
+    const recording = (p: string): string => { seen.push(p); return realpath(p); };
+    const outside = "/Users/hsnam/Documents";
+    expect(checkCwd(policy, outside, recording)).toEqual({ rule: "cwd-outside-roots", detail: outside });
+    expect(checkCwd(policy, "/data/repos/../repos-evil/x", recording)).toEqual({ rule: "cwd-outside-roots", detail: "/data/repos-evil/x" });
+    const r = checkCommand(policy, start({ cwd: outside }), recording);
+    expect(r.ok ? undefined : [r.rule, r.detail]).toEqual(["cwd-outside-roots", outside]);
+    expect(rule(job({ cwd: outside }))).toBe("cwd-outside-roots");
+    expect(seen.filter((p) => p.startsWith("/Users") || p.includes("repos-evil"))).toEqual([]);
+    // Even a throwing stub is never reached for the path (only roots may be resolved).
+    const guarded = (p: string): string => { if (!p.startsWith("/data/repos")) throw new Error(`realpath touched ${p}`); return realpath(p); };
+    expect(checkCwd(policy, outside, guarded)?.rule).toBe("cwd-outside-roots");
+  });
+
+  test("a cwd inside a root still resolves, and a symlink escaping the root is still refused after the lexical pre-check", () => {
+    expect(checkCwd(policy, "/data/repos/a", realpath)).toBeUndefined();
+    expect(checkCwd(policy, "/data/repos/escape", (p) => { if (p === "/data/repos/escape") return "/data/repos/a"; return realpath(p); })).toBeUndefined();
+    expect(checkCwd(policy, "/data/repos/escape", realpath)).toEqual({ rule: "cwd-outside-roots", detail: "/etc" });
+  });
+
+  test("a root given in symlinked form admits a cwd given in either its symlinked or resolved form", () => {
+    const fs: Record<string, string> = { "/var/tmp/root": "/private/var/tmp/root", "/private/var/tmp/root": "/private/var/tmp/root", "/private/var/tmp/root/w": "/private/var/tmp/root/w", "/var/tmp/root/w": "/private/var/tmp/root/w" };
+    const rp = (p: string): string => { const r = fs[p]; if (r === undefined) throw new Error(`ENOENT ${p}`); return r; };
+    const linked: RunnerPolicy = { ...policy, allowedRoots: ["/var/tmp/root"] };
+    expect(checkCwd(linked, "/private/var/tmp/root/w", rp)).toBeUndefined();
+    expect(checkCwd(linked, "/var/tmp/root/w", rp)).toBeUndefined();
+    expect(checkCwd(linked, "/private/var/other", rp)?.rule).toBe("cwd-outside-roots");
+  });
+
   test("lane.git root must resolve under allowedRoots, and jobs deny refuses it", () => {
     const git = (over: Record<string, unknown> = {}) => frame("lane.git", { key: "k", op: "branch-delete", root: "/data/repos/a", branch: "lane-k", ...over });
     expect(checkCommand(policy, git(), realpath).ok).toBe(true);
@@ -169,6 +199,106 @@ describe("runner command policy", () => {
     expect(qrule({ ...q("q.panes", {}), cmdSeq: 1 })).toBe("sequence");
     expect(qrule({ v: 1, runner: "r1", gen: 1, epoch: 1, type: "ack", body: { eventAck: 1 } })).toBe("not-a-command");
     expect(rule(q("q.panes", {}))).toBe("not-a-command");
+  });
+
+  test("sandboxCheck parses as an argv; an empty, non-array or non-string one is refused", () => {
+    expect(parsePolicy({ sandbox: "required", sandboxCheck: ["/h/.dori/runner/bin/lane-sandbox", "--check"] }).sandboxCheck)
+      .toEqual(["/h/.dori/runner/bin/lane-sandbox", "--check"]);
+    expect(parsePolicy({}).sandboxCheck).toBeUndefined();
+    for (const bad of [[], [""], "lane-sandbox --check", ["lane-sandbox", 3]]) {
+      expect(() => parsePolicy({ sandboxCheck: bad })).toThrow("sandboxCheck must be a non-empty string array");
+    }
+  });
+
+  test("a retired defaultCwd is ignored with one RUNNER_CONFIG_KEY_IGNORED warning, whatever its value", () => {
+    for (const value of ["~/work", "relative", 3]) {
+      const warnings: string[] = [];
+      const p = parsePolicy({ agents: { omo: ["omo"] }, defaultCwd: value }, "/Users/me", "/tmp", { warn: (line) => { warnings.push(line); } });
+      expect(p).not.toHaveProperty("defaultCwd");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toStartWith("RUNNER_CONFIG_KEY_IGNORED defaultCwd: ");
+    }
+    const warnings: string[] = [];
+    parsePolicy({ agents: { omo: ["omo"] } }, "/Users/me", "/tmp", { warn: (line) => { warnings.push(line); } });
+    expect(warnings).toEqual([]);
+    expect(() => parsePolicy({ defaultCwdd: "/x" })).toThrow("runner-config: unknown key defaultCwdd");
+  });
+
+  test("loadPolicy loads a file that still holds defaultCwd and warns once", () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    writeFileSync(join(dir, "runner-config.json"), JSON.stringify({ agents: { omo: ["omo"] }, allowedRoots: ["/srv"], defaultCwd: "~/work" }));
+    const warnings: string[] = [];
+    const p = loadPolicy(dir, (line) => { warnings.push(line); });
+    expect(p.agents).toEqual({ omo: ["omo"] });
+    expect(p.allowedRoots).toEqual(["/srv", join(dir, "lanes")]);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("a lane.start without cwd gets <runnerDir>/lanes/<key>, checked against allowedRoots before it exists", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    const [home, tmp] = [join(base, "home"), join(base, "tmp")];
+    const runnerDir = join(home, ".dori", "runner");
+    const reposRoot = join(home, "repos");
+    for (const dir of [join(runnerDir, "lanes"), reposRoot, tmp]) mkdirSync(dir, { recursive: true });
+    const p = parsePolicy({ agents: { omo: ["omo", "run"] }, reposRoot }, home, tmp);
+    expect(p.allowedRoots).toContain(join(runnerDir, "lanes"));
+    const { cwd: _, ...noCwd } = start().body as Record<string, unknown>;
+    const bare = (key: string) => ({ ...start(), body: { ...noCwd, key } });
+    expect(checkCommand(p, bare("lane-a"), realpathSync, runnerDir)).toMatchObject({ ok: true, command: { body: { cwd: join(runnerDir, "lanes", "lane-a") } } });
+    // A key that is no directory name is refused; a symlink planted as the lane's directory cannot leave the roots.
+    expect(checkCommand(p, bare("../x"), realpathSync, runnerDir)).toMatchObject({ ok: false, rule: "cwd-missing" });
+    symlinkSync(home, join(runnerDir, "lanes", "lane-evil"));
+    expect(rejection(checkCommand(p, bare("lane-evil"), realpathSync, runnerDir))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+    // An explicit cwd is never replaced.
+    expect(checkCommand(p, start({ cwd: reposRoot }), realpathSync, runnerDir)).toMatchObject({ ok: true, command: { body: { cwd: reposRoot } } });
+  });
+
+  test("reposRoot and the effective worktree root are added to allowedRoots after the explicit ones", () => {
+    const agents = { omo: ["omo", "run"] };
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u"], reposRoot: "/data/repos" }, "/home/u").allowedRoots).toEqual(["/home/u", "/data/repos", "/data/repos/worktrees"]);
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u", "/data/repos"], reposRoot: "/data/repos", worktreeRoot: "/srv/wt" }, "/home/u").allowedRoots)
+      .toEqual(["/home/u", "/data/repos", "/srv/wt"]);
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u"] }, "/home/u").allowedRoots).toEqual(["/home/u"]);
+    // The lanes directory joins a list that does not already hold it.
+    expect(parsePolicy({ agents, allowedRoots: ["/srv"] }, "/home/u").allowedRoots).toEqual(["/srv", "/home/u/.dori/runner/lanes"]);
+    // The same directory spelled with a trailing slash or through ~ is not added twice.
+    expect(parsePolicy({ agents, allowedRoots: ["/home/u/repos/", "/home/u/wt"], reposRoot: "~/repos", worktreeRoot: "/home/u/wt/" }, "/home/u").allowedRoots)
+      .toEqual(["/home/u/repos/", "/home/u/wt", "/home/u/.dori/runner/lanes"]);
+  });
+
+  test("without allowedRoots (or with []) the roots are derived: temp, home only without reposRoot/worktreeRoot, then the lanes directory", () => {
+    const agents = { omo: ["omo", "run"] };
+    const roots = (v: Record<string, unknown>) => parsePolicy({ agents, ...v }, "/home/u", "/tmp").allowedRoots;
+    const lanes = "/home/u/.dori/runner/lanes";
+    expect(roots({ reposRoot: "~/repos" })).toEqual(["/tmp", lanes, "/home/u/repos", "/home/u/repos/worktrees"]);
+    expect(roots({ allowedRoots: [], reposRoot: "/data/repos", defaultCwd: "~/work" })).toEqual(["/tmp", lanes, "/data/repos", "/data/repos/worktrees"]);
+    expect(roots({ worktreeRoot: "/srv/wt" })).toEqual(["/tmp", lanes, "/srv/wt"]);
+    expect(roots({})).toEqual(["/tmp", "/home/u"]);
+    // A listed allowedRoots derives nothing.
+    expect(roots({ allowedRoots: ["/srv"], reposRoot: "/data/repos" })).toEqual(["/srv", lanes, "/data/repos", "/data/repos/worktrees"]);
+  });
+
+  test("derived roots admit reposRoot and temp but refuse home and the runner directory when reposRoot is set", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    const [home, tmp] = [join(base, "home"), join(base, "tmp")];
+    const reposRoot = join(home, "repos");
+    for (const dir of [join(reposRoot, "a"), join(home, ".dori", "runner"), join(tmp, "job")]) mkdirSync(dir, { recursive: true });
+    const p = parsePolicy({ agents: { omo: ["omo", "run"] }, reposRoot }, home, tmp);
+    expect(checkCommand(p, start({ cwd: join(reposRoot, "a") }), realpathSync).ok).toBe(true);
+    expect(checkCommand(p, start({ cwd: join(tmp, "job") }), realpathSync).ok).toBe(true);
+    expect(rejection(checkCommand(p, start({ cwd: home }), realpathSync))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+    expect(rejection(checkCommand(p, start({ cwd: join(home, ".dori", "runner") }), realpathSync))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
+  });
+
+  test("a lane.start under reposRoot passes without listing it in allowedRoots; outside every root it is still refused", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "runner-cmd-policy-")));
+    const reposRoot = join(base, "repos");
+    const cwd = join(reposRoot, "a");
+    const outside = join(base, "outside");
+    for (const dir of [reposRoot, cwd, outside]) mkdirSync(dir, { recursive: true });
+    const p = parsePolicy({ agents: { omo: ["omo", "run"] }, allowedRoots: ["/home/u"], reposRoot });
+    expect(checkCommand(p, start({ cwd }), realpathSync).ok).toBe(true);
+    expect(rejection(checkCommand(p, start({ cwd: outside }), realpathSync))).toBe("RUNNER_CMD_REJECTED cwd-outside-roots");
   });
 
   test("absent config file yields defaults", () => {

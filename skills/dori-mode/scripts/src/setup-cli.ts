@@ -3,6 +3,7 @@ import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
+import { ConfigKeyError, DORI_CONFIG_KEYS, parseSetArgs } from "./config-keys.ts";
 import { configPath } from "./config.ts";
 import { doctorMain } from "./doctor.ts";
 import { fetchHttp } from "./messenger/http.ts";
@@ -12,15 +13,26 @@ import { type Prompter, runSetup, SetupError, type SetupInput } from "./setup.ts
 
 export const SETUP_USAGE = `dori setup [options]
 
-  Interactive by default: every question shows the current value, Enter keeps it.
-  GitHub repos are optional; setup reads and saves this machine's watched list.
+  Interactive by default: every question shows the current value in [brackets] (none shown: the default applies),
+  Enter keeps it and - clears an optional key.
+  Asks five questions: bot token, channel ids, owner id, whether new GitHub issues start work (yes: the logins and
+  repos to watch), and autostart (yes: every system step runs). Everything else keeps its value or default.
+  --advanced              also ask models, directories, every other config key, the herdr step, each autostart step
+                          and whether to keep a channel that failed its check; GitHub repos are asked every time
   --yes, -y               non-interactive: take flags, then stored values, then defaults
   --token-file FILE       read the Discord bot token from FILE ("-" for stdin); never pass it as an argument
   --channel ID            main Discord channel id (repeatable)
   --model M  --cwd DIR  --state-dir DIR
   --issue-author LOGIN    GitHub account whose new issues start work automatically (repeatable)
+  --set KEY=VALUE         set a config.json key as given, without asking (repeatable; an empty VALUE unsets it)
+  --unset KEY             delete a config.json key without asking (repeatable)
+  --migrate               after an update: migrate the schema, remove keys config.json no longer reads (warned once first)
+                          and ask only keys never shown before; no token, Discord, herdr or autostart steps
   --no-herdr              skip the herdr lead pane and lanes workspace
-  --autostart             install and enable the systemd user units (with --yes: runs every step)`;
+  --autostart             install and enable the systemd user units (with --yes: runs every step)
+
+  Keys config.json no longer reads are warned about on the first run that finds them and removed on the next;
+  every write first keeps the old file as config.json.<UTC time>.bak.`;
 
 class LineReader {
   private buffered = "";
@@ -74,7 +86,7 @@ class LineReader {
   }
 }
 
-const ttyPrompter = (): Prompter => {
+export const ttyPrompter = (): Prompter => {
   const reader = new LineReader(process.stdin);
   return {
     ask: async (q, current) => (await reader.line(`${q}${current ? ` [${current}]` : ""}: `, false)).trim() || current,
@@ -86,7 +98,7 @@ const ttyPrompter = (): Prompter => {
   };
 };
 
-const defaultsPrompter: Prompter = { ask: async (_, current) => current, secret: async () => "", confirm: async (_, fallback) => fallback };
+export const defaultsPrompter: Prompter = { ask: async (_, current) => current, secret: async () => "", confirm: async (_, fallback) => fallback };
 
 export const setupMain = async (args: readonly string[]): Promise<number> => {
   const { values } = parseArgs({
@@ -96,6 +108,8 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
       yes: { type: "boolean", short: "y" }, "token-file": { type: "string" }, channel: { type: "string", multiple: true },
       model: { type: "string" }, cwd: { type: "string" }, "state-dir": { type: "string" }, "issue-author": { type: "string", multiple: true },
       "no-herdr": { type: "boolean" }, autostart: { type: "boolean" }, help: { type: "boolean", short: "h" },
+      set: { type: "string", multiple: true }, unset: { type: "string", multiple: true }, migrate: { type: "boolean" },
+      advanced: { type: "boolean" },
     },
   });
   if (values.help) {
@@ -106,6 +120,14 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
   const home = homedir();
   const cfg = configPath();
   const tokenFile = values["token-file"];
+  let keys: ReturnType<typeof parseSetArgs>;
+  try {
+    keys = parseSetArgs(DORI_CONFIG_KEYS, values.set ?? [], values.unset ?? []);
+  } catch (e) {
+    if (!(e instanceof ConfigKeyError)) throw e;
+    console.error(`SETUP_FAILED ${e.message}`);
+    return 1;
+  }
   const input: SetupInput = {
     token: tokenFile ? readFileSync(tokenFile === "-" ? 0 : tokenFile, "utf8").trim() || undefined : undefined,
     channels: values.channel?.flatMap((c) => c.split(",")).map((c) => c.trim()).filter(Boolean),
@@ -115,6 +137,10 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
     issueAuthors: values["issue-author"]?.flatMap((a) => a.split(",")).map((a) => a.trim()).filter(Boolean),
     herdr: values["no-herdr"] ? false : undefined,
     autostart: values.autostart,
+    patch: keys.patch,
+    unset: keys.unset,
+    migrate: values.migrate,
+    advanced: values.advanced,
   };
   if (!interactive) console.log("SETUP non-interactive (flags, then stored values, then defaults)");
   try {
@@ -135,6 +161,7 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
       },
       input,
     );
+    if (values.migrate) return code;
     console.log("\nDOCTOR (dori doctor)");
     await doctorMain();
     return code;

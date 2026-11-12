@@ -1,6 +1,8 @@
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { configureKeys, DORI_CONFIG_KEYS, doriConfigDefault, formatValue, KEY_INPUT_HINT, keyLabel, pruneDoriConfig, readSeenKeys, writeSeenKeys } from "./config-keys.ts";
+import { CONFIG_SCHEMA_KEY, CONFIG_SCHEMA_VERSION, ConfigSchemaError, migrateConfigSchema, removalReason } from "./config-schema.ts";
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
 import type { Http } from "./messenger/http.ts";
 import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
@@ -52,9 +54,81 @@ export type SetupInput = {
   readonly herdr?: boolean;
   /** Install and enable the systemd user units (default no). */
   readonly autostart?: boolean;
+  /** `--set key=value` values: applied as given, never asked. */
+  readonly patch?: Json;
+  /** `--unset key` keys: deleted, never asked. */
+  readonly unset?: readonly string[];
+  /** Prune obsolete keys and ask only keys never shown before; no token, Discord, herdr or autostart steps. */
+  readonly migrate?: boolean;
+  /**
+   * Also ask what the default flow takes from flags, stored values or defaults: models, directories, every other config
+   * key, the herdr step, each autostart step and keeping a channel that failed its check. The default flow asks five
+   * questions: bot token, channels, owner id, issue auto-start and autostart.
+   */
+  readonly advanced?: boolean;
 };
 
 type Json = Record<string, unknown>;
+
+/** In `<stateDir>`: the config keys setup has already shown, so a later run asks only new ones. */
+export const SETUP_KEYS_FILE = "setup-keys.json";
+/** The config keys the core setup questions own; the generic key pass skips them. */
+export const SETUP_CORE_KEYS = ["discord", "discordChannels", "defaultModel", "leadModel", "leadCwd", "stateDir", "githubIssueAuthors", "ignorePanes"] as const;
+
+const labelOf = (key: string): string => {
+  const spec = DORI_CONFIG_KEYS.find((s) => s.key === key);
+  return spec ? keyLabel(spec) : "[optional]";
+};
+
+/** In `<stateDir>`: the obsolete config keys already warned about; the next run that still finds one removes it. */
+export const CONFIG_REMOVALS_FILE = "config-removals.json";
+
+const isRecord = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** `pruned` with the `pending` keys (top-level or `<key>.<sub>`) put back as `source` has them, in `source`'s order. */
+const keepPending = (source: Json, pruned: Json, pending: readonly string[]): Json => {
+  if (!pending.length) return pruned;
+  const out: Json = {};
+  for (const [key, value] of Object.entries(source)) {
+    const kept = pruned[key];
+    if (pending.includes(key)) out[key] = value;
+    else if (!(key in pruned)) continue;
+    else if (isRecord(value) && isRecord(kept)) out[key] = Object.fromEntries(Object.entries(value).filter(([sub]) => sub in kept || pending.includes(`${key}.${sub}`)));
+    else out[key] = kept;
+  }
+  return out;
+};
+
+/**
+ * `config` stamped with the current schema version after the CONFIG_MIGRATIONS steps it has not had, without the keys
+ * config.json no longer reads. Legacy pane keys are migrated into `stateDir` and dropped at once. Any other key is first
+ * kept and warned about (`SETUP_KEY_REMOVAL_PENDING`, recorded in `<stateDir>/config-removals.json`); a later run that
+ * still finds it removes it (`SETUP_KEY_REMOVED`). A config written by a newer dori throws SetupError before anything is
+ * written. saveConfig keeps a timestamped copy of the file it replaces.
+ */
+export const pruneObsolete = (d: Pick<SetupDeps, "log">, stateDir: string, config: Json): Json => {
+  let migrated: ReturnType<typeof migrateConfigSchema>;
+  try {
+    migrated = migrateConfigSchema(config);
+  } catch (e) {
+    throw e instanceof ConfigSchemaError ? new SetupError(e.message) : e;
+  }
+  resolveManagedPanes(stateDir, config);
+  for (const [from, to] of migrated.renamed) d.log(`SETUP_KEY_RENAMED ${from} -> ${to}`);
+  for (const key of migrated.filled) d.log(`SETUP_KEY_SET ${key} (kept the built-in default it ran with; that default changed)`);
+  for (const [key, why] of migrated.dropped) d.log(`SETUP_KEY_REMOVED ${key} (${why})`);
+  const { next, removed } = pruneDoriConfig(migrated.next);
+  const removalsPath = join(stateDir, CONFIG_REMOVALS_FILE);
+  const warned = readSeenKeys(removalsPath);
+  const pending = removed.filter((key) => !(LEGACY_PANE_KEYS as readonly string[]).includes(key) && !warned.has(key));
+  for (const key of removed) {
+    d.log(pending.includes(key)
+      ? `SETUP_KEY_REMOVAL_PENDING ${key} (${removalReason(key)}): kept this time; the next dori setup removes it`
+      : `SETUP_KEY_REMOVED ${key} (${removalReason(key)})`);
+  }
+  if (pending.length !== warned.size || pending.some((key) => !warned.has(key))) writeSeenKeys(removalsPath, pending);
+  return { [CONFIG_SCHEMA_KEY]: CONFIG_SCHEMA_VERSION, ...keepPending(migrated.next, next, pending) };
+};
 
 /** Seams for `renameWithRetry`: the platform (default `process.platform`), the rename itself, and the pause between tries. */
 export type RenameDeps = {
@@ -118,8 +192,23 @@ export const mergeConfig = (existing: Json, patch: Json): Json => {
   return out;
 };
 
-export const saveConfig = (path: string, existing: Json, next: Json): boolean => {
-  if (existsSync(path) && JSON.stringify(existing) === JSON.stringify(next)) return false;
+/** `<path>.<UTC time>.bak`, or `<path>.<UTC time>-<n>.bak` when a backup from the same second exists. */
+export const configBackupPath = (path: string, now = new Date()): string => {
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  let candidate = `${path}.${stamp}.bak`;
+  for (let n = 1; existsSync(candidate); n++) candidate = `${path}.${stamp}-${n}.bak`;
+  return candidate;
+};
+
+/** Writes `next` unless the file holds `existing` unchanged; the file it replaces is first copied to configBackupPath. */
+export const saveConfig = (path: string, existing: Json, next: Json, log?: (line: string) => void): boolean => {
+  const hasFile = existsSync(path);
+  if (hasFile && JSON.stringify(existing) === JSON.stringify(next)) return false;
+  if (hasFile) {
+    const backup = configBackupPath(path);
+    writeFileAtomic(backup, readFileSync(path, "utf8"), 0o600);
+    log?.(`SETUP_CONFIG_BACKUP ${backup}`);
+  }
   writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
   return true;
 };
@@ -275,16 +364,17 @@ const str = (v: unknown): string => (typeof v === "string" && !v.startsWith("<")
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && !x.startsWith("<")) : []);
 
 const askToken = async (d: SetupDeps, stored: string | undefined, given: string | undefined): Promise<string | undefined> => {
-  const typed = (await d.prompt.secret("Discord bot token", Boolean(given ?? stored))).trim();
+  const typed = (await d.prompt.secret("Discord bot token [required]", Boolean(given ?? stored))).trim();
   const token = typed || given || stored;
   if (token && !/^[\w.-]+$/.test(token)) throw new SetupError("the bot token has characters a Discord token never has (spaces, quotes or newlines); paste it again");
   return token;
 };
 
-const askChannels = async (d: SetupDeps, token: string | undefined, initial: readonly string[]): Promise<string[]> => {
+/** `given` channels (from a flag or --set) are verified but never asked. */
+const askChannels = async (d: SetupDeps, token: string | undefined, initial: readonly string[], given: boolean, advanced: boolean): Promise<string[]> => {
   let current = [...initial];
   for (;;) {
-    const channels = parseChannels(await d.prompt.ask("Main Discord channel id(s), comma separated", current.join(",")));
+    const channels = given ? current : parseChannels(await d.prompt.ask(`Main Discord channel id(s), comma separated ${labelOf("discordChannels")}`, current.join(",")));
     if (!channels.length || !token) {
       if (channels.length) d.log("SETUP channels not verified: no bot token yet");
       return channels;
@@ -292,8 +382,8 @@ const askChannels = async (d: SetupDeps, token: string | undefined, initial: rea
     const checks = await Promise.all(channels.map((id) => verifyChannel(d.http, token, id)));
     for (const c of checks) d.log(`SETUP channel ${c.id} ${c.ok ? "ok" : "FAILED"}: ${c.detail}`);
     if (checks.every((c) => c.ok)) return channels;
-    if (!d.interactive) throw new SetupError(`the bot cannot read channel(s) ${checks.filter((c) => !c.ok).map((c) => c.id).join(", ")}; nothing was written`);
-    if (await d.prompt.confirm("Keep these channels anyway?", false)) return channels;
+    if (d.interactive && advanced && (await d.prompt.confirm("Keep these channels anyway?", false))) return channels;
+    if (!d.interactive || given) throw new SetupError(`the bot cannot read channel(s) ${checks.filter((c) => !c.ok).map((c) => c.id).join(", ")}; nothing was written`);
     current = channels;
   }
 };
@@ -318,39 +408,124 @@ const askDiscord = async (d: SetupDeps, token: string, channel: string, existing
   const owner = app.owner && typeof app.owner === "object" && "id" in app.owner ? str(app.owner.id) : "";
   const applicationId = str(prior.applicationId) || str(app.id);
   const guildId = str(prior.guildId) || str(room.guild_id);
-  const ownerId = (await d.prompt.ask("Discord owner user id for slash commands", str(prior.ownerId) || owner)).trim();
+  const ownerId = (await d.prompt.ask(`Discord owner user id for slash commands ${labelOf("discord")}`, str(prior.ownerId) || owner)).trim();
   if (![applicationId, guildId, ownerId].every((id) => /^\d{15,22}$/.test(id))) {
     throw new SetupError("Discord application, guild and owner ids must be snowflakes; use a server channel and a Discord owner user id");
   }
   return { applicationId, guildId, ownerId };
 };
 
+/** Logs each required key with no value; true when any is missing. */
+const reportMissing = (d: SetupDeps, missing: readonly string[]): boolean => {
+  for (const key of missing) d.log(`SETUP_KEY_MISSING ${key} [required]`);
+  return missing.length > 0;
+};
+
+/** `dori setup --migrate`: prune obsolete keys and ask only keys never shown before. */
+const runMigrate = async (d: SetupDeps, input: SetupInput): Promise<number> => {
+  if (!existsSync(d.configPath)) {
+    d.log(`SETUP_MIGRATE_SKIPPED no config at ${d.configPath}; run dori setup`);
+    return 0;
+  }
+  const raw = readConfigObject(d.configPath);
+  const stateDir = expandHome(str(raw.stateDir) || "~/.dori/state", d.home);
+  const seenPath = join(stateDir, SETUP_KEYS_FILE);
+  const seen = readSeenKeys(seenPath);
+  const configured = await configureKeys({
+    specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateDir, raw), patch: input.patch ?? {}, unset: input.unset ?? [],
+    prompt: d.prompt, interactive: d.interactive, seen, mode: "new", defaults: doriConfigDefault(d.home), log: d.log,
+  });
+  d.log(`SETUP config ${saveConfig(d.configPath, raw, configured.next, d.log) ? "written" : "unchanged"}: ${d.configPath}`);
+  if (d.interactive) writeSeenKeys(seenPath, [...seen, ...configured.shown]);
+  if (reportMissing(d, configured.missingRequired)) {
+    d.log("SETUP_MIGRATE_DONE with problems: config");
+    return 2;
+  }
+  d.log("SETUP_MIGRATE_DONE");
+  return 0;
+};
+
 export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<number> => {
+  if (input.migrate) return runMigrate(d, input);
+  const advanced = input.advanced ?? false;
   const problems: string[] = [];
   const raw = readConfigObject(d.configPath);
   const envText = existsSync(d.envPath) ? readFileSync(d.envPath, "utf8") : "";
   const base = defaultConfig(d.home);
+  const patch = input.patch ?? {};
+  const unset = input.unset ?? [];
+  // Core keys whose question was shown (recorded as seen) and core keys taken from --set (not passed on to configureKeys).
+  const asked: string[] = [];
+  const consumed: string[] = [];
+  const given = (key: string): string | undefined => {
+    if (!(key in patch)) return undefined;
+    consumed.push(key);
+    const spec = DORI_CONFIG_KEYS.find((s) => s.key === key);
+    return spec ? formatValue(spec, patch[key]) : String(patch[key]);
+  };
+  const givenList = (key: string): string[] | undefined => {
+    if (!(key in patch)) return undefined;
+    consumed.push(key);
+    return strings(patch[key]);
+  };
+  /** `-` clears an optional key; a required one is asked again. */
+  const ask = async (key: string, question: string, current: string, fallback?: string): Promise<string> => {
+    if (unset.includes(key)) return "";
+    asked.push(key);
+    for (;;) {
+      const answer = (await d.prompt.ask(`${question} ${labelOf(key)}${fallback && !current ? ` (default: ${fallback})` : ""}`, current)).trim();
+      if (answer !== "-") return answer;
+      if (labelOf(key) === "[optional]") return "";
+      d.log(`SETUP_KEY_REQUIRED ${key}: it cannot be cleared`);
+    }
+  };
+  if (d.interactive) d.log(`SETUP ${KEY_INPUT_HINT}`);
 
   const storedToken = envGet(envText, TOKEN_KEY) || undefined;
   const token = await askToken(d, storedToken, input.token);
-  const channels = await askChannels(d, token, input.channels ?? strings(raw.discordChannels));
-  const discord = token && channels[0] ? await askDiscord(d, token, channels[0], raw.discord) : undefined;
-  const defaultModel = (await d.prompt.ask("Default model for lanes (and the lead unless a lead model is set)", input.model ?? (str(raw.defaultModel) || base.defaultModel))).trim();
-  // A legacy leadModel array is kept as written; the config loader uses its first entry and warns.
-  const chain = Array.isArray(raw.leadModel) ? raw.leadModel : undefined;
-  const leadModel = chain ? "" : (await d.prompt.ask("Lead model (empty = same as the lane default)", str(raw.leadModel))).trim();
-  const defaultCwd = (await d.prompt.ask("Default working directory for new lanes", input.cwd ?? (str(raw.defaultCwd) || "~"))).trim();
-  const stateDir = (await d.prompt.ask("State directory", input.stateDir ?? (str(raw.stateDir) || "~/.dori/state"))).trim();
+  const givenChannels = input.channels ?? givenList("discordChannels");
+  if (!givenChannels && !unset.includes("discordChannels")) asked.push("discordChannels");
+  const channels = unset.includes("discordChannels") ? [] : await askChannels(d, token, givenChannels ?? strings(raw.discordChannels), Boolean(givenChannels), advanced);
+  let discord: unknown;
+  if ("discord" in patch) {
+    consumed.push("discord");
+    discord = patch.discord;
+  } else if (token && channels[0] && !unset.includes("discord")) {
+    asked.push("discord");
+    discord = await askDiscord(d, token, channels[0], raw.discord);
+  }
+  /** Advanced only: the default flow keeps `current` (the stored value or the default) without asking. */
+  const askAdvanced = async (key: string, question: string, current: string, fallback?: string): Promise<string> =>
+    advanced ? ask(key, question, current, fallback) : unset.includes(key) ? "" : current;
+  const defaultModel = (input.model ?? given("defaultModel") ?? await askAdvanced("defaultModel", "Default model for lanes (and the lead unless a lead model is set)", str(raw.defaultModel) || base.defaultModel)).trim();
+  // A legacy leadModel array (or object) is kept as written; the config loader uses its first entry and warns.
+  const leadStored = "leadModel" in patch ? patch.leadModel : raw.leadModel;
+  const chain = typeof leadStored === "object" && leadStored !== null ? leadStored : undefined;
+  if (chain && "leadModel" in patch) consumed.push("leadModel");
+  const leadModel = chain ? "" : given("leadModel") ?? await askAdvanced("leadModel", "Lead model", str(raw.leadModel), defaultModel);
+  // A file not yet migrated keeps its lead directory under the old defaultCwd name; pruneObsolete then drops that key.
+  // An existing file written before schema step 4 with neither key ran the lead in the home directory and keeps it.
+  const leadFallback = existsSync(d.configPath) && !(typeof raw[CONFIG_SCHEMA_KEY] === "number" && raw[CONFIG_SCHEMA_KEY] >= 4) ? "~" : "~/.dori/lead";
+  const leadCwd = (input.cwd ?? given("leadCwd") ?? await askAdvanced("leadCwd", "Working directory of the lead session (local lanes started without --cwd start here too)", str(raw.leadCwd) || str(raw.defaultCwd) || leadFallback)).trim() || leadFallback;
+  const stateDir = (input.stateDir ?? given("stateDir") ?? await askAdvanced("stateDir", "State directory", str(raw.stateDir) || "~/.dori/state")).trim() || "~/.dori/state";
   const repos = new Repos(expandHome(stateDir, d.home));
-  const watchedRepos = (await d.prompt.ask("GitHub repos to watch (owner/repo, comma separated; optional)", repos.list().join(",")))
-    .split(/[\s,]+/).filter(Boolean);
-  const issueAuthors = parseChannels((await d.prompt.ask(
-    "GitHub accounts whose new issues start work automatically (comma separated; optional)",
-    (input.issueAuthors ?? strings(raw.githubIssueAuthors)).join(","),
-  )).toLowerCase());
+  const givenAuthors = input.issueAuthors ?? givenList("githubIssueAuthors");
+  const storedAuthors = strings(raw.githubIssueAuthors);
+  // One yes/no gates the logins and the repo list; flags, --set and --unset answer it without asking. No turns it off.
+  const issuesOn = givenAuthors || unset.includes("githubIssueAuthors") ? undefined
+    : await d.prompt.confirm("Start work automatically when a watched GitHub repo gets a new issue?", storedAuthors.length > 0);
+  const watchedRepos = advanced || issuesOn
+    ? (await d.prompt.ask("GitHub repos to watch (owner/repo, comma separated) [optional]", repos.list().join(","))).split(/[\s,]+/).filter(Boolean)
+    : repos.list();
+  if (issuesOn === false) asked.push("githubIssueAuthors");
+  const issueAuthors = parseChannels((givenAuthors ? givenAuthors.join(",") : issuesOn ? await ask(
+    "githubIssueAuthors",
+    "GitHub accounts whose new issues start work automatically (comma separated)",
+    storedAuthors.join(","),
+  ) : "").toLowerCase());
   const badAuthor = issueAuthors.find((a) => !/^[a-z0-9](?:[a-z0-9-]{0,38})$/.test(a));
   if (badAuthor) throw new SetupError(`${badAuthor} is not a GitHub login; nothing was written`);
-  const workDir = expandHome(defaultCwd, d.home);
+  const workDir = expandHome(leadCwd, d.home);
   for (const dir of [workDir, expandHome(stateDir, d.home)]) ensureDir(d, dir);
   repos.replace(watchedRepos);
 
@@ -361,15 +536,35 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     d.log(`SETUP env ${TOKEN_KEY} ${token === storedToken ? "kept" : "saved"} in ${d.envPath} (mode 600)${changed ? "" : ", unchanged"}`);
   } else d.log(`SETUP env no bot token; set ${TOKEN_KEY} later by running dori setup again`);
 
-  let config = mergeConfig(raw, {
-    discordChannels: channels, defaultModel, leadModel: chain ?? (leadModel || undefined), defaultCwd, stateDir, discord,
+  const merged = mergeConfig(raw, {
+    discordChannels: channels, defaultModel, leadModel: chain ?? (leadModel || undefined), leadCwd, stateDir, discord,
     // Keep configs that never set it byte-identical.
     githubIssueAuthors: issueAuthors.length || Array.isArray(raw.githubIssueAuthors) ? issueAuthors : undefined,
   });
-  d.log(`SETUP config ${saveConfig(d.configPath, raw, config) ? "written" : "unchanged"}: ${d.configPath}`);
+  for (const key of new Set(consumed)) if (JSON.stringify(raw[key]) !== JSON.stringify(merged[key])) d.log(`SETUP_KEY_SET ${key}`);
+  const stateAbs = expandHome(stateDir, d.home);
+  const seenPath = join(stateAbs, SETUP_KEYS_FILE);
+  const seen = readSeenKeys(seenPath);
+  const configured = await configureKeys({
+    // A new file is written at the current version: no migration step, so no old default is filled in.
+    specs: DORI_CONFIG_KEYS, current: pruneObsolete(d, stateAbs, existsSync(d.configPath) ? merged : { [CONFIG_SCHEMA_KEY]: CONFIG_SCHEMA_VERSION, ...merged }),
+    patch: Object.fromEntries(Object.entries(patch).filter(([key]) => !consumed.includes(key))), unset,
+    prompt: d.prompt, interactive: d.interactive && advanced, seen, mode: "full", skip: SETUP_CORE_KEYS, defaults: doriConfigDefault(d.home), hinted: true, log: d.log,
+  });
+  let config = configured.next;
+  d.log(`SETUP config ${saveConfig(d.configPath, raw, config, d.log) ? "written" : "unchanged"}: ${d.configPath}`);
+  // The default flow settles every key it does not ask with its value or default, so a later --migrate asks only keys added after it.
+  const settled = advanced ? [] : DORI_CONFIG_KEYS.map((s) => s.key);
+  if (d.interactive) writeSeenKeys(seenPath, [...seen, ...configured.shown, ...asked, ...settled, ...Object.keys(patch), ...unset]);
+  if (reportMissing(d, configured.missingRequired)) problems.push("config");
+  const alertsChannel = str(config.alertsChannel).trim();
+  d.log(alertsChannel
+    ? `SETUP alertsChannel ${alertsChannel}: system notices go there`
+    : `SETUP alertsChannel unset: system notices go to the first discordChannels entry; optional, add "alertsChannel": "<channel id>" to ${d.configPath} to send them elsewhere`);
 
   let serverUp = false;
-  if (await d.prompt.confirm("Create or reuse the herdr lead pane and lanes workspace?", input.herdr ?? true)) {
+  const herdrStep = input.herdr ?? true;
+  if (advanced ? await d.prompt.confirm("Create or reuse the herdr lead pane and lanes workspace?", herdrStep) : herdrStep) {
     if (!d.bins.herdr) {
       problems.push("herdr");
       d.log("SETUP herdr not found on PATH; install it (https://herdr.dev) and run dori setup again");
@@ -384,7 +579,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
         const before = config;
         // The herdr ids live in dori state; setup drops the legacy keys from the config.
         config = Object.fromEntries(Object.entries(mergeConfig(config, h.patch)).filter(([key]) => !(LEGACY_PANE_KEYS as readonly string[]).includes(key)));
-        d.log(`SETUP config ${saveConfig(d.configPath, before, config) ? "updated" : "unchanged"} for herdr`);
+        d.log(`SETUP config ${saveConfig(d.configPath, before, config, d.log) ? "updated" : "unchanged"} for herdr`);
       } catch (e) {
         problems.push("herdr");
         d.log(`SETUP herdr failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -393,7 +588,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   } else d.log("SETUP herdr skipped");
 
   if (await d.prompt.confirm("Start herdr and the supervisor automatically at boot (systemd user units)?", input.autostart ?? false)) {
-    problems.push(...(await autostart(d, workDir, serverUp)));
+    problems.push(...(await autostart(d, workDir, serverUp, advanced)));
   } else d.log("SETUP autostart skipped");
 
   d.log(problems.length ? `SETUP_DONE with problems: ${[...new Set(problems)].join(", ")}` : "SETUP_DONE");
@@ -406,10 +601,12 @@ const ensureDir = (d: SetupDeps, dir: string): void => {
   d.log(`SETUP created ${dir}`);
 };
 
-const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean): Promise<string[]> => {
+/** `advanced` asks before each step; otherwise the one autostart answer accepts them all. */
+const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean, advanced: boolean): Promise<string[]> => {
   const problems: string[] = [];
   const files = renderAutostart(d, workDir);
-  if (!(await d.prompt.confirm(`Write ${UNITS.join(", ")} to ${d.unitDir} and the boot prep script?`, true))) {
+  const confirm = advanced ? d.prompt.confirm : async () => true;
+  if (!(await confirm(`Write ${UNITS.join(", ")} to ${d.unitDir} and the boot prep script?`, true))) {
     d.log("SETUP autostart units not written; stopping autostart here");
     return problems;
   }
@@ -420,7 +617,7 @@ const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean): Prom
     d.log(`SETUP wrote ${path}${same ? " (unchanged)" : ""}`);
   }
   const step = async (question: string, argv: string[]): Promise<void> => {
-    if (!(await d.prompt.confirm(`${question}\n  runs: ${argv.join(" ")}`, true))) {
+    if (!(await confirm(`${question}\n  runs: ${argv.join(" ")}`, true))) {
       d.log(`SETUP skipped: ${argv.join(" ")}`);
       return;
     }

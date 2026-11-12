@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { fillHook } from "./config.ts";
+import { displayTime } from "./display-time.ts";
 import { claimDone, type Emit, type FlowDeps, laneMeta } from "./done-flow.ts";
 import { relayedText, scrubForThread } from "./freshness.ts";
-import { Discord } from "./messenger/discord.ts";
+import { Discord, DISCORD_MESSAGES_PAGE, DISCORD_SUPPRESS_NOTIFICATIONS } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
 import type { Clock } from "./run.ts";
@@ -15,6 +16,9 @@ import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
 import { REPORT_KINDS, type ReportKind } from "./runner/report-kinds.ts";
+import type { LaneFileReceipt } from "./runner/protocol.ts";
+import { LaneFileError } from "./lane-files.ts";
+import { ownerClosedRecorded, redirectIfClosed } from "./thread-followup.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -28,6 +32,7 @@ export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kin
 export type ReportRoute = "journal" | "thread" | "claim" | "dropped" | "late";
 
 export type LaneReport = {
+  readonly fileReceipt?: LaneFileReceipt;
   /** `<lane>:<generation>:<seq>`. */
   readonly id: string;
   readonly lane: string;
@@ -47,7 +52,7 @@ export type LaneReport = {
   readonly source?: string;
 };
 
-export type NewReport = Pick<LaneReport, "lane" | "generation" | "kind" | "text" | "evidence" | "at" | "source">;
+export type NewReport = Pick<LaneReport, "lane" | "generation" | "kind" | "text" | "evidence" | "at" | "source" | "fileReceipt">;
 
 /** A row written without an ownership generation (older dori, or a writer that does not fence): never fenced. */
 export const UNFENCED_GENERATION = 0;
@@ -79,6 +84,7 @@ const withId = (report: NewReport, seq: number): LaneReport => ({
   id: `${report.lane}:${report.generation}:${seq}`, lane: report.lane, generation: report.generation, seq, kind: report.kind,
   text: redactSecrets(report.text), ...(report.evidence ? { evidence: redactSecrets(report.evidence) } : {}), at: report.at,
   ...(report.source ? { source: report.source } : {}),
+  ...(report.fileReceipt ? { fileReceipt: report.fileReceipt } : {}),
 });
 
 /** `lane-reports.json` beside supervisor.json, rewritten whole under a short state lock (lanes and the supervisor both write). */
@@ -136,15 +142,17 @@ const ensureSchema = (db: Database): void => {
   const columns = db.query("PRAGMA table_info(lane_reports)").all() as { name: string }[];
   if (!columns.some((c) => c.name === "event_id")) db.exec("ALTER TABLE lane_reports ADD COLUMN event_id TEXT");
   if (!columns.some((c) => c.name === "source")) db.exec("ALTER TABLE lane_reports ADD COLUMN source TEXT");
+  if (!columns.some((c) => c.name === "file_receipt")) db.exec("ALTER TABLE lane_reports ADD COLUMN file_receipt TEXT");
 };
 
-type Row = { id: string; lane: string; generation: number; seq: number; kind: string; text: string; evidence: string | null; at: number; consumed_at: number | null; route: string | null; event_id?: string | null; source?: string | null };
+type Row = { id: string; lane: string; generation: number; seq: number; kind: string; text: string; evidence: string | null; at: number; consumed_at: number | null; route: string | null; event_id?: string | null; source?: string | null; file_receipt?: string | null };
 const reportOf = (row: Row): LaneReport => ({
   id: row.id, lane: row.lane, generation: row.generation, seq: row.seq, kind: row.kind as ReportKind, text: row.text,
   ...(row.evidence !== null ? { evidence: row.evidence } : {}), at: row.at,
   ...(row.consumed_at !== null ? { consumedAt: row.consumed_at } : {}), ...(row.route !== null ? { route: row.route as ReportRoute } : {}),
   ...(row.event_id != null ? { eventId: row.event_id } : {}),
   ...(row.source != null ? { source: row.source } : {}),
+  ...(row.file_receipt != null ? { fileReceipt: JSON.parse(row.file_receipt) as LaneFileReceipt } : {}),
 });
 
 /** Every row of `db`'s lane_reports table, as stored and in list() order; no table reads as no rows (`dori store export`). */
@@ -156,8 +164,8 @@ export const readReportRows = (db: Database): LaneReport[] =>
 /** Inserts `rows` with every column kept (id, seq, consumed_at, route), for `dori store import`; an id already there throws. */
 export const putReportRows = (db: Database, rows: readonly LaneReport[]): void => {
   ensureSchema(db);
-  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null, r.eventId ?? null, r.source ?? null);
+  const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id, source, file_receipt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  for (const r of rows) insert.run(r.id, r.lane, r.generation, r.seq, r.kind, r.text, r.evidence ?? null, r.at, r.consumedAt ?? null, r.route ?? null, r.eventId ?? null, r.source ?? null, r.fileReceipt ? JSON.stringify(r.fileReceipt) : null);
 };
 
 /** The `lane_reports` table of supervisor.sqlite, on its own connection (WAL: the supervisor's connection keeps writing). */
@@ -184,8 +192,8 @@ export class SqliteLaneReports implements LaneReportStore {
       }
       const max = this.db.query("SELECT max(seq) AS seq FROM lane_reports WHERE lane = ?").get(report.lane) as { seq: number | null };
       const row = withId(report, (max.seq ?? 0) + 1);
-      this.db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .run(row.id, row.lane, row.generation, row.seq, row.kind, row.text, row.evidence ?? null, row.at, row.source ?? null);
+      this.db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, source, file_receipt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(row.id, row.lane, row.generation, row.seq, row.kind, row.text, row.evidence ?? null, row.at, row.source ?? null, row.fileReceipt ? JSON.stringify(row.fileReceipt) : null);
       return row;
     }).immediate();
   }
@@ -286,11 +294,34 @@ const failures = new WeakMap<LaneReportStore, Map<string, number>>();
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
 export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
-/** Posts and edits a lane's status message in its thread; `post` returns the new message's id. */
+/** A message posted after a lane's status message, as the status check reads it: by the bot itself, its Discord type, its text. */
+export type LaterMessage = { readonly own: boolean; readonly type: number; readonly content: string };
+
+/**
+ * Posts, edits and deletes a lane's status message in its thread; `post` returns the new message's id and `silent` posts
+ * it without a notification. `threadState` tells a thread the owner closed (thread-followup.ts closedByOwner) from one
+ * that is open and names its last message; `laterMessages` lists what was posted after a message (`more` when Discord
+ * has more than one page of them).
+ */
 export type LaneStatusTransport = {
-  post(channel: string, text: string, stableId: string): Promise<string>;
+  post(channel: string, text: string, stableId: string, silent?: boolean): Promise<string>;
   edit(channel: string, messageId: string, text: string): Promise<void>;
+  remove(channel: string, messageId: string): Promise<void>;
+  threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined; readonly lastMessageId?: string | undefined }>;
+  laterMessages(channel: string, afterId: string): Promise<{ readonly messages: readonly LaterMessage[]; readonly more: boolean }>;
 };
+
+/** The status transport over a Discord client (the supervisor's own, or one on DORI_DISCORD_TOKEN). */
+export const statusTransportOf = (discord: Discord): LaneStatusTransport => ({
+  post: (channel, text, stableId, silent) => discord.send(channel, text, stableId, undefined, silent ? DISCORD_SUPPRESS_NOTIFICATIONS : undefined),
+  edit: (channel, id, text) => discord.edit(channel, id, text),
+  remove: (channel, id) => discord.deleteMessage(channel, id),
+  threadState: (threadId) => discord.threadState(threadId),
+  laterMessages: async (channel, afterId) => {
+    const [me, messages] = await Promise.all([discord.selfId(), discord.messagesAfter(channel, afterId)]);
+    return { messages: messages.map((m) => ({ own: m.authorId === me, type: m.type, content: m.content })), more: messages.length >= DISCORD_MESSAGES_PAGE };
+  },
+});
 
 /**
  * The Discord status transport, on DORI_DISCORD_TOKEN from the process environment (the supervisor unit loads it from
@@ -299,8 +330,7 @@ export type LaneStatusTransport = {
 export const discordStatusTransport = (clock: Clock, env: Readonly<Record<string, string | undefined>> = process.env): LaneStatusTransport | undefined => {
   const token = env.DORI_DISCORD_TOKEN?.trim();
   if (!token) return undefined;
-  const discord = new Discord(fetchHttp, clock, token);
-  return { post: (channel, text, stableId) => discord.send(channel, text, stableId), edit: (channel, id, text) => discord.edit(channel, id, text) };
+  return statusTransportOf(new Discord(fetchHttp, clock, token));
 };
 
 /** Longest report text a status message line carries. */
@@ -311,14 +341,14 @@ const elapsed = (ms: number): string => {
   const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
   return d ? `${d}일 ${h}시간` : h ? `${h}시간 ${m}분` : `${m}분`;
 };
-const stamp = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e)).slice(0, 160);
 
 /**
  * The text of a lane's status message as of `report`: its key, time since it opened, and its last milestone and last
  * progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post.
  */
-export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: LaneReport, now: number, home: string): string => {
+export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: LaneReport, now: number, home: string, timeZone?: string): string => {
+  const stamp = (at: number): string => displayTime(at, timeZone);
   const upTo = rows.filter((r) => r.seq <= report.seq && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
   const last = (kind: ReportKind): LaneReport | undefined =>
     [...upTo, ...(upTo.some((r) => r.id === report.id) ? [] : [report])].filter((r) => r.kind === kind).sort((a, b) => a.seq - b.seq).at(-1);
@@ -335,22 +365,64 @@ export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: 
   ].join("\n");
 };
 
+const STATUS_HEAD = /^\[System\] 레인 \S+ 상태, 진행 /;
+
+/** Whether `text` is a lane status message (laneStatusText) of any lane. */
+export const isLaneStatusText = (text: string): boolean => STATUS_HEAD.test(text);
+
+/**
+ * Whether status message `statusId` is still the latest thing in thread `channel`: the thread is not archived, and
+ * either its last message is the status message or everything posted after it is the bot's own plain status message
+ * of some lane (so lanes sharing a thread never push each other's status up). Anything else after it, a thread system
+ * message (rename, member added, pin) included, means it is not.
+ */
+const statusIsLatest = async (transport: LaneStatusTransport, channel: string, statusId: string): Promise<boolean> => {
+  const state = await transport.threadState(channel);
+  if (state.archived) return false;
+  if (state.lastMessageId === statusId) return true;
+  const later = await transport.laterMessages(channel, statusId);
+  return !later.more && later.messages.every((m) => m.own && m.type === 0 && isLaneStatusText(m.content));
+};
+
 /** The Discord channel id of a lane's thread, or undefined for no thread or a non-Discord one. */
 const statusChannel = (lane: Lane): string | undefined =>
   lane.thread !== "none" && lane.thread.startsWith("discord:") ? resolveTarget("discord", lane.thread).to : undefined;
 
 /**
- * Edits the lane's status message to the text as of `report`, or posts it when there is none yet or the edit fails (a
- * deleted message), and stores the new id on the lane (statusMessageId). A failed post throws.
+ * Keeps the lane's status message at the bottom of its thread with the text as of `report`. While it is still the latest
+ * there (statusIsLatest) it is edited in place; once something else was posted after it, or Discord archived the thread,
+ * a new one is posted without a notification, its id stored on the lane (statusMessageId), and only then the old one
+ * deleted (a failed delete is logged). It is posted when there is none yet or the edit fails (a deleted message). A failed
+ * latest check is logged and the message edited as before. A thread the owner closed is neither edited nor
+ * posted into (either would reopen it): the report goes as one line linking the thread to its parent channel, else the
+ * owner channel (redirectIfClosed), and the status message is left as it is. A failed post throws.
  */
 const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string): Promise<void> => {
-  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home);
-  if (lane.statusMessageId) {
+  const relayed = relayedText(lane.key, scrubForThread(oneLine(report.text), home));
+  const redirected = await redirectIfClosed(deps.config.stateDir, transport, channel, relayed, deps.config.discordChannels[0],
+    (target, line) => transport.post(target, line, `lane-status:${report.id}`));
+  if (redirected) {
+    console.error(`LANE_STATUS_REDIRECTED ${lane.key} ${report.id}: thread ${channel} was closed by the owner, so one line went to ${redirected}`);
+    return;
+  }
+  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone);
+  const previous = lane.statusMessageId;
+  if (previous) {
+    let latest = true;
+    try { latest = await statusIsLatest(transport, channel, previous); }
+    catch (e) { console.error(`LANE_STATUS_CHECK_FAILED ${lane.key} ${previous} ${errorText(e)}; editing it in place`); }
+    if (!latest) {
+      const id = await transport.post(channel, text, `lane-status:${report.id}`, true);
+      await deps.registry.patch(lane.key, { statusMessageId: id });
+      try { await transport.remove(channel, previous); }
+      catch (e) { console.error(`LANE_STATUS_DELETE_FAILED ${lane.key} ${previous} ${errorText(e)}`); }
+      return;
+    }
     try {
-      await transport.edit(channel, lane.statusMessageId, text);
+      await transport.edit(channel, previous, text);
       return;
     } catch (e) {
-      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${lane.statusMessageId} ${errorText(e)}; posting a new status message`);
+      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${previous} ${errorText(e)}; posting a new status message`);
     }
   }
   const id = await transport.post(channel, text, `lane-status:${report.id}`);
@@ -396,7 +468,8 @@ export const routeReports = async (
         await enqueue(eventId, stale ? `${line} (from a replaced session)` : line, lane ? laneMeta(lane) : { lane: report.lane });
         route = "late";
       } else if (report.kind === "done") {
-        await claimDone(deps, lane, oneLine(report.evidence ?? report.text));
+        if (lane.fileRun && !report.fileReceipt) throw new LaneFileError("LANE_REPORT_FILES_MISSING", lane.key, "this managed lane's done report has no file snapshot; claim done again through its runner");
+        await claimDone(deps, lane, oneLine(report.evidence ?? report.text), report.fileReceipt);
         const claim = (await deps.registry.read(report.lane))?.claim;
         // done-flow.ts claimEventId's format, spelled here: test/cli-sync-watch.test.ts mocks done-flow with a fixed export list.
         if (claim) eventId = `done-claim:${report.lane}:${claim.at}`;
@@ -410,7 +483,7 @@ export const routeReports = async (
           await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report))} (status message failed: ${errorText(e)})`, laneMeta(lane));
           route = "journal";
         }
-      } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none") {
+      } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none" && !ownerClosedRecorded(deps.config.stateDir, lane.thread)) {
         const posted = await deps.run(fillHook(deps.config.hooks.threadReply, { thread: lane.thread, text: relayedText(lane.key, scrubForThread(oneLine(report.text), home)), key: lane.key }));
         if (posted.code === 0) route = "thread";
         else {
@@ -435,6 +508,26 @@ export const routeReports = async (
       failed.delete(report.id);
       out.push(`LANE_REPORT_ROUTED ${report.id} ${report.kind} ${route}`);
     } catch (e) {
+      if (e instanceof LaneFileError && !e.transient) {
+        // A permanent file refusal never retries: a stale report is routed late, any other refusal journals its exact leaf line.
+        try {
+          const lane = await deps.registry.read(report.lane);
+          const meta = lane ? laneMeta(lane) : { lane: report.lane };
+          let route: ReportRoute = "journal";
+          let eventId = `lane-report-refused:${report.id}`;
+          if (e.code === "LANE_REPORT_STALE") {
+            eventId = `lane-report-late:${report.id}`;
+            route = "late";
+            await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report), "LANE_REPORT_LATE")} (from a replaced session)`, meta);
+          } else await enqueue(eventId, e.message, meta);
+          store.consume(report.id, deps.clock.now(), route, eventId);
+          failed.delete(report.id);
+          out.push(`LANE_REPORT_ROUTED ${report.id} ${report.kind} ${route}`);
+          continue;
+        } catch (refuse) {
+          console.error(`LANE_REPORT_REFUSE_ERROR ${report.id} ${refuse instanceof Error ? refuse.message : String(refuse)}`);
+        }
+      }
       // Poison isolation: the row stays pending and is retried on the next supervisor pass, never in a hot loop.
       const message = e instanceof Error ? e.message : String(e);
       console.error(`LANE_REPORT_ERROR ${report.id} ${message}`);

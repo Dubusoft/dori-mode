@@ -103,6 +103,37 @@ test("resume: a held session the message releases is running", async () => {
   expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
 });
 
+const ESC_FOOTER = "❯ \n(😺 OmO Native by Q Kim) ◉ working (5m) Paused · 2 updates held · type to continue, /resume to resume";
+
+test("resume: a turn the pause cut with Escape gets /resume after the goal, and runs", async () => {
+  const w = world("idle");
+  w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
+  w.screen = ESC_FOOTER;
+  let enters = 0;
+  const run: Runner = async (argv) => {
+    // /goal resume alone leaves the cut turn paused; the /resume Enter continues it.
+    if (argv[2] === "send-keys" && argv[4] !== "escape" && ++enters === 2) w.onEnterStatus = "working";
+    return fakeRunner(w)(argv);
+  };
+  expect(await resume({ run, clock: fakeClock(T0) }, "p1")).toEqual({ goal: "confirmed", execution: "running" });
+  expect(sentText(w)).toEqual(["/goal resume", "/resume"]);
+});
+
+test("resume: an Escape-paused session /resume does not start falls back to the release message", async () => {
+  const w = world("idle");
+  w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
+  w.screen = ESC_FOOTER;
+  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "held" });
+  expect(sentText(w)).toEqual(["/goal resume", "/resume", RESUME_TEXT]);
+});
+
+test("resume: a goal not confirmed types no /resume, even under the paused footer", async () => {
+  const w = world("idle");
+  w.screen = ESC_FOOTER;
+  expect(await resume(deps(w), "p1")).toEqual({ goal: "unconfirmed" });
+  expect(sentText(w)).toEqual(["/goal resume"]);
+});
+
 test("resume: a session with no goal that stays held is held", async () => {
   const w = world("idle");
   w.screens = ["❯ ", "❯ ", "Error: cannot update goal: no goal exists\n❯ "];

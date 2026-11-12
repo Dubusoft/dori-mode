@@ -7,6 +7,7 @@ import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
 import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
 import { loadPolicy } from "../src/runner/policy.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { enrollOverStdio, RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { readRunnerEndpoints } from "../src/runner/endpoints.ts";
 
@@ -113,7 +114,7 @@ const fakeHost = () => {
 };
 
 const PLIST = readFileSync(join(import.meta.dir, "..", "templates", "dori-runner-launchd.plist"), "utf8");
-const SYSTEM_TOOLS = ["mkdir", "chmod", "cat", "mv", "rm", "sed", "mktemp", "unzip", "dirname", "cp", "sleep", "tail"];
+const SYSTEM_TOOLS = ["mkdir", "chmod", "cat", "mv", "rm", "sed", "mktemp", "unzip", "dirname", "cp", "sleep", "tail", "grep"];
 /** A Darwin host whose PATH is only the fake bin, with the system tools the script needs linked into it. */
 const darwinHost = (launchctl = "exit 0") => {
   const host = fakeHost();
@@ -221,8 +222,14 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   const first = await runScript(host, script);
   expect(first).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
   const policyFile = join(host.home, ".dori/runner/runner-config.json");
-  expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ agents: { default: AGENT }, allowedRoots: [host.home, "/tmp"] });
+  const wrapperPath = join(host.home, ".dori/runner/bin/lane-sandbox");
+  expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+    agents: { default: AGENT, sandboxed: [wrapperPath, ...AGENT] }, allowedRoots: [host.home, "/tmp"], sandbox: "required", sandboxCheck: [wrapperPath, "--check"],
+  });
+  expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ sandbox: "required", sandboxCheck: [wrapperPath, "--check"] });
   expect(statSync(policyFile).mode & 0o777).toBe(0o600);
+  expect(readFileSync(wrapperPath, "utf8")).toBe(readFileSync(LANE_SANDBOX_TEMPLATE, "utf8"));
+  expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
   const argvLog = readFileSync(host.log, "utf8");
   expect(argvLog).not.toContain(CODE);
   expect(argvLog).not.toContain(FINGERPRINT);
@@ -246,6 +253,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   const again = await runScript(host, script);
   expect(again.code).toBe(0);
   expect(readFileSync(policyFile, "utf8")).toBe('{"agents":{"mine":["claude"]}}\n');
+  expect(again.out).toContain(`RUNNER_CONFIG_SANDBOX_MISSING sandbox:required agents.sandboxed sandboxCheck in ${policyFile}; add them to sandbox lanes on this runner\n`);
   const second = readFileSync(host.log, "utf8");
   expect(second).not.toContain("--enroll-only");
   expect(second).toContain("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service");
@@ -265,14 +273,17 @@ const plistPath = (home: string) => join(home, "Library/LaunchAgents/com.dori.ru
 
 test("on Darwin with bun on PATH, the script writes the launchd agent, boots it into the gui domain, and enrolls through a pipe", async () => {
   const host = darwinHost();
-  const result = await runDarwin(host, darwinScript());
+  const script = darwinScript();
+  expect(script).toContain('sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g"');
+  expect(script).not.toContain('$(dirname "$BUN"):$PATH');
+  const result = await runDarwin(host, script);
   expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\n" });
   expect(loadPolicy(join(host.home, ".dori/runner")).allowedRoots).toEqual([host.home, "/private/tmp"]);
   const bun = join(host.bin, "bun");
   const plist = readFileSync(plistPath(host.home), "utf8");
   expect(plist).not.toMatch(/@[A-Z]+@/);
   expect(programArguments(plist)).toEqual([bun, join(host.home, ".dori/runner/bin/dori.js"), ...ARGS]);
-  expect(plist).toContain(`<key>PATH</key>\n    <string>${host.bin}:${host.bin}</string>`);
+  expect(plist).toContain(`<key>PATH</key>\n    <string>${host.bin}:/opt/login&amp;tools|x/bin:${host.bin}</string>`);
   expect(plist).toContain(`<string>${join(host.home, ".dori/runner/runner.log")}</string>`);
   expect(statSync(plistPath(host.home)).mode & 0o777).toBe(0o644);
   const domain = join(host.home, ".dori/runner/launchd-domain");
@@ -311,7 +322,7 @@ test.skipIf(!Bun.which("zip") || CANDIDATES.some((p) => existsSync(p)))("on Darw
   expect(readFileSync(host.log, "utf8")).toContain("https://github.com/oven-sh/bun/releases/latest/download/bun-darwin-aarch64.zip");
   const plist = readFileSync(plistPath(host.home), "utf8");
   expect(programArguments(plist)[0]).toBe(bun);
-  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/bun")}:${host.bin}</string>`);
+  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/bun")}:/opt/login&amp;tools|x/bin:${host.bin}</string>`);
   expect(readFileSync(join(host.home, ".dori/runner/bin/dori"), "utf8")).toContain(`exec "${bun}"`);
   const left = new Bun.Glob("bun-download.*").scanSync({ cwd: join(host.home, ".dori/runner"), onlyFiles: false });
   expect([...left]).toEqual([]);
@@ -349,6 +360,48 @@ test("on Darwin the agent is enabled before bootstrap, and a gui domain that ref
   expect(enable).toBeGreaterThanOrEqual(0);
   expect(bootstrap).toBeGreaterThan(enable);
   expect(lines.at(-1)).toBe("launchctl kickstart -k user/501/com.dori.runner");
+});
+
+test("on Darwin the script installs the seatbelt lane-sandbox and a starter policy that runs sandboxed lanes behind it", async () => {
+  const host = darwinHost();
+  const result = await runDarwin(host, darwinScript());
+  expect(result.code).toBe(0);
+  const policyFile = join(host.home, ".dori/runner/runner-config.json");
+  const wrapperPath = join(host.home, ".dori/runner/bin/lane-sandbox");
+  expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
+    agents: { default: AGENT, sandboxed: [wrapperPath, ...AGENT] }, allowedRoots: [host.home, "/private/tmp"], sandbox: "required", sandboxCheck: [wrapperPath, "--check"],
+  });
+  expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ sandbox: "required", sandboxCheck: [wrapperPath, "--check"] });
+  expect(readFileSync(wrapperPath, "utf8")).toBe(readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"));
+  expect(readFileSync(wrapperPath, "utf8")).toContain('r "$H/.dori/runner/briefs/$key.files"');
+  expect(readFileSync(wrapperPath, "utf8")).toContain('w "$H/.dori/runner/briefs/$key.out"');
+  expect(readFileSync(wrapperPath, "utf8")).toContain('echo "DORI_LANE_FILES=1"');
+  expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
+  expect(result.out).not.toContain("RUNNER_CONFIG_SANDBOX_MISSING");
+  // A reinstall over an operator's file names every key it lacks for sandboxed lanes, and leaves the file alone.
+  writeFileSync(policyFile, '{"agents":{"default":["claude"]}}\n', { mode: 0o600 });
+  const again = await runDarwin(host, darwinScript());
+  expect(again.code).toBe(0);
+  expect(again.out).toContain(`RUNNER_CONFIG_SANDBOX_MISSING sandbox:required agents.sandboxed sandboxCheck in ${policyFile}; add them to sandbox lanes on this runner\n`);
+  expect(readFileSync(policyFile, "utf8")).toBe('{"agents":{"default":["claude"]}}\n');
+});
+
+test("a Linux reinstall over a complete sandbox policy prints no missing-key line; the generated script parses under sh -n", async () => {
+  const host = fakeHost();
+  expect((await runScript(host, linuxScript())).code).toBe(0);
+  const wrapper = readFileSync(join(host.home, ".dori/runner/bin/lane-sandbox"), "utf8");
+  expect(wrapper).toContain('--ro-bind "$H/.dori/runner/briefs/$key.files"');
+  expect(wrapper).toContain('--bind "$H/.dori/runner/briefs/$key.out"');
+  expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
+  const again = await runScript(host, linuxScript());
+  expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
+  const p = Bun.spawn(["/bin/sh", "-n"], { stdin: new TextEncoder().encode(linuxScript()), stdout: "pipe", stderr: "pipe" });
+  const [code, err] = await Promise.all([p.exited, new Response(p.stderr).text()]);
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+});
+
+test("the lane-sandbox payload is checked against the heredoc delimiter too", () => {
+  expect(() => installScript(BUNDLE, UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, "plist", [], { unit: "u", plist: "p" }, "a\nDORI_RUNNER_EOF\n")).toThrow("heredoc delimiter");
 });
 
 test("on any other OS the script exits with the unsupported code before touching anything", async () => {

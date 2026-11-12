@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { laneFilePaths } from "../src/runner/lane-files.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Pane } from "../src/panes.ts";
@@ -18,7 +20,8 @@ const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 const QUESTION = ["work output", "? Question pending (1 unanswered) · 30m", "  deploy - Which region?", "  [ seoul ]  [ tokyo ]  [ own answer… ]", ""].join("\n");
-const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0 };
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES };
 
 /** A RunnerLanes over a scripted herdr: `world` decides each herdr answer, every call is recorded. */
 const setup = (over: Partial<RunnerLanesDeps> = {}) => {
@@ -26,6 +29,7 @@ const setup = (over: Partial<RunnerLanesDeps> = {}) => {
   dirs.push(join(runnerDir, ".."));
   mkdirSync(runnerDir, { mode: 0o700 });
   const world = { panes: [] as Pane[], screen: "", tabCreateFails: 0, nextPane: 1, paneGet: {} as Record<string, object>, processInfo: {} as Record<string, object>, workspaces: [] as { workspace_id: string; label: string }[], tabs: [] as { tab_id: string; label: string }[] };
+  const control = { checkOut: "DORI_LANE_FILES=1\n", checkCode: 0, checkThrows: false, runCode: 0, runThrows: false, beforeRun: () => {} };
   const calls: string[][] = [];
   const published: [RunnerEventType, unknown][] = [];
   let tokens = 0;
@@ -33,11 +37,20 @@ const setup = (over: Partial<RunnerLanesDeps> = {}) => {
   const make = () => new RunnerLanes({
     instance: async () => "server-1",
     runnerDir, clock: fakeClock(T0), token: () => `tok-${++tokens}`, realpath: (p: string) => p,
-    policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
+    policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] },
     publish: (type, body) => { published.push([type, body]); },
     ...over,
     run: async (argv) => {
       calls.push([...argv]);
+      if (argv[0] === "lane-sandbox") {
+        if (control.checkThrows) throw new Error("probe failed");
+        return { code: control.checkCode, out: control.checkOut, err: control.checkCode ? "probe unavailable" : "" } as Ran;
+      }
+      if (argv[1] === "pane" && argv[2] === "run") {
+        control.beforeRun();
+        if (control.runThrows) throw new Error("lost run reply");
+        if (control.runCode) return { code: control.runCode, out: "", err: "refused" } as Ran;
+      }
       const verb = argv.slice(0, 3).join(" ");
       if (verb === "herdr workspace list") return ok(JSON.stringify({ result: { workspaces: world.workspaces } }));
       if (verb === "herdr workspace create") {
@@ -63,7 +76,7 @@ const setup = (over: Partial<RunnerLanesDeps> = {}) => {
       return ok();
     },
   });
-  return { runnerDir, world, calls, published, lanes: make(), make };
+  return { runnerDir, world, calls, published, lanes: make(), make, control };
 };
 
 test("a reused pane id after a server restart cannot be observed, steered or closed as the old lane", async () => {
@@ -84,14 +97,97 @@ test("a reused pane id after a server restart cannot be observed, steered or clo
   expect(t.published).toContainEqual(["lane.state", { key: "lane-a", status: "missing", pane: "p1", reason: "pane-missing" }]);
 });
 
+test("input and output are installed before pane run; fresh dead recovery replaces inputs and preserves output", async () => {
+  const t = setup(), paths = laneFilePaths(t.runnerDir, "lane-a");
+  const input = (value: string, id: string) => ({ ...FILES, run: { ...FILES.run, id }, tree: { directories: [], files: [
+    { path: "input.md", bytes: Buffer.byteLength(value), sha256: createHash("sha256").update(value).digest("hex"), base64: Buffer.from(value).toString("base64") },
+  ] } });
+  t.control.beforeRun = () => {
+    expect(existsSync(paths.input)).toBe(true);
+    expect(existsSync(paths.output)).toBe(true);
+    expect(existsSync(t.lanes.briefPath("lane-a"))).toBe(true);
+  };
+  await t.lanes.start({ ...START, files: input("first", FILES.run.id) });
+  writeFileSync(join(paths.output, "report.md"), "kept");
+  expect(t.lanes.reportFiles("lane-a")?.revision).toBe(1);
+  expect(t.make().reportFiles("lane-a")?.revision).toBe(1);
+  writeFileSync(join(paths.output, "report.md"), "updated");
+  expect(t.lanes.reportFiles("lane-a")?.revision).toBe(2);
+  const next = input("second", "00000000-0000-4000-8000-000000000002");
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent_status: "working" }];
+  await t.lanes.recover("lane-a", undefined, undefined, "new brief", next);
+  expect(readFileSync(join(paths.input, "input.md"), "utf8")).toBe("first");
+  expect(t.lanes.records()["lane-a"]?.fileRun).toEqual(FILES.run);
+  expect(t.published.at(-1)).toEqual(["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "", fileRun: FILES.run }]);
+  t.world.panes = [];
+  await t.lanes.recover("lane-a", undefined, undefined, "new brief", next);
+  expect(readFileSync(join(paths.input, "input.md"), "utf8")).toBe("second");
+  expect(readFileSync(join(paths.output, "report.md"), "utf8")).toBe("updated");
+  expect(t.lanes.records()["lane-a"]?.fileRun).toEqual(next.run);
+  expect(t.lanes.reportFiles("lane-a")?.revision).toBe(1);
+  expect(t.calls.filter((a) => a[0] === "lane-sandbox")).toHaveLength(2);
+  symlinkSync(join(t.runnerDir, "missing"), join(paths.output, "invalid"));
+  await t.lanes.close("lane-a");
+  expect([paths.input, paths.output, paths.stage, t.lanes.briefPath("lane-a")].map(existsSync)).toEqual([false, false, false, false]);
+});
+
+test("missing input, recover half-pairs and stale dead recovery refuse before writes or pane closure", async () => {
+  const t = setup();
+  await expect(t.lanes.start({ ...START, files: undefined })).rejects.toThrow("LANE_FILES_INPUT_REQUIRED");
+  expect(t.calls).toEqual([]);
+  expect(existsSync(t.lanes.briefPath("lane-a"))).toBe(false);
+  await t.lanes.start(START);
+  const before = t.calls.length;
+  await expect(t.lanes.recover("lane-a", undefined, undefined, "brief")).rejects.toThrow("(recover-pair)");
+  await expect(t.lanes.recover("lane-a")).rejects.toThrow("LANE_FILES_RECOVER_INPUT_REQUIRED");
+  expect(t.calls.slice(before).some((a) => a[2] === "close" || a[2] === "create")).toBe(false);
+  expect(readFileSync(t.lanes.briefPath("lane-a"), "utf8")).toBe(START.briefText);
+});
+
+for (const argv of [undefined, []] as const) test(`sandbox check ${argv ? "empty" : "missing"} argv has exact configuration advice before side effects`, async () => {
+  const t = setup({ policy: { agents: { omo: ["omo"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: argv } });
+  await expect(t.lanes.start(START)).rejects.toThrow(`LANE_FILES_SANDBOX_CHECK_MISSING lane-a: no sandboxCheck argv is configured; add "sandboxCheck": [<wrapper>, "--check"] to ${JSON.stringify(join(t.runnerDir, "runner-config.json"))} using the sandbox wrapper argv, then retry`);
+  expect(t.calls).toEqual([]);
+  expect(t.lanes.records()).toEqual({});
+  expect(existsSync(join(t.runnerDir, "briefs"))).toBe(false);
+});
+
+test("successful old wrapper, failed probe, and thrown probe are distinct refusals before writing", async () => {
+  const t = setup();
+  t.control.checkOut = "custom wrapper\nDORI_LANE_FILES=10\n";
+  await expect(t.lanes.start(START)).rejects.toThrow("LANE_FILES_SANDBOX_OLD lane-a: sandboxCheck succeeded without DORI_LANE_FILES=1; run dori runner update and refresh the maintained lane-sandbox wrapper, or update the configured custom wrapper to grant own-key .files read-only and .out read-write and print DORI_LANE_FILES=1 after its successful --check; then retry");
+  t.control.checkCode = 3;
+  await expect(t.lanes.start(START)).rejects.toThrow("RUNNER_CMD_REJECTED sandbox-unavailable probe unavailable");
+  t.control.checkThrows = true;
+  await expect(t.lanes.start(START)).rejects.toThrow("RUNNER_CMD_REJECTED sandbox-unavailable lane-sandbox --check: probe failed");
+  expect(t.calls.every((a) => a[0] === "lane-sandbox")).toBe(true);
+  expect(existsSync(join(t.runnerDir, "briefs"))).toBe(false);
+});
+
+test("definite initial failures remove all private files; ambiguous pane run preserves them", async () => {
+  for (const ambiguous of [false, true]) {
+    const t = setup();
+    t.control.runThrows = ambiguous;
+    t.control.runCode = ambiguous ? 0 : 1;
+    await expect(t.lanes.start(START)).rejects.toThrow(ambiguous ? "lost run reply" : "herdr pane run failed");
+    const paths = laneFilePaths(t.runnerDir, "lane-a");
+    expect(existsSync(paths.input)).toBe(ambiguous);
+    expect(existsSync(paths.output)).toBe(ambiguous);
+    expect(existsSync(t.lanes.briefPath("lane-a"))).toBe(ambiguous);
+    expect(existsSync(join(t.runnerDir, "briefs/lane-a.1.token"))).toBe(ambiguous);
+    expect(existsSync(paths.stage)).toBe(false);
+    expect(t.lanes.records()).toEqual({});
+  }
+});
+
 test("recovery relaunches a lane whose old pane id now belongs to another live agent without closing that agent", async () => {
   let instance = "server-1";
-  const t = setup({ instance: async () => instance, policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" } });
+  const t = setup({ instance: async () => instance, policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] } });
   await t.lanes.start(START);
   instance = "server-2";
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "working" }];
   const before = t.calls.length;
-  expect((await t.lanes.recover("lane-a", "session-a")).result).toMatchObject({ pane: "p2", relaunched: true, resumed: true });
+  expect((await t.lanes.recover("lane-a", "session-a", undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p2", relaunched: true, resumed: true });
   expect(t.calls.slice(before).some((a) => a[2] === "close")).toBe(false);
   expect(t.lanes.records()["lane-a"]?.herdrInstance).toBe("server-2");
 });
@@ -103,7 +199,7 @@ test("terminal identity fences a recycled pane even while the server identity is
   expect(t.lanes.records()["lane-a"]?.terminalId).toBe("term-old");
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", terminal_id: "term-new", agent: "omo", agent_status: "working" }];
   await expect(t.lanes.send("lane-a", "unsafe", false)).rejects.toThrow("RUNNER_LANE_ABSENT");
-  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p2", relaunched: true });
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p2", relaunched: true });
   expect(t.calls.some((a) => a[2] === "close")).toBe(false);
 });
 
@@ -117,7 +213,7 @@ test("recovery reuses a restored empty shell tab only when its label still names
   t.world.paneGet.p1 = { pane_id: "p1", workspace_id: "wL", tab_id: "t1", cwd: "/repo", terminal_id: "term-new" };
   t.world.processInfo.p1 = { shell_pid: 10, foreground_process_group_id: 10, foreground_processes: [{ pid: 10, name: "bash" }] };
   const before = t.calls.length;
-  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p1", tab: "t1", relaunched: true });
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p1", tab: "t1", relaunched: true });
   expect(t.calls.slice(before).some((a) => a[1] === "tab" && a[2] === "create")).toBe(false);
   expect(t.calls).toContainEqual(["herdr", "tab", "list", "--workspace", "wL"]);
   expect(t.lanes.records()["lane-a"]?.terminalId).toBe("term-new");
@@ -135,7 +231,7 @@ test("a restored tab with another label or a foreground job is left untouched", 
     t.world.paneGet.p1 = { pane_id: "p1", workspace_id: "w", tab_id: "t1", cwd: "/repo" };
     t.world.processInfo.p1 = { shell_pid: 10, foreground_process_group_id: 11 };
     const before = t.calls.length;
-    expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p2", relaunched: true });
+    expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p2", relaunched: true });
     expect(t.calls.slice(before).some((a) => a[2] === "close" || a[2] === "run" && a[3] === "p1")).toBe(false);
   }
 });
@@ -145,7 +241,7 @@ test("a remote runner finds or creates its lanes workspace without relying on fo
   await t.lanes.start(START);
   expect(t.calls).toContainEqual(["herdr", "workspace", "create", "--label", "lanes", "--cwd", "/repo", "--no-focus"]);
   expect(t.calls.find((a) => a[1] === "tab" && a[2] === "create")?.slice(3, 5)).toEqual(["--workspace", "wL"]);
-  await t.lanes.recover("lane-a");
+  await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES);
   expect(t.calls.filter((a) => a[1] === "workspace" && a[2] === "create")).toHaveLength(1);
   const existing = setup({ remote: true });
   existing.world.workspaces = [{ workspace_id: "wExisting", label: "lanes" }];
@@ -157,7 +253,7 @@ test("a remote runner finds or creates its lanes workspace without relying on fo
 test("an unknown server instance refuses a launch before creating a tab or typing", async () => {
   const t = setup({ instance: async () => undefined });
   await expect(t.lanes.start(START)).rejects.toThrow("RUNNER_HERDR_INSTANCE_UNKNOWN");
-  expect(t.calls).toEqual([]);
+  expect(t.calls).toEqual([["lane-sandbox", "--check"]]);
 });
 
 test("a legacy live lane acquires server identity only after its foreground process proves ownership", async () => {
@@ -170,9 +266,9 @@ test("a legacy live lane acquires server identity only after its foreground proc
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle", terminal_id: "term-current" }];
   t.world.processInfo.p1 = { foreground_processes: [{ pid: 20 }] };
   const before = t.calls.length;
-  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p1", relaunched: false });
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p1", relaunched: false });
   expect(t.lanes.records()["lane-a"]).toMatchObject({ herdrInstance: "server-1", terminalId: "term-current" });
-  expect((await t.make().recover("lane-a")).result).toMatchObject({ pane: "p1", relaunched: false });
+  expect((await t.make().recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p1", relaunched: false });
   expect(t.calls.slice(before).filter((a) => a[2] === "process-info")).toHaveLength(1);
   expect(t.calls.slice(before).every((a) => a[2] === "list" || a[2] === "process-info")).toBe(true);
   expect(t.calls.filter((a) => a[1] === "tab" && a[2] === "create")).toHaveLength(1);
@@ -205,7 +301,7 @@ test.each([true, false])("an unattributed legacy record never reuses its old pan
   const before = t.calls.length;
   await expect(t.lanes.send("lane-a", "unsafe", false)).rejects.toThrow("RUNNER_LANE_ABSENT");
   expect(t.lanes.records()["lane-a"]?.herdrInstance).toBeUndefined();
-  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true });
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true });
   expect(t.calls.slice(before).some((a) => a[2] === "close" || a[2] === "run" && a[3] === "p1")).toBe(false);
   expect(t.calls.slice(before).some((a) => a[1] === "tab" && a[2] === "list")).toBe(false);
 });
@@ -226,7 +322,7 @@ test("a restored empty shell with the old pane id, label and cwd is not migrated
   await expect(t.lanes.observe("lane-a")).rejects.toThrow("RUNNER_LANE_ABSENT");
   expect(t.lanes.records()["lane-a"]?.herdrInstance).toBeUndefined();
   expect(t.calls.slice(before)).toEqual([["herdr", "pane", "list"], ["herdr", "pane", "process-info", "--pane", "p1"]]);
-  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true });
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true });
   expect(t.calls.slice(before).some((a) => a[2] === "close" || a[2] === "run" && a[3] === "p1")).toBe(false);
 });
 
@@ -236,7 +332,7 @@ test("a stamped lane record never requests process-info during identity checks",
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "idle" }];
   const before = t.calls.length;
   expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "idle" });
-  expect((await t.lanes.recover("lane-a")).result).toMatchObject({ relaunched: false });
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).result).toMatchObject({ relaunched: false });
   expect(t.calls.slice(before).some((a) => a[2] === "process-info")).toBe(false);
 });
 
@@ -262,11 +358,11 @@ test("P6: a recover whose relaunch fails keeps the lane's record, and a later re
   expect(before?.pane).toBe("p1");
   t.world.panes = []; // the lane's pane is gone
   t.world.tabCreateFails = 1;
-  await expect(t.lanes.recover("lane-a")).rejects.toThrow("herdr tab create failed");
+  await expect(t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).rejects.toThrow("herdr tab create failed");
   expect(t.lanes.records()["lane-a"]).toEqual(before as NonNullable<typeof before>);
   expect(t.lanes.tokenFor("lane-a", "tok-1")).toBe(true);
 
-  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("started pane=p2 tab=t2");
   expect(t.lanes.records()["lane-a"]?.pane).toBe("p2");
   expect(t.lanes.tokenFor("lane-a", "tok-2")).toBe(true);
   expect(t.lanes.tokenFor("lane-a", "tok-1")).toBe(false);
@@ -322,12 +418,12 @@ test("recover leaves a lane still in its startup window alone instead of closing
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   clock.at = started + STARTUP_GRACE_MS - 1;
   const calls = t.calls.length;
-  expect(await t.lanes.recover("lane-a")).toEqual({ detail: "starting pane=p1", result: { pane: "p1", tab: "t1", relaunched: false, resumed: false } });
+  expect(await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).toEqual({ detail: "starting pane=p1", result: { pane: "p1", tab: "t1", relaunched: false, resumed: false } });
   expect(t.calls.slice(calls).filter((c) => c[1] === "tab" && (c[2] === "close" || c[2] === "create"))).toEqual([]);
-  expect(t.published).toEqual([["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "" }]]);
+  expect(t.published).toEqual([["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "", fileRun: FILES.run }]]);
   // A pane that is gone is not starting: it is started again at once.
   t.world.panes = [];
-  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("started pane=p2 tab=t2");
 });
 
 test("alive criteria: observe and recover use paneAlive (agent_status), not the agent field", async () => {
@@ -340,11 +436,11 @@ test("alive criteria: observe and recover use paneAlive (agent_status), not the 
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
   expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]]);
-  expect((await t.lanes.recover("lane-a")).detail).toBe("started pane=p2 tab=t2");
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("started pane=p2 tab=t2");
   // An alive status without an agent field is alive, as paneAlive says.
   t.world.panes = [{ pane_id: "p2", workspace_id: "w", tab_id: "t2", agent_status: "blocked" }];
   expect((await t.lanes.observe("lane-a")).detail).toBe("observed idle");
-  expect((await t.lanes.recover("lane-a")).detail).toBe("alive pane=p2");
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("alive pane=p2");
 });
 
 test("the lane token is never on the herdr command line; the lane CLI authenticates through DORI_LANE_TOKEN_FILE", async () => {
@@ -352,7 +448,7 @@ test("the lane token is never on the herdr command line; the lane CLI authentica
   await t.lanes.start(START);
   const run = t.calls.find((a) => a[2] === "run");
   const file = t.lanes.tokenPath("lane-a");
-  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} omo --model m1 `);
+  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} omo --model m1 `);
   expect(t.calls.flat().join("\n")).not.toContain("tok-1");
   expect(readFileSync(file, "utf8")).toBe("tok-1");
   expect(statSync(file).mode & 0o777).toBe(0o600);
@@ -389,16 +485,17 @@ test("B2: recovering a lane whose pane is alive publishes lane.started, which cl
   t.world.panes = [{ pane_id: "p1", agent_status: "working", agent: "omo" } as unknown as Pane];
   const head = { runner: "worker-a", gen: 1, epoch: 1 };
   let seq = 0;
-  let lane: Record<string, unknown> = { key: "lane-a", runner: "worker-a", openedAt: "2026-11-01T00:00:00Z", pane: "p1", tab: "t1" };
+  let lane: Record<string, unknown> = { key: "lane-a", runner: "worker-a", openedAt: "2026-11-01T00:00:00Z", pane: "p1", tab: "t1", fileRun: FILES.run };
   const deps = {
     registry: { read: async () => lane, open: async () => [lane], update: async (_k: string, fn: (l: unknown) => unknown) => { lane = fn(lane) as Record<string, unknown>; return lane; } },
+    stateDir: join(t.runnerDir, "state"), prepareRecovery: async () => ({ cmdId: "recover:lane-a:1000", notes: [] }),
     reports: () => undefined, emit: () => {}, recover: () => 1, now: () => 1000,
   } as unknown as LaneHubDeps;
   await reconcileInventory(deps, "worker-a", []); // a stale hello from before the launch
   expect(lane.recoveryPending).toBe(true);
   t.published.length = 0;
-  expect((await t.lanes.recover("lane-a")).detail).toBe("alive pane=p1");
-  expect(t.published).toEqual([["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "" }]]);
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("alive pane=p1");
+  expect(t.published).toEqual([["lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "", fileRun: FILES.run }]]);
   for (const [type, body] of t.published) await acceptLaneEvent(deps, "worker-a", runnerEvent(head, ++seq, type, body as never) as Parameters<typeof acceptLaneEvent>[2]);
   expect(lane.recoveryPending).toBeFalsy();
 });
@@ -411,9 +508,10 @@ test("B3: the launch command runs under /bin/sh when the runner directory has a 
   const lanes = new RunnerLanes({
     instance: async () => "server-1",
     runnerDir, clock: fakeClock(T0), token: () => "secret-not-on-argv",
-    policy: { agents: { omo: ["/usr/bin/env"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
+    policy: { agents: { omo: ["/usr/bin/env"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] },
     publish: () => {},
     run: async (argv) => {
+      if (argv[0] === "lane-sandbox") return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
       if (argv[1] === "tab" && argv[2] === "create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" } as Ran;
       if (argv[1] === "pane" && argv[2] === "run") command = argv[4] ?? "";
       return { code: 0, out: "", err: "" } as Ran;
@@ -435,12 +533,22 @@ test("lane.start carries keywords and heavy env into the launch line, and a reco
   expect(started.detail).toBe("started pane=p1 tab=t1");
   expect(started.result.startup.verdict).toBe("unconfirmed");
   const first = t.calls.find((a) => a[2] === "run")?.[4] ?? "";
-  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 'ulw set goal and work. Read and execute`);
+  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 'ulw set goal and work. Read and execute`);
   t.world.panes = [];
-  const recovered = await t.lanes.recover("lane-a", "ses_123");
+  const recovered = await t.lanes.recover("lane-a", "ses_123", undefined, "# fresh brief\n", FILES);
   expect(recovered.result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true, resumed: true });
   const second = t.calls.filter((a) => a[2] === "run").at(-1)?.[4] ?? "";
   expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --session ses_123 'ulw set goal and work.");
+});
+
+test("lane.start hands the policy's repos and worktree roots to the lane sandbox, the worktree root defaulting under the repos root", async () => {
+  const policy = { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] } as const;
+  const both = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos", worktreeRoot: "/Users/u/work/worktrees" } });
+  await both.lanes.start(START);
+  expect(both.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/worktrees omo --model m1 ");
+  const repos = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos" } });
+  await repos.lanes.start(START);
+  expect(repos.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/repos/worktrees omo --model m1 ");
 });
 
 test("lane.start with a target runs in that idle shell pane, leaves it open on a failed run, and refuses a pane another lane holds", async () => {
@@ -487,7 +595,7 @@ test("B7: adopt and target start check the pane's effective cwd against allowedR
   mkdirSync(outside);
   symlinkSync(outside, join(allowed, "escape"));
   // The real realpathSync (the runner's default), not the identity the other tests use.
-  const t = setup({ realpath: undefined, policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: [allowed], sandbox: "optional", jobs: "allow" } });
+  const t = setup({ realpath: undefined, policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: [allowed], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] } });
   const briefs = join(t.runnerDir, "briefs");
   const tokenFiles = () => (existsSync(briefs) ? readdirSync(briefs).filter((f) => f.endsWith(".token")) : []);
   const adopt = (key: string, pane: string, cwd?: string) => t.lanes.adopt({ cmdId: key, key, pane, mode: "ulw", model: "m1", ...(cwd ? { cwd } : {}) });
@@ -546,7 +654,7 @@ test("pause and resume run the lane-control sequences on the lane's pane; a reco
   expect(resumed.result.goal).toBe("unconfirmed");
   await t.lanes.notify({ cmdId: "n", key: "lane-a", status: "paused" });
   t.world.panes = [];
-  await t.lanes.recover("lane-a");
+  await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES);
   expect(t.lanes.notice("lane-a")).toEqual({ status: "paused" });
   await expect(t.lanes.notify({ cmdId: "n2", key: "nope", status: "x" })).rejects.toThrow("RUNNER_LANE_UNKNOWN");
 });

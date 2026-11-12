@@ -9,6 +9,8 @@ import type { Ran } from "../src/run.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, withState } from "./fakes.ts";
 
+const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
+
 const T0 = 1_800_000_000_000;
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -25,7 +27,7 @@ test("legacy config pane keys seed dori state once; later config values are igno
   const stateDir = join(s.dir, "state");
   writeFileSync(path, JSON.stringify({ stateDir, leadPane: "wA:p1", laneWorkspace: "wS", workspaces: ["wS"] }));
   const first = await loadConfig(path, s.dir);
-  expect({ leadPane: first.leadPane, laneWorkspace: first.laneWorkspace, workspaces: first.workspaces }).toEqual({ leadPane: "wA:p1", laneWorkspace: "wS", workspaces: ["wS"] });
+  expect({ leadPane: first.leadPane, laneWorkspace: first.laneWorkspace }).toEqual({ leadPane: "wA:p1", laneWorkspace: "wS" });
   expect(readManagedPanes(stateDir)).toEqual({ leadPane: "wA:p1", laneWorkspace: "wS", migrated: true });
   expect(statSync(managedPanesPath(stateDir)).mode & 0o777).toBe(0o600);
 
@@ -43,7 +45,7 @@ test("a config without pane keys and no state leaves both ids empty and writes n
   const stateDir = join(s.dir, "state");
   writeFileSync(path, JSON.stringify({ stateDir }));
   const config = await loadConfig(path, s.dir);
-  expect({ leadPane: config.leadPane, laneWorkspace: config.laneWorkspace, workspaces: config.workspaces }).toEqual({ leadPane: "", laneWorkspace: "", workspaces: [] });
+  expect({ leadPane: config.leadPane, laneWorkspace: config.laneWorkspace }).toEqual({ leadPane: "", laneWorkspace: "" });
   expect(readManagedPanes(stateDir)).toEqual({});
 });
 
@@ -93,7 +95,8 @@ test("a local launch opens its tab in the managed lanes workspace; a pane target
 test("a local launch is refused, not sent to herdr's focused workspace, when herdr cannot give a lanes workspace", async () => {
   const s = state();
   const w = newWorld();
-  const deps = { ...depsFor(w, fakeClock(T0), s.dir, { defaultModel: "m1" }), run: async (): Promise<Ran> => ({ code: 1, out: "", err: "server not running" }) };
+  // The local sandbox check passes; every herdr call fails.
+  const deps = { ...depsFor(w, fakeClock(T0), s.dir, { defaultModel: "m1" }), run: async (argv: readonly string[]): Promise<Ran> => (argv[0] === "lane-sandbox" ? { code: 0, out: "", err: "" } : { code: 1, out: "", err: "server not running" }) };
   const brief = join(s.dir, "brief.md");
   writeFileSync(brief, "# brief\n");
   expect(launchLane(deps, { key: "lane-a", title: "a", brief, done: "command [\"true\"]", thread: "none", cwd: "/repo" })).rejects.toThrow("no lanes workspace");
@@ -125,14 +128,14 @@ test("the runner opens a lane tab in tabWorkspace and a relaunch uses the worksp
     },
   });
   const creates = () => herdr.filter((a) => a.slice(0, 3).join(" ") === "herdr tab create");
-  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, tabWorkspace: "wS" });
+  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES, tabWorkspace: "wS" });
   expect(creates()[0]).toEqual(["herdr", "tab", "create", "--workspace", "wS", "--cwd", "/repo", "--label", "lane-a", "--no-focus"]);
   expect(lanes.records()["lane-a"]?.tabWorkspace).toBe("wS");
 
   panes = [];
-  await lanes.recover("lane-a", undefined, "wT");
+  await lanes.recover("lane-a", undefined, "wT", "# fresh brief\n", FILES);
   expect(creates()[1]?.slice(3, 5)).toEqual(["--workspace", "wT"]);
   panes = [];
-  await lanes.recover("lane-a");
+  await lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES);
   expect(creates()[2]?.slice(3, 5)).toEqual(["--workspace", "wT"]);
 });

@@ -13,7 +13,7 @@ Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只
 ## 安装
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 它会把仓库克隆到 `~/.dori/src`,把技能链接到 `~/.agents/skills/dori-mode`,用 `bun link` 把 `dori` 放进 PATH,然后启动 `dori setup`。如果你的智能体从别的目录加载技能，请设置 `SKILLS_DIR`。
@@ -58,7 +58,7 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 
 | 字段 | 含义 |
 |---|---|
-| `defaultCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
+| `leadCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
 | `agentCommand` | 启动智能体的命令，写成含 `{model}` 和 `{prompt}` 的 argv 列表 |
 | `hooks.threadReply` | 你的消息 CLI,写成含 `{thread}` 和 `{text}` 的 argv 列表，用来发布 lane 进度 |
 
@@ -129,7 +129,7 @@ Done = command ["bun","test"] stdout~" 0 fail"; file qa/report.json json:.passed
 | `dori watch` | 自动关闭的 watcher,作为常驻监控运行 |
 | `dori freshness [--loop MIN]` | 提醒变安静的 lane,提醒后仍无动静就上报给 lead,再把它最后一条汇报发到线程里 |
 | `dori dead-panes [--loop MIN]` | 报告已停止的智能体 pane |
-| `dori guard [--loop MIN]` | 负载、内存、磁盘和 pane 数量告警，也按工作机器 (`guard install`、`guard machines`) |
+| `dori guard [--loop MIN]` | 负载、内存、磁盘和 pane 数量告警，也按 runner 机器 (基于 runner 采样，`dori status` 中显示) |
 | `dori heavy <label> -- <cmd>` | 只在有空闲槽位且负载低时运行构建、测试或模拟器 (每台机器一个) |
 
 发给 pane 的文字总是作为一个参数传入，从不经过 shell 字符串，并把每次发送报告为已送达或未确认。

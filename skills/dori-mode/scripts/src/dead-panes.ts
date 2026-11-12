@@ -4,6 +4,7 @@ import type { LaneOps } from "./lane-ops.ts";
 import { appendDeadPaneReport } from "./lane-reports.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Lane } from "./registry.ts";
+import { BUILT_IN } from "./tunables.ts";
 
 /** Unrecognised ticks in a row before one alert names the pane. */
 export const UNRECOGNISED_ALERT_AFTER = 3;
@@ -35,7 +36,7 @@ export const deadPaneTick = async (ops: LaneOps, config: DoriConfig, seen: Set<s
     // Remote inventories contain other people's panes too: inspect only registered lane panes.
     const owned = new Set(lanes.flatMap((lane) => lane.machine === machine && lane.pane ? [lane.pane] : []));
     try {
-      out.push(...await inspect(view, { ...config, workspaces: [], leadPane: "", ignorePanes: [] }, seen, hourKey, state, ctx, machine, owned));
+      out.push(...await inspect(view, { ...config, laneWorkspace: "", leadPane: "", ignorePanes: [] }, seen, hourKey, state, ctx, machine, owned));
     } catch (e) {
       out.push(`DEAD_PANES_WARN machine=${machine} ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -48,9 +49,9 @@ type Ctx = { readonly byPane: ReadonlyMap<string, Lane>; readonly now: () => num
 
 const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState, ctx: Ctx, machine?: string, owned?: ReadonlySet<string>): Promise<string[]> => {
   const out: string[] = [];
-  const watch = new Set(config.workspaces);
+  const watch = new Set([config.laneWorkspace].filter(Boolean));
   const skip = new Set([config.leadPane, ...config.ignorePanes].filter(Boolean));
-  const marked = (tail: string) => config.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
+  const marked = (tail: string) => BUILT_IN.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
   const panes = await view.panes(machine);
   const laneTabs = new Set(panes.flatMap((p) => p.tab_id && ctx.byPane.has(machine ? `${machine}/${p.pane_id}` : p.pane_id) ? [p.tab_id] : []));
   for (const pane of panes) {

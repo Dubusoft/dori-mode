@@ -103,13 +103,18 @@ test("over the runner hub: a runner's guard samples save herdr on its row, enque
   cleanups.push(() => { outbox.close(); state.close(); });
   const { code } = handle.auth.issueCode("lab");
   expect(await enrollRunner({ auth, connect, code, label: "lab", hostId: "host-b", expectedFingerprint: handle.auth.fingerprint })).toMatchObject({ ok: true });
-  const client = new RunnerClient({ label: "lab", hostId: "host-b", proto: 3 }, { connect, outbox, state, clock, auth });
+  const client = new RunnerClient({ label: "lab", hostId: "host-b", proto: 5 }, { connect, outbox, state, clock, auth });
   expect(await client.connectOnce()).toMatchObject({ ok: true });
+  let unreadableSamples = 0;
+  let health = { state: "up" as "up" | "down", since: clock.now(), instance: "server-1" };
   /** Publishes one guard sample and waits until the hub committed it. */
   const publish = async (panes: number): Promise<void> => {
     const want = committed + 1;
     const done = new Promise<void>((resolve) => { seen = () => { if (committed >= want) resolve(); }; });
-    client.publish("guard.sample", sampleBody(panes) as never);
+    unreadableSamples = panes < 0 ? unreadableSamples + 1 : 0;
+    const state = unreadableSamples >= 2 ? "down" : "up";
+    if (state !== health.state) health = { ...health, state, since: clock.now() };
+    client.publish("guard.sample", { ...sampleBody(panes), herdr: health } as never);
     await done;
   };
   const row = () => readRunnerRows(stateDir).find((r) => r.label === "lab");
@@ -123,7 +128,7 @@ test("over the runner hub: a runner's guard samples save herdr on its row, enque
   const downAt = clock.at;
   expect(row()).toMatchObject({ herdr: "down", herdrSince: downAt });
   expect(herdrDownSince(stateDir)).toEqual(new Map([["lab", downAt]]));
-  expect(herdrLines.map(([id, line]) => [id, line.split(" ").slice(0, 2).join(" ")])).toEqual([[`herdr:lab:down:${downAt}`, "HERDR_DOWN machine=lab"]]);
+  expect(herdrLines.map(([id, line]) => [id, line.split(" ").slice(0, 2).join(" ")])).toEqual([["herdr:lab:down:3", "HERDR_DOWN machine=lab"]]);
   const lab = runnerViews(readRunnerRows(stateDir), clock.now()).find((r) => r.label === "lab")!;
   expect(machineLines(lab)[0]).toContain(" · herdr 다운");
   // The sample's readings are saved on the row for dori status, stamped with the supervisor's clock.

@@ -4,12 +4,14 @@ import { join } from "node:path";
 
 import { defaultConfig, type PlacementConfig } from "../src/config.ts";
 import { eventKind } from "../src/event-policy.ts";
-import { type MachineCheck, planLaunch } from "../src/placement.ts";
+import { type MachineCheck, planLaunch, type RunnerPlacement } from "../src/placement.ts";
 import { enqueueLaunch, launchHeld, launchQueue, type QueuedLaunch, recordLaunchVerdict } from "../src/routing.ts";
 import type { Runner } from "../src/run.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { runSweeps, supervisorSweeps } from "../src/supervise-loop.ts";
+import { RunnerGuardBoard } from "../src/runner/guard.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState } from "./fakes.ts";
+import { enrollRunners, runnerSample } from "./runner-guard-world.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; process startup under a loaded full run outgrows bun's default 5 s.
 setDefaultTimeout(30_000);
@@ -19,30 +21,31 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const T0 = 1_800_000_000_000;
 const ok = (out = "") => ({ code: 0, out, err: "" });
-const agentLine = (memFreePct: number) => `DORI_GUARD_SAMPLE version=v0 os=linux load1=1 mem_free_pct=${memFreePct} swap_free_gb=4 disk_free_gb=200`;
 const held = (key: string, machine?: string): QueuedLaunch => ({
   key, title: key, done: "merged acme/app#1", brief: `/b/${key}.md`, queuedAt: new Date(T0).toISOString(), reasons: ["full"], ...(machine ? { machine } : {}),
 });
 
-/** Supervisor sweeps over three saved machines: big and spare have room, mini is short of memory; each has one pane. */
+/** Supervisor sweeps over three machines with runners: big and spare have room, mini is short of memory; each has one pane. */
 const machineWorld = () => {
   const state = withState();
   cleanups.push(state.done);
   const world = newWorld();
   const clock = fakeClock(T0);
   const base = depsFor(world, clock, state.dir, { guardMachines: { big: "u@big", mini: "u@mini", spare: "u@spare" } });
-  const mem: Record<string, number> = { "u@big": 60, "u@mini": 5, "u@spare": 60 };
   const run: Runner = async (argv) => {
     if (argv[0] === "df") return ok("Filesystem 1K-blocks Used Available\n/dev/x 1 1 209715200");
-    if (argv[0] === "ssh" && argv.at(-1)?.startsWith("x=6;")) return ok("DORI_POSIX_42");
-    if (argv[0] === "ssh") return ok(agentLine(mem[argv[argv.indexOf("--") + 1] ?? ""] ?? 0));
     return base.run(argv);
   };
+  enrollRunners(state.dir, "big", "mini", "spare");
+  const board = new RunnerGuardBoard(clock.now);
+  for (const [label, memFreePct] of [["big", 60], ["mini", 5], ["spare", 60]] as const) {
+    board.event(label, runnerSample({ load1: 1, memFreePct, diskFreeGb: 200, swapFreeGb: 4 }, T0, label));
+  }
   // Each machine's runner lists one pane.
   const ops = { ...base.ops, panes: async (machine?: string) => [{ pane_id: `${machine ?? "local"}:p1`, workspace_id: "w" }] };
   const deps = { ...base, run, ops };
   const queue: string[] = [];
-  const sweeps = supervisorSweeps(deps, "/home/test");
+  const sweeps = supervisorSweeps(deps, "/home/test", undefined, undefined, undefined, () => board);
   const tick = () => runSweeps(sweeps, async (line) => { queue.push(line); }, clock.now, new Map(), () => {});
   return { deps, state, queue, tick };
 };
@@ -104,16 +107,67 @@ test("planLaunch moves a held default launch to the first fallback machine with 
 });
 
 test("planLaunch keeps a pinned or workspace launch on its HOLD target, and a default one when no fallback has room", async () => {
-  const p = placement({ defaultMachine: "big", workspaces: { "*": "big" }, fallback: ["local"] });
+  const p = placement({ defaultMachine: "big", fallback: ["local"] });
+  const reports: RunnerPlacement[] = [{ machine: "big", online: true, declared: [{ repo: "acme/x", path: "/repo/x" }], detected: [] }];
   for (const input of [{ machine: "big", done: "" }, { cwd: "/repo/x", done: "" }]) {
     const c = checks({ big: ["full"] });
-    const plan = await planLaunch(input, p, c.check);
+    const plan = await planLaunch(input, p, c.check, reports);
     expect(plan.check).toEqual({ machine: "big", verdict: { ok: false, reasons: ["full"] }, summary: "" });
     expect(c.asked).toEqual(["big"]);
   }
   const none = await planLaunch({ done: "" }, p, checks({ big: ["full"], local: ["disk"] }).check);
   expect(none.check.machine).toBe("big");
   expect(none.lines).toHaveLength(1);
+});
+
+/** big, mini and spare all declare acme/app, each in its own checkout. */
+const declaring = (offline: readonly string[] = []): RunnerPlacement[] => ["mini", "big", "spare"].map((machine) => ({
+  machine, online: !offline.includes(machine), declared: [{ repo: "acme/app", path: `/${machine}/app` }], detected: [],
+}));
+
+test("planLaunch checks every online candidate and picks defaultMachine when it has room, in that runner's checkout", async () => {
+  const c = checks({});
+  const plan = await planLaunch({ done: "merged acme/app#1" }, placement({ defaultMachine: "mini", fallback: ["spare"] }), c.check, declaring(["big"]));
+  expect(c.asked).toEqual(["spare", "mini"]);
+  expect(plan.check.machine).toBe("mini");
+  expect(plan.placement).toMatchObject({ machine: "mini", cwd: "/mini/app", online: true });
+  expect(plan.lines).toEqual(["PLACEMENT machine=mini source=runner rule=acme/app cwd=/mini/app", "PLACEMENT_CANDIDATES repo=acme/app machines=spare,big,mini chosen=mini"]);
+});
+
+test("planLaunch takes the first candidate with room when defaultMachine has none or is not a candidate", async () => {
+  const full = await planLaunch({ done: "merged acme/app#1" }, placement({ defaultMachine: "mini", fallback: ["spare"] }), checks({ mini: ["full"], spare: ["disk"] }).check, declaring());
+  expect(full.check.machine).toBe("big");
+  expect(full.lines).toEqual(["PLACEMENT machine=big source=runner rule=acme/app cwd=/big/app", "PLACEMENT_CANDIDATES repo=acme/app machines=spare,big,mini chosen=big"]);
+  const other = await planLaunch({ done: "merged acme/app#1" }, placement({ defaultMachine: "local" }), checks({}).check, declaring());
+  expect(other.placement).toMatchObject({ machine: "big", cwd: "/big/app" });
+});
+
+test("planLaunch holds on the preferred candidate when none has room, naming every candidate's reasons; all offline holds unchecked", async () => {
+  const c = checks({ mini: ["full"], big: ["disk"] });
+  const plan = await planLaunch({ done: "merged acme/app#1" }, placement({ defaultMachine: "mini" }), c.check, declaring(["spare"]));
+  expect(c.asked).toEqual(["big", "mini"]);
+  expect(plan.check).toEqual({ machine: "mini", verdict: { ok: false, reasons: ["full"] }, summary: "" });
+  expect(plan.lines).toEqual([
+    "PLACEMENT machine=mini source=runner rule=acme/app cwd=/mini/app",
+    "PLACEMENT_CANDIDATES repo=acme/app machines=big,mini,spare chosen=none",
+    "HOLD machine=big disk",
+    "HOLD machine=spare runner spare that owns acme/app is offline; the launch waits for it",
+  ]);
+  const away = checks({});
+  const waiting = await planLaunch({ done: "merged acme/app#1" }, placement({ defaultMachine: "big" }), away.check, declaring(["mini", "big", "spare"]));
+  expect(away.asked).toEqual([]);
+  expect(waiting.check).toEqual({ machine: "big", verdict: { ok: false, reasons: ["runner big that owns acme/app is offline; the launch waits for it"] }, summary: "" });
+  expect(waiting.lines).toEqual(["PLACEMENT machine=big source=runner rule=acme/app cwd=/big/app", "PLACEMENT_CANDIDATES repo=acme/app machines=big,mini,spare chosen=none"]);
+});
+
+test("planLaunch with --machine or a --cwd that narrows to one runner checks only that machine, without a candidates line", async () => {
+  const flag = checks({});
+  expect((await planLaunch({ machine: "spare", done: "merged acme/app#1" }, placement({}), flag.check, declaring())).lines).toEqual(["PLACEMENT machine=spare source=flag"]);
+  expect(flag.asked).toEqual(["spare"]);
+  const narrowed = checks({});
+  const plan = await planLaunch({ cwd: "/mini/app/sub", done: "merged acme/app#1" }, placement({}), narrowed.check, declaring());
+  expect(narrowed.asked).toEqual(["mini"]);
+  expect(plan.lines).toEqual(["PLACEMENT machine=mini source=runner rule=acme/app cwd=/mini/app"]);
 });
 
 /** `bun src/cli.ts` with a config saving machine big and fake herdr/ssh on PATH; no supervisor runs, so no runner observes big. */

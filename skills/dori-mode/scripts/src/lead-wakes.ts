@@ -4,6 +4,7 @@ import type { DoriConfig } from "./config.ts";
 import { eventKind } from "./event-policy.ts";
 import { sessionDirFor } from "./session-id.ts";
 import type { JournalStore } from "./store.ts";
+import type { Tunables } from "./tunables.ts";
 
 /**
  * Lead wake metrics (design 1.7). A wake is a delivery that starts a lead turn: events appended for an idle warm lead,
@@ -37,6 +38,7 @@ const LANE_EVENTS = new Set([
   "DEAD_PANE", "UNRECOGNISED_PANE", "NO-PROGRESS", "IDLE-ESCALATE", "NUDGED", "LAUNCH_READY", "WORKING-WHILE-PAUSED",
   "WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED", "UNREPORTED", "UNRESOLVED", "CI_MERGED", "CI_CONFLICT", "GH_PR",
   "MERGE_UNVERIFIED", "MERGE_STALLED", "MERGE_VERIFIED", "RUNNER_LANE_DEAD", "RUNNER_LAUNCH_FAILED", "RUNNER_RECOVER_FAILED",
+  "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
 ]);
 
 export const wakeSource = (trigger: readonly string[]): WakeSource => {
@@ -61,7 +63,7 @@ export const callsSince = (file: string, since: number): number => {
 };
 
 export class WakeMeter {
-  constructor(private readonly store: JournalStore, private readonly config: () => DoriConfig, private readonly now: () => number) {}
+  constructor(private readonly store: JournalStore, private readonly deps: () => { readonly config: DoriConfig; readonly tunables: Tunables }, private readonly now: () => number) {}
 
   /**
    * Closes the open wake, then opens one for `events` handed to `session`, triggered by `trigger`. Called after the
@@ -83,7 +85,7 @@ export class WakeMeter {
   }
 
   private open(session: string, events: readonly { readonly line: string }[], trigger: readonly { readonly line: string }[]): void {
-    const policy = this.config().eventPolicy;
+    const policy = this.deps().tunables.eventPolicy;
     this.start(session, events.map((event) => eventKind(event.line, policy)), trigger.map((event) => eventKind(event.line, policy)));
   }
 
@@ -111,8 +113,8 @@ export class WakeMeter {
 
   private sessionFile(session: string): string | undefined {
     if (session.includes("/")) return existsSync(session) ? session : undefined;
-    const config = this.config();
-    const dir = sessionDirFor(config.sessionsDir, config.defaultCwd);
+    const { config, tunables } = this.deps();
+    const dir = sessionDirFor(tunables.sessionsDir, config.leadCwd);
     if (!existsSync(dir)) return undefined;
     return Array.from(new Bun.Glob(`*${session}.jsonl`).scanSync({ cwd: dir, absolute: true, onlyFiles: true }))
       .find((path) => path.endsWith(`_${session}.jsonl`) || path.endsWith(`/${session}.jsonl`));

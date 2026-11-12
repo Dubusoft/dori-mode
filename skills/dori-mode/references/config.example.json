@@ -1,7 +1,8 @@
 {
+  "schemaVersion": 1,
   "stateDir": "~/.dori/state",
   "ignorePanes": [],
-  "defaultCwd": "~/code/my-project",
+  "leadCwd": "~/code/my-project",
   "agentCommand": [
     "omo",
     "--model",
@@ -9,22 +10,12 @@
     "{prompt}"
   ],
   "defaultModel": "anthropic-subscription/claude-opus-5-5",
-  "launchKeywords": "ulw set goal and work",
-  "massLaunchKeywords": "/mass-ulw set goal and work",
-  "laneThinking": "medium",
   "leadArgs": [],
-  "leadDiet": true,
   "leadStuckRestartMin": 30,
-  "leadUnreadRestartMin": 5,
   "leadChildWaitMaxMin": 60,
-  "cacheTtlMin": 5,
-  "leadContextCapTokens": 150000,
-  "leadContextHardCapTokens": 300000,
   "discordChannels": [
     "123456789012345678"
   ],
-  "discordSafetyPollSeconds": 300,
-  "discordFirstSeenLimit": 100,
   "githubIssueAuthors": [
     "your-github-login"
   ],
@@ -33,37 +24,11 @@
     "guildId": "1100000000000000002",
     "ownerId": "<owner Discord user id>"
   },
-  "sessionsDir": "~/.omo/agent/sessions",
-  "nudgeAfterMin": 15,
-  "idleEscalateMin": 30,
   "drift": { "enabled": true, "milestoneOverdueMin": 90, "ciFailStreak": 3 },
-  "closeAfterMin": 5,
-  "mergeWaitMaxMin": 60,
-  "mergeStallMin": 15,
-  "waitMaxFailures": 30,
   "worktreeRoot": "/data/repos/worktrees",
   "ownerLanguage": "Korean",
-  "laneRules": ["Open a PR into the repo's dev branch and stop once its CI is green; do not merge.", "CI runs the typecheck only; do not add tests to CI."],
-  "digestMaxDelayMin": 60,
-  "ownerDelayNotice": "Got your message. The lead session is not taking it yet; it stays queued and will be answered as soon as the lead is back.",
-  "ackTimeoutSec": 60,
-  "ackMissingNotice": "Your message reached the lead session, but it has not confirmed reading it yet. It has been reminded and will answer here.",
-  "handledTimeoutMin": 30,
-  "resolveTimeoutMin": 15,
-  "resolveKinds": [
-    "LANE_REPORT * question",
-    "LANE_REPORT * blocked",
-    "LANE_ASKING",
-    "LANE_REPORT_LATE * question",
-    "LANE_REPORT_LATE * blocked",
-    "LANE_REPORT_LATE * done",
-    "LANE_NOT_DONE",
-    "WAIT_DONE",
-    "WAIT_TIMEOUT",
-    "WAIT_FAILED",
-    "DEAD_PANE"
-  ],
-  "unhandledNotice": "Your message was read, but not all of its tasks have been linked to work or a reply. The lead has been reminded to handle it.",
+  "displayTimeZone": "Asia/Seoul",
+  "laneRules": ["Open a PR into the repo's dev branch; once its CI is green, claim done and stop. Do not merge it and do not wait for the merge: the supervisor merges it.", "CI runs the typecheck only; do not add tests to CI."],
   "heavySlots": 1,
   "heavyKill": [
     "qemu-system",
@@ -71,10 +36,6 @@
     "expo export"
   ],
   "heavyMaxLoad": 80,
-  "deadPanePatterns": [
-    "has stopped",
-    "no suitable jobs"
-  ],
   "guard": {
     "loadAlert": 150,
     "loadOk": 80,
@@ -85,29 +46,14 @@
     "panesMax": 20
   },
   "runTimeoutMs": 60000,
-  "sweepMachineDeadlineMs": 20000,
-  "store": "json",
-  "ciConfirmMin": 20,
   "ciMergeBase": "dev",
-  "delivery": {
-    "tailMonitor": true,
-    "restartMaxPerHour": 3,
-    "push": {
-      "ackSec": 45,
-      "retries": 2,
-      "escalateMin": 5,
-      "maxChars": 200,
-      "pasteCheckMs": 3000,
-      "toWorking": false,
-      "takeMaxBytes": 16384
-    }
+  "autopilot": {
+    "quotaUnreadable": "hold",
+    "mergeBase": "dev",
+    "crossWorkspacePrereqs": "block",
+    "tickSec": 300
   },
-  "diskGuardPath": "",
   "guardMachines": {},
-  "memoryCheck": {
-    "repo": "",
-    "maxKb": 15
-  },
   "hooks": {
     "threadReply": [
       "my-messenger",

@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
+import { autopilotPausePath, readPause } from "./autopilot-cli.ts";
 import type { DoriConfig } from "./config.ts";
-import { eventClass, eventKind, type EventClass } from "./event-policy.ts";
+import { displayTime } from "./display-time.ts";
+import { eventClass, eventKind, type EventClass, type EventPolicy } from "./event-policy.ts";
 import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./event-sources.ts";
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { githubSummary } from "./github-events.ts";
@@ -20,7 +22,9 @@ import { readStoreView, readWakes } from "./store.ts";
 import { readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_STALE_MS, type RunnerMachine, type RunnerRow } from "./runner/hub.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { probe as probeRunner, type Verdict } from "./runner/health.ts";
+import { unsandboxedReason } from "./runner-sandbox.ts";
 import { openOperations } from "./operations.ts";
+import type { Tunables } from "./tunables.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const LEGACY_PRESENCE = "dori-presence.service";
@@ -46,17 +50,23 @@ export type LeadState = {
 
 export type Status = {
   readonly at: string;
+  /** The config's displayTimeZone: every time in the report is shown in it; absent (an older status) reads as UTC. */
+  readonly timeZone?: string;
   readonly services: readonly UnitState[];
   /** `laneWorkspace`: the supervisor-managed herdr workspace new local lane tabs open in ("" when none is recorded yet). */
   readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string };
+  /** Autopilot is always on; `paused` while `dori autopilot pause` is in force. Absent in an older status. */
+  readonly autopilot?: { readonly paused: false } | { readonly paused: true; readonly since: string; readonly reason: string | null };
   readonly lanes: readonly {
     readonly key: string; readonly model?: string; readonly ageMin: number; readonly progress?: string; readonly repo?: string; readonly pr?: number;
+    /** The runner the lane runs on (its owning runner, else its machine, else "local"); absent in an older status reads as "local". */
+    readonly machine?: string;
     /** recoveryPending: "exhausted" after every recovery attempt failed (LANE_RECOVERY_EXHAUSTED), else "pending". */
     readonly recovery?: "pending" | "exhausted";
     /** The lane's latest `dori report` row (highest seq), routed or not. */
     readonly report?: LaneReport;
   }[];
-  readonly waits: readonly { readonly key: string; readonly until: string; readonly deadline?: string; readonly note?: string }[];
+  readonly waits: readonly { readonly key: string; readonly until: string; readonly deadline?: string; readonly note?: string; readonly machine?: string }[];
   readonly github: {
     readonly repos: readonly string[];
     readonly lastPollAt?: string;
@@ -77,6 +87,37 @@ export type Status = {
   readonly schedules?: readonly ScheduleRow[];
   /** Every runner in the hub's table (`runners.sqlite`), and always the local runner (offline until it first says hello). */
   readonly runners?: readonly RunnerView[];
+  /** The working lanes grouped by runner (see laneGroups): every runner, even one with no lanes, local first. */
+  readonly laneGroups?: readonly LaneGroup[];
+};
+
+/** One runner's working lanes as `dori status` groups them. `state` is absent for a machine no runner row names. */
+export type LaneGroup = {
+  readonly machine: string;
+  readonly state?: RunnerView["state"];
+  /** Not offline, lost or revoked (the same reading as a wait's "@machine 오프라인" mark). */
+  readonly online: boolean;
+  /** Lane keys, in the order of Status.lanes. */
+  readonly lanes: readonly string[];
+};
+
+const OFFLINE_STATES: ReadonlySet<RunnerView["state"]> = new Set(["offline", "lost", "revoked"]);
+const laneMachine = (lane: { readonly machine?: string }): string => lane.machine ?? LOCAL_RUNNER;
+
+/**
+ * The lanes grouped by the runner they run on: one group per runner in `runners` (in that order, so local first), lanes
+ * or not, then one per other machine a lane names. Without runners (an older status) only the lanes' machines appear.
+ */
+export const laneGroups = (runners: readonly RunnerView[] | undefined, lanes: Status["lanes"]): LaneGroup[] => {
+  const labels = (runners ?? []).map((r) => r.label);
+  for (const lane of lanes) if (!labels.includes(laneMachine(lane))) labels.push(laneMachine(lane));
+  return labels.map((machine) => {
+    const state = runners?.find((r) => r.label === machine)?.state;
+    return {
+      machine, ...(state ? { state } : {}), online: state !== undefined && !OFFLINE_STATES.has(state),
+      lanes: lanes.filter((lane) => laneMachine(lane) === machine).map((lane) => lane.key),
+    };
+  });
 };
 
 /** One runner as `dori status` shows it. Fields the hub does not track yet are absent and print `-`. */
@@ -99,6 +140,8 @@ export type RunnerView = {
   readonly herdrSince?: number;
   /** The machine's readings from the runner's last guard sample (CPU load, free memory, disk, swap), and how old they are. */
   readonly machine?: Omit<RunnerMachine, "at"> & { readonly sampledAt: string; readonly ageSec: number };
+  /** Why its lanes run without a sandbox (runner-sandbox.ts: a Windows runner, or allowUnsandboxed); absent: sandboxed. */
+  readonly unsandboxed?: string;
   /**
    * The local runner only: its process as the supervisor's child, from the health file it writes
    * (`<runnerDir>/health`, the same reading as `dori runner probe`).
@@ -122,10 +165,12 @@ export const localChildState = (runnerDir: string, now: number): NonNullable<Run
  */
 export const runnerViews = (rows: readonly RunnerRow[], now: number, opts: {
   readonly restarts?: (label: string) => number | undefined; readonly lanes?: (label: string) => number; readonly child?: RunnerView["child"];
+  readonly unsandboxed?: (label: string, os: string | undefined) => string | undefined;
 } = {}): RunnerView[] => {
   const local = rows.find((r) => r.label === LOCAL_RUNNER) ?? { label: LOCAL_RUNNER, eventAck: 0, maxGen: 0, cmdSeq: 0, cmdAck: 0 };
   return [local, ...rows.filter((r) => r.label !== LOCAL_RUNNER)].map((row) => {
-    const view = runnerView(row, now, opts.restarts?.(row.label), opts.lanes?.(row.label));
+    const why = opts.unsandboxed?.(row.label, row.machine?.os);
+    const view = { ...runnerView(row, now, opts.restarts?.(row.label), opts.lanes?.(row.label)), ...(why ? { unsandboxed: why } : {}) };
     return row.label === LOCAL_RUNNER && opts.child ? { ...view, child: opts.child } : view;
   });
 };
@@ -205,9 +250,8 @@ export type EventStats = {
 
 export const STATS_HOURS = 24;
 
-const eventStats = (config: DoriConfig, now: number): EventStats => {
+const eventStats = (config: DoriConfig, policy: EventPolicy, now: number): EventStats => {
   const since = now - STATS_HOURS * 3_600_000;
-  const policy = config.eventPolicy;
   const lines = readStoreView(config.stateDir, {
     json: (journal) => (Array.isArray(journal.events) ? journal.events : []).filter((event) => (event.at ?? 0) >= since).map((event) => event.line),
     sqlite: (db) => (db.query("SELECT line FROM events WHERE at >= ?").all(since) as { line: string }[]).map((row) => row.line),
@@ -246,6 +290,7 @@ export type StatusDeps = {
   readonly run: Runner;
   readonly clock: Clock;
   readonly config: DoriConfig;
+  readonly tunables: Tunables;
   readonly registry: Registry;
   /** The runner directory whose health file tells the local runner child's state; without it no child state is shown. */
   readonly runnerDir?: string;
@@ -267,10 +312,10 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
     const found = (await listPanes(d.run)).find((p) => p.pane_id === pane);
     if (!found) return { pane, state: "missing", note: "pane not found in herdr" };
     if (!found.agent) return { pane, state: "cold", note: "no agent running in the lead pane" };
-    const cwd = found.cwd ?? d.config.defaultCwd;
-    const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.config.sessionsDir });
+    const cwd = found.cwd ?? d.config.leadCwd;
+    const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.tunables.sessionsDir });
     if (!hit.id) return { pane, state: "unknown", note: "cannot resolve the lead session" };
-    const dir = sessionDirFor(d.config.sessionsDir, cwd);
+    const dir = sessionDirFor(d.tunables.sessionsDir, cwd);
     const files = await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true }));
     const started = existsSync(hit.id) ? hit.id :
       files.find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`));
@@ -280,7 +325,7 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
     const file = files.filter((path) => basename(path) > basename(started))
       .reduce((best, path) => statSync(path).mtimeMs > statSync(best).mtimeMs ? path : best, started);
     const idleMs = d.clock.now() - statSync(file).mtimeMs;
-    return { pane, state: idleMs < d.config.cacheTtlMin * 60_000 ? "warm" : "cold", idleMin: Math.floor(idleMs / 60_000), tokens: lastTokens(file) };
+    return { pane, state: idleMs < d.tunables.cacheTtlMin * 60_000 ? "warm" : "cold", idleMin: Math.floor(idleMs / 60_000), tokens: lastTokens(file) };
   } catch (e) {
     return { pane, state: "unknown", note: e instanceof Error ? e.message.slice(0, 80) : "lookup failed" };
   }
@@ -291,9 +336,9 @@ const readWaits = (stateDir: string): Status["waits"] => {
     const raw: unknown = JSON.parse(readFileSync(join(stateDir, "waits.json"), "utf8"));
     if (!Array.isArray(raw)) return [];
     return raw.flatMap((w: unknown) => {
-      const r = w as { key?: unknown; until?: unknown; deadline?: unknown; note?: unknown };
+      const r = w as { key?: unknown; until?: unknown; deadline?: unknown; note?: unknown; machine?: unknown };
       return typeof r.key === "string" && typeof r.until === "string"
-        ? [{ key: r.key, until: r.until, ...(typeof r.deadline === "number" && Number.isFinite(r.deadline) ? { deadline: new Date(r.deadline).toISOString() } : {}), ...(typeof r.note === "string" && r.note.trim() ? { note: r.note } : {}) }]
+        ? [{ key: r.key, until: r.until, ...(typeof r.deadline === "number" && Number.isFinite(r.deadline) ? { deadline: new Date(r.deadline).toISOString() } : {}), ...(typeof r.note === "string" && r.note.trim() ? { note: r.note } : {}), ...(typeof r.machine === "string" && r.machine ? { machine: r.machine } : {}) }]
         : [];
     });
   } catch {
@@ -341,20 +386,31 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   ]);
   const gh = githubSummary(d.config.stateDir);
   const pendingRestart = pendingLeadRestart(d.config.stateDir);
+  const pause = readPause(autopilotPausePath(d.config.stateDir));
   let repos: string[] = [];
   try { repos = new Repos(d.config.stateDir).list(); } catch { /* unreadable list: show none */ }
   const reports = latestLaneReports(d.config);
+  const lanes = open.filter((l) => statusOf(l) === "working").map((l) => ({
+    key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
+    ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
+    ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
+    ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
+    ...(reports.has(l.key) ? { report: reports.get(l.key) } : {}),
+    // The same owner rule as runnerLaneCount: the owning runner, else the unowned lane's machine, else local.
+    machine: l.runner ?? (l.machine || LOCAL_RUNNER),
+  }));
+  const runners = runnerViews(readRunnerRows(d.config.stateDir), now, {
+    restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
+    unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
+    ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
+  });
   return {
     at: new Date(now).toISOString(),
+    timeZone: d.config.displayTimeZone,
     services,
-    lead: { ...lead, cacheTtlMin: d.config.cacheTtlMin, capTokens: d.config.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
-    lanes: open.filter((l) => statusOf(l) === "working").map((l) => ({
-      key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
-      ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
-      ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
-      ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
-      ...(reports.has(l.key) ? { report: reports.get(l.key) } : {}),
-    })),
+    lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
+    autopilot: pause ? { paused: true, ...pause } : { paused: false },
+    lanes,
     waits: readWaits(d.config.stateDir),
     github: {
       repos,
@@ -366,13 +422,11 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     gateway: gatewayView(readGatewayStatus(d.config.stateDir), now),
     unacked: readUnacked(d.config.stateDir),
     unreported: readUnreported(d.config.stateDir),
-    events: eventStats(d.config, now),
+    events: eventStats(d.config, d.tunables.eventPolicy, now),
     sources: sourceViews(d.config.stateDir),
     schedules: scheduleRows(d.config.stateDir, now),
-    runners: runnerViews(readRunnerRows(d.config.stateDir), now, {
-      restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
-      ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
-    }),
+    runners,
+    laneGroups: laneGroups(runners, lanes),
   };
 };
 
@@ -413,13 +467,8 @@ const ago = (iso: string | undefined, now: number): string => {
 /** "40초 전", "5분 전": an age in seconds. */
 const agoSec = (sec: number): string => (sec < 60 ? `${sec}초 전` : `${dur(Math.round(sec / 60))} 전`);
 
-const KST_MS = 9 * 3_600_000;
-const two = (n: number): string => String(n).padStart(2, "0");
-/** Fixed +09:00 (Asia/Seoul has no DST): "10-21 09:53". */
-export const kst = (ms: number): string => {
-  const d = new Date(ms + KST_MS);
-  return `${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}`;
-};
+/** "10-21 09:53 KST": `ms` in the status's time zone. */
+const time = (s: Status, ms: number): string => displayTime(ms, s.timeZone, "short");
 
 /** "anthropic-subscription/claude-opus-5-5" -> "opus-5-5"; other ids keep their readable tail. */
 export const shortModel = (model: string): string =>
@@ -483,6 +532,7 @@ export const machineLines = (r: RunnerView): string[] => {
   const level = m && m.level !== "ok" ? `[${LEVEL_WORDS[m.level]}] ` : "";
   const head = [
     RUNNER_WORDS[r.state],
+    ...(r.unsandboxed ? ["샌드박스 없음"] : []),
     ...(r.state !== "connected" && r.heartbeatAgeSec !== undefined ? [`마지막 응답 ${agoSec(r.heartbeatAgeSec)}`] : []),
     ...(r.lanes !== undefined ? [count(r.lanes, "레인")] : []),
     `herdr ${r.herdr ? HERDR_WORDS[r.herdr] : "미확인"}`,
@@ -557,20 +607,27 @@ const LIMITS: readonly Limits[] = [
 
 const iso = (ms: number | undefined): string | undefined => (ms === undefined ? undefined : new Date(ms).toISOString());
 
+/** "@mac-mini", or "@mac-mini 오프라인" while that machine's runner is not connected (offline, lost or revoked); empty for the supervisor host. */
+const machineMark = (s: Status, machine: string | undefined): string => {
+  if (!machine) return "";
+  const state = (s.runners ?? []).find((r) => r.label === machine)?.state;
+  return `@${machine}${state === "offline" || state === "lost" || state === "revoked" ? " 오프라인" : ""}`;
+};
+
 /** "- 이벤트 소스: discord INBOUND 2분 전, github 이벤트 없음, deploys (poll) ... 실패": each source's last event age. */
 const sourceLine = (s: Status, now: number, max: number): string[] => {
   if (!s.sources) return [];
   const parts = s.sources.sources.map((src) => {
     const last = src.lastEventAt === undefined ? "이벤트 없음" : `${src.lastKind ?? "?"} ${ago(iso(src.lastEventAt), now)}`;
-    return `${src.name}${src.type === "builtin" ? "" : ` (${src.type})`} ${last}${src.failing ? " 실패" : ""}`;
+    return `${src.name}${src.machine ? machineMark(s, src.machine) : ""}${src.type === "builtin" ? "" : ` (${src.type})`} ${last}${src.failing ? " 실패" : ""}`;
   });
   return parts.length ? [`- 이벤트 소스: ${list(parts, max, 400)}`] : [];
 };
 
 /** "- brief: 다음 10-24 09:00 KST (20시간 후)", "- backup: ..., 지난 실행 failed exit 1": one line per scheduled job. */
 const scheduleLines = (s: Status, now: number): string[] => (s.schedules ?? []).map((job) => {
-  const next = job.waiting ? `${job.waiting} 기다리는 중` : job.nextRunAt === undefined ? "다음 실행 없음" : `다음 ${kst(job.nextRunAt)} KST (${left(job.nextRunAt, now)})`;
-  return clip(`- ${job.name}: ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? `, 지난 실행 ${job.lastResult}` : ""}`, 200);
+  const next = job.waiting ? `${job.waiting} 기다리는 중` : job.nextRunAt === undefined ? "다음 실행 없음" : `다음 ${time(s, job.nextRunAt)} (${left(job.nextRunAt, now)})`;
+  return clip(`- ${job.name}${job.machine ? machineMark(s, job.machine) : ""}: ${next}${job.lastResult && job.lastResult !== "ok" && job.lastResult !== "emitted" ? `, 지난 실행 ${job.lastResult}` : ""}`, 200);
 });
 
 const perWake = (calls: number, measured: number): string => (measured ? (calls / measured).toFixed(1) : "?");
@@ -597,6 +654,16 @@ const laneLine = (lane: Lanes[number], progress: number): string => {
   return `- ${flag}${lane.key} (${facts})${lane.progress ? `: ${clip(lane.progress, progress)}` : ""}`;
 };
 
+/** "▸ local: 연결됨 · 레인 2개", "▸ mac-mini: 오프라인 · 레인 없음": a runner's heading over its lanes. */
+const groupLine = (g: LaneGroup): string =>
+  `▸ ${g.machine}: ${g.state ? RUNNER_WORDS[g.state] : "미확인"} · ${g.lanes.length ? count(g.lanes.length, "레인") : "레인 없음"}`;
+
+/** The lanes in runner-group order, each with its group; pages 2.. continue from page 1 in this order. */
+const groupedLanes = (s: Status): { readonly lane: Lanes[number]; readonly group: LaneGroup }[] => {
+  const byKey = new Map(s.lanes.map((lane) => [lane.key, lane]));
+  return laneGroups(s.runners, s.lanes).flatMap((group) => group.lanes.map((key) => ({ lane: byKey.get(key)!, group })));
+};
+
 const leadLine = (l: Status["lead"]): string => {
   const state = l.state === "cold" && l.idleMin === undefined ? "멈춤" : LEAD_WORDS[l.state];
   const parts = [
@@ -617,7 +684,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const probs = problems(s, now);
   const counts = `작업 중 레인 ${s.lanes.length}개 · ${s.waits.length ? `대기 ${s.waits.length}개` : "대기 없음"}`;
   const lines = [
-    `도리 상태 · ${kst(now)} KST`,
+    `도리 상태 · ${time(s, now)}`,
     probs.length ? `⚠️ 확인 필요: ${probs.slice(0, 3).map((p) => p.label).join(", ")}${probs.length > 3 ? ` 외 ${probs.length - 3}건` : ""} · ${counts}` : `✅ 모두 정상 · ${counts}`,
   ];
   const section = (title: string, items: readonly string[]) => { if (items.length) lines.push("", `■ ${title}`, ...items); };
@@ -629,11 +696,21 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   section("리드", [
     leadLine(l),
     `- 새 레인 워크스페이스: ${l.laneWorkspace || "아직 없음 (수퍼바이저가 만듦)"}`,
+    ...(s.autopilot ? [s.autopilot.paused
+      ? clip(`- 오토파일럿: 일시정지 (${s.autopilot.since}부터${s.autopilot.reason ? `: ${s.autopilot.reason}` : ""}; dori autopilot resume)`, 200)
+      : "- 오토파일럿: 켜짐 (autopilot 표시된 작업만 실행)"] : []),
     ...(l.pendingRestart ? [clip(`- 재시작 ${l.pendingRestart.id} 대기 중: ${l.pendingRestart.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}, 다음 유휴 때`, 300)] : []),
   ]);
 
-  section(`레인 (${s.lanes.length})`, s.lanes.length ? [
-    ...s.lanes.slice(0, lim.lanes).map((lane) => laneLine(lane, lim.progress)),
+  const groups = laneGroups(s.runners, s.lanes);
+  const byKey = new Map(s.lanes.map((lane) => [lane.key, lane]));
+  let room = lim.lanes;
+  section(`레인 (${s.lanes.length})`, groups.length ? [
+    ...groups.flatMap((g) => {
+      const shown = g.lanes.slice(0, room);
+      room -= shown.length;
+      return [groupLine(g), ...shown.map((key) => laneLine(byKey.get(key)!, lim.progress))];
+    }),
     ...(s.lanes.length > lim.lanes ? [`- ${more(s.lanes.length - lim.lanes)}`] : []),
   ] : ["- 없음"]);
 
@@ -641,10 +718,10 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
     ...s.waits.slice(0, lim.waits).map((w) => {
       const fire = waitFireMs(w);
       const timeout = waitTimeoutMs(w);
-      const when = fire !== null ? `${kst(fire)} KST에 실행 (${left(fire, now)})`
-        : timeout !== null ? `신호 대기, ${kst(timeout)} KST 시한 (${left(timeout, now)})`
+      const when = fire !== null ? `${time(s, fire)}에 실행 (${left(fire, now)})`
+        : timeout !== null ? `신호 대기, ${time(s, timeout)} 시한 (${left(timeout, now)})`
         : `조건: ${clip(w.until, 50)}`;
-      return `- ${w.key}: ${when}${w.note ? ` - ${clip(w.note, lim.progress)}` : ""}`;
+      return `- ${w.key}${w.machine ? machineMark(s, w.machine) : ""}: ${when}${w.note ? ` - ${clip(w.note, lim.progress)}` : ""}`;
     }),
     ...(s.waits.length > lim.waits ? [`- 외 ${s.waits.length - lim.waits}개`] : []),
   ] : ["- 없음"]);
@@ -701,23 +778,30 @@ const PAGE_BODY_MAX = STATUS_MAX_CHARS - 120;
 export const statusPages = (s: Status): string[] => {
   // Choose page 1's limits with the longest "more" line it can get, so the real one never pushes it over.
   const { lim } = fit(s, (hidden) => `외 ${hidden}개 (2-99999쪽)`);
-  const rest = s.lanes.slice(lim.lanes);
+  const ordered = groupedLanes(s);
+  const rest = ordered.slice(lim.lanes);
   if (!rest.length) return [renderStatus(s)];
   const chunks: string[][] = [];
   let chunk: string[] = [];
   let size = 0;
-  for (const lane of rest) {
+  // A runner's heading opens its group; a page that starts inside a group repeats it as "이어서".
+  let prev = ordered[lim.lanes - 1]?.group.machine;
+  for (const { lane, group } of rest) {
     const line = clip(laneLine(lane, PAGE_PROGRESS), PAGE_LINE_MAX);
-    if (chunk.length && size + line.length + 1 > PAGE_BODY_MAX) { chunks.push(chunk); chunk = []; size = 0; }
+    let head = group.machine !== prev ? groupLine(group) : undefined;
+    if (chunk.length && size + line.length + 1 + (head ? head.length + 1 : 0) > PAGE_BODY_MAX) { chunks.push(chunk); chunk = []; size = 0; }
+    if (!chunk.length && !head) head = `▸ ${group.machine} 이어서`;
+    if (head) { chunk.push(head); size += head.length + 1; }
     chunk.push(line);
     size += line.length + 1;
+    prev = group.machine;
   }
   chunks.push(chunk);
   const total = chunks.length + 1;
-  const now = kst(Date.parse(s.at));
+  const now = time(s, Date.parse(s.at));
   const first = bounded(build(s, lim, (hidden) => `외 ${hidden}개 (${total > 2 ? `2-${total}` : "2"}쪽)`));
   return [first, ...chunks.map((lines, i) => [
-    `도리 레인 · ${i + 2}/${total}쪽 · ${now} KST`,
+    `도리 레인 · ${i + 2}/${total}쪽 · ${now}`,
     "",
     `■ 레인 (${s.lanes.length}) 이어서`,
     ...lines,

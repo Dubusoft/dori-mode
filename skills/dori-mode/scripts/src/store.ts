@@ -22,7 +22,7 @@ export const PRE_SQLITE_FILE = "supervisor.json.pre-sqlite";
 export const WAKES_FILE = "lead-wakes.jsonl";
 /** The json store's consumed take receipts (event-trace.ts), one `{ids, at, session}` per line; sqlite keeps them on deliveries. */
 export const TAKES_FILE = "lead-takes.jsonl";
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 /** Every row belongs to the single lead today; per-lead rows arrive with Phase 3. */
 export const DEFAULT_LEAD = "dori";
 
@@ -210,7 +210,12 @@ CREATE INDEX IF NOT EXISTS lead_wakes_at ON lead_wakes (at);
   [5, (db) => addColumns(db, "lead_state", ["outcomes TEXT"])],
   [6, (db) => { addColumns(db, "events", ["meta TEXT"]); addColumns(db, "deliveries", ["taken_at INTEGER", "taken_session TEXT"]); }],
   [7, (db) => addColumns(db, "lead_state", ["pending TEXT"])],
-  [8, (db) => addColumns(db, "gh_prs", ["head_repo TEXT"])]];
+  [8, (db) => addColumns(db, "gh_prs", ["head_repo TEXT"])],
+  [9, (db) => addColumns(db, "owner_messages", ["awaiting_owner_at INTEGER", "awaiting_note TEXT"])]];
+
+/** Whether `table` has `column`: a read-only reader of a store the supervisor has not migrated yet must not name it. */
+export const hasColumn = (db: Database, table: string, column: string): boolean =>
+  (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((info) => info.name === column);
 
 /** ADD COLUMN has no IF NOT EXISTS: a migration replayed over a database that already has a column must skip it. */
 const addColumns = (db: Database, table: string, columns: readonly string[]): void => {
@@ -291,13 +296,13 @@ export class SqliteStore implements JournalStore {
       eventTombstone: db.prepare("INSERT OR IGNORE INTO event_tombstones (id, at) VALUES (?, ?)"),
       tombstoned: db.prepare("SELECT 1 AS hit FROM event_tombstones WHERE id = ?"),
       owner: db.prepare(`INSERT INTO owner_messages (id, pos, lead, generation, state, since, reminded, noticed, acked_at, tasks, lanes, reply,
-          handled_at, handling_since, unhandled_reminded_at, revision, deleted)
+          handled_at, handling_since, unhandled_reminded_at, revision, deleted, awaiting_owner_at, awaiting_note)
         VALUES ($id, $pos, $lead, 0, $state, $since, $reminded, $noticed, $acked_at, $tasks, $lanes, $reply, $handled_at, $handling_since,
-          $unhandled_reminded_at, $revision, $deleted)
+          $unhandled_reminded_at, $revision, $deleted, $awaiting_owner_at, $awaiting_note)
         ON CONFLICT (id) DO UPDATE SET state = excluded.state, since = excluded.since, reminded = excluded.reminded, noticed = excluded.noticed,
           acked_at = excluded.acked_at, tasks = excluded.tasks, lanes = excluded.lanes, reply = excluded.reply, handled_at = excluded.handled_at,
           handling_since = excluded.handling_since, unhandled_reminded_at = excluded.unhandled_reminded_at, revision = excluded.revision,
-          deleted = excluded.deleted`),
+          deleted = excluded.deleted, awaiting_owner_at = excluded.awaiting_owner_at, awaiting_note = excluded.awaiting_note`),
       ownerDelete: db.prepare("DELETE FROM owner_messages WHERE id = ?"),
       revisionsDelete: db.prepare("DELETE FROM owner_revisions WHERE message_id = ?"),
       revision: db.prepare("INSERT OR IGNORE INTO owner_revisions (message_id, revision_id, pos) VALUES (?, ?, ?)"),
@@ -383,6 +388,7 @@ export class SqliteStore implements JournalStore {
         ackedAt: num(row.acked_at), tasks: num(row.tasks), lanes, reply: row.reply === null ? undefined : row.reply === 1,
         handledAt: num(row.handled_at), handlingSince: num(row.handling_since), unhandledRemindedAt: num(row.unhandled_reminded_at),
         revision: str(row.revision), revisions: revs, deleted: row.deleted ? true : undefined,
+        awaitingOwnerAt: num(row.awaiting_owner_at), awaitingNote: str(row.awaiting_note),
         quarantined: row.state === "quarantined" ? true : undefined,
       };
       return Object.fromEntries(Object.entries(entry).filter(([, value]) => value !== undefined)) as AwaitingAck;
@@ -519,6 +525,7 @@ export class SqliteStore implements JournalStore {
         lanes: entry.lanes === undefined ? null : JSON.stringify(entry.lanes), reply: entry.reply === undefined ? null : entry.reply ? 1 : 0,
         handled_at: entry.handledAt ?? null, handling_since: entry.handlingSince ?? null, unhandled_reminded_at: entry.unhandledRemindedAt ?? null,
         revision: entry.revision ?? null, deleted: entry.deleted ? 1 : null,
+        awaiting_owner_at: entry.awaitingOwnerAt ?? null, awaiting_note: entry.awaitingNote ?? null,
       });
       if (old?.revisions === entry.revisions) return;
       const had = new Set(old?.revisions ?? []);
@@ -692,9 +699,15 @@ export const openStore = (stateDir: string, kind: StoreKind, now: () => number =
   return new SqliteStore(sqlitePath, { create: true, now });
 };
 
-/** The store that holds this state dir's journal on disk: sqlite once imported (no supervisor.json left), else json. */
-export const storeOnDisk = (stateDir: string): StoreKind =>
-  existsSync(join(stateDir, SQLITE_FILE)) && !existsSync(join(stateDir, JOURNAL_FILE)) ? "sqlite" : "json";
+/**
+ * The store that holds this state dir's journal on disk: sqlite once imported (no supervisor.json left), else json.
+ * An import marker with neither file left (database lost) also answers sqlite, so openStore stops with STORE_MISSING
+ * instead of starting an empty json journal.
+ */
+export const storeOnDisk = (stateDir: string): StoreKind => {
+  if (existsSync(join(stateDir, JOURNAL_FILE))) return "json";
+  return existsSync(join(stateDir, SQLITE_FILE)) || existsSync(join(stateDir, PRE_SQLITE_FILE)) ? "sqlite" : "json";
+};
 
 /**
  * Read-only views for readers outside the Supervisor (status): they never parse the journal file

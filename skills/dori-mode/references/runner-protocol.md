@@ -34,12 +34,15 @@ frame closes the connection without an ack.
 
 Control frames, used in this release:
 
-- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, nonce, dh}`,
+- Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, worktreeRoot?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
-  `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)).
+  `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)),
+  `secret.get {rid, key, names, repo?}` and `secret.run {rid, key, op, repo?}` (protocol 6, see [Secrets](#secrets-over-the-link)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
   `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`, and the queries `q.panes`,
-  `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3).
+  `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3), and `secret.value` and
+  `secret.run.result {rid, ok, code?, detail?, sealed?: {n, c}}` (protocol 6). The secret frames are control frames: no
+  `seq`/`cmdSeq`, never queued, journaled or logged.
 
 `hello` must be the first frame on a connection (after an `enroll` connection has closed). After the handshake
 (below) the hub applies its hello rules: `RUNNER_PROTO_MISMATCH` when the protocol version isn't accepted, then the
@@ -47,11 +50,12 @@ fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
 `lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `herdr.state`, `herdr.start`, `heavy.state` and `cmd.result`. Today
-a runner publishes `lane.state`, `lane.progress`, `cmd.result` and, on a worker, `lane.started`, `lane.report` and
+a runner publishes `lane.state`, `lane.progress`, `cmd.result`, `wait.result` and `job.result` and, on a worker, `lane.started`, `lane.report` and
 the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
 `lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `host.herdr`, `runner.rotate`)
 are part of the schema. A worker's runner carries out `lane.start`, `lane.stop`, `lane.close`, `lane.send`,
-`lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); `runner.rotate` is
+`lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); every runner, the local one
+included, carries out `wait.check` and `job.run` (see [Runner-owned waits and jobs](#runner-owned-waits-and-jobs)); `runner.rotate` is
 handled by the connection itself. Every command the runner receives goes through the command policy (below): a refused one is
 answered `cmd.result failed RUNNER_CMD_REJECTED <rule>`, a carried-out one `cmd.result verified <detail>`, and an
 accepted one that this release cannot carry out yet `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Both get an
@@ -86,7 +90,7 @@ runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<l
 
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
-`lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal}`,
+`lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal, execution?}` (`/goal resume`, then `/resume` when the pane shows omo's Esc-paused footer, then the turn read back: `running` or `held`),
 `lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
 `lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
 managed, paused}`. A runner effect that only returns a
@@ -176,21 +180,118 @@ refuses or fails leaves the lane without an agent and raises `RUNNER_LAUNCH_FAIL
 (urgent); the supervisor's own recovery never relaunches a runner-owned lane, which only its runner recovers
 (`lane.recover`).
 
+Edits apply without restarting the runner. It watches `runner-config.json` (the local runner also watches the
+`config.json` its derived policy and guard defaults come from), debounced by 0.5 s, with a stat check every 30 s for
+filesystems that miss watch events. A file that loads and validates replaces the live policy in place: the next command,
+query and guard tick use it, and running lanes are left alone. `RUNNER_CONFIG_RELOADED <keys>` is logged and sent as a
+`runner.config` event (`state` `reloaded`), which the supervisor journals for the lead as digest
+`RUNNER_CONFIG_RELOADED runner=<label> <keys>`. When the reported workspaces change, the runner reconnects at once so
+its next hello carries them; unacked events replay from the outbox as after any reconnect. A file that does not load
+or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `invalid`). On the local runner a changed
+`diskGuardPath` applies only after a restart: `RUNNER_CONFIG_RESTART_NEEDED` (state `restart`).
+
 | Key | Meaning | Default |
 |---|---|---|
 | `agents` | profile name to argv; `lane.start.agentProfile` must name one | none |
-| `allowedRoots` | directories every `cwd` must be under | none |
+| `allowedRoots` | directories every `cwd` must be under, besides the lanes directory, `reposRoot` and the effective worktree root, which are always added; optional, see [Derived allowed roots](#derived-allowed-roots) | derived |
 | `sandbox` | `required` refuses `lane.start` with `sandbox: false` | `optional` |
+| `sandboxCheck` | argv run before a `lane.start` with `sandbox: true`; a non-zero exit refuses it with `sandbox-unavailable` and its stderr. `dori runner install` sets it to `lane-sandbox --check` on Linux and macOS, where it also ships the wrapper (bubblewrap on Linux, Seatbelt `sandbox-exec` on macOS) and sets `sandbox: required`; Windows has no lane sandbox, so it gets `sandbox: optional`, only the `default` profile and no `sandboxCheck` (an older install's `lane-sandbox` profile and check are removed); the lead starts its lanes unsandboxed with `SANDBOX_SKIPPED` | none |
 | `jobs` | `deny` refuses `job.run`, `wait.check`, `lane.git` and a `q.lane.inspect` with `done` | `allow` |
 | `guard` | this host's guard thresholds (`loadAlert`, `loadOk`, `memFreeMinPct`, `memFreeCritPct`, `swapFreeCritPct`, `diskFreeMinGb`, `panesMax`), each optional | the config's `guard` |
 | `heavyKill` | command-line patterns killed under critical memory | the config's `heavyKill` |
+| `reposRoot` | the directory whose direct children are this host's repos for placement, absolute or `~/...`; see [Workspace placement](#workspace-placement) | none |
+| `worktreeRoot` | where lanes on this host create their git worktrees, absolute or `~/...`; reported in the hello | `<reposRoot>/worktrees` when `reposRoot` is set, else none |
+| `workspaces` | overrides for discovered repos: `{"owner/repo": "<checkout path>"}`, absolute or `~/...`; an entry replaces the discovered path of that repo (case-insensitive) or adds a repo not under `reposRoot` | none |
+| `detectWorkspaces` | `false` turns off the scan of `allowedRoots` for checkouts (`detected`); `dori runner setup` does not ask it (`--set detectWorkspaces=false`) | `true` |
+
+A `lane.start` without `cwd` (`dori launch --machine M` with no `--cwd`) starts in its own directory `<runnerDir>/lanes/<key>`
+(`~/.dori/runner/lanes/<key>`, `%USERPROFILE%\.dori\runner\lanes\<key>` on Windows). The runner fills it before the
+`allowedRoots` check, creates it (0700) when the start runs, and the `lane.start` result reports it as `cwd`. The
+runner creates `<runnerDir>/lanes` at start and always admits it as an allowed root (unless a listed root already holds
+it); the runner-directory safety check audits each `lanes/<key>` directory itself but not what the lane puts in it.
+A key that cannot name a directory is refused `cwd-missing`. The lane sandbox (Linux and macOS) lets such a lane read
+and write its own directory; update the wrapper (`dori runner update`) on a host that still has an older one.
+
+The former `defaultCwd` key is retired. A runner-config.json that still holds it loads as before, the key is ignored
+and each load logs one `RUNNER_CONFIG_KEY_IGNORED defaultCwd: ...` line; `dori runner setup` removes it.
 
 A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
 `unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
 (compared by path segment after resolving symlinks on both sides, so `/data/repos-evil` is not under `/data/repos`),
-`sandbox-required`, `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
+`sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
 `guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
 `lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
+
+### Derived allowed roots
+
+A runner-config.json without `allowedRoots` (or with `[]`) gets these roots instead, then `reposRoot` and the
+effective worktree root as always:
+
+- the runner's temp directory (`os.tmpdir()`: `$TMPDIR`, else `/tmp` on Linux; the per-user `$TMPDIR` on macOS;
+  `%TEMP%` on Windows), where lanes and jobs keep scratch files;
+- the runner's home only when the file sets neither `reposRoot` nor `worktreeRoot`. Such a file names no other place
+  to work, and that is the root `dori runner install`'s starter gives. A file that does name a repo location keeps
+  home out, because home would admit every file the runner's user owns, the runner directory and its keys included.
+
+The lanes directory is added after these, so a `lane.start` without `cwd` passes the check on every host. A listed
+`allowedRoots` is used as written and nothing is derived. A worker without any runner-config.json keeps no roots at all (it has no agent
+profile either), and the local runner without the file keeps the policy derived from config.json.
+
+### Workspace placement
+
+A runner tells the supervisor which repos live on its host, and `dori launch` places work by it (see
+`dori placement` in scripts.md). Each hello carries two optional lists of `{repo, path}`:
+
+- `workspaces`: the declared repos. Every directory directly under `reposRoot` that holds a `.git` directory is one
+  (symlinks not followed; dot folders, the effective worktree root and linked worktrees, whose `.git` is a file, are
+  skipped), named by the owner/repo of its `origin`; a directory without an origin is skipped. When two directories
+  share an origin (case-insensitive) the first by name is kept and each scan logs
+  `RUNNER_WORKSPACE_DUPLICATE <repo> <kept> <skipped>`. Runner-config `workspaces` entries then replace the discovered
+  path of their repo or add one. Each path must pass the same check as a `cwd` (absolute, resolving, under
+  `allowedRoots`); one that fails is left out and logged `RUNNER_WORKSPACE_SKIPPED <repo> <rule> <path>`. These decide
+  placement: a launch for a declared repo goes to that runner and holds while it is offline. A repo several runners
+  declare is not an error: each is a candidate, and the launch takes the first with room (`dori launch` in scripts.md).
+- `detected`: directories with a `.git` directory, up to three levels below an allowed root (dot folders,
+  `node_modules` and, on macOS, the TCC-guarded home folders skipped; a worktree's `.git` file is not a checkout),
+  whose `origin` names an owner/repo the runner does not declare, and not under the worktree root; at most 200.
+  Information only: such a repo follows `placement.defaultMachine`.
+- `worktreeRoot`: the effective worktree root, absolute (runner-config `worktreeRoot`, else `<reposRoot>/worktrees`;
+  the local runner without either reports config.json `worktreeRoot`), sent only when there is one. A lane placed on this runner creates its worktrees there (its brief footer says so).
+
+The runner caches the report and rescans when `reposRoot` changes: it watches `reposRoot` with `fs.watch`
+(non-recursive; inotify on Linux, FSEvents on macOS), debounced by 2 s, rescans every 5 minutes as a fallback (also
+re-arming a watch that failed, `RUNNER_REPOS_WATCH_FAILED <detail>`, or a `reposRoot` that did not exist yet), and
+rescans after a runner-config reload. A report that changed is sent with a new hello.
+
+The hub stores the three in the `runners.workspaces` column at each hello that carries any of them, and keeps the last report
+while the runner is away. The local runner (no runner-config.json) reports the same way: a runner-config.json
+holding only `workspaces`, `detectWorkspaces`, `reposRoot` and `worktreeRoot` adds them to the policy derived from
+config.json; a file with any other key is the whole policy, as before. Every runner-config.json (a remote runner's
+too) gets `reposRoot` and the effective worktree root added to `allowedRoots`, so they need not be listed. The fields need no protocol bump, but a supervisor older than them refuses
+the hello `unknown-field`, so update the supervisor before its runners.
+
+## Runner-owned waits and jobs
+
+A wait (`dori wait --machine`), poll source or command schedule (`--machine`) that names a runner is carried out on
+it. The supervisor keeps the scheduling, dedupe and journal; it sends each check or run over `RunnerCall` and waits
+for the `cmd.result`. A runner that is not connected fails the call at once with `RUNNER_UNAVAILABLE`. Both commands
+need protocol 5 (`NEEDS_PROTO`); there is no protocol bump. A runner without the handler answers `cmd.result failed
+RUNNER_CMD_UNSUPPORTED <type>`. Under `jobs: deny` both are refused (`jobs-denied`), and `cwd` must be absolute,
+existing and under `allowedRoots`.
+
+| Command | Body | `cmd.result` result |
+| --- | --- | --- |
+| `wait.check` | `{cmdId, waitId, signal, cwd}` | `{met, error?}` |
+| `job.run` | `{cmdId, opKey, name, command: string[], cwd, timeoutSec, heavy}` | `{exitCode, timedOut, output, err}` |
+
+- `wait.check` runs the `Done =` signal once in `cwd`, bounded by 10 s. A met check also publishes
+  `wait.result {waitId, outcome: WAIT_DONE, detail}` (detail at most 500 characters), which the supervisor settles as
+  the same `WAIT_DONE` a local check gives; an unmet or failed check publishes nothing. A check that throws answers
+  `{met: false, error}`. The supervisor allows 20 s past the check's bound.
+- `job.run` runs the argv in `cwd`, killed after `timeoutSec`, and publishes one `job.result {opKey, state:
+  verified|failed, exitCode, output}` per run (journal only). `output` is capped at 64 KiB and `err` at 4 KiB, cut on
+  a UTF-8 character boundary. `heavy: true` is not supported on a runner and fails before anything runs. The
+  supervisor allows 30 s past `timeoutSec`; a failed or malformed answer is `RUNNER_JOB_REFUSED runner=<label>`.
 
 ## Fencing
 
@@ -378,8 +479,12 @@ code and fingerprint reach `runner serve --enroll-only` through stdin, never an 
 4. Writes a starter `runner-config.json` (roots `%USERPROFILE%` and `%TEMP%`) only if none exists, and enrolls unless
    `keys\supervisor.pub` exists (failure exits 5).
 5. Registers and starts the Task Scheduler task `\dori\dori-runner` (failure exits 6): at logon, interactive token,
-   least privilege, runs on battery, restarts every minute on failure. Its action runs `runner-task.ps1`, which loops
-   `bun dori.js runner serve`, logs to `logs\runner.log` (rotated at 10 MB between starts) and restarts after 5 s.
+   least privilege, runs on battery, restarts every minute on failure. Its action runs `runner-task.ps1` as
+   `conhost.exe --headless powershell.exe ...`, so no console window opens at logon: a console program started
+   directly by the task always gets a window, and `-WindowStyle Hidden` only hides it after it has appeared (and not at
+   all when Windows Terminal is the default terminal). The wrapper loops `bun dori.js runner serve`, logs to
+   `logs\runner.log` (rotated at 10 MB between starts) and restarts after 5 s. It records its own pid in
+   `runner-task-wrapper.pid` and the runner's in `runner-task.pid`.
 
 Shims in `bin\`, all finding Bun through `bun.txt` next to them:
 
@@ -389,9 +494,10 @@ Shims in `bin\`, all finding Bun through `bun.txt` next to them:
 | cmd.exe | `dori.cmd` |
 | Git Bash / MSYS | `dori` (sh, turns off MSYS path conversion) |
 
-The supervisor drives the task with PowerShell: restart stops the task, kills the tree and starts it; stop disables
-the task first so the wrapper can't bring Bun back. `uninstall.ps1` removes the task and the install, and
-`-Purge` removes the whole runner dir.
+The supervisor drives the task with PowerShell: restart stops the task, kills the trees and starts it; stop disables
+the task first. Stopping the task ends only the headless conhost, so every stop (restart, stop, install, remove,
+`uninstall.ps1`) kills the wrapper by its recorded pid before the runner tree, so it can't bring Bun back.
+`uninstall.ps1` removes the task and the install, and `-Purge` removes the whole runner dir.
 
 On Windows the runner:
 
@@ -403,8 +509,7 @@ On Windows the runner:
   an argv with a double quote is refused with `RUNNER_LANE_ARGV_UNSAFE`;
 - only watches herdr (through CIM); it never installs or starts a herdr service.
 
-WSL and UNC runner dirs aren't supported. A Windows machine without a runner keeps working the old way: the
-PowerShell guard agent (`guard-agent.ps1`) and lane reports.
+WSL and UNC runner dirs aren't supported. A Windows machine without a runner isn't guarded at all.
 
 ## Guard
 
@@ -423,13 +528,15 @@ supervisor takes of its own host, judged against `runner-config.json`'s `guard` 
 
 The local runner on the lead host does none of this: the supervisor's own guard sweep samples and kills there.
 
-On the supervisor, the machine-guard sweep takes a runner's sample when it is at most 90 seconds old and then makes
-no ssh call to that machine. The sample goes through the same transitions as an ssh sample, so `HOST_GUARD ALERT`,
-`CLEAR`, `OFFLINE`, `ONLINE` and `LAUNCH_READY machine=<label>` read exactly as before. A runner machine never reads
-as `OUTDATED`, because it has no guard agent. Its critical stage reports the runner's kills (`HOST_GUARD CRITICAL
+On the supervisor, the machine-guard sweep judges each runner machine from that runner's latest sample when it is at
+most 90 seconds old; it never samples over ssh. The sample gives `HOST_GUARD ALERT`, `CLEAR` and
+`LAUNCH_READY machine=<label>`, while `OFFLINE` and `ONLINE` come from runner liveness. The critical stage reports the runner's kills (`HOST_GUARD CRITICAL
 machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane on entering critical with nothing
-killed, but it kills nothing over ssh. Without a fresh runner sample (no runner, or it went quiet) the machine is
-sampled over ssh again, as before.
+killed, but it kills nothing over ssh. A machine whose runner sent no fresh sample is skipped that round, and a machine
+without a runner isn't guarded.
+
+When it starts, a runner deletes the old guard agent files on its host (`~/.dori/guard-agent.sh`,
+`guard-agent.ps1`, `guard-agent.version`) and logs `RUNNER_GUARD_AGENT_REMOVED <files>`.
 
 ## herdr outages
 
@@ -520,6 +627,42 @@ The probe also reads the host's herdr once and adds `herdr` (`herdr=` in the tex
 `down` when none does, and `unknown` when pgrep cannot tell. It is one reading for diagnosis; the verdict and the exit
 code stay the runner's alone.
 
+## Cleanup sweep
+
+Every runner (local, remote, Windows) sweeps its own host once a day (`src/runner/cleanup.ts`); there is no per-machine
+cron or tmpfiles rule and no dry-run mode. The first check runs 10 minutes after start and then hourly; a sweep runs when
+the last one recorded in `~/.dori/runner/logs/cleanup.json` is at least 24 hours old, so restarts neither skip nor repeat
+a day.
+
+| Target | Root (Linux/macOS; Windows) | Action |
+|---|---|---|
+| lane sandbox TMPDIRs | `~/.cache/omo-tmp/lane-sandbox/<key>`; `%USERPROFILE%\.cache\omo-tmp\lane-sandbox` | files older than 3 days, then empty dirs |
+| lane build temp | `~/.cache/omo-tmp`; `%USERPROFILE%\.cache\omo-tmp` | same, 3 days |
+| system temp | `/tmp` (macOS also `$TMPDIR`); `%TEMP%` (else `%TMP%`, `%LOCALAPPDATA%\Temp`) | the user's own files older than 2 days |
+| `/var/tmp` | Linux only | the user's own files older than 30 days |
+| browser profiles | `.<id>.bun-chrome` directly in a temp root | removed when untouched for 2 hours |
+| omo sessions | `~/.omo/agent/sessions/<cwd>/*.jsonl` | untouched 14 days: moved with their `-artifacts` dir to `~/.omo/agent/sessions-archive/<cwd>/` |
+| empty artifact dirs | empty `*-artifacts` session dirs, empty dirs under `~/.dori/runner/evidence` | removed after a day |
+| memory agents | `~/.omo/memory/agents/<slug>-<hash>` | removed when untouched for 30 days |
+| worktree records | every workspace repo the runner reports | `git worktree prune` |
+
+Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The sweep never removes: an open lane's
+sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
+`~/.dori/secrets` and `~/.secrets`; anything a process holds open or runs in (Linux `/proc`, macOS `lsof`; Windows
+refuses to delete an open file); sockets, FIFOs, symlinks, lock files and other users' files; temp entries of live
+sessions (`tmux-*`, `herdr*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the rest of `TEMP_EXCLUDES`); and any root
+that is the home dir, above it, or a secret store. When the in-use listing fails, that day's sweep skips the deleting
+targets and reports `inUse=failed`.
+
+Each sweep logs one line and rewrites the status file with the full report:
+
+```text
+RUNNER_CLEANUP at=<iso> sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> worktreePrune=<ok>/<repos> freedBytes=<n> kept=<n> inUse=ok errors=<n> ms=<n>
+```
+
+To check a host, read `~/.dori/runner/logs/cleanup.json` there (`at` is the last sweep) or find the `RUNNER_CLEANUP`
+line in the runner's log.
+
 ## Shadow mode (removed)
 
 Shadow mode is gone. The supervisor always opens the hub, `dori supervise` always spawns the local runner as its
@@ -541,7 +684,10 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 4, so a supervisor accepts runners at 4 and 3. The runner's `state.sqlite` gained the
+The current protocol is 6, so a supervisor accepts runners at 6 and 5. Protocol 6 adds the four secret control frames
+(see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
+**Upgrade the supervisor before its runners**: a proto 5 runner still connects to a proto 6 supervisor, but a proto 6
+runner is refused by a proto 5 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
 nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
 
 ## Liveness and restarts
@@ -583,9 +729,9 @@ runner directory, and each runner's protocol, outbox backlog and restart circuit
 
 `dori update` restarts the supervisor first. Only once it is active again does it move the runners, one at a time.
 The local runner's unit is restarted; every other runner gets the new bundle the way `dori runner install` sends it.
-The update then waits up to 2 minutes for a hello with a higher gen before it goes to the next runner. The first
-runner that fails stops the rollout with `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent), and the runners after
-it keep their version.
+The update then waits up to 2 minutes for a hello with a higher gen before it goes to the next runner. A runner
+that fails logs `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent) and keeps its version; the rollout goes on with
+the next runner.
 
 The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_FAILED`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
 `RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_ONLINE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
@@ -651,10 +797,37 @@ does not end a lane.
 
 **Reporting.** A runner lane's footer has it report with `~/.dori/runner/bin/dori` (a wrapper the installer puts there
 for the bundle). In a lane that CLI takes only `report`, `claim-done` and `heavy`, and only for the lane's own key; any
-other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane`
-with the lane's token. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
+other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane.d/lane`
+with the lane's token. The socket has a directory of its own so the Linux lane sandbox can bind the directory rather
+than the socket file: a restarted runner binds a new socket at the same path, and a lane started before the restart
+reaches it. The runner also serves the older `~/.dori/runner/sock/lane`, and a lane's CLI falls back to it when the
+`lane.d` connect fails (a sandbox set up before the move). The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
-`guard-agent.sh heavy` uses, so old and new footers share one heavy count per machine.
+the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
+
+**Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>", "names": ["NPM_TOKEN"]}`,
+sent by the lane's `dori secret exec NAME... -- <cmd>`. `names` holds 1 to 32 unique secret names (else
+`RUNNER_LANE_BAD_REQUEST`), and the token is checked first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "..."}}`;
+a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_MISSING`,
+`RUNNER_SECRET_FAILED`). The local runner grants from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
+a protocol 5 runner answers `RUNNER_SECRET_UNSUPPORTED` and never receives a value. The lane reply is never journaled,
+logged or put in the outbox. See [secrets.md](secrets.md).
+
+### Secrets over the link
+
+Protocol 6. A remote runner sends `secret.get {rid, key, names, repo?}` (`rid`: 32 random hex chars; `repo`: the lane's
+`owner/repo` read from its worktree) and the supervisor answers `secret.value {rid, ok, code?, detail?, sealed?}`.
+`secret.run {rid, key, op, repo?}` asks the supervisor host to run the configured command `op`; the answer is
+`secret.run.result`, shaped like `secret.value`. A refusal carries `ok: false` and a `RUNNER_SECRET_*` code
+(`DENIED`, `MISSING`, `FAILED`, `UNSUPPORTED`, `OUTDATED` when either side speaks protocol < 6, `TIMEOUT` when the runner
+got no answer); `detail` names secret names and lanes, never a value.
+
+Values never cross the link in clear. `sealed {n, c}` is an AEAD box: AES-256-GCM, a fresh 12-byte nonce `n` and the
+ciphertext with its 16-byte tag `c` (both base64), under a key derived per direction from the handshake session key
+(`s2r` supervisor to runner, `r2s` runner to supervisor), with the frame's `{runner, gen, epoch, type, rid}` as
+associated data, so a box moved to another frame, rid, runner or direction fails to open. The frame also carries the
+normal `mac`. Both sides send secret frames only on an authenticated link whose peer announced protocol >= 6; the
+supervisor must therefore be upgraded before runners, and an older runner is never sent a value.
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not

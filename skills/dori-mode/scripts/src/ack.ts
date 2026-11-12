@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import { COLD_START_EMOJI } from "./supervise.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { dropCarried } from "./inbox.ts";
-import { JOURNAL_FILE, readStoreView, SQLITE_FILE } from "./store.ts";
+import { hasColumn, JOURNAL_FILE, readStoreView, SQLITE_FILE } from "./store.ts";
+import { leadOwes } from "./supervise-journal.ts";
 
 /** The lead's read receipt, the one reaction it puts on an owner message. */
 export const EYES_EMOJI = "\u{1F440}";
@@ -27,6 +28,46 @@ export type MessageCoverage = {
   readonly reply?: boolean;
   /** The lead declares every task of the message covered (e.g. one reply answering all of them). */
   readonly all?: boolean;
+  /** `--awaiting`: the lead's reply waits on the owner (a go-ahead, a choice), so nothing is owed until the owner answers. */
+  readonly awaiting?: boolean;
+  readonly note?: string;
+  /** Set by `dori handled` on a message it found unacked: it ran the ack itself ("acked") or tried and failed ("failed"). */
+  readonly autoAck?: "acked" | "failed";
+};
+
+/** How much of an `--awaiting` note is kept (it is printed on every take). */
+export const AWAITING_NOTE_MAX = 200;
+
+/** A tracked message's coverage state, as the supervisor keeps it. */
+export type TrackedCoverage = Omit<MessageCoverage, "all" | "awaiting" | "note" | "autoAck"> & {
+  readonly handledAt?: number;
+  readonly awaitingOwnerAt?: number;
+  readonly awaitingNote?: string;
+};
+
+/**
+ * Merges a tracked message's coverage with its unconsumed receipts. Each distinct lane and the reply cover one task; --all
+ * settles the task count on the coverage. An --awaiting receipt parks the message (the earliest one is the start); any
+ * --lane, --reply or --all receipt recorded after it closes the message, as the follow-up the owner's answer led to.
+ * Replaying the same receipts gives the same result.
+ */
+export const mergeCoverage = (entry: TrackedCoverage, receipts: readonly (MessageCoverage & { readonly at: number })[]): {
+  readonly tasks: number; readonly lanes: string[]; readonly reply: boolean; readonly covered: boolean;
+  readonly awaitingOwnerAt?: number; readonly awaitingNote?: string;
+} => {
+  const all = receipts.some((receipt) => receipt.all);
+  const lanes = [...new Set([...(entry.lanes ?? []), ...receipts.flatMap((receipt) => receipt.lanes ?? [])])];
+  const reply = !!(entry.reply || receipts.some((receipt) => receipt.reply) || (all && !lanes.length));
+  const tasks = all ? lanes.length + Number(reply) : Math.max(entry.tasks ?? 1, ...receipts.map((receipt) => receipt.tasks ?? 1));
+  const parked = receipts.filter((receipt) => receipt.awaiting).sort((a, b) => a.at - b.at);
+  const awaitingOwnerAt = entry.awaitingOwnerAt ?? parked[0]?.at;
+  const closes = awaitingOwnerAt !== undefined &&
+    receipts.some((receipt) => !receipt.awaiting && (receipt.lanes?.length || receipt.reply || receipt.all) && receipt.at > awaitingOwnerAt);
+  const awaitingNote = parked.findLast((receipt) => receipt.note !== undefined)?.note ?? entry.awaitingNote;
+  return {
+    tasks, lanes, reply, covered: closes || lanes.length + Number(reply) >= tasks,
+    ...(awaitingOwnerAt !== undefined ? { awaitingOwnerAt } : {}), ...(awaitingNote !== undefined ? { awaitingNote } : {}),
+  };
 };
 
 export const checkTasks = (tasks: number | undefined): void => {
@@ -77,37 +118,86 @@ const recordReceipt = (stateDir: string, channel: string, message: string, at: n
 export const recordAck = (stateDir: string, channel: string, message: string, at: number, tasks?: number): void =>
   recordReceipt(stateDir, channel, message, at, { tasks });
 
+const checkHandled = (coverage: MessageCoverage): void => {
+  if (!coverage.lanes?.length && !coverage.reply && !coverage.all && !coverage.awaiting) throw new AckError("handled needs --lane <key>, --reply, --all and/or --awaiting");
+  if (coverage.note !== undefined && !coverage.awaiting) throw new AckError("--note goes with --awaiting");
+  if (coverage.lanes?.some((lane) => !/^[\w.-]+$/.test(lane))) throw new AckError("--lane must name a lane key");
+};
+
 /** Each distinct lane and the optional reply cover one declared task; replaying the same link never adds coverage. */
 export const recordHandled = (stateDir: string, channel: string, message: string, at: number, coverage: MessageCoverage): void => {
-  if (!coverage.lanes?.length && !coverage.reply && !coverage.all) throw new AckError("handled needs --lane <key>, --reply and/or --all");
-  if (coverage.lanes?.some((lane) => !/^[\w.-]+$/.test(lane))) throw new AckError("--lane must name a lane key");
+  checkHandled(coverage);
   recordReceipt(stateDir, channel, message, at, coverage);
-  // A complete message no longer needs its UNFINISHED reminder. Completeness is the supervisor's merge (consumeReceipts)
-  // of the coverage it already tracks with the receipts it has not consumed yet; an unreadable store leaves the pruning
-  // to the supervisor.
+  // A message the lead no longer owes (complete, or waiting on the owner) no longer needs its UNFINISHED reminder. That is
+  // the supervisor's merge (consumeReceipts) of the coverage it already tracks with the receipts it has not consumed yet;
+  // an unreadable store leaves the pruning to the supervisor.
   const id = ownerMessageId(channel, message);
   const tracked = trackedCoverage(stateDir, id);
   if (!tracked) return;
-  const entry = tracked.entry ?? {};
-  const receipts = pendingAcks(stateDir).filter((receipt) => receipt.id === id);
-  const all = receipts.some((receipt) => receipt.all);
-  const lanes = new Set([...(entry.lanes ?? []), ...receipts.flatMap((receipt) => receipt.lanes ?? [])]);
-  const reply = !!(entry.reply || receipts.some((receipt) => receipt.reply) || (all && !lanes.size));
-  const covered = lanes.size + Number(reply);
-  const tasks = all ? covered : Math.max(entry.tasks ?? 1, ...receipts.map((receipt) => receipt.tasks ?? 1));
-  if (covered >= tasks) dropCarried(stateDir, id);
+  const merged = mergeCoverage(tracked.entry ?? {}, pendingAcks(stateDir).filter((receipt) => receipt.id === id));
+  if (!leadOwes({ handledAt: merged.covered ? at : undefined, awaitingOwnerAt: merged.awaitingOwnerAt })) dropCarried(stateDir, id);
 };
 
-/** The coverage the supervisor tracks for owner message `id` (`entry` absent when untracked); undefined when the store cannot be read. */
-const trackedCoverage = (stateDir: string, id: string): { readonly entry?: MessageCoverage } | undefined =>
+/**
+ * Whether the lead's read receipt on this message exists: an ack receipt the supervisor has not consumed yet, or a
+ * tracked ack. An unreadable store counts as no ack (acking again is harmless: the supervisor keeps the earliest ack time).
+ */
+export const ackRecorded = (stateDir: string, channel: string, message: string): boolean => {
+  const id = ownerMessageId(channel, message);
+  // Only a pure ack receipt counts: a pending link (say, one whose auto-ack failed) put no eyes on the message.
+  const isAck = (receipt: MessageCoverage): boolean => !receipt.lanes?.length && !receipt.reply && !receipt.all && !receipt.awaiting;
+  return pendingAcks(stateDir).some((receipt) => receipt.id === id && isAck(receipt)) || trackedCoverage(stateDir, id)?.ackedAt !== undefined;
+};
+
+/** What `dori handled` did about a missing ack: nothing (already acked), acked it itself, or failed to (with the reason). */
+export type HandledOutcome = { readonly autoAck?: "acked" } | { readonly autoAck: "failed"; readonly error: string };
+
+/**
+ * `dori handled`: a message the lead never acked gets the same ack `dori ack` gives it (hourglass off, eyes on, read
+ * receipt) before the handled link, so the owner sees it was read. A failed ack never blocks the link; the receipt
+ * carries the outcome for the supervisor's log either way. `discord` is called only when an ack is needed.
+ */
+export const handled = async (
+  stateDir: string, discord: () => AckReactions, channel: string, message: string, now: number, coverage: MessageCoverage,
+): Promise<HandledOutcome> => {
+  if (!DISCORD_ID.test(channel) || !DISCORD_ID.test(message)) throw new AckError("channel must be a Discord channel id, and message its message id (digits only)");
+  checkTasks(coverage.tasks);
+  checkHandled(coverage);
+  let outcome: HandledOutcome = {};
+  if (!ackRecorded(stateDir, channel, message)) {
+    try {
+      await ack(stateDir, discord(), channel, message, now);
+      outcome = { autoAck: "acked" };
+    } catch (e) {
+      outcome = { autoAck: "failed", error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  recordHandled(stateDir, channel, message, now, { ...coverage, ...(outcome.autoAck ? { autoAck: outcome.autoAck } : {}) });
+  return outcome;
+};
+
+/**
+ * The coverage the supervisor tracks for owner message `id` (`entry` absent when untracked) and its ack time; undefined
+ * when the store cannot be read.
+ */
+const trackedCoverage = (stateDir: string, id: string): { readonly entry?: TrackedCoverage; readonly ackedAt?: number } | undefined =>
   !existsSync(join(stateDir, JOURNAL_FILE)) && !existsSync(join(stateDir, SQLITE_FILE)) ? {} : readStoreView(stateDir, {
   json: (journal) => {
     const entry = journal.awaitingAck?.find((tracked) => tracked.id === id);
-    return entry ? { entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply } } : {};
+    return entry ? {
+      entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply, awaitingOwnerAt: entry.awaitingOwnerAt },
+      ...(entry.ackedAt !== undefined ? { ackedAt: entry.ackedAt } : {}),
+    } : {};
   },
   sqlite: (db) => {
-    const row = db.query("SELECT tasks, lanes, reply FROM owner_messages WHERE id = ?").get(id) as { tasks: number | null; lanes: string | null; reply: number | null } | null;
-    return row ? { entry: { tasks: row.tasks ?? undefined, lanes: row.lanes ? JSON.parse(row.lanes) as string[] : undefined, reply: row.reply === 1 } } : {};
+    // A store the supervisor has not migrated yet has no awaiting column: nothing there is parked.
+    const parked = hasColumn(db, "owner_messages", "awaiting_owner_at") ? ", awaiting_owner_at" : "";
+    const row = db.query(`SELECT tasks, lanes, reply, acked_at${parked} FROM owner_messages WHERE id = ?`).get(id) as
+      { tasks: number | null; lanes: string | null; reply: number | null; acked_at: number | null; awaiting_owner_at?: number | null } | null;
+    return row ? { entry: {
+      tasks: row.tasks ?? undefined, lanes: row.lanes ? JSON.parse(row.lanes) as string[] : undefined, reply: row.reply === 1,
+      awaitingOwnerAt: row.awaiting_owner_at ?? undefined,
+    }, ...(row.acked_at !== null ? { ackedAt: row.acked_at } : {}) } : {};
   },
 });
 
@@ -120,7 +210,8 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
     if (!m) return [];
     const path = join(ackDir(stateDir), name);
     try {
-      const { at, tasks, lanes, reply, all } = JSON.parse(readFileSync(path, "utf8")) as { at?: unknown; tasks?: unknown; lanes?: unknown; reply?: unknown; all?: unknown };
+      const { at, tasks, lanes, reply, all, awaiting, note, autoAck } = JSON.parse(readFileSync(path, "utf8")) as
+        { at?: unknown; tasks?: unknown; lanes?: unknown; reply?: unknown; all?: unknown; awaiting?: unknown; note?: unknown; autoAck?: unknown };
       if (tasks !== undefined && (typeof tasks !== "number" || !Number.isSafeInteger(tasks) || tasks < 1)) return [];
       if (lanes !== undefined && (!Array.isArray(lanes) || !lanes.every((lane): lane is string => typeof lane === "string" && /^[\w.-]+$/.test(lane)))) return [];
       return [{
@@ -129,6 +220,8 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
         ...(Array.isArray(lanes) ? { lanes } : {}),
         ...(reply === true ? { reply: true } : {}),
         ...(all === true ? { all: true } : {}),
+        ...(awaiting === true ? { awaiting: true, ...(typeof note === "string" ? { note } : {}) } : {}),
+        ...(autoAck === "acked" || autoAck === "failed" ? { autoAck } : {}),
       }];
     } catch { return []; }
   });

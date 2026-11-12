@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
-import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { platform } from "node:os";
 
+import { omoSessionsDir } from "../config.ts";
 import { type HostSample, sampleHost } from "../host-guard.ts";
 import { listPanes, type Pane, readScreen } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
@@ -13,6 +13,8 @@ import type {
   AnySupervisorControl, JsonValue, LaneInspection, MachineObservation, ProcessInfo, QueryBodies, QueryResults, QueryType, RunnerControlBodies,
 } from "./protocol.ts";
 import { laneStatus } from "./serve.ts";
+import { checkFileBody, LaneFileError } from "./lane-files.ts";
+import type { LaneOutputFiles } from "./protocol.ts";
 
 /**
  * The runner's answers to the supervisor's read-only `q.*` queries (design 0.3, 2.4): control frames that are never
@@ -27,6 +29,7 @@ export const SCREEN_MAX_LINES = 400;
 export type QueryLane = { readonly pane?: string; readonly cwd?: string };
 
 export type QueryDeps = {
+  readonly files?: (key: string) => LaneOutputFiles | undefined;
   readonly currentPane?: (key: string, panes: readonly Pane[]) => Promise<Pane | undefined>;
   readonly run: Runner;
   readonly clock: Clock;
@@ -42,10 +45,12 @@ export type QueryDeps = {
   readonly signalIo?: Omit<SignalIo, "cwd">;
   /** The agent session directory a `session` inspection reads when the query names none. */
   readonly sessionsDir?: string;
+  /** The guard thresholds runner-config.json sets (policy.ts `guard`), reported by `q.machine.observe`. */
+  readonly guard?: RunnerPolicy["guard"];
 };
 
 /** Default agent session directory on a host (omo's own). */
-export const defaultSessionsDir = (): string => join(homedir(), ".omo", "agent", "sessions");
+export const defaultSessionsDir = (): string => omoSessionsDir();
 
 type Body<T extends QueryType> = Omit<QueryBodies[T], "qid">;
 
@@ -121,13 +126,17 @@ export const laneInspect = async (deps: QueryDeps, body: Body<"q.lane.inspect">)
   };
 };
 
-/** `q.machine.observe`: this host's guard sample (its `panes` filled from the pane list, -1 when unreadable) and pane list. */
+/**
+ * `q.machine.observe`: this host's guard sample (its `panes` filled from the pane list, -1 when unreadable), pane list,
+ * and the guard thresholds its runner-config.json sets (`guard`, only when it sets any).
+ */
 export const observeMachine = async (deps: QueryDeps): Promise<MachineObservation> => {
   let panes: Pane[] | undefined;
   try { panes = await listPanes(deps.run); } catch { panes = undefined; }
   const listed = panes;
   const sample: HostSample = await sampleHost(deps.run, deps.dataPath ?? "/", async () => listed?.length ?? -1, deps.readMemInfo);
-  return { os: deps.os ?? platform(), sampledAt: deps.clock.now(), sample, panes: listed ?? [] };
+  const guard = deps.guard && Object.keys(deps.guard).length > 0 ? { guard: deps.guard } : {};
+  return { os: deps.os ?? platform(), sampledAt: deps.clock.now(), sample, panes: listed ?? [], ...guard };
 };
 
 /** Runs one checked query and resolves to its result. */
@@ -135,6 +144,11 @@ export const answerQuery = async (deps: QueryDeps, query: AnySupervisorControl):
   const { qid: _qid, ...body } = query.body as { readonly qid: string } & Record<string, unknown>;
   const result: QueryResults[QueryType] = await (async () => {
     switch (query.type) {
+      case "q.lane.files": {
+        if (!deps.files) throw new Error("RUNNER_QUERY_UNSUPPORTED q.lane.files");
+        const files = deps.files((body as Body<"q.lane.files">).key);
+        return files ? { files } : {};
+      }
       case "q.panes": return queryPanes(deps);
       case "q.screen": return queryScreen(deps, body as Body<"q.screen">);
       case "q.process": return queryProcess(deps, body as Body<"q.process">);
@@ -148,7 +162,8 @@ export const answerQuery = async (deps: QueryDeps, query: AnySupervisorControl):
 };
 
 export type QueryDispatchDeps = QueryDeps & {
-  readonly policy: Pick<RunnerPolicy, "jobs">;
+  /** `guard` (runner-config.json's thresholds) is what `q.machine.observe` reports. */
+  readonly policy: Pick<RunnerPolicy, "jobs" | "guard">;
   /** Sends the `q.result` control frame (client.ts `control("q.result", ...)`). */
   readonly reply: (body: RunnerControlBodies["q.result"]) => void;
   readonly log: (line: string) => void;
@@ -176,10 +191,17 @@ export const queryDispatcher = (deps: QueryDispatchDeps) => (frame: unknown): vo
     send({ qid, ok: false, detail: `RUNNER_CMD_REJECTED ${checked.rule}` });
     return;
   }
-  void answerQuery(deps, checked.query).then(
-    (result) => send({ qid, ok: true, detail: "", result }),
+  void answerQuery({ ...deps, guard: deps.guard ?? deps.policy.guard }, checked.query).then(
+    (result) => {
+      const response = { qid, ok: true, detail: "", result };
+      if (checked.query.type === "q.lane.files") {
+        try { checkFileBody(checked.query.body.key, response); }
+        catch (error) { send({ qid, ok: false, detail: (error as Error).message }); return; }
+      }
+      send(response);
+    },
     (error: unknown) => {
-      const detail = `RUNNER_QUERY_FAILED ${type} ${error instanceof Error ? error.message : String(error)}`.slice(0, 400);
+      const detail = error instanceof LaneFileError ? error.message : `RUNNER_QUERY_FAILED ${type} ${error instanceof Error ? error.message : String(error)}`.slice(0, 400);
       deps.log(`${detail} qid=${qid}`);
       send({ qid, ok: false, detail });
     },

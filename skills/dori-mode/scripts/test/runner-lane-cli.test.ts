@@ -1,13 +1,14 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GUARD_AGENT_TEMPLATE } from "../src/remote-guard.ts";
 import { heavyDirOf, laneCliMain } from "../src/runner/lane-cli.ts";
 import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { connectUnix, listenUnix } from "../src/runner/unix-transport.ts";
+import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
+import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -18,22 +19,51 @@ const io = () => {
   const err: string[] = [];
   return { out, err, deps: { out: (l: string) => { out.push(l); }, err: (l: string) => { err.push(l); } } };
 };
-const laneSocket = () => {
+const laneSocket = (capture?: () => LaneOutputFiles | undefined) => {
   const net = memoryNetwork();
   const published: [RunnerEventType, unknown][] = [];
-  serveLaneSocket(net.listener, { tokenFor: (key, token) => key === "lane-a" && token === "tok-a" }, (type, body) => { published.push([type, body]); }, () => {});
+  serveLaneSocket(net.listener, { tokenFor: (key, token) => key === "lane-a" && token === "tok-a", ...(capture ? { reportFiles: capture } : {}) }, (type, body) => { published.push([type, body]); }, () => {});
+  const requests: Record<string, unknown>[] = [];
   // The in-memory link delivers on pump(); pumping on each send delivers the request and the socket's reply in order.
   const connect: Connector = async () => {
     const link = await net.connect();
     const pair = net.pairs.at(-1) as (typeof net.pairs)[number];
     return {
-      send: (line) => { link.send(line); pair.pump(); },
+      send: (line) => { requests.push(JSON.parse(line)); link.send(line); pair.pump(); },
       onLine: (h) => link.onLine(h), onClose: (h) => link.onClose(h), close: (reason) => { link.close(reason); },
       get open() { return link.open; },
     } satisfies Transport;
   };
-  return { connect, published };
+  return { connect, published, requests };
 };
+
+test("claim-done and report done share authenticated capture without extra CLI arguments or client file paths", async () => {
+  const tree = { directories: [], files: [] }, files = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, revision: 1, tree, sha256: treeDigest(tree) };
+  let captures = 0;
+  const sock = laneSocket(() => { captures++; return files; });
+  for (const args of [
+    ["claim-done", "lane-a", "--evidence", "same"],
+    ["report", "lane-a", "done", "--text", "same", "--evidence", "same"],
+  ]) {
+    const output = io();
+    expect(await laneCliMain(args, { env, connect: sock.connect, ...output.deps })).toBe(0);
+  }
+  expect(captures).toBe(2);
+  expect(sock.published[0]).toEqual(sock.published[1]);
+  for (const request of sock.requests) {
+    expect(Object.keys(request).sort()).toEqual(["evidence", "key", "kind", "text", "token"]);
+    expect(request).toEqual({ kind: "done", key: "lane-a", token: "tok-a", text: "same", evidence: "same" });
+  }
+});
+
+test("typed capture refusal makes the unchanged CLI exit nonzero with the complete repair message", async () => {
+  const detail = 'DORI_LANE_OUT is empty; write your report to "/runner/briefs/lane-a.out/report.md", then run dori report lane-a done --text "<one line>" --evidence "<summary>"';
+  const sock = laneSocket(() => { throw new LaneFileError("LANE_REPORT_REQUIRED", "lane-a", detail); });
+  const output = io();
+  expect(await laneCliMain(["claim-done", "lane-a", "--evidence", "done"], { env, connect: sock.connect, ...output.deps })).toBe(1);
+  expect(output.err).toEqual([`LANE_REPORT_REQUIRED lane-a: ${detail}`]);
+  expect(sock.published).toEqual([]);
+});
 
 test("a lane reports only for its own key, with its own token", async () => {
   const sock = laneSocket();
@@ -156,20 +186,13 @@ test("the socket client retries ENOENT/ECONNREFUSED every second for 60 s on the
   expect(sleeps).toHaveLength(60);
 });
 
-test("dori heavy waits for ~/.dori/heavy/slot.1 that guard-agent.sh heavy holds, then takes it", async () => {
+test("dori heavy waits for ~/.dori/heavy/slot.1 that another live footer holds, then takes it", async () => {
   const home = mkdtempSync(join(tmpdir(), "runner-lane-heavy-"));
   dirs.push(home);
-  // The old footer's job holds the slot until the test writes to this fifo: no stdin pipe whose early close would free it.
-  const release = join(home, "release.fifo");
-  expect(Bun.spawnSync(["mkfifo", release]).exitCode).toBe(0);
-  const agent = Bun.spawn(["sh", GUARD_AGENT_TEMPLATE, "heavy", "old-footer", "--", "sh", "-c", 'echo HOLDING; cat "$0" >/dev/null', release], {
-    env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
-  });
-  const reader = agent.stdout.getReader();
-  const first = new TextDecoder().decode((await reader.read()).value);
-  expect(first).toContain("HOLDING");
+  // Another footer on this host (a live pid: this test process) holds slot.1 until it releases the directory.
   const slot = join(heavyDirOf(home), "slot.1");
-  expect(readFileSync(join(slot, "owner"), "utf8")).toContain("old-footer");
+  mkdirSync(slot, { recursive: true });
+  writeFileSync(join(slot, "owner"), `${process.pid} old-footer ${new Date().toISOString()}`);
 
   let waited = 0;
   let ownerWhileRunning = "";
@@ -178,8 +201,8 @@ test("dori heavy waits for ~/.dori/heavy/slot.1 that guard-agent.sh heavy holds,
     env, connect: laneSocket().connect, ...r.deps, heavyDir: heavyDirOf(home),
     clock: {
       now: () => 0,
-      // The first wait is where the old footer's job ends and frees the slot.
-      sleep: async () => { waited += 1; if (waited === 1) { writeFileSync(release, ""); await agent.exited; } },
+      // The first wait is where the other footer's job ends and frees the slot.
+      sleep: async () => { waited += 1; if (waited === 1) rmSync(slot, { recursive: true, force: true }); },
     },
     spawn: async () => { ownerWhileRunning = readFileSync(join(slot, "owner"), "utf8"); return 0; },
   });

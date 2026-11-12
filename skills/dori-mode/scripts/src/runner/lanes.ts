@@ -8,13 +8,14 @@ import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane 
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
-import { checkCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
+import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
+import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { turnStop } from "./observe.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
   CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, ProcessInfo, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
-  TurnEvidence,
+  TurnEvidence, LaneBriefFiles, LaneFileRun, LaneOutputFiles,
 } from "./protocol.ts";
 
 export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
@@ -25,7 +26,8 @@ export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } 
  * `lane.start` opens a herdr tab labelled with the lane key (or takes the idle shell pane `target` names), writes the
  * brief to `~/.dori/runner/briefs/<key>.md` (not /tmp), issues the lane a fresh 32-byte token, writes it to
  * `briefs/<key>.<gen>.token` (0600, one file per launch generation) and runs the agent of the requested profile from the runner's policy with
- * `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given) in front of it,
+ * `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given, and
+ * `LANE_SANDBOX_REPOS` / `LANE_SANDBOX_WORKTREES` when the policy has a repos or worktree root) in front of it,
  * so the token itself is never on a command line (shell history, process listings). Only the token's sha256 is kept,
  * in `lanes.json` (0600) with the lane's pane, tab and cwd; that file is the hello inventory. The agent runs inside
  * the herdr pane, not as a child of the runner, so a runner restart does not end it. After the agent is admitted the
@@ -57,6 +59,10 @@ export type LaneNotice = {
 };
 
 export type LaneRecord = {
+  readonly sandbox?: boolean;
+  readonly fileRun?: LaneFileRun;
+  readonly fileRevision?: number;
+  readonly fileDigest?: string;
   readonly key: string;
   readonly pane: string;
   readonly tab: string;
@@ -91,6 +97,7 @@ export type LaneRecord = {
 };
 
 export type RunnerLanesDeps = {
+  readonly fileReaders?: Partial<FileReaders>;
   readonly instance?: () => Promise<string | undefined>;
   readonly remote?: boolean;
   readonly procs?: () => Promise<readonly Proc[]>;
@@ -164,12 +171,15 @@ export const agentArgv = (
 
 /** What a launch needs; a relaunch takes it from the record. */
 type LaunchInput = {
+  readonly sandbox?: boolean;
+  readonly fileRun?: LaneFileRun;
+  readonly mayStart?: (value: boolean) => void;
   readonly key: string; readonly cwd: string; readonly profile: string; readonly mode: string; readonly model: string;
   readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
   readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
   readonly restored?: boolean;
 };
-type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict };
+type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string };
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
@@ -253,6 +263,27 @@ export class RunnerLanes {
     if (refused) throw new Error(`${rejectionText(refused.rule)} ${refused.detail}`);
   }
 
+  /**
+   * Runs the policy's `sandboxCheck` (when set) before a sandboxed start writes or opens anything: a wrapper that cannot
+   * sandbox on this host (no bwrap, user namespaces off) would otherwise run the agent unsandboxed or not at all.
+   * Throws `RUNNER_CMD_REJECTED sandbox-unavailable <stderr>`, the shape checkPaneCwd uses, so the lead sees the rule.
+   */
+  private async checkSandbox(key: string): Promise<void> {
+    const argv = this.deps.policy.sandboxCheck;
+    if (!argv?.length) throw new LaneFileError("LANE_FILES_SANDBOX_CHECK_MISSING", key,
+      `no sandboxCheck argv is configured; add "sandboxCheck": [<wrapper>, "--check"] to ${JSON.stringify(join(this.deps.runnerDir, "runner-config.json"))} using the sandbox wrapper argv, then retry`);
+    let why: string | undefined;
+    let marker = false;
+    try {
+      const ran = await this.deps.run(argv, { timeoutMs: 30_000 });
+      if (ran.code !== 0) why = ran.err.trim() || ran.out.trim() || `${argv.join(" ")} exited ${ran.code}`;
+      marker = ran.out.split(/\r?\n/).includes("DORI_LANE_FILES=1");
+    } catch (e) { why = `${argv.join(" ")}: ${e instanceof Error ? e.message : String(e)}`; }
+    if (why !== undefined) throw new Error(`${rejectionText("sandbox-unavailable")} ${why}`);
+    if (!marker) throw new LaneFileError("LANE_FILES_SANDBOX_OLD", key,
+      "sandboxCheck succeeded without DORI_LANE_FILES=1; run dori runner update and refresh the maintained lane-sandbox wrapper, or update the configured custom wrapper to grant own-key .files read-only and .out read-write and print DORI_LANE_FILES=1 after its successful --check; then retry");
+  }
+
   inventory(): InventoryLane[] {
     return Object.values(this.records()).map((r) => ({ key: r.key, pane: r.pane, tab: r.tab }));
   }
@@ -276,18 +307,59 @@ export class RunnerLanes {
     return Object.values(this.records()).find((r) => r.pane === pane)?.key;
   }
 
+  /** The working directory recorded for lane `key`, if the runner owns it. */
+  cwdOf(key: string): string | undefined {
+    return this.records()[key]?.cwd;
+  }
+
+  reportFiles(key: string): LaneOutputFiles | undefined {
+    const record = this.record(key);
+    if (!record.fileRun) return undefined;
+    const tree = captureOutput(this.deps.runnerDir, key, record.fileRun, this.deps.remote, this.deps.fileReaders);
+    const sha256 = treeDigest(tree);
+    const revision = record.fileDigest === sha256 ? record.fileRevision! : (record.fileRevision ?? 0) + 1;
+    if (!Number.isSafeInteger(revision) || revision < 1) throw new LaneFileError("LANE_FILES_INVALID", key, "invalid file payload (revision); regenerate the brief or report and retry");
+    try { this.update(key, (r) => ({ ...r, fileRevision: revision, fileDigest: sha256 })); }
+    catch { throw new LaneFileError("LANE_REPORT_STORE_FAILED", key, "the complete report was not stored by the runner; fix runner disk space and permissions, then claim done again"); }
+    return { run: record.fileRun, revision, sha256, tree };
+  }
+
   async start(body: SupervisorCommandBodies["lane.start"]): Promise<Effect<"lane.start">> {
     if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
-    ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
-    writeRunnerFile(this.briefPath(body.key), body.briefText);
-    const launched = await this.launch({
-      key: body.key, cwd: body.cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
-      ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
-      ...(body.target ? { target: body.target } : {}),
-      ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
-      ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
-    });
-    return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup } };
+    if (!body.files) throw new LaneFileError("LANE_FILES_INPUT_REQUIRED", body.key, "this start needs a fresh lead brief and attachment scan; launch the lane again from the lead");
+    validateBriefFiles(body.key, body.briefText, body.files);
+    checkFileBody(body.key, body);
+    // policy.ts checkCommand fills a missing cwd (the lane's own laneCwd) at dispatch; a body without one never got checked.
+    const cwd = body.cwd;
+    if (cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} ${body.key}`);
+    if (cwd === laneCwd(this.deps.runnerDir, body.key)) {
+      ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.lanes);
+      ensureRunnerSubdir(this.deps.runnerDir, join(RUNNER_PATHS.lanes, body.key));
+    }
+    if (body.sandbox) await this.checkSandbox(body.key);
+    let mayStart = false;
+    try {
+      prepareInput(this.deps.runnerDir, body.key, body.briefText, body.files, false);
+      const launched = await this.launch({
+        sandbox: body.sandbox,
+        fileRun: body.files.run, mayStart: (value) => { mayStart = value; },
+        key: body.key, cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
+        ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
+        ...(body.target ? { target: body.target } : {}),
+        ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
+        ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
+      });
+      return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd } };
+    } catch (error) {
+      if (!mayStart && !this.records()[body.key]) {
+        const paths = laneFilePaths(this.deps.runnerDir, body.key);
+        for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
+        rmSync(this.briefPath(body.key), { force: true });
+        rmSync(this.tokenFileOf(body.key, 1), { force: true });
+        rmSync(this.tokenFileOf(body.key, undefined), { force: true });
+      }
+      throw error;
+    }
   }
 
   /** Opens the lane's pane (a new tab, or the checked `target` pane) and runs its agent there; publishes `lane.started`. */
@@ -353,6 +425,7 @@ export class RunnerLanes {
       try {
         command = powershellLaunchLine(shell, [
           ["DORI_LANE_KEY", key], ["DORI_LANE_TOKEN_FILE", tokenFile],
+          ...(input.fileRun ? [["DORI_LANE_OUT", laneFilePaths(this.deps.runnerDir, key).output] as const] : []),
           ...(input.heavySlots !== undefined ? [["DORI_HEAVY_SLOTS", String(input.heavySlots)] as const] : []),
           ...(input.heavyMaxLoad !== undefined ? [["DORI_HEAVY_MAX_LOAD", String(input.heavyMaxLoad)] as const] : []),
         ], argv);
@@ -362,16 +435,23 @@ export class RunnerLanes {
         throw e;
       }
     } else {
+      const worktreeRoot = effectiveWorktreeRoot(this.deps.policy);
       const env = [
         `DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`,
+        ...(input.fileRun ? [`DORI_LANE_OUT=${quote(laneFilePaths(this.deps.runnerDir, key).output)}`] : []),
         ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
         ...(input.heavyMaxLoad !== undefined ? [`DORI_HEAVY_MAX_LOAD=${input.heavyMaxLoad}`] : []),
+        // Where a lane started without --cwd makes its worktree; the macOS lane-sandbox makes them writable.
+        ...(this.deps.policy.reposRoot !== undefined ? [`LANE_SANDBOX_REPOS=${quote(this.deps.policy.reposRoot)}`] : []),
+        ...(worktreeRoot !== undefined ? [`LANE_SANDBOX_WORKTREES=${quote(worktreeRoot)}`] : []),
       ];
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = [...env, ...argv.map(quote)].join(" ");
     }
+    input.mayStart?.(true);
     const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
     if (ran.code !== 0) {
+      input.mayStart?.(false);
       rmSync(tokenFile, { force: true });
       await rollback();
       throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
@@ -380,6 +460,8 @@ export class RunnerLanes {
       ...this.records(),
       [key]: {
         key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
+        ...(input.fileRun ? { fileRun: input.fileRun } : {}),
+        ...(input.sandbox !== undefined ? { sandbox: input.sandbox } : {}),
         herdrInstance, ...(terminalId ? { terminalId } : {}), ...(shellPid ? { shellPid } : {}),
         ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
         ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),
@@ -388,9 +470,9 @@ export class RunnerLanes {
     });
     // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
     if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
-    this.deps.publish("lane.started", { key, pane, tab, session: "" });
+    this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
     const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
-    return { pane, tab, resumed, startup };
+    return { pane, tab, resumed, startup, cwd };
   }
 
   private record(key: string): LaneRecord {
@@ -456,6 +538,10 @@ export class RunnerLanes {
     rmSync(this.briefPath(key), { force: true });
     rmSync(this.tokenFileOf(key, record.gen), { force: true });
     rmSync(this.tokenFileOf(key, undefined), { force: true });
+    if (record.fileRun) {
+      const paths = laneFilePaths(this.deps.runnerDir, key);
+      for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
+    }
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
     let gone = !current;
@@ -545,20 +631,27 @@ export class RunnerLanes {
    * lane publishes `lane.started` for its current record, which completes the supervisor's pending recovery. `session`
    * resumes that agent session when the profile allows (`resumed` says whether it did).
    */
-  async recover(key: string, session?: string, tabWorkspace?: string): Promise<Effect<"lane.recover">> {
+  async recover(key: string, session?: string, tabWorkspace?: string, briefText?: string, files?: LaneBriefFiles): Promise<Effect<"lane.recover">> {
     const record = this.record(key);
+    if ((briefText === undefined) !== (files === undefined)) throw new LaneFileError("LANE_FILES_INVALID", key, "invalid file payload (recover-pair); regenerate the brief or report and retry");
     const panes = await listPanes(this.deps.run);
     const pane = await this.currentPane(record, panes);
     // A pane still in its startup window whose agent has not reported yet is starting, not dead: closing its tab would
     // kill the launch in progress, so it is left alone like a live one.
     if (paneAlive(pane) || (pane && this.starting(record))) {
-      this.deps.publish("lane.started", { key, pane: record.pane, tab: record.tab, session: "" });
+      this.deps.publish("lane.started", { key, pane: record.pane, tab: record.tab, session: "", ...(record.fileRun ? { fileRun: record.fileRun } : {}) });
       return { detail: `${paneAlive(pane) ? "alive" : "starting"} pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
     }
     if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
+    if (briefText === undefined || files === undefined) throw new LaneFileError("LANE_FILES_RECOVER_INPUT_REQUIRED", key, "recovery needs a fresh lead brief and attachment scan; recover the lane again from the lead");
+    validateBriefFiles(key, briefText, files);
+    if (record.sandbox || record.profile === "sandboxed") await this.checkSandbox(key);
+    prepareInput(this.deps.runnerDir, key, briefText, files, true);
     const restored = record.herdrInstance && !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;
     if (pane && record.tab) await this.deps.run(["herdr", "tab", "close", record.tab]);
     const launched = await this.launch({
+      sandbox: record.sandbox,
+      fileRun: files.run,
       key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,
       ...(restored ? { target: { pane: restored }, restored: true } : {}),
       ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),

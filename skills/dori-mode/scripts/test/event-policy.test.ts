@@ -54,14 +54,12 @@ test("the done claim and lane-ending events, a close after a received claim too,
   }
 });
 
-test("a worker machine going OFFLINE or OUTDATED wakes the lead; NOT_INSTALLED, CURRENT and ONLINE are digest", () => {
+test("a worker machine going OFFLINE wakes the lead; ONLINE is digest; the retired agent kinds have no entry", () => {
   expect(eventClass("HOST_GUARD OFFLINE machine=mac unreachable: timeout")).toBe("lead-urgent");
-  expect(eventClass("HOST_GUARD OUTDATED machine=mac have=a want=b; run dori update")).toBe("lead-urgent");
-  expect(eventClass("HOST_GUARD NOT_INSTALLED machine=mac guard agent not installed; run dori guard install --machine mac")).toBe("lead-digest");
-  expect(eventClass("HOST_GUARD CURRENT machine=mac abcdef012345")).toBe("lead-digest");
   expect(eventClass("HOST_GUARD ONLINE machine=mac")).toBe("lead-digest");
-  // Digest even under a config whose default is urgent.
-  expect(eventClass("HOST_GUARD NOT_INSTALLED machine=mac x", resolveEventPolicy({ default: "lead-urgent" }))).toBe("lead-digest");
+  for (const kind of ["HOST_GUARD NOT_INSTALLED", "HOST_GUARD UNSUPPORTED", "HOST_GUARD CURRENT", "HOST_GUARD OUTDATED"]) {
+    expect(Object.keys(DEFAULT_EVENT_POLICY.kinds)).not.toContain(kind);
+  }
 });
 
 test("LEAD_UNRESPONSIVE (restart cap refused) wakes the lead; a leftover ACK_MISSING line is digest", () => {
@@ -96,7 +94,7 @@ test("an eventPolicy in the config file is ignored: the built-in table holds", a
   const path = join(state.dir, "config.json");
   for (const eventPolicy of [{ default: "lead-urgent", kinds: { NUDGED: "engine-only" } }, 7]) {
     writeFileSync(path, JSON.stringify({ eventPolicy }));
-    expect((await loadConfig(path, state.dir)).eventPolicy).toBe(DEFAULT_EVENT_POLICY);
+    expect("eventPolicy" in await loadConfig(path, state.dir)).toBe(false);
   }
 });
 
@@ -128,4 +126,16 @@ test.each([
 ])("a malformed eventPolicy %j is refused", (raw, message) => {
   expect(() => resolveEventPolicy(raw)).toThrow(EventPolicyError);
   expect(() => resolveEventPolicy(raw)).toThrow(message);
+});
+
+test("a sandbox refusal of a recovery, an allowed unsandboxed run and an undelivered sandbox notice wake the lead; other recovery errors stay digest", () => {
+  for (const line of [
+    "LANE_RECOVERY_ERROR k1 sandbox-missing: SANDBOX_MISSING k1: lane-sandbox is not on PATH",
+    "LANE_RECOVERY_ERROR k1 sandbox-broken: SANDBOX_BROKEN k1: lane-sandbox --check failed",
+    "LANE_RECOVERY_ERROR k1 sandbox-unavailable: SANDBOX_UNAVAILABLE k1: machine m2 refused",
+    "SANDBOX_SKIPPED k1: relaunch of a lane recorded without a sandbox", "SANDBOX_NOTICE_ERROR k1 (no discordChannels configured): [sandbox] x",
+  ]) expect(eventClass(line)).toBe("lead-urgent");
+  for (const line of ["LANE_RECOVERY_ERROR k1 replacement-unconfirmed", "LANE_RECOVERY_ERROR k1 process-info failed: x", "SANDBOX_NOTICE_FALLBACK k1 posted to the owner channel (thread post failed: x)"]) {
+    expect(eventClass(line)).toBe("lead-digest");
+  }
 });

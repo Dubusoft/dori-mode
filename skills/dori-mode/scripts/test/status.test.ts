@@ -14,8 +14,11 @@ import { JsonLaneReports, type LaneReportStore, SqliteLaneReports } from "../src
 import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind, WAKES_FILE } from "../src/store.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { healthPath } from "../src/runner/health.ts";
-import { collectStatus, kst, lookupStatus, renderStatus, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
+import { displayTime } from "../src/display-time.ts";
+import { collectStatus, lookupStatus, machineLines, renderStatus, runnerViews, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
+import { unsandboxedReason } from "../src/runner-sandbox.ts";
 import { fakeClock, withState } from "./fakes.ts";
+import { builtInTunables } from "../src/tunables.ts";
 
 const OPENED = "2026-10-19T00:00:00.000Z";
 const NOW = Date.parse(OPENED) + 90 * 60_000;
@@ -37,10 +40,21 @@ const fixture = async (panes: unknown[] = [{ pane_id: "lead:p1", workspace_id: "
     return { code: 127, out: "", err: line };
   };
   const registry = new Registry(state.dir);
-  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1" } };
+  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1", displayTimeZone: "Asia/Seoul" }, tunables: builtInTunables("/home/test") };
   return { deps, registry, calls, dir: state.dir };
 };
 const lane = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, thread: "discord:1/2", brief: "/b", done: "d", openedAt: OPENED, ...extra });
+
+test("status shows autopilot on, or paused with its reason while dori autopilot pause is in force", async () => {
+  const f = await fixture();
+  const on = await collectStatus(f.deps);
+  expect(on.autopilot).toEqual({ paused: false });
+  expect(renderStatus(on)).toContain("\n- 오토파일럿: 켜짐 (autopilot 표시된 작업만 실행)\n");
+  await Bun.write(join(f.dir, "autopilot-pause.json"), JSON.stringify({ since: "2026-10-21T00:00:00.000Z", reason: "deploy freeze" }));
+  const paused = await collectStatus(f.deps);
+  expect(paused.autopilot).toEqual({ paused: true, since: "2026-10-21T00:00:00.000Z", reason: "deploy freeze" });
+  expect(renderStatus(paused)).toContain("\n- 오토파일럿: 일시정지 (2026-10-21T00:00:00.000Z부터: deploy freeze; dori autopilot resume)\n");
+});
 
 test("status lists working lanes with model, age and last progress; paused and closed lanes are left out", async () => {
   const f = await fixture();
@@ -48,10 +62,10 @@ test("status lists working lanes with model, age and last progress; paused and c
   await f.registry.write(lane("beta", { status: "paused" }));
   await f.registry.write(lane("gamma", { closedAt: OPENED }));
   const s = await collectStatus(f.deps);
-  expect(s.lanes).toEqual([{ key: "alpha", model: "m/one", ageMin: 90, progress: "Write the tests" }]);
+  expect(s.lanes).toEqual([{ key: "alpha", model: "m/one", ageMin: 90, progress: "Write the tests", machine: "local" }]);
   const text = renderStatus(s);
   expect(text).toContain("작업 중 레인 1개");
-  expect(text).toContain("\n■ 레인 (1)\n- alpha (90분 · one): Write the tests");
+  expect(text).toContain("\n■ 레인 (1)\n▸ local: 오프라인 · 레인 1개\n- alpha (90분 · one): Write the tests");
   expect(text).not.toContain("beta");
 });
 
@@ -132,7 +146,7 @@ test("/status pages through 100 lanes: every page fits Discord, every lane is li
   const listed = pages.flatMap((page) => page.split("\n").filter((line) => line.startsWith("- scale-lane-")).map((line) => line.slice(2).split(" ")[0]));
   expect(listed.sort()).toEqual([...keys].sort());
   expect(pages[0]).toContain(`개 (2-${pages.length}쪽)`);
-  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`도리 레인 · 2/${pages.length}쪽 · ${kst(NOW)} KST`, "", "■ 레인 (100) 이어서"]);
+  expect(pages[1]!.split("\n").slice(0, 3)).toEqual([`도리 레인 · 2/${pages.length}쪽 · ${displayTime(NOW, "Asia/Seoul", "short")}`, "", "■ 레인 (100) 이어서"]);
   expect(pages[1]).toEndWith("\n\n다음: /status page:3");
   expect(pages.at(-1)).not.toContain("다음: /status");
   // The slash command's page option picks the page; past the end it says how many there are.
@@ -214,7 +228,7 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
   expect(text).toContain("\n■ 활동 (최근 24시간)\n- 리드 깨움 3회 (소유자 3 · 레인 0 · 노이즈 0), 깨울 때마다 모델 호출 6.5회\n");
   expect(text).toContain("\n- 많은 순: INBOUND 이벤트 2 · 깨움 2; GH_PR * merged 이벤트 1 · 깨움 1; (restart) 이벤트 0 · 깨움 1; NUDGED 이벤트 3");
   // A kind moved by config is counted and classed under the config's table, with no code change.
-  const moved = await collectStatus({ ...f.deps, config: { ...f.deps.config, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
+  const moved = await collectStatus({ ...f.deps, tunables: { ...f.deps.tunables, eventPolicy: resolveEventPolicy({ kinds: { "NUDGED lane": "engine-only" } }) } });
   expect(moved.events.kinds.find((k) => k.kind === "NUDGED lane")).toEqual({ kind: "NUDGED lane", cls: "engine-only", events: 3, wakes: 0, measured: 0, calls: 0 });
 });
 
@@ -234,6 +248,7 @@ test("status splits wakes into owner, lane and noise by their triggers; a wake a
 
 const base: Status = {
   at: "2026-10-21T00:53:36.000Z",
+  timeZone: "Asia/Seoul",
   services: [
     { name: "herdr-server.service", enabled: "enabled", active: "active" },
     { name: "dori-supervisor.service", enabled: "enabled", active: "active" },
@@ -269,6 +284,7 @@ test("healthy status reads as titled sections with one line per item, in KST", (
     "- 새 레인 워크스페이스: wS",
     "",
     "■ 레인 (1)",
+    "▸ local: 미확인 · 레인 1개",
     "- ops (27분 · opus-5-5 · dori-mode #55): Full run then the docs",
     "",
     "■ 대기 (0)",
@@ -315,6 +331,16 @@ test("wait time: a date-epoch signal is the fire time; the deadline field is onl
   expect(text).toContain("\n- m: 조건: merged o/r#7\n");
 });
 
+test("a machine wait shows @machine after its key, marked 오프라인 while that runner is not connected; a local wait is unchanged", () => {
+  const runner = (label: string, state: "connected" | "offline") => ({ label, state, gen: 1, cmds: 0, restarts1h: 0, lanes: 0 });
+  const text = renderStatus({ ...base, runners: [runner("mini", "offline"), runner("box", "connected")], waits: [
+    { key: "a", until: "merged o/r#7", machine: "mini" }, { key: "b", until: "merged o/r#8", machine: "box" }, { key: "c", until: "merged o/r#9" },
+  ] });
+  expect(text).toContain("\n- a@mini 오프라인: 조건: merged o/r#7\n");
+  expect(text).toContain("\n- b@box: 조건: merged o/r#8\n");
+  expect(text).toContain("\n- c: 조건: merged o/r#9\n");
+});
+
 test("a (#N) in the lane title is never shown as a PR", async () => {
   const f = await fixture();
   await f.registry.write(lane("task-lane", { title: "polish dori /status (#55)", done: 'command ["gh","pr","list","-R","dev-bokdong/dori-mode","--head","b","--json","number"] stdout~"number"' }));
@@ -331,9 +357,10 @@ test("model names lose the provider and claude- prefix; other ids stay readable"
   expect(shortModel("openai/gpt-6.1-sol")).toBe("gpt-6.1-sol");
 });
 
-test("kst formats fixed +09:00 across a day boundary", () => {
-  expect(kst(Date.parse("2026-10-21T15:05:00Z"))).toBe("10-22 00:05");
-  expect(kst(Date.parse("2026-12-31T14:59:00Z"))).toBe("12-31 23:59");
+test("a status without a time zone (the default config, or one written before the key) shows its times in UTC", () => {
+  const { timeZone: _, ...older } = base;
+  expect(renderStatus(older).split("\n")[0]).toBe("도리 상태 · 10-21 00:53 UTC");
+  expect(renderStatus({ ...base, timeZone: "UTC" }).split("\n")[0]).toBe("도리 상태 · 10-21 00:53 UTC");
 });
 
 test("collectStatus derives a lane's repo and PR from its Done signal, with no network", async () => {
@@ -377,6 +404,35 @@ test("RUNNER lanes= follows the registry's open lanes on each runner's machine, 
   await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
   expect(await counts()).toEqual({ local: 1, macbook: 1 });
   expect(renderStatus(await collectStatus(f.deps))).toMatch(/^- macbook: 연결됨 · 레인 1개 · herdr 미확인$/m);
+});
+
+test("lanes are grouped by runner: each runner's heading has its state and lane count, a runner with no lanes still shows", async () => {
+  const f = await fixture();
+  new RunnerHub({ stateDir: f.dir, commit: () => true, now: () => NOW, monotonic: () => 0, epoch: 1 }).close();
+  const db = new Database(join(f.dir, HUB_FILE));
+  db.run("INSERT INTO runners (label, maxGen, lastHeartbeatAt) VALUES ('local', 1, ?), ('macbook', 1, ?), ('mac-mini', 1, NULL)", [NOW, NOW]);
+  db.close();
+  await f.registry.write(lane("alpha"));
+  await f.registry.write(lane("beta", { machine: "macbook", runner: "macbook" }));
+  await f.registry.write(lane("delta", { machine: "macbook" }));
+  const s = await collectStatus(f.deps);
+  expect(Object.fromEntries(s.lanes.map((l) => [l.key, l.machine]))).toEqual({ alpha: "local", beta: "macbook", delta: "macbook" });
+  // Within a group the lanes keep Status.lanes order (the registry's).
+  const mac = s.lanes.filter((l) => l.machine === "macbook").map((l) => l.key);
+  expect(s.laneGroups).toEqual([
+    { machine: "local", state: "connected", online: true, lanes: ["alpha"] },
+    { machine: "mac-mini", state: "offline", online: false, lanes: [] },
+    { machine: "macbook", state: "connected", online: true, lanes: mac },
+  ]);
+  expect(renderStatus(s)).toContain([
+    "■ 레인 (3)",
+    "▸ local: 연결됨 · 레인 1개",
+    "- alpha (90분)",
+    "▸ mac-mini: 오프라인 · 레인 없음",
+    "▸ macbook: 연결됨 · 레인 2개",
+    ...mac.map((key) => `- ${key} (90분)`),
+    "",
+  ].join("\n"));
 });
 
 test("the local runner row is always shown, with its child's state from the health file, even before the hub ever opened", async () => {
@@ -430,4 +486,15 @@ test("each runner's machine shows CPU load, free memory, disk and swap from its 
     "  머신 샘플 없음\n",
   ].join("\n"));
   expect(text).toContain("\n- 머신 macbook 경고: memory free 8% < 10%\n");
+});
+
+test("dori status marks a runner whose lanes run without a sandbox: a Windows machine, or one opted in with allowUnsandboxed", () => {
+  const config = { ...defaultConfig(), runners: { mini: { allowUnsandboxed: true } } };
+  const row = (label: string, os: string) => ({ label, eventAck: 0, maxGen: 1, cmdSeq: 0, cmdAck: 0, machine: { at: 0, level: "ok" as const, reasons: [], os } });
+  const views = runnerViews([row("win", "win32"), row("mini", "linux"), row("box", "linux")], 0, { unsandboxed: (label, os) => unsandboxedReason(config, label, os) });
+  expect(views.map((v) => [v.label, v.unsandboxed])).toEqual([
+    ["local", undefined], ["win", "is a Windows runner (Windows has no lane sandbox)"], ["mini", "is opted in with runners.mini.allowUnsandboxed"], ["box", undefined],
+  ]);
+  expect(machineLines(views[1]!)[0]).toBe("- win (win32): 오프라인 · 샌드박스 없음 · herdr 미확인");
+  expect(machineLines(views[3]!)[0]).toBe("- box (linux): 오프라인 · herdr 미확인");
 });

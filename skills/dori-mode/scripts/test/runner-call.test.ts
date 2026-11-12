@@ -13,24 +13,26 @@ const fakeTimers = () => {
   return { api, timers, fire: (i = 0) => { const t = timers.filter((x) => x.live)[i]!; t.live = false; t.fn(); } };
 };
 
-const setup = (over: { connected?: boolean; proto?: number } = {}) => {
+const setup = (over: { connected?: boolean; proto?: number; lowRefusal?: Error } = {}) => {
   const sent: { label: string; type: string; body: Record<string, unknown> }[] = [];
   const controls: { label: string; type: string; body: Record<string, unknown> }[] = [];
   const logs: string[] = [];
+  const attempts: string[] = [], settledAttempts: string[] = [];
   const t = fakeTimers();
   let connected = over.connected ?? true;
   const deps: RunnerCallsDeps = {
     accept: {
-      command: ((label: string, type: string, body: Record<string, unknown>) => { if (!connected) return undefined; sent.push({ label, type, body }); return sent.length; }) as never,
+      command: ((label: string, type: string, body: Record<string, unknown>) => { if (over.lowRefusal) throw over.lowRefusal; if (!connected) return undefined; sent.push({ label, type, body }); return sent.length; }) as never,
       control: ((label: string, type: string, body: Record<string, unknown>) => { if (!connected) return false; controls.push({ label, type, body }); return true; }) as never,
       connected: () => connected,
     },
-    proto: () => over.proto ?? 3,
+    proto: () => "proto" in over ? over.proto : 5,
     now: () => 1000,
     timers: t.api,
     log: (l) => logs.push(l),
+    attempts: { record: (_label, _type, id) => { attempts.push(id); }, settle: (_label, id) => { settledAttempts.push(id); } },
   };
-  return { calls: new RunnerCalls(deps), sent, controls, logs, t, setConnected: (v: boolean) => { connected = v; } };
+  return { calls: new RunnerCalls(deps), sent, controls, logs, attempts, settledAttempts, t, setConnected: (v: boolean) => { connected = v; } };
 };
 const result = (cmdId: string, state: "verified" | "failed" | "ambiguous", detail: string, res?: unknown) =>
   ({ type: "cmd.result", body: { cmdId, cmdSeq: 1, state, detail, result: res } }) as unknown as AnyRunnerEvent;
@@ -155,4 +157,50 @@ describe("RunnerCalls.query", () => {
     s.calls.onControl("local", qresult("q:1:9", true, "ok"));
     expect(s.logs).toHaveLength(1);
   });
+});
+
+test.each([undefined, 4])("file operations fail closed for proto %s before attempts, sends or timers", async (proto) => {
+  const s = setup({ proto });
+  const detail = proto === undefined
+    ? "lane files require proto 5 (runner proto unknown); run dori runner update, wait for its hello, and retry"
+    : "lane files require proto 5 (runner proto 4); run dori runner update";
+  for (const type of ["lane.start", "lane.recover", "q.lane.files"] as const) {
+    const p = type === "q.lane.files" ? s.calls.query("box", type, { key: "a" }) : s.calls.call("box", type, { key: "a" } as never);
+    await expect(p).rejects.toMatchObject({ why: "outdated", message: `RUNNER_UNAVAILABLE runner=box outdated: ${detail}` });
+  }
+  expect([s.sent.length, s.controls.length, s.attempts.length, s.t.timers.length, s.calls.pending()]).toEqual([0, 0, 0, 0, 0]);
+});
+
+test("unknown proto retains existing host.herdr and ordinary query behavior; known proto 3 retains its minimum", async () => {
+  const s = setup({ proto: undefined });
+  const command = s.calls.call("box", "host.herdr", {} as never);
+  s.calls.onEvent("box", result(s.sent[0]!.body.cmdId as string, "verified", "ok", {}));
+  expect((await command).state).toBe("verified");
+  const query = s.calls.query("box", "q.panes", {});
+  s.calls.onControl("box", qresult(s.controls[0]!.body.qid as string, true, "", { panes: [] }));
+  expect(await query).toEqual({ panes: [] });
+  await expect(setup({ proto: 3 }).calls.call("box", "host.herdr", {} as never)).rejects.toThrow("host.herdr needs runner proto 4, the runner speaks 3");
+});
+
+test("a low-level gate change settles the never-sent attempt and removes its waiter and timer", async () => {
+  const refusal = new RunnerUnavailable("box", "outdated", "lane files require proto 5 (runner proto 4); run dori runner update");
+  const s = setup({ lowRefusal: refusal });
+  await expect(s.calls.call("box", "lane.start", { key: "a" } as never)).rejects.toBe(refusal);
+  expect(s.attempts).toEqual(["lane-start:a:1000"]);
+  expect(s.settledAttempts).toEqual(s.attempts);
+  expect(s.sent).toEqual([]);
+  expect(s.calls.pending()).toBe(0);
+  expect(s.t.timers.every((t) => !t.live)).toBe(true);
+});
+
+test("complete body preflight includes the exact cmdId and allocates nothing on overflow", async () => {
+  const s = setup();
+  const body = { key: "a", briefText: "" };
+  const fixed = Buffer.byteLength(JSON.stringify({ ...body, cmdId: "c" }));
+  const briefText = "x".repeat(786432 - fixed);
+  const p = s.calls.call("box", "lane.start", { ...body, briefText } as never, { cmdId: "c" });
+  s.calls.onEvent("box", result("c", "verified", "ok", {})); await p;
+  const before = [s.attempts.length, s.sent.length, s.t.timers.length];
+  await expect(s.calls.call("box", "lane.start", { ...body, briefText: briefText + "x" } as never, { cmdId: "c" })).rejects.toThrow("LANE_FILES_FRAME_TOO_LARGE");
+  expect([s.attempts.length, s.sent.length, s.t.timers.length]).toEqual(before);
 });

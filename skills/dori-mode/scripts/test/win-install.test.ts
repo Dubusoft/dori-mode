@@ -66,6 +66,9 @@ test("every payload decodes to its input, the task XML with label and connect fi
   ]));
   const xml = got.get("dori-runner-task.xml") ?? "";
   expect(xml).toContain(`-Label ${LABEL} -Listen ${LISTEN}`);
+  // A headless console host runs the wrapper, so the logon task never opens a window.
+  expect(xml).toContain("<Command>conhost.exe</Command>");
+  expect(xml).toContain("<Arguments>--headless powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"@RUNNER@\\bin\\runner-task.ps1\" ");
   for (const want of ["<LogonType>InteractiveToken</LogonType>", "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
     "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>", "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", "<StartWhenAvailable>true</StartWhenAvailable>",
     "<Interval>PT1M</Interval>", "<Count>999</Count>", "<LogonTrigger>"]) expect(xml).toContain(want);
@@ -102,13 +105,60 @@ test("the directory gets the protected DACL, the starter policy and the task reg
   const s = script();
   expect(s).toContain("& icacls.exe $R /inheritance:r /grant:r ('*' + $Sid + ':(OI)(CI)F') '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'");
   expect(s).toContain("& icacls.exe $R /setowner ('*' + $Sid) /T /C /Q");
-  expect(s).toContain("(ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP)");
   const agent = /FromBase64String\('([A-Za-z0-9+/=]+)'\)\)\n/.exec(s)?.[1] ?? "";
   expect(JSON.parse(Buffer.from(agent, "base64").toString("utf8"))).toEqual(AGENT);
+  // Windows has no lane sandbox: the starter policy has only the default profile, with sandbox optional.
+  expect(JSON.parse(starterPolicy(s, { USERPROFILE: "C:\\Users\\me", TEMP: "C:\\Users\\me\\AppData\\Local\\Temp", Bin: "C:\\Users\\me\\.dori\\runner\\bin" }))).toEqual({
+    agents: { default: AGENT },
+    allowedRoots: ["C:\\Users\\me", "C:\\Users\\me\\AppData\\Local\\Temp"],
+    sandbox: "optional",
+  });
+  // An older install's policy loses its lane-sandbox profile and check; one that still requires a sandbox is printed.
+  for (const want of ["  if ($Have -match '\"lane-sandbox\"') {", "$O.agents.PSObject.Properties.Remove('sandboxed')", "$O.PSObject.Properties.Remove('sandboxCheck')",
+    "$O | Add-Member -NotePropertyName sandbox -NotePropertyValue 'optional' -Force", "Write-Output ('RUNNER_CONFIG_UNSANDBOXED ' + $Cfg",
+    "} elseif ($Have -match '\"sandbox\"\\s*:\\s*\"required\"') {", "Write-Output ('RUNNER_CONFIG_SANDBOX_REQUIRED ' + $Cfg"]) expect(s).toContain(want);
+  expect(s).not.toContain("sandboxCheck\":");
   expect(s).toContain("Register-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner' -Xml $Xml -Force");
   expect(s).toContain("Start-ScheduledTask -TaskPath '\\dori\\' -TaskName 'dori-runner'");
   expect(s).toContain(`} catch { Exit-Dori ${INSTALL_EXIT.systemd} `);
   expect(windowsInstallScript(BUNDLE, LABEL, LISTEN, ISSUE, [])).not.toContain("runner-config.json");
+});
+
+/**
+ * Evaluates the starter policy's `$Json = ...` concatenation the way PowerShell would: single-quoted literals, $Agent,
+ * $Agent.Substring(1), $Ps1 (ConvertTo-Json of dori.ps1 under $Bin) and ConvertTo-Json of the two environment paths.
+ */
+const starterPolicy = (s: string, at: { USERPROFILE: string; TEMP: string; Bin: string }): string => {
+  const agent = Buffer.from(/FromBase64String\('([A-Za-z0-9+/=]+)'\)\)\n/.exec(s)?.[1] ?? "", "base64").toString("utf8");
+  const line = /^ {2}\$Json = (.+)$/m.exec(s)?.[1] ?? "";
+  const values: Record<string, string> = {
+    "$Agent": agent, "$Agent.Substring(1)": agent.slice(1), "$Ps1": JSON.stringify(`${at.Bin}\\dori.ps1`),
+    "(ConvertTo-Json $env:USERPROFILE)": JSON.stringify(at.USERPROFILE), "(ConvertTo-Json $env:TEMP)": JSON.stringify(at.TEMP),
+  };
+  return [...line.matchAll(/'((?:[^']|'')*)'|(\([^)]*\)|\$[A-Za-z.()0-9]+)/g)].map((m) => {
+    if (m[1] !== undefined) return m[1].replace(/''/g, "'");
+    const v = values[m[2] ?? ""];
+    if (v === undefined) throw new Error(`unknown term ${m[2]}`);
+    return v;
+  }).join("");
+};
+
+test("an older install's lane sandbox executors are removed and nothing is downloaded for a sandbox", () => {
+  const s = script();
+  expect(s).toContain("if (Test-Path -LiteralPath $OldSandbox) { Remove-Item -LiteralPath $OldSandbox -Recurse -Force -ErrorAction SilentlyContinue }");
+  expect(s.match(/Invoke-WebRequest/g)?.length).toBe(1);
+});
+
+test("installRunner says a Windows host's lanes run unsandboxed, and fails the step when its policy still requires a sandbox", async () => {
+  const lines: string[] = [];
+  const none = "none: Windows has no lane sandbox, so lanes here run unsandboxed (SANDBOX_SKIPPED at each launch)";
+  const required = fakeRun((_c, argv) => (argv[0] === "scp" ? {} : { out: "RUNNER_CONFIG_SANDBOX_REQUIRED C:\\r\\runner-config.json says it\r\nDORI_BUN 1.4.4\r\n" }));
+  expect((await installRunner({ ...deps(required.run, "windows"), progress: (l) => lines.push(l) }, request())).ok).toBe(true);
+  expect(lines).toContain(`RUNNER_STEP runner=${LABEL} sandbox failed: RUNNER_CONFIG_SANDBOX_REQUIRED C:\\r\\runner-config.json says it; ${none}`);
+  lines.length = 0;
+  const fine = fakeRun(() => ({}));
+  expect((await installRunner({ ...deps(fine.run, "windows"), progress: (l) => lines.push(l) }, request())).ok).toBe(true);
+  expect(lines).toContain(`RUNNER_STEP runner=${LABEL} sandbox done: ${none}`);
 });
 
 test("the enrollment secret goes to the enrolling process's stdin, never its arguments", () => {

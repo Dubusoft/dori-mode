@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -16,8 +17,9 @@ import { herdrDownSince } from "./runner/herdr-down.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
+import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import type { Durability } from "./store.ts";
-import { type AwaitingAck, type Event, type Journal, type JournalCore, type OutboxItem, type Restart, SuperviseError, TransientSuperviseError } from "./supervise-journal.ts";
+import { type AwaitingAck, type Event, type Journal, type JournalCore, leadOwes, type OutboxItem, type Restart, SuperviseError, TransientSuperviseError } from "./supervise-journal.ts";
 import { COLD_START_EMOJI, HUNG_EMOJI, latest, OWNER_INBOUND, OWNER_REVISION, type OwnerTracking, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 
 /** Lines read to inspect a paused or stuck lead. */
@@ -179,16 +181,16 @@ export class LeadLifecycle {
 
   /** Owner messages handed to the lead with no ack and not handled; `readable` narrows to those whose read window opened. */
   private unacked(readable?: boolean): AwaitingAck[] {
-    return (this.journal.awaitingAck ?? []).filter((entry) => !entry.quarantined && entry.ackedAt === undefined && entry.handledAt === undefined &&
+    return (this.journal.awaitingAck ?? []).filter((entry) => !entry.quarantined && entry.ackedAt === undefined && leadOwes(entry) &&
       this.delivered.has(latest(entry)) && (readable === undefined || (entry.since !== undefined) === readable));
   }
 
   /** The lead's session id and file; either is empty/undefined when it cannot be resolved. */
   private async sessionFile(cwd: string): Promise<{ readonly id: string; readonly file?: string }> {
-    const hit = await resolveSession(this.deps.config.leadPane, cwd, await procTable(this.deps.run), { run: this.deps.run, sessionsDir: this.deps.config.sessionsDir });
+    const hit = await resolveSession(this.deps.config.leadPane, cwd, await procTable(this.deps.run), { run: this.deps.run, sessionsDir: this.deps.tunables.sessionsDir });
     if (!hit.id) return { id: "" };
     if (existsSync(hit.id)) return { id: hit.id, file: hit.id };
-    const dir = sessionDirFor(this.deps.config.sessionsDir, cwd);
+    const dir = sessionDirFor(this.deps.tunables.sessionsDir, cwd);
     const files = await Array.fromAsync(new Bun.Glob("*.jsonl").scan({ cwd: dir, absolute: true, onlyFiles: true }));
     return heldSession(dir, hit.pid) ?? { id: hit.id, file: files.find((path) => path.endsWith(`_${hit.id}.jsonl`) || path.endsWith(`/${hit.id}.jsonl`)) };
   }
@@ -200,7 +202,7 @@ export class LeadLifecycle {
    * says why nobody restarts it); the push step keeps re-pushing meanwhile.
    */
   capRefuses(what: string): boolean {
-    const { delivery } = this.deps.config;
+    const { delivery } = this.deps.tunables;
     const now = this.deps.clock.now();
     const count = this.core.forcedRestartsSince(now);
     if (count < delivery.restartMaxPerHour) return false;
@@ -223,9 +225,9 @@ export class LeadLifecycle {
    */
   async resumePaused(readPane = async (): Promise<Pane | undefined> =>
     (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<void> {
-    const { config, clock, run } = this.deps;
+    const { config, tunables, clock, run } = this.deps;
     const now = clock.now();
-    const window = config.ackTimeoutSec * 1000;
+    const window = tunables.ackTimeoutSec * 1000;
     if (now - this.resumedAt < window) return;
     if (!this.unacked(true).some((entry) => now - (entry.since ?? now) >= window)) return;
     const pane = await readPane();
@@ -234,7 +236,7 @@ export class LeadLifecycle {
     if (!PAUSED.test(screen)) return;
     this.resumedAt = now;
     if (!emptyInput(screen)) {
-      console.log(`LEAD_PAUSED_INPUT ${config.leadPane}: paused with text in its input; not typing, restart follows after ${config.delivery.push.escalateMin} min`);
+      console.log(`LEAD_PAUSED_INPUT ${config.leadPane}: paused with text in its input; not typing, restart follows after ${tunables.delivery.push.escalateMin} min`);
       return;
     }
     console.log(`LEAD_RESUMED ${config.leadPane} ${await sendVerified(run, clock, config.leadPane, "/resume")}`);
@@ -254,11 +256,11 @@ export class LeadLifecycle {
    */
   async stuckRestart(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
     (await listPanes(this.deps.run)).find((p) => p.pane_id === this.deps.config.leadPane)): Promise<boolean> {
-    const { config, clock, run } = this.deps;
+    const { config, tunables, clock, run } = this.deps;
     const limit = config.leadStuckRestartMin * 60_000;
     if (!(limit > 0)) return false;
     // The push ladder owns idle leads, and one tool call is clocked by push.escalateMin (supervise-push.ts).
-    const unreadLimit = config.delivery.push.escalateMin * 60_000;
+    const unreadLimit = tunables.delivery.push.escalateMin * 60_000;
     const waiting = this.unacked();
     if (!waiting.length) { this.patchJournal({ leadBusySince: undefined, leadScreen: undefined }); return false; }
     const now = clock.now();
@@ -270,7 +272,7 @@ export class LeadLifecycle {
       this.patchJournal({ leadBusySince: undefined, leadScreen: undefined });
       const session = randomUUID();
       console.log(`LEAD_STUCK_RESTART ${config.leadPane} ${status} ${minutes} min, ${count} owner message(s) unread`);
-      await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.defaultCwd);
+      await this.noteRestart("stuck", `${status} ${minutes} min with ${count} owner message(s) unread`, pane.cwd ?? config.leadCwd);
       this.owners.announce(`lead-stuck:${session}`, `리드가 ${minutes}분째 멈춘 상태(${status})로 메시지를 읽지 못하고 있어 재시작합니다. 답변받지 못한 메시지는 새 리드에게 넘어갑니다.`);
       this.setRestart({
         session, events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size,
@@ -290,7 +292,7 @@ export class LeadLifecycle {
       // A probe that cannot resolve the session must not stop delivery: the other rules still apply.
       let file: string | undefined;
       let id = "";
-      try { ({ id, file } = await this.sessionFile(pane.cwd ?? config.defaultCwd)); } catch (e) {
+      try { ({ id, file } = await this.sessionFile(pane.cwd ?? config.leadCwd)); } catch (e) {
         if (!(e instanceof Error)) throw e;
         console.error(`LEAD_SESSION_UNRESOLVED ${config.leadPane}: ${e.message}`);
       }
@@ -323,10 +325,11 @@ export class LeadLifecycle {
   setRestart(restart: Restart | undefined): void {
     if (restart?.phase === "stopping") {
       this.owners.consumeReceipts();
-      // Unfinished owner messages travel in their latest revision; deleted ones never reach the new lead.
+      // Unfinished owner messages travel in their latest revision; deleted ones never reach the new lead, and one waiting on
+      // the owner reaches it only as the AWAITING_OWNER line of dori inbox take.
       const awaiting = this.journal.awaitingAck ?? [];
       const deleted = new Set(awaiting.filter((entry) => entry.deleted).map((entry) => entry.id));
-      const unfinished = new Set(awaiting.filter((entry) => entry.handledAt === undefined && !entry.quarantined).map(latest));
+      const unfinished = new Set(awaiting.filter((entry) => leadOwes(entry) && !entry.quarantined).map(latest));
       const events = new Map(restart.events.filter((event) => !deleted.has(event.id)).map((event) => [event.id, event]));
       for (const event of this.journal.events) if (unfinished.has(event.id)) events.set(event.id, event);
       restart = { ...restart, events: [...events.values()] };
@@ -336,7 +339,7 @@ export class LeadLifecycle {
   }
 
   /**
-   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at defaultCwd.
+   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at leadCwd.
    * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
    * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
    */
@@ -363,7 +366,7 @@ export class LeadLifecycle {
   }
 
   /**
-   * A new "dori-lead" tab in the Dori workspace at defaultCwd, persisted as the lead pane. herdr removes a workspace
+   * A new "dori-lead" tab in the Dori workspace at leadCwd, persisted as the lead pane. herdr removes a workspace
    * together with its last pane, so closing the lead by hand can take the Dori workspace with it: then the workspace is
    * created again, as dori-boot-prep.sh does, and its root pane becomes the lead. Undefined, with herdr's reason logged,
    * when herdr refuses.
@@ -395,11 +398,11 @@ export class LeadLifecycle {
     const workspace = (JSON.parse(listed.out) as { result: { workspaces: { label?: string; workspace_id: string }[] } }).result.workspaces.find((w) => w.label === "Dori");
     let pane: string | undefined;
     if (workspace) {
-      const made = await run(["herdr", "tab", "create", "--workspace", workspace.workspace_id, "--cwd", config.defaultCwd, "--label", "dori-lead"]);
+      const made = await run(["herdr", "tab", "create", "--workspace", workspace.workspace_id, "--cwd", config.leadCwd, "--label", "dori-lead"]);
       if (made.code !== 0) return refused(`herdr tab create in ${workspace.workspace_id}`, made);
       pane = (JSON.parse(made.out) as { result: { root_pane: { pane_id?: string } } }).result.root_pane.pane_id;
     } else {
-      const made = await run(["herdr", "workspace", "create", "--label", "Dori", "--cwd", config.defaultCwd, "--no-focus"]);
+      const made = await run(["herdr", "workspace", "create", "--label", "Dori", "--cwd", config.leadCwd, "--no-focus"]);
       if (made.code !== 0) return refused("herdr workspace create Dori", made);
       const root = (JSON.parse(made.out) as { result: { root_pane: { pane_id?: string; tab_id?: string; workspace_id?: string } } }).result.root_pane;
       pane = root.pane_id;
@@ -461,20 +464,20 @@ export class LeadLifecycle {
 
   /** Why the idle lead must be cold-started for a delivery now, or undefined when it is warm and takes it in place. */
   async coldReason(cwd: string): Promise<ColdReason | undefined> {
-    const { config, clock } = this.deps;
+    const { tunables, clock } = this.deps;
     const { id, file } = await this.sessionFile(cwd);
     if (!id) throw new TransientSuperviseError("cannot resolve idle lead session; refusing an unproven cold restart");
     if (!file) throw new TransientSuperviseError(`cannot find lead session file for ${id}`);
     this.warmSession = file;
     const tokens = this.leadTokens(file);
     // Idle at delivery time (checked by the caller): a lead past the hard cap restarts even with a warm cache.
-    if (tokens >= config.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${config.leadContextHardCapTokens}` };
+    if (tokens >= tunables.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${tunables.leadContextHardCapTokens}` };
     const idleMs = clock.now() - statSync(file).mtimeMs;
     const idle = `idle ${Math.floor(idleMs / 60_000)} min`;
     // A lead at or above the context cap always restarts at this safe point (idle, its own children done), warm cache or not.
-    if (tokens >= config.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `context ${tokens} tokens at or above leadContextCapTokens ${config.leadContextCapTokens} (${idle}, cache ${idleMs < config.cacheTtlMin * 60_000 ? "warm" : "stale"})` };
-    if (idleMs < config.cacheTtlMin * 60_000) return undefined;
-    const stale = `${idle} (past cacheTtlMin ${config.cacheTtlMin})`;
+    if (tokens >= tunables.leadContextCapTokens) return { kind: "context-cap", tokens, detail: `context ${tokens} tokens at or above leadContextCapTokens ${tunables.leadContextCapTokens} (${idle}, cache ${idleMs < tunables.cacheTtlMin * 60_000 ? "warm" : "stale"})` };
+    if (idleMs < tunables.cacheTtlMin * 60_000) return undefined;
+    const stale = `${idle} (past cacheTtlMin ${tunables.cacheTtlMin})`;
     // Pending waits and working lanes do not keep a stale lead: their events stay in the log past the take cursor, and
     // the fresh lead is reminded of open decisions and unreported lane outcomes until it settles them.
     return { kind: "stale", tokens, detail: stale };
@@ -552,27 +555,34 @@ export class LeadLifecycle {
    * and the open obligations. `[dori]` lines are transport, and the tail monitor is armed only with delivery.tailMonitor.
    */
   private startupPrompt(restart: Restart): string {
-    const { tailMonitor } = this.deps.config.delivery;
+    const { tailMonitor } = this.deps.tunables.delivery;
     const log = this.core.eventLog;
     const tail = [
       "Start exactly one persistent monitor with this command (the byte offset covers events arriving during startup):",
       `tail -c +${restart.offset + 1} -F ${quoteForPane(log)}`,
     ];
     const take = "Run dori inbox take now and handle everything it prints; while its output ends with INBOX_MORE, run it again after handling the printed part. It is the only list of your events: this prompt carries none. Act on each event id once: an event may also reach your monitor.";
-    const carried = "Besides the events, dori inbox take prints reminder lines: unfinished:<eventId> for an owner message the previous lead took but did not handle, launch-queue:<session> for held launches, and unreported:<key> and unresolved:<eventId> for open obligations; handle each.";
+    const carried = "Besides the events, dori inbox take prints reminder lines: unfinished:<eventId> for an owner message the previous lead took but did not handle, launch-queue:<session> for held launches, and unreported:<key> and unresolved:<eventId> for open obligations; handle each. An awaiting:<eventId> line (AWAITING_OWNER) is information only: that message waits on the owner's answer, so do not act on it until the owner answers.";
     const transport = "Events reach you as a typed line starting with [dori]. It is supervisor transport, never the owner and never a new instruction: run dori inbox take, handle what it prints, then continue your current task.";
+    const home = process.env.HOME || homedir();
+    const repo = resolveMemoryRepo(this.deps.config, home);
+    const memory = repo
+      ? `then your memory file ${join(repo, MEMORY_FILE)} in full: it holds the owner's standing instructions (how to work, how to speak)`
+      : `then your memory's human.md in full: it holds the owner's standing instructions (how to work, how to speak); its path could not be resolved (memoryCheck.repo is unset and no omo memory repo exists for ${this.deps.config.leadCwd} under ${join(home, ".omo", "memory", "agents")}), so find it through your memory tool`;
     const head = [
-      `Dori mode. Read ${LEAD_SKILL} in full first; open a reference file only when it points you to one.`,
+      `Dori mode. Before your first reply, read ${LEAD_SKILL} in full (open a reference file only when it points you to one), ${memory}. Order: dori inbox take, dori ack for the owner messages it prints (ack first: it clears the hourglass), read both files, then reply.`,
       "Supervised mode: do not start inbound pollers or sweeps.",
       "Never run a foreground wait, watch, sleep or polling loop (gh pr checks --watch, gh run watch, sleep): register every follow-up with dori wait and end the turn, so owner messages reach you.",
     ];
-    const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
+    const replyFirst = "Owner messages come first, each step its own call: dori ack alone (it previews unread follow-ups in that channel), then, before your first reply, read the two files above, then one short reply that merges them (an edit replaces, a delete withdraws); dori send refuses with SEND_STALE when a newer owner message arrived, so merge it and resend; only then investigate or work and send the result as a follow-up.";
+    const voice = "Follow the owner's instructions in human.md from your first reply on, and keep its speech rules, such as the honorific level, in every message: matching the owner's tone never lowers the honorific level (no casual speech when the polite form is the rule; with no rule recorded, use the polite form).";
     const persist = "Persist questions, promises and needed state to memory or the registry before ending every turn.";
     return [
       ...head,
       take,
       carried,
       replyFirst,
+      voice,
       ...(restart.reason ? [`The previous lead stopped: ${restart.reason}. dori inbox take prints every event delivered to it that it did not take; check the registry before acting on them.`] : []),
       persist,
       transport,
@@ -601,7 +611,7 @@ export class LeadLifecycle {
     const { stateDir } = this.deps.config;
     const carried = readCarried(stateDir);
     if (!carried.length) return;
-    const open = new Set((this.journal.awaitingAck ?? []).filter((entry) => entry.handledAt === undefined && !entry.quarantined).map(latest));
+    const open = new Set((this.journal.awaitingAck ?? []).filter((entry) => leadOwes(entry) && !entry.quarantined).map(latest));
     let queue: ReturnType<typeof launchQueue> | undefined;
     const next = carried.flatMap((item): Carried[] => {
       if (item.kind === "owner") return open.has(item.id) ? [item] : [];
@@ -627,10 +637,10 @@ export class LeadLifecycle {
     if (restart.phase === "stopping" && !restart.force) {
       const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
       if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) {
-        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.defaultCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.config.sessionsDir });
+        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.leadCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
         const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
         if (hit.pid && latest?.agent && (latest.agent_status === "idle" || latest.agent_status === "done")) {
-          const old = (await this.sessionFile(pane.cwd ?? deps.config.defaultCwd)).id || hit.id;
+          const old = (await this.sessionFile(pane.cwd ?? deps.config.leadCwd)).id || hit.id;
           if (restart.request) this.journal = { ...this.journal, models: restart.request.models };
           softStartedAt = deps.clock.now();
           this.owners.record(restart.events);
@@ -672,7 +682,7 @@ export class LeadLifecycle {
         if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
         const table = await procTable(deps.run);
         const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.defaultCwd, table, { run: deps.run, sessionsDir: deps.config.sessionsDir });
+        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.leadCwd, table, { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
         if (!hit.pid) throw new TransientSuperviseError("cannot identify reused lead process");
         const targets = await ownedTargets(deps, table, undefined, old);
         const protectedPids = new Set<number>();
@@ -743,11 +753,11 @@ export class LeadLifecycle {
       const executable = agent[0];
       if (!executable) throw new SuperviseError("agentCommand must name an executable");
       const argv = [
-        "env", "DORI_SUPERVISED=1", ...(deps.config.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
-        "--session-dir", sessionDirFor(deps.config.sessionsDir, deps.config.defaultCwd),
-        ...deps.config.leadArgs, ...(deps.config.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
+        "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
+        "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd),
+        ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
       ];
-      const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.defaultCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
+      const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.leadCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
       if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${restart.session}`);
     }
     let confirmed = soft ? await softLive(deps) : await confirmLead(deps, restart.session);
@@ -802,13 +812,13 @@ export class LeadLifecycle {
       ...this.journal,
       awaitingAck: this.journal.awaitingAck?.map((entry) => entry.quarantined || !this.delivered.has(latest(entry)) ? entry : {
         ...entry, since: ready,
-        ...(entry.ackedAt !== undefined && entry.handledAt === undefined ? { handlingSince: ready, unhandledRemindedAt: undefined } : {}),
+        ...(entry.ackedAt !== undefined && leadOwes(entry) ? { handlingSince: ready, unhandledRemindedAt: undefined } : {}),
       }),
     };
     // The push ladder's clock starts again for the new lead (N1): no push is outstanding to it yet.
     if (this.journal.inbox) this.journal = { ...this.journal, inbox: { ...this.journal.inbox, sessionSince: ready, push: undefined } };
     this.setRestart(undefined);
-    const policy = deps.config.eventPolicy;
+    const policy = deps.tunables.eventPolicy;
     const urgent = restart.events.filter((event) => eventClass(event.line, policy) === "lead-urgent");
     this.core.wakes.record(restart.session, restart.events, urgent.length ? urgent : restart.events);
     if (restart.request) completeLeadRestart(deps.config.stateDir, restart.request.id);
@@ -922,7 +932,7 @@ const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
 /** The new session's file once it has started and settled with its agent back, or undefined at the deadline. */
 const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
   let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
@@ -954,7 +964,7 @@ const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
 const softEvidence = async (deps: FlowDeps, old: string, markers: readonly string[], startedAt: number | undefined): Promise<string | undefined> => {
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-  const dir = sessionDirFor(deps.config.sessionsDir, pane?.cwd ?? deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
   for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
@@ -1031,7 +1041,7 @@ export const STARTUP_EVIDENCE_MS = 20_000;
  * is positive evidence for that exact session and does not depend on the model replying.
  */
 export const hasStartupEvidence = (deps: FlowDeps, session: string): boolean => {
-  const dir = sessionDirFor(deps.config.sessionsDir, deps.config.defaultCwd);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd);
   const names = (path: string): readonly string[] => { try { return readdirSync(path); } catch { return []; } };
   return names(join(dir, "session-holders", session)).some((name) => name.endsWith(".json")) ||
     names(dir).some((name) => name.endsWith(`_${session}.jsonl`) || name === `${session}.jsonl`);
@@ -1097,13 +1107,14 @@ export const stopHung = async (deps: FlowDeps, session: string): Promise<void> =
 
 /** Stop the pane's exact foreground agent tree, then its detached session-owned monitors. */
 export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> => {
-  const { leadPane, sessionsDir, defaultCwd } = deps.config;
+  const { leadPane, leadCwd } = deps.config;
+  const { sessionsDir } = deps.tunables;
   const pane = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!pane) throw new TransientSuperviseError(`lead pane ${leadPane} is missing`);
   // `force` (a stuck lead) stops a working/blocked lead too.
   if (!force && pane.agent && pane.agent_status !== "idle" && pane.agent_status !== "done") return false;
   const table = await procTable(deps.run);
-  const hit = await resolveSession(leadPane, pane.cwd ?? defaultCwd, table, { run: deps.run, sessionsDir });
+  const hit = await resolveSession(leadPane, pane.cwd ?? leadCwd, table, { run: deps.run, sessionsDir });
   if (pane.agent && !hit.pid) throw new TransientSuperviseError("cannot identify lead process; refusing broad process cleanup");
   if (!pane.agent && !hit.pid) {
     const info = await deps.run(["herdr", "pane", "process-info", "--pane", leadPane]);
@@ -1111,7 +1122,7 @@ export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> 
     const proc: { readonly shell_pid: number; readonly foreground_process_group_id?: number } = JSON.parse(info.out).result.process_info;
     if (proc.foreground_process_group_id && proc.foreground_process_group_id !== proc.shell_pid) throw new TransientSuperviseError("lead pane contains a non-agent foreground process; refusing to type into it");
   }
-  const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? defaultCwd), hit.pid);
+  const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? leadCwd), hit.pid);
   const targets = await ownedTargets(deps, table, hit.pid, current?.id ?? hit.id);
   const latest = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
   if (!latest) throw new TransientSuperviseError("lead pane disappeared during process resolution");

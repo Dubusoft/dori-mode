@@ -6,6 +6,8 @@ import { DEFAULT_EVENT_POLICY, type EventPolicy, eventKind } from "./event-polic
 import { redactSecrets } from "./redact.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import type { Runner } from "./run.ts";
+import { machineLabel, remoteRunner } from "./remote-jobs.ts";
+import type { RunnerCall } from "./runner/call.ts";
 import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, validateSchedule } from "./schedule.ts";
 
 /*
@@ -23,7 +25,7 @@ import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, valid
  * and the others keep running. The per-source last event and error are written to sources-status.json for dori status.
  */
 
-export const BUILTIN_SOURCES = ["discord", "github", "sweeps", "waits", "emit"] as const;
+export const BUILTIN_SOURCES = ["discord", "github", "sweeps", "waits", "emit", "toodo"] as const;
 export type BuiltinSource = (typeof BUILTIN_SOURCES)[number];
 export const SOURCE_TYPES = ["poll", "webhook", "file", "schedule"] as const;
 export type SourceType = (typeof SOURCE_TYPES)[number];
@@ -31,6 +33,8 @@ export type SourceType = (typeof SOURCE_TYPES)[number];
 export type PollSpec = {
   readonly name: string; readonly type: "poll"; readonly kind: string;
   readonly command: readonly string[]; readonly everySec: number; readonly match: string; readonly cwd?: string;
+  /** The runner that runs the command (`job.run`, in `cwd` on that machine); absent: the supervisor host. */
+  readonly machine?: string;
 };
 export type WebhookSpec = { readonly name: string; readonly type: "webhook"; readonly kind: string; readonly port: number; readonly secret: string };
 export type FileSpec = { readonly name: string; readonly type: "file"; readonly kind: string; readonly path: string; readonly match: string };
@@ -98,7 +102,12 @@ export const validateSpec = (raw: unknown): SourceSpec => {
       const everySec = r.everySec;
       if (typeof everySec !== "number" || !Number.isFinite(everySec) || everySec < POLL_MIN_SEC) throw new SourceError(`source ${name}: everySec must be at least ${POLL_MIN_SEC}`);
       if (r.cwd !== undefined && (typeof r.cwd !== "string" || !isAbsolute(r.cwd))) throw new SourceError(`source ${name}: cwd must be an absolute path`);
-      return { name, type: "poll", kind, command: command as string[], everySec, match: regex(r.match, name), ...(typeof r.cwd === "string" ? { cwd: r.cwd } : {}) };
+      const machine = machineLabel(r.machine, (why) => new SourceError(`source ${name}: ${why}`));
+      if (machine && r.cwd === undefined) throw new SourceError(`source ${name}: a poll on a machine needs cwd (a directory on that machine)`);
+      return {
+        name, type: "poll", kind, command: command as string[], everySec, match: regex(r.match, name), ...(typeof r.cwd === "string" ? { cwd: r.cwd } : {}),
+        ...(machine ? { machine } : {}),
+      };
     }
     case "webhook": {
       const port = r.port;
@@ -232,21 +241,21 @@ export const readSourceStatus = (stateDir: string): SourceStatusFile | undefined
 };
 
 /** One row of dori status: the built-ins, then every registered source (also one the supervisor has not run yet). */
-export type SourceView = { readonly name: string } & Partial<SourceStatus> & { readonly type: SourceStatus["type"]; readonly kind?: string };
+export type SourceView = { readonly name: string } & Partial<SourceStatus> & { readonly type: SourceStatus["type"]; readonly kind?: string; readonly machine?: string };
 
 export const sourceViews = (stateDir: string): { readonly sources: readonly SourceView[]; readonly error?: string } => {
   const status = readSourceStatus(stateDir)?.sources ?? {};
   let specs: SourceSpec[] = [];
   let error: string | undefined;
   try { specs = new SourceSpecs(stateDir).list(); } catch (e) { error = e instanceof Error ? e.message : String(e); }
-  const view = (name: string, type: SourceView["type"], kind?: string): SourceView => {
+  const view = (name: string, type: SourceView["type"], kind?: string, machine?: string): SourceView => {
     const { cursor: _, ...rest } = status[name] ?? { events: 0, duplicates: 0 };
-    return { ...rest, name, type, ...(kind ? { kind } : {}) };
+    return { ...rest, name, type, ...(kind ? { kind } : {}), ...(machine ? { machine } : {}) };
   };
   return {
     sources: [
       ...BUILTIN_SOURCES.map((name) => view(name, "builtin")),
-      ...specs.map((spec) => view(spec.name, spec.type, spec.kind)),
+      ...specs.map((spec) => view(spec.name, spec.type, spec.kind, spec.type === "poll" || spec.type === "schedule" ? spec.machine : undefined)),
     ],
     ...(error ? { error } : {}),
   };
@@ -263,6 +272,8 @@ export type EventSourcesDeps = {
   readonly log?: (line: string) => void;
   /** The schedule sources run, their runs kept in this operation store; absent leaves them unrun. */
   readonly schedules?: ScheduleDeps;
+  /** Runs the polls and scheduled commands that name a machine on that machine's runner; absent: those fail. */
+  readonly remote?: RunnerCall;
 };
 
 const sha = (text: string | Uint8Array): string => createHash("sha256").update(text).digest("hex");
@@ -296,9 +307,10 @@ export class EventSources {
         update: (name, patch) => { this.set(name, { ...this.entry(name, "schedule"), ...patch }); },
         fail: (name, e) => { this.fail(name, e); }, ok: (name) => { this.ok(name); },
         ...(deps.log ? { log: deps.log } : {}),
+        ...(deps.remote ? { remote: deps.remote } : {}),
       }, deps.schedules);
     }
-    // A built-in no longer in BUILTIN_SOURCES (an old status file's `toodo`, the removed Toodo chat) is dropped.
+    // A built-in no longer in BUILTIN_SOURCES is dropped.
     for (const [name, entry] of Object.entries(readSourceStatus(deps.stateDir)?.sources ?? {})) {
       if (entry.type !== "builtin" || (BUILTIN_SOURCES as readonly string[]).includes(name)) this.status.set(name, entry);
     }
@@ -432,7 +444,9 @@ export class EventSources {
   }
 
   private async poll(spec: PollSpec): Promise<void> {
-    const ran = await this.deps.run(spec.command, { timeoutMs: POLL_TIMEOUT_MS, ...(spec.cwd ? { cwd: spec.cwd } : {}) });
+    // A poll on a machine runs there; its event ids and lines are a local poll's, so the store dedupes across both.
+    const run = spec.machine === undefined ? this.deps.run : this.remoteRun(spec.machine, spec.name);
+    const ran = await run(spec.command, { timeoutMs: POLL_TIMEOUT_MS, ...(spec.cwd ? { cwd: spec.cwd } : {}) });
     if (ran.code !== 0) throw new SourceError(`${spec.command[0]} exited ${ran.code}${ran.timedOut ? " (timed out)" : ""}: ${(ran.err || ran.out).trim().slice(0, 150) || "(no output)"}`);
     const re = new RegExp(spec.match);
     const put = this.enqueueFor(spec.name);
@@ -443,6 +457,11 @@ export class EventSources {
       // Identity is the first capture group when present, otherwise the whole line; repeats collapse.
       put(`src:${spec.name}:${sha(hit[1] ?? line).slice(0, 32)}`, `${spec.kind} ${line}`);
     }
+  }
+
+  private remoteRun(machine: string, name: string): Runner {
+    if (!this.deps.remote) throw new SourceError("runner calls are not available");
+    return remoteRunner(this.deps.remote, machine, { opKey: `poll:${name}:${this.deps.now()}`, name });
   }
 
   /** From the saved offset to the last complete line; a file seen for the first time starts at its end. */

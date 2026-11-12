@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../lane-sandbox-install.ts";
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
 import { WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
 import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
@@ -10,6 +11,7 @@ import type { SupervisorAuth } from "./auth.ts";
 import { writeRunnerEndpoint } from "./endpoints.ts";
 import { decodeFrame, encodeFrame, supervisorControl, type RunnerControlBodies } from "./protocol.ts";
 import { isPrivateListen } from "./ws-transport.ts";
+import { stepper, type Progress } from "./steps.ts";
 
 /**
  * Installs or upgrades the runner on a remote Linux or macOS machine over ssh, as design 3.2 and 5.4 lay out. The ssh
@@ -113,8 +115,14 @@ export type InstallDeps = {
   readonly herdrTemplates?: HerdrTemplates;
   /** The Windows payload templates; default to the files under templates/. */
   readonly windowsTemplates?: WindowsTemplates;
+  /** The lane-sandbox wrapper a Linux host gets as `~/.dori/runner/bin/lane-sandbox`; defaults to templates/lane-sandbox.sh. */
+  readonly laneSandbox?: string;
+  /** The lane-sandbox wrapper a macOS host gets there instead; defaults to templates/lane-sandbox-macos.sh. */
+  readonly laneSandboxMacos?: string;
   /** How the machine runs commands; defaults to `machineKind`. */
   readonly kind?: (run: Runner, machine: GuardMachine) => Promise<KindResult>;
+  /** Receives a `RUNNER_STEP` line as each step starts, finishes or fails. */
+  readonly progress?: Progress;
 };
 
 export type InstallRequest = {
@@ -153,8 +161,10 @@ export const installScript = (
   plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, listenAddress),
   agentCommand: readonly string[] = [],
   herdr: HerdrTemplates = herdrTemplates(),
+  laneSandbox: string = readFileSync(LANE_SANDBOX_TEMPLATE, "utf8"),
+  laneSandboxMacos: string = readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"),
 ): string => {
-  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist]) {
+  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, laneSandbox, laneSandboxMacos]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
   }
   const body = (text: string): string => (text.endsWith("\n") ? text : `${text}\n`);
@@ -202,17 +212,41 @@ export const installScript = (
     // made it) is tightened, since the runner refuses to start on any runner directory that is not 0700.
     'mkdir -p "$R/evidence" || exit 1',
     'chmod 700 "$HOME/.dori" "$R" "$R/bin" "$R/evidence" || exit 1',
+    // Lanes run sandboxed through the lane-sandbox wrapper, installed beside the runner's own files: bubblewrap on Linux,
+    // Seatbelt (sandbox-exec) on macOS. It needs no extra paths here: the runner socket, the lane's brief and token file
+    // and its cwd are handled by the wrapper itself, and the lead's verify directory is not on this host.
+    'if [ "$OS" = Linux ]; then',
+    `cat > "$R/bin/lane-sandbox.tmp" <<'${HEREDOC}' || exit 1`,
+    `${body(laneSandbox)}${HEREDOC}`,
+    "else",
+    `cat > "$R/bin/lane-sandbox.tmp" <<'${HEREDOC}' || exit 1`,
+    `${body(laneSandboxMacos)}${HEREDOC}`,
+    "fi",
+    // 0700 like `dori`: the runner refuses to start on a runner directory holding anything wider (fs-safety.ts).
+    'chmod 700 "$R/bin/lane-sandbox.tmp" && mv -f "$R/bin/lane-sandbox.tmp" "$R/bin/lane-sandbox" || exit 1',
     // A starter command policy, only when the host has none: without an agent profile and a root every lane.start is
-    // refused. An existing runner-config.json is the operator's and is never rewritten.
+    // refused. Sandboxing is required: the `sandboxed` profile runs the agent behind the wrapper, and its `--check` runs
+    // before each sandboxed start. An existing runner-config.json is the operator's and is never rewritten; what it
+    // lacks for sandboxed lanes is printed instead.
+    'if [ ! -e "$R/runner-config.json" ]; then',
     ...(agentCommand.length ? [
-      'if [ ! -e "$R/runner-config.json" ]; then',
       `  A=${quote(JSON.stringify(agentCommand))}`,
       '  case "$OS" in Darwin) TR=/private/tmp ;; *) TR=/tmp ;; esac',
       `  H=$(printf '%s' "$HOME" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')`,
-      `  printf '{"agents":{"default":%s},"allowedRoots":["%s","%s"]}\\n' "$A" "$H" "$TR" > "$R/runner-config.json.tmp" && mv -f "$R/runner-config.json.tmp" "$R/runner-config.json" || exit 1`,
-      "  unset A H TR",
-      "fi",
-    ] : []),
+      // The sandboxed argv is the wrapper, then A's elements: A without its leading '['.
+      '  W="$H/.dori/runner/bin/lane-sandbox"',
+      `  printf '{"agents":{"default":%s,"sandboxed":["%s",%s},"allowedRoots":["%s","%s"],"sandbox":"required","sandboxCheck":["%s","--check"]}\\n' "$A" "$W" "\${A#?}" "$H" "$TR" "$W" > "$R/runner-config.json.tmp" || exit 1`,
+      '  mv -f "$R/runner-config.json.tmp" "$R/runner-config.json" || exit 1',
+      "  unset A H TR W",
+    ] : ["  :"]),
+    "else",
+    "  M=",
+    `  grep -Eq '"sandbox"[[:space:]]*:[[:space:]]*"required"' "$R/runner-config.json" || M="$M sandbox:required"`,
+    `  grep -q '"sandboxed"' "$R/runner-config.json" || M="$M agents.sandboxed"`,
+    `  grep -q '"sandboxCheck"' "$R/runner-config.json" || M="$M sandboxCheck"`,
+    `  [ -z "$M" ] || printf 'RUNNER_CONFIG_SANDBOX_MISSING %s in %s; add them to sandbox lanes on this runner\\n' "\${M# }" "$R/runner-config.json"`,
+    "  unset M",
+    "fi",
     `cat > "$R/bin/dori.js.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(bundle)}${HEREDOC}`,
     'mv -f "$R/bin/dori.js.tmp" "$R/bin/dori.js" || exit 1',
@@ -234,7 +268,7 @@ export const installScript = (
     `PL="$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist"`,
     `cat > "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(plist)}${HEREDOC}`,
-    `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(dirname "$BUN"):$PATH|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$PL" || exit 1`,
+    `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$PL" || exit 1`,
     `rm -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp"`,
     'chmod 644 "$PL"',
     // launchd appends the agent's output here; created 0600 beforehand so the runner's directory check accepts it.
@@ -373,7 +407,13 @@ const TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
  *   are removed;
  * - writes every file as `.tmp`, checks the bundle's full SHA-256, stops a running runner (task and recorded tree),
  *   and moves the files into `bin\`; `bin\bun.txt` names the Bun directory the shims and the wrapper use;
- * - writes a starter runner-config.json (allowedRoots `%USERPROFILE%` and `%TEMP%`) only when there is none;
+ * - removes the sandbox executors an older install put in `mxc\` (Windows has no lane sandbox any more);
+ * - writes a starter runner-config.json (allowedRoots `%USERPROFILE%` and `%TEMP%`, `sandbox: "optional"`, only the
+ *   `default` profile: Windows lanes run without a sandbox, and the lead says so at each launch) when there is none.
+ *   An existing one is the operator's, except that a policy from an older install still running lanes behind the
+ *   removed `dori.ps1 lane-sandbox` loses that profile and its check and becomes `sandbox: "optional"`
+ *   (`RUNNER_CONFIG_UNSANDBOXED`); one that still says `sandbox: "required"` is printed
+ *   (`RUNNER_CONFIG_SANDBOX_REQUIRED`), since its lanes are refused;
  * - enrolls once, skipped when `keys\supervisor.pub` exists: the code and fingerprint go to the enrolling process's
  *   stdin through a ProcessStartInfo, never its argv (exit 5 when it fails);
  * - registers and starts the `\dori\dori-runner` task (exit 6 when the Task Scheduler refuses).
@@ -456,6 +496,9 @@ export const windowsInstallScript = (
     "}",
     `if (-not $BunDir) { Exit-Dori ${INSTALL_EXIT.noBun} 'no usable bun: the pinned bun-windows-x64 builds could not be downloaded, verified or run' }`,
     "$Bun = Join-Path $R ('bun\\' + $BunDir + '\\bun.exe')",
+    // An older install's lane sandbox executors: nothing runs them any more.
+    "$OldSandbox = Join-Path $R 'mxc'",
+    "if (Test-Path -LiteralPath $OldSandbox) { Remove-Item -LiteralPath $OldSandbox -Recurse -Force -ErrorAction SilentlyContinue }",
     // Every file is written beside its target first; the bundle's hash is checked before anything is replaced.
     "Step 'files'",
     "function Write-DoriFile([string]$Name, [string]$Data) { [IO.File]::WriteAllBytes((Join-Path $Bin ($Name + '.tmp')), [Convert]::FromBase64String($Data)) }",
@@ -482,13 +525,31 @@ export const windowsInstallScript = (
     "[IO.File]::WriteAllText($BunTxt, $BunDir)",
     // A starter command policy, only when the host has none; an existing runner-config.json is the operator's.
     "Step 'config'",
+    // Windows has no lane sandbox: lanes run unsandboxed under the `default` profile, which needs `sandbox: "optional"`.
     ...(agentCommand.length ? [
       "$Cfg = Join-Path $R 'runner-config.json'",
       "if (-not (Test-Path -LiteralPath $Cfg)) {",
       `  $Agent = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64(JSON.stringify(agentCommand))}'))`,
-      "  $Json = '{\"agents\":{\"default\":' + $Agent + '},\"allowedRoots\":[' + (ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP) + ']}'",
+      `  $Json = '{"agents":{"default":' + $Agent + '},"allowedRoots":[' + (ConvertTo-Json $env:USERPROFILE) + ',' + (ConvertTo-Json $env:TEMP) + '],"sandbox":"optional"}'`,
       "  [IO.File]::WriteAllText($Cfg + '.tmp', $Json + [char]10)",
       "  Move-Item -LiteralPath ($Cfg + '.tmp') -Destination $Cfg -Force",
+      "} else {",
+      "  $Have = [IO.File]::ReadAllText($Cfg)",
+      // An older install's policy runs sandboxed lanes behind the removed `dori.ps1 lane-sandbox`: that profile and its
+      // check go, and the lanes run unsandboxed; everything else in the file is kept.
+      "  if ($Have -match '\"lane-sandbox\"') {",
+      "    try {",
+      "      $O = $Have | ConvertFrom-Json",
+      "      if ($O.agents) { $O.agents.PSObject.Properties.Remove('sandboxed') }",
+      "      $O.PSObject.Properties.Remove('sandboxCheck')",
+      "      $O | Add-Member -NotePropertyName sandbox -NotePropertyValue 'optional' -Force",
+      "      [IO.File]::WriteAllText($Cfg + '.tmp', ($O | ConvertTo-Json -Depth 20 -Compress) + [char]10)",
+      "      Move-Item -LiteralPath ($Cfg + '.tmp') -Destination $Cfg -Force",
+      "      Write-Output ('RUNNER_CONFIG_UNSANDBOXED ' + $Cfg + ': dropped the lane-sandbox profile and sandboxCheck, sandbox is optional')",
+      "    } catch { Write-Output ('RUNNER_CONFIG_SANDBOX_REQUIRED ' + $Cfg + ' could not be rewritten (' + $_.Exception.Message + '); remove agents.sandboxed and sandboxCheck and set \"sandbox\": \"optional\": Windows lanes run without a sandbox') }",
+      "  } elseif ($Have -match '\"sandbox\"\\s*:\\s*\"required\"') {",
+      "    Write-Output ('RUNNER_CONFIG_SANDBOX_REQUIRED ' + $Cfg + ' says \"sandbox\": \"required\"; set it to \"optional\": Windows lanes run without a sandbox, so this runner refuses them')",
+      "  }",
       "}",
     ] : []),
     "Set-DoriOwner",
@@ -555,9 +616,24 @@ const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult
 export const installRunner = async (deps: InstallDeps, req: InstallRequest): Promise<InstallResult> => {
   if (!LABEL.test(req.label)) return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: `bad label ${req.label}` };
   if (!isPrivateListen(req.listenAddress)) return { ok: false, code: "RUNNER_LISTEN_REFUSED", detail: `${req.listenAddress} is not a private host:port` };
+  const step = stepper(deps.progress, req.label);
+  step("connect", "start", req.machine.target);
   const k = await (deps.kind ?? machineKind)(deps.run, req.machine);
-  if (!k.ok) return { ok: false, code: k.unsupported ? "RUNNER_INSTALL_UNSUPPORTED" : "RUNNER_INSTALL_UNREACHABLE", detail: k.detail };
-  const bundle = await deps.bundle();
+  if (!k.ok) {
+    const code = k.unsupported ? "RUNNER_INSTALL_UNSUPPORTED" : "RUNNER_INSTALL_UNREACHABLE";
+    step("connect", "failed", `${code} ${k.detail}`);
+    return { ok: false, code, detail: k.detail };
+  }
+  step("connect", "done", k.kind);
+  step("upload", "start", "bundling the runner");
+  let bundle: string;
+  try {
+    bundle = await deps.bundle();
+  } catch (error) {
+    step("upload", "failed", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  step("upload", "done", `bundle ${bundleVersion(bundle)}; ${k.kind === "windows" ? "each install pass copies its script over scp" : "each install pass sends it over ssh stdin"}`);
   const unit = remoteUnit(deps.unitTemplate ?? readFileSync(RUNNER_REMOTE_UNIT_TEMPLATE, "utf8"), req.label, req.listenAddress);
   const plist = remoteUnit(deps.plistTemplate ?? readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), req.label, req.listenAddress);
   const issue = req.issue();
@@ -567,7 +643,8 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   // A Windows pass: scp uploads the script to the profile directory, then ssh runs it from there with an empty stdin.
   // An scp failure is returned as the install's result and the ssh step is skipped.
   const installWindows = async (script: string): Promise<Ran | InstallResult> => {
-    const dir = mkdtempSync(join(tmpdir(), "dori-runner-install-"));
+    // The state dir, not /tmp: the script embeds the bundle, and a supervisor host's /tmp may be a small, quota'd tmpfs.
+    const dir = mkdtempSync(join(req.stateDir, "runner-install-"));
     try {
       const local = join(dir, "install.ps1");
       writeFileSync(local, script, { mode: 0o600 });
@@ -585,20 +662,27 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   };
   const install = (enrollment: EnrollIssue): Promise<Ran | InstallResult> => {
     if (kind === "windows") return installWindows(windowsInstallScript(bundle, req.label, req.listenAddress, enrollment, req.agentCommand, deps.windowsTemplates ?? windowsTemplates()));
-    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates);
+    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates, deps.laneSandbox, deps.laneSandboxMacos);
     return deps.run(sshArgv(target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   };
+  const failed = (result: InstallResult): InstallResult => {
+    if (!result.ok) step("install", "failed", `${result.code} ${result.detail}`);
+    return result;
+  };
+  step("install", "start", "files, bun, enrollment and service registration in one remote pass");
   let pass = await install(issue);
-  if ("ok" in pass) return pass;
+  if ("ok" in pass) return failed(pass);
   let r = pass;
   // A POSIX shell on Windows: powershell.exe is reachable from it, so the Windows install runs instead.
   if (kind === "posix" && r.code === INSTALL_EXIT.windowsShell) {
     kind = "windows";
+    step("install", "start", "again as a Windows install (the ssh shell is a POSIX shell on Windows)");
     pass = await install(issue);
-    if ("ok" in pass) return pass;
+    if ("ok" in pass) return failed(pass);
     r = pass;
   }
   if (r.code === INSTALL_EXIT.enrollPending) {
+    step("enroll", "start", "the host sent an enrollment request");
     try {
       const line = /^RUNNER_ENROLL_REQUEST (.+)$/m.exec(r.out)?.[1];
       if (!line) throw new Error("missing enrollment request on SSH stdout");
@@ -609,24 +693,46 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
       const accepted = req.enroll(body);
       if (!accepted.ok) throw new Error(`${accepted.code} ${accepted.detail}`);
       const reply = Buffer.from(encodeFrame(supervisorControl({ runner: req.label, gen: 0, epoch: 0 }, "enroll.ok", accepted.reply))).toString("base64");
+      step("enroll", "done", "accepted");
+      step("install", "start", "again with the supervisor's enrollment reply");
       pass = await install({ ...issue, reply });
-      if ("ok" in pass) return pass;
+      if ("ok" in pass) return failed(pass);
       r = pass;
     } catch (error) {
-      return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail: error instanceof Error ? error.message : String(error) };
+      const detail = error instanceof Error ? error.message : String(error);
+      step("enroll", "failed", detail);
+      return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail };
     }
   }
   const result = installResult(kind, r, bundle);
-  if (result.ok) writeRunnerEndpoint(req.stateDir, req.label, req.listenAddress);
+  if (!result.ok) {
+    // Exit `systemd` is the script's service-manager stage, so everything before it went through.
+    if (r.code !== INSTALL_EXIT.systemd) return failed(result);
+    step("install", "done");
+    step("service", "failed", `${result.code} ${result.detail}`);
+    return result;
+  }
+  step("install", "done");
+  step("service", "done", kind === "windows" ? "scheduled task registered and started" : `runner service registered and started; ${herdrInstallNote(result.herdr)}`);
+  if (kind === "windows") {
+    // Windows has no lane sandbox; a policy that still requires one refuses this host's lanes (the install went through).
+    const refused = [...r.out.matchAll(/^RUNNER_CONFIG_SANDBOX_REQUIRED .*$/gm)].map((m) => m[0].trim());
+    const migrated = [...r.out.matchAll(/^RUNNER_CONFIG_UNSANDBOXED .*$/gm)].map((m) => m[0].trim());
+    step("sandbox", refused.length ? "failed" : "done", [...refused, ...migrated, "none: Windows has no lane sandbox, so lanes here run unsandboxed (SANDBOX_SKIPPED at each launch)"].join("; "));
+  }
+  step("verify", "start");
+  writeRunnerEndpoint(req.stateDir, req.label, req.listenAddress);
+  step("verify", "done", `remote pass exited 0, version=${result.version}, endpoint ${req.listenAddress} recorded`);
   return result;
 };
 
 /**
  * Bundles the CLI for a remote runner. The bundle has no git checkout on the remote host, so the source's short SHA is
- * baked in as `DORI_RUNNER_VERSION` (version.ts), which the runner reports in its hello.
+ * baked in as `DORI_RUNNER_VERSION` (version.ts), which the runner reports in its hello. The bundle is written under
+ * `scratchRoot` (the supervisor passes its state dir): /tmp on a supervisor host may be a quota'd tmpfs that is full.
  */
-export const buildBundle = (run: Runner, entry: string = RUNNER_CLI_ENTRY) => async (): Promise<string> => {
-  const dir = mkdtempSync(join(tmpdir(), "dori-runner-bundle-"));
+export const buildBundle = (run: Runner, entry: string = RUNNER_CLI_ENTRY, scratchRoot: string = tmpdir()) => async (): Promise<string> => {
+  const dir = mkdtempSync(join(scratchRoot, "dori-runner-bundle-"));
   try {
     const out = join(dir, "dori.js");
     const version = await gitVersion(run, import.meta.dir);

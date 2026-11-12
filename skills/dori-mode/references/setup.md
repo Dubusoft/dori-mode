@@ -35,28 +35,66 @@ Greet the owner through the bot before doing anything else.
 ## 4. Scripts and `dori setup`
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 The installer clones the repo, links the skill, runs `bun link` (puts `dori` on PATH) and then `dori setup` when it has a terminal. Otherwise run `dori setup` yourself, or from a checkout: `cd skills/dori-mode/scripts && bun install && bun link && dori setup`.
 
-`dori setup` is interactive and safe to rerun: each question shows the current value and Enter keeps it. It does, in order:
+`dori setup` is interactive and safe to rerun: each question shows the current value in brackets, or `(default: ...)` with the value that applies when the key is unset; Enter keeps it and `-` clears an optional key. It asks five questions: the bot token, the channel ids, the owner id, whether new GitHub issues start work, and autostart. Everything else keeps its stored value or default (change it with `--set key=value`). `dori setup --advanced` also asks the steps marked *advanced* below. It does, in order:
 
 1. **Bot token**: saved as `DORI_DISCORD_TOKEN` in `~/.dori/env` (mode 600, other lines kept). Input is hidden and the token is never printed.
 2. **Main channel ids**: `discordChannels`. Each id is checked with the token (`GET /channels/{id}`); a 401 means a bad token, a 403 means the bot is not in the server or cannot view the channel.
+   A channel that fails its check is asked again (*advanced*: setup offers to keep it anyway).
    With a token and at least one channel, setup reads `GET /oauth2/applications/@me` and the first channel's `guild_id`, then asks for the Discord owner user id (defaults to the application owner). It writes `discord.applicationId`, `discord.guildId`, and `discord.ownerId` for slash commands, preserving existing values on reruns.
-3. **`defaultModel`, `leadModel`, `defaultCwd`, `stateDir`**: defaults are the subscription model, empty (the lead uses `defaultModel`), `~` and `~/.dori/state`. `defaultModel` is for lanes; `leadModel` only changes the lead. `laneThinking` (default `medium`) sets the lanes' `--thinking`; `launch --mode mass-ulw` uses `massLaunchKeywords`. `leadModel` is one model; a legacy array uses its first entry with a warning.
-   It also asks for optional GitHub repos to watch on this machine and saves them in the state directory; `dori repos add/remove/list` changes the list without a supervisor restart.
-   Then it asks which GitHub accounts' new issues start work automatically (`githubIssueAuthors`, optional, comma separated; `--issue-author LOGIN` non-interactively). Issues from anyone else never wake the lead.
-4. **herdr**: keeps the lead pane and lanes workspace recorded in `<stateDir>/herdr-panes.json` when they still exist, otherwise creates a `dori-lead` tab in a `Dori` workspace and a `lanes` workspace, and records both there (the supervisor does the same at every start). The config gets only `ignorePanes` (the shell pane a new workspace starts with); an old config's `leadPane`, `laneWorkspace` and `workspaces` are moved into the state file and dropped from the config. The herdr server must be running.
-5. **Autostart (optional, Linux)**: renders only `herdr-server.service` and `dori-supervisor.service` from `scripts/templates` (there is no runner unit on the lead host: the supervisor spawns the local runner as its child) into `~/.config/systemd/user`, plus `~/.dori/dori-boot-prep.sh` (the supervisor's ExecStartPre: it waits for the herdr server; the supervisor then finds or recreates the lead pane and lanes workspace). Then, asking before each: `loginctl enable-linger`, `systemctl --user daemon-reload`, and `systemctl --user enable herdr-server.service dori-supervisor.service`. Before enabling, setup checks systemd for an existing `dori-presence.service` and asks to run `systemctl --user disable --now dori-presence.service`. Accepting stops and disables it without deleting its file; declining leaves it untouched. Stop the legacy presence process before starting the supervisor. Start the new units with `systemctl --user start herdr-server.service dori-supervisor.service`; if herdr already runs by hand, setup instead prints a supervisor-only start command to avoid a socket conflict.
+3. **`defaultModel`, `leadModel`, `leadCwd`, `stateDir`** (*advanced*; otherwise flags `--model`, `--cwd`, `--state-dir`, then stored values, then defaults): defaults are the subscription model, empty (the lead uses `defaultModel`), `~/.dori/lead` and `~/.dori/state`; setup creates both directories. `defaultModel` is for lanes; `leadModel` only changes the lead. `leadCwd` is the lead session's working directory; local lanes started without `--cwd` start there too. A config that still names it `defaultCwd` keeps its value: setup renames the key to `leadCwd` (`SETUP_KEY_RENAMED defaultCwd -> leadCwd`), and an existing config with neither key gets `"leadCwd": "~"`, the home directory it ran the lead in. Lanes run at `--thinking medium`; change it in `agentCommand` or a runner's `runner-config.json` `agents`; `launch --mode mass-ulw` uses `massLaunchKeywords`. `leadModel` is one model; a legacy array uses its first entry with a warning.
+   Then it asks whether new GitHub issues start work automatically. Yes asks which GitHub accounts' new issues do (`githubIssueAuthors`, comma separated; `--issue-author LOGIN` answers it without asking) and the GitHub repos to watch on this machine, saved in the state directory (*advanced* asks the repos either way); no clears `githubIssueAuthors`. Issues from anyone else never wake the lead. `dori repos add/remove/list` changes the repo list without a supervisor restart.
+   *Advanced* then asks the other config keys (see below); the default flow records them as seen, so `dori setup --migrate` later asks only keys added after this run.
+4. **herdr** (asked only with *advanced*; `--no-herdr` skips it):
+   Keeps the lead pane and lanes workspace recorded in `<stateDir>/herdr-panes.json` when they still exist, otherwise creates a `dori-lead` tab in a `Dori` workspace and a `lanes` workspace, and records both there (the supervisor does the same at every start). The config gets only `ignorePanes` (the shell pane a new workspace starts with); an old config's `leadPane`, `laneWorkspace` and `workspaces` are moved into the state file and dropped from the config. The herdr server must be running.
+5. **Autostart (optional, Linux)**: renders only `herdr-server.service` and `dori-supervisor.service` from `scripts/templates` (there is no runner unit on the lead host: the supervisor spawns the local runner as its child) into `~/.config/systemd/user`, plus `~/.dori/dori-boot-prep.sh` (the supervisor's ExecStartPre: it waits for the herdr server; the supervisor then finds or recreates the lead pane and lanes workspace). Then, asking before each: `loginctl enable-linger`, `systemctl --user daemon-reload`, and `systemctl --user enable herdr-server.service dori-supervisor.service` (without *advanced*, answering yes to autostart runs every step without asking). Before enabling, setup checks systemd for an existing `dori-presence.service` and asks to run `systemctl --user disable --now dori-presence.service`. Accepting stops and disables it without deleting its file; declining leaves it untouched. Stop the legacy presence process before starting the supervisor. Start the new units with `systemctl --user start herdr-server.service dori-supervisor.service`; if herdr already runs by hand, setup instead prints a supervisor-only start command to avoid a socket conflict.
    The supervisor unit uses the systemd watchdog (`Type=notify`, `WatchdogSec=300`) and both units stop after 5 starts in 600 s, then run `dori-failure-notify@.service`, which posts one Discord line with the fix (`systemctl --user reset-failed <unit> && systemctl --user start <unit>`). Rerun autostart and `daemon-reload` on older installs to get them.
 
-The config is written atomically (mode 600) and every key setup does not manage, such as `hooks`, stays as it is. Add the hooks and anything else by hand; `references/scripts.md` explains every field and `config.example.json` shows them all.
+The config is written atomically (mode 600). `references/scripts.md` explains every field and `config.example.json` shows them all.
+
+### Config keys: by argument or interactively
+
+`dori setup` and `dori runner setup` (a runner's `runner-config.json`) work the same way:
+
+- **By argument.** `--set key=value` and `--unset key` (both repeatable) are applied exactly as given and never asked. An empty value unsets. A list takes `a,b` or a JSON array, a JSON key takes JSON. An unknown key or a bad value stops the run before anything is written (`SETUP_FAILED` / exit 1, listing the valid keys).
+- **Interactively.** Every other key is asked with its `[required]` or `[optional]` label and its current value; Enter keeps it and `-` clears an optional key. Required keys without a value and keys never shown before come first, then setup offers the other keys; a required key that already has a value is not asked again. `dori setup` asks these only with `--advanced`. Without a terminal or with `--yes` nothing is asked.
+- **Seen keys.** Each key shown or given is recorded in `<stateDir>/setup-keys.json` (runners: `<stateDir>/runner-setup-keys/<label|local>.json`). A later run in "new" mode (`dori setup --migrate`, `dori runner setup --new`) asks only keys never shown before, such as keys a `dori update` added, plus required keys that are empty.
+- **Automatic removal.** Keys the file no longer reads are deleted: unknown top-level keys, `hooks.*` other than `threadReply`/`transcribe`, `laneSandbox.default`, the old `runners` keys (`listen`, `mode`, `restartCircuit`, or a `runners` array), and in `runner-config.json` unknown keys and `guard.*` subkeys. Legacy pane keys are moved into `<stateDir>` first. In `config.json` every other removal is warned about once first: the run that first finds the key keeps it and logs `SETUP_KEY_REMOVAL_PENDING <key> (<reason>)`, and the next run removes it (`SETUP_KEY_REMOVED <key>`). Before any write the previous file is copied to `config.json.<UTC time>.bak` (each run keeps its own copy) / `runner-config.json.bak`, and runner removals are logged as `RUNNER_SETUP_KEY_REMOVED <key>`.
+- **Schema version.** `config.json` holds `schemaVersion`. Setup applies the migration table (`scripts/src/config-schema.ts`: renames move a value, removals carry their reason, fills write a changed built-in default into a file that lacks the key, so an existing install keeps the value it ran with) for every version the file has not had, then writes the current version. A file written by a newer dori is refused and left untouched; update dori first.
+- **Missing required keys** log `SETUP_KEY_MISSING <key> [required]` (`RUNNER_SETUP_KEY_MISSING`) and exit 2.
+
+`config.json` keys:
+
+| Key | Label |
+|---|---|
+| `discord`, `stateDir`, `leadCwd`, `defaultModel`, `discordChannels` | [required] |
+| `worktreeRoot`, `agentCommand`, `leadModel`, `leadThinking`, `leadArgs`, `alertsChannel`, `githubIssueAuthors`, `ownerLanguage`, `displayTimeZone`, `laneRules`, `laneSandbox`, `guardMachines`, `runners`, `placement`, `buttonHooks`, `hooks`, `ciMergeBase`, `ignorePanes` | [optional] |
+
+`runner-config.json` keys:
+
+| Key | Label |
+|---|---|
+| `agents` | [required] |
+| `allowedRoots`, `sandbox` (`required`\|`optional`), `jobs` (`allow`\|`deny`), `guard`, `heavyKill`, `sandboxCheck`, `workspaces`, `reposRoot`, `worktreeRoot` | [optional] |
+| `detectWorkspaces` | [optional], never asked: set it with `--set detectWorkspaces=false` |
+
+The runner-config `defaultCwd` key is retired: a lane started without `--cwd` starts in `~/.dori/runner/lanes/<key>` on its runner. A file that still holds it loads with one `RUNNER_CONFIG_KEY_IGNORED defaultCwd` line and the key has no effect; `dori runner setup` removes it (with `RUNNER_SETUP_KEY_REMOVED defaultCwd` and a `.bak`).
+
+A `runner-config.json` that would not pass the runner's policy check is never written (`RUNNER_SETUP_FAILED invalid runner-config: ...`). The running runner reloads the file itself; no restart.
+
+What runs it for you:
+
+- `dori runner install` runs `dori runner setup --new` on the new runner afterwards (it takes `--set`, `--unset` and `--yes`).
+- `dori update` runs `dori setup --migrate`: migrate to the current `schemaVersion`, warn about or prune obsolete keys (timestamped `.bak` before each write) and ask only new keys. With no `config.json` it prints `SETUP_MIGRATE_SKIPPED` and creates nothing.
+- `dori runner upgrade` (and so `dori update`'s rollout) runs `dori runner setup --new` for every runner, upgraded or already on the current version, and reports a worker without `runner-config.json` or with a required key missing (`RUNNER_POLICY_MISSING`, exit 1).
 
 Figma MCP: set the figma server to `"exposure": "search"` in the global `~/.omo/agent/mcp.json`. Its tools then cost no prompt tokens until a lane activates them with `tool_search`. `dori launch` writes no `.omo/mcp.json` into lane folders and removes one that is exactly the old figma-off file.
 
-Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --channel ID [--model M] [--cwd DIR] [--state-dir DIR] [--no-herdr] [--autostart]`. Flags win, then stored values, then defaults. A channel the bot cannot read stops the run before anything is written. `--autostart` with `--yes` accepts every system step, including disabling and stopping a detected legacy presence unit. Failed system steps are reported and return exit code 2; a failed legacy-unit check stops autostart before enabling the new units.
+Non-interactive, for scripts and CI: `dori setup --yes --token-file FILE --channel ID [--model M] [--cwd DIR] [--state-dir DIR] [--set key=value ...] [--unset key ...] [--no-herdr] [--autostart]`. Flags win, then stored values, then defaults. A channel the bot cannot read stops the run before anything is written. `--autostart` with `--yes` accepts every system step, including disabling and stopping a detected legacy presence unit. Failed system steps are reported and return exit code 2; a failed legacy-unit check stops autostart before enabling the new units.
 
 ## 5. Monitors
 

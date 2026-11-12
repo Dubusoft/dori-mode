@@ -12,7 +12,7 @@ import { type Lane, statusOf } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";
 import { resolveSession } from "../src/session-id.ts";
 import { syncRegistry } from "../src/sync.ts";
-import { depsFor, fakeClock, newWorld, type OpsEntry, sent, withState, type World, withSqliteStore } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, type OpsEntry, sent, withState, type World, withSqliteStore, WT } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00Z");
 const MACHINE = "build host";
@@ -102,14 +102,21 @@ test("remote --workspace launch resolves the shell pane from that machine's inve
   expect(startInput()).toMatchObject({ target: { pane: "w:p3" } });
 });
 
-test("plain remote launch needs a directory on the machine and never sends the lead's workspace or defaultCwd", async () => {
+test("a plain remote launch without --cwd names no directory (the runner's defaultCwd), never the lead's leadCwd", async () => {
+  const d = deps();
+  await Bun.write(lane().brief, "work\n");
+  world.startResult = { pane: "w:p7", tab: "w:t7", startup: { verdict: "ok", detail: "" } };
+  const bare = await launchLane(d, lane({ pane: undefined, cwd: undefined }));
+  expect(startInput()).toMatchObject({ machine: MACHINE });
+  expect(startInput()).not.toHaveProperty("cwd");
+  expect(bare.lane.cwd).toBeUndefined();
+  expect(bare.lane.remoteCwd).toBeUndefined();
+});
+
+test("plain remote launch never sends the lead's workspace or leadCwd", async () => {
   const d = deps();
   const config = { ...d.config, laneWorkspace: "local-only-workspace" };
   await Bun.write(lane().brief, "work\n");
-  // The lead's defaultCwd means nothing on the machine.
-  await expect(launchLane({ ...d, config }, lane({ pane: undefined, cwd: undefined }))).rejects.toThrow(`a lane on machine ${MACHINE} needs --cwd`);
-  expect(opsOf("start")).toEqual([]);
-  expect(await d.registry.read("remote-lane")).toBeNull();
   world.startResult = { pane: "w:p8", tab: "w:t8", startup: { verdict: "ok", detail: "" } };
   expect((await launchLane({ ...d, config }, lane({ pane: undefined }))).lane.tab).toBe("w:t8");
   expectRemote();
@@ -161,12 +168,16 @@ test("remote footer reports through the runner's lane CLI; local footer through 
   expect(remote).not.toContain("[REPORT]");
   expect(remote).not.toContain("lead:p1");
   const local = footer(lane({ machine: undefined }));
-  expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<merge SHA, closed issue, version>"');
+  expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"');
   expect(local).not.toContain("~/.dori/runner/bin/dori");
   expect(local).not.toContain("[REPORT]");
+  for (const text of [local, remote]) {
+    expect(text).toContain("Rewritten paths under briefs/<key>.files are read-only snapshots of lead files; do not edit them. Write every output to DORI_LANE_OUT, including updated versions of an attached file.");
+    expect(text).toContain('Write report files in DORI_LANE_OUT (POSIX: "$DORI_LANE_OUT"; PowerShell: "$env:DORI_LANE_OUT"). Finish writing before claiming done. dori ships that entire directory to the lead when you run claim-done or report done; files elsewhere are not collected. Keep each file at or below 262144 bytes and the directory at or below 393216 bytes total, with at most 64 files.');
+  }
 });
 
-test("close runs a remote lane's command signals in the local defaultCwd, also for entries that stored the remote path", async () => {
+test("close runs a remote lane's command signals in the local leadCwd, also for entries that stored the remote path", async () => {
   for (const entry of [lane({ cwd: undefined, remoteCwd: "D:\\dev\\app" }), lane({ cwd: "D:\\dev\\app" })]) {
     world.ops = [];
     const d = deps();
@@ -174,7 +185,7 @@ test("close runs a remote lane's command signals in the local defaultCwd, also f
     const result = await closeLane(d, { ...entry, done: 'command ["gh","pr","list"] stdout~"MERGED"' }, "verified");
     expect(result.closed).toBe(true);
     const asked = opsOf("inspect").map((e) => (e.args as { want: Record<string, unknown> }).want).filter((want) => want.done !== undefined);
-    expect(asked).toEqual([{ done: 'command ["gh","pr","list"] stdout~"MERGED"', doneCwd: d.config.defaultCwd }]);
+    expect(asked).toEqual([{ done: 'command ["gh","pr","list"] stdout~"MERGED"', doneCwd: d.config.leadCwd }]);
   }
 });
 
@@ -323,6 +334,17 @@ test("dead-panes scopes remote reads and state independently from local IDs", as
   expect(reads.some((r) => r.pane === "w:p9")).toBe(false);
 });
 
+test("dead-panes reads a remote lane pane in any workspace, whatever the local lanes workspace is", async () => {
+  const d = deps();
+  world.panes = [{ pane_id: "w:p3", workspace_id: "w" }];
+  world.screen = "agent has stopped";
+  const config = { ...d.config, laneWorkspace: "local-only-workspace" };
+  const seen = new Set<string>();
+  const memory = newDeadPaneState();
+  expect(await deadPaneTick(d.ops, config, seen, "hour", memory, [lane()])).toEqual([]);
+  expect(await deadPaneTick(d.ops, config, seen, "hour", memory, [lane()])).toEqual([`DEAD_PANE w:p3 machine=${MACHINE}`]);
+});
+
 test("dead-panes never alerts on a remote host's own panes over several sweeps", async () => {
   const d = deps();
   // The machine's herdr lists the lane's working pane plus panes no lane owns: a plain shell and another workspace's pane.
@@ -354,6 +376,28 @@ test("remote worktree checks and cleanup skip explicitly and never ask for git",
   expect(opsOf("git")).toEqual([]);
   expect(opsOf("inspect").some((e) => (e.args as { want: { git?: boolean } }).want.git)).toBe(false);
   expect(world.calls.some((argv) => argv[0] === "git")).toBe(false);
+  expectRemote();
+});
+
+test("a closed remote lane's worktrees under its runner's root are recorded at the close and removed once clean and pushed", async () => {
+  const d = { ...deps(), runnerWorktreeRoot: (label: string) => (label === MACHINE ? "/repo/.wt" : undefined) };
+  world.aheadCount = "1";
+  expect((await closeLane(d, lane(), "verified")).closed).toBe(true);
+  const closed = (await d.registry.read("remote-lane")) as Lane;
+  expect(closed.receipt).toMatchObject({ worktreeCheck: { status: "skipped" } });
+  // Only the lane's worktree under the root: the checkout at /repo is outside it.
+  expect((closed.receipt as { cleanup: string[] }).cleanup.filter((l) => l.startsWith("worktree /"))).toEqual([`worktree ${WT} kept: remote lane, removed by the closed-lane cleanup once clean and pushed`]);
+  expect(opsOf("git")).toEqual([]);
+  // A commit no remote has keeps it, and so does any change.
+  expect(await closedWorktreeSweep(d, closed)).toEqual([]);
+  world.aheadCount = "0";
+  world.dirty = " M file.ts\n";
+  expect(await closedWorktreeSweep(d, closed)).toEqual([]);
+  expect(opsOf("git")).toEqual([]);
+  world.dirty = "";
+  expect(await closedWorktreeSweep(d, closed)).toEqual([`WORKTREE_CLEANED remote-lane ${WT}`]);
+  expect(opsOf("git").map((e) => e.args)).toEqual([{ op: "worktree-remove", root: WT, path: WT }]);
+  expect(opsOf("exists").every((e) => (e.args as { machine?: string }).machine === MACHINE)).toBe(true);
   expectRemote();
 });
 

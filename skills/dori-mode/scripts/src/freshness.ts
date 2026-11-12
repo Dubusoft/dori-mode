@@ -29,7 +29,7 @@ export type SweepAct = { readonly kind: "nudged" | "no-progress" | "idle-escalat
  */
 export const nudgeText = (lane: Lane, silentMin: number, ownerLanguage?: string): string => {
   const dori = lane.machine ? "~/.dori/runner/bin/dori" : "dori";
-  const done = `claim it: ${dori} report ${lane.key} done --text "<one line>" --evidence "<merge SHA, closed issue, version>"`;
+  const done = `claim it: ${dori} report ${lane.key} done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"`;
   const blocked = `report it: ${dori} report ${lane.key} blocked --text "<what blocks you>"`;
   const language = languageInstruction(ownerLanguage);
   return `[LEAD] your work thread has had no update for ${silentMin} min. If the deliverable is done and every Done signal is live, ${done}. If you are blocked on something outside this lane, ${blocked}. Otherwise post a 1-2 sentence progress line (done since last, next), keep its status true, and continue the work now.${language ? ` ${language}` : ""}`;
@@ -71,7 +71,7 @@ export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: 
     if (statusOf(lane) !== "working" || !lane.pane || lane.recoveryPending) continue;
     if (reports) rows ??= lastRowAt(reports);
     const rowAt = rows?.get(lane.key);
-    if (rowAt !== undefined && now - rowAt < deps.config.nudgeAfterMin * 60_000) continue;
+    if (rowAt !== undefined && now - rowAt < deps.tunables.nudgeAfterMin * 60_000) continue;
     const heard = Math.max(lastHeard(lane), rowAt ?? -Infinity);
     const silentMin = Math.round((now - heard) / 60_000);
     let current = lane;
@@ -80,7 +80,7 @@ export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: 
       current = { ...current, ...fields };
       await deps.registry.patch(lane.key, fields);
     };
-    if (silentMin >= deps.config.nudgeAfterMin) {
+    if (silentMin >= deps.tunables.nudgeAfterMin) {
       // The pane's agent status (read by the lane's runner) decides. A working lane is never interrupted and nothing is posted for it: the lead hears
       // once per silence and decides. No nudge was sent, so this silence never escalates.
       if ((await reads.status(lane)).status === "working") {
@@ -105,7 +105,7 @@ export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: 
         // idleEscalateMin after the nudge and then after twice the previous wait each time, until the lane speaks.
         const count = current.idleEscalations;
         const since = current.lastIdleEscalateAt ?? current.lastNudgeAt;
-        if (now - since >= deps.config.idleEscalateMin * 2 ** count * 60_000) {
+        if (now - since >= deps.tunables.idleEscalateMin * 2 ** count * 60_000) {
           const nudgedMin = Math.round((now - current.lastNudgeAt) / 60_000);
           await save({ idleEscalations: count + 1, lastIdleEscalateAt: now });
           acts.push({ kind: "idle-escalate", lane: lane.key, detail: `${silentMin} min silent and idle, no update ${nudgedMin} min after its nudge (escalation ${count + 1}); it is not nudged again: read its pane, steer it, or dori close ${lane.key}` });

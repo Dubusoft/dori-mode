@@ -13,7 +13,7 @@ Dori モードは、コーディングエージェントのセッションひと
 ## インストール
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/dev-bokdong/dori-mode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
 ```
 
 リポジトリを `~/.dori/src` に取得し、スキルを `~/.agents/skills/dori-mode` にリンクし、`bun link` で `dori` を PATH に通してから `dori setup` を起動します。エージェントが別の場所からスキルを読む場合は `SKILLS_DIR` を指定してください。
@@ -58,7 +58,7 @@ Dori はあなたの話し方に合わせます。短く、くだけた調子で
 
 | 項目 | 意味 |
 |---|---|
-| `defaultCwd` | レーンが始まるディレクトリで、レーンが worktree を作るリポジトリ |
+| `leadCwd` | レーンが始まるディレクトリで、レーンが worktree を作るリポジトリ |
 | `agentCommand` | エージェントの起動コマンド。`{model}` と `{prompt}` を含む argv のリスト |
 | `hooks.threadReply` | メッセンジャー CLI を `{thread}` と `{text}` を含む argv のリストで。レーンの進捗投稿に使います。 |
 
@@ -129,7 +129,7 @@ watcher はレーンを閉じるときに、シェルを通さずこの確認を
 | `dori watch` | 自動クローズの watcher。常駐モニターとして動かします |
 | `dori freshness [--loop MIN]` | 静かになったレーンに声をかけ、それでも静かならリードに上げ、最後の報告をスレッドに投稿 |
 | `dori dead-panes [--loop MIN]` | 止まったエージェントの pane を報告 |
-| `dori guard [--loop MIN]` | 負荷、メモリ、ディスク、pane 数の警告、ワーカーマシンごとにも (`guard install`、`guard machines`) |
+| `dori guard [--loop MIN]` | 負荷、メモリ、ディスク、pane 数の警告、ランナーマシンごとにも (ランナーのサンプルから、`dori status` に表示) |
 | `dori heavy <label> -- <cmd>` | スロットが空いて負荷が低いときだけビルド、テスト、エミュレータを実行 (マシンごとに1つ) |
 
 pane に送る文字列は必ず引数ひとつとして渡し、シェル文字列を通しません。送信結果は「届いた」か「未確認」として報告します。
