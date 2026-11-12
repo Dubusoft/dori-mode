@@ -6,6 +6,9 @@
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <leadCwd>/state/verify)
+#   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
+#   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
+#                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
 # Host paths outside ~/.dori hidden from every lane (e.g. ~/.secrets) are listed one per line in ~/.dori/lane-sandbox-hide
 # ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it. ~/.dori/env and
 # ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
@@ -165,6 +168,7 @@ opts+=(--unsetenv DBUS_SESSION_BUS_ADDRESS)
 # Working directory
 C=$(pwd -P)
 broad=0
+gits=()
 case "$C" in / | /home | "$H") broad=1 ;; esac
 if [ -n "${LANE_SANDBOX_NO_CWD:-}" ]; then
   IFS=: read -r -a nocwd <<<"$LANE_SANDBOX_NO_CWD"
@@ -180,10 +184,33 @@ case "$broad" in
     opts+=(--bind "$C" "$C")
     if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
       opts+=(--bind "$gcd" "$gcd")
+      gits+=("$gcd")
     fi
     ;;
 esac
 opts+=(--chdir "$C")
+
+# A lane started without --cwd makes its worktree from a repo under the repos root into the worktree root: the worktree
+# root and each repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>) are writable; the repos root itself and each
+# repo's working tree stay read-only.
+if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then
+  opts+=(--bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+fi
+if [ -n "${LANE_SANDBOX_REPOS:-}" ]; then
+  shopt -s nullglob
+  for g in "${LANE_SANDBOX_REPOS%/}"/*/.git; do
+    if [ -d "$g" ]; then
+      opts+=(--bind "$g" "$g")
+      gits+=("$g")
+    fi
+  done
+  shopt -u nullglob
+fi
+# A hook written by a lane would run outside the sandbox at the next git command on the host: each writable .git's
+# hooks stay read-only, bound after every read-write .git so none of them re-exposes one.
+for g in ${gits[@]+"${gits[@]}"}; do
+  opts+=(--ro-bind-try "$g/hooks" "$g/hooks")
+done
 
 # Hidden host paths last among the binds, so neither the cwd nor LANE_SANDBOX_RW can re-expose one.
 if [ -f "$H/.dori/lane-sandbox-hide" ]; then
