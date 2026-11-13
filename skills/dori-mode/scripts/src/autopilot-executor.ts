@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { autopilotLaneKey, LAUNCH_ACTION, ledgerRows } from "./autopilot.ts";
-import { type AutopilotDeps, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
+import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
 import { type AutopilotContract, planTask } from "./autopilot-plan.ts";
 import { resolveCredential } from "./credentials.ts";
 import type { FlowDeps } from "./done-flow.ts";
@@ -39,7 +39,6 @@ import { ToodoClient, ToodoWriter } from "./toodo-client.ts";
  * The brief stays under stateDir: only the lead reads it; the runner writes the lane's own copy from briefText.
  */
 
-const EXECUTE = "autopilot-execute";
 type Terminal = "launched" | "review" | "failed" | "ambiguous";
 
 /** An execution's current result. Held and paused executions retain their original reservation. */
