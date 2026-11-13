@@ -276,6 +276,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
       return { code: 0, out: "", err: "" };
     },
     notify: async (lane, notice) => { record("notify", lane.key, notice); },
+    attach: async (lane, tree) => { record("attach", lane.key, tree); down(runnerOf(lane)); return { dir: `/runner/briefs/${lane.key}.files/a0001` }; },
     kill: async (machine, keys) => { record("kill", undefined, { machine, keys }); down(machineRunner(machine)); return []; },
     observe: async (lane) => { record("observe", lane.key, {}); down(runnerOf(lane)); return statusOf(lane); },
     turn: async (lane) => { record("turn", lane.key, {}); down(runnerOf(lane)); return w.turn; },

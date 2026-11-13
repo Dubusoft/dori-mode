@@ -11,7 +11,7 @@ import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.t
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, runnerPaths, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
-import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
+import { addInput, captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { laneProcessAlive, turnStop } from "./observe.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
@@ -587,6 +587,15 @@ export class RunnerLanes {
   }
 
   /** Closes the lane's tab (else its pane), deletes its brief and token file and forgets its token; `gone` is read back from the pane list. */
+  /** Adds lead files to a running lane's briefs/<key>.files (`dori attach`); only a lane started with lane files has one. */
+  async attach(body: SupervisorCommandBodies["lane.attach"]): Promise<Effect<"lane.attach">> {
+    const record = this.record(body.key);
+    if (!record.fileRun) throw new LaneFileError("LANE_ATTACH_UNMANAGED", body.key, "this lane was not started with lane files (adopted or started by an older dori); relaunch it from the lead to attach files");
+    checkFileBody(body.key, body);
+    const dir = addInput(this.deps.runnerDir, body.key, body.tree);
+    return { detail: `attached files=${body.tree.files.length} dir=${dir}`, result: { dir } };
+  }
+
   async close(key: string): Promise<Effect<"lane.close">> {
     const record = this.record(key);
     const current = await this.currentPane(record);

@@ -163,6 +163,50 @@ export const prepareInput = (runnerDir: string, key: string, brief: string, file
   }
 };
 
+/**
+ * Adds a lead's tree to a running lane's input directory under the next free `a<NNNN>` group and returns that group's
+ * path. The directory is written in place, never replaced: a Linux lane sandbox binds it by inode at start, so a renamed
+ * replacement would stay invisible to the lane. The combined input keeps the launch caps.
+ */
+export const addInput = (runnerDir: string, key: string, tree: LaneFileTree): string => {
+  validateFileKey(key);
+  validateTree(key, tree);
+  const paths = laneFilePaths(runnerDir, key);
+  let st: Stats;
+  try { st = lstatSync(paths.input); } catch {
+    throw new LaneFileError("LANE_ATTACH_NO_INPUT", key, `the lane has no attachment directory ${JSON.stringify(paths.input)}; relaunch it from the lead`);
+  }
+  if (!st.isDirectory() || st.isSymbolicLink() || realpathSync(paths.input) !== resolve(paths.input)) {
+    throw new LaneFileError("LANE_ATTACH_NO_INPUT", key, `the attachment directory ${JSON.stringify(paths.input)} is not a plain directory; relaunch the lane from the lead`);
+  }
+  let files = 0, directories = 0, total = 0;
+  const count = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name), s = lstatSync(path);
+      if (s.isDirectory() && !s.isSymbolicLink()) { directories++; count(path); } else { files++; total += s.size; }
+    }
+  };
+  count(paths.input);
+  limit(key, "files", files + tree.files.length);
+  limit(key, "directories", directories + tree.directories.length + 1);
+  totalSize(key, tree.files.reduce((n, f) => n + f.bytes, total), false);
+  const taken = new Set(readdirSync(paths.input).map((name) => name.toLowerCase()));
+  let n = 1;
+  while (taken.has(`a${String(n).padStart(4, "0")}`)) n++;
+  const group = join(paths.input, `a${String(n).padStart(4, "0")}`);
+  try {
+    removeLaneTree(runnerDir, paths.stage);
+    mkdirSync(paths.stage, { mode: 0o700 });
+    for (const dir of tree.directories) mkdirSync(join(paths.stage, dir), { mode: 0o700 });
+    for (const f of tree.files) writeFileSync(join(paths.stage, f.path), Buffer.from(f.base64, "base64"), { flag: "wx", mode: 0o600 });
+    renameSync(paths.stage, group);
+  } catch {
+    removeLaneTree(runnerDir, paths.stage);
+    throw new LaneFileError("LANE_FILES_WRITE_FAILED", key, "cannot add the files to the lane's attachment directory; fix runner disk space and permissions, then retry");
+  }
+  return group;
+};
+
 export type FileReaders = {
   lstat: typeof lstatSync; readdir: (path: string) => string[]; realpath: (path: string) => string;
   open: (path: string, flags: number) => number; stat: (fd: number) => Stats;

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { briefDeliverable, prepareLeadLaneBrief } from "../src/launch.ts";
-import { checkLaneFilesBody, checkLaneReportText, FILE_LIMITS, installLaneReports, LaneFileError, LEAD_ATTACHMENT_ROOTS, prepareLaneBrief, protectLaneCollectionDirectory, scanBriefPaths, treeDigest, validateLaneOutput, validateLaneTree, verifyLaneFileReceipt, writeLaneAttachmentPin } from "../src/lane-files.ts";
+import { checkLaneFilesBody, checkLaneReportText, FILE_LIMITS, installLaneReports, LaneFileError, LEAD_ATTACHMENT_ROOTS, prepareLaneAttachment, prepareLaneBrief, protectLaneCollectionDirectory, scanBriefPaths, treeDigest, validateLaneOutput, validateLaneTree, verifyLaneFileReceipt, writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { StateLockError, tryStateLock } from "../src/state-lock.ts";
 import type { Lane } from "../src/registry.ts";
 import type { LaneFile, LaneOutputFiles } from "../src/runner/protocol.ts";
@@ -440,4 +440,32 @@ test("unsafe ancestry and lock links refuse without following or modifying their
   symlinkSync(outside, join(f.stateDir, "lane-files", `${f.lane.key}.lock.sqlite`));
   await expect(installLaneReports(f.stateDir, f.lane.key, output(), f.options)).rejects.toThrow("LANE_REPORT_DESTINATION_UNSAFE");
   expect(readFileSync(outside, "utf8")).toBe("preserved");
+});
+
+test("a brief path under the attachment roots that did not ship says why, even when the research root is missing", () => {
+  const f = fixture(), gone = join(f.research, "k", "report.md"), briefs = join(f.stateDir, "briefs", "x.md");
+  mkdirSync(join(f.research, "k"));
+  const p = prepareLaneBrief({ key: f.lane.key, stateDir: f.stateDir, briefText: `read ${gone} and ${gone} and ${briefs}`, requiredReport: false });
+  expect(p.files.tree.files).toEqual([]);
+  expect(p.notes).toEqual([
+    `LANE_FILE_NOT_SHIPPED lane-a: ${JSON.stringify(gone)} does not exist (no ${JSON.stringify(gone)}) and stays literal`,
+    `LANE_FILE_NOT_SHIPPED lane-a: ${JSON.stringify(briefs)} does not exist (the attachment root ${JSON.stringify(join(f.stateDir, "briefs"))} is missing) and stays literal`,
+  ]);
+  rmSync(f.research, { recursive: true });
+  expect(prepareLaneBrief({ key: f.lane.key, stateDir: f.stateDir, briefText: gone, requiredReport: false }).notes)
+    .toEqual([`LANE_FILE_NOT_SHIPPED lane-a: ${JSON.stringify(gone)} does not exist (the attachment root ${JSON.stringify(f.research)} is missing) and stays literal`]);
+});
+
+test("attach ships named in-root paths and refuses anything a brief would leave literal", () => {
+  const f = fixture(), dir = join(f.research, "more"), spaced = join(dir, "a b.md");
+  mkdirSync(dir); writeFileSync(spaced, "added");
+  const p = prepareLaneAttachment({ key: f.lane.key, stateDir: f.stateDir, paths: [spaced] });
+  expect(p.tree.files).toEqual([file("r0000/a b.md", "added")]);
+  expect(p.targets).toEqual([{ source: spaced, target: "r0000/a b.md" }]);
+  const outside = join(f.dir, "outside.md"); writeFileSync(outside, "x");
+  for (const paths of [[outside], [join(dir, "missing.md")], [join(f.dir, "nowhere")], ["more/a b.md"], [`${dir}/x\`y`], []]) {
+    expect(() => prepareLaneAttachment({ key: f.lane.key, stateDir: f.stateDir, paths })).toThrow(/LANE_ATTACH_(REFUSED|INVALID) lane-a/);
+  }
+  const link = join(dir, "link"); symlinkSync(outside, link);
+  expect(() => prepareLaneAttachment({ key: f.lane.key, stateDir: f.stateDir, paths: [link] })).toThrow("LANE_FILE_UNSAFE");
 });

@@ -23,9 +23,9 @@ import type { ReportKind } from "./report-kinds.ts";
 
 /**
  * The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. Proto 6
- * adds the secret control frames, so the supervisor must be upgraded before its runners.
+ * adds the secret control frames and proto 7 the `lane.attach` command, so the supervisor must be upgraded before its runners.
  */
-export const PROTO = 6;
+export const PROTO = 7;
 /** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */
 export const SECRET_PROTO = 6;
 /** Whether a peer that announced `proto` understands the secret frames; an unknown version does not. */
@@ -227,6 +227,8 @@ export type SupervisorCommandBodies = {
   readonly "lane.recover": Cmd<{
     readonly key: string; readonly session?: string; readonly tabWorkspace?: string; readonly briefText?: string; readonly files?: LaneBriefFiles;
   }>;
+  /** Since proto 7: add `tree` to the running lane's input directory, in place, under a fresh `a<NNNN>` group. */
+  readonly "lane.attach": Cmd<{ readonly key: string; readonly tree: LaneFileTree }>;
   /** `mode` and `refuseWhileAsking` since proto 3. */
   readonly "lane.send": Cmd<{ readonly key: string; readonly text: string; readonly verify: boolean; readonly mode?: SendMode; readonly refuseWhileAsking?: boolean }>;
   /** Since proto 3: the lane's status as the supervisor holds it, answered to the lane's `dori lane status`. */
@@ -393,6 +395,8 @@ export type CommandResults = {
   readonly "lane.resume": { readonly goal: GoalOutcome; readonly execution?: ExecutionOutcome };
   readonly "lane.recover": { readonly pane: string; readonly tab: string; readonly relaunched: boolean; readonly resumed: boolean; readonly startup?: StartupVerdict };
   readonly "lane.send": { readonly delivery: "delivered" | "unconfirmed" | "failed" | "sent"; readonly refusal?: string };
+  /** `dir`: the added group's path as the lane sees it. */
+  readonly "lane.attach": { readonly dir: string };
   readonly "lane.notify": Record<never, never>;
   /** `out` and `err` are capped at 4 KiB each. */
   readonly "lane.git": { readonly code: number; readonly out: string; readonly err: string };
@@ -615,6 +619,7 @@ const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
   "lane.recover": cmd({
     key: req("string"), session: opt("string"), tabWorkspace: opt("string"), briefText: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),
   }),
+  "lane.attach": cmd({ key: req("string"), tree: req({ object: LANE_FILE_TREE }) }),
   "lane.send": cmd({
     key: req("string"), text: req("string"), verify: req("bool"), mode: opt({ enum: ["verified", "guarded"] }), refuseWhileAsking: opt("bool"),
   }),

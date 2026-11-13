@@ -93,6 +93,7 @@ export const runnerEffects = (deps: {
   "lane.pause": async (command) => deps.lanes.pause(command.body.key, command.body.step),
   "lane.resume": async (command) => deps.lanes.resume(command.body.key),
   "lane.notify": async (command) => deps.lanes.notify(command.body),
+  "lane.attach": async (command) => deps.lanes.attach(command.body),
   "lane.git": async (command) => laneGitEffect(deps.run, command.body),
   "lane.recover": async (command) => {
     if (command.body.files) checkFileBody(command.body.key, command.body);

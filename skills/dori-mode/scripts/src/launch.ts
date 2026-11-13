@@ -17,7 +17,7 @@ import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
-import { briefBody, FILE_FOOTER_HEADING, LaneFileError, prepareLaneBrief, readLaneAttachmentPin, writeLaneAttachmentPin } from "./lane-files.ts";
+import { briefBody, FILE_FOOTER_HEADING, LaneFileError, prepareLaneAttachment, prepareLaneBrief, readLaneAttachmentPin, writeLaneAttachmentPin } from "./lane-files.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
 import type { LaneBriefFiles } from "./runner/protocol.ts";
 import type { RecoveryLane } from "./recover.ts";
@@ -199,6 +199,22 @@ export const prepareLeadLaneBrief = async (deps: FlowDeps, lane: Lane, runId?: s
   }
 };
 
+/**
+ * `dori attach`: adds lead files to a running lane's briefs/<key>.files through its runner and returns one
+ * `LANE_FILES_ATTACHED` line per named path, with the path the lane reads it at. A relaunch rebuilds that directory from
+ * the brief, so added files last until the lane is recovered.
+ */
+export const attachLaneFiles = async (deps: FlowDeps, lane: Lane, paths: readonly string[]): Promise<string[]> => {
+  if (!lane.fileRun) throw new LaunchError(`LANE_ATTACH_UNMANAGED ${lane.key}: this lane was not launched with lane files (adopted or launched by an older dori); relaunch it to attach files`);
+  let prepared: ReturnType<typeof prepareLaneAttachment>;
+  try { prepared = prepareLaneAttachment({ key: lane.key, stateDir: deps.config.stateDir, paths }); }
+  catch (e) { if (e instanceof LaneFileError) throw new LaunchError(e.message); throw e; }
+  const { dir } = await deps.ops.attach(lane, prepared.tree);
+  // The runner's own separator: a Windows runner answers a backslash path.
+  const sep = /^[A-Za-z]:\\/.test(dir) ? "\\" : "/";
+  return prepared.targets.map((t) => `LANE_FILES_ATTACHED ${lane.key}: ${JSON.stringify(t.source)} -> ${JSON.stringify([dir, ...t.target.split("/")].join(sep))}`);
+};
+
 export const recoveryFields = (lane: Partial<RecoveryLane>): Partial<RecoveryLane> => ({
   pendingFileRun: lane.pendingFileRun, recoveryPending: lane.recoveryPending, recoveryAfter: lane.recoveryAfter,
   recoveryPreviousPane: lane.recoveryPreviousPane, recoveryExhausted: lane.recoveryExhausted, fileProposal: lane.fileProposal,
@@ -245,6 +261,7 @@ const hasMergedSignal = (done: string): boolean => splitDone(done).some((part) =
 
 export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: readonly string[] = []): string => [
   "- Rewritten paths under briefs/<key>.files are read-only snapshots of lead files; do not edit them. Write every output to DORI_LANE_OUT, including updated versions of an attached file.",
+  "- The lead can add files there while you run (dori attach) and tells you their paths; they are read-only like the rest. A missing file the brief names was not shipped: ask the lead to attach it rather than working without it.",
   '- Write report files in DORI_LANE_OUT (POSIX: "$DORI_LANE_OUT"; PowerShell: "$env:DORI_LANE_OUT"). Finish writing before claiming done. dori ships that entire directory to the lead when you run claim-done or report done; files elsewhere are not collected. Keep each file at or below 262144 bytes and the directory at or below 393216 bytes total, with at most 64 files.',
   "- Set a goal restating the deliverable and its end condition (the `Done =` signals below decide the close), and work until it holds without asking leave for reversible steps the brief covers.",
   "- Done: once every `Done =` signal is live and all work is pushed, run the done command below, then stop and stay idle. A lane ends at its green PR: never wait for the merge (no monitor, wait, sleep, polling loop or `gh pr checks --watch` on it). The supervisor merges the PR at the head your claim recorded and the watcher closes the lane after that merge (5 min after the claim when nothing is left to merge) unless the Dori objects; it refuses while a worktree has uncommitted or unpushed changes. On `[LEAD] not done: <reasons>`, fix them and claim again.",

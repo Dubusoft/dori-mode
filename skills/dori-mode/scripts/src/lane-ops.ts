@@ -9,7 +9,7 @@ import type {
 } from "./runner/protocol.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { checkLaneFilesBody, isLaneOutputFiles } from "./lane-files.ts";
-import type { LaneBriefFiles, LaneOutputFiles } from "./runner/protocol.ts";
+import type { LaneBriefFiles, LaneFileTree, LaneOutputFiles } from "./runner/protocol.ts";
 
 /**
  * The lane facade (design 3.3): every lane and host-pane operation the supervisor and the CLI need, each one a single
@@ -93,6 +93,8 @@ export type LaneOps = {
   readonly git: (lane: LaneRef, op: GitOp, opts?: { readonly cmdId?: string }) => Promise<Ran>;
   /** Never throws (logged). */
   readonly notify: (lane: LaneRef, notice: LaneNotice) => Promise<void>;
+  /** Adds `tree` to the running lane's briefs/<key>.files (proto 7); throws like `start`. */
+  readonly attach: (lane: LaneRef, tree: LaneFileTree) => Promise<CommandResults["lane.attach"]>;
   readonly kill: (machine: string | undefined, keys: readonly string[]) => Promise<KilledProc[]>;
   readonly observe: (lane: LaneRef) => Promise<LaneStatus>;
   /** An idle lane's last stopped turn as its runner recorded it (`lane.observe`); undefined when it has none to give. */
@@ -157,6 +159,7 @@ export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) =
   "lane.recover": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isBool(v.relaunched) && isBool(v.resumed) && (v.startup === undefined || isStartup(v.startup)),
   "lane.send": (v) => isObj(v) && DELIVERIES(v.delivery) && optStr(v.refusal),
   "lane.notify": (v) => v === undefined || isObj(v),
+  "lane.attach": (v) => isObj(v) && isStr(v.dir),
   "lane.git": (v) => isObj(v) && isNum(v.code) && isStr(v.out) && isStr(v.err),
   "lane.observe": (v) => isObj(v) && LANE_STATUSES(v.status) && (v.turn === undefined || isTurn(v.turn)),
   "guard.kill": (v) => isObj(v) && listOf(v.killed, (k) => isObj(k) && isNum(k.pid) && isStr(k.comm) && isNum(k.rssKb) && optStr(k.lane)),
@@ -206,6 +209,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
   ): Promise<CommandResults[T]> => {
     let r;
     try {
+      if (type === "lane.attach") checkLaneFilesBody((body as { key?: string }).key!, body);
       if (type === "lane.start" || type === "lane.recover") {
         cmdId ??= `${type === "lane.start" ? "lane-start" : "recover"}:${(body as { key?: string }).key}:${deps.now()}`;
         checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
@@ -352,6 +356,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
         log(`LANE_NOTIFY_FAILED ${lane.key} runner=${label} ${toOpsError(e, label).message}`);
       }
     },
+    attach: (lane, tree) => effect(runnerOf(lane), "lane.attach", { key: lane.key, tree }),
     kill: async (machine, keys) => [...(await effect(machineRunner(machine), "guard.kill", { keys: [...keys] })).killed],
     observe: async (lane) => (await effect(runnerOf(lane), "lane.observe", { key: lane.key })).status,
     turn: async (lane) => (await effect(runnerOf(lane), "lane.observe", { key: lane.key })).turn,

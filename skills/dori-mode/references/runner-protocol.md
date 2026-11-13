@@ -88,10 +88,16 @@ Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}
 verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action. A protocol 3
 runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
 
+Protocol 7 adds the command `lane.attach {key, tree}` (`dori attach`): the runner validates `tree` like a `lane.start`
+input tree, writes it into the running lane's existing `briefs/<key>.files` directory under the next free `a<NNNN>`
+group (in place, so a sandbox that bound that directory at start sees it; the combined directory keeps the launch caps),
+and answers `{dir}`, that group's path. A lane without a file run (adopted, or started before lane files) refuses it
+with `LANE_ATTACH_UNMANAGED`. A protocol 6 runner is never sent it (`RUNNER_UNAVAILABLE ... outdated`).
+
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
 `lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal, execution?}` (`/goal resume`, then `/resume` when the pane shows omo's Esc-paused footer, then the turn read back: `running` or `held`),
-`lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
+`lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.attach` `{dir}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
 `lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
 managed, paused}`. A runner effect that only returns a
 detail sends no `result`. The supervisor never sends a protocol 3 command or any query to a runner that said hello
@@ -698,10 +704,12 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 6, so a supervisor accepts runners at 6 and 5. Protocol 6 adds the four secret control frames
+The current protocol is 7, so a supervisor accepts runners at 7 and 6. Protocol 6 adds the four secret control frames
 (see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
-**Upgrade the supervisor before its runners**: a proto 5 runner still connects to a proto 6 supervisor, but a proto 6
-runner is refused by a proto 5 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
+Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes and takes secrets, and `dori doctor`
+warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).
+**Upgrade the supervisor before its runners**: a proto 6 runner still connects to a proto 7 supervisor, but a proto 7
+runner is refused by a proto 6 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
 nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
 
 ## Liveness and restarts

@@ -2,7 +2,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir, loadavg } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 import { alertsChannelOf, configPath, loadConfig } from "./config.ts";
@@ -16,7 +16,7 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
 import { type GuardMachine, listGuardMachines, machineKind, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
 import type { Json, KeyPrompter } from "./config-keys.ts";
-import { adoptLane, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, SandboxRefusal, validateLaunch } from "./launch.ts";
+import { adoptLane, attachLaneFiles, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, SandboxRefusal, validateLaunch } from "./launch.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
@@ -171,6 +171,8 @@ const USAGE = `dori <command> [options]
                                        lanes go on to claim); kept in <stateDir>/autopilot-pause.json
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
+  attach <key> <path> [<path> ...]    add lead files or directories under the attachment roots to a running lane's briefs/<key>.files
+                                       (local or remote, launch caps and checks); prints the path the lane reads each at; tell the lane
   claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
   object-done <key> --reason TEXT [--reason TEXT ...]
   lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); inside a lane its own (from its runner), the lead names the lane
@@ -1215,6 +1217,15 @@ try {
       }
       console.log(r.drift.length ? `DRIFT (${r.drift.length}):\n${r.drift.map((d) => `- ${d}`).join("\n")}` : "DRIFT none");
       console.log(flags.values.write ? "WROTE session ids" : "READ_ONLY");
+      break;
+    }
+    case "attach": {
+      const paths = flags.positionals.slice(1);
+      if (!key || !paths.length || Object.keys(flags.values).length) die("usage: dori attach <key> <path> [<path> ...]");
+      const target = await lane(key ?? "");
+      await needSupervisor();
+      try { for (const line of await attachLaneFiles(deps, target, paths.map((p) => resolve(p)))) console.log(line); }
+      catch (e) { die(e instanceof Error ? e.message : String(e)); }
       break;
     }
     case "claim-done": {
