@@ -114,6 +114,8 @@ export type RunnerLanesDeps = {
   readonly legacyMcp?: (cwd: string) => Promise<boolean>;
   /** Resolves a pane's directory for the allowedRoots check (default `fs.realpathSync`). */
   readonly realpath?: (path: string) => string;
+  /** The per-lane herdr report sockets (herdr-report.ts): opened before a POSIX lane's command runs, closed with the lane. */
+  readonly herdrReports?: { open(key: string): void; close(key: string): void };
 };
 
 export type Effect<T extends keyof CommandResults> = { readonly detail: string; readonly result: CommandResults[T] };
@@ -506,10 +508,13 @@ export class RunnerLanes {
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = [...env, ...argv.map(quote)].join(" ");
     }
+    // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
+    if (shell === "posix") this.deps.herdrReports?.open(key);
     input.mayStart?.(true);
     const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
     if (ran.code !== 0) {
       input.mayStart?.(false);
+      if (!previous) this.deps.herdrReports?.close(key);
       rmSync(tokenFile, { force: true });
       await rollback();
       throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
@@ -611,6 +616,7 @@ export class RunnerLanes {
     }
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
+    this.deps.herdrReports?.close(key);
     let gone = !current;
     try { if (current) gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
     catch { gone = false; }

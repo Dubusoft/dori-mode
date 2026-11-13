@@ -829,6 +829,17 @@ reaches it. The runner also serves the older `~/.dori/runner/sock/lane`, and a l
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
 the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
 
+**Agent state in herdr.** The lane sandbox keeps herdr's control socket out of reach, so omo's herdr extension in a
+sandboxed lane cannot report its state there itself. On Linux and macOS the runner serves each lane its own socket,
+`~/.dori/runner/sock/herdr.d/<key>/herdr` (opened before the lane's command runs, removed by `lane.close`), and the lane
+sandbox makes only that lane's one reachable and points `HERDR_SOCKET_PATH` at it. A line there is herdr's own socket
+request. The runner forwards it to herdr's socket (`HERDR_SOCKET_PATH`, else `<XDG_CONFIG_HOME or ~/.config>/herdr/herdr.sock`),
+rebuilt from the checked fields, only when it is `pane.report_agent` or `pane.release_agent` for the pane the runner
+records for that lane, with known parameters of the right type, and relays herdr's reply. Any other method, another
+pane, `resume_argv` (a command herdr would run outside the sandbox) or an unknown field gets herdr's error reply shape
+(`{"id", "error": {"code": "forbidden" | "invalid_request", "message"}}`) and logs `HERDR_REPORT_REFUSED`; nothing
+reaches herdr.
+
 **Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>", "names": ["NPM_TOKEN"]}`,
 sent by the lane's `dori secret exec NAME... -- <cmd>`. `names` holds 1 to 32 unique secret names (else
 `RUNNER_LANE_BAD_REQUEST`), and the token is checked first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "..."}}`;
