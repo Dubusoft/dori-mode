@@ -29,7 +29,7 @@ The owner's answer is not forwarded to the lane. The lead relays it. Decision an
 
 ## Decision answers straight to the lane
 
-Status: partly built. The supervisor records a lane decision's target when it opens, and stores answer revisions with their delivery intent and reconciles them with the lane message queue at start (`owner-decisions.ts`); it does not route any owner message this way yet, so until it does, the lead relays every answer as above. This section is what that routing has to do, and the one place it is defined.
+Status: partly built. The supervisor records a lane decision's target when it opens, stores answer revisions with their delivery intent and reconciles them with the lane message queue at start (`owner-decisions.ts`), and routes each owner message to one side as below, edits and deletes included (`decision-inbound.ts`): a direct answer is queued for the lane and the lead gets `DECISION_ANSWER_DIRECT` (digest) or `DECISION_ANSWER_CORRECTED` (urgent) instead of `INBOUND`. Not built yet: closing the decision on the lane's ack and the owner-facing notices; until then a direct answer's decision stays open after the lane acks, and the lead closes it. This section is what the routing has to do, and the one place it is defined.
 
 The idea: when a lane asked the owner a question with choices and the owner answers with nothing but a choice, the answer goes to the lane through the lane message queue and the lead is not woken for it. Anything else goes to the lead, whole.
 

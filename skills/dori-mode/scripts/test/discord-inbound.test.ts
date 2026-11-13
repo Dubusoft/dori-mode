@@ -2,9 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { answeredDecision, type DirectRouting, routeOwnerDelete, routeOwnerEdit, routeOwnerMessage } from "../src/decision-inbound.ts";
+import { JsonLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
 import {
-  discordChannels, discordDispatchThreads, discordSnowflakeAt, discordThreadFloor, listDiscordInbound, pollDiscordInbound, seedDiscordCursor,
+  discordChannels, discordDispatchThreads, discordSnowflakeAt, discordThreadFloor, emitDiscordEdit, emitDiscordInbound, type InboundMessage,
+  listDiscordInbound, parseDiscordMessage, pollDiscordInbound, seedDiscordCursor,
 } from "../src/messenger/discord-inbound.ts";
+import { type DecisionTransport, openLaneDecision, openOwnerDecision, readDecisions, type TargetLane } from "../src/owner-decisions.ts";
+import { serializeDecisionText, serializeRequestText } from "../src/runner/decision-text.ts";
 import { Discord } from "../src/messenger/discord.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
@@ -284,6 +289,123 @@ test("supervised polling drains a backlog larger than one API page without losin
   expect(paths).toHaveLength(2);
   expect(new URL(paths[1] ?? "").searchParams.get("before")).toBe("36");
   expect(await s.cursors()).toEqual({ "100": "135" });
+});
+
+const choices = { question: "Which path?", options: ["Keep", "Replace", "Drop"], recommend: 1, reason: "smaller", waiting: "the choice", blocking: true };
+
+/** Opens lane decisions like the supervisor does; each gets thread `t<n>` and question message `q<n>`. */
+const decisionWorld = () => {
+  const s = setup();
+  let threads = 0;
+  let posts = 0;
+  const transport: DecisionTransport = {
+    send: async () => `q${++posts}`, edit: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
+    startThread: async () => ({ id: `t${++threads}` }), setThread: async () => {},
+    threadState: async () => ({ archived: false, parent: "555" }), threadArchived: async () => false,
+  };
+  const ctx = { config: { stateDir: s.dir, discordChannels: ["100"], decisionsChannel: "555", alertsChannel: undefined, displayTimeZone: "UTC" }, transport, now: () => 1_000, home: "/home/test" };
+  let lanes: TargetLane[] = [];
+  const laneOf = (key: string, lastRecoveryAt = 5): TargetLane & { thread: string } =>
+    ({ key, thread: "discord:100/222", runner: "mini", lastRecoveryAt, openedAt: "2026-11-13T00:00:00.000Z" });
+  const ask = async (key: string, text = serializeDecisionText(choices)) => {
+    const lane = laneOf(key);
+    if (!lanes.some((l) => l.key === key)) lanes.push(lane);
+    const opened = await openLaneDecision(ctx, lane, { id: `row-${key}-${threads}`, text });
+    if (!opened) throw new Error("not a decision text");
+    return opened.decision;
+  };
+  const store = new JsonLaneMessages(s.dir);
+  const logs: string[] = [];
+  const routing: DirectRouting = { stateDir: s.dir, store: () => store, lanes: async () => lanes, now: () => 2_000, emit: s.emit, log: (line) => { logs.push(line); } };
+  const options = {
+    route: (channel: string, m: InboundMessage) => routeOwnerMessage(routing, channel, m),
+    routeEdit: (channel: string, m: InboundMessage, edit: number) => routeOwnerEdit(routing, channel, m, edit),
+  };
+  const say = (channel: string, id: string, content: string, extra: Partial<InboundMessage> = {}) =>
+    emitDiscordInbound(channel, { id, author: "Owner", authorId: "300", content, attachments: [], ...extra }, s.emit, "300", options);
+  const edit = (channel: string, id: string, content: string, at: string) =>
+    emitDiscordEdit(channel, { id, channel_id: channel, author: { id: "300", username: "Owner" }, content, attachments: [], edited_timestamp: at }, s.emit, "300", options);
+  const kinds = () => s.emitted.map(([, line]) => line.split(" ").slice(0, 2).join(" "));
+  const queue = () => store.list().map((m) => `${m.id}:${m.state}`);
+  return { ...s, ctx, ask, store, routing, say, edit, kinds, queue, logs, relaunch: (key: string) => { lanes = lanes.map((l) => (l.key === key ? laneOf(key, 9) : l)); } };
+};
+
+test("a bare number answering a lane's only open question in its thread goes to the lane alone; a replay adds nothing; any other text goes to the lead alone", async () => {
+  const w = decisionWorld();
+  const d = await w.ask("ap-1-1");
+  const thread = d.thread ?? "";
+  await w.say(thread, "51", " 2 ");
+  await w.say(thread, "51", " 2 ");
+  expect(w.kinds()).toEqual(["DECISION_ANSWER_DIRECT ap-1-1"]);
+  expect(w.queue()).toEqual(["decision-d1-r1:queued"]);
+  expect(w.store.get("decision-d1-r1")?.text).toContain("Owner answered d1 (Which path?): 2. Replace. Revision r1.");
+  expect(readDecisions(w.dir).decisions[0]).toMatchObject({ state: "open" });
+  await w.say(thread, "52", "2, but also rename the flag");
+  await w.say(thread, "53", "2", { attachments: [{ filename: "a.png" }] });
+  expect(w.kinds().slice(1)).toEqual(["INBOUND " + thread, "INBOUND " + thread]);
+  expect(w.queue()).toEqual(["decision-d1-r1:queued"]);
+  expect(readDecisions(w.dir).decisions[0]?.answers?.map((a) => a.message)).toBeUndefined();
+});
+
+test("d<ID>=<N> answers from any watched channel; a bare number with several open questions needs a reply; out of range, lead, request and relaunched-lane decisions go to the lead", async () => {
+  const w = decisionWorld();
+  const a = await w.ask("ap-1-1");
+  const b = await w.ask("ap-2-1");
+  await w.say("100", "61", "D2=3");
+  expect(w.queue()).toEqual(["decision-d2-r1:queued"]);
+  await w.say("100", "62", "d1=4");
+  await w.say("100", "63", "d1=2 d2=1");
+  await w.say("100", "64", "2");
+  const lead = await openOwnerDecision(w.ctx, { ...choices, source: "lead", lane: "ap-1-1" });
+  await w.say("100", "65", `${lead.decision.id}=1`);
+  const request = await w.ask("ap-3-1", serializeRequestText({ need: "the 2FA code", reason: "login", waiting: "deploy", blocking: true }));
+  await w.say("100", "66", `${request.id}=1`);
+  w.relaunch("ap-1-1");
+  await w.say(a.thread ?? "", "67", "1");
+  expect(w.kinds()).toEqual(["DECISION_ANSWER_DIRECT ap-2-1", "INBOUND 100", "INBOUND 100", "INBOUND 100", "INBOUND 100", "INBOUND 100", `INBOUND ${a.thread}`]);
+  expect(w.queue()).toEqual(["decision-d2-r1:queued"]);
+  // Two open questions in one thread: a bare number names one only as a Discord reply to that question's message.
+  const [x, y] = readDecisions(w.dir).decisions.filter((d) => d.id === a.id || d.id === b.id).map((d) => ({ ...d, thread: "777" }));
+  if (!x || !y) throw new Error("decisions missing");
+  expect(answeredDecision([x, y], "777", { choice: 1 })).toBeUndefined();
+  expect(answeredDecision([x, y], "777", { choice: 1 }, y.message)?.id).toBe(b.id);
+  expect(parseDiscordMessage({ id: "70", author: { username: "Owner" }, content: "1", attachments: [], message_reference: { message_id: "77" } }).replyTo).toBe("77");
+});
+
+test("an edit of a direct answer revises it, an edit out of the form withdraws it and reaches the lead, and a lead message's edit stays with the lead", async () => {
+  const w = decisionWorld();
+  const d = await w.ask("ap-1-1");
+  const thread = d.thread ?? "";
+  await w.say(thread, "51", "1");
+  expect(await w.edit(thread, "51", "3", "2026-11-13T01:00:00.000000+00:00")).toBe(true);
+  expect(w.queue()).toEqual(["decision-d1-r1:superseded", "decision-d1-r2:queued"]);
+  // The same edit replayed by the gateway is one revision.
+  await w.edit(thread, "51", "3", "2026-11-13T01:00:00.000000+00:00");
+  const r2 = w.store.get("decision-d1-r2");
+  if (!r2) throw new Error("r2 missing");
+  updateLaneMessage(w.store, r2, { state: "delivered", deliveredAt: 2_000 }, 2_000);
+  await w.edit(thread, "51", "3, unless the API is gone", "2026-11-13T02:00:00.000000+00:00");
+  expect(w.queue()).toEqual(["decision-d1-r1:superseded", "decision-d1-r2:delivered", "decision-d1-r3:queued"]);
+  expect(w.store.get("decision-d1-r3")?.text).toStartWith("[dori] Owner withdrew the answer to d1 (Which path?). Revision r3 replaces r2");
+  expect(w.kinds()).toEqual(["DECISION_ANSWER_DIRECT ap-1-1", "DECISION_ANSWER_DIRECT ap-1-1", "DECISION_ANSWER_CORRECTED ap-1-1", `INBOUND_EDIT ${thread}`]);
+  await w.say(thread, "52", "let me think");
+  await w.edit(thread, "52", "2", "2026-11-13T03:00:00.000000+00:00");
+  expect(w.kinds().slice(4)).toEqual([`INBOUND ${thread}`, `INBOUND_EDIT ${thread}`]);
+  expect(w.queue()).toHaveLength(3);
+});
+
+test("a delete withdraws a direct answer without telling the lead it existed; a lead message's delete stays with the lead", async () => {
+  const w = decisionWorld();
+  const d = await w.ask("ap-1-1");
+  const thread = d.thread ?? "";
+  await w.say(thread, "51", "2");
+  expect(await routeOwnerDelete(w.routing, thread, "51")).toBe("direct");
+  expect(await routeOwnerDelete(w.routing, thread, "51")).toBe("direct");
+  expect(w.queue()).toEqual(["decision-d1-r1:superseded"]);
+  expect(readDecisions(w.dir).decisions[0]?.revisions?.map((r) => r.delivery.state)).toEqual(["superseded", "cancelled"]);
+  expect(w.emitted.map(([, line]) => line).at(-1)).toContain("withdrawn before anything reached the lane, nothing sent");
+  expect(await routeOwnerDelete(w.routing, thread, "99")).toBe("lead");
+  expect(w.logs).toEqual([]);
 });
 
 test("seedDiscordCursor writes a cursor only when the channel has none", async () => {

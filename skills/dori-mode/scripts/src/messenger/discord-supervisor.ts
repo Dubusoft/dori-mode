@@ -1,6 +1,9 @@
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { type DirectRouting, routeOwnerDelete, routeOwnerEdit, routeOwnerMessage } from "../decision-inbound.ts";
 import type { FlowDeps } from "../done-flow.ts";
+import type { LaneMessageStore } from "../lane-messages.ts";
+import { statusOf } from "../registry.ts";
 import { answeredEventId, answeredLine, recordChannelAnswer, recordOwnerAnswer } from "../owner-decisions.ts";
 import { recordOwnerClosed } from "../thread-followup.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
@@ -22,6 +25,11 @@ export type SupervisorDiscordOptions = {
   readonly open?: (url?: string) => GatewaySocket;
   readonly timers?: Timers;
   readonly log?: (line: string) => void;
+  /**
+   * The lane message queue. When set, an owner message that answers a lane's question in the qualifying form goes to
+   * that lane instead of the lead (decision-inbound.ts); unset, every owner message goes to the lead.
+   */
+  readonly laneMessages?: () => LaneMessageStore;
 };
 
 /** The gateway session a stopping supervisor leaves for the next one. */
@@ -94,7 +102,18 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   let contentWarned = false;
   // Owner message id -> channel, so a MESSAGE_DELETE can be reported for messages this process has seen. Bounded.
   const ownerMessages = new Map<string, string>();
+  const laneMessages = options.laneMessages;
+  const routing: DirectRouting | undefined = laneMessages && {
+    stateDir: deps.config.stateDir, store: laneMessages, now: () => deps.clock.now(), log,
+    lanes: async () => (await deps.registry.open()).filter((lane) => statusOf(lane) !== "closed"),
+    emit: options.emit,
+  };
   const inboundOptions: DiscordInboundOptions = {
+    ...(routing ? {
+      // The lead already has a message it was told about in this process, so it never becomes direct afterwards.
+      route: (channel, m) => (ownerMessages.has(m.id) ? Promise.resolve("lead" as const) : routeOwnerMessage(routing, channel, m)),
+      routeEdit: (channel, m, edit) => routeOwnerEdit(routing, channel, m, edit),
+    } satisfies Pick<DiscordInboundOptions, "route" | "routeEdit"> : {}),
     get botId() { return botId; },
     log,
     onMissingContent: () => {
@@ -240,6 +259,8 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       },
       onMessageDelete: async (value) => {
         if (stopped || typeof value !== "object" || value === null || !("id" in value) || typeof value.id !== "string") return;
+        const at = discordMessageChannel(value);
+        if (routing && at && await routeOwnerDelete(routing, at, value.id) === "direct") return;
         const channel = ownerMessages.get(value.id);
         if (!channel || discordMessageChannel(value) !== channel) return;
         ownerMessages.delete(value.id);

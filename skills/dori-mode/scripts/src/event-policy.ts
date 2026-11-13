@@ -79,6 +79,8 @@ const URGENT_KINDS = [
   "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
   // A direct decision answer whose lane session is gone: the lead takes the answer over (owner-decisions.ts).
   "DECISION_ANSWER_UNDELIVERED",
+  // A direct answer changed or withdrawn after an older revision may have reached the lane (decision-inbound.ts).
+  "DECISION_ANSWER_CORRECTED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
@@ -104,6 +106,8 @@ const DIGEST_KINDS = [
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
   // OWNER_DECISION_OPENED is digest: opening a thread needs no immediate lead action.
   "OWNER_DECISION_OPENED",
+  // An owner answer routed straight to the lane that asked (decision-inbound.ts): no INBOUND reaches the lead for it.
+  "DECISION_ANSWER_DIRECT",
   // A pane no registered lane owns (dead-panes.ts) is told once and never wakes the lead; a lane's own pane stays urgent.
   "UNRECOGNISED_PANE * unregistered",
   // A met wait registered with --on-success digest (waits.ts): news for the next wake, not a decision.
