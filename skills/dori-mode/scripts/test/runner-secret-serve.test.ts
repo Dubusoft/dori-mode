@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { SecretRule } from "../src/config.ts";
+import { readDecisions } from "../src/owner-decisions.ts";
 import { SecretStoreError } from "../src/secret-store.ts";
 import { RunnerAuth, SupervisorAuth, type Session } from "../src/runner/auth.ts";
 import { RunnerHub } from "../src/runner/hub.ts";
@@ -66,7 +67,7 @@ const harness = (patch: Partial<SupervisorSecretDeps> = {}, store: Record<string
     laneOwner: (key) => owners[key],
     runnerUnsandboxed: () => false,
     granter: supervisorGranter({
-      stateDir: tmp.dir, rules: async () => RULES, now: clock.now, log,
+      stateDir: tmp.dir, rules: async () => RULES, commands: async () => ({}), now: clock.now, log,
       store: {
         read: async (name) => {
           if (!Object.hasOwn(store, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`);
@@ -170,7 +171,8 @@ describe("supervisorSecretHandler", () => {
     const { handler, logs } = harness();
     const ctx = context(supervisor);
     await handler(LABEL, getFrame("lane-a", ["API_TOKEN", "REPO_TOKEN"]), ctx);
-    expect(refusal(ctx)).toEqual({ rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-a may not receive REPO_TOKEN (config secrets)" });
+    expect(refusal(ctx)).toEqual({ rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: `lane-a may not receive REPO_TOKEN (config secrets); the owner is asked in an owner decision; run the command again after the lead says it was answered` });
+    expect(readDecisions(tmp.dir).secretRequests).toEqual([{ lane: "lane-a", names: ["REPO_TOKEN"], at: clock.now() }]);
     expect(logs).toEqual([`RUNNER_SECRET_DENIED runner=${LABEL} lane=lane-a names=API_TOKEN,REPO_TOKEN`]);
     expect(JSON.parse(readFileSync(secretAuditPath(tmp.dir), "utf8"))).toMatchObject({ allowed: false, reason: "not allowed: REPO_TOKEN" });
   });

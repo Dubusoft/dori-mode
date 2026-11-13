@@ -52,6 +52,24 @@ A rule may also carry `as` (`"env"`, the default, or `"ssh-key"`, see [Deploy ke
 
 A request names one or more secrets, and it's all or nothing: if any one name is denied, the whole request is refused with `RUNNER_SECRET_DENIED` and no value is sent. The config is re-read on every request, so an edit takes effect without a restart.
 
+## Asking the owner
+
+When `secrets` denies a lane some names, the host that decided (the local runner, or the supervisor for a remote runner) queues a secret request in `<stateDir>/decisions.json`, and the supervisor's decision tick opens it as one owner decision in `decisionsChannel` (see [owner decisions](messaging.md)). It offers three options:
+
+1. allow this lane only (adds the lane key to the name's `lanes`);
+2. keep allowing lanes of this repo (adds the lane's `owner/repo` to `repos`; offered only when the lane has a repo);
+3. deny.
+
+The owner answers in the thread. The lead then runs `dori decision close <id> --choice N --text "..."`. For options 1 and 2 the close writes the rule into the config file first (a new rule is created when the name has none, other keys are kept, the file stays mode 0600) and prints `DECISION_SECRET_GRANTED <id> <names> lane=<key>|repo=<owner/repo> changed=<names>`. Because config is read per request, the lane's next `dori secret exec` succeeds. If the write fails, `DECISION_GRANT_FAILED` is printed and the decision stays open. A deny writes nothing, and the lane stays refused.
+
+The refusal's detail tells the lane what happened. A lane opens at most one decision per set of names:
+
+- A repeat request for names a pending request or a decision of that lane (in any state, a denied one included) already covers opens nothing, and the detail names the decision.
+- After `SECRET_REQUESTS_PER_LANE` (3) secret request decisions, the lane opens no more and is told to report the refusal to the lead as blocked.
+- Names listed in any `secretCommands` op are never offered, because production deploy credentials go only through `dori secret run`.
+
+Other lanes are not affected.
+
 ## Lane usage
 
 ```sh

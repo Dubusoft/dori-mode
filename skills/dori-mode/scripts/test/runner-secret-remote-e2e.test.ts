@@ -70,7 +70,7 @@ const system = async () => {
     laneOwner: (key) => OWNERS[key],
     runnerUnsandboxed: () => false,
     granter: supervisorGranter({
-      stateDir: supDir, rules: async () => RULES, now: realClock.now, log,
+      stateDir: supDir, rules: async () => RULES, commands: async () => ({}), now: realClock.now, log,
       store: { read: async (name) => { if (!Object.hasOwn(STORE, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`); return STORE[name] as string; } },
     }),
     log,
@@ -151,7 +151,7 @@ describe("remote secrets end to end", () => {
     const marker = join(tmp.dir, "ran");
     const run = await s.lane("lane-a", TOKENS["lane-a"] as string, ["OTHER_TOKEN", "--", "sh", "-c", 'touch "$MARKER"'], { MARKER: marker });
     expect(run.code).toBe(1);
-    expect(run.err).toEqual(["RUNNER_SECRET_DENIED lane-a may not receive OTHER_TOKEN (config secrets)"]);
+    expect(run.err).toEqual(["RUNNER_SECRET_DENIED lane-a may not receive OTHER_TOKEN (config secrets); the owner is asked in an owner decision; run the command again after the lead says it was answered"]);
     expect(existsSync(marker)).toBe(false);
     expect(secretFrames(s.wire, "secret.value")[0]?.body).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
     expect(s.logs).toContain("RUNNER_SECRET_DENIED lane=lane-a names=OTHER_TOKEN code=RUNNER_SECRET_DENIED");

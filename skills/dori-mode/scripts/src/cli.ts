@@ -5,7 +5,7 @@ import { homedir, loadavg } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
-import { alertsChannelOf, configPath, loadConfig } from "./config.ts";
+import { alertsChannelOf, configPath, grantSecretRule, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
@@ -1583,6 +1583,7 @@ try {
         return {
           config, now: realClock.now, home: homedir(),
           get transport() { return discord(); },
+          secretGrant: (names, to) => grantSecretRule(configPath(), names, to),
           ...(withReceipts ? { receipts } : {}),
         };
       };
@@ -1701,6 +1702,10 @@ try {
         if (closed.archivePending) console.log(`DECISION_ARCHIVE_PENDING ${did}: ${closed.archivePending}`);
         if (closed.resolved) console.log(`DECISION_RESOLVED_EVENT ${did} ${closed.resolved}`);
         if (closed.linkNote) console.log(`DECISION_LINK_NOTE ${did}: ${closed.linkNote}`);
+        if (closed.granted) {
+          const g = closed.granted;
+          console.log(`DECISION_SECRET_GRANTED ${did} ${g.names.join(",")} ${"lane" in g.to ? `lane=${g.to.lane}` : `repo=${g.to.repo}`} changed=${g.changed.join(",") || "-"}`);
+        }
         break;
       }
       if (sub === "list") {

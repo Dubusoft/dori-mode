@@ -1232,7 +1232,8 @@ export const supervise = async (
             laneOwner: async (key) => { const lane = (await deps.registry.open()).find((l) => l.key === key); return lane && runnerOf(lane); },
             runnerUnsandboxed: (label) => deps.config.runners?.[label]?.allowUnsandboxed === true,
             granter: supervisorGranter({
-              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets, now: deps.clock.now,
+              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets,
+              commands: async () => (await loadConfig()).secretCommands, now: deps.clock.now,
               log: (line) => { console.log(line); },
             }),
             // A remote runner's secret.run: the op runs here, outside any lane; only its redacted output goes back.
