@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
+import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
 import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
@@ -199,7 +200,12 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       client.publish(type, body);
     };
     // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
-    const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}) });
+    // A sandboxed lane reports its agent state to herdr through a socket of its own (herdr-report.ts); Windows has no lane sandbox.
+    let lanesForReports: RunnerLanes | undefined;
+    const herdrReports = process.platform === "win32" ? undefined
+      : new HerdrReportSockets({ runnerDir, log, paneOf: (key) => lanesForReports?.records()[key]?.pane });
+    const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}), ...(herdrReports ? { herdrReports } : {}) });
+    lanesForReports = runnerLanes;
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
     // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
     const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir), platform: process.platform });
@@ -322,6 +328,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     ensureRunnerSubdir(join(runnerDir, RUNNER_PATHS.sock), LANE_SOCKET_DIR);
     const laneListeners = [listenUnix(laneSocketPath(runnerDir)), listenUnix(legacyLaneSocketPath(runnerDir))];
+    for (const key of Object.keys(runnerLanes.records())) herdrReports?.open(key);
     // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
     if (remote) {
@@ -398,6 +405,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       clearTimeout(reposDebounce);
       unwatchRepos();
       stopLaneSocket();
+      herdrReports?.stop();
       stopGuard();
       stopCleanup();
       stopPrune();

@@ -18,7 +18,8 @@
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
 # its own brief and token), and ~/.dori/env, ~/.dori/secrets and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
 # are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
-# but the lane socket (sock/lane.d/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
+# but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
+# HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
 # Host paths outside ~/.dori listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
 # refused outright, reads, writes and socket connects alike, over every rule above. Every path is resolved first
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
@@ -65,7 +66,7 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" gcd broad kc rr
+  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" k_rules="" gcd broad kc rr
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   param() { PARAMS+=(-D "$1=$(canon "$2")"); }
@@ -144,6 +145,10 @@ build_profile() {
   param DOCKER_VAR /var/run/docker.sock
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
   param LANE_SOCK "$H/.dori/runner/sock/lane.d/lane"
+  if [ -n "$key" ]; then
+    param HERDR_SOCK "$H/.dori/runner/sock/herdr.d/$key/herdr"
+    k_rules="(allow network-outbound (remote unix-socket (path-literal (param \"HERDR_SOCK\"))))"
+  fi
   param CONFIG "$H/.config"
   param CONFIG_GH "$H/.config/gh"
   param CONFIG_GIT "$H/.config/git"
@@ -194,6 +199,7 @@ $d_rules
 (allow file-read* (subpath (param \"CONFIG_GH\")) (subpath (param \"CONFIG_GIT\")))
 (deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))
 (allow network-outbound (remote unix-socket (path-literal (param \"LANE_SOCK\"))))
+$k_rules
 $a_rules
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
 $h_rules
@@ -239,7 +245,7 @@ LT=$(canon "$LT")
 C=$(pwd -P)
 build_profile
 
-export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT"
+export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT" HERDR_SOCKET_PATH="$H/.dori/runner/sock/herdr.d/$key/herdr"
 # omo starts its engine with an empty OpenSSL bundle (SSL_CERT_FILE/SSL_CERT_DIR under ~/.omo/engine-trust/defaults)
 # and its agent shell inherits it, so curl, git and gh there fail every TLS verification. With SSL_CERT_FILE already
 # set omo keeps it and only adds its own roots for itself; the system bundle is what these tools read by default.

@@ -60,7 +60,7 @@ test("a sandboxed lane gets its own token file, the runner's lane socket, its br
   expect(tokenBind).toBeLessThan(doriRo);
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "lane.d")]);
+  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "herdr.d", "lane-a"), join(runner, "sock", "herdr.d", "lane-a", "herdr"), join(runner, "sock", "lane.d")]);
   // sock itself is only a mount point (--dir); the lane socket's directory is the one thing bound into it. A directory,
   // not the socket file: a restarted runner's new socket at the same path shows through a directory bind only.
   expect(argv.flatMap((a, i) => (argv[i + 1] === join(runner, "sock") ? [a] : []))).toEqual(["--dir"]);
@@ -74,6 +74,22 @@ test("a sandboxed lane gets its own token file, the runner's lane socket, its br
   const bin = join(runner, "bin");
   expect(argv.flatMap((a, i) => (argv[i + 1] === bin && argv[i + 2] === bin ? [a] : []))).toEqual(["--ro-bind-try"]);
   expect(argv.some((a) => a.startsWith(join(home, ".dori", "env")))).toBe(false);
+});
+
+test("a lane reaches herdr only through its own report socket directory, read-only, named by HERDR_SOCKET_PATH", async () => {
+  const home = join(tempDir(), "home");
+  const own = join(home, ".dori", "runner", "sock", "herdr.d", "lane-a");
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", HERDR_SOCKET_PATH: join(home, ".config", "herdr", "herdr.sock") });
+
+  const herdrDirs = [...new Set(argv.filter((a) => a.includes("herdr.d")))].sort();
+  expect(herdrDirs).toEqual([own, join(own, "herdr")]);
+  expect(argv.flatMap((a, i) => (argv[i + 1] === own && argv[i + 2] === own ? [a] : []))).toEqual(["--ro-bind-try"]);
+  // The directory's mount point has to exist before ~/.dori's tmpfs turns read-only.
+  expect(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === own)).toBeLessThan(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori")));
+  const setenv = argv.flatMap((a, i) => (a === "--setenv" && argv[i + 1] === "HERDR_SOCKET_PATH" ? [argv[i + 2]] : []));
+  expect(setenv).toEqual([join(own, "herdr")]);
+  expect(argv.some((a) => a.startsWith(join(home, ".config", "herdr")))).toBe(false);
 });
 
 test("the D-Bus session bus and the systemd user manager's sockets are covered, so a lane cannot start a unit outside the sandbox", async () => {
@@ -275,7 +291,7 @@ const runMacos = async (home: string, cwd: string, args: string[], env: Record<s
 const seatbelt = async (home: string, cwd: string, env: Record<string, string>): Promise<Seatbelt> => {
   const out = join(home, "..", "sbx-argv");
   const sbx = join(home, "..", "fake-sandbox-exec");
-  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0OMO_PROFILE=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" "$OMO_PROFILE" > "${out}.env"\n`);
+  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0OMO_PROFILE=%s\\0HERDR_SOCKET_PATH=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" "$OMO_PROFILE" "$HERDR_SOCKET_PATH" > "${out}.env"\n`);
   chmodSync(sbx, 0o755);
   const r = await runMacos(home, cwd, ["omo", "--model", "m"], env, sbx);
   expect(r.code).toBe(0);
@@ -367,7 +383,7 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   const lt = join(home, ".cache", "omo-tmp", "lane-sandbox", "lane-a");
 
   expect(sb.command).toEqual(["omo", "--model", "m"]);
-  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "", OMO_PROFILE: "dori-lane" });
+  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "", OMO_PROFILE: "dori-lane", HERDR_SOCKET_PATH: join(runner, "sock", "herdr.d", "lane-a", "herdr") });
   expect(statSync(lt).mode & 0o777).toBe(0o700);
   expect(sb.err).toBe("");
 
@@ -402,7 +418,8 @@ test("macOS: of the runner's sockets only the lane socket can be dialed, and of 
 
   expect(dial(join(runner, "sock", "lane.d", "lane"))).toBe(true);
   expect(read(join(runner, "sock", "lane.d", "lane"))).toBe(true);
-  for (const no of [join(runner, "sock", "lane"), join(runner, "sock", "control"), join(runner, "sock", "cli"), join(home, ".config", "herdr", "herdr.sock")]) {
+  expect(dial(join(runner, "sock", "herdr.d", "lane-a", "herdr"))).toBe(true);
+  for (const no of [join(runner, "sock", "lane"), join(runner, "sock", "control"), join(runner, "sock", "cli"), join(runner, "sock", "herdr.d", "lane-b", "herdr"), join(home, ".config", "herdr", "herdr.sock")]) {
     expect({ no, dial: dial(no) }).toEqual({ no, dial: false });
   }
   expect(dial(agent)).toBe(true);

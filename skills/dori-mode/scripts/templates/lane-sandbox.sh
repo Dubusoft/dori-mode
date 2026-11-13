@@ -99,6 +99,10 @@ case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH
 # The lane socket's own directory is bound, not the socket file: a restarted runner unlinks the socket and binds a
 # new one at the same path, which a bind of the old file would never show (the lane would dial the dead inode).
 opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane.d" "$H/.dori/runner/sock/lane.d")
+# The lane's own herdr report socket (the runner's sock/herdr.d/<key>, bound as a directory like lane.d): omo's herdr
+# extension reports the agent state through it, and the runner forwards only reports for this lane's own pane to herdr.
+opts+=(--ro-bind-try "$H/.dori/runner/sock/herdr.d/$key" "$H/.dori/runner/sock/herdr.d/$key")
+opts+=(--setenv HERDR_SOCKET_PATH "$H/.dori/runner/sock/herdr.d/$key/herdr")
 # A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
 opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
 opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
