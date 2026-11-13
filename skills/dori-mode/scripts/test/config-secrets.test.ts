@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { CONFIG_FILE_KEYS, defaultConfig, loadConfig } from "../src/config.ts";
+import { readFileSync, statSync } from "node:fs";
+
+import { CONFIG_FILE_KEYS, defaultConfig, grantSecretRule, loadConfig } from "../src/config.ts";
 import { CONFIG_SCHEMA_VERSION, migrateConfigSchema } from "../src/config-schema.ts";
 import { pruneObsolete } from "../src/setup.ts";
 import { withState } from "./fakes.ts";
@@ -73,6 +75,25 @@ test("a bad as or mint throws TypeError", async () => {
   for (const [i, secrets] of bad.entries()) {
     await expect(load(`bad-mint-${i}`, { secrets })).rejects.toBeInstanceOf(TypeError);
   }
+});
+
+test("grantSecretRule adds a lane or repo once, keeps other keys and rules, and refuses a result loadConfig would reject", async () => {
+  const path = join(state.dir, "grant.json");
+  await Bun.write(path, JSON.stringify({ defaultModel: "a/b", secrets: { KEEP: { lanes: ["x"], as: "ssh-key" }, NPM_TOKEN: { repos: ["o/r"] } } }));
+  expect(grantSecretRule(path, ["NPM_TOKEN", "NEW_TOKEN"], { lane: "ap-1-1" })).toEqual(["NPM_TOKEN", "NEW_TOKEN"]);
+  expect(grantSecretRule(path, ["NPM_TOKEN"], { lane: "ap-1-1" })).toEqual([]);
+  expect(grantSecretRule(path, ["NEW_TOKEN"], { repo: "o/r" })).toEqual(["NEW_TOKEN"]);
+  const c = await loadConfig(path, "/home/ana");
+  expect(c.defaultModel).toBe("a/b");
+  expect(c.secrets).toEqual({
+    KEEP: { lanes: ["x"], repos: [], as: "ssh-key" },
+    NPM_TOKEN: { lanes: ["ap-1-1"], repos: ["o/r"] },
+    NEW_TOKEN: { lanes: ["ap-1-1"], repos: ["o/r"] },
+  });
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+  const before = readFileSync(path, "utf8");
+  expect(() => grantSecretRule(path, ["lower_case"], { lane: "ap-1-1" })).toThrow(TypeError);
+  expect(readFileSync(path, "utf8")).toBe(before);
 });
 
 test("schema 6 fills secrets into a version-5 file and setup stamps the new version", () => {

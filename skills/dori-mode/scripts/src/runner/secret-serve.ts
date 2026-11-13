@@ -1,4 +1,5 @@
 import type { SecretCommand, SecretRule } from "../config.ts";
+import { secretRequester } from "../owner-decisions.ts";
 import type { SecretStore } from "../secret-store.ts";
 import type { SecretGrant } from "./lane-socket.ts";
 import { secretsSupported, SECRET_PROTO } from "./protocol.ts";
@@ -81,6 +82,8 @@ export type SupervisorGranterDeps = {
   readonly store: Pick<SecretStore, "read">;
   /** The config `secrets` rules, read again per request. */
   readonly rules: () => Promise<Readonly<Record<string, SecretRule>>>;
+  /** The config `secretCommands`, read again per request: their secrets are never offered in a secret request decision. */
+  readonly commands: () => Promise<Readonly<Record<string, SecretCommand>>>;
   readonly now: () => number;
   readonly log: (line: string) => void;
 };
@@ -88,12 +91,14 @@ export type SupervisorGranterDeps = {
 /**
  * `SupervisorSecretDeps.granter` for production: phase 1's `secretGranter` with `runner: label`, the frame's repo,
  * and audit lines appended to `<stateDir>/secret-audit.jsonl` plus a log line
- * `RUNNER_SECRET_GRANTED|RUNNER_SECRET_DENIED runner=<label> lane=<key> names=<A,B>`.
+ * `RUNNER_SECRET_GRANTED|RUNNER_SECRET_DENIED runner=<label> lane=<key> names=<A,B>`. A config denial queues a secret
+ * request in `<stateDir>/decisions.json` (owner-decisions.ts secretRequester), which the decision tick opens.
  */
 export const supervisorGranter = (deps: SupervisorGranterDeps) => (label: string, repo: string | undefined): LaneGranter => {
   const append = appendSecretAudit(secretAuditPath(deps.stateDir), deps.log);
   return secretGranter({
     runner: label, store: deps.store, rules: deps.rules, now: deps.now, laneRepo: async () => repo,
+    request: secretRequester(deps.stateDir, deps.commands, deps.now),
     audit: (entry) => {
       append(entry);
       deps.log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} runner=${entry.runner} lane=${entry.lane} names=${entry.names.join(",")}`);
@@ -101,10 +106,7 @@ export const supervisorGranter = (deps: SupervisorGranterDeps) => (label: string
   });
 };
 
-export type SupervisorCommandRunnerDeps = SupervisorGranterDeps & Pick<SecretRunnerDeps, "spawn" | "timer" | "hostEnv" | "home" | "mint"> & {
-  /** The config `secretCommands`, read again per request. */
-  readonly commands: () => Promise<Readonly<Record<string, SecretCommand>>>;
-};
+export type SupervisorCommandRunnerDeps = SupervisorGranterDeps & Pick<SecretRunnerDeps, "spawn" | "timer" | "hostEnv" | "home" | "mint">;
 
 /**
  * `SupervisorSecretDeps.commandRunner` for production: `secretCommandRunner` on this host with `runner: label`, the

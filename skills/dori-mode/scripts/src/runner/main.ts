@@ -26,6 +26,7 @@ import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig } from "../config.ts";
+import { secretRequester } from "../owner-decisions.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
@@ -369,6 +370,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
             log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")}${entry.reason ? ` reason=${entry.reason}` : ""}`);
           },
           runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
+          // A config denial asks the owner: queued in this host's decisions.json, opened by the supervisor's decision tick.
+          request: secretRequester(cfg.stateDir, async () => (await loadConfig()).secretCommands, realClock.now),
         }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.

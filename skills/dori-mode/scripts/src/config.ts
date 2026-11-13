@@ -1,3 +1,4 @@
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -333,6 +334,38 @@ const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
       ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
     }];
   }));
+};
+
+/** Who a granted rule adds: one lane key, or every lane of one repo ("owner/repo"). */
+export type SecretGrantTarget = { readonly lane: string } | { readonly repo: string };
+
+/**
+ * Adds `to` to the `secrets` rule of each of `names` in the config file at `path` (a missing rule is created with that
+ * one entry; one already listed is left alone), keeping every other key as it is. The result is checked like loadConfig
+ * checks `secrets` (TypeError, nothing written) and written atomically with mode 0600. Returns the names whose rule
+ * changed. The supervisor and runners read config per secret request, so the next request sees it without a restart.
+ */
+export const grantSecretRule = (path: string, names: readonly string[], to: SecretGrantTarget): string[] => {
+  const loaded: unknown = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+  if (!isRecord(loaded)) throw new TypeError(`${path} is not a JSON object`);
+  const current = loaded.secrets ?? {};
+  if (!isRecord(current)) throw new TypeError("secrets must be an object");
+  const [field, value] = "lane" in to ? ["lanes", to.lane] as const : ["repos", to.repo] as const;
+  const next: Record<string, unknown> = { ...current };
+  const changed: string[] = [];
+  for (const name of names) {
+    const rule = isRecord(next[name]) ? next[name] as Record<string, unknown> : {};
+    const list = Array.isArray(rule[field]) ? rule[field] as unknown[] : [];
+    if (list.includes(value)) continue;
+    next[name] = { ...rule, [field]: [...list, value] };
+    changed.push(name);
+  }
+  if (!changed.length) return [];
+  secrets(next);
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify({ ...loaded, secrets: next }, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+  return changed;
 };
 
 /** The longest `secretCommands.<op>.timeoutSec` may be; the op is killed then, so its answer comes no later. */

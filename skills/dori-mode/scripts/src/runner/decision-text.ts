@@ -62,6 +62,33 @@ export const decisionChoicesProblem = (choices: {
     ?? text("--waiting", choices.waiting, DECISION_WAITING_MAX);
 };
 
+/** What one option of a secret request decision grants when the lead closes it with that choice. */
+export type SecretRequestGrant = "lane" | "repo" | "deny";
+
+/**
+ * The owner decision for a lane's `dori secret exec` of `names` that config `secrets` does not grant it: allow this lane
+ * only, keep allowing lanes of `repo` (offered only when the lane has one), or deny. `grants[i]` is what option i+1 does.
+ */
+export const secretRequestChoices = (lane: string, names: readonly string[], repo: string | undefined): { readonly choices: DecisionChoices; readonly grants: readonly SecretRequestGrant[] } => {
+  const list = names.join(", ");
+  const options: [string, SecretRequestGrant][] = [
+    [`이 레인(${lane})만 허용`, "lane"],
+    ...(repo ? [[`${repo} 리포의 레인에 계속 허용`, "repo"] as [string, SecretRequestGrant]] : []),
+    ["거부 (이 레인은 다시 묻지 않음)", "deny"],
+  ];
+  return {
+    choices: {
+      question: `레인 ${lane}이(가) config secrets에 허용되지 않은 자격 증명 ${list}을(를) dori secret exec로 요청했습니다. 허용할까요?`.slice(0, DECISION_QUESTION_MAX),
+      options: options.map(([text]) => text),
+      recommend: 1,
+      reason: "가장 좁은 허용입니다. exec로 받은 값은 그 레인에 드러나므로, 범위가 좁고 수명이 짧은 토큰일 때 허용하는 것이 좋습니다.",
+      waiting: `${lane}의 secret exec ${list}`.slice(0, DECISION_WAITING_MAX),
+      blocking: true,
+    },
+    grants: options.map(([, grant]) => grant),
+  };
+};
+
 /** `choices` (already checked with decisionChoicesProblem) in the fixed text form. */
 export const serializeDecisionText = (choices: DecisionChoices): string => [
   DECISION_TEXT_HEAD,

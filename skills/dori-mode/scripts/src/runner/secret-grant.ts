@@ -33,6 +33,11 @@ export type SecretGranterDeps = {
   readonly onGranted?: (values: readonly string[]) => void;
   /** Mints a GitHub App installation token; defaults to `mintInstallationToken`. Injected by tests to stay offline. */
   readonly mint?: typeof mintInstallationToken;
+  /**
+   * Asks the owner to allow names config `secrets` denied this lane (owner-decisions.ts secretRequester); its sentence is
+   * appended to the refusal. A failure only drops the sentence: the refusal stands either way.
+   */
+  readonly request?: (key: string, names: readonly string[], repo: string | undefined) => Promise<string>;
 };
 
 /** Where the runner appends its secret audit lines. */
@@ -111,7 +116,8 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
   }
   if (denied.length) {
     const list = denied.join(",");
-    return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)`, `not allowed: ${list}`);
+    const asked = deps.request ? await laneRepo().then((r) => deps.request?.(key, denied, r)).catch(() => undefined) : undefined;
+    return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)${asked ? `; ${asked}` : ""}`, `not allowed: ${list}`);
   }
   const values: Record<string, string> = {};
   const kinds: Record<string, "env" | "ssh-key"> = {};
