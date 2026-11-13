@@ -27,6 +27,20 @@ export const unreportedCorruptWaits = (stateDir: string): string[] => {
 type Outcome = "WAIT_DONE" | "WAIT_TIMEOUT" | "WAIT_FAILED";
 const OUTCOMES: readonly unknown[] = ["WAIT_DONE", "WAIT_TIMEOUT", "WAIT_FAILED"];
 
+/**
+ * What a met check tells the lead (`--on-success`). `wake` (the default): urgent `WAIT_DONE`, a decision to resolve.
+ * `digest`: `WAIT_DONE_DIGEST`, delivered with the next urgent wake and never a decision. `silent`: `WAIT_DONE_SILENT`,
+ * journaled for the engine only. A timeout or a failure always wakes the lead.
+ */
+export const ON_SUCCESS = ["wake", "digest", "silent"] as const;
+export type OnSuccess = (typeof ON_SUCCESS)[number];
+const SUCCESS_KIND: Readonly<Record<OnSuccess, string>> = { wake: "WAIT_DONE", digest: "WAIT_DONE_DIGEST", silent: "WAIT_DONE_SILENT" };
+const isOnSuccess = (value: unknown): value is OnSuccess => (ON_SUCCESS as readonly unknown[]).includes(value);
+
+/** The event line a settled wait emits. */
+const outcomeLine = (wait: Wait, outcome: Outcome, why = ""): string =>
+  `${outcome === "WAIT_DONE" ? SUCCESS_KIND[wait.onSuccess ?? "wake"] : outcome} ${wait.key} ${wait.note}${why}${wait.thread ? ` thread=${wait.thread}` : ""}`;
+
 export type Wait = {
   readonly id: string;
   readonly key: string;
@@ -42,6 +56,8 @@ export type Wait = {
   readonly failures?: number;
   /** The runner that checks this wait (`wait.check`); absent: the supervisor host checks it. */
   readonly machine?: string;
+  /** Absent: `wake`. */
+  readonly onSuccess?: OnSuccess;
 };
 
 type Registration = {
@@ -54,6 +70,8 @@ type Registration = {
   readonly timeout?: string;
   /** A runner label; absent or `local`: the supervisor host. */
   readonly machine?: string;
+  /** `wake`, `digest` or `silent`; absent: `wake`. */
+  readonly onSuccess?: string;
 };
 
 const positive = (value: string, name: string): number => {
@@ -75,7 +93,8 @@ const decode = (value: unknown): Wait => {
       ("deadline" in value && (typeof value.deadline !== "number" || !Number.isFinite(value.deadline))) ||
       ("outcome" in value && !OUTCOMES.includes(value.outcome)) ||
       ("failures" in value && (typeof value.failures !== "number" || !Number.isInteger(value.failures) || value.failures < 0)) ||
-      ("machine" in value && typeof value.machine !== "string")) {
+      ("machine" in value && typeof value.machine !== "string") ||
+      ("onSuccess" in value && !isOnSuccess(value.onSuccess))) {
     throw new WaitError("invalid wait state");
   }
   return {
@@ -86,6 +105,7 @@ const decode = (value: unknown): Wait => {
     ...("outcome" in value && OUTCOMES.includes(value.outcome) ? { outcome: value.outcome as Outcome } : {}),
     ...("failures" in value && typeof value.failures === "number" && value.failures > 0 ? { failures: value.failures } : {}),
     ...("machine" in value && typeof value.machine === "string" ? { machine: value.machine } : {}),
+    ...("onSuccess" in value && isOnSuccess(value.onSuccess) && value.onSuccess !== "wake" ? { onSuccess: value.onSuccess } : {}),
   };
 };
 
@@ -162,11 +182,14 @@ export class Waits {
     const deadline = input.timeout === undefined ? undefined : now + positive(input.timeout, "--timeout") * 60_000;
     if (!Number.isFinite(everyMs) || (deadline !== undefined && !Number.isFinite(deadline))) throw new WaitError("wait duration is too large");
     const machine = machineLabel(input.machine, (why) => new WaitError(`--machine: ${why}`));
+    const onSuccess = input.onSuccess ?? "wake";
+    if (!isOnSuccess(onSuccess)) throw new WaitError(`--on-success must be one of ${ON_SUCCESS.join(", ")}`);
     const wait: Wait = {
       id: randomUUID(), key: input.key, until: input.until, note: input.note, cwd: input.cwd,
       everyMs, nextAt: now, ...(deadline === undefined ? {} : { deadline }),
       ...(input.thread ? { thread: input.thread } : {}),
       ...(machine ? { machine } : {}),
+      ...(onSuccess === "wake" ? {} : { onSuccess }),
     };
     return this.locked((waits) => {
       if (waits.some((w) => w.key === wait.key)) throw new WaitError(`wait ${wait.key} already exists; cancel it first`);
@@ -254,7 +277,7 @@ export class Waits {
           if (!current) return; // cancelled/replaced during the check
           this.save(waits.map((w) => w.id === wait.id ? { ...w, outcome: terminal } : w));
           const why = terminal === "WAIT_FAILED" ? ` (${current.failures ?? 0} checks in a row failed; no --timeout set)` : "";
-          emit(`wait:${wait.id}`, `${terminal} ${wait.key} ${wait.note}${why}${wait.thread ? ` thread=${wait.thread}` : ""}`, wait.key ? { lane: wait.key } : undefined);
+          emit(`wait:${wait.id}`, outcomeLine(current, terminal, why), wait.key ? { lane: wait.key } : undefined);
           this.save(waits.filter((w) => w.id !== wait.id));
         });
       } catch (e) {
@@ -272,7 +295,7 @@ export class Waits {
       const wait = waits.find((w) => w.id === waitId);
       if (!wait || wait.machine !== label || wait.outcome) return;
       this.save(waits.map((w) => w.id === waitId ? { ...w, outcome: "WAIT_DONE" as const } : w));
-      emit(`wait:${wait.id}`, `WAIT_DONE ${wait.key} ${wait.note}${wait.thread ? ` thread=${wait.thread}` : ""}`, wait.key ? { lane: wait.key } : undefined);
+      emit(`wait:${wait.id}`, outcomeLine(wait, "WAIT_DONE"), wait.key ? { lane: wait.key } : undefined);
       this.save(waits.filter((w) => w.id !== waitId));
     });
   }

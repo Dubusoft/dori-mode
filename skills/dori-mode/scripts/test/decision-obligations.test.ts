@@ -54,7 +54,7 @@ test("the default kinds table matches decision events like eventPolicy does, and
     "LANE_REPORT_LATE alpha done x", "LANE_NOT_DONE alpha dirty tree", "WAIT_DONE ci green", "WAIT_TIMEOUT ci", "WAIT_FAILED ci", "DEAD_PANE w:p3",
     "OWNER_DECISION_ANSWERED ap-1-1 d3 blocking discord:1/2: q",
   ]) expect(isDecision(line, kinds)).toBe(true);
-  for (const line of ["LANE_REPORT alpha progress x", "LANE_REPORT alpha done x", "LANE_REPORT_LATE alpha milestone x", "LANE_CLOSED alpha", "WAIT_DONEX x", "INBOUND 1 1 hi"]) {
+  for (const line of ["LANE_REPORT alpha progress x", "LANE_REPORT alpha done x", "LANE_REPORT_LATE alpha milestone x", "LANE_CLOSED alpha", "WAIT_DONEX x", "WAIT_DONE_DIGEST ci green", "WAIT_DONE_SILENT ci green", "INBOUND 1 1 hi"]) {
     expect(isDecision(line, kinds)).toBe(false);
   }
 });

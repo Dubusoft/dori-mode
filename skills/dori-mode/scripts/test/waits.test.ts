@@ -49,7 +49,7 @@ test("the CLI registers the parsed signal and scheduling options durably", async
 });
 
 test.each([
-  { key: "../escape" }, { until: "not a signal" }, { note: "" },
+  { key: "../escape" }, { until: "not a signal" }, { note: "" }, { onSuccess: "loud" },
   { every: "0" }, { every: "NaN" }, { timeout: "-1" }, { timeout: "Infinity" },
 ])("invalid registration is rejected without persisting: %j", (patch) => {
   const f = fixture();
@@ -231,6 +231,36 @@ test("a check that answers resets the failure count, and a wait with a deadline 
   expect(f.events).toEqual([]);
   expect(waits.list().find((w) => w.key === "bounded")?.failures).toBe(3);
   expect(WAIT_MAX_FAILURES).toBeGreaterThan(1);
+});
+
+test("--on-success picks the success line; a timeout still wakes, and old state without the field means wake", async () => {
+  const f = fixture();
+  for (const onSuccess of ["wake", "digest", "silent"]) f.waits.register({ ...f.input, key: onSuccess, onSuccess, thread: "discord:1/2" }, f.clock.now());
+  f.waits.register({ ...f.input, key: "late", onSuccess: "silent", timeout: "1" }, f.clock.now());
+  expect(new Waits(f.state.dir).list().map((w) => [w.key, w.onSuccess])).toEqual([["wake", undefined], ["digest", "digest"], ["silent", "silent"], ["late", "silent"]]);
+  f.clock.at += 60_000;
+  await f.waits.tick(f.clock.now, run, f.emit, async (wait) => ({ signal: "", ok: wait.key !== "late", detail: "" }));
+  expect(f.events.map((e) => e.line).sort()).toEqual([
+    "WAIT_DONE wake tell owner thread=discord:1/2",
+    "WAIT_DONE_DIGEST digest tell owner thread=discord:1/2",
+    "WAIT_DONE_SILENT silent tell owner thread=discord:1/2",
+    "WAIT_TIMEOUT late tell owner",
+  ]);
+});
+
+test("a runner's WAIT_DONE settles with the wait's --on-success line", () => {
+  const f = fixture();
+  const wait = f.waits.register({ ...f.input, machine: "mini", onSuccess: "digest" }, f.clock.now());
+  f.waits.settleRemote("mini", wait.id, f.emit);
+  expect(f.events).toEqual([{ id: `wait:${wait.id}`, line: "WAIT_DONE_DIGEST release tell owner" }]);
+});
+
+test("a stored onSuccess outside the allowed values is corrupt state", () => {
+  const f = fixture();
+  const wait = f.waits.register(f.input, f.clock.now());
+  writeFileSync(join(f.state.dir, "waits.json"), JSON.stringify([{ ...wait, onSuccess: "loud" }]));
+  expect(f.waits.list()).toEqual([]);
+  expect(readdirSync(f.state.dir).some((n) => n.startsWith("waits.json.corrupt-"))).toBe(true);
 });
 
 test("a wait's event carries its key as the lane meta", async () => {

@@ -115,6 +115,12 @@ test("LANE_REPORT_LATE follows LANE_REPORT: question, blocked and done are urgen
   expect(eventClass("UNRESOLVED wait:1 WAIT_DONE alpha ci green")).toBe("lead-urgent");
 });
 
+test("a met wait's class follows its --on-success: wake urgent, digest digest, silent engine-only", () => {
+  expect(eventClass("WAIT_DONE ci green")).toBe("lead-urgent");
+  expect(eventClass("WAIT_DONE_DIGEST ci green")).toBe("lead-digest");
+  expect(eventClass("WAIT_DONE_SILENT ci green")).toBe("engine-only");
+});
+
 test("an eventPolicy in the config file is ignored: the built-in table holds", async () => {
   const state = withState();
   cleanups.push(state.done);

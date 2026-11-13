@@ -101,6 +101,8 @@ const DIGEST_KINDS = [
   "OWNER_DECISION_OPENED",
   // A pane no registered lane owns (dead-panes.ts) is told once and never wakes the lead; a lane's own pane stays urgent.
   "UNRECOGNISED_PANE * unregistered",
+  // A met wait registered with --on-success digest (waits.ts): news for the next wake, not a decision.
+  "WAIT_DONE_DIGEST",
 ] as const;
 
 /**
@@ -116,6 +118,8 @@ const ENGINE_KINDS = [
   "NUDGED", "THREAD_CLOSED_BY_OWNER",
   "TOODO_TASK_STATUS * new->planned", "TOODO_TASK_STATUS * planned->in_progress",
   "LANE_FINISH_NOTICE",
+  // A met wait registered with --on-success silent (waits.ts).
+  "WAIT_DONE_SILENT",
 ] as const;
 
 /** The actionable kinds wake the lead, every other line is digest. */

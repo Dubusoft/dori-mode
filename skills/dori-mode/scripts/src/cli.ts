@@ -221,7 +221,7 @@ const USAGE = `dori <command> [options]
                                        the store follows the files in the state dir
   store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
                                        from supervisor.sqlite (rollback); the store follows the files in the state dir
-  wait <key> --until SIGNAL --note TEXT [--thread REF] [--every SEC] [--timeout MIN] [--machine M --cwd DIR]
+  wait <key> --until SIGNAL --note TEXT [--thread REF] [--every SEC] [--timeout MIN] [--on-success wake|digest|silent] [--machine M --cwd DIR]
   wait --list | --cancel <key>          durable supervisor-owned follow-ups
   emit <KIND> --text T [--id ID]       journal one event (dedupe by --id); its class comes from eventPolicy
   source list [--json]                 event sources: built-ins and registered ones, with their last event and error
@@ -756,7 +756,7 @@ const flags = parseArgs({
     model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, append: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
-    until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" },
+    until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" }, "on-success": { type: "string" },
     list: { type: "boolean" }, final: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, sandbox: { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
     lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" },
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
@@ -970,7 +970,7 @@ try {
         if (target && !opt("cwd")) die("dori wait --machine needs --cwd (a directory on that machine)");
         const wait = waits.register({
           key: key ?? die("wait needs a key"), until: need("until"), note: need("note"),
-          thread: opt("thread"), every: opt("every"), timeout: opt("timeout"), cwd: target ? need("cwd") : process.cwd(),
+          thread: opt("thread"), every: opt("every"), timeout: opt("timeout"), onSuccess: opt("on-success"), cwd: target ? need("cwd") : process.cwd(),
           ...(target ? { machine: target.machine } : {}),
         }, realClock.now());
         console.log(`WAIT_REGISTERED ${wait.key}${target ? ` machine=${target.machine}` : ""}`);
