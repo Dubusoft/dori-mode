@@ -57,6 +57,8 @@ export type LaunchInput = {
   readonly session?: string;
   /** The Toodo task id (`--task`), recorded on the lane as `task`. */
   readonly task?: number;
+  /** `--grant NAME` (repeatable): names in the lane's runner's runner-config `grants`, recorded on the lane as `grants`. */
+  readonly grants?: readonly string[];
 };
 
 /** A `--task` value: a positive integer in decimal, else undefined. Toodo itself is not asked whether the task exists. */
@@ -293,6 +295,26 @@ const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 const worktreeLine = (root: string, key: string): string =>
   `- Create every git worktree this lane needs under ${root}, as ${root}/<repo name>-${key} (<repo name>: the last segment of owner/repo).`;
 
+/** The footer line naming a lane's path grants; the paths themselves live in its runner's runner-config.json. */
+const grantLine = (grants: readonly string[]): string =>
+  `- Path grants: ${grants.join(", ")} (its runner's runner-config.json grants table names the paths). Those paths are writable or readable inside the sandbox as the table says; the hide list still wins, and nothing else outside the lane sandbox opens.`;
+
+/**
+ * A `--grant` launch its runner refused for the grant: a name its table lacks or a path it may not name (`grant-unknown`,
+ * `grant-path`, `grant-unsandboxed`), or a runner too old to know grants at all (`unknown-field ...grants`).
+ */
+const grantRefusal = (input: LaunchInput, error: unknown): string | undefined => {
+  if (!input.grants?.length) return undefined;
+  const text = error instanceof Error ? error.message : String(error);
+  const where = input.machine ? `machine ${input.machine}` : "this host's runner";
+  // The start's only field an older runner lacks is grants: its refusal names the rule, not the field.
+  if (/RUNNER_CMD_REJECTED unknown-field/.test(text)) {
+    return `LAUNCH_GRANT_UNSUPPORTED ${input.key}: ${where} predates --grant (${text.replace(/\s+/g, " ").trim()}); run dori runner update there, or launch without --grant`;
+  }
+  const rule = /RUNNER_CMD_REJECTED (grant-[a-z]+)[^\r\n]*/.exec(text);
+  return rule ? `LAUNCH_GRANT_REFUSED ${input.key}: ${where} refused --grant ${input.grants.join(",")} (${rule[0]}); the owner edits its runner-config.json grants table` : undefined;
+};
+
 /** The kinds of a `dori report` footer and where each goes. */
 const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question (with --option choices, see the owner-decision rule above), request (owner input, see the owner-input rule above) and blocked wake the lead.";
 
@@ -309,6 +331,7 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}`,
   ...(worktreeRoot ? [worktreeLine(worktreeRoot.replace(/\/+$/, ""), lane.key)] : []),
+  ...(lane.grants?.length ? [grantLine(lane.grants)] : []),
   ...(lane.fileRun?.requiredReport ? ["- This lane declares deliverable: report. Write at least one regular report file in DORI_LANE_OUT before claiming done."] : []),
   ...(lane.machine
     ? [
@@ -497,10 +520,12 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const os = input.machine ? (deps.runnerOs ?? ((label) => runnerOs(deps.config.stateDir, label)))(machineRunner(input.machine)) : undefined;
   const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which, existing, os);
   const sandbox = choice.on;
+  if (input.grants?.length && !sandbox) throw new LaunchError(`LAUNCH_GRANT_REFUSED ${input.key}: --grant needs a sandboxed lane (${choice.skipped ?? "no sandbox"})`);
   // All attachment reads and declaration validation precede reservations, workspace creation and brief writes.
   const prepared = await prepareLeadLaneBrief(deps, {
     ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"),
     brief: input.brief, done: input.done, openedAt: existing?.openedAt ?? iso(deps.clock), ...(input.machine ? { machine: input.machine } : {}),
+    ...(input.grants?.length ? { grants: input.grants } : {}),
   }, undefined, Boolean(existing));
   if (sandbox && !input.machine) await checkLocalSandbox(deps, input.key);
   const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
@@ -519,7 +544,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     ...(input.task !== undefined ? { task: input.task } : {}),
     ...(!existing ? { fileRun: prepared.files.run } : {}),
     reportVia: "cli" as const, // every lane reports through its runner; an old-footer lane moves onto dori report when recovery relaunches it
-    ...laneDirs(input.machine, dir, deps.config.leadCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
+    ...laneDirs(input.machine, dir, deps.config.leadCwd), ...(sandbox ? { sandbox: true as const } : {}), ...(input.grants?.length ? { grants: input.grants } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
   };
   const token = existing ? undefined : randomUUID();
   if (token) draft = await reserveLane(deps, input, draft, token);
@@ -550,6 +575,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       ...(input.session !== undefined ? { session: input.session } : {}),
       ...(target ? { target: { pane: target.pane } } : {}),
       ...(tabWorkspace ? { tabWorkspace } : {}),
+      ...(input.grants?.length ? { grants: input.grants } : {}),
     };
     let result;
     try {
@@ -557,6 +583,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     } catch (error) {
       const leaf = /(?:LANE_FILES_|LANE_REPORT_)[A-Z_]+ [^\r\n]*/.exec(error instanceof Error ? error.message : String(error))?.[0];
       if (leaf) throw new LaunchError(leaf);
+      const grantHint = grantRefusal(input, error);
+      if (grantHint) throw new LaunchError(grantHint);
       // A sandbox refusal started nothing, whatever error shape carried it.
       const refusal = runnerSandboxRefusal(input.key, input.machine, error);
       if (refusal) throw refusal;

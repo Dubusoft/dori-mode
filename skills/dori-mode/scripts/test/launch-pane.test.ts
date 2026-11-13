@@ -400,3 +400,24 @@ test("a mass-ulw launch refuses keywords or a brief path that omo would not bind
   await expect(mass("/mass-ulw set goal and work", { brief: join(state.dir, "what?.md") })).rejects.toThrow(LaunchError);
   await mass("/mass-ulw set goal and work");
 });
+
+test("--grant names travel on the start, the lane record and the footer; an old runner or an unknown name starts nothing and says why", async () => {
+  await writeBrief();
+  const base = deps({});
+  const r = await launchLane(base, { ...input({ machine: "m1", cwd: "/home/u/app" }), grants: ["blog-topic"] });
+  expect(starts()[0]).toMatchObject({ machine: "m1", sandbox: true, grants: ["blog-topic"] });
+  expect(starts()[0]!.briefText).toContain("- Path grants: blog-topic ");
+  expect(r.lane.grants).toEqual(["blog-topic"]);
+
+  const refusals: [string, string][] = [
+    ["lane.start RUNNER_CMD_REJECTED unknown-field", "LAUNCH_GRANT_UNSUPPORTED pane-lane-2: machine m1 predates --grant"],
+    ["lane.start RUNNER_CMD_REJECTED grant-unknown", "LAUNCH_GRANT_REFUSED pane-lane-2: machine m1 refused --grant blog-topic (RUNNER_CMD_REJECTED grant-unknown)"],
+  ];
+  for (const [detail, message] of refusals) {
+    const refusing = { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "m1", detail); } };
+    const attempt = launchLane({ ...base, ops: refusing }, { ...input({ key: "pane-lane-2", machine: "m1", cwd: "/home/u/app" }), grants: ["blog-topic"] });
+    await expect(attempt).rejects.toBeInstanceOf(LaunchError);
+    await expect(attempt).rejects.toThrow(message);
+    expect(await base.registry.read("pane-lane-2")).toBeNull();
+  }
+});

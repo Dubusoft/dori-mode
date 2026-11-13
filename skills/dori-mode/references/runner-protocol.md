@@ -209,6 +209,7 @@ or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `in
 | `worktreeRoot` | where lanes on this host create their git worktrees, absolute or `~/...`; reported in the hello | `<reposRoot>/worktrees` when `reposRoot` is set, else none |
 | `workspaces` | overrides for discovered repos: `{"owner/repo": "<checkout path>"}`, absolute or `~/...`; an entry replaces the discovered path of that repo (case-insensitive) or adds a repo not under `reposRoot` | none |
 | `detectWorkspaces` | `false` turns off the scan of `allowedRoots` for checkouts (`detected`); `dori runner setup` does not ask it (`--set detectWorkspaces=false`) | `true` |
+| `grants` | named path grants a sandboxed lane gets only when its launch asks for them by name (`dori launch --grant NAME`, `lane.start.grants`): `{"<name>": {"write": [dirs], "read": [dirs]}}`, absolute or `~/...`; see [Path grants](#path-grants) | none |
 
 A `lane.start` without `cwd` (`dori launch --machine M` with no `--cwd`) starts in its own directory `<runnerDir>/lanes/<key>`
 (`~/.dori/runner/lanes/<key>`, `%USERPROFILE%\.dori\runner\lanes\<key>` on Windows). The runner fills it before the
@@ -218,13 +219,37 @@ it); the runner-directory safety check audits each `lanes/<key>` directory itsel
 A key that cannot name a directory is refused `cwd-missing`. The lane sandbox (Linux and macOS) lets such a lane read
 and write its own directory; update the wrapper (`dori runner update`) on a host that still has an older one.
 
+### Path grants
+
+The owner keeps a named table of narrow paths in runner-config.json `grants`; the lead picks names from it per lane
+(`dori launch --grant NAME`, repeatable) and never edits the table. A grant's `write` directories reach the lane
+sandbox as `LANE_SANDBOX_RW` (read-write) and its `read` directories as `LANE_SANDBOX_RO` (read-only, bound before every
+read-write path, so a cwd under one stays writable); the wrapper takes only these two lists. Both wrappers apply
+`~/.dori/lane-sandbox-hide` after every grant, so a hidden path stays hidden whatever a grant names. A lane without
+`--grant` gets neither list, as before.
+
+The table may not name, and parsing refuses (`RUNNER_CONFIG_INVALID`): a relative path or one holding `:`; `/`, the home
+directory or anything above it; anything that holds or lies under `~/.dori`, `~/.config` or the user runtime directory
+(`/run/user`, `XDG_RUNTIME_DIR`: the D-Bus session bus and the systemd user manager). At each start and relaunch the
+runner resolves every granted path (`realpath`) and checks the real form again, and refuses a write grant that is a git
+checkout (it holds `.git`): the host runs that checkout's scripts, so grant a data directory inside it instead (for
+example `/data/dori/blog-writer/runs`, never `/data/dori/blog-writer`). A refused or unknown name starts nothing
+(`RUNNER_CMD_REJECTED grant-path|grant-unknown ...`), and the lane record keeps the names, so a relaunch resolves them
+against the table as it is then. On the local runner a runner-config.json holding only placement keys and `grants`
+layers them onto the policy derived from config.json.
+
+`lane.start.grants` is sent only when non-empty and needs no protocol bump: a runner older than it refuses that start
+`RUNNER_CMD_REJECTED unknown-field` (the lead reports `LAUNCH_GRANT_UNSUPPORTED`; `dori runner update` there), and
+every other start is unchanged.
+
 The former `defaultCwd` key is retired. A runner-config.json that still holds it loads as before, the key is ignored
 and each load logs one `RUNNER_CONFIG_KEY_IGNORED defaultCwd: ...` line; `dori runner setup` removes it.
 
 A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
 `unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
 (compared by path segment after resolving symlinks on both sides, so `/data/repos-evil` is not under `/data/repos`),
-`sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
+`sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings), `jobs-denied`,
+`grant-unknown` (a `grants` name the table lacks), `grant-unsandboxed` (grants on a start with `sandbox: false`) or `grant-path` (a granted path refused at start, see [Path grants](#path-grants)).
 `guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
 `lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
 

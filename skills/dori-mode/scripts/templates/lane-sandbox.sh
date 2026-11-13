@@ -3,7 +3,8 @@
 # Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check
 # Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
-#   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir)
+#   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir; the runner's grants)
+#   LANE_SANDBOX_RO      extra read-only directories under $HOME, which is otherwise empty (the runner's grants)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
@@ -124,6 +125,14 @@ for f in /etc/ssh/ssh_config.d/*; do
   exec {fd}<"$r"
   opts+=(--ro-bind-data "$fd" "$r")
 done
+
+# Granted read-only paths, before every read-write bind so a cwd or rw path under one stays writable.
+if [ -n "${LANE_SANDBOX_RO:-}" ]; then
+  IFS=: read -r -a extra_ro <<<"$LANE_SANDBOX_RO"
+  for p in "${extra_ro[@]}"; do
+    [ -n "$p" ] && opts+=(--ro-bind-try "$p" "$p")
+  done
+fi
 
 # Read-write re-binds (after ro ones so nested rw paths win)
 opts+=(--bind "$H/.dori/runner/briefs/$key.out" "$H/.dori/runner/briefs/$key.out")

@@ -631,3 +631,62 @@ test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a m
   expect(argv[1]).toContain("(deny file-write*)");
   expect(argv.at(-1)).toBe("/usr/bin/true");
 });
+
+test("a granted lane gets its runner's write grants read-write and read grants read-only, before its cwd; an ungranted lane names neither", async () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const runs = join(root, "blog-writer", "runs"), notes = join(home, "notes");
+  mkdirSync(runs, { recursive: true });
+  mkdirSync(notes, { recursive: true });
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: runs, LANE_SANDBOX_RO: notes });
+
+  const rw = argv.findIndex((a, i) => a === "--bind-try" && argv[i + 1] === runs && argv[i + 2] === runs);
+  const ro = argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === notes && argv[i + 2] === notes);
+  const cwd = argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, "work"));
+  expect(rw).toBeGreaterThan(-1);
+  expect(ro).toBeGreaterThan(-1);
+  // A read grant above a writable path must not shadow it: the read-write re-binds, grants and cwd come after it.
+  const out = join(home, ".dori", "runner", "briefs", "lane-a.out");
+  expect(ro).toBeLessThan(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === out));
+  expect(rw).toBeGreaterThan(ro);
+  expect(cwd).toBeGreaterThan(ro);
+  expect(argv.some((a, i) => (a === "--bind" || a === "--bind-try") && argv[i + 1] === notes)).toBe(false);
+
+  const plain = await sandboxArgv(home, { DORI_LANE_KEY: "lane-b" });
+  expect(plain.some((a) => a.startsWith(runs) || a.startsWith(notes))).toBe(false);
+});
+
+test("the hide list wins over a lane's grants: a granted path under a hidden one is covered after it is bound", async () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const hidden = join(root, "private");
+  const runs = join(hidden, "runs"), notes = join(hidden, "notes");
+  mkdirSync(runs, { recursive: true });
+  mkdirSync(notes, { recursive: true });
+  mkdirSync(join(home, ".dori"), { recursive: true });
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${hidden}\n`);
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: runs, LANE_SANDBOX_RO: notes });
+
+  const hide = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === hidden);
+  expect(hide).toBeGreaterThan(argv.findIndex((a, i) => a === "--bind-try" && argv[i + 1] === runs));
+  expect(hide).toBeGreaterThan(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === notes));
+});
+
+test("macOS: a granted lane may write its write grants and read its read grants; the hide list still wins, and an ungranted lane may not write there", async () => {
+  const { root, home, wt } = macHome();
+  const runs = join(root, "blog-writer", "runs"), notes = join(root, "notes");
+  mkdirSync(runs, { recursive: true });
+  mkdirSync(notes, { recursive: true });
+  const granted = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: runs, LANE_SANDBOX_RO: notes });
+  expect(allows(granted, "file-write-data", join(runs, "topic.lock"))).toBe(true);
+  expect(allows(granted, "file-read-data", join(notes, "a.md"))).toBe(true);
+  expect(allows(granted, "file-write-data", join(notes, "a.md"))).toBe(false);
+
+  const plain = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" });
+  expect(allows(plain, "file-write-data", join(runs, "topic.lock"))).toBe(false);
+
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${join(root, "blog-writer")}\n${notes}\n`);
+  const hidden = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: runs, LANE_SANDBOX_RO: notes });
+  expect(allows(hidden, "file-write-data", join(runs, "topic.lock"))).toBe(false);
+  expect(allows(hidden, "file-read-data", join(notes, "a.md"))).toBe(false);
+});
