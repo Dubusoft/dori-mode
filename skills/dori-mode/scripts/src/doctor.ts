@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -119,8 +119,52 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
   if (!probe.out.split(/\r?\n/).includes("DORI_LANE_FILES=1")) return [fail("lane sandbox", `${installed} --check does not print DORI_LANE_FILES=1; sandboxed lane starts and recoveries are refused (LANE_FILES_SANDBOX_OLD)`, refresh)];
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
   const templateHash = createHash("sha256").update(readFileSync(template)).digest("hex");
-  if (installedHash === templateHash) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`)];
-  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh)];
+  const exposed = await exposure(d, installed);
+  if (installedHash === templateHash) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`), exposed];
+  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh), exposed];
+};
+
+/** Credential stores under $HOME a lane must not read. ~/.ssh private keys (id_*) are added from the host's ~/.ssh. */
+const SENSITIVE = [".aws", ".azure", ".oci", ".gnupg", ".kube", ".docker/config.json", ".netrc", ".git-credentials", ".vault-token",
+  ".password-store", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml", ".config/gcloud", ".config/gh", ".npmrc",
+  ".dori/env", ".dori/secrets", ".dori/state"];
+/** Bound into every lane on purpose: gh drives PRs, and npm reads its registry settings. */
+const INTENDED = new Set([".config/gh", ".npmrc"]);
+/** Prints each argument a lane could read: a file with its first byte, a directory with at least one entry (a hidden one is an empty tmpfs or refused). */
+const PROBE = 'for p do if [ -d "$p" ]; then [ -n "$(ls -A "$p" 2>/dev/null)" ] && printf "%s\\n" "$p"; elif [ "$(head -c1 "$p" 2>/dev/null | wc -c)" -gt 0 ]; then printf "%s\\n" "$p"; fi; done; true';
+
+/**
+ * Which sensitive host paths a lane can read, measured by running a probe through the installed wrapper as a lane
+ * (DORI_LANE_KEY set, cwd /): the credential stores above, ~/.ssh private keys and each path in ~/.dori/lane-sandbox-hide.
+ * Only paths with content on the host are probed. The runner's worktree and repos roots are not part of the probe.
+ */
+const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string): Promise<Check> => {
+  const nonEmpty = (p: string): boolean => {
+    try {
+      return statSync(p).isDirectory() ? readdirSync(p).length > 0 : statSync(p).size > 0;
+    } catch {
+      return false;
+    }
+  };
+  let keys: string[] = [];
+  try {
+    keys = readdirSync(join(d.home, ".ssh")).filter((f) => /^id_[^/.]+$/.test(f)).map((f) => `.ssh/${f}`);
+  } catch {
+    // no ~/.ssh on this host
+  }
+  const hidePath = join(d.home, ".dori", "lane-sandbox-hide");
+  const hidden = existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : [];
+  const candidates = [...new Set([...SENSITIVE, ...keys].map((p) => join(d.home, p)).concat(hidden))].filter(nonEmpty);
+  if (candidates.length === 0) return ok("lane exposure", "none of the known credential stores exist on this host");
+  const probe = await d.run(["env", "DORI_LANE_KEY=doctor-probe", installed, "/bin/sh", "-c", PROBE, "lane-exposure", ...candidates], { ...T, cwd: "/" });
+  if (probe.code !== 0) return warn("lane exposure", `could not probe what a lane can read (${probe.err.trim() || `exit ${probe.code}`})`, "run dori doctor again once the lane sandbox check passes");
+  const seen = new Set(probe.out.split(/\r?\n/).filter(Boolean));
+  const home = (p: string) => (p.startsWith(`${d.home}/`) ? `~/${p.slice(d.home.length + 1)}` : p);
+  const intended = candidates.filter((p) => seen.has(p) && INTENDED.has(p.slice(d.home.length + 1)));
+  const unexpected = candidates.filter((p) => seen.has(p) && !intended.includes(p));
+  const onPurpose = intended.length ? `; bound on purpose: ${intended.map(home).join(", ")}` : "";
+  if (unexpected.length) return warn("lane exposure", `a lane can read ${unexpected.map(home).join(", ")}${onPurpose}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
+  return ok("lane exposure", `${candidates.length - intended.length} sensitive path(s) checked, none readable in a lane${onPurpose}`);
 };
 
 /** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */
