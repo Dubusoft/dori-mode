@@ -711,8 +711,8 @@ never used. A supervisor start counts as the last time it saw each runner it kno
 
 | Silent for | What happens |
 |---|---|
-| 60 s | `RUNNER_STALE machine=<label>` (digest), once |
-| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (digest), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes |
+| 60 s | `RUNNER_STALE machine=<label>` (engine-only), once |
+| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (engine-only), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes |
 | 10 min offline, or the probe finds it dead | `HOST_GUARD OFFLINE machine=<label> ...` (urgent), once per disconnect |
 | 30 min offline, or the restart circuit open | the runner is lost: `LANE_RUNNER_LOST <key> runner=<label>` (urgent) once for each open lane it owns; nothing is moved |
 
@@ -722,7 +722,7 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
 - **Unreachable** (ssh fails or times out after 20 s, the machine is unknown, or there is no probe answer): no
   restart; the next decision waits 2 min, doubling to 30 min.
 - **Alive** (`healthy` or `stalled`): the runner is fine and only its connection is down, so it is not restarted.
-  `RUNNER_UNREACHABLE machine=<label>` (digest) is said once per outage.
+  `RUNNER_UNREACHABLE machine=<label>` (engine-only) is said once per outage.
 - **Dead**: a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>`, and then
   the runner's service is restarted on that host (`systemctl --user restart dori-runner.service`, or
   `launchctl kickstart -k` on the recorded launchd domain on macOS). A hello with a higher gen within 2 minutes
@@ -748,8 +748,8 @@ that fails logs `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent) and keeps it
 the next runner.
 
 The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_FAILED`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
-`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_ONLINE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
-`RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
+`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_ONLINE`, `RUNNER_RESTARTED`, `RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest;
+`RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_UNREACHABLE` and `RUNNER_UNAVAILABLE` are engine-only (journaled, never delivered).
 
 ## Command durability
 
@@ -861,7 +861,7 @@ so an event acked just before a crash is still stored.
 
 **Sweeps without a runner.** The supervisor's watch, dead-panes and freshness sweeps read a machine only through an
 admitted connection. While a runner has none (after a supervisor restart, before its hello, or while it is gone) its
-lanes are skipped without a line per lane, and the sweeps say `RUNNER_UNAVAILABLE runner=<label>` (digest) once per
+lanes are skipped without a line per lane, and the sweeps say `RUNNER_UNAVAILABLE runner=<label>` (engine-only) once per
 outage; the archive's worktree cleanup runs right after the local runner's hello.
 
 **Evacuate.** `dori runner evacuate <label>` is the forced rollback for a runner that cannot be used. In order:

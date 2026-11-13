@@ -555,7 +555,7 @@ test("an issue is not closed for a PR merged into main, nor commented on when so
 const mergedSeven = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7", headRepo: "acme/app" }];
 const views = () => world.calls.filter((c) => c[0] === "gh" && c[2] === "view").length;
 
-test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED with its merge SHA; later polls and a restart read nothing", async () => {
+test("a merged PR of an open lane is read back once as engine-only MERGE_VERIFIED with its merge SHA; later polls and a restart read nothing", async () => {
   gh.view = greenView({ state: "MERGED", mergeCommit: { oid: "m3rge5ha" } });
   const ci = follow();
   await ci.tick([], emit, mergedSeven);
@@ -565,8 +565,8 @@ test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED wit
     ["merge-verified:acme/app#7", "MERGE_VERIFIED acme/app#7 into dev lane=demo-lane merge=m3rge5ha https://github.com/acme/app/pull/7"],
   ]);
   expect(views()).toBe(1);
-  expect(eventClass(lines("MERGE_VERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("GH_PR acme/app#7 merged sha=x u", deps.tunables.eventPolicy)).toBe("lead-digest");
+  expect(eventClass(lines("MERGE_VERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("engine-only");
+  expect(eventClass("GH_PR acme/app#7 merged sha=x u", deps.tunables.eventPolicy)).toBe("engine-only");
 });
 
 test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and a PR of no open lane is never read", async () => {

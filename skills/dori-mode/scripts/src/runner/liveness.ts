@@ -9,7 +9,7 @@ import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
  * Runner liveness and restart decisions (design 4.3), on the supervisor's monotonic clock only.
  *
  * - No heartbeat for 60 s: `RUNNER_STALE machine=<label>` once. For 180 s the runner is offline and the restart decision
- *   starts; the first disconnect is `RUNNER_OFFLINE machine=<label>` (digest). The lead is woken with
+ *   starts; the first disconnect is `RUNNER_OFFLINE machine=<label>` (engine-only). The lead is woken with
  *   `HOST_GUARD OFFLINE machine=<label>` only when the runner owns open lanes, the probe finds it dead, or it stays
  *   offline for 10 min.
  * - Hysteresis per machine: an outage ends only after the runner has stayed connected for 10 min. A disconnect before

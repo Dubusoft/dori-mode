@@ -89,12 +89,13 @@ const URGENT_KINDS = [
  * Kinds that stay digest whatever `default` says. The lane hears about its PR first (CI follow-up messages it and merges
  * or opens a merge lane), and a lane's milestone and progress reports wait for the next urgent delivery. The supervisor
  * settles the rest itself: a done claim (urgent LANE_DONE_CLAIMED) is re-checked live (then closed, or objected to,
- * LANE_NOT_DONE, which is urgent), and a merged lane PR has its merge read back (MERGE_VERIFIED, or urgent MERGE_UNVERIFIED).
+ * LANE_NOT_DONE, which is urgent).
  */
 const DIGEST_KINDS = [
-  "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
+  "GH_PR * checks_failing", "GH_PR * conflicting", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
-  "MERGE_VERIFIED",
+  // A nudge that could not be typed is the one nudge outcome the lead hears about (the lane may be stuck).
+  "NUDGED * * min silent, delivery failed;",
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
   // OWNER_DECISION_OPENED is digest: opening a thread needs no immediate lead action.
   "OWNER_DECISION_OPENED",
@@ -102,8 +103,20 @@ const DIGEST_KINDS = [
   "UNRECOGNISED_PANE * unregistered",
 ] as const;
 
-/** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */
-const ENGINE_KINDS = ["LANE_FINISH_NOTICE"] as const;
+/**
+ * Kinds the supervisor settles or that need no lead action: journaled and counted, never delivered. A lane PR's routine
+ * states (the lane and CI follow-up act on them; a merged one is read back as MERGE_VERIFIED, or urgent MERGE_UNVERIFIED),
+ * runner link states (a runner owning open lanes wakes the lead as urgent HOST_GUARD OFFLINE or LANE_RUNNER_LOST), a
+ * nudge that reached the lane, the owner's own thread close, and the Toodo moves that only queue or start a task (the
+ * lead makes most of them itself). LANE_FINISH_NOTICE is kept only for old journals of the removed lane-finish line.
+ */
+const ENGINE_KINDS = [
+  "GH_PR * opened", "GH_PR * updated", "GH_PR * checks_green", "GH_PR * merged", "MERGE_VERIFIED",
+  "RUNNER_STALE", "RUNNER_UNREACHABLE", "RUNNER_UNAVAILABLE", "RUNNER_OFFLINE",
+  "NUDGED", "THREAD_CLOSED_BY_OWNER",
+  "TOODO_TASK_STATUS * new->planned", "TOODO_TASK_STATUS * planned->in_progress",
+  "LANE_FINISH_NOTICE",
+] as const;
 
 /** The actionable kinds wake the lead, every other line is digest. */
 export const DEFAULT_EVENT_POLICY: EventPolicy = {

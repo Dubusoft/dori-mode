@@ -116,7 +116,7 @@ test("task events are journaled by class and resume after a restart from the sav
     expect.objectContaining({ id: "toodo:ep-3", line: "TOODO_TASK_READY #13 workspace=2 unblocked-by=#12" }),
     expect.objectContaining({ id: "toodo:ep-4", line: "TOODO_TASK_STATUS #14 new->planned workspace=2" }),
   ]);
-  expect(f.toodo().map((e) => eventClass(e.line, f.deps.tunables.eventPolicy))).toEqual(["lead-digest", "lead-urgent", "lead-digest"]);
+  expect(f.toodo().map((e) => eventClass(e.line, f.deps.tunables.eventPolicy))).toEqual(["lead-digest", "lead-urgent", "engine-only"]);
   expect(f.logs.join("\n")).not.toContain("secret-token");
 });
 

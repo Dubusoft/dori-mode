@@ -8,7 +8,7 @@ import { redactSecrets } from "./redact.ts";
 /*
  * The Toodo task events (the built-in `toodo` source). The supervisor follows toodo-server's event stream
  * (`GET <url>/api/events`, server-sent events, bearer token read from `tokenFile`) and journals:
- *   task-status-changed  -> TOODO_TASK_STATUS #<task> <from>-><to> workspace=<id>         (digest)
+ *   task-status-changed  -> TOODO_TASK_STATUS #<task> <from>-><to> workspace=<id>         (digest; new->planned and planned->in_progress engine-only)
  *   task-ready           -> TOODO_TASK_READY #<task> workspace=<id> unblocked-by=#<task>  (urgent)
  *   resync               -> TOODO_TASK_RESYNC ...                                         (digest)
  * The event id is `toodo:<stream id>`, so the journal's dedupe drops a replayed event. The id of the last event handled

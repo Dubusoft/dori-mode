@@ -1341,7 +1341,7 @@ test("a kind's class comes from config: engine-only stays journaled and never re
 test("a warm wake records its trigger kinds and is closed with the lead's model calls when the next wake starts", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("nudged", "NUDGED lane silent");
+  supervisor.enqueue("nudged", "OWNER_DECISION_OPENED d1 lane question");
   supervisor.enqueue("owner", "INBOUND 1 1 hello");
   const woke = f.clock.now();
   await supervisor.flush();
@@ -1355,7 +1355,7 @@ test("a warm wake records its trigger kinds and is closed with the lead's model 
   await supervisor.flush();
   supervisor.close();
   expect(readWakes(f.state.dir, 0)).toEqual([
-    { at: woke, session: f.file, trigger: ["INBOUND"], kinds: { NUDGED: 1, INBOUND: 1 }, calls: 2, closed: true },
+    { at: woke, session: f.file, trigger: ["INBOUND"], kinds: { OWNER_DECISION_OPENED: 1, INBOUND: 1 }, calls: 2, closed: true },
     { at: typed + 3_000, session: f.file, trigger: ["GH_PR * closed"], kinds: { "GH_PR * closed": 1 } },
   ]);
   expect(readWakes(f.state.dir, woke + 1)).toHaveLength(1);
@@ -1365,7 +1365,7 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
   const f = fixture({ digestMaxDelayMin: 60 });
   f.cold();
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("nudged", "NUDGED lane silent");
+  supervisor.enqueue("nudged", "OWNER_DECISION_OPENED d1 lane question");
   f.clock.at += 61 * 60_000;
   const start = f.clock.now();
   await supervisor.flush();
@@ -1373,7 +1373,7 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
   const session = f.session();
   expect(session).not.toBe("");
   const wakes = readWakes(f.state.dir, 0);
-  expect(wakes).toMatchObject([{ session, trigger: ["NUDGED"], kinds: { NUDGED: 1 } }]);
+  expect(wakes).toMatchObject([{ session, trigger: ["OWNER_DECISION_OPENED"], kinds: { OWNER_DECISION_OPENED: 1 } }]);
   // Stamped during the soft restart, which now waits for the new session to start.
   expect(wakes[0]?.at).toBeGreaterThanOrEqual(start);
   expect(wakes[0]?.at).toBeLessThanOrEqual(f.clock.now());
@@ -1382,13 +1382,13 @@ test("a cold start is a wake on the new session; a digest-only batch past digest
 test("digest waits for an urgent event, but no longer than digestMaxDelayMin", async () => {
   const f = fixture({ digestMaxDelayMin: 60 });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("digest", "NUDGED lane silent");
+  supervisor.enqueue("digest", "OWNER_DECISION_OPENED d1 lane question");
   f.clock.at += 59 * 60_000;
   await supervisor.flush();
   expect(f.log()).toEqual([]);
   f.clock.at += 60_000;
   await supervisor.flush();
-  expect(f.log()).toEqual([{ id: "digest", line: "NUDGED lane silent" }]);
+  expect(f.log()).toEqual([{ id: "digest", line: "OWNER_DECISION_OPENED d1 lane question" }]);
 });
 
 test("a sweep warning alone never forces a delivery, however old it gets", async () => {
@@ -1426,7 +1426,7 @@ test("an owner message the lead has not taken within a minute is reported once; 
 test("the next warm urgent delivery includes held digest once", async () => {
   const f = fixture();
   const before = new Supervisor(f.deps);
-  before.enqueue("digest", "NUDGED lane silent");
+  before.enqueue("digest", "OWNER_DECISION_OPENED d1 lane question");
   await before.flush();
   const after = new Supervisor(f.deps);
   after.enqueue("urgent", "INBOUND 123 1 Owner hello");
@@ -1439,7 +1439,7 @@ test("the next warm urgent delivery includes held digest once", async () => {
 test("GitHub digest survives restart then joins an actionable PR event exactly once", async () => {
   const f = fixture();
   const before = new Supervisor(f.deps);
-  before.enqueue("github:opened", "GH_PR acme/app#7 opened sha=abc url");
+  before.enqueue("github:failing", "GH_PR acme/app#7 checks_failing sha=abc url");
   await before.flush();
   expect(f.calls).toEqual([]);
   expect(f.log()).toEqual([]);
@@ -1449,7 +1449,7 @@ test("GitHub digest survives restart then joins an actionable PR event exactly o
   const restarted = new Supervisor(f.deps);
   restarted.enqueue("github:closed", "GH_PR acme/app#7 closed sha=abc url");
   await restarted.flush();
-  expect(f.log().map((event) => event.id)).toEqual(["github:opened", "github:closed"]);
+  expect(f.log().map((event) => event.id)).toEqual(["github:failing", "github:closed"]);
   expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
 });
 
@@ -1457,14 +1457,14 @@ test("the next cold urgent delivery includes held digest in the new session prom
   const f = fixture();
   f.cold();
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("digest", "NUDGED lane silent");
+  supervisor.enqueue("digest", "OWNER_DECISION_OPENED d1 lane question");
   await supervisor.flush();
   supervisor.enqueue("urgent", "LANE_NOT_DONE lane reason");
   await supervisor.flush();
   expect(f.prompt()).toContain(TAKE_FIRST);
   expect(f.log().map((event) => event.id)).toEqual(["digest", "urgent"]);
   expect(restartStarts(f)).toHaveLength(1);
-  expect(taken(f)).toEqual(["digest\tNUDGED lane silent", "urgent\tLANE_NOT_DONE lane reason"]);
+  expect(taken(f)).toEqual(["digest\tOWNER_DECISION_OPENED d1 lane question", "urgent\tLANE_NOT_DONE lane reason"]);
 });
 
 test("a claim reads delivered to the lead only once a cold start carrying it confirmed", async () => {
@@ -2493,7 +2493,7 @@ test("safety-work events reach an idle lead at once, without waiting for the dig
     expect(f.log().map((event) => event.id)).toContain(`urgent:${i}`);
   }
   // Control: a digest line alone still waits.
-  supervisor.enqueue("digest", "NUDGED lane silent");
+  supervisor.enqueue("digest", "OWNER_DECISION_OPENED d1 lane question");
   await supervisor.flush();
   expect(f.log().map((event) => event.id)).not.toContain("digest");
 });

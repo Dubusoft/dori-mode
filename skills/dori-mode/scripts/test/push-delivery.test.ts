@@ -616,7 +616,7 @@ test("after retries + 1 pushes the next one waits twice ackSec (N7)", async () =
 test("digest traffic is pushed only once overdue, and a _WARN line never", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  supervisor.enqueue("nudge:1", "OWNER_DECISION_OPENED d1 lane question");
   supervisor.enqueue("warn:1", "SWEEP_WARN guard slow");
   await flush(supervisor);
   expect(f.texts()).toEqual([]);
@@ -625,13 +625,13 @@ test("digest traffic is pushed only once overdue, and a _WARN line never", async
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   await flush(supervisor);
   expect(f.texts()).toHaveLength(1);
-  expect(f.texts()[0]).toContain("(digest: NUDGED)");
+  expect(f.texts()[0]).toContain("(digest: OWNER_DECISION_OPENED)");
 });
 
 test("a noise-only batch keeps one pointer at its take cursor: never typed again, idle or working, until a take", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  supervisor.enqueue("nudge:1", "OWNER_DECISION_OPENED d1 lane question");
   f.clock.at += 61 * 60_000;
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   await flush(supervisor);
@@ -640,13 +640,13 @@ test("a noise-only batch keeps one pointer at its take cursor: never typed again
     f.pane.agent_status = status;
     f.clock.at += 11 * 60_000;
     utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
-    supervisor.enqueue(`nudge:${f.clock.now()}`, "NUDGED lane silent");
+    supervisor.enqueue(`nudge:${f.clock.now()}`, "OWNER_DECISION_OPENED d1 lane question");
     await flush(supervisor);
   }
   expect(f.texts()).toHaveLength(1);
   expect(f.launches()).toHaveLength(0);
   take(f.state.dir, { maxBytes: 16_384, now: f.clock.now() });
-  supervisor.enqueue("nudge:after", "NUDGED lane silent");
+  supervisor.enqueue("nudge:after", "OWNER_DECISION_OPENED d1 lane question");
   f.clock.at += 61 * 60_000;
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   f.pane.agent_status = "idle";
@@ -657,7 +657,7 @@ test("a noise-only batch keeps one pointer at its take cursor: never typed again
 test("an actionable event joining a pointed noise-only batch still retries after ackSec and escalates an idle lead", async () => {
   const f = fixture({ delivery: delivery({ tailMonitor: false }), digestMaxDelayMin: 60 });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("nudge:1", "NUDGED lane silent");
+  supervisor.enqueue("nudge:1", "OWNER_DECISION_OPENED d1 lane question");
   f.clock.at += 61 * 60_000;
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   await flush(supervisor);
@@ -677,10 +677,10 @@ test("an actionable event joining a pointed noise-only batch still retries after
   expect(f.launches()).toHaveLength(1);
 });
 
-test("a first runner disconnect waits in the digest batch; an owner message arriving meanwhile is pushed at once and carries it", async () => {
+test("a runner restart waits in the digest batch; an owner message arriving meanwhile is pushed at once and carries it", async () => {
   const f = fixture({ delivery: delivery({ push: { escalateMin: 120 } }), digestMaxDelayMin: 60 });
   const supervisor = new Supervisor(f.deps);
-  supervisor.enqueue("runner:offline:1", "RUNNER_OFFLINE machine=mac runner heartbeat missing for 180 s");
+  supervisor.enqueue("runner:restarted:1", "RUNNER_RESTARTED machine=mac gen=2");
   await flush(supervisor);
   expect(f.texts()).toEqual([]);
   f.clock.at += 5 * 60_000;
@@ -688,7 +688,7 @@ test("a first runner disconnect waits in the digest batch; an owner message arri
   utimesSync(f.file, f.clock.now() / 1000, f.clock.now() / 1000);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 is the build done?");
   await flush(supervisor);
-  // One pointer for both: the owner message and the batched disconnect the same take prints.
+  // One pointer for both: the owner message and the batched restart the same take prints.
   expect(f.texts()).toHaveLength(1);
   expect(f.texts()[0]).toContain("2 new events (urgent: INBOUND)");
 });

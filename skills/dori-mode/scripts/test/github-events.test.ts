@@ -7,8 +7,9 @@ import { GitHubEvents, githubSummary, githubTargets, PRE_SQLITE_GITHUB_FILE } fr
 import { Repos } from "../src/repos.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE } from "../src/store.ts";
+import { eventClass } from "../src/event-policy.ts";
 import { Supervisor, eventPriority } from "../src/supervise.ts";
-import { depsFor, fakeClock, fakeLaneOps, newWorld, readGithub, TEST_STORE, withState } from "./fakes.ts";
+import { depsFor, fakeClock, fakeLaneOps, newWorld, readGithub, readJournal, TEST_STORE, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -173,7 +174,7 @@ test("checks still poll when the pull list is 304 and comments paginate", async 
   expect(f.events.map((e) => e.line.split(" ")[2])).toEqual(["comment", "checks_green"]);
 });
 
-test("other updates are digest, with stable IDs after a crash before snapshot save", async () => {
+test("other updates are engine-only, with stable IDs after a crash before snapshot save", async () => {
   const f = await fixture();
   const next = pull({ updated_at: "later" });
   f.responses.set("repos/acme/app/pulls/7", ok(next));
@@ -188,9 +189,10 @@ test("other updates are digest, with stable IDs after a crash before snapshot sa
   await poller(f.state.dir).tick(f.deps, (id, line) => after.enqueue(id, line));
   after.enqueue("test-wake", "INBOUND verification");
   await after.flush();
-  const delivered = readFileSync(after.eventLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  expect(delivered.filter((e) => e.line.startsWith("GH_PR"))).toHaveLength(1);
-  expect(eventPriority(delivered.find((e) => e.line.startsWith("GH_PR")).line)).toBe("digest");
+  // Journaled once (the replay after the crash is dropped), never delivered to the lead.
+  const journaled = readJournal(f.state.dir).events.filter((e: { line: string }) => e.line.startsWith("GH_PR"));
+  expect(journaled.map((e: { line: string }) => [e.line.split(" ")[2], eventClass(e.line)])).toEqual([["updated", "engine-only"]]);
+  expect(readFileSync(after.eventLog, "utf8")).not.toContain("GH_PR");
 });
 
 test("a newly opened PR is digest and its comments are not lost", async () => {
