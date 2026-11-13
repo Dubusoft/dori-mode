@@ -72,8 +72,8 @@ const URGENT_KINDS = [
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED", "TOODO_TASK_NOT_COMPLETED",
   // The automatic `dori update --dev` after a merge of dori's own repo failed (update.ts AutoUpdate); its success is digest.
   "AUTO_UPDATE_FAILED",
-  // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched), a done one
-  // has its Toodo task completed by the lead.
+  // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched; the supervisor
+  // records the task's blocker), a done one whose task the supervisor could not complete is completed by the lead.
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
   // Owner decision answers, stuck posts, and missing threads require the lead to act or check state.
   "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
@@ -117,6 +117,8 @@ const DIGEST_KINDS = [
   // A close after a claim the lead already took, whose Toodo task the supervisor completed and whose report it appended
   // the merge to (task-finish.ts): nothing is left for the lead.
   "LANE_CLOSED * closed seen-claim toodo=done", "TOODO_TASK_COMPLETED",
+  // An autopilot lane's done outcome whose task the supervisor completed and read back (task-finish.ts finishedOutcome).
+  "AUTOPILOT_LANE_DONE * * * toodo=done:",
 ] as const;
 
 /**

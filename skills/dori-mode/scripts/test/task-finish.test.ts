@@ -2,10 +2,12 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { claimDone, type FlowDeps, watchTick } from "../src/done-flow.ts";
+import { LAUNCH_ACTION, ledgerRows } from "../src/autopilot.ts";
+import { claimDone, closeLane, finishClosedTask, type FlowDeps, watchTick } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
-import { taskFinisher } from "../src/task-finish.ts";
+import { openOperations, plan, settleOperation } from "../src/operations.ts";
+import { taskBlocker, taskFinisher } from "../src/task-finish.ts";
 import { appendFollowUp, type FollowUpDiscord, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { ToodoWriter } from "../src/toodo-client.ts";
 import { depsFor, fakeClock, newWorld, withSqliteStore, withState, type World } from "./fakes.ts";
@@ -37,6 +39,10 @@ const fakeToodo = (task: Task) => {
       if (name === "complete_task") {
         if (task.criteria.some((c) => c.state !== "met")) return refuse(rpc.id, "criteriaUnmet");
         task.status = "done"; task.resolution = "completed"; task.refs.push(...(a.refs as string[]));
+        return ok(rpc.id, task);
+      }
+      if (name === "report_blocker") {
+        task.notes.push({ kind: "blocker", body: String(a.note) });
         return ok(rpc.id, task);
       }
       return refuse(rpc.id, "unknownTool");
@@ -97,12 +103,10 @@ const closeMerged = async (subject: Lane, task: Task, discord: FollowUpDiscord, 
   await claimDone(at(T0), subject, `merged ${PR}`);
   await at(T0).registry.patch(subject.key, (current) => current.claim ? { claim: { ...current.claim, pulls: [{ repo: "acme/app", number: 1, sha: "a".repeat(40) }] } } : undefined);
   await watchTick(at(T0));
-  const finishTask = taskFinisher({
-    writer: new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") }),
-    append: (l, text) => appendFollowUp(state.dir, discord, l, text),
-  });
+  const writer = new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") });
+  const finishTask = taskFinisher({ writer, append: (l, text) => appendFollowUp(state.dir, discord, l, text) });
   const base = at(T0 + 5 * MIN + 1);
-  return { lines: await watchTick({ ...base, ...(run ? { run: run(base.run) } : {}), finishTask }), calls: toodo.calls };
+  return { lines: await watchTick({ ...base, ...(run ? { run: run(base.run) } : {}), finishTask, blockTask: taskBlocker(writer) }), calls: toodo.calls };
 };
 
 test("a task-linked lane closing after its merge has its task completed and read back, its report appended, and its seen-claim close sent as digest", async () => {
@@ -169,4 +173,73 @@ test("a thread already closed gets no append and no redirected line in its paren
   expect(task.status).toBe("done");
   expect(fake.edits).toEqual([]);
   expect(fake.sends).toEqual([]);
+});
+
+/** Autopilot lane `ap-951-1` of task 951 (launched without --task), its launch attempt reserved and settled launched. */
+const { task: _untasked, ...plainLane } = lane;
+const apLane: Lane = { ...plainLane, key: "ap-951-1" };
+const reserveAutopilot = (): void => {
+  const store = openOperations(at(T0).config);
+  try {
+    const op = plan(store, T0, { lane: "toodo:951", action: LAUNCH_ACTION, target: "1", data: JSON.stringify({ laneKey: "ap-951-1" }) });
+    settleOperation(store, T0, op.id, "verified", "launched ap-951-1");
+  } finally { store.close(); }
+};
+const attemptData = (): Record<string, unknown> => {
+  const store = openOperations(at(T0).config);
+  try { return JSON.parse(ledgerRows(store)[0]?.data ?? "{}") as Record<string, unknown>; } finally { store.close(); }
+};
+
+test("an autopilot lane closing after its merge has its task completed with the PR and merge evidence, and its done outcome is digest", async () => {
+  reserveAutopilot();
+  const task = inProgress([manual(1)]);
+  const { lines } = await closeMerged(apLane, task, fakeDiscord().discord);
+  expect(lines[0]).toBe(`LANE_CLOSED ap-951-1 closed seen-claim toodo=done ${PR}`);
+  expect(lines[1]).toStartWith(`TOODO_TASK_COMPLETED ap-951-1 #951 ${PR} merge=${SHA};`);
+  const done = lines.find((l) => l.startsWith("AUTOPILOT_LANE_DONE "));
+  expect(done).toBe("AUTOPILOT_LANE_DONE #951 lane=ap-951-1 attempt=1 toodo=done: toodo task #951 completed and read back by the supervisor");
+  expect(eventClass(done ?? "")).toBe("lead-digest");
+  expect(task.status).toBe("done");
+  expect(task.refs).toEqual([PR]);
+  expect(task.criteria[0]?.evidence).toContain(`${PR} merged into its base as ${SHA}`);
+  expect(attemptData()).toMatchObject({ outcome: "done", toodo: "done" });
+});
+
+test("an autopilot task toodo refuses to complete gets a blocker note, one failure line, and nothing again on a repeated finish", async () => {
+  reserveAutopilot();
+  const task = inProgress([{ id: 1, text: "deployed", kind: "url", state: "pending", evidence: null }]);
+  const { lines, calls } = await closeMerged(apLane, task, fakeDiscord().discord);
+  expect(lines[0]).toBe(`LANE_CLOSED ap-951-1 closed seen-claim toodo=failed ${PR}`);
+  const failures = lines.filter((l) => eventClass(l) === "lead-urgent" && !l.startsWith("LANE_CLOSED ") && !l.startsWith("AUTOPILOT_"));
+  expect(failures).toHaveLength(1);
+  expect(failures[0]).toStartWith("TOODO_TASK_NOT_COMPLETED ap-951-1 #951 toodo: toodo-server refused complete_task: Rejected: criteriaUnmet;");
+  expect(failures[0]).toEndWith("; blocker recorded on toodo task #951");
+  // The done outcome still asks the lead to complete the task: it is not rewritten toodo=done.
+  expect(lines.find((l) => l.startsWith("AUTOPILOT_LANE_DONE "))).toBe("AUTOPILOT_LANE_DONE #951 lane=ap-951-1 attempt=1: complete toodo task #951");
+  expect(task.status).toBe("in_progress");
+  expect(task.notes).toEqual([{ kind: "blocker", body: "Autopilot lane ap-951-1 ended without finishing this task: toodo: toodo-server refused complete_task: Rejected: criteriaUnmet. Autopilot does not launch it again; the lead decides whether to fix, drop or retry it." }]);
+  expect(attemptData()).toMatchObject({ outcome: "done", toodo: "blocked" });
+  // A repeated finish of the same close (a resumed pass) writes nothing and tells no one.
+  const before = calls.length;
+  const again = await finishClosedTask({ ...at(T0 + 6 * MIN), finishTask: async () => { throw new Error("finished again"); } }, apLane);
+  expect(again).toEqual({ tag: "failed", lines: [] });
+  expect(calls.length).toBe(before);
+});
+
+test("a cancelled autopilot lane gets its blocker recorded once and its failure line says so", async () => {
+  reserveAutopilot();
+  const task = inProgress([manual(1)]);
+  const toodo = fakeToodo(task);
+  stops.push(toodo.stop);
+  const blockTask = taskBlocker(new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") }));
+  await at(T0).registry.write({ ...apLane, pane: undefined, runner: "local" });
+  const r = await closeLane({ ...at(T0), blockTask }, { ...apLane, pane: undefined, runner: "local" }, "cancelled", { cancelled: { reason: "start failed" } });
+  const failed = r.lines.filter((l) => l.startsWith("AUTOPILOT_"));
+  expect(failed).toEqual(["AUTOPILOT_LANE_FAILED #951 lane=ap-951-1 attempt=1 cancelled: start failed toodo=blocked: blocker recorded on toodo task #951; tell the owner; autopilot does not launch it again"]);
+  expect(eventClass(failed[0] ?? "")).toBe("lead-urgent");
+  expect(task.notes).toEqual([{ kind: "blocker", body: "Autopilot lane ap-951-1 ended without finishing this task: #951 lane=ap-951-1 attempt=1 cancelled: start failed. Autopilot does not launch it again; the lead decides whether to fix, drop or retry it." }]);
+  expect(attemptData()).toMatchObject({ outcome: "failed", toodo: "blocked" });
+  const calls = toodo.calls.length;
+  expect((await closeLane({ ...at(T0 + MIN), blockTask }, apLane, "again")).lines).toEqual(["CLOSED ap-951-1 already closed"]);
+  expect(toodo.calls.length).toBe(calls);
 });

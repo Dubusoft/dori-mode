@@ -4,6 +4,7 @@ import { Database, SQLiteError } from "bun:sqlite";
 
 import { type ArgvTemplate, fillHook } from "./config.ts";
 import { isLaneOutcomeLine, laneOutcomeEventId } from "./autopilot.ts";
+import { finishedOutcome } from "./task-finish.ts";
 import { closeLane, closeRunning, finishClosedTask, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
@@ -287,9 +288,11 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     const closed = await closeLane(deps, current, `recovery: ${finished}; not relaunched`);
     const event = `LANE_RECOVERY_SKIPPED ${lane.key} ${lane.pane ?? "-"} ${reason}: ${finished}; ${closed.closed ? "lane closed" : `not relaunched, left for dori close (${closed.lines.at(-1) ?? "refused"})`}`;
     // An autopilot lane's close also settles its launch attempt (AUTOPILOT_LANE_DONE).
-    const outcomes = closed.lines.filter(isLaneOutcomeLine);
-    // The supervisor finishes the closed lane's Toodo task as after a done claim (TOODO_TASK_COMPLETED / _NOT_COMPLETED).
-    const taskLines = closed.closed ? (await finishClosedTask(deps, current))?.lines ?? [] : [];
+    // The supervisor finishes the closed lane's Toodo task as after a done claim (TOODO_TASK_COMPLETED / _NOT_COMPLETED);
+    // an AUTOPILOT_LANE_DONE whose task it completed is then digest (toodo=done).
+    const finish = closed.closed ? await finishClosedTask(deps, current) : undefined;
+    const outcomes = closed.lines.filter(isLaneOutcomeLine).map((line) => finishedOutcome(line, finish));
+    const taskLines = finish?.lines ?? [];
     if (!enqueue) return [event, ...outcomes, ...taskLines];
     // A refused close leaves the lane for the next sweep: the same lane, generation and reason is said once.
     await enqueue(event, `recovery-skipped:${JSON.stringify([lane.key, lane.openedAt, current.lastRecoveryAt ?? null, reason, finished, closed.closed])}`);

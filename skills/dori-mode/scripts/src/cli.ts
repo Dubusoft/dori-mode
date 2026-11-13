@@ -1279,7 +1279,11 @@ try {
       const note = opt("note") ?? (cancelled ? `cancelled: ${cancelled.reason}` : "closed by the lead");
       const target = await lane(key ?? die("close needs a lane key"));
       await needSupervisor();
-      const r = await closeLane(deps, target, note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
+      // A cancelled autopilot lane's task gets its blocker note here (task-finish.ts taskBlocker), as in the supervisor.
+      const { taskBlocker } = await import("./task-finish.ts");
+      const { ToodoWriter } = await import("./toodo-client.ts");
+      const blockTask = taskBlocker(new ToodoWriter(deps.tunables.toodoWriter));
+      const r = await closeLane({ ...deps, blockTask }, target, note, { force: Boolean(flags.values.force), ...(cancelled ? { cancelled } : {}) });
       for (const line of r.lines) console.log(line);
       // Owner decisions still open for this lane never block the close; they are named so the lead closes or keeps them.
       const { openOwnerDecisions } = await import("./owner-decisions.ts");

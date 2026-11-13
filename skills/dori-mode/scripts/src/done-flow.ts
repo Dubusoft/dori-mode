@@ -4,7 +4,7 @@ import type { DoriConfig } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
-import { OPEN_STATES, openOperations, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
+import { OPEN_STATES, openOperations, type Operation, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
 import { type Check, parseSignal, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings, type WorktreeFact } from "./branch-cleanup.ts";
@@ -13,12 +13,12 @@ import type { EventMeta } from "./supervise-journal.ts";
 import { LaneOpsError, type LaneOps, machineRunner, type PaneRef } from "./lane-ops.ts";
 import { runnerWorktreeRoot } from "./runner/hub.ts";
 import { deliverLaneMessage, MERGE_VERIFY, queueSteering } from "./ci-follow.ts";
-import { type LaneMerge, notCompletedLine, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
+import { blockedOutcome, finishedOutcome, type LaneMerge, notCompletedLine, type TaskBlocker, taskCompleted, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
 import { openLaneMessages } from "./lane-messages.ts";
 import { checkLaneReportText, installLaneReports, LaneFileError, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import type { Tunables } from "./tunables.ts";
-import { isLaneOutcomeLine, laneOutcomeEventId, settleLaneOutcome } from "./autopilot.ts";
+import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -51,6 +51,11 @@ export type FlowDeps = {
    * appends the merge to its report. Absent (`dori watch`), a close carries no `toodo=` tag and the lead finishes the task.
    */
   readonly finishTask?: TaskFinisher;
+  /**
+   * Records a blocker note on the Toodo task of an autopilot lane that closed cancelled or whose task finishTask could
+   * not complete (task-finish.ts taskBlocker). Absent, the failure line goes to the lead with nothing written.
+   */
+  readonly blockTask?: TaskBlocker;
 };
 
 /**
@@ -377,7 +382,7 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string, opts: 
     throw e;
   }
   try {
-    return await withOperations(deps, async (store) => {
+    const closed = await withOperations(deps, async (store) => {
       const id = closeId(lane.key);
       // A close that finished while this one waited for the lock (the CLI and the supervisor resuming the same lane).
       const fresh = (await deps.registry.read(lane.key)) ?? lane;
@@ -398,7 +403,33 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string, opts: 
       if (store.get(id)?.state === "planned") settleOperation(store, now, id, "failed", result.lines.at(-1) ?? "refused");
       return result;
     });
+    return await blockFailedAttempt(deps, lane, closed);
   } finally { release(); }
+};
+
+/**
+ * A close that settled an autopilot attempt failed (AUTOPILOT_LANE_FAILED): the attempt's task gets a blocker note
+ * (deps.blockTask, read back) and the line says what was recorded. Marked on the attempt once, so a resumed close never
+ * writes it again. The Toodo write runs outside the operation store.
+ */
+const blockFailedAttempt = async (deps: FlowDeps, lane: Lane, result: { readonly closed: boolean; readonly lines: string[] }): Promise<{ readonly closed: boolean; readonly lines: string[] }> => {
+  const at = result.lines.findIndex((line) => line.startsWith(`${LANE_FAILED_EVENT} `));
+  const line = result.lines[at];
+  const task = line === undefined ? NaN : Number(/^\S+ #(\d+) /.exec(line)?.[1]);
+  if (!deps.blockTask || line === undefined || !Number.isSafeInteger(task)) return result;
+  const told = (said: string) => ({ ...result, lines: result.lines.map((l, i) => (i === at ? blockedOutcome(l, said) : l)) });
+  // The lane is closed by now: a ledger failure is said on the line instead of thrown.
+  const failure = (e: unknown) => `launch ledger: ${e instanceof Error ? e.message : String(e)}`;
+  let unmarked: boolean;
+  try {
+    unmarked = await withOperations(deps, async (store) => { const op = laneAttempt(store, lane.key); return op !== undefined && toodoMarkOf(op) === undefined; });
+  } catch (e) { return told(`blocker not recorded: ${failure(e)}`); }
+  if (!unmarked) return result;
+  const said = await deps.blockTask(lane, task, line.slice(LANE_FAILED_EVENT.length + 1).replace(/: tell the owner;.*$/, ""));
+  try {
+    await withOperations(deps, async (store) => markLaneToodo(store, deps.clock.now(), lane.key, said.startsWith("blocker recorded") ? "blocked" : "failed"));
+  } catch (e) { return told(`${said}; attempt not marked: ${failure(e)}`); }
+  return told(said);
 };
 
 /** The cancel reason a closed lane's receipt records (`dori close --cancelled`), else undefined. */
@@ -824,7 +855,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   const closed = finish ? marked.replace(/^(LANE_CLOSED \S+ closed(?: seen-claim)?)(?= |$)/, `$1 toodo=${finish.tag}`) : marked;
   await push(machine && closed.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${closed.slice("LANE_CLOSED ".length)}` : closed, undefined, laneMeta(lane));
   for (const extra of finish?.lines ?? []) await push(extra, undefined, laneMeta(lane));
-  await pushOutcomes(push, lane, settled.outcomes ?? []);
+  await pushOutcomes(push, lane, (settled.outcomes ?? []).map((l) => finishedOutcome(l, finish)));
 };
 
 const PR_SUBJECT = /^([\w.-]+\/[\w.-]+)#(\d+)(?:@\S+)?$/;
@@ -859,16 +890,45 @@ export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<{ readonly
 /** The supervisor's task follow-up of a lane it closed (deps.finishTask), or undefined when it has none to run. */
 export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<TaskFinish | undefined> => {
   if (!deps.finishTask) return undefined;
-  const task = lane.task;
-  if (task === undefined) return { tag: "no-task", lines: [] };
   // The lane is already closed: a throw here would lose its close line, so any failure is the lead's to finish.
+  let attempt: Operation | undefined;
+  try {
+    attempt = await withOperations(deps, async (store) => laneAttempt(store, lane.key));
+  } catch (e) {
+    return lane.task === undefined ? { tag: "no-task", lines: [] } : { tag: "failed", lines: [notCompletedLine(lane, lane.task, `the launch ledger could not be read: ${e instanceof Error ? e.message : String(e)}`)] };
+  }
+  // An autopilot lane's task is its launch attempt's, also when the lead launched it without --task.
+  const task = lane.task ?? (attempt ? Number(attempt.lane.slice("toodo:".length)) : undefined);
+  if (task === undefined || !Number.isSafeInteger(task)) return { tag: "no-task", lines: [] };
+  // Finished at an earlier close of the lane (a resumed close): nothing is written or told again.
+  const mark = attempt ? toodoMarkOf(attempt) : undefined;
+  if (mark !== undefined) return { tag: mark === "done" ? "done" : "failed", lines: [] };
+  let finish: TaskFinish;
+  let why: string | undefined;
   try {
     const read = await laneMerges(deps, lane);
-    if ("why" in read) return { tag: "unmerged", lines: [notCompletedLine(lane, task, `no merge read back: ${read.why}`)] };
-    return await deps.finishTask(lane, task, read.merges);
+    if ("why" in read) {
+      why = `no merge read back: ${read.why}`;
+      finish = { tag: "unmerged", lines: [notCompletedLine(lane, task, why)] };
+    } else finish = await deps.finishTask(lane, task, read.merges);
   } catch (e) {
-    return { tag: "failed", lines: [notCompletedLine(lane, task, e instanceof Error ? e.message : String(e))] };
+    why = e instanceof Error ? e.message : String(e);
+    finish = { tag: "failed", lines: [notCompletedLine(lane, task, why)] };
   }
+  if (!attempt) return finish;
+  // An autopilot task left unfinished: its blocker is recorded and its one failure line (TOODO_TASK_NOT_COMPLETED) says so.
+  const done = taskCompleted(finish);
+  // The finisher says why in its TOODO_TASK_NOT_COMPLETED line; the note keeps only the reason.
+  const reason = why ?? (finish.lines[0] ?? finish.tag).replace(/^TOODO_TASK_NOT_COMPLETED \S+ #\d+ /, "").replace(/; finish it yourself .*$/, "");
+  const said = !done && deps.blockTask ? await deps.blockTask(lane, task, reason) : undefined;
+  const marked = done ? "done" : said?.startsWith("blocker recorded") ? "blocked" : "failed";
+  let unmarked: string | undefined;
+  try { await withOperations(deps, async (store) => markLaneToodo(store, deps.clock.now(), lane.key, marked)); } catch (e) {
+    unmarked = `launch attempt not marked ${marked}: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  const extra = [said, unmarked].filter((s): s is string => s !== undefined);
+  if (!extra.length) return finish;
+  return { ...finish, lines: finish.lines.map((l, i) => (i === 0 ? `${l}; ${extra.join("; ")}` : l)) };
 };
 
 /**
