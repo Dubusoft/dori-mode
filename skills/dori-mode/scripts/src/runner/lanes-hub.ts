@@ -37,7 +37,9 @@ import { recoveryFields } from "../launch.ts";
  * `LaneMessageError` is the digest line `LANE_ACK_FAILED <key> <id> <reason>`.
  *
  * Signals: the owner's `lane.state` dead is urgent `RUNNER_LANE_DEAD` (with the runner's `reason=` when it gave one;
- * dropped for a closed lane, one with a launch reservation or a pending recovery, and one about another pane), its `lane.asking` is urgent `LANE_ASKING` (the line
+ * dropped for a closed lane, one with a launch reservation or a pending recovery, and one about another pane; raised once
+ * per lane and pane: `Lane.deadAlertPane` holds it back until a working or idle `lane.state` for that pane or a
+ * `lane.started` clears it), its `lane.asking` is urgent `LANE_ASKING` (the line
  * ask-user.ts raises for a local lane's on-screen question), and a failed `lane.start` or `lane.recover` result is urgent
  * `RUNNER_LAUNCH_FAILED` or `RUNNER_RECOVER_FAILED`; each under a stable id from the runner label and the event's seq.
  *
@@ -222,20 +224,31 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
       return { ...current,
       pane: b.pane, tab: b.tab, ...(b.session ? { session: b.session } : {}),
       ...(b.fileRun ? { fileRun: b.fileRun, pendingFileRun: undefined } : {}),
-      fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined,
+      fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined, deadAlertPane: undefined,
       ...(late ? { status: undefined, launchReservation: undefined, launchUnconfirmed: undefined } : {}),
     }; });
     if (late) deps.emit(`launch-confirmed-late:${label}:${frame.seq}`, `LAUNCH_CONFIRMED_LATE ${key} runner=${label} pane=${b.pane} the runner started the lane after its launch stopped waiting; the reservation is released and the lane is working`);
     return;
   }
   if (frame.type === "lane.state") {
+    const pane = frame.body.pane ?? "";
+    if (frame.body.status === "working" || frame.body.status === "idle") {
+      // Alive again on the pane its last dead named: a later dead there is news again.
+      if (lane.deadAlertPane !== undefined && lane.deadAlertPane === pane) {
+        await deps.registry.update(key, (current) => current?.deadAlertPane === pane ? { ...current, deadAlertPane: undefined } : undefined);
+      }
+      return;
+    }
     if (frame.body.status !== "dead") return;
     // A dead replayed from the journal can predate what the lane is now: a closed lane, a launch still being
     // reserved, a recovery already under way, or another pane than the lane's own say nothing about its agent.
     const lr = lane as RecoveryLane;
     if (lr.closedAt || lr.launchReservation || lr.recoveryPending) return;
     if (frame.body.pane && lr.pane && frame.body.pane !== lr.pane) return;
+    // One alert per lane and pane: a dead the lead already heard of for this pane is not raised again.
+    if (lane.deadAlertPane === pane) return;
     deps.emit(`runner-lane-dead:${label}:${frame.seq}`, `RUNNER_LANE_DEAD ${key} runner=${label}${frame.body.pane ? ` pane=${frame.body.pane}` : ""}${frame.body.reason ? ` reason=${frame.body.reason}` : ""} the lane's agent stopped on its runner: read its last report, then dori close ${key} or launch it again`);
+    await deps.registry.update(key, (current) => current && !current.closedAt ? { ...current, deadAlertPane: pane } : undefined);
     return;
   }
   if (frame.type === "lane.asking") {

@@ -15,8 +15,11 @@ import { laneStatus, type ObservedLane } from "./serve.ts";
  * argv: the launch prompt names the lane brief (`briefs/<key>.md` in the runner directory, or an older launch's
  * `dori-brief-<key>.md`), and a foreground process whose argv carries that path belongs to `<key>`. The owned record
  * wins, then the environment attribution, then the argv. For each such
- * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle). A pane's text is
- * never read here: a lane's reports reach the supervisor only as `lane.report` events.
+ * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle), except that a
+ * pane herdr calls dead whose lane agent process still runs there (`laneAgentRunning`) is idle: herdr detects a lane's
+ * agent from one child process, which a live agent can lack (a sandboxed omo on a non-Anthropic model, after an idle
+ * spell or an extension reload). A pane's text is never read here: a lane's reports reach the supervisor only as
+ * `lane.report` events.
  */
 
 type ProcessInfo = {
@@ -93,6 +96,25 @@ const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | und
   catch { return undefined; }
 };
 
+const agentProcesses = (info: ProcessInfo | undefined) =>
+  (info?.foreground_processes ?? []).filter((p): p is typeof p & { readonly pid: number } => typeof p.pid === "number" && p.pid !== info?.shell_pid);
+
+/**
+ * Whether lane `key`'s agent process still runs in a pane, from herdr's process-info of it: one of the pane's foreground
+ * processes other than its shell belongs to the lane by its environment (`owner`: `procLanes`, `DORI_LANE_KEY` own or
+ * inherited; Linux) or names the lane's brief in its argv (`briefLane`: the launch prompt names it; every OS). The
+ * launch sets `DORI_LANE_KEY` for the agent's command only, so a shell left after the agent exited never counts.
+ */
+export const laneAgentRunning = (info: ProcessInfo | undefined, key: string, owner?: ReadonlyMap<number, string | undefined>): boolean =>
+  agentProcesses(info).some((p) => owner?.get(p.pid) === key || briefLane(p.argv) === key);
+
+/** `laneAgentRunning` on this host for `pane`; the process table (`procs`) is read only when the argv does not decide it. */
+export const laneProcessAlive = async (run: Runner, pane: string, key: string, procs: () => Promise<readonly Proc[]> = () => sampleProcs(run)): Promise<boolean> => {
+  const info = await processInfo(run, pane);
+  if (laneAgentRunning(info, key)) return true;
+  return agentProcesses(info).length > 0 && laneAgentRunning(info, key, procLanes(await procs()));
+};
+
 export const observeHost = async (deps: ObserveHostDeps): Promise<ObservedLane[]> => {
   const [panes, procs] = await Promise.all([listPanes(deps.run), (deps.procs ?? (() => sampleProcs(deps.run)))()]);
   const owner = procLanes(procs);
@@ -108,7 +130,9 @@ export const observeHost = async (deps: ObserveHostDeps): Promise<ObservedLane[]
       ?? (info?.foreground_processes ?? []).map((p) => briefLane(p.argv)).find((k): k is string => k !== undefined);
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    out.push({ key, pane: pane.pane_id, tab: pane.tab_id ?? "", status: laneStatus(pane) });
+    const status = laneStatus(pane);
+    const running = status === "dead" && laneAgentRunning(info ?? await processInfo(deps.run, pane.pane_id), key, owner);
+    out.push({ key, pane: pane.pane_id, tab: pane.tab_id ?? "", status: running ? "idle" : status });
   }
   return out.sort((a, b) => a.key.localeCompare(b.key));
 };

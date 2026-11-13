@@ -66,7 +66,7 @@ Protocol 3 adds, all optional on existing frames:
 
 | Frame | Addition |
 |---|---|
-| `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane |
+| `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane; an `agent-gone` dead is published only by the runner's observe loop, after 90 s of dead reads with no alive one between (a lane agent process still running in the pane counts as alive), and the hub raises one `RUNNER_LANE_DEAD` per lane and pane |
 | `lane.ack {key, id}` | new event: the lane confirmed the supervisor's lane message `id` |
 | `guard.sample` | `panes` (herdr's pane count, -1 when the runner could not read herdr) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
 | `cmd.result` | `result`: the effect's structured result (any JSON value; below) |
