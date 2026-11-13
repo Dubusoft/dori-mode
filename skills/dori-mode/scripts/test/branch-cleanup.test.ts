@@ -151,6 +151,54 @@ test("a commit pushed after the merge keeps the worktree and the branch, says wh
   expect(statusOf((await deps().registry.read("demo-lane")) ?? lane())).toBe("closed");
 });
 
+/**
+ * A closed lane whose close left no kept line (its worktree `<root>/app-demo-lane` is not named by the key and sits on a
+ * detached HEAD, so the close never found it), with gitignored build output in it.
+ */
+const closedUnfound = async (): Promise<{ readonly path: string; readonly closed: Lane }> => {
+  const path = join(state.dir, "wt", "app-demo-lane");
+  await git("-C", repo, "worktree", "add", "-q", "--detach", path, mergedHead);
+  writeFileSync(join(path, ".gitignore"), "node_modules/\n");
+  await git("-C", path, "add", ".gitignore");
+  await git("-C", path, "commit", "-q", "-m", "ignore");
+  await git("-C", path, "push", "-q", "origin", "HEAD:refs/heads/app-demo");
+  mkdirSync(join(path, "node_modules", "dep"), { recursive: true });
+  writeFileSync(join(path, "node_modules", "dep", "index.js"), "x");
+  const closed: Lane = { ...lane(), cwd: path, worktrees: [path], status: "closed", closedAt: new Date(T0).toISOString(), receipt: { cleanup: [] } };
+  await deps().registry.write(closed);
+  return { path, closed };
+};
+const listed = async (path: string): Promise<boolean> => (await git("-C", repo, "worktree", "list", "--porcelain")).split("\n").includes(`worktree ${path}`);
+
+test("the closed-lane sweep removes the lane's own clean, pushed worktree the close never found, gitignored output and all", async () => {
+  const { path } = await closedUnfound();
+  expect(await watchTick(deps())).toEqual([`WORKTREE_CLEANED demo-lane ${path}`]);
+  expect(existsSync(path)).toBe(false);
+  expect(await listed(path)).toBe(false);
+});
+
+test("the closed-lane sweep keeps the lane's own worktree with a tracked change, a commit no remote has, or an open lane in it", async () => {
+  const { path, closed } = await closedUnfound();
+  writeFileSync(join(path, "init"), "changed");
+  expect(await watchTick(deps())).toEqual([]);
+  await git("-C", path, "commit", "-q", "-am", "local only");
+  expect(await watchTick(deps())).toEqual([]);
+  await git("-C", path, "push", "-q", "origin", "HEAD:refs/heads/app-demo");
+  await deps().registry.write({ ...lane(), key: "other-lane", pane: "w:p2", cwd: path, worktrees: [] });
+  expect(await watchTick(deps())).toEqual([]);
+  expect(existsSync(path) && await listed(path)).toBe(true);
+  expect(statusOf((await deps().registry.read(closed.key)) ?? closed)).toBe("closed");
+});
+
+test("a closed remote lane's own worktree under its runner's root is removed from inside itself once clean and pushed", async () => {
+  const { path, closed } = await closedUnfound();
+  await deps().registry.write({ ...closed, machine: "build host" });
+  const remote = { ...deps({ worktreeRoot: "" }), runnerWorktreeRoot: (label: string) => (label === "build host" ? join(state.dir, "wt") : undefined) };
+  expect(await watchTick(remote)).toEqual([`WORKTREE_CLEANED demo-lane ${path}`]);
+  expect(world.ops.filter((e) => e.op === "git").map((e) => e.args)).toEqual([{ op: "worktree-remove", root: path, path }]);
+  expect(await listed(path)).toBe(false);
+});
+
 test("a remote branch that moved after the merge keeps the local branch even when the local tip is the merged head", async () => {
   await commit(wt, "pushed-elsewhere");
   await git("-C", wt, "push", "-q", "origin", "feat-x");
