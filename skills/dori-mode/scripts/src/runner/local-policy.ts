@@ -11,9 +11,8 @@ import { BUILT_IN } from "../tunables.ts";
  *
  * - `agents.default`: `agentCommand` with `laneThinking` applied the way launch.ts applies it (only to a template with a
  *   `--model` or `--thinking` flag), its `{model}` and `{prompt}` slots left for the runner to fill.
- * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that, run with
- *   `LANE_SANDBOX_VERIFY=<leadCwd>/state/verify` so the lane can write its result files there (the lane's pane gets
- *   no environment from the runner beyond its own DORI_* variables).
+ * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that. A lane writes its results
+ *   only to its own `DORI_LANE_OUT`; no lead directory (such as `<leadCwd>/state/verify`) is made writable for it.
  * - `sandboxCheck`: `<laneSandbox.command> --check`, so a sandboxed start on a host where the wrapper cannot sandbox is
  *   refused `sandbox-unavailable` before its pane opens. `sandbox` stays `optional`: lanes recorded unsandboxed must keep
  *   recovering, and the lead decides which new lanes need a sandbox.
@@ -38,7 +37,7 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
   const roots = [env.home ?? homedir(), env.tmp ?? tmpdir(), dirname(cfg.leadCwd), worktreeRoot]
     .filter((r): r is string => typeof r === "string" && r !== "");
   return {
-    agents: { default: lane, sandboxed: ["env", `LANE_SANDBOX_VERIFY=${join(cfg.leadCwd, "state", "verify")}`, ...sandbox, ...lane] },
+    agents: { default: lane, sandboxed: [...sandbox, ...lane] },
     allowedRoots: [...new Set(roots)],
     sandbox: "optional",
     sandboxCheck: [...sandbox, "--check"],

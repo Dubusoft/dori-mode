@@ -168,7 +168,7 @@ test("the top-level directory holding $HOME is the sandbox's own, not a read-onl
   expect(argv.filter((a, i) => a.startsWith("--") && argv[i + 1] === top)).toEqual([]);
 });
 
-test("LANE_SANDBOX_VERIFY is bound read-write on its own, leaving its parent directories unbound", async () => {
+test("LANE_SANDBOX_VERIFY binds nothing: a lane's only output path is DORI_LANE_OUT", async () => {
   const home = join(tempDir(), "home");
   const state = join(home, "..", "ws", "state");
   const verify = join(state, "verify");
@@ -176,11 +176,9 @@ test("LANE_SANDBOX_VERIFY is bound read-write on its own, leaving its parent dir
 
   const rw = (argv: string[]) => argv.flatMap((a, i) => (a === "--bind" || a === "--bind-try" ? [argv[i + 2] ?? ""] : []));
   const bound = rw(await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_VERIFY: verify }));
-  expect(bound).toContain(verify);
+  expect(bound).not.toContain(verify);
   expect(bound).not.toContain(state);
   expect(bound).not.toContain(join(state, ".."));
-
-  expect(rw(await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" }))).not.toContain(verify);
 });
 
 test("a cwd-less lane gets the worktree root and each repo's .git under the repos root read-write, but no repo's hooks, working tree or the repos root itself", async () => {
@@ -539,7 +537,7 @@ test("macOS: every path reaches the profile resolved (as /var does to /private/v
   expect(allows(sb, "file-write-data", join(wt, "a"))).toBe(true);
   expect(allows(sb, "file-write-data", join(home, "rw", "a"))).toBe(true);
   expect(allows(sb, "file-write-data", join(extra, "a"))).toBe(true);
-  expect(allows(sb, "file-write-data", join(root, "verify", "a"))).toBe(true);
+  expect(allows(sb, "file-write-data", join(root, "verify", "a"))).toBe(false);
   expect(allows(sb, "file-write-data", join(root, "a"))).toBe(false);
   expect(allows(sb, "file-read-data", join(home, ".dori", "env"))).toBe(false);
   expect(Object.values(sb.params).filter((p) => p.includes("-link"))).toEqual([]);

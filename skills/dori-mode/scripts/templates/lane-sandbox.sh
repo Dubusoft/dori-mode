@@ -3,9 +3,8 @@
 # Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check
 # Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
-#   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a verify/scratch dir)
+#   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
-#   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, bound read-write (the local runner passes <leadCwd>/state/verify)
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
 #                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
@@ -135,10 +134,6 @@ if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   for p in "${extra[@]}"; do
     [ -n "$p" ] && opts+=(--bind-try "$p" "$p")
   done
-fi
-# Only the verify directory itself: the rest of its parent stays read-only.
-if [ -n "${LANE_SANDBOX_VERIFY:-}" ]; then
-  opts+=(--bind-try "$LANE_SANDBOX_VERIFY" "$LANE_SANDBOX_VERIFY")
 fi
 
 # Private key only when the ssh agent has no identities
