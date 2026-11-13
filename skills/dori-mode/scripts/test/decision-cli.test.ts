@@ -45,6 +45,23 @@ test("decision list: DECISION_NONE with no decisions; open ones oldest first; --
   expect((JSON.parse(json.out) as { id: string }[]).map((d) => d.id)).toEqual(["d1", "d2"]);
 });
 
+test("decision list shows a direct answer's newest revision and where its delivery stands", async () => {
+  const now = Date.now();
+  const target = { lane: "ap-7-1", runner: "local", generation: 0 };
+  const revision = (rev: number, choice: number | undefined, state: string) => ({
+    rev, channel: "901", message: "7", edit: rev - 1, hash: "h", ...(choice !== undefined ? { choice } : {}), target, at: now,
+    delivery: { id: `decision-d1-r${rev}`, state, updatedAt: now },
+  });
+  writeFileSync(join(dir, DECISIONS_FILE), JSON.stringify({ nextSeq: 3, decisions: [
+    decision("d1", "open", now - 60_000, { source: "lane", lane: "ap-7-1", target, revisions: [revision(1, 1, "superseded"), revision(2, 2, "queued")] }),
+    decision("d2", "open", now - 30_000, { source: "lane", lane: "ap-7-1", target, revisions: [revision(1, undefined, "cancelled")] }),
+  ] }));
+  const r = await cli(["decision", "list"]);
+  expect(r.code).toBe(0);
+  expect(r.out).toContain("d1 open blocking lane=ap-7-1 answer=r2:2 delivery=queued age=");
+  expect(r.out).toContain("d2 open blocking lane=ap-7-1 answer=r1:withdrawn delivery=cancelled age=");
+});
+
 test("decision open refuses bad input with DECISION_REFUSED and a usage line (exit 2), before any token is needed", async () => {
   const base = ["decision", "open", "--question", "q", "--recommend", "1", "--reason", "r", "--waiting", "w"];
   for (const [extra, reason] of [

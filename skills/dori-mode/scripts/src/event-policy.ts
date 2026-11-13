@@ -76,6 +76,8 @@ const URGENT_KINDS = [
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
   // Owner decision answers, stuck posts, and missing threads require the lead to act or check state.
   "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
+  // A direct decision answer whose lane session is gone: the lead takes the answer over (owner-decisions.ts).
+  "DECISION_ANSWER_UNDELIVERED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",

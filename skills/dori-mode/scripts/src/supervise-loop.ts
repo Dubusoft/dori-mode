@@ -78,7 +78,7 @@ import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, openLaneReports, routeReports, statusTransportOf } from "./lane-reports.ts";
-import { type DecisionContext, openLaneDecision, ownerDecisionTick } from "./owner-decisions.ts";
+import { type DecisionContext, openLaneDecision, ownerDecisionTick, reconcileDecisionsAtStart } from "./owner-decisions.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -1152,12 +1152,22 @@ export const supervise = async (
     };
     // A finished lane the lead did not report to the owner (dori reported) in time: UNREPORTED wakes the lead. The
     // supervisor never tells the owner itself.
+    let decisionsReconciled = false;
     const checkReported = async (): Promise<void> => {
       try { await supervisor.reportTick(); }
       catch (e) { console.error(`REPORT_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
       // A decision event the lead did not close (dori resolved) in time: UNRESOLVED wakes the lead.
       try { supervisor.resolveTick(); }
       catch (e) { console.error(`RESOLVE_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      // Once per start: direct decision answers' delivery intents against the lane message queue (crash repair).
+      if (!decisionsReconciled) {
+        try {
+          const open = (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed");
+          await reconcileDecisionsAtStart(deps.config.stateDir, laneMessages ??= openLaneMessages(deps.config), open, deps.clock.now(),
+            (id, line) => supervisor.enqueue(id, line), (line) => { console.error(line); });
+          decisionsReconciled = true;
+        } catch (e) { console.error(`DECISION_RECONCILE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      }
       // Owner decisions: a stuck post, a missing link line, a pending archive, the daily reminder.
       try { await ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }); }
       catch (e) { console.error(`OWNER_DECISION_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }

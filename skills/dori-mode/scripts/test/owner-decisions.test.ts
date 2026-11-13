@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,7 +11,12 @@ import {
   openOwnerDecision,
   openOwnerDecisions,
   ownerDecisionTick,
+  queueDecisionAnswer,
   readDecisions,
+  reconcileDecisionDeliveries,
+  reconcileDecisionsAtStart,
+  recordAnswerRevision,
+  decisionTargetOf,
   recordChannelAnswer,
   recordOwnerAnswer,
   type DecisionContext,
@@ -27,6 +32,7 @@ import {
   serializeRequestText,
   type DecisionChoices,
 } from "../src/runner/decision-text.ts";
+import { ackLaneMessage, JsonLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -475,4 +481,109 @@ test("a decision in a lane's own thread covers only its first answer; the rest a
     "DECISION_ANSWER_LEFT 777 52: acked, not covered by the close; cover it with dori handled 777 52 --reply|--lane KEY");
   expect(answeredLine(readDecisions(dir).decisions[0] as NonNullable<ReturnType<typeof readDecisions>["decisions"][0]>))
     .toContain("run dori decision close d1 --text \"...\" first");
+});
+
+const laneOf = (key: string, extra: { runner?: string; lastRecoveryAt?: number; openedAt?: string } = {}) =>
+  ({ key, thread: "discord:111/222", runner: "mini", lastRecoveryAt: 5, openedAt: "2026-11-13T00:00:00.000Z", ...extra });
+
+const openLane = async (ctx: DecisionContext, key: string) =>
+  (await openLaneDecision(ctx, laneOf(key), { id: `row-${key}`, text: serializeDecisionText(choices) }))?.decision.id as string;
+
+const answer = (key: string, choice: number | undefined, edit = 0, message = "m1", extra: { lastRecoveryAt?: number } = {}) => ({
+  channel: "1000", message, edit, content: choice === undefined ? "" : String(choice), ...(choice !== undefined ? { choice } : {}),
+  target: decisionTargetOf(laneOf(key, extra)),
+});
+
+test("a lane decision pins its target; answer revisions count from r1, drop a repeat, and refuse what is no direct answer", async () => {
+  const dir = stateDir();
+  const ctx = context(dir, fakeTransport().transport);
+  const id = await openLane(ctx, "ap-955-1");
+  expect(readDecisions(dir).decisions[0]?.target).toEqual({ lane: "ap-955-1", runner: "mini", generation: 5, openedAt: "2026-11-13T00:00:00.000Z" });
+  const r1 = recordAnswerRevision(dir, id, answer("ap-955-1", 1), 10);
+  expect(r1).toMatchObject({ kind: "recorded", revision: { rev: 1, choice: 1, delivery: { id: "decision-d1-r1", state: "intended" } } });
+  expect(recordAnswerRevision(dir, id, answer("ap-955-1", 1), 11).kind).toBe("duplicate");
+  expect(recordAnswerRevision(dir, id, { ...answer("ap-955-1", 1, 1), content: " 1 " }, 11).kind).toBe("duplicate");
+  expect(recordAnswerRevision(dir, id, answer("ap-955-1", 3, 2), 12)).toEqual({ kind: "refused", reason: "choice must be 1-2" });
+  expect(recordAnswerRevision(dir, id, answer("ap-955-1", 2, 2, "m1", { lastRecoveryAt: 6 }), 12)).toEqual({ kind: "refused", reason: "target changed since the question was asked" });
+  expect(recordAnswerRevision(dir, id, answer("ap-955-1", undefined, 0, "m9"), 12).kind).toBe("refused");
+  const lead = (await open(ctx, { lane: "ap-955-1", origin: "discord:111/222" })).decision.id;
+  expect(recordAnswerRevision(dir, lead, answer("ap-955-1", 1), 12)).toEqual({ kind: "refused", reason: "not a lane decision" });
+  const r2 = recordAnswerRevision(dir, id, answer("ap-955-1", 2, 2), 13);
+  expect(r2).toMatchObject({ kind: "recorded", revision: { rev: 2, choice: 2 }, replaced: { rev: 1 } });
+  expect(readDecisions(dir).decisions[0]?.revisions?.map((r) => r.delivery.state)).toEqual(["superseded", "intended"]);
+});
+
+test("queueing an answer writes decision-d<ID>-r<n> once, replaces a queued older one, and corrects or withdraws one the lane may have", async () => {
+  const dir = stateDir();
+  const store = new JsonLaneMessages(dir);
+  const id = await openLane(context(dir, fakeTransport().transport), "ap-955-1");
+  recordAnswerRevision(dir, id, answer("ap-955-1", 1), 10);
+  const q1 = queueDecisionAnswer(dir, store, id, 20);
+  expect(q1).toMatchObject({ kind: "queued", message: { id: "decision-d1-r1", lane: "ap-955-1", state: "queued" } });
+  expect(q1.kind === "queued" && q1.message.text).toBe("[dori] Owner answered d1 (Which path should we take?): 1. Use the existing API. Revision r1. Confirm with: dori report ack decision-d1-r1");
+  expect(queueDecisionAnswer(dir, store, id, 21).kind).toBe("none");
+  recordAnswerRevision(dir, id, answer("ap-955-1", 2, 1), 30);
+  const q2 = queueDecisionAnswer(dir, store, id, 31);
+  expect(store.get("decision-d1-r1")?.state).toBe("superseded");
+  expect(q2.kind === "queued" && q2.message.text).toStartWith("[dori] Owner answered d1 (Which path should we take?): 2. Build a replacement. Revision r2.");
+  updateLaneMessage(store, store.get("decision-d1-r2")!, { state: "delivered", deliveredAt: 32 }, 32);
+  recordAnswerRevision(dir, id, answer("ap-955-1", 1, 2), 40);
+  const q3 = queueDecisionAnswer(dir, store, id, 41);
+  expect(q3).toMatchObject({ kind: "queued", replaces: 2 });
+  expect(q3.kind === "queued" && q3.message.text).toContain("1. Use the existing API. Revision r3 replaces r2; follow r3. Confirm with: dori report ack decision-d1-r3");
+  expect(store.get("decision-d1-r2")?.state).toBe("delivered");
+  recordAnswerRevision(dir, id, answer("ap-955-1", undefined, 3), 50);
+  const q4 = queueDecisionAnswer(dir, store, id, 51);
+  expect(q4.kind === "queued" && q4.message.text).toStartWith("[dori] Owner withdrew the answer to d1 (Which path should we take?). Revision r4 replaces r2:");
+  expect(store.get("decision-d1-r3")?.state).toBe("superseded");
+});
+
+test("a withdrawal before anything reached the lane cancels the queued answer and sends nothing", async () => {
+  const dir = stateDir();
+  const store = new JsonLaneMessages(dir);
+  const id = await openLane(context(dir, fakeTransport().transport), "ap-955-1");
+  recordAnswerRevision(dir, id, answer("ap-955-1", 2), 10);
+  queueDecisionAnswer(dir, store, id, 11);
+  recordAnswerRevision(dir, id, answer("ap-955-1", undefined, 1), 12);
+  expect(queueDecisionAnswer(dir, store, id, 13)).toEqual({ kind: "cancelled", reason: "withdrawn before anything reached the lane" });
+  expect(store.list().map((m) => [m.id, m.state])).toEqual([["decision-d1-r1", "superseded"]]);
+  expect(readDecisions(dir).decisions[0]?.revisions?.map((r) => r.delivery.state)).toEqual(["superseded", "cancelled"]);
+});
+
+test("after a restart the intents are reconciled with the queue: queued once, acked, closed, and undelivered when the lane session is gone", async () => {
+  const dir = stateDir();
+  const store = new JsonLaneMessages(dir);
+  const ctx = context(dir, fakeTransport().transport);
+  const [a, b, c, d, e] = [await openLane(ctx, "ap-1-1"), await openLane(ctx, "ap-2-1"), await openLane(ctx, "ap-3-1"), await openLane(ctx, "ap-4-1"), await openLane(ctx, "ap-5-1")];
+  // A crash after the intent, before the queue write (a, b, d); c and e got their message queued.
+  for (const [id, key] of [[a, "ap-1-1"], [b, "ap-2-1"], [c, "ap-3-1"], [d, "ap-4-1"], [e, "ap-5-1"]] as const) recordAnswerRevision(dir, id, answer(key, 1), 10);
+  queueDecisionAnswer(dir, store, c, 11);
+  queueDecisionAnswer(dir, store, e, 11);
+  await closeOwnerDecision(ctx, c, { text: "Closed by the lead", choice: 1 });
+  // The queue lost e's message (a damaged or switched store): it is never queued again.
+  writeFileSync(join(dir, "lane-messages.json"), JSON.stringify({ messages: { "decision-d3-r1": store.get("decision-d3-r1") } }));
+  const lanes = new Map([
+    ["ap-1-1", decisionTargetOf(laneOf("ap-1-1"))],
+    ["ap-3-1", decisionTargetOf(laneOf("ap-3-1"))],
+    ["ap-4-1", decisionTargetOf(laneOf("ap-4-1", { lastRecoveryAt: 9 }))],
+    ["ap-5-1", decisionTargetOf(laneOf("ap-5-1"))],
+  ]);
+  const first = reconcileDecisionDeliveries(dir, store, lanes, 100);
+  expect(first.map((x) => [x.decision, x.action, x.reason])).toEqual([
+    [a, "queued", undefined],
+    [b, "undelivered", "lane ap-2-1 is closed"],
+    [c, "closed", "decision closed"],
+    [d, "undelivered", "lane ap-4-1 was relaunched, replaced or moved"],
+    [e, "undelivered", "its lane message is missing from the queue"],
+  ]);
+  expect(store.list().map((m) => [m.id, m.state])).toEqual([["decision-d3-r1", "superseded"], ["decision-d1-r1", "queued"]]);
+  expect(reconcileDecisionDeliveries(dir, store, lanes, 101)).toEqual([]);
+  expect(store.list()).toHaveLength(2);
+  ackLaneMessage(store, "ap-1-1", "decision-d1-r1", 102);
+  expect(reconcileDecisionDeliveries(dir, store, lanes, 103).map((x) => [x.decision, x.action])).toEqual([[a, "acked"]]);
+  expect(readDecisions(dir).decisions.map((x) => x.revisions?.[0]?.delivery.state)).toEqual(["acked", "undelivered", "superseded", "undelivered", "undelivered"]);
+  const events: [string, string][] = [];
+  await reconcileDecisionsAtStart(dir, store, [laneOf("ap-1-1")], 104, (id, line) => { events.push([id, line]); }, () => {});
+  expect(events.map(([id]) => id)).toEqual(["decision-undelivered:d2:r1", "decision-undelivered:d4:r1", "decision-undelivered:d5:r1"]);
+  expect(events[0]?.[1]).toBe("DECISION_ANSWER_UNDELIVERED ap-2-1 d2 r1 decision-d2-r1: lane ap-2-1 is closed; take the answer over with dori decision close d2");
 });
