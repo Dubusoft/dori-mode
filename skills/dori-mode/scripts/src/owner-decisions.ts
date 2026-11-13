@@ -61,6 +61,12 @@ export type OwnerDecision = DecisionChoices & {
   readonly sourceRef?: string;
   readonly channel: string;
   readonly thread?: string;
+  /**
+   * Set when a lane decision was posted into the lane's own thread because that thread already sits in decisionsChannel
+   * (laneThreadInDecisions): `thread` is the lane thread, no thread of its own is started, no link line is posted, and
+   * closing it leaves the lane thread open.
+   */
+  readonly inLaneThread?: boolean;
   /** The question's message, the first one in the thread. */
   readonly message?: string;
   /** Why Discord's "started a thread" notice was left in the channel body; unset when it was deleted or never posted. */
@@ -219,7 +225,7 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
       ? `보내는 곳: 파일 \`${d.file}\`에 넣고 권한을 600으로 맞춰 주세요(\`chmod 600 ${d.file}\`). 값은 이 스레드에 붙여넣지 마시고, 넣은 뒤 이 스레드에 "완료"라고만 답해 주세요.`
       : "보내는 곳: 이 스레드에 답으로 보내 주세요(인증코드처럼 한 번 쓰고 끝나는 값만). 비밀번호나 API 키 같은 오래 쓰는 비밀은 여기에 올리지 마세요.",
     d.blocking ? `기다리는 쪽: ${d.lane ? `레인 ${d.lane}, ` : ""}${d.waiting}` : `먼저 진행 중: ${d.lane ? `레인 ${d.lane}, ` : ""}${d.waiting}`,
-    ...(origin ? [`원래 스레드: <#${origin}>`] : []),
+    ...(origin && !d.inLaneThread ? [`원래 스레드: <#${origin}>`] : []),
   ].join("\n"), home);
   return scrubForThread([
     head,
@@ -227,7 +233,7 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
     ...d.options.map((option, i) => `${i + 1}. ${option}${i + 1 === d.recommend ? " ← 추천" : ""}`),
     `추천 이유: ${d.reason}`,
     d.blocking ? `기다리는 동안 멈춘 것: ${d.waiting}` : `먼저 진행 중: 추천안(${d.recommend}번)으로 진행하고 있습니다(${d.waiting}). 다르게 정하시면 되돌립니다.`,
-    ...(origin ? [`원래 스레드: <#${origin}>`] : []),
+    ...(origin && !d.inLaneThread ? [`원래 스레드: <#${origin}>`] : []),
     "이 스레드에 번호나 문장으로 답해 주세요.",
   ].join("\n"), home);
 };
@@ -250,7 +256,7 @@ export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home:
   const where = from ? ` (<#${from[1]}>에서 받은 답: https://discord.com/channels/@me/${from[1]}/${from[2]})` : "";
   const note = options.text.replace(/\s+/g, " ").trim();
   const outcome = options.cancel ? "취소" : d.kind === "request" ? "요청 처리" : `결정 반영:${picked}`;
-  return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."} 스레드를 닫습니다.`, home);
+  return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."}${d.inLaneThread ? "" : " 스레드를 닫습니다."}`, home);
 };
 
 /** The line appended to the origin thread's link message when the decision closes. */
@@ -291,6 +297,7 @@ const isGone = (e: unknown): boolean => e instanceof MessengerError && e.status 
  * no origin thread or the owner closed it, failed (retried by the tick) when the post throws.
  */
 export const postDecisionLink = async (ctx: DecisionContext, d: OwnerDecision): Promise<LinkResult> => {
+  if (d.inLaneThread) return { kind: "none" };
   const origin = refIds(d.origin)?.thread;
   if (!origin || !d.thread) {
     if (!d.linkSkipped) patchOne(ctx.config.stateDir, d.id, (x) => ({ ...x, linkSkipped: "no origin thread" }));
@@ -314,16 +321,35 @@ export const postDecisionLink = async (ctx: DecisionContext, d: OwnerDecision): 
 const THREAD_CREATED = 18;
 
 /**
- * Deletes the "started a thread" notice Discord posts in the decision's channel when its thread starts without a message
- * (a THREAD_CREATED message after the thread's id whose reference names the thread). Returns why it stayed, if it did.
+ * Deletes the "started a thread" notice Discord posts in `channel` when `thread` starts there without a message (a
+ * THREAD_CREATED message after the thread's id whose reference names the thread). Returns why it stayed, if it did.
+ * Used by decisions and by `dori thread --drop-notice`.
  */
-const removeThreadNotice = async (ctx: DecisionContext, channel: string, thread: string): Promise<string | undefined> => {
+export const removeThreadNotice = async (transport: Pick<DecisionTransport, "messagesAfter" | "deleteMessage">, channel: string, thread: string): Promise<string | undefined> => {
   try {
-    const notice = (await ctx.transport.messagesAfter(channel, thread)).find((m) => m.type === THREAD_CREATED && m.reference === thread);
-    if (notice) await ctx.transport.deleteMessage(channel, notice.id);
+    const notice = (await transport.messagesAfter(channel, thread)).find((m) => m.type === THREAD_CREATED && m.reference === thread);
+    if (notice) await transport.deleteMessage(channel, notice.id);
     return undefined;
   } catch (e) {
     return errorText(e);
+  }
+};
+
+/**
+ * The lane thread a lane decision is posted into instead of a thread of its own: its origin thread when that already
+ * sits in decisionsChannel (the ref's channel, else the thread's parent read from Discord) and the owner has not closed
+ * it. Undefined otherwise, and when reading the thread fails (the decision then opens its own thread as before).
+ */
+const laneThreadInDecisions = async (ctx: DecisionContext, origin: string | undefined): Promise<string | undefined> => {
+  const set = ctx.config.decisionsChannel?.trim();
+  const ids = refIds(origin);
+  if (!set || !ids) return undefined;
+  try {
+    const parent = ids.channel ?? (await ctx.transport.threadState(ids.thread)).parent;
+    if (parent !== set || await closedByOwner(ctx.config.stateDir, ctx.transport, ids.thread)) return undefined;
+    return ids.thread;
+  } catch {
+    return undefined;
   }
 };
 
@@ -335,11 +361,15 @@ const removeThreadNotice = async (ctx: DecisionContext, channel: string, thread:
  * (a crash mid-post): a thread already recorded is reused. When the thread or its message cannot be made, the thread is
  * archived, the reservation dropped, and OwnerDecisionError DECISION_NOT_POSTED thrown. A notice that cannot be deleted
  * is recorded as `noticeKept`; a link that fails leaves the decision open (the tick retries it).
+ * A lane decision whose lane thread already sits in decisionsChannel (laneThreadInDecisions) is posted into that thread
+ * instead (`inLaneThread`): no thread is started, no notice deleted, no link posted, and a failed post leaves the lane
+ * thread open.
  */
 export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec): Promise<OpenResult> => {
   const { stateDir } = ctx.config;
   const now = ctx.now();
   const channel = await decisionChannel(ctx.config, spec.origin, ctx.transport);
+  const laneThread = spec.source === "lane" ? await laneThreadInDecisions(ctx, spec.origin) : undefined;
   const reserved = updateDecisions(stateDir, (file) => {
     const known = spec.sourceRef ? file.decisions.find((d) => d.source === spec.source && d.sourceRef === spec.sourceRef) : undefined;
     if (known) return { result: { decision: known, duplicateOf: undefined as string | undefined } };
@@ -354,6 +384,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       ...(spec.kind ? { kind: spec.kind } : {}), ...(spec.file ? { file: spec.file } : {}),
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
+      ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
     };
     return { file: { ...file, nextSeq: file.nextSeq + 1, decisions: [...file.decisions, decision] }, result: { decision, duplicateOf: undefined } };
   });
@@ -372,13 +403,13 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       const started = (await ctx.transport.startThread(d.channel, undefined, decisionThreadName(d), ctx.config.discord?.ownerId, DECISION_AUTO_ARCHIVE_MIN)).id;
       thread = started;
       d = patchOne(stateDir, d.id, (x) => ({ ...x, thread: started })) ?? { ...d, thread: started };
-      noticeKept = await removeThreadNotice(ctx, d.channel, started);
+      noticeKept = await removeThreadNotice(ctx.transport, d.channel, started);
     }
     const message = d.message ?? await ctx.transport.send(thread, decisionStartText(d, ctx.home), `decision:${d.id}`);
     const kept = noticeKept;
     d = patchOne(stateDir, d.id, (x) => ({ ...x, state: "open", message, ...(kept ? { noticeKept: kept } : {}) })) ?? { ...d, state: "open", message };
   } catch (e) {
-    if (thread) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
+    if (thread && !d.inLaneThread) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
     removeOne(stateDir, d.id);
     throw new OwnerDecisionError("DECISION_NOT_POSTED", `DECISION_NOT_POSTED ${errorText(e)}`);
   }
@@ -425,8 +456,11 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   if (d.thread) {
     try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home), `decision-close:${d.id}`); }
     catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
-    try { await archiveThread(ctx.transport, d.thread); }
-    catch (e) { archivePending = errorText(e); }
+    // A decision posted in a lane's own thread leaves that thread open: the lane keeps working there.
+    if (!d.inLaneThread) {
+      try { await archiveThread(ctx.transport, d.thread); }
+      catch (e) { archivePending = errorText(e); }
+    }
   }
   const at = ctx.now();
   const closed = patchOne(stateDir, id, (x) => (x.state === "closed" ? undefined : {
@@ -450,9 +484,18 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   return { decision: closed, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}) };
 };
 
-/** The decision whose thread is `channel` (any state but posting), from the file as it is now. */
-export const decisionOfThread = (stateDir: string, channel: string): OwnerDecision | undefined =>
-  readDecisions(stateDir).decisions.find((d) => d.thread === channel && d.state !== "posting");
+/**
+ * The decision whose thread is `channel` (any state but posting): the newest one not closed when the thread holds
+ * several (a lane thread that took more than one question), else the newest. A closed decision posted in a lane's own
+ * thread no longer claims that thread.
+ */
+const ofThread = (decisions: readonly OwnerDecision[], channel: string): OwnerDecision | undefined => {
+  const mine = decisions.filter((d) => d.thread === channel && d.state !== "posting" && !(d.inLaneThread && d.state === "closed"));
+  return mine.filter((d) => d.state !== "closed").at(-1) ?? mine.at(-1);
+};
+
+/** The decision whose thread is `channel` (ofThread), from the file as it is now. */
+export const decisionOfThread = (stateDir: string, channel: string): OwnerDecision | undefined => ofThread(readDecisions(stateDir).decisions, channel);
 
 export const answeredEventId = (id: string): string => `owner-decision-answered:${id}`;
 
@@ -463,7 +506,7 @@ export const answeredEventId = (id: string): string => `owner-decision-answered:
  */
 export const recordOwnerAnswer = (stateDir: string, channel: string, message: string, at: number): { readonly decision: OwnerDecision; readonly first: boolean } | undefined => {
   if (!decisionOfThread(stateDir, channel)) return undefined;
-  return recordAnswer(stateDir, (file) => file.decisions.find((x) => x.thread === channel && x.state !== "posting"), channel, message, at);
+  return recordAnswer(stateDir, (file) => ofThread(file.decisions, channel), channel, message, at);
 };
 
 const waitingIn = (decisions: readonly OwnerDecision[], channel: string): OwnerDecision[] =>
