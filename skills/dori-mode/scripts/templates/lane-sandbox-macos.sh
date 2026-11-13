@@ -16,7 +16,8 @@
 # the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
-# its own brief and token), and ~/.dori/env, ~/.dori/secrets and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
+# its own brief and token), and ~/.dori/env, ~/.dori/secrets, ~/.ssh private keys and the credential stores in CREDENTIALS below
+# (cloud, kube, gpg, docker and git logins) are refused outright. Of ~/.config only gh and git
 # are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
@@ -25,6 +26,11 @@
 # (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
 set -eu
+
+# Credential stores under $HOME no lane reads, files and directories alike (a lane gets a credential only through the
+# secret broker). ~/.config is refused already, but for gh and git.
+CREDENTIALS=".aws .azure .oci .gnupg .password-store .kube .docker/config.json .netrc .git-credentials .vault-token
+  .terraform.d/credentials.tfrc.json .pypirc .cargo/credentials .cargo/credentials.toml"
 
 SBX=/usr/bin/sandbox-exec
 # macOS's own OpenSSL-format root bundle (what curl and git use by default).
@@ -161,6 +167,12 @@ build_profile() {
 (allow network-outbound (remote unix-socket (path-literal (param \"AGENT_SOCK\"))) (remote unix-socket (path-literal (param \"AGENT_LINK\"))))"
       ;;
   esac
+  local c_rules=""
+  for p in $CREDENTIALS; do
+    param "CRED$n" "$H/$p"
+    c_rules="$c_rules (subpath (param \"CRED$n\"))"
+    n=$((n + 1))
+  done
   if [ -f "$H/.dori/lane-sandbox-hide" ]; then
     while IFS= read -r p || [ -n "$p" ]; do
       p=${p%%#*}
@@ -195,6 +207,7 @@ $d_rules
 (allow file-read-data (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_LANES\")))
 (allow process-exec (literal \"/bin/ps\") (with no-sandbox))
 (deny file-read* (literal (param \"DORI_ENV\")) (regex #\"/\\.ssh/id_[^/.]+\$\"))
+(deny file-read*$c_rules)
 (deny file-read* (subpath (param \"CONFIG\")))
 (allow file-read* (subpath (param \"CONFIG_GH\")) (subpath (param \"CONFIG_GIT\")))
 (deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))

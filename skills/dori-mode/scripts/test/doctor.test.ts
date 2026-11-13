@@ -128,6 +128,42 @@ test("doctor warns when the installed lane sandbox differs from the template", a
   expect(check.detail).toContain("LANE_SANDBOX_OUTDATED");
 });
 
+test("doctor names the sensitive host paths a lane can read, probed through the installed wrapper", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  const wrapper = join(home, ".local", "bin", "lane-sandbox");
+  // A wrapper that hides nothing: the probe runs on the host as is.
+  writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = --check ]; then echo DORI_LANE_FILES=1; exit 0; fi\nexec "$@"\n');
+  chmodSync(wrapper, 0o755);
+  for (const d of [".aws", ".ssh", ".config/gh", ".kube"]) mkdirSync(join(home, d), { recursive: true });
+  for (const p of [".aws/credentials", ".ssh/id_rsa", ".ssh/id_rsa.pub", ".config/gh/hosts.yml"]) writeFileSync(join(home, p), "x");
+  writeFileSync(join(home, ".netrc"), "");
+  const backups = join(home, "backups");
+  mkdirSync(backups);
+  writeFileSync(join(backups, "snap"), "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# backups\n${backups}\n`);
+  const argvs: string[][] = [];
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env") return f.deps.run(argv, {});
+    argvs.push([...argv]);
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  const check = find(await runDoctor({ ...f.deps, run: real }), "lane exposure");
+  expect(argvs[0]?.slice(0, 3)).toEqual(["env", "DORI_LANE_KEY=doctor-probe", wrapper]);
+  expect(check).toMatchObject({ level: "WARN", fix: expect.stringContaining("lane-sandbox-hide") });
+  expect(check.detail).toContain("~/.aws");
+  expect(check.detail).toContain("~/.ssh/id_rsa");
+  expect(check.detail).toContain("~/backups");
+  expect(check.detail).toContain("bound on purpose: ~/.config/gh");
+  // Empty on the host (an empty file, an empty dir) or a public key: not probed.
+  for (const no of ["~/.netrc", "~/.kube", "id_rsa.pub"]) expect(check.detail).not.toContain(no);
+
+  // A wrapper under which the probe reads nothing: OK.
+  writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = --check ]; then echo DORI_LANE_FILES=1; exit 0; fi\nexit 0\n');
+  expect(find(await runDoctor({ ...f.deps, run: real }), "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
+});
+
 test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {
   const f = fixture();
   const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? ok() : f.deps.run(argv, {})) }), "lane sandbox");

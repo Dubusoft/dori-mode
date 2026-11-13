@@ -121,6 +121,19 @@ test("of ~/.config only gh, git and an ssh agent socket under it are bound", asy
   expect(outside).not.toContain("/run/user/1/openssh_agent");
 });
 
+test("no ssh private key is bound, even when the ssh agent holds no identities", async () => {
+  const home = join(tempDir(), "home");
+  mkdirSync(join(home, ".ssh"), { recursive: true });
+  for (const f of ["id_rsa", "id_ed25519", "known_hosts"]) writeFileSync(join(home, ".ssh", f), "x");
+  const bin = join(home, "fake-bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "ssh-add"), "#!/bin/sh\necho 'The agent has no identities.'\nexit 1\n");
+  chmodSync(join(bin, "ssh-add"), 0o755);
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+  expect(argv.filter((a) => a.startsWith(join(home, ".ssh", "id_")))).toEqual([]);
+  expect(argv).toContain(join(home, ".ssh", "known_hosts"));
+});
+
 test("each existing path in ~/.dori/lane-sandbox-hide is covered after every bind, a cwd or LANE_SANDBOX_RW under it included", async () => {
   const root = realpathSync(tempDir());
   const home = join(root, "home");
@@ -448,6 +461,19 @@ test("macOS: each path in ~/.dori/lane-sandbox-hide is refused for reads, writes
   expect(allows(sb, "network-outbound", join(backup, "s.sock"))).toBe(false);
   expect(allows(sb, "file-read-data", join(root, "other"))).toBe(true);
   expect(sb.profile).not.toContain(root);
+});
+
+test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git logins) are refused for reads", async () => {
+  const { home, wt } = macHome();
+  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" });
+  const read = (p: string) => allows(sb, "file-read-data", p);
+  for (const no of [".aws/credentials", ".azure/msal_token_cache.json", ".oci/config", ".gnupg/private-keys-v1.d/k.key", ".password-store/a.gpg", ".kube/config", ".docker/config.json",
+    ".netrc", ".git-credentials", ".vault-token", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml"]) {
+    expect({ no, read: read(join(home, no)) }).toEqual({ no, read: false });
+  }
+  for (const ok of [".docker/cli-plugins/x", ".cargo/registry/index/x", ".gitconfig", ".config/gh/hosts.yml"]) {
+    expect({ ok, read: read(join(home, ok)) }).toEqual({ ok, read: true });
+  }
 });
 
 test("macOS: ~/.dori/secrets is refused for reads, writes and socket connects with no hide file", async () => {

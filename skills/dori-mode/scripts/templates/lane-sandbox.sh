@@ -141,10 +141,8 @@ if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   done
 fi
 
-# Private key only when the ssh agent has no identities
-if ! ssh-add -l >/dev/null 2>&1; then
-  opts+=(--ro-bind-try "$H/.ssh/id_rsa" "$H/.ssh/id_rsa")
-fi
+# No ssh private key is ever bound, even when the agent holds no identities: a lane gets a key only for one command,
+# through the secret broker (dori secret exec <ssh-key secret> -- git push).
 
 # Hide docker sockets (resolve symlinks such as /var/run -> /run, bind each real path once)
 seen=""
