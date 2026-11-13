@@ -335,3 +335,45 @@ test("a request with a file tells the owner to write it there with chmod 600 and
   expect(start).toContain("chmod 600 ~/.config/dori/npm-token");
   expect(start).toContain("붙여넣지 마시고");
 });
+
+test("a lane question whose lane thread sits in decisionsChannel is asked in that thread, answered there, and closed without archiving it", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const opened = await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-1", text: serializeDecisionText(choices) });
+  expect(opened?.decision).toMatchObject({ state: "open", channel: "555", thread: "777", inLaneThread: true, lane: "ap-925-1" });
+  expect(opened?.link).toEqual({ kind: "none" });
+  // No thread of its own, no notice to delete, no link line: the question is the only post, in the lane thread.
+  expect(fake.calls.filter((call) => !["threadState", "messagesAfter"].includes(call.method)).map((call) => [call.method, call.args[0]]))
+    .toEqual([["send", "777"]]);
+  const start = String(fake.calls.find((call) => call.method === "send")?.args[1]);
+  expect(start).toContain(choices.question);
+  expect(start).not.toContain("원래 스레드");
+  await ownerDecisionTick({ ...ctx, enqueue: () => undefined, log: () => undefined });
+  expect(fake.calls.filter((call) => call.method === "send")).toHaveLength(1);
+  const answer = recordOwnerAnswer(dir, "777", "owner-1", 1_800_000_000_100);
+  expect(answer?.first).toBe(true);
+  expect(answeredLine(answer?.decision as NonNullable<typeof answer>["decision"])).toStartWith("OWNER_DECISION_ANSWERED ap-925-1 d1 blocking discord:555/777: ");
+  const closed = await closeOwnerDecision(ctx, "d1", { text: "Going with option 1", choice: 1 });
+  expect(closed).toMatchObject({ decision: { state: "closed" }, resolved: "owner-decision-answered:d1" });
+  expect(closed.archivePending).toBeUndefined();
+  expect(fake.calls.some((call) => call.method === "setThread" || call.method === "startThread")).toBe(false);
+  expect(String(fake.calls.filter((call) => call.method === "send").at(-1)?.args[1])).not.toContain("스레드를 닫습니다");
+  // Once closed, the lane thread is a lane thread again: later owner messages there answer nothing.
+  expect(recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200)).toBeUndefined();
+});
+
+test("a second question in the same lane thread takes the next answer, and a lane thread outside decisionsChannel still gets its own thread", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-1", text: serializeDecisionText(choices) });
+  recordOwnerAnswer(dir, "777", "owner-1", 1_800_000_000_100);
+  await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
+  const second = recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200);
+  expect(second).toMatchObject({ first: true, decision: { id: "d2", state: "answered" } });
+  const other = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-3", text: serializeDecisionText(choices) });
+  expect(other?.decision).toMatchObject({ channel: "555", thread: "thread" });
+  expect(other?.decision.inLaneThread).toBeUndefined();
+  expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
+});
