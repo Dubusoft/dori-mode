@@ -55,7 +55,7 @@ import { LaneMessageError } from "./lane-messages.ts";
 import { oneLine, openLaneReports } from "./lane-reports.ts";
 import { publicSpec, queueEmit, readSourceStatus, SourceError, SourceSpecs, sourceViews } from "./event-sources.ts";
 import { nextSlot, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "./schedule.ts";
-import { updateInstall } from "./update.ts";
+import { updateInstall, writeUpdateResult } from "./update.ts";
 import { refreshBootPrep } from "./boot-prep-install.ts";
 import { refreshLaneSandbox } from "./lane-sandbox-install.ts";
 import { laneOps, type LaneOps, LaneOpsError } from "./lane-ops.ts";
@@ -766,7 +766,7 @@ const flags = parseArgs({
     type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
-    dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" },
+    dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" }, result: { type: "string" },
     "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" },
   },
 });
@@ -887,11 +887,14 @@ try {
       break;
     }
     case "update": {
-      if (flags.positionals.length || Object.entries(flags.values).some(([name, v]) => (name !== "dev" && name !== "force") || v !== true)) {
-        die("usage: dori update [--dev] [--force]");
+      const result = opt("result");
+      if (flags.positionals.length || ("result" in flags.values && !result) ||
+          Object.entries(flags.values).some(([name, v]) => name !== "result" && ((name !== "dev" && name !== "force") || v !== true))) {
+        die("usage: dori update [--dev] [--force] [--result PATH]");
       }
+      const logged: string[] = [];
       const code = await updateInstall({
-        run, sleep: realClock.sleep, log: (line) => console.log(line),
+        run, sleep: realClock.sleep, log: (line) => { console.log(line); logged.push(line); },
         // A fresh process: this one still holds the modules it loaded before the pull, which may refer to files the pull
         // removed or exports the pulled code no longer has.
         // stdin is inherited so runner setup and `dori setup --migrate` can ask new keys on a terminal.
@@ -908,6 +911,8 @@ try {
         refreshBootPrep: () => refreshBootPrep(homedir()),
       },
         { packageDir: join(import.meta.dir, ".."), branch: flags.values.dev ? "dev" : "main", force: flags.values.force === true });
+      // The supervisor's automatic update (update.ts AutoUpdate) reads its outcome from here.
+      if (result) writeUpdateResult(result, { at: Date.now(), code, lines: logged });
       process.exit(code);
     }
     case "repos": {

@@ -46,7 +46,8 @@ import { memorySweep } from "./memory-check.ts";
 import { alertReasons, criticalReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
 import { describeLane, formatKb, type LaneMemory, laneMemoryDetail } from "./lane-memory.ts";
 import { pauseLane, type PauseResult } from "./pause.ts";
-import type { Lane } from "./registry.ts";
+import { type Lane, statusOf } from "./registry.ts";
+import { AutoUpdate, doriRepoOf, noteDevMerge } from "./update.ts";
 import {
   type GuardMachine, type KillResult, loadMachineGuardState, machineGuardTick, type MachineSample, readGuardMachines, saveMachineGuardState,
 } from "./remote-guard.ts";
@@ -64,9 +65,9 @@ import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
 import { OWNER_NOTICE_AFTER_MS, RetryingDelivery, SuperviseError, Supervisor } from "./supervise.ts";
 import { Waits } from "./waits.ts";
-import { GitHubEvents, type OpenPull } from "./github-events.ts";
+import { GitHubEvents, githubTargets, type OpenPull } from "./github-events.ts";
 import { driftTick, pullOwners } from "./drift.ts";
-import { CiFollowUp } from "./ci-follow.ts";
+import { CiFollowUp, defaultCiIo } from "./ci-follow.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
@@ -559,6 +560,33 @@ export const warnMachineLanes = async (
   return [warned.length ? `warned ${warned.join(", ")}` : "", failed.length ? `could not warn ${failed.join(", ")}` : ""].filter(Boolean).join("; ");
 };
 
+/** The dori checkout this supervisor runs from (the package dir of `dori update`). */
+const PACKAGE_DIR = join(import.meta.dir, "..");
+
+/** dori's own repo (`owner/repo`), read once per process from the checkout's origin; undefined when it has none. */
+const doriRepo = (deps: Pick<FlowDeps, "run">): (() => Promise<string | undefined>) => {
+  let repo: Promise<string | undefined> | undefined;
+  return () => (repo ??= doriRepoOf(deps.run, PACKAGE_DIR).catch(() => undefined));
+};
+
+/** Lane states that hold back the automatic update: still working, told not done, or waiting on its done claim. */
+const UPDATE_BLOCKING = new Set(["working", "not-done", "done-claimed"]);
+
+/**
+ * The open lanes of `repo` that hold back the automatic update. A lane whose runner cannot say which repo it works in
+ * counts as one: an update is never started under a lane that may be dori's.
+ */
+export const lanesBlockingUpdate = async (deps: Pick<FlowDeps, "registry" | "ops">, repo: string): Promise<string[]> => {
+  const busy: string[] = [];
+  for (const lane of await deps.registry.open()) {
+    if (!UPDATE_BLOCKING.has(statusOf(lane))) continue;
+    const unresolved = new Set<string>();
+    const targets = await githubTargets([lane], deps.ops, unresolved);
+    if (targets.has(repo) || unresolved.has(lane.key)) busy.push(lane.key);
+  }
+  return busy;
+};
+
 /** A named sweep. It may hand lines over itself through `emit` (as they happen) and/or return them. */
 export type Sweep = readonly [name: string, step: (emit: Emit) => Promise<readonly string[]>];
 
@@ -597,6 +625,15 @@ export const supervisorSweeps = (
   // runner label (the machine it serves as value), instead of one warning per lane and sweep every round.
   const admitted = (machine?: string): boolean => deps.ops.connected(machine);
   const unavailable = new Map<string, string | undefined>();
+  const ownRepo = doriRepo(deps);
+  const autoUpdate = new AutoUpdate({
+    stateDir: deps.config.stateDir, run: deps.run, now: deps.clock.now, env: process.env, log: (line) => { console.error(line); },
+    command: [process.execPath, join(PACKAGE_DIR, "src", "cli.ts"), "update", "--dev"],
+    busy: async () => {
+      const repo = await ownRepo();
+      return repo ? lanesBlockingUpdate(deps, repo) : [];
+    },
+  });
   return [
     ["snapshot", async (emit) => {
       view = passthroughView(deps.ops);
@@ -659,6 +696,11 @@ export const supervisorSweeps = (
       return [];
     }],
     ["memory", async () => memorySweep(deps, home)],
+    // `dori update --dev` after a merge of dori's own repo into dev, in its own unit once no lane of that repo is working.
+    ["auto-update", async (emit) => {
+      await autoUpdate.tick((line, id) => emit(line, id));
+      return [];
+    }],
     // Each worker machine with an enrolled runner is judged from its runner's guard sample; nothing is sampled over ssh.
     // Last, so a slow herdr machine list never delays the pane reads of the sweeps before it.
     ["machine-guard", async (emit) => {
@@ -977,7 +1019,14 @@ export const supervise = async (
     });
     const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.tunables.waitMaxFailures, hubCall));
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
-    const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps));
+    const ownRepo = doriRepo(deps);
+    // A merge of dori's own repo into dev queues the automatic update (the auto-update sweep runs it).
+    const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps, {
+      ...defaultCiIo,
+      merged: async (pull, base) => {
+        if (base === "dev" && pull.repo.toLowerCase() === await ownRepo()) noteDevMerge(deps.config.stateDir, `${pull.repo}#${pull.number}`);
+      },
+    }));
     // CI follow-up reads the poll it follows, so it runs right after each GitHub tick.
     const pollGithub = async (): Promise<void> => {
       await github.tick(deps, enqueueGitHub);

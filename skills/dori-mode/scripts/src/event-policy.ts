@@ -69,6 +69,8 @@ const URGENT_KINDS = [
   // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
   // waits on the close itself, so it must not sit in the digest.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
+  // The automatic `dori update --dev` after a merge of dori's own repo failed (update.ts AutoUpdate); its success is digest.
+  "AUTO_UPDATE_FAILED",
   // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched), a done one
   // has its Toodo task completed by the lead.
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
@@ -103,6 +105,8 @@ const DIGEST_KINDS = [
   "UNRECOGNISED_PANE * unregistered",
   // A met wait registered with --on-success digest (waits.ts): news for the next wake, not a decision.
   "WAIT_DONE_DIGEST",
+  // The automatic `dori update --dev` finished (update.ts AutoUpdate).
+  "AUTO_UPDATE_DONE",
 ] as const;
 
 /**
