@@ -16,8 +16,8 @@ export class MemoryCheckError extends Error {}
 
 export const MEMORY_FILE = join("system", "human.md");
 export const MEMORY_CHECK_EVERY_MS = 24 * 60 * 60_000;
-/** A lane close is checked this long after it is first seen, so the lead's own cleanup turn comes first. */
-export const MEMORY_CHECK_AFTER_CLOSE_MS = 15 * 60_000;
+/** Growth of human.md since the last MEMORY_CHECK that is worth another one. */
+export const MEMORY_CHECK_GROWTH_BYTES = 1024;
 
 export type OpenItem = { readonly index: number; readonly label: string; readonly text: string };
 export type StaleItem = { readonly item: OpenItem; readonly refs: readonly string[] };
@@ -180,7 +180,18 @@ export const renderMemoryReport = (r: MemoryReport): string => [
   needsAction(r) ? "MEMORY_CHECK action needed: condense human.md and delete or shrink the STALE Open items" : "MEMORY_CHECK clean",
 ].join("\n");
 
-type SweepState = { readonly at?: number; readonly closed?: readonly string[]; readonly pendingSince?: number; readonly sent?: string };
+/**
+ * `at`: the last daily check. `bytes`/`over`/`stale`: what the last MEMORY_CHECK said, lowered to what later checks
+ * still find (a condensed file or a deleted item resets the baseline). Absent after a clean check.
+ */
+type SweepState = {
+  readonly at?: number;
+  readonly bytes?: number;
+  readonly over?: boolean;
+  readonly stale?: readonly string[];
+  /** Pre-daily-only state: a fingerprint of the last line sent. Read once, so an upgrade does not repeat it. */
+  readonly sent?: string;
+};
 
 const saveState = (path: string, state: SweepState): void => {
   const tmp = `${path}.${process.pid}.tmp`;
@@ -190,25 +201,18 @@ const saveState = (path: string, state: SweepState): void => {
 };
 
 /**
- * The supervisor's memory sweep. It checks once every MEMORY_CHECK_EVERY_MS and MEMORY_CHECK_AFTER_CLOSE_MS after a
- * newly closed lane is first seen. Findings become one MEMORY_CHECK line, sent again only when they change; state
- * lives in <stateDir>/memory-check.json. The run is recorded before checking, so a failure waits for the next turn.
+ * The supervisor's memory sweep: one check every MEMORY_CHECK_EVERY_MS, nothing else triggers it. A finding becomes
+ * one MEMORY_CHECK line only when there was no earlier one, human.md grew by MEMORY_CHECK_GROWTH_BYTES or went over
+ * the limit since it, or a STALE reference it did not name appears. State lives in <stateDir>/memory-check.json. The
+ * run is recorded before checking, so a failure waits for the next daily turn.
  */
 export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[]> => {
   const path = join(deps.config.stateDir, "memory-check.json");
   const now = deps.clock.now();
   const state: SweepState = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as SweepState : {};
-  const closed = await closedLaneKeys(deps);
-  const known = new Set(state.closed ?? closed);
-  const fresh = closed.some((key) => !known.has(key));
-  const next: SweepState = { ...state, closed, pendingSince: state.pendingSince ?? (fresh ? now : undefined) };
-  const due = now - (next.at ?? -Infinity) >= MEMORY_CHECK_EVERY_MS ||
-    (next.pendingSince !== undefined && now - next.pendingSince >= MEMORY_CHECK_AFTER_CLOSE_MS);
-  if (!due) {
-    if (JSON.stringify(next) !== JSON.stringify(state)) saveState(path, next);
-    return [];
-  }
-  saveState(path, { ...next, at: now, pendingSince: undefined });
+  if (now - (state.at ?? -Infinity) < MEMORY_CHECK_EVERY_MS) return [];
+  const base: SweepState = state.bytes === undefined ? {} : { bytes: state.bytes, over: state.over, stale: state.stale };
+  saveState(path, { ...base, at: now });
   let report: MemoryReport;
   try { report = await checkMemory(deps, home); }
   catch (e) {
@@ -216,10 +220,16 @@ export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[
     throw e;
   }
   const line = memoryEvent(report);
-  const fingerprint = line
-    ? createHash("sha256").update(JSON.stringify([report.bytes > report.limitBytes, report.stale.flatMap((s) => s.refs).sort()])).digest("hex").slice(0, 16)
-    : undefined;
   // A clean check forgets the last finding, so the same finding coming back later is said again.
-  saveState(path, { ...next, at: now, pendingSince: undefined, sent: fingerprint });
-  return line && fingerprint !== state.sent ? [line] : [];
+  if (!line) { saveState(path, { at: now }); return []; }
+  const over = report.bytes > report.limitBytes;
+  const stale = [...new Set(report.stale.flatMap((s) => s.refs))].sort();
+  // An old state's fingerprint means a line went out already: take today's findings as its baseline.
+  const last = base.bytes !== undefined ? base : state.sent !== undefined ? { bytes: report.bytes, over, stale } : undefined;
+  const said = new Set(last?.stale ?? []);
+  const send = !last || report.bytes - (last.bytes ?? 0) >= MEMORY_CHECK_GROWTH_BYTES || (over && !last.over) || stale.some((ref) => !said.has(ref));
+  saveState(path, send
+    ? { at: now, bytes: report.bytes, over, stale }
+    : { at: now, bytes: Math.min(last.bytes ?? report.bytes, report.bytes), over: over && last.over === true, stale: stale.filter((ref) => said.has(ref)) });
+  return send ? [line] : [];
 };

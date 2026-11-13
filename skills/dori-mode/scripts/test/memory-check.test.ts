@@ -3,7 +3,7 @@ import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "n
 import { join } from "node:path";
 
 import type { FlowDeps } from "../src/done-flow.ts";
-import { checkMemory, itemRefs, MEMORY_CHECK_AFTER_CLOSE_MS, MEMORY_CHECK_EVERY_MS, memorySweep, needsAction, openItems, renderMemoryReport } from "../src/memory-check.ts";
+import { checkMemory, itemRefs, MEMORY_CHECK_EVERY_MS, MEMORY_CHECK_GROWTH_BYTES, memorySweep, needsAction, openItems, renderMemoryReport } from "../src/memory-check.ts";
 import type { Lane } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
 import { runSweeps, supervisorSweeps } from "../src/supervise-loop.ts";
@@ -120,24 +120,68 @@ test("without memoryCheck.repo the repo is omo's for leadCwd; nothing found is a
   expect((await checkMemory(blank, state.dir)).file).toBe(join(found, "system", "human.md"));
 });
 
-test("the sweep sends one MEMORY_CHECK per distinct finding: daily, and 15 minutes after a newly closed lane", async () => {
+test("the sweep checks once a day; a lane closing in between waits for the next daily check", async () => {
   const { deps } = await setup();
   const at = (ms: number): FlowDeps => ({ ...deps, clock: fakeClock(ms) });
   const first = await memorySweep(at(T0), "/home/test");
   expect(first).toHaveLength(1);
   expect(first[0]).toStartWith("MEMORY_CHECK 2 Open item(s) reference finished work: #1 closed lane dori-ack");
   expect(await memorySweep(at(T0 + MIN), "/home/test")).toEqual([]);
-  // A day later the same findings stay quiet.
-  expect(await memorySweep(at(T0 + MEMORY_CHECK_EVERY_MS), "/home/test")).toEqual([]);
-  // live-lane closes: nothing before the grace period, then one line with the new finding.
-  const t1 = T0 + MEMORY_CHECK_EVERY_MS + MIN;
-  await deps.registry.write(lane("live-lane", { closedAt: new Date(t1).toISOString(), status: "closed" }));
-  expect(await memorySweep(at(t1), "/home/test")).toEqual([]);
-  expect(await memorySweep(at(t1 + MEMORY_CHECK_AFTER_CLOSE_MS - 1), "/home/test")).toEqual([]);
-  const after = await memorySweep(at(t1 + MEMORY_CHECK_AFTER_CLOSE_MS), "/home/test");
+  // live-lane closes: no check until a day after the last one, then one line with the new finding.
+  await deps.registry.write(lane("live-lane", { closedAt: new Date(T0 + MIN).toISOString(), status: "closed" }));
+  expect(await memorySweep(at(T0 + 16 * MIN), "/home/test")).toEqual([]);
+  expect(await memorySweep(at(T0 + MEMORY_CHECK_EVERY_MS - 1), "/home/test")).toEqual([]);
+  const after = await memorySweep(at(T0 + MEMORY_CHECK_EVERY_MS), "/home/test");
   expect(after).toHaveLength(1);
   expect(after[0]).toContain("#3 closed lane live-lane");
-  expect(await memorySweep(at(t1 + MEMORY_CHECK_AFTER_CLOSE_MS + MIN), "/home/test")).toEqual([]);
+  // The next day finds the same items: quiet.
+  expect(await memorySweep(at(T0 + 2 * MEMORY_CHECK_EVERY_MS), "/home/test")).toEqual([]);
+});
+
+test("the same findings are sent again only when human.md grew 1 KB since the last MEMORY_CHECK or a new STALE item appears", async () => {
+  const { deps, memory } = await setup();
+  const file = join(memory, "system", "human.md");
+  const day = (n: number): FlowDeps => ({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) });
+  expect(await memorySweep(day(0), "/home/test")).toHaveLength(1);
+  // Growth under 1 KB, counted from the last line sent, never adds up to a line on its own.
+  writeFileSync(file, `${HUMAN}\n${"y".repeat(MEMORY_CHECK_GROWTH_BYTES / 2)}\n`);
+  expect(await memorySweep(day(1), "/home/test")).toEqual([]);
+  // Two newlines plus the y run: one byte short of 1 KB, then exactly 1 KB.
+  writeFileSync(file, `${HUMAN}\n${"y".repeat(MEMORY_CHECK_GROWTH_BYTES - 3)}\n`);
+  expect(await memorySweep(day(2), "/home/test")).toEqual([]);
+  writeFileSync(file, `${HUMAN}\n${"y".repeat(MEMORY_CHECK_GROWTH_BYTES - 2)}\n`);
+  expect(await memorySweep(day(3), "/home/test")).toHaveLength(1);
+  expect(await memorySweep(day(4), "/home/test")).toEqual([]);
+  // One more finished reference is a new STALE item: sent though the file barely changed.
+  writeFileSync(file, `${HUMAN.replace("- QUIET:", "- NEW: acme/app#9 shipped\n- QUIET:")}\n${"y".repeat(MEMORY_CHECK_GROWTH_BYTES)}\n`);
+  expect(await memorySweep(day(5), "/home/test")).toEqual([]);
+  await deps.registry.write(lane("live-lane", { closedAt: new Date(T0).toISOString(), status: "closed" }));
+  const fresh = await memorySweep(day(6), "/home/test");
+  expect(fresh).toHaveLength(1);
+  expect(fresh[0]).toContain("closed lane live-lane");
+});
+
+test("an oversized human.md is said once, then again only after 1 KB more", async () => {
+  const { deps, memory } = await setup(`## Open\n- ${"x".repeat(2048)}\n`, 1);
+  const file = join(memory, "system", "human.md");
+  const day = (n: number): FlowDeps => ({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) });
+  const first = await memorySweep(day(0), "/home/test");
+  expect(first[0]).toContain("over the 1.0KB limit");
+  expect(await memorySweep(day(1), "/home/test")).toEqual([]);
+  // Condensed but still over: the lower size is the new baseline.
+  writeFileSync(file, `## Open\n- ${"x".repeat(1500)}\n`);
+  expect(await memorySweep(day(2), "/home/test")).toEqual([]);
+  writeFileSync(file, `## Open\n- ${"x".repeat(1500 + MEMORY_CHECK_GROWTH_BYTES)}\n`);
+  expect(await memorySweep(day(3), "/home/test")).toHaveLength(1);
+});
+
+test("a state written before the daily-only sweep does not repeat the line it already sent", async () => {
+  const { deps } = await setup();
+  mkdirSync(deps.config.stateDir, { recursive: true });
+  writeFileSync(join(deps.config.stateDir, "memory-check.json"), JSON.stringify({ at: T0 - MEMORY_CHECK_EVERY_MS, closed: ["dori-ack"], pendingSince: T0 - MIN, sent: "0123456789abcdef" }));
+  expect(await memorySweep({ ...deps, clock: fakeClock(T0 - MIN) }, "/home/test")).toEqual([]);
+  expect(await memorySweep({ ...deps, clock: fakeClock(T0) }, "/home/test")).toEqual([]);
+  expect(JSON.parse(readFileSync(join(deps.config.stateDir, "memory-check.json"), "utf8"))).toEqual({ at: T0, bytes: expect.any(Number), over: false, stale: ["closed lane dori-ack", "closed lane hsj-dead", "merged PR acme/app#7", "merged PR acme/app#9"] });
 });
 
 test("a finding that comes back after a clean check is sent again", async () => {
