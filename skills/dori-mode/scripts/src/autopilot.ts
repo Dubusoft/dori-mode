@@ -42,6 +42,8 @@ export type ToodoTask = {
 // Config
 
 export type AutopilotConfig = {
+  /** Supervisor execution is opt-in; false keeps the lead's manual launch flow. */
+  readonly executor: boolean;
   readonly quotaUnreadable: "hold";
   readonly mergeBase: string;
   readonly crossWorkspacePrereqs: "block";
@@ -57,6 +59,7 @@ export const QUOTA_CACHE_SEC_MIN = 30;
 export const QUOTA_CACHE_SEC_MAX = 900;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
+  executor: false,
   quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300, quotaCacheSec: 90,
 };
 
@@ -87,6 +90,7 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
   };
   const only = (value: string) => (v: unknown) => v === value;
   return {
+    executor: pick<boolean>("executor", (v) => typeof v === "boolean", "a boolean"),
     quotaUnreadable: pick<"hold">("quotaUnreadable", only("hold"), "\"hold\""),
     mergeBase: pick<string>("mergeBase", (v) => typeof v === "string" && v.trim() !== "" && v === v.trim(), "a branch name"),
     crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
