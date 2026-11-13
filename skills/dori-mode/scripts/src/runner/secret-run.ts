@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import type { SecretCommand, SecretRule } from "../config.ts";
 import { redactSecrets } from "../redact.ts";
+import { hostGitEnv } from "../run.ts";
 import { readSecretValue, ruleMatches, type SecretSource } from "./secret-grant.ts";
 
 /**
@@ -62,7 +63,7 @@ export const SECRET_RUN_TIMEOUT_EXIT = 124;
 const HOST_ENV = ["PATH", "HOME", "LANG", "TMPDIR"] as const;
 
 const defaultSpawn: SecretSpawner = (argv, { env, cwd }) => {
-  const child = Bun.spawn([...argv], { env, cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn([...argv], { env: hostGitEnv(env), cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   return { stdout: child.stdout, stderr: child.stderr, exited: child.exited, kill: () => { child.kill("SIGKILL"); } };
 };
 const defaultTimer = (ms: number, fire: () => void): (() => void) => { const t = setTimeout(fire, ms); return () => { clearTimeout(t); }; };

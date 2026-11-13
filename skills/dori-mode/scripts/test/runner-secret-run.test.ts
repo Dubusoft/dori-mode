@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { SecretCommand, SecretRule } from "../src/config.ts";
+import { hostGitEnv } from "../src/run.ts";
 import { SecretStoreError } from "../src/secret-store.ts";
 import { SECRET_RUN_OUTPUT_CAP, secretCommandRunner, type SecretRunAuditEntry, type SecretRunnerDeps, type SecretSpawner } from "../src/runner/secret-run.ts";
 
@@ -64,13 +65,13 @@ describe("secretCommandRunner", () => {
     h.clean(result);
   });
 
-  test("the child env is PATH, HOME, LANG, TMPDIR and the secrets, nothing else from the parent", async () => {
+  test("the child env is PATH, HOME, LANG, TMPDIR, the host git guard and the secrets, nothing else from the parent", async () => {
     const h = harness({ env: command(["env"]) });
     const result = await h.run("lane-a", "env");
     expect(result.ok).toBe(true);
     const vars = Object.fromEntries((result.ok ? result.stdout : "").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
     // redactSecrets also masks the NAME=value shape, so the line reads API_TOKEN=[REDACTED].
-    expect(vars).toEqual({ PATH: HOST_ENV.PATH, HOME: "/home/test", LANG: "C.UTF-8", TMPDIR: "/tmp", API_TOKEN: expect.stringMatching(/^\[REDACTED/) });
+    expect(vars).toEqual({ ...hostGitEnv({ PATH: HOST_ENV.PATH, HOME: "/home/test", LANG: "C.UTF-8", TMPDIR: "/tmp" }), API_TOKEN: expect.stringMatching(/^\[REDACTED/) });
     h.clean(result);
   });
 

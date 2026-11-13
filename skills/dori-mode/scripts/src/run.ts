@@ -101,7 +101,38 @@ export const makeRunner = (deps: RunDeps): Runner => async (argv, opts = {}) => 
   }
 };
 
-export const run: Runner = makeRunner({ os: process.platform, spawn: (argv, options) => Bun.spawn(argv, options) });
+/**
+ * Repo config git would turn into a command on this host. A lane can write its checkout's `.git/config` (and the
+ * common git dir of its worktrees), so a host-side git in that repo would otherwise run the lane's hooks
+ * (`core.hooksPath`), fsmonitor command (`core.fsmonitor`) or ssh wrapper (`core.sshCommand`) outside the sandbox.
+ */
+export const HOST_GIT_CONFIG: readonly (readonly [key: string, value: string])[] = [
+  ["core.hooksPath", "/dev/null"],
+  ["core.fsmonitor", "false"],
+  ["core.sshCommand", "ssh"],
+];
+
+/**
+ * `base` with HOST_GIT_CONFIG appended as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`: command-scope
+ * config that outranks every config file, for git itself and for any git a child (gh, a shell) starts. Pairs `base`
+ * already carries stay in front.
+ */
+export const hostGitEnv = (base: Readonly<Record<string, string | undefined>>): Record<string, string> => {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
+  const had = Number(env.GIT_CONFIG_COUNT);
+  let n = Number.isInteger(had) && had > 0 ? had : 0;
+  for (const [key, value] of HOST_GIT_CONFIG) {
+    env[`GIT_CONFIG_KEY_${n}`] = key;
+    env[`GIT_CONFIG_VALUE_${n}`] = value;
+    n++;
+  }
+  env.GIT_CONFIG_COUNT = String(n);
+  return env;
+};
+
+/** The host's runner: every command it starts gets hostGitEnv, so no repo config a lane wrote runs here. */
+export const run: Runner = makeRunner({ os: process.platform, spawn: (argv, options) => Bun.spawn(argv, { ...options, env: hostGitEnv(process.env) }) });
 
 export type Clock = { readonly now: () => number; readonly sleep: (ms: number) => Promise<void> };
 export const realClock: Clock = { now: () => Date.now(), sleep: (ms) => Bun.sleep(ms) };
