@@ -76,6 +76,7 @@ import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } fro
 import { autopilotLocalStateKey } from "./autopilot.ts";
 import { judgeCandidates, liveJudgeDeps, RECONCILE_JOB } from "./autopilot-cli.ts";
 import { AUTOPILOT_KICK_EVENTS, AutopilotTick } from "./autopilot-tick.ts";
+import { liveExecutorDeps, reconcileExecutions, runExecutor } from "./autopilot-executor.ts";
 import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
@@ -1005,8 +1006,12 @@ export const supervise = async (
     const enqueueGitHub = enqueueOf("github");
     const enqueueDiscord = enqueueOf("discord");
     // AUTOPILOT_READY counts under the toodo source: it is what toodo's marked tasks add up to.
+    // The executor's deps are rebuilt per call over the live `deps`, so a config reload applies; the toodo source journals its notices.
+    const executorDeps = () => liveExecutorDeps(deps, ops, enqueueOf("toodo"), (line) => { console.error(line); });
     const autopilot = new AutopilotTick({
       tickMs: () => deps.config.autopilot.tickSec * 1000,
+      executorOn: () => deps.config.autopilot.executor,
+      execute: async (ids) => { const exec = executorDeps(); await reconcileExecutions(exec); return runExecutor(exec, ids); },
       judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), enqueue: enqueueOf("toodo"), now: deps.clock.now,
       localState: async () => autopilotLocalStateKey(ops, new Set((await deps.registry.open()).map((l) => l.key))),
       log: (line) => { console.error(line); },
@@ -1014,6 +1019,7 @@ export const supervise = async (
     // The tick replaced the hourly autopilot-reconcile schedule job; one left from an earlier version is removed.
     try { if (new SourceSpecs(deps.config.stateDir).remove(RECONCILE_JOB)) console.log(`AUTOPILOT_RECONCILE_JOB_REMOVED ${RECONCILE_JOB}: the supervisor's autopilot tick replaces it`); }
     catch (e) { console.error(`AUTOPILOT_RECONCILE_JOB_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+    let executorStarted = false;
     const toodoEvents = new ToodoEvents({
       config: deps.tunables.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
       fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
@@ -1432,6 +1438,11 @@ export const supervise = async (
         await Promise.all(polls);
       }),
       task(AUTOPILOT_TASK, AUTOPILOT_PASS_MS, async () => {
+        // Switch on: crash reconcile once at start (never fatal); the tick reconciles again on every pass.
+        if (!executorStarted && deps.config.autopilot.executor) {
+          executorStarted = true;
+          try { await reconcileExecutions(executorDeps()); } catch (e) { console.error(`AUTOPILOT_EXECUTOR_RECONCILE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        }
         if (deps.tunables.toodoEvents.enabled) await autopilot.tick();
       }),
       task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {

@@ -257,12 +257,12 @@ const candidates = async (deps: AutopilotDeps, json: boolean, extraIds: readonly
 };
 
 /**
- * Reserves the next launch attempt of `taskId` under the launch lock: re-reads toodo, the ledger, open lanes, quota and
+ * Reserves the next launch attempt of `taskId`; the caller must hold the launch lock. Re-reads toodo, the ledger, open lanes, quota and
  * the host, judges the task among every marked one (other tasks' reservations not running yet take a host slot each),
  * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH, and before
  * reading anything when a pause is in force.
  */
-const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
+export const reserveAutopilot = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
   const pause = readPause(deps.pauseFile);
   if (pause) {
     deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} paused ${pauseText(pause)} (dori autopilot resume lifts it)`);
@@ -320,7 +320,7 @@ const launch = async (deps: AutopilotDeps, positionals: readonly string[], v: Re
   if (note !== undefined && !settles.length) throw new UsageError("--note goes with --launched, --failed or --ambiguous");
   const release = await deps.lock();
   try {
-    return settles[0] ? settle(deps, Number(id), settles[0], note) : await reserve(deps, Number(id));
+    return settles[0] ? settle(deps, Number(id), settles[0], note) : await reserveAutopilot(deps, Number(id));
   } finally {
     release();
   }

@@ -11,6 +11,12 @@ import type { CandidatesReport } from "./autopilot.ts";
  * has settled: AUTOPILOT_KICK_QUIET_MS after the last kick, or AUTOPILOT_KICK_MAX_MS after the first. Reservations and
  * lane changes raise no toodo event, so an optional `localState` key is compared every pass and a change kicks. The
  * remembered set lives in memory: a supervisor restart announces a waiting set once more.
+ *
+ * With the optional `execute` dep and `executorOn()` true (config `autopilot.executor`), every judged tick hands its LAUNCH ids
+ * to the executor first (an empty list on a pause or an empty set, so open sequences still resume) and wakes the lead only
+ * for ids the executor did not take over: a result of kind review, disabled or refused, or none at all. launched, held,
+ * paused, failed and ambiguous ids are the executor's (it journals its own AUTOPILOT_EXECUTOR_* notices). With the switch off
+ * nothing is executed and the wake is exactly the one above.
  */
 
 export const AUTOPILOT_RENOTIFY_MS = 30 * 60_000;
@@ -26,6 +32,10 @@ export type AutopilotTickDeps = {
   readonly judge: () => Promise<CandidatesReport>;
   /** An opaque key of supervisor-local state (reservations, lanes) that raises no toodo event; a change kicks. */
   readonly localState?: () => Promise<string>;
+  /** Read every pass: whether `execute` is used (config `autopilot.executor`). */
+  readonly executorOn?: () => boolean;
+  /** Hands LAUNCH ids to the executor (reconciling open sequences first); a throw is logged and the tick goes on. */
+  readonly execute?: (ids: readonly number[]) => Promise<readonly { taskId: number; kind: string }[]>;
   readonly enqueue: (id: string, line: string) => void;
   readonly now: () => number;
   readonly log: (line: string) => void;
@@ -35,6 +45,9 @@ export type AutopilotTickDeps = {
 export const readyLine = (ids: readonly number[], slots: number | null, again: boolean): string =>
   `AUTOPILOT_READY ${ids.map((id) => `#${id}`).join(",")} slots=${slots ?? "unlimited"}${again ? " again" : ""}`;
 
+/** Executor outcomes that leave the task to the lead (the executor started nothing and sent no notice for them). */
+const LEAD_KINDS: ReadonlySet<string> = new Set(["review", "disabled", "refused"]);
+
 export class AutopilotTick {
   private nextAt = Number.NEGATIVE_INFINITY;
   private firstKickAt: number | undefined;
@@ -43,6 +56,7 @@ export class AutopilotTick {
   private lastError: string | undefined;
   private localKey: string | undefined;
   private lastLocalError: string | undefined;
+  private lastExecuteError: string | undefined;
 
   constructor(private readonly deps: AutopilotTickDeps) {}
 
@@ -73,6 +87,20 @@ export class AutopilotTick {
     }
   }
 
+  /** Runs the executor over `ids`; returns the ids of `all` the lead must still hear about. An executor that throws leaves them to the lead. */
+  private async execute(ids: readonly number[], all: readonly number[]): Promise<number[]> {
+    try {
+      const results = await this.deps.execute!(ids);
+      this.lastExecuteError = undefined;
+      return all.filter((id) => !ids.includes(id) || results.every((r) => r.taskId !== id || LEAD_KINDS.has(r.kind)) );
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      if (why !== this.lastExecuteError) this.deps.log(`AUTOPILOT_EXECUTOR_ERROR ${why}`);
+      this.lastExecuteError = why;
+      return [...all];
+    }
+  }
+
   /** One pass: judges when due. Never throws; an unreadable toodo is logged once per distinct error and retried next tick. */
   async tick(): Promise<void> {
     await this.checkLocalState();
@@ -91,7 +119,8 @@ export class AutopilotTick {
     }
     if (this.lastError !== undefined) this.deps.log("AUTOPILOT_TICK_OK");
     this.lastError = undefined;
-    const ids = report.verdicts.filter((v) => v.verdict === "LAUNCH").map((v) => v.taskId).sort((a, b) => a - b);
+    let ids = report.verdicts.filter((v) => v.verdict === "LAUNCH").map((v) => v.taskId).sort((a, b) => a - b);
+    if (this.deps.execute && this.deps.executorOn?.()) ids = await this.execute(report.paused ? [] : ids, ids);
     // A pause wakes no one; forgetting the set makes it news once the pause is lifted.
     if (!ids.length || report.paused) { this.remembered = undefined; return; }
     const prev = this.remembered;

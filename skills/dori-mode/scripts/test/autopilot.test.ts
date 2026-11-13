@@ -225,6 +225,14 @@ test("formatCandidates prints the header and one line per verdict; none prints A
 
 // Config
 
+test("the executor is opt-in and only accepts booleans", () => {
+  expect(DEFAULT_AUTOPILOT.executor).toBe(false);
+  expect(parseAutopilotConfig({}).executor).toBe(false);
+  expect(parseAutopilotConfig({ executor: true }).executor).toBe(true);
+  expect(parseAutopilotConfig({ executor: false }).executor).toBe(false);
+  for (const executor of ["true", 1, null, {}]) expect(() => parseAutopilotConfig({ executor })).toThrow("autopilot.executor must be a boolean");
+});
+
 test("parseAutopilotConfig defaults every key", () => {
   expect(parseAutopilotConfig(undefined)).toEqual(DEFAULT_AUTOPILOT);
   expect(parseAutopilotConfig({})).toEqual(DEFAULT_AUTOPILOT);

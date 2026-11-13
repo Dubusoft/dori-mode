@@ -69,6 +69,7 @@ Key `autopilot` in `config.json`; every field is optional. An invalid value or a
 | `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
 | `tickSec` | `300` | Seconds between the supervisor's ticks, an integer from 30 to 3600. |
 | `quotaCacheSec` | `90` | Seconds a quota read is reused before the usage endpoints are read again, an integer from 30 to 900. It applies to every quota caller (the judge, `dori quota`, Discord `/quota`); see Quota reads. |
+| `executor` | `false` | A boolean (anything else is rejected). `true` lets the supervisor launch LAUNCH tasks itself; see Supervisor executor. |
 
 Both apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
 
@@ -151,8 +152,27 @@ The supervisor judges the same candidates itself every `autopilot.tickSec` (5 mi
 - `AUTOPILOT_READY` never comes while paused. Take the named tasks through the order below: `dori autopilot launch <id>` judges each again under its lock, so a task that changed since the tick is refused there. The supervisor's tick replaces any periodic reconcile of your own; there is no `autopilot-reconcile` schedule job any more.
 - Autopilot has no mode to set. When the owner says to stop autopilot, run `dori autopilot pause --reason TEXT` (and `resume` when they say to go on).
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
-- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
+- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched. With `autopilot.executor` on, the supervisor runs this order itself (see Supervisor executor).
 - A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them; the close already recorded its blocker (`toodo=blocked`), so add one only when the line says it was not recorded. `AUTOPILOT_LANE_DONE ... toodo=done` needs nothing: the supervisor completed the task with its PR, which lets its dependents become ready. On a plain `AUTOPILOT_LANE_DONE` (its `TOODO_TASK_NOT_COMPLETED` says why) complete the task yourself (`complete_task` with the PR as a ref).
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
 - Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 
+## Supervisor executor
+
+`src/autopilot-executor.ts` can take the lead's launch order over. It's off by default (`autopilot.executor: false`), and while it's off `runExecutor` and `reconcileExecutions` return `disabled` and touch nothing, so the lead keeps launching by hand as above. It stays off until the lead/ops contract switch-over task flips it.
+
+When on, each supervisor tick first runs `reconcileExecutions`, then `runExecutor` on the tick's LAUNCH ids, one task at a time under the same `autopilot-launch.lock.sqlite` lock as `dori autopilot launch`. A task goes through these steps:
+
+1. prepare: read the task and its contract again; a reason to stop goes to review before anything is reserved or started.
+2. reserve: open the task's `autopilot-launch` ledger attempt, exactly as the CLI does. A reservation the CLI opened is never adopted.
+3. start-task: `start_task` with the `lane:<key>` ref.
+4. thread: create the lane's Discord thread under the first `discordChannels` entry and add `discord.ownerId`.
+5. launch: write the brief, then place, validate and admit through the real launch service (never `launchLane` directly). A HOLD from admission queues the lane.
+6. settle: settle the ledger attempt `verified`, `failed` or `ambiguous`, and notify with `AUTOPILOT_EXECUTOR_LAUNCHED`, `_REVIEW`, `_FAILED` or `_AMBIGUOUS`.
+
+Every step is journaled in the operation store: one sequence row `toodo:<taskId>/autopilot-execute/1` and step rows with actions `autopilot-prepare`, `autopilot-reserve`, `autopilot-start-task`, `autopilot-thread`, `autopilot-brief`, `autopilot-hold`, `autopilot-admit`, `autopilot-settle`, `autopilot-drop-held`, `autopilot-blocker` and `autopilot-notice`. The thread id and its member result are kept, so a member-add error doesn't create a second thread. The `autopilot-launch` ledger row stays authoritative.
+
+- Crash reconcile: at startup and on every tick, `reconcileExecutions` resumes open sequences from their last journaled step. It never relaunches. An admission whose start can't be proved (a startup receipt or the runner's journaled startup result; a registered pane alone isn't proof) settles `ambiguous` and goes to the lead, as does a lost thread-create reply. Positive proof that a launch never started settles `failed` with one blocker, without retry.
+- HOLD resume: a held lane drains under its original key. A pause or a changed contract keeps it queued, and a scope change sends it to review. If the key left the queue outside the executor, a registry lane for it is `ambiguous` (a manual `dori launch` is never repeated) and no lane is review `hold-dropped` (`dori hold drop` was the lead's call). Neither path admits again.
+- Base enforcement: `autopilot.mergeBase` must equal the CI merge base, and the contract's base and version are recorded before launch.
+- Worktree isolation: a local launch runs in `<worktree root>/<repo name>-<laneKey>`, created empty right before validation. The root is the local runner's reported worktree root, else `config.worktreeRoot`; with neither the task goes to review `worktree-root-missing`, and a directory that can't be made is review `local-cwd-unusable`. It's never under the state dir and never left out. Remote placement drops the cwd so the runner makes its own lane directory.
