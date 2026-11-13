@@ -9,7 +9,7 @@ import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-
 import { defaultRunnerDir, ensureRunnerDir, ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./runner/fs-safety.ts";
 import { RunnerAuth, SupervisorAuth } from "./runner/auth.ts";
 import { HUB_FILE, readRunnerRows, RunnerHub } from "./runner/hub.ts";
-import { LivenessMonitor, livenessIo } from "./runner/liveness.ts";
+import { fileOutageStore, LivenessMonitor, livenessIo } from "./runner/liveness.ts";
 import {
   acceptLaneEvent, laneEventsAfter, type LaneHubDeps, type LaneStartReadbackDeps, readBackLaneStarts, reconcileInventory, runnerJournalHead,
 } from "./runner/lanes-hub.ts";
@@ -1240,6 +1240,8 @@ export const supervise = async (
             void systemPost(channel, scrubForThread(text, homedir()), `runner-liveness-alert:${boot}:${++livenessSeq}`)
               .catch((e: unknown) => { console.error(`RUNNER_ALERT_NOTIFY_FAILED ${e instanceof Error ? e.message : String(e)}`); });
           },
+          // Escalated outages outlive this process: a restart neither wakes the lead again nor loses the ONLINE.
+          outages: fileOutageStore(deps.config.stateDir),
         });
         for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
       } catch (e) {

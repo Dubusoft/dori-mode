@@ -1,3 +1,4 @@
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { machineBackoffMs, machineKind, sshArgv, type GuardMachine, type KindResult, type MachineKind } from "../remote-guard.ts";
 import { RUN_TIMEOUT_CODE, type Runner } from "../run.ts";
@@ -30,6 +31,9 @@ import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
  *   another machine.
  * - A heartbeat or hello ends the disconnect: `HOST_GUARD ONLINE machine=<label>` right away when it had woken the lead
  *   with `HOST_GUARD OFFLINE`.
+ * - A machine the lead was woken for stays recorded in the outage store (`<stateDir>/runner-outages.json`) until its
+ *   `HOST_GUARD ONLINE`. A supervisor started during that outage carries it over: no new `HOST_GUARD OFFLINE` or
+ *   `RUNNER_OFFLINE` for it, and its reconnect says `HOST_GUARD ONLINE`.
  *
  * A restart never touches herdr or a lane pane: the runner's unit is its own, so the lanes keep running through it.
  */
@@ -62,6 +66,53 @@ export type LivenessDeps = {
   readonly emit: (line: string) => Promise<void> | void;
   /** A system notice for the owner's alerts channel; fire and forget, a failed post never stops a tick. */
   readonly alert?: (text: string) => void;
+  /** The machines whose outage woke the lead, kept across supervisor restarts. */
+  readonly outages?: OutageStore;
+};
+
+/** Machines with an escalated outage that has not yet ended in `HOST_GUARD ONLINE`; label to wall-clock escalation time. */
+export type OutageStore = {
+  readonly escalated: () => ReadonlyMap<string, number>;
+  /** Records (`at` given) or clears (`undefined`) the escalated outage of `label`. A failed write never stops a tick. */
+  readonly set: (label: string, at: number | undefined) => void;
+};
+
+export const OUTAGES_FILE = "runner-outages.json";
+
+/**
+ * The outage store as `<stateDir>/runner-outages.json` (`{"<label>": {"escalatedAt": <ms>}}`), replaced atomically. A file
+ * that is missing or cannot be parsed reads as no outages: the worst case is the old behaviour, one repeated wake.
+ */
+export const fileOutageStore = (stateDir: string, log: (line: string) => void = (line) => { console.error(line); }): OutageStore => {
+  const path = join(stateDir, OUTAGES_FILE);
+  const read = (): Map<string, number> => {
+    let raw: unknown;
+    try { raw = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`RUNNER_OUTAGE_STATE_UNREADABLE ${e instanceof Error ? e.message : String(e)}`);
+      return new Map();
+    }
+    const out = new Map<string, number>();
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      for (const [label, row] of Object.entries(raw as Record<string, unknown>)) {
+        const at = (row as { escalatedAt?: unknown } | null)?.escalatedAt;
+        if (typeof at === "number" && Number.isFinite(at)) out.set(label, at);
+      }
+    }
+    return out;
+  };
+  return {
+    escalated: read,
+    set: (label, at) => {
+      const all = read();
+      if (at === undefined ? !all.delete(label) : all.get(label) === at) return;
+      if (at !== undefined) all.set(label, at);
+      const json = Object.fromEntries([...all].map(([l, escalatedAt]) => [l, { escalatedAt }]));
+      const tmp = `${path}.${process.pid}.tmp`;
+      try { writeFileSync(tmp, `${JSON.stringify(json)}\n`, { mode: 0o600 }); renameSync(tmp, path); } catch (e) {
+        log(`RUNNER_OUTAGE_STATE_WRITE_FAILED machine=${label} ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  };
 };
 
 type Watched = {
@@ -70,7 +121,7 @@ type Watched = {
   stale: boolean;
   offline: boolean;
   offlineSince?: number;
-  /** This disconnect woke the lead with HOST_GUARD OFFLINE. */
+  /** This disconnect woke the lead with HOST_GUARD OFFLINE (or one before a supervisor restart, carried over). */
   escalated: boolean;
   /** A heartbeat or hello arrived since tracking began; a runner tracked at supervisor start has none yet. */
   contacted: boolean;
@@ -140,8 +191,12 @@ export const livenessIo = (
 export class LivenessMonitor {
   private readonly runners = new Map<string, Watched>();
   private deciding = false;
+  /** Escalated outages from before this supervisor started, read once; each is taken by the first `track` of its label. */
+  private readonly carried: Map<string, number>;
 
-  constructor(private readonly deps: LivenessDeps) {}
+  constructor(private readonly deps: LivenessDeps) {
+    this.carried = new Map(deps.outages?.escalated() ?? []);
+  }
 
   /**
    * Starts watching `label` as if it had just been seen (a supervisor start counts from then). Restarts already in the
@@ -154,13 +209,22 @@ export class LivenessMonitor {
       const restarts = this.deps.operations.list({ lane: `runner:${label}` })
         .filter((op) => op.action === "restart" && wall - op.at < RESTART_CIRCUIT_WINDOW_MS)
         .map((op) => mono - (wall - op.at));
-      this.runners.set(label, { lastSeen: mono, gen, stale: false, offline: false, escalated: false, contacted: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0 });
+      // An outage that woke the lead before a supervisor restart continues: already escalated and woken, so neither the
+      // owned-lane wake, the 10 min wake nor RUNNER_OFFLINE says it again, and the reconnect closes it with ONLINE.
+      const carried = this.carried.has(label);
+      this.carried.delete(label);
+      this.runners.set(label, {
+        lastSeen: mono, gen, stale: false, offline: false, escalated: carried, contacted: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0,
+        ...(carried ? { outage: { since: mono, disconnects: 1, woke: true } } : {}),
+      });
     }
   }
 
   /** Stops watching `label` (a removed runner); nothing is emitted. A later heartbeat or hello tracks it afresh. */
   untrack(label: string): void {
     this.runners.delete(label);
+    this.carried.delete(label);
+    this.deps.outages?.set(label, undefined);
   }
 
   async heartbeat(label: string): Promise<void> {
@@ -188,9 +252,11 @@ export class LivenessMonitor {
 
   private async seen(label: string, r: Watched): Promise<void> {
     r.lastSeen = this.deps.monotonic();
-    if (r.offline && r.outage) r.outage.recoveredAt = r.lastSeen;
-    if (r.offline && r.escalated) {
+    // `escalated` holds only while offline, or for an outage carried over from before a supervisor restart.
+    if ((r.offline || r.escalated) && r.outage) r.outage.recoveredAt = r.lastSeen;
+    if (r.escalated) {
       const line = `HOST_GUARD ONLINE ${tag(label)}`;
+      this.deps.outages?.set(label, undefined);
       await this.deps.emit(line);
       this.deps.alert?.(`도리 알림: 러너 ${label}가 다시 연결되었습니다. (${line})`);
     }
@@ -201,6 +267,7 @@ export class LivenessMonitor {
     if (r.escalated) return;
     r.escalated = true;
     if (r.outage) r.outage.woke = true;
+    this.deps.outages?.set(label, this.deps.now());
     const line = `HOST_GUARD OFFLINE ${tag(label)} ${why}`;
     await this.deps.emit(line);
     this.deps.alert?.(`도리 경고: 러너 ${label}의 연결이 끊겨 있습니다. 리드에게도 알렸습니다. (${line})`);

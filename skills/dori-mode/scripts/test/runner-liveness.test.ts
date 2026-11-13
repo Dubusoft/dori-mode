@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openOperations, plan, type OperationStore } from "../src/operations.ts";
-import { LivenessMonitor, livenessIo, type ProbeOutcome } from "../src/runner/liveness.ts";
+import { fileOutageStore, LivenessMonitor, livenessIo, OUTAGES_FILE, type ProbeOutcome } from "../src/runner/liveness.ts";
 import type { Runner } from "../src/run.ts";
 
 const dirs: string[] = [];
@@ -14,11 +14,13 @@ type RigOptions = {
   readonly duringRestart?: (monitor: LivenessMonitor) => Promise<void>;
   /** Rows already in the operations store when the monitor starts (a supervisor restart). */
   readonly seed?: (operations: OperationStore, wallNow: number) => void;
+  /** The state directory (shared by two rigs to stand for one supervisor and the next); outages are kept in it. */
+  readonly stateDir?: string;
 };
 
 const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOutcome>, lanes: readonly string[] = [], options: RigOptions = {}) => {
-  const dir = mkdtempSync(join(tmpdir(), "runner-liveness-"));
-  dirs.push(dir);
+  const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), "runner-liveness-"));
+  if (!options.stateDir) dirs.push(dir);
   let at = 0;
   const lines: string[] = [];
   const alerts: string[] = [];
@@ -31,6 +33,7 @@ const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOu
     probe: async () => probe(monitor),
     restart: async () => { restarts.push(at); await options.duringRestart?.(monitor); return { ok: true, detail: "restarted" }; },
     ownedLanes: async () => owned, operations, emit: (line) => { lines.push(line); }, alert: (text) => { alerts.push(text); },
+    ...(options.stateDir ? { outages: fileOutageStore(options.stateDir) } : {}),
   });
   monitor.track("worker-a", 1);
   /** Ticks every 5 s (the runners task period) until `untilMs`. */
@@ -237,6 +240,64 @@ test("the local runner is restarted through the supervisor's child, never a syst
   // Without the child hook a local restart fails instead of touching systemd.
   expect((await livenessIo(run, "local", async () => []).restart("local")).ok).toBe(false);
   expect(argv).toHaveLength(1);
+});
+
+test("an escalated outage outlives a supervisor restart: no second HOST_GUARD OFFLINE, and the reconnect says ONLINE", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "runner-liveness-"));
+  dirs.push(stateDir);
+  const unreachable = (): ProbeOutcome => ({ kind: "unreachable", detail: "ssh: no route" });
+  const before = rig(unreachable, [], { stateDir });
+  await before.runTo(780_000);
+  expect(urgent(before.lines)).toEqual(["HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 780 s"]);
+  expect(Object.keys(JSON.parse(readFileSync(join(stateDir, OUTAGES_FILE), "utf8")) as object)).toEqual(["worker-a"]);
+
+  // The next supervisor, the machine still down: nothing new for the lead, however long it stays down.
+  const after = rig(unreachable, ["lane-a"], { stateDir });
+  await after.runTo(20 * 60_000);
+  expect(urgent(after.lines)).toEqual([]);
+  expect(after.lines.filter((l) => l.startsWith("RUNNER_OFFLINE") || l.startsWith("RUNNER_STALE"))).toEqual([]);
+  expect(after.alerts).toEqual([]);
+  await after.monitor.heartbeat("worker-a");
+  expect(after.lines.at(-1)).toBe("HOST_GUARD ONLINE machine=worker-a");
+  expect(after.alerts).toHaveLength(1);
+  expect(after.alerts[0]).toContain("(HOST_GUARD ONLINE machine=worker-a)");
+  expect(readFileSync(join(stateDir, OUTAGES_FILE), "utf8").trim()).toBe("{}");
+
+  // Closed once: a third supervisor starts clean, and its runner reconnecting says nothing.
+  const third = rig(unreachable, [], { stateDir });
+  await third.monitor.heartbeat("worker-a");
+  expect(third.lines).toEqual([]);
+});
+
+test("a carried-over outage whose runner reconnects before going offline again still closes with ONLINE, then ends steady", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "runner-liveness-"));
+  dirs.push(stateDir);
+  const before = rig(() => ({ kind: "dead", detail: "no process" }), [], { stateDir });
+  await before.runTo(180_000);
+  expect(urgent(before.lines)).toHaveLength(1);
+  const after = rig(() => ({ kind: "alive" }), [], { stateDir });
+  await after.runTo(30_000);
+  await after.monitor.hello("worker-a", 2);
+  expect(after.lines).toEqual(["HOST_GUARD ONLINE machine=worker-a"]);
+  const steadyUntil = after.at() + 11 * 60_000;
+  while (after.at() < steadyUntil) { await after.runTo(after.at() + 30_000); await after.monitor.heartbeat("worker-a"); }
+  expect(kinds(after.lines)).toEqual(["HOST_GUARD ONLINE", "RUNNER_ONLINE"]);
+});
+
+test("an untracked runner's carried outage is dropped; a missing or broken outage file reads as none", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "runner-liveness-"));
+  dirs.push(stateDir);
+  const store = fileOutageStore(stateDir, () => {});
+  expect(store.escalated().size).toBe(0);
+  store.set("worker-a", 5);
+  const r = rig(() => ({ kind: "alive" }), [], { stateDir });
+  r.monitor.untrack("worker-a");
+  expect(store.escalated().size).toBe(0);
+  writeFileSync(join(stateDir, OUTAGES_FILE), "{not json");
+  const logged: string[] = [];
+  expect(fileOutageStore(stateDir, (l) => { logged.push(l); }).escalated().size).toBe(0);
+  expect(logged[0]).toStartWith("RUNNER_OUTAGE_STATE_UNREADABLE");
+  expect(existsSync(join(stateDir, `${OUTAGES_FILE}.${process.pid}.tmp`))).toBe(false);
 });
 
 test("restarts from before a supervisor restart still count toward the circuit", async () => {
