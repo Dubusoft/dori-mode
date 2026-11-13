@@ -286,7 +286,7 @@ existing and under `allowedRoots`.
 
 - `wait.check` runs the `Done =` signal once in `cwd`, bounded by 10 s. A met check also publishes
   `wait.result {waitId, outcome: WAIT_DONE, detail}` (detail at most 500 characters), which the supervisor settles as
-  the same `WAIT_DONE` a local check gives; an unmet or failed check publishes nothing. A check that throws answers
+  the same success line a local check gives (`WAIT_DONE`, or the wait's `--on-success` line); an unmet or failed check publishes nothing. A check that throws answers
   `{met: false, error}`. The supervisor allows 20 s past the check's bound.
 - `job.run` runs the argv in `cwd`, killed after `timeoutSec`, and publishes one `job.result {opKey, state:
   verified|failed, exitCode, output}` per run (journal only). `output` is capped at 64 KiB and `err` at 4 KiB, cut on
