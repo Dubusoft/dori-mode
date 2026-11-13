@@ -63,6 +63,8 @@ The lane CLI sends the names to the runner over the lane socket with the lane's 
 
 A lane should pass the variable to the tool that needs it, not echo it, write it to a file or put it in a report. Keep the value itself off command lines too (for example `test "$NAME" = <value>`): argv shows in `ps`, shell history and the pane.
 
+Every lane footer `dori launch` writes says this: credentials come only through `secret exec` and `secret run` (the runner's `~/.dori/runner/bin/dori` on a remote lane), production deploys only through `secret run`, the lane never reads or copies credential files or CLI logins, and a refusal is reported as `blocked` with the name or op so the lead can add the secret or its rule.
+
 An `ssh-key` secret arrives as a file path instead of the key (see [Deploy keys](#deploy-keys)). A minted name looks like any other env secret to the lane.
 
 For an operation the lane should never hold the credential for, it asks the host to run it instead:
