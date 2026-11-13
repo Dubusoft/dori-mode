@@ -183,13 +183,6 @@ test("LANE_SANDBOX_VERIFY is bound read-write on its own, leaving its parent dir
   expect(rw(await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" }))).not.toContain(verify);
 });
 
-test("~/.android (the Android emulator and adb user home) is bound read-write when it exists", async () => {
-  const home = join(tempDir(), "home");
-  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
-  const android = join(home, ".android");
-  expect(argv.some((a, i) => a === "--bind-try" && argv[i + 1] === android && argv[i + 2] === android)).toBe(true);
-});
-
 test("a cwd-less lane gets the worktree root and each repo's .git under the repos root read-write, but no repo's hooks, working tree or the repos root itself", async () => {
   const root = realpathSync(tempDir());
   const home = join(root, "home");
@@ -388,7 +381,7 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   expect(write(join(runner, "briefs/lane-a.out/report.md"))).toBe(true);
   expect(read(join(runner, "briefs/lane-b.files/input.bin"))).toBe(false);
   expect(write(join(runner, "briefs/lane-b.out/report.md"))).toBe(false);
-  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), join(home, ".android", "avd", "x"), "/tmp/x", "/dev/null"]) {
+  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null"]) {
     expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
   }
   for (const no of [join(home, "probe"), join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {

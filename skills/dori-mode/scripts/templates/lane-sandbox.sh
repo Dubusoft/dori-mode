@@ -124,7 +124,7 @@ done
 # Read-write re-binds (after ro ones so nested rw paths win)
 opts+=(--bind "$H/.dori/runner/briefs/$key.out" "$H/.dori/runner/briefs/$key.out")
 for p in "$H/.omo" "$H/.dori/state" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
-  "$H/.cargo/registry" "$H/.cargo/git" "$H/.android"; do
+  "$H/.cargo/registry" "$H/.cargo/git"; do
   opts+=(--bind-try "$p" "$p")
 done
 mkdir -p "$H/.dori/heavy"

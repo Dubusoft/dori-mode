@@ -76,7 +76,7 @@ build_profile() {
 
   w "$LT"
   for p in "$H/.omo" "$H/.dori/state" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
-    "$H/.cargo/registry" "$H/.cargo/git" "$H/Library/Caches" "$H/Library/Developer" "$H/.android" /tmp; do
+    "$H/.cargo/registry" "$H/.cargo/git" "$H/Library/Caches" "$H/Library/Developer" /tmp; do
     w "$p"
   done
   # Claude Code's lock files: its processes take them so only one refreshes an account's OAuth token at a time.
