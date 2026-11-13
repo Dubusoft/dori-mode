@@ -858,7 +858,6 @@ export const supervise = async (
   const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
   if (!Number.isFinite(deps.tunables.cacheTtlMin) || deps.tunables.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
   if (!Number.isFinite(deps.tunables.leadContextCapTokens) || deps.tunables.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
-  if (!Number.isFinite(deps.tunables.leadContextHardCapTokens) || deps.tunables.leadContextHardCapTokens <= 0) throw new SuperviseError("leadContextHardCapTokens must be positive");
   if (!Number.isFinite(deps.tunables.githubPollSeconds) || deps.tunables.githubPollSeconds <= 0) throw new SuperviseError("githubPollSeconds must be positive");
   if (!Number.isFinite(deps.tunables.githubTimeoutMs) || deps.tunables.githubTimeoutMs <= 0) throw new SuperviseError("githubTimeoutMs must be positive");
   if (!Number.isFinite(deps.tunables.discordSafetyPollSeconds) || deps.tunables.discordSafetyPollSeconds <= 0) throw new SuperviseError("discordSafetyPollSeconds must be positive");
