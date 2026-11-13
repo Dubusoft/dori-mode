@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { SECRET_COMMAND_MAX_TIMEOUT_SEC } from "../config.ts";
 import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
@@ -33,8 +34,14 @@ export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
 export const RECONNECT_JITTER = 0.2;
 export const HEARTBEAT_MS = 15_000;
-/** How long `secretRequest` waits for the supervisor's answer before `RUNNER_SECRET_TIMEOUT`. */
+/** How long `secretRequest("secret.get")` waits for the supervisor's answer before `RUNNER_SECRET_TIMEOUT`. */
 export const SECRET_TIMEOUT_MS = 30_000;
+/**
+ * How long `secretRequest("secret.run")` waits: the op runs on the supervisor host for up to its `timeoutSec` (at most
+ * `SECRET_COMMAND_MAX_TIMEOUT_SEC`, then it is killed and answered), plus a margin for the hops and the reply. The runner
+ * does not know the op's own `timeoutSec` (the supervisor's config holds it), so it waits for the longest one allowed.
+ */
+export const SECRET_RUN_TIMEOUT_MS = SECRET_COMMAND_MAX_TIMEOUT_SEC * 1000 + 60_000;
 
 /** The secret frames a runner sends, and the answer type each one waits for. */
 export type SecretRequestType = "secret.get" | "secret.run";
@@ -255,7 +262,7 @@ export class RunnerClient {
    * 32-hex rid) and resolves with the opened `s2r` box of the matching answer, or a refusal: `RUNNER_SECRET_FAILED`
    * when not connected, on a lost connection or a box that does not open; `RUNNER_SECRET_UNSUPPORTED` without an auth
    * session; `RUNNER_SECRET_OUTDATED` when the supervisor's `hello.ok` proto is below `SECRET_PROTO`;
-   * `RUNNER_SECRET_TIMEOUT` after `SECRET_TIMEOUT_MS`; the supervisor's own code otherwise. Never rejects and never
+   * `RUNNER_SECRET_TIMEOUT` after `SECRET_TIMEOUT_MS` (`SECRET_RUN_TIMEOUT_MS` for `secret.run`); the supervisor's own code otherwise. Never rejects and never
    * logs a body.
    */
   secretRequest<T extends SecretRequestType>(type: T, body: Omit<RunnerControlBodies[T], "rid">): Promise<SecretReply> {
@@ -266,14 +273,15 @@ export class RunnerClient {
       return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; secrets need proto ${SECRET_PROTO}` });
     }
     const rid = randomBytes(16).toString("hex");
+    const timeoutMs = type === "secret.run" ? SECRET_RUN_TIMEOUT_MS : SECRET_TIMEOUT_MS;
     return new Promise<SecretReply>((resolve) => {
       let cancel: () => void = () => {};
       const settle = (reply: SecretReply): void => { cancel(); resolve(reply); };
       this.secrets.set(rid, { answer: SECRET_ANSWER[type], transport, settle });
-      cancel = (this.deps.timer ?? defaultTimer)(SECRET_TIMEOUT_MS, () => {
+      cancel = (this.deps.timer ?? defaultTimer)(timeoutMs, () => {
         if (this.secrets.get(rid)?.settle !== settle) return;
         this.secrets.delete(rid);
-        resolve({ ok: false, code: "RUNNER_SECRET_TIMEOUT", detail: `no answer to ${type} within ${SECRET_TIMEOUT_MS / 1000}s` });
+        resolve({ ok: false, code: "RUNNER_SECRET_TIMEOUT", detail: `no answer to ${type} within ${timeoutMs / 1000}s` });
       });
       try {
         this.sendFrame(runnerControl(this.head(), type, { ...body, rid } as RunnerControlBodies[T]) as AnyRunnerControl);
