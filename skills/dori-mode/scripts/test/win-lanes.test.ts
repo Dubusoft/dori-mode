@@ -55,10 +55,17 @@ test("a pwsh pane gets a nested encoded command with env, quoting and argv order
   const line = typed(t.calls);
   const tokenFile = t.lanes.tokenPath("lane-a");
   const script = decode(line, "pwsh");
-  expect(script).toStartWith(`$env:DORI_LANE_KEY='lane-a'; $env:DORI_LANE_TOKEN_FILE='${tokenFile.replace(/'/g, "''")}'; $env:DORI_LANE_OUT='${join(tokenFile, "..", "lane-a.out").replace(/'/g, "''")}'; $env:DORI_HEAVY_SLOTS='2'; $env:DORI_HEAVY_MAX_LOAD='3'; $env:PSExecutionPolicyPreference='Bypass'; & 'omo' '--model' 'm1' '`);
+  expect(script).toStartWith(`$env:DORI_LANE_KEY='lane-a'; $env:DORI_LANE_TOKEN_FILE='${tokenFile.replace(/'/g, "''")}'; $env:DORI_LANE_OUT='${join(tokenFile, "..", "lane-a.out").replace(/'/g, "''")}'; $env:DORI_HEAVY_SLOTS='2'; $env:DORI_HEAVY_MAX_LOAD='3'; $env:PSExecutionPolicyPreference='Bypass'; Set-Location -LiteralPath '/repo'; & 'omo' '--model' 'm1' '`);
   expect(script).toEndWith("'; exit $LASTEXITCODE");
   expect(script).not.toContain("DORI_LANE_TOKEN='");
   expect(t.calls.some((a) => a.join(" ").includes("-NoProfile"))).toBe(false);
+});
+
+test("an unsandboxed pwsh lane enters its cwd and its outside-deny rules allow that cwd", async () => {
+  const t = setup("pwsh.exe");
+  await t.lanes.start({ ...START, sandbox: false });
+  const script = decode(typed(t.calls), "pwsh");
+  expect(script).toContain("Set-Location -LiteralPath '/repo'; & 'omo' '--model' 'm1' '--permission-preset' 'full-access' '--permission' 'external_directory=deny,external_directory:/repo=allow,external_directory:/repo/*=allow,");
 });
 
 test("the lane record stores the pane's shell pid", async () => {

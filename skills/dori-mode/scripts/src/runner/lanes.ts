@@ -129,8 +129,12 @@ const psQuote = (value: string): string => `'${value.replace(/'/g, "''")}'`;
  * The line typed into a PowerShell pane: a nested `<shell> -NoLogo -EncodedCommand <base64(utf16le(script))>`, so the
  * variables live only in the nested process and the typed text is plain base64. Windows PowerShell 5.1 mangles native
  * arguments containing a double quote, so it is refused there (`RUNNER_LANE_ARGV_UNSAFE`); pwsh passes them intact.
+ * With `cwd` the nested shell enters it before the agent starts: the nested shell loads the user's profile, and a profile
+ * that changes directory would otherwise start the agent outside the lane's directory.
  */
-export const powershellLaunchLine = (shell: "pwsh" | "powershell", env: readonly (readonly [string, string])[], argv: readonly string[]): string => {
+export const powershellLaunchLine = (
+  shell: "pwsh" | "powershell", env: readonly (readonly [string, string])[], argv: readonly string[], cwd?: string,
+): string => {
   if (shell === "powershell" && argv.some((arg) => arg.includes('"'))) {
     throw new Error("RUNNER_LANE_ARGV_UNSAFE Windows PowerShell 5.1 cannot pass an argument containing a double quote; use pwsh");
   }
@@ -138,6 +142,7 @@ export const powershellLaunchLine = (shell: "pwsh" | "powershell", env: readonly
   const script = [
     ...env.map(([name, value]) => `$env:${name}=${psQuote(value)}`),
     "$env:PSExecutionPolicyPreference='Bypass'",
+    ...(cwd !== undefined ? [`Set-Location -LiteralPath ${psQuote(cwd)}`] : []),
     `& ${[program ?? "", ...args].map(psQuote).join(" ")}`,
     "exit $LASTEXITCODE",
   ].join("; ");
@@ -221,13 +226,14 @@ export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
 
   /**
-   * `outsideDenyRules` for this host: what a sandboxed lane may also reach, the runner directory (its brief, attachments,
-   * output and the lane-mode dori), the repos and worktree roots, the temp directory and omo's own ~/.omo.
+   * `outsideDenyRules` for this host: what a sandboxed lane may also reach, its own `cwd` (named, not left to omo's
+   * working directory), the runner directory (its brief, attachments, output and the lane-mode dori), the repos and
+   * worktree roots, the temp directory and omo's own ~/.omo.
    */
-  private outsideRules(): string {
+  private outsideRules(cwd: string): string {
     const paths = runnerPaths();
     const { policy } = this.deps;
-    const dirs = [this.deps.runnerDir, policy.reposRoot, effectiveWorktreeRoot(policy), tmpdir(), paths.join(homedir(), ".omo")];
+    const dirs = [cwd, this.deps.runnerDir, policy.reposRoot, effectiveWorktreeRoot(policy), tmpdir(), paths.join(homedir(), ".omo")];
     return outsideDenyRules(dirs.filter((dir): dir is string => dir !== undefined), paths.join);
   }
 
@@ -417,8 +423,9 @@ export class RunnerLanes {
     const brief = this.briefPath(key);
     const keywords = input.keywords ?? (input.mode === "mass-ulw" ? "mass-ulw" : "ulw");
     const prompt = `${keywords}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
-    const argv = agentArgv(this.deps.policy, input.profile, { prompt, model: input.model, brief }, input.session,
-      input.sandbox || input.profile === "sandboxed" ? undefined : this.outsideRules());
+    const agentValues = { prompt, model: input.model, brief };
+    // Checks the profile before a tab opens; an unsandboxed lane's rules wait for its final cwd (a target pane's own).
+    let argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session);
     const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
     let pane: string;
     let tab: string;
@@ -462,6 +469,9 @@ export class RunnerLanes {
       }
     }
     await (this.deps.legacyMcp ?? removeLegacyLaneMcp)(cwd);
+    if (!input.sandbox && input.profile !== "sandboxed") {
+      argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session, this.outsideRules(cwd));
+    }
     const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
     const previous = this.records()[key];
@@ -476,7 +486,7 @@ export class RunnerLanes {
           ...(input.fileRun ? [["DORI_LANE_OUT", laneFilePaths(this.deps.runnerDir, key).output] as const] : []),
           ...(input.heavySlots !== undefined ? [["DORI_HEAVY_SLOTS", String(input.heavySlots)] as const] : []),
           ...(input.heavyMaxLoad !== undefined ? [["DORI_HEAVY_MAX_LOAD", String(input.heavyMaxLoad)] as const] : []),
-        ], argv);
+        ], argv, cwd);
       } catch (e) {
         rmSync(tokenFile, { force: true });
         await rollback();
