@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # lane-sandbox: run a dori lane agent command inside a bubblewrap sandbox.
-# Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check
+# Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check | lane-sandbox --explain
+# --explain prints the mount table a lane in the current directory would get (same environment, DORI_LANE_KEY defaulting
+# to "explain") instead of running anything: one "<mode> <path>" line per mount, in mount order, where a later line wins at
+# and below its path. Modes: rw, ro, hide (an empty read-only tmpfs or /dev/null over the path) and empty (a fresh tmpfs:
+# none of the host's entries there show). A -try bind whose source is missing is left out, as bwrap skips it.
 # Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir; the runner's grants)
@@ -29,8 +33,15 @@ if [ "${1:-}" = "--check" ]; then
   exit 0
 fi
 
-if [ "$#" -eq 0 ]; then
-  echo "usage: lane-sandbox <cmd> [args...]" >&2
+explain=0
+if [ "${1:-}" = "--explain" ]; then
+  explain=1
+  shift
+  : "${DORI_LANE_KEY:=explain}"
+fi
+
+if [ "$#" -eq 0 ] && [ "$explain" = 0 ]; then
+  echo "usage: lane-sandbox <cmd> [args...] | --check | --explain" >&2
   exit 2
 fi
 
@@ -240,5 +251,40 @@ fi
 opts+=(--bind "$LT" "$H/.lane-tmp" --setenv TMPDIR "$H/.lane-tmp")
 # Keep the root tmpfs read-only like the old --ro-bind / / (after all mountpoints exist)
 opts+=(--remount-ro /)
+
+# --explain: the table is read off the very argv bwrap would get, so it cannot drift from the mounts.
+if [ "$explain" = 1 ]; then
+  echo "# lane-sandbox --explain (bwrap) for lane $key in $C: a later line wins at and below its path"
+  i=0
+  while [ "$i" -lt "${#opts[@]}" ]; do
+    o=${opts[$i]}
+    case "$o" in
+      --bind | --bind-try | --ro-bind | --ro-bind-try | --ro-bind-data | --symlink | --setenv)
+        a=${opts[$((i + 1))]}
+        b=${opts[$((i + 2))]}
+        i=$((i + 3))
+        case "$o" in --bind-try | --ro-bind-try) [ -e "$a" ] || continue ;; esac
+        case "$o" in
+          --bind | --bind-try) echo "rw $b" ;;
+          --ro-bind | --ro-bind-try) if [ "$a" = /dev/null ]; then echo "hide $b"; else echo "ro $b"; fi ;;
+          --ro-bind-data) echo "ro $b" ;;
+        esac
+        ;;
+      --tmpfs)
+        a=${opts[$((i + 1))]}
+        i=$((i + 2))
+        if [ "${opts[$i]:-}" = --remount-ro ] && [ "${opts[$((i + 1))]:-}" = "$a" ]; then
+          echo "hide $a"
+          i=$((i + 2))
+        else
+          echo "empty $a"
+        fi
+        ;;
+      --unshare-pid | --die-with-parent) i=$((i + 1)) ;;
+      *) i=$((i + 2)) ;;
+    esac
+  done
+  exit 0
+fi
 
 exec bwrap "${opts[@]}" -- "$@"

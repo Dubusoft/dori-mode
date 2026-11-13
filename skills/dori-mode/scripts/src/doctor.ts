@@ -119,8 +119,9 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
   if (!probe.out.split(/\r?\n/).includes("DORI_LANE_FILES=1")) return [fail("lane sandbox", `${installed} --check does not print DORI_LANE_FILES=1; sandboxed lane starts and recoveries are refused (LANE_FILES_SANDBOX_OLD)`, refresh)];
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
   const templateHash = createHash("sha256").update(readFileSync(template)).digest("hex");
-  const exposed = await exposure(d, installed);
-  if (installedHash === templateHash) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`), exposed];
+  // Only a current wrapper is asked for its table: an older one has no --explain.
+  const [exposed, allowed] = await Promise.all([exposure(d, installed), installedHash === templateHash ? permissions(d, installed) : undefined]);
+  if (allowed) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`), exposed, allowed];
   return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh), exposed];
 };
 
@@ -175,6 +176,23 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   const onPurpose = intended.length ? `; bound on purpose: ${intended.map(home).join(", ")}` : "";
   if (unexpected.length) return warn("lane exposure", `a lane can read ${unexpected.map(home).join(", ")}${onPurpose}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
   return ok("lane exposure", `${candidates.length - intended.length} sensitive path(s) checked, none readable in a lane${onPurpose}`);
+};
+
+/**
+ * What a lane on this host may touch, read off the installed wrapper's --explain table run as a lane with cwd / (so no
+ * cwd is in it, nor the runner's worktree and repos roots and grants, which each lane adds). A row a later row overrides at
+ * its own path is left out, as the table's later lines win.
+ */
+const permissions = async (d: Pick<DoctorDeps, "home" | "run">, installed: string): Promise<Check> => {
+  const ran = await d.run(["env", "DORI_LANE_KEY=doctor-probe", installed, "--explain"], { ...T, cwd: "/" });
+  if (ran.code !== 0) return warn("lane permissions", `${installed} --explain failed: ${(ran.err || ran.out).replace(/\s+/g, " ").trim() || `exit ${ran.code}`}`, "run dori doctor again once the lane sandbox check passes");
+  const rows = ran.out.split(/\r?\n/).filter((l) => l !== "" && !l.startsWith("#")).map((l) => ({ mode: l.slice(0, l.indexOf(" ")), path: l.slice(l.indexOf(" ") + 1) }));
+  const covers = (pattern: string, p: string) => new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]+")}(/|$)`).test(p);
+  const home = (p: string) => (p === d.home ? "~" : p.startsWith(`${d.home}/`) ? `~/${p.slice(d.home.length + 1)}` : p);
+  const list = (mode: string) => [...new Set(rows.filter((r) => r.mode === mode && r.path !== "/" && rows.findLast((o) => covers(o.path, r.path))?.mode === mode).map((r) => home(r.path)))];
+  const parts = [["writable", list("rw")], ["hidden", list("hide")], ["empty (only the paths bound into it show)", list("empty")]] as const;
+  const shown = parts.filter(([, paths]) => paths.length).map(([label, paths]) => `${label}: ${paths.join(", ")}`).join("; ");
+  return ok("lane permissions", `${shown}; each lane adds its cwd, its runner's worktree and repos roots and its grants (the full table: DORI_LANE_KEY=<key> ${installed} --explain)`);
 };
 
 /** The label of a worker runner installed on this host (`dori runner install`); undefined on the lead host, whose runner is `local`. */

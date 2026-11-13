@@ -179,6 +179,10 @@ test("a remote lane is sandboxed by default; a machine opted in with runners.<la
   expect(starts()[1]).toMatchObject({ machine: "m2", sandbox: false });
   expect(r.lane.sandbox).toBeUndefined();
   expect(r.notes).toContain("SANDBOX_SKIPPED pane-lane-2: machine m2 is opted in with runners.m2.allowUnsandboxed; this lane runs WITHOUT a sandbox");
+  // The footer tells each lane which permissions it got: the sandbox's table, or none.
+  expect(starts()[0]!.briefText).toContain("- Sandbox permissions: writable = ");
+  expect(starts()[1]!.briefText).toContain("- Sandbox permissions: none.");
+  expect(starts()[1]!.briefText).not.toContain("- Sandbox permissions: writable = ");
 });
 
 test("a lane on a Windows runner runs without a sandbox and says so; a runner reporting another OS stays sandboxed", async () => {

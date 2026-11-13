@@ -62,7 +62,7 @@ const fixture = (patch: Patch = {}) => {
   const wrapper = join(state.dir, ".local", "bin", "lane-sandbox");
   mkdirSync(join(state.dir, ".local", "bin"), { recursive: true });
   copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);
-  const table = { ...happyRun, [`${wrapper} --check`]: checked(), ...patch.run };
+  const table = { ...happyRun, [`${wrapper} --check`]: checked(), [`env DORI_LANE_KEY=doctor-probe ${wrapper} --explain`]: ok("rw /tmp\n"), ...patch.run };
   const routes = { ...happyHttp, ...patch.http };
   const calls: string[] = [];
   const requests: HttpRequest[] = [];
@@ -187,6 +187,33 @@ test("doctor probes lane exposure through the shipped Linux template, whose lane
   expect(find(checks, "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
   // The probe lane's directories do not outlive the run.
   for (const n of ["doctor-probe.files", "doctor-probe.out"]) expect(existsSync(join(defaultRunnerDir(home), "briefs", n))).toBe(false);
+});
+
+test("doctor shows what a lane may write and what it cannot see, read off the installed wrapper's --explain", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  const wrapper = join(home, ".local", "bin", "lane-sandbox");
+  const backups = join(home, "backups");
+  mkdirSync(join(backups, "granted"), { recursive: true });
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${backups}\n`);
+  const argvs: string[][] = [];
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env") return f.deps.run(argv, {});
+    argvs.push([...argv]);
+    // A runner grant under a hidden path: the table binds it, then hides it again.
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, env: { PATH: process.env.PATH, HOME: home, LANE_SANDBOX_RW: join(backups, "granted") }, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  const check = find(await runDoctor({ ...f.deps, run: real }), "lane permissions");
+  expect(argvs).toContainEqual(["env", "DORI_LANE_KEY=doctor-probe", wrapper, "--explain"]);
+  expect(check.level).toBe("OK");
+  expect(check.detail).toMatch(/^writable: [^;]*~\/\.cache[^;]*; hidden: [^;]*~\/backups[^;]*; empty \(only the paths bound into it show\): ~, ~\/\.dori; /);
+  // Hidden after it is bound, so not writable.
+  expect(check.detail).not.toContain("~/backups/granted");
+  expect(check.detail).toContain(`${wrapper} --explain`);
+
+  const failing = async (argv: readonly string[]): Promise<Ran> => (argv.at(-1) === "--explain" ? { code: 2, out: "", err: "usage: lane-sandbox\n" } : f.deps.run(argv, {}));
+  expect(find(await runDoctor({ ...f.deps, run: failing }), "lane permissions")).toMatchObject({ level: "WARN", detail: `${wrapper} --explain failed: usage: lane-sandbox` });
 });
 
 test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {

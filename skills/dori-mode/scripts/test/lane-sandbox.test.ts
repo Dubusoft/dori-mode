@@ -690,3 +690,97 @@ test("macOS: a granted lane may write its write grants and read its read grants;
   expect(allows(hidden, "file-write-data", join(runs, "topic.lock"))).toBe(false);
   expect(allows(hidden, "file-read-data", join(notes, "a.md"))).toBe(false);
 });
+
+/** The `<mode> <path>` lines a template's --explain prints, comments dropped. */
+const explainRows = (out: string): string[] => out.split("\n").filter((l) => l !== "" && !l.startsWith("#"));
+
+/**
+ * The mounts bwrap makes from `argv`, as --explain rows in mount order: a bind is rw or ro (ro over /dev/null hides the
+ * path), a tmpfs remounted read-only at once hides its path and any other tmpfs starts empty; a -try bind of a missing
+ * source is skipped, as bwrap skips it.
+ */
+const mountTable = (argv: string[]): string[] => {
+  const rows: string[] = [];
+  const withTwo = new Set(["--bind", "--bind-try", "--ro-bind", "--ro-bind-try", "--ro-bind-data", "--symlink", "--setenv"]);
+  for (let i = 0; i < argv.length && argv[i] !== "--";) {
+    const o = argv[i] as string;
+    if (withTwo.has(o)) {
+      const src = argv[i + 1] as string, dst = argv[i + 2] as string;
+      i += 3;
+      if (o.endsWith("-try") && !existsSync(src)) continue;
+      if (o === "--bind" || o === "--bind-try") rows.push(`rw ${dst}`);
+      else if (o === "--ro-bind-data") rows.push(`ro ${dst}`);
+      else if (o === "--ro-bind" || o === "--ro-bind-try") rows.push(`${src === "/dev/null" ? "hide" : "ro"} ${dst}`);
+    } else if (o === "--tmpfs") {
+      const p = argv[i + 1] as string;
+      i += 2;
+      if (argv[i] === "--remount-ro" && argv[i + 1] === p) {
+        rows.push(`hide ${p}`);
+        i += 2;
+      } else rows.push(`empty ${p}`);
+    } else i += o === "--unshare-pid" || o === "--die-with-parent" ? 1 : 2;
+  }
+  return rows;
+};
+
+test("--explain prints the mount table bwrap gets, grants, repos, hide list and the hidden sockets included", async () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const hidden = join(root, "private"), runs = join(root, "runs"), notes = join(root, "notes"), underHidden = join(hidden, "granted");
+  const repos = join(root, "repos"), worktrees = join(root, "worktrees");
+  for (const d of [hidden, runs, notes, underHidden, join(repos, "app", ".git", "hooks"), worktrees, join(home, ".dori", "runner", "briefs")]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(hidden, "key"), "x");
+  writeFileSync(join(home, ".gitconfig"), "x");
+  const token = join(home, ".dori", "runner", "briefs", "lane-a.1.token");
+  writeFileSync(token, "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# private\n${hidden}\n${join(hidden, "key")}\n${join(root, "missing")}\n`);
+  const env = { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token, LANE_SANDBOX_RW: `${runs}:${underHidden}`, LANE_SANDBOX_RO: notes, LANE_SANDBOX_REPOS: repos, LANE_SANDBOX_WORKTREES: worktrees };
+
+  const argv = await sandboxArgv(home, env);
+  const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "--explain"], { cwd: join(home, "work"), env: { PATH: `${join(home, "fake-bin")}:${process.env.PATH ?? ""}`, HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+
+  const rows = explainRows(out);
+  expect(rows).toEqual(mountTable(argv));
+  for (const row of [`rw ${runs}`, `ro ${notes}`, `rw ${worktrees}`, `rw ${join(repos, "app", ".git")}`, `ro ${join(repos, "app", ".git", "hooks")}`, `ro ${token}`, `ro ${join(home, ".gitconfig")}`, `empty ${join(home, ".dori")}`, `rw ${join(home, ".lane-tmp")}`]) expect(rows).toContain(row);
+  // The hide list comes after every grant, so a granted path under a hidden one stays covered.
+  expect(rows.indexOf(`hide ${hidden}`)).toBeGreaterThan(rows.indexOf(`rw ${underHidden}`));
+  expect(rows).toContain(`hide ${join(hidden, "key")}`);
+  // A missing -try source (an absent dotfile) is not listed: bwrap skips it.
+  expect(rows.some((r) => r.endsWith("/.zshrc"))).toBe(false);
+});
+
+test("macOS: --explain lists every path the profile names, each with the access the profile gives it", async () => {
+  const { root, home, wt, token } = macHome();
+  const hidden = join(root, "private"), runs = join(root, "runs"), notes = join(root, "notes"), repos = join(root, "repos"), worktrees = join(root, "worktrees");
+  for (const d of [hidden, runs, notes, join(repos, "app", ".git"), worktrees]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${hidden}\n`);
+  const env = { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token, LANE_SANDBOX_RW: runs, LANE_SANDBOX_RO: notes, LANE_SANDBOX_REPOS: repos, LANE_SANDBOX_WORKTREES: worktrees, SSH_AUTH_SOCK: join(home, ".config", "herdr", "agent") };
+
+  const sb = await seatbelt(home, wt, env);
+  const explained = await runMacos(home, wt, ["--explain"], env, join(root, "no-sandbox-exec"));
+  expect({ code: explained.code, err: explained.err }).toEqual({ code: 0, err: "" });
+  const rows = explainRows(explained.out).map((l) => ({ mode: l.slice(0, l.indexOf(" ")), path: l.slice(l.indexOf(" ") + 1) }));
+
+  // Every path parameter the profile's file rules use is a row (sockets, /dev and the keychain's temp copies are not paths).
+  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|CRED|HIDE)\d+$|^(DORI|DORI_ENV|DORI_SECRETS|CONFIG|CONFIG_GH|CONFIG_GIT|HOOKS|KEYCHAIN)$/.test(k)).map(([, v]) => v);
+  expect(named.filter((p) => !rows.some((r) => r.path === p))).toEqual([]);
+  expect(sb.params.REPOS_GIT).toBeDefined();
+  expect(rows).toContainEqual({ mode: "rw", path: `${repos}/*/.git` });
+
+  // A row's path pattern, * standing for one component, covers the path itself and everything below it.
+  const covers = (pattern: string, p: string) => new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]+")}(/|$)`).test(p);
+  const verdict = (p: string) => rows.findLast((r) => covers(r.path, p))?.mode;
+  const kc = sb.params.KEYCHAIN;
+  for (const row of rows) {
+    const at = row.path.replace(/\*/g, "app");
+    // ~/.dori itself may be listed (omo resolves a cwd-less lane's parents); the keychain and ssh keys are single files.
+    const probes = row.path === sb.params.DORI ? [join(at, "x")] : row.path === kc || row.path.endsWith("/id_*") ? [at] : [at, join(at, "x")];
+    for (const p of probes) {
+      const mode = verdict(p);
+      const got = { p, read: allows(sb, "file-read-data", p), write: allows(sb, "file-write-data", p) };
+      expect(got).toEqual({ p, read: mode !== "hide", write: mode === "rw" });
+    }
+  }
+});
