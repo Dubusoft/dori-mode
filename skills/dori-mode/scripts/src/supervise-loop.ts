@@ -61,7 +61,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
 import { appendFollowUp, redirectIfClosed } from "./thread-followup.ts";
-import { taskFinisher } from "./task-finish.ts";
+import { taskBlocker, taskFinisher } from "./task-finish.ts";
 import { ToodoWriter } from "./toodo-client.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
@@ -1039,8 +1039,10 @@ export const supervise = async (
     // Each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog.
     // The watcher reads its claim announcements back from the journal.
     // The supervisor finishes a merged lane's Toodo task and appends the merge to its report (task-finish.ts).
-    const finishTask = taskFinisher({ writer: new ToodoWriter(deps.tunables.toodoWriter), append: (lane, text) => appendFollowUp(stateDir, discord, lane, text) });
-    const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask };
+    // An autopilot task it cannot finish, or whose lane closed cancelled, gets a blocker note instead.
+    const toodoWriter = new ToodoWriter(deps.tunables.toodoWriter);
+    const finishTask = taskFinisher({ writer: toodoWriter, append: (lane, text) => appendFollowUp(stateDir, discord, lane, text) });
+    const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter) };
     const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard, () => github.openPulls()).map(([name, step]): Sweep => [name, async (emit) =>
       watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
     const recentWarnings = new Map<string, number>();

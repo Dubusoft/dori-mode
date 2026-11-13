@@ -48,6 +48,12 @@ When the lane a row names closes, the close settles the row once and adds `outco
 - A close with `--cancelled` (the lane never started, e.g. after `RUNNER_LAUNCH_FAILED`, was given up, or its Done can never hold) settles the row `failed` with `outcome: "failed"` and gives the lead `AUTOPILOT_LANE_FAILED #<id> lane=<key> attempt=<n> cancelled: <reason>: tell the owner; autopilot does not launch it again`.
 - Any other close (every Done signal held, or its PR merged) keeps the row `verified` with `outcome: "done"` and gives `AUTOPILOT_LANE_DONE #<id> lane=<key> attempt=<n>: complete toodo task #<id>`.
 
+After the close the supervisor writes the outcome to the task (task-finish.ts, every write read back with `get_task`) and marks the row's data `toodo` once (`done`, `blocked` or `failed`), so a resumed or repeated close never writes to the task or tells the lead again; nothing is relaunched:
+
+- Done, PR read back merged: each pending manual criterion is checked with the merge as evidence and the task is completed with the PR as a ref and a note naming its merge SHA. The line becomes `AUTOPILOT_LANE_DONE ... attempt=<n> toodo=done: toodo task #<id> completed and read back by the supervisor`, which is digest.
+- Done, but the task could not be completed (no merge read back, toodo refused or did not confirm): the task gets a blocker note and the one failure line, `TOODO_TASK_NOT_COMPLETED`, ends with `blocker recorded on toodo task #<id>` (or why it was not).
+- Cancelled: `dori close` (or the supervisor resuming it) records the blocker note and the failure line reads `AUTOPILOT_LANE_FAILED ... cancelled: <reason> toodo=blocked: blocker recorded on toodo task #<id>; tell the owner; ...`.
+
 `dori close` prints the line; a close the supervisor runs journals it as an urgent event under the id `autopilot-outcome:<key>`, so it is told once. A row the launch itself settled `failed` or `ambiguous` is left as it is.
 
 Rows with lane `autopilot` and action `autopilot-shadow` are judgment records an older dori wrote (shadow mode, now removed); nothing reads or writes them any more.
@@ -146,7 +152,7 @@ The supervisor judges the same candidates itself every `autopilot.tickSec` (5 mi
 - Autopilot has no mode to set. When the owner says to stop autopilot, run `dori autopilot pause --reason TEXT` (and `resume` when they say to go on).
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
 - Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
-- A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them (`report_blocker` on it). On `AUTOPILOT_LANE_DONE` complete the task (`complete_task` with the PR as a ref), which lets its dependents become ready.
+- A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them; the close already recorded its blocker (`toodo=blocked`), so add one only when the line says it was not recorded. `AUTOPILOT_LANE_DONE ... toodo=done` needs nothing: the supervisor completed the task with its PR, which lets its dependents become ready. On a plain `AUTOPILOT_LANE_DONE` (its `TOODO_TASK_NOT_COMPLETED` says why) complete the task yourself (`complete_task` with the PR as a ref).
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
 - Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 

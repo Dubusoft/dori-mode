@@ -1,3 +1,4 @@
+import { LANE_DONE_EVENT, LANE_FAILED_EVENT } from "./autopilot.ts";
 import type { Lane } from "./registry.ts";
 import type { ToodoWriter } from "./toodo-client.ts";
 
@@ -7,6 +8,11 @@ import type { ToodoWriter } from "./toodo-client.ts";
  * with a note naming the PR and its merge SHA (ToodoWriter reads every write back), then the lane's last report gets
  * the merge appended. The close line then carries `toodo=done` and, after a claim the lead already took, is digest
  * (event-policy.ts). Anything else (no task, no merge read back, a refused or unconfirmed write) is left to the lead.
+ *
+ * An autopilot lane's close is told the same way: its AUTOPILOT_LANE_DONE is rewritten `toodo=done` (digest) once the
+ * supervisor completed the task (finishedOutcome). An autopilot task the supervisor did not finish, or whose lane closed
+ * cancelled, gets a blocker note (taskBlocker, read back) and its one failure line says so; done-flow.ts marks the
+ * launch attempt (autopilot.ts markLaneToodo) so the task is written to and told about once, and never relaunched.
  */
 
 /** A lane PR read back merged: its merge SHA and base, as CI_MERGED / MERGE_VERIFIED report them. */
@@ -33,6 +39,39 @@ export type TaskFinisher = (lane: Lane, task: number, merges: readonly LaneMerge
 
 const flat = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim().slice(0, max);
 const errorText = (e: unknown): string => flat(e instanceof Error ? e.message : String(e));
+
+/** Records why an autopilot lane's task was not finished, as a blocker note; returns what to say about it (never throws). */
+export type TaskBlocker = (lane: Lane, task: number, why: string) => Promise<string>;
+
+/**
+ * The blocker note is the same text for the same lane and reason, so a repeated write finds it and sends nothing
+ * (ToodoWriter.reportBlocker). The task's status stays: the lead decides whether to fix, drop or retry it.
+ */
+export const taskBlocker = (writer: Pick<ToodoWriter, "reportBlocker">): TaskBlocker => async (lane, task, why) => {
+  const note = `Autopilot lane ${lane.key} ended without finishing this task: ${flat(why, 500)}. Autopilot does not launch it again; the lead decides whether to fix, drop or retry it.`;
+  try {
+    await writer.reportBlocker(task, note);
+    return `blocker recorded on toodo task #${task}`;
+  } catch (e) {
+    return `blocker not recorded on toodo task #${task}: ${errorText(e)}`;
+  }
+};
+
+/** Tags whose task the supervisor completed and read back. */
+export const taskCompleted = (finish: TaskFinish | undefined): boolean => finish?.tag === "done" || finish?.tag === "append-failed";
+
+/**
+ * An autopilot outcome line after its lane's task follow-up: AUTOPILOT_LANE_DONE asks the lead to complete the task only
+ * while the supervisor has not (`toodo=done` otherwise, which is digest). Any other line is returned as is.
+ */
+export const finishedOutcome = (line: string, finish: TaskFinish | undefined): string =>
+  line.startsWith(`${LANE_DONE_EVENT} `) && taskCompleted(finish)
+    ? line.replace(/: complete toodo task (#\d+)$/, " toodo=done: toodo task $1 completed and read back by the supervisor")
+    : line;
+
+/** An AUTOPILOT_LANE_FAILED line with what was recorded on its task (`said`, from TaskBlocker) and `toodo=blocked`. */
+export const blockedOutcome = (line: string, said: string): string =>
+  line.startsWith(`${LANE_FAILED_EVENT} `) ? line.replace(/: tell the owner; /, ` toodo=blocked: ${said}; tell the owner; `) : line;
 
 export const notCompletedLine = (lane: Lane, task: number, why: string): string =>
   `TOODO_TASK_NOT_COMPLETED ${lane.key} #${task} ${flat(why)}; finish it yourself (complete_task with the PR and its merge SHA, then dori reported ${lane.key} --append)`;

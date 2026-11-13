@@ -11,7 +11,8 @@ import { redactSecrets } from "./redact.ts";
  * Rows:
  * - launch attempt (written by `dori autopilot launch`): lane `toodo:<taskId>`, action `autopilot-launch`, target
  *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous. When its lane
- *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed).
+ *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed). After the
+ *   close the supervisor's Toodo follow-up adds `toodo` (markLaneToodo): what it recorded on the task, written once.
  */
 
 export const LAUNCH_ACTION = "autopilot-launch";
@@ -167,7 +168,10 @@ export const autopilotLocalStateKey = (store: OperationStore, openLanes: Readonl
       .map((op) => `${op.id}:${op.state}`).sort(),
   ]);
 
-/** The lines settleLaneOutcome returns; the lead reports a failure to the owner and completes the toodo task of a done one. */
+/**
+ * The lines settleLaneOutcome returns. A done one asks the lead to complete the task unless the supervisor did
+ * (task-finish.ts rewrites it `toodo=done`); a failed one goes to the owner with the task's blocker recorded.
+ */
 export const LANE_DONE_EVENT = "AUTOPILOT_LANE_DONE";
 export const LANE_FAILED_EVENT = "AUTOPILOT_LANE_FAILED";
 export const isLaneOutcomeLine = (line: string): boolean => line.startsWith(`${LANE_DONE_EVENT} `) || line.startsWith(`${LANE_FAILED_EVENT} `);
@@ -198,6 +202,32 @@ export const settleLaneOutcome = (store: OperationStore, now: number, laneKey: s
   }
   store.put({ ...op, state: "failed", detail: `lane ${laneKey} closed without finishing${why ? `: ${why}` : ""}`, data, updatedAt: now });
   return `${LANE_FAILED_EVENT} ${head}${why ? ` ${why}` : ""}: tell the owner; autopilot does not launch it again`;
+};
+
+/** The launch attempt whose lane is `laneKey`, else undefined (not an autopilot lane). */
+export const laneAttempt = (store: OperationStore, laneKey: string): Operation | undefined =>
+  ledgerRows(store).find((row) => laneKeyOf(row) === laneKey);
+
+/** What the supervisor recorded on the Toodo task of an attempt's closed lane (`data.toodo`), else undefined. */
+export const toodoMarkOf = (op: Operation): string | undefined => {
+  try {
+    const data = JSON.parse(op.data ?? "") as unknown;
+    return isRecord(data) && typeof data.toodo === "string" ? data.toodo : undefined;
+  } catch { return undefined; }
+};
+
+/**
+ * Records on the launch attempt of `laneKey` what the supervisor wrote to its Toodo task when the lane closed (e.g.
+ * `done`, `blocked`): the terminal mark that keeps a resumed or repeated close from writing to the task or telling the
+ * lead again. Returns false when the lane has no attempt or the mark is already there.
+ */
+export const markLaneToodo = (store: OperationStore, now: number, laneKey: string, mark: string): boolean => {
+  const op = laneAttempt(store, laneKey);
+  if (!op || toodoMarkOf(op) !== undefined) return false;
+  // Found by the laneKey in its data, so the data is a JSON object.
+  const data = JSON.parse(op.data ?? "{}") as Record<string, unknown>;
+  store.put({ ...op, data: JSON.stringify({ ...data, toodo: mark }), updatedAt: now });
+  return true;
 };
 
 export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>): LedgerState => {
