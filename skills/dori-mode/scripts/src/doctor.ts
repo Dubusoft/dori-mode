@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -156,7 +156,17 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   const hidden = existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : [];
   const candidates = [...new Set([...SENSITIVE, ...keys].map((p) => join(d.home, p)).concat(hidden))].filter(nonEmpty);
   if (candidates.length === 0) return ok("lane exposure", "none of the known credential stores exist on this host");
-  const probe = await d.run(["env", "DORI_LANE_KEY=doctor-probe", installed, "/bin/sh", "-c", PROBE, "lane-exposure", ...candidates], { ...T, cwd: "/" });
+  // The wrapper binds a lane's input and output directories without -try (a lane missing its inputs must not start), so
+  // the probe lane gets empty ones for the run.
+  const briefs = join(defaultRunnerDir(d.home), "briefs");
+  const laneDirs = ["doctor-probe.files", "doctor-probe.out"].map((n) => join(briefs, n));
+  for (const dir of laneDirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let probe: Awaited<ReturnType<Runner>>;
+  try {
+    probe = await d.run(["env", "DORI_LANE_KEY=doctor-probe", installed, "/bin/sh", "-c", PROBE, "lane-exposure", ...candidates], { ...T, cwd: "/" });
+  } finally {
+    for (const dir of laneDirs) rmSync(dir, { recursive: true, force: true });
+  }
   if (probe.code !== 0) return warn("lane exposure", `could not probe what a lane can read (${probe.err.trim() || `exit ${probe.code}`})`, "run dori doctor again once the lane sandbox check passes");
   const seen = new Set(probe.out.split(/\r?\n/).filter(Boolean));
   const home = (p: string) => (p.startsWith(`${d.home}/`) ? `~/${p.slice(d.home.length + 1)}` : p);

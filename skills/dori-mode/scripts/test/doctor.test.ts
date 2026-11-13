@@ -164,6 +164,31 @@ test("doctor names the sensitive host paths a lane can read, probed through the 
   expect(find(await runDoctor({ ...f.deps, run: real }), "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
 });
 
+test("doctor probes lane exposure through the shipped Linux template, whose lane input and output binds need existing sources", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  copyFileSync(LANE_SANDBOX_TEMPLATE, join(home, ".local", "bin", "lane-sandbox"));
+  chmodSync(join(home, ".local", "bin", "lane-sandbox"), 0o755);
+  // Like bwrap, a --ro-bind or --bind whose source is missing fails the run; the command itself reads nothing.
+  const bin = join(home, "fake-bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "bwrap"), '#!/bin/sh\nprev=\nfor a do [ "$a" = -- ] && exit 0; case "$prev" in --ro-bind|--bind) [ -e "$a" ] || { echo "bwrap: Can\'t find source path $a: No such file or directory" >&2; exit 1; } ;; esac; prev=$a; done\nexit 0\n');
+  chmodSync(join(bin, "bwrap"), 0o755);
+  process.env.PATH = `${bin}:${PATH}`;
+  mkdirSync(join(home, ".aws"));
+  writeFileSync(join(home, ".aws", "credentials"), "x");
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env" && argv[1] !== "--check") return f.deps.run(argv, {});
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  const checks = await runDoctor({ ...f.deps, run: real });
+  expect(find(checks, "lane sandbox")).toMatchObject({ level: "OK" });
+  expect(find(checks, "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
+  // The probe lane's directories do not outlive the run.
+  for (const n of ["doctor-probe.files", "doctor-probe.out"]) expect(existsSync(join(defaultRunnerDir(home), "briefs", n))).toBe(false);
+});
+
 test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {
   const f = fixture();
   const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? ok() : f.deps.run(argv, {})) }), "lane sandbox");
