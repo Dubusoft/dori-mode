@@ -25,7 +25,10 @@ import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journ
  * The obligation is also the lane's one finish record: a finish event that joins it with nothing new for the lead is
  * quiet and wakes no one (supervise-delivery.ts); it rides along with the next delivery. That is a claimed lane's first
  * CI_MERGED, or one at a PR head the row already saw merged: the claim already woke the lead, and the merge closes the
- * lane at once (done-flow.ts mergeConfirmed). A claim, a close and a merge at another PR head always wake.
+ * lane at once (done-flow.ts mergeConfirmed). Once an event of the row has woken the lead, a close whose Toodo task the
+ * supervisor finished (`toodo=done`, task-finish.ts) and the lane's AUTOPILOT_LANE_DONE are quiet too: one lane result
+ * wakes the lead once. A claim, a close the lead still has work on, and a merge at another PR head always wake; so do the
+ * failure lines (LANE_NOT_DONE, TOODO_TASK_NOT_COMPLETED, AUTOPILOT_LANE_FAILED), which never join a row.
  */
 
 export const REPORTED_DIR = "reported";
@@ -45,6 +48,9 @@ export class ReportedError extends Error {}
 const CLAIM = "LANE_DONE_CLAIMED ";
 const REJECTED = "LANE_NOT_DONE ";
 const MERGED = "CI_MERGED ";
+const AUTOPILOT_DONE = "AUTOPILOT_LANE_DONE ";
+/** A close after which nothing is left for the lead: the supervisor finished the lane's Toodo task. */
+const FINISHED_CLOSE = /^LANE_CLOSED \S+ closed\b.* toodo=done(?= |$)/;
 
 /** The PR head a `CI_MERGED ... head=<sha> ...` line names. */
 const mergedHead = (line: string): string | undefined => (line.startsWith(MERGED) ? / head=(\S+)/.exec(line)?.[1] : undefined);
@@ -57,6 +63,9 @@ const keyOf = (lane: string | undefined): string | undefined => (lane && LANE_KE
  */
 export const outcomeLane = (line: string): string | undefined =>
   keyOf(line.startsWith("LANE_CLOSED ") || line.startsWith(CLAIM) ? line.split(" ")[1] : line.startsWith("CI_MERGED ") ? / lane=(\S+)/.exec(line)?.[1] : undefined);
+
+/** The lane an autopilot lane's done outcome names (`AUTOPILOT_LANE_DONE #<task> lane=<key> ...`): it joins a row, never opens one. */
+const riderLane = (line: string): string | undefined => keyOf(line.startsWith(AUTOPILOT_DONE) ? / lane=(\S+)/.exec(line)?.[1] : undefined);
 
 /** The lane whose done claim was rejected: `LANE_NOT_DONE <key> ...`. */
 export const rejectedLane = (line: string): string | undefined => keyOf(line.startsWith(REJECTED) ? line.split(" ")[1] : undefined);
@@ -164,25 +173,32 @@ export class OutcomeTracking {
   track(event: Event): void {
     const rejected = rejectedLane(event.line);
     if (rejected) { this.dropClaim(rejected); return; }
-    const lane = outcomeLane(event.line);
-    if (!lane || !forLead(eventClass(event.line, this.core.deps.tunables.eventPolicy))) return;
+    const rider = riderLane(event.line);
+    const lane = outcomeLane(event.line) ?? rider;
+    const cls = eventClass(event.line, this.core.deps.tunables.eventPolicy);
+    if (!lane || !forLead(cls)) return;
     const outcomes = this.journal.outcomes ?? [];
     const at = outcomes.findIndex((outcome) => outcome.lane === lane);
     const line = event.line.slice(0, OUTCOME_LINE_MAX);
     const found = at < 0 ? undefined : outcomes[at];
-    if (found?.events?.includes(event.id)) return;
+    if (found?.events?.includes(event.id) || (rider && !found)) return;
     // Claim-only while every event in the row is a claim (a receipt-only row has none yet).
     const claim = event.line.startsWith(CLAIM) && (!found || found.claim === true || !found.events?.length);
     const head = mergedHead(event.line);
     const heads = found?.heads ?? [];
     // A merge after the claim (of the claimed head, or one already merged) adds nothing the lead must do now.
-    const quiet = event.line.startsWith(MERGED) && found?.claimed === true && (!heads.length || (head !== undefined && heads.includes(head)));
+    const merge = event.line.startsWith(MERGED) && found?.claimed === true && (!heads.length || (head !== undefined && heads.includes(head)));
+    // A row from before `woke` was kept counts its claim as the wake.
+    const woke = found?.woke === true || found?.claimed === true;
+    // The lead already woke for this lane's result: a finished close or the autopilot outcome adds nothing it must do now.
+    const quiet = merge || (woke && (rider !== undefined || FINISHED_CLOSE.test(event.line)));
     const { claim: _was, ...kept } = found ?? { lane, since: event.at ?? this.core.deps.clock.now() };
     const next: LaneOutcome = {
       ...kept, line: kept.line ?? line, events: [...(kept.events ?? []), event.id], ...(claim ? { claim } : {}),
       ...(event.line.startsWith(CLAIM) ? { claimed: true as const } : {}),
       ...(head && !heads.includes(head) ? { heads: [...heads, head] } : {}),
       ...(quiet ? { quiet: [...(kept.quiet ?? []), event.id] } : {}),
+      ...(woke || (cls === "lead-urgent" && !quiet) ? { woke: true as const } : {}),
     };
     this.journal = { ...this.journal, outcomes: at < 0 ? [...outcomes, next] : outcomes.map((outcome, i) => (i === at ? next : outcome)) };
   }
