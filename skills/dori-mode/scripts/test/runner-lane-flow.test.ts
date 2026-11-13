@@ -177,7 +177,7 @@ test("an effect's {detail, result} goes out in cmd.result.result and the lanes h
   expect(t.emitted).toEqual([]);
 });
 
-test("the runner's effects table answers lane.start, lane.notify, lane.observe and guard.kill with their structured results", async () => {
+test("the runner's effects table answers lane.start, lane.notify, lane.observe, guard.kill and lane.attach with their structured results", async () => {
   const t = await setup();
   const runnerDir = join(t.s.dir, "runner");
   mkdirSync(runnerDir, { mode: 0o700 });
@@ -207,12 +207,16 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe a
   await send(2, "lane.notify", { cmdId: "lane.notify:lane-a:2:1", key: "lane-a", status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
   await send(3, "lane.observe", { cmdId: "lane.observe:lane-a:3:1", key: "lane-a" });
   await send(4, "guard.kill", { cmdId: "guard.kill:-:4:1", keys: ["lane-a"] });
+  const added = Buffer.from("added later");
+  await send(5, "lane.attach", { cmdId: "lane.attach:lane-a:5:1", key: "lane-a", tree: { directories: ["r0000"], files: [{ path: "r0000/more.md", bytes: added.length, sha256: createHash("sha256").update(added).digest("hex"), base64: added.toString("base64") }] } });
   expect(published.map(({ state: s, detail, result }) => ({ s, detail, result }))).toEqual([
     { s: "verified", detail: "started pane=p7 tab=t7", result: { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "ready" }, cwd: "/repo" } },
     { s: "verified", detail: "noted done-claimed", result: {} },
     { s: "verified", detail: "observed working", result: { status: "working" } },
     { s: "verified", detail: "killed 1", result: { killed: [{ pid: 40, comm: "qemu", rssKb: 9, lane: "lane-a" }] } },
+    { s: "verified", detail: `attached files=1 dir=${join(runnerDir, "briefs/lane-a.files/a0001")}`, result: { dir: join(runnerDir, "briefs/lane-a.files/a0001") } },
   ]);
+  expect(readFileSync(join(runnerDir, "briefs/lane-a.files/a0001/r0000/more.md"), "utf8")).toBe("added later");
   expect(lanes.notice("lane-a")).toEqual({ status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
 });
 

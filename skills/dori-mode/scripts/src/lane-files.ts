@@ -221,8 +221,9 @@ export const prepareLaneBrief = (input: {
   const { key, stateDir, briefText, requiredReport } = input;
   validateFileKey(key);
   limit(key, "briefBytes", bytes(input.rawBriefText ?? briefBody(briefText)));
-  const roots = LEAD_ATTACHMENT_ROOTS(stateDir).flatMap((path) => {
-    try { return [{ path: resolve(path), real: realpathSync(path) }]; } catch (e) { if (codeOf(e) === "ENOENT") return []; throw e; }
+  // A root that does not exist still claims its paths, so a reference under it is reported missing rather than outside.
+  const roots = LEAD_ATTACHMENT_ROOTS(stateDir).map((path): { path: string; real?: string } => {
+    try { return { path: resolve(path), real: realpathSync(path) }; } catch (e) { if (codeOf(e) === "ENOENT") return { path: resolve(path) }; throw e; }
   });
   const research = resolve(LEAD_ATTACHMENT_ROOTS(stateDir)[0]!);
   const unsafe = (path: string, reason: string): never => { throw new LaneFileError("LANE_FILE_UNSAFE", key,
@@ -238,7 +239,7 @@ export const prepareLaneBrief = (input: {
   const occurrences = scanBriefPaths(briefText);
   for (const occurrence of occurrences) {
     const path = resolve(occurrence.path);
-    const root = roots.find((r) => inside(r.path, path) || inside(r.real, path));
+    const root = roots.find((r) => inside(r.path, path) || (r.real !== undefined && inside(r.real, path)));
     if (!root) {
       // Metadata only: do not resolve, open, enumerate, or charge outside-root paths.
       try { stat(path); if (!noted.has(occurrence.path)) { noted.add(occurrence.path); notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} is outside the attachment roots and stays literal`); } } catch {}
@@ -250,10 +251,21 @@ export const prepareLaneBrief = (input: {
       noted.add(occurrence.path);
       notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} was not attached at launch and stays literal`);
     };
+    const missingNote = (why: string): void => {
+      if (noted.has(occurrence.path)) return;
+      noted.add(occurrence.path);
+      notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} ${why} and stays literal`);
+    };
+    const rootReal = root.real;
+    if (rootReal === undefined) {
+      if (input.allowed && !input.allowed.some((a) => inside(a, path))) notPinned();
+      else missingNote(`does not exist (the attachment root ${JSON.stringify(root.path)} is missing)`);
+      continue;
+    }
     // Checked before any stat, so a reference the launch never attached can neither ship nor refuse the recovery.
-    if (!pinned(inside(root.path, path) ? join(root.real, relative(root.path, path)) : path)) { notPinned(); continue; }
+    if (!pinned(inside(root.path, path) ? join(rootReal, relative(root.path, path)) : path)) { notPinned(); continue; }
     limit(key, "sourcePathBytes", bytes(occurrence.path));
-    const base = inside(root.path, path) ? root.path : root.real;
+    const base = inside(root.path, path) ? root.path : rootReal;
     let cursor = base, missing = false;
     for (const component of relative(base, path).split(sep).filter(Boolean)) {
       cursor = join(cursor, component);
@@ -263,9 +275,9 @@ export const prepareLaneBrief = (input: {
       }
       catch (e) { if (codeOf(e) === "ENOENT") { missing = true; break; } if (e instanceof LaneFileError) throw e; throw new LaneFileError("LANE_FILE_READ_FAILED", key, `cannot read attachment ${JSON.stringify(path)}; make it readable or remove its reference and launch again`); }
     }
-    if (missing) continue;
+    if (missing) { missingNote(`does not exist (no ${JSON.stringify(cursor)})`); continue; }
     const real = realpathSync(path);
-    if (!inside(root.real, real)) unsafe(path, "outside-root");
+    if (!inside(rootReal, real)) unsafe(path, "outside-root");
     if (!pinned(real)) { notPinned(); continue; }
     source.set(occurrence.path, real);
   }
@@ -320,6 +332,33 @@ export const prepareLaneBrief = (input: {
   const result = { files: { run, tree, references }, notes, sources: top };
   checkLaneFilesBody(key, { briefText, files: result.files });
   return result;
+};
+
+/**
+ * The tree `dori attach` adds to a running lane: the named lead paths under the same roots, safety checks and caps as a
+ * launch. A path that would stay literal in a brief (missing, outside the roots) refuses the whole attachment.
+ */
+export const prepareLaneAttachment = (input: {
+  readonly key: string; readonly stateDir: string; readonly paths: readonly string[]; readonly readers?: FileReaders;
+}): { readonly tree: LaneFileTree; readonly targets: readonly { readonly source: string; readonly target: string }[] } => {
+  const { key, paths } = input;
+  validateFileKey(key);
+  if (paths.length === 0) throw new LaneFileError("LANE_ATTACH_INVALID", key, "name at least one file or directory under the attachment roots");
+  for (const p of paths) {
+    if (!isAbsolute(p) || /[`\r\n]/.test(p)) throw new LaneFileError("LANE_ATTACH_INVALID", key, `${JSON.stringify(p)} must be an absolute path without backticks or line breaks`);
+  }
+  // Each path as one delimited brief token, so the launch scanner, roots and caps decide exactly as for a brief.
+  const briefText = paths.map((p) => `\`${p}\``).join("\n");
+  const prepared = prepareLaneBrief({ key, stateDir: input.stateDir, briefText, requiredReport: false, ...(input.readers ? { readers: input.readers } : {}) });
+  const targets = prepared.files.references.map((ref) => ({ source: briefText.slice(ref.start, ref.end), target: ref.target }));
+  const skipped = paths.filter((p) => !targets.some((t) => t.source === p));
+  if (prepared.notes.length || skipped.length) {
+    const roots = LEAD_ATTACHMENT_ROOTS(input.stateDir).map((r) => JSON.stringify(resolve(r))).join(" or ");
+    throw new LaneFileError("LANE_ATTACH_REFUSED", key, [...prepared.notes,
+      ...skipped.filter((p) => !prepared.notes.some((n) => n.includes(JSON.stringify(p)))).map((p) => `${JSON.stringify(p)} is not a file or directory under ${roots}`),
+    ].join("; "));
+  }
+  return { tree: prepared.files.tree, targets };
 };
 
 export type CollectionNote = { readonly id: string; readonly line: string };

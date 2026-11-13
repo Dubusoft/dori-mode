@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readSync, readdirSync, rmSync, symlinkSync, writeFileSync, type Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureOutput, checkFileBody, checkManagedReport, FILE_LIMITS, laneFilePaths, prepareInput, removeLaneTree, rewriteBrief, treeDigest, validateBriefFiles, validateFileKey, validateTree } from "../src/runner/lane-files.ts";
+import { addInput, captureOutput, checkFileBody, checkManagedReport, FILE_LIMITS, laneFilePaths, prepareInput, removeLaneTree, rewriteBrief, treeDigest, validateBriefFiles, validateFileKey, validateTree } from "../src/runner/lane-files.ts";
 import type { LaneBriefFiles, LaneFileTree } from "../src/runner/protocol.ts";
 
 const roots: string[] = [];
@@ -174,4 +174,20 @@ test("failed manifest admission leaves previous inputs and brief untouched", () 
   expect(readFileSync(join(t.dir, "briefs/lane-a.md"), "utf8")).toBe("brief");
   expect(existsSync(t.stage)).toBe(false);
   expect(readdirSync(t.input)).toEqual([]);
+});
+
+test("added files land in place under the next free group and keep the combined caps", () => {
+  const t = setup(), before = lstatSync(t.input).ino;
+  const tree: LaneFileTree = { directories: ["r0000"], files: [file("r0000/notes.md")] };
+  expect(addInput(t.dir, "lane-a", tree)).toBe(join(t.input, "a0001"));
+  expect(addInput(t.dir, "lane-a", tree)).toBe(join(t.input, "a0002"));
+  // A sandbox binds the input directory at start: it must stay the same directory.
+  expect(lstatSync(t.input).ino).toBe(before);
+  expect(readFileSync(join(t.input, "a0002/r0000/notes.md"))).toEqual(Buffer.from([0, 255, 128, 1]));
+  expect(existsSync(t.stage)).toBe(false);
+  const many: LaneFileTree = { directories: [], files: Array.from({ length: FILE_LIMITS.files - 1 }, (_, i) => file(`f${String(i).padStart(3, "0")}`)) };
+  expect(() => addInput(t.dir, "lane-a", many)).toThrow("LANE_FILES_LIMIT lane-a: files is 65, above 64");
+  expect(readdirSync(t.input).sort()).toEqual(["a0001", "a0002"]);
+  rmSync(t.input, { recursive: true });
+  expect(() => addInput(t.dir, "lane-a", tree)).toThrow("LANE_ATTACH_NO_INPUT");
 });

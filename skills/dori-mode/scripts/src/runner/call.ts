@@ -55,6 +55,7 @@ export const NEEDS_PROTO: Partial<Record<DurableCommandType | QueryType, number>
   "q.panes": 3, "q.screen": 3, "q.process": 3, "q.stat": 3, "q.lane.inspect": 3, "q.machine.observe": 3,
   "host.herdr": 4,
   "wait.check": 5, "job.run": 5,
+  "lane.attach": 7,
 };
 export const isFileOperation = (type: string): type is "lane.start" | "lane.recover" | "q.lane.files" =>
   type === "lane.start" || type === "lane.recover" || type === "q.lane.files";
