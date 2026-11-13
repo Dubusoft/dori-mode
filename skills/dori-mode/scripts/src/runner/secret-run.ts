@@ -60,7 +60,8 @@ export type SecretRunnerDeps = SecretSource & {
 export const SECRET_RUN_OUTPUT_CAP = 64 * 1024;
 /** The exit code of a command killed at its `timeoutSec`. */
 export const SECRET_RUN_TIMEOUT_EXIT = 124;
-const HOST_ENV = ["PATH", "HOME", "LANG", "TMPDIR"] as const;
+/** XDG_RUNTIME_DIR lets a host command reach the user's systemd manager (`systemctl --user daemon-reload`). */
+const HOST_ENV = ["PATH", "HOME", "LANG", "TMPDIR", "XDG_RUNTIME_DIR"] as const;
 
 const defaultSpawn: SecretSpawner = (argv, { env, cwd }) => {
   const child = Bun.spawn([...argv], { env: hostGitEnv(env), cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -107,8 +108,10 @@ const redactOutput = (text: string, secrets: Readonly<Record<string, string>>, t
  * The lane socket's `secret-run` handler on the supervisor host: runs `secretCommands.<op>` for lane `key` (repo
  * `repo`, else `deps.laneRepo`), or refuses. Unknown op or a lane its lanes/repos do not match -> `RUNNER_SECRET_DENIED`;
  * a secret that cannot be read or minted -> the granter's code; a command that cannot start -> `RUNNER_SECRET_FAILED`.
- * The command gets env {PATH, HOME, LANG, TMPDIR (when set on the host)} + its secrets, stdin closed, cwd = `cwd` ??
- * home, and is killed after `timeoutSec` (exit 124, stderr says so). Each of stdout/stderr keeps its first 64 KiB.
+ * A DENIED detail names the ops this lane may run, so a lane finds a registered host command without asking.
+ * The command gets env {PATH, HOME, LANG, TMPDIR, XDG_RUNTIME_DIR (when set on the host)} + DORI_LANE_KEY + its
+ * secrets (an op may list none: a plain host command), stdin closed, cwd = `cwd` ?? home, and is killed after
+ * `timeoutSec` (exit 124, stderr says so). Each of stdout/stderr keeps its first 64 KiB.
  */
 export const secretCommandRunner = (deps: SecretRunnerDeps) => async (key: string, op: string, repo?: string): Promise<SecretRunResult> => {
   let names: readonly string[] = [];
@@ -125,12 +128,17 @@ export const secretCommandRunner = (deps: SecretRunnerDeps) => async (key: strin
   try { [commands, rules] = await Promise.all([deps.commands(), deps.rules()]); } catch (e) {
     return refuse("RUNNER_SECRET_FAILED", e instanceof Error ? e.message : String(e));
   }
-  const command = Object.hasOwn(commands, op) ? commands[op] : undefined;
-  if (!command) return refuse("RUNNER_SECRET_DENIED", `${op} is not a configured secret command (config secretCommands)`);
-  names = command.secrets;
   let laneRepoP: Promise<string | undefined> | undefined;
   const laneRepo = (): Promise<string | undefined> => (laneRepoP ??= repo !== undefined ? Promise.resolve(repo) : (deps.laneRepo?.(key) ?? Promise.resolve(undefined)).catch(() => undefined));
-  if (!await ruleMatches(command, key, laneRepo)) return refuse("RUNNER_SECRET_DENIED", `${key} may not run ${op} (config secretCommands)`);
+  const deny = async (detail: string): Promise<SecretRunResult> => {
+    const allowed: string[] = [];
+    for (const [name, rule] of Object.entries(commands)) if (await ruleMatches(rule, key, laneRepo)) allowed.push(name);
+    return refuse("RUNNER_SECRET_DENIED", `${detail}; ops this lane may run: ${allowed.length ? allowed.sort().join(", ") : "none"}`);
+  };
+  const command = Object.hasOwn(commands, op) ? commands[op] : undefined;
+  if (!command) return deny(`${op} is not a configured secret command (config secretCommands)`);
+  names = command.secrets;
+  if (!await ruleMatches(command, key, laneRepo)) return deny(`${key} may not run ${op} (config secretCommands)`);
   const values: Record<string, string> = {};
   for (const name of command.secrets) {
     const read = await readSecretValue(deps, name, Object.hasOwn(rules, name) ? rules[name] : undefined, key, laneRepo);
@@ -141,6 +149,7 @@ export const secretCommandRunner = (deps: SecretRunnerDeps) => async (key: strin
   const host = deps.hostEnv ?? process.env;
   const env: Record<string, string> = {};
   for (const name of HOST_ENV) { const v = host[name]; if (v !== undefined) env[name] = v; }
+  env.DORI_LANE_KEY = key;
   Object.assign(env, values);
   let child: SecretChild;
   try { child = (deps.spawn ?? defaultSpawn)(command.argv, { env, cwd: command.cwd ?? deps.home ?? homedir() }); } catch (e) {

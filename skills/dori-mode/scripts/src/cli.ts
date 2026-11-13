@@ -183,7 +183,7 @@ const USAGE = `dori <command> [options]
   close  <key> --cancelled --reason TEXT [--force]   lead-only: close a lane whose work was cancelled or whose Done can never hold;
                                        Done signals are not checked, the lane is recorded closed as cancelled with the reason
                                        inside a lane (DORI_LANE_KEY, or a pane its runner knows) dori takes only report, claim-done, report ack,
-                                       lane status, heavy and secret exec (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
+                                       lane status, heavy, secret exec and secret run (alias host <op>) (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
                                        supervisor (RUNNER_UNAVAILABLE, exit 2, while it is down)
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
@@ -243,6 +243,7 @@ const USAGE = `dori <command> [options]
   secret list [--json]                 stored secret names and backend (systemd-creds or plain); values are never printed
   secret delete NAME                   remove a stored secret
   secret exec NAME... -- <cmd>         inside a lane: run cmd with the allowlisted secrets in its environment only
+  secret run <op> | host <op>          inside a lane: the supervisor host runs config secretCommands.<op> and prints its redacted output
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts

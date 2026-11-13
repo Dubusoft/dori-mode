@@ -5,7 +5,7 @@ import { SecretStoreError } from "../src/secret-store.ts";
 import { SECRET_RUN_OUTPUT_CAP, secretCommandRunner, type SecretRunAuditEntry, type SecretRunnerDeps, type SecretSpawner } from "../src/runner/secret-run.ts";
 
 const VALUE = "dori-test-throwaway-123";
-const HOST_ENV = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: "/home/test", LANG: "C.UTF-8", TMPDIR: "/tmp", UNRELATED_PARENT_VAR: "leak-me" };
+const HOST_ENV = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: "/home/test", LANG: "C.UTF-8", TMPDIR: "/tmp", XDG_RUNTIME_DIR: "/run/user/1000", UNRELATED_PARENT_VAR: "leak-me" };
 
 const command = (argv: readonly string[], patch: Partial<SecretCommand> = {}): SecretCommand => ({ argv, secrets: ["API_TOKEN"], lanes: ["lane-a", "pre-*"], repos: [], timeoutSec: 300, ...patch });
 
@@ -39,7 +39,7 @@ describe("secretCommandRunner", () => {
   test("an op missing from secretCommands is DENIED and audited without names", async () => {
     const h = harness({});
     const result = await h.run("lane-a", "deploy");
-    expect(result).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "deploy is not a configured secret command (config secretCommands)" });
+    expect(result).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "deploy is not a configured secret command (config secretCommands); ops this lane may run: none" });
     expect(h.audit).toEqual([{ at: "1970-01-01T00:00:00.000Z", runner: "local", lane: "lane-a", op: "deploy", names: [], allowed: false }]);
     expect(h.logs).toEqual(["RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_DENIED"]);
   });
@@ -47,7 +47,7 @@ describe("secretCommandRunner", () => {
   test("a lane the op's lanes/repos do not match is DENIED before any secret is read", async () => {
     let reads = 0;
     const h = harness({ deploy: command(["true"], { repos: ["Acme/Widget"] }) }, { store: { read: async () => { reads++; return VALUE; } } });
-    expect(await h.run("lane-b", "deploy", "acme/other")).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-b may not run deploy (config secretCommands)" });
+    expect(await h.run("lane-b", "deploy", "acme/other")).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-b may not run deploy (config secretCommands); ops this lane may run: none" });
     expect(reads).toBe(0);
     expect(h.audit[0]).toMatchObject({ lane: "lane-b", op: "deploy", names: ["API_TOKEN"], allowed: false });
     // A matching repo (case-insensitive) or a prefix-* lane is let through.
@@ -65,13 +65,25 @@ describe("secretCommandRunner", () => {
     h.clean(result);
   });
 
-  test("the child env is PATH, HOME, LANG, TMPDIR, the host git guard and the secrets, nothing else from the parent", async () => {
+  test("a refusal lists the ops this lane may run, by lane or repo, sorted", async () => {
+    const h = harness({ zeta: command(["true"], { lanes: ["*"] }), alpha: command(["true"], { lanes: [], repos: ["Acme/Widget"] }), other: command(["true"], { lanes: ["lane-z"] }) });
+    expect(await h.run("lane-b", "probe", "acme/widget")).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "probe is not a configured secret command (config secretCommands); ops this lane may run: alpha, zeta" });
+    expect(await h.run("lane-b", "other", "acme/widget")).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-b may not run other (config secretCommands); ops this lane may run: alpha, zeta" });
+  });
+
+  test("an op with no secrets is a plain host command: it runs with the host env and the asking lane's key", async () => {
+    const h = harness({ probe: command(["sh", "-c", "printf '%s %s' \"$DORI_LANE_KEY\" \"$XDG_RUNTIME_DIR\""], { secrets: [], lanes: ["*"] }) });
+    expect(await h.run("lane-b", "probe")).toEqual({ ok: true, exitCode: 0, stdout: "lane-b /run/user/1000", stderr: "", truncated: false });
+    expect(h.audit).toEqual([{ at: "1970-01-01T00:00:00.000Z", runner: "local", lane: "lane-b", op: "probe", names: [], allowed: true, exitCode: 0 }]);
+  });
+
+  test("the child env is PATH, HOME, LANG, TMPDIR, XDG_RUNTIME_DIR, DORI_LANE_KEY, the host git guard and the secrets, nothing else from the parent", async () => {
     const h = harness({ env: command(["env"]) });
     const result = await h.run("lane-a", "env");
     expect(result.ok).toBe(true);
     const vars = Object.fromEntries((result.ok ? result.stdout : "").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
-    // redactSecrets also masks the NAME=value shape, so the line reads API_TOKEN=[REDACTED].
-    expect(vars).toEqual({ ...hostGitEnv({ PATH: HOST_ENV.PATH, HOME: "/home/test", LANG: "C.UTF-8", TMPDIR: "/tmp" }), API_TOKEN: expect.stringMatching(/^\[REDACTED/) });
+    // redactSecrets also masks the NAME=value shape of *_TOKEN and *_KEY names, so those lines read NAME=[REDACTED].
+    expect(vars).toEqual({ ...hostGitEnv({ PATH: HOST_ENV.PATH, HOME: "/home/test", LANG: "C.UTF-8", TMPDIR: "/tmp", XDG_RUNTIME_DIR: "/run/user/1000" }), DORI_LANE_KEY: "[REDACTED]", API_TOKEN: expect.stringMatching(/^\[REDACTED/) });
     h.clean(result);
   });
 
@@ -80,7 +92,7 @@ describe("secretCommandRunner", () => {
     const h = harness({ a: command(["x"]), b: command(["x"], { cwd: "/srv/ops" }) }, { spawn: fakeSpawn(seen), hostEnv: { PATH: "/bin", OTHER: "no" }, home: "/home/u" });
     await h.run("lane-a", "a");
     expect(seen).toMatchObject({ env: { PATH: "/bin", API_TOKEN: VALUE }, cwd: "/home/u" });
-    expect(Object.keys(seen.env ?? {}).sort()).toEqual(["API_TOKEN", "PATH"]);
+    expect(Object.keys(seen.env ?? {}).sort()).toEqual(["API_TOKEN", "DORI_LANE_KEY", "PATH"]);
     await h.run("lane-a", "b");
     expect(seen.cwd).toBe("/srv/ops");
     const real = harness({ stdin: command(["sh", "-c", "cat; echo eof"]) });

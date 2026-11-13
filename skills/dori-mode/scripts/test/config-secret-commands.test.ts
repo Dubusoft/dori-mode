@@ -26,6 +26,11 @@ test("a valid op loads with the default timeout, and optional fields are kept", 
   expect(c.secretCommands.bare).toEqual({ argv: ["x"], secrets: [], lanes: ["a"], repos: [], timeoutSec: 3600, cwd: "/srv/app" });
 });
 
+test("a host command may leave out secrets and repos", async () => {
+  const c = await load("host", { secretCommands: { "probe-sandbox": { argv: ["/home/u/.dori/ops/probe.sh"], lanes: ["*"] } } });
+  expect(c.secretCommands["probe-sandbox"]).toEqual({ argv: ["/home/u/.dori/ops/probe.sh"], secrets: [], lanes: ["*"], repos: [], timeoutSec: 300 });
+});
+
 test("an invalid op throws TypeError", async () => {
   const bad: [string, unknown][] = [
     ["not an object", ["deploy"]],

@@ -183,6 +183,24 @@ test("dori secret run writes the output to its own stdout/stderr and exits with 
   expect([...r.out, ...r.err, ...written.map((w) => w[1])].join("\n")).not.toContain(VALUE);
 });
 
+test("dori host <op> is dori secret run <op>: same verb and output; bad usage exits 2 without the socket", async () => {
+  const ops: string[] = [];
+  const sock = socket(undefined, async (_key, op) => { ops.push(op); return ran; });
+  const r = io();
+  const written: [string, string][] = [];
+  expect(await laneCliMain(["host", "probe-sandbox"], { env, connect: sock.connect, ...r.deps, write: (stream, text) => { written.push([stream, text]); } })).toBe(3);
+  expect(ops).toEqual(["probe-sandbox"]);
+  expect(written).toEqual([["stdout", "out [REDACTED:API_TOKEN]\n"], ["stderr", "err\n"]]);
+  let connects = 0;
+  const counting: Connector = async () => { connects++; throw new Error("unused"); };
+  for (const args of [["host"], ["host", "Probe"], ["host", "run", "probe"]]) {
+    const u = io();
+    expect(await laneCliMain(args, { env, connect: counting, ...u.deps })).toBe(2);
+    expect(u.err).toEqual(["usage: dori host <op>"]);
+  }
+  expect(connects).toBe(0);
+});
+
 test("dori secret run: a refusal prints code and detail and exits 1; bad usage exits 2 without the socket", async () => {
   const denied = socket(undefined, async () => ({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-a may not run deploy (config secretCommands)" }));
   const r = io();

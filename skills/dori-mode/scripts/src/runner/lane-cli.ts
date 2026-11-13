@@ -12,14 +12,14 @@ import type { Connector, Transport } from "./transport.ts";
 
 /**
  * The `dori` a lane runs on a worker machine (design 3.4): the runner bundle in lane mode, set by `DORI_LANE_KEY`. It
- * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret exec` and `secret run`, and only for the lane's own
+ * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret exec` and `secret run` (alias `host <op>`), and only for the lane's own
  * key; any other subcommand exits 2 with `DORI_CLI_LANE_ONLY <cmd>`. A report goes to the runner's lane socket with the lane's token, read from
  * the file `DORI_LANE_TOKEN_FILE` names (or, for a lane an older runner started, `DORI_LANE_TOKEN` itself), so the
  * runner accepts it only from the lane it started. `heavy` uses the host's `~/.dori/heavy/slot.N` directories,
  * the same ones `dori heavy` on the host takes, so every footer on a machine shares one slot count.
  */
 
-export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret"] as const;
+export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret", "host"] as const;
 
 /** How long a request keeps retrying a missing or refusing lane socket (a supervisor/runner restart), and how often. */
 export const LANE_SOCKET_RETRY_MS = 60_000;
@@ -113,7 +113,7 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
   }
 };
 
-const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec and secret run";
+const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec and secret run (alias host <op>)";
 
 const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking] | dori report <key> request --text \"<what you need from the owner>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]";
 const CLAIM_DONE_USAGE = "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"";
@@ -133,6 +133,12 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
   lane: "usage: dori lane status [<key>]",
   heavy: "usage: dori heavy <label> -- <command ...>",
   secret: "usage: dori secret exec NAME [NAME...] -- <command ...>\nusage: dori secret run <op>",
+  host: [
+    "usage: dori host <op>",
+    "  same as dori secret run <op>: the supervisor host runs the registered command config secretCommands.<op> (a sandbox",
+    "  probe, systemctl --user daemon-reload) outside the lane and prints its redacted output, exiting with its code.",
+    "  A refused op lists the ops this lane may run.",
+  ].join("\n"),
 };
 
 /** `text` as one single-quoted POSIX shell word. */
@@ -166,9 +172,9 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     done(reply);
     return 0;
   };
-  if (sub === "secret" && rest[0] === "run") {
-    const [, op, ...extra] = rest;
-    if (!op || extra.length || !/^[a-z][a-z0-9-]{0,63}$/.test(op)) { deps.err("usage: dori secret run <op>"); return 2; }
+  if ((sub === "secret" && rest[0] === "run") || sub === "host") {
+    const [op, ...extra] = sub === "host" ? rest : rest.slice(1);
+    if (!op || extra.length || !/^[a-z][a-z0-9-]{0,63}$/.test(op)) { deps.err(sub === "host" ? "usage: dori host <op>" : "usage: dori secret run <op>"); return 2; }
     let result: Reply = { ok: true };
     const code = await send({ kind: "secret-run", op }, (reply) => { result = reply; });
     if (code !== 0) return code;

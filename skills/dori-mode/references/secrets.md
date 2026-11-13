@@ -143,18 +143,33 @@ Config `secretCommands` names operations the supervisor host runs for a lane, wi
 
 - The op name matches `^[a-z][a-z0-9-]{0,63}$`.
 - `argv` is the command, non-empty strings, run without a shell.
-- `secrets` lists store names (or minted names, see below) put in the command's environment.
+- `secrets` lists store names (or minted names, see below) put in the command's environment. It may be empty or left out: see [Host commands](#host-commands).
 - `lanes` and `repos` decide which lanes may run it, with the same matching as config `secrets`. The secrets themselves need no `secrets` rule of their own: the op's rule is the only check.
 - `timeoutSec` is 1 to 3600, default 300.
 - `cwd` is an absolute path; without it the command runs in the host user's home.
 
-A lane runs `dori secret run <op>`. The command runs on the supervisor host, outside every lane and sandbox, also for a lane on a remote runner (its request goes to the supervisor as a sealed `secret.run` control frame). Its environment is only `PATH`, `HOME`, `LANG` and `TMPDIR` (those set on the host) plus its secrets, and stdin is closed. A secret whose `secrets` rule has `mint` is minted for the lane's repo, as in [Minted GitHub tokens](#minted-github-tokens).
+A lane runs `dori secret run <op>`, or its alias `dori host <op>`. The command runs on the supervisor host, outside every lane and sandbox, also for a lane on a remote runner (its request goes to the supervisor as a sealed `secret.run` control frame). Its environment is only `PATH`, `HOME`, `LANG`, `TMPDIR` and `XDG_RUNTIME_DIR` (those set on the host), `DORI_LANE_KEY` (the asking lane's key) and its secrets, and stdin is closed. A secret whose `secrets` rule has `mint` is minted for the lane's repo, as in [Minted GitHub tokens](#minted-github-tokens).
 
 The lane sees only the exit code and the output. Each of stdout and stderr keeps its first 64 KiB, and the lane CLI adds `dori: <op> output was truncated at 64 KiB per stream` when either was cut. Every secret value in the output becomes `[REDACTED:<NAME>]`, including a value cut off at the end of truncated output, and then the usual masking runs. A command still running after `timeoutSec` is killed and exits 124, with `dori: <op> killed after <n>s (timeoutSec)` on stderr.
 
-The runner log (the supervisor's for a remote runner, tagged `runner=<label>`) gets `RUNNER_SECRET_RUN lane=<key> op=<op> exit=<n>`, or `RUNNER_SECRET_DENIED lane=<key> op=<op> code=<code>` for a refusal. An unknown op or a lane the op doesn't allow is `RUNNER_SECRET_DENIED`, and a command that can't start is `RUNNER_SECRET_FAILED`.
+The runner log (the supervisor's for a remote runner, tagged `runner=<label>`) gets `RUNNER_SECRET_RUN lane=<key> op=<op> exit=<n>`, or `RUNNER_SECRET_DENIED lane=<key> op=<op> code=<code>` for a refusal. An unknown op or a lane the op doesn't allow is `RUNNER_SECRET_DENIED`, and its detail ends with `ops this lane may run: <op, ...>` (or `none`). A command that can't start is `RUNNER_SECRET_FAILED`.
 
 Use this for the most sensitive operational credentials: production deploys, cloud admin keys, anything a lane shouldn't hold even for one command. The lane can still choose when to run the op, so keep the op narrow (a fixed argv, not a shell that takes input) and its output free of anything you wouldn't show the lane.
+
+### Host commands
+
+The same mechanism runs host work the lane sandbox blocks and that needs no credential at all: a sandbox probe that must see the real host, or `systemctl --user daemon-reload` after a unit file changes (inside a lane the user bus is hidden). Register it as an op with no `secrets`:
+
+```json
+"secretCommands": {
+  "probe-sandbox": { "argv": ["/home/me/.dori/ops/probe-sandbox.sh"], "lanes": ["*"], "timeoutSec": 120 },
+  "systemd-user-reload": { "argv": ["systemctl", "--user", "daemon-reload"], "lanes": ["ap-*"] }
+}
+```
+
+A lane runs `dori host probe-sandbox` and gets the output and exit code. `XDG_RUNTIME_DIR` is passed through so `systemctl --user` finds the user manager, and `DORI_LANE_KEY` tells a script which lane asked (for example, to pick its worktree). A lane that doesn't know the op names runs any name: the refusal lists the ops it may run.
+
+The command still runs outside every sandbox as the host user. Don't register one that runs a file the lane can write (a script in its worktree, a template it edits): that hands the lane unsandboxed code execution. Keep the script under a path lanes can't write, such as `~/.dori/ops`.
 
 ## Remote runners
 
