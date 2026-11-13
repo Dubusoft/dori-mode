@@ -13,15 +13,32 @@ export const UNRECOGNISED_ALERT_AFTER = 3;
 export const DAG_VIEWER_TITLE = "OmO DAG";
 
 /** Per-pane memory across ticks: the CLI keeps one of these for the life of the loop. */
-export type DeadPaneState = { readonly unknown: Map<string, number>; readonly lastTail: Map<string, string> };
-export const newDeadPaneState = (): DeadPaneState => ({ unknown: new Map(), lastTail: new Map() });
+export type DeadPaneState = {
+  readonly unknown: Map<string, number>;
+  readonly lastTail: Map<string, string>;
+  /** The owning lane's activity stamp (laneActivity) when the pane's unrecognised count was last checked. */
+  readonly activity: Map<string, number>;
+  /** Panes no registered lane owns that already raised their one digest line. */
+  readonly digested: Set<string>;
+};
+export const newDeadPaneState = (): DeadPaneState => ({ unknown: new Map(), lastTail: new Map(), activity: new Map(), digested: new Set() });
+
+/** The latest sign of life the registry holds for a lane: a report or progress ping (lastReplyAt), its done claim, a status change. */
+const laneActivity = (lane: Lane): number => Math.max(
+  lane.lastReplyAt ?? 0,
+  lane.claim ? Date.parse(lane.claim.at) || 0 : 0,
+  ...(lane.history ?? []).map((entry) => Date.parse(entry.at) || 0),
+);
 
 /**
  * A pane is alive when herdr reports a running agent status for it; that wins over any screen text. Otherwise it is
  * dead only when this tick's tail carries a configured dead marker AND equals the previous tick's tail, so the two
  * reads are a full loop interval apart and a screen mid-redraw never counts. A marker seen once is pending. Anything
  * else is unrecognised, counted per pane, with one alert after UNRECOGNISED_ALERT_AFTER ticks in a row.
- * A DAG viewer pane in the same tab as a registered lane's pane belongs to that lane and is never counted.
+ * A pane belongs to a lane when it is the lane's pane or shares its tab. A DAG viewer pane of a lane is never counted; any
+ * other lane pane's alert names the lane (`lane=<key>`), and its count starts over whenever the lane shows activity in the
+ * registry (a report, a done claim, a status change), so a lane that keeps reporting is never flagged. A pane no lane
+ * owns raises one `unregistered` line (lead-digest) for the life of the state, however often its count fills again.
  * A dead pane that is a registered lane's pane also leaves a synthetic `blocked` report row under that lane's key (lane-reports.ts appendDeadPaneReport), so the lane's result is not lost.
  * Pane lists and tails come from each machine's runner: `view` (the supervisor round's cached reads), else `ops`.
  * A machine that is not `admitted` (its runner has no admitted connection) is skipped without a line.
@@ -53,7 +70,10 @@ const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, h
   const skip = new Set([config.leadPane, ...config.ignorePanes].filter(Boolean));
   const marked = (tail: string) => BUILT_IN.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
   const panes = await view.panes(machine);
-  const laneTabs = new Set(panes.flatMap((p) => p.tab_id && ctx.byPane.has(machine ? `${machine}/${p.pane_id}` : p.pane_id) ? [p.tab_id] : []));
+  const laneTabs = new Map(panes.flatMap((p) => {
+    const lane = p.tab_id ? ctx.byPane.get(machine ? `${machine}/${p.pane_id}` : p.pane_id) : undefined;
+    return lane && p.tab_id ? [[p.tab_id, lane] as const] : [];
+  }));
   for (const pane of panes) {
     if (owned && !owned.has(pane.pane_id)) continue;
     if (skip.has(pane.pane_id) || (watch.size > 0 && !watch.has(pane.workspace_id))) continue;
@@ -61,6 +81,7 @@ const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, h
     if (pane.agent_status && ALIVE_STATUSES.has(pane.agent_status)) {
       state.unknown.delete(id);
       state.lastTail.delete(id);
+      state.activity.delete(id);
       continue;
     }
     if (pane.tab_id && laneTabs.has(pane.tab_id) && pane.terminal_title?.trim().startsWith(DAG_VIEWER_TITLE)) {
@@ -85,9 +106,24 @@ const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, h
       }
       continue;
     }
+    const owner = ctx.byPane.get(id) ?? (pane.tab_id ? laneTabs.get(pane.tab_id) : undefined);
+    if (owner) {
+      const active = laneActivity(owner);
+      if (state.activity.get(id) !== active) {
+        state.unknown.delete(id);
+        state.activity.set(id, active);
+      }
+    }
     const n = (state.unknown.get(id) ?? 0) + 1;
     state.unknown.set(id, n);
-    if (n === UNRECOGNISED_ALERT_AFTER) out.push(`UNRECOGNISED_PANE ${pane.pane_id}${machine ? ` machine=${machine}` : ""} dead-panes: no alive status and no dead marker for ${n} ticks`);
+    if (n !== UNRECOGNISED_ALERT_AFTER) continue;
+    const where = machine ? ` machine=${machine}` : "";
+    const detail = `dead-panes: no alive status and no dead marker for ${n} ticks`;
+    if (owner) out.push(`UNRECOGNISED_PANE ${pane.pane_id} lane=${owner.key}${where} ${detail}`);
+    else if (!state.digested.has(id)) {
+      state.digested.add(id);
+      out.push(`UNRECOGNISED_PANE ${pane.pane_id} unregistered${where} ${detail}`);
+    }
   }
   return out;
 };
