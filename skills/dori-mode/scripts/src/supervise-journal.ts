@@ -106,6 +106,8 @@ export type LaneOutcome = {
   readonly claimed?: true;
   /** The PR heads its CI_MERGED events named. */
   readonly heads?: readonly string[];
+  /** An event of the row woke the lead (urgent, not quiet): later finish events with nothing new stay quiet (lane-outcomes.ts). */
+  readonly woke?: true;
   /** Events that joined with nothing new for the lead: they wake no one (lane-outcomes.ts). */
   readonly quiet?: readonly string[];
   /** The lane's thread id and its latest report there, from `dori reported` receipts: the automatic thread close reads them. */

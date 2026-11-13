@@ -350,6 +350,28 @@ test("a merge that brings something new still wakes the lead: before the claim, 
     [["ci-merged:acme/app#8", "CI_MERGED acme/app#8 into dev lane=alpha head=fed merge=cba https://x/8"]]])).map((step) => step.pointers)).toEqual([1, 0, 1]);
 });
 
+test("one lane result wakes the lead once: a finished close and the autopilot outcome ride with the wake the merge or claim made", async () => {
+  const claim = ["done-claim:alpha:1", "LANE_DONE_CLAIMED alpha w:p1 proof"] as const;
+  const autopilotDone = ["autopilot-outcome:alpha", "AUTOPILOT_LANE_DONE #12 lane=alpha attempt=1: complete toodo task #12"] as const;
+  // An unclaimed lane: the merge wakes, the close whose task the supervisor finished does not.
+  expect((await finishSteps([[["ci-merged:acme/app#7", MERGED_7]], [["lane-closed:alpha", "LANE_CLOSED alpha closed toodo=done https://x/7"]]], 1))
+    .map((step) => step.pointers)).toEqual([1, 0]);
+  // A claimed autopilot lane: the claim wakes; the merge, the finished close and the autopilot outcome do not.
+  expect((await finishSteps([[claim], [["ci-merged:acme/app#7", MERGED_7]],
+    [["lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim toodo=done https://x/7"], autopilotDone]], 2)).map((step) => step.pointers)).toEqual([1, 0, 0]);
+  // Claim and close pending together are one wake.
+  expect((await finishSteps([[claim, ["lane-closed:alpha", "LANE_CLOSED alpha closed toodo=done https://x/7"], autopilotDone]])).map((step) => step.pointers)).toEqual([1]);
+});
+
+test("a lane result the lead still has work on wakes it again: an unfinished task, a failed autopilot lane, an outcome with no earlier wake", async () => {
+  const claim = ["done-claim:alpha:1", "LANE_DONE_CLAIMED alpha w:p1 proof"] as const;
+  expect((await finishSteps([[claim], [["lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim toodo=failed https://x/7"],
+    ["task-finish:alpha", "TOODO_TASK_NOT_COMPLETED alpha #12 toodo: refused; finish it yourself"]]])).map((step) => step.pointers)).toEqual([1, 1]);
+  expect((await finishSteps([[["ci-merged:acme/app#7", MERGED_7]], [["autopilot-outcome:alpha", "AUTOPILOT_LANE_FAILED #12 lane=alpha attempt=1 cancelled: gave up: tell the owner"]]]))
+    .map((step) => step.pointers)).toEqual([1, 1]);
+  expect((await finishSteps([[["autopilot-outcome:alpha", "AUTOPILOT_LANE_DONE #12 lane=alpha attempt=1: complete toodo task #12"]]])).map((step) => step.pointers)).toEqual([1]);
+});
+
 test("a cold lead's prompt names SKILL.md and human.md by absolute path, or says human.md could not be resolved", async () => {
   const home = withState();
   cleanups.push(home.done);
