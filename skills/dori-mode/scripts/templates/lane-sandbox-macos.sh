@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # lane-sandbox (macOS): run a dori lane agent command inside a Seatbelt sandbox (sandbox-exec).
-# Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check
+# Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check | lane-sandbox --explain
+# --explain prints what the profile a lane in the current directory would get (same environment, DORI_LANE_KEY defaulting
+# to "explain") lets it touch, instead of running anything: one "<mode> <path>" line per profile path, where a later line
+# wins at and below its path. Modes: rw, ro (readable, writes refused) and hide (reads and writes refused). Outside every
+# line reads are allowed and writes refused; a * stands for one path component.
 # Same inputs as the Linux (bubblewrap) lane-sandbox. Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset:
 # the lead runs outside the sandbox. Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra writable directories (e.g. your worktree root, a scratch dir; the runner's grants)
@@ -76,10 +80,12 @@ build_profile() {
   local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" k_rules="" gcd broad kc rr
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
-  param() { PARAMS+=(-D "$1=$(canon "$2")"); }
+  # The paths --explain lists, each as resolved for its parameter (LAST is the last one param resolved).
+  XW=() XR=() XHOOKS=() XCRED=() XHIDE=() XREPOS=
+  param() { LAST=$(canon "$2"); PARAMS+=(-D "$1=$LAST"); }
   param_raw() { PARAMS+=(-D "$1=$2"); }
-  w() { param "W$n" "$1"; w_rules="$w_rules (subpath (param \"W$n\"))"; n=$((n + 1)); }
-  r() { param "R$n" "$1"; r_rules="$r_rules (subpath (param \"R$n\"))"; n=$((n + 1)); }
+  w() { param "W$n" "$1"; XW+=("$LAST"); w_rules="$w_rules (subpath (param \"W$n\"))"; n=$((n + 1)); }
+  r() { param "R$n" "$1"; XR+=("$LAST"); r_rules="$r_rules (subpath (param \"R$n\"))"; n=$((n + 1)); }
 
   w "$LT"
   for p in "$H/.omo" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
@@ -93,6 +99,7 @@ build_profile() {
   # same directory, then a rename over the original, so both names need writes. It is not SQLite (no -journal, -wal or
   # -shm), and nothing else in Keychains, nor another user's keychain, is opened.
   kc=$(canon "$H/Library/Keychains/login.keychain-db")
+  XKEYCHAIN=$kc
   param_raw KEYCHAIN "$kc"
   param_raw KEYCHAIN_TMP "^$(re_escape "$kc")[.]sb-[^/]+\$"
   # Per-user temp and cache dirs under /var/folders (Xcode, clang module cache and other Apple tools use these, not TMPDIR).
@@ -107,7 +114,8 @@ build_profile() {
   # worktree, and the repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>), but not the repo's working tree.
   if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then w "$LANE_SANDBOX_WORKTREES"; fi
   if [ -n "${LANE_SANDBOX_REPOS:-}" ]; then
-    rr=$(re_escape "$(canon "$LANE_SANDBOX_REPOS")")
+    XREPOS=$(canon "$LANE_SANDBOX_REPOS")
+    rr=$(re_escape "$XREPOS")
     param_raw REPOS_GIT "^$rr/[^/]+/[.]git(/|\$)"
     param_raw REPOS_HOOKS "^$rr/[^/]+/[.]git/hooks(/|\$)"
     g_rules="(allow file-write* (regex (param \"REPOS_GIT\")))"
@@ -128,6 +136,7 @@ build_profile() {
       w "$gcd"
       # A hook written by a lane would run outside the sandbox at the next git command on the host.
       param HOOKS "$gcd/hooks"
+      XHOOKS+=("$LAST")
       d_rules="$d_rules (deny file-write* (subpath (param \"HOOKS\")))"
     fi
   fi
@@ -147,11 +156,14 @@ build_profile() {
   done
 
   param DORI "$H/.dori"
+  XDORI=$LAST
   param DORI_RUNNER "$H/.dori/runner"
   param DORI_BRIEFS "$H/.dori/runner/briefs"
   param DORI_LANES "$H/.dori/runner/lanes"
   param DORI_ENV "$H/.dori/env"
+  XDORI_ENV=$LAST
   param DORI_SECRETS "$H/.dori/secrets"
+  XDORI_SECRETS=$LAST
   param DOCKER_HOME "$H/.docker/run/docker.sock"
   param DOCKER_VAR /var/run/docker.sock
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
@@ -161,8 +173,11 @@ build_profile() {
     k_rules="(allow network-outbound (remote unix-socket (path-literal (param \"HERDR_SOCK\"))))"
   fi
   param CONFIG "$H/.config"
+  XCONFIG=$LAST
   param CONFIG_GH "$H/.config/gh"
+  XCONFIG_GH=$LAST
   param CONFIG_GIT "$H/.config/git"
+  XCONFIG_GIT=$LAST
   # herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent, a symlink to the agent's socket: both names stay usable.
   case "${SSH_AUTH_SOCK:-}" in
     "$H"/.config/*)
@@ -175,6 +190,7 @@ build_profile() {
   local c_rules=""
   for p in $CREDENTIALS; do
     param "CRED$n" "$H/$p"
+    XCRED+=("$LAST")
     c_rules="$c_rules (subpath (param \"CRED$n\"))"
     n=$((n + 1))
   done
@@ -184,6 +200,7 @@ build_profile() {
       p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
       if [ -n "$p" ]; then
         param "HIDE$n" "$p"
+        XHIDE+=("$LAST")
         h_rules="$h_rules
 (deny file-read* (subpath (param \"HIDE$n\")))
 (deny file-write* (subpath (param \"HIDE$n\")))
@@ -227,6 +244,40 @@ $h_rules
 "
 }
 
+# The --explain table of the profile build_profile made, in the profile's own order so a later line wins as a later rule
+# does: ~/.dori refused, its exceptions readable, the writable paths, then the refusals that come after them.
+explain_profile() {
+  local p
+  echo "# lane-sandbox --explain (seatbelt) for lane $key in $C: reads are allowed and writes refused outside these lines; a later line wins at and below its path"
+  echo "hide $XDORI"
+  for p in ${XR[@]+"${XR[@]}"}; do echo "ro $p"; done
+  for p in ${XW[@]+"${XW[@]}"}; do echo "rw $p"; done
+  echo "rw $XKEYCHAIN"
+  if [ -n "$XREPOS" ]; then
+    echo "rw $XREPOS/*/.git"
+    echo "ro $XREPOS/*/.git/hooks"
+  fi
+  for p in ${XHOOKS[@]+"${XHOOKS[@]}"}; do echo "ro $p"; done
+  echo "hide $XDORI_ENV"
+  echo "hide $H/.ssh/id_*"
+  for p in ${XCRED[@]+"${XCRED[@]}"}; do echo "hide $p"; done
+  echo "hide $XCONFIG"
+  echo "ro $XCONFIG_GH"
+  echo "ro $XCONFIG_GIT"
+  for p in ${XHIDE[@]+"${XHIDE[@]}"}; do echo "hide $p"; done
+  echo "hide $XDORI_SECRETS"
+}
+
+# --explain: the table of the profile a lane here would get, built by the same build_profile (see the header).
+if [ "${1:-}" = "--explain" ]; then
+  key=${key:-explain}
+  LT=$(canon "$H/.cache/omo-tmp/lane-sandbox/$key")
+  C=$(pwd -P)
+  build_profile
+  explain_profile
+  exit 0
+fi
+
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough below so it
 # also answers on the lead; exit 3 (not 2) keeps "no sandbox here" apart from a usage error. It runs `true` under the
 # same profile a lane gets, so a profile this macOS refuses is caught before a lane's pane opens.
@@ -248,7 +299,7 @@ if [ "${1:-}" = "--check" ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-  echo "usage: lane-sandbox <cmd> [args...]" >&2
+  echo "usage: lane-sandbox <cmd> [args...] | --check | --explain" >&2
   exit 2
 fi
 

@@ -295,6 +295,14 @@ const FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
 const worktreeLine = (root: string, key: string): string =>
   `- Create every git worktree this lane needs under ${root}, as ${root}/<repo name>-${key} (<repo name>: the last segment of owner/repo).`;
 
+/**
+ * The footer line telling a lane what its sandbox lets it touch, the same table `lane-sandbox --explain` prints on its
+ * host (templates/lane-sandbox.sh and lane-sandbox-macos.sh); a lane without a sandbox is told it has none.
+ */
+const sandboxLine = (lane: Pick<Lane, "sandbox">): string => lane.sandbox
+  ? "- Sandbox permissions: writable = the cwd and its git dir, DORI_LANE_OUT, the runner's worktree root and each .git under its repos root (hooks stay read-only), TMPDIR, /tmp, ~/.omo, ~/.cache and the package caches, plus write grants. Read-only = the system, the brief and briefs/<key>.files, dori and its config, ~/.config/gh and ~/.config/git, the shell and tool dotfiles, plus read grants. Hidden = the rest of ~/.dori (env, secrets and state too), the rest of ~/.config, ssh private keys, credential stores (cloud, kube, gpg, docker and git logins), docker sockets and every path in the host's ~/.dori/lane-sandbox-hide, which wins over grants; any other path under $HOME is hidden on Linux and readable on macOS. The exact table is what `lane-sandbox --explain` prints on the host."
+  : "- Sandbox permissions: none. This lane runs without a lane sandbox, so only omo's own path rules bound it.";
+
 /** The footer line naming a lane's path grants; the paths themselves live in its runner's runner-config.json. */
 const grantLine = (grants: readonly string[]): string =>
   `- Path grants: ${grants.join(", ")} (its runner's runner-config.json grants table names the paths). Those paths are writable or readable inside the sandbox as the table says; the hide list still wins, and nothing else outside the lane sandbox opens.`;
@@ -331,6 +339,7 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
   `- Done = ${lane.done}`,
   ...(worktreeRoot ? [worktreeLine(worktreeRoot.replace(/\/+$/, ""), lane.key)] : []),
+  sandboxLine(lane),
   ...(lane.grants?.length ? [grantLine(lane.grants)] : []),
   ...(lane.fileRun?.requiredReport ? ["- This lane declares deliverable: report. Write at least one regular report file in DORI_LANE_OUT before claiming done."] : []),
   ...(lane.machine
@@ -525,7 +534,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const prepared = await prepareLeadLaneBrief(deps, {
     ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"),
     brief: input.brief, done: input.done, openedAt: existing?.openedAt ?? iso(deps.clock), ...(input.machine ? { machine: input.machine } : {}),
-    ...(input.grants?.length ? { grants: input.grants } : {}),
+    ...(sandbox ? { sandbox: true as const } : {}), ...(input.grants?.length ? { grants: input.grants } : {}),
   }, undefined, Boolean(existing));
   if (sandbox && !input.machine) await checkLocalSandbox(deps, input.key);
   const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
