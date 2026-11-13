@@ -12,6 +12,29 @@ Autopilot decides which ready toodo tasks may run as lanes without a fresh word 
 
 Toodo's web RPC `list_tasks` filter has no `autopilot` key, so dori reads every planned task (`{ statuses: ["planned"] }`, all workspaces) and keeps the marked ones.
 
+## Execution contract
+
+A marked task states how it runs through task refs, which toodo stores without interpreting them. `planTask` (`scripts/src/autopilot-plan.ts`) reads them, with the task, its dependencies and the workspace guidelines (`ToodoClient.guidelines`, toodo's `list_guidelines`), and returns either a ready contract with its template brief or the reasons the task needs the lead's review. It is pure: nothing in it reads toodo, writes a file or launches.
+
+| Ref | Default | Meaning |
+| --- | --- | --- |
+| `repo:<owner>/<name>` | required | The one repository the lane works in (case-insensitive). |
+| `base:<branch>` | `autopilot.mergeBase` | The branch the lane starts from and opens its PR into. It must be `autopilot.mergeBase`. |
+| `branch:<name>` | `autopilot/<taskId>` | The lane's branch, a valid git branch name other than the base. The lane's Done is `pr <repo> <branch>`. |
+| `mode:<ulw\|mass-ulw>` | `ulw` | The lane's mode. Nothing guesses it from the text. |
+| `model:<id>` | `defaultModel` | The lane's model. |
+| `approved:<version>` | none | The lead reviewed the task at that contract version. |
+
+The contract also carries:
+
+- `version`: a 12-digit sha256 over the title, description, criteria, dependencies and contract refs. Status, notes and other refs (`owner:`, `lane:`, `approved:`) are left out, so starting or approving the task keeps it, while a scope change moves it.
+- `guidelines`: a snapshot of the workspace's guidelines (rules and memories, by id) with its own hash, so a later run can tell whether they changed since the brief was built.
+- `approvedVersion`: the version an `approved:` ref names when it matches.
+
+The task goes to review instead (`kind: "review"`, reasons in this order) on `repo-missing`, `repo-ambiguous` (two repos), `ref-invalid` (a malformed repo, base, branch, mode or model, or a branch equal to the base), `ref-conflict` (two different values for one key), `base-not-allowed` (a base other than `autopilot.mergeBase`) and `approval-stale` (an `approved:` ref none of which names the current version). Whether a criterion can be judged by a script is not guessed: a lead who reviews such a task records `approved:<version>`, and any later scope change sends it back to review.
+
+The template brief is the task's title (`# <title> (Toodo #<id>)`), its description as written, its criteria with kind and target, its dependencies with status, its other refs, the workspace guidelines (rules, then memories) and the contract (repo, base, branch, Done, mode, version, snapshot hash). `dori launch` appends the common lane footer, so the brief does not repeat it. Storing the snapshot outside the repo and launching from the contract belong to the executor.
+
 ## Ledger
 
 Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>` (1, 2, ...), data `{ "laneKey" }` with the lane key `ap-<taskId>-<attempt>`. Only `dori autopilot launch` writes them (see Commands): `planned` when reserved, then `verified` (launched), `failed` or `ambiguous` when settled. The predicate reads them:
