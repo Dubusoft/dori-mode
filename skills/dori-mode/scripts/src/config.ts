@@ -335,6 +335,9 @@ const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
   }));
 };
 
+/** The longest `secretCommands.<op>.timeoutSec` may be; the op is killed then, so its answer comes no later. */
+export const SECRET_COMMAND_MAX_TIMEOUT_SEC = 3600;
+
 /** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match (same rules as `secrets`). */
 export type SecretCommand = {
   readonly argv: readonly string[];
@@ -359,7 +362,7 @@ const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> =
     const names = stringList(rule.secrets, bad, `.${op}.secrets`);
     if (names.some((name) => !SECRET_NAME.test(name))) throw bad(`.${op}.secrets`);
     const { timeoutSec, cwd } = rule;
-    if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600)) throw bad(`.${op}.timeoutSec`);
+    if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > SECRET_COMMAND_MAX_TIMEOUT_SEC)) throw bad(`.${op}.timeoutSec`);
     if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) throw bad(`.${op}.cwd`);
     return [op, {
       argv, secrets: names, lanes: stringList(rule.lanes, bad, `.${op}.lanes`), repos: stringList(rule.repos, bad, `.${op}.repos`),

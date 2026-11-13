@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { RunnerAuth, SupervisorAuth, enrollOverStdio, type PendingHello, type Session } from "../src/runner/auth.ts";
-import { RunnerClient, SECRET_TIMEOUT_MS } from "../src/runner/client.ts";
+import { SECRET_COMMAND_MAX_TIMEOUT_SEC } from "../src/config.ts";
+import { RunnerClient, SECRET_RUN_TIMEOUT_MS, SECRET_TIMEOUT_MS } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import {
   decodeFrame, encodeFrame, supervisorControl,
@@ -271,6 +272,32 @@ describe("remote runner secrets over the link", () => {
     expect(sup.badMacs).toEqual([]);
     expect(logs).toEqual(["RUNNER_SECRET_RUN lane=lane-a op=deploy exit=5"]);
     expect([...logs, ...run.logs].join("\n")).not.toContain(VALUE);
+  });
+
+  test("secret.run waits for the longest op timeoutSec plus a margin, not the 30 s of secret.get", async () => {
+    const { sup, run } = await connected();
+    const result = { exitCode: 0, stdout: "deployed", stderr: "", truncated: false };
+    let answer: (() => void) | undefined;
+    sup.onSecret = (frame, session, reply) => {
+      answer = () => {
+        const box = (session as Session).sealSecret("s2r", { runner: LABEL, gen: frame.gen, epoch: EPOCH, type: "secret.run.result", rid: frame.body.rid }, JSON.stringify(result));
+        reply("secret.run.result", { rid: frame.body.rid, ok: true, sealed: box });
+      };
+    };
+    const runOp = remoteSecretRunner({ client: run.client, laneRepo: async () => undefined, log: () => {} });
+    const pending = runOp("lane-a", "deploy");
+    await drive(sup, (async () => { while (!answer) await Promise.resolve(); })());
+    expect(run.timers).toHaveLength(1);
+    expect(run.timers[0]?.ms).toBe(SECRET_RUN_TIMEOUT_MS);
+    expect(SECRET_RUN_TIMEOUT_MS).toBeGreaterThan(SECRET_COMMAND_MAX_TIMEOUT_SEC * 1000);
+    answer?.();
+    expect(await drive(sup, pending)).toEqual({ ok: true, ...result });
+    expect(run.timers[0]?.cancelled).toBe(true);
+
+    const late = run.client.secretRequest("secret.run", { key: "lane-a", op: "deploy" });
+    for (const pair of sup.net.pairs) pair.pump();
+    run.timers[1]?.fire();
+    expect(await late).toEqual({ ok: false, code: "RUNNER_SECRET_TIMEOUT", detail: `no answer to secret.run within ${SECRET_RUN_TIMEOUT_MS / 1000}s` });
   });
 
   test("secret.run: a refusal passes through; a box sealed as secret.value or a malformed result is FAILED", async () => {

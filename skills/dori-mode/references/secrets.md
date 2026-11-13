@@ -151,7 +151,7 @@ Each side checks different things:
 
 A request for a lane the runner doesn't own also logs `RUNNER_FORGED_SECRET runner=<label> key=<key>` in the supervisor log. An honest runner never sends one, so treat it as a sign the runner host is compromised.
 
-Remote secrets need protocol 6 on both sides. Upgrade the supervisor first: it still accepts protocol 5 runners. An old runner keeps answering its lanes `RUNNER_SECRET_UNSUPPORTED` and never receives a value. When either side speaks a protocol older than 6, the lane gets `RUNNER_SECRET_OUTDATED`. With no answer in 30 seconds the lane gets `RUNNER_SECRET_TIMEOUT`.
+Remote secrets need protocol 6 on both sides. Upgrade the supervisor first: it still accepts protocol 5 runners. An old runner keeps answering its lanes `RUNNER_SECRET_UNSUPPORTED` and never receives a value. When either side speaks a protocol older than 6, the lane gets `RUNNER_SECRET_OUTDATED`. With no answer in 30 seconds the lane gets `RUNNER_SECRET_TIMEOUT`. `dori secret run` waits longer: the op runs on the supervisor host until its `timeoutSec` (at most 3600 seconds), so the runner waits 3660 seconds before it gives up.
 
 ## Audit log
 
@@ -180,7 +180,7 @@ Stored values are registered with dori's output masking, so a value that turns u
 | `SECRET_EXEC_LANE_ONLY` | `dori secret exec` run outside a lane. |
 | `RUNNER_SECRET_UNSUPPORTED` | The lane's runner doesn't hand out secrets (a remote runner older than protocol 6), or the link to the supervisor isn't authenticated. |
 | `RUNNER_SECRET_OUTDATED` | The runner or the supervisor speaks a protocol older than 6. |
-| `RUNNER_SECRET_TIMEOUT` | A remote runner got no answer from the supervisor within 30 seconds. |
+| `RUNNER_SECRET_TIMEOUT` | A remote runner got no answer from the supervisor within 30 seconds (3660 seconds for `dori secret run`). |
 | `RUNNER_SECRET_DENIED` | At least one name isn't allowed for this lane by config `secrets`, a minted name was asked for by a lane with no repo, or `dori secret run` named an op that isn't configured or doesn't allow this lane. |
 | `RUNNER_SECRET_MISSING` | A name is allowed but not in the store, or a mint rule's `keySecret` isn't. |
 | `RUNNER_SECRET_FAILED` | Reading the store or the config failed, a mint failed (detail `GITHUB_MINT_FAILED ...`), a secret command couldn't start, or a remote runner lost its connection or got a reply it couldn't open. |
