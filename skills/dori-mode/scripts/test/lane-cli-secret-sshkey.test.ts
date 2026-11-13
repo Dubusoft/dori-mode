@@ -77,6 +77,23 @@ test("two ssh-key secrets: two paths, no GIT_SSH_COMMAND, dir removed", async ()
   expect(readdirSync(tempRoot)).toEqual([]);
 });
 
+test("a file secret: path in env, value written byte for byte in a 0600 file, no GIT_SSH_COMMAND, dir removed", async () => {
+  const json = `{"key":"${KEY_A}"}`;
+  const { seen, tempRoot } = await run({ ok: true, values: { KEY_A: json }, kinds: { KEY_A: "file" } });
+  expect(seen.env.KEY_A).not.toContain(KEY_A);
+  expect(seen.files.KEY_A).toEqual({ text: json, mode: 0o600 });
+  expect(seen.files.__dir?.mode).toBe(0o700);
+  expect(seen.env.GIT_SSH_COMMAND).toBeUndefined();
+  expect(readdirSync(tempRoot)).toEqual([]);
+});
+
+test("one ssh-key next to a file secret still sets GIT_SSH_COMMAND for the key", async () => {
+  const { seen } = await run({ ok: true, values: { KEY_A, KEY_B }, kinds: { KEY_A: "ssh-key", KEY_B: "file" } });
+  expect(seen.files.KEY_A?.text).toBe(`${KEY_A}\n`);
+  expect(seen.files.KEY_B?.text).toBe(KEY_B);
+  expect(seen.env.GIT_SSH_COMMAND).toBe(`ssh -i '${seen.env.KEY_A}' -o IdentitiesOnly=yes -o IdentityAgent=none`);
+});
+
 test("env-kind secrets stay plain env values and make no temp dir", async () => {
   const { seen, tempRoot } = await run({ ok: true, values: { KEY_A } });
   expect(seen.env.KEY_A).toBe(KEY_A);

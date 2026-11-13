@@ -209,7 +209,7 @@ describe("event cursor over a lossy in-memory link", () => {
 });
 
 describe("hub commit-then-ack", () => {
-  const hello = (hub: RunnerHub) => hub.hello(runnerControl(HEAD, "hello", { proto: 6, gen: 1, label: LABEL, hostId: "h", cmdAck: 0, version: "v" }));
+  const hello = (hub: RunnerHub) => hub.hello(runnerControl(HEAD, "hello", { proto: 7, gen: 1, label: LABEL, hostId: "h", cmdAck: 0, version: "v" }));
 
   test("a throwing commit leaves eventAck unchanged and sends no ack; a retry commits", () => {
     let fail = true;
@@ -247,7 +247,7 @@ describe("hub commit-then-ack", () => {
       expect(hub.receive(runnerEvent(HEAD, 1, "lane.state", stateBody))).toMatchObject({ result: "duplicate", eventAck: 1 });
       expect(ids).toEqual([journalId(LABEL, 1)]);
       const reply = hello(hub);
-      expect(reply.ok && reply.reply.body).toEqual({ proto: 7, epoch: 1, eventAck: 1 });
+      expect(reply.ok && reply.reply.body).toEqual({ proto: 8, epoch: 1, eventAck: 1 });
     } finally {
       hub.close();
     }
@@ -257,24 +257,24 @@ describe("hub commit-then-ack", () => {
     let mono = 0;
     const hub = new RunnerHub({ stateDir: join(tmp.dir, "sup"), now: () => 5, monotonic: () => mono, epoch: 1, commit: () => true });
     try {
-      // The supervisor speaks proto 7 and accepts 7 and 6 (N and N-1).
-      const body = { proto: 6, gen: 2, label: LABEL, hostId: "h", cmdAck: 0 };
+      // The supervisor speaks proto 8 and accepts 8 and 7 (N and N-1).
+      const body = { proto: 7, gen: 2, label: LABEL, hostId: "h", cmdAck: 0 };
       const rejectCode = (b: typeof body) => {
         const out = hub.hello(runnerControl(HEAD, "hello", b));
         return out.ok ? "ok" : out.reply.body.code;
       };
+      expect(rejectCode({ ...body, proto: 10 })).toBe("RUNNER_PROTO_MISMATCH");
       expect(rejectCode({ ...body, proto: 9 })).toBe("RUNNER_PROTO_MISMATCH");
-      expect(rejectCode({ ...body, proto: 8 })).toBe("RUNNER_PROTO_MISMATCH");
-      expect(rejectCode({ ...body, proto: 5 })).toBe("RUNNER_PROTO_MISMATCH");
+      expect(rejectCode({ ...body, proto: 6 })).toBe("RUNNER_PROTO_MISMATCH");
       expect(rejectCode({ ...body, proto: 1 })).toBe("RUNNER_PROTO_MISMATCH");
-      const tooOld = hub.hello(runnerControl(HEAD, "hello", { ...body, proto: 5 }));
+      const tooOld = hub.hello(runnerControl(HEAD, "hello", { ...body, proto: 6 }));
       expect(tooOld.ok ? undefined : tooOld.reply.body).toEqual({
-        code: "RUNNER_PROTO_MISMATCH", detail: "runner proto 5 is too old for the supervisor (accepts 6..7); run dori runner update",
+        code: "RUNNER_PROTO_MISMATCH", detail: "runner proto 6 is too old for the supervisor (accepts 7..8); run dori runner update",
       });
       expect(rejectCode(body)).toBe("ok");
       expect(rejectCode({ ...body, hostId: "other" })).toBe("RUNNER_CONFLICT");
       expect(rejectCode({ ...body, gen: 1 })).toBe("RUNNER_CONFLICT");
-      expect(formatRunnerStatus(hub.status()[0] as never)).toBe("RUNNER r1 connected proto=6 version=- gen=2 hb=- outbox=-");
+      expect(formatRunnerStatus(hub.status()[0] as never)).toBe("RUNNER r1 connected proto=7 version=- gen=2 hb=- outbox=-");
       mono = 61_000;
       expect(hub.status()[0]?.state).toBe("stale");
       hub.disconnected(LABEL);
@@ -299,7 +299,7 @@ describe("proto 3 frames", () => {
   const roundTrip = (frame: Parameters<typeof encodeFrame>[0], from: "runner" | "supervisor") => decodeFrame(encodeFrame(frame), from);
 
   test("the new event fields and lane.ack validate; cmd.result.result takes any JSON value", () => {
-    expect(PROTO).toBe(7);
+    expect(PROTO).toBe(8);
     expect(roundTrip(runnerEvent(HEAD, 1, "lane.ack", { key: "lane-a", id: "m-1" }), "runner").type).toBe("lane.ack");
     expect(roundTrip(runnerEvent(HEAD, 2, "lane.state", { key: "lane-a", status: "dead", reason: "agent-gone" }), "runner").body)
       .toEqual({ key: "lane-a", status: "dead", reason: "agent-gone" });

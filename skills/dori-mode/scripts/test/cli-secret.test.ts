@@ -52,4 +52,8 @@ test("there is no get subcommand, and exec is lane-only", async () => {
   const exec = await dori(h, ["exec", "TEST_TOKEN", "--", "true"]);
   expect(exec.code).toBe(2);
   expect(exec.err).toContain("SECRET_EXEC_LANE_ONLY");
+  const put = await dori(h, ["put", "TEST_TOKEN"], VALUE);
+  expect(put.code).toBe(2);
+  expect(put.err).toContain("SECRET_PUT_LANE_ONLY");
+  expect((await dori(h, ["list"])).out).toBe("");
 });

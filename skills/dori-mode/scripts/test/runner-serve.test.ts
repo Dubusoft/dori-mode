@@ -29,7 +29,7 @@ const waiter = <T>() => {
   };
 };
 
-test.each([6, 7])("direct and queued file operations pass admitted proto %i and enforce the frame limits", async (proto) => {
+test.each([7, 8])("direct and queued file operations pass admitted proto %i and enforce the frame limits", async (proto) => {
   const tmp = withState(); cleanups.push(tmp.done);
   const hub = new RunnerHub({ stateDir: tmp.dir, now: () => 1000, monotonic: () => 1000, epoch: 1, commit: () => true });
   cleanups.push(() => hub.close());
@@ -107,7 +107,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 7, gen: 1, heartbeatAgeSec: 0 });
+  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 8, gen: 1, heartbeatAgeSec: 0 });
   // The lane count is the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
   expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · herdr 미확인 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
 

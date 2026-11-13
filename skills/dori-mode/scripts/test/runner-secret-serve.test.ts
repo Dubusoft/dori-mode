@@ -256,7 +256,7 @@ describe("acceptRunners secret frames", () => {
     const transport = await network.connect();
     const received: SupervisorControl[] = [];
     transport.onLine((line) => { received.push(decodeFrame(line, "supervisor") as SupervisorControl); });
-    transport.send(encodeFrame(runnerControl(HEAD, "hello", { label: LABEL, hostId: HOST, gen: HEAD.gen, proto: 6, cmdAck: 0 })));
+    transport.send(encodeFrame(runnerControl(HEAD, "hello", { label: LABEL, hostId: HOST, gen: HEAD.gen, proto: 7, cmdAck: 0 })));
     network.pairs[0]!.pump();
     expect(received.map((f) => f.type)).toEqual(["hello.ok"]);
     const send = (frame: SecretFrame): void => { transport.send(encodeFrame(frame)); network.pairs[0]!.pump(); };
@@ -279,7 +279,7 @@ describe("acceptRunners secret frames", () => {
       ctx.reply("secret.value", { rid: frame.body.rid, ok: false, code: "RUNNER_SECRET_DENIED", detail: "test" });
     });
     send(getFrame("lane-a", ["API_TOKEN"]));
-    expect(seen).toEqual([{ label: LABEL, key: "lane-a", session: undefined, proto: 6, head: { ...HEAD, epoch: 2 } }]);
+    expect(seen).toEqual([{ label: LABEL, key: "lane-a", session: undefined, proto: 7, head: { ...HEAD, epoch: 2 } }]);
     expect(received.slice(1)).toMatchObject([{ type: "secret.value", body: { rid: RID, code: "RUNNER_SECRET_DENIED" } }]);
     expect(logs.join("\n")).not.toContain("API_TOKEN");
   });

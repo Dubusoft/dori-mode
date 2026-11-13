@@ -4,7 +4,7 @@ import type { SecretRule } from "../config.ts";
 import { GithubMintError, mintInstallationToken } from "../github-app-token.ts";
 import type { Runner } from "../run.ts";
 import { type SecretStore, SecretStoreError } from "../secret-store.ts";
-import type { SecretGrant } from "./lane-socket.ts";
+import type { SecretGrant, SecretKind, SecretPutResult } from "./lane-socket.ts";
 import type { SecretRunAuditEntry } from "./secret-run.ts";
 
 /**
@@ -19,6 +19,8 @@ export type SecretAuditEntry = {
   readonly allowed: boolean; readonly reason?: string;
   /** Names whose value was minted (a GitHub App token) rather than read from the store. */
   readonly minted?: readonly string[];
+  /** Set on a `dori secret put` line: the lane stored a value instead of reading one. */
+  readonly put?: true;
 };
 
 export type SecretGranterDeps = {
@@ -120,18 +122,58 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
     return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)${asked ? `; ${asked}` : ""}`, `not allowed: ${list}`);
   }
   const values: Record<string, string> = {};
-  const kinds: Record<string, "env" | "ssh-key"> = {};
+  const kinds: Record<string, Exclude<SecretKind, "env">> = {};
   for (const name of names) {
     const rule = rules[name] as SecretRule;
     const read = await readSecretValue(deps, name, rule, key, laneRepo);
     if (!read.ok) return refuse(read.code, read.detail, read.reason);
     values[name] = read.value;
     if (read.minted) minted.push(name);
-    if (rule.as === "ssh-key") kinds[name] = "ssh-key";
+    if (rule.as === "ssh-key" || rule.as === "file") kinds[name] = rule.as;
   }
   audit(true);
   deps.onGranted?.(Object.values(values));
   return { ok: true, values, ...(Object.keys(kinds).length ? { kinds } : {}) };
+};
+
+export type SecretDepositorDeps = Omit<SecretGranterDeps, "store" | "mint" | "request" | "onGranted"> & {
+  readonly store: Pick<SecretStore, "put">;
+  /** Called with the stored value, e.g. to register it for log masking. */
+  readonly onStored?: (value: string) => void;
+};
+
+/**
+ * The `secretPut` handler for the lane socket: stores `value` under `name` for lane `key` when the name's rule has a
+ * `put` entry matching the lane, else `RUNNER_SECRET_DENIED`. Write only: it grants no read, so the lane gets the value
+ * back through `secret exec` only when the rule's own `lanes`/`repos` allow it. One audit line per request (`put: true`),
+ * never the value.
+ */
+export const secretDepositor = (deps: SecretDepositorDeps) => async (key: string, name: string, value: string): Promise<SecretPutResult> => {
+  const audit = (allowed: boolean, reason?: string): void => {
+    deps.audit({ at: new Date(deps.now()).toISOString(), runner: deps.runner, lane: key, names: [name], allowed, put: true, ...(reason !== undefined ? { reason } : {}) });
+  };
+  const refuse = (code: string, detail: string, reason: string): SecretPutResult => {
+    audit(false, reason);
+    return { ok: false, code, detail };
+  };
+  let rules: Readonly<Record<string, SecretRule>>;
+  try { rules = await deps.rules(); } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return refuse("RUNNER_SECRET_FAILED", message, `config: ${message}`);
+  }
+  const put = Object.hasOwn(rules, name) ? rules[name]?.put : undefined;
+  if (!put || !await ruleMatches(put, key, () => deps.laneRepo(key).catch(() => undefined))) {
+    return refuse("RUNNER_SECRET_DENIED", `${key} may not store ${name} (config secrets.${name}.put)`, `put not allowed: ${name}`);
+  }
+  try {
+    const entry = await deps.store.put(name, value);
+    audit(true);
+    deps.onStored?.(value);
+    return { ok: true, created: entry.created, backend: entry.backend };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return refuse("RUNNER_SECRET_FAILED", message, `write failed: ${name}`);
+  }
 };
 
 /**

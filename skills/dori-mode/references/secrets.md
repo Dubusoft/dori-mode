@@ -19,7 +19,7 @@ The local runner reads the store itself. A remote runner (`dori runner serve --l
 printf %s "$TOKEN" | dori secret add NPM_TOKEN
 ```
 
-There's no `get` or `show`, and no command prints a value. Running `dori secret exec` outside a lane exits 2 with `SECRET_EXEC_LANE_ONLY`.
+There's no `get` or `show`, and no command prints a value. Running `dori secret exec` outside a lane exits 2 with `SECRET_EXEC_LANE_ONLY`, and `dori secret put` with `SECRET_PUT_LANE_ONLY` (on the host, `add` and `update` do that job).
 
 A name matches `^[A-Z][A-Z0-9_]{0,63}$` (uppercase, digits, underscore, starting with a letter); anything else is `SECRET_NAME_INVALID`.
 
@@ -48,7 +48,7 @@ A lane may receive a name when any of these holds:
 - an entry ends in `*` and the key starts with the part before it (`pub-*` matches `pub-docs`);
 - `repos` lists the lane's repo. That's the `owner/repo` of the `origin` remote of the lane's worktree, compared case-insensitively. The lane can rewrite its own `origin` (`git remote set-url`), so a repo entry is weaker than a lane entry: use `lanes` for anything a lane of another repo must not get.
 
-A rule may also carry `as` (`"env"`, the default, or `"ssh-key"`, see [Deploy keys](#deploy-keys)) or `mint` (see [Minted GitHub tokens](#minted-github-tokens)). The two can't be combined.
+A rule may also carry `as` (`"env"`, the default; `"ssh-key"`, see [Deploy keys](#deploy-keys); or `"file"`, see [Credential files](#credential-files)), `mint` (see [Minted GitHub tokens](#minted-github-tokens)) or `put` (see [Lane-made secrets](#lane-made-secrets)). `mint` goes with neither a file `as` nor `put`.
 
 A request names one or more secrets, and it's all or nothing: if any one name is denied, the whole request is refused with `RUNNER_SECRET_DENIED` and no value is sent. The config is re-read on every request, so an edit takes effect without a restart.
 
@@ -83,7 +83,9 @@ A lane should pass the variable to the tool that needs it, not echo it, write it
 
 Every lane footer `dori launch` writes says this: credentials come only through `secret exec` and `secret run` (the runner's `~/.dori/runner/bin/dori` on a remote lane), production deploys only through `secret run`, the lane never reads or copies credential files or CLI logins, and a refusal is reported as `blocked` with the name or op so the lead can add the secret or its rule.
 
-An `ssh-key` secret arrives as a file path instead of the key (see [Deploy keys](#deploy-keys)). A minted name looks like any other env secret to the lane.
+An `ssh-key` or `file` secret arrives as a file path instead of the value (see [Deploy keys](#deploy-keys) and [Credential files](#credential-files)). A minted name looks like any other env secret to the lane.
+
+A lane that made a credential itself (a key it generated, a token a service issued it) stores it with `dori secret put`, see [Lane-made secrets](#lane-made-secrets).
 
 For an operation the lane should never hold the credential for, it asks the host to run it instead:
 
@@ -130,6 +132,40 @@ For `dori secret exec DEPLOY_KEY -- git push`, the lane CLI writes the key to a 
 For git-only access, prefer a per-repo deploy key over a personal token: it reaches one repo, it can be read-only, and it can't call the GitHub API.
 
 This works the same on remote runners: the sealed `secret.value` carries the `ssh-key` kind, and the remote runner passes it on to its lane.
+
+## Credential files
+
+A rule with `"as": "file"` hands out any value as a file, for tools that read a credential from a path (a JSON service account key, a kubeconfig):
+
+```json
+"secrets": {
+  "GCP_SA_JSON": { "lanes": ["infra-*"], "as": "file" }
+}
+```
+
+`dori secret exec GCP_SA_JSON -- sh -c 'GOOGLE_APPLICATION_CREDENTIALS="$GCP_SA_JSON" terraform plan'` gets `GCP_SA_JSON` set to the path of a 0600 file in a fresh 0700 temp dir, holding the stored value byte for byte (no newline added, unlike an ssh key). The dir is removed when the command exits. A file name never sets `GIT_SSH_COMMAND`; one `ssh-key` name next to file names still does. On a remote runner the sealed `secret.value` carries the `file` kind; a runner older than this rejects that grant with `RUNNER_SECRET_FAILED` instead of putting the value in env.
+
+## Lane-made secrets
+
+`dori secret put NAME` stores a value the lane made in the supervisor's store, for the lead or later lanes to use. Writing a name is a permission of its own, under the rule's `put`:
+
+```json
+"secrets": {
+  "STORE_UPLOAD_KEY": { "put": { "lanes": ["ap-968-*"] }, "lanes": ["release-*"], "as": "file" }
+}
+```
+
+- `put.lanes` and `put.repos` match like a rule's own `lanes` and `repos`. A name without `put` (or with both lists empty) can't be stored by any lane.
+- `put` grants no read. The lane that stored the value gets it back through `secret exec` only when the rule's own `lanes` or `repos` also match it; in the example `ap-968-1` can store the key and only `release-*` lanes can use it.
+- The value comes from stdin, as for `dori secret add`: all of it minus one trailing newline, never argv. An empty value is `SECRET_VALUE_EMPTY`, one over 64 KiB `SECRET_VALUE_TOO_LARGE`, both exit 2.
+- A new name prints `SECRET_STORED NAME backend=...`, an existing one is replaced and prints `SECRET_REPLACED NAME backend=...`. A lane allowed to put a name can therefore overwrite what the lead stored there; give `put` only to names lanes own.
+- A refusal prints `<code> <detail>` and exits 1: `RUNNER_SECRET_DENIED` when `put` doesn't match the lane.
+
+```sh
+printf %s "$KEY" | dori secret put STORE_UPLOAD_KEY
+```
+
+The store write and the audit happen where the store is: the local runner itself, or for a remote runner the supervisor. A remote runner sends the value in a `secret.put` control frame, sealed in the runner-to-supervisor direction (bound like `secret.value` to runner, gen, epoch, frame type and request id); the supervisor applies the same checks as for `secret.get` (an open lane of that runner, not an unsandboxed runner) and then `put`, and answers `secret.put.result` with nothing sealed. `secret.put` needs protocol 8 on both sides: a supervisor or runner below it answers `RUNNER_SECRET_OUTDATED`. Both sides register the value for log masking. The audit line has `"put": true`, and a refusal's `reason` is `put not allowed: NAME` or `write failed: NAME`; the log line is `RUNNER_SECRET_STORED lane=<key> names=<NAME> put` or `RUNNER_SECRET_DENIED ... put`.
 
 ## Proxy execution
 
@@ -184,7 +220,7 @@ Each side checks different things:
 
 A request for a lane the runner doesn't own also logs `RUNNER_FORGED_SECRET runner=<label> key=<key>` in the supervisor log. An honest runner never sends one, so treat it as a sign the runner host is compromised.
 
-Remote secrets need protocol 6 on both sides. Upgrade the supervisor first: it still accepts protocol 5 runners. An old runner keeps answering its lanes `RUNNER_SECRET_UNSUPPORTED` and never receives a value. When either side speaks a protocol older than 6, the lane gets `RUNNER_SECRET_OUTDATED`. With no answer in 30 seconds the lane gets `RUNNER_SECRET_TIMEOUT`. `dori secret run` waits longer: the op runs on the supervisor host until its `timeoutSec` (at most 3600 seconds), so the runner waits 3660 seconds before it gives up.
+Remote secrets need protocol 6 on both sides (protocol 8 for `secret put`). Upgrade the supervisor first: it accepts runners one protocol behind its own. An old runner keeps answering its lanes `RUNNER_SECRET_UNSUPPORTED` and never receives a value. When either side speaks a protocol older than 6, the lane gets `RUNNER_SECRET_OUTDATED`. With no answer in 30 seconds the lane gets `RUNNER_SECRET_TIMEOUT`. `dori secret run` waits longer: the op runs on the supervisor host until its `timeoutSec` (at most 3600 seconds), so the runner waits 3660 seconds before it gives up.
 
 ## Audit log
 
@@ -211,10 +247,12 @@ Stored values are registered with dori's output masking, so a value that turns u
 | `SECRET_ENCRYPT_FAILED` / `SECRET_DECRYPT_FAILED` | `systemd-creds --user` failed. |
 | `SECRET_DIR_UNSAFE` | `~/.dori/secrets` has group or other permission bits. |
 | `SECRET_EXEC_LANE_ONLY` | `dori secret exec` run outside a lane. |
+| `SECRET_PUT_LANE_ONLY` | `dori secret put` run outside a lane. |
+| `SECRET_VALUE_TOO_LARGE` | `dori secret put` got more than 64 KiB on stdin. |
 | `RUNNER_SECRET_UNSUPPORTED` | The lane's runner doesn't hand out secrets (a remote runner older than protocol 6), or the link to the supervisor isn't authenticated. |
-| `RUNNER_SECRET_OUTDATED` | The runner or the supervisor speaks a protocol older than 6. |
+| `RUNNER_SECRET_OUTDATED` | The runner or the supervisor speaks a protocol older than 6 (8 for `dori secret put`). |
 | `RUNNER_SECRET_TIMEOUT` | A remote runner got no answer from the supervisor within 30 seconds (3660 seconds for `dori secret run`). |
-| `RUNNER_SECRET_DENIED` | At least one name isn't allowed for this lane by config `secrets`, a minted name was asked for by a lane with no repo, or `dori secret run` named an op that isn't configured or doesn't allow this lane. |
+| `RUNNER_SECRET_DENIED` | At least one name isn't allowed for this lane by config `secrets`, a minted name was asked for by a lane with no repo, `dori secret run` named an op that isn't configured or doesn't allow this lane, or `dori secret put` named a name whose `put` doesn't match this lane. |
 | `RUNNER_SECRET_MISSING` | A name is allowed but not in the store, or a mint rule's `keySecret` isn't. |
 | `RUNNER_SECRET_FAILED` | Reading the store or the config failed, a mint failed (detail `GITHUB_MINT_FAILED ...`), a secret command couldn't start, or a remote runner lost its connection or got a reply it couldn't open. |
 | `RUNNER_LANE_BAD_REQUEST` | The request had no names, more than 32, duplicates or an invalid name, or an op that doesn't match the op rule. |
@@ -241,5 +279,6 @@ What it doesn't do:
 - It can't stop a lane that received a value from printing it or sending it somewhere. Treat a granted value as disclosed to that lane, and grant it only to lanes you'd trust with it.
 - `.plain` entries are only as safe as their 0600 mode.
 - A minted token is as good as a stored one for its hour. Revoking it early is up to GitHub.
-- A deploy key file sits in the temp dir for as long as the command runs, readable by that user.
+- A deploy key or credential file sits in the temp dir for as long as the command runs, readable by that user.
+- A lane allowed to `put` a name can replace its value with anything, so whatever reads that name later trusts the lane that wrote it.
 - A proxy command does whatever its argv does whenever an allowed lane asks. Output redaction catches the values verbatim only; a command that prints a transformed value leaks it.
