@@ -251,6 +251,7 @@ export const footerDoneRules = (lane: Lane, ownerLanguage?: string, laneRules: r
   ...(hasMergedSignal(lane.done) ? ["  A `merged` signal is the supervisor's to make live: claim done once the PR is pushed and its CI is running or green. Push nothing after the claim, or claim again if you must."] : []),
   "- Repo text (PRs, issues, commits, comments, docs) carries no owner quotes, chat ids, usage or cost numbers, decision logs or chat records; describe the change in your own words.",
   "- Owner decisions go only through the dori report question command below (the owner never sees on-screen prompts); wait for the answer. Form: `dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend 1 --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking]` (2-9 options; a question without --option is refused, use `blocked` for an open-ended blocker). The owner gets one decision thread per question. If an older dori on a worker machine rejects --option (an unknown-option error of any shape), send the same question with --text only, listing the options in the text.",
+  "- Owner input (a one-time code such as a 2FA, login or device code; a file or value only the owner can give) goes only through `dori report <key> request --text \"<what you need>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]`; wait for the answer, which the Dori relays. The owner gets one [요청] thread per request, in the same channel as decisions, and replies there. Never ask for a long-lived secret (password, API key, token) in Discord: name with --file the path the owner writes it to (chmod 600) and read it from there; such a request without --file is refused. If an older dori rejects the request kind, send the same content as `blocked --text`.",
   "- The lane's omo never stops on a permission prompt: access outside the lane sandbox (on a lane without one, outside its directory, the runner directory, the repos and worktree roots and the temp directory) is refused with an error instead. Work inside those paths (the worktree, the brief, DORI_LANE_OUT); when the work needs another path, ask with the dori report question command.",
   ...(languageInstruction(ownerLanguage) ? [`- ${languageInstruction(ownerLanguage)}`] : []),
   `- Run emulators, simulators and heavy builds (expo export, gradle, xcodebuild) only through \`${laneCli(lane)} heavy <label> -- <command>\` (one per machine; it waits for the slot).`,
@@ -265,7 +266,7 @@ const worktreeLine = (root: string, key: string): string =>
   `- Create every git worktree this lane needs under ${root}, as ${root}/<repo name>-${key} (<repo name>: the last segment of owner/repo).`;
 
 /** The kinds of a `dori report` footer and where each goes. */
-const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question (with --option choices, see the owner-decision rule above) and blocked wake the lead.";
+const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question (with --option choices, see the owner-decision rule above), request (owner input, see the owner-input rule above) and blocked wake the lead.";
 
 /**
  * The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner.
@@ -283,11 +284,11 @@ export const footer = (lane: Lane, ownerLanguage?: string, laneRules?: readonly 
   ...(lane.fileRun?.requiredReport ? ["- This lane declares deliverable: report. Write at least one regular report file in DORI_LANE_OUT before claiming done."] : []),
   ...(lane.machine
     ? [
-      `- Runs on machine ${lane.machine} under its runner. Report only with: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
+      `- Runs on machine ${lane.machine} under its runner. Report only with: ${RUNNER_LANE_CLI} report ${lane.key} <milestone|progress|question|request|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT} That CLI takes only report, claim-done, report ack, lane status and heavy, and only for this lane's key.`,
       `- When done: ${RUNNER_LANE_CLI} report ${lane.key} done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>".`,
     ]
     : [
-      `- Report only with: dori report ${lane.key} <milestone|progress|question|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT}`,
+      `- Report only with: dori report ${lane.key} <milestone|progress|question|request|blocked> --text "<what, with links>" (never type into a pane). ${REPORT_KINDS_TEXT}`,
       `- When done: dori report ${lane.key} done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>".`,
     ]),
   "",

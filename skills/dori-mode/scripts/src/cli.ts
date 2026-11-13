@@ -281,6 +281,10 @@ const USAGE = `dori <command> [options]
                                        --task defaults to the ap-<task>-<n> lane's task; --nonblocking: work goes ahead on the
                                        recommendation; --from-event resolves that decision event (DECISION_SOURCE_RESOLVED);
                                        a bad or missing field exits 2 DECISION_REFUSED
+  decision open --request --question "<what is needed>" --reason TEXT --waiting TEXT [--file PATH] [...]
+                                       lead-only: ask the owner for input only they can give (a one-time code, a file or value) in a
+                                       [요청] thread, answered and closed like a decision; a long-lived secret (password, API key,
+                                       token) needs --file, the path the owner writes it to (chmod 600), never a reply in Discord
   decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel]
                                        lead-only: post the outcome into the decision's thread, archive it and resolve its
                                        OWNER_DECISION_ANSWERED event; --from names an answer given outside the thread
@@ -1562,7 +1566,7 @@ try {
       const refusal = laneDecisionRefusal(await callerLane(deps));
       if (refusal) die(refusal);
       const od = await import("./owner-decisions.ts");
-      const { decisionChoicesProblem } = await import("./runner/decision-text.ts");
+      const { decisionChoicesProblem, inputRequestProblem } = await import("./runner/decision-text.ts");
       const [sub, ...subArgs] = rest;
       const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
       /** Discord is reached only when a call needs it; `token` already resolved, else read on first use. */
@@ -1574,7 +1578,7 @@ try {
         };
       };
       if (sub === "open") {
-        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]";
+        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]\n       dori decision open --request --question \"<what is needed>\" --reason TEXT --waiting TEXT [--file PATH] [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]";
         const refuse = (reason: string): never => {
           console.error(`DECISION_REFUSED ${reason}`);
           return die(usage, 2);
@@ -1586,13 +1590,18 @@ try {
               options: {
                 question: { type: "string" }, option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" },
                 waiting: { type: "string" }, task: { type: "string" }, lane: { type: "string" }, thread: { type: "string" },
-                nonblocking: { type: "boolean" }, "from-event": { type: "string" },
+                nonblocking: { type: "boolean" }, "from-event": { type: "string" }, request: { type: "boolean" }, file: { type: "string" },
               },
             });
           } catch (e) { return refuse(e instanceof Error ? e.message : String(e)); }
         })();
         const v = parsed.values;
-        const problem = decisionChoicesProblem({ question: v.question, options: v.option, recommend: v.recommend, reason: v.reason, waiting: v.waiting });
+        const request = v.request === true;
+        if (request && (v.option !== undefined || v.recommend !== undefined)) refuse("a --request takes no --option or --recommend");
+        if (!request && v.file !== undefined) refuse("--file goes only with --request");
+        const problem = request
+          ? inputRequestProblem({ need: v.question, reason: v.reason, waiting: v.waiting, ...(v.file !== undefined ? { file: v.file } : {}) })
+          : decisionChoicesProblem({ question: v.question, options: v.option, recommend: v.recommend, reason: v.reason, waiting: v.waiting });
         if (problem) refuse(problem);
         let task: number | undefined;
         if (v.task !== undefined) {
@@ -1611,16 +1620,19 @@ try {
         const { recordResolved, validEventId } = await import("./decision-obligations.ts");
         if (fromEvent !== undefined && !validEventId(fromEvent)) refuse(`--from-event ${fromEvent} is not an event id`);
         const token = messengerToken("DORI_DISCORD_TOKEN");
+        const asked = request
+          ? od.requestSpec({ need: flat(v.question ?? ""), reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true, ...(v.file !== undefined ? { file: flat(v.file) } : {}) })
+          : { question: flat(v.question ?? ""), options: (v.option ?? []).map(flat), recommend: Number((v.recommend ?? "").trim()),
+            reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true };
         const opened = await od.openOwnerDecision(decisionContext(token), {
-          question: flat(v.question ?? ""), options: (v.option ?? []).map(flat), recommend: Number((v.recommend ?? "").trim()),
-          reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true, source: "lead",
+          ...asked, source: "lead",
           ...(task !== undefined ? { task } : {}), ...(laneKey ? { lane: laneKey } : {}), ...(origin ? { origin } : {}),
         }).catch((e: unknown) => {
           if (e instanceof od.OwnerDecisionError) die(e.message, 1);
           throw e;
         });
         const d = opened.decision;
-        console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}`);
+        console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}${d.kind === "request" ? " request" : ""}`);
         if (opened.channel.unset) console.log(od.channelUnsetLine(opened.channel));
         if (opened.noticeKept) console.log(`DECISION_NOTICE_KEPT ${d.id}: the channel's "started a thread" notice could not be deleted: ${opened.noticeKept}`);
         const link = opened.link;
