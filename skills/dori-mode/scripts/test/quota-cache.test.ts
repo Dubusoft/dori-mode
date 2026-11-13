@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { quotaSummary } from "../src/autopilot-cli.ts";
-import { DEFAULT_AUTOPILOT, judge, type ToodoTask } from "../src/autopilot.ts";
+import { DEFAULT_AUTOPILOT, judge, singleHost, type ToodoTask } from "../src/autopilot.ts";
 import { type QuotaResult, readUsage, skippedClaudeAccounts, type UsageLookup } from "../src/claude-quota.ts";
 import { cachedQuotaLookup, cacheNoteLines, DEFAULT_BACKOFF_SEC, STALE_READ_MAX_MS } from "../src/quota-cache.ts";
 
@@ -110,7 +110,7 @@ test("the judge counts a stale read with its age as readable, and holds quota-un
     id: 1, workspaceId: 1, title: "t", description: "d", status: "planned", resolution: null, dependsOn: [], refs: ["owner:x"],
     criteria: [{ text: "c", kind: "manual" }], wait: null, autopilot: true, dueDate: null,
   };
-  const ctx = { tasks: new Map([[1, task]]), ledger: [], openLanes: new Set<string>(), host: { ok: true }, config: DEFAULT_AUTOPILOT };
+  const ctx = { tasks: new Map([[1, task]]), ledger: [], openLanes: new Set<string>(), hosts: singleHost({ ok: true }), config: DEFAULT_AUTOPILOT };
   expect(judge({ ...ctx, taskId: 1, quota: summary }).verdict).toBe("LAUNCH");
   expect(judge({ ...ctx, taskId: 1, quota: unreadable }).reasons).toContain("quota-unreadable");
 });

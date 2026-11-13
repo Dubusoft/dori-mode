@@ -248,6 +248,20 @@ const planCandidates = async (p: Placement, candidates: readonly PlacementCandid
 };
 
 /**
+ * The machines a launch placed at `p` may go to, in the order planLaunch tries them: none while its owning runner is
+ * offline, the online candidates (defaultMachine first) when several runners declare the repo, the placed machine then
+ * the `fallback` machines for a movable placement, else the placed machine alone.
+ */
+export const placementTargets = (p: Placement, placement: PlacementConfig): string[] => {
+  if (p.online === false) return [];
+  if (p.candidates) {
+    const online = p.candidates.filter((c) => c.online).map((c) => c.machine);
+    return online.includes(placement.defaultMachine) ? [placement.defaultMachine, ...online.filter((m) => m !== placement.defaultMachine)] : online;
+  }
+  return p.movable ? [p.machine, ...placement.fallback.filter((m) => m !== p.machine)] : [p.machine];
+};
+
+/**
  * Places a launch and checks it there; a movable placement on HOLD takes the first `fallback` machine with room. A
  * launch placed on a declaring runner that is offline holds for it unchecked: it never moves to another machine. A repo
  * several runners declare goes to one of those candidates (planCandidates); all of them offline holds like one.

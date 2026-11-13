@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 import {
-  type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll,
+  type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, type Hosts, judgeAll,
   LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaAccount, quotaAccountText, quotaSplit,
   type QuotaSummary, type ToodoTask,
 } from "./autopilot.ts";
@@ -11,6 +11,7 @@ import { type ClaudeSkip, type ClaudeUsage, quotaProvidersFor, readUsage } from 
 import { ageText, type QuotaCacheNote, sharedQuotaLookup } from "./quota-cache.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
+import { hostSummary, machineHosts } from "./launch-service.ts";
 import { checkMachine } from "./placement.ts";
 import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
 
@@ -82,8 +83,15 @@ export type JudgeDeps = {
    * unreadable read is `{ readable: false }`).
    */
   readonly quota: () => Promise<QuotaSummary>;
-  /** The can-launch verdict and free slots of the default machine; must not throw. */
-  readonly host: () => Promise<HostSummary>;
+  /** Where the tasks would launch and each of those machines' can-launch verdict and free slots; must not throw. */
+  readonly hosts: (taskIds: readonly number[]) => Promise<TaskHosts>;
+};
+
+/** Each task's target machines (most preferred first; a task not named targets `defaultMachine`) and their summaries. */
+export type TaskHosts = {
+  readonly defaultMachine: string;
+  readonly machines: ReadonlyMap<string, HostSummary>;
+  readonly targets: ReadonlyMap<number, readonly string[]>;
 };
 
 export type AutopilotDeps = JudgeDeps & {
@@ -129,8 +137,10 @@ export const within = async <T>(ms: number, work: () => Promise<T>, fallback: (w
 const PROBE_MS = 15_000;
 
 /**
- * JudgeDeps over the live world: toodo-server, the registry's open lanes, the Claude quota and the default machine's
- * can-launch check (without recording a launch verdict). `dori autopilot` and the supervisor's tick share it.
+ * JudgeDeps over the live world: toodo-server, the registry's open lanes, the Claude quota and the can-launch check of
+ * every machine a task's launch may be placed on (launch-service's machineHosts, without recording a launch verdict).
+ * `dori autopilot` and the supervisor's tick share it. A task carries no repo or checkout, so it is placed like a launch
+ * without one: placement.defaultMachine, then the fallback machines.
  */
 export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry" | "tunables" | "clock">, store: OperationStore): JudgeDeps => ({
   config: flow.config.autopilot, store, pauseFile: autopilotPausePath(flow.config.stateDir),
@@ -140,12 +150,32 @@ export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry"
     const read = await readUsage(sharedQuotaLookup(flow.config), flow.clock.now(), AbortSignal.timeout(PROBE_MS), quotaProvidersFor(flow.config.defaultModel));
     return quotaSummary(read.usage, read.skipped, read.cache, flow.clock.now());
   }, () => ({ readable: false })),
-  host: () => within(PROBE_MS, async () => {
-    const c = await checkMachine(flow.ops, flow.config, flow.config.placement.defaultMachine);
-    const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
-    return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
-  }, (why) => ({ ok: false, reason: why })),
+  hosts: async (taskIds) => {
+    const { defaultMachine } = flow.config.placement;
+    const probe = (machine: string) => within(PROBE_MS, async () => hostSummary(await checkMachine(flow.ops, flow.config, machine)), (why): HostSummary => ({ ok: false, reason: why }));
+    try {
+      const found = await machineHosts(flow, taskIds.map(() => ({ done: "" })), probe);
+      return { defaultMachine, machines: found.machines, targets: new Map(taskIds.map((id, i) => [id, found.targets[i]!])) };
+    } catch (e) {
+      return { defaultMachine, machines: new Map([[defaultMachine, { ok: false, reason: e instanceof Error ? e.message : String(e) }]]), targets: new Map() };
+    }
+  },
 });
+
+/** `found` with each machine's slots less the reservations waiting for it (pendingReservations). */
+const slotted = (found: TaskHosts, pending: ReadonlyMap<string, number>): Hosts => ({
+  machines: new Map([...found.machines].map(([m, h]) => [m, h.slots === undefined ? h : { ...h, slots: Math.max(0, h.slots - (pending.get(m) ?? 0)) }])),
+  targets: (taskId) => found.targets.get(taskId) ?? [found.defaultMachine],
+});
+
+/** The free slots of every machine not held, summed (null when one has no pane limit), and each machine's when several. */
+const slotsOf = (hosts: Hosts): Pick<CandidatesReport, "slots" | "machines"> => {
+  const all = [...hosts.machines];
+  const open = all.filter(([, h]) => h.ok);
+  const slots = open.some(([, h]) => h.slots === undefined) ? null : open.reduce((sum, [, h]) => sum + h.slots!, 0);
+  if (all.length < 2) return { slots };
+  return { slots, machines: all.map(([machine, h]) => ({ machine, slots: h.ok ? h.slots ?? null : "hold" as const })) };
+};
 
 class UsageError extends Error {}
 
@@ -198,14 +228,13 @@ export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number
   const { tasks, ids } = await loadTasks(deps, extraIds);
   const paused = readPause(deps.pauseFile) !== undefined;
   if (!ids.length) return { paused, slots: null, verdicts: [] };
-  const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
+  const [openLanes, quota, found] = await Promise.all([deps.openLanes(), deps.quota(), deps.hosts(ids)]);
   const ledger = ledgerRows(deps.store);
-  const pending = pendingReservations(ledger, openLanes);
-  const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
-  const verdicts = judgeAll({ tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, ids);
+  const hosts = slotted(found, pendingReservations(ledger, openLanes, found.defaultMachine));
+  const verdicts = judgeAll({ tasks, ledger, openLanes, quota, hosts, config: deps.config }, ids);
   const { over, room } = quotaSplit(quota);
   return {
-    paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts,
+    paused, ...slotsOf(hosts), verdicts,
     ...(quota.skipped?.length ? { quotaSkipped: quota.skipped } : {}),
     ...(quota.stale?.length ? { quotaStale: quota.stale } : {}),
     ...(over.length ? { quotaOver: over.map(quotaAccountText), quotaRoom: room.map(quotaAccountText) } : {}),
@@ -242,10 +271,9 @@ const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => 
   const read = await readTasks(deps, [taskId]);
   if (!read) return 1;
   const ledger = ledgerRows(deps.store);
-  const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
-  const pending = pendingReservations(ledger, openLanes, taskId);
-  const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
-  const verdict = judgeAll({ tasks: read.tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, read.ids)
+  const [openLanes, quota, found] = await Promise.all([deps.openLanes(), deps.quota(), deps.hosts(read.ids)]);
+  const hosts = slotted(found, pendingReservations(ledger, openLanes, found.defaultMachine, taskId));
+  const verdict = judgeAll({ tasks: read.tasks, ledger, openLanes, quota, hosts, config: deps.config }, read.ids)
     .find((v) => v.taskId === taskId)!;
   if (verdict.verdict !== "LAUNCH") {
     deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} ${verdict.verdict} ${verdict.reasons.join(", ")}`);
@@ -253,8 +281,10 @@ const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => 
   }
   const attempt = ledgerState(ledger, taskId, openLanes).attempts + 1;
   const laneKey = autopilotLaneKey(taskId, attempt);
-  plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: LAUNCH_ACTION, target: String(attempt), data: JSON.stringify({ laneKey }) });
-  deps.out(`AUTOPILOT_RESERVED #${taskId} lane=${laneKey} attempt=${attempt}`);
+  // A reservation on the default machine names none, as rows written before machines were recorded.
+  const machine = verdict.machine !== undefined && verdict.machine !== found.defaultMachine ? verdict.machine : undefined;
+  plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: LAUNCH_ACTION, target: String(attempt), data: JSON.stringify({ laneKey, ...(machine ? { machine } : {}) }) });
+  deps.out(`AUTOPILOT_RESERVED #${taskId} lane=${laneKey} attempt=${attempt}${machine ? ` machine=${machine}` : ""}`);
   return 0;
 };
 
