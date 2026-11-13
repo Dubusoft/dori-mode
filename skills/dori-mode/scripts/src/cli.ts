@@ -46,7 +46,7 @@ import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
-import { ack, AckError, AWAITING_NOTE_MAX, handled } from "./ack.ts";
+import { ack, AckError, ackRecorded, AWAITING_NOTE_MAX, handled } from "./ack.ts";
 import { checklistLine, InboxError, take, takeAwaitingReminders, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
@@ -276,10 +276,12 @@ const USAGE = `dori <command> [options]
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT
-                [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]
+                [--task N] [--lane KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]
                                        lead-only: ask the owner one question with 2-9 numbered options, a recommendation and its
                                        reason in its own thread in decisionsChannel (else the asking thread's channel, else the
                                        first discordChannels entry); a link line goes into --thread (else --lane's thread);
+                                       with neither it is refused (DECISION_REFUSED no origin) unless --no-origin says the
+                                       question came from no thread (DECISION_LINK_SKIPPED);
                                        --task defaults to the ap-<task>-<n> lane's task; --nonblocking: work goes ahead on the
                                        recommendation; --from-event resolves that decision event (DECISION_SOURCE_RESOLVED);
                                        a bad or missing field exits 2 DECISION_REFUSED
@@ -287,9 +289,15 @@ const USAGE = `dori <command> [options]
                                        lead-only: ask the owner for input only they can give (a one-time code, a file or value) in a
                                        [요청] thread, answered and closed like a decision; a long-lived secret (password, API key,
                                        token) needs --file, the path the owner writes it to (chmod 600), never a reply in Discord
-  decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel]
-                                       lead-only: post the outcome into the decision's thread, archive it and resolve its
-                                       OWNER_DECISION_ANSWERED event; --from names an answer given outside the thread
+  decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel] [--tasks N] [--force]
+                                       lead-only, the first call on the owner's answer: ack the answer messages, post the outcome
+                                       into the decision's thread (the reply; no separate dori send there), archive it, resolve its
+                                       OWNER_DECISION_ANSWERED event and record each answer handled --reply (DECISION_ACKED,
+                                       DECISION_HANDLED <ch> <msg> coverage=1/N); --tasks N: the answer asks for N tasks, the rest
+                                       go to dori handled --lane; --from names an answer given outside the thread; unseen owner
+                                       messages there exit 3 DECISION_STALE with UNREAD lines (--force closes anyway); a decision
+                                       in a lane's own thread covers only its first answer (DECISION_ANSWER_LEFT for the rest);
+                                       a closed one records missing handled receipts and exits 2 DECISION_ALREADY_CLOSED
   decision list [--all] [--json]       lead-only: decisions not closed, oldest first (DECISION_NONE when none); --all adds those
                                        closed in the last 7 days
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:
@@ -1576,15 +1584,27 @@ try {
       const [sub, ...subArgs] = rest;
       const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
       /** Discord is reached only when a call needs it; `token` already resolved, else read on first use. */
-      const decisionContext = (token?: string): import("./owner-decisions.ts").DecisionContext => {
+      const decisionContext = (token?: string, withReceipts = false): import("./owner-decisions.ts").DecisionContext => {
         let transport: Discord | undefined;
+        const discord = (): Discord => transport ??= new Discord(fetchHttp, realClock, token ?? messengerToken("DORI_DISCORD_TOKEN"));
+        // close settles the owner's answer messages with the same stale guard, ack and handled as dori send/ack/handled.
+        const receipts: import("./owner-decisions.ts").DecisionReceipts = {
+          unseen: (channel) => staleOwnerEvents(config.stateDir, channel),
+          acked: (channel, message) => ackRecorded(config.stateDir, channel, message),
+          ack: (channel, message) => ack(config.stateDir, discord(), channel, message, realClock.now()),
+          handled: async (channel, message, tasks) => {
+            const outcome = await handled(config.stateDir, discord, channel, message, realClock.now(), { reply: true, ...(tasks > 1 ? { tasks } : {}) });
+            if (outcome.autoAck === "failed") console.error(`DECISION_ACK_FAILED ${channel} ${message}: ${outcome.error}; handled is recorded anyway`);
+          },
+        };
         return {
           config, now: realClock.now, home: homedir(),
-          get transport() { return transport ??= new Discord(fetchHttp, realClock, token ?? messengerToken("DORI_DISCORD_TOKEN")); },
+          get transport() { return discord(); },
+          ...(withReceipts ? { receipts } : {}),
         };
       };
       if (sub === "open") {
-        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]\n       dori decision open --request --question \"<what is needed>\" --reason TEXT --waiting TEXT [--file PATH] [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]";
+        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]\n       dori decision open --request --question \"<what is needed>\" --reason TEXT --waiting TEXT [--file PATH] [--task N] [--lane KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]";
         const refuse = (reason: string): never => {
           console.error(`DECISION_REFUSED ${reason}`);
           return die(usage, 2);
@@ -1597,6 +1617,7 @@ try {
                 question: { type: "string" }, option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" },
                 waiting: { type: "string" }, task: { type: "string" }, lane: { type: "string" }, thread: { type: "string" },
                 nonblocking: { type: "boolean" }, "from-event": { type: "string" }, request: { type: "boolean" }, file: { type: "string" },
+                "no-origin": { type: "boolean" },
               },
             });
           } catch (e) { return refuse(e instanceof Error ? e.message : String(e)); }
@@ -1621,7 +1642,11 @@ try {
         const thread = v.thread?.trim();
         if (thread !== undefined && !od.refIds(thread)) refuse(`--thread ${thread} is not a thread ref such as discord:<channel>/<thread>`);
         const laneThread = found?.thread && found.thread !== "none" ? found.thread : undefined;
-        const origin = thread ?? laneThread;
+        const noOrigin = v["no-origin"] === true;
+        if (noOrigin && thread !== undefined) refuse("--no-origin cannot go with --thread");
+        const origin = noOrigin ? undefined : thread ?? laneThread;
+        // The link line cannot be added once the decision is posted, so a missing origin is said up front, never guessed.
+        if (!origin && !noOrigin) refuse("no origin: pass --thread REF (the thread the question came from) or --no-origin");
         const fromEvent = v["from-event"]?.trim();
         const { recordResolved, validEventId } = await import("./decision-obligations.ts");
         if (fromEvent !== undefined && !validEventId(fromEvent)) refuse(`--from-event ${fromEvent} is not an event id`);
@@ -1647,6 +1672,7 @@ try {
           console.log(`DECISION_LINKED ${d.id} discord:${ids?.channel ? `${ids.channel}/` : ""}${link.origin} ${link.message}`);
         } else if (link.kind === "skipped") console.log(`DECISION_LINK_SKIPPED ${d.id}: ${link.reason}`);
         else if (link.kind === "failed") console.log(`DECISION_LINK_FAILED ${d.id} ${link.reason}`);
+        else if (!d.origin && !d.inLaneThread) console.log(`DECISION_LINK_SKIPPED ${d.id}: no origin thread`);
         if (fromEvent !== undefined) {
           recordResolved(config.stateDir, fromEvent, realClock.now(), `decision ${d.id}`);
           console.log(`DECISION_SOURCE_RESOLVED ${d.id} ${fromEvent}`);
@@ -1654,28 +1680,41 @@ try {
         break;
       }
       if (sub === "close") {
-        const usage = "usage: dori decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel]";
+        const usage = "usage: dori decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel] [--tasks N] [--force]";
         const parsed = (() => {
           try {
             return parseArgs({
               args: subArgs, allowPositionals: true, strict: true,
-              options: { text: { type: "string" }, choice: { type: "string" }, from: { type: "string" }, cancel: { type: "boolean" } },
+              options: {
+                text: { type: "string" }, choice: { type: "string" }, from: { type: "string" }, cancel: { type: "boolean" },
+                tasks: { type: "string" }, force: { type: "boolean" },
+              },
             });
           } catch (e) { return die(`${e instanceof Error ? e.message : String(e)}\n${usage}`, 2); }
         })();
         const [id, ...extra] = parsed.positionals;
-        const { text, choice, from, cancel } = parsed.values;
+        const { text, choice, from, cancel, tasks, force } = parsed.values;
         if (!id || extra.length || !text?.trim() || (choice !== undefined && !/^\d+$/.test(choice.trim()))
-          || (from !== undefined && !/^\d+\/\d+$/.test(from.trim())) || (cancel && choice !== undefined)) die(usage, 2);
-        const closed = await od.closeOwnerDecision(decisionContext(), id ?? "", {
+          || (from !== undefined && !/^\d+\/\d+$/.test(from.trim())) || (cancel && choice !== undefined)
+          || (tasks !== undefined && !/^[1-9]\d*$/.test(tasks.trim()))) die(usage, 2);
+        const closed = await od.closeOwnerDecision(decisionContext(undefined, true), id ?? "", {
           text: (text ?? "").trim(), ...(choice !== undefined ? { choice: Number(choice.trim()) } : {}),
           ...(from !== undefined ? { from: from.trim() } : {}), ...(cancel ? { cancel: true } : {}),
+          ...(tasks !== undefined ? { tasks: Number(tasks.trim()) } : {}), ...(force ? { force: true } : {}),
         }).catch((e: unknown) => {
-          if (e instanceof od.OwnerDecisionError) die(e.message, e.code === "DECISION_NOT_CLOSED" ? 1 : 2);
-          throw e;
+          if (!(e instanceof od.OwnerDecisionError)) throw e;
+          // Like SEND_STALE: nothing was posted; the unseen messages are printed (and now seen), so a close after reading them goes through.
+          if (e.code === "DECISION_STALE") {
+            console.log(e.message);
+            for (const line of e.lines) console.log(line);
+            process.exit(3);
+          }
+          for (const line of e.lines) console.log(line);
+          return die(e.message, e.code === "DECISION_NOT_CLOSED" ? 1 : 2);
         });
         const did = closed.decision.id;
         console.log(`DECISION_CLOSED ${did}`);
+        for (const line of closed.answers ? od.answerOutcomeLines(closed.answers) : []) console.log(line);
         if (closed.archivePending) console.log(`DECISION_ARCHIVE_PENDING ${did}: ${closed.archivePending}`);
         if (closed.resolved) console.log(`DECISION_RESOLVED_EVENT ${did} ${closed.resolved}`);
         if (closed.linkNote) console.log(`DECISION_LINK_NOTE ${did}: ${closed.linkNote}`);

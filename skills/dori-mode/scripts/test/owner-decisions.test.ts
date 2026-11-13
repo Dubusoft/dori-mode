@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   answeredLine,
+  answerOutcomeLines,
   closeOwnerDecision,
   openLaneDecision,
   openOwnerDecision,
@@ -14,6 +15,7 @@ import {
   recordChannelAnswer,
   recordOwnerAnswer,
   type DecisionContext,
+  type DecisionReceipts,
   type DecisionTransport,
 } from "../src/owner-decisions.ts";
 import {
@@ -389,4 +391,88 @@ test("a second question in the same lane thread takes the next answer, and a lan
   expect(other?.decision).toMatchObject({ channel: "555", thread: "1000" });
   expect(other?.decision.inLaneThread).toBeUndefined();
   expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
+});
+
+/** Receipts that log each call into `calls` (beside the transport's), with the unseen counts and failures a case sets. */
+const fakeReceipts = (calls: { method: string; args: unknown[] }[], unseen: Record<string, string[]> = {}, failHandled = new Set<string>()) => {
+  const acked = new Set<string>();
+  const receipts: DecisionReceipts = {
+    unseen: (channel) => { const lines = unseen[channel] ?? []; delete unseen[channel]; return { count: lines.length, lines }; },
+    acked: (channel, message) => acked.has(`${channel}/${message}`),
+    ack: async (channel, message) => { calls.push({ method: "ack", args: [channel, message] }); acked.add(`${channel}/${message}`); },
+    handled: async (channel, message, tasks) => {
+      if (failHandled.delete(`${channel}/${message}`)) throw new Error("disk full");
+      calls.push({ method: "handled", args: [channel, message, tasks] });
+    },
+  };
+  return receipts;
+};
+
+test("close acks every answer before the archive, records each handled --reply after it with --tasks, and a re-close adds nothing", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx: DecisionContext = { ...context(dir, fake.transport), receipts: fakeReceipts(fake.calls) };
+  const { decision } = await open(ctx, { origin: "discord:111/222" });
+  recordOwnerAnswer(dir, "1000", "41", 1_800_000_000_100);
+  recordOwnerAnswer(dir, "1000", "42", 1_800_000_000_200);
+  const closed = await closeOwnerDecision(ctx, decision.id, { text: "Option one.", choice: 1, from: "333/43", tasks: 2 });
+  const order = fake.calls.map((call) => call.method).filter((m) => ["ack", "send", "setThread", "handled"].includes(m)).slice(2);
+  expect(order).toEqual(["ack", "ack", "ack", "send", "setThread", "handled", "handled", "handled"]);
+  expect(fake.calls.filter((call) => call.method === "handled").map((call) => call.args)).toEqual([["1000", "41", 2], ["1000", "42", 2], ["333", "43", 2]]);
+  expect(closed.answers).toMatchObject({ tasks: 2, left: [], handledFailed: [], ackFailed: [] });
+  expect(answerOutcomeLines(closed.answers as NonNullable<typeof closed.answers>)).toContain("DECISION_HANDLED 1000 41 coverage=1/2");
+  expect(closed.decision).toMatchObject({ coveredAnswers: ["1000/41", "1000/42", "333/43"], closeTasks: 2, handledAnswers: ["1000/41", "1000/42", "333/43"] });
+  const again = await closeOwnerDecision(ctx, decision.id, { text: "Again" }).catch((e: unknown) => e);
+  expect(again).toMatchObject({ code: "DECISION_ALREADY_CLOSED", lines: [] });
+  expect(fake.calls.filter((call) => call.method === "handled")).toHaveLength(3);
+});
+
+test("a handled receipt that fails is reported, and closing the closed decision again records only the missing one", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx: DecisionContext = { ...context(dir, fake.transport), receipts: fakeReceipts(fake.calls, {}, new Set(["1000/42"])) };
+  const { decision } = await open(ctx);
+  recordOwnerAnswer(dir, "1000", "41", 1_800_000_000_100);
+  recordOwnerAnswer(dir, "1000", "42", 1_800_000_000_200);
+  const closed = await closeOwnerDecision(ctx, decision.id, { text: "Done.", choice: 1 });
+  expect(closed.decision.state).toBe("closed");
+  expect(answerOutcomeLines(closed.answers as NonNullable<typeof closed.answers>).find((l) => l.startsWith("DECISION_HANDLED_FAILED")))
+    .toBe("DECISION_HANDLED_FAILED 1000 42: disk full; run the close again, or dori handled 1000 42 --reply");
+  const again = await closeOwnerDecision(ctx, decision.id, { text: "Done." }).catch((e: unknown) => e);
+  expect(again).toMatchObject({ code: "DECISION_ALREADY_CLOSED", lines: ["DECISION_HANDLED 1000 42 coverage=1/1"] });
+  expect(fake.calls.filter((call) => call.method === "handled").map((call) => call.args[1])).toEqual(["41", "42"]);
+});
+
+test("close refuses with DECISION_STALE when the lead has not seen an owner message in the thread, posting nothing; --force closes", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const unread = "UNREAD 1000 INBOUND discord:1000:44 and one more thing";
+  const ctx: DecisionContext = { ...context(dir, fake.transport), receipts: fakeReceipts(fake.calls, { "1000": [unread] }) };
+  const { decision } = await open(ctx);
+  recordOwnerAnswer(dir, "1000", "41", 1_800_000_000_100);
+  const sends = fake.calls.filter((call) => call.method === "send").length;
+  const stale = await closeOwnerDecision(ctx, decision.id, { text: "Done.", choice: 1 }).catch((e: unknown) => e);
+  expect(stale).toMatchObject({ code: "DECISION_STALE", message: "DECISION_STALE 1", lines: [unread] });
+  expect(fake.calls.filter((call) => call.method === "send")).toHaveLength(sends);
+  expect(fake.calls.some((call) => call.method === "ack")).toBe(false);
+  expect(readDecisions(dir).decisions[0]?.state).toBe("answered");
+  const forced = fakeReceipts(fake.calls, { "1000": ["UNREAD 1000 INBOUND discord:1000:45 still unseen"] });
+  const closed = await closeOwnerDecision({ ...ctx, receipts: forced }, decision.id, { text: "Done.", choice: 1, force: true });
+  expect(closed.decision.state).toBe("closed");
+});
+
+test("a decision in a lane's own thread covers only its first answer; the rest are acked and left to the lead", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx: DecisionContext = { ...context(dir, fake.transport), receipts: fakeReceipts(fake.calls) };
+  await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-1", text: serializeDecisionText(choices) });
+  recordOwnerAnswer(dir, "777", "51", 1_800_000_000_100);
+  recordOwnerAnswer(dir, "777", "52", 1_800_000_000_200);
+  const closed = await closeOwnerDecision(ctx, "d1", { text: "Option one.", choice: 1 });
+  expect(fake.calls.filter((call) => call.method === "ack").map((call) => call.args)).toEqual([["777", "51"], ["777", "52"]]);
+  expect(fake.calls.filter((call) => call.method === "handled").map((call) => call.args)).toEqual([["777", "51", 1]]);
+  expect(answerOutcomeLines(closed.answers as NonNullable<typeof closed.answers>)).toContain(
+    "DECISION_ANSWER_LEFT 777 52: acked, not covered by the close; cover it with dori handled 777 52 --reply|--lane KEY");
+  expect(answeredLine(readDecisions(dir).decisions[0] as NonNullable<ReturnType<typeof readDecisions>["decisions"][0]>))
+    .toContain("run dori decision close d1 --text \"...\" first");
 });

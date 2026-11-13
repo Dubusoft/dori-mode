@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { EVENT_LOG, writeCursorFile } from "../src/inbox.ts";
 import { DECISIONS_FILE } from "../src/owner-decisions.ts";
 import { Registry } from "../src/registry.ts";
 
@@ -56,9 +57,19 @@ test("decision open refuses bad input with DECISION_REFUSED and a usage line (ex
     expect(r.err).toStartWith(reason);
     expect(r.err).toContain("usage: dori decision open");
   }
-  const noToken = await cli([...base, "--option", "a", "--option", "b"]);
+  const noToken = await cli([...base, "--option", "a", "--option", "b", "--no-origin"]);
   expect(noToken.code).toBe(1);
   expect(noToken.err).toContain("DORI_DISCORD_TOKEN is not set");
+});
+
+test("a lead decision with no origin thread is refused unless --no-origin says so (exit 2), before any token is needed", async () => {
+  const base = ["decision", "open", "--question", "q", "--option", "a", "--option", "b", "--recommend", "1", "--reason", "r", "--waiting", "w"];
+  const none = await cli(base);
+  expect(none.code).toBe(2);
+  expect(none.err).toStartWith("DECISION_REFUSED no origin: pass --thread REF (the thread the question came from) or --no-origin\n");
+  await new Registry(dir).write({ key: "ap-7-1", title: "t", brief: "b", done: "d", thread: "none", status: "working" } as never);
+  expect((await cli([...base, "--lane", "ap-7-1"])).err).toStartWith("DECISION_REFUSED no origin");
+  expect((await cli([...base, "--no-origin", "--thread", "discord:1/2"])).err).toStartWith("DECISION_REFUSED --no-origin cannot go with --thread");
 });
 
 test("decision open --request refuses options and a long-lived secret without --file (exit 2), before any token is needed", async () => {
@@ -72,7 +83,7 @@ test("decision open --request refuses options and a long-lived secret without --
     expect(r.code).toBe(2);
     expect(r.err).toStartWith(reason);
   }
-  const noToken = await cli([...base, "--question", "the npm API token", "--file", "~/.config/npm-token"]);
+  const noToken = await cli([...base, "--question", "the npm API token", "--file", "~/.config/npm-token", "--thread", "discord:1/2"]);
   expect(noToken.code).toBe(1);
   expect(noToken.err).toContain("DORI_DISCORD_TOKEN is not set");
 });
@@ -85,6 +96,19 @@ test("decision close: unknown, already closed and out-of-range choice exit 2 wit
   expect(await cli(["decision", "close", "d2", "--text", "x"])).toMatchObject({ code: 2, err: "DECISION_ALREADY_CLOSED d2\n" });
   expect((await cli(["decision", "close", "d1", "--text", "x", "--choice", "3"])).err).toStartWith("DECISION_BAD_CHOICE d1");
   expect((await cli(["decision", "close", "d1"])).code).toBe(2);
+});
+
+test("decision close refuses with DECISION_STALE and the unread lines (exit 3) while an owner message in the thread is unseen, then goes on", async () => {
+  writeFileSync(join(dir, DECISIONS_FILE), JSON.stringify({ nextSeq: 2, decisions: [decision("d1", "open", Date.now())] }));
+  writeCursorFile(dir, 0);
+  appendFileSync(join(dir, EVENT_LOG), `${JSON.stringify({ id: "discord:901:7", line: "INBOUND 901 7 also do X" })}\n`);
+  const stale = await cli(["decision", "close", "d1", "--text", "x", "--choice", "1"]);
+  expect(stale).toMatchObject({ code: 3, out: "DECISION_STALE 1\nUNREAD 901 INBOUND discord:901:7 also do X\n" });
+  // Printed once, it counts as seen: the next close goes on to Discord (no token here).
+  const again = await cli(["decision", "close", "d1", "--text", "x", "--choice", "1"]);
+  expect(again.code).toBe(1);
+  expect(again.err).toContain("DORI_DISCORD_TOKEN is not set");
+  expect((await cli(["decision", "close", "d1", "--text", "x", "--tasks", "0"])).code).toBe(2);
 });
 
 test("a pane registered to a lane is refused decision with LANE_PERMISSION_DENIED (exit 1)", async () => {
