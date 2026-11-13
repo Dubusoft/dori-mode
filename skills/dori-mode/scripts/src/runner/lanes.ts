@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureLaneWorkspace } from "../managed-panes.ts";
 import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
@@ -8,7 +9,7 @@ import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane 
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
-import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, type RunnerPolicy } from "./policy.ts";
+import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, runnerPaths, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
 import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { turnStop } from "./observe.ts";
@@ -159,12 +160,47 @@ export const removeLegacyLaneMcp = async (cwd: string): Promise<boolean> => {
   } catch { return false; } // unremovable: the lane still launches as before
 };
 
-/** The agent argv of `profile`, each `{prompt}`, `{model}` and `{brief}` filled in; `session` resumes it when the profile allows (`resumeArgv`). */
+/**
+ * omo's permission preset for every lane. A lane's pane has no one to answer omo's interactive permission prompt, and a
+ * host whose omo settings pick a stricter preset (`workspace`, `ask`) would stop the lane on it. Under `full-access` omo
+ * never prompts: a configured `deny` rule still refuses, and the lane sandbox, not omo, bounds what the lane can reach.
+ */
+export const LANE_PERMISSION_FLAGS: readonly string[] = ["--permission-preset", "full-access"];
+
+/**
+ * The omo `--permission` value for a lane with no sandbox (a Windows runner, a machine opted in to run unsandboxed), where
+ * full-access alone would leave nothing in place: every path outside the lane's cwd is refused without a prompt, except
+ * each `allowed` directory and everything under it. A directory whose path holds `,` or `=` cannot be written as an omo
+ * rule, so it stays refused.
+ */
+export const outsideDenyRules = (allowed: readonly string[], join: (dir: string, name: string) => string): string => [
+  "external_directory=deny",
+  ...[...new Set(allowed)].filter((dir) => dir !== "" && !/[,=]/.test(dir))
+    .flatMap((dir) => [`external_directory:${dir}=allow`, `external_directory:${join(dir, "*")}=allow`]),
+].join(",");
+
+/**
+ * `template` with LANE_PERMISSION_FLAGS (and `--permission <outsideRules>` when given) before its `{prompt}` slot;
+ * unchanged when it already names a preset or has no slot.
+ */
+export const lanePermissionArgv = (template: readonly string[], outsideRules?: string): readonly string[] => {
+  if (template.some((part) => /^--permission-preset(?:=|$)/.test(part))) return template;
+  const at = template.findIndex((part) => part.includes("{prompt}"));
+  const flags = [...LANE_PERMISSION_FLAGS, ...(outsideRules ? ["--permission", outsideRules] : [])];
+  return at < 1 ? template : [...template.slice(0, at), ...flags, ...template.slice(at)];
+};
+
+/**
+ * The agent argv of `profile`, each `{prompt}`, `{model}` and `{brief}` filled in, with the lane permission flags
+ * (`lanePermissionArgv`, `outsideRules` for an unsandboxed lane); `session` resumes it when the profile allows (`resumeArgv`).
+ */
 export const agentArgv = (
   policy: RunnerPolicy, profile: string, values: { readonly prompt: string; readonly model: string; readonly brief: string }, session?: string,
+  outsideRules?: string,
 ): string[] => {
-  const template = policy.agents[profile];
-  if (!template?.length) throw new Error(`RUNNER_LANE_PROFILE_UNKNOWN ${profile}`);
+  const configured = policy.agents[profile];
+  if (!configured?.length) throw new Error(`RUNNER_LANE_PROFILE_UNKNOWN ${profile}`);
+  const template = lanePermissionArgv(configured, outsideRules);
   const parts = resumeArgv(template, session) ?? template;
   return parts.map((part) => part.replaceAll("{prompt}", values.prompt).replaceAll("{model}", values.model).replaceAll("{brief}", values.brief));
 };
@@ -183,6 +219,17 @@ type Launched = { readonly pane: string; readonly tab: string; readonly resumed:
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
+
+  /**
+   * `outsideDenyRules` for this host: what a sandboxed lane may also reach, the runner directory (its brief, attachments,
+   * output and the lane-mode dori), the repos and worktree roots, the temp directory and omo's own ~/.omo.
+   */
+  private outsideRules(): string {
+    const paths = runnerPaths();
+    const { policy } = this.deps;
+    const dirs = [this.deps.runnerDir, policy.reposRoot, effectiveWorktreeRoot(policy), tmpdir(), paths.join(homedir(), ".omo")];
+    return outsideDenyRules(dirs.filter((dir): dir is string => dir !== undefined), paths.join);
+  }
 
   private instance(): Promise<string | undefined> {
     return this.deps.instance ? this.deps.instance() : herdrProcess(this.deps.run).then((p) => p.instance);
@@ -370,7 +417,8 @@ export class RunnerLanes {
     const brief = this.briefPath(key);
     const keywords = input.keywords ?? (input.mode === "mass-ulw" ? "mass-ulw" : "ulw");
     const prompt = `${keywords}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
-    const argv = agentArgv(this.deps.policy, input.profile, { prompt, model: input.model, brief }, input.session);
+    const argv = agentArgv(this.deps.policy, input.profile, { prompt, model: input.model, brief }, input.session,
+      input.sandbox || input.profile === "sandboxed" ? undefined : this.outsideRules());
     const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
     let pane: string;
     let tab: string;

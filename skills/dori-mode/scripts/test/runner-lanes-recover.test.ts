@@ -2,12 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { laneFilePaths } from "../src/runner/lane-files.ts";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, win32 } from "node:path";
 import type { Pane } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
-import { RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
+import { agentArgv, outsideDenyRules, RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
+import type { RunnerPolicy } from "../src/runner/policy.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { type RunnerEventType, runnerEvent, type TurnEvidence } from "../src/runner/protocol.ts";
 import { STARTUP_GRACE_MS } from "../src/runner/serve.ts";
@@ -533,12 +534,40 @@ test("lane.start carries keywords and heavy env into the launch line, and a reco
   expect(started.detail).toBe("started pane=p1 tab=t1");
   expect(started.result.startup.verdict).toBe("unconfirmed");
   const first = t.calls.find((a) => a[2] === "run")?.[4] ?? "";
-  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 'ulw set goal and work. Read and execute`);
+  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --permission-preset full-access 'ulw set goal and work. Read and execute`);
   t.world.panes = [];
   const recovered = await t.lanes.recover("lane-a", "ses_123", undefined, "# fresh brief\n", FILES);
   expect(recovered.result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true, resumed: true });
   const second = t.calls.filter((a) => a[2] === "run").at(-1)?.[4] ?? "";
-  expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --session ses_123 'ulw set goal and work.");
+  expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --permission-preset full-access --session ses_123 'ulw set goal and work.");
+});
+
+test("agentArgv runs every lane under omo's full-access preset unless its profile already names a preset", () => {
+  const values = { prompt: "go", model: "m1", brief: "/b.md" };
+  const policy = (template: readonly string[]) => ({ agents: { p: template }, allowedRoots: [], sandbox: "optional", jobs: "allow" }) as unknown as RunnerPolicy;
+  const sandboxed = ["env", "V=1", "lane-sandbox", "omo", "--model", "{model}", "{prompt}"];
+  expect(agentArgv(policy(sandboxed), "p", values)).toEqual(["env", "V=1", "lane-sandbox", "omo", "--model", "m1", "--permission-preset", "full-access", "go"]);
+  expect(agentArgv(policy(sandboxed), "p", values, "ses_1")).toEqual(["env", "V=1", "lane-sandbox", "omo", "--model", "m1", "--permission-preset", "full-access", "--session", "ses_1", "go"]);
+  expect(agentArgv(policy(["omo", "--permission-preset", "workspace", "{prompt}"]), "p", values)).toEqual(["omo", "--permission-preset", "workspace", "go"]);
+  expect(agentArgv(policy(["omo", "--permission-preset=ask", "{prompt}"]), "p", values)).toEqual(["omo", "--permission-preset=ask", "go"]);
+  expect(agentArgv(policy(["omo", "--model", "{model}"]), "p", values)).toEqual(["omo", "--model", "m1"]);
+  // A lane without a sandbox also gets the rules that refuse every outside path but the allowed ones.
+  expect(agentArgv(policy(["omo", "{prompt}"]), "p", values, undefined, "external_directory=deny")).toEqual(["omo", "--permission-preset", "full-access", "--permission", "external_directory=deny", "go"]);
+  expect(outsideDenyRules(["C:\\Users\\u\\.dori\\runner", "C:\\a,b", "C:\\x=y", "", "C:\\Users\\u\\.dori\\runner"], win32.join))
+    .toBe("external_directory=deny,external_directory:C:\\Users\\u\\.dori\\runner=allow,external_directory:C:\\Users\\u\\.dori\\runner\\*=allow");
+});
+
+test("a lane.start without a sandbox refuses outside paths but the runner dir, repos and worktree roots, temp and ~/.omo; a sandboxed one gets no rules", async () => {
+  const policy = { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", reposRoot: "/srv/repos", sandboxCheck: ["lane-sandbox", "--check"] } as const;
+  const bare = setup({ policy });
+  await bare.lanes.start({ ...START, sandbox: false });
+  const line = bare.calls.find((a) => a[2] === "run")?.[4] ?? "";
+  const rules = [bare.runnerDir, "/srv/repos", "/srv/repos/worktrees", tmpdir(), join(homedir(), ".omo")]
+    .flatMap((dir) => [`external_directory:${dir}=allow`, `external_directory:${dir}/*=allow`]);
+  expect(line).toContain(` omo --permission-preset full-access --permission '${["external_directory=deny", ...rules].join(",")}' 'ulw`);
+  const boxed = setup({ policy });
+  await boxed.lanes.start(START);
+  expect(boxed.calls.find((a) => a[2] === "run")?.[4]).toContain(" omo --permission-preset full-access 'ulw");
 });
 
 test("lane.start hands the policy's repos and worktree roots to the lane sandbox, the worktree root defaulting under the repos root", async () => {
