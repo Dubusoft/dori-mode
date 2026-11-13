@@ -222,7 +222,7 @@ describe("supervisorSecretHandler", () => {
     const { handler } = harness();
     const ctx = context(supervisor);
     await handler(LABEL, runnerControl(HEAD, "secret.run", { rid: RID, key: "lane-c", op: "show" }), ctx);
-    expect(ctx.replies).toEqual([{ type: "secret.run.result", body: { rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-c may not run show (config secretCommands)" } }]);
+    expect(ctx.replies).toEqual([{ type: "secret.run.result", body: { rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-c may not run show (config secretCommands); ops this lane may run: none" } }]);
   });
 
   test("without a command runner secret.run is answered secret.run.result UNSUPPORTED", async () => {
