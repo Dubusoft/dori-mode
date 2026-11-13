@@ -57,7 +57,6 @@ import { machineVerdict, summaryOf } from "./placement.ts";
 import { Discord } from "./messenger/discord.ts";
 import { acquireDiscordGateway } from "./messenger/discord-lock.ts";
 import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/discord-supervisor.ts";
-import { closeThreadButton } from "./messenger/discord-commands.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
 import { redirectIfClosed } from "./thread-followup.ts";
@@ -133,8 +132,6 @@ export const laneEventReader = (stateDir: string, deps: LaneHubDeps): (() => Pro
 /** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
 export const SYSTEM_PREFIX = "[System] ";
 export const systemText = (text: string): string => text.startsWith(SYSTEM_PREFIX) ? text : `${SYSTEM_PREFIX}${text}`;
-/** The supervisor's own post carrying the owner's close-thread button, once a thread's work is finished and reported. */
-export const CLOSE_BUTTON_TEXT = "이 스레드의 작업이 모두 끝났고 보고도 마쳤습니다. 아래 버튼으로 스레드를 닫아 주세요.";
 
 /** One supervisor writer per stateDir, including across competing CLI invocations. */
 export const acquireSupervisor = (stateDir: string): (() => void) => {
@@ -1115,9 +1112,9 @@ export const supervise = async (
       // Owner decisions: a stuck post, a missing link line, a pending archive, the daily reminder.
       try { await ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }); }
       catch (e) { console.error(`OWNER_DECISION_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-      // A thread whose work is all finished and reported gets the owner's close-thread button once, --final or not.
-      try { await supervisor.closeButtonTick(async (thread, id) => { await discord.send(thread, systemText(CLOSE_BUTTON_TEXT), id, closeThreadButton(thread)); }); }
-      catch (e) { console.error(`CLOSE_BUTTON_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      // A thread whose work is all finished and reported is closed (archived) once; the owner gets no button to press.
+      try { await supervisor.autoCloseTick(async (thread) => { await discord.setThread(thread, { archived: true }); }); }
+      catch (e) { console.error(`THREAD_AUTO_CLOSE_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     };
     let lastGitHub = -Infinity;
     let lastLaneMessages = -Infinity;

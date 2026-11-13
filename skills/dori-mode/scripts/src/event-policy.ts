@@ -2,7 +2,7 @@
  * The event policy table (design 1.7): every event kind is delivered by class. `lead-urgent` wakes the lead,
  * `lead-digest` waits for the next urgent delivery (or `digestMaxDelayMin`), `engine-only` is journaled for the engine and
  * the counts only. The supervisor never posts an event to the owner itself: everything the owner hears goes through the lead,
- * except the close-thread button and failed-delivery notices, owner decision threads (a lane question with choices becomes
+ * except failed-delivery notices, owner decision threads (a lane question with choices becomes
  * a decision thread), and the daily 09:00 reminder of waiting decisions.
  * The removed `owner-only` class still loads from an old config, as `lead-digest`, with one warning per process.
  *
@@ -99,6 +99,8 @@ const DIGEST_KINDS = [
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
   // OWNER_DECISION_OPENED is digest: opening a thread needs no immediate lead action.
   "OWNER_DECISION_OPENED",
+  // A pane no registered lane owns (dead-panes.ts) is told once and never wakes the lead; a lane's own pane stays urgent.
+  "UNRECOGNISED_PANE * unregistered",
 ] as const;
 
 /**

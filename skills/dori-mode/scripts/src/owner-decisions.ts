@@ -710,7 +710,7 @@ export const takeOwnerDecisionLines = (stateDir: string, now: number): string[] 
   openOwnerDecisions(stateDir).map((d) =>
     `decision:${d.id}\tDECISION_${d.state === "answered" ? "ANSWERED" : "WAITING"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"}${d.task !== undefined ? ` task=#${d.task}` : ""}${d.lane ? ` lane=${d.lane}` : ""} open ${age(now - d.openedAt)}: ${subject(d)}`);
 
-/** Open decisions bound to a lane, as close-button blockers (thread-finality.ts): `{ id, lane }`. */
+/** Open decisions bound to a lane, as blockers of a thread's automatic close (thread-finality.ts): `{ id, lane }`. */
 export const ownerDecisionBlockers = (stateDir: string): { readonly id: string; readonly lane: string }[] =>
   openOwnerDecisions(stateDir).flatMap((d) => (d.lane ? [{ id: d.id, lane: d.lane }] : []));
 
