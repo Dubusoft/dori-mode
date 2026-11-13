@@ -108,6 +108,8 @@ const DIGEST_KINDS = [
   "OWNER_DECISION_OPENED",
   // An owner answer routed straight to the lane that asked (decision-inbound.ts): no INBOUND reaches the lead for it.
   "DECISION_ANSWER_DIRECT",
+  // The lane confirmed a direct answer and the supervisor closes its decision (owner-decisions.ts decisionDeliveryTick).
+  "DECISION_ANSWER_ACKED",
   // A pane no registered lane owns (dead-panes.ts) is told once and never wakes the lead; a lane's own pane stays urgent.
   "UNRECOGNISED_PANE * unregistered",
   // A met wait registered with --on-success digest (waits.ts): news for the next wake, not a decision.

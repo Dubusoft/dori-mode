@@ -17,6 +17,7 @@ import {
   reconcileDecisionsAtStart,
   recordAnswerRevision,
   decisionTargetOf,
+  decisionDeliveryTick,
   recordChannelAnswer,
   recordOwnerAnswer,
   type DecisionContext,
@@ -586,4 +587,84 @@ test("after a restart the intents are reconciled with the queue: queued once, ac
   await reconcileDecisionsAtStart(dir, store, [laneOf("ap-1-1")], 104, (id, line) => { events.push([id, line]); }, () => {});
   expect(events.map(([id]) => id)).toEqual(["decision-undelivered:d2:r1", "decision-undelivered:d4:r1", "decision-undelivered:d5:r1"]);
   expect(events[0]?.[1]).toBe("DECISION_ANSWER_UNDELIVERED ap-2-1 d2 r1 decision-d2-r1: lane ap-2-1 is closed; take the answer over with dori decision close d2");
+});
+
+const tickOf = (dir: string, transport: DecisionTransport) => {
+  const events: [string, string][] = [];
+  return { events, deps: { ...context(dir, transport), enqueue: (id: string, line: string) => { events.push([id, line]); }, log: () => {} } };
+};
+
+const posts = (calls: { method: string; args: unknown[] }[]) => calls.filter((c) => c.method === "send" || c.method === "edit").map((c) => c.args);
+
+test("a direct answer waits queued for its lane with the owner told so; the lane's ack closes the decision once", async () => {
+  const dir = stateDir();
+  const store = new JsonLaneMessages(dir);
+  const fake = fakeTransport();
+  const { events, deps } = tickOf(dir, fake.transport);
+  const lanes = async () => [laneOf("ap-957-1")];
+  const id = await openLane(deps, "ap-957-1");
+  recordAnswerRevision(dir, id, answer("ap-957-1", 2), 10);
+  queueDecisionAnswer(dir, store, id, 11);
+  const before = posts(fake.calls).length;
+  await decisionDeliveryTick(deps, store, lanes);
+  await decisionDeliveryTick(deps, store, lanes);
+  expect(posts(fake.calls).slice(before)).toEqual([["1000", "[System] d1: 2번으로 기록했습니다. 레인 ap-957-1에 전달하는 중입니다.", "decision-notice:d1"]]);
+  expect(store.get("decision-d1-r1")?.state).toBe("queued");
+  expect(readDecisions(dir).decisions[0]?.state).toBe("open");
+  expect(events).toEqual([]);
+
+  ackLaneMessage(store, "ap-957-1", "decision-d1-r1", 20);
+  await decisionDeliveryTick(deps, store, lanes);
+  const d = readDecisions(dir).decisions[0];
+  expect(d).toMatchObject({ state: "closed", choice: 2, notice: { text: "[System] d1: 레인 ap-957-1이 2번을 받았습니다." } });
+  expect(d?.revisions?.[0]?.delivery.state).toBe("acked");
+  expect(posts(fake.calls).slice(before + 1, before + 3)).toEqual([
+    ["1000", "m3", "[System] d1: 레인 ap-957-1이 2번을 받았습니다."],
+    ["1000", "[System] d1 결정 반영: 2번(Build a replacement). 레인 ap-957-1이 2번을 받았습니다. 스레드를 닫습니다.", "decision-close:d1"],
+  ]);
+  expect(fake.archived.get("1000")).toBe(true);
+  expect(events).toEqual([["decision-acked:d1:r1", "DECISION_ANSWER_ACKED ap-957-1 d1 r1 choice=2 decision-d1-r1: the lane confirmed it received the answer; the decision closes, nothing to do"]]);
+  await decisionDeliveryTick(deps, store, lanes);
+  expect(events).toHaveLength(1);
+});
+
+test("an acked answer whose close failed is closed by the next round, under the same lead event id", async () => {
+  const dir = stateDir();
+  const store = new JsonLaneMessages(dir);
+  const fake = fakeTransport();
+  let down = true;
+  const transport: DecisionTransport = { ...fake.transport, send: async (channel, content, stableId) => {
+    if (down && stableId?.startsWith("decision-close:")) throw new Error("discord unavailable");
+    return fake.transport.send(channel, content, stableId);
+  } };
+  const { events, deps } = tickOf(dir, transport);
+  const lanes = async () => [laneOf("ap-957-1")];
+  const id = await openLane(deps, "ap-957-1");
+  recordAnswerRevision(dir, id, answer("ap-957-1", 1), 10);
+  queueDecisionAnswer(dir, store, id, 11);
+  ackLaneMessage(store, "ap-957-1", "decision-d1-r1", 12);
+  await decisionDeliveryTick(deps, store, lanes);
+  expect(readDecisions(dir).decisions[0]?.state).toBe("open");
+  expect(readDecisions(dir).decisions[0]?.revisions?.[0]?.delivery.state).toBe("acked");
+  down = false;
+  await decisionDeliveryTick(deps, store, lanes);
+  expect(readDecisions(dir).decisions[0]).toMatchObject({ state: "closed", choice: 1 });
+  expect(events.map(([eventId]) => eventId)).toEqual(["decision-acked:d1:r1", "decision-acked:d1:r1"]);
+});
+
+test("an answer whose lane was relaunched is never delivered: the owner is told and the lead is woken once", async () => {
+  const dir = stateDir();
+  const store = new JsonLaneMessages(dir);
+  const fake = fakeTransport();
+  const { events, deps } = tickOf(dir, fake.transport);
+  const id = await openLane(deps, "ap-957-1");
+  recordAnswerRevision(dir, id, answer("ap-957-1", 2), 10);
+  queueDecisionAnswer(dir, store, id, 11);
+  const relaunched = async () => [laneOf("ap-957-1", { lastRecoveryAt: 9 })];
+  await decisionDeliveryTick(deps, store, relaunched);
+  await decisionDeliveryTick(deps, store, relaunched);
+  expect(store.get("decision-d1-r1")?.state).toBe("superseded");
+  expect(readDecisions(dir).decisions[0]).toMatchObject({ state: "open", revisions: [{ delivery: { state: "undelivered" } }] });
+  expect(events).toEqual([["decision-undelivered:d1:r1", "DECISION_ANSWER_UNDELIVERED ap-957-1 d1 r1 decision-d1-r1: lane ap-957-1 was relaunched, replaced or moved; take the answer over with dori decision close d1"]]);
+  expect(readDecisions(dir).decisions[0]?.notice?.text).toBe("[System] d1: 레인 ap-957-1이 종료되거나 바뀌어 전달하지 못했습니다. 리드가 이어받습니다.");
 });

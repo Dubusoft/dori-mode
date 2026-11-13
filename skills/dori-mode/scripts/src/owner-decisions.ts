@@ -101,6 +101,8 @@ export type OwnerDecision = DecisionChoices & {
   readonly revisions?: readonly AnswerRevision[];
   /** Set on the decision a lane's denied `dori secret exec` opened: closing it with a choice applies `grants[choice - 1]`. */
   readonly secretRequest?: SecretRequestDecision;
+  /** The `[System]` status message of the direct answer in the decision's thread, edited in place (decisionDeliveryTick). */
+  readonly notice?: { readonly message: string; readonly text: string };
 };
 
 /** The secret names a lane asked for, the lane's repo when it had one, and what each option grants. */
@@ -329,7 +331,7 @@ export type CloseOptions = {
 export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string): string => {
   const from = options.from ? /^(\d+)\/(\d+)$/.exec(options.from) : null;
   const picked = options.choice !== undefined ? ` ${options.choice}번(${cut(d.options[options.choice - 1] ?? "", 60)})` : "";
-  const by = d.answeredAt === undefined && !from && !options.cancel ? " (리드가 정함)" : "";
+  const by = d.answeredAt === undefined && !d.revisions?.length && !from && !options.cancel ? " (리드가 정함)" : "";
   const where = from ? ` (<#${from[1]}>에서 받은 답: https://discord.com/channels/@me/${from[1]}/${from[2]})` : "";
   const note = options.text.replace(/\s+/g, " ").trim();
   const outcome = options.cancel ? "취소" : d.kind === "request" ? "요청 처리" : `결정 반영:${picked}`;
@@ -1149,7 +1151,9 @@ export const reconcileDecisionDeliveries = (stateDir: string, store: LaneMessage
       if (d.state === "closed") { supersedeQueued("decision closed"); settle("superseded", "decision closed"); note("closed", "decision closed"); continue; }
       const current = lanes.get(r.target.lane);
       if (!current || !sameTarget(r.target, current) || m?.state === "superseded") {
-        const reason = !current || m?.state === "superseded" ? `lane ${r.target.lane} is closed` : `lane ${r.target.lane} was relaunched, replaced or moved`;
+        const reason = !current ? `lane ${r.target.lane} is closed`
+          : !sameTarget(r.target, current) ? `lane ${r.target.lane} was relaunched, replaced or moved`
+          : m?.blocked ?? `lane ${r.target.lane} is closed`;
         supersedeQueued(reason); settle("undelivered", reason); note("undelivered", reason); continue;
       }
       if (state === "queued") {
@@ -1182,5 +1186,100 @@ export const reconcileDecisionsAtStart = async (
     await enqueue(`decision-undelivered:${d.id}:r${r.rev}`, undeliveredLine({
       decision: d.id, rev: r.rev, action: "undelivered", message: r.delivery.id, lane: r.target.lane, ...(r.delivery.reason ? { reason: r.delivery.reason } : {}),
     }));
+  }
+};
+
+const DECISION_MESSAGE_ID = /^decision-(d\d+)-r(\d+)$/;
+
+/**
+ * Why decision answer `message` must not be typed into `lane` now (the check right before each delivery attempt), or
+ * undefined: its decision is closed or gone, its revision is no longer the newest live one, or `lane` is no longer the
+ * session that asked (relaunched, replaced or moved). Any other lane message is never refused here.
+ */
+export const decisionDeliveryRefusal = (stateDir: string, message: Pick<LaneMessage, "id">, lane: TargetLane): string | undefined => {
+  const m = DECISION_MESSAGE_ID.exec(message.id);
+  if (!m) return undefined;
+  const d = readDecisions(stateDir).decisions.find((x) => x.id === m[1]);
+  const r = d?.revisions?.find((x) => x.rev === Number(m[2]));
+  if (!d || !r) return "its decision is no longer recorded";
+  if (d.state === "closed") return "decision closed";
+  if (r !== d.revisions?.at(-1) || r.delivery.state !== "queued") return `revision r${r.rev} is no longer the one to deliver (${r.delivery.state})`;
+  if (!sameTarget(r.target, decisionTargetOf(lane))) return `lane ${lane.key} was relaunched, replaced or moved`;
+  return undefined;
+};
+
+/**
+ * The owner's `[System]` status line for newest revision `r` of `d` (references/messaging.md, Owner-facing notices), or
+ * undefined when there is none to show (a close or a newer revision took over). `m` is its lane message; `corrects`
+ * says an older revision may have reached the lane.
+ */
+export const decisionNoticeText = (d: OwnerDecision, r: AnswerRevision, m: LaneMessage | undefined, corrects: boolean): string | undefined => {
+  const head = `[System] ${d.id}:`;
+  const lane = r.target.lane;
+  switch (r.delivery.state) {
+    case "acked": return r.choice === undefined ? `${head} 레인 ${lane}이 답 취소를 받았습니다. 질문은 다시 열려 있습니다.` : `${head} 레인 ${lane}이 ${r.choice}번을 받았습니다.`;
+    case "undelivered": return `${head} 레인 ${lane}이 종료되거나 바뀌어 전달하지 못했습니다. 리드가 이어받습니다.`;
+    case "cancelled": return `${head} 답을 취소했습니다. 질문은 다시 열려 있습니다.`;
+    case "superseded": return undefined;
+    default: break;
+  }
+  if (r.choice === undefined) return `${head} 답을 취소했다고 레인 ${lane}에 알렸습니다.`;
+  if (corrects) return `${head} 레인 ${lane}에 정정(${r.choice}번)을 보냈습니다.`;
+  if (m?.state === "delivered") return `${head} ${r.choice}번을 레인 ${lane}에 전달했습니다. 레인의 수신 확인을 기다립니다.`;
+  const recorded = `${head} ${r.choice}번으로 ${r.rev > 1 ? "바꿔 " : ""}기록했습니다.`;
+  return m?.blocked ? `${recorded} 레인 ${lane}이 받을 수 있게 되면 전달합니다.` : `${recorded} 레인 ${lane}에 전달하는 중입니다.`;
+};
+
+/** The lead's digest line once the lane acked a direct answer and its decision closes. */
+export const ackedLine = (d: OwnerDecision, r: AnswerRevision): string =>
+  `DECISION_ANSWER_ACKED ${r.target.lane} ${d.id} r${r.rev} choice=${r.choice ?? "-"} ${r.delivery.id}: the lane confirmed it received the answer; the decision closes, nothing to do`;
+
+/** A revision that still moves (its notice may change, its ack may close the decision). */
+const live = (d: OwnerDecision): boolean => d.state !== "closed" && d.state !== "posting" && !!d.revisions?.length;
+
+/**
+ * The supervisor's pass over direct answers, every delivery round (decision-inbound.ts queues them, ci-follow.ts types
+ * them). In order: reconcileDecisionDeliveries against the open lanes (a lane message the lane acked marks its revision
+ * acked; one superseded because its lane closed or changed marks it undelivered), each change logged, and one
+ * DECISION_ANSWER_UNDELIVERED for a newest revision it just found undelivered; the owner's `[System]` status message per
+ * decision, posted once (stable id `decision-notice:<id>`) and edited as the answer moves; then a newest revision
+ * acked with a choice closes its decision as `dori decision close` would (choice, confirmation, archive, link line),
+ * after DECISION_ANSWER_ACKED (digest) under a stable id. Every step reads its state back from decisions.json and the
+ * lane message store, so a pass cut short by a crash or a failed post is finished by a later one. `lanes` is read only
+ * when a direct answer is still moving.
+ */
+export const decisionDeliveryTick = async (deps: TickDeps, store: LaneMessageStore, lanes: () => Promise<readonly TargetLane[]>): Promise<void> => {
+  const { stateDir } = deps.config;
+  const log = deps.log ?? console.error;
+  if (!readDecisions(stateDir).decisions.some(live)) return;
+  const now = deps.now();
+  const targets = new Map((await lanes()).map((l) => [l.key, decisionTargetOf(l)] as const));
+  for (const a of reconcileDecisionDeliveries(stateDir, store, targets, now)) {
+    log(reconcileLine(a));
+    if (a.action !== "undelivered") continue;
+    const d = readDecisions(stateDir).decisions.find((x) => x.id === a.decision);
+    if (d && d.state !== "closed" && d.revisions?.at(-1)?.rev === a.rev) await deps.enqueue(`decision-undelivered:${a.decision}:r${a.rev}`, undeliveredLine(a));
+  }
+  for (const d of readDecisions(stateDir).decisions.filter(live)) {
+    const revisions = d.revisions ?? [];
+    const r = revisions.at(-1);
+    if (!r || !d.thread) continue;
+    const corrects = revisions.slice(0, -1).some((o) => reachedLane(store.get(o.delivery.id)));
+    const text = decisionNoticeText(d, r, store.get(r.delivery.id), corrects);
+    if (text && text !== d.notice?.text) {
+      try {
+        if (d.notice) await deps.transport.edit(d.thread, d.notice.message, text);
+        const message = d.notice?.message ?? await deps.transport.send(d.thread, text, `decision-notice:${d.id}`);
+        patchOne(stateDir, d.id, (x) => ({ ...x, notice: { message, text } }));
+      } catch (e) { log(`DECISION_NOTICE_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`); }
+    }
+    if (r.delivery.state !== "acked" || r.choice === undefined) continue;
+    await deps.enqueue(`decision-acked:${d.id}:r${r.rev}`, ackedLine(d, r));
+    try {
+      await closeOwnerDecision(deps, d.id, { text: `레인 ${r.target.lane}이 ${r.choice}번을 받았습니다`, choice: r.choice, force: true });
+      log(`DECISION_CLOSED_ON_ACK ${d.id} r${r.rev} ${r.delivery.id}`);
+    } catch (e) {
+      if (!(e instanceof OwnerDecisionError && e.code === "DECISION_ALREADY_CLOSED")) log(`DECISION_CLOSE_ON_ACK_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`);
+    }
   }
 };

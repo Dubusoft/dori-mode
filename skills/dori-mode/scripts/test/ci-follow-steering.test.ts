@@ -1,10 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { ATTEMPT_IN_FLIGHT_MS, deliverLaneMessages, queueSteering } from "../src/ci-follow.ts";
 import { claimDone, type FlowDeps, objectDone } from "../src/done-flow.ts";
 import { laneOps } from "../src/lane-ops.ts";
 import { ackLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
 import { openOperations, operationId, plan, settleOperation } from "../src/operations.ts";
+import { decisionTargetOf, DECISIONS_FILE } from "../src/owner-decisions.ts";
 import { sendVerified } from "../src/panes.ts";
 import type { Lane } from "../src/registry.ts";
 import type { RunnerCall } from "../src/runner/call.ts";
@@ -202,4 +205,29 @@ test("sendVerified names why a pane did not take the text: other text in its inp
     expect(why).toEqual([REFUSAL]);
   }
   expect(t.world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
+});
+
+/** decisions.json holding lane decision d1 whose answer r1 (decision-d1-r1) is queued for `target`. */
+const queuedAnswer = (stateDir: string, target: ReturnType<typeof decisionTargetOf>): void => {
+  const revision = { rev: 1, channel: "1000", message: "m1", edit: 0, hash: "h", choice: 1, target, at: T0, delivery: { id: "decision-d1-r1", state: "queued", updatedAt: T0 } };
+  writeFileSync(join(stateDir, DECISIONS_FILE), JSON.stringify({ nextSeq: 2, decisions: [{
+    id: "d1", state: "open", source: "lane", lane: lane.key, channel: "555", thread: "1000", question: "Which?", options: ["a", "b"], recommend: 1,
+    reason: "r", waiting: "w", blocking: true, openedAt: T0, target, revisions: [revision],
+  }] }));
+};
+
+test("a direct decision answer is typed only into the lane session that asked; a relaunched lane's copy is superseded untyped", async () => {
+  const t = await setup();
+  t.control.pane = "take";
+  queuedAnswer(t.deps.config.stateDir, decisionTargetOf(lane));
+  t.messages.put({ id: "decision-d1-r1", lane: lane.key, subject: "decision:d1", text: "[dori] Owner answered d1", state: "queued", at: T0, updatedAt: T0 });
+  await t.pass();
+  expect(t.messages.get("decision-d1-r1")?.state).toBe("delivered");
+  expect(t.typed).toEqual(["[dori] Owner answered d1"]);
+
+  queuedAnswer(t.deps.config.stateDir, { ...decisionTargetOf(lane), generation: 7 });
+  t.messages.put({ id: "decision-d1-r1", lane: lane.key, subject: "decision:d1", text: "[dori] Owner answered d1", state: "queued", at: T0, updatedAt: T0 });
+  await t.pass();
+  expect(t.messages.get("decision-d1-r1")).toMatchObject({ state: "superseded", blocked: "lane demo-lane was relaunched, replaced or moved" });
+  expect(t.typed).toHaveLength(1);
 });

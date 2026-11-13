@@ -20,7 +20,7 @@ The supervisor never talks to the owner itself, with two exceptions:
 - a lane question with choices becomes a `[결정]` thread, and a lane's owner-input request (`dori report <key> request`) a `[요청]` thread, in the decisions channel (#inbox to the owner; wired by `decisionsChannel` id), opened by the supervisor;
 - every day at 09:00 `displayTimeZone`, while any decision or request still waits, the supervisor posts one `[System]` reminder listing them in the decisions channel.
 
-The owner's answer is not forwarded to the lane. The lead relays it. Decision answers straight to the lane (below) narrows this for one kind of answer; until the supervisor ships it, every answer still goes through the lead.
+The owner's answer is not forwarded to the lane. The lead relays it, except for one kind of answer: Decision answers straight to the lane (below).
 
 | What you close | How |
 |---|---|
@@ -29,7 +29,7 @@ The owner's answer is not forwarded to the lane. The lead relays it. Decision an
 
 ## Decision answers straight to the lane
 
-Status: partly built. The supervisor records a lane decision's target when it opens, stores answer revisions with their delivery intent and reconciles them with the lane message queue at start (`owner-decisions.ts`), and routes each owner message to one side as below, edits and deletes included (`decision-inbound.ts`): a direct answer is queued for the lane and the lead gets `DECISION_ANSWER_DIRECT` (digest) or `DECISION_ANSWER_CORRECTED` (urgent) instead of `INBOUND`. Not built yet: closing the decision on the lane's ack and the owner-facing notices; until then a direct answer's decision stays open after the lane acks, and the lead closes it. This section is what the routing has to do, and the one place it is defined.
+Status: built. The supervisor records a lane decision's target when it opens, stores answer revisions with their delivery intent (`owner-decisions.ts`), and routes each owner message to one side as below, edits and deletes included (`decision-inbound.ts`): a direct answer is queued for the lane and the lead gets `DECISION_ANSWER_DIRECT` (digest) or `DECISION_ANSWER_CORRECTED` (urgent) instead of `INBOUND`. The delivery round checks the target again right before typing (`ci-follow.ts`), and every supervisor round (`decisionDeliveryTick`) reconciles intents with the queue, keeps the owner's status message current, closes a decision on its lane's ack (`DECISION_ANSWER_ACKED`, digest), and hands an answer whose lane session went away to the lead once (`DECISION_ANSWER_UNDELIVERED`). This section is what the routing has to do, and the one place it is defined.
 
 The idea: when a lane asked the owner a question with choices and the owner answers with nothing but a choice, the answer goes to the lane through the lane message queue and the lead is not woken for it. Anything else goes to the lead, whole.
 
@@ -88,6 +88,7 @@ The supervisor keeps one `[System]` status message per direct answer in the deci
 |---|---|
 | recorded, being delivered | `d17: 2번으로 기록했습니다. 레인 <key>에 전달하는 중입니다.` |
 | waiting (pane busy, lane paused, runner offline) | `d17: 2번으로 기록했습니다. 레인 <key>이 받을 수 있게 되면 전달합니다.` |
+| typed into the lane, not acked yet | `d17: 2번을 레인 <key>에 전달했습니다. 레인의 수신 확인을 기다립니다.` |
 | lane acked | `d17: 레인 <key>이 2번을 받았습니다.` (then the decision closes) |
 | revised before delivery | `d17: 3번으로 바꿔 기록했습니다. 레인 <key>에 전달하는 중입니다.` |
 | revised or withdrawn after delivery | `d17: 레인 <key>에 정정(3번)을 보냈습니다.` / `d17: 답을 취소했다고 레인 <key>에 알렸습니다.` |

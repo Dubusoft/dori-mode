@@ -80,7 +80,7 @@ import { pidAlive, releaseSlot, trySlot } from "./heavy-slot.ts";
 import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { type LaneReportStore, openLaneReports, routeReports, statusTransportOf } from "./lane-reports.ts";
-import { type DecisionContext, openLaneDecision, ownerDecisionTick, reconcileDecisionsAtStart } from "./owner-decisions.ts";
+import { type DecisionContext, decisionDeliveryTick, openLaneDecision, ownerDecisionTick, reconcileDecisionsAtStart } from "./owner-decisions.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -1172,6 +1172,12 @@ export const supervise = async (
           decisionsReconciled = true;
         } catch (e) { console.error(`DECISION_RECONCILE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
       }
+      // Every round: direct answers' acks close their decisions, the owner's status line follows each answer, and an
+      // answer whose lane session went away is handed to the lead once.
+      try {
+        await decisionDeliveryTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
+          laneMessages ??= openLaneMessages(deps.config), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed"));
+      } catch (e) { console.error(`DECISION_DELIVERY_ERROR ${e instanceof Error ? e.message : String(e)}`); }
       // Owner decisions: a stuck post, a missing link line, a pending archive, the daily reminder.
       try { await ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }); }
       catch (e) { console.error(`OWNER_DECISION_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }

@@ -13,6 +13,7 @@ import {
 import {
   FINAL_STATES, type Observed, type Operation, operationId, type OperationSpec, type OperationStore, openOperations, perform, plan, type ReadBack, reconcile, settleOperation,
 } from "./operations.ts";
+import { decisionDeliveryRefusal } from "./owner-decisions.ts";
 import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
@@ -186,6 +187,12 @@ export const deliverLaneMessages = async (deps: FlowDeps, ops: OperationStore, m
     const lane = await deps.registry.read(message.lane);
     if (!lane || statusOf(lane) === "closed") {
       updateLaneMessage(messages, message, { state: "superseded", blocked: "lane closed" }, deps.clock.now());
+      continue;
+    }
+    // A direct decision answer is typed only into the session that asked, while it is still the answer to send.
+    const refused = message.state === "queued" ? decisionDeliveryRefusal(deps.config.stateDir, message, lane) : undefined;
+    if (refused) {
+      updateLaneMessage(messages, message, { state: "superseded", blocked: refused }, deps.clock.now());
       continue;
     }
     if (message.state === "queued") message = await deliver(deps, ops, messages, lane, message, panesOf);
