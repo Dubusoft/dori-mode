@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { alertsChannelOf, type DoriConfig } from "./config.ts";
 import { recordResolved } from "./decision-obligations.ts";
 import { scrubForThread } from "./freshness.ts";
+import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
+import { runnerOf } from "./lane-ops.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { type DecisionChoices, parseDecisionText, parseRequestText } from "./runner/decision-text.ts";
 import { withStateLockSync } from "./state-lock.ts";
@@ -92,6 +95,42 @@ export type OwnerDecision = DecisionChoices & {
   readonly archivePending?: boolean;
   readonly stuckAt?: number;
   readonly goneAt?: number;
+  /** A lane decision's target when it opened: a direct answer goes to this lane session only (references/messaging.md). */
+  readonly target?: DecisionTarget;
+  /** Direct answer revisions, oldest first (`rev` 1, 2, ...), each with its delivery intent. */
+  readonly revisions?: readonly AnswerRevision[];
+};
+
+/**
+ * The lane session a lane decision belongs to: lane key, owning runner, session generation (lane-reports.ts
+ * laneGeneration: the last recovery, 0 before any) and the registry's openedAt (a lane closed and opened again under the
+ * same key is a new lane). Another value of any of them is another target.
+ */
+export type DecisionTarget = { readonly lane: string; readonly runner: string; readonly generation: number; readonly openedAt?: string };
+
+/**
+ * Where a revision's lane message stands, as decisions.json records it: `intended` (recorded, the lane message may not
+ * be queued yet), `queued` (the lane message `decision-d<ID>-r<n>` exists), `acked` (the lane confirmed it), `superseded`
+ * (a newer revision or a close replaced it), `cancelled` (a withdrawal before anything reached the lane: nothing to send),
+ * `undelivered` (its lane session is gone or its queue entry was lost; the lead takes the answer over).
+ */
+export type DeliveryState = "intended" | "queued" | "acked" | "superseded" | "cancelled" | "undelivered";
+
+export type AnswerDelivery = { readonly id: string; readonly state: DeliveryState; readonly updatedAt: number; readonly reason?: string };
+
+export type AnswerRevision = {
+  readonly rev: number;
+  /** The owner message (`channel`/`message`) and its edit revision (0 for the message as first posted). */
+  readonly channel: string;
+  readonly message: string;
+  readonly edit: number;
+  /** answerContentHash of the message text. */
+  readonly hash: string;
+  /** The chosen option; absent when this revision withdraws the answer (an edit out of the answer form, or a delete). */
+  readonly choice?: number;
+  readonly target: DecisionTarget;
+  readonly at: number;
+  readonly delivery: AnswerDelivery;
 };
 
 export type DecisionsFile = {
@@ -313,6 +352,7 @@ export type DecisionSpec = DecisionChoices & {
   readonly origin?: string;
   readonly source: "lead" | "lane";
   readonly sourceRef?: string;
+  readonly target?: DecisionTarget;
 };
 
 const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
@@ -412,6 +452,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       ...(spec.kind ? { kind: spec.kind } : {}), ...(spec.file ? { file: spec.file } : {}),
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
+      ...(spec.target ? { target: spec.target } : {}),
       ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
     };
     return { file: { ...file, nextSeq: file.nextSeq + 1, decisions: [...file.decisions, decision] }, result: { decision, duplicateOf: undefined } };
@@ -695,8 +736,11 @@ const age = (ms: number): string => {
 };
 
 /** `dori decision list`'s line for one decision. */
-export const decisionListLine = (d: OwnerDecision, now: number): string =>
-  `${d.id} ${d.state} ${d.blocking ? "blocking" : "nonblocking"}${d.task !== undefined ? ` task=#${d.task}` : ""}${d.lane ? ` lane=${d.lane}` : ""} age=${age(now - d.openedAt)} thread=${threadRef(d)} ${subject(d)}`;
+export const decisionListLine = (d: OwnerDecision, now: number): string => {
+  const last = d.revisions?.at(-1);
+  const answer = last ? ` answer=r${last.rev}:${last.choice ?? "withdrawn"} delivery=${last.delivery.state}` : "";
+  return `${d.id} ${d.state} ${d.blocking ? "blocking" : "nonblocking"}${d.task !== undefined ? ` task=#${d.task}` : ""}${d.lane ? ` lane=${d.lane}` : ""}${answer} age=${age(now - d.openedAt)} thread=${threadRef(d)} ${subject(d)}`;
+};
 
 /** Decisions not closed, oldest first. */
 export const openOwnerDecisions = (stateDir: string): OwnerDecision[] =>
@@ -799,14 +843,246 @@ export const requestSpec = (request: { readonly need: string; readonly reason: s
  * openOwnerDecision.
  */
 export const openLaneDecision = async (
-  ctx: DecisionContext, lane: { readonly key: string; readonly thread: string }, report: { readonly id: string; readonly text: string },
+  ctx: DecisionContext, lane: TargetLane & { readonly thread: string }, report: { readonly id: string; readonly text: string },
 ): Promise<OpenResult | undefined> => {
   const request = parseRequestText(report.text);
   const choices = request ? requestSpec(request) : parseDecisionText(report.text);
   if (!choices) return undefined;
   const task = taskOfLane(lane.key);
   return openOwnerDecision(ctx, {
-    ...choices, source: "lane", sourceRef: report.id, lane: lane.key,
+    ...choices, source: "lane", sourceRef: report.id, lane: lane.key, ...(request ? {} : { target: decisionTargetOf(lane) }),
     ...(task !== undefined ? { task } : {}), ...(lane.thread !== "none" && refIds(lane.thread) ? { origin: lane.thread } : {}),
   });
+};
+
+/*
+ * Decision answers straight to the lane (references/messaging.md): the store side. Each direct answer is an answer
+ * revision pinned to the target the decision recorded when it opened, carrying its delivery intent; the lane message
+ * `decision-d<ID>-r<n>` is queued under DECISIONS_LOCK right after the intent is recorded. The two stores are not one
+ * transaction: reconcileDecisionDeliveries compares intent, queue, ack and close after a restart and repairs the gap
+ * without typing anything twice. Classifying an inbound owner message and calling recordAnswerRevision, typing the
+ * message into the pane, and closing the decision on the lane's ack belong to their callers.
+ */
+
+/** The lane fields a decision target is read from (a registry Lane fits). */
+export type TargetLane = {
+  readonly key: string;
+  readonly runner?: string;
+  readonly machine?: string;
+  readonly lastRecoveryAt?: number;
+  readonly openedAt?: string;
+};
+
+/** The lane's target as it is now; generation is lane-reports.ts laneGeneration (not imported: that module imports this one). */
+export const decisionTargetOf = (lane: TargetLane): DecisionTarget => ({
+  lane: lane.key, runner: runnerOf(lane), generation: lane.lastRecoveryAt ?? 0, ...(lane.openedAt ? { openedAt: lane.openedAt } : {}),
+});
+
+export const sameTarget = (a: DecisionTarget, b: DecisionTarget): boolean =>
+  a.lane === b.lane && a.runner === b.runner && a.generation === b.generation && (a.openedAt === undefined || b.openedAt === undefined || a.openedAt === b.openedAt);
+
+/** The lane message id of revision `rev` of decision `id`: `decision-d17-r1`. */
+export const decisionMessageId = (id: string, rev: number): string => `decision-${id}-r${rev}`;
+
+/** The hash an answer revision keeps of the owner's text (whitespace-trimmed), so the same text seen twice is one revision. */
+export const answerContentHash = (content: string): string => createHash("sha256").update(content.trim()).digest("hex").slice(0, 16);
+
+export type AnswerInput = {
+  readonly channel: string;
+  readonly message: string;
+  /** The owner message's edit revision: 0 as first posted, then one more per edit (a delete is its last revision). */
+  readonly edit: number;
+  /** The message text as seen (empty for a delete). */
+  readonly content: string;
+  /** The chosen option; absent withdraws the answer this message gave. */
+  readonly choice?: number;
+  /** The target the caller checked the lane against when the message came in. */
+  readonly target: DecisionTarget;
+};
+
+export type RevisionResult =
+  | { readonly kind: "recorded"; readonly decision: OwnerDecision; readonly revision: AnswerRevision; readonly replaced?: AnswerRevision }
+  | { readonly kind: "duplicate"; readonly decision: OwnerDecision; readonly revision: AnswerRevision }
+  | { readonly kind: "refused"; readonly reason: string };
+
+/**
+ * Records one direct answer revision and its delivery intent (`intended`, lane message `decision-d<ID>-r<n>`) under
+ * DECISIONS_LOCK. The same owner message at an edit already recorded, or unchanged text, is a duplicate (gateway and
+ * REST catch-up both see it). Refused, recording nothing: an unknown, closed or lead decision, a request, a decision
+ * opened before targets were recorded, a choice out of range, a target that is no longer the decision's, a withdrawal
+ * with no live answer from that message. A new revision supersedes the intents of older ones not yet acked; the queue
+ * side follows in queueDecisionAnswer.
+ */
+export const recordAnswerRevision = (stateDir: string, id: string, input: AnswerInput, now: number): RevisionResult =>
+  updateDecisions(stateDir, (file): { file?: DecisionsFile; result: RevisionResult } => {
+    const d = file.decisions.find((x) => x.id === id);
+    const refuse = (reason: string) => ({ result: { kind: "refused" as const, reason } });
+    if (!d) return refuse("unknown decision");
+    if (d.state === "closed" || d.state === "posting") return refuse(`decision is ${d.state}`);
+    if (d.source !== "lane" || d.kind === "request") return refuse("not a lane decision");
+    if (!d.target) return refuse("decision has no recorded target");
+    if (!sameTarget(d.target, input.target)) return refuse("target changed since the question was asked");
+    if (input.choice !== undefined && (!Number.isInteger(input.choice) || input.choice < 1 || input.choice > d.options.length)) return refuse(`choice must be 1-${d.options.length}`);
+    const revisions = d.revisions ?? [];
+    const hash = answerContentHash(input.content);
+    const ofMessage = revisions.filter((r) => r.channel === input.channel && r.message === input.message);
+    const seen = ofMessage.find((r) => r.edit === input.edit) ?? (ofMessage.at(-1)?.hash === hash ? ofMessage.at(-1) : undefined);
+    if (seen) return { result: { kind: "duplicate" as const, decision: d, revision: seen } };
+    const last = revisions.at(-1);
+    if (input.choice === undefined && (last?.choice === undefined || last.channel !== input.channel || last.message !== input.message)) return refuse("no live answer from this message to withdraw");
+    const rev = (last?.rev ?? 0) + 1;
+    const revision: AnswerRevision = {
+      rev, channel: input.channel, message: input.message, edit: input.edit, hash, ...(input.choice !== undefined ? { choice: input.choice } : {}),
+      target: d.target, at: now, delivery: { id: decisionMessageId(d.id, rev), state: "intended", updatedAt: now },
+    };
+    const older = revisions.map((r): AnswerRevision => (r.delivery.state === "intended" || r.delivery.state === "queued"
+      ? { ...r, delivery: { ...r.delivery, state: "superseded", updatedAt: now, reason: `replaced by r${rev}` } } : r));
+    const next: OwnerDecision = { ...d, revisions: [...older, revision] };
+    return { file: { ...file, decisions: file.decisions.map((x) => (x.id === id ? next : x)) }, result: { kind: "recorded" as const, decision: next, revision, ...(last ? { replaced: last } : {}) } };
+  });
+
+/** States in which a lane message may have reached the lane. */
+const reachedLane = (m: LaneMessage | undefined): boolean => m?.state === "delivered" || m?.state === "acked";
+
+/**
+ * The lane message of revision `r`: the answer; a correction naming the revision it replaces when `replaces` (a revision
+ * that may have reached the lane) is given; a withdrawal when `r` has no choice.
+ */
+export const decisionAnswerText = (d: OwnerDecision, r: AnswerRevision, replaces?: number): string => {
+  const q = short(d.question, 120);
+  const ack = `Confirm with: dori report ack ${r.delivery.id}`;
+  if (r.choice === undefined) return `[dori] Owner withdrew the answer to ${d.id} (${q}). Revision r${r.rev} replaces r${replaces ?? r.rev - 1}: do not act on that answer; the question is open again. ${ack}`;
+  const picked = `${r.choice}. ${short(d.options[r.choice - 1] ?? "", 120)}`;
+  if (replaces !== undefined) return `[dori] Owner changed the answer to ${d.id} (${q}): ${picked}. Revision r${r.rev} replaces r${replaces}; follow r${r.rev}. ${ack}`;
+  return `[dori] Owner answered ${d.id} (${q}): ${picked}. Revision r${r.rev}. ${ack}`;
+};
+
+export type QueueOutcome =
+  | { readonly kind: "queued"; readonly message: LaneMessage; readonly replaces?: number }
+  | { readonly kind: "cancelled" | "superseded"; readonly reason: string }
+  | { readonly kind: "none" };
+
+const withDelivery = (d: OwnerDecision, rev: number, patch: Omit<AnswerDelivery, "id">): OwnerDecision => ({
+  ...d, revisions: (d.revisions ?? []).map((r) => (r.rev === rev ? { ...r, delivery: { id: r.delivery.id, ...patch } } : r)),
+});
+
+/**
+ * Queues the newest revision's lane message when its intent is still `intended`, under DECISIONS_LOCK (the lane message
+ * store takes its own lock inside it; nothing takes them the other way round). Older revisions' messages still queued
+ * are superseded first; when one may have reached the lane, the new message is a correction (or a withdrawal) naming
+ * it. A withdrawal nothing reached is cancelled with no message. A closed decision supersedes the intent. The lane
+ * message id is fixed per revision, so a repeat after a crash finds the queued message instead of adding one.
+ */
+export const queueDecisionAnswer = (stateDir: string, store: LaneMessageStore, id: string, now: number): QueueOutcome =>
+  updateDecisions(stateDir, (file): { file?: DecisionsFile; result: QueueOutcome } => {
+    const d = file.decisions.find((x) => x.id === id);
+    const r = d?.revisions?.at(-1);
+    if (!d || !r || r.delivery.state !== "intended") return { result: { kind: "none" } };
+    const save = (next: OwnerDecision) => ({ ...file, decisions: file.decisions.map((x) => (x.id === id ? next : x)) });
+    if (d.state === "closed") {
+      const reason = "decision closed";
+      return { file: save(withDelivery(d, r.rev, { state: "superseded", updatedAt: now, reason })), result: { kind: "superseded", reason } };
+    }
+    let replaces: number | undefined;
+    for (const older of (d.revisions ?? []).slice(0, -1)) {
+      const m = store.get(older.delivery.id);
+      if (m?.state === "queued") updateLaneMessage(store, m, { state: "superseded", blocked: `replaced by r${r.rev}` }, now);
+      else if (reachedLane(m)) replaces = older.rev;
+    }
+    if (r.choice === undefined && replaces === undefined) {
+      const reason = "withdrawn before anything reached the lane";
+      return { file: save(withDelivery(d, r.rev, { state: "cancelled", updatedAt: now, reason })), result: { kind: "cancelled", reason } };
+    }
+    const message = queueLaneMessage(store, now, { id: r.delivery.id, lane: r.target.lane, subject: `decision:${d.id}`, text: decisionAnswerText(d, r, replaces) });
+    return { file: save(withDelivery(d, r.rev, { state: "queued", updatedAt: now })), result: { kind: "queued", message, ...(replaces !== undefined ? { replaces } : {}) } };
+  });
+
+export type ReconcileAction = {
+  readonly decision: string;
+  readonly rev: number;
+  /** What was repaired: queued (an intent without its message), recorded (the message existed), acked, closed, undelivered, queue-superseded. */
+  readonly action: "queued" | "recorded" | "acked" | "closed" | "undelivered" | "queue-superseded";
+  readonly message: string;
+  readonly lane: string;
+  readonly reason?: string;
+};
+
+/** The log line of one reconcile action. */
+export const reconcileLine = (a: ReconcileAction): string =>
+  `DECISION_DELIVERY_RECONCILED ${a.decision} r${a.rev} ${a.action} ${a.message} lane=${a.lane}${a.reason ? `: ${a.reason}` : ""}`;
+
+/** The lead's event for an answer whose lane session is gone: the lead takes it over (messaging.md, Failures). */
+export const undeliveredLine = (a: ReconcileAction): string =>
+  `DECISION_ANSWER_UNDELIVERED ${a.lane} ${a.decision} r${a.rev} ${a.message}: ${a.reason ?? "not delivered"}; take the answer over with dori decision close ${a.decision}`;
+
+/**
+ * Repairs the gap between decisions.json and the lane message store after a restart: for every revision whose intent
+ * is not final, an acked lane message marks it acked; a closed decision supersedes it (and its queued message); a target
+ * missing from `lanes` (the open lanes' current targets) or no longer equal marks it undelivered and supersedes a queued
+ * message; an `intended` newest revision is queued (queueDecisionAnswer), or recorded as queued when its message already
+ * exists; a `queued` intent whose message is gone is undelivered, never queued again. A final intent whose message is
+ * still queued has that message superseded. Returns what it changed.
+ */
+export const reconcileDecisionDeliveries = (stateDir: string, store: LaneMessageStore, lanes: ReadonlyMap<string, DecisionTarget>, now: number): ReconcileAction[] => {
+  const actions: ReconcileAction[] = [];
+  for (const d of readDecisions(stateDir).decisions) {
+    const revisions = d.revisions ?? [];
+    for (const r of revisions) {
+      const note = (action: ReconcileAction["action"], reason?: string): void => {
+        actions.push({ decision: d.id, rev: r.rev, action, message: r.delivery.id, lane: r.target.lane, ...(reason ? { reason } : {}) });
+      };
+      const settle = (state: DeliveryState, reason?: string): void => {
+        updateDecisions(stateDir, (file) => {
+          const x = file.decisions.find((y) => y.id === d.id);
+          const cur = x?.revisions?.find((y) => y.rev === r.rev);
+          if (!x || !cur || cur.delivery.state !== r.delivery.state) return { result: undefined };
+          return { file: { ...file, decisions: file.decisions.map((y) => (y.id === d.id ? withDelivery(x, r.rev, { state, updatedAt: now, ...(reason ? { reason } : {}) }) : y)) }, result: undefined };
+        });
+      };
+      const m = store.get(r.delivery.id);
+      const supersedeQueued = (why: string): void => { if (m?.state === "queued") updateLaneMessage(store, m, { state: "superseded", blocked: why }, now); };
+      const state = r.delivery.state;
+      if (state === "acked") continue;
+      if (state !== "intended" && state !== "queued") {
+        if (m?.state === "queued") { supersedeQueued(r.delivery.reason ?? state); note("queue-superseded", r.delivery.reason ?? state); }
+        continue;
+      }
+      if (m?.state === "acked") { settle("acked"); note("acked"); continue; }
+      if (d.state === "closed") { supersedeQueued("decision closed"); settle("superseded", "decision closed"); note("closed", "decision closed"); continue; }
+      const current = lanes.get(r.target.lane);
+      if (!current || !sameTarget(r.target, current) || m?.state === "superseded") {
+        const reason = !current || m?.state === "superseded" ? `lane ${r.target.lane} is closed` : `lane ${r.target.lane} was relaunched, replaced or moved`;
+        supersedeQueued(reason); settle("undelivered", reason); note("undelivered", reason); continue;
+      }
+      if (state === "queued") {
+        if (!m) { const reason = "its lane message is missing from the queue"; settle("undelivered", reason); note("undelivered", reason); }
+        continue;
+      }
+      if (m) { settle("queued"); note("recorded"); continue; }
+      if (r !== revisions.at(-1)) { settle("superseded", "a newer revision exists"); continue; }
+      const queued = queueDecisionAnswer(stateDir, store, d.id, now);
+      if (queued.kind === "queued") note("queued");
+    }
+  }
+  return actions;
+};
+
+/**
+ * The supervisor's start: reconcileDecisionDeliveries against the open lanes, each change logged, then one
+ * DECISION_ANSWER_UNDELIVERED per open decision whose newest revision is undelivered, under a stable id (the journal
+ * dedupes it, so a crash between the reconcile and the enqueue is repaired by the next start).
+ */
+export const reconcileDecisionsAtStart = async (
+  stateDir: string, store: LaneMessageStore, openLanes: readonly TargetLane[], now: number,
+  enqueue: (id: string, line: string) => unknown, log: (line: string) => void,
+): Promise<void> => {
+  const lanes = new Map(openLanes.map((l) => [l.key, decisionTargetOf(l)] as const));
+  for (const a of reconcileDecisionDeliveries(stateDir, store, lanes, now)) log(reconcileLine(a));
+  for (const d of readDecisions(stateDir).decisions) {
+    const r = d.revisions?.at(-1);
+    if (d.state === "closed" || r?.delivery.state !== "undelivered") continue;
+    await enqueue(`decision-undelivered:${d.id}:r${r.rev}`, undeliveredLine({
+      decision: d.id, rev: r.rev, action: "undelivered", message: r.delivery.id, lane: r.target.lane, ...(r.delivery.reason ? { reason: r.delivery.reason } : {}),
+    }));
+  }
 };

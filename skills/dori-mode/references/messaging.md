@@ -29,7 +29,7 @@ The owner's answer is not forwarded to the lane. The lead relays it. Decision an
 
 ## Decision answers straight to the lane
 
-Status: contract only. The supervisor does not route answers this way yet; until it does, the lead relays every answer as above. This section is what that routing has to do, and the one place it is defined.
+Status: partly built. The supervisor records a lane decision's target when it opens, and stores answer revisions with their delivery intent and reconciles them with the lane message queue at start (`owner-decisions.ts`); it does not route any owner message this way yet, so until it does, the lead relays every answer as above. This section is what that routing has to do, and the one place it is defined.
 
 The idea: when a lane asked the owner a question with choices and the owner answers with nothing but a choice, the answer goes to the lane through the lane message queue and the lead is not woken for it. Anything else goes to the lead, whole.
 
@@ -110,7 +110,7 @@ An answer that goes to the lead gets no notice from the supervisor: the lead's `
 - **Lane paused**: the message waits; delivery never resumes a paused lane.
 - **Runner offline or unreachable**: a send that surely did not happen waits for the reconnect. A send whose result was lost is retried under the same id, never as a new message, so the lane sees one copy.
 - **No ack**: an unconfirmed message reaches the lead after `ciConfirmMin` as `LANE_MESSAGE_UNCONFIRMED`, once, like any other lane message; until then the owner's notice says it waits.
-- **Supervisor crash**: at start, intent, queue, ack and close are reconciled; an answer stays "waiting" to the owner until the ack is in.
+- **Supervisor crash**: at start, intent, queue, ack and close are reconciled; an answer stays "waiting" to the owner until the ack is in. An intent with no queued message is queued under its fixed id; one whose queued message is lost, or whose lane session is gone, is marked undelivered and the lead gets `DECISION_ANSWER_UNDELIVERED <lane> d<ID> r<n> ...` once.
 
 ### What the lead sees
 
