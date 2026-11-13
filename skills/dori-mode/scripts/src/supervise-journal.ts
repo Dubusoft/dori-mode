@@ -108,7 +108,7 @@ export type LaneOutcome = {
   readonly heads?: readonly string[];
   /** Events that joined with nothing new for the lead: they wake no one (lane-outcomes.ts). */
   readonly quiet?: readonly string[];
-  /** The lane's thread id and its latest report there, from `dori reported` receipts: the close-button check reads them. */
+  /** The lane's thread id and its latest report there, from `dori reported` receipts: the automatic thread close reads them. */
   readonly thread?: string;
   readonly lastReportAt?: number;
 };

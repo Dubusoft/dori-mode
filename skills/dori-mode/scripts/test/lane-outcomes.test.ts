@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { eventPriority, Supervisor } from "../src/supervise.ts";
 import { outcomeLane, pendingReported, recordReported, REPORTED_DIR, takeReminders } from "../src/lane-outcomes.ts";
-import { CLOSE_BUTTONS_FILE, readCloseButtons } from "../src/thread-finality.ts";
+import { readFinishedThreads } from "../src/thread-finality.ts";
 import { readLastReports, readOwnerClosed, recordOwnerClosed } from "../src/thread-followup.ts";
 import { Waits } from "../src/waits.ts";
 import type { Lane } from "../src/registry.ts";
@@ -391,7 +391,7 @@ test("dori reported is lead-only, needs a registered lane, and needs --text", as
   expect(unknown.err).toContain('no registered lane "nope"');
   const bare = await cli(f.state.dir, ["reported", "alpha", "--note", "told"]);
   expect(bare.code).toBe(1);
-  expect(bare.err).toContain("usage: dori reported <key> --text TEXT [--final] [--to TARGET] [--thread ID] [--note TEXT]");
+  expect(bare.err).toContain("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT]");
   expect([...denied.requests, ...unknown.requests, ...bare.requests]).toEqual([]);
   expect(existsSync(join(f.state.dir, REPORTED_DIR))).toBe(false);
 }, CLI_TIMEOUT);
@@ -443,44 +443,65 @@ test("pendingReported reads receipts written before reports carried a message id
   expect(pendingReported(f.state.dir).map(({ path: _path, ...rest }) => rest)).toEqual([{ lane: "alpha", at: T0, note: "told" }]);
 });
 
-const closeButtons = () => {
+const autoClose = () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
-  const posts: { thread: string; id: string }[] = [];
-  const tick = async () => { await supervisor.reportTick(); await supervisor.closeButtonTick(async (thread, id) => { posts.push({ thread, id }); }); };
+  // Each archive the supervisor asked for, in order.
+  const posts: string[] = [];
+  const tick = async () => { await supervisor.reportTick(); await supervisor.autoCloseTick(async (thread) => { posts.push(thread); }); };
   const close = (key: string) => f.deps.registry.patch(key, { closedAt: new Date(f.clock.now()).toISOString() });
+  // `button` marks a receipt of an older `dori reported --final`, which posted a close button.
   const report = (key: string, extra: { button?: boolean } = {}) => recordReported(f.state.dir, key, f.clock.now(), undefined, { message: "m", target: "discord:200", thread: "200", ...extra });
   return { ...f, supervisor, posts, tick, close, report };
 };
 
-test("the supervisor posts the close button once the last lane on a thread is closed and reported, once per report", async () => {
-  const f = closeButtons();
+test("the supervisor closes a thread once its last lane is closed and reported, records it closed, once per report", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200" }));
   f.supervisor.enqueue("claim:alpha", "LANE_DONE_CLAIMED alpha w:p1 proof");
   f.clock.at += 1_000;
   f.report("alpha");
-  // Reported at the claim: the lane is still open, so the button waits for its close.
+  // Reported at the claim: the lane is still open, so the close waits for the lane's.
   await f.tick();
   expect(f.posts).toEqual([]);
   f.clock.at += 1_000;
   await f.close("alpha");
   await f.tick();
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0 + 1_000}` }]);
-  expect(readCloseButtons(f.state.dir)).toEqual({ "200": T0 + 2_000 });
+  expect(f.posts).toEqual(["200"]);
+  expect(readFinishedThreads(f.state.dir)).toEqual({ "200": T0 + 2_000 });
+  // Recorded like the owner's close, so later posts addressed to the thread are redirected.
+  expect(readOwnerClosed(f.state.dir)).toEqual({ "200": T0 + 2_000 });
   await f.tick();
   expect(f.posts).toHaveLength(1);
-  // New work on the thread, finished and reported later, gets a button of its own.
+  // The owner wrote in the thread and it opened again (the close record went): it is not closed again without new work.
+  writeFileSync(join(f.state.dir, "owner-closed-threads.json"), "{}");
+  await f.tick();
+  expect(f.posts).toHaveLength(1);
+  // New work on the thread, finished and reported later, closes it again.
   await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
   f.clock.at += 1_000;
   await f.close("beta");
   f.report("beta");
   await f.tick();
-  expect(f.posts.map((post) => post.id)).toEqual([`close-button:200:${T0 + 1_000}`, `close-button:200:${T0 + 3_000}`]);
+  expect(f.posts).toEqual(["200", "200"]);
   f.supervisor.close();
 });
 
-test("a reported done-claimed lane still open holds the button back across a supervisor restart, until it closes", async () => {
-  const f = closeButtons();
+test("a failed archive records nothing and is retried on the next pass", async () => {
+  const f = autoClose();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha");
+  await f.supervisor.reportTick();
+  await f.supervisor.autoCloseTick(async () => { throw new Error("discord PATCH /channels/200: 500"); });
+  expect(readFinishedThreads(f.state.dir)).toEqual({});
+  expect(readOwnerClosed(f.state.dir)).toEqual({});
+  await f.tick();
+  expect(f.posts).toEqual(["200"]);
+  f.supervisor.close();
+});
+
+test("a reported done-claimed lane still open holds the close back across a supervisor restart, until it closes", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", claim: { at: new Date(T0).toISOString(), evidence: "PR o/r#1" } }));
   f.supervisor.enqueue("claim:alpha", "LANE_DONE_CLAIMED alpha w:p1 PR o/r#1");
   f.clock.at += 1_000;
@@ -489,30 +510,30 @@ test("a reported done-claimed lane still open holds the button back across a sup
   f.supervisor.close();
   // A new process on the same state: its first passes see the claim reported and the lane still open.
   const restarted = new Supervisor(f.deps);
-  const tick = async () => { await restarted.reportTick(); await restarted.closeButtonTick(async (thread, id) => { f.posts.push({ thread, id }); }); };
+  const tick = async () => { await restarted.reportTick(); await restarted.autoCloseTick(async (thread) => { f.posts.push(thread); }); };
   await tick();
   await tick();
   expect(f.posts).toEqual([]);
-  expect(readCloseButtons(f.state.dir)).toEqual({});
+  expect(readFinishedThreads(f.state.dir)).toEqual({});
   f.clock.at += 1_000;
   await f.close("alpha");
   await tick();
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0 + 1_000}` }]);
+  expect(f.posts).toEqual(["200"]);
   restarted.close();
 });
 
-test("a --final report's button stands for the thread: the supervisor posts none", async () => {
-  const f = closeButtons();
+test("an older --final report's button stands for the thread's close: the supervisor does not close it", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   f.report("alpha", { button: true });
   await f.tick();
   expect(f.posts).toEqual([]);
-  expect(readCloseButtons(f.state.dir)).toEqual({ "200": T0 });
+  expect(readFinishedThreads(f.state.dir)).toEqual({ "200": T0 });
   f.supervisor.close();
 });
 
-test("an open lane, an unreported lane, a wait or an open decision on the thread holds the button back", async () => {
-  const f = closeButtons();
+test("an open lane, an unreported lane, a wait or an open decision on the thread holds the close back", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
   await f.deps.registry.write(lane("gamma", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
@@ -535,12 +556,12 @@ test("an open lane, an unreported lane, a wait or an open decision on the thread
   writeFileSync(join(f.state.dir, "resolved", `${T0}-q.json`), JSON.stringify({ id: "q:alpha", at: T0 }));
   f.supervisor.resolveTick();
   await f.tick();
-  expect(f.posts.map((post) => post.thread)).toEqual(["200"]);
+  expect(f.posts).toEqual(["200"]);
   f.supervisor.close();
 });
 
-test("receipts without a thread (written before this check) never post a button", async () => {
-  const f = closeButtons();
+test("receipts without a thread (written before this check) never close one", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   recordReported(f.state.dir, "alpha", T0, undefined, { message: "m", target: "discord:200" });
   await f.tick();
@@ -548,37 +569,38 @@ test("receipts without a thread (written before this check) never post a button"
   f.supervisor.close();
 });
 
-test("a report of a lane that closed before the supervisor's button re-arms nothing; a lane closed after it does", async () => {
-  const f = closeButtons();
+test("a report of a lane that closed before the supervisor's close re-arms nothing; a lane closed after it does", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
   f.report("alpha");
   await f.tick();
   expect(f.posts).toEqual([]);
-  // beta closes; its report has not arrived yet, so nothing is left on the thread and the button goes on.
+  // beta closes; its report has not arrived yet, so nothing is left on the thread and it is closed.
   f.clock.at += 1_000;
   await f.close("beta");
   f.clock.at += 1_000;
   await f.tick();
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0}` }]);
-  // beta's report arrives after the button: that button already covers it.
+  expect(f.posts).toEqual(["200"]);
+  // beta's report arrives after the close (the owner reopened the thread meanwhile): that close already covers it.
+  writeFileSync(join(f.state.dir, "owner-closed-threads.json"), "{}");
   f.clock.at += 5_000;
   f.report("beta");
   await f.tick();
   await f.tick();
   expect(f.posts).toHaveLength(1);
-  // gamma starts after the button, closes and is reported: new work gets a button of its own.
+  // gamma starts after the close, closes and is reported: new work closes the thread again.
   await f.deps.registry.write(lane("gamma", { thread: "discord:100/200" }));
   f.clock.at += 1_000;
   await f.close("gamma");
   f.report("gamma");
   await f.tick();
-  expect(f.posts.map((post) => post.id)).toEqual([`close-button:200:${T0}`, `close-button:200:${f.clock.now()}`]);
+  expect(f.posts).toEqual(["200", "200"]);
   f.supervisor.close();
 });
 
-test("a repeat report of a lane after its --final button does not post a second button", async () => {
-  const f = closeButtons();
+test("a repeat report of a lane after an older --final button does not close the thread", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   f.report("alpha", { button: true });
   await f.tick();
@@ -586,12 +608,12 @@ test("a repeat report of a lane after its --final button does not post a second 
   f.report("alpha");
   await f.tick();
   expect(f.posts).toEqual([]);
-  expect(readCloseButtons(f.state.dir)).toEqual({ "200": T0 });
+  expect(readFinishedThreads(f.state.dir)).toEqual({ "200": T0 });
   f.supervisor.close();
 });
 
-test("repeat reports of a lane into the same thread get one supervisor button", async () => {
-  const f = closeButtons();
+test("repeat reports of a lane into the same thread close it once", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   f.report("alpha");
   await f.tick();
@@ -600,13 +622,13 @@ test("repeat reports of a lane into the same thread get one supervisor button", 
     f.report("alpha");
     await f.tick();
   }
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0}` }]);
+  expect(f.posts).toEqual(["200"]);
   expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "alpha", thread: "200", lastReportAt: T0, reportedAt: T0 });
   f.supervisor.close();
 });
 
 test("receipts are taken in time order, and a replayed receipt re-arms nothing", async () => {
-  const f = closeButtons();
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   const posted = { message: "m", target: "discord:200", thread: "200" };
   // Both pending in one pass, the later plain report written first.
@@ -621,8 +643,8 @@ test("receipts are taken in time order, and a replayed receipt re-arms nothing",
   f.supervisor.close();
 });
 
-test("the first explicit report after a machine lane closed itself gets the button", async () => {
-  const f = closeButtons();
+test("the first explicit report after a machine lane closed itself closes the thread", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("robot", { thread: "discord:100/200", autoClose: "machine", closedAt: new Date(T0).toISOString() }));
   f.supervisor.enqueue("lane-closed:robot", "LANE_CLOSED robot x");
   f.clock.at += 5 * MIN;
@@ -631,12 +653,12 @@ test("the first explicit report after a machine lane closed itself gets the butt
   expect(f.posts).toEqual([]);
   f.report("robot");
   await f.tick();
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${f.clock.now()}` }]);
+  expect(f.posts).toEqual(["200"]);
   f.supervisor.close();
 });
 
-test("another lane reported into a thread after its --final button gets a button of its own", async () => {
-  const f = closeButtons();
+test("another lane reported into a thread after an older --final button closes it", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   f.report("alpha", { button: true });
   await f.tick();
@@ -644,12 +666,12 @@ test("another lane reported into a thread after its --final button gets a button
   f.clock.at += 1_000;
   f.report("beta");
   await f.tick();
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0 + 1_000}` }]);
+  expect(f.posts).toEqual(["200"]);
   f.supervisor.close();
 });
 
-test("a repeat report while the lane is open keeps the button waiting for its close", async () => {
-  const f = closeButtons();
+test("a repeat report while the lane is open keeps the thread's close waiting for the lane's", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200" }));
   f.report("alpha");
   await f.tick();
@@ -661,55 +683,32 @@ test("a repeat report while the lane is open keeps the button waiting for its cl
   await f.close("alpha");
   await f.tick();
   await f.tick();
-  expect(f.posts).toEqual([{ thread: "200", id: `close-button:200:${T0}` }]);
+  expect(f.posts).toEqual(["200"]);
   f.supervisor.close();
 });
 
-test("dori reported --final records its button and thread; one after the supervisor's button is withheld", async () => {
+test("dori reported --final (older leads) is accepted and posts no close button; its receipt names the thread", async () => {
   const f = fixture();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   const final = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final"]);
   expect(final.code).toBe(0);
-  expect(final.out).not.toContain("REPORT_BUTTON_WITHHELD");
-  expect(JSON.stringify(final.requests[0]?.body)).toContain("dori:close-thread:200");
-  expect(pendingReported(f.state.dir).map(({ thread, button }) => ({ thread, button }))).toEqual([{ thread: "200", button: true }]);
-  writeFileSync(join(f.state.dir, CLOSE_BUTTONS_FILE), JSON.stringify({ "200": T0 + 1 }));
-  const again = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final"]);
-  expect(again.code).toBe(0);
-  expect(again.out).toContain("REPORT_BUTTON_WITHHELD alpha: the close button is already posted on this thread");
-  expect(JSON.stringify(again.requests[0]?.body)).not.toContain("dori:close-thread");
+  expect(final.out.trim()).toBe("REPORTED_RECORDED alpha m-42");
+  expect(final.requests).toHaveLength(1);
+  expect(JSON.stringify(final.requests[0]?.body)).not.toContain("dori:close-thread");
+  expect(pendingReported(f.state.dir).map(({ thread, button }) => ({ thread, button }))).toEqual([{ thread: "200", button: undefined }]);
 }, CLI_TIMEOUT);
 
-test("a lane stored with a bare thread id (older launches) gets its --final button and its supervisor button", async () => {
-  const f = closeButtons();
-  await f.deps.registry.write(lane("alpha", { thread: "200", closedAt: new Date(T0).toISOString() }));
-  expect((await f.deps.registry.read("alpha"))?.thread).toBe("discord:200");
-  const final = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final"]);
-  expect(final.code).toBe(0);
-  expect(final.out).not.toContain("REPORT_BUTTON_WITHHELD");
-  expect(JSON.stringify(final.requests[0]?.body)).toContain("dori:close-thread:200");
+test("a lane stored with a bare thread id (older launches) has its thread closed by the supervisor", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("beta", { thread: "300", closedAt: new Date(T0).toISOString() }));
+  expect((await f.deps.registry.read("beta"))?.thread).toBe("discord:300");
   const plain = await cli(f.state.dir, ["reported", "beta", "--text", "done"]);
   expect(plain.code).toBe(0);
   // The CLI stamps its receipts with the real clock; an old supervisor clock would prune them as long reported.
   f.clock.at = Date.now();
   await f.tick();
-  expect(f.posts.map((post) => post.thread)).toEqual(["300"]);
+  expect(f.posts).toEqual(["300"]);
   f.supervisor.close();
-}, CLI_TIMEOUT);
-
-test("dori reported --to discord:<thread> --final posts into that thread with the button; a configured channel is no thread", async () => {
-  const f = fixture();
-  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
-  const final = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final", "--to", "discord:200"]);
-  expect(final.code).toBe(0);
-  expect(final.out).not.toContain("REPORT_BUTTON_WITHHELD");
-  expect(JSON.stringify(final.requests[0]?.body)).toContain("dori:close-thread:200");
-  const config = join(f.state.dir, "config.json");
-  writeFileSync(config, JSON.stringify({ discordChannels: ["100"] }));
-  const channel = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--final", "--to", "discord:100"], { DORI_CONFIG: config });
-  expect(channel.code).toBe(0);
-  expect(channel.out).toContain("REPORT_BUTTON_WITHHELD alpha: the report is not posted into a thread");
 }, CLI_TIMEOUT);
 
 const API = "https://discord.com/api/v10";
@@ -772,8 +771,8 @@ test("a report, an append or a send into a thread the owner closed goes to its p
   expect(readOwnerClosed(f.state.dir)).toEqual({});
 }, CLI_TIMEOUT);
 
-test("a follow-up receipt never re-arms the close button, and a thread the owner closed after its last report gets none", async () => {
-  const f = closeButtons();
+test("a follow-up receipt never re-arms the close, and a thread the owner closed after its last report is left alone", async () => {
+  const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   f.report("alpha", { button: true });
   await f.tick();
@@ -782,7 +781,7 @@ test("a follow-up receipt never re-arms the close button, and a thread the owner
   recordReported(f.state.dir, "alpha", f.clock.now(), undefined, { message: "m2", target: "discord:900", followUp: true });
   await f.tick();
   expect(f.posts).toEqual([]);
-  // beta reported into the thread, then the owner closed it with an earlier button: no new button goes in.
+  // beta reported into the thread, then the owner closed it with an earlier button: it is not archived again.
   await f.deps.registry.write(lane("beta", { thread: "discord:100/200", closedAt: new Date(f.clock.now()).toISOString() }));
   f.clock.at += 1_000;
   f.report("beta");

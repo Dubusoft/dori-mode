@@ -491,7 +491,7 @@ const decisionsChannel = (raw: unknown): string | undefined => {
 /**
  * Where the supervisor's system notices go (lead stuck or restart-capped, SUPERVISOR_STUCK, TASK_STALLED, a failed
  * unit, and what the lead posts with `dori send --to alerts`): `alertsChannel` when set, else `discordChannels[0]`.
- * Lane reports, owner replies, close buttons and closed-thread redirects keep using `discordChannels[0]`.
+ * Lane reports, owner replies and closed-thread redirects keep using `discordChannels[0]`.
  */
 export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "discordChannels">): string | undefined =>
   config.alertsChannel?.trim() || config.discordChannels[0];

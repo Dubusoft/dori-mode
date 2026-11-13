@@ -28,14 +28,15 @@ type Interaction = {
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
-/** The close-thread button's custom_id carries the thread id, so a click works after a restart with no stored state. */
+/**
+ * The close-thread button's custom_id carries the thread id, so a click works after a restart with no stored state. No
+ * button is posted any more (`dori supervise` closes a finished thread itself); clicks on buttons posted before still work.
+ */
 const CLOSE_THREAD = /^dori:close-thread:(\d+)$/;
 const closeRow = (threadId: string, closed: boolean) => [{
   type: 1,
   components: [{ type: 2, style: 2, label: closed ? "닫았습니다" : "스레드 닫기", custom_id: `dori:close-thread:${threadId}`, ...(closed ? { disabled: true } : {}) }],
 }];
-/** The action row `dori reported` attaches to a lane's finish report in its thread. */
-export const closeThreadButton = (threadId: string): unknown[] => closeRow(threadId, false);
 /** Called after the owner's click archived `threadId`; `interactionId` is unique per click. */
 export type ThreadClosed = (threadId: string, interactionId: string) => Promise<void>;
 /** Called after the owner's button click started hook `name`; `channel` is the message's channel or thread. */

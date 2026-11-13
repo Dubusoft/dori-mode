@@ -8,8 +8,8 @@ import { unresolved } from "./decision-obligations.ts";
 import { ownerDecisionBlockers } from "./owner-decisions.ts";
 import type { Registry } from "./registry.ts";
 import { discordThreadOf } from "./messenger/target.ts";
-import { readCloseButtons, recordCloseButton, threadBlockers } from "./thread-finality.ts";
-import { readOwnerClosed } from "./thread-followup.ts";
+import { readFinishedThreads, recordFinishedThread, threadBlockers } from "./thread-finality.ts";
+import { readOwnerClosed, recordOwnerClosed } from "./thread-followup.ts";
 import { Waits } from "./waits.ts";
 import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journal.ts";
 
@@ -69,8 +69,9 @@ const fsyncDir = (dir: string): void => {
 /**
  * Where `dori reported` posted the report: the message id and its target (`platform:to[/thread]`); `thread` is the id of
  * the lane's thread (its bound thread, else the thread the report went into), `button` that the post carried the owner's
- * close-thread button. `followUp` marks a post that is no new report in the thread (an edit appended to the last report,
- * or a line sent to the owner channel because the owner closed the thread): it never re-arms the thread's close button.
+ * close-thread button (only receipts of an older `dori reported --final`; it no longer posts one). `followUp` marks a post
+ * that is no new report in the thread (an edit appended to the last report, or a line sent to the owner channel because
+ * the thread is closed): it never re-arms the thread's automatic close.
  */
 export type ReportedPost = { readonly message: string; readonly target: string; readonly thread?: string; readonly button?: boolean; readonly followUp?: boolean };
 
@@ -198,7 +199,7 @@ export class OutcomeTracking {
    * `dori reported` receipts close their lane's obligation; one for a lane with none yet (reported before its outcome
    * event arrived) is kept, so that event opens nothing. Persisted before the receipts are dropped: a replay only takes
    * the earliest report time again. A repeat report of a lane into the same thread without a button keeps its last report
-   * time, so it does not re-arm that thread's close button; new work in a thread runs under a new lane key. A follow-up
+   * time, so it does not re-arm that thread's automatic close; new work in a thread runs under a new lane key. A follow-up
    * receipt (an appended edit, or a line sent to the owner channel for a closed thread) leaves the thread and its last
    * report time as they were. Receipts are taken in time order.
    */
@@ -218,8 +219,8 @@ export class OutcomeTracking {
         ...(note ? { note } : {}),
         ...(thread && !receipt.followUp ? { thread, lastReportAt: repeat ? found.lastReportAt : Math.max(found?.lastReportAt ?? -Infinity, receipt.at) } : {}),
       };
-      // A --final report's button counts as the thread's close button: the supervisor posts none for that report.
-      if (receipt.button && receipt.thread) recordCloseButton(this.core.deps.config.stateDir, receipt.thread, receipt.at);
+      // An older --final report's button stands for the thread's close: the supervisor does not close it for that report.
+      if (receipt.button && receipt.thread) recordFinishedThread(this.core.deps.config.stateDir, receipt.thread, receipt.at);
       if (at < 0) outcomes.push(next); else outcomes[at] = next;
       if (found?.reportedAt === undefined) console.log(`LANE_OUTCOME_REPORTED ${receipt.lane}`);
     }
@@ -320,18 +321,19 @@ export class OutcomeTracking {
   }
 
   /**
-   * Posts the owner's close-thread button into each thread whose work is finished: a report into it was recorded after the
-   * last close button there (from a --final report or from this tick), and threadBlockers finds nothing left on it. A
-   * report for a lane that closed before that button is covered by it and re-arms nothing; one for a lane that closed
-   * later (or has not closed yet) is new work. A thread the owner closed after its last report gets none: a post would
-   * reopen it. Run
-   * every pass, so it fires right after the last report or right after the last lane closes, whichever comes later. A
-   * failed post is retried on the next pass; `post` gets a stable id per thread and report, so a retry is not doubled.
+   * Closes (through `archive`) each thread whose work is finished: a report into it was recorded after the thread was
+   * last finished (closed by this tick, or an older --final report's button), and threadBlockers finds nothing left on
+   * it. A report for a lane that closed before that time is covered by it and re-arms nothing; one for a lane that closed
+   * later (or has not closed yet) is new work. A thread already closed after its last report is left alone. Run every
+   * pass, so it fires right after the last report or right after the last lane closes, whichever comes later. A closed
+   * thread is recorded as both finished and closed (owner-closed-threads.json), so later posts addressed to it are
+   * redirected to its parent channel as for a thread the owner closed, until the owner writes in it and it opens again.
+   * A failed archive is retried on the next pass.
    */
-  async closeButtonTick(registry: Pick<Registry, "open" | "read">, post: (thread: string, id: string) => Promise<void>): Promise<void> {
+  async autoCloseTick(registry: Pick<Registry, "open" | "read">, archive: (thread: string) => Promise<void>): Promise<void> {
     const stateDir = this.core.deps.config.stateDir;
     const outcomes = this.journal.outcomes ?? [];
-    const buttons = readCloseButtons(stateDir);
+    const buttons = readFinishedThreads(stateDir);
     const latest = new Map<string, number>();
     for (const outcome of outcomes) {
       if (outcome.thread === undefined || outcome.lastReportAt === undefined) continue;
@@ -362,10 +364,12 @@ export class OutcomeTracking {
         unreported: [...threadOf].filter(([, on]) => on === thread).map(([lane]) => lane),
       });
       if (blockers.length) continue;
-      try { await post(thread, `close-button:${thread}:${at}`); }
-      catch (e) { console.error(`CLOSE_BUTTON_FAILED ${thread}: ${e instanceof Error ? e.message : String(e)}`); continue; }
-      recordCloseButton(stateDir, thread, this.core.deps.clock.now());
-      console.log(`CLOSE_BUTTON_POSTED ${thread}`);
+      try { await archive(thread); }
+      catch (e) { console.error(`THREAD_AUTO_CLOSE_FAILED ${thread}: ${e instanceof Error ? e.message : String(e)}`); continue; }
+      const now = this.core.deps.clock.now();
+      recordFinishedThread(stateDir, thread, now);
+      recordOwnerClosed(stateDir, thread, now);
+      console.log(`THREAD_AUTO_CLOSED ${thread}`);
     }
   }
 
