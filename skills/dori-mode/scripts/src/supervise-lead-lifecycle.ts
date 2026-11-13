@@ -140,7 +140,7 @@ export const childWork = (file: string): ChildWork | undefined => {
 };
 
 /** Why an idle lead is cold-started for a delivery instead of taking it in place. */
-export type ColdReason = { readonly kind: "hard-cap" | "context-cap" | "stale"; readonly detail: string; readonly tokens: number };
+export type ColdReason = { readonly kind: "context-cap" | "stale"; readonly detail: string; readonly tokens: number };
 
 /** omo's footer on a session paused by Esc ("Paused · N updates held · type to continue, /resume to resume"). */
 export const PAUSED = /\bPaused\b.*\/resume\b/;
@@ -482,8 +482,6 @@ export class LeadLifecycle {
     if (!file) throw new TransientSuperviseError(`cannot find lead session file for ${id}`);
     this.warmSession = file;
     const tokens = this.leadTokens(file);
-    // Idle at delivery time (checked by the caller): a lead past the hard cap restarts even with a warm cache.
-    if (tokens >= tunables.leadContextHardCapTokens) return { kind: "hard-cap", tokens, detail: `context ${tokens} tokens reached leadContextHardCapTokens ${tunables.leadContextHardCapTokens}` };
     const idleMs = clock.now() - statSync(file).mtimeMs;
     const idle = `idle ${Math.floor(idleMs / 60_000)} min`;
     // A lead at or above the context cap always restarts at this safe point (idle, its own children done), warm cache or not.
