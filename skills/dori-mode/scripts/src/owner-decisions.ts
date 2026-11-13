@@ -322,13 +322,15 @@ const THREAD_CREATED = 18;
 
 /**
  * Deletes the "started a thread" notice Discord posts in `channel` when `thread` starts there without a message (a
- * THREAD_CREATED message after the thread's id whose reference names the thread). Returns why it stayed, if it did.
- * Used by decisions and by `dori thread --drop-notice`.
+ * THREAD_CREATED message whose reference names the thread). Returns why it stayed, if it did, including when no notice
+ * is found. Used by decisions and by `dori thread --drop-notice`.
  */
 export const removeThreadNotice = async (transport: Pick<DecisionTransport, "messagesAfter" | "deleteMessage">, channel: string, thread: string): Promise<string | undefined> => {
   try {
-    const notice = (await transport.messagesAfter(channel, thread)).find((m) => m.type === THREAD_CREATED && m.reference === thread);
-    if (notice) await transport.deleteMessage(channel, notice.id);
+    // The notice carries the thread's own id, and `after` excludes that id, so read from the id just before it.
+    const notice = (await transport.messagesAfter(channel, (BigInt(thread) - 1n).toString())).find((m) => m.type === THREAD_CREATED && m.reference === thread);
+    if (!notice) return `no "started a thread" notice for ${thread} in ${channel}`;
+    await transport.deleteMessage(channel, notice.id);
     return undefined;
   } catch (e) {
     return errorText(e);

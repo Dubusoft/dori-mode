@@ -58,14 +58,16 @@ const fakeTransport = () => {
     edit: async (...args) => { record("edit", ...args); },
     content: async (...args) => { record("content", ...args); return ""; },
     deleteMessage: async (...args) => { record("deleteMessage", ...args); },
-    // Discord's "started a thread" notice for the thread the fake starts, after an unrelated message.
+    // Like Discord: the "started a thread" notice for the thread the fake starts carries the thread's own id, and `after`
+    // returns only messages with a greater id.
     messagesAfter: async (...args) => {
       record("messagesAfter", ...args);
-      return [{ id: "other", type: 0 }, { id: "notice", type: 18, reference: "thread" }];
+      return [{ id: "999", type: 0 }, { id: "1000", type: 18, reference: "1000" }, { id: "1001", type: 0 }]
+        .filter((m) => BigInt(m.id) > BigInt(args[1]));
     },
     startThread: async (channel, messageId, name, memberId, autoArchiveMin) => {
       record("startThread", channel, messageId, name, memberId, autoArchiveMin);
-      return { id: messageId ?? "thread" };
+      return { id: messageId ?? "1000" };
     },
     // Like Discord: a rename posts a "changed the channel name" message into the thread, which reopens it, even when the
     // same PATCH archives it.
@@ -121,12 +123,12 @@ test("opens in decisionsChannel, starts a thread, records open, and links the or
   expect(fake.calls.map((call) => call.method).filter((method) => method !== "threadState" && method !== "messagesAfter"))
     .toEqual(["startThread", "deleteMessage", "send", "send"]);
   expect(fake.calls.find((call) => call.method === "startThread")?.args.slice(0, 2)).toEqual(["555", undefined]);
-  expect(fake.calls.find((call) => call.method === "deleteMessage")?.args).toEqual(["555", "notice"]);
-  expect(fake.calls.filter((call) => call.method === "send").map((call) => call.args[0])).toEqual(["thread", "222"]);
+  expect(fake.calls.find((call) => call.method === "deleteMessage")?.args).toEqual(["555", "1000"]);
+  expect(fake.calls.filter((call) => call.method === "send").map((call) => call.args[0])).toEqual(["1000", "222"]);
   expect(String(fake.calls.find((call) => call.method === "send")?.args[1])).toContain(choices.question);
   // The origin thread gets one link line, not the question.
   const link = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "222")?.args[1]);
-  expect(link).toBe("[System] 오너 결정 d1: <#thread>");
+  expect(link).toBe("[System] 오너 결정 d1: <#1000>");
   expect(result.noticeKept).toBeUndefined();
   expect(readDecisions(dir).decisions[0]).toMatchObject({ state: "open", linkMessage: result.link.kind === "linked" ? result.link.message : undefined });
 });
@@ -153,7 +155,7 @@ test("archives the thread and drops the reservation when the question cannot be 
   const fake = fakeTransport();
   fake.transport.send = async () => { throw new Error("send failed"); };
   await expect(open(context(dir, fake.transport))).rejects.toMatchObject({ code: "DECISION_NOT_POSTED" });
-  expect(fake.calls.find((call) => call.method === "setThread")?.args).toEqual(["thread", { archived: true }]);
+  expect(fake.calls.find((call) => call.method === "setThread")?.args).toEqual(["1000", { archived: true }]);
   expect(readDecisions(dir).decisions).toEqual([]);
 });
 
@@ -165,6 +167,17 @@ test("a notice that cannot be deleted is reported and recorded, and the decision
   expect(result.decision.state).toBe("open");
   expect(result.noticeKept).toBe("missing access");
   expect(readDecisions(dir).decisions[0]?.noticeKept).toBe("missing access");
+});
+
+test("a notice that is not found is reported and recorded, and nothing is deleted", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  fake.transport.messagesAfter = async () => [{ id: "1001", type: 0 }];
+  const result = await open(context(dir, fake.transport));
+  expect(result.decision.state).toBe("open");
+  expect(result.noticeKept).toContain("no \"started a thread\" notice for 1000");
+  expect(readDecisions(dir).decisions[0]?.noticeKept).toBe(result.noticeKept);
+  expect(fake.calls.some((call) => call.method === "deleteMessage")).toBe(false);
 });
 
 test("thread names stay within 40 characters, and closing keeps the name", async () => {
@@ -307,23 +320,23 @@ test("a lane request opens a [요청] thread saying what, why, where and which l
   expect(opened?.decision).toMatchObject({ kind: "request", options: [], task: 923, lane: "ap-923-1", state: "open" });
   const name = String(fake.calls.find((call) => call.method === "startThread")?.args[2]);
   expect(name).toStartWith("[요청] d1 · #923 · 2FA code");
-  const start = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "thread")?.args[1]);
+  const start = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "1000")?.args[1]);
   expect(start).toContain("2FA code for the App Store login");
   expect(start).toContain("Upload the build");
   expect(start).toContain("이 스레드에 답으로");
   expect(start).toContain("레인 ap-923-1");
-  expect(String(fake.calls.find((call) => call.method === "send" && call.args[0] === "222")?.args[1])).toBe("[System] 오너 요청 d1: <#thread>");
-  const answer = recordOwnerAnswer(dir, "thread", "code-msg", 1_800_000_000_100);
+  expect(String(fake.calls.find((call) => call.method === "send" && call.args[0] === "222")?.args[1])).toBe("[System] 오너 요청 d1: <#1000>");
+  const answer = recordOwnerAnswer(dir, "1000", "code-msg", 1_800_000_000_100);
   expect(answer?.first).toBe(true);
   const line = answeredLine(answer?.decision as NonNullable<typeof answer>["decision"]);
-  expect(line).toStartWith("OWNER_DECISION_ANSWERED ap-923-1 d1 blocking discord:555/thread: [request] ");
-  expect(line).toContain("message thread/code-msg");
+  expect(line).toStartWith("OWNER_DECISION_ANSWERED ap-923-1 d1 blocking discord:555/1000: [request] ");
+  expect(line).toContain("message 1000/code-msg");
   expect(line).toContain("lane ap-923-1");
   await expect(closeOwnerDecision(ctx, "d1", { text: "x", choice: 1 })).rejects.toMatchObject({ code: "DECISION_BAD_CHOICE" });
   const closed = await closeOwnerDecision(ctx, "d1", { text: "Relayed to the lane" });
   expect(closed.decision.state).toBe("closed");
   expect(closed.resolved).toBe("owner-decision-answered:d1");
-  expect(String(fake.calls.filter((call) => call.method === "send" && call.args[0] === "thread").at(-1)?.args[1])).toStartWith("[System] d1 요청 처리.");
+  expect(String(fake.calls.filter((call) => call.method === "send" && call.args[0] === "1000").at(-1)?.args[1])).toStartWith("[System] d1 요청 처리.");
 });
 
 test("a request with a file tells the owner to write it there with chmod 600 and not to paste it", async () => {
@@ -331,7 +344,7 @@ test("a request with a file tells the owner to write it there with chmod 600 and
   const fake = fakeTransport();
   const text = serializeRequestText({ need: "The npm API token", reason: "Publish", file: "~/.config/dori/npm-token", waiting: "Publish", blocking: false });
   await openLaneDecision(context(dir, fake.transport), { key: "lane-x", thread: "none" }, { id: "row-1", text });
-  const start = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "thread")?.args[1]);
+  const start = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "1000")?.args[1]);
   expect(start).toContain("chmod 600 ~/.config/dori/npm-token");
   expect(start).toContain("붙여넣지 마시고");
 });
@@ -373,7 +386,7 @@ test("a second question in the same lane thread takes the next answer, and a lan
   const second = recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200);
   expect(second).toMatchObject({ first: true, decision: { id: "d2", state: "answered" } });
   const other = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-3", text: serializeDecisionText(choices) });
-  expect(other?.decision).toMatchObject({ channel: "555", thread: "thread" });
+  expect(other?.decision).toMatchObject({ channel: "555", thread: "1000" });
   expect(other?.decision.inLaneThread).toBeUndefined();
   expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
 });
