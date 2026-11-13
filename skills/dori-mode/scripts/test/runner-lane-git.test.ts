@@ -22,6 +22,7 @@ const PORCELAIN = [
   "worktree /repo/.wt/demo-lane-2", "HEAD 3333", "branch refs/heads/feature/demo-lane-2", "",
   "worktree /repo/.wt/other", "HEAD 4444", "branch refs/heads/other", "",
   "worktree /repo/.wt/detached", "HEAD 5555", "detached", "",
+  "worktree /repo/.wt/demo-lane-3", "HEAD 6666", "detached", "",
 ].join("\n");
 
 const repo: Script = (argv) => {
@@ -31,6 +32,8 @@ const repo: Script = (argv) => {
   if (a.startsWith("git -C /repo/.wt/demo-lane rev-list")) return ok("2\n");
   if (a.startsWith("git -C /repo/.wt/demo-lane-2 status")) return ok("");
   if (a.startsWith("git -C /repo/.wt/demo-lane-2 rev-list")) return { code: 128, out: "", err: "fatal: bad HEAD" };
+  if (a.startsWith("git -C /repo/.wt/demo-lane-3 status")) return ok("");
+  if (a.startsWith("git -C /repo/.wt/demo-lane-3 rev-list")) return ok("0\n");
   if (a === "git -C /repo rev-parse --show-toplevel") return ok("/repo\n");
   if (a === "git -C /repo remote get-url origin") return ok("git@github.com:o/r.git\n");
   if (a === "git -C /repo symbolic-ref --quiet --short HEAD") return ok("main\n");
@@ -49,10 +52,10 @@ test("listWorktrees parses path, HEAD and branch", async () => {
   expect(await listWorktrees(recording(() => undefined).run, "/nope")).toBeUndefined();
 });
 
-test("discoverWorktrees finds the key's worktrees by branch or directory, never the root or others", async () => {
+test("discoverWorktrees finds the key's worktrees by branch or directory (a detached one by directory), never the root or others", async () => {
   const { run } = recording(repo);
   const found = await discoverWorktrees(run, "demo-lane", ["/repo", "/repo", "/unreadable"]);
-  expect(found.map((w) => w.path)).toEqual(["/repo/.wt/demo-lane", "/repo/.wt/demo-lane-2"]);
+  expect(found.map((w) => w.path)).toEqual(["/repo/.wt/demo-lane", "/repo/.wt/demo-lane-2", "/repo/.wt/demo-lane-3"]);
 });
 
 test("gitFacts: dirty/ahead per worktree, an unreadable one carries error, a missing one exists:false", async () => {
@@ -63,6 +66,7 @@ test("gitFacts: dirty/ahead per worktree, an unreadable one carries error, a mis
     worktrees: [
       { path: "/repo/.wt/demo-lane", branch: "demo-lane", head: "2222", exists: true, dirty: true, ahead: 2 },
       { path: "/repo/.wt/demo-lane-2", branch: "feature/demo-lane-2", head: "3333", exists: true, error: "fatal: bad HEAD" },
+      { path: "/repo/.wt/demo-lane-3", head: "6666", exists: true, dirty: false, ahead: 0 },
     ],
     branches: { "demo-lane": { local: true, remote: true }, gone: { local: false, remote: false } },
   });

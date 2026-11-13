@@ -44,15 +44,16 @@ export const listWorktrees = async (run: Runner, root: string): Promise<ListedWo
 
 /**
  * The worktrees of lane `key`: in each root (the lane's cwd first, then `roots`), every linked worktree other than the
- * root itself whose branch or directory name is the key or starts with `<key>-`. Unreadable roots are skipped.
+ * root itself whose branch or directory name is the key or starts with `<key>-` (a detached HEAD by its directory name
+ * alone). Unreadable roots are skipped.
  */
 export const discoverWorktrees = async (run: Runner, key: string, roots: readonly string[]): Promise<ListedWorktree[]> => {
   const ours = (name: string): boolean => name === key || name.startsWith(`${key}-`);
   const found = new Map<string, ListedWorktree>();
   for (const root of new Set(roots.filter(Boolean))) {
     for (const wt of (await listWorktrees(run, root)) ?? []) {
-      if (wt.path === root || !wt.branch) continue;
-      if ((ours(wt.branch.split("/").pop() ?? "") || ours(basename(wt.path))) && !found.has(wt.path)) found.set(wt.path, wt);
+      if (wt.path === root) continue;
+      if ((ours(wt.branch?.split("/").pop() ?? "") || ours(basename(wt.path))) && !found.has(wt.path)) found.set(wt.path, wt);
     }
   }
   return [...found.values()];
