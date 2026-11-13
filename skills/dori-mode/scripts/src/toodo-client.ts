@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import type { ToodoTask } from "./autopilot.ts";
 
 /**
- * The toodo-server clients. ToodoClient reads for autopilot: `list_tasks` and `get_task` over `POST <url>/api/rpc/<command>` with
+ * The toodo-server clients. ToodoClient reads for autopilot: `list_tasks`, `get_task` and `list_guidelines` over `POST <url>/api/rpc/<command>` with
  * the bearer token read from `tokenFile` (the same url and token file as the toodo event stream). Every failure (token
  * file missing or empty, network error, timeout, non-200, a reply that is not a task list) throws ToodoUnreadable, so a
  * caller maps any of them to `toodo-unreadable`. A missing task on `get_task` (404) is undefined, not an error.
@@ -72,6 +72,27 @@ const toTask = (raw: unknown): ToodoTask => {
   };
 };
 
+/** A workspace guideline as `list_guidelines` returns it: a `rule` agents follow or a `memory` recorded for the workspace. */
+export type ToodoGuideline = {
+  readonly id: number;
+  readonly workspaceId: number;
+  readonly kind: "rule" | "memory";
+  /** Markdown. */
+  readonly body: string;
+  /** Seconds since the epoch. */
+  readonly updatedAt: number;
+};
+
+const toGuideline = (raw: unknown): ToodoGuideline => {
+  const bad = (what: string): never => { throw new ToodoUnreadable(`toodo-server returned a guideline with ${what}`); };
+  if (!isRecord(raw) || !isId(raw.id)) return bad("no id");
+  if (!isId(raw.workspaceId)) return bad(`no workspaceId (${raw.id})`);
+  if (raw.kind !== "rule" && raw.kind !== "memory") return bad(`kind ${JSON.stringify(raw.kind)} (${raw.id})`);
+  if (typeof raw.body !== "string") return bad(`no body (${raw.id})`);
+  if (typeof raw.updatedAt !== "number") return bad(`no updatedAt (${raw.id})`);
+  return { id: raw.id, workspaceId: raw.workspaceId, kind: raw.kind, body: raw.body, updatedAt: raw.updatedAt };
+};
+
 export class ToodoClient {
   private readonly fetch: ToodoFetch;
   private readonly timeoutMs: number;
@@ -86,7 +107,7 @@ export class ToodoClient {
   }
 
   /** One read command; `allow404` returns undefined on 404 instead of throwing. */
-  private async call(command: "list_tasks" | "get_task", args: unknown, allow404 = false): Promise<unknown> {
+  private async call(command: "list_tasks" | "get_task" | "list_guidelines", args: unknown, allow404 = false): Promise<unknown> {
     const url = `${this.config.url.replace(/\/+$/, "")}/api/rpc/${command}`;
     const token = this.token();
     let response: Response;
@@ -133,6 +154,13 @@ export class ToodoClient {
   async task(id: number): Promise<ToodoTask | undefined> {
     const reply = await this.call("get_task", { id }, true);
     return reply === undefined ? undefined : toTask(reply);
+  }
+
+  /** The guidelines (rules and memories) of one workspace, for the autopilot contract's snapshot. */
+  async guidelines(workspaceId: number): Promise<ToodoGuideline[]> {
+    const reply = await this.call("list_guidelines", { workspaceId });
+    if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_guidelines did not answer a guideline list");
+    return reply.map(toGuideline);
   }
 }
 
