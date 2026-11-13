@@ -187,7 +187,9 @@ export type ToodoTaskRecord = {
 /** A confirmed write: `wrote` is false when the task already was in the wanted state and nothing was sent. */
 export type ToodoWrite = { readonly wrote: boolean; readonly task: ToodoTaskRecord };
 
-const toTaskRecord = (raw: unknown): ToodoTaskRecord => {
+/** The task of a `get_task` reply: toodo-server's MCP wraps it with its links (`{task, dependsOn, dependents, related, guidelines, ...}`); a bare task is read as is. */
+const toTaskRecord = (reply: unknown): ToodoTaskRecord => {
+  const raw = isRecord(reply) && isRecord(reply.task) ? reply.task : reply;
   const bad = (what: string): never => { throw new ToodoWriteFailed(`toodo-server get_task returned a task with ${what}`); };
   if (!isRecord(raw) || !isId(raw.id)) return bad("no id");
   const id = raw.id;
