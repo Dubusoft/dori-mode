@@ -77,10 +77,11 @@ opts+=(
 )
 
 # ~/.dori gets its own tmpfs that is made read-only after the ro binds, so
-# rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env and ~/.dori/secrets stay hidden, since nothing
-# under ~/.dori is bound from the host and no bind below names them.
+# rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env, ~/.dori/secrets and ~/.dori/state stay hidden,
+# since nothing under ~/.dori is bound from the host and no bind below names them. A lane's dori reaches the
+# supervisor only through the runner's lane socket and never opens the state dir.
 # Every rw mount point under it is created here: bwrap cannot mkdir one once it is read-only.
-opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/state" --dir "$H/.dori/heavy")
+opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/heavy")
 
 # Read-only re-binds (skipped when missing)
 for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
@@ -126,7 +127,7 @@ done
 
 # Read-write re-binds (after ro ones so nested rw paths win)
 opts+=(--bind "$H/.dori/runner/briefs/$key.out" "$H/.dori/runner/briefs/$key.out")
-for p in "$H/.omo" "$H/.dori/state" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
+for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
   "$H/.cargo/registry" "$H/.cargo/git"; do
   opts+=(--bind-try "$p" "$p")
 done

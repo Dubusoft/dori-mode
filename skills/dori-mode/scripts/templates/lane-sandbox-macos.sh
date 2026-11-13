@@ -13,7 +13,7 @@
 # Seatbelt cannot hide or remap paths the way bubblewrap does; it only refuses access (EPERM). So the profile allows
 # reads almost everywhere and refuses writes by default, with a whitelist: the cwd (worktree) and its git common dir,
 # the runner's worktree root and the .git directories of the repos under its repos root,
-# the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/state, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
+# the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
 # its own brief and token), and ~/.dori/env, ~/.dori/secrets and ~/.ssh private keys are refused outright. Of ~/.config only gh and git
@@ -75,7 +75,7 @@ build_profile() {
   r() { param "R$n" "$1"; r_rules="$r_rules (subpath (param \"R$n\"))"; n=$((n + 1)); }
 
   w "$LT"
-  for p in "$H/.omo" "$H/.dori/state" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
+  for p in "$H/.omo" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
     "$H/.cargo/registry" "$H/.cargo/git" "$H/Library/Caches" "$H/Library/Developer" /tmp; do
     w "$p"
   done
@@ -125,7 +125,7 @@ build_profile() {
     fi
   fi
 
-  for p in .dori/config.json .dori/src .dori/bin .dori/state .dori/heavy .dori/runner/sock/lane.d .dori/runner/bin "runner-brief"; do
+  for p in .dori/config.json .dori/src .dori/bin .dori/heavy .dori/runner/sock/lane.d .dori/runner/bin "runner-brief"; do
     case "$p" in runner-brief) r "$H/.dori/runner/briefs/$key.md" ;; *) r "$H/$p" ;; esac
   done
   if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then r "$DORI_LANE_TOKEN_FILE"; fi

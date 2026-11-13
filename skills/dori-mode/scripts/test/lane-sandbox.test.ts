@@ -167,6 +167,9 @@ test("every read-write mount under ~/.dori has its mount point created before ~/
   expect(doriRo).toBeGreaterThan(-1);
   const rwInDori = argv.flatMap((a, i) => ((a === "--bind" || a === "--bind-try") && argv[i + 2]?.startsWith(`${dori}/`) ? [argv[i + 2]] : []));
   expect(rwInDori).toContain(join(dori, "heavy"));
+  // The state dir (supervisor key, registry, decisions) is hidden: no bind, not even an empty mount point.
+  const state = join(dori, "state");
+  expect(argv.filter((a) => a === state || a.startsWith(`${state}/`))).toEqual([]);
   // bwrap cannot mkdir a missing mount point on the read-only tmpfs (EROFS), so each one is a --dir before the remount.
   const createdBefore = argv.slice(0, doriRo).flatMap((a, i, before) => (a === "--dir" ? [before[i + 1]] : []));
   expect(rwInDori.filter((p) => !createdBefore.includes(p))).toEqual([]);
@@ -395,16 +398,16 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   expect(write(join(runner, "briefs/lane-a.out/report.md"))).toBe(true);
   expect(read(join(runner, "briefs/lane-b.files/input.bin"))).toBe(false);
   expect(write(join(runner, "briefs/lane-b.out/report.md"))).toBe(false);
-  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null"]) {
+  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null"]) {
     expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
   }
-  for (const no of [join(home, "probe"), join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {
+  for (const no of [join(home, "probe"), join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "state", "x"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {
     expect({ no, write: write(no) }).toEqual({ no, write: false });
   }
   for (const ok of [token, join(runner, "briefs", "lane-a.md"), join(runner, "bin", "dori"), join(home, ".dori", "config.json"), join(home, ".dori", "src", "cli.ts"), join(home, ".ssh", "id_ed25519.pub"), join(home, ".ssh", "known_hosts"), "/etc/hosts", join(wt, "README.md")]) {
     expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
   }
-  for (const no of [join(home, ".dori", "env"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key")]) {
+  for (const no of [join(home, ".dori", "env"), join(home, ".dori", "state", "runners.sqlite"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
 });
