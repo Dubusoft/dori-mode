@@ -13,9 +13,10 @@ type Call = { name: string; args: Record<string, unknown>; authorization: string
 /**
  * A fake toodo MCP endpoint: stateless `tools/call` on `/mcp` with toodo's result shape (the task as JSON text, a refusal
  * as `isError` with `structuredContent.error`). `loseReply` applies the named tool's write and answers 500, as a reply
- * lost on the way back; `ignore` answers the write without applying it.
+ * lost on the way back; `ignore` answers the write without applying it. `wrapped` answers `get_task` as toodo-server's
+ * MCP does, the task wrapped with its links (`{task, dependsOn, dependents, related, guidelines, ...}`).
  */
-const fakeToodo = (task: Task, opts: { loseReply?: Set<string>; ignore?: Set<string> } = {}) => {
+const fakeToodo = (task: Task, opts: { loseReply?: Set<string>; ignore?: Set<string>; wrapped?: boolean } = {}) => {
   const calls: Call[] = [];
   const ok = (id: unknown, value: unknown) => Response.json({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] } });
   const refuse = (id: unknown, code: string, message: string) => Response.json({
@@ -50,7 +51,13 @@ const fakeToodo = (task: Task, opts: { loseReply?: Set<string>; ignore?: Set<str
       calls.push({ name: rpc.params.name, args: rpc.params.arguments, authorization });
       if (authorization !== "Bearer mcp-1") return new Response("Toodo MCP: unknown token", { status: 401 });
       const { name, arguments: a } = rpc.params;
-      if (name === "get_task") return a.id === task.id ? ok(rpc.id, { ...task, workspaceId: 7, title: "t", notes: task.notes }) : refuse(rpc.id, "taskNotFound", "no task");
+      if (name === "get_task") {
+        if (a.id !== task.id) return refuse(rpc.id, "taskNotFound", "no task");
+        const shown = { ...task, workspaceId: 7, title: "t", notes: task.notes };
+        return ok(rpc.id, opts.wrapped ? {
+          task: shown, workspace: "w", commits: [], dependsOn: [], ready: false, blockedBy: [], dependents: [], related: [], guidelines: [],
+        } : shown);
+      }
       if (opts.ignore?.has(name)) return ok(rpc.id, task);
       const refused = apply(name, a);
       if (refused) return refuse(rpc.id, refused.code, refused.message);
@@ -125,6 +132,17 @@ test("each write is sent once with toodo's arguments, read back, and skipped whe
   expect(again[0]).toBeInstanceOf(ToodoWriteFailed);
   expect(again.slice(1).map((w) => (w as { wrote: boolean }).wrote)).toEqual([false, false, false, false]);
   expect(names(fake.calls)).toEqual(["get_task", "start_task", "get_task", "get_task", "get_task", "get_task", "get_task"]);
+});
+
+test("the task wrapped in toodo-server's get_task reply is read, so a blocker and a completion are recorded", async () => {
+  const task = { ...planned(), status: "in_progress" };
+  const { fake, writer } = serve(task, { wrapped: true });
+  expect((await writer.reportBlocker(12, "needs the token")).wrote).toBe(true);
+  expect((await writer.checkCriterion(12, 3, "bun test green")).wrote).toBe(true);
+  const done = await writer.completeTask(12, { refs: ["pr:7"] });
+  expect(done.wrote).toBe(true);
+  expect(done.task).toMatchObject({ id: 12, status: "done", resolution: "completed", refs: ["pr:7"], notes: [{ kind: "blocker", body: "needs the token" }] });
+  expect(names(fake.calls).filter((n) => n !== "get_task")).toEqual(["report_blocker", "check_criterion", "complete_task"]);
 });
 
 test("a write whose reply is lost is confirmed by the read-back", async () => {
