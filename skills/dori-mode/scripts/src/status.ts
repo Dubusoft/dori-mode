@@ -60,6 +60,8 @@ export type Status = {
   readonly autopilot?: { readonly paused: false } | { readonly paused: true; readonly since: string; readonly reason: string | null };
   readonly lanes: readonly {
     readonly key: string; readonly model?: string; readonly ageMin: number; readonly progress?: string; readonly repo?: string; readonly pr?: number;
+    /** The Toodo task the lane works on (Lane.task); absent when none was named. */
+    readonly task?: number;
     /** The runner the lane runs on (its owning runner, else its machine, else "local"); absent in an older status reads as "local". */
     readonly machine?: string;
     /** recoveryPending: "exhausted" after every recovery attempt failed (LANE_RECOVERY_EXHAUSTED), else "pending". */
@@ -395,7 +397,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   const reports = latestLaneReports(d.config);
   const decisions = openOwnerDecisions(d.config.stateDir);
   const lanes = open.filter((l) => statusOf(l) === "working").map((l) => ({
-    key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
+    key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l), ...(l.task !== undefined ? { task: l.task } : {}),
     ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
     ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
     ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
@@ -667,10 +669,10 @@ const eventLines = (e: EventStats, max: number): string[] => {
 export const STATUS_MAX_CHARS = 1900;
 
 type Lanes = Status["lanes"];
-/** "- ops (27분 · opus-5-5 · dori-mode #55): Full run"; a lane in recovery starts with "[복구 포기]" or "[복구 대기]". */
+/** "- ops (27분 · opus-5-5 · dori-mode #55 · 태스크 #949): Full run"; a lane in recovery starts with "[복구 포기]" or "[복구 대기]". */
 const laneLine = (lane: Lanes[number], progress: number): string => {
   const where = [lane.repo, lane.pr !== undefined ? `#${lane.pr}` : ""].filter(Boolean).join(" ");
-  const facts = [dur(lane.ageMin), lane.model ? shortModel(lane.model) : "", where].filter(Boolean).join(" · ");
+  const facts = [dur(lane.ageMin), lane.model ? shortModel(lane.model) : "", where, lane.task !== undefined ? `태스크 #${lane.task}` : ""].filter(Boolean).join(" · ");
   const flag = lane.recovery ? `[복구 ${lane.recovery === "exhausted" ? "포기" : "대기"}] ` : "";
   return `- ${flag}${lane.key} (${facts})${lane.progress ? `: ${clip(lane.progress, progress)}` : ""}`;
 };

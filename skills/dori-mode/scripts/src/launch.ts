@@ -55,6 +55,15 @@ export type LaunchInput = {
   readonly sandbox?: true;
   /** Resume this agent session (recovery): the runner inserts `--session <id>` when its profile allows. */
   readonly session?: string;
+  /** The Toodo task id (`--task`), recorded on the lane as `task`. */
+  readonly task?: number;
+};
+
+/** A `--task` value: a positive integer in decimal, else undefined. Toodo itself is not asked whether the task exists. */
+export const parseLaneTask = (value: string): number | undefined => {
+  if (!/^[1-9]\d*$/.test(value.trim())) return undefined;
+  const id = Number(value.trim());
+  return Number.isSafeInteger(id) ? id : undefined;
 };
 
 /** A lane launched with --share-thread: the keys of the other open lanes on its thread at launch time. */
@@ -76,6 +85,7 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
   if (input.machine && herdrDown !== undefined) {
     throw new LaunchError(`HERDR_DOWN machine=${input.machine.replace(/\s/g, "_")} herdr there has been unreadable since ${new Date(herdrDown).toISOString()}; launch there once it reads again (HERDR_UP), or pick another machine`);
   }
+  if (input.task !== undefined && !(Number.isSafeInteger(input.task) && input.task > 0)) throw new LaunchError(`--task must be a positive integer (a Toodo task id), got ${input.task}`);
   if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} is already registered`);
   const errors = doneSyntaxErrors(input.done);
   if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);
@@ -506,6 +516,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"), ...(input.machine ? { machine: input.machine } : {}),
     runner: machineRunner(input.machine), runnerAdoptedAt: existing?.runnerAdoptedAt ?? deps.clock.now(),
     brief: input.brief, done: input.done, autoClose: prepared.autoClose, ghIssue: prepared.ghIssue,
+    ...(input.task !== undefined ? { task: input.task } : {}),
     ...(!existing ? { fileRun: prepared.files.run } : {}),
     reportVia: "cli" as const, // every lane reports through its runner; an old-footer lane moves onto dori report when recovery relaunches it
     ...laneDirs(input.machine, dir, deps.config.leadCwd), ...(sandbox ? { sandbox: true as const } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),

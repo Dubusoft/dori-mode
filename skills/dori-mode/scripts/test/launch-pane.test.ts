@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { footer, footerDoneRules, LaunchError, launchLane, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
+import { footer, footerDoneRules, LaunchError, launchLane, parseLaneTask, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
 import { LaneOpsError, laneOps, type StartInput } from "../src/lane-ops.ts";
 import type { Lane } from "../src/registry.ts";
 import type { RunnerCall } from "../src/runner/call.ts";
@@ -103,6 +103,27 @@ test("--mode mass-ulw opens with massLaunchKeywords and records the mode; the de
   const plain = await launchLane(deps({}), input({ key: "pane-lane-2", pane: "w:p3" }));
   expect(starts()[1]).toMatchObject({ keywords: "ulw set goal and work", mode: "ulw" });
   expect(plain.lane.mode).toBe("ulw");
+});
+
+test("--task records the Toodo task id on the lane; a launch without it records none", async () => {
+  await writeBrief();
+  const d = deps({});
+  const linked = await launchLane(d, { ...input({ pane: "w:p3" }), task: 949 });
+  expect(linked.lane.task).toBe(949);
+  expect((await d.registry.read("pane-lane"))?.task).toBe(949);
+  await d.registry.write({ ...linked.lane, closedAt: new Date(T0).toISOString() });
+  await launchLane(deps({}), input({ key: "pane-lane-2", pane: "w:p3" }));
+  expect(await d.registry.read("pane-lane-2")).not.toHaveProperty("task");
+});
+
+test("--task takes only a positive decimal integer, and launch refuses any other task id before registering", async () => {
+  expect(parseLaneTask("949")).toBe(949);
+  for (const bad of ["0", "-1", "abc", "1.5", "0x10", "1e3", "", "9007199254740993"]) expect(parseLaneTask(bad)).toBeUndefined();
+  await writeBrief();
+  for (const task of [0, -3, 1.5]) {
+    await expect(launchLane(deps({}), { ...input({ pane: "w:p3" }), task })).rejects.toThrow(/--task must be a positive integer/);
+  }
+  expect(starts()).toEqual([]);
 });
 
 test("the lane's model reaches the runner: defaultModel unless the launch names one; leadModel never does", async () => {
