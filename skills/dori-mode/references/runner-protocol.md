@@ -712,7 +712,7 @@ never used. A supervisor start counts as the last time it saw each runner it kno
 | Silent for | What happens |
 |---|---|
 | 60 s | `RUNNER_STALE machine=<label>` (engine-only), once |
-| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (engine-only), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes |
+| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (engine-only), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes and has sent a heartbeat or hello since the supervisor started (one still reconnecting after a supervisor restart waits for the next row) |
 | 10 min offline, or the probe finds it dead | `HOST_GUARD OFFLINE machine=<label> ...` (urgent), once per disconnect |
 | 30 min offline, or the restart circuit open | the runner is lost: `LANE_RUNNER_LOST <key> runner=<label>` (urgent) once for each open lane it owns; nothing is moved |
 
@@ -730,7 +730,9 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
   follows the backoff.
 
 The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello ends a disconnect, with
-`HOST_GUARD ONLINE machine=<label>` when it had woken the lead with `HOST_GUARD OFFLINE`.
+`HOST_GUARD ONLINE machine=<label>` when it had woken the lead with `HOST_GUARD OFFLINE`. Each such
+`HOST_GUARD OFFLINE` and `HOST_GUARD ONLINE` is also posted as a system notice to the alerts channel (config
+`alertsChannel`, else the first `discordChannels` entry).
 
 Outages have hysteresis per machine: an outage ends only once the runner has stayed connected for 10 minutes. A
 disconnect before then folds into the same outage: no new `RUNNER_STALE` or `RUNNER_OFFLINE`, and owned lanes do not
