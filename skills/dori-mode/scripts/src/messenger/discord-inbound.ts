@@ -14,6 +14,8 @@ export type InboundMessage = {
   readonly bot?: boolean;
   /** Set on a message posted through a webhook. */
   readonly webhookId?: string;
+  /** The message this one replies to (Discord message_reference). */
+  readonly replyTo?: string;
 };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -225,6 +227,13 @@ export type DiscordInboundOptions = {
   readonly onMissingContent?: () => void;
   /** Called after an owner message is emitted, e.g. to track it for edit and delete notices. */
   readonly onOwner?: (channel: string, id: string) => void;
+  /**
+   * Decides an owner message's side before anything is emitted (decision-inbound.ts): "direct" means it went to a lane
+   * as a decision answer, so neither INBOUND nor onOwner follows; absent or "lead" emits as before.
+   */
+  readonly route?: (channel: string, m: InboundMessage) => Promise<"direct" | "lead">;
+  /** Like route for an owner edit at `edit` (edited_timestamp in ms): "direct" means no INBOUND_EDIT. */
+  readonly routeEdit?: (channel: string, m: InboundMessage, edit: number) => Promise<"direct" | "lead">;
   readonly log?: (line: string) => void;
 };
 
@@ -276,6 +285,8 @@ export const emitDiscordInbound = async (
   const pendingKey = `${channel}:${m.id}`;
   // Recovered content cannot reuse the original id (dedup would drop it), so it is a separate revision.
   const revision = hasRealContent(m) && pendingHydration.has(pendingKey);
+  // A recovered placeholder already reached the lead, so it stays there.
+  if (owner && !revision && options.route && await options.route(channel, m) === "direct") return;
   await emit(`discord:${channel}:${m.id}${revision ? ":rev:content" : ""}`, owner
     ? `INBOUND ${channel} ${m.id} ${m.author} ${text}`
     : `VISITOR ${channel} ${m.id} ${m.author} ${VISITOR_NOTE} ${text}`);
@@ -316,6 +327,8 @@ export const emitDiscordEdit = async (
   if (!record(value) || typeof value.edited_timestamp !== "string" || !record(value.author) || typeof value.content !== "string") return false;
   const m = parseDiscordMessage({ ...value, attachments: Array.isArray(value.attachments) ? value.attachments : [] });
   if (m.bot || !discordOwnerConfigured(ownerId) || m.authorId !== ownerId) return false;
+  const edited = Date.parse(value.edited_timestamp);
+  if (options.routeEdit && await options.routeEdit(channel, m, Number.isNaN(edited) ? 0 : edited) === "direct") return true;
   await emit(`discord:${channel}:${m.id}:edit:${value.edited_timestamp}`, `INBOUND_EDIT ${channel} ${m.id} ${m.author} ${EDIT_NOTE} ${discordMessageText(m, options)}`);
   return true;
 };
@@ -332,6 +345,7 @@ export const parseDiscordMessage = (value: unknown): InboundMessage => {
     id: value.id, author: value.author.username, bot: value.author.bot === true,
     ...(typeof value.author.id === "string" ? { authorId: value.author.id } : {}),
     ...(snowflake(value.webhook_id) ? { webhookId: value.webhook_id } : {}),
+    ...(record(value.message_reference) && snowflake(value.message_reference.message_id) ? { replyTo: value.message_reference.message_id } : {}),
     content: value.content, attachments: value.attachments,
   };
 };

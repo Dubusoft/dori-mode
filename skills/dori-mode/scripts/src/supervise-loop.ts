@@ -1061,7 +1061,7 @@ export const supervise = async (
     let deliveryError: unknown;
     const emit = async (id: string, line: string): Promise<void> => { enqueueDiscord(id, line); };
     const discordInbound = probe.step("inbound", () => supervisorDiscord(deps, {
-      ...discordOptions, token, emit,
+      ...discordOptions, token, emit, laneMessages: () => (laneMessages ??= openLaneMessages(deps.config)),
       http: discordOptions.http ?? ((request) => fetchHttp({
         ...request, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
       })),
