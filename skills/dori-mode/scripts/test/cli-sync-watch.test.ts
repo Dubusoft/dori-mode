@@ -83,6 +83,7 @@ test("dori watch suppresses repeated warnings per lane and reason until they cle
       claimDone: async () => "",
       closeLane: async () => ({}),
       closeRunning: () => false,
+      finishClosedTask: async () => undefined,
       finishedReason: () => "",
       laneActRefusal: () => undefined,
       laneSendRefusal: () => undefined,

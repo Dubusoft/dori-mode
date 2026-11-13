@@ -60,7 +60,9 @@ import { acquireDiscordGateway } from "./messenger/discord-lock.ts";
 import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/discord-supervisor.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
-import { redirectIfClosed } from "./thread-followup.ts";
+import { appendFollowUp, redirectIfClosed } from "./thread-followup.ts";
+import { taskFinisher } from "./task-finish.ts";
+import { ToodoWriter } from "./toodo-client.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
 import { lookupStatus } from "./status.ts";
 import { OWNER_NOTICE_AFTER_MS, RetryingDelivery, SuperviseError, Supervisor } from "./supervise.ts";
@@ -1036,7 +1038,9 @@ export const supervise = async (
     const sweepProbe = probe.span();
     // Each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog.
     // The watcher reads its claim announcements back from the journal.
-    const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id) };
+    // The supervisor finishes a merged lane's Toodo task and appends the merge to its report (task-finish.ts).
+    const finishTask = taskFinisher({ writer: new ToodoWriter(deps.tunables.toodoWriter), append: (lane, text) => appendFollowUp(stateDir, discord, lane, text) });
+    const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask };
     const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard, () => github.openPulls()).map(([name, step]): Sweep => [name, async (emit) =>
       watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
     const recentWarnings = new Map<string, number>();

@@ -3,6 +3,9 @@ import { join } from "node:path";
 
 import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord.ts";
 import { guardText } from "./messenger/http.ts";
+import { resolveTarget } from "./messenger/target.ts";
+import type { Lane } from "./registry.ts";
+import type { AppendOutcome } from "./task-finish.ts";
 
 /**
  * Follow-ups after a thread's work is reported (a merge result, a Toodo note) must not reopen a thread the owner closed:
@@ -161,4 +164,19 @@ export const appendToMessage = async (discord: FollowUpDiscord, channel: string,
     if (archived) await discord.setThread(channel, { archived: true });
   }
   return true;
+};
+
+/**
+ * The supervisor's own `dori reported <key> --append`: `text` is appended to the lane's last report (else its [System]
+ * status message) by editing it. Unlike the CLI it never redirects: a thread the owner or the supervisor closed is left
+ * as it is, with no line in its parent channel, and so is a lane with no message to edit or a text that does not fit.
+ */
+export const appendFollowUp = async (stateDir: string, discord: FollowUpDiscord, lane: Lane, text: string): Promise<AppendOutcome> => {
+  const status = lane.statusMessageId && lane.thread.startsWith("discord:") ? { channel: resolveTarget("discord", lane.thread).to, message: lane.statusMessageId } : undefined;
+  const last = readLastReports(stateDir)[lane.key] ?? status;
+  if (!last) return { appended: false, why: "the lane has no report or status message" };
+  if (await closedByOwner(stateDir, discord, last.channel)) return { appended: false, why: `thread ${last.channel} is closed` };
+  const archived = await discord.threadArchived(last.channel).catch(() => false);
+  if (!(await appendToMessage(discord, last.channel, last.message, text, archived))) return { appended: false, why: "the report would pass Discord's message limit" };
+  return { appended: true, message: last.message };
 };

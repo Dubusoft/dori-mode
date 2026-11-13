@@ -12,7 +12,8 @@ import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { LaneOpsError, type LaneOps, machineRunner, type PaneRef } from "./lane-ops.ts";
 import { runnerWorktreeRoot } from "./runner/hub.ts";
-import { deliverLaneMessage, queueSteering } from "./ci-follow.ts";
+import { deliverLaneMessage, MERGE_VERIFY, queueSteering } from "./ci-follow.ts";
+import { type LaneMerge, notCompletedLine, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
 import { openLaneMessages } from "./lane-messages.ts";
 import { checkLaneReportText, installLaneReports, LaneFileError, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
@@ -45,6 +46,11 @@ export type FlowDeps = {
    * which hands its lines to stdout) an event counts as received once it is handed over.
    */
   readonly leadDelivered?: (eventId: string) => boolean;
+  /**
+   * The supervisor's follow-up of a lane that closed after its merge (task-finish.ts): completes its Toodo task and
+   * appends the merge to its report. Absent (`dori watch`), a close carries no `toodo=` tag and the lead finishes the task.
+   */
+  readonly finishTask?: TaskFinisher;
 };
 
 /**
@@ -808,12 +814,61 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   const settled = await settle(deps, lane, evidence, start ?? deps.clock.now());
   if (settled === undefined) return;
   const line = settled.line;
-  // A close whose claim announcement already reached the lead is marked seen-claim; either way it wakes the lead.
+  // A close whose claim announcement already reached the lead is marked seen-claim. It wakes the lead unless the
+  // supervisor finished the lane's task itself (`seen-claim toodo=done`, digest).
   const event = claim.event;
   const seen = event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event));
-  const closed = seen ? line.replace(/^(LANE_CLOSED \S+ closed)(?= |$)/, "$1 seen-claim") : line;
+  const marked = seen ? line.replace(/^(LANE_CLOSED \S+ closed)(?= |$)/, "$1 seen-claim") : line;
+  // The task follow-up runs before the close is handed over: its tag decides whether the close wakes the lead.
+  const finish = marked.startsWith("LANE_CLOSED ") ? await finishClosedTask(deps, lane) : undefined;
+  const closed = finish ? marked.replace(/^(LANE_CLOSED \S+ closed(?: seen-claim)?)(?= |$)/, `$1 toodo=${finish.tag}`) : marked;
   await push(machine && closed.startsWith("LANE_CLOSED ") ? `LANE_AUTO_CLOSED ${closed.slice("LANE_CLOSED ".length)}` : closed, undefined, laneMeta(lane));
+  for (const extra of finish?.lines ?? []) await push(extra, undefined, laneMeta(lane));
   await pushOutcomes(push, lane, settled.outcomes ?? []);
+};
+
+const PR_SUBJECT = /^([\w.-]+\/[\w.-]+)#(\d+)(?:@\S+)?$/;
+
+/**
+ * The PRs of a closed lane, each read back merged with its merge SHA: the PRs its claim bound and those the supervisor
+ * merged or verified merged for it (`merge` / `merge-verify` operations, CI_MERGED / MERGE_VERIFIED). A lane with none,
+ * or with one GitHub does not read MERGED with a merge commit, has `why` instead.
+ */
+export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<{ readonly merges: readonly LaneMerge[] } | { readonly why: string }> => {
+  const pulls = new Map<string, { readonly repo: string; readonly number: number }>();
+  for (const p of lane.claim?.pulls ?? []) pulls.set(`${p.repo.toLowerCase()}#${p.number}`, { repo: p.repo, number: p.number });
+  const ops = await withOperations(deps, async (store) => store.list({ lane: lane.key }).filter((op) => (op.action === "merge" || op.action === MERGE_VERIFY) && op.state === "verified"));
+  for (const op of ops) {
+    const m = PR_SUBJECT.exec(op.target);
+    if (m?.[1] && m[2]) pulls.set(`${m[1].toLowerCase()}#${m[2]}`, { repo: m[1], number: Number(m[2]) });
+  }
+  if (!pulls.size) return { why: "no PR of the lane is recorded (no claimed or supervisor-merged PR)" };
+  const merges: LaneMerge[] = [];
+  for (const { repo, number } of pulls.values()) {
+    const r = await deps.run(["gh", "pr", "view", String(number), "-R", repo, "--json", "state,url,baseRefName,mergeCommit"], { timeoutMs: 20_000 });
+    let view: { readonly state?: string; readonly url?: string; readonly baseRefName?: string; readonly mergeCommit?: { readonly oid?: string } | null } | undefined;
+    try { view = r.code === 0 ? JSON.parse(r.out) : undefined; } catch { view = undefined; }
+    if (!view) return { why: `${repo}#${number} could not be read: ${(r.err || r.out).replace(/\s+/g, " ").slice(0, 120)}` };
+    const sha = view.mergeCommit?.oid;
+    if (view.state !== "MERGED" || !sha) return { why: `${repo}#${number} reads ${view.state ?? "unknown"}${sha ? "" : " with no merge commit"}` };
+    merges.push({ repo, number, url: view.url ?? `https://github.com/${repo}/pull/${number}`, base: view.baseRefName ?? "its base", sha });
+  }
+  return { merges };
+};
+
+/** The supervisor's task follow-up of a lane it closed (deps.finishTask), or undefined when it has none to run. */
+export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<TaskFinish | undefined> => {
+  if (!deps.finishTask) return undefined;
+  const task = lane.task;
+  if (task === undefined) return { tag: "no-task", lines: [] };
+  // The lane is already closed: a throw here would lose its close line, so any failure is the lead's to finish.
+  try {
+    const read = await laneMerges(deps, lane);
+    if ("why" in read) return { tag: "unmerged", lines: [notCompletedLine(lane, task, `no merge read back: ${read.why}`)] };
+    return await deps.finishTask(lane, task, read.merges);
+  } catch (e) {
+    return { tag: "failed", lines: [notCompletedLine(lane, task, e instanceof Error ? e.message : String(e))] };
+  }
 };
 
 /**
