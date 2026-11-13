@@ -12,7 +12,7 @@ import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, r
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, runnerPaths, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
 import { captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
-import { turnStop } from "./observe.ts";
+import { laneProcessAlive, turnStop } from "./observe.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
   CommandResults, InventoryLane, LaneDeadReason, LaneStatus, PauseStep, ProcessInfo, RunnerEventBodies, RunnerEventType, StartupVerdict, SupervisorCommandBodies,
@@ -647,16 +647,22 @@ export class RunnerLanes {
     return this.deps.clock.now() - record.startedAt < STARTUP_GRACE_MS;
   }
 
+  /** Whether the lane's agent process still runs in `pane` though herdr no longer detects it (observe.ts `laneProcessAlive`). */
+  private processAlive(key: string, pane: Pane | undefined): Promise<boolean> {
+    return pane ? laneProcessAlive(this.deps.run, pane.pane_id, key, this.deps.procs) : Promise.resolve(false);
+  }
+
   async observe(key: string): Promise<Effect<"lane.observe">> {
     const record = this.record(key);
     const pane = await this.currentPane(record);
-    // The same alive test as serve.ts laneStatus, so the runner and the supervisor call one pane the same.
-    const status: LaneStatus = !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
-    const reason: LaneDeadReason | undefined = !pane ? "pane-missing" : status === "dead" ? "agent-gone" : undefined;
-    // herdr names a fresh pane's agent unknown until its integration first reports: a lane started less than
-    // STARTUP_GRACE_MS ago whose pane is there is still starting, so its dead is answered but not published.
-    const starting = reason === "agent-gone" && this.starting(record);
-    if (!starting) this.deps.publish("lane.state", { key, status, pane: record.pane, ...(reason ? { reason } : {}) });
+    // The same alive test as serve.ts observeHost, so the runner and the supervisor call one pane the same: herdr's
+    // agent status, and the lane's agent process when herdr misses it.
+    let status: LaneStatus = !pane ? "missing" : !paneAlive(pane) ? "dead" : pane.agent_status === "working" ? "working" : "idle";
+    if (status === "dead" && await this.processAlive(key, pane)) status = "idle";
+    const reason: LaneDeadReason | undefined = !pane ? "pane-missing" : undefined;
+    // A dead agent is answered but published only by the serve loop, which holds it back through the startup and dead
+    // grace windows (serve.ts serveRunner); a one-off read here would skip them.
+    if (status !== "dead") this.deps.publish("lane.state", { key, status, pane: record.pane, ...(reason ? { reason } : {}) });
     if (!pane) throw new Error(`RUNNER_LANE_ABSENT ${key} pane ${record.pane} is gone`);
     await this.noteTurn(record, pane);
     const turn = status === "idle" ? this.records()[key]?.turnStop : undefined;
@@ -695,10 +701,11 @@ export class RunnerLanes {
     const panes = await listPanes(this.deps.run);
     const pane = await this.currentPane(record, panes);
     // A pane still in its startup window whose agent has not reported yet is starting, not dead: closing its tab would
-    // kill the launch in progress, so it is left alone like a live one.
-    if (paneAlive(pane) || (pane && this.starting(record))) {
+    // kill the launch in progress, so it is left alone like a live one. So is a pane whose agent process still runs.
+    const alive = paneAlive(pane) || await this.processAlive(key, pane);
+    if (alive || (pane && this.starting(record))) {
       this.deps.publish("lane.started", { key, pane: record.pane, tab: record.tab, session: "", ...(record.fileRun ? { fileRun: record.fileRun } : {}) });
-      return { detail: `${paneAlive(pane) ? "alive" : "starting"} pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
+      return { detail: `${alive ? "alive" : "starting"} pane=${record.pane}`, result: { pane: record.pane, tab: record.tab, relaunched: false, resumed: false } };
     }
     if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
     if (briefText === undefined || files === undefined) throw new LaneFileError("LANE_FILES_RECOVER_INPUT_REQUIRED", key, "recovery needs a fresh lead brief and attachment scan; recover the lane again from the lead");

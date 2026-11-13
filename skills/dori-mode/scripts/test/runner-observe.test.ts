@@ -7,7 +7,7 @@ import type { Ran } from "../src/run.ts";
 import { briefLane, observeHost, turnStop } from "../src/runner/observe.ts";
 import { RunnerClient, yieldTurn } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
-import { serveRunner, STARTUP_GRACE_MS, type ObservedLane } from "../src/runner/serve.ts";
+import { LANE_DEAD_GRACE_MS, serveRunner, STARTUP_GRACE_MS, type ObservedLane } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { fakeClock } from "./fakes.ts";
 
@@ -106,10 +106,22 @@ test("observeHost prefers the environment attribution over a different key in th
   expect(observed.map((l) => l.key)).toEqual(["lane-a"]);
 });
 
-test("observeHost reports a lane whose agent_status is not alive as dead", async () => {
+test("observeHost reports a lane as dead only when herdr misses its agent and no lane agent process runs in its pane", async () => {
   const unknown = panes.map((p) => (p.pane_id === "p1" ? { ...p, agent_status: "unknown" } : p));
-  const observed = await observeHost({ run: herdrWith(unknown), procs: async () => procs });
-  expect(observed.map((l) => [l.key, l.status])).toEqual([["lane-a", "dead"], ["lane-b", "idle"]]);
+  const runWith = (override: Record<string, object>) => async (argv: readonly string[]): Promise<Ran> =>
+    argv[1] === "pane" && argv[2] === "process-info" ? ok(JSON.stringify({ result: { process_info: override[argv[4] as string] } })) : herdrWith(unknown)(argv);
+  const status = (observed: readonly ObservedLane[]) => observed.map((l) => [l.key, l.status]);
+  // Linux: lane-a's agent (DORI_LANE_KEY in its environment) still runs though herdr lost it: idle.
+  expect(status(await observeHost({ run: herdrWith(unknown), procs: async () => procs }))).toEqual([["lane-a", "idle"], ["lane-b", "idle"]]);
+  // macOS: no environment is readable; the agent's argv names lane-a's brief.
+  const mac = runWith({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: agentArgv("/Users/x/.dori/runner/briefs/lane-a.md") }] } });
+  expect(status(await observeHost({ run: mac, procs: async () => [] }))).toEqual([["lane-a", "idle"]]);
+  const owned = async () => new Map([["p1", "lane-a"]]);
+  // The agent exited and left only its shell, or the pane runs another lane's agent: dead.
+  const exited = runWith({ p1: { shell_pid: 100, foreground_processes: [{ pid: 100, argv: ["sh"] }] } });
+  expect(status(await observeHost({ run: exited, procs: async () => procs, owned }))).toEqual([["lane-a", "dead"]]);
+  const other = runWith({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: agentArgv("/Users/x/.dori/runner/briefs/lane-z.md") }] } });
+  expect(status(await observeHost({ run: other, procs: async () => [], owned }))).toEqual([["lane-a", "dead"]]);
 });
 
 test("serveRunner publishes lane.state on a status change once, and no lane.progress", async () => {
@@ -156,6 +168,8 @@ test("serveRunner holds back dead for a starting lane until its agent was seen a
     { at: 31_000, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "working" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
     { at: 61_000, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
     { at: 1_000 + STARTUP_GRACE_MS, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
+    // lane-a was seen alive: its dead waits out LANE_DEAD_GRACE_MS from its first dead read (61_000).
+    { at: 61_000 + LANE_DEAD_GRACE_MS, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },
   ];
   let step = 0;
   let observeTick: (() => void) | undefined;
@@ -173,9 +187,52 @@ test("serveRunner holds back dead for a starting lane until its agent was seen a
   await serving;
   expect(published()).toEqual([
     { key: "lane-a", status: "working", pane: "p1" },
-    { key: "lane-a", status: "dead", pane: "p1" },
-    { key: "lane-b", status: "dead", pane: "p2" },
+    { key: "lane-b", status: "dead", pane: "p2", reason: "agent-gone" },
+    { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" },
   ]);
+  outbox.close();
+  state.close();
+});
+
+test("serveRunner publishes no dead for a lane that reads alive again inside the dead grace window", async () => {
+  const dir = stateDir();
+  const clock = fakeClock(1_000);
+  const state = new RunnerState(dir, { now: clock.now });
+  state.boot();
+  const outbox = new Outbox(dir, { now: clock.now });
+  const client = new RunnerClient({ label: "worker-a", hostId: "h" }, { connect: async () => { throw new Error("offline"); }, outbox, state, clock });
+  const lane = (status: ObservedLane["status"]): ObservedLane[] => [{ key: "lane-a", pane: "p1", tab: "t1", status }];
+  // Dead for less than the grace, alive once, dead again: the window starts over at the second dead read.
+  const steps: { readonly at: number; readonly view: ObservedLane[] }[] = [
+    { at: 1_000, view: lane("working") },
+    { at: 31_000, view: lane("dead") },
+    { at: 31_000 + LANE_DEAD_GRACE_MS - 1, view: lane("dead") },
+    { at: 31_000 + LANE_DEAD_GRACE_MS, view: lane("working") },
+    { at: 61_000 + LANE_DEAD_GRACE_MS, view: lane("dead") },
+    { at: 61_000 + 2 * LANE_DEAD_GRACE_MS - 1, view: lane("dead") },
+  ];
+  let step = 0;
+  let observeTick: (() => void) | undefined;
+  const abort = new AbortController();
+  const serving = serveRunner({
+    client, latest: () => undefined, clock, heartbeatMs: 15_000, observeMs: 30_000, log: () => {},
+    every: (ms, tick) => { if (ms === 30_000) observeTick = tick; return () => {}; },
+    observe: async () => steps[step]?.view ?? [],
+  }, abort.signal);
+  await yieldTurn();
+  const published = (): unknown[] => outbox.unacked(0).map((r) => r.body);
+  for (step = 1; step < steps.length; step++) { clock.at = steps[step]?.at ?? 0; observeTick?.(); await yieldTurn(); }
+  expect(published()).toEqual([{ key: "lane-a", status: "working", pane: "p1" }]);
+  // Still dead once the window is over: published once.
+  step = steps.length - 1;
+  clock.at = 61_000 + 2 * LANE_DEAD_GRACE_MS;
+  observeTick?.();
+  await yieldTurn();
+  observeTick?.();
+  await yieldTurn();
+  abort.abort();
+  await serving;
+  expect(published()).toEqual([{ key: "lane-a", status: "working", pane: "p1" }, { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]);
   outbox.close();
   state.close();
 });

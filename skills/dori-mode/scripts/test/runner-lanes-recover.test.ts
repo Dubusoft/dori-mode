@@ -390,7 +390,7 @@ test("lane.asking: an owned lane's on-screen question is published once, and aga
   expect(t.published).toHaveLength(2);
 });
 
-test("observe answers dead but publishes no lane.state dead for a lane still in its startup window", async () => {
+test("observe answers dead but leaves publishing a dead agent to the serve loop, which holds it through its grace windows", async () => {
   const clock = fakeClock(T0);
   const t = setup({ clock });
   await t.lanes.start(START);
@@ -403,11 +403,29 @@ test("observe answers dead but publishes no lane.state dead for a lane still in 
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "working" }];
   expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "working" });
   expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working", pane: "p1" }]]);
-  // Once the window is over a dead agent is published as before.
+  // Past the startup window too: answered, not published.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   clock.at = started + STARTUP_GRACE_MS;
-  await t.lanes.observe("lane-a");
-  expect(t.published.at(-1)).toEqual(["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]);
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "dead" });
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working", pane: "p1" }]]);
+});
+
+test("observe and recover keep a lane whose agent process still runs though herdr no longer detects it", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
+  await t.lanes.start(START);
+  t.published.length = 0;
+  clock.at = (t.lanes.records()["lane-a"]?.startedAt ?? 0) + STARTUP_GRACE_MS;
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent_status: "unknown" }];
+  t.world.processInfo.p1 = { shell_pid: 10, foreground_processes: [{ pid: 11, argv: ["omo", `Read and execute the lane brief at ${t.lanes.briefPath("lane-a")} in full.`] }] };
+  expect((await t.lanes.observe("lane-a")).detail).toBe("observed idle");
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "idle", pane: "p1" }]]);
+  const calls = t.calls.length;
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("alive pane=p1");
+  expect(t.calls.slice(calls).filter((c) => c[1] === "tab" && (c[2] === "close" || c[2] === "create"))).toEqual([]);
+  // The agent exited: only the shell is left, and the lane is dead.
+  t.world.processInfo.p1 = { shell_pid: 10, foreground_processes: [{ pid: 10, argv: ["sh"] }] };
+  expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
 });
 
 test("recover leaves a lane still in its startup window alone instead of closing its tab and starting it again", async () => {
@@ -436,7 +454,7 @@ test("alive criteria: observe and recover use paneAlive (agent_status), not the 
   // herdr still names the agent, but its status is not an alive one: the supervisor's laneStatus calls this dead.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
-  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]]);
+  expect(t.published).toEqual([]);
   expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("started pane=p2 tab=t2");
   // An alive status without an agent field is alive, as paneAlive says.
   t.world.panes = [{ pane_id: "p2", workspace_id: "w", tab_id: "t2", agent_status: "blocked" }];

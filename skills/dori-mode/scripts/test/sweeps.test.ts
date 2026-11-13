@@ -101,6 +101,41 @@ test("a lane pane's count starts over on each report, claim or status change, an
   expect(eventClass(line)).toBe("lead-urgent");
 });
 
+const agentOf = (key: string) => ({ shell_pid: 10, foreground_processes: [{ pid: 11, name: "omo", argv: ["omo", `Read and execute the lane brief at /home/u/.dori/runner/briefs/${key}.md in full.`] }] });
+
+test("a lane pane herdr misses while its lane agent process still runs raises nothing; once only the shell is left it is dead", async () => {
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2", agent_status: "unknown" }];
+  world.screen = "omo has stopped\n$ ";
+  // The agent's argv names the lane's brief (every OS); herdr's agent detection lost it.
+  world.inspection = { process: agentOf("quiet-lane") };
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  const st = newDeadPaneState();
+  const tick = () => deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st, [working]);
+  for (let i = 0; i < 4; i++) expect(await tick()).toEqual([]);
+  // Another lane's agent in the pane is not this lane's.
+  world.inspection = { process: agentOf("other-lane") };
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual(["DEAD_PANE w:p7"]);
+});
+
+test("a lane pane its runner already reported dead (deadAlertPane) raises no DEAD_PANE or UNRECOGNISED_PANE of its own", async () => {
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2" }];
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  const alerted: Lane = { ...working, deadAlertPane: "w:p7" };
+  world.screen = "omo has stopped\n$ ";
+  const st = newDeadPaneState();
+  for (let i = 0; i < 4; i++) expect(await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st, [alerted])).toEqual([]);
+  world.screen = "something else\n$ ";
+  const st2 = newDeadPaneState();
+  for (let i = 0; i < 4; i++) expect(await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st2, [alerted])).toEqual([]);
+  // The same lane on another pane is news.
+  const moved: Lane = { ...alerted, deadAlertPane: "w:p3" };
+  const st3 = newDeadPaneState();
+  const lines: string[] = [];
+  for (let i = 0; i < 3; i++) lines.push(...await deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st3, [moved]));
+  expect(lines).toEqual(["UNRECOGNISED_PANE w:p7 lane=quiet-lane dead-panes: no alive status and no dead marker for 3 ticks"]);
+});
+
 test("a DAG viewer pane in a registered lane's tab is part of that lane and never raises UNRECOGNISED_PANE", async () => {
   world.panes = [
     { pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2", agent: "pi", agent_status: "working" },
