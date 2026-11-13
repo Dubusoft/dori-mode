@@ -7,7 +7,7 @@ import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
 import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { connectUnix, listenUnix } from "../src/runner/unix-transport.ts";
-import { parseDecisionText } from "../src/runner/decision-text.ts";
+import { parseDecisionText, parseRequestText } from "../src/runner/decision-text.ts";
 import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
@@ -267,4 +267,21 @@ test("a valid question is sent in the fixed DECISION v1 text and round-trips", a
   const sent = String(sock.requests[0]?.text);
   expect(sent.startsWith("DECISION v1")).toBe(true);
   expect(parseDecisionText(sent)).toEqual({ question: "Which db?", options: ["sqlite", "postgres"], recommend: 2, reason: "scales", waiting: "레인 lane-a 진행", blocking: false });
+});
+
+test("a request is sent as a question in the fixed REQUEST v1 text; a long-lived secret without --file is refused", async () => {
+  const sock = laneSocket();
+  const ok = io();
+  const args = ["report", "lane-a", "request", "--text", "Login code for the staging console", "--reason", "Sign in to deploy"];
+  expect(await laneCliMain(args, { env, connect: sock.connect, ...ok.deps })).toBe(0);
+  expect(ok.out).toEqual(["LANE_REPORTED lane-a request (through the runner)"]);
+  expect(sock.requests[0]?.kind).toBe("question");
+  expect(parseRequestText(String(sock.requests[0]?.text))).toEqual({ need: "Login code for the staging console", reason: "Sign in to deploy", waiting: "레인 lane-a 진행", blocking: true });
+  const refused = io();
+  expect(await laneCliMain(["report", "lane-a", "request", "--text", "The deploy API key", "--reason", "Deploy"], { env, connect: sock.connect, ...refused.deps })).toBe(2);
+  expect(refused.err[0]).toMatch(/^REPORT_REFUSED request .*long-lived secret/);
+  const filed = io();
+  expect(await laneCliMain(["report", "lane-a", "request", "--text", "The deploy API key", "--reason", "Deploy", "--file", "~/.secrets/deploy-key"], { env, connect: sock.connect, ...filed.deps })).toBe(0);
+  expect(parseRequestText(String(sock.requests[1]?.text))?.file).toBe("~/.secrets/deploy-key");
+  expect(sock.requests).toHaveLength(2);
 });

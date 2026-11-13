@@ -557,12 +557,12 @@ test("agentArgv runs every lane under omo's full-access preset unless its profil
     .toBe("external_directory=deny,external_directory:C:\\Users\\u\\.dori\\runner=allow,external_directory:C:\\Users\\u\\.dori\\runner\\*=allow");
 });
 
-test("a lane.start without a sandbox refuses outside paths but the runner dir, repos and worktree roots, temp and ~/.omo; a sandboxed one gets no rules", async () => {
+test("a lane.start without a sandbox refuses outside paths but its cwd, the runner dir, repos and worktree roots, temp and ~/.omo; a sandboxed one gets no rules", async () => {
   const policy = { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", reposRoot: "/srv/repos", sandboxCheck: ["lane-sandbox", "--check"] } as const;
   const bare = setup({ policy });
   await bare.lanes.start({ ...START, sandbox: false });
   const line = bare.calls.find((a) => a[2] === "run")?.[4] ?? "";
-  const rules = [bare.runnerDir, "/srv/repos", "/srv/repos/worktrees", tmpdir(), join(homedir(), ".omo")]
+  const rules = [START.cwd, bare.runnerDir, "/srv/repos", "/srv/repos/worktrees", tmpdir(), join(homedir(), ".omo")]
     .flatMap((dir) => [`external_directory:${dir}=allow`, `external_directory:${dir}/*=allow`]);
   expect(line).toContain(` omo --permission-preset full-access --permission '${["external_directory=deny", ...rules].join(",")}' 'ulw`);
   const boxed = setup({ policy });

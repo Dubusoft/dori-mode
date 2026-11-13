@@ -255,7 +255,9 @@ const USAGE = `dori <command> [options]
   memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
-                                       inside a lane: its structured report (own key only), sent through its runner to the supervisor
+                                       inside a lane: its structured report (own key only), sent through its runner to the supervisor;
+                                       a question or request opens its own [결정]/[요청] thread, or is posted in the lane's thread when
+                                       that thread already sits in decisionsChannel (and the owner has not closed it)
   report ack <id>                      inside a lane: confirm a supervisor message to this lane by its ID (CI follow-up, done-claim notice, objection)
   inbox take [--max-bytes N] [--peek]  the lead's read path: delivered events past the take cursor as id<TAB>line, whole lines
                                        up to N bytes (INBOX_MORE <lines> <bytes> when more wait, INBOX_EMPTY when none); writes a take receipt
@@ -281,6 +283,10 @@ const USAGE = `dori <command> [options]
                                        --task defaults to the ap-<task>-<n> lane's task; --nonblocking: work goes ahead on the
                                        recommendation; --from-event resolves that decision event (DECISION_SOURCE_RESOLVED);
                                        a bad or missing field exits 2 DECISION_REFUSED
+  decision open --request --question "<what is needed>" --reason TEXT --waiting TEXT [--file PATH] [...]
+                                       lead-only: ask the owner for input only they can give (a one-time code, a file or value) in a
+                                       [요청] thread, answered and closed like a decision; a long-lived secret (password, API key,
+                                       token) needs --file, the path the owner writes it to (chmod 600), never a reply in Discord
   decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel]
                                        lead-only: post the outcome into the decision's thread, archive it and resolve its
                                        OWNER_DECISION_ANSWERED event; --from names an answer given outside the thread
@@ -291,15 +297,18 @@ const USAGE = `dori <command> [options]
   handled <channel> <messageId> [--tasks N] [--lane KEY ...] [--reply] [--all] [--awaiting [--note TEXT]]
                                        link what handled an owner message, or park it on the owner's answer (--awaiting);
                                        acks it first (warning HANDLED_AUTO_ACKED) when no dori ack was recorded
-  send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force]
+  send [discord] --to TARGET --text TEXT [--thread ID] [--edit ID | --buttons JSON] [--force] [--no-redirect]
                                        post or edit a Discord message (the platform defaults to discord) (token from DORI_DISCORD_TOKEN);
                                        --to alerts is config alertsChannel, else the first discordChannels entry. A new post is refused with
                                        SEND_STALE <n> (the unseen owner events follow, exit 3) when the destination got owner messages
                                        you have not taken, acked or seen in an ack preview; merge them and resend. --force skips the
-                                       check; --edit is never checked
-  thread [discord] --to CHANNEL [--message ID] --name NAME
+                                       check; --edit is never checked. --no-redirect: a thread the owner closed gets nothing (no
+                                       SENT_REDIRECTED line in its parent channel); prints SEND_NOT_REDIRECTED and exits 5
+  thread [discord] --to CHANNEL [--message ID] --name NAME [--drop-notice]
                                        start a Discord thread (on a message, else standalone) with discord.ownerId added as a member;
-                                       prints THREAD discord:<channel>/<thread>
+                                       prints THREAD discord:<channel>/<thread>. --drop-notice: delete the "started a thread" notice
+                                       Discord leaves in the channel (THREAD_NOTICE_REMOVED); when that fails it only warns
+                                       (THREAD_NOTICE_KEPT on stderr) and the thread stays as created
   typing [discord] <channel>           show the typing indicator in a Discord channel or lane thread ref (about 10 s, or until the bot posts)
   presence [discord]                   keep the bot shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text`;
@@ -747,6 +756,7 @@ const flags = parseArgs({
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
     dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" },
+    "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -1562,7 +1572,7 @@ try {
       const refusal = laneDecisionRefusal(await callerLane(deps));
       if (refusal) die(refusal);
       const od = await import("./owner-decisions.ts");
-      const { decisionChoicesProblem } = await import("./runner/decision-text.ts");
+      const { decisionChoicesProblem, inputRequestProblem } = await import("./runner/decision-text.ts");
       const [sub, ...subArgs] = rest;
       const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
       /** Discord is reached only when a call needs it; `token` already resolved, else read on first use. */
@@ -1574,7 +1584,7 @@ try {
         };
       };
       if (sub === "open") {
-        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]";
+        const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]\n       dori decision open --request --question \"<what is needed>\" --reason TEXT --waiting TEXT [--file PATH] [--task N] [--lane KEY] [--thread REF] [--nonblocking] [--from-event EVENT_ID]";
         const refuse = (reason: string): never => {
           console.error(`DECISION_REFUSED ${reason}`);
           return die(usage, 2);
@@ -1586,13 +1596,18 @@ try {
               options: {
                 question: { type: "string" }, option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" },
                 waiting: { type: "string" }, task: { type: "string" }, lane: { type: "string" }, thread: { type: "string" },
-                nonblocking: { type: "boolean" }, "from-event": { type: "string" },
+                nonblocking: { type: "boolean" }, "from-event": { type: "string" }, request: { type: "boolean" }, file: { type: "string" },
               },
             });
           } catch (e) { return refuse(e instanceof Error ? e.message : String(e)); }
         })();
         const v = parsed.values;
-        const problem = decisionChoicesProblem({ question: v.question, options: v.option, recommend: v.recommend, reason: v.reason, waiting: v.waiting });
+        const request = v.request === true;
+        if (request && (v.option !== undefined || v.recommend !== undefined)) refuse("a --request takes no --option or --recommend");
+        if (!request && v.file !== undefined) refuse("--file goes only with --request");
+        const problem = request
+          ? inputRequestProblem({ need: v.question, reason: v.reason, waiting: v.waiting, ...(v.file !== undefined ? { file: v.file } : {}) })
+          : decisionChoicesProblem({ question: v.question, options: v.option, recommend: v.recommend, reason: v.reason, waiting: v.waiting });
         if (problem) refuse(problem);
         let task: number | undefined;
         if (v.task !== undefined) {
@@ -1611,16 +1626,19 @@ try {
         const { recordResolved, validEventId } = await import("./decision-obligations.ts");
         if (fromEvent !== undefined && !validEventId(fromEvent)) refuse(`--from-event ${fromEvent} is not an event id`);
         const token = messengerToken("DORI_DISCORD_TOKEN");
+        const asked = request
+          ? od.requestSpec({ need: flat(v.question ?? ""), reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true, ...(v.file !== undefined ? { file: flat(v.file) } : {}) })
+          : { question: flat(v.question ?? ""), options: (v.option ?? []).map(flat), recommend: Number((v.recommend ?? "").trim()),
+            reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true };
         const opened = await od.openOwnerDecision(decisionContext(token), {
-          question: flat(v.question ?? ""), options: (v.option ?? []).map(flat), recommend: Number((v.recommend ?? "").trim()),
-          reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true, source: "lead",
+          ...asked, source: "lead",
           ...(task !== undefined ? { task } : {}), ...(laneKey ? { lane: laneKey } : {}), ...(origin ? { origin } : {}),
         }).catch((e: unknown) => {
           if (e instanceof od.OwnerDecisionError) die(e.message, 1);
           throw e;
         });
         const d = opened.decision;
-        console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}`);
+        console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}${d.kind === "request" ? " request" : ""}`);
         if (opened.channel.unset) console.log(od.channelUnsetLine(opened.channel));
         if (opened.noticeKept) console.log(`DECISION_NOTICE_KEPT ${d.id}: the channel's "started a thread" notice could not be deleted: ${opened.noticeKept}`);
         const link = opened.link;
@@ -1739,6 +1757,10 @@ try {
       // A thread the owner closed is never posted into (a post would reopen it): one line linking it goes to its parent
       // channel, else the owner channel.
       const closed = await closedByOwner(config.stateDir, discord, to);
+      if (closed && flags.values["no-redirect"] === true) {
+        console.log(`SEND_NOT_REDIRECTED ${to}: thread ${to} was closed by the owner and --no-redirect is set, so nothing was posted`);
+        process.exit(5);
+      }
       if (closed) {
         const target = closed.parent ?? config.discordChannels[0]
           ?? die(`SEND_NOT_POSTED thread ${to} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel`);
@@ -1756,14 +1778,22 @@ try {
       // `dori thread [discord] --to CHANNEL [--message ID] --name NAME`: start a thread (on a message, else standalone) and
       // make discord.ownerId a member. The thread ref is printed either way; a failed add prints THREAD_OWNER_FAILED and exits 1.
       if ((key ?? "discord") !== "discord") die(`unknown platform ${key}`);
-      if (flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name"].includes(name))) {
-        die("usage: dori thread [discord] --to CHANNEL [--message ID] --name NAME");
+      if (flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !["to", "message", "name", "drop-notice"].includes(name))) {
+        die("usage: dori thread [discord] --to CHANNEL [--message ID] --name NAME [--drop-notice]");
       }
       const { to } = resolveTarget("discord", need("to"));
       const owner = config.discord?.ownerId;
       if (!discordOwnerConfigured(owner)) console.error("THREAD_OWNER_SKIPPED discord.ownerId is not configured; the thread is created without adding the owner");
-      const { id, member } = await new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN")).startThread(to, opt("message"), need("name"), discordOwnerConfigured(owner) ? owner : undefined);
+      const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
+      const { id, member } = await discord.startThread(to, opt("message"), need("name"), discordOwnerConfigured(owner) ? owner : undefined);
       console.log(`THREAD discord:${to}/${id}`);
+      // --drop-notice: the channel keeps no "started a thread" line; a failed delete only warns, the thread is usable.
+      if (flags.values["drop-notice"] === true) {
+        const { removeThreadNotice } = await import("./owner-decisions.ts");
+        const kept = await removeThreadNotice(discord, to, id);
+        if (kept) console.error(`THREAD_NOTICE_KEPT ${id}: the "started a thread" notice could not be deleted (${kept}); the thread is created and usable`);
+        else console.log(`THREAD_NOTICE_REMOVED ${id}`);
+      }
       if (member === "added") console.log(`THREAD_OWNER_ADDED ${id}`);
       else if (member === "already") console.log(`THREAD_OWNER_ALREADY_MEMBER ${id}: Discord joined the owner as the thread started (the starter message mentions them), so no "added" line shows`);
       else if (member !== "skipped") {

@@ -61,6 +61,22 @@ test("decision open refuses bad input with DECISION_REFUSED and a usage line (ex
   expect(noToken.err).toContain("DORI_DISCORD_TOKEN is not set");
 });
 
+test("decision open --request refuses options and a long-lived secret without --file (exit 2), before any token is needed", async () => {
+  const base = ["decision", "open", "--request", "--reason", "r", "--waiting", "w"];
+  for (const [extra, reason] of [
+    [["--question", "login code", "--option", "a"], "DECISION_REFUSED a --request takes no --option or --recommend"],
+    [["--question", "the npm API token"], "DECISION_REFUSED a long-lived secret"],
+    [["--question", "the npm API token", "--file", "secrets/npm"], "DECISION_REFUSED --file must be an absolute"],
+  ] as const) {
+    const r = await cli([...base, ...extra]);
+    expect(r.code).toBe(2);
+    expect(r.err).toStartWith(reason);
+  }
+  const noToken = await cli([...base, "--question", "the npm API token", "--file", "~/.config/npm-token"]);
+  expect(noToken.code).toBe(1);
+  expect(noToken.err).toContain("DORI_DISCORD_TOKEN is not set");
+});
+
 test("decision close: unknown, already closed and out-of-range choice exit 2 without touching Discord", async () => {
   writeFileSync(join(dir, DECISIONS_FILE), JSON.stringify({ nextSeq: 3, decisions: [
     decision("d1", "open", Date.now()), decision("d2", "closed", Date.now(), { closedAt: Date.now() }),

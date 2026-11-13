@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  answeredLine,
   closeOwnerDecision,
+  openLaneDecision,
   openOwnerDecision,
   openOwnerDecisions,
   ownerDecisionTick,
@@ -16,8 +18,11 @@ import {
 } from "../src/owner-decisions.ts";
 import {
   decisionChoicesProblem,
+  inputRequestProblem,
   parseDecisionText,
+  parseRequestText,
   serializeDecisionText,
+  serializeRequestText,
   type DecisionChoices,
 } from "../src/runner/decision-text.ts";
 
@@ -170,7 +175,7 @@ test("thread names stay within 40 characters, and closing keeps the name", async
   const { decision } = await open(ctx, { question, task: 904 });
   await closeOwnerDecision(ctx, decision.id, { text: "Done.", choice: 1 });
   const opened = String(fake.calls.find((call) => call.method === "startThread")?.args[2]);
-  expect(opened).toStartWith("결정 d1 · #904 · 이 결정");
+  expect(opened).toStartWith("[결정] d1 · #904 · 이 결정");
   expect(Array.from(opened).length).toBeLessThanOrEqual(40);
   expect(fake.calls.filter((call) => call.method === "setThread").some((call) => "name" in (call.args[1] as object))).toBe(false);
 });
@@ -279,4 +284,96 @@ test("tick sends one daily digest and enqueues a posting-stuck event once", asyn
   await ownerDecisionTick({ ...stuckCtx, enqueue: (id, line) => { if (line.startsWith("OWNER_DECISION_STUCK")) stuckEvents.push(id); } });
   await ownerDecisionTick({ ...stuckCtx, enqueue: (id, line) => { if (line.startsWith("OWNER_DECISION_STUCK")) stuckEvents.push(id); } });
   expect(stuckEvents).toEqual(["owner-decision-stuck:d1"]);
+});
+
+test("request text round-trips, and a long-lived secret is refused unless a file path is named", () => {
+  const code = { need: "Device code for gh auth login", reason: "To push the branch", waiting: "Push of the PR", blocking: true };
+  expect(parseRequestText(serializeRequestText(code))).toEqual(code);
+  const file = { ...code, need: "The npm API token", file: "~/.config/dori/npm-token" };
+  expect(parseRequestText(serializeRequestText(file))).toEqual(file);
+  expect(parseDecisionText(serializeRequestText(code))).toBeUndefined();
+  expect(parseRequestText(serializeDecisionText(choices))).toBeUndefined();
+  expect(inputRequestProblem({ ...code, need: "The npm API token" })).toMatch(/^a long-lived secret/);
+  expect(inputRequestProblem({ ...code, need: "스토어 계정 비밀번호" })).toMatch(/^a long-lived secret/);
+  expect(inputRequestProblem({ ...code, file: "relative/path" })).toMatch(/^--file must be an absolute/);
+});
+
+test("a lane request opens a [요청] thread saying what, why, where and which lane waits; its answer is relayed and it closes", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const text = serializeRequestText({ need: "2FA code for the App Store login", reason: "Upload the build", waiting: "The upload step", blocking: true });
+  const opened = await openLaneDecision(ctx, { key: "ap-923-1", thread: "discord:111/222" }, { id: "row-1", text });
+  expect(opened?.decision).toMatchObject({ kind: "request", options: [], task: 923, lane: "ap-923-1", state: "open" });
+  const name = String(fake.calls.find((call) => call.method === "startThread")?.args[2]);
+  expect(name).toStartWith("[요청] d1 · #923 · 2FA code");
+  const start = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "thread")?.args[1]);
+  expect(start).toContain("2FA code for the App Store login");
+  expect(start).toContain("Upload the build");
+  expect(start).toContain("이 스레드에 답으로");
+  expect(start).toContain("레인 ap-923-1");
+  expect(String(fake.calls.find((call) => call.method === "send" && call.args[0] === "222")?.args[1])).toBe("[System] 오너 요청 d1: <#thread>");
+  const answer = recordOwnerAnswer(dir, "thread", "code-msg", 1_800_000_000_100);
+  expect(answer?.first).toBe(true);
+  const line = answeredLine(answer?.decision as NonNullable<typeof answer>["decision"]);
+  expect(line).toStartWith("OWNER_DECISION_ANSWERED ap-923-1 d1 blocking discord:555/thread: [request] ");
+  expect(line).toContain("message thread/code-msg");
+  expect(line).toContain("lane ap-923-1");
+  await expect(closeOwnerDecision(ctx, "d1", { text: "x", choice: 1 })).rejects.toMatchObject({ code: "DECISION_BAD_CHOICE" });
+  const closed = await closeOwnerDecision(ctx, "d1", { text: "Relayed to the lane" });
+  expect(closed.decision.state).toBe("closed");
+  expect(closed.resolved).toBe("owner-decision-answered:d1");
+  expect(String(fake.calls.filter((call) => call.method === "send" && call.args[0] === "thread").at(-1)?.args[1])).toStartWith("[System] d1 요청 처리.");
+});
+
+test("a request with a file tells the owner to write it there with chmod 600 and not to paste it", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const text = serializeRequestText({ need: "The npm API token", reason: "Publish", file: "~/.config/dori/npm-token", waiting: "Publish", blocking: false });
+  await openLaneDecision(context(dir, fake.transport), { key: "lane-x", thread: "none" }, { id: "row-1", text });
+  const start = String(fake.calls.find((call) => call.method === "send" && call.args[0] === "thread")?.args[1]);
+  expect(start).toContain("chmod 600 ~/.config/dori/npm-token");
+  expect(start).toContain("붙여넣지 마시고");
+});
+
+test("a lane question whose lane thread sits in decisionsChannel is asked in that thread, answered there, and closed without archiving it", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const opened = await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-1", text: serializeDecisionText(choices) });
+  expect(opened?.decision).toMatchObject({ state: "open", channel: "555", thread: "777", inLaneThread: true, lane: "ap-925-1" });
+  expect(opened?.link).toEqual({ kind: "none" });
+  // No thread of its own, no notice to delete, no link line: the question is the only post, in the lane thread.
+  expect(fake.calls.filter((call) => !["threadState", "messagesAfter"].includes(call.method)).map((call) => [call.method, call.args[0]]))
+    .toEqual([["send", "777"]]);
+  const start = String(fake.calls.find((call) => call.method === "send")?.args[1]);
+  expect(start).toContain(choices.question);
+  expect(start).not.toContain("원래 스레드");
+  await ownerDecisionTick({ ...ctx, enqueue: () => undefined, log: () => undefined });
+  expect(fake.calls.filter((call) => call.method === "send")).toHaveLength(1);
+  const answer = recordOwnerAnswer(dir, "777", "owner-1", 1_800_000_000_100);
+  expect(answer?.first).toBe(true);
+  expect(answeredLine(answer?.decision as NonNullable<typeof answer>["decision"])).toStartWith("OWNER_DECISION_ANSWERED ap-925-1 d1 blocking discord:555/777: ");
+  const closed = await closeOwnerDecision(ctx, "d1", { text: "Going with option 1", choice: 1 });
+  expect(closed).toMatchObject({ decision: { state: "closed" }, resolved: "owner-decision-answered:d1" });
+  expect(closed.archivePending).toBeUndefined();
+  expect(fake.calls.some((call) => call.method === "setThread" || call.method === "startThread")).toBe(false);
+  expect(String(fake.calls.filter((call) => call.method === "send").at(-1)?.args[1])).not.toContain("스레드를 닫습니다");
+  // Once closed, the lane thread is a lane thread again: later owner messages there answer nothing.
+  expect(recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200)).toBeUndefined();
+});
+
+test("a second question in the same lane thread takes the next answer, and a lane thread outside decisionsChannel still gets its own thread", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-1", text: serializeDecisionText(choices) });
+  recordOwnerAnswer(dir, "777", "owner-1", 1_800_000_000_100);
+  await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
+  const second = recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200);
+  expect(second).toMatchObject({ first: true, decision: { id: "d2", state: "answered" } });
+  const other = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-3", text: serializeDecisionText(choices) });
+  expect(other?.decision).toMatchObject({ channel: "555", thread: "thread" });
+  expect(other?.decision.inLaneThread).toBeUndefined();
+  expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
 });

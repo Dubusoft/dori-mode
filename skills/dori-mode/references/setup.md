@@ -74,7 +74,7 @@ The config is written atomically (mode 600). `references/scripts.md` explains ev
 | `discord`, `stateDir`, `leadCwd`, `defaultModel`, `discordChannels` | [required] |
 | `worktreeRoot`, `agentCommand`, `leadModel`, `leadThinking`, `leadArgs`, `alertsChannel`, `decisionsChannel`, `githubIssueAuthors`, `ownerLanguage`, `displayTimeZone`, `laneRules`, `laneSandbox`, `guardMachines`, `runners`, `placement`, `buttonHooks`, `hooks`, `ciMergeBase`, `ignorePanes` | [optional] |
 
-`decisionsChannel` holds the owner decision threads: `dori setup --set decisionsChannel=<channel id>`, or `--unset decisionsChannel`. Use a new, empty channel. Unset, each decision goes to the channel that asked for it.
+`decisionsChannel` holds the owner decision (`[결정]`) and input request (`[요청]`) threads (the owner's #inbox; it is wired by id, so renaming the channel needs no change): `dori setup --set decisionsChannel=<channel id>`, or `--unset decisionsChannel`. Use a new, empty channel. Unset, each decision goes to the channel that asked for it.
 
 `runner-config.json` keys:
 
