@@ -83,6 +83,12 @@ export type OwnerDecision = DecisionChoices & {
   readonly choice?: number;
   readonly closeText?: string;
   readonly cancelled?: boolean;
+  /** The answer messages (`<channel>/<message>`) the close covers with a handled --reply receipt, set when it closes. */
+  readonly coveredAnswers?: readonly string[];
+  /** The close's `--tasks` (the task count each covered message is recorded with). */
+  readonly closeTasks?: number;
+  /** The covered answers whose handled receipt is recorded; a close of a closed decision records the rest. */
+  readonly handledAnswers?: readonly string[];
   readonly archivePending?: boolean;
   readonly stuckAt?: number;
   readonly goneAt?: number;
@@ -96,7 +102,8 @@ export type DecisionsFile = {
 };
 
 export class OwnerDecisionError extends Error {
-  constructor(readonly code: string, message: string) { super(message); }
+  /** Lines printed on stdout before the error (DECISION_STALE's UNREAD lines, a re-close's DECISION_HANDLED lines). */
+  constructor(readonly code: string, message: string, readonly lines: readonly string[] = []) { super(message); }
 }
 
 const EMPTY: DecisionsFile = { nextSeq: 1, decisions: [] };
@@ -154,12 +161,27 @@ export type DecisionConfig = Pick<DoriConfig, "stateDir" | "discordChannels" | "
   readonly discord?: { readonly ownerId?: string } | undefined;
 };
 
+/**
+ * What closing needs to settle the owner's answer messages: the lead's stale guard and read/handled receipts (ack.ts and
+ * inbox.ts, injected by the CLI). Without it a close touches no answer message.
+ */
+export type DecisionReceipts = {
+  /** Owner events in `channel` the lead has not seen, as `UNREAD ...` lines; the printed ones are recorded as seen. */
+  readonly unseen: (channel: string) => { readonly count: number; readonly lines: readonly string[] };
+  readonly acked: (channel: string, message: string) => boolean;
+  /** `dori ack` on one message (hourglass off, eyes on, read receipt). */
+  readonly ack: (channel: string, message: string) => Promise<void>;
+  /** `dori handled <channel> <message> --reply --tasks <tasks>`. */
+  readonly handled: (channel: string, message: string, tasks: number) => Promise<void>;
+};
+
 export type DecisionContext = {
   readonly config: DecisionConfig;
   readonly transport: DecisionTransport;
   readonly now: () => number;
   /** The home directory scrubbed out of posted text. */
   readonly home: string;
+  readonly receipts?: DecisionReceipts;
 };
 
 /** The Toodo task number in an autopilot lane key `ap-<task>-<attempt>`. */
@@ -247,6 +269,10 @@ export type CloseOptions = {
   /** `<channel>/<message>` of an answer the owner gave outside the decision thread. */
   readonly from?: string;
   readonly cancel?: boolean;
+  /** The tasks each covered answer message holds; the close covers one of them (the rest go to `dori handled --lane`). */
+  readonly tasks?: number;
+  /** Close even when the lead has not seen every owner message in the decision's thread and answer channels. */
+  readonly force?: boolean;
 };
 
 export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string): string => {
@@ -437,22 +463,116 @@ export type CloseResult = {
   /** The OWNER_DECISION_ANSWERED event resolved by this close. */
   readonly resolved?: string;
   readonly linkNote?: string;
+  /** What the close did with the owner's answer messages (set when the context carries receipts). */
+  readonly answers?: AnswerOutcome;
+};
+
+export type AnswerRef = { readonly channel: string; readonly message: string };
+
+export type AnswerOutcome = {
+  /** The task count each covered message was recorded with (coverage 1/tasks). */
+  readonly tasks: number;
+  readonly acked: readonly AnswerRef[];
+  readonly ackFailed: readonly (AnswerRef & { readonly error: string })[];
+  readonly handled: readonly AnswerRef[];
+  readonly handledFailed: readonly (AnswerRef & { readonly error: string })[];
+  /** Answer messages acked but not covered (a decision in a lane's own thread covers only its first answer). */
+  readonly left: readonly AnswerRef[];
+};
+
+const refKey = (a: AnswerRef): string => `${a.channel}/${a.message}`;
+const refOf = (key: string): AnswerRef => {
+  const [channel = "", message = ""] = key.split("/");
+  return { channel, message };
 };
 
 /**
- * Closes a decision: posts the `[System]` confirmation into its thread (stable nonce `decision-close:<id>`, so two closes
- * post it once), archives the thread and reads it back (archiveThread), records it closed, appends the outcome to the origin link
- * line, and resolves its OWNER_DECISION_ANSWERED obligation. Throws OwnerDecisionError DECISION_UNKNOWN,
- * DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, or DECISION_NOT_CLOSED (the confirmation could not be posted; nothing changed).
+ * The answer messages a close covers, and the ones it only acks: every recorded answer plus `--from`; in a lane's own
+ * thread (where every owner message counts as an answer while the decision is open) only the first answer and `--from`.
+ */
+const answerTargets = (d: OwnerDecision, from: string | undefined): { readonly covered: string[]; readonly left: string[] } => {
+  const recorded = (d.answers ?? []).map(refKey);
+  const fromKey = from && /^\d+\/\d+$/.test(from) ? [from] : [];
+  const covered = [...new Set([...(d.inLaneThread ? recorded.slice(0, 1) : recorded), ...fromKey])];
+  return { covered, left: [...new Set(recorded)].filter((key) => !covered.includes(key)) };
+};
+
+/** The close's lines about the answer messages, in the order they happened. */
+export const answerOutcomeLines = (o: AnswerOutcome): string[] => {
+  const tasks = o.tasks > 1 ? ` --tasks ${o.tasks}` : "";
+  return [
+    ...o.acked.map((a) => `DECISION_ACKED ${a.channel} ${a.message}`),
+    ...o.ackFailed.map((a) => `DECISION_ACK_FAILED ${a.channel} ${a.message}: ${a.error}; the close went on`),
+    ...o.handled.map((a) => `DECISION_HANDLED ${a.channel} ${a.message} coverage=1/${o.tasks}`),
+    ...o.handledFailed.map((a) => `DECISION_HANDLED_FAILED ${a.channel} ${a.message}: ${a.error}; run the close again, or dori handled ${a.channel} ${a.message} --reply${tasks}`),
+    ...o.left.map((a) => `DECISION_ANSWER_LEFT ${a.channel} ${a.message}: acked, not covered by the close; cover it with dori handled ${a.channel} ${a.message} --reply|--lane KEY`),
+  ];
+};
+
+/** Records handled --reply for each covered answer not recorded yet, each success noted on the decision at once. */
+const recordAnswersHandled = async (
+  stateDir: string, receipts: DecisionReceipts, d: OwnerDecision,
+): Promise<{ readonly handled: AnswerRef[]; readonly handledFailed: (AnswerRef & { readonly error: string })[] }> => {
+  const handled: AnswerRef[] = [];
+  const handledFailed: (AnswerRef & { readonly error: string })[] = [];
+  const done = new Set(d.handledAnswers ?? []);
+  for (const key of d.coveredAnswers ?? []) {
+    if (done.has(key)) continue;
+    const ref = refOf(key);
+    try {
+      await receipts.handled(ref.channel, ref.message, d.closeTasks ?? 1);
+      patchOne(stateDir, d.id, (x) => ({ ...x, handledAnswers: [...new Set([...(x.handledAnswers ?? []), key])] }));
+      handled.push(ref);
+    } catch (e) {
+      handledFailed.push({ ...ref, error: errorText(e) });
+    }
+  }
+  return { handled, handledFailed };
+};
+
+/**
+ * Closes a decision, the lead's one call on the owner's answer. In order: validates; with receipts, refuses
+ * (DECISION_STALE, unless `force`) when the lead has not seen every owner message in the decision's thread and answer
+ * channels, then acks the answer messages before the thread is archived (a failed ack only warns); posts the `[System]`
+ * confirmation into its thread (stable nonce `decision-close:<id>`, so two closes post it once), archives the thread and
+ * reads it back (archiveThread), records it closed, appends the outcome to the origin link line, and resolves its
+ * OWNER_DECISION_ANSWERED obligation; last, records handled --reply (coverage 1/`tasks`) for each covered answer. A
+ * close of a closed decision records the handled receipts still missing, then throws DECISION_ALREADY_CLOSED with their
+ * lines. Throws OwnerDecisionError DECISION_UNKNOWN, DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, DECISION_STALE, or
+ * DECISION_NOT_CLOSED (the confirmation could not be posted; nothing closed).
  */
 export const closeOwnerDecision = async (ctx: DecisionContext, id: string, options: CloseOptions): Promise<CloseResult> => {
   const { stateDir } = ctx.config;
+  const { receipts } = ctx;
   const d = readDecisions(stateDir).decisions.find((x) => x.id === id);
   if (!d) throw new OwnerDecisionError("DECISION_UNKNOWN", `DECISION_UNKNOWN ${id}`);
-  if (d.state === "closed") throw new OwnerDecisionError("DECISION_ALREADY_CLOSED", `DECISION_ALREADY_CLOSED ${id}`);
+  if (d.state === "closed") {
+    const again = receipts ? await recordAnswersHandled(stateDir, receipts, d) : { handled: [], handledFailed: [] };
+    const lines = answerOutcomeLines({ tasks: d.closeTasks ?? 1, acked: [], ackFailed: [], left: [], ...again });
+    throw new OwnerDecisionError("DECISION_ALREADY_CLOSED", `DECISION_ALREADY_CLOSED ${id}`, lines);
+  }
   if (options.choice !== undefined && d.kind === "request") throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: a request takes no --choice`);
   if (options.choice !== undefined && (!Number.isInteger(options.choice) || options.choice < 1 || options.choice > d.options.length)) {
     throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: --choice must be 1-${d.options.length}`);
+  }
+  const tasks = options.tasks ?? 1;
+  const targets = answerTargets(d, options.from);
+  const acked: AnswerRef[] = [];
+  const ackFailed: (AnswerRef & { readonly error: string })[] = [];
+  if (receipts) {
+    if (!options.force) {
+      const channels = [...new Set([d.thread, ...[...targets.covered, ...targets.left].map((key) => refOf(key).channel)].filter((c): c is string => !!c))];
+      const stale = channels.map((channel) => receipts.unseen(channel));
+      const count = stale.reduce((sum, s) => sum + s.count, 0);
+      if (count) throw new OwnerDecisionError("DECISION_STALE", `DECISION_STALE ${count}`, stale.flatMap((s) => s.lines));
+    }
+    // Before the archive: a reaction on a message in an archived thread may be refused.
+    for (const key of [...targets.covered, ...targets.left]) {
+      const ref = refOf(key);
+      if (receipts.acked(ref.channel, ref.message)) continue;
+      try { await receipts.ack(ref.channel, ref.message); acked.push(ref); }
+      catch (e) { ackFailed.push({ ...ref, error: errorText(e) }); }
+    }
   }
   let archivePending: string | undefined;
   if (d.thread) {
@@ -469,6 +589,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     ...x, state: "closed", closedAt: at, closeText: options.text,
     ...(options.choice !== undefined ? { choice: options.choice } : {}), ...(options.cancel ? { cancelled: true } : {}),
     ...(archivePending ? { archivePending: true } : {}),
+    ...(receipts && targets.covered.length ? { coveredAnswers: targets.covered, closeTasks: tasks } : {}),
   })) ?? d;
   let resolved: string | undefined;
   if (closed.answerEvent) {
@@ -483,7 +604,13 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
       else if (!await appendToMessage(ctx.transport, origin, closed.linkMessage, decisionLinkClosedText(closed), await ctx.transport.threadArchived(origin))) linkNote = "link line too long to append";
     } catch (e) { linkNote = `link line not updated: ${errorText(e)}`; }
   }
-  return { decision: closed, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}) };
+  let answers: AnswerOutcome | undefined;
+  if (receipts) {
+    const recorded = await recordAnswersHandled(stateDir, receipts, closed);
+    answers = { tasks: closed.closeTasks ?? tasks, acked, ackFailed, left: targets.left.map(refOf), ...recorded };
+  }
+  const decision = readDecisions(stateDir).decisions.find((x) => x.id === id) ?? closed;
+  return { decision, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}) };
 };
 
 /**
@@ -550,8 +677,12 @@ export const answeredLine = (d: OwnerDecision): string => {
   const from = answer && answer.channel !== d.thread ? ` --from ${answer.channel}/${answer.message}` : "";
   const act = d.kind === "request"
     ? `${d.file ? `the owner says the value is in ${d.file}` : `the owner's reply is message ${answer?.channel ?? "?"}/${answer?.message ?? "?"}`}: hand it to ${d.lane ? `lane ${d.lane}` : "the work that waits"} (never into a report, the repo or another thread)`
-    : "act on the owner's answer";
-  return `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}; ${act}, then run dori decision close ${d.id}${from} --text "..."`;
+    : undefined;
+  const close = `dori decision close ${d.id}${from} --text "..."`;
+  const head = `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}`;
+  // A request closes once the value is handed over; a decision closes first (it acks, answers and covers the answer).
+  if (act) return `${head}; ${act}, then run ${close} right away`;
+  return `${head}; run ${close} first (it acks the answer, posts the reply and records it handled; --tasks N when the answer asks for more work), then act on it${d.lane ? ` and relay it to lane ${d.lane}` : ""}`;
 };
 
 /** The digest event of a decision the supervisor opened from a lane question. */

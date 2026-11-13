@@ -25,4 +25,4 @@ The owner's answer is not forwarded to the lane. The lead relays it.
 | What you close | How |
 |---|---|
 | decision obligation (an event that needs your call) | `dori resolved <eventId>` |
-| owner decision (a thread waiting on the owner) | `dori decision close <id> --text "..." [--choice N]` |
+| owner decision (a thread waiting on the owner) | `dori decision close <id> --text "..." [--choice N] [--tasks N]`, the first call on the answer: it also acks the answer messages, posts the reply and records them handled |
