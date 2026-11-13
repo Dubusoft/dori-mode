@@ -144,11 +144,11 @@ export class Supervisor {
   }
 
   /**
-   * Posts the owner's close-thread button (through `post`) into threads whose work is finished and reported, once per
-   * report; see OutcomeTracking.closeButtonTick.
+   * Closes (through `archive`) threads whose work is finished and reported, once per report; see
+   * OutcomeTracking.autoCloseTick.
    */
-  closeButtonTick(post: (thread: string, id: string) => Promise<void>): Promise<void> {
-    return this.outcomes.closeButtonTick(this.core.deps.registry, post);
+  autoCloseTick(archive: (thread: string) => Promise<void>): Promise<void> {
+    return this.outcomes.autoCloseTick(this.core.deps.registry, archive);
   }
 
   /** Consumes `dori resolved` receipts and enqueues UNRESOLVED for decision events the lead left open past resolveTimeoutMin. */
