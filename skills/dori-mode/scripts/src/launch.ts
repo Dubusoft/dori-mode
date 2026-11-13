@@ -104,15 +104,15 @@ const within = (dir: string, parent: string): boolean => { const r = relative(pa
 
 /**
  * The dori home (~/.dori) when a local launch's --cwd is inside it (every new local lane, --pane ones too, is sandboxed):
- * lane-sandbox mounts a read-only tmpfs there and binds only <home>/.dori/state read-write, so any other directory under
- * it cannot be bound as the lane's cwd. A remote lane's directory is on its own machine.
+ * lane-sandbox mounts a read-only tmpfs there and hides the state dir, so no directory under it can be bound as the
+ * lane's cwd. A remote lane's directory is on its own machine.
  */
 const sandboxedCwdInDoriHome = (deps: FlowDeps, input: LaunchInput): string | undefined => {
   if (!input.cwd || input.machine) return undefined;
   const state = resolve(deps.config.stateDir);
   const home = basename(state) === "state" && basename(dirname(state)) === ".dori" ? dirname(state) : join(homedir(), ".dori"); // the sandbox always uses $HOME/.dori
   const cwd = resolve(input.cwd);
-  return within(cwd, home) && !within(cwd, state) ? home : undefined;
+  return within(cwd, home) ? home : undefined;
 };
 
 /** Open lanes on the input's thread, by thread id: `discord:<thread>` and `discord:<channel>/<thread>` are the same thread. */

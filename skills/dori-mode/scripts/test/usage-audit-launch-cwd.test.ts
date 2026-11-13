@@ -38,10 +38,10 @@ test("a sandboxed local launch with --cwd inside ~/.dori is refused with a workt
   await expect(attempt).rejects.toThrow(`is inside ${join(home, ".dori")}, which the lane sandbox cannot bind; put the worktree outside it (e.g. under ${join(home, "work")})`);
 });
 
-test("--cwd outside ~/.dori, inside the bound state dir, and --machine pass; a --pane lane (sandboxed now) and a missing sandbox command are refused there", async () => {
+test("--cwd outside ~/.dori and --machine pass; the hidden state dir, a --pane lane (sandboxed now) and a missing sandbox command are refused there", async () => {
   const inDori = join(home, ".dori", "worktrees", "x");
   await validateLaunch(deps(), input({ cwd: join(home, "work", "wt") }));
-  await validateLaunch(deps(), input({ cwd: join(home, ".dori", "state", "wt") }));
+  await expect(validateLaunch(deps(), input({ cwd: join(home, ".dori", "state", "wt") }))).rejects.toThrow(/lane sandbox cannot bind/);
   await validateLaunch(deps(), input({ cwd: inDori, machine: "box" }));
   await expect(validateLaunch(deps(), input({ cwd: inDori, pane: "w:p3" }))).rejects.toThrow(/lane sandbox cannot bind/);
   // A missing wrapper no longer lets the lane run unsandboxed: the cwd is still refused, and launch refuses SANDBOX_MISSING.
