@@ -3,9 +3,8 @@
 # Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check
 # Same inputs as the Linux (bubblewrap) lane-sandbox. Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset:
 # the lead runs outside the sandbox. Host paths come from the environment, colon-separated:
-#   LANE_SANDBOX_RW      extra writable directories (e.g. your worktree root, a verify/scratch dir)
+#   LANE_SANDBOX_RW      extra writable directories (e.g. your worktree root, a scratch dir)
 #   LANE_SANDBOX_NO_CWD  directories too broad to make writable as the cwd (e.g. the parents of the worktree root)
-#   LANE_SANDBOX_VERIFY  the lead workspace's verify directory, made writable
 #   DORI_LANE_TOKEN_FILE the lane's own token file, readable
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, made writable (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is made writable
@@ -96,8 +95,6 @@ build_profile() {
   for p in ${SPLIT[@]+"${SPLIT[@]}"}; do
     if [ -n "$p" ]; then w "$p"; fi
   done
-  # Only the verify directory itself: the rest of its parent stays read-only.
-  if [ -n "${LANE_SANDBOX_VERIFY:-}" ]; then w "$LANE_SANDBOX_VERIFY"; fi
   # A lane started without --cwd makes its worktree from a repo under reposRoot into the worktree root: the new
   # worktree, and the repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>), but not the repo's working tree.
   if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then w "$LANE_SANDBOX_WORKTREES"; fi
