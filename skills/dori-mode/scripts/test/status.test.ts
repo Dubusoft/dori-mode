@@ -109,7 +109,7 @@ test("status shows open owner decisions and answered decisions awaiting close", 
 
 test("lead state: missing pane, and a pane with no agent is cold; cap and ttl come from config", async () => {
   const missing = await fixture([]);
-  expect((await collectStatus(missing.deps)).lead).toMatchObject({ pane: "lead:p1", state: "missing", cacheTtlMin: 5, capTokens: 150_000 });
+  expect((await collectStatus(missing.deps)).lead).toMatchObject({ pane: "lead:p1", state: "missing", cacheTtlMin: 5, capTokens: 250_000 });
   const bare = await fixture();
   const s = await collectStatus(bare.deps);
   expect(s.lead.state).toBe("cold");

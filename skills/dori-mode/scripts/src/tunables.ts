@@ -16,7 +16,6 @@ export type Tunables = {
   readonly leadDiet: boolean;
   readonly cacheTtlMin: number;
   readonly leadContextCapTokens: number;
-  readonly leadContextHardCapTokens: number;
   readonly discordSafetyPollSeconds: number;
   /** Messages fetched (one REST page, 1-100) the first time a Discord channel is caught up with no saved cursor. */
   readonly discordFirstSeenLimit: number;
@@ -81,8 +80,7 @@ export type Tunables = {
 export const builtInTunables = (home = homedir()): Tunables => ({
   leadDiet: true,
   cacheTtlMin: 5,
-  leadContextCapTokens: 150_000,
-  leadContextHardCapTokens: 300_000,
+  leadContextCapTokens: 250_000,
   discordSafetyPollSeconds: 300,
   discordFirstSeenLimit: 100,
   githubPollSeconds: 90,

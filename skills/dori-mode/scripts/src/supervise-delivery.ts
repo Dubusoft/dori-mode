@@ -122,7 +122,6 @@ export class Delivery {
         woke = true;
         continue;
       }
-      if (cold.kind === "hard-cap") console.log(`LEAD_HARD_CAP ${cold.tokens}`);
       await this.lead.noteRestart(cold.kind, cold.detail);
       this.lead.setRestart({ session: randomUUID(), events: pending.map(({ id, line }) => ({ id, line })), offset: statSync(this.core.eventLog).size, phase: "stopping" });
     }

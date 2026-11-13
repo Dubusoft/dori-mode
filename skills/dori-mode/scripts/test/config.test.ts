@@ -146,7 +146,7 @@ test("a lead context cap in the file is ignored: the built-in default holds", as
     const path = join(local.dir, "cap.json");
     await Bun.write(path, JSON.stringify({ leadContextCapTokens: 42_000 }));
     expect("leadContextCapTokens" in await loadConfig(path, "/home/ana")).toBe(false);
-    expect(BUILT_IN.leadContextCapTokens).toBe(150_000);
+    expect(BUILT_IN.leadContextCapTokens).toBe(250_000);
   } finally { local.done(); }
 });
 
