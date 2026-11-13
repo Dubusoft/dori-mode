@@ -16,6 +16,7 @@ import { completeLeadRestart } from "./lead-restart.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { redactSecrets } from "./redact.ts";
+import { LANE_PERMISSION_FLAGS } from "./runner/lanes.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import type { Durability } from "./store.ts";
@@ -783,7 +784,8 @@ export class LeadLifecycle {
       const executable = agent[0];
       if (!executable) throw new SuperviseError("agentCommand must name an executable");
       const argv = [
-        "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable, "--session-id", restart.session,
+        "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable,
+        ...leadPermissionArgs([...deps.config.leadArgs, ...agent.slice(1)]), "--session-id", restart.session,
         "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd),
         ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
       ];
@@ -1034,6 +1036,14 @@ const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> => 
 const LEAD_STAYS = /old lead has not exited|cannot stop owned lead process/;
 
 /** A lead process the supervisor launched: its lead command always carries `--session-id`. Entries without argv never match. */
+/**
+ * The lead's omo permission flags: like every lane, the lead has nobody to answer an omo permission prompt, so on Linux
+ * and macOS it runs under `--permission-preset full-access` unless its own argv (`leadArgs`, `agentCommand`) names a
+ * preset. Windows keeps its launch unchanged.
+ */
+export const leadPermissionArgs = (argv: readonly string[], platform: NodeJS.Platform = process.platform): readonly string[] =>
+  platform === "win32" || argv.some((part) => /^--permission-preset(?:=|$)/.test(part)) ? [] : LANE_PERMISSION_FLAGS;
+
 const supervisorLaunch = (p: ForegroundProcess): boolean => Array.isArray(p.argv) && p.argv.includes("--session-id");
 
 /**
