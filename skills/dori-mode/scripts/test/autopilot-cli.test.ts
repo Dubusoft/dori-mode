@@ -3,14 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type QuotaSummary, type ToodoTask } from "../src/autopilot.ts";
-import { type AutopilotDeps, autopilotMain, judgeCandidates, liveJudgeDeps, quotaSummary, type TaskHosts } from "../src/autopilot-cli.ts";
+import { type AutopilotConfig, DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type QuotaSummary, type ToodoTask } from "../src/autopilot.ts";
+import { type AutopilotDeps, autopilotMain, EXECUTE_ACTION, judgeCandidates, liveJudgeDeps, quotaSummary, type TaskHosts } from "../src/autopilot-cli.ts";
 import { defaultConfig } from "../src/config.ts";
 import type { HostSample } from "../src/host-guard.ts";
 import type { LaneOps } from "../src/lane-ops.ts";
 import type { MachineObservation } from "../src/runner/protocol.ts";
 import { quotaProvidersFor, type QuotaResult, readUsage } from "../src/claude-quota.ts";
-import { JsonOperations } from "../src/operations.ts";
+import { JsonOperations, plan } from "../src/operations.ts";
 import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
 
@@ -98,13 +98,13 @@ type Run = { code: number; out: string[]; err: string[] };
 const harness = (
   tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set(),
   quota: QuotaSummary = { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
-  machines?: (ids: readonly number[]) => TaskHosts,
+  machines?: (ids: readonly number[]) => TaskHosts, config: AutopilotConfig = DEFAULT_AUTOPILOT,
 ) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
   const unreadable = () => { throw new ToodoUnreadable("toodo-server list_tasks answered HTTP 401"); };
   const deps = (out: string[], err: string[]): AutopilotDeps => ({
-    config: DEFAULT_AUTOPILOT, store, pauseFile: join(dir, "autopilot-pause.json"),
+    config, store, pauseFile: join(dir, "autopilot-pause.json"),
     toodo: () => ({
       flaggedTasks: async () => {
         reads.push("flagged");
@@ -319,6 +319,30 @@ test("launch usage errors exit 2 and write nothing", async () => {
     expect(r.err.join("\n")).toContain("dori autopilot launch <taskId>");
   }
   expect([h.reads, rows()]).toEqual([[], []]);
+});
+
+test("with autopilot.executor on, launch refuses to reserve before reading anything and writes no row", async () => {
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, undefined, { ...DEFAULT_AUTOPILOT, executor: true });
+  expect(await h.run("launch", "12")).toEqual({ code: 1, out: [], err: [
+    "AUTOPILOT_LAUNCH_REFUSED #12 executor-on: the supervisor's executor reserves and launches marked tasks (autopilot.executor)",
+  ] });
+  expect([h.reads, h.probes, rows()]).toEqual([[], { quota: 0, host: 0 }, []]);
+});
+
+test("with autopilot.executor on, an executor-owned reservation refuses a settle; the lead's own earlier reservation still settles", async () => {
+  const on = { ...DEFAULT_AUTOPILOT, executor: true };
+  const tasks = [task(12), task(13)];
+  // 12: the lead reserved it before the switch. 13: the executor opened its sequence, then reserved under the same lock.
+  await harness(tasks).run("launch", "12");
+  plan(store, T0, { lane: "toodo:13", action: EXECUTE_ACTION, target: "1", data: "{}" });
+  await harness(tasks).run("launch", "13");
+  const owned = await harness(tasks, { ok: true }, T0 + 60_000, new Set(), undefined, undefined, on).run("launch", "13", "--failed");
+  expect(owned).toEqual({ code: 1, out: [], err: ["AUTOPILOT_LAUNCH_REFUSED #13 executor-owned: the supervisor's executor settles this reservation"] });
+  expect((await harness(tasks, { ok: true }, T0 + 60_000, new Set(), undefined, undefined, on).run("launch", "12", "--launched", "ap-12-1")).out)
+    .toEqual(["AUTOPILOT_SETTLED #12 attempt=1 verified lane=ap-12-1"]);
+  expect(rows().map((r) => [r[0], r[1]])).toEqual([["toodo:12/autopilot-launch/1", "verified"], ["toodo:13/autopilot-launch/1", "planned"]]);
+  // Switched off again, the stopped executor resumes nothing, so the lead settles what it left open.
+  expect((await harness(tasks).run("launch", "13", "--failed")).out).toEqual(["AUTOPILOT_SETTLED #13 attempt=1 failed lane=ap-13-1"]);
 });
 
 // pause

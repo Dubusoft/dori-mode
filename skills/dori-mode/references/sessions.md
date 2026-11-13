@@ -101,3 +101,5 @@ Before you type into a pane, run the pre-send check in [messaging.md](messaging.
 ## Under supervision
 
 With `dori supervise` running, the sweeps above run inside the supervisor and reach you as lines in `<stateDir>/lead-events.log`, read through the single monitor your startup prompt names (`tail -c +N -F <path>`, used exactly as given). The lane protocol doesn't change: launch, claim, object, close and pause work the same way. What changes is your own memory. The supervisor can restart you on a new session, so before any turn ends, put open questions, promises to the owner and lane notes into memory or the lane's registry record. Treat your context as gone after every turn.
+
+With `autopilot.executor` on, the supervisor also launches marked autopilot tasks itself, so `ap-<id>-<n>` lanes appear in the registry with threads you did not open. Follow them like any lane (claims, questions, blockers, close), but never launch, hold-drop or settle them yourself: `references/autopilot.md` Switch-over lists what stays yours.

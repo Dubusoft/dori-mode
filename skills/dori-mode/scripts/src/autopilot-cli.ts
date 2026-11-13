@@ -20,6 +20,8 @@ import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
  * launches a lane, writes to toodo or merges: candidates only reads, launch writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
  * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every `autopilot.tickSec`.
  * Autopilot is always on: a reservation needs only no pause; `pause` / `resume` set and clear the pause file.
+ * With `autopilot.executor` on, the supervisor's executor (autopilot-executor.ts) owns reserve, launch and settle: `launch`
+ * refuses to reserve, and refuses to settle a reservation an executor sequence owns, so one task never has two launchers.
  */
 
 export const AUTOPILOT_USAGE = [
@@ -58,6 +60,9 @@ const writePause = (path: string, pause: Pause): void => {
   writeFileSync(tmp, `${JSON.stringify(pause)}\n`);
   renameSync(tmp, path);
 };
+
+/** The operation action of an executor sequence row (`toodo:<taskId>/autopilot-execute/<attempt>`). */
+export const EXECUTE_ACTION = "autopilot-execute";
 
 /** The hourly schedule job the supervisor's autopilot tick replaced; the supervisor removes it at startup. */
 export const RECONCILE_JOB = "autopilot-reconcile";
@@ -318,8 +323,18 @@ const launch = async (deps: AutopilotDeps, positionals: readonly string[], v: Re
   if (settles.length > 1) throw new UsageError("--launched, --failed and --ambiguous exclude each other");
   const note = v.note as string | undefined;
   if (note !== undefined && !settles.length) throw new UsageError("--note goes with --launched, --failed or --ambiguous");
+  const taskId = Number(id);
+  if (deps.config.executor && !settles.length) {
+    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} executor-on: the supervisor's executor reserves and launches marked tasks (autopilot.executor)`);
+    return 1;
+  }
   const release = await deps.lock();
   try {
+    // Checked under the lock: the executor opens its sequence row under the same lock before it reserves.
+    if (deps.config.executor && deps.store.list({ lane: `toodo:${taskId}` }).some((op) => op.action === EXECUTE_ACTION)) {
+      deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} executor-owned: the supervisor's executor settles this reservation`);
+      return 1;
+    }
     return settles[0] ? settle(deps, Number(id), settles[0], note) : await reserveAutopilot(deps, Number(id));
   } finally {
     release();
