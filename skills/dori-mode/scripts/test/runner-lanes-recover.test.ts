@@ -755,3 +755,22 @@ test("a lane still in its startup window records no stopped turn", async () => {
   t.world.screen = ABORTED;
   expect((await t.lanes.observe("lane-a")).result).toMatchObject({ turn: { stop: 1, cause: "aborted" } });
 });
+
+test("lane.start hands a lane's grants to the sandbox as LANE_SANDBOX_RW/RO and keeps the names for a relaunch; a name the table lacks opens no tab", async () => {
+  const policy = {
+    agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"],
+    grants: { "blog-topic": { write: ["/srv/blog-writer/runs"], read: ["/srv/notes", "/srv/more"] } },
+  } as const;
+  const granted = setup({ policy });
+  await granted.lanes.start({ ...START, grants: ["blog-topic"] });
+  expect(granted.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_RW=/srv/blog-writer/runs LANE_SANDBOX_RO=/srv/notes:/srv/more omo --model m1 ");
+  expect(granted.lanes.records()["lane-a"]?.grants).toEqual(["blog-topic"]);
+
+  const plain = setup({ policy });
+  await plain.lanes.start(START);
+  expect(plain.calls.find((a) => a[2] === "run")?.[4]).not.toContain("LANE_SANDBOX_R");
+
+  const gone = setup({ policy: { ...policy, grants: {} } });
+  await expect(gone.lanes.start({ ...START, grants: ["blog-topic"] })).rejects.toThrow("RUNNER_CMD_REJECTED grant-unknown blog-topic");
+  expect(gone.calls.some((a) => a[1] === "tab" && a[2] === "create")).toBe(false);
+});

@@ -9,7 +9,7 @@ import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane 
 import type { Clock, Runner } from "../run.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
-import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, runnerPaths, type RunnerPolicy } from "./policy.ts";
+import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, resolveGrants, runnerPaths, runtimeDirOption, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
 import { addInput, captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { laneProcessAlive, turnStop } from "./observe.ts";
@@ -85,6 +85,8 @@ export type LaneRecord = {
   readonly tabWorkspace?: string;
   readonly heavySlots?: number;
   readonly heavyMaxLoad?: number;
+  /** The runner-config `grants` names of the start, resolved again against the current policy by a relaunch. */
+  readonly grants?: readonly string[];
   /** The status the supervisor last pushed with `lane.notify`. */
   readonly notice?: LaneNotice;
   /** A pane the runner took over with `lane.adopt` rather than started; it has no brief or profile to relaunch from. */
@@ -220,6 +222,7 @@ type LaunchInput = {
   readonly key: string; readonly cwd: string; readonly profile: string; readonly mode: string; readonly model: string;
   readonly keywords?: string; readonly session?: string; readonly target?: { readonly pane?: string; readonly workspace?: string };
   readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
+  readonly grants?: readonly string[];
   readonly restored?: boolean;
 };
 type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string };
@@ -403,6 +406,7 @@ export class RunnerLanes {
         ...(body.target ? { target: body.target } : {}),
         ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
         ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
+        ...(body.grants?.length ? { grants: body.grants } : {}),
       });
       return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd } };
     } catch (error) {
@@ -426,6 +430,12 @@ export class RunnerLanes {
     const keywords = input.keywords ?? (input.mode === "mass-ulw" ? "mass-ulw" : "ulw");
     const prompt = `${keywords}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
     const agentValues = { prompt, model: input.model, brief };
+    // Grants resolve before a tab opens: a name the table no longer has, or a path it may not name, starts nothing.
+    const granted = input.grants?.length
+      ? resolveGrants(this.deps.policy, input.grants, {
+        home: homedir(), ...runtimeDirOption(), realpath: this.deps.realpath ?? realpathSync, isCheckout: (path) => existsSync(join(path, ".git")),
+      })
+      : undefined;
     // Checks the profile before a tab opens; an unsandboxed lane's rules wait for its final cwd (a target pane's own).
     let argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session);
     const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
@@ -504,6 +514,9 @@ export class RunnerLanes {
         // Where a lane started without --cwd makes its worktree; the macOS lane-sandbox makes them writable.
         ...(this.deps.policy.reposRoot !== undefined ? [`LANE_SANDBOX_REPOS=${quote(this.deps.policy.reposRoot)}`] : []),
         ...(worktreeRoot !== undefined ? [`LANE_SANDBOX_WORKTREES=${quote(worktreeRoot)}`] : []),
+        // The lane's runner-config grants: the wrapper binds these on top of its own, under its hide list.
+        ...(granted?.write.length ? [`LANE_SANDBOX_RW=${quote(granted.write.join(":"))}`] : []),
+        ...(granted?.read.length ? [`LANE_SANDBOX_RO=${quote(granted.read.join(":"))}`] : []),
       ];
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = [...env, ...argv.map(quote)].join(" ");
@@ -529,6 +542,7 @@ export class RunnerLanes {
         ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
         ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),
         ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
+        ...(input.grants?.length ? { grants: input.grants } : {}),
       },
     });
     // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
@@ -737,6 +751,7 @@ export class RunnerLanes {
       ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),
       ...((tabWorkspace ?? record.tabWorkspace) !== undefined ? { tabWorkspace: tabWorkspace ?? record.tabWorkspace } : {}),
       ...(record.heavySlots !== undefined ? { heavySlots: record.heavySlots } : {}), ...(record.heavyMaxLoad !== undefined ? { heavyMaxLoad: record.heavyMaxLoad } : {}),
+      ...(record.grants?.length ? { grants: record.grants } : {}),
     });
     // The relaunch replaced the record; a notice the supervisor pushed stays with the lane.
     if (record.notice) this.update(key, (r) => ({ ...r, notice: record.notice as LaneNotice }));

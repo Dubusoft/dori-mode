@@ -108,6 +108,8 @@ export type Lane = {
   readonly reportVia?: "cli";
   /** Launched behind `laneSandbox.command` (every local `dori launch` that the sandbox fits, or `--sandbox`); recovery relaunches it the same way. */
   readonly sandbox?: true;
+  /** The runner-config `grants` names the lane was launched with (`--grant`); recovery relaunches it with the same ones. */
+  readonly grants?: readonly string[];
   /** @deprecated No longer written; kept so old registries load. */
   readonly leadPaneSeen?: readonly { readonly hash: string; readonly at: string }[];
   /** @deprecated No longer written; kept so old registries load. */

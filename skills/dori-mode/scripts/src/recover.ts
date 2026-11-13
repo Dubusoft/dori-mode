@@ -202,6 +202,7 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
     ...(lane.mode ? { mode: lane.mode } : {}),
     ...(cwd ? { cwd } : {}), ...(lane.machine ? { machine: lane.machine } : {}),
     ...(lane.sandbox ? { sandbox: true as const } : {}),
+    ...(lane.grants?.length ? { grants: lane.grants } : {}),
     ...(session !== undefined ? { session } : {}),
   }, stored);
   return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined,

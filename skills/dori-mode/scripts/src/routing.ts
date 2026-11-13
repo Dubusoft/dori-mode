@@ -37,6 +37,8 @@ export type QueuedLaunch = {
   readonly machine?: string;
   readonly pane?: string;
   readonly workspace?: string;
+  /** The launch's `--grant` names. */
+  readonly grants?: readonly string[];
   readonly queuedAt: string;
   readonly reasons: readonly string[];
 };
@@ -90,6 +92,7 @@ const validLaunch = (value: unknown): value is QueuedLaunch =>
   (!("machine" in value) || typeof value.machine === "string") &&
   (!("pane" in value) || typeof value.pane === "string") &&
   (!("workspace" in value) || typeof value.workspace === "string") &&
+  (!("grants" in value) || (Array.isArray(value.grants) && value.grants.every((grant) => typeof grant === "string"))) &&
   "queuedAt" in value && typeof value.queuedAt === "string" &&
   "reasons" in value && Array.isArray(value.reasons) && value.reasons.every((reason) => typeof reason === "string");
 
@@ -202,6 +205,7 @@ export const launchQueueText = (queue: readonly QueuedLaunch[]): string =>
       ...(q.machine ? [`machine=${q.machine}`] : []),
       ...(q.mode ? [`mode=${q.mode}`] : []),
       ...(q.task !== undefined ? [`task=${q.task}`] : []),
+      ...(q.grants?.length ? [`grant=${q.grants.join(",")}`] : []),
       `done=${JSON.stringify(q.done)}`,
       `brief=${q.brief}`,
       `queued ${q.queuedAt}`,

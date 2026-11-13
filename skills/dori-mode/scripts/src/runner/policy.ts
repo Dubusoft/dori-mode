@@ -43,7 +43,19 @@ export type RunnerPolicy = {
   readonly reposRoot?: string;
   /** Where this host's lane worktrees live (absolute, `~` expanded); absent: `<reposRoot>/worktrees` (effectiveWorktreeRoot). Added to allowedRoots automatically. */
   readonly worktreeRoot?: string;
+  /**
+   * Named path grants a `lane.start` may ask for by name (`grants`): each one's `write` directories become writable for
+   * that lane (LANE_SANDBOX_RW) and its `read` directories readable (LANE_SANDBOX_RO). Absolute, `~` expanded, checked by
+   * grantPathRefusal; the wrapper's hide list still wins over every grant.
+   */
+  readonly grants?: Readonly<Record<string, PathGrant>>;
 };
+
+/** One named entry of runner-config `grants`. */
+export type PathGrant = { readonly write: readonly string[]; readonly read: readonly string[] };
+
+/** A grant name: what `dori launch --grant` and a `lane.start` `grants` entry spell. */
+export const GRANT_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 /**
  * The path rules of the runner host's platform: a runner-config.json is judged by them, not by the machine reading it
@@ -66,7 +78,7 @@ export const laneCwd = (runnerDir: string, key: string): string => join(lanesDir
 
 /** The top-level keys runner-config.json may hold; parsePolicy throws on any other (RETIRED_POLICY_KEYS aside). */
 export const RUNNER_POLICY_KEYS = [
-  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot",
+  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot", "grants",
 ] as const;
 
 /**
@@ -84,7 +96,8 @@ export const DEFAULT_POLICY: RunnerPolicy = { agents: {}, allowedRoots: [], sand
 
 /** Rules beyond the protocol schema rules (which pass through under their own names, e.g. `unknown-field`). */
 export type PolicyRule =
-  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "sandbox-unavailable" | "command-not-argv" | "jobs-denied";
+  | "not-a-command" | "agent-profile" | "cwd-outside-roots" | "cwd-missing" | "sandbox-required" | "sandbox-unavailable" | "command-not-argv" | "jobs-denied"
+  | "grant-unknown" | "grant-unsandboxed" | "grant-path";
 
 export type CheckResult = { readonly ok: true; readonly command: AnySupervisorCommand } | { readonly ok: false; readonly rule: string; readonly detail: string };
 
@@ -106,6 +119,28 @@ const expandHome = (path: string, home: string, p: typeof posix): string =>
 const derivedRoots = (o: { readonly tmp: string; readonly home: string; readonly hasRepoRoots: boolean }): string[] =>
   [...new Set([o.tmp, o.hasRepoRoots ? undefined : o.home].filter((r): r is string => r !== undefined && r !== ""))];
 
+/**
+ * Why `path` may not be in a grant, else undefined. Refused: a relative path or one holding `:` (the wrapper lists are
+ * colon-separated); `/`, the home directory or any directory above it; anything that holds or lies under ~/.dori (the
+ * runner directory, the state dir, secrets), ~/.config (credentials, herdr's control socket) or the user runtime
+ * directory (/run/user, XDG_RUNTIME_DIR: the D-Bus session bus and the systemd user manager). A host directory whose
+ * scripts the host runs (a checkout) is refused at lane start (resolveGrants), where the filesystem is read.
+ */
+export const grantPathRefusal = (
+  path: string, o: { readonly home: string; readonly runtimeDir?: string }, p: typeof posix = posix,
+): string | undefined => {
+  if (!p.isAbsolute(path)) return "is not absolute";
+  if (path.includes(":")) return "holds ':'";
+  const full = p.resolve(path);
+  if (underRoot(full, p.resolve(o.home), p)) return "covers the home directory";
+  const off = [p.join(o.home, ".dori"), p.join(o.home, ".config"), "/run/user", o.runtimeDir].filter((d): d is string => d !== undefined && d !== "");
+  for (const dir of off) {
+    const d = p.resolve(dir);
+    if (underRoot(d, full, p) || underRoot(full, d, p)) return `overlaps ${d}`;
+  }
+  return undefined;
+};
+
 export type ParsePolicyOptions = {
   /** The runner directory whose `lanes` directory joins allowedRoots; absent: `~/.dori/runner` under `home`. */
   readonly runnerDir?: string;
@@ -113,6 +148,8 @@ export type ParsePolicyOptions = {
   readonly warn?: (line: string) => void;
   /** The runner host's platform, whose path rules judge the file (runnerPaths); absent: this process's. */
   readonly platform?: NodeJS.Platform;
+  /** The runner's XDG_RUNTIME_DIR when set, refused in grants like /run/user (grantPathRefusal). */
+  readonly runtimeDir?: string;
 };
 
 /**
@@ -164,6 +201,31 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
   };
   const reposRoot = rootPath("reposRoot");
   const worktreeRoot = rootPath("worktreeRoot");
+  let grants: Record<string, PathGrant> | undefined;
+  if (value.grants !== undefined) {
+    if (!isRecord(value.grants)) throw new Error("runner-config: grants must be an object of name -> {write, read}");
+    grants = {};
+    for (const [name, entry] of Object.entries(value.grants)) {
+      if (!GRANT_NAME.test(name)) throw new Error(`runner-config: grants key ${name} must match ${GRANT_NAME.source}`);
+      if (!isRecord(entry)) throw new Error(`runner-config: grants.${name} must be an object with write and/or read`);
+      for (const key of Object.keys(entry)) if (key !== "write" && key !== "read") throw new Error(`runner-config: unknown key grants.${name}.${key}`);
+      const list = (kind: "write" | "read"): string[] => {
+        const raw = entry[kind];
+        if (raw === undefined) return [];
+        if (!strings(raw)) throw new Error(`runner-config: grants.${name}.${kind} must be a string array`);
+        return raw.map((path) => {
+          const full = expandHome(path, home, p);
+          const why = grantPathRefusal(full, { home, ...(options.runtimeDir ? { runtimeDir: options.runtimeDir } : {}) }, p);
+          if (why) throw new Error(`runner-config: grants.${name}.${kind} ${path} ${why}`);
+          return full;
+        });
+      };
+      const write = list("write");
+      const read = list("read");
+      if (!write.length && !read.length) throw new Error(`runner-config: grants.${name} names no path`);
+      grants[name] = { write, read };
+    }
+  }
   // Explicit roots stay as written (none listed: derivedRoots); the lanes directory is appended unless a root already
   // holds it, then reposRoot and the effective worktree root unless one already names the same directory.
   const explicit = (value.allowedRoots as string[] | undefined) ?? [];
@@ -192,6 +254,7 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
     ...(value.detectWorkspaces !== undefined ? { detectWorkspaces: value.detectWorkspaces as boolean } : {}),
     ...(reposRoot !== undefined ? { reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
+    ...(grants ? { grants } : {}),
     agents,
     allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,
@@ -208,8 +271,40 @@ export function loadPolicy(runnerDir: string, warn?: (line: string) => void): Ru
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return DEFAULT_POLICY;
     throw error;
   }
-  return parsePolicy(JSON.parse(text), homedir(), tmpdir(), { runnerDir, ...(warn ? { warn } : {}) });
+  return parsePolicy(JSON.parse(text), homedir(), tmpdir(), { runnerDir, ...(warn ? { warn } : {}), ...runtimeDirOption() });
 }
+
+/** `{runtimeDir}` from this process's XDG_RUNTIME_DIR, else nothing. */
+export const runtimeDirOption = (): { readonly runtimeDir?: string } =>
+  process.env.XDG_RUNTIME_DIR ? { runtimeDir: process.env.XDG_RUNTIME_DIR } : {};
+
+/**
+ * The sandbox lists of `names` under `policy`: each write and read path resolved (`realpath`; a missing one is kept as
+ * written, the wrapper skips it) and checked again on its real form, so a symlink cannot point a grant at a refused
+ * place. A write path that is a git checkout (`isCheckout`) is refused too: the host runs that checkout's scripts and
+ * hooks, so a lane gets a data directory inside it instead. Throws `RUNNER_CMD_REJECTED grant-unknown|grant-path ...`.
+ */
+export const resolveGrants = (
+  policy: Pick<RunnerPolicy, "grants">, names: readonly string[],
+  o: { readonly home: string; readonly runtimeDir?: string; readonly realpath: (path: string) => string; readonly isCheckout: (path: string) => boolean },
+): { readonly write: string[]; readonly read: string[] } => {
+  const write: string[] = [];
+  const read: string[] = [];
+  for (const name of names) {
+    const grant = policy.grants?.[name];
+    if (!grant) throw new Error(`${rejectionText("grant-unknown")} ${name}`);
+    for (const [kind, paths, into] of [["write", grant.write, write], ["read", grant.read, read]] as const) {
+      for (const path of paths) {
+        let real = path;
+        try { real = o.realpath(path); } catch { /* missing: the wrapper's -try bind skips it */ }
+        const why = grantPathRefusal(real, o) ?? (kind === "write" && o.isCheckout(real) ? "is a git checkout the host runs scripts from" : undefined);
+        if (why) throw new Error(`${rejectionText("grant-path")} ${name}.${kind} ${path} ${why}`);
+        if (!into.includes(real)) into.push(real);
+      }
+    }
+  }
+  return { write, read };
+};
 
 const underRoot = (root: string, path: string, p: typeof posix = runnerPaths()): boolean => {
   const rel = p.relative(root, path);
@@ -298,6 +393,10 @@ export function checkCommand(policy: RunnerPolicy, command: unknown, realpath: (
   if (frame.type === "lane.start") {
     if (!Object.hasOwn(policy.agents, body.agentProfile as string)) return reject("agent-profile", String(body.agentProfile));
     if (body.sandbox === false && policy.sandbox === "required") return reject("sandbox-required", "sandbox:false");
+    const grants = (body.grants as readonly string[] | undefined) ?? [];
+    for (const name of grants) if (!policy.grants || !Object.hasOwn(policy.grants, name)) return reject("grant-unknown", name);
+    // A grant widens what the wrapper binds; an unsandboxed lane has no wrapper to narrow it to those paths.
+    if (grants.length && body.sandbox !== true) return reject("grant-unsandboxed", grants.join(","));
   }
   const paths = [body.cwd, frame.type === "lane.git" ? body.root : undefined].filter((p): p is string => typeof p === "string");
   for (const path of paths) {

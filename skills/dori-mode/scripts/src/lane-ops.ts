@@ -37,6 +37,8 @@ export type StartInput = {
   readonly target?: { pane?: string; workspace?: string }; readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly cmdId?: string;
   /** The herdr workspace a new tab opens in (the supervisor-managed lanes workspace of a local lane). */
   readonly tabWorkspace?: string;
+  /** Names in the runner's runner-config `grants` (`dori launch --grant`); sent only when non-empty. */
+  readonly grants?: readonly string[];
 };
 export type AdoptInput = { readonly key: string; readonly machine?: string; readonly pane: string; readonly cwd?: string; readonly mode: string; readonly model: string };
 export type GitOp =
@@ -319,6 +321,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
       ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}),
       ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
       ...(input.tabWorkspace !== undefined ? { tabWorkspace: input.tabWorkspace } : {}),
+      ...(input.grants?.length ? { grants: input.grants } : {}),
     }, input.cmdId),
     adopt: (input) => effect(machineRunner(input.machine), "lane.adopt", {
       key: input.key, pane: input.pane, mode: input.mode, model: input.model, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),

@@ -216,6 +216,11 @@ export type SupervisorCommandBodies = {
     readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly tabWorkspace?: string;
     /** Since proto 5: the input snapshot and its file run (optional only so historical bodies decode). */
     readonly files?: LaneBriefFiles;
+    /**
+     * Names of the runner's runner-config `grants` this lane gets (sandboxed starts only). Sent only when non-empty, so
+     * no proto bump: a runner without it refuses such a start `RUNNER_CMD_REJECTED unknown-field`.
+     */
+    readonly grants?: readonly string[];
   }>;
   /** Since proto 3: take the existing pane `pane` as lane `key`; issues a token file. */
   readonly "lane.adopt": Cmd<{ readonly key: string; readonly pane: string; readonly cwd?: string; readonly mode: string; readonly model: string }>;
@@ -624,6 +629,7 @@ const COMMAND_SCHEMAS: { readonly [T in SupervisorCommandType]: Shape } = {
     agentProfile: req("string"), mode: req("string"), model: req("string"), sandbox: req("bool"), expectedLaneGen: req("int"),
     keywords: opt("string"), session: opt("string"), target: opt({ object: { pane: opt("string"), workspace: opt("string") } }),
     heavySlots: opt("int"), heavyMaxLoad: opt("number"), tabWorkspace: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),
+    grants: opt("string[]"),
   }),
   "lane.adopt": cmd({ key: req("string"), pane: req("string"), cwd: opt("string"), mode: req("string"), model: req("string") }),
   "lane.stop": cmd(laneKey),

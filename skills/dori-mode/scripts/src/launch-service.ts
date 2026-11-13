@@ -68,6 +68,7 @@ export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: Pl
       ...(placed.cwd ? { cwd: placed.cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
       ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}), ...(input.task !== undefined ? { task: input.task } : {}),
       ...(placed.machine ? { machine: placed.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
+      ...(input.grants?.length ? { grants: input.grants } : {}),
     });
     return { kind: "held", target: placed.target, verdict, queued: queue.length };
   }
