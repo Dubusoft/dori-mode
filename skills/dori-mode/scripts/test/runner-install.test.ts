@@ -102,7 +102,7 @@ const fakeHost = () => {
     chmodSync(join(bin, name), 0o755);
   };
   tool("uname", "echo Linux");
-  tool("bun", `[ "$1" = --version ] && { echo 1.3.0; exit 0; }; cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
+  tool("bun", `[ "$1" = --version ] && { echo 1.3.0; exit 0; }; [ "$3" = omo-profile ] && exit 0; cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
   tool("loginctl", "exit 0");
   // The herdr unit is inactive and no herdr answers, unless a test says otherwise.
   tool("systemctl", `[ "$2" = is-active ] && exit 3; exit 0`);
@@ -378,6 +378,8 @@ test("on Darwin the script installs the seatbelt lane-sandbox and a starter poli
   expect(readFileSync(wrapperPath, "utf8")).toContain('echo "DORI_LANE_FILES=1"');
   expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
   expect(result.out).not.toContain("RUNNER_CONFIG_SANDBOX_MISSING");
+  // The installed bundle adds the omo profile those lanes run under; a Linux host has no nested sandbox to avoid.
+  expect(readFileSync(host.log, "utf8")).toContain(`bun ${join(host.home, ".dori/runner/bin/dori.js")} runner omo-profile\n`);
   // A reinstall over an operator's file names every key it lacks for sandboxed lanes, and leaves the file alone.
   writeFileSync(policyFile, '{"agents":{"default":["claude"]}}\n', { mode: 0o600 });
   const again = await runDarwin(host, darwinScript());
@@ -395,6 +397,7 @@ test("a Linux reinstall over a complete sandbox policy prints no missing-key lin
   expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
   const again = await runScript(host, linuxScript());
   expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
+  expect(readFileSync(host.log, "utf8")).not.toContain("omo-profile");
   const p = Bun.spawn(["/bin/sh", "-n"], { stdin: new TextEncoder().encode(linuxScript()), stdout: "pipe", stderr: "pipe" });
   const [code, err] = await Promise.all([p.exited, new Response(p.stderr).text()]);
   expect({ code, err }).toEqual({ code: 0, err: "" });
