@@ -45,13 +45,32 @@ test("the default table classifies every line as the hard-coded list did, except
   expect(corpus.filter((line) => eventPriority(line) === "urgent").length).toBeGreaterThan(LEGACY_URGENT.length);
 });
 
-test("the done claim and lane-ending events, a close after a received claim too, are lead-urgent; the merge readback stays lead-digest", () => {
+test("the done claim and lane-ending events, a close after a received claim too, are lead-urgent; the merge readback is engine-only", () => {
   for (const line of ["LANE_DONE_CLAIMED alpha w:p1 proof", "LANE_CLOSED alpha closed", "LANE_CLOSED alpha closed seen-claim https://x", "LANE_CLOSED alpha closed seen-claim", "LANE_AUTO_CLOSED alpha {}", "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def https://x"]) {
     expect(eventClass(line)).toBe("lead-urgent");
   }
   for (const line of ["MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x", "GH_PR acme/app#7 merged sha=abc"]) {
-    expect(eventClass(line)).toBe("lead-digest");
+    expect(eventClass(line)).toBe("engine-only");
   }
+});
+
+test("routine PR states, runner link states, a delivered nudge, the owner's thread close and queueing Toodo moves are engine-only", () => {
+  for (const line of [
+    "GH_PR acme/app#7 opened sha=abc https://x", "GH_PR acme/app#7 updated sha=abc https://x", "GH_PR acme/app#7 checks_green sha=abc https://x",
+    "GH_PR acme/app#7 merged sha=abc https://x", "MERGE_VERIFIED acme/app#7 into dev lane=alpha merge=def https://x",
+    "RUNNER_STALE machine=mac no heartbeat for 60 s", "RUNNER_UNREACHABLE machine=mac the runner is alive",
+    "RUNNER_UNAVAILABLE runner=mac no admitted connection", "RUNNER_OFFLINE machine=mac runner heartbeat missing for 180 s",
+    "NUDGED alpha 16 min silent, delivery delivered", "NUDGED alpha 16 min silent, delivery unconfirmed",
+    "THREAD_CLOSED_BY_OWNER 777 lane alpha channel=#work/alpha",
+    "TOODO_TASK_STATUS #14 new->planned workspace=2", "TOODO_TASK_STATUS #14 planned->in_progress workspace=2",
+  ]) expect([line, eventClass(line)]).toEqual([line, "engine-only"]);
+  // The outcomes the lead still acts on keep their class.
+  for (const [line, cls] of [
+    ["NUDGED alpha 16 min silent, delivery failed; retried each tick", "lead-digest"],
+    ["TOODO_TASK_STATUS #14 in_review->done workspace=2", "lead-digest"], ["TOODO_TASK_STATUS #14 new->in_progress workspace=2", "lead-digest"],
+    ["GH_PR acme/app#7 checks_failing sha=abc https://x", "lead-digest"], ["GH_PR acme/app#7 closed sha=abc https://x", "lead-urgent"],
+    ["RUNNER_RESTARTED machine=mac gen=2", "lead-digest"], ["HOST_GUARD OFFLINE machine=mac unreachable", "lead-urgent"],
+  ] as const) expect([line, eventClass(line)]).toEqual([line, cls]);
 });
 
 test("owner decision answers and failures are urgent; opening a decision stays digest", () => {
@@ -77,7 +96,8 @@ test("LEAD_UNRESPONSIVE (restart cap refused) wakes the lead; a leftover ACK_MIS
 
 test("a kind is the most specific matching entry, else the line's first word", () => {
   expect(eventKind("GH_PR acme/app#7 merged sha=1")).toBe("GH_PR * merged");
-  expect(eventKind("GH_PR acme/app#7 opened")).toBe("GH_PR");
+  expect(eventKind("GH_PR acme/app#7 opened")).toBe("GH_PR * opened");
+  expect(eventKind("GH_PR acme/app#7 opened_x")).toBe("GH_PR");
   expect(eventKind("HOST_GUARD ALERT load")).toBe("HOST_GUARD ALERT");
   expect(eventKind("INBOUND 1 2 hi")).toBe("INBOUND");
   expect(eventKind("")).toBe("(empty)");

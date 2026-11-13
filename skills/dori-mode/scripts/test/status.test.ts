@@ -235,10 +235,10 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
   expect(s.events).toMatchObject({ hours: 24, wakes: 3, sources: { owner: 3, lane: 0, noise: 0 }, measured: 2, calls: 13 });
   expect(s.events.kinds).toEqual([
     { kind: "INBOUND", cls: "lead-urgent", events: 2, wakes: 2, measured: 2, calls: 13 },
-    // The class is the current policy's: a merged PR is digest now, though it woke the lead when this wake was recorded.
-    { kind: "GH_PR * merged", cls: "lead-digest", events: 1, wakes: 1, measured: 1, calls: 9 },
+    // The class is the current policy's: a merged PR is engine-only now, though it woke the lead when this wake was recorded.
+    { kind: "GH_PR * merged", cls: "engine-only", events: 1, wakes: 1, measured: 1, calls: 9 },
     { kind: "(restart)", events: 0, wakes: 1, measured: 0, calls: 0 },
-    { kind: "NUDGED", cls: "lead-digest", events: 3, wakes: 0, measured: 0, calls: 0 },
+    { kind: "NUDGED", cls: "engine-only", events: 3, wakes: 0, measured: 0, calls: 0 },
   ]);
   const text = renderStatus(s);
   expect(text).toContain("\n■ 활동 (최근 24시간)\n- 리드 깨움 3회 (소유자 3 · 레인 0 · 노이즈 0), 깨울 때마다 모델 호출 6.5회\n");

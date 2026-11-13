@@ -32,7 +32,7 @@ import { parseSignal, splitDone } from "./signals.ts";
  * - a lane bound to a GitHub issue (Lane.ghIssue): once its PR is confirmed merged into `ciMergeBase`, the issue is
  *   closed with a comment (a `close-issue` operation planned while the PR is open, so a closed lane still settles it).
  * - a merged PR of an open lane that the supervisor did not merge itself: its merge is read back once (a `merge-verify`
- *   operation) as digest MERGE_VERIFIED with the merge SHA, or urgent MERGE_UNVERIFIED when it cannot be confirmed.
+ *   operation) as engine-only MERGE_VERIFIED with the merge SHA, or urgent MERGE_UNVERIFIED when it cannot be confirmed.
  *   The watcher then closes a done-claimed lane at once (done-flow.ts mergeConfirmed), with its worktree and branch.
  * - an open lane PR the supervisor cannot merge for a reason only a person fixes (claimed at its head but no checks, a
  *   required review, a draft; or green and clean while its lane never claimed at that head) for `mergeStallMin`: urgent
@@ -467,7 +467,7 @@ export class CiFollowUp {
 
   /**
    * Reads back, once, the merge of every merged PR that belongs to an open lane and was not merged by the supervisor (its
-   * own merges are read back as CI_MERGED): MERGE_VERIFIED (digest) with the base and merge SHA, or MERGE_UNVERIFIED
+   * own merges are read back as CI_MERGED): MERGE_VERIFIED (engine-only) with the base and merge SHA, or MERGE_UNVERIFIED
    * (urgent) when GitHub does not call it merged or `gh pr view` fails MERGE_ATTEMPTS polls in a row. The line is
    * journaled before the row settles: a crash in between re-emits the same id, which the journal dedupes.
    */
