@@ -1554,17 +1554,14 @@ test("a cold start points the lead at the full SKILL.md and puts leadArgs on the
   expect(f.prompt()).toContain(LEAD_SKILL);
   expect(f.prompt()).toContain("Supervised mode: do not start inbound pollers or sweeps.");
   const command = f.command() ?? "";
-  const preset = process.platform === "win32" ? "" : "'?--permission-preset'? '?full-access'? ";
-  expect(command).toMatch(new RegExp(`omo ${preset}'?--session-id'? \\S+ '?--session-dir'? \\S+ '?--approve'? '?--model'?`));
+  expect(command).toMatch(/omo '?--permission-preset'? '?full-access'? '?--session-id'? \S+ '?--session-dir'? \S+ '?--approve'? '?--model'?/);
   expect(command).toContain("test/lead-default");
 });
 
-test("the lead runs under omo's full-access preset off Windows unless its own argv names a preset", () => {
-  expect(leadPermissionArgs(["--approve", "--model", "m"], "linux")).toEqual(["--permission-preset", "full-access"]);
-  expect(leadPermissionArgs(["--approve"], "darwin")).toEqual(["--permission-preset", "full-access"]);
-  expect(leadPermissionArgs(["--approve"], "win32")).toEqual([]);
-  expect(leadPermissionArgs(["--permission-preset", "ask"], "linux")).toEqual([]);
-  expect(leadPermissionArgs(["--permission-preset=workspace"], "darwin")).toEqual([]);
+test("the lead runs under omo's full-access preset unless its own argv names a preset", () => {
+  expect(leadPermissionArgs(["--approve", "--model", "m"])).toEqual(["--permission-preset", "full-access"]);
+  expect(leadPermissionArgs(["--permission-preset", "ask"])).toEqual([]);
+  expect(leadPermissionArgs(["--permission-preset=workspace"])).toEqual([]);
 });
 
 test.each([true, false])("leadDiet=%s: the lead launch carries the slim omo flags and env only when on, never the lane command", async (leadDiet) => {

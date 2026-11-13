@@ -1037,12 +1037,11 @@ const LEAD_STAYS = /old lead has not exited|cannot stop owned lead process/;
 
 /** A lead process the supervisor launched: its lead command always carries `--session-id`. Entries without argv never match. */
 /**
- * The lead's omo permission flags: like every lane, the lead has nobody to answer an omo permission prompt, so on Linux
- * and macOS it runs under `--permission-preset full-access` unless its own argv (`leadArgs`, `agentCommand`) names a
- * preset. Windows keeps its launch unchanged.
+ * The lead's omo permission flags: like every lane, the lead has nobody to answer an omo permission prompt, so it runs
+ * under `--permission-preset full-access` on every OS unless its own argv (`leadArgs`, `agentCommand`) names a preset.
  */
-export const leadPermissionArgs = (argv: readonly string[], platform: NodeJS.Platform = process.platform): readonly string[] =>
-  platform === "win32" || argv.some((part) => /^--permission-preset(?:=|$)/.test(part)) ? [] : LANE_PERMISSION_FLAGS;
+export const leadPermissionArgs = (argv: readonly string[]): readonly string[] =>
+  argv.some((part) => /^--permission-preset(?:=|$)/.test(part)) ? [] : LANE_PERMISSION_FLAGS;
 
 const supervisorLaunch = (p: ForegroundProcess): boolean => Array.isArray(p.argv) && p.argv.includes("--session-id");
 
