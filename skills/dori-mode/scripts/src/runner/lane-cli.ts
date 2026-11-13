@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
 import { sampleLoad1 } from "../host-guard.ts";
-import { decisionChoicesProblem, serializeDecisionText } from "./decision-text.ts";
+import { decisionChoicesProblem, inputRequestProblem, serializeDecisionText, serializeRequestText } from "./decision-text.ts";
 import { isReportKind } from "./report-kinds.ts";
 import { realClock, run as realRun, type Clock, type Runner } from "../run.ts";
 import { SECRET_NAME } from "../secret-name.ts";
@@ -115,7 +115,7 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
 
 const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec and secret run";
 
-const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking]";
+const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking] | dori report <key> request --text \"<what you need from the owner>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]";
 const CLAIM_DONE_USAGE = "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"";
 
 /** What `--help` (or `-h`) prints for each lane command. */
@@ -124,6 +124,9 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
     REPORT_USAGE,
     "  question needs 2-9 --option values, --recommend N (1-based, in range) and --reason; --waiting names what is paused",
     "  (with --nonblocking: what goes ahead on the recommendation). An open-ended blocker without choices is: blocked --text ...",
+    "  request asks the owner for input only they can give (a one-time code such as 2FA, login or device codes, a file or a value)",
+    "  in its own thread; the owner replies there. A long-lived secret (password, API key, token) is never asked for in Discord:",
+    "  --file <path> names where the owner writes it (chmod 600), and a request naming one without --file is refused",
     "usage: dori report ack <id>",
   ].join("\n"),
   "claim-done": CLAIM_DONE_USAGE,
@@ -244,9 +247,12 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
   const parsed = parseArgs({ args: [...rest], allowPositionals: true, options: {
     text: { type: "string" }, evidence: { type: "string" },
     option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" }, waiting: { type: "string" }, nonblocking: { type: "boolean" },
+    file: { type: "string" },
   } });
   const [key, kindArg, ...extra] = parsed.positionals;
-  const kind = sub === "claim-done" ? "done" : kindArg;
+  // A request travels as a question report in the REQUEST v1 text form, so the runner protocol is unchanged.
+  const isRequest = sub === "report" && kindArg === "request";
+  const kind = sub === "claim-done" ? "done" : isRequest ? "question" : kindArg;
   if (!key || extra.length || (sub === "claim-done" && kindArg !== undefined) || !isReportKind(kind)) {
     deps.err(sub === "claim-done" ? CLAIM_DONE_USAGE : REPORT_USAGE);
     return 2;
@@ -257,11 +263,21 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
   }
   const text = parsed.values.text ?? (kind === "done" ? parsed.values.evidence ?? "" : "");
   if (!text) { deps.err("--text is required"); return 2; }
-  const { option, recommend, reason, waiting, nonblocking } = parsed.values;
+  const { option, recommend, reason, waiting, nonblocking, file } = parsed.values;
   let sentText = text;
-  if (kind !== "question") {
+  if (file !== undefined && !isRequest) { deps.err("usage: --file goes only with the request kind"); return 2; }
+  if (isRequest) {
+    if (option !== undefined || recommend !== undefined) { deps.err("usage: a request takes no --option or --recommend; to ask the owner to choose use the question kind"); return 2; }
+    const asked = { need: text, reason, waiting: waiting ?? `레인 ${key} 진행`, ...(file !== undefined ? { file } : {}) };
+    const problem = inputRequestProblem(asked);
+    if (problem) {
+      deps.err(`REPORT_REFUSED request needs --text (what is needed) and --reason; not sent (${problem})`);
+      return 2;
+    }
+    sentText = serializeRequestText({ ...asked, reason: reason as string, blocking: !nonblocking });
+  } else if (kind !== "question") {
     if (option !== undefined || recommend !== undefined || reason !== undefined || waiting !== undefined || nonblocking !== undefined) {
-      deps.err("usage: --option, --recommend, --reason, --waiting and --nonblocking go only with the question kind");
+      deps.err("usage: --option, --recommend, --reason, --waiting and --nonblocking go only with the question and request kinds");
       return 2;
     }
   } else {
@@ -273,5 +289,5 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     }
     sentText = serializeDecisionText({ ...choices, recommend: Number((recommend as string).trim()), reason: reason as string, blocking: !nonblocking });
   }
-  return send({ kind, text: sentText, ...(parsed.values.evidence ? { evidence: parsed.values.evidence } : {}) }, () => { deps.out(`LANE_REPORTED ${key} ${kind} (through the runner)`); });
+  return send({ kind, text: sentText, ...(parsed.values.evidence ? { evidence: parsed.values.evidence } : {}) }, () => { deps.out(`LANE_REPORTED ${key} ${isRequest ? "request" : kind} (through the runner)`); });
 };

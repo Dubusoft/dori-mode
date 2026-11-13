@@ -17,8 +17,8 @@ Exit code 0 and echoed input aren't proof the agent got the message. A reply fro
 
 The supervisor never talks to the owner itself, with two exceptions:
 
-- a lane question with choices becomes a decision thread in the decisions channel, opened by the supervisor;
-- every day at 09:00 `displayTimeZone`, while any decision still waits, the supervisor posts one `[System]` reminder listing them in the decisions channel.
+- a lane question with choices becomes a `[결정]` thread, and a lane's owner-input request (`dori report <key> request`) a `[요청]` thread, in the decisions channel (#inbox to the owner; wired by `decisionsChannel` id), opened by the supervisor;
+- every day at 09:00 `displayTimeZone`, while any decision or request still waits, the supervisor posts one `[System]` reminder listing them in the decisions channel.
 
 The owner's answer is not forwarded to the lane. The lead relays it.
 

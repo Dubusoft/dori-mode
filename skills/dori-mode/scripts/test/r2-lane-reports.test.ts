@@ -178,7 +178,7 @@ test("a lane registered on the old [REPORT] footer moves onto dori report when i
   const { lane: relaunched } = await launchLane(deps, { key: "old-lane", title: "t", brief, done: old.done, thread: old.thread, cwd: join(dir, "nogit") }, old);
   expect(relaunched.reportVia).toBe("cli");
   const text = await Bun.file(brief).text();
-  expect(text).toContain("dori report old-lane <milestone|progress|question|blocked>");
+  expect(text).toContain("dori report old-lane <milestone|progress|question|request|blocked>");
   expect(text).not.toContain("sent to pane w:lead");
   expect(text).toStartWith("do the thing\n");
   expect(text.split("## Lane footer (written by dori launch)")).toHaveLength(2);
