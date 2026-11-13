@@ -7,7 +7,7 @@ import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork, SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
+import { childWork, leadPermissionArgs, SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -1554,8 +1554,14 @@ test("a cold start points the lead at the full SKILL.md and puts leadArgs on the
   expect(f.prompt()).toContain(LEAD_SKILL);
   expect(f.prompt()).toContain("Supervised mode: do not start inbound pollers or sweeps.");
   const command = f.command() ?? "";
-  expect(command).toMatch(/omo '?--session-id'? \S+ '?--session-dir'? \S+ '?--approve'? '?--model'?/);
+  expect(command).toMatch(/omo '?--permission-preset'? '?full-access'? '?--session-id'? \S+ '?--session-dir'? \S+ '?--approve'? '?--model'?/);
   expect(command).toContain("test/lead-default");
+});
+
+test("the lead runs under omo's full-access preset unless its own argv names a preset", () => {
+  expect(leadPermissionArgs(["--approve", "--model", "m"])).toEqual(["--permission-preset", "full-access"]);
+  expect(leadPermissionArgs(["--permission-preset", "ask"])).toEqual([]);
+  expect(leadPermissionArgs(["--permission-preset=workspace"])).toEqual([]);
 });
 
 test.each([true, false])("leadDiet=%s: the lead launch carries the slim omo flags and env only when on, never the lane command", async (leadDiet) => {

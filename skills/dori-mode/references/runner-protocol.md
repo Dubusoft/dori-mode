@@ -78,14 +78,14 @@ Protocol 3 adds, all optional on existing frames:
 | `lane.notify {key, status, objection?: {at, reasons}, claim?: {at, evidence}}` | new command: the lane's status as the supervisor holds it |
 | `lane.git {key, op, root, path?, branch?, remote?}` | new command: `worktree-remove`, `branch-delete` or `remote-branch-delete` in `root` |
 
-Protocol 4 adds `guard.sample.herdr?: {state: up|down|hung, instance?: string, since: number}`,
+Protocol 4 adds `guard.sample.herdr?: {state: up|down|hung|elevated, instance?: string, since: number}`,
 `herdr.state {state, instance?, detail}` on transitions, and `herdr.start {ok, detail}` for managed-unit start
 outcomes. `since` is the runner's wall time; the supervisor records its own receipt time for shared state.
 The supervisor continues to infer outages from `panes: -1` for protocol 3 runners. Protocol 4 samples without
 `herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
 Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
-verified with `{action, state: up|down|hung, instance?, managed, paused}` as read after the action. A protocol 3
+verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action. A protocol 3
 runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
 
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
@@ -542,25 +542,37 @@ When it starts, a runner deletes the old guard agent files on its host (`~/.dori
 
 Each runner, including the local runner, watches herdr on the existing 30 s guard sampling timer. A readable pane
 list means `up`; a failed list and no server process means `down`; a failed list with a server process (or an
-unreadable process table) means `hung`. Two consecutive failures spanning at least 30 s are required. A gap longer
+unreadable process table) means `hung`. On Windows a list refused with PermissionDenied (os error 5) or herdr's
+elevated-server hint means `elevated`: the server runs as administrator (started from an administrator's ssh session,
+such as herdr's remote bridge) and refuses the unelevated runner. Two consecutive failures spanning at least 30 s are required. A gap longer
 than three sampling intervals resets the failure window and discards the first failed sample after waking.
 
 The runner starts an installed `herdr-server.service` on Linux or kickstarts `com.dori.herdr` in its saved launchd
-domain on macOS only while `down`. Attempts wait one minute, doubling to a thirty minute cap; `up` resets the
+domain on macOS only while `down`. On Windows the runner owns the server: it starts `herdr server` itself through
+WMI (`Win32_Process.Create`) with its own unelevated token, outside its process tree and scheduled task, so a
+runner restart leaves herdr and its panes running. It also does so once at start, before anything reads herdr, when
+no server runs and the pause marker is absent, so it starts the server before an administrator session can. Attempts wait one minute, doubling to a thirty minute cap; `up` resets the
 cooldown. Each attempt is durably reported as `HERDR_START machine=<label> ok|failed <detail>`. An absent unit
-is reported through the down state without starting anything. A hung server is reported and left running. While the
+is reported through the down state without starting anything. A hung or elevated server is reported and left running. While the
 pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a down herdr is reported but not started.
 
 `dori runner herdr <start|restart|stop|status> --machine <label> [--yes]` sends `host.herdr` to that machine's runner
 (`local` is the lead host) through the supervisor's CLI relay:
 
-- `status` only reads: `RUNNER_HERDR machine=<label> action=status state=<up|down|hung> managed=<bool> paused=<bool> ...`.
-- `start` removes the pause marker and starts the installed unit when herdr is down, then waits up to 15 s for the pane
-  list to read. It refuses a hung server (`HERDR_HUNG`, use restart) and a host without a herdr unit (`HERDR_UNMANAGED`).
+- `status` only reads: `RUNNER_HERDR machine=<label> action=status state=<up|down|hung|elevated> managed=<bool> paused=<bool> ...`.
+  `managed` is always true on Windows, where the runner starts the server itself.
+- `start` removes the pause marker and starts the installed unit (on Windows the runner's own server) when herdr is
+  down, then waits up to 15 s for the pane list to read. It refuses a hung server (`HERDR_HUNG`, use restart) and a
+  host without a herdr unit (`HERDR_UNMANAGED`).
+- On Windows `start`, `restart` and `stop` refuse an elevated server before ending or starting anything
+  (`HERDR_ELEVATED`): the runner can neither read nor end it. End it from an administrator terminal on that host
+  (`herdr server stop`) and the runner starts an unelevated one; or add `[server] allow_unelevated_clients = true` to
+  `%APPDATA%\herdr\config.toml` there and restart the server from an administrator terminal.
 - `restart` ends the server and starts the unit again. It refuses at once, before ending anything, on a host without a
   herdr unit. It stops the unit (Linux `systemctl --user stop`, macOS `launchctl bootout`), sends `SIGTERM` to any
   `herdr server` process of the user still running, `SIGKILL` after 10 s, then starts the unit (on macOS the agent is
-  bootstrapped again before the kickstart).
+  bootstrapped again before the kickstart). On Windows it runs `herdr server stop`, then ends any server process of
+  the user still running (`taskkill`, `/F` after 10 s), then starts the runner's own server.
 - `stop` writes the pause marker first, then ends the server the same way and starts nothing.
 - `restart` and `stop` end every pane herdr runs on that machine. The CLI first prints
   `RUNNER_HERDR_LANES machine=<label> ...` with the machine's open lanes (and the lead pane for `local`), and sends the
@@ -570,7 +582,9 @@ pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a 
   `dori runner install --machine <label>` to upgrade it.
 
 The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
-with `HERDR_DOWN` / `HERDR_HUNG` (urgent) and `HERDR_UP ... server=<instance>` (digest). For protocol 3 runners:
+with `HERDR_DOWN` / `HERDR_HUNG` / `HERDR_ELEVATED` (urgent; lane recovery and launches on that machine are held as
+for down) and `HERDR_UP ... server=<instance>` (digest). `dori doctor` names the elevated-server fix above for
+`elevated`, not a restart. For protocol 3 runners:
 
 - Two committed samples in a row with `panes: -1` mark the machine's herdr `down`: `HERDR_DOWN machine=<label> ...`
   (urgent), once. Protocol 3 cannot tell a stopped herdr from a hung one, and -1 also covers a pane list that timed

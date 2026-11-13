@@ -200,7 +200,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}) });
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
     // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
-    const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir) });
+    const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir), platform: process.platform });
     const paneCount = () => herdr.sample();
     const guard = new RunnerGuard({
       herdr: () => herdr.snapshot(),
@@ -265,6 +265,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       { label: identity.label, hostId: identity.hostId, ...(version ? { version } : {}) },
       { connect: tracked.connect, outbox, state, clock: realClock, inventory: currentInventory, workspaces, auth, log, onCommand: dispatch, onInvalidCommand: dispatch, onQuery },
     );
+    // On Windows the runner starts the herdr server itself when none runs, before anything reads herdr (HerdrWatch.boot).
+    await herdr.boot().catch((e: unknown) => { log(`RUNNER_HERDR_BOOT_FAILED ${e instanceof Error ? e.message : String(e)}`); });
     // A command a crash left between its intent and its result is settled by looking at herdr, never run again.
     const observeLane = async (key: string): Promise<Observation> => {
       try { return (await observeHost({ run })).some((l) => l.key === key) ? "present" : "absent"; } catch { return "unknown"; }

@@ -167,4 +167,9 @@ test("supervisor uses explicit proto 4 health, keeps proto 3 inference, and rout
   expect(infer.event("lab", runnerEvent(head, 5, "herdr.state", { state: "up", instance: "server-3", detail: "same" }), 4)).toBeUndefined();
   expect(infer.event("lab", runnerEvent(head, 4, "herdr.start", { ok: false, detail: "unit failed" }), 4)?.line).toBe("HERDR_START machine=lab failed unit failed");
   expect(eventClass("HERDR_HUNG machine=lab")).toBe("lead-urgent");
+  const elevated = runnerEvent(head, 6, "herdr.state", { state: "elevated", detail: "refused" });
+  expect(decodeFrame(encodeFrame(elevated), "runner")).toEqual(elevated);
+  expect(infer.event("lab", elevated, 4)?.line).toStartWith("HERDR_ELEVATED machine=lab lane recovery on this machine is held");
+  expect(store.get("lab")?.state).toBe("elevated");
+  expect(eventClass("HERDR_ELEVATED machine=lab")).toBe("lead-urgent");
 });

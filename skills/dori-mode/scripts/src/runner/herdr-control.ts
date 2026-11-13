@@ -4,13 +4,16 @@ import { join } from "node:path";
 import { listPanes } from "../panes.ts";
 import type { Runner } from "../run.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
-import { herdrProcess, herdrUnitInstalled, launchdDomain, startManagedHerdr } from "./herdr-watch.ts";
+import {
+  HERDR_ELEVATED_FIX, herdrElevatedError, herdrProcess, herdrUnitInstalled, launchdDomain, startManagedHerdr, winHerdrServers,
+} from "./herdr-watch.ts";
 import type { CommandResults, HerdrAction, HerdrHealth } from "./protocol.ts";
 
 /**
  * The runner side of `host.herdr` (since proto 4): what `dori runner herdr <start|restart|stop|status> --machine X`
  * asks of the runner on X. The runner only ever starts herdr through the unit `dori setup` / `dori runner install`
- * installed; ending the server (restart, stop) is done only on this explicit command, never by the watch.
+ * installed, or on Windows as its own unelevated `herdr server` (startManagedHerdr); ending the server (restart, stop)
+ * is done only on this explicit command, never by the watch.
  */
 
 /** In the runner directory: present while `dori runner herdr stop` holds herdr down (HerdrWatch does not start it). */
@@ -35,6 +38,8 @@ export type HerdrControlDeps = {
   readonly read?: (path: string) => string;
   /** The marker writers; default: a 0600 file in the runner directory. */
   readonly setPaused?: (on: boolean) => void;
+  /** The Windows account whose herdr server processes count (default: the runner's). */
+  readonly user?: string;
 };
 
 type Output = { readonly detail: string; readonly result: CommandResults["host.herdr"] };
@@ -42,7 +47,12 @@ type Output = { readonly detail: string; readonly result: CommandResults["host.h
 const SERVER_PATTERN = "(^|/)herdr server($| )";
 
 /** The current user's `herdr server` pids; throws when they cannot be read (nothing may be signalled blind). */
-const serverPids = async (run: Runner): Promise<number[]> => {
+const serverPids = async (run: Runner, os: string, user?: string): Promise<number[]> => {
+  if (os === "win32") {
+    const ids = await winHerdrServers(run, user);
+    if (!ids) throw new Error("HERDR_PIDS_UNREADABLE the herdr.exe processes could not be read (an elevated server hides its command line)");
+    return ids.map((id) => Number(id.split("@")[0]));
+  }
   const r = await run(["pgrep", "-u", String(process.getuid?.() ?? 0), "-f", SERVER_PATTERN]);
   if (r.code === 1) return [];
   if (r.code !== 0) throw new Error(`HERDR_PIDS_UNREADABLE pgrep exit ${r.code}: ${(r.err || r.out).trim()}`);
@@ -60,8 +70,10 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
 
   const state = async (): Promise<{ state: HerdrHealth["state"]; instance?: string }> => {
     let up = true;
-    try { await listPanes(deps.run); } catch { up = false; }
-    const proc = await herdrProcess(deps.run);
+    let failure = "";
+    try { await listPanes(deps.run); } catch (e) { up = false; failure = e instanceof Error ? e.message : String(e); }
+    if (!up && herdrElevatedError(failure, os)) return { state: "elevated" };
+    const proc = await herdrProcess(deps.run, { platform: os, ...(deps.user ? { user: deps.user } : {}) });
     if (up) return { state: "up", ...(proc.instance ? { instance: proc.instance } : {}) };
     return { state: proc.running ? "hung" : "down" };
   };
@@ -77,7 +89,11 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
   /** Ends the server: the unit first (so its supervisor does not start it again), then any server process left, TERM before KILL. */
   const end = async (): Promise<string> => {
     const steps: string[] = [];
-    if (herdrUnitInstalled(unit)) {
+    if (os === "win32") {
+      // herdr's own stop first: taskkill without /F only asks a console process to close, which a headless server ignores.
+      const r = await deps.run(["herdr", "server", "stop"], { timeoutMs: 30_000 });
+      steps.push(`herdr server stop exit ${r.code}`);
+    } else if (herdrUnitInstalled(unit)) {
       if (os === "linux") {
         const r = await deps.run(["systemctl", "--user", "stop", "herdr-server.service"], { timeoutMs: 30_000 });
         steps.push(`unit stop exit ${r.code}`);
@@ -90,7 +106,7 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
       }
     }
     for (const sig of ["SIGTERM", "SIGKILL"] as const) {
-      let pids = await serverPids(deps.run);
+      let pids = await serverPids(deps.run, os, deps.user);
       if (!pids.length) return steps.join(", ") || "no server process";
       for (const pid of pids) {
         try { deps.signal(pid, sig); } catch (e) {
@@ -100,11 +116,11 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
       steps.push(`${sig} ${pids.join(",")}`);
       for (const until = deps.now() + HERDR_EXIT_WAIT_MS; deps.now() < until;) {
         await deps.sleep(POLL_MS);
-        pids = await serverPids(deps.run);
+        pids = await serverPids(deps.run, os, deps.user);
         if (!pids.length) return steps.join(", ");
       }
     }
-    const left = await serverPids(deps.run);
+    const left = await serverPids(deps.run, os, deps.user);
     if (left.length) throw new Error(`HERDR_STOP_FAILED herdr server ${left.join(",")} still runs after SIGKILL`);
     return steps.join(", ");
   };
@@ -115,14 +131,18 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
     if (!started) throw new Error("HERDR_UNMANAGED no herdr unit is installed on this host; dori runner install --machine <label> installs one");
     if (!started.ok) throw new Error(`HERDR_START_FAILED ${started.detail}`);
     for (const until = deps.now() + HERDR_UP_WAIT_MS; ;) {
-      try { await listPanes(deps.run); return "unit started"; } catch { /* not answering yet */ }
+      try { await listPanes(deps.run); return os === "win32" ? "server started" : "unit started"; } catch { /* not answering yet */ }
       if (deps.now() >= until) throw new Error(`HERDR_START_UNCONFIRMED the unit started but herdr did not answer within ${HERDR_UP_WAIT_MS / 1000} s`);
       await deps.sleep(POLL_MS);
     }
   };
 
+  const elevated = (what: string): Error => new Error(`HERDR_ELEVATED the herdr server runs elevated and refuses this unelevated runner, so it cannot ${what}; ${HERDR_ELEVATED_FIX}`);
+
   return async (action) => {
     if (action === "status") return result(action, "read");
+    // An elevated server (Windows only) can be neither read nor ended from here: refuse before the pause marker or any signal.
+    if (action !== "start" && os === "win32" && (await state()).state === "elevated") throw elevated(action === "stop" ? "stop it" : "restart it");
     if (action === "stop") {
       // The marker goes first: the watch must not start the unit between the stop and the marker.
       setPaused(true);
@@ -132,6 +152,7 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
       setPaused(false);
       const now = await state();
       if (now.state === "up") return result(action, "already running");
+      if (now.state === "elevated") throw elevated("use it");
       if (now.state === "hung") throw new Error("HERDR_HUNG the server process runs but does not answer; dori runner herdr restart ends it and starts the unit");
       return result(action, await start());
     }

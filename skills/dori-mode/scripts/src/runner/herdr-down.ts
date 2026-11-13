@@ -16,7 +16,7 @@ import { LOCAL_RUNNER } from "./serve.ts";
  * read the saved state through `herdrDownSince`, so a `dori` command in another process sees it too.
  */
 
-export type HerdrState = "up" | "down" | "hung";
+export type HerdrState = "up" | "down" | "hung" | "elevated";
 
 /** Unreadable samples in a row before a machine's herdr counts as down. */
 export const HERDR_DOWN_SAMPLES = 2;
@@ -93,4 +93,4 @@ export class HerdrDownInference {
 
 /** The runners whose machine's herdr is saved as down, with the time it went down (read-only; empty without a hub). */
 export const herdrDownSince = (stateDir: string): ReadonlyMap<string, number> =>
-  new Map(readRunnerRows(stateDir).flatMap((row) => (row.herdr === "down" || row.herdr === "hung" ? [[row.label, row.herdrSince ?? 0] as const] : [])));
+  new Map(readRunnerRows(stateDir).flatMap((row) => (row.herdr === "down" || row.herdr === "hung" || row.herdr === "elevated" ? [[row.label, row.herdrSince ?? 0] as const] : [])));

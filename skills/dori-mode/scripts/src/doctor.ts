@@ -19,7 +19,7 @@ import { type Clock, realClock, type Runner, run } from "./run.ts";
 import { LEGACY_PRESENCE, SERVICES, unitState } from "./status.ts";
 import { openOperations } from "./operations.ts";
 import { checkRunnerDir, defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
-import { herdrUnitInstalled } from "./runner/herdr-watch.ts";
+import { HERDR_ELEVATED_FIX, herdrUnitInstalled } from "./runner/herdr-watch.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { readRunnerRows } from "./runner/hub.ts";
 import { readRunnerEndpoints } from "./runner/endpoints.ts";
@@ -447,13 +447,18 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} refuses lane start and recover (they need proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
-    if (row.herdr === "down" || row.herdr === "hung") {
+    if (row.herdr === "down" || row.herdr === "hung" || row.herdr === "elevated") {
       // The runner saw its machine's herdr stop answering: its lanes cannot run there and their recovery is held.
       const since = row.herdrSince ? ` since ${new Date(row.herdrSince).toISOString()}` : "";
-      const herdrProblem = row.herdr === "down" ? `herdr down${since} (no server process)` : `herdr hung${since} (the server process runs but does not answer)`;
+      const herdrProblem = row.herdr === "down" ? `herdr down${since} (no server process)`
+        : row.herdr === "hung" ? `herdr hung${since} (the server process runs but does not answer)`
+          : `herdr elevated${since} (the server runs as administrator and refuses the unelevated runner)`;
+      // An elevated server cannot be ended by the unelevated runner, so dori runner herdr restart would be refused too.
       const command = row.herdr === "down"
         ? `dori runner herdr start --machine ${row.label}`
-        : `dori runner herdr restart --machine ${row.label} --yes (ends every lane pane there; without --yes it lists them)`;
+        : row.herdr === "hung"
+          ? `dori runner herdr restart --machine ${row.label} --yes (ends every lane pane there; without --yes it lists them)`
+          : HERDR_ELEVATED_FIX;
       const upgrade = row.proto !== undefined && row.proto < 4 ? `dori runner install --machine ${row.label} to upgrade (proto ${row.proto} has no host.herdr), then ` : "";
       checks.push(fail(id, [herdrProblem, ...problems].join("; "), `${upgrade}${command}`));
       continue;
