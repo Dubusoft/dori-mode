@@ -21,6 +21,7 @@ const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOu
   dirs.push(dir);
   let at = 0;
   const lines: string[] = [];
+  const alerts: string[] = [];
   const restarts: number[] = [];
   let owned = lanes;
   const operations = openOperations({ stateDir: dir, store: "json" });
@@ -29,12 +30,12 @@ const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOu
     monotonic: () => at, now: () => 1_800_000_000_000 + at, epoch: 7,
     probe: async () => probe(monitor),
     restart: async () => { restarts.push(at); await options.duringRestart?.(monitor); return { ok: true, detail: "restarted" }; },
-    ownedLanes: async () => owned, operations, emit: (line) => { lines.push(line); },
+    ownedLanes: async () => owned, operations, emit: (line) => { lines.push(line); }, alert: (text) => { alerts.push(text); },
   });
   monitor.track("worker-a", 1);
   /** Ticks every 5 s (the runners task period) until `untilMs`. */
   const runTo = async (untilMs: number): Promise<void> => { while (at < untilMs) { at = Math.min(untilMs, at + 5_000); await monitor.tick(); } };
-  return { monitor, lines, restarts, operations, runTo, at: () => at, own: (next: readonly string[]) => { owned = next; } };
+  return { monitor, lines, alerts, restarts, operations, runTo, at: () => at, own: (next: readonly string[]) => { owned = next; } };
 };
 const kinds = (lines: readonly string[]): string[] => lines.map((l) => l.split(" ").slice(0, l.startsWith("HOST_GUARD") ? 2 : 1).join(" "));
 
@@ -86,12 +87,40 @@ test("a dead host escalates at once, before its restart", async () => {
   expect(r.restarts).toEqual([180_000]);
 });
 
-test("a runner that owns open lanes escalates on its first disconnect", async () => {
+test("a runner that owns open lanes escalates on its first disconnect, and the alerts channel hears it and its end", async () => {
   const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }), ["lane-a"]);
+  await r.monitor.heartbeat("worker-a");
   await r.runTo(180_000);
   expect(r.lines.at(-1)).toBe("HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 180 s; it owns open lanes lane-a");
+  expect(r.alerts).toHaveLength(1);
+  expect(r.alerts[0]).toContain("(HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 180 s; it owns open lanes lane-a)");
   await r.monitor.heartbeat("worker-a");
   expect(r.lines.at(-1)).toBe("HOST_GUARD ONLINE machine=worker-a");
+  expect(r.alerts).toHaveLength(2);
+  expect(r.alerts[1]).toContain("(HOST_GUARD ONLINE machine=worker-a)");
+});
+
+test("after a supervisor start, a runner owning lanes that has not reconnected yet wakes nobody until 10 min or a dead probe", async () => {
+  const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }), ["lane-a"]);
+  await r.runTo(5 * 60_000);
+  expect(kinds(r.lines)).toEqual(["RUNNER_STALE", "RUNNER_OFFLINE"]);
+  expect(urgent(r.lines)).toEqual([]);
+  expect(r.alerts).toEqual([]);
+  // A late reconnect ends it quietly.
+  await r.monitor.heartbeat("worker-a");
+  expect(urgent(r.lines)).toEqual([]);
+  expect(r.lines.some((l) => l.startsWith("HOST_GUARD ONLINE"))).toBe(false);
+
+  const down = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }), ["lane-a"]);
+  await down.runTo(775_000);
+  expect(urgent(down.lines)).toEqual([]);
+  await down.runTo(780_000);
+  expect(urgent(down.lines)).toEqual(["HOST_GUARD OFFLINE machine=worker-a runner heartbeat missing for 780 s"]);
+  expect(down.alerts).toHaveLength(1);
+
+  const dead = rig(() => ({ kind: "dead", detail: "no process" }), ["lane-a"]);
+  await dead.runTo(180_000);
+  expect(urgent(dead.lines)).toEqual(["HOST_GUARD OFFLINE machine=worker-a runner dead on its host: no process"]);
 });
 
 test("reconnects within the hysteresis fold into one outage per machine: one RUNNER_OFFLINE, one RUNNER_ONLINE, no wake", async () => {
@@ -117,6 +146,7 @@ test("reconnects within the hysteresis fold into one outage per machine: one RUN
 
 test("a folded disconnect that stays down 10 min still wakes the lead; owned lanes wake it once per outage", async () => {
   const r = rig(() => ({ kind: "unreachable", detail: "ssh: no route" }), ["lane-a"]);
+  await r.monitor.heartbeat("worker-a");
   await r.runTo(180_000);
   await r.monitor.heartbeat("worker-a");
   await r.runTo(r.at() + 180_000);

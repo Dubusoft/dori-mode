@@ -11,7 +11,11 @@ import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
  * - No heartbeat for 60 s: `RUNNER_STALE machine=<label>` once. For 180 s the runner is offline and the restart decision
  *   starts; the first disconnect is `RUNNER_OFFLINE machine=<label>` (engine-only). The lead is woken with
  *   `HOST_GUARD OFFLINE machine=<label>` only when the runner owns open lanes, the probe finds it dead, or it stays
- *   offline for 10 min.
+ *   offline for 10 min. A runner not heard from since the monitor started tracking it (a supervisor restart: it is
+ *   still reconnecting to the new hub) gets no owned-lane wake on that first judgment; it wakes the lead only by
+ *   dying or staying offline for 10 min.
+ * - Each `HOST_GUARD OFFLINE`, and the `HOST_GUARD ONLINE` that ends it, is also posted as a system notice to the
+ *   owner's alerts channel (`alert`).
  * - Hysteresis per machine: an outage ends only after the runner has stayed connected for 10 min. A disconnect before
  *   then folds into the same outage (no new `RUNNER_STALE` or `RUNNER_OFFLINE`), and the steady reconnect is said once
  *   as `RUNNER_ONLINE machine=<label>` (digest) with the number of disconnects folded into it.
@@ -56,6 +60,8 @@ export type LivenessDeps = {
   readonly ownedLanes: (label: string) => Promise<readonly string[]>;
   readonly operations: OperationStore;
   readonly emit: (line: string) => Promise<void> | void;
+  /** A system notice for the owner's alerts channel; fire and forget, a failed post never stops a tick. */
+  readonly alert?: (text: string) => void;
 };
 
 type Watched = {
@@ -66,6 +72,8 @@ type Watched = {
   offlineSince?: number;
   /** This disconnect woke the lead with HOST_GUARD OFFLINE. */
   escalated: boolean;
+  /** A heartbeat or hello arrived since tracking began; a runner tracked at supervisor start has none yet. */
+  contacted: boolean;
   /** From the first disconnect until FLAP_HOLD_MS connected after the last one. */
   outage?: { readonly since: number; disconnects: number; recoveredAt?: number; woke: boolean; unreachableSaid?: boolean };
   lost: boolean;
@@ -146,7 +154,7 @@ export class LivenessMonitor {
       const restarts = this.deps.operations.list({ lane: `runner:${label}` })
         .filter((op) => op.action === "restart" && wall - op.at < RESTART_CIRCUIT_WINDOW_MS)
         .map((op) => mono - (wall - op.at));
-      this.runners.set(label, { lastSeen: mono, gen, stale: false, offline: false, escalated: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0 });
+      this.runners.set(label, { lastSeen: mono, gen, stale: false, offline: false, escalated: false, contacted: false, lost: false, failures: 0, nextDecisionAt: 0, restarts, seq: 0 });
     }
   }
 
@@ -181,15 +189,21 @@ export class LivenessMonitor {
   private async seen(label: string, r: Watched): Promise<void> {
     r.lastSeen = this.deps.monotonic();
     if (r.offline && r.outage) r.outage.recoveredAt = r.lastSeen;
-    if (r.offline && r.escalated) await this.deps.emit(`HOST_GUARD ONLINE ${tag(label)}`);
-    Object.assign(r, { stale: false, offline: false, offlineSince: undefined, escalated: false, lost: false, failures: 0, nextDecisionAt: 0 });
+    if (r.offline && r.escalated) {
+      const line = `HOST_GUARD ONLINE ${tag(label)}`;
+      await this.deps.emit(line);
+      this.deps.alert?.(`도리 알림: 러너 ${label}가 다시 연결되었습니다. (${line})`);
+    }
+    Object.assign(r, { stale: false, offline: false, offlineSince: undefined, escalated: false, contacted: true, lost: false, failures: 0, nextDecisionAt: 0 });
   }
 
   private async escalate(label: string, r: Watched, why: string): Promise<void> {
     if (r.escalated) return;
     r.escalated = true;
     if (r.outage) r.outage.woke = true;
-    await this.deps.emit(`HOST_GUARD OFFLINE ${tag(label)} ${why}`);
+    const line = `HOST_GUARD OFFLINE ${tag(label)} ${why}`;
+    await this.deps.emit(line);
+    this.deps.alert?.(`도리 경고: 러너 ${label}의 연결이 끊겨 있습니다. 리드에게도 알렸습니다. (${line})`);
   }
 
   /** One pass over every tracked runner; a pass still running when the next is due is skipped. */
@@ -222,8 +236,9 @@ export class LivenessMonitor {
       r.nextDecisionAt = at;
       const first = !r.outage;
       if (r.outage) { r.outage.disconnects += 1; r.outage.recoveredAt = undefined; } else r.outage = { since: at, disconnects: 1, woke: false };
-      // Owned lanes wake the lead once per outage; a folded disconnect wakes it again only by staying down or dying.
-      const lanes = r.outage.woke ? [] : await this.deps.ownedLanes(label);
+      // Owned lanes wake the lead once per outage; a folded disconnect wakes it again only by staying down or dying. So
+      // does a runner not heard from since tracking began: after a supervisor restart it may still be reconnecting.
+      const lanes = r.outage.woke || !r.contacted ? [] : await this.deps.ownedLanes(label);
       if (lanes.length > 0) await this.escalate(label, r, `runner heartbeat missing for ${Math.floor(silent / 1000)} s; it owns open lanes ${lanes.join(",")}`);
       else if (first) await this.deps.emit(`RUNNER_OFFLINE ${tag(label)} runner heartbeat missing for ${Math.floor(silent / 1000)} s`);
     }

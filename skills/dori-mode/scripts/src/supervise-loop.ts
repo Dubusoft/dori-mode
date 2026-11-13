@@ -1232,6 +1232,14 @@ export const supervise = async (
           },
           ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
           emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
+          // A runner outage the lead is woken for is also a system notice in the alerts channel. Not awaited: a hung post
+          // must not stop the liveness tick.
+          alert: (text) => {
+            const channel = alertsChannelOf(deps.config);
+            if (!channel) return;
+            void systemPost(channel, scrubForThread(text, homedir()), `runner-liveness-alert:${boot}:${++livenessSeq}`)
+              .catch((e: unknown) => { console.error(`RUNNER_ALERT_NOTIFY_FAILED ${e instanceof Error ? e.message : String(e)}`); });
+          },
         });
         for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
       } catch (e) {
