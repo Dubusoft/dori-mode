@@ -98,6 +98,8 @@ const DIGEST_KINDS = [
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
   // OWNER_DECISION_OPENED is digest: opening a thread needs no immediate lead action.
   "OWNER_DECISION_OPENED",
+  // A pane no registered lane owns (dead-panes.ts) is told once and never wakes the lead; a lane's own pane stays urgent.
+  "UNRECOGNISED_PANE * unregistered",
 ] as const;
 
 /** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */

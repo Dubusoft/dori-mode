@@ -3,6 +3,7 @@ import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
+import { eventClass } from "../src/event-policy.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { acquireSlot, releaseSlot } from "../src/heavy-slot.ts";
 import { guardTick } from "../src/host-guard.ts";
@@ -57,8 +58,47 @@ test("a reworded stop message is not dead: with no alive status it is unrecognis
   const st = newDeadPaneState();
   expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
   expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
-  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual(["UNRECOGNISED_PANE w:p1 dead-panes: no alive status and no dead marker for 3 ticks"]);
+  expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual(["UNRECOGNISED_PANE w:p1 unregistered dead-panes: no alive status and no dead marker for 3 ticks"]);
   expect(await deadPaneTick(deps.ops, deps.config, seen, "2026-01-01T12", st)).toEqual([]);
+});
+
+test("a pane no lane owns raises one digest line, even after an alive status starts its count over", async () => {
+  world.panes = [{ pane_id: "w:p1", workspace_id: "w" }];
+  world.screen = "ubuntu@host:~$ ";
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  const st = newDeadPaneState();
+  const tick = () => deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st, [working]);
+  const lines: string[] = [];
+  for (let i = 0; i < 3; i++) lines.push(...await tick());
+  world.panes[0] = { pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" };
+  lines.push(...await tick());
+  world.panes[0] = { pane_id: "w:p1", workspace_id: "w" };
+  for (let i = 0; i < 6; i++) lines.push(...await tick());
+  expect(lines).toEqual(["UNRECOGNISED_PANE w:p1 unregistered dead-panes: no alive status and no dead marker for 3 ticks"]);
+  expect(eventClass(lines[0] as string)).toBe("lead-digest");
+});
+
+test("a lane pane's count starts over on each report, claim or status change, and a silent lane pane is named with its key", async () => {
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2" }];
+  world.screen = "something else\n$ ";
+  const deps = depsFor(world, fakeClock(T0), state.dir);
+  const st = newDeadPaneState();
+  let lane: Lane = working;
+  const tick = () => deadPaneTick(deps.ops, deps.config, new Set(), "2026-01-01T12", st, [lane]);
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual([]);
+  lane = { ...lane, lastReplyAt: T0 + MIN };
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual([]);
+  lane = { ...lane, claim: { at: new Date(T0 + 2 * MIN).toISOString(), evidence: "pr" } };
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual([]);
+  lane = { ...lane, history: [{ at: new Date(T0 + 3 * MIN).toISOString(), status: "working", note: "resumed" }] };
+  expect(await tick()).toEqual([]);
+  expect(await tick()).toEqual([]);
+  const line = "UNRECOGNISED_PANE w:p7 lane=quiet-lane dead-panes: no alive status and no dead marker for 3 ticks";
+  expect(await tick()).toEqual([line]);
+  expect(eventClass(line)).toBe("lead-urgent");
 });
 
 test("a DAG viewer pane in a registered lane's tab is part of that lane and never raises UNRECOGNISED_PANE", async () => {
@@ -85,8 +125,8 @@ test("a DAG viewer pane outside every lane's tab, and any other unknown pane in 
   expect(await tick()).toEqual([]);
   expect(await tick()).toEqual([]);
   expect(await tick()).toEqual([
-    "UNRECOGNISED_PANE w:p8 dead-panes: no alive status and no dead marker for 3 ticks",
-    "UNRECOGNISED_PANE w:p9 dead-panes: no alive status and no dead marker for 3 ticks",
+    "UNRECOGNISED_PANE w:p8 lane=quiet-lane dead-panes: no alive status and no dead marker for 3 ticks",
+    "UNRECOGNISED_PANE w:p9 unregistered dead-panes: no alive status and no dead marker for 3 ticks",
   ]);
 });
 
