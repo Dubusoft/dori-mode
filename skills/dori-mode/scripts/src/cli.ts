@@ -16,8 +16,8 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
 import { type GuardMachine, listGuardMachines, machineKind, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
 import type { Json, KeyPrompter } from "./config-keys.ts";
-import { adoptLane, attachLaneFiles, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, parseLaneTask, SandboxRefusal, validateLaunch } from "./launch.ts";
-import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
+import { adoptLane, attachLaneFiles, type LaunchInput, launchNextLine, LaunchError, parseLaneTask, validateLaunch } from "./launch.ts";
+import { admitLaunch, placeLaunch, placementReports } from "./launch-service.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -25,10 +25,9 @@ import { Repos, ReposError } from "./repos.ts";
 import { realClock, run, setDefaultRunTimeout } from "./run.ts";
 import { remoteRunnerCli, remoteRunnerService } from "./runner/service.ts";
 import { syncRegistry } from "./sync.ts";
-import { dequeueLaunch, enqueueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
+import { dequeueLaunch, launchQueue, recordLaunchVerdict } from "./routing.ts";
 import {
-  candidatesLine, checkMachine, LOCAL_MACHINE, placementLine, placementTable, planLaunch, resolvePlacement, type RunnerPlacement,
-  runnerPlacements, verdictLine,
+  candidatesLine, checkMachine, LOCAL_MACHINE, placementLine, placementTable, planLaunch, resolvePlacement, verdictLine,
 } from "./placement.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
 import { Discord, discordPresence, openDiscordGateway } from "./messenger/discord.ts";
@@ -796,13 +795,6 @@ const machineOpt = async (stateDir: string): Promise<{ machine: string; offline:
   if (offline === undefined) die(`RUNNER_UNKNOWN_MACHINE ${machine}: no runner with that label has enrolled; see them with \`dori status\` or \`dori runner probe\``);
   return { machine, offline: offline === true };
 };
-/** What every runner reported about its repos, `online` unless its runner is offline, lost or revoked (as runnerOffline). */
-const placementReports = async (stateDir: string): Promise<RunnerPlacement[]> => {
-  const { readRunnerRows } = await import("./runner/hub.ts");
-  const { runnerView } = await import("./status.ts");
-  const now = Date.now();
-  return runnerPlacements(readRunnerRows(stateDir), (row) => !["offline", "lost", "revoked"].includes(runnerView(row, now).state));
-};
 const offlineWarn = (machine: string, what: "wait" | "source" | "schedule"): string =>
   `WARN runner ${machine} is not connected; the ${what} is kept and runs when it reconnects`;
 
@@ -1158,34 +1150,16 @@ try {
       const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), ...(task !== undefined ? { task } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
-      const reports = await placementReports(config.stateDir);
-      const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine), reports);
-      for (const line of plan.lines) console.log(line);
-      const target = plan.check.machine;
-      const machine = target === LOCAL_MACHINE ? undefined : target;
-      // A remote launch without --cwd starts in the checkout its owning runner declared.
-      const cwd = input.cwd ?? (machine && plan.placement.machine === target ? plan.placement.cwd : undefined);
-      if (!machine && config.guard.panesMax <= 0) console.log(`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
-      if (!plan.check.verdict.ok) {
-        const repos = doneRepos(input.done);
-        const queue = enqueueLaunch(config.stateDir, {
-          key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [plan.check.verdict.reasons.join(" | ")],
-          ...(cwd ? { cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
-          ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}), ...(input.task !== undefined ? { task: input.task } : {}),
-          ...(machine ? { machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
-        });
-        console.log(verdictLine(target, plan.check.verdict));
-        console.log(`QUEUED ${input.key} (${queue.length} waiting; dori hold list)`);
+      const placed = await placeLaunch(deps, input);
+      for (const line of placed.lines) console.log(line);
+      const r = await admitLaunch(deps, input, placed, (line) => { console.error(line); });
+      if (r.kind === "held") {
+        console.log(verdictLine(r.target, r.verdict));
+        console.log(`QUEUED ${input.key} (${r.queued} waiting; dori hold list)`);
         process.exit(4);
       }
-      // A refused sandbox and an allowed unsandboxed run both reach the owner on Discord (sandbox-notice.ts) before the exit.
-      const r = await launchLane(deps, { ...input, machine, ...(cwd ? { cwd } : {}) }).catch(async (e: unknown) => {
-        if (e instanceof SandboxRefusal) for (const line of await postSandboxNotice(deps, input, e.message)) console.error(line);
-        throw e;
-      });
-      dequeueLaunch(config.stateDir, input.key);
       for (const note of r.notes) console.log(note);
-      for (const line of await postSkippedNotices(deps, input, r.notes)) console.error(line);
+      for (const line of r.notices) console.error(line);
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
       const next = launchNextLine(r.lane.key, r.startup); if (next) console.log(next);

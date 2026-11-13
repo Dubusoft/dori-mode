@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import {
   autopilotLocalStateKey, candidatesJson, DEFAULT_AUTOPILOT, formatCandidates, type JudgeContext, judge, judgeAll, ledgerRows, ledgerState,
-  parseAutopilotConfig, reservedTaskOf, type ToodoTask,
+  parseAutopilotConfig, reservedTaskOf, singleHost, type ToodoTask,
 } from "../src/autopilot.ts";
 import { JsonOperations, type Operation, type OperationState } from "../src/operations.ts";
 
@@ -30,7 +30,7 @@ const merged = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => task(id
 
 const ctx = (tasks: readonly ToodoTask[], over: Partial<JudgeContext> = {}): JudgeContext => ({
   tasks: new Map(tasks.map((t) => [t.id, t])), ledger: [], openLanes: new Set(), quota: { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
-  host: { ok: true }, config: DEFAULT_AUTOPILOT, ...over,
+  hosts: singleHost({ ok: true }), config: DEFAULT_AUTOPILOT, ...over,
 });
 
 const attempt = (taskId: number, n: number, state: OperationState, laneKey = `lane-${taskId}-${n}`): Operation => ({
@@ -129,12 +129,12 @@ test("one account with room launches; every account spent holds quota-over-thres
 });
 
 test("a host HOLD holds host-hold", () => {
-  expect(outcome(ctx([task(12)], { host: { ok: false, reason: "load high" } }), 12)).toEqual(["HOLD", ["host-hold"]]);
+  expect(outcome(ctx([task(12)], { hosts: singleHost({ ok: false, reason: "load high" }) }), 12)).toEqual(["HOLD", ["host-hold"]]);
 });
 
 test("every failing reason is collected, refusals first", () => {
   const t = task(12, { autopilot: false, refs: [], criteria: [], wait: { until: 1, status: "planned" }, dependsOn: [5] });
-  expect(outcome(ctx([t, task(5)], { quota: { readable: false }, host: { ok: false } }), 12))
+  expect(outcome(ctx([t, task(5)], { quota: { readable: false }, hosts: singleHost({ ok: false }) }), 12))
     .toEqual(["REFUSE", ["not-flagged", "owner-ref-missing", "criteria-missing", "prerequisite-open", "waiting", "quota-unreadable", "host-hold"]]);
 });
 
@@ -143,7 +143,7 @@ test("every failing reason is collected, refusals first", () => {
 test("judgeAll keeps only host.slots LAUNCH verdicts, due date first then id; the rest hold no-slot", () => {
   const tasks = [task(12), task(13, { dueDate: "2026-02-01" }), task(14), task(15, { dueDate: "2026-01-15" }), task(16, { autopilot: false })];
   const judged = (slots?: number) =>
-    judgeAll(ctx(tasks, { host: slots === undefined ? { ok: true } : { ok: true, slots } }), [16, 14, 15, 13, 12]).map((v) => [v.taskId, v.verdict, v.reasons]);
+    judgeAll(ctx(tasks, { hosts: singleHost(slots === undefined ? { ok: true } : { ok: true, slots }) }), [16, 14, 15, 13, 12]).map((v) => [v.taskId, v.verdict, v.reasons]);
   expect(judged(2)).toEqual([
     [12, "HOLD", ["no-slot"]], [13, "LAUNCH", []], [14, "HOLD", ["no-slot"]], [15, "LAUNCH", []], [16, "REFUSE", ["not-flagged"]],
   ]);
@@ -154,7 +154,7 @@ test("judgeAll keeps only host.slots LAUNCH verdicts, due date first then id; th
 
 test("a HOLD or REFUSE task takes no slot", () => {
   const tasks = [task(12, { criteria: [] }), task(13, { wait: { until: 1, status: "planned" } }), task(14)];
-  expect(judgeAll(ctx(tasks, { host: { ok: true, slots: 1 } }), [12, 13, 14]).map((v) => [v.taskId, v.verdict]))
+  expect(judgeAll(ctx(tasks, { hosts: singleHost({ ok: true, slots: 1 }) }), [12, 13, 14]).map((v) => [v.taskId, v.verdict]))
     .toEqual([[12, "REFUSE"], [13, "HOLD"], [14, "LAUNCH"]]);
 });
 
