@@ -11,6 +11,7 @@ import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
 import { laneGitEffect } from "./lane-git.ts";
+import { ensureOmoLaneProfile } from "./omo-profile.ts";
 import { runnerPolicy } from "./local-policy.ts";
 import { policyReloader } from "./policy-reload.ts";
 import { watchConfigFiles } from "../config-watch.ts";
@@ -52,7 +53,7 @@ import { acceptWs } from "./ws-transport.ts";
  * the CLI. Returns the process exit code.
  */
 
-export const RUNNER_HOST_USAGE = "usage: runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | runner probe [--json]";
+export const RUNNER_HOST_USAGE = "usage: runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | runner probe [--json] | runner omo-profile";
 
 class Exit extends Error {
   constructor(readonly code: number, message: string) { super(message); }
@@ -429,6 +430,12 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
     const [sub, ...extra] = parsed.positionals;
     if (extra.length) fail(RUNNER_HOST_USAGE, 2);
     if (sub === "probe") return probeMain(parsed.values.json === true);
+    if (sub === "omo-profile") {
+      // For `dori runner install` on a Mac: the omo profile its sandboxed lanes run under (omo-profile.ts).
+      const line = ensureOmoLaneProfile(homedir());
+      if (line) console.log(line);
+      return 0;
+    }
     if (sub === "export-outbox") {
       // For `dori runner evacuate` over ssh: every event this runner has not had acked, as the frames it would send.
       const runnerDir = defaultRunnerDir();

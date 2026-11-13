@@ -277,7 +277,7 @@ const runMacos = async (home: string, cwd: string, args: string[], env: Record<s
 const seatbelt = async (home: string, cwd: string, env: Record<string, string>): Promise<Seatbelt> => {
   const out = join(home, "..", "sbx-argv");
   const sbx = join(home, "..", "fake-sandbox-exec");
-  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" > "${out}.env"\n`);
+  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0OMO_PROFILE=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" "$OMO_PROFILE" > "${out}.env"\n`);
   chmodSync(sbx, 0o755);
   const r = await runMacos(home, cwd, ["omo", "--model", "m"], env, sbx);
   expect(r.code).toBe(0);
@@ -369,7 +369,7 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   const lt = join(home, ".cache", "omo-tmp", "lane-sandbox", "lane-a");
 
   expect(sb.command).toEqual(["omo", "--model", "m"]);
-  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "" });
+  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "", OMO_PROFILE: "dori-lane" });
   expect(statSync(lt).mode & 0o777).toBe(0o700);
   expect(sb.err).toBe("");
 
@@ -488,6 +488,12 @@ test("macOS: a lane's tools get the system root bundle as SSL_CERT_FILE, and one
   writeFileSync(join(root, "cert.pem"), "");
   expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" })).env.SSL_CERT_FILE).toBe(join(root, "cert.pem"));
   expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", SSL_CERT_FILE: "/opt/corp.pem" })).env.SSL_CERT_FILE).toBe("/opt/corp.pem");
+});
+
+test("macOS: a lane's omo runs under the dori-lane profile, and an OMO_PROFILE already set is kept", async () => {
+  const { home, wt } = macHome();
+  expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" })).env.OMO_PROFILE).toBe("dori-lane");
+  expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", OMO_PROFILE: "mine" })).env.OMO_PROFILE).toBe("mine");
 });
 
 test("macOS: a cwd-less lane may list the directories above its cwd (realpath opens them), but read nothing under them", async () => {

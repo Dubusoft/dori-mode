@@ -247,4 +247,9 @@ export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT"
 # and its agent shell inherits it, so curl, git and gh there fail every TLS verification. With SSL_CERT_FILE already
 # set omo keeps it and only adds its own roots for itself; the system bundle is what these tools read by default.
 if [ -z "${SSL_CERT_FILE:-}" ] && [ -f "$CERTS" ]; then export SSL_CERT_FILE="$CERTS"; fi
+# omo wraps its memory reflection child in a sandbox-exec of its own, and macOS refuses to apply a sandbox inside this
+# one ("sandbox_apply: Operation not permitted"). The omo profile dori-lane, which `dori runner install` adds to
+# ~/.omo/omo.jsonc, turns that inner sandbox off: the reflection child still runs inside this profile. An OMO_PROFILE
+# already set is kept.
+if [ -z "${OMO_PROFILE:-}" ]; then export OMO_PROFILE=dori-lane; fi
 exec "$SBX" -p "$PROFILE" "${PARAMS[@]}" -- "$@"
