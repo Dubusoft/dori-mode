@@ -55,10 +55,21 @@ test("as and mint load on a rule", async () => {
   expect(c.secrets.GH_TOKEN).toEqual({ lanes: [], repos: ["o/r"], mint: MINT });
 });
 
+test("a file as and a put permission load on a rule", async () => {
+  const c = await load("file-put", { secrets: { SA_JSON: { lanes: ["a"], as: "file", put: { lanes: ["b-*"] } }, DEPLOY_KEY: { as: "ssh-key", put: { repos: ["o/r"] } } } });
+  expect(c.secrets.SA_JSON).toEqual({ lanes: ["a"], repos: [], as: "file", put: { lanes: ["b-*"], repos: [] } });
+  expect(c.secrets.DEPLOY_KEY).toEqual({ lanes: [], repos: [], as: "ssh-key", put: { lanes: [], repos: ["o/r"] } });
+});
+
 test("a bad as or mint throws TypeError", async () => {
   const { kind: _k, ...noKind } = MINT;
   const bad: unknown[] = [
-    { A: { as: "file" } },
+    { A: { as: "pem" } },
+    { A: { as: "file", mint: MINT } },
+    { A: { put: { lanes: ["a"] }, mint: MINT } },
+    { A: { put: ["a"] } },
+    { A: { put: { lanes: "a" } } },
+    { A: { put: { lanes: ["a"], other: [] } } },
     { A: { as: 1 } },
     { A: { as: "ssh-key", mint: MINT } },
     { A: { mint: "x" } },

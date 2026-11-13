@@ -928,6 +928,7 @@ try {
       const [action, name, ...extra] = flags.positionals;
       const usage = "usage: dori secret add NAME | dori secret update NAME | dori secret list [--json] | dori secret delete NAME";
       if (action === "exec") die("SECRET_EXEC_LANE_ONLY dori secret exec runs inside a lane; it asks the runner for allowlisted names", 2);
+      if (action === "put") die("SECRET_PUT_LANE_ONLY dori secret put runs inside a lane; on the host use dori secret add or update", 2);
       if (extra.length || Object.keys(flags.values).some((flag) => flag !== "json" || action !== "list")) die(usage, 2);
       const store = new SecretStore();
       try {

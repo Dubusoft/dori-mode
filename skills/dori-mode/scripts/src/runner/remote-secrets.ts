@@ -1,5 +1,5 @@
 import type { RunnerClient } from "./client.ts";
-import type { SecretGrant } from "./lane-socket.ts";
+import type { SecretGrant, SecretKind, SecretPutResult } from "./lane-socket.ts";
 import type { SecretRunResult } from "./secret-run.ts";
 
 /**
@@ -20,10 +20,10 @@ export type RemoteSecretDeps = {
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-type Granted = { readonly values: Record<string, string>; readonly kinds?: Record<string, "env" | "ssh-key"> };
+type Granted = { readonly values: Record<string, string>; readonly kinds?: Record<string, SecretKind> };
 
 /**
- * The values (and `kinds`, ssh-key entries only) of a `secret.value` plaintext when it grants exactly `names` as
+ * The values (and `kinds`, ssh-key and file entries only) of a `secret.value` plaintext when it grants exactly `names` as
  * strings; else undefined.
  */
 const grantedValues = (plaintext: string, names: readonly string[]): Granted | undefined => {
@@ -40,10 +40,10 @@ const grantedValues = (plaintext: string, names: readonly string[]): Granted | u
   }
   if (parsed.kinds === undefined) return { values };
   if (!isRecord(parsed.kinds)) return undefined;
-  const kinds: Record<string, "env" | "ssh-key"> = {};
+  const kinds: Record<string, SecretKind> = {};
   for (const [name, kind] of Object.entries(parsed.kinds)) {
-    if (!Object.hasOwn(values, name) || (kind !== "env" && kind !== "ssh-key")) return undefined;
-    if (kind === "ssh-key") kinds[name] = kind;
+    if (!Object.hasOwn(values, name) || (kind !== "env" && kind !== "ssh-key" && kind !== "file")) return undefined;
+    if (kind !== "env") kinds[name] = kind;
   }
   return Object.keys(kinds).length ? { values, kinds } : { values };
 };
@@ -63,6 +63,29 @@ export const remoteSecretGranter = (deps: RemoteSecretDeps) => async (key: strin
   deps.onGranted?.(Object.values(granted.values));
   deps.log(`RUNNER_SECRET_GRANTED lane=${key} names=${list}`);
   return { ok: true, ...granted };
+};
+
+export type RemoteSecretPutDeps = Omit<RemoteSecretDeps, "client"> & { readonly client: Pick<RunnerClient, "secretPut"> };
+
+/**
+ * The `secretPut` handler for a remote runner's lane socket: the runner holds no store, so it sends the value to the
+ * supervisor sealed in `secret.put` (client.ts `secretPut`); the supervisor checks `secrets.<name>.put`, stores and
+ * audits. Registers the value for log masking here too and logs lane, name and outcome only, never the value.
+ */
+export const remoteSecretDepositor = (deps: RemoteSecretPutDeps) => async (key: string, name: string, value: string): Promise<SecretPutResult> => {
+  const repo = await deps.laneRepo(key).catch(() => undefined);
+  const reply = await deps.client.secretPut({ key, name, value, ...(repo !== undefined ? { repo } : {}) });
+  if (!reply.ok) {
+    deps.log(`RUNNER_SECRET_DENIED lane=${key} names=${name} put code=${reply.code}`);
+    return { ok: false, code: reply.code, detail: reply.detail };
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(reply.plaintext); } catch { parsed = undefined; }
+  deps.onGranted?.([value]);
+  deps.log(`RUNNER_SECRET_STORED lane=${key} names=${name} put`);
+  const created = isRecord(parsed) && parsed.created === true;
+  const backend = isRecord(parsed) && typeof parsed.backend === "string" ? parsed.backend : "";
+  return { ok: true, created, backend };
 };
 
 export type RemoteSecretRunDeps = Omit<RemoteSecretDeps, "onGranted">;

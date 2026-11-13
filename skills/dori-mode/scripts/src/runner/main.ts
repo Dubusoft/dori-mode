@@ -6,8 +6,8 @@ import { type Observation, pruneCommandRecords, resolveInterrupted } from "./dur
 import { RunnerLanes } from "./lanes.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
-import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
-import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
+import { appendSecretAudit, laneRepoOf, secretAuditPath, secretDepositor, secretGranter } from "./secret-grant.ts";
+import { remoteSecretDepositor, remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
@@ -344,6 +344,10 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         }),
         // Proxy execution runs on the supervisor host: secret.run over the link.
         secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
+        // A value a lane made goes sealed to the supervisor's store: secret.put over the link.
+        secretPut: remoteSecretDepositor({
+          client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log, onGranted: addKnownSecrets,
+        }),
       };
     } else {
       const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
@@ -361,6 +365,16 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         keyForPane: (pane) => runnerLanes.keyForPane(pane),
         reportFiles: (key) => runnerLanes.reportFiles(key),
         secretRun: (key, op) => runOp(key, op),
+        secretPut: secretDepositor({
+          store: secretStore,
+          rules: async () => (await loadConfig()).secrets,
+          laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
+          audit: (entry) => {
+            auditFile(entry);
+            log(`${entry.allowed ? "RUNNER_SECRET_STORED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")} put${entry.reason ? ` reason=${entry.reason}` : ""}`);
+          },
+          runner: identity.label, now: realClock.now, onStored: (value) => { addKnownSecrets([value]); },
+        }),
         secrets: secretGranter({
           store: secretStore,
           rules: async () => (await loadConfig()).secrets,

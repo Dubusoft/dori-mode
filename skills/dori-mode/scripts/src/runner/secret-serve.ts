@@ -1,11 +1,12 @@
 import type { SecretCommand, SecretRule } from "../config.ts";
 import { secretRequester } from "../owner-decisions.ts";
 import type { SecretStore } from "../secret-store.ts";
-import type { SecretGrant } from "./lane-socket.ts";
-import { secretsSupported, SECRET_PROTO } from "./protocol.ts";
-import { appendSecretAudit, secretAuditPath, secretGranter } from "./secret-grant.ts";
+import { SECRET_PUT_MAX_BYTES, type SecretGrant, type SecretPutResult } from "./lane-socket.ts";
+import { secretsSupported, SECRET_PROTO, SECRET_PUT_PROTO } from "./protocol.ts";
+import { appendSecretAudit, secretAuditPath, secretDepositor, secretGranter } from "./secret-grant.ts";
 import { secretCommandRunner, type SecretRunnerDeps, type SecretRunResult } from "./secret-run.ts";
-import type { SecretFrame, SecretReplyContext } from "./serve.ts";
+import { SECRET_ANSWER_TYPE, type SecretFrame, type SecretReplyContext } from "./serve.ts";
+import { SECRET_NAME } from "../secret-name.ts";
 
 /**
  * The supervisor side of remote secrets: answers a remote runner's `secret.get` with a `secret.value` whose values
@@ -20,6 +21,9 @@ export type LaneGranter = (key: string, names: readonly string[]) => Promise<Sec
 /** A secret command runner for one runner's lanes: secret-run.ts `secretCommandRunner` shape, repo bound. */
 export type LaneCommandRunner = (key: string, op: string) => Promise<SecretRunResult>;
 
+/** Stores a value for one runner's lanes: secret-grant.ts `secretDepositor` shape, repo bound. */
+export type LaneDepositor = (key: string, name: string, value: string) => Promise<SecretPutResult>;
+
 export type SupervisorSecretDeps = {
   /** The runner that owns lane `key` in the registry (`Lane.runner`), undefined when no open lane has that key. */
   readonly laneOwner: (key: string) => string | undefined | Promise<string | undefined>;
@@ -29,6 +33,8 @@ export type SupervisorSecretDeps = {
   readonly granter: (label: string, repo: string | undefined) => LaneGranter;
   /** Runs `secretCommands.<op>` on this host for `label`'s lanes, with `repo` (from the frame); absent: `secret.run` is UNSUPPORTED. */
   readonly commandRunner?: (label: string, repo: string | undefined) => LaneCommandRunner;
+  /** Stores a value `label`'s lane made (`secret.put`), with `repo` (from the frame); absent: `secret.put` is UNSUPPORTED. */
+  readonly depositor?: (label: string, repo: string | undefined) => LaneDepositor;
   readonly log: (line: string) => void;
 };
 
@@ -38,11 +44,13 @@ export type SupervisorSecretDeps = {
  * `RUNNER_FORGED_SECRET runner=<label> key=<key>`; unsandboxed runner -> `RUNNER_SECRET_DENIED`; then the granter
  * (`secret.get`) or the command runner (`secret.run`; `RUNNER_SECRET_UNSUPPORTED` without one). A grant is answered `ok`
  * with `sealed` = JSON `{values, kinds?}` sealed `s2r` under aad `{runner, gen, epoch, type: "secret.value", rid}`; a run
- * with `sealed` = JSON `{exitCode, stdout, stderr, truncated}` under aad type `"secret.run.result"`. Refusals go unsealed
- * with code and detail. The returned promise settles once the answer went out.
+ * with `sealed` = JSON `{exitCode, stdout, stderr, truncated}` under aad type `"secret.run.result"`. A `secret.put` (proto
+ * 8, else `RUNNER_SECRET_OUTDATED`) opens its `r2s` box under the frame's own aad `{runner, gen, epoch, type:
+ * "secret.put", rid}` and goes to the depositor; its `secret.put.result` carries `created`/`backend`, nothing sealed.
+ * Refusals go unsealed with code and detail. The returned promise settles once the answer went out.
  */
 export const supervisorSecretHandler = (deps: SupervisorSecretDeps) => async (label: string, frame: SecretFrame, ctx: SecretReplyContext): Promise<void> => {
-  const type = frame.type === "secret.get" ? "secret.value" : "secret.run.result";
+  const type = SECRET_ANSWER_TYPE[frame.type];
   const { rid, key } = frame.body;
   const refuse = (code: string, detail: string): void => { ctx.reply(type, { rid, ok: false, code, detail }); };
   try {
@@ -56,6 +64,18 @@ export const supervisorSecretHandler = (deps: SupervisorSecretDeps) => async (la
     }
     if (deps.runnerUnsandboxed(label)) {
       refuse("RUNNER_SECRET_DENIED", `runner ${label} runs lanes unsandboxed (runners.${label}.allowUnsandboxed); it gets no secrets`);
+      return;
+    }
+    if (frame.type === "secret.put") {
+      if (!deps.depositor) { refuse("RUNNER_SECRET_UNSUPPORTED", "storing lane secrets is not enabled"); return; }
+      if (ctx.proto < SECRET_PUT_PROTO) { refuse("RUNNER_SECRET_OUTDATED", `runner speaks proto ${ctx.proto}; secret put needs proto ${SECRET_PUT_PROTO}`); return; }
+      const { name, sealed } = frame.body;
+      if (!SECRET_NAME.test(name)) { refuse("RUNNER_SECRET_FAILED", "secret.put names no valid secret"); return; }
+      const value = session.openSecret("r2s", { runner: frame.runner, gen: frame.gen, epoch: frame.epoch, type: "secret.put", rid }, sealed);
+      if (value === undefined) { refuse("RUNNER_SECRET_FAILED", "sealed value did not open"); return; }
+      if (!value || Buffer.byteLength(value) > SECRET_PUT_MAX_BYTES) { refuse("RUNNER_SECRET_FAILED", `secret.put needs a value of 1 to ${SECRET_PUT_MAX_BYTES} bytes`); return; }
+      const result = await deps.depositor(label, frame.body.repo)(key, name, value);
+      ctx.reply("secret.put.result", result.ok ? { rid, ok: true, created: result.created, backend: result.backend } : { rid, ok: false, code: result.code, detail: result.detail });
       return;
     }
     if (frame.type === "secret.run") {
@@ -102,6 +122,22 @@ export const supervisorGranter = (deps: SupervisorGranterDeps) => (label: string
     audit: (entry) => {
       append(entry);
       deps.log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} runner=${entry.runner} lane=${entry.lane} names=${entry.names.join(",")}`);
+    },
+  });
+};
+
+/**
+ * `SupervisorSecretDeps.depositor` for production: phase 1's `secretDepositor` with `runner: label`, the frame's repo,
+ * audit lines appended to `<stateDir>/secret-audit.jsonl` plus a log line
+ * `RUNNER_SECRET_STORED|RUNNER_SECRET_DENIED runner=<label> lane=<key> names=<NAME> put`.
+ */
+export const supervisorDepositor = (deps: Omit<SupervisorGranterDeps, "commands" | "store"> & { readonly store: Pick<SecretStore, "put"> }) => (label: string, repo: string | undefined): LaneDepositor => {
+  const append = appendSecretAudit(secretAuditPath(deps.stateDir), deps.log);
+  return secretDepositor({
+    runner: label, store: deps.store, rules: deps.rules, now: deps.now, laneRepo: async () => repo,
+    audit: (entry) => {
+      append(entry);
+      deps.log(`${entry.allowed ? "RUNNER_SECRET_STORED" : "RUNNER_SECRET_DENIED"} runner=${entry.runner} lane=${entry.lane} names=${entry.names.join(",")} put`);
     },
   });
 };

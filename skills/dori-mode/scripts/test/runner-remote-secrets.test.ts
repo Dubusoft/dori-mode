@@ -9,7 +9,11 @@ import {
   decodeFrame, encodeFrame, supervisorControl,
   type AnySupervisorControl, type RunnerControl, type RunnerControlBodies, type SupervisorControlBodies, type SupervisorControlType,
 } from "../src/runner/protocol.ts";
-import { remoteSecretGranter, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
+import { remoteSecretDepositor, remoteSecretGranter, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
+import { supervisorDepositor, supervisorGranter, supervisorSecretHandler } from "../src/runner/secret-serve.ts";
+import type { SecretFrame } from "../src/runner/serve.ts";
+import type { SecretRule } from "../src/config.ts";
+import { SecretStoreError } from "../src/secret-store.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { fakeClock, withState } from "./fakes.ts";
@@ -25,8 +29,8 @@ const cleanups: (() => void)[] = [];
 beforeEach(() => { tmp = withState(); clock.at = 1_000_000; });
 afterEach(() => { for (const done of cleanups.splice(0).reverse()) done(); tmp.done(); });
 
-/** A secret request the fake supervisor saw: `secret.get` or `secret.run`. */
-type SecretGet = RunnerControl<"secret.get"> | RunnerControl<"secret.run">;
+/** A secret request the fake supervisor saw: `secret.get`, `secret.run` or `secret.put`. */
+type SecretGet = RunnerControl<"secret.get"> | RunnerControl<"secret.run"> | RunnerControl<"secret.put">;
 type Reply = <T extends SupervisorControlType>(type: T, body: SupervisorControlBodies[T]) => void;
 
 /**
@@ -68,7 +72,7 @@ const supervisor = (opts: { proto?: number; auth?: boolean } = {}) => {
         return;
       }
       if (session && !session.check(frame)) { badMacs.push(frame.type); return; }
-      if (frame.type === "secret.get" || frame.type === "secret.run") { received.push(frame as SecretGet); onSecret(frame as SecretGet, session, reply); }
+      if (frame.type === "secret.get" || frame.type === "secret.run" || frame.type === "secret.put") { received.push(frame as SecretGet); onSecret(frame as SecretGet, session, reply); }
     });
   });
   cleanups.push(() => { auth.close(); });
@@ -323,5 +327,94 @@ describe("remote runner secrets over the link", () => {
       "RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_FAILED",
       "RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_FAILED",
     ]);
+  });
+});
+
+describe("lane-made secrets over the link (a remote runner such as the mac-mini)", () => {
+  /** The production supervisor handler (granter + depositor) over an in-memory store, answering on the fake link. */
+  const realSupervisor = (sup: Sup, rules: Record<string, SecretRule>, proto = 8) => {
+    const store = new Map<string, string>();
+    const logs: string[] = [];
+    const log = (line: string): void => { logs.push(line); };
+    const base = { stateDir: join(tmp.dir, "sup-state"), rules: async () => rules, now: clock.now, log };
+    const handler = supervisorSecretHandler({
+      laneOwner: () => LABEL, runnerUnsandboxed: () => false, log,
+      granter: supervisorGranter({
+        ...base, commands: async () => ({}),
+        store: { read: async (name) => { const v = store.get(name); if (v === undefined) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`); return v; } },
+      }),
+      depositor: supervisorDepositor({
+        ...base, store: { put: async (name, value) => { const created = !store.has(name); store.set(name, value); return { name, backend: "plain" as const, created }; } },
+      }),
+    });
+    const answer = (frame: SecretGet, session: Session | undefined, reply: Reply): void => {
+      void handler(LABEL, frame as SecretFrame, { session, proto, head: { runner: LABEL, gen: frame.gen, epoch: EPOCH }, reply: (type, body) => { reply(type, body); } });
+    };
+    sup.onSecret = answer;
+    return { store, logs, answer };
+  };
+
+  test("an allowed lane's value is stored sealed through the supervisor, and that lane's exec stays denied", async () => {
+    const { sup, run } = await connected({ proto: 8 });
+    const real = realSupervisor(sup, { UPLOAD_KEY: { lanes: [], repos: [], put: { lanes: ["lane-a"], repos: [] } } });
+    const masked: string[] = [];
+    const logs: string[] = [];
+    const put = remoteSecretDepositor({ client: run.client, laneRepo: async () => "acme/app", log: (l) => { logs.push(l); }, onGranted: (v) => { masked.push(...v); } });
+    expect(await drive(sup, put("lane-a", "UPLOAD_KEY", VALUE))).toEqual({ ok: true, created: true, backend: "plain" });
+    expect(real.store.get("UPLOAD_KEY")).toBe(VALUE);
+    // The value crossed the link only inside the r2s box.
+    expect(sup.received.map((f) => f.type)).toEqual(["secret.put"]);
+    expect(JSON.stringify(sup.received)).not.toContain(VALUE);
+    expect(sup.badMacs).toEqual([]);
+    expect(masked).toEqual([VALUE]);
+    expect(logs).toEqual(["RUNNER_SECRET_STORED lane=lane-a names=UPLOAD_KEY put"]);
+    expect(real.logs).toEqual([`RUNNER_SECRET_STORED runner=${LABEL} lane=lane-a names=UPLOAD_KEY put`]);
+    // Write only: the lane that stored it cannot read it back.
+    const grant = remoteSecretGranter({ client: run.client, laneRepo: async () => "acme/app", log: () => {} });
+    expect(await drive(sup, grant("lane-a", ["UPLOAD_KEY"]))).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
+    // A second put replaces it.
+    expect(await drive(sup, put("lane-a", "UPLOAD_KEY", `${VALUE}-2`))).toEqual({ ok: true, created: false, backend: "plain" });
+    expect([...logs, ...real.logs, ...run.logs].join("\n")).not.toContain(VALUE);
+  });
+
+  test("a lane without put is refused and nothing is stored; a proto 7 supervisor gets no secret.put frame", async () => {
+    const { sup, run } = await connected({ proto: 8 });
+    const real = realSupervisor(sup, { UPLOAD_KEY: { lanes: ["lane-a"], repos: [], put: { lanes: ["lane-b"], repos: [] } } });
+    const put = remoteSecretDepositor({ client: run.client, laneRepo: async () => undefined, log: () => {} });
+    expect(await drive(sup, put("lane-a", "UPLOAD_KEY", VALUE))).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-a may not store UPLOAD_KEY (config secrets.UPLOAD_KEY.put)" });
+    expect(real.store.size).toBe(0);
+
+    const old = await connected({ proto: 7 });
+    const oldPut = remoteSecretDepositor({ client: old.run.client, laneRepo: async () => undefined, log: () => {} });
+    expect(await oldPut("lane-b", "UPLOAD_KEY", VALUE)).toEqual({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: "supervisor speaks proto 7; secret put needs proto 8" });
+    for (const pair of old.sup.net.pairs) pair.pump();
+    expect(old.sup.received).toEqual([]);
+  });
+
+  test("a runner below proto 8 is refused by the supervisor, and a box moved to another rid does not open", async () => {
+    const { sup, run } = await connected({ proto: 8 });
+    const rules = { UPLOAD_KEY: { lanes: [], repos: [], put: { lanes: ["lane-a"], repos: [] } } };
+    const put = remoteSecretDepositor({ client: run.client, laneRepo: async () => undefined, log: () => {} });
+    const old = realSupervisor(sup, rules, 7);
+    expect(await drive(sup, put("lane-a", "UPLOAD_KEY", VALUE))).toEqual({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: "runner speaks proto 7; secret put needs proto 8" });
+    expect(old.store.size).toBe(0);
+    const real = realSupervisor(sup, rules);
+    sup.onSecret = (frame, session, reply) => {
+      const rid = frame.body.rid;
+      real.answer({ ...frame, body: { ...frame.body, rid: "0".repeat(32) } } as SecretGet, session, ((type, body) => { reply(type, { ...body, rid } as never); }) as Reply);
+    };
+    expect(await drive(sup, put("lane-a", "UPLOAD_KEY", VALUE))).toEqual({ ok: false, code: "RUNNER_SECRET_FAILED", detail: "sealed value did not open" });
+    expect(real.store.size).toBe(0);
+  });
+
+  test("a file-kind grant from the real supervisor reaches the remote lane as kind file", async () => {
+    const { sup, run } = await connected({ proto: 8 });
+    const real = realSupervisor(sup, { SA_JSON: { lanes: ["lane-a"], repos: [], as: "file", put: { lanes: ["lane-a"], repos: [] } } });
+    const put = remoteSecretDepositor({ client: run.client, laneRepo: async () => undefined, log: () => {} });
+    const json = JSON.stringify({ type: "service_account", private_key: VALUE });
+    expect(await drive(sup, put("lane-a", "SA_JSON", json))).toMatchObject({ ok: true, created: true });
+    const grant = remoteSecretGranter({ client: run.client, laneRepo: async () => undefined, log: () => {} });
+    expect(await drive(sup, grant("lane-a", ["SA_JSON"]))).toEqual({ ok: true, values: { SA_JSON: json }, kinds: { SA_JSON: "file" } });
+    expect(real.store.get("SA_JSON")).toBe(json);
   });
 });

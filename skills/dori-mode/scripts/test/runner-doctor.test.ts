@@ -40,18 +40,18 @@ test("without recorded endpoints doctor still checks local runner basics", () =>
 
 test("missing endpoints warn; a healthy runner is OK", () => {
   const s = setup();
-  addRunner(s.stateDir, "worker-a", 7);
-  addRunner(s.stateDir, "worker-b", 6);
+  addRunner(s.stateDir, "worker-a", 8);
+  addRunner(s.stateDir, "worker-b", 7);
   const checks = runnerChecks(s.deps);
   expect(checks.find((c) => c.id === "runner endpoints")?.level).toBe("WARN");
-  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 7, gen 4, restarts1h 0" });
-  // A runner one proto behind still starts and recovers lanes but cannot take dori attach until it is upgraded.
-  expect(checks.find((c) => c.id === "runner worker-b")).toMatchObject({ level: "WARN", detail: "proto 6 refuses dori attach (it needs proto 7)", fix: expect.stringContaining("dori runner install --machine worker-b") });
+  expect(checks.find((c) => c.id === "runner worker-a")).toMatchObject({ level: "OK", detail: "proto 8, gen 4, restarts1h 0" });
+  // A runner one proto behind still runs lanes and serves secret exec but cannot take dori secret put until it is upgraded.
+  expect(checks.find((c) => c.id === "runner worker-b")).toMatchObject({ level: "WARN", detail: "proto 7 refuses dori secret put (it needs proto 8)", fix: expect.stringContaining("dori runner install --machine worker-b") });
 });
 
 test("a protocol two versions apart and an open restart circuit warn", () => {
   const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "worker-a", 8);
+  addRunner(s.stateDir, "worker-a", 9);
   const ops = openOperations(s.config);
   for (const n of [1, 2, 3]) plan(ops, NOW - n * 60_000, { lane: "runner:worker-a", action: "restart", target: `1-${n}` });
   plan(ops, NOW - 2 * 60 * 60_000, { lane: "runner:worker-a", action: "restart", target: "0-9" });
@@ -60,15 +60,15 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   expect(checks.find((c) => c.id === "runner endpoints")).toMatchObject({ level: "OK", detail: "worker-a=100.101.1.2:7411" });
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
-  expect(row?.detail).toBe("proto 8 is not 7 or 6; restart circuit open (3 restarts in the last hour)");
+  expect(row?.detail).toBe("proto 9 is not 8 or 7; restart circuit open (3 restarts in the last hour)");
 });
 
 test("a runner whose machine's herdr is down or hung is FAIL with the herdr command for that machine; up is OK", () => {
   const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "worker-a", 7);
-  addRunner(s.stateDir, "worker-b", 7);
+  addRunner(s.stateDir, "worker-a", 8);
+  addRunner(s.stateDir, "worker-b", 8);
   addRunner(s.stateDir, "worker-c", 3);
-  addRunner(s.stateDir, "worker-d", 7);
+  addRunner(s.stateDir, "worker-d", 8);
   markHerdr(s.stateDir, "worker-a", "down", NOW - 60_000);
   markHerdr(s.stateDir, "worker-b", "hung", NOW - 60_000);
   markHerdr(s.stateDir, "worker-c", "down", NOW - 60_000);
@@ -83,12 +83,12 @@ test("a runner whose machine's herdr is down or hung is FAIL with the herdr comm
     fix: "dori runner herdr restart --machine worker-b --yes (ends every lane pane there; without --yes it lists them)",
   });
   expect(checks.find((c) => c.id === "runner worker-c")?.fix).toBe("dori runner install --machine worker-c to upgrade (proto 3 has no host.herdr), then dori runner herdr start --machine worker-c");
-  expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 7, gen 4, restarts1h 0, herdr up" });
+  expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 8, gen 4, restarts1h 0, herdr up" });
 });
 
 test("a runner whose herdr server runs elevated is FAIL with the elevated-server fix, never the restart the runner would refuse", () => {
   const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "windows-pc", 7);
+  addRunner(s.stateDir, "windows-pc", 8);
   markHerdr(s.stateDir, "windows-pc", "elevated", NOW - 60_000);
   const row = runnerChecks(s.deps).find((c) => c.id === "runner windows-pc");
   expect(row).toMatchObject({ level: "FAIL", detail: `herdr elevated since ${new Date(NOW - 60_000).toISOString()} (the server runs as administrator and refuses the unelevated runner)` });

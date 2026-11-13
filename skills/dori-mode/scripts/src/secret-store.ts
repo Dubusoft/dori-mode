@@ -73,6 +73,14 @@ export class SecretStore {
     return this.write(name, value);
   }
 
+  /** Stores `value` under `name`, adding it or replacing the stored one; `created` tells which. */
+  async put(name: string, value: string): Promise<SecretEntry & { readonly created: boolean }> {
+    this.check(name, value);
+    this.ensureDir();
+    const created = this.files(name).length === 0;
+    return { ...await this.write(name, value), created };
+  }
+
   /** The stored names with their backend, sorted by name. */
   list(): readonly SecretEntry[] {
     if (!existsSync(this.dir)) return [];

@@ -291,15 +291,22 @@ export type GithubAppMint = {
   readonly permissions: Readonly<Record<string, "read" | "write">>;
 };
 
-/** Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. `as` absent means env; `mint` replaces the stored value with a minted token. */
-export type SecretRule = {
-  readonly lanes: readonly string[];
-  readonly repos: readonly string[];
-  readonly as?: "env" | "ssh-key";
+/** Which lanes (exact key or `prefix-*`) and repos match a rule; both lists empty match nothing. */
+export type SecretLaneMatch = { readonly lanes: readonly string[]; readonly repos: readonly string[] };
+
+/**
+ * Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. `as`
+ * absent means env; `ssh-key` and `file` hand the lane a 0600 file path instead of the value; `mint` replaces the stored
+ * value with a minted token. `put` lists the lanes that may store a value under the name (`dori secret put`): a separate
+ * write-only permission that grants no read.
+ */
+export type SecretRule = SecretLaneMatch & {
+  readonly as?: "env" | "ssh-key" | "file";
   readonly mint?: GithubAppMint;
+  readonly put?: SecretLaneMatch;
 };
 
-const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" } }`;
+const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key" | "file", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" }, "put"?: { "lanes": [strings], "repos": [strings] } }`;
 
 /** A list-of-strings field; absent is empty, anything else throws `bad(path)`. */
 const stringList = (value: unknown, bad: (what: string) => TypeError, path: string): readonly string[] => {
@@ -311,7 +318,7 @@ const stringList = (value: unknown, bad: (what: string) => TypeError, path: stri
 /** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?, repos?, as?, mint? } } (see RULE_SHAPE). */
 const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
   if (raw == null) return {};
-  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`as: "ssh-key"\` and \`mint\` are exclusive`);
+  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`mint\` goes with neither a file \`as\` nor \`put\``);
   if (!isRecord(raw)) throw bad("");
   const mintOf = (value: unknown, path: string): GithubAppMint => {
     const nonEmpty = (v: unknown) => typeof v === "string" && v.trim() !== "";
@@ -323,15 +330,18 @@ const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
     return { kind, appId: appId as string, installationId: installationId as string, keySecret, permissions: permissions as Record<string, "read" | "write"> };
   };
   return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
-    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint"].includes(key))) throw bad(`.${name}`);
-    const { as, mint } = rule;
-    if (as !== undefined && as !== "env" && as !== "ssh-key") throw bad(`.${name}.as`);
-    if (mint !== undefined && as === "ssh-key") throw bad(`.${name}.mint`);
+    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint", "put"].includes(key))) throw bad(`.${name}`);
+    const { as, mint, put } = rule;
+    if (as !== undefined && as !== "env" && as !== "ssh-key" && as !== "file") throw bad(`.${name}.as`);
+    // A minted name has no stored value to hand over as a file or to replace.
+    if (mint !== undefined && (as === "ssh-key" || as === "file" || put !== undefined)) throw bad(`.${name}.mint`);
+    if (put !== undefined && (!isRecord(put) || Object.keys(put).some((key) => key !== "lanes" && key !== "repos"))) throw bad(`.${name}.put`);
     return [name, {
       lanes: stringList(rule.lanes, bad, `.${name}.lanes`),
       repos: stringList(rule.repos, bad, `.${name}.repos`),
       ...(as !== undefined ? { as } : {}),
       ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
+      ...(isRecord(put) ? { put: { lanes: stringList(put.lanes, bad, `.${name}.put.lanes`), repos: stringList(put.repos, bad, `.${name}.put.repos`) } } : {}),
     }];
   }));
 };

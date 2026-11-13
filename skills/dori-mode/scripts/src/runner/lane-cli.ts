@@ -8,11 +8,12 @@ import { decisionChoicesProblem, inputRequestProblem, serializeDecisionText, ser
 import { isReportKind } from "./report-kinds.ts";
 import { realClock, run as realRun, type Clock, type Runner } from "../run.ts";
 import { SECRET_NAME } from "../secret-name.ts";
+import { SECRET_PUT_MAX_BYTES } from "./lane-socket.ts";
 import type { Connector, Transport } from "./transport.ts";
 
 /**
  * The `dori` a lane runs on a worker machine (design 3.4): the runner bundle in lane mode, set by `DORI_LANE_KEY`. It
- * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret exec` and `secret run` (alias `host <op>`), and only for the lane's own
+ * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret exec`, `secret run` (alias `host <op>`) and `secret put`, and only for the lane's own
  * key; any other subcommand exits 2 with `DORI_CLI_LANE_ONLY <cmd>`. A report goes to the runner's lane socket with the lane's token, read from
  * the file `DORI_LANE_TOKEN_FILE` names (or, for a lane an older runner started, `DORI_LANE_TOKEN` itself), so the
  * runner accepts it only from the lane it started. `heavy` uses the host's `~/.dori/heavy/slot.N` directories,
@@ -38,8 +39,10 @@ export type LaneCliDeps = {
   /** Runs a command with exactly this environment and resolves to its exit code; default Bun.spawn with inherited stdio. */
   readonly spawnWithEnv?: (argv: readonly string[], env: Record<string, string>) => Promise<number>;
   readonly readFile?: (path: string) => string;
-  /** Directory under which ssh-key secret files get their private temp dir; default `os.tmpdir()`. */
+  /** Directory under which ssh-key and file secrets get their private temp dir; default `os.tmpdir()`. */
   readonly tempRoot?: string;
+  /** All of stdin as text (`secret put` reads the value from it); default `Bun.stdin.text()`. */
+  readonly readStdin?: () => Promise<string>;
   /** The runner directory holding `briefs/<key>.token`; default `~/.dori/runner`. */
   readonly runnerDir?: string;
   /** The lane's own key when it is not in `DORI_LANE_KEY` (a lane found through the socket's whoami). */
@@ -113,7 +116,8 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
   }
 };
 
-const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec and secret run (alias host <op>)";
+const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec, secret run (alias host <op>) and secret put";
+const SECRET_PUT_USAGE = "usage: dori secret put NAME (the value comes from stdin)";
 
 const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking] | dori report <key> request --text \"<what you need from the owner>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]";
 const CLAIM_DONE_USAGE = "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"";
@@ -132,7 +136,12 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
   "claim-done": CLAIM_DONE_USAGE,
   lane: "usage: dori lane status [<key>]",
   heavy: "usage: dori heavy <label> -- <command ...>",
-  secret: "usage: dori secret exec NAME [NAME...] -- <command ...>\nusage: dori secret run <op>",
+  secret: [
+    "usage: dori secret exec NAME [NAME...] -- <command ...>",
+    "usage: dori secret run <op>",
+    SECRET_PUT_USAGE,
+    "  put stores a credential the lane made, write only: the lane reads it back only if config also lets it exec the name",
+  ].join("\n"),
   host: [
     "usage: dori host <op>",
     "  same as dori secret run <op>: the supervisor host runs the registered command config secretCommands.<op> (a sandbox",
@@ -184,6 +193,18 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (result.truncated === true) deps.err(`dori: ${op} output was truncated at 64 KiB per stream`);
     return typeof result.exitCode === "number" && Number.isInteger(result.exitCode) ? result.exitCode : 1;
   }
+  if (sub === "secret" && rest[0] === "put") {
+    const [, name, ...extra] = rest;
+    if (!name || extra.length || !SECRET_NAME.test(name)) { deps.err(SECRET_PUT_USAGE); return 2; }
+    // As `dori secret add`: all of stdin minus one trailing newline; never argv, so the value stays out of `ps`.
+    const text = await (deps.readStdin ?? (() => Bun.stdin.text()))();
+    const value = text.endsWith("\n") ? text.slice(0, -1) : text;
+    if (!value) { deps.err(`SECRET_VALUE_EMPTY nothing on stdin for ${name}; ${SECRET_PUT_USAGE}`); return 2; }
+    if (Buffer.byteLength(value) > SECRET_PUT_MAX_BYTES) { deps.err(`SECRET_VALUE_TOO_LARGE ${name} is over ${SECRET_PUT_MAX_BYTES} bytes`); return 2; }
+    return send({ kind: "secret-put", name, value }, (reply) => {
+      deps.out(`${reply.created === true ? "SECRET_STORED" : "SECRET_REPLACED"} ${name}${typeof reply.backend === "string" ? ` backend=${reply.backend}` : ""}`);
+    });
+  }
   if (sub === "secret") {
     const sep = rest.indexOf("--");
     const names = sep >= 0 ? rest.slice(1, sep) : rest.slice(1);
@@ -203,16 +224,18 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     const base: Record<string, string> = {};
     for (const [k, v] of Object.entries(deps.env)) if (typeof v === "string") base[k] = v;
     const childEnv: Record<string, string> = { ...base, ...values };
-    // An ssh-key secret goes to a 0600 file in a private 0700 dir; the env carries the path, never the key.
+    // An ssh-key or file secret goes to a 0600 file in a private 0700 dir; the env carries the path, never the value.
+    // A file secret (a JSON credential, say) is written as stored; a key gets the trailing newline ssh wants.
     const keyNames = Object.keys(values).filter((n) => kinds[n] === "ssh-key");
+    const fileNames = Object.keys(values).filter((n) => kinds[n] === "ssh-key" || kinds[n] === "file");
     let dir: string | undefined;
     try {
-      if (keyNames.length) {
+      if (fileNames.length) {
         dir = mkdtempSync(join(deps.tempRoot ?? tmpdir(), "dori-secret-"));
-        for (const name of keyNames) {
+        for (const name of fileNames) {
           const path = join(dir, name);
           const value = values[name] as string;
-          writeFileSync(path, value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
+          writeFileSync(path, kinds[name] === "file" || value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
           childEnv[name] = path;
         }
         if (keyNames.length === 1) childEnv.GIT_SSH_COMMAND = `ssh -i ${shellQuote(childEnv[keyNames[0] as string] as string)} -o IdentitiesOnly=yes -o IdentityAgent=none`;
