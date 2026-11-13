@@ -138,7 +138,7 @@ test("a normal start logs one STARTUP_TIMINGS line for the steps up to READY=1 a
   for (const task of ["inbound", "delivery", "polling", "runners"]) expect(steps(label(`first-${task}`))).toEqual([`task:${task}`]);
   expect(steps(label("first-sweep"))).toEqual([
     "loop:sweep:snapshot", "loop:sweep:watch", "loop:sweep:guard", "loop:sweep:dead-panes", "loop:sweep:recover", "loop:sweep:freshness",
-    "loop:sweep:drift", "loop:sweep:memory", "loop:sweep:machine-guard",
+    "loop:sweep:drift", "loop:sweep:memory", "loop:sweep:auto-update", "loop:sweep:machine-guard",
   ]);
   expect(lines.every((line) => /^STARTUP_TIMINGS \S+ \d+ms( \S+=\d+ms)+$/.test(line))).toBe(true);
   expect(notified[0]).toBe("READY=1");

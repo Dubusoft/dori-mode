@@ -53,6 +53,8 @@ export type MergeLaneRequest = {
 export type CiIo = {
   /** Starts a merge lane for `request`; `ok` false with the reason when it cannot (HOLD, no worktree, launch error). */
   readonly launch: (deps: FlowDeps, request: MergeLaneRequest) => Promise<{ readonly ok: boolean; readonly detail: string }>;
+  /** Called after each CI_MERGED (a merge the supervisor made and read back), with the base it merged into. */
+  readonly merged?: (pull: OpenPull, base: string) => Promise<void>;
 };
 
 /** A merge GitHub refused this many times stops retrying and goes to the lead as OPERATION_FAILED. */
@@ -557,6 +559,7 @@ export class CiFollowUp {
     }
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
+    await this.io.merged?.(pull, base);
   }
 
   /**

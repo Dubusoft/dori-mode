@@ -229,6 +229,16 @@ test("a green, clean lane PR into dev is merged once with --match-head-commit an
   expect(gh.merges).toHaveLength(1);
 });
 
+test("each merge the supervisor makes is handed to the merged hook with its base, once", async () => {
+  const merged: string[] = [];
+  const hook = { merged: async (p: OpenPull, base: string) => { merged.push(`${p.repo}#${p.number} ${base}`); } };
+  await follow(hook).tick([pull({ checks: "green" })], emit);
+  expect(merged).toEqual(["acme/app#7 dev"]);
+  gh.view = greenView();
+  await follow(hook).tick([pull({ checks: "failing" })], emit);
+  expect(merged).toHaveLength(1);
+});
+
 test("a green lane PR is merged only at the head its done claim recorded: no claim, an older claimed head or a claim without a head never merge", async () => {
   const ci = follow();
   const green = pull({ checks: "green" });
