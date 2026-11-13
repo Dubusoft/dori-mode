@@ -16,7 +16,7 @@ import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
 import { type GuardMachine, listGuardMachines, machineKind, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
 import type { Json, KeyPrompter } from "./config-keys.ts";
-import { adoptLane, attachLaneFiles, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, SandboxRefusal, validateLaunch } from "./launch.ts";
+import { adoptLane, attachLaneFiles, doneRepos, type LaunchInput, launchLane, launchNextLine, LaunchError, parseLaneTask, SandboxRefusal, validateLaunch } from "./launch.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
@@ -151,6 +151,8 @@ const USAGE = `dori <command> [options]
                 [--from-message CHANNEL MESSAGE_ID]   repeatable, instead of --brief: the brief is "# <title>", "## Owner request" with those owner messages (latest edit) in order,
                                        then "## Lead notes" with each --note as a bullet; written to <stateDir>/briefs/<key>.md; a deleted, visitor or unknown message exits 1
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
+                [--task ID]   the Toodo task the lane works on (a positive integer, not looked up), recorded on the lane and shown by status;
+                                       an autopilot lane gets its reservation's task without it
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
                 [--sandbox]   every lane runs in the sandbox (--sandbox is accepted and changes nothing): a local one (--pane too) in laneSandbox.command after a --check preflight, a --machine one under its runner's sandboxed profile; a missing or broken sandbox refuses the launch (SANDBOX_MISSING / SANDBOX_BROKEN / SANDBOX_UNAVAILABLE) and warns on Discord; only Windows runners (no lane sandbox exists there) and machines opted in with runners.<label>.allowUnsandboxed run unsandboxed, with SANDBOX_SKIPPED and a Discord warning each time
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
@@ -755,7 +757,7 @@ const flags = parseArgs({
   strict: false,
   options: {
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, mode: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
+    model: { type: "string" }, mode: { type: "string" }, task: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, append: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
     until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" }, "on-success": { type: "string" },
@@ -1132,13 +1134,23 @@ try {
       const fromMessage = fromArgs.refs.length > 0;
       if (fromMessage === (flags.values.brief !== undefined)) die("launch needs exactly one of --brief FILE or --from-message <channel> <messageId> (repeatable)");
       if (!fromMessage && fromArgs.notes.length) die("--note goes with --from-message; with --brief put lead notes in the brief file");
+      const taskArg = opt("task");
+      const flagTask = taskArg === undefined ? undefined : (parseLaneTask(taskArg) ?? die(`--task must be a positive integer (a Toodo task id), got ${JSON.stringify(taskArg)}`));
+      // An autopilot lane carries its reservation's task id; a --task naming another task is refused.
+      const reservedTask = await (async () => {
+        const { ledgerRows, reservedTaskOf } = await import("./autopilot.ts");
+        const store = openOperations(config);
+        try { return reservedTaskOf(ledgerRows(store), key ?? ""); } finally { store.close(); }
+      })();
+      if (flagTask !== undefined && reservedTask !== undefined && flagTask !== reservedTask) die(`LAUNCH_TASK_MISMATCH lane ${key} is reserved by autopilot for task #${reservedTask}, not --task ${flagTask}`);
+      const task = flagTask ?? reservedTask;
       const title = need("title");
       const generated = fromMessage ? (() => {
         try {
           return { path: generatedBriefPath(config.stateDir, key ?? ""), text: assembleBrief(title, fromArgs.refs.map((ref) => ownerMessageText(config.stateDir, ref)), fromArgs.notes) };
         } catch (e) { return die(e instanceof Error ? e.message : String(e)); }
       })() : undefined;
-      const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
+      const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), ...(task !== undefined ? { task } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }) };
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
       const reports = await placementReports(config.stateDir);
@@ -1154,7 +1166,7 @@ try {
         const queue = enqueueLaunch(config.stateDir, {
           key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [plan.check.verdict.reasons.join(" | ")],
           ...(cwd ? { cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
-          ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}),
+          ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}), ...(input.task !== undefined ? { task: input.task } : {}),
           ...(machine ? { machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
         });
         console.log(verdictLine(target, plan.check.verdict));

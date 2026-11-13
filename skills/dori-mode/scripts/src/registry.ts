@@ -55,6 +55,11 @@ export type Lane = {
   readonly mode?: LaneMode;
   /** The GitHub issue the lane works on (`owner/repo#N`, the brief's `issue:` line); closed once its PR merges into ciMergeBase. */
   readonly ghIssue?: string;
+  /**
+   * The Toodo task the lane works on (`dori launch --task <id>`, a positive integer; Toodo is not asked). An autopilot lane
+   * gets its reservation's task id here. Absent: no task was named (or the lane predates the field).
+   */
+  readonly task?: number;
   readonly recoveryPending?: boolean;
   readonly recoveryPreviousPane?: string;
   /**

@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import {
   autopilotLocalStateKey, candidatesJson, DEFAULT_AUTOPILOT, formatCandidates, type JudgeContext, judge, judgeAll, ledgerRows, ledgerState,
-  parseAutopilotConfig, type ToodoTask,
+  parseAutopilotConfig, reservedTaskOf, type ToodoTask,
 } from "../src/autopilot.ts";
 import { JsonOperations, type Operation, type OperationState } from "../src/operations.ts";
 
@@ -170,6 +170,16 @@ test("ledgerRows reads only launch-attempt rows", () => {
   store.put(attempt(12, 1, "failed"));
   store.put(oldShadowRow(12));
   expect(ledgerRows(store).map((op) => op.id)).toEqual(["toodo:12/autopilot-launch/1"]);
+});
+
+test("reservedTaskOf names the task whose launch attempt reserved the lane key, and none for any other lane", () => {
+  store.put(attempt(12, 1, "failed", "ap-12-1"));
+  store.put(attempt(949, 1, "planned", "ap-949-1"));
+  store.put(oldShadowRow(77));
+  expect(reservedTaskOf(ledgerRows(store), "ap-949-1")).toBe(949);
+  expect(reservedTaskOf(ledgerRows(store), "ap-12-1")).toBe(12);
+  expect(reservedTaskOf(ledgerRows(store), "ap-949-2")).toBeUndefined();
+  expect(reservedTaskOf(ledgerRows(store), "ops")).toBeUndefined();
 });
 
 test("autopilotLocalStateKey tracks open lanes and open launch rows, ignoring an older dori's shadow rows", () => {

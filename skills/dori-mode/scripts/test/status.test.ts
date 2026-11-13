@@ -45,6 +45,18 @@ const fixture = async (panes: unknown[] = [{ pane_id: "lead:p1", workspace_id: "
 };
 const lane = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, thread: "discord:1/2", brief: "/b", done: "d", openedAt: OPENED, ...extra });
 
+test("a lane's Toodo task shows in status --json and on its status line; a lane without one shows none", async () => {
+  const f = await fixture();
+  await f.registry.write(lane("linked", { task: 949 }));
+  await f.registry.write(lane("plain"));
+  const s = await collectStatus(f.deps);
+  expect(s.lanes.find((l) => l.key === "linked")?.task).toBe(949);
+  expect(s.lanes.find((l) => l.key === "plain")).not.toHaveProperty("task");
+  const text = renderStatus(s);
+  expect(text).toContain("- linked (90분 · 태스크 #949)");
+  expect(text).toContain("- plain (90분)");
+});
+
 test("status shows autopilot on, or paused with its reason while dori autopilot pause is in force", async () => {
   const f = await fixture();
   const on = await collectStatus(f.deps);

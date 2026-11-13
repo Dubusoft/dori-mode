@@ -32,6 +32,8 @@ export type QueuedLaunch = {
   readonly model?: string;
   /** `mass-ulw` when launched with that mode; absent means `ulw`. */
   readonly mode?: "mass-ulw";
+  /** The launch's `--task` (Toodo task id). */
+  readonly task?: number;
   readonly machine?: string;
   readonly pane?: string;
   readonly workspace?: string;
@@ -84,6 +86,7 @@ const validLaunch = (value: unknown): value is QueuedLaunch =>
   (!("thread" in value) || typeof value.thread === "string") &&
   (!("model" in value) || typeof value.model === "string") &&
   (!("mode" in value) || value.mode === "mass-ulw") &&
+  (!("task" in value) || (typeof value.task === "number" && Number.isSafeInteger(value.task) && value.task > 0)) &&
   (!("machine" in value) || typeof value.machine === "string") &&
   (!("pane" in value) || typeof value.pane === "string") &&
   (!("workspace" in value) || typeof value.workspace === "string") &&
@@ -198,6 +201,7 @@ export const launchQueueText = (queue: readonly QueuedLaunch[]): string =>
       ...(q.thread && q.thread !== "none" ? [`thread=${q.thread}`] : []),
       ...(q.machine ? [`machine=${q.machine}`] : []),
       ...(q.mode ? [`mode=${q.mode}`] : []),
+      ...(q.task !== undefined ? [`task=${q.task}`] : []),
       `done=${JSON.stringify(q.done)}`,
       `brief=${q.brief}`,
       `queued ${q.queuedAt}`,

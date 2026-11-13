@@ -118,6 +118,13 @@ export const laneKeyOf = (op: Operation): string | undefined => {
   } catch { return undefined; }
 };
 
+/** The task id of the launch attempt reserved for `laneKey` (its ledger row names the lane), else undefined. */
+export const reservedTaskOf = (rows: readonly Operation[], laneKey: string): number | undefined => {
+  const op = rows.find((row) => row.action === LAUNCH_ACTION && row.lane.startsWith("toodo:") && laneKeyOf(row) === laneKey);
+  const id = op ? Number(op.lane.slice("toodo:".length)) : NaN;
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+};
+
 /** A row still running: open (planned/attempted), or verified with its laneKey an open registry lane. */
 const rowLive = (op: Operation, openLanes: ReadonlySet<string>): boolean => {
   if (OPEN_STATES.includes(op.state)) return true;
