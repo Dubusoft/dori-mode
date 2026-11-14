@@ -580,10 +580,11 @@ export class CiFollowUp {
         await this.review.ensureJob(claimed, pull, observed, emit);
         return;
       }
-      // Final base re-read: a base that moved since the approval makes it stale; a later poll reviews the new base.
+      // Final base re-read: a base that moved since the approval makes it stale; a later poll reviews the new base. An
+      // exemption is classified again by that poll instead of starting a review now (T6).
       const now = await this.review.observeSnapshot(pull, fresh);
-      if (now.snapshot.baseSha !== approval.receipt.baseSha) {
-        await this.review.ensureJob(claimed, pull, now, emit);
+      if (now.snapshot.baseSha !== ("exempt" in approval ? approval.exempt.baseSha : approval.receipt.baseSha)) {
+        if (!("exempt" in approval)) await this.review.ensureJob(claimed, pull, now, emit);
         return;
       }
       claimant = claimed;

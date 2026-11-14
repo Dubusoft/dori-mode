@@ -42,7 +42,11 @@ const harness = async () => {
   ]);
   const views = new Map<number, Record<string, unknown>>([[7, greenView(H7)], [8, greenView(H8)]]);
   /** `tips` (when non-empty) answers the next base-tip reads in order, then `baseTip`. */
-  const gh = { baseTip: sha("b"), tips: [] as string[], mergeBase: sha("c"), parent: undefined as string | undefined };
+  /** `files` holds file texts by `<sha>:<path>` for the exemption classifier; a missing one reads as an error. */
+  const gh = {
+    baseTip: sha("b"), tips: [] as string[], mergeBase: sha("c"), parent: undefined as string | undefined, diff: "diff --git a/x b/x\n+1\n",
+    files: new Map<string, string>(),
+  };
   const merges: string[][] = [];
   const base = fakeRunner(world);
   const run: Runner = async (argv, opts): Promise<Ran> => {
@@ -64,7 +68,12 @@ const harness = async () => {
     prInfo: async (_repo, num) => { const p = prs.get(num); if (!p) throw new Error(`no PR ${num}`); return p; },
     branchSha: async () => gh.tips.shift() ?? gh.baseTip,
     mergeBase: async () => gh.mergeBase,
-    diff: async () => "diff --git a/x b/x\n+1\n",
+    diff: async () => gh.diff,
+    fileAt: async (_repo, at, path) => {
+      const text = gh.files.get(`${at}:${path}`);
+      if (text === undefined) throw new Error(`no ${path} at ${at}`);
+      return text;
+    },
     mergeParent: async () => gh.parent ?? gh.baseTip,
     fetchHead: async () => {},
     prepareSnapshot: async (input) => ({ ok: true, path: input.path, startedAt: clock.now() }),
@@ -305,4 +314,62 @@ test("a multi-PR claim into one base is reviewed and merged lowest number first"
   await h.pass(job8!.job.jobId);
   await h.poll([h.pull(8)]);
   expect(h.merges.map((m) => m[3])).toEqual(["7", "8"]);
+});
+
+/** T6: H7 is a one-line prose fix of README.md on top of the merge base. */
+const docsOnly = (h: Awaited<ReturnType<typeof harness>>, head = H7): void => {
+  h.gh.diff = "diff --git a/README.md b/README.md\nindex 1111111..2222222 100644\n--- a/README.md\n+++ b/README.md\n@@ -3 +3 @@\n-Teh fix.\n+The fix.\n";
+  h.gh.files.set(`${h.gh.mergeBase}:README.md`, "# App\n\nTeh fix.\n");
+  h.gh.files.set(`${head}:README.md`, "# App\n\nThe fix.\n");
+};
+
+test("an exempt docs-only PR: merged without a reviewer, recorded once as kind exempt, and the close hold releases", async () => {
+  const h = await harness();
+  docsOnly(h);
+  const decision = await h.gate.exemption(await h.gate.observeSnapshot(h.pull(), h.author()));
+  expect(decision).toMatchObject({ kind: "exempt", receipt: { kind: "exempt", headSha: H7, baseSha: sha("b"), files: ["README.md"] } });
+  expect(await h.gate.holdsLane(h.author())).toBe(false);
+  await h.poll();
+  await h.poll();
+  expect(h.merges).toEqual([["gh", "pr", "merge", "7", "-R", REPO, "--merge", "--match-head-commit", H7]]);
+  expect(h.launches).toEqual([]);
+  expect(h.gate.jobs.list()).toEqual([]);
+  expect(h.gate.exemptions.list()).toHaveLength(1);
+});
+
+test("a non-exempt PR still holds the lane and gets a reviewer; an unreadable file is never exempt", async () => {
+  const h = await harness();
+  docsOnly(h);
+  h.gh.files.delete(`${H7}:README.md`);
+  expect(await h.gate.holdsLane(h.author())).toBe(true);
+  await h.poll();
+  expect(h.merges).toEqual([]);
+  expect(h.launches).toHaveLength(1);
+  expect(h.gate.exemptions.list()).toMatchObject([{ kind: "review", reason: `README.md unreadable: no README.md at ${H7}` }]);
+});
+
+test("an exemption binds its head: a new head with code is classified again and reviewed", async () => {
+  const h = await harness();
+  docsOnly(h);
+  expect((await h.gate.exemption(await h.gate.observeSnapshot(h.pull(), h.author()))).kind).toBe("exempt");
+  const H9 = sha("9");
+  h.views.set(7, greenView(H9));
+  h.prs.set(7, { ...h.prs.get(7)!, headSha: H9 });
+  await h.deps.registry.update("author", () => h.author([{ number: 7, sha: H9 }]));
+  h.gh.diff = "diff --git a/src/a.ts b/src/a.ts\nindex 1111111..2222222 100644\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n";
+  await h.poll([h.pull(7, H9)]);
+  expect(h.merges).toEqual([]);
+  expect(h.launches).toHaveLength(1);
+  expect(h.gate.exemptions.list().map((d) => [d.kind, d.kind === "exempt" ? d.receipt.headSha : d.key.includes(H9)])).toEqual([["exempt", H7], ["review", true]]);
+});
+
+test("an exemption binds its base: a moved base is classified again before the merge, never reviewed for it", async () => {
+  const h = await harness();
+  docsOnly(h);
+  expect((await h.gate.exemption(await h.gate.observeSnapshot(h.pull(), h.author()))).kind).toBe("exempt");
+  h.gh.baseTip = sha("d");
+  await h.poll();
+  expect(h.merges).toHaveLength(1);
+  expect(h.launches).toEqual([]);
+  expect(h.gate.exemptions.list().map((d) => (d.kind === "exempt" ? d.receipt.baseSha : d.kind))).toEqual([sha("b"), sha("d")]);
 });
