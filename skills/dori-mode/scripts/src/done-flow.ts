@@ -7,7 +7,7 @@ import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { OPEN_STATES, openOperations, type Operation, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
 import { type Check, parseSignal, type SignalIo } from "./signals.ts";
-import { BRANCH_DELETE, type BranchPlan, deleteBranch, planBranchCleanup, readBindings, readBranchBindings, type WorktreeFact } from "./branch-cleanup.ts";
+import { BRANCH_DELETE, type BranchPlan, type BranchTarget, deleteBranch, planBranchCleanup, readBindings, readBranchBindings, REMOTE_BRANCH_DELETE, type WorktreeFact } from "./branch-cleanup.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { LaneOpsError, type LaneOps, machineRunner, type PaneRef } from "./lane-ops.ts";
@@ -299,7 +299,7 @@ const unpushedIn = (worktrees: readonly WorktreeFact[]): string[] => worktrees.f
 export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]> => unpushedIn((await readLane(deps, lane)).worktrees);
 
 export type CloseOptions = {
-  /** `dori close --force`: close despite unpushed/uncommitted work; a worktree git refuses to remove is kept, as before. */
+  /** `dori close --force`: close despite unpushed/uncommitted work; its worktrees are still queued, and the sweep keeps one that is not clean and pushed. */
   readonly force?: boolean;
   /**
    * `dori close --cancelled --reason`: the owner cancelled the work or its Done can never hold. The Done signals are not
@@ -368,8 +368,9 @@ const closeEffect = (deps: FlowDeps, lane: Lane) => async (cmdId: string): Promi
 
 /**
  * Close a lane: every Done signal must read back live, and (unless `force`) no worktree may hold unpushed, uncommitted
- * or untracked work. Worktrees are removed before the pane closes, so a failed removal leaves the lane and its pane up.
- * The thread is marked done only when no other open lane works in it.
+ * or untracked work. Nothing is removed at the close: the worktrees and SHA-bound branches it may drop are queued in its
+ * receipt (`receipt.queue`, with each worktree's repository root and each branch's binding), and the watcher's
+ * closedWorktreeSweep removes them once they read clean and pushed again. The lane's thread is left open.
  *
  * The close holds a per-lane lock, records its intent (a `close` operation with the note and
  * force flag) and runs every effect as an operation: a crash anywhere is resumed by `resumeOperations` without
@@ -486,7 +487,14 @@ const closeSequence = async (
     return { closed: false, lines: [...lines, ...cleanup, `OPERATION_AMBIGUOUS ${step.id} ${step.detail}`,
       `REFUSED ${lane.key}: the close stopped at an operation that may or may not have happened; check it, run dori ops resolve ${step.id} --as verified|retry, then close again`] };
   };
-  if (lane.machine) cleanup.push(remoteWorktreeNote(lane), ...(await remoteWorktrees(deps, lane)));
+  // Nothing is removed here: each worktree and branch the close may drop is queued in its receipt, and the watcher's
+  // closedWorktreeSweep removes it once it is clean with nothing unpushed (two stages, the same for local and remote lanes).
+  const queue: CleanupQueue = { worktrees: [], branches: [] };
+  if (lane.machine) {
+    const remote = await remoteWorktrees(deps, lane);
+    cleanup.push(remoteWorktreeNote(lane), ...remote.lines);
+    queue.worktrees.push(...remote.queued.map((path) => ({ path, root: path })));
+  }
   const root = read.root;
   // A worktree an interrupted close already removed is no longer found; its operation still has to settle.
   const pending = store.list({ lane: lane.key }).filter((op) => op.action === "worktree-remove" && op.state !== "verified").map((op) => op.target);
@@ -510,25 +518,23 @@ const closeSequence = async (
   for (const wt of [...worktrees, ...adopted]) {
     const hold = branches?.holds.get(wt);
     if (hold) { cleanup.push(`branch-bound worktree ${wt} kept: ${hold}`); continue; }
-    const step = await act("worktree-remove", wt, (cmdId) => deps.ops.git(lane, { op: "worktree-remove", root, path: wt }, { cmdId }),
-      async () => ((await deps.ops.exists(lane.machine, [wt]))[0] ? "not-done" : "done"));
-    if (step.state === "ambiguous") return ambiguous(step);
-    // The lane's cwd was never checked for unpushed work: git refuses to remove it dirty, and it is kept, not a refusal.
-    if (step.state !== "verified" && !opts.force && !adopted.has(wt)) {
-      return { closed: false, lines: [...lines, ...cleanup, `REFUSED ${lane.key}: worktree ${wt} not removed: ${(step.err || step.out).slice(0, 120)}; the pane is left open (dori close --force keeps the worktree and closes)`] };
-    }
-    cleanup.push(step.state === "verified" ? `worktree ${wt} removed` : `worktree ${wt} kept: ${step.err.slice(0, 120)}`);
+    queue.worktrees.push({ path: wt, root });
+    cleanup.push(`worktree ${wt} queued: ${QUEUED_WORKTREE}`);
   }
-  if (branches?.targets.length) {
-    const others = (await deps.registry.open()).filter((l) => l.key !== lane.key);
-    for (const target of branches.targets) {
-      const r = await deleteBranch(deps.ops, lane, act, target, others, [...present, ...(candidate ? [candidate] : [])]);
-      if (r.remoteStep?.state === "ambiguous") return ambiguous(r.remoteStep);
-      if (r.step?.state === "ambiguous") return ambiguous(r.step);
-      if (r.kept && r.step === undefined) settleOperation(store, deps.clock.now(), operationId({ lane: lane.key, action: BRANCH_DELETE, target: `${target.repo}#${target.n}@${target.sha}` }), "failed", `kept: ${r.kept}`);
-      if (r.remoteLine) cleanup.push(r.remoteLine);
-      cleanup.push(r.line);
+  // Each branch target is also a planned operation (planBranchCleanup), so a close resumed before it records the lane
+  // closed finds it again; once closed, the receipt's queue is what the sweep works from.
+  const facts = [...present, ...(candidate ? [candidate] : [])];
+  for (const target of branches?.targets ?? []) {
+    // A branch a worktree of the lane shows past its merged head stays for good (that worktree stays too: a branch hold).
+    const tip = facts.find((w) => w.exists && w.branch === target.branch && w.head)?.head;
+    if (tip && tip !== target.sha) {
+      const why = `tip ${tip.slice(0, 10)} is not the merged head ${target.sha.slice(0, 10)} of ${target.repo}#${target.n} (a commit after the merge)`;
+      settleOperation(store, deps.clock.now(), operationId({ lane: lane.key, action: BRANCH_DELETE, target: `${target.repo}#${target.n}@${target.sha}` }), "failed", `kept: ${why}`);
+      cleanup.push(`branch ${target.branch} kept: ${why}`);
+      continue;
     }
+    queue.branches.push(target);
+    cleanup.push(`branch ${target.branch} queued: deleted by the closed-lane cleanup after its worktrees go, only while it is at ${target.repo}#${target.n} merged head ${target.sha.slice(0, 10)}`);
   }
   // The lane's thread stays open: only the owner closes it, with the button on the lead's report.
   if (lane.tab) {
@@ -549,7 +555,8 @@ const closeSequence = async (
   }
   const at = iso(deps.clock);
   const operations = store.list({ lane: lane.key }).filter((op) => op.action !== CLOSE_ACTION).map((op) => ({ id: op.id, state: op.state }));
-  const receipt = { checks, note, cleanup, ...(cancelled ? { cancelled } : {}), ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations };
+  const receipt = { checks, note, cleanup, ...(cancelled ? { cancelled } : {}), ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations,
+    ...(queue.worktrees.length || queue.branches.length ? { queue } : {}) };
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "closed", note, at, { closedAt: at, receipt }));
   return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}${cancelled ? " cancelled" : ""}`] };
 };
@@ -706,21 +713,21 @@ const cleanupRoot = (deps: FlowDeps, lane: Lane): string => {
 const under = (root: string, path: string): boolean => Boolean(root) && path.startsWith(`${root}/`) && !path.includes("..");
 
 /**
- * The receipt lines of a remote lane's worktrees, found by its runner by key under its reported worktree root: each
- * `worktree <path> kept: ...`, so closedWorktreeSweep removes it once it is clean and pushed. A runner that cannot
- * answer never holds the close up.
+ * A remote lane's worktrees, found by its runner by key under its reported worktree root: each is queued for
+ * closedWorktreeSweep, which removes it from inside itself once it is clean and pushed. A runner that cannot answer
+ * never holds the close up.
  */
-const remoteWorktrees = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
+const remoteWorktrees = async (deps: FlowDeps, lane: Lane): Promise<{ readonly lines: string[]; readonly queued: string[] }> => {
   const root = cleanupRoot(deps, lane);
-  if (!root) return [];
+  if (!root) return { lines: [], queued: [] };
   let found: readonly { readonly path: string }[];
   try {
     found = (await deps.ops.inspect(lane, { git: true })).git?.worktrees ?? [];
   } catch (e) {
-    return [`remote worktrees not read on machine ${lane.machine}: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`];
+    return { lines: [`remote worktrees not read on machine ${lane.machine}: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`], queued: [] };
   }
-  return [...new Set(found.map((w) => w.path.replace(/\/+$/, "")))].filter((p) => under(root, p))
-    .map((p) => `worktree ${p} kept: remote lane, removed by the closed-lane cleanup once clean and pushed`);
+  const queued = [...new Set(found.map((w) => trimPath(w.path)))].filter((p) => under(root, p));
+  return { lines: queued.map((p) => `worktree ${p} queued: remote lane, ${QUEUED_WORKTREE}`), queued };
 };
 
 /**
@@ -737,47 +744,171 @@ const keptWorktrees = (lane: Lane, prefix = "worktree "): string[] => {
   });
 };
 
+/** The receipt line of a worktree a close queued for the closed-lane cleanup. */
+const QUEUED_WORKTREE = "removed by the closed-lane cleanup once clean and pushed";
+
+const trimPath = (path: string): string => path.replace(/\/+$/, "");
+
+/** A worktree a close queued: `root` is the checkout its `git worktree remove` runs in (the worktree itself once that is gone). */
+type QueuedWorktree = { readonly path: string; readonly root: string; readonly removed?: true };
 /**
- * Finish a closed lane's worktree cleanup: a worktree its close kept is removed once it is clean and has no commit
- * that no remote has, only under the lane's runner's reported worktree root, or (local lanes) `config.worktreeRoot`
- * while that runner has reported none; one whose unpushed commits cannot be read stays, with a warning. The lane's own
- * cwd and the worktrees its record lists are candidates too, on the same terms: a close that did not find them (a `<repo>-<key>` directory, a detached HEAD) left no kept line; one the
- * close held with its branch (`branch-bound worktree ... kept`) stays. Open
- * lanes (working, not-done, paused, done-claimed) are never touched, nor any path an open lane uses: their Done signals
- * have not all read back yet, and work can continue after a merge. Failures come back as LANE_WATCH_WARN lines.
+ * A SHA-bound branch a close queued (branch-cleanup.ts BranchTarget). `settled` is set once nothing is left to do:
+ * `deleted`, or `kept: <why>` when this binding can never be deleted (protected, or moved off its merged head). `note`
+ * is the last reason a retry still waits on, so each reason is reported once.
+ */
+type QueuedBranch = BranchTarget & { readonly settled?: string; readonly note?: string };
+/** The cleanup a close leaves to the watcher, in its receipt (`receipt.queue`). */
+export type CleanupQueue = { readonly worktrees: QueuedWorktree[]; readonly branches: QueuedBranch[] };
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+const BRANCH_FIELDS = ["repo", "n", "base", "branch", "sha", "root", "remote"] as const;
+
+/** The cleanup queue in a closed lane's receipt; empty for a lane an older dori closed (its `kept:` lines still count). */
+const cleanupQueue = (lane: Lane): CleanupQueue => {
+  const queue = isRecord(lane.receipt) ? lane.receipt.queue : undefined;
+  if (!isRecord(queue)) return { worktrees: [], branches: [] };
+  const list = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? v.filter(isRecord) : []);
+  return {
+    worktrees: list(queue.worktrees).filter((w) => typeof w.path === "string" && typeof w.root === "string") as unknown as QueuedWorktree[],
+    branches: list(queue.branches).filter((b) => BRANCH_FIELDS.every((k) => typeof b[k] === "string")) as unknown as QueuedBranch[],
+  };
+};
+
+/** A branch keep no later pass can change: the branch is protected, or it moved off the merged head it was bound to. */
+const FINAL_KEEP = /^protected|is not the merged head|at another commit than the merged head|moved off the merged head/;
+
+/**
+ * The watcher's half of a lane's close (two stages: the close queues, this removes). For a closed lane:
+ *
+ * - Each worktree its close queued (`receipt.queue`) is read again and removed once it is clean and has no commit that
+ *   no remote has; one whose unpushed commits cannot be read stays, with a warning. Then each SHA-bound branch the
+ *   close queued is deleted (branch-cleanup.ts deleteBranch: remote with a lease, then local with a compare-and-delete,
+ *   both only at the merged head), also when its worktree was already gone. A branch still checked out in a queued
+ *   worktree that stays waits for it.
+ * - Outside the root: a local lane's queued worktree is removed wherever it is, because its close found it as the
+ *   lane's and checked it (the close itself used to remove exactly these). A remote lane's queued worktree, a worktree an
+ *   older close listed as kept (`worktree <path> kept: ...`), and the lane's own directory (`cwd`, a remote lane's
+ *   `remoteCwd`) and recorded worktrees are removed only under the lane's runner's reported worktree root, or (local
+ *   lanes) `config.worktreeRoot` while that runner has reported none. One the close held with its branch
+ *   (`branch-bound worktree ... kept`) stays.
+ * - Every removal and delete is a recorded operation with a read-back (operations.ts), so a crash mid-sweep is resumed by
+ *   the next pass without repeating an effect; what is done is marked in the receipt's queue, so an operation row pruned
+ *   later never runs it again. A newly ambiguous operation is one OPERATION_AMBIGUOUS line.
+ *
+ * Open lanes (working, not-done, paused, done-claimed) are never touched, nor any path an open lane uses (its cwd,
+ * remoteCwd or worktrees) or the lead's cwd. Failures come back as LANE_WATCH_WARN lines.
  */
 export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
   if (statusOf(lane) !== "closed") return [];
   const root = cleanupRoot(deps, lane);
-  const kept = keptWorktrees(lane).filter((wt) => under(root, wt));
-  const own = [...new Set([...(lane.cwd ? [lane.cwd] : []), ...(lane.worktrees ?? [])].map((p) => p.replace(/\/+$/, "")))]
-    .filter((p) => under(root, p) && !kept.includes(p) && !keptWorktrees(lane, "branch-bound worktree ").includes(p));
-  if (!kept.length && !own.length) return [];
+  const queue = cleanupQueue(lane);
+  const queuedPaths = queue.worktrees.map((w) => w.path);
+  const queued = queue.worktrees.filter((w) => !w.removed && (!lane.machine || under(root, w.path)));
+  const bound = keptWorktrees(lane, "branch-bound worktree ");
+  const kept = keptWorktrees(lane).filter((wt) => under(root, wt) && !queuedPaths.includes(wt));
+  const dir = lane.machine ? lane.remoteCwd : lane.cwd;
+  const own = [...new Set([...(dir ? [dir] : []), ...(lane.worktrees ?? [])].map(trimPath))]
+    .filter((p) => under(root, p) && !kept.includes(p) && !queuedPaths.includes(p) && !bound.includes(p));
+  const branches = queue.branches.filter((b) => !b.settled);
+  if (!queued.length && !kept.length && !own.length && !branches.length) return [];
+  const paths = [...new Set([...queued.flatMap((w) => [w.path, w.root]), ...kept, ...own])];
   const [cwdThere = false, ...present] = lane.machine
-    ? [false, ...(await deps.ops.exists(lane.machine, [...kept, ...own]))]
-    : await deps.ops.exists(undefined, [lane.cwd ?? deps.config.leadCwd, ...kept, ...own]);
-  const candidates = [...kept, ...own].filter((_, i) => present[i]);
-  if (!candidates.length) return [];
-  const busy = new Set([deps.config.leadCwd, ...(await deps.registry.open()).flatMap((l) => [...(l.cwd ? [l.cwd] : []), ...(l.worktrees ?? [])])]
-    .map((p) => p.replace(/\/+$/, "")));
+    ? [false, ...(await deps.ops.exists(lane.machine, paths))]
+    : await deps.ops.exists(undefined, [lane.cwd ?? deps.config.leadCwd, ...paths]);
+  const there = new Map(paths.map((p, i) => [p, Boolean(present[i])]));
+  const openLanes = await deps.registry.open();
+  const busy = new Set([deps.config.leadCwd, ...openLanes.flatMap((l) => [l.cwd ?? "", l.remoteCwd ?? "", ...(l.worktrees ?? [])])]
+    .filter(Boolean).map(trimPath));
   const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.leadCwd;
-  const removed: string[] = [];
-  const out: string[] = [];
-  for (const wt of candidates) {
-    if (busy.has(wt)) continue;
-    const recorded = own.includes(wt);
-    const fact = await probeWorktree(deps, lane, wt);
-    if (!fact || fact.error !== undefined || fact.dirty === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read git status of ${wt}: ${(fact?.error ?? "git lists no worktree there").slice(0, 160)}`);
-    else if (fact.dirty || (fact.ahead !== undefined && fact.ahead !== 0)) continue;
-    else if (fact.ahead === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read unpushed commits of ${wt}, so it is kept`);
-    else {
-      // A remote worktree, and one found from the lane's record, is removed from inside itself: its repository is not known here.
-      const r = await deps.ops.git(lane, { op: "worktree-remove", root: lane.machine || recorded ? wt : repo, path: wt });
-      if (r.code === 0) removed.push(wt);
-      else out.push(`LANE_WATCH_WARN ${lane.key} worktree ${wt} not removed: ${(r.err || r.out).slice(0, 160)}`);
+  return withOperations(deps, async (store) => {
+    const act = actRecorded(deps, store, lane);
+    const out: string[] = [];
+    const removed: string[] = [];
+    const gone = new Set<string>();
+    /** Queued or candidate worktrees that stay this pass, as read: a branch they hold waits for them. */
+    const staying: WorktreeFact[] = [];
+    const stateOf = (action: string, target: string) => store.get(operationId({ lane: lane.key, action, target }))?.state;
+    const ambiguousOnce = (step: Step, before: OperationState | undefined) => {
+      if (before !== "ambiguous") out.push(`OPERATION_AMBIGUOUS ${step.id} ${step.detail}`);
+    };
+    /** The worktree's fact when it may go (clean, nothing unpushed); otherwise it stays, with a warning when unreadable. */
+    const removable = async (wt: string): Promise<boolean> => {
+      const fact = await probeWorktree(deps, lane, wt);
+      if (fact && fact.error === undefined && fact.dirty === false && fact.ahead === 0) return true;
+      if (fact) staying.push(fact);
+      if (!fact || fact.error !== undefined || fact.dirty === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read git status of ${wt}: ${(fact?.error ?? "git lists no worktree there").slice(0, 160)}`);
+      else if (!fact.dirty && fact.ahead === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read unpushed commits of ${wt}, so it is kept`);
+      return false;
+    };
+    const remove = async (wt: string, gitRoot: string, wasThere: boolean): Promise<void> => {
+      const before = stateOf("worktree-remove", wt);
+      const step = await act("worktree-remove", wt, (cmdId) => deps.ops.git(lane, { op: "worktree-remove", root: gitRoot, path: wt }, { cmdId }),
+        async () => ((await deps.ops.exists(lane.machine, [wt]))[0] ? "not-done" : "done"));
+      if (step.state === "verified") {
+        gone.add(wt);
+        if (wasThere) removed.push(wt);
+      } else if (step.state === "ambiguous") ambiguousOnce(step, before);
+      else out.push(`LANE_WATCH_WARN ${lane.key} worktree ${wt} not removed: ${(step.err || step.out).slice(0, 160)}`);
+    };
+    for (const w of queued) {
+      if (busy.has(w.path)) {
+        // An open lane works there: it stays, and so does a branch it has checked out.
+        const fact = there.get(w.path) ? await probeWorktree(deps, lane, w.path) : undefined;
+        if (fact) staying.push(fact);
+        continue;
+      }
+      // A queued worktree already gone (removed by hand, or by a pass a crash cut short) only settles its operation.
+      if (!there.get(w.path)) { await remove(w.path, w.path, false); continue; }
+      if (await removable(w.path)) await remove(w.path, there.get(w.root) && !gone.has(w.root) ? w.root : w.path, true);
     }
-  }
-  return removed.length ? [`WORKTREE_CLEANED ${lane.key} ${removed.join(" ")}`, ...out] : out;
+    for (const wt of [...kept, ...own]) {
+      if (!there.get(wt) || busy.has(wt)) continue;
+      // A remote worktree, and one found from the lane's record, is removed from inside itself: its repository is not known here.
+      if (await removable(wt)) await remove(wt, lane.machine || own.includes(wt) ? wt : repo, true);
+    }
+    const settled = new Map<string, Pick<QueuedBranch, "settled" | "note">>();
+    const cleaned: string[] = [];
+    const others = branches.length ? openLanes.filter((l) => l.key !== lane.key) : [];
+    for (const t of branches) {
+      if (staying.some((f) => f.branch === t.branch)) continue;
+      const key = `${t.repo}#${t.n}@${t.sha}`;
+      const before = new Map([REMOTE_BRANCH_DELETE, BRANCH_DELETE].map((a) => [operationId({ lane: lane.key, action: a, target: key }), stateOf(a, key)]));
+      // An ambiguous delete is the lead's to resolve (dori ops resolve); it was told once and is never retried on a guess.
+      if ([...before.values()].includes("ambiguous")) continue;
+      const r = await deleteBranch(deps.ops, lane, act, t, others, staying);
+      const stuck = [r.remoteStep, r.step].find((s) => s?.state === "ambiguous");
+      if (stuck) { ambiguousOnce(stuck, before.get(stuck.id ?? "")); continue; }
+      if (!r.kept && r.step?.state === "verified") {
+        settled.set(key, { settled: "deleted" });
+        cleaned.push(...(r.remoteLine ? [r.remoteLine] : []), r.line);
+        continue;
+      }
+      const why = r.kept ?? `delete failed: ${(r.step?.err || r.step?.out || "no answer").replace(/\s+/g, " ").slice(0, 120)}`;
+      if (r.kept && FINAL_KEEP.test(r.kept)) {
+        if (r.step === undefined) settleOperation(store, deps.clock.now(), operationId({ lane: lane.key, action: BRANCH_DELETE, target: key }), "failed", `kept: ${r.kept}`);
+        settled.set(key, { settled: `kept: ${r.kept}` });
+        out.push(`LANE_WATCH_WARN ${lane.key} branch ${t.branch} kept: ${r.kept}`);
+      } else if (t.note !== why) {
+        settled.set(key, { note: why });
+        out.push(`LANE_WATCH_WARN ${lane.key} branch ${t.branch} not deleted yet: ${why}`);
+      }
+    }
+    if (queue.worktrees.some((w) => gone.has(w.path)) || settled.size) {
+      await deps.registry.patch(lane.key, (current) => {
+        if (!isRecord(current.receipt)) return undefined;
+        const now = cleanupQueue(current);
+        return { receipt: { ...current.receipt, queue: {
+          worktrees: now.worktrees.map((w) => (gone.has(w.path) ? { ...w, removed: true as const } : w)),
+          branches: now.branches.map((b) => ({ ...b, ...settled.get(`${b.repo}#${b.n}@${b.sha}`) })),
+        } } };
+      });
+    }
+    return [
+      ...(removed.length ? [`WORKTREE_CLEANED ${lane.key} ${removed.join(" ")}`] : []),
+      ...(cleaned.length ? [`BRANCH_CLEANED ${lane.key} ${cleaned.join("; ")}`] : []),
+      ...out,
+    ];
+  });
 };
 
 /**

@@ -55,9 +55,10 @@ const ops = () => {
 const laneStatus = async () => statusOf((await new Registry(stateDir()).read("demo-lane")) as Lane);
 const ALL_EFFECTS = [`worktree-remove ${join("WORLD", "wt/demo-lane")}`, `worktree-remove ${join("WORLD", "wt/demo-lane-2")}`, "pane-close w:p1"].sort();
 
-test("an uninterrupted automatic close runs each effect once and verifies every operation", async () => {
+test("an uninterrupted automatic close, then the sweep, runs each effect once and verifies every operation", async () => {
   const run = await worker(-1);
-  expect(run.lines.at(-1)).toStartWith("LANE_CLOSED demo-lane ");
+  expect(run.lines[0]).toStartWith("LANE_CLOSED demo-lane ");
+  expect(run.lines.at(-1)).toStartWith("WORKTREE_CLEANED demo-lane ");
   expect(effects().map((line) => line.replace(world, "WORLD")).sort()).toEqual(ALL_EFFECTS);
   expect(ops().map((op) => `${op.action} ${op.state}`).sort()).toEqual([
     "close verified", "pane-close verified", "worktree-remove verified", "worktree-remove verified",
@@ -66,8 +67,9 @@ test("an uninterrupted automatic close runs each effect once and verifies every 
 }, 30_000);
 
 /**
- * The acceptance test of design 1.1: a SIGKILL after every step of the close sequence (each operation write, so before
- * every effect and between effects, each effect itself, each registry write), then a restart. Every run ends with each
+ * The acceptance test of design 1.1: a SIGKILL after every step of the close sequence and of the closed-lane sweep that
+ * follows it (each operation write, so before every effect and between effects, each effect itself, each registry write:
+ * from queueing the worktrees to removing them), then a restart. Every run ends with each
  * effect done at most once and every operation verified or ambiguous. Every effect of a close has a read-back, so no
  * effect operation is left ambiguous and the restart always finishes the close.
  */

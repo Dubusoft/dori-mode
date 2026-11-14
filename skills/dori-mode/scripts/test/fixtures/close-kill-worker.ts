@@ -1,4 +1,5 @@
-// One supervisor pass over a done-claimed lane whose window has passed (the automatic close).
+// Two supervisor passes over a done-claimed lane whose window has passed: the automatic close (it queues the lane's
+// worktrees), then the closed-lane sweep (it removes them).
 // argv: <stateDir> <worldDir> <killAt> <mode: watch|close>. The process SIGKILLs itself right after its killAt-th step;
 // a step is an operation row write, an effect on the world, or a registry write. killAt -1 never kills and prints
 // {"steps": n, "lines": [...]}. The world (panes, worktree directories, effect log) lives in worldDir.
@@ -85,6 +86,7 @@ if (mode === "close") {
   const lane = await deps.registry.read("demo-lane");
   if (lane) lines.push(...(await closeLane(deps, lane, "closed by the lead")).lines);
 } else {
+  lines.push(...(await watchTick(deps)));
   lines.push(...(await watchTick(deps)));
 }
 inner.close();

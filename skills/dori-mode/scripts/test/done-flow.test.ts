@@ -135,7 +135,7 @@ test("sendVerified types nothing when the pane list cannot be read", async () =>
   expect(world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
 });
 
-test("five quiet minutes after a claim is handed over the lane is closed and its worktree removed", async () => {
+test("five quiet minutes after a claim is handed over the lane is closed, and the next pass removes its queued worktree", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
   expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
@@ -144,10 +144,13 @@ test("five quiet minutes after a claim is handed over the lane is closed and its
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
   expect(lines[0]).toBe("LANE_CLOSED demo-lane closed seen-claim");
   expect(closedVia()).toEqual(["demo-lane"]);
-  expect(removals()).toEqual([{ op: "worktree-remove", root: "/repo", path: WT, opts: { cmdId: `op:demo-lane/worktree-remove/${WT}:1` } }]);
+  expect(removals()).toEqual([]);
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("closed");
-  expect(await watchTick(at(T0 + 9 * MIN))).toEqual([]);
+  expect(after?.receipt).toMatchObject({ queue: { worktrees: [{ path: WT, root: "/repo" }], branches: [] } });
+  expect(await watchTick(at(T0 + 9 * MIN))).toEqual([`WORKTREE_CLEANED demo-lane ${WT}`]);
+  expect(removals()).toEqual([{ op: "worktree-remove", root: "/repo", path: WT, opts: { cmdId: `op:demo-lane/worktree-remove/${WT}:1` } }]);
+  expect(await watchTick(at(T0 + 10 * MIN))).toEqual([]);
 });
 
 test("a second done with the same evidence keeps the first claim: one LANE_DONE_CLAIMED, one notice, the window unmoved", async () => {
@@ -223,14 +226,15 @@ test("settling a claim reads each Done signal once, in one inspection by the lan
   expect(reads(start).sort()).toEqual(["issue view 2", "pr view 1"]);
 });
 
-test("a close runs through the lane's runner: inspect, then the recorded worktree removal, then lane.close", async () => {
+test("a close runs through the lane's runner: inspect, then lane.close, with its worktree queued instead of removed", async () => {
   livePane();
   const r = await closeLane(at(T0), lane, "manual");
   expect(r.closed).toBe(true);
   const steps = world.ops.filter((e) => e.op === "inspect" || e.op === "git" || e.op === "close").map((e) => e.op);
   expect(steps[0]).toBe("inspect");
-  expect(steps.slice(steps.indexOf("git"))).toEqual(["git", "close"]);
-  expect(removals()).toEqual([{ op: "worktree-remove", root: "/repo", path: WT, opts: { cmdId: `op:demo-lane/worktree-remove/${WT}:1` } }]);
+  expect(steps.at(-1)).toBe("close");
+  expect(removals()).toEqual([]);
+  expect(((await at(T0).registry.read("demo-lane"))?.receipt as { cleanup: string[] }).cleanup).toContain(`worktree ${WT} queued: removed by the closed-lane cleanup once clean and pushed`);
   expect(world.ops.find((e) => e.op === "close")?.args).toEqual({ opts: { cmdId: "op:demo-lane/pane-close/w:p1:1" } });
 });
 
@@ -556,7 +560,7 @@ test("a closed lane's worktree its close had to keep is removed once clean, unde
   expect(await watchTick(at(T0))).toEqual([]);
   facts([KEPT_WT], false);
   expect(await watchTick(at(T0))).toEqual([`WORKTREE_CLEANED demo-lane ${KEPT_WT}`]);
-  expect(removals()).toEqual([{ op: "worktree-remove", root: "/repo", path: KEPT_WT }]);
+  expect(removals()).toEqual([{ op: "worktree-remove", root: "/repo", path: KEPT_WT, opts: { cmdId: `op:demo-lane/worktree-remove/${KEPT_WT}:1` } }]);
 });
 
 test("a local lane's kept worktree with commits no remote has stays, and one whose unpushed commits are unreadable stays with a warning", async () => {
