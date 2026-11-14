@@ -35,7 +35,7 @@ import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
-import { CLEANUP_STATUS_FILE, cleanupPaths, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
+import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
@@ -321,6 +321,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
           keepAgents: [cfg.leadCwd],
           inUse: () => inUsePaths(process.platform, run, process.getuid?.()),
           uid: process.getuid?.(),
+          settings: cleanupSettings(process.env),
         });
       },
     });
