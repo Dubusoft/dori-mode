@@ -32,6 +32,13 @@
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
 set -eu
 
+# LANE_SANDBOX_PROFILE (e.g. review) has no Seatbelt profile yet: review lanes are placed on local Linux only. Refused
+# before anything else (--check and --explain too), so a profiled lane never runs here with the default write access.
+if [ -n "${LANE_SANDBOX_PROFILE:-}" ]; then
+  echo "lane-sandbox: LANE_SANDBOX_PROFILE=$LANE_SANDBOX_PROFILE is not supported on macOS (review lanes run on Linux only); refusing" >&2
+  exit 2
+fi
+
 # Credential stores under $HOME no lane reads, files and directories alike (a lane gets a credential only through the
 # secret broker). ~/.config is refused already, but for gh and git.
 CREDENTIALS=".aws .azure .oci .gnupg .password-store .kube .docker/config.json .netrc .git-credentials .vault-token
