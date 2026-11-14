@@ -7,6 +7,7 @@ import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
 import { type ObservedReview, prBudget, type PrInfo, REVIEW_TIMEOUT_MS, REVIEW_TOTAL_MS, ReviewGate, type ReviewGateIo } from "../src/review-gate.ts";
 import type { ReviewLaunchRequest, ReviewLaunchResult } from "../src/review-lane.ts";
+import { recordReviewDecision } from "../src/review-jobs.ts";
 import { responseFileName } from "../src/review-response.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
@@ -451,8 +452,10 @@ describe("review gate holds and base race", () => {
   });
 
   test("review event kinds are registered as urgent or digest", () => {
-    for (const k of ["REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_ESCALATED", "REVIEW_BASE_RACE"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-urgent");
-    for (const k of ["REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-digest");
+    for (const k of ["REVIEW_ESCALATED", "REVIEW_BASE_RACE", "REVIEW_DECISION_FAILED"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-urgent");
+    for (const k of ["REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE", "REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_CAP_REACHED"]) {
+      expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-digest");
+    }
   });
 });
 
@@ -646,14 +649,14 @@ describe("review fix loop: answers and re-review", () => {
 });
 
 describe("review fix loop: per-PR limits", () => {
-  test("a second findings round escalates once to the lead, objects no more and keeps the lane held", async () => {
+  test("a second findings round reaches the cap once, objects no more and keeps the lane held", async () => {
     const h = harness(), g = h.gate();
     const { second } = await capped(h, g);
     expect(h.objections).toHaveLength(1);
-    const esc = h.events.filter(([, l]) => l.startsWith("REVIEW_ESCALATED"));
+    const esc = h.events.filter(([, l]) => l.startsWith("REVIEW_CAP_REACHED"));
     expect(esc).toHaveLength(1);
-    expect(esc[0]![0]).toBe(`review-cap:${REPO}#7`);
-    expect(esc[0]![1]).toContain("2 review rounds ended with findings (limit 2); automatic review stops for this PR and the lead decides");
+    expect(esc[0]![0]).toBe(`review-cap:${REPO}#7:${second}`);
+    expect(esc[0]![1]).toContain("2 review rounds ended with findings (limit 2); automatic review stops for this PR and the owner decides");
     expect(g.jobs.get(second)?.capReached?.reason).toBe("2 review rounds ended with findings (limit 2)");
     expect(g.jobs.get(second)?.authorNotified).toBeUndefined();
     dispute(h, second);
@@ -663,7 +666,7 @@ describe("review fix loop: per-PR limits", () => {
     await h.gate().tick(h.emit);
     expect(g.jobs.list()).toHaveLength(2);
     expect(h.objections).toHaveLength(1);
-    expect(h.kinds().filter((k) => k === "REVIEW_ESCALATED")).toHaveLength(1);
+    expect(h.kinds().filter((k) => k === "REVIEW_CAP_REACHED")).toHaveLength(1);
     expect(await g.holdsLane(lane)).toBe(true);
   });
 
@@ -678,7 +681,7 @@ describe("review fix loop: per-PR limits", () => {
     expect(results).toEqual(["started", "started", "escalated"]);
     expect(g.jobs.list()).toHaveLength(3);
     expect(prBudget(g.jobs.list()).staleReschedules).toBe(3);
-    expect(h.events.filter(([, l]) => l.startsWith("REVIEW_ESCALATED")).map(([, l]) => l))
+    expect(h.events.filter(([, l]) => l.startsWith("REVIEW_CAP_REACHED")).map(([, l]) => l))
       .toEqual([expect.stringContaining("3 review runs went stale on head or base changes (limit 2 re-schedules)")]);
     expect((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind).toBe("escalated");
     expect(await g.holdsLane(h.author())).toBe(true);
@@ -707,7 +710,55 @@ describe("review fix loop: per-PR limits", () => {
     h.prs.set(7, { ...h.prs.get(7)!, state: "OPEN" });
     expect((await tryLane(await h.reclaim(H2, "author-3", "reopened"), H2)).kind).toBe("escalated");
     expect(g.jobs.list()).toHaveLength(count);
-    expect(h.kinds().filter((k) => k === "REVIEW_ESCALATED")).toHaveLength(1);
+    expect(h.kinds().filter((k) => k === "REVIEW_CAP_REACHED")).toHaveLength(1);
+  });
+
+  test("owner continue: the held findings go to the author, its answer gets a new reviewer under a fresh budget", async () => {
+    const h = harness(), g = h.gate();
+    const { first, second } = await capped(h, g);
+    recordReviewDecision(g.jobs, h.clock.now(), second, "d1", "continue");
+    await g.tick(h.emit);
+    expect(h.objections.map(([k, r]) => [k, r[0]!.split(" ")[1]])).toEqual([["author", first], ["author", second]]);
+    const lane = await h.reclaim(H7);
+    expect((await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).kind).toBe("awaiting-response");
+    dispute(h, second);
+    expect((await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).kind).toBe("started");
+    expect(g.jobs.list()).toHaveLength(3);
+    expect(g.jobs.list().at(-1)?.job).toMatchObject({ round: 3, previousJobId: second });
+    expect(h.kinds().filter((k) => k === "REVIEW_CAP_REACHED")).toHaveLength(1);
+  });
+
+  test("owner rereview: the findings are dismissed, never sent to the author, and a new reviewer reviews the same head", async () => {
+    const h = harness(), g = h.gate();
+    const { second } = await capped(h, g);
+    recordReviewDecision(g.jobs, h.clock.now(), second, "d1", "rereview");
+    await g.tick(h.emit);
+    expect(h.objections).toHaveLength(1);
+    expect(g.jobs.get(second)?.authorNotified).toMatchObject({ laneKey: "author" });
+    const lane = await h.reclaim(H7);
+    const res = await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit);
+    expect(res.kind).toBe("started");
+    const next = g.jobs.get((res as { jobId: string }).jobId)!;
+    expect(next.job).toMatchObject({ round: 3, previousJobId: second, responseSha256: digest("owner-rereview:d1") });
+    expect(readFileSync(join(h.dir, "review-inputs", next.job.jobId, "previous.md"), "utf8")).toContain("The owner dismissed these findings (decision d1)");
+    expect(await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).toEqual({ kind: "running", jobId: next.job.jobId });
+  });
+
+  test("owner hold: no job, no objection, the lane stays held and the reason names the decision", async () => {
+    const h = harness(), g = h.gate();
+    const { second } = await capped(h, g);
+    recordReviewDecision(g.jobs, h.clock.now(), second, "d1", "hold");
+    await g.tick(h.emit);
+    dispute(h, second);
+    const lane = await h.reclaim(H7);
+    expect(await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).toEqual({
+      kind: "escalated", jobId: second, reason: "held by the owner (decision d1): 2 review rounds ended with findings (limit 2)",
+    });
+    expect(g.jobs.list()).toHaveLength(2);
+    expect(h.objections).toHaveLength(1);
+    expect(await g.holdsLane(lane)).toBe(true);
+    expect((await g.approval(lane, h.pull(), await h.observe(g, 7, lane))).approved).toBe(false);
+    expect(() => recordReviewDecision(g.jobs, h.clock.now(), second, "d1", "continue")).toThrow("already decided hold by d1");
   });
 
   test("rounds count per PR: a new author lane after one findings round gets round 2", async () => {
@@ -721,7 +772,7 @@ describe("review fix loop: per-PR limits", () => {
     expect(g.jobs.get((res as { jobId: string }).jobId)?.job).toMatchObject({ round: 2, authorLaneKey: "author-2", responseSha256: digest(text) });
     await h.submit(g, (res as { jobId: string }).jobId, { verdict: "findings" });
     await g.tick(h.emit);
-    expect(h.kinds().filter((k) => k === "REVIEW_ESCALATED")).toHaveLength(1);
+    expect(h.kinds().filter((k) => k === "REVIEW_CAP_REACHED")).toHaveLength(1);
     expect(h.objections.map(([k]) => k)).toEqual(["author"]);
   });
 });

@@ -145,3 +145,19 @@ export const previousReviewMarkdown = (receipt: ReviewReceipt, responseText: str
     "Re-check every finding: a `fixed` finding must be fixed at this head; a `disputed` finding stands unless its note is supported by code or test evidence. Review the whole current diff, not only these findings.",
     "",
   ].join("\n");
+
+/**
+ * The file a re-review the owner asked for gets as `previous.md` after dismissing the previous findings (owner decision
+ * `decisionId`): those findings, marked dismissed, and the instruction to review the whole current diff afresh.
+ */
+export const dismissedReviewMarkdown = (receipt: ReviewReceipt, decisionId: string): string =>
+  [
+    `# Previous review: job ${receipt.jobId}, round ${receipt.round}, head ${receipt.headSha}`,
+    "",
+    `The owner dismissed these findings (decision ${decisionId}) and asked for a new review:`,
+    "",
+    fenced("json", JSON.stringify(receipt.result.findings, null, 2)),
+    "",
+    "Do not raise a dismissed finding again unless this head adds new evidence for it. Review the whole current diff against the criteria.",
+    "",
+  ].join("\n");

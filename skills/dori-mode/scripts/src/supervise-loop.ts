@@ -72,6 +72,7 @@ import { GitHubEvents, githubTargets, type OpenPull } from "./github-events.ts";
 import { driftTick, pullOwners } from "./drift.ts";
 import { CiFollowUp, defaultCiIo } from "./ci-follow.ts";
 import { ReviewGate } from "./review-gate.ts";
+import { reviewSectionOf, reviewStatusTick } from "./review-status.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
@@ -1127,7 +1128,15 @@ export const supervise = async (
         reportStore.prune(now);
         nextHistoryPrune = now + 60 * 60_000;
       }
-      return routeReports(deps, reportStore, enqueueSweep, home, statusTransport, (lane, report) => openLaneDecision(decisionCtx, lane, report));
+      const lines = await routeReports(deps, reportStore, enqueueSweep, home, statusTransport, (lane, report) => openLaneDecision(decisionCtx, lane, report),
+        reviewSectionOf(deps, review));
+      // Review status in each author lane's status message and the owner decision of a reached review limit
+      // (review-status.ts), right after the reports so the two never write one status message at once.
+      lines.push(...await reviewStatusTick({
+        flow: deps, stores: review, reports: reportStore, transport: statusTransport, decisions: decisionCtx, home,
+        emit: (id, line) => { enqueueSweep(id, line); },
+      }));
+      return lines;
     })())
       .then((lines) => { for (const line of lines) console.log(line); })
       .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });

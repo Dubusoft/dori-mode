@@ -10,8 +10,8 @@ import { briefBody } from "./lane-files.ts";
 import { machineRunner } from "./lane-ops.ts";
 import { type Lane, LANE_KEY, statusOf } from "./registry.ts";
 import {
-  annotate, complete, enqueue, escalate, fail, markRunning, markStale, recoverAfterRestart, requeue, ReviewJobError, type ReviewJobRecord,
-  ReviewJobs,
+  annotate, capHoldReason, complete, dismissalOf, enqueue, escalate, fail, markRunning, markStale, openCap, recoverAfterRestart, requeue,
+  ReviewJobError, type ReviewJobRecord, ReviewJobs, sinceOwner,
 } from "./review-jobs.ts";
 import {
   installedOutDir, launchReviewLane, REVIEW_REPORT_FILE, REVIEW_RESULT_FILE, reviewBrief, type ReviewLaunchRequest, type ReviewLaunchResult,
@@ -20,7 +20,10 @@ import {
   acceptReviewSubmission, isApproval, type ReceiptRejectCode, REVIEWER_CHANNEL, type ReviewErrorCode, type ReviewJob, type ReviewReceipt,
   type ReviewSnapshot, type ReviewSource, snapshotKey,
 } from "./review-receipt.ts";
-import { findingsReasons, MAX_REVIEW_ROUNDS, parseReviewResponse, previousReviewMarkdown, responseFileName } from "./review-response.ts";
+import {
+  dismissedReviewMarkdown, findingsReasons, MAX_REVIEW_ROUNDS, parseReviewResponse, previousReviewMarkdown, responseFileName,
+} from "./review-response.ts";
+import { ReviewStatusStore } from "./review-status.ts";
 import {
   checkReviewScope, prepareReviewSnapshot, releaseReviewSnapshot, reviewSnapshotPath, type ReleaseResult, type ScopeInput, type ScopeResult,
   type SnapshotInput, type SnapshotResult,
@@ -230,7 +233,11 @@ export const capReason = (budget: PrBudget, now: number): string | undefined => 
 
 /** The author's answer to the PR's last findings review, as {@link ReviewGate.ensureJob} reads it. */
 type Answer =
-  | { readonly ok: true; readonly prior: ReviewJobRecord; readonly receipt: ReviewReceipt; readonly text: string; readonly sha256: string }
+  | {
+    readonly ok: true; readonly prior: ReviewJobRecord; readonly receipt: ReviewReceipt; readonly text: string; readonly sha256: string;
+    /** Set when the owner dismissed the findings (decision id): the re-review needs no author answer. */
+    readonly dismissedBy?: string;
+  }
   | { readonly ok: false; readonly prior: ReviewJobRecord; readonly receipt: ReviewReceipt; readonly problem: string };
 
 /** D4: the claimed PRs of `lane` in `pull`'s repo with a lower number, lowest first (candidates that go before `pull`). */
@@ -254,6 +261,7 @@ type ResultFile = {
 export class ReviewGate {
   readonly jobs: ReviewJobs;
   readonly exemptions: ReviewExemptions;
+  readonly merges: ReviewStatusStore;
   /** Settles once recoverAfterRestart ran. */
   readonly ready: Promise<void>;
   private readonly io: ReviewGateIo;
@@ -263,6 +271,7 @@ export class ReviewGate {
   constructor(private readonly deps: FlowDeps, io: Partial<ReviewGateIo> = {}) {
     this.jobs = new ReviewJobs(deps.config.stateDir);
     this.exemptions = new ReviewExemptions(deps.config.stateDir);
+    this.merges = new ReviewStatusStore(deps.config.stateDir);
     this.io = { ...defaultReviewGateIo(deps), ...io };
     this.ready = this.recover();
   }
@@ -373,11 +382,11 @@ export class ReviewGate {
     if (!turn.ok) return { kind: "waiting", why: turn.why };
     const key = snapshotKey(observed.snapshot);
     const pr = this.recordsOf(pull.repo, pull.number);
-    const capped = pr.find((r) => r.capReached);
-    if (capped?.capReached) return { kind: "escalated", jobId: capped.job.jobId, reason: capped.capReached.reason };
+    const capped = openCap(pr);
+    if (capped) return { kind: "escalated", jobId: capped.job.jobId, reason: capHoldReason(capped.capReached) };
     const answer = this.answerOf(lane, pr, observed);
     if (answer && !answer.ok) {
-      const reason = capReason(prBudget(pr), this.now());
+      const reason = capReason(prBudget(sinceOwner(pr)), this.now());
       if (reason) return this.capEscalate(pr, reason, emit);
       const id = answer.prior.job.jobId;
       await this.io.objectAuthor(lane, [`review ${id} of ${pull.repo}#${pull.number} is waiting for your answer: ${answer.problem}`, ...findingsReasons(answer.receipt)]);
@@ -392,7 +401,7 @@ export class ReviewGate {
     const ofRound = records.filter((r) => r.job.round === round);
     const blocked = this.escalation(ofRound, emit);
     if (blocked) return blocked;
-    const reason = capReason(prBudget(pr), this.now());
+    const reason = capReason(prBudget(sinceOwner(pr)), this.now());
     if (reason) return this.capEscalate(pr, reason, emit);
     return this.startJob(lane, pull, observed, ofRound.length + 1, round, answer?.ok ? answer : undefined, emit);
   }
@@ -406,6 +415,11 @@ export class ReviewGate {
     const prior = pr.filter((r) => r.receipt).at(-1);
     const receipt = prior?.receipt;
     if (!prior || !receipt || receipt.result.verdict !== "findings") return undefined;
+    const dismissedBy = dismissalOf(pr, prior);
+    if (dismissedBy) {
+      const text = dismissedReviewMarkdown(receipt, dismissedBy);
+      return { ok: true, prior, receipt, text, sha256: sha256(`owner-rereview:${dismissedBy}`), dismissedBy };
+    }
     const refuse = (problem: string): Answer => ({ ok: false, prior, receipt, problem });
     const file = responseFileName(prior.job.jobId);
     const text = this.io.readText(join(this.io.outDir(lane.key), file));
@@ -421,13 +435,16 @@ export class ReviewGate {
     return { ok: true, prior, receipt, text, sha256: parsed.sha256 };
   }
 
-  /** A per-PR limit is reached: marks the PR's newest record and emits REVIEW_ESCALATED once; the lead decides. */
+  /**
+   * A per-PR limit is reached: marks the PR's newest record and emits digest REVIEW_CAP_REACHED once per cap; the
+   * supervisor's review status tick opens the one owner decision for it (review-status.ts).
+   */
   private capEscalate(pr: readonly ReviewJobRecord[], reason: string, emit: ReviewEmit): EnsureResult {
-    const capped = pr.find((r) => r.capReached);
-    if (capped?.capReached) return { kind: "escalated", jobId: capped.job.jobId, reason: capped.capReached.reason };
+    const capped = openCap(pr);
+    if (capped) return { kind: "escalated", jobId: capped.job.jobId, reason: capHoldReason(capped.capReached) };
     const newest = pr.at(-1)!, now = this.now(), s = newest.job.snapshot;
     const next = annotate(this.jobs, now, newest.job.jobId, { capReached: { reason, at: now } });
-    emit(`review-cap:${s.repo}#${s.prNumber}`, line("REVIEW_ESCALATED", next, `head=${short(s.headSha)} ${reason}; automatic review stops for this PR and the lead decides ${prUrl(s.repo, s.prNumber)}`));
+    emit(`review-cap:${s.repo}#${s.prNumber}:${next.job.jobId}`, line("REVIEW_CAP_REACHED", next, `head=${short(s.headSha)} ${reason}; automatic review stops for this PR and the owner decides ${prUrl(s.repo, s.prNumber)}`));
     return { kind: "escalated", jobId: next.job.jobId, reason };
   }
 
@@ -447,8 +464,13 @@ export class ReviewGate {
       return;
     }
     const pr = this.recordsOf(s.repo, s.prNumber);
-    if (pr.some((j) => j.capReached)) return;
-    const reason = capReason(prBudget(pr), this.now());
+    if (openCap(pr)) return;
+    // Findings the owner dismissed (rereview) are never handed to the author: only recorded.
+    if (dismissalOf(pr, r)) {
+      annotate(this.jobs, this.now(), r.job.jobId, { authorNotified: { at: this.now(), laneKey: r.job.authorLaneKey } });
+      return;
+    }
+    const reason = capReason(prBudget(sinceOwner(pr)), this.now());
     if (reason) { this.capEscalate(pr, reason, emit); return; }
     if (!(author.objection?.reasons ?? []).some((x) => x.includes(receipt.receiptId))) {
       await this.io.objectAuthor(author, findingsReasons(receipt));
@@ -535,7 +557,7 @@ export class ReviewGate {
     writeFileSync(criteriaPath, observed.criteria);
     writeFileSync(prPath, `# ${observed.title}\n\n${observed.body}\n`);
     const previousPath = answer ? join(inputDir, "previous.md") : undefined;
-    if (answer && previousPath) writeFileSync(previousPath, previousReviewMarkdown(answer.receipt, answer.text));
+    if (answer && previousPath) writeFileSync(previousPath, answer.dismissedBy ? answer.text : previousReviewMarkdown(answer.receipt, answer.text));
     mkdirSync(join(stateDir, "briefs"), { recursive: true });
     writeFileSync(this.briefPath(reviewerLaneKey), reviewBrief(record.job, token, {
       url: observed.url, title: observed.title, snapshotPath: snap.path, inputDir, diffPath, criteriaPath, prPath, ...(previousPath ? { previousPath } : {}),
@@ -782,6 +804,11 @@ export class ReviewGate {
       return true;
     }
     return false;
+  }
+
+  /** Records a merge the supervisor made for the owner lane's review status (review-status.ts); never affects a gate. */
+  recordMerge(lane: Lane, pull: ReviewPull & { readonly sha: string }, mergeSha: string): void {
+    this.merges.recordMerge({ lane: lane.key, repo: pull.repo, prNumber: pull.number, headSha: pull.sha, mergeSha, at: this.now() });
   }
 
   /**

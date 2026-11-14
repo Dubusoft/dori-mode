@@ -49,7 +49,7 @@ import { parseSignal, splitDone } from "./signals.ts";
 export type CiEmit = (id: string, line: string) => void;
 
 /** The review gate's part in a merge (design D3, D9, D10). Required: nothing approves a merge by default. */
-export type CiReview = Pick<ReviewGate, "observeSnapshot" | "approval" | "ensureJob" | "recordBaseRace">;
+export type CiReview = Pick<ReviewGate, "observeSnapshot" | "approval" | "ensureJob" | "recordBaseRace"> & Partial<Pick<ReviewGate, "recordMerge">>;
 
 export type MergeLaneRequest = {
   readonly key: string;
@@ -598,6 +598,12 @@ export class CiFollowUp {
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
     await this.io.merged?.(pull, base);
+    // The owner lane's review status shows the merge (review-status.ts); a failed record only costs that line.
+    if (sha !== "unknown") {
+      try { this.review.recordMerge?.(lane, pull, sha); } catch (e) {
+        console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} merge record: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     // D10: a merge that landed on another base than the approved one is reported once; never reverted.
     if (sha === "unknown") return;
     try { await this.review.recordBaseRace(claimant, pull, sha, emit); } catch (e) {

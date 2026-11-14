@@ -47,8 +47,55 @@ export type ReviewJobRecord = {
   readonly baseRace?: ReviewBaseRace;
   /** Set once a findings receipt was delivered to the author lane (`laneKey`), or found undeliverable (lane gone). */
   readonly authorNotified?: { readonly at: number; readonly laneKey: string };
-  /** Set on the PR's newest record once a per-PR review limit was reached: no more automatic jobs, the lead decides. */
-  readonly capReached?: { readonly reason: string; readonly at: number };
+  /**
+   * Set on the PR's newest record once a per-PR review limit was reached: no more automatic jobs until the owner decides.
+   * `decisionId` is the owner decision opened for it (one per cap); `ownerDecision` is the owner's recorded choice.
+   */
+  readonly capReached?: ReviewCap;
+};
+
+/**
+ * The owner's answer to a reached review limit. `continue`: the author lane keeps fixing its findings and the PR gets a
+ * fresh automatic budget; `rereview`: the owner dismissed the findings and a new reviewer reviews the current head with a
+ * fresh budget; `hold`: the PR stays held with no automatic review. There is no outcome that merges without a review.
+ */
+export type ReviewDecisionOutcome = "continue" | "rereview" | "hold";
+
+export const REVIEW_DECISION_OUTCOMES: readonly ReviewDecisionOutcome[] = ["continue", "rereview", "hold"];
+
+export type ReviewCap = {
+  readonly reason: string;
+  readonly at: number;
+  readonly decisionId?: string;
+  readonly ownerDecision?: { readonly decisionId: string; readonly outcome: ReviewDecisionOutcome; readonly at: number };
+};
+
+/** Whether a cap was lifted by the owner (continue or rereview); a held or undecided cap still stops automatic review. */
+export const capLifted = (cap: ReviewCap | undefined): boolean =>
+  cap?.ownerDecision?.outcome === "continue" || cap?.ownerDecision?.outcome === "rereview";
+
+/** The PR's cap that still stops automatic review: reached and not lifted by the owner (undecided or held). */
+export const openCap = (pr: readonly ReviewJobRecord[]): (ReviewJobRecord & { readonly capReached: ReviewCap }) | undefined =>
+  pr.find((r): r is ReviewJobRecord & { readonly capReached: ReviewCap } => r.capReached !== undefined && !capLifted(r.capReached));
+
+/** Why an open cap stops the PR, naming the owner's hold when there is one. */
+export const capHoldReason = (cap: ReviewCap): string =>
+  cap.ownerDecision?.outcome === "hold" ? `held by the owner (decision ${cap.ownerDecision.decisionId}): ${cap.reason}` : cap.reason;
+
+/** The newest owner decision that lifted a cap of the PR (continue or rereview), if any. */
+const lastLift = (pr: readonly ReviewJobRecord[]): NonNullable<ReviewCap["ownerDecision"]> | undefined =>
+  pr.map((r) => r.capReached).filter((c): c is ReviewCap => capLifted(c)).map((c) => c.ownerDecision!).sort((a, b) => a.at - b.at).at(-1);
+
+/** The PR's records its automatic budget counts: those created after the owner last lifted a cap (all without one). */
+export const sinceOwner = (pr: readonly ReviewJobRecord[]): ReviewJobRecord[] => {
+  const lift = lastLift(pr);
+  return lift ? pr.filter((r) => r.job.createdAt > lift.at) : [...pr];
+};
+
+/** The owner's rereview decision that dismissed the findings of `r` (decided after `r` was created), if any. */
+export const dismissalOf = (pr: readonly ReviewJobRecord[], r: ReviewJobRecord): string | undefined => {
+  const lift = lastLift(pr);
+  return lift?.outcome === "rereview" && lift.at >= r.job.createdAt ? lift.decisionId : undefined;
 };
 
 /** A merge whose first parent was not the base the approval covered (another PR merged in between). */
@@ -242,6 +289,39 @@ export const markStale = (store: ReviewJobs, now: number, observed: ReviewSnapsh
 export const annotate = (store: ReviewJobs, now: number, jobId: string, patch: ReviewJobAnnotation): ReviewJobRecord =>
   store.transact((records, put) => {
     const next: ReviewJobRecord = { ...require_(records, jobId), ...patch, updatedAt: now };
+    put(next);
+    return next;
+  });
+
+/**
+ * Records the owner's `outcome` of decision `decisionId` on the capped record `jobId`. The same decision and outcome again
+ * writes nothing; a record without a cap, or a cap another decision or outcome already settled, throws `bad_state`.
+ */
+export const recordReviewDecision = (
+  store: ReviewJobs, now: number, jobId: string, decisionId: string, outcome: ReviewDecisionOutcome,
+): ReviewJobRecord =>
+  store.transact((records, put) => {
+    const r = require_(records, jobId);
+    const cap = r.capReached;
+    if (!cap) throw new ReviewJobError("bad_state", `${jobId} reached no review limit`);
+    const known = cap.ownerDecision;
+    if (known?.decisionId === decisionId && known.outcome === outcome) return r;
+    if (known) throw new ReviewJobError("bad_state", `${jobId} was already decided ${known.outcome} by ${known.decisionId}`);
+    const next: ReviewJobRecord = { ...r, capReached: { ...cap, decisionId: cap.decisionId ?? decisionId, ownerDecision: { decisionId, outcome, at: now } }, updatedAt: now };
+    put(next);
+    return next;
+  });
+
+/**
+ * Records on the capped record `jobId` the owner decision opened for its cap, merged into the cap as it is now (an outcome
+ * the CLI recorded meanwhile stays). A cap that already names a decision is left as it is.
+ */
+export const noteCapDecision = (store: ReviewJobs, now: number, jobId: string, decisionId: string): ReviewJobRecord =>
+  store.transact((records, put) => {
+    const r = require_(records, jobId);
+    if (!r.capReached) throw new ReviewJobError("bad_state", `${jobId} reached no review limit`);
+    if (r.capReached.decisionId) return r;
+    const next: ReviewJobRecord = { ...r, capReached: { ...r.capReached, decisionId }, updatedAt: now };
     put(next);
     return next;
   });
