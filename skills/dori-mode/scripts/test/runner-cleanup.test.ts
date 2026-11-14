@@ -38,7 +38,7 @@ const fixture = (): Fixture => {
 };
 const deps = (f: Fixture, over: Partial<CleanupDeps> = {}): CleanupDeps => ({
   paths: f.paths, now: NOW, run: realRun, log: () => {}, repos: [], openLanes: [], keepAgents: [],
-  inUse: async () => ({ files: [], dirs: [] }), uid: process.getuid?.(), ...over,
+  inUse: async () => ({ files: [], dirs: [] }), procs: async () => [], uid: process.getuid?.(), ...over,
 });
 
 test("removes aged lane temp, temp files, browser profiles, memory agents and empty dirs; archives old sessions", async () => {
@@ -252,7 +252,8 @@ test("closed lanes' node_modules stay for open and opening lanes, recent activit
     // An open lane working in a worktree a closed lane also recorded, and an observed lane (no cwd yet) being opened.
     openLanes: [{ key: "open-2", cwd: wt["repo-open-1"]! }, { key: "ap-9-1" }],
     inUse: async () => ({ files: [join(nm(wt["repo-held"]!), "pkg", "index.js")], dirs: [join(wt["repo-busy-cwd"]!, "src")] }),
-    settings: cleanupSettings({ DORI_CLEANUP_TARGETS: "closedNodeModules=on" }),
+    // The build-output targets read the registry too; off here so `reads` counts closedNodeModules' two reads.
+    settings: cleanupSettings({ DORI_CLEANUP_TARGETS: "closedNodeModules=on closedAndroidBuild=off closedExpo=off closedPods=off closedCargoTarget=off" }),
   }));
   for (const name of names) expect({ name, exists: existsSync(nm(wt[name]!)) }).toEqual({ name, exists: true });
   expect(reads).toBe(2);
@@ -274,6 +275,123 @@ test("closedNodeModules is skipped whole when the in-use listing fails, the regi
   const none = await runCleanup(deps(f, { settings }));
   expect(none.targets.closedNodeModules).toMatchObject({ skip: "noRegistry" });
   expect(existsSync(nm(wt["repo-ap-2-1"]!))).toBe(true);
+});
+
+/** Build output in a worktree: Android (also in a monorepo app), Expo, untracked Pods, a cargo target and one without its tag. */
+const buildOutput = (wt: string): Record<string, string> => {
+  const out: Record<string, string> = {
+    androidBuild: join(wt, "android", "build"), androidGradle: join(wt, "android", ".gradle"), androidApp: join(wt, "android", "app", "build"),
+    monorepoApp: join(wt, "mobile", "android", "app", "build"), expo: join(wt, ".expo"), pods: join(wt, "ios", "Pods"),
+    target: join(wt, "target"), untaggedTarget: join(wt, "crate", "target"),
+  };
+  for (const dir of Object.values(out)) file(join(dir, "out.bin"), "0123456789");
+  file(join(out.target!, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n");
+  return out;
+};
+const ARTIFACTS_ON = "closedAndroidBuild=on closedExpo=on closedPods=on closedCargoTarget=on";
+
+test("closed lanes' build output: report by default, removed when on, tracked Pods, untagged targets and sources stay", async () => {
+  const f = fixture();
+  const wt = await laneWorktrees(f, ["repo-ap-3-1", "repo-ap-4-1"]);
+  const out = buildOutput(wt["repo-ap-3-1"]!);
+  // A repo that commits its Pods: removing them would dirty the checkout.
+  const committed = file(join(wt["repo-ap-4-1"]!, "ios", "Pods", "Manifest.lock.txt"), "pods");
+  await git("-C", wt["repo-ap-4-1"]!, "add", "ios");
+  await git("-C", wt["repo-ap-4-1"]!, "commit", "-q", "-m", "pods");
+  // An `android` link out of the worktree: its build dir is not the worktree's to remove.
+  const outside = file(join(f.tmp, "..", "shared-android", "build", "out.bin"));
+  symlinkSync(join(f.tmp, "..", "shared-android"), join(wt["repo-ap-4-1"]!, "android"));
+  const closedLanes = async () => [
+    { key: "ap-3-1", closedAt: NOW - 20 * DAY, worktrees: [wt["repo-ap-3-1"]!] },
+    { key: "ap-4-1", closedAt: NOW - 20 * DAY, worktrees: [wt["repo-ap-4-1"]!] },
+  ];
+
+  const reported = await runCleanup(deps(f, { closedLanes }));
+  for (const dir of Object.values(out)) expect(existsSync(dir)).toBe(true);
+  expect(reported.targets.closedAndroidBuild).toMatchObject({ mode: "report", candidates: 4, candidateBytes: 40, removed: 0 });
+  expect(reported.targets.closedExpo).toMatchObject({ mode: "report", candidates: 1, removed: 0 });
+  expect(reported.targets.closedPods).toMatchObject({ mode: "report", candidates: 1, removed: 0, skipped: { tracked: 1 } });
+  expect(reported.targets.closedAndroidBuild!.skipped).toEqual({ unsafeRoot: 1 });
+  expect(reported.targets.closedCargoTarget).toMatchObject({ mode: "report", candidates: 1, removed: 0 });
+  expect(cleanupLine(reported)).toContain("closedAndroidBuild=report:4/40B");
+
+  const on = await runCleanup(deps(f, { closedLanes, settings: cleanupSettings({ DORI_CLEANUP_TARGETS: ARTIFACTS_ON }) }));
+  for (const key of ["androidBuild", "androidGradle", "androidApp", "monorepoApp", "expo", "pods", "target"]) expect({ key, exists: existsSync(out[key]!) }).toEqual({ key, exists: false });
+  expect(existsSync(out.untaggedTarget!)).toBe(true);
+  expect(existsSync(committed)).toBe(true);
+  expect(existsSync(outside)).toBe(true);
+  expect(existsSync(join(wt["repo-ap-3-1"]!, "a.txt"))).toBe(true);
+  expect(existsSync(nm(wt["repo-ap-3-1"]!))).toBe(true);
+  expect(await git("-C", wt["repo-ap-4-1"]!, "status", "--porcelain", "--", "ios")).toBe("");
+  expect(on.targets.closedAndroidBuild).toMatchObject({ mode: "on", removed: 4, bytes: 40 });
+  expect(on.targets.closedCargoTarget).toMatchObject({ mode: "on", removed: 1 });
+});
+
+test("closed lanes' build output stays while its tool runs, for lanes idle too briefly, open, in-use or reopened lanes", async () => {
+  const f = fixture();
+  const names = ["repo-ap-5-1", "repo-ap-6-1", "repo-open-7", "repo-ap-8-1", "repo-ap-9-1"];
+  const wt = await laneWorktrees(f, names);
+  const out = Object.fromEntries(names.map((n) => [n, buildOutput(wt[n]!)]));
+  let reads = 0;
+  const closedLanes = async () => {
+    reads++;
+    return [
+      // Closed 10 days ago: past the 7 days of Android, Pods and cargo, not the 14 of Expo.
+      { key: "ap-5-1", closedAt: NOW - 10 * DAY, worktrees: [wt["repo-ap-5-1"]!] },
+      { key: "ap-6-1", closedAt: NOW - 3 * DAY, worktrees: [wt["repo-ap-6-1"]!] },
+      { key: "gone-7", closedAt: NOW - 20 * DAY, worktrees: [wt["repo-open-7"]!] },
+      { key: "ap-8-1", closedAt: NOW - 20 * DAY, worktrees: [wt["repo-ap-8-1"]!] },
+      ...(reads === 1 ? [{ key: "ap-9-1", closedAt: NOW - 20 * DAY, worktrees: [wt["repo-ap-9-1"]!] }] : []),
+    ];
+  };
+  const gradle = "/usr/lib/jvm/bin/java -cp gradle-launcher-8.7.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.7";
+  const report = await runCleanup(deps(f, {
+    closedLanes,
+    openLanes: [{ key: "open-7" }],
+    inUse: async () => ({ files: [join(out["repo-ap-8-1"]!.pods!, "out.bin")], dirs: [] }),
+    procs: async () => ["/bin/zsh", gradle],
+    // closedNodeModules off: its own registry read would hide the lane that reopens after the first read.
+    settings: cleanupSettings({ DORI_CLEANUP_TARGETS: `${ARTIFACTS_ON} closedNodeModules=off` }),
+  }));
+  expect(report.targets.closedAndroidBuild).toMatchObject({ skip: "toolRunning", candidates: 0 });
+  expect(cleanupLine(report)).toContain("closedAndroidBuild=skip:toolRunning");
+  expect(report.targets.closedExpo).toMatchObject({ removed: 0, skipped: { recent: 2, shielded: 2, reopened: 1 } });
+  expect(report.targets.closedPods).toMatchObject({ removed: 1, skipped: { recent: 1, shielded: 2, reopened: 1 } });
+  expect(existsSync(out["repo-ap-5-1"]!.pods!)).toBe(false);
+  expect(existsSync(out["repo-ap-5-1"]!.expo!)).toBe(true);
+  for (const n of ["repo-ap-6-1", "repo-open-7", "repo-ap-8-1", "repo-ap-9-1"]) {
+    for (const key of ["androidApp", "expo", "pods", "target"]) expect({ n, key, exists: existsSync(out[n]![key]!) }).toEqual({ n, key, exists: true });
+  }
+
+  const settings = cleanupSettings({ DORI_CLEANUP_TARGETS: ARTIFACTS_ON });
+  const blind = await runCleanup(deps(f, { closedLanes, settings, procs: async () => { throw new Error("ps timed out"); } }));
+  expect(blind.targets.closedExpo).toMatchObject({ skip: "procsFailed", candidates: 0 });
+  expect(blind.targets.metroCache).toMatchObject({ skip: "procsFailed" });
+  const none = await runCleanup(deps(f, { settings }));
+  expect(none.targets.closedPods).toMatchObject({ skip: "noRegistry" });
+});
+
+test("Metro's temp caches are metroCache's alone: kept by the temp sweep, removed when on unless recent or Metro runs", async () => {
+  const f = fixture();
+  const cache = file(join(f.tmp, "metro-cache", "ab", "cdef"), "bundle");
+  const fileMap = file(join(f.tmp, "metro-file-map-0123abcd-ef"), "map");
+  const busy = fresh(file(join(f.tmp, "metro-cache-busy", "12", "3456"), "new"), NOW - DAY);
+  const other = file(join(f.tmp, "stale.txt"));
+  const reported = await runCleanup(deps(f));
+  for (const p of [cache, fileMap, busy]) expect(existsSync(p)).toBe(true);
+  expect(existsSync(other)).toBe(false);
+  expect(reported.targets.metroCache).toMatchObject({ mode: "report", candidates: 2, candidateBytes: 9, skipped: { recent: 1 } });
+
+  const settings = cleanupSettings({ DORI_CLEANUP_TARGETS: "metroCache=on" });
+  const running = await runCleanup(deps(f, { settings, procs: async () => ["node /w/app/node_modules/.bin/expo start --port 8081"] }));
+  expect(running.targets.metroCache).toMatchObject({ skip: "toolRunning" });
+  expect(existsSync(cache)).toBe(true);
+
+  const on = await runCleanup(deps(f, { settings }));
+  expect(existsSync(join(f.tmp, "metro-cache"))).toBe(false);
+  expect(existsSync(fileMap)).toBe(false);
+  expect(existsSync(busy)).toBe(true);
+  expect(on.targets.metroCache).toMatchObject({ mode: "on", removed: 2, bytes: 9 });
 });
 
 test("closedLanesOf lists one host's closed lanes with their cwd and recorded worktrees", () => {

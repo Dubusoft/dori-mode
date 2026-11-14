@@ -703,6 +703,8 @@ a day.
 | memory agents | `~/.omo/memory/agents/<slug>-<hash>` | removed when untouched for 30 days |
 | worktree records | every workspace repo the runner reports | `git worktree prune` |
 | closed lanes' `node_modules` | `<worktree>/node_modules` of each worktree (cwd and recorded worktrees) of a lane the registry records as closed | removed once the lane's last activity (its close, the worktree's `HEAD`, index and `HEAD` log) is 3 days old and nothing in the worktree, its `.git` or its `node_modules` changed for 6 hours; `report` by default |
+| closed lanes' build output | in the same worktrees and their direct subdirectories: `android/build`, `android/<module>/build` and `android/.gradle` (closedAndroidBuild), `.expo` (closedExpo), `ios/Pods` (closedPods), a `target` holding cargo's `CACHEDIR.TAG` (closedCargoTarget) | removed once the lane's last activity is 7 days old (14 for `.expo`; for `target` also its newest file), with the same keeps as `node_modules`, never when git tracks anything in it (`tracked`), and not that day while Gradle, Metro/Expo, Xcode/xcodebuild/Simulator/pod or cargo/rustc/rust-analyzer runs on the host (`skip:toolRunning`); `report` by default |
+| Metro caches | `metro-*` directly in a temp root (`metro-cache`, `metro-file-map-*`) | removed when nothing in them changed for 3 days and no Metro or Expo dev server runs (metroCache); the system temp sweep leaves them to this target; `report` by default |
 
 Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The sweep never removes: an open lane's
 sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
@@ -726,28 +728,31 @@ refuses, is older than proto 9 or does not answer within 60 seconds, it is skipp
 
 Each target runs in one of three modes: `on` removes (sessions are moved), `report` only counts what it would remove
 and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
-Every target defaults to `on` except `closedNodeModules`, which starts at `report`; a target added later starts at
+Every target defaults to `on` except `closedNodeModules`, the build-output targets and `metroCache`, which start at `report`; a target added later starts at
 `report` until its reports have been read. The runner's
 environment sets them, read at each sweep:
 
 | Variable | Effect |
 |---|---|
 | `DORI_CLEANUP_DRY_RUN=1` | every target that is not `off` runs in `report` (empty, `0`, `false`, `no` and `off` leave it unset) |
-| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune`, `closedNodeModules` |
+| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune`, `closedNodeModules`, `closedAndroidBuild`, `closedExpo`, `closedPods`, `closedCargoTarget`, `metroCache` |
 
 An entry that is not understood is ignored and logged as a `RUNNER_CLEANUP_ERROR`.
 
 Each sweep logs one line and rewrites the status file with the full report:
 
 ```text
-RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> closedNodeModules=<n> worktreePrune=<ok>/<repos> freedBytes=<n> [wouldFreeBytes=<n>] kept=<n> inUse=ok errors=<n> [skipped=<target>.<reason>:<n>,...] ms=<n>
+RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> closedNodeModules=<n> closedAndroidBuild=<n> closedExpo=<n> closedPods=<n> closedCargoTarget=<n> metroCache=<n> worktreePrune=<ok>/<repos> freedBytes=<n> [wouldFreeBytes=<n>] kept=<n> inUse=ok errors=<n> [skipped=<target>.<reason>:<n>,...] ms=<n>
 ```
 
 A target's value is the number removed in `on`, `report:<candidates>/<bytes>B` in `report` (`worktreePrune=report:<records>`),
-`off`, `skip:inUseFailed` when the in-use listing failed, or (closedNodeModules) `skip:noRegistry` / `skip:registryFailed`. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
+`off`, `skip:inUseFailed` when the in-use listing failed, (closed-lane targets) `skip:noRegistry` / `skip:registryFailed`, or
+(build output and Metro) `skip:procsFailed` when the process listing (Linux `/proc/*/cmdline`, macOS `ps`; none on Windows)
+failed and `skip:toolRunning` when a process of the target's tool runs. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
 counts the entries left and why: `shielded` (an open lane's, in use, or a secret store), `checkout`, `lock`, `otherUser`,
 `excluded` (a live-session temp name), `archived` (already in the archive), `unsafeRoot`, `recent` (a closed lane's worktree
-active within 3 days or changed within 6 hours) and `reopened` (the lane is open again). In `cleanup.json` each
+active within 3 days or changed within 6 hours, or build output within its age), `reopened` (the lane is open again) and
+`tracked` (build output git tracks). In `cleanup.json` each
 target carries `mode`, `removed`, `bytes`, `candidates`, `candidateBytes`, `kept`, `errors`, `skipped` and, when it did
 not run, `skip`; the report has `dryRun` and `worktreePrune.{mode,ok,failed,candidates}`. Bytes of a removed browser
 profile or memory agent are its files' total size.

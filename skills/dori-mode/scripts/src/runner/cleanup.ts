@@ -4,6 +4,7 @@ import { lstat, mkdir, readdir, readlink, realpath, rename, rm, rmdir, unlink } 
 import { join, posix, win32 } from "node:path";
 import type { Lane } from "../registry.ts";
 import type { Runner } from "../run.ts";
+import { sweepArtifacts } from "./cleanup-artifacts.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
 
 /**
@@ -18,7 +19,9 @@ import { writeRunnerFile } from "./fs-safety.ts";
  * - omo memory agents (`~/.omo/memory/agents/<slug>-<hash>`) untouched for 30 days;
  * - `git worktree prune` in every repo the runner knows (drops records of worktrees whose directory is gone);
  * - `node_modules` of the worktrees of lanes the registry records as closed, once the lane's last activity is 3 days
- *   old and the worktree has not changed for 6 hours (closedNodeModules; `report` by default).
+ *   old and the worktree has not changed for 6 hours (closedNodeModules; `report` by default);
+ * - other build output of those worktrees (`android` build dirs, `.expo`, untracked `ios/Pods`, cargo `target`) and
+ *   Metro's `metro-*` temp caches, each with its own age and tool-process check (cleanup-artifacts.ts; `report` by default).
  * Never removed: anything outside those roots, `~/.dori/secrets`, `~/.secrets`, an open lane's cwd, sandbox TMPDIR,
  * session dir and memory agent, the lead's memory agent, any git checkout (a worktree, dirty or clean, stays as it is),
  * anything a process holds open or runs in (Linux /proc, macOS lsof; Windows refuses to delete an open file), sockets,
@@ -43,11 +46,18 @@ export const CLEANUP_AGES = {
   closedNodeModules: 3 * DAY_MS,
   /** Any change to such a worktree (or its `node_modules`) this recent keeps it: something may be installing there. */
   worktreeQuiet: 6 * HOUR_MS,
+  /** Lane idle (closedAndroidBuild, closedPods, closedCargoTarget also for the newest file in `target`) or closed (closedExpo). */
+  closedAndroidBuild: 7 * DAY_MS,
+  closedExpo: 14 * DAY_MS,
+  closedPods: 7 * DAY_MS,
+  closedCargoTarget: 7 * DAY_MS,
+  /** No change anywhere in a temp `metro-*` entry. */
+  metroCache: 3 * DAY_MS,
 } as const;
 /** The sweep's targets, as they appear in the report and in `DORI_CLEANUP_TARGETS`. */
 export const CLEANUP_TARGETS = [
   "sandbox", "omoTmp", "bunChrome", "temp", "varTmp", "sessionsArchived", "emptyArtifactDirs", "memoryAgents", "worktreePrune",
-  "closedNodeModules",
+  "closedNodeModules", "closedAndroidBuild", "closedExpo", "closedPods", "closedCargoTarget", "metroCache",
 ] as const;
 export type CleanupTarget = (typeof CLEANUP_TARGETS)[number];
 /** `on`: remove (or move, for sessions); `report`: count candidates and bytes, change nothing; `off`: skip the target. */
@@ -57,6 +67,7 @@ const CLEANUP_MODES: readonly CleanupMode[] = ["on", "report", "off"];
 export const CLEANUP_DEFAULT_MODES: Readonly<Record<CleanupTarget, CleanupMode>> = {
   sandbox: "on", omoTmp: "on", bunChrome: "on", temp: "on", varTmp: "on", sessionsArchived: "on", emptyArtifactDirs: "on",
   memoryAgents: "on", worktreePrune: "on", closedNodeModules: "report",
+  closedAndroidBuild: "report", closedExpo: "report", closedPods: "report", closedCargoTarget: "report", metroCache: "report",
 };
 export type CleanupSettings = {
   /** Every target that is not `off` runs in `report`. */
@@ -103,10 +114,13 @@ const MAX_DEPTH = 32;
 const GIT_PRUNE_TIMEOUT_MS = 30_000;
 const IN_USE_TIMEOUT_MS = 60_000;
 
-/** Top-level temp entries that belong to live sessions (the same set the Linux host's tmpfiles rule excluded). */
+/**
+ * Top-level temp entries that belong to live sessions (the same set the Linux host's tmpfiles rule excluded), and Metro's
+ * `metro-*` caches, which only metroCache removes.
+ */
 export const TEMP_EXCLUDES: readonly string[] = [
   ".X11-unix", ".ICE-unix", ".XIM-unix", ".font-unix", "systemd-private-*", "snap-private-tmp", "tmux-*", "herdr*", ".*.hm",
-  "*.sock", "*.lock", "clr-debug-pipe-*", "dotnet-diagnostic-*", "senpi-*", "event-log-*", "metro-file-map-*", "node-compile-cache",
+  "*.sock", "*.lock", "clr-debug-pipe-*", "dotnet-diagnostic-*", "senpi-*", "event-log-*", "metro-*", "node-compile-cache",
   "com.apple.*", ".com.apple.*", "launchd*", "*.pid",
 ];
 const globRegex = (glob: string): RegExp =>
@@ -134,7 +148,7 @@ export type CleanupPaths = {
   readonly secrets: readonly string[];
 };
 
-const stripSlash = (p: string, path: typeof posix): string => (p.length > path.parse(p).root.length ? p.replace(/[\\/]+$/, "") : p);
+export const stripSlash = (p: string, path: typeof posix): string => (p.length > path.parse(p).root.length ? p.replace(/[\\/]+$/, "") : p);
 
 /**
  * Where the sweep looks on `os`: Linux from `$HOME`, `/tmp` and `/var/tmp`; macOS from `$HOME`, `$TMPDIR` and `/tmp`;
@@ -247,8 +261,9 @@ export const inUsePaths = async (os: string, run: Runner, uid: number | undefine
 
 /** Why an entry the target walked was left: shielded (open lane, in use, secret store), a git checkout, a lock file,
  * another user's, a live-session temp name, an archive copy already there, a root the sweep refuses, a closed lane's
- * worktree still active (closed or worked in less than 3 days ago, changed in the last 6 hours), or reopened. */
-export type SkipReason = "shielded" | "checkout" | "lock" | "otherUser" | "excluded" | "archived" | "unsafeRoot" | "recent" | "reopened";
+ * worktree still active (closed or worked in less than 3 days ago, changed in the last 6 hours), reopened, or build output
+ * git tracks. */
+export type SkipReason = "shielded" | "checkout" | "lock" | "otherUser" | "excluded" | "archived" | "unsafeRoot" | "recent" | "reopened" | "tracked";
 /**
  * One target's counts. `candidates`/`candidateBytes`: what qualified for removal (removed in `on`, only counted in
  * `report`); `removed`/`bytes`: what was actually removed. `skip`: why the whole target did not run.
@@ -262,7 +277,7 @@ export type TargetCount = {
   kept: number;
   errors: number;
   skipped: Partial<Record<SkipReason, number>>;
-  skip?: "off" | "inUseFailed" | "noRegistry" | "registryFailed";
+  skip?: "off" | "inUseFailed" | "noRegistry" | "registryFailed" | "procsFailed" | "toolRunning";
 };
 /** A lane the registry records as closed: when, and the worktrees it used (its cwd and its recorded worktrees). */
 export type ClosedLane = { readonly key: string; readonly closedAt: number; readonly worktrees: readonly string[] };
@@ -314,9 +329,11 @@ export type CleanupDeps = {
    * removing. Absent: this runner has no registry to ask, and closedNodeModules is skipped (`noRegistry`).
    */
   readonly closedLanes?: () => Promise<readonly ClosedLane[]>;
+  /** The command lines of the processes running on this host (processCommands); a target whose tool runs is skipped. */
+  readonly procs: () => Promise<readonly string[]>;
 };
 
-type Ctx = {
+export type Ctx = {
   readonly shield: Shield;
   readonly uid: number | undefined;
   readonly errors: string[];
@@ -324,14 +341,14 @@ type Ctx = {
 
 const ageOf = (st: { mtimeMs: number; ctimeMs: number; atimeMs: number }): number => Math.max(st.mtimeMs, st.ctimeMs, st.atimeMs);
 const newCount = (mode: CleanupMode): TargetCount => ({ mode, removed: 0, bytes: 0, candidates: 0, candidateBytes: 0, kept: 0, errors: 0, skipped: {} });
-const skipped = (count: TargetCount, reason: SkipReason): void => { count.skipped[reason] = (count.skipped[reason] ?? 0) + 1; };
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-const noteError = (ctx: Ctx, count: TargetCount, path: string, e: unknown): void => {
+export const skipped = (count: TargetCount, reason: SkipReason): void => { count.skipped[reason] = (count.skipped[reason] ?? 0) + 1; };
+export const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+export const noteError = (ctx: Ctx, count: TargetCount, path: string, e: unknown): void => {
   count.errors++;
   if (ctx.errors.length < 20) ctx.errors.push(`${path}: ${errText(e)}`);
 };
 
-const isCheckout = async (dir: string): Promise<boolean> => {
+export const isCheckout = async (dir: string): Promise<boolean> => {
   try { await lstat(join(dir, ".git")); return true; } catch { return false; }
 };
 
@@ -344,7 +361,7 @@ type WalkOptions = {
 };
 
 /** The size of the files under `dir` (symlinks not followed), bounded like a sweep walk. */
-const treeBytes = async (dir: string, depth = 0): Promise<number> => {
+export const treeBytes = async (dir: string, depth = 0): Promise<number> => {
   let names: string[];
   try { names = await readdir(dir); } catch { return 0; }
   let total = 0;
@@ -397,7 +414,7 @@ const sweepChildren = async (dir: string, opts: WalkOptions, ctx: Ctx, count: Ta
 };
 
 /** A root the sweep may walk: absolute, not a filesystem root, and neither the home dir nor above it or a secret store. */
-const safeRoot = (root: string, paths: CleanupPaths): boolean => {
+export const safeRoot = (root: string, paths: CleanupPaths): boolean => {
   const path = paths.os === "win32" ? win32 : posix;
   if (!path.isAbsolute(root) || path.parse(root).root === path.normalize(root)) return false;
   const shield = new Shield(path);
@@ -420,12 +437,12 @@ const agentAge = async (dir: string): Promise<number> => {
 };
 
 /** The newest change time of a path (mtime or ctime; atime is not a change), 0 when it is absent. */
-const changedAt = async (p: string): Promise<number> => {
+export const changedAt = async (p: string): Promise<number> => {
   try { const st = await lstat(p); return Math.max(st.mtimeMs, st.ctimeMs); } catch { return 0; }
 };
 
 /** A linked worktree's git dir (`.git` is a file `gitdir: <path>`), or its `.git` dir in a main checkout. */
-const gitDirOf = async (worktree: string): Promise<string | undefined> => {
+export const gitDirOf = async (worktree: string): Promise<string | undefined> => {
   const dotGit = join(worktree, ".git");
   try {
     const st = await lstat(dotGit);
@@ -436,7 +453,7 @@ const gitDirOf = async (worktree: string): Promise<string | undefined> => {
 };
 
 /** Whether a lane key names this worktree dir: the key itself, `<key>-...` or `<repo>-<key>` (done-flow's worktree names). */
-const keyNames = (key: string, dir: string): boolean => dir === key || dir.startsWith(`${key}-`) || dir.endsWith(`-${key}`);
+export const keyNames = (key: string, dir: string): boolean => dir === key || dir.startsWith(`${key}-`) || dir.endsWith(`-${key}`);
 
 /**
  * closedNodeModules: `<worktree>/node_modules` of every worktree of a lane the registry records as closed, when the lane's
@@ -668,6 +685,8 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   const nodeModules = runs("closedNodeModules", true);
   if (nodeModules && !deps.closedLanes) nodeModules.skip = "noRegistry";
   else if (nodeModules && deps.closedLanes) await sweepClosedNodeModules(deps, deps.closedLanes, used, nodeModules, ctx);
+  // The rest of their build output, and Metro's temp caches (cleanup-artifacts.ts).
+  await sweepArtifacts({ deps, runs, used, temps, ctx });
 
   // Worktree records whose directory is gone; git keeps locked ones and never touches a worktree that exists.
   // In report mode `--dry-run --verbose` lists the records (`Removing worktrees/<name>: ...`) without dropping them.
