@@ -28,7 +28,7 @@ import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
-import { legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
+import { LEGACY_GUARD_AGENT_FILES, legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
 import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
@@ -177,6 +177,47 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   const onPurpose = intended.length ? `; bound on purpose: ${intended.map(home).join(", ")}` : "";
   if (unexpected.length) return warn("lane exposure", `a lane can read ${unexpected.map(home).join(", ")}${onPurpose}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
   return ok("lane exposure", `${candidates.length - intended.length} sensitive path(s) checked, none readable in a lane${onPurpose}`);
+};
+
+/**
+ * The $HOME dot entries a lane may read without a review: the paths the lane sandbox handles itself (bound, rebound or
+ * hidden as a subtree) and the shells' and common tools' own files. A credential store's top entry (CREDENTIAL_DENY) is
+ * known too.
+ */
+const KNOWN_HOME_ENTRIES: ReadonlySet<string> = new Set([
+  ".dori", ".ssh", ".config", ".local", ".cache", ".omo", ".lane-tmp", ".bsk", ".npm", ".npm-global", ".bun", ".cargo", ".rustup", ".nvm",
+  ".gitconfig", ".npmrc", ".profile", ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".zshrc", ".zshenv", ".zprofile",
+  ".zlogin", ".zlogout", ".oh-my-zsh", ".fzf", ".fzf.bash", ".fzf.zsh", ".inputrc", ".tmux.conf", ".vim", ".vimrc", ".viminfo",
+  ".hushlogin", ".sudo_as_admin_successful", ".selected_editor", ".wget-hsts", ".motd_shown", ".landscape",
+]);
+/** What dori itself keeps directly in ~/.dori; its credential stores (CREDENTIAL_DENY) and the legacy guard files are known too. */
+const KNOWN_DORI_ENTRIES: ReadonlySet<string> = new Set(["runner", "heavy", "lead", "research", "config.json", "src", "bin", "dori-boot-prep.sh", "freshness.log"]);
+
+/**
+ * Entries a lane can read that nobody has looked at: a $HOME dot entry or a ~/.dori entry outside the known sets above
+ * and not in ~/.dori/lane-sandbox-hide. A lane sees $HOME and ~/.dori read-only, so a new tool's credential file there is
+ * readable until it is hidden. Only hosts with a lane sandbox (Linux, macOS) are checked.
+ */
+const homeEntries = (d: Pick<DoctorDeps, "home" | "platform">): Check[] => {
+  const platform = d.platform ?? process.platform;
+  if (platform !== "linux" && platform !== "darwin") return [];
+  const list = (dir: string): string[] => {
+    try {
+      return readdirSync(dir);
+    } catch {
+      return [];
+    }
+  };
+  const hidePath = join(d.home, ".dori", "lane-sandbox-hide");
+  const hidden = new Set(existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : []);
+  const homeKnown = new Set([...KNOWN_HOME_ENTRIES, ...CREDENTIAL_DENY.map((p) => p.split("/")[0] as string)]);
+  const doriKnown = new Set([...KNOWN_DORI_ENTRIES, ...LEGACY_GUARD_AGENT_FILES, ...CREDENTIAL_DENY.filter((p) => p.startsWith(".dori/")).map((p) => p.slice(".dori/".length))]);
+  const unknown = [
+    ...list(d.home).filter((n) => n.startsWith(".") && !homeKnown.has(n)).map((n) => [`~/${n}`, join(d.home, n)] as const),
+    ...list(join(d.home, ".dori")).filter((n) => !doriKnown.has(n)).map((n) => [`~/.dori/${n}`, join(d.home, ".dori", n)] as const),
+  ].filter(([, path]) => !hidden.has(path)).map(([shown]) => shown).sort();
+  if (unknown.length) return [warn("lane home entries", `a lane can read ${unknown.join(", ")}, which dori does not know; check that none holds a credential`, "list each one that does in ~/.dori/lane-sandbox-hide")];
+  return [ok("lane home entries", "every $HOME dot entry and ~/.dori entry is known or hidden")];
 };
 
 /**
@@ -603,7 +644,7 @@ export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | 
 };
 
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), secretStoreChecks(d)])).flat();
+  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), Promise.resolve(homeEntries(d)), secretStoreChecks(d)])).flat();
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 
