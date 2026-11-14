@@ -24,6 +24,9 @@ import {
   checkReviewScope, prepareReviewSnapshot, releaseReviewSnapshot, reviewSnapshotPath, type ReleaseResult, type ScopeInput, type ScopeResult,
   type SnapshotInput, type SnapshotResult,
 } from "./review-snapshot.ts";
+import {
+  classifyExemption, EXEMPT_POLICY_VERSION, type ExemptDecision, exemptKey, exemptReceipt, type ExemptReceipt, isExemptFor, ReviewExemptions,
+} from "./review-exempt.ts";
 import { runnerWorktreeRoot } from "./runner/hub.ts";
 
 /**
@@ -93,6 +96,8 @@ export type ReviewGateIo = {
   readonly mergeBase: (repo: string, base: string, head: string) => Promise<string>;
   /** The `mergeBase...head` diff text. */
   readonly diff: (repo: string, mergeBase: string, head: string) => Promise<string>;
+  /** The text of `path` in `repo` at commit `sha` (throws when it cannot be read). */
+  readonly fileAt: (repo: string, sha: string, path: string) => Promise<string>;
   /** The first parent of a merge commit. */
   readonly mergeParent: (repo: string, mergeSha: string) => Promise<string>;
   /** Makes `sha` present in the local checkout `repoDir` (git fetch origin <sha>). */
@@ -139,6 +144,8 @@ export const defaultReviewGateIo = (deps: FlowDeps): ReviewGateIo => ({
   branchSha: async (repo, ref) => (await ghJson(deps, ["api", `repos/${repo}/branches/${ref}`, "--jq", ".commit.sha"])).trim(),
   mergeBase: async (repo, base, head) => (await ghJson(deps, ["api", `repos/${repo}/compare/${base}...${head}`, "--jq", ".merge_base_commit.sha"])).trim(),
   diff: (repo, mergeBase, head) => ghJson(deps, ["api", "-H", "Accept: application/vnd.github.diff", `repos/${repo}/compare/${mergeBase}...${head}`]),
+  fileAt: (repo, sha, path) =>
+    ghJson(deps, ["api", "-H", "Accept: application/vnd.github.raw", `repos/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${sha}`]),
   mergeParent: async (repo, mergeSha) => (await ghJson(deps, ["api", `repos/${repo}/commits/${mergeSha}`, "--jq", ".parents[0].sha"])).trim(),
   fetchHead: async (repoDir, sha) => {
     const r = await deps.run(["git", "-C", repoDir, "fetch", "--quiet", "origin", sha], { timeoutMs: 120_000 });
@@ -161,6 +168,8 @@ export type ReviewEmit = (id: string, line: string) => void;
 
 export type ApprovalResult =
   | { readonly approved: true; readonly jobId: string; readonly receipt: ReviewReceipt }
+  /** T6: the snapshot is a non-code edit the exemption policy admits; no reviewer ran. */
+  | { readonly approved: true; readonly exempt: ExemptReceipt }
   | { readonly approved: false; readonly reason: string };
 
 export type EnsureResult =
@@ -201,6 +210,7 @@ type ResultFile = {
 /** One gate per supervisor. Construction reconciles the job store after a restart (D8); every method waits for that. */
 export class ReviewGate {
   readonly jobs: ReviewJobs;
+  readonly exemptions: ReviewExemptions;
   /** Settles once recoverAfterRestart ran. */
   readonly ready: Promise<void>;
   private readonly io: ReviewGateIo;
@@ -209,6 +219,7 @@ export class ReviewGate {
 
   constructor(private readonly deps: FlowDeps, io: Partial<ReviewGateIo> = {}) {
     this.jobs = new ReviewJobs(deps.config.stateDir);
+    this.exemptions = new ReviewExemptions(deps.config.stateDir);
     this.io = { ...defaultReviewGateIo(deps), ...io };
     this.ready = this.recover();
   }
@@ -245,12 +256,39 @@ export class ReviewGate {
     };
   }
 
-  /** D9 step 3: a completed reviewer `pass` receipt for exactly the observed snapshot, else why not. */
+  /**
+   * T6: the stored exemption decision of the observed snapshot, classified once per snapshot key (head, base, policy and
+   * exemption policy). A diff or file that cannot be read is a `review` decision: nothing unclassifiable is exempt.
+   */
+  async exemption(observed: ObservedReview): Promise<ExemptDecision> {
+    const s = observed.snapshot, key = exemptKey(s);
+    const known = this.exemptions.get(key);
+    if (known) return known;
+    const at = this.now();
+    let decision: ExemptDecision;
+    try {
+      const diff = await this.io.diff(s.repo, s.mergeBaseSha, s.headSha);
+      const c = await classifyExemption(diff, (side, path) => this.io.fileAt(s.repo, side === "base" ? s.mergeBaseSha : s.headSha, path));
+      decision = c.exempt
+        ? { kind: "exempt", key, receipt: exemptReceipt(s, c, sha256(diff), at) }
+        : { kind: "review", key, reason: c.reason, classifiedAt: new Date(at).toISOString() };
+    } catch (e) {
+      decision = { kind: "review", key, reason: `diff unreadable: ${oneLine(e instanceof Error ? e.message : String(e))}`, classifiedAt: new Date(at).toISOString() };
+    }
+    return this.exemptions.record(decision);
+  }
+
+  /**
+   * D9 step 3: a completed reviewer `pass` receipt for exactly the observed snapshot, else (T6) an exemption of exactly
+   * that snapshot, else why not.
+   */
   async approval(lane: Lane, pull: ReviewPull, observed: ObservedReview): Promise<ApprovalResult> {
     await this.ready;
     const records = this.recordsOf(pull.repo, pull.number);
     const ok = records.filter((r) => r.execution.state === "completed" && r.receipt && isApproval(r.receipt, observed.snapshot)).at(-1);
     if (ok?.receipt) return { approved: true, jobId: ok.job.jobId, receipt: ok.receipt };
+    const ex = await this.exemption(observed);
+    if (ex.kind === "exempt" && isExemptFor(ex.receipt, observed.snapshot)) return { approved: true, exempt: ex.receipt };
     const cur = records.filter((r) => r.key === snapshotKey(observed.snapshot)).at(-1);
     const where = `${pull.repo}#${pull.number}@${short(observed.snapshot.headSha)} (lane ${lane.key})`;
     if (!cur) return { approved: false, reason: `no review of ${where} at base ${short(observed.snapshot.baseSha)} yet` };
@@ -582,7 +620,8 @@ export class ReviewGate {
   /**
    * D11: whether the done watcher must keep `lane` open, from durable state only (the job store and GitHub), so it holds
    * across a restart. For each PR its claim binds, at the claimed head:
-   * - the newest non-stale job is a completed reviewer `pass`: this PR releases;
+   * - the newest non-stale job is a completed reviewer `pass`, or (T6) the claimed head has an exemption under the
+   *   current exemption policy: this PR releases;
    * - else the PR is read (a failed read holds): MERGED or CLOSED releases, and so does an open PR whose head moved off
    *   the claimed one, whose base is not `ciMergeBase` (the supervisor never reviews it) or whose checks failed (the
    *   watcher's red-check objection runs; no review job starts on red);
@@ -598,6 +637,8 @@ export class ReviewGate {
       const records = this.recordsOf(bound.repo, bound.number).filter((r) => r.job.snapshot.headSha === bound.sha);
       const last = records.filter((r) => r.execution.state !== "stale").at(-1);
       if (last?.execution.state === "completed" && last.receipt?.result.verdict === "pass" && last.receipt.source === "reviewer") continue;
+      if (this.exemptions.list().some((d) => d.kind === "exempt" && sameRepo(d.receipt.repo, bound.repo) && d.receipt.prNumber === bound.number
+        && d.receipt.headSha === bound.sha && d.receipt.exemptPolicyVersion === EXEMPT_POLICY_VERSION)) continue;
       let info: PrInfo;
       try { info = await this.io.prInfo(bound.repo, bound.number); } catch { return true; }
       if (info.state !== "OPEN" || info.headSha !== bound.sha || info.baseRef !== this.deps.config.ciMergeBase || info.checks === "red") continue;
