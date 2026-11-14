@@ -35,6 +35,7 @@ import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
 import { HerdrWatch } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
+import { processCommands } from "./cleanup-artifacts.ts";
 import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
@@ -320,6 +321,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
           openLanes: [...owned, ...observedOnly.map((l) => ({ key: l.key }))],
           keepAgents: [cfg.leadCwd],
           inUse: () => inUsePaths(process.platform, run, process.getuid?.()),
+          procs: () => processCommands(process.platform, run),
           uid: process.getuid?.(),
           settings: cleanupSettings(process.env),
           // The supervisor's registry knows which lanes closed (lanes.closed, proto 9); an older supervisor refuses, and the target is skipped.
