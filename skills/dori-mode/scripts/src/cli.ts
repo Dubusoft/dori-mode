@@ -1718,6 +1718,7 @@ try {
           const g = closed.granted;
           console.log(`DECISION_SECRET_GRANTED ${did} ${g.names.join(",")} ${"lane" in g.to ? `lane=${g.to.lane}` : `repo=${g.to.repo}`} changed=${g.changed.join(",") || "-"}`);
         }
+        if (closed.review) console.log(`DECISION_REVIEW_RECORDED ${did} job=${closed.review.jobId} outcome=${closed.review.outcome}`);
         break;
       }
       if (sub === "list") {

@@ -352,14 +352,17 @@ const elapsed = (ms: number): string => {
 const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e)).slice(0, 160);
 
 /**
- * The text of a lane's status message as of `report`: its key, time since it opened, and its last milestone and last
- * progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post.
+ * The text of a lane's status message as of `report` (absent: every row): its key, time since it opened, and its last
+ * milestone and last progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post;
+ * then the lines of `review` (review-status.ts reviewStatusLines), scrubbed the same way.
  */
-export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: LaneReport, now: number, home: string, timeZone?: string): string => {
+export const laneStatusText = (
+  lane: Lane, rows: readonly LaneReport[], report: LaneReport | undefined, now: number, home: string, timeZone?: string, review: readonly string[] = [],
+): string => {
   const stamp = (at: number): string => displayTime(at, timeZone);
-  const upTo = rows.filter((r) => r.seq <= report.seq && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
+  const upTo = rows.filter((r) => (!report || r.seq <= report.seq) && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
   const last = (kind: ReportKind): LaneReport | undefined =>
-    [...upTo, ...(upTo.some((r) => r.id === report.id) ? [] : [report])].filter((r) => r.kind === kind).sort((a, b) => a.seq - b.seq).at(-1);
+    [...upTo, ...(!report || upTo.some((r) => r.id === report.id) ? [] : [report])].filter((r) => r.kind === kind).sort((a, b) => a.seq - b.seq).at(-1);
   const line = (label: string, row: LaneReport | undefined): string => {
     if (!row) return `${label}: 아직 없음`;
     const text = scrubForThread(oneLine(row.text), home);
@@ -370,6 +373,7 @@ export const laneStatusText = (lane: Lane, rows: readonly LaneReport[], report: 
     `[System] 레인 ${lane.key} 상태, 진행 ${Number.isNaN(opened) ? "(알 수 없음)" : elapsed(now - opened)} (갱신 ${stamp(now)})`,
     line("마지막 마일스톤", last("milestone")),
     line("마지막 진행", last("progress")),
+    ...review.map((l) => scrubForThread(l, home)),
   ].join("\n");
 };
 
@@ -393,7 +397,7 @@ const statusIsLatest = async (transport: LaneStatusTransport, channel: string, s
 };
 
 /** The Discord channel id of a lane's thread, or undefined for no thread or a non-Discord one. */
-const statusChannel = (lane: Lane): string | undefined =>
+export const statusChannel = (lane: Lane): string | undefined =>
   lane.thread !== "none" && lane.thread.startsWith("discord:") ? resolveTarget("discord", lane.thread).to : undefined;
 
 /**
@@ -405,7 +409,10 @@ const statusChannel = (lane: Lane): string | undefined =>
  * posted into (either would reopen it): the report goes as one line linking the thread to its parent channel, else the
  * owner channel (redirectIfClosed), and the status message is left as it is. A failed post throws.
  */
-const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string): Promise<void> => {
+const upsertStatus = async (
+  deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string,
+  review: readonly string[] = [],
+): Promise<void> => {
   const relayed = relayedText(lane.key, scrubForThread(oneLine(report.text), home));
   const redirected = await redirectIfClosed(deps.config.stateDir, transport, channel, relayed, deps.config.discordChannels[0],
     (target, line) => transport.post(target, line, `lane-status:${report.id}`));
@@ -413,14 +420,25 @@ const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, chan
     console.error(`LANE_STATUS_REDIRECTED ${lane.key} ${report.id}: thread ${channel} was closed by the owner, so one line went to ${redirected}`);
     return;
   }
-  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone);
+  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone, review);
+  await writeLaneStatus(deps, transport, channel, lane, text, `lane-status:${report.id}`);
+};
+
+/**
+ * Writes `text` as the lane's status message in `channel` (upsertStatus without the closed-thread redirect): edited in
+ * place while it is the latest, else posted anew without a notification and the old one deleted; posted when there is
+ * none yet (silent when `silent`) or the edit fails. A failed post throws; nothing but the lane's statusMessageId changes.
+ */
+export const writeLaneStatus = async (
+  deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, text: string, stableId: string, silent = false,
+): Promise<void> => {
   const previous = lane.statusMessageId;
   if (previous) {
     let latest = true;
     try { latest = await statusIsLatest(transport, channel, previous); }
     catch (e) { console.error(`LANE_STATUS_CHECK_FAILED ${lane.key} ${previous} ${errorText(e)}; editing it in place`); }
     if (!latest) {
-      const id = await transport.post(channel, text, `lane-status:${report.id}`, true);
+      const id = await transport.post(channel, text, stableId, true);
       await deps.registry.patch(lane.key, { statusMessageId: id });
       try { await transport.remove(channel, previous); }
       catch (e) { console.error(`LANE_STATUS_DELETE_FAILED ${lane.key} ${previous} ${errorText(e)}`); }
@@ -433,9 +451,12 @@ const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, chan
       console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${previous} ${errorText(e)}; posting a new status message`);
     }
   }
-  const id = await transport.post(channel, text, `lane-status:${report.id}`);
+  const id = await transport.post(channel, text, stableId, silent);
   await deps.registry.patch(lane.key, { statusMessageId: id });
 };
+
+/** The review lines a lane's status message carries (review-status.ts), read when a report updates it. */
+export type ReviewSection = (lane: Lane) => Promise<readonly string[]>;
 
 /**
  * Routes every pending row once, oldest first, and marks it consumed after its effect. question, blocked and milestone
@@ -463,8 +484,15 @@ const upsertStatus = async (deps: FlowDeps, transport: LaneStatusTransport, chan
  */
 export const routeReports = async (
   deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? "",
-  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener,
+  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener, reviewSection?: ReviewSection,
 ): Promise<string[]> => {
+  // A review status that cannot be read never stops a report: the status message goes out without it.
+  const review = async (lane: Lane): Promise<readonly string[]> => {
+    try { return (await reviewSection?.(lane)) ?? []; } catch (e) {
+      console.error(`LANE_STATUS_REVIEW_ERROR ${lane.key} ${errorText(e)}`);
+      return [];
+    }
+  };
   const out: string[] = [];
   const failed = failures.get(store) ?? new Map<string, number>();
   failures.set(store, failed);
@@ -494,7 +522,7 @@ export const routeReports = async (
         route = "claim";
       } else if (report.kind === "progress" && transport && statusChannel(lane)) {
         try {
-          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home);
+          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home, await review(lane));
           route = "thread";
         } catch (e) {
           eventId = `lane-report:${report.id}`;
@@ -516,7 +544,7 @@ export const routeReports = async (
         route = "journal";
         const channel = statusChannel(lane);
         if (report.kind === "milestone" && transport && channel) {
-          try { await upsertStatus(deps, transport, channel, lane, store, report, home); }
+          try { await upsertStatus(deps, transport, channel, lane, store, report, home, await review(lane)); }
           catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errorText(e)}`); }
         }
       }

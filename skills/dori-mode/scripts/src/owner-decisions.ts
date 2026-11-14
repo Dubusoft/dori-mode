@@ -8,6 +8,7 @@ import { scrubForThread } from "./freshness.ts";
 import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
 import { runnerOf } from "./lane-ops.ts";
 import { MessengerError } from "./messenger/http.ts";
+import { recordReviewDecision, REVIEW_DECISION_OUTCOMES, type ReviewDecisionOutcome, ReviewJobs } from "./review-jobs.ts";
 import { type DecisionChoices, parseDecisionText, parseRequestText, type SecretRequestGrant, secretRequestChoices } from "./runner/decision-text.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import { saveJsonFile } from "./store.ts";
@@ -101,12 +102,20 @@ export type OwnerDecision = DecisionChoices & {
   readonly revisions?: readonly AnswerRevision[];
   /** Set on the decision a lane's denied `dori secret exec` opened: closing it with a choice applies `grants[choice - 1]`. */
   readonly secretRequest?: SecretRequestDecision;
+  /** Set on the decision a PR's reached review limit opened: closing it with a choice records that outcome on the job. */
+  readonly reviewCap?: ReviewCapDecision;
   /** The `[System]` status message of the direct answer in the decision's thread, edited in place (decisionDeliveryTick). */
   readonly notice?: { readonly message: string; readonly text: string };
 };
 
 /** The secret names a lane asked for, the lane's repo when it had one, and what each option grants. */
 export type SecretRequestDecision = { readonly names: readonly string[]; readonly repo?: string; readonly grants: readonly SecretRequestGrant[] };
+
+/**
+ * The capped review job (review-jobs.ts capReached) a decision answers; option `n` records REVIEW_DECISION_OUTCOMES[n - 1]
+ * (continue, rereview, hold). No option merges without a review.
+ */
+export type ReviewCapDecision = { readonly jobId: string; readonly repo: string; readonly prNumber: number };
 
 /** A lane's denied secret request waiting for the supervisor's tick to open its owner decision. */
 export type PendingSecretRequest = { readonly lane: string; readonly names: readonly string[]; readonly repo?: string; readonly at: number };
@@ -368,6 +377,7 @@ export type DecisionSpec = DecisionChoices & {
   readonly sourceRef?: string;
   readonly target?: DecisionTarget;
   readonly secretRequest?: SecretRequestDecision;
+  readonly reviewCap?: ReviewCapDecision;
 };
 
 const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
@@ -468,6 +478,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
       ...(spec.target ? { target: spec.target } : {}), ...(spec.secretRequest ? { secretRequest: spec.secretRequest } : {}),
+      ...(spec.reviewCap ? { reviewCap: spec.reviewCap } : {}),
       ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
     };
     return { file: { ...file, nextSeq: file.nextSeq + 1, decisions: [...file.decisions, decision] }, result: { decision, duplicateOf: undefined } };
@@ -523,6 +534,8 @@ export type CloseResult = {
   readonly answers?: AnswerOutcome;
   /** The secret rule a secret request decision's choice wrote (`changed`: the names whose rule was new to it). */
   readonly granted?: { readonly names: readonly string[]; readonly to: SecretGrantTarget; readonly changed: readonly string[] };
+  /** The outcome a review limit decision's choice recorded on its capped job. */
+  readonly review?: { readonly jobId: string; readonly outcome: ReviewDecisionOutcome };
 };
 
 export type AnswerRef = { readonly channel: string; readonly message: string };
@@ -613,6 +626,9 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   if (options.choice !== undefined && (!Number.isInteger(options.choice) || options.choice < 1 || options.choice > d.options.length)) {
     throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: --choice must be 1-${d.options.length}`);
   }
+  if (d.reviewCap && options.choice === undefined && !options.cancel) {
+    throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: a review limit decision closes with --choice 1-${d.options.length} (or --cancel)`);
+  }
   const tasks = options.tasks ?? 1;
   const targets = answerTargets(d, options.from);
   const acked: AnswerRef[] = [];
@@ -641,6 +657,15 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     if (!ctx.secretGrant) throw new OwnerDecisionError("DECISION_GRANT_FAILED", `DECISION_GRANT_FAILED ${id}: no config writer`);
     try { granted = { names: d.secretRequest.names, to, changed: [...ctx.secretGrant(d.secretRequest.names, to)] }; }
     catch (e) { throw new OwnerDecisionError("DECISION_GRANT_FAILED", `DECISION_GRANT_FAILED ${id}: ${errorText(e)}; nothing closed`); }
+  }
+  // A review limit decision's outcome is recorded on its job first too: the review gate reads it from there.
+  let review: CloseResult["review"];
+  const outcome = d.reviewCap && options.choice !== undefined ? REVIEW_DECISION_OUTCOMES[options.choice - 1] : undefined;
+  if (d.reviewCap && outcome) {
+    try {
+      recordReviewDecision(new ReviewJobs(stateDir), ctx.now(), d.reviewCap.jobId, d.id, outcome);
+      review = { jobId: d.reviewCap.jobId, outcome };
+    } catch (e) { throw new OwnerDecisionError("DECISION_REVIEW_FAILED", `DECISION_REVIEW_FAILED ${id}: ${errorText(e)}; nothing closed`); }
   }
   let archivePending: string | undefined;
   if (d.thread) {
@@ -678,7 +703,8 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     answers = { tasks: closed.closeTasks ?? tasks, acked, ackFailed, left: targets.left.map(refOf), ...recorded };
   }
   const decision = readDecisions(stateDir).decisions.find((x) => x.id === id) ?? closed;
-  return { decision, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}), ...(granted ? { granted } : {}) };
+  return { decision, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}), ...(granted ? { granted } : {}),
+    ...(review ? { review } : {}) };
 };
 
 /**
