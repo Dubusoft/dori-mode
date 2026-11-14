@@ -705,6 +705,12 @@ a day.
 | closed lanes' `node_modules` | `<worktree>/node_modules` of each worktree (cwd and recorded worktrees) of a lane the registry records as closed | removed once the lane's last activity (its close, the worktree's `HEAD`, index and `HEAD` log) is 3 days old and nothing in the worktree, its `.git` or its `node_modules` changed for 6 hours; `report` by default |
 | closed lanes' build output | in the same worktrees and their direct subdirectories: `android/build`, `android/<module>/build` and `android/.gradle` (closedAndroidBuild), `.expo` (closedExpo), `ios/Pods` (closedPods), a `target` holding cargo's `CACHEDIR.TAG` (closedCargoTarget) | removed once the lane's last activity is 7 days old (14 for `.expo`; for `target` also its newest file), with the same keeps as `node_modules`, never when git tracks anything in it (`tracked`), and not that day while Gradle, Metro/Expo, Xcode/xcodebuild/Simulator/pod or cargo/rustc/rust-analyzer runs on the host (`skip:toolRunning`); `report` by default |
 | Metro caches | `metro-*` directly in a temp root (`metro-cache`, `metro-file-map-*`) | removed when nothing in them changed for 3 days and no Metro or Expo dev server runs (metroCache); the system temp sweep leaves them to this target; `report` by default |
+| Xcode DerivedData (`xcodeDerivedData`) | macOS only: `~/Library/Developer/Xcode/DerivedData/<folder>` | a folder in which nothing changed (mtime or ctime) for 14 days is removed; `report` by default |
+| iOS DeviceSupport (`xcodeDeviceSupport`) | macOS only: `~/Library/Developer/Xcode/iOS DeviceSupport/<version>` | same, 60 days; `report` by default |
+| unavailable simulators (`simulatorsUnavailable`) | macOS only | `xcrun simctl delete unavailable` when `xcrun simctl list --json devices unavailable` lists any; `report` by default |
+| bun cache (`bunCache`) | the dir `bun pm cache` prints | `bun pm cache rm` (it empties the cache), at most every 30 days; `report` by default |
+| npm cache (`npmCache`) | `<npm config get cache>/_cacache` | `npm cache verify`; `report` by default |
+| pnpm store (`pnpmStore`) | the dir `pnpm store path` prints | `pnpm store prune`, after the `node_modules` target so it frees what nothing links to any more; `report` by default |
 
 Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The sweep never removes: an open lane's
 sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
@@ -726,16 +732,30 @@ worktrees), only the asking runner's lanes (local lanes for `local`, a remote ru
 secret, so it is not sealed. Without a registry to ask the target is skipped (`noRegistry`); when the supervisor
 refuses, is older than proto 9 or does not answer within 60 seconds, it is skipped (`registryFailed`).
 
+The developer-cache targets (`src/runner/cleanup-dev-caches.ts`) never remove files of the global package caches
+themselves: only the tools' own commands above run, in a scratch directory (bun's need a `package.json`). Xcode Archives
+(dSYMs cannot be rebuilt), `~/.expo` (login state) and CoreSimulator `Devices` (only simctl removes a simulator) are no
+target. Each target first reads the host's process list (`ps -A -o pid=,args=`) and is skipped (`busy`) while a process
+that uses its cache runs: Xcode, Simulator or xcodebuild for the three Xcode targets; `bunx` or bun's package commands
+(`install`, `add`, `remove`, `update`, `pm`, `x`, ...) for bun; any npm/npx or pnpm/pnpx. When the list cannot be read
+they are all skipped (`processesFailed`). An Xcode folder a process holds a file open in or runs in is kept (`shielded`;
+only paths inside the folder count), symlinks and other users' folders too, and the two folder targets are skipped
+when the in-use listing fails. The Xcode targets are skipped on Linux and Windows (`platform`), the package caches on
+Windows; a tool that is not installed is skipped (`notInstalled`). In `report` the folders and unavailable simulators
+count with their size, bun's cache with its whole size, npm's and pnpm's with 0 bytes (what they collect is known only
+once they run). When a tool target runs its command, the report records the time under `lastRuns.<target>`; the next
+sweep reads it from `cleanup.json`, and `bunCache` is skipped (`notDue`) until 30 days after its last run.
+
 Each target runs in one of three modes: `on` removes (sessions are moved), `report` only counts what it would remove
 and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
-Every target defaults to `on` except `closedNodeModules`, the build-output targets and `metroCache`, which start at `report`; a target added later starts at
+Every target defaults to `on` except `closedNodeModules`, the build-output targets, `metroCache` and the developer-cache targets, which start at `report`; a target added later starts at
 `report` until its reports have been read. The runner's
 environment sets them, read at each sweep:
 
 | Variable | Effect |
 |---|---|
 | `DORI_CLEANUP_DRY_RUN=1` | every target that is not `off` runs in `report` (empty, `0`, `false`, `no` and `off` leave it unset) |
-| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune`, `closedNodeModules`, `closedAndroidBuild`, `closedExpo`, `closedPods`, `closedCargoTarget`, `metroCache` |
+| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune`, `closedNodeModules`, `closedAndroidBuild`, `closedExpo`, `closedPods`, `closedCargoTarget`, `metroCache`, `xcodeDerivedData`, `xcodeDeviceSupport`, `simulatorsUnavailable`, `bunCache`, `npmCache`, `pnpmStore` |
 
 An entry that is not understood is ignored and logged as a `RUNNER_CLEANUP_ERROR`.
 
@@ -746,13 +766,14 @@ RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n>
 ```
 
 A target's value is the number removed in `on`, `report:<candidates>/<bytes>B` in `report` (`worktreePrune=report:<records>`),
-`off`, `skip:inUseFailed` when the in-use listing failed, (closed-lane targets) `skip:noRegistry` / `skip:registryFailed`, or
+`off`, `skip:inUseFailed` when the in-use listing failed, (closed-lane targets) `skip:noRegistry` / `skip:registryFailed`,
 (build output and Metro) `skip:procsFailed` when the process listing (Linux `/proc/*/cmdline`, macOS `ps`; none on Windows)
-failed and `skip:toolRunning` when a process of the target's tool runs. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
+failed and `skip:toolRunning` when a process of the target's tool runs, or (developer caches) `skip:platform` / `skip:busy` /
+`skip:processesFailed` / `skip:notInstalled` / `skip:notDue`. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
 counts the entries left and why: `shielded` (an open lane's, in use, or a secret store), `checkout`, `lock`, `otherUser`,
 `excluded` (a live-session temp name), `archived` (already in the archive), `unsafeRoot`, `recent` (a closed lane's worktree
-active within 3 days or changed within 6 hours, or build output within its age), `reopened` (the lane is open again) and
-`tracked` (build output git tracks). In `cleanup.json` each
+active within 3 days or changed within 6 hours, build output within its age, or an Xcode folder changed within its age),
+`reopened` (the lane is open again) and `tracked` (build output git tracks). In `cleanup.json` each
 target carries `mode`, `removed`, `bytes`, `candidates`, `candidateBytes`, `kept`, `errors`, `skipped` and, when it did
 not run, `skip`; the report has `dryRun` and `worktreePrune.{mode,ok,failed,candidates}`. Bytes of a removed browser
 profile or memory agent are its files' total size.

@@ -37,6 +37,7 @@ import { HerdrWatch } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
 import { processCommands } from "./cleanup-artifacts.ts";
 import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
+import { processList, readLastRuns } from "./cleanup-dev-caches.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
@@ -309,8 +310,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     guardTick();
     const stopGuard = realEvery(GUARD_SAMPLE_MS, guardTick);
     // The daily cleanup sweep of this host's caches and temp (cleanup.ts); `logs/cleanup.json` holds the last report.
+    const cleanupStatus = join(ensureRunnerSubdir(runnerDir, RUNNER_PATHS.logs), CLEANUP_STATUS_FILE);
     const stopCleanup = startCleanup({
-      statusFile: join(ensureRunnerSubdir(runnerDir, RUNNER_PATHS.logs), CLEANUP_STATUS_FILE),
+      statusFile: cleanupStatus,
       now: realClock.now, every: realEvery, log,
       delay: (ms, fn) => { const timer = setTimeout(fn, ms); return () => { clearTimeout(timer); }; },
       sweep: () => {
@@ -329,6 +331,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
             if (!client) throw new Error("runner client is not initialized");
             return client.closedLanes();
           },
+          processes: () => processList(run, process.pid),
+          lastRuns: readLastRuns(cleanupStatus),
         });
       },
     });

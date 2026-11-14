@@ -5,6 +5,7 @@ import { join, posix, win32 } from "node:path";
 import type { Lane } from "../registry.ts";
 import type { Runner } from "../run.ts";
 import { sweepArtifacts } from "./cleanup-artifacts.ts";
+import { type DevCacheTarget, type Proc, sweepDevCaches } from "./cleanup-dev-caches.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
 
 /**
@@ -21,7 +22,10 @@ import { writeRunnerFile } from "./fs-safety.ts";
  * - `node_modules` of the worktrees of lanes the registry records as closed, once the lane's last activity is 3 days
  *   old and the worktree has not changed for 6 hours (closedNodeModules; `report` by default);
  * - other build output of those worktrees (`android` build dirs, `.expo`, untracked `ios/Pods`, cargo `target`) and
- *   Metro's `metro-*` temp caches, each with its own age and tool-process check (cleanup-artifacts.ts; `report` by default).
+ *   Metro's `metro-*` temp caches, each with its own age and tool-process check (cleanup-artifacts.ts; `report` by default);
+ * - developer caches (cleanup-dev-caches.ts, `report` by default): macOS Xcode DerivedData and iOS DeviceSupport folders,
+ *   unavailable simulators through `xcrun simctl delete unavailable`, and the bun, npm and pnpm caches through
+ *   `bun pm cache rm`, `npm cache verify` and `pnpm store prune` only.
  * Never removed: anything outside those roots, `~/.dori/secrets`, `~/.secrets`, an open lane's cwd, sandbox TMPDIR,
  * session dir and memory agent, the lead's memory agent, any git checkout (a worktree, dirty or clean, stays as it is),
  * anything a process holds open or runs in (Linux /proc, macOS lsof; Windows refuses to delete an open file), sockets,
@@ -58,6 +62,7 @@ export const CLEANUP_AGES = {
 export const CLEANUP_TARGETS = [
   "sandbox", "omoTmp", "bunChrome", "temp", "varTmp", "sessionsArchived", "emptyArtifactDirs", "memoryAgents", "worktreePrune",
   "closedNodeModules", "closedAndroidBuild", "closedExpo", "closedPods", "closedCargoTarget", "metroCache",
+  "xcodeDerivedData", "xcodeDeviceSupport", "simulatorsUnavailable", "bunCache", "npmCache", "pnpmStore",
 ] as const;
 export type CleanupTarget = (typeof CLEANUP_TARGETS)[number];
 /** `on`: remove (or move, for sessions); `report`: count candidates and bytes, change nothing; `off`: skip the target. */
@@ -68,6 +73,7 @@ export const CLEANUP_DEFAULT_MODES: Readonly<Record<CleanupTarget, CleanupMode>>
   sandbox: "on", omoTmp: "on", bunChrome: "on", temp: "on", varTmp: "on", sessionsArchived: "on", emptyArtifactDirs: "on",
   memoryAgents: "on", worktreePrune: "on", closedNodeModules: "report",
   closedAndroidBuild: "report", closedExpo: "report", closedPods: "report", closedCargoTarget: "report", metroCache: "report",
+  xcodeDerivedData: "report", xcodeDeviceSupport: "report", simulatorsUnavailable: "report", bunCache: "report", npmCache: "report", pnpmStore: "report",
 };
 export type CleanupSettings = {
   /** Every target that is not `off` runs in `report`. */
@@ -277,7 +283,10 @@ export type TargetCount = {
   kept: number;
   errors: number;
   skipped: Partial<Record<SkipReason, number>>;
-  skip?: "off" | "inUseFailed" | "noRegistry" | "registryFailed" | "procsFailed" | "toolRunning";
+  /** Build output and Metro also: `procsFailed`, `toolRunning`. Developer caches also: `platform` (not this OS), `busy`
+   * (Xcode or the package manager runs), `processesFailed` (no process list), `notInstalled` (no such tool), `notDue`
+   * (bun's cache was emptied less than 30 days ago). */
+  skip?: "off" | "inUseFailed" | "noRegistry" | "registryFailed" | "procsFailed" | "toolRunning" | "platform" | "busy" | "processesFailed" | "notInstalled" | "notDue";
 };
 /** A lane the registry records as closed: when, and the worktrees it used (its cwd and its recorded worktrees). */
 export type ClosedLane = { readonly key: string; readonly closedAt: number; readonly worktrees: readonly string[] };
@@ -306,6 +315,8 @@ export type CleanupReport = {
   readonly inUse: "ok" | "failed";
   readonly skippedRoots: readonly string[];
   readonly errors: readonly string[];
+  /** When each developer-cache tool target last ran its command; carried from one sweep's status file to the next. */
+  readonly lastRuns?: Readonly<Partial<Record<DevCacheTarget, string>>>;
 };
 
 export type CleanupDeps = {
@@ -331,6 +342,10 @@ export type CleanupDeps = {
   readonly closedLanes?: () => Promise<readonly ClosedLane[]>;
   /** The command lines of the processes running on this host (processCommands); a target whose tool runs is skipped. */
   readonly procs: () => Promise<readonly string[]>;
+  /** This host's processes, so a running Xcode or package manager keeps its cache. Absent: those targets are skipped. */
+  readonly processes?: () => Promise<readonly Proc[]>;
+  /** The last sweep's `lastRuns` (readLastRuns of the status file). */
+  readonly lastRuns?: Readonly<Partial<Record<DevCacheTarget, string>>>;
 };
 
 export type Ctx = {
@@ -688,6 +703,14 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   // The rest of their build output, and Metro's temp caches (cleanup-artifacts.ts).
   await sweepArtifacts({ deps, runs, used, temps, ctx });
 
+  // After node_modules: pnpm's prune frees only what no node_modules links to any more.
+  const ran = await sweepDevCaches({
+    paths, now, run: deps.run, uid: deps.uid, used, processes: deps.processes, lastRuns: deps.lastRuns ?? {},
+    count: (name, needsInUse) => runs(name, needsInUse), treeBytes: (dir) => treeBytes(dir),
+    noteError: (count, path, e) => noteError(ctx, count, path, e), skipped, errors,
+  });
+  const lastRuns = { ...deps.lastRuns, ...ran };
+
   // Worktree records whose directory is gone; git keeps locked ones and never touches a worktree that exists.
   // In report mode `--dry-run --verbose` lists the records (`Removing worktrees/<name>: ...`) without dropping them.
   const pruneMode = cleanupMode(deps.settings, "worktreePrune");
@@ -702,6 +725,7 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   return {
     at: new Date(now).toISOString(), ms: Date.now() - started, dryRun: deps.settings?.dryRun ?? false, targets,
     worktreePrune: { mode: pruneMode, ok, failed, candidates }, inUse: inUseKnown ? "ok" : "failed", skippedRoots, errors,
+    ...(Object.keys(lastRuns).length ? { lastRuns } : {}),
   };
 };
 
