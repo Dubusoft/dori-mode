@@ -322,6 +322,11 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
           inUse: () => inUsePaths(process.platform, run, process.getuid?.()),
           uid: process.getuid?.(),
           settings: cleanupSettings(process.env),
+          // The supervisor's registry knows which lanes closed (lanes.closed, proto 9); an older supervisor refuses, and the target is skipped.
+          closedLanes: async () => {
+            if (!client) throw new Error("runner client is not initialized");
+            return client.closedLanes();
+          },
         });
       },
     });

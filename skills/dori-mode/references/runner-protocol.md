@@ -717,8 +717,12 @@ registry does not know (a lane being opened may not be registered yet) is never 
 an open lane uses as its cwd, one whose directory name carries an open or observed lane's key (the key itself,
 `<key>-...` or `<repo>-<key>`), and one under which a process holds a file open or runs (only paths inside the worktree
 count, not a shell whose cwd is a directory above it). The registry is read again right before removing, and a lane
-that is no longer closed by then keeps its worktree (`reopened`). Without a registry to ask the target is skipped
-(`noRegistry`); when the registry cannot be read it is skipped (`registryFailed`).
+that is no longer closed by then keeps its worktree (`reopened`). The registry lives with the supervisor, so the runner asks it over
+the link at each sweep: the runner control frame `lanes.closed {rid}` (proto 9) is answered with `lanes.closed.result
+{rid, ok, detail?, lanes?}`, each lane `{key, closedAt, worktrees}` (closedAt in ms; worktrees are its cwd and recorded
+worktrees), only the asking runner's lanes (local lanes for `local`, a remote runner's by its label). Nothing in it is
+secret, so it is not sealed. Without a registry to ask the target is skipped (`noRegistry`); when the supervisor
+refuses, is older than proto 9 or does not answer within 60 seconds, it is skipped (`registryFailed`).
 
 Each target runs in one of three modes: `on` removes (sessions are moved), `report` only counts what it would remove
 and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
@@ -803,7 +807,9 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 7, so a supervisor accepts runners at 7 and 6. Protocol 6 adds the four secret control frames
+The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 adds `secret.put`; protocol 9 adds
+`lanes.closed` / `lanes.closed.result`, and a proto 8 runner still runs lanes and secrets while `dori doctor` warns
+that its cleanup sweep skips the closed lanes' `node_modules`. Earlier versions: Protocol 6 adds the four secret control frames
 (see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
 Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes and takes secrets, and `dori doctor`
 warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).

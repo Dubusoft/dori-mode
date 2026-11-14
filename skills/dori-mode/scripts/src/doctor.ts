@@ -515,8 +515,8 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     const id = `runner ${row.label}`;
     const problems: string[] = [];
     if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
-    // Proto 8 adds secret.put: the previous proto still runs lanes and serves secret exec but refuses dori secret put.
-    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} refuses dori secret put (it needs proto ${PROTO})`);
+    // Proto 9 adds lanes.closed: the previous proto still runs lanes and secrets but its cleanup sweep has no closed lanes to look at.
+    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} skips the closed lanes' node_modules cleanup (it needs proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
     if (row.herdr === "down" || row.herdr === "hung" || row.herdr === "elevated") {

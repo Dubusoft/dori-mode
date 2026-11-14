@@ -24,10 +24,12 @@ import type { ReportKind } from "./report-kinds.ts";
 
 /**
  * The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. Proto 6
- * adds the secret control frames, proto 7 the `lane.attach` command and proto 8 `secret.put`, so the supervisor must be
- * upgraded before its runners.
+ * adds the secret control frames, proto 7 the `lane.attach` command, proto 8 `secret.put` and proto 9 `lanes.closed`, so
+ * the supervisor must be upgraded before its runners.
  */
-export const PROTO = 8;
+export const PROTO = 9;
+/** The first protocol version with `lanes.closed` / `lanes.closed.result` (the cleanup sweep's closed lanes). */
+export const CLOSED_LANES_PROTO = 9;
 /** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */
 export const SECRET_PROTO = 6;
 /** The first protocol version with `secret.put` / `secret.put.result` (a lane storing a value it made). */
@@ -311,7 +313,12 @@ export type RunnerControlBodies = {
    * type: "secret.put", rid}`) to the value; the supervisor checks `secrets.<name>.put` and answers `secret.put.result`.
    */
   readonly "secret.put": { readonly rid: string; readonly key: string; readonly name: string; readonly sealed: SealedBody; readonly repo?: string };
+  /** Since proto 9: ask for the lanes of this runner the registry records as closed (the cleanup sweep's closedNodeModules). */
+  readonly "lanes.closed": { readonly rid: string };
 };
+
+/** A closed lane in `lanes.closed.result`: its key, when it closed (ms since epoch), its cwd and recorded worktrees. */
+export type ClosedLaneBody = { readonly key: string; readonly closedAt: number; readonly worktrees: readonly string[] };
 
 /** An AEAD box (auth.ts `SealedBox`): base64 nonce and base64 ciphertext with its tag. */
 export type SealedBody = { readonly n: string; readonly c: string };
@@ -345,6 +352,8 @@ export type SupervisorControlBodies = {
   readonly "secret.put.result": {
     readonly rid: string; readonly ok: boolean; readonly code?: string; readonly detail?: string; readonly created?: boolean; readonly backend?: string;
   };
+  /** Since proto 9: the answer to `lanes.closed` `rid`; `lanes` on `ok`, the reason in `detail` otherwise. Nothing sealed (no secret). */
+  readonly "lanes.closed.result": { readonly rid: string; readonly ok: boolean; readonly detail?: string; readonly lanes?: readonly ClosedLaneBody[] };
 } & QueryBodies;
 
 /**
@@ -678,6 +687,7 @@ const RUNNER_CONTROL_SCHEMAS: { readonly [T in RunnerControlType]: Shape } = {
   "secret.get": { rid: req("string"), key: req("string"), names: req("string[]"), repo: opt("string") },
   "secret.run": { rid: req("string"), key: req("string"), op: req("string"), repo: opt("string") },
   "secret.put": { rid: req("string"), key: req("string"), name: req("string"), sealed: req({ object: { n: req("string"), c: req("string") } }), repo: opt("string") },
+  "lanes.closed": { rid: req("string") },
 };
 
 const SEALED: Shape = { n: req("string"), c: req("string") };
@@ -714,6 +724,10 @@ const SUPERVISOR_CONTROL_SCHEMAS: { readonly [T in SupervisorControlType]: Shape
   "secret.value": SECRET_ANSWER,
   "secret.run.result": SECRET_ANSWER,
   "secret.put.result": { rid: req("string"), ok: req("bool"), code: opt("string"), detail: opt("string"), created: opt("bool"), backend: opt("string") },
+  "lanes.closed.result": {
+    rid: req("string"), ok: req("bool"), detail: opt("string"),
+    lanes: opt({ list: { key: req("string"), closedAt: req("int"), worktrees: req("string[]") } }),
+  },
   ...QUERY_SCHEMAS,
 };
 

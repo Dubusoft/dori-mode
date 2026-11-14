@@ -12,7 +12,7 @@ const raw = (value: unknown, from: "runner" | "supervisor") => () => decodeFrame
 
 describe("proto 6 secret frames", () => {
   test("the version gate", () => {
-    expect(PROTO).toBe(8);
+    expect(PROTO).toBe(9);
     expect(SECRET_PROTO).toBe(6);
     expect([undefined, 0, 5].map(secretsSupported)).toEqual([false, false, false]);
     expect([6, 7, 8].map(secretsSupported)).toEqual([true, true, true]);
