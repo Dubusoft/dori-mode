@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { displayTime } from "./display-time.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { type MergePause, mergePausedText, readMergePause } from "./merge-pause.ts";
 import { type LaneReportStore, type LaneStatusTransport, laneStatusText, statusChannel, writeLaneStatus } from "./lane-reports.ts";
 import { type DecisionContext, type DecisionSpec, openedLine, openOwnerDecision, refIds, taskOfLane } from "./owner-decisions.ts";
 import { type Lane, statusOf } from "./registry.ts";
@@ -73,6 +74,8 @@ export type ReviewStatusInput = {
   readonly defaultModel: string;
   readonly now: number;
   readonly timeZone?: string | undefined;
+  /** The merge pause in force (merge-pause.ts), read fresh with the rest; absent when merges run. */
+  readonly mergePause?: MergePause | undefined;
 };
 
 const short = (sha: string): string => sha.slice(0, 7);
@@ -158,8 +161,14 @@ const capLine = (name: string, cap: ReviewCap, pr: readonly ReviewJobRecord[], r
 };
 
 /** The review lines of `lane`'s status message, one per PR (design 5.8), each at most REVIEW_LINE_MAX characters. */
-export const reviewStatusLines = (lane: Lane, input: ReviewStatusInput): string[] =>
-  prsOf(lane, input).map((p) => prLine(p, input)).filter((l): l is string => l !== undefined).slice(0, REVIEW_LINES_MAX).map((l) => cut(l, REVIEW_LINE_MAX));
+export const reviewStatusLines = (lane: Lane, input: ReviewStatusInput): string[] => {
+  const lines = prsOf(lane, input).map((p) => prLine(p, input)).filter((l): l is string => l !== undefined);
+  // While merges are paused, a lane with any PR not yet merged shows the pause first, so the owner sees why it waits.
+  const pause = input.mergePause;
+  const waiting = pause && lines.some((l) => !l.includes(": 머지 완료 - "));
+  const head = waiting ? [`${mergePausedText(pause)} (${pause.since}부터, ${pause.who}); 리뷰는 계속, 재개 후 전체 게이트를 다시 확인해 머지`] : [];
+  return [...head, ...lines].slice(0, REVIEW_LINES_MAX).map((l) => cut(l, REVIEW_LINE_MAX));
+};
 
 /** Reads the review status input from the stores and the registry (reviewer lanes of running jobs). */
 export const readReviewStatus = async (deps: FlowDeps, stores: ReviewStores): Promise<ReviewStatusInput> => {
@@ -172,7 +181,7 @@ export const readReviewStatus = async (deps: FlowDeps, stores: ReviewStores): Pr
   }
   return {
     records, exemptions: stores.exemptions.list(), merges: stores.merges.merges(), reviewers, defaultModel: deps.config.defaultModel,
-    now: deps.clock.now(), timeZone: deps.config.displayTimeZone,
+    now: deps.clock.now(), timeZone: deps.config.displayTimeZone, mergePause: readMergePause(deps.config.stateDir),
   };
 };
 

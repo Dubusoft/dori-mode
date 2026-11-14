@@ -6,7 +6,7 @@ import { Worker } from "node:worker_threads";
 import { type ToodoTask, LAUNCH_ACTION } from "../src/autopilot.ts";
 import { judgeCandidates, liveJudgeDeps } from "../src/autopilot-cli.ts";
 import { defaultConfig } from "../src/config.ts";
-import { admissionSlots, claimSlot, LAUNCH_SLOT_TTL_MS, type LaunchSlot, precheckSlots, releaseSlot } from "../src/launch-admission.ts";
+import { admissionSlots, claimSlot, LAUNCH_SLOT_TTL_MS, type LaunchSlot, precheckSlots } from "../src/launch-admission.ts";
 import type { LaunchInput } from "../src/launch.ts";
 import { admitLaunch, hostSummary, placeLaunch } from "../src/launch-service.ts";
 import { JsonOperations, plan } from "../src/operations.ts";
@@ -190,14 +190,14 @@ test("launch failure releases the slot and a later launch can claim it", async (
   expect((await h.launch(h.input("after-failure"))).kind).toBe("launched");
 });
 
-test("pruning removes closed and expired pane-less entries, but keeps a launch with a not-yet-observed pane", async () => {
+test("pruning removes closed entries at once, keeps a not-yet-observed pane within the TTL and expires it after", async () => {
   const h = world();
   for (const key of ["closed-1", "expired-1", "starting-1"]) expect(claimSlot(h.state.dir, check(), key, "author", T0).ok).toBe(true);
   await h.deps.registry.write(lane("closed-1", { status: "closed" }));
   await h.deps.registry.write(lane("starting-1", { pane: "not-observed" }));
-  expect(precheckSlots(h.state.dir, check(), T0 + LAUNCH_SLOT_TTL_MS + 1).reservedKeys).toEqual(["starting-1"]);
-  expect(slots(h.state.dir).map((s) => s.key)).toEqual(["starting-1"]);
-  releaseSlot(h.state.dir, "starting-1");
+  expect(precheckSlots(h.state.dir, check(), T0 + LAUNCH_SLOT_TTL_MS).reservedKeys.sort()).toEqual(["expired-1", "starting-1"]);
+  // A pane still unobserved after the TTL is gone (it died before any observation): its slot is released.
+  expect(precheckSlots(h.state.dir, check(), T0 + LAUNCH_SLOT_TTL_MS + 1).reservedKeys).toEqual([]);
   expect(slots(h.state.dir)).toEqual([]);
 });
 

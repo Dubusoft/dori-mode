@@ -9,7 +9,7 @@ import { saveJsonFile } from "./store.ts";
 
 /** Every machine keeps one slot for a review, even when its pane cap is off. */
 export const REVIEW_SLOTS_PER_MACHINE = 1;
-/** A crashed launcher without a pane stops occupying admission after ten minutes. */
+/** A launch whose pane has not been observed stops occupying admission after ten minutes, whether or not its lane has a pane. */
 export const LAUNCH_SLOT_TTL_MS = 10 * 60_000;
 /** A launch approved before its pane has appeared in an observation. */
 export type LaunchSlot = { readonly key: string; readonly machine: string; readonly kind: "author" | "review"; readonly at: number };
@@ -51,7 +51,7 @@ const inspect = (stateDir: string, check: MachineCheck, now: number, kind: Launc
       const lane = lanes.get(slot.key) ?? readLane(join(stateDir, "lanes-archive", `${slot.key}.json`));
       if (lane && statusOf(lane) === "closed") return false;
       if (slot.machine === check.machine && lane?.pane && panes.has(lane.pane)) return false;
-      return !(!lane?.pane && now - slot.at > LAUNCH_SLOT_TTL_MS);
+      return now - slot.at <= LAUNCH_SLOT_TTL_MS;
     });
     const pending = slots.filter((s) => s.machine === check.machine && s.key !== key);
     const running = [...lanes.values()].filter((l) => l.key !== key && (l.machine ?? "local") === check.machine

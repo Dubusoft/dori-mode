@@ -16,6 +16,7 @@ import {
 import { decisionDeliveryRefusal } from "./owner-decisions.ts";
 import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
+import { mergePausedText, readMergePause } from "./merge-pause.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
 import type { ReviewGate } from "./review-gate.ts";
 import { canLaunch } from "./routing.ts";
@@ -30,6 +31,7 @@ import { parseSignal, splitDone } from "./signals.ts";
  *   `pass` receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
  *   only while the base it re-reads right before merging is the approved base (`--match-head-commit`, never `--admin`,
  *   never into main); it reads the merge SHA back and reports a merge that landed on another base (REVIEW_BASE_RACE);
+ *   while `dori merge pause` is in force (merge-pause.ts) it runs that whole gate but makes no merge (MERGE_PAUSED);
  * - conflicting: while the PR's own lane is live (laneDown) it gets one lane message asking it to rebase, and no merge
  *   lane starts; once that lane is closed, paused or dead, a new merge lane (its own detached worktree) resolves, pushes
  *   and claims done at the pushed head; the supervisor reviews and merges it like any lane PR (the merge lane's claim
@@ -585,6 +587,13 @@ export class CiFollowUp {
       const now = await this.review.observeSnapshot(pull, fresh);
       if (now.snapshot.baseSha !== ("exempt" in approval ? approval.exempt.baseSha : approval.receipt.baseSha)) {
         if (!("exempt" in approval)) await this.review.ensureJob(claimed, pull, now, emit);
+        return;
+      }
+      // The rollback switch (merge-pause.ts), read fresh each pass: the gate above ran (review jobs and receipts go on),
+      // but nothing merges while it is on. After resume a later poll merges only through this whole gate again.
+      const paused = readMergePause(deps.config.stateDir);
+      if (paused) {
+        emit(`merge-paused:${paused.since}:${target}`, `MERGE_PAUSED ${pull.repo}#${pull.number} lane=${claimed.key} head=${short(pull.sha)} ${mergePausedText(paused)}; approved but not merged until dori merge resume ${pull.url}`);
         return;
       }
       claimant = claimed;
