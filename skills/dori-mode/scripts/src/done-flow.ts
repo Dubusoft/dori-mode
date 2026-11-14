@@ -738,11 +738,10 @@ const keptWorktrees = (lane: Lane, prefix = "worktree "): string[] => {
 };
 
 /**
- * Finish a closed lane's worktree cleanup: a worktree its close kept is removed once it is clean, only under
- * the lane's runner's reported worktree root, or (local lanes) `config.worktreeRoot` while that runner has reported
- * none. A remote lane's worktree, never checked for unpushed work at its close, also needs no commit that no remote
- * has. The lane's own cwd and the worktrees its record lists are candidates too, on the same terms plus no commit that
- * no remote has: a close that did not find them (a `<repo>-<key>` directory, a detached HEAD) left no kept line; one the
+ * Finish a closed lane's worktree cleanup: a worktree its close kept is removed once it is clean and has no commit
+ * that no remote has, only under the lane's runner's reported worktree root, or (local lanes) `config.worktreeRoot`
+ * while that runner has reported none; one whose unpushed commits cannot be read stays, with a warning. The lane's own
+ * cwd and the worktrees its record lists are candidates too, on the same terms: a close that did not find them (a `<repo>-<key>` directory, a detached HEAD) left no kept line; one the
  * close held with its branch (`branch-bound worktree ... kept`) stays. Open
  * lanes (working, not-done, paused, done-claimed) are never touched, nor any path an open lane uses: their Done signals
  * have not all read back yet, and work can continue after a merge. Failures come back as LANE_WATCH_WARN lines.
@@ -769,7 +768,8 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
     const recorded = own.includes(wt);
     const fact = await probeWorktree(deps, lane, wt);
     if (!fact || fact.error !== undefined || fact.dirty === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read git status of ${wt}: ${(fact?.error ?? "git lists no worktree there").slice(0, 160)}`);
-    else if (fact.dirty || ((lane.machine || recorded) && fact.ahead !== 0)) continue;
+    else if (fact.dirty || (fact.ahead !== undefined && fact.ahead !== 0)) continue;
+    else if (fact.ahead === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read unpushed commits of ${wt}, so it is kept`);
     else {
       // A remote worktree, and one found from the lane's record, is removed from inside itself: its repository is not known here.
       const r = await deps.ops.git(lane, { op: "worktree-remove", root: lane.machine || recorded ? wt : repo, path: wt });
