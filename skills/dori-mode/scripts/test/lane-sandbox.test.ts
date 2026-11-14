@@ -532,10 +532,10 @@ test("macOS: of the runner's sockets only the lane socket can be dialed, and of 
   }
   expect(dial(agent)).toBe(true);
   expect(dial("/private/tmp/com.apple.launchd.x/Listeners")).toBe(true);
-  for (const ok of [join(home, ".config", "gh", "hosts.yml"), join(home, ".config", "git", "ignore")]) {
+  for (const ok of [join(home, ".config", "gh", "config.yml"), join(home, ".config", "git", "ignore")]) {
     expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
   }
-  for (const no of [join(home, ".config", "cloudflare", "x"), join(home, ".config", "herdr", "config.toml")]) {
+  for (const no of [join(home, ".config", "gh", "hosts.yml"), join(home, ".config", "cloudflare", "x"), join(home, ".config", "herdr", "config.toml")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
 });
@@ -583,10 +583,10 @@ test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git
   const read = (p: string) => allows(sb, "file-read-data", p);
   for (const no of [".aws/credentials", ".azure/msal_token_cache.json", ".oci/config", ".gnupg/private-keys-v1.d/k.key", ".password-store/a.gpg", ".kube/config", ".docker/config.json",
     ".netrc", ".git-credentials", ".vault-token", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml",
-    ".secrets/x", ".local/share/toodo-server/mcp-token", ".m2/settings.xml", ".zsh_history"]) {
+    ".secrets/x", ".local/share/toodo-server/mcp-token", ".m2/settings.xml", ".zsh_history", ".config/gh/hosts.yml"]) {
     expect({ no, read: read(join(home, no)) }).toEqual({ no, read: false });
   }
-  for (const ok of [".docker/cli-plugins/x", ".cargo/registry/index/x", ".gitconfig", ".config/gh/hosts.yml"]) {
+  for (const ok of [".docker/cli-plugins/x", ".cargo/registry/index/x", ".gitconfig", ".config/gh/config.yml"]) {
     expect({ ok, read: read(join(home, ok)) }).toEqual({ ok, read: true });
   }
 });
@@ -933,6 +933,28 @@ test("--explain regression: every credential store, ssh key and other lane's tok
   ].sort());
   // ...and none of it is a hidden path.
   expect(table.filter((r) => r.mode === "rw" && verdict(r.path) !== "rw")).toEqual([]);
+});
+
+test("the gh login file is hidden under the kept gh config bind, and --explain says so; config.yml is not", async () => {
+  const home = realpathSync(tempDir());
+  const gh = join(home, ".config", "gh");
+  mkdirSync(gh, { recursive: true });
+  for (const f of ["hosts.yml", "config.yml"]) writeFileSync(join(gh, f), "x");
+  const env = { DORI_LANE_KEY: "lane-a" };
+
+  const argv = await sandboxArgv(home, env);
+  const over = (p: string) => argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === p);
+  expect(over(join(gh, "hosts.yml"))).toBeGreaterThan(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === gh));
+  expect(over(join(gh, "hosts.yml"))).toBeGreaterThan(lastReadWrite(argv, home));
+  expect(argv).not.toContain(join(gh, "config.yml"));
+
+  const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "--explain"], { cwd: join(home, "work"), env: { PATH: `${join(home, "fake-bin")}:${process.env.PATH ?? ""}`, HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+  const rows = explainRows(out);
+  expect(rows).toContain(`hide ${join(gh, "hosts.yml")}`);
+  expect(rows.indexOf(`hide ${join(gh, "hosts.yml")}`)).toBeGreaterThan(rows.indexOf(`ro ${gh}`));
+  expect(rows).not.toContain(`hide ${join(gh, "config.yml")}`);
 });
 
 test("macOS: --explain lists every path the profile names, each with the access the profile gives it", async () => {

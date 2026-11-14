@@ -81,7 +81,7 @@ The lane CLI sends the names to the runner over the lane socket with the lane's 
 
 A lane should pass the variable to the tool that needs it, not echo it, write it to a file or put it in a report. Keep the value itself off command lines too (for example `test "$NAME" = <value>`): argv shows in `ps`, shell history and the pane.
 
-Every lane footer `dori launch` writes says this: credentials come only through `secret exec` and `secret run` (the runner's `~/.dori/runner/bin/dori` on a remote lane), production deploys only through `secret run`, the lane never reads or copies credential files or CLI logins, and a refusal is reported as `blocked` with the name or op so the lead can add the secret or its rule.
+Every lane footer `dori launch` writes says this: credentials come only through `secret exec` and `secret run` (the runner's `~/.dori/runner/bin/dori` on a remote lane), production deploys only through `secret run`, the lane never reads or copies credential files or CLI logins (gh's `~/.config/gh/hosts.yml` is hidden from lanes; GitHub access goes through `secret exec GH_TOKEN`, see [GitHub access in lanes](#github-access-in-lanes)), and a refusal is reported as `blocked` with the name or op so the lead can add the secret or its rule.
 
 An `ssh-key` or `file` secret arrives as a file path instead of the value (see [Deploy keys](#deploy-keys) and [Credential files](#credential-files)). A minted name looks like any other env secret to the lane.
 
@@ -94,6 +94,22 @@ dori secret run deploy-prod
 ```
 
 See [Proxy execution](#proxy-execution). The lane gets the command's output and exit code; a refusal prints `<code> <detail>` to stderr and exits 1, and a missing, extra or malformed op prints `usage: dori secret run <op>` and exits 2.
+
+## GitHub access in lanes
+
+A lane cannot read `~/.config/gh/hosts.yml`: the lane sandbox hides it, and the rest of `~/.config/gh` (`config.yml`) stays readable. A lane gets a GitHub token only through the broker, under the name `GH_TOKEN`, which both `gh` and gh's git credential helper (`gh auth git-credential`) read from the environment. Configure it one of two ways:
+
+- A stored token: `dori secret add GH_TOKEN`, plus a `secrets.GH_TOKEN` rule whose `lanes` or `repos` allow the lane (see [Allowlist](#allowlist)).
+- A GitHub App mint rule on `secrets.GH_TOKEN`, see [Minted GitHub tokens](#minted-github-tokens).
+
+In a lane:
+
+```sh
+dori secret exec GH_TOKEN -- gh pr view 12
+dori secret exec GH_TOKEN -- git push https://github.com/<owner>/<repo>.git HEAD:refs/heads/<branch>
+```
+
+The push names the https URL explicitly: an ssh remote doesn't use `GH_TOKEN`.
 
 ## Minted GitHub tokens
 

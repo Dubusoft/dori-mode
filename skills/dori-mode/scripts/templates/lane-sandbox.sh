@@ -23,7 +23,8 @@
 #                        writable, so omo cannot back up <cwd>/.omo/omo.jsonc there; omo tolerates that failure.
 # $HOME and ~/.dori are bound read-only; what no lane may read is hidden after every read-write bind, so neither the cwd
 # nor a grant can re-expose it: ~/.dori/runner, ~/.ssh and ~/.config (each an empty read-only tmpfs with only the
-# lane's own runner entries, ssh known_hosts and config, and gh, git and the ssh agent socket bound back), the
+# lane's own runner entries, ssh known_hosts and config, and gh (without its hosts.yml login: a lane gets GH_TOKEN only
+# through the secret broker), git and the ssh agent socket bound back), the
 # credential stores below (~/.dori/env, secrets and state among them) and every other host path listed one per line in
 # ~/.dori/lane-sandbox-hide ('#' starts a comment), ~/.dori's own entries included; the lead owns that file, and a lane
 # can neither read nor change it. An entry of either list may be a glob (* ? [...], dotfiles matched too): each existing
@@ -41,9 +42,9 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
   .cargo/credentials .cargo/credentials.toml .gem/credentials .m2/settings.xml .gradle/gradle.properties
   .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
-  .local/share/toodo-server .mozilla .config/google-chrome .config/chromium .config/BraveSoftware
-  .config/microsoft-edge .config/discord .config/Slack .config/Signal .local/share/TelegramDesktop
-  .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
+  .config/gh/hosts.yml .local/share/toodo-server .mozilla .config/google-chrome .config/chromium
+  .config/BraveSoftware .config/microsoft-edge .config/discord .config/Slack .config/Signal
+  .local/share/TelegramDesktop .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
 # END CREDENTIALS
 
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough

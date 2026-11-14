@@ -24,7 +24,8 @@
 # lane socket and bin and the lane's own brief, files, out dir, token and lanes/<key>, re-opened after it) and the
 # credential stores in CREDENTIALS below (~/.dori/env, secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube,
 # gpg, docker, git and registry logins, keyrings, browser profiles, shell history). ~/.ssh is refused but for config,
-# known_hosts and *.pub. Of ~/.config only gh and git are readable. A unix socket connect is not a file read to
+# known_hosts and *.pub. Of ~/.config only gh (but for its hosts.yml login: a lane
+# gets GH_TOKEN only through the secret broker) and git are readable. A unix socket connect is not a file read to
 # Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
@@ -46,7 +47,7 @@ fi
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
 # through the secret broker); the Linux template and `dori doctor` use the same list. ~/.config is refused already, but
-# for gh and git.
+# for gh and git; the profile refuses these after the gh/git grant, so ~/.config/gh/hosts.yml stays hidden.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
   .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
@@ -55,9 +56,9 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
   .cargo/credentials .cargo/credentials.toml .gem/credentials .m2/settings.xml .gradle/gradle.properties
   .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
-  .local/share/toodo-server .mozilla .config/google-chrome .config/chromium .config/BraveSoftware
-  .config/microsoft-edge .config/discord .config/Slack .config/Signal .local/share/TelegramDesktop
-  .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
+  .config/gh/hosts.yml .local/share/toodo-server .mozilla .config/google-chrome .config/chromium
+  .config/BraveSoftware .config/microsoft-edge .config/discord .config/Slack .config/Signal
+  .local/share/TelegramDesktop .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
 # END CREDENTIALS
 
 SBX=/usr/bin/sandbox-exec
@@ -324,12 +325,12 @@ $d_rules
 (allow file-read*$o_rules)
 (allow file-read-metadata (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")) (literal (param \"DORI_LANES\")))
 (allow file-read-data (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_LANES\")))
-(deny file-read*$c_rules)
 (deny file-read* (subpath (param \"SSH\")))
 (allow file-read-metadata (literal (param \"SSH\")))
 (allow file-read* (literal (param \"SSH_CONFIG\")) (literal (param \"SSH_KNOWN_HOSTS\")) (regex (param \"SSH_PUB\")))
 (deny file-read* (subpath (param \"CONFIG\")))
 (allow file-read* (subpath (param \"CONFIG_GH\")) (subpath (param \"CONFIG_GIT\")))
+(deny file-read*$c_rules)
 (deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))
 (allow network-outbound (remote unix-socket (path-literal (param \"LANE_SOCK\"))))
 $k_rules
@@ -365,7 +366,6 @@ explain_profile() {
     done
     echo "$m $p"
   done
-  for p in ${XCRED[@]+"${XCRED[@]}"}; do echo "hide $p"; done
   echo "hide $XSSH"
   echo "ro $XSSH/config"
   echo "ro $XSSH/known_hosts"
@@ -373,6 +373,7 @@ explain_profile() {
   echo "hide $XCONFIG"
   echo "ro $XCONFIG_GH"
   echo "ro $XCONFIG_GIT"
+  for p in ${XCRED[@]+"${XCRED[@]}"}; do echo "hide $p"; done
   for p in ${XHIDE[@]+"${XHIDE[@]}"}; do echo "hide $p"; done
   echo "hide $XDORI_SECRETS"
 }
