@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  CLEANUP_CHECK_MS, CLEANUP_FIRST_DELAY_MS, cleanupLine, cleanupPaths, type CleanupDeps, type CleanupPaths, type CleanupReport,
+  CLEANUP_CHECK_MS, CLEANUP_FIRST_DELAY_MS, cleanupLine, cleanupPaths, cleanupSettings, type CleanupDeps, type CleanupPaths, type CleanupReport,
   memoryAgentSuffix, parseLsof, runCleanup, sessionDirName, startCleanup,
 } from "../src/runner/cleanup.ts";
 import { run as realRun } from "../src/run.ts";
@@ -121,6 +121,63 @@ test("never removes open lanes' dirs, git checkouts, secrets, live-session temp,
   expect(existsSync(secretsA) && existsSync(secretsB)).toBe(true);
 });
 
+test("a dry run removes and moves nothing, and reports each target's candidates, bytes and skip reasons", async () => {
+  const f = fixture();
+  const { paths, tmp } = f;
+  const tempOld = file(join(tmp, "stale-dir", "f.txt"), "0123456789");
+  const lock = file(join(tmp, "proj", "x.lock"));
+  const chromeOld = join(tmp, ".abc.bun-chrome");
+  file(join(chromeOld, "Prefs"), "12345");
+  const session = file(join(paths.sessions, "--data-old--", "2026-09-01_a.jsonl"), "{}\n");
+  const emptyEvidence = join(paths.evidence, "lane-x");
+  mkdirSync(emptyEvidence, { recursive: true });
+  const agentOld = join(paths.memoryAgents, `gone${memoryAgentSuffix("/data/gone")}`);
+  file(join(agentOld, "repo", "a.md"), "abc");
+  const repo = join(f.tmp, "..", "repo");
+  mkdirSync(repo);
+  await git("-C", repo, "init", "-q", "-b", "main");
+  file(join(repo, "a.txt"));
+  await git("-C", repo, "add", "a.txt");
+  await git("-C", repo, "commit", "-q", "-m", "a");
+  const gone = join(f.tmp, "..", "wt-gone");
+  await git("-C", repo, "worktree", "add", "-q", "-b", "g", gone);
+  rmSync(gone, { recursive: true, force: true });
+
+  const report = await runCleanup(deps(f, { repos: [repo], settings: cleanupSettings({ DORI_CLEANUP_DRY_RUN: "1", DORI_CLEANUP_TARGETS: "varTmp=off" }) }));
+
+  for (const kept of [tempOld, lock, chromeOld, session, emptyEvidence, agentOld]) expect({ kept, exists: existsSync(kept) }).toEqual({ kept, exists: true });
+  expect(await git("-C", repo, "worktree", "list", "--porcelain")).toContain("wt-gone");
+  expect(report.dryRun).toBe(true);
+  expect(report.targets.temp).toMatchObject({ mode: "report", removed: 0, bytes: 0, candidates: 2, candidateBytes: 10, skipped: { lock: 1 } });
+  expect(report.targets.bunChrome).toMatchObject({ mode: "report", removed: 0, candidates: 1, candidateBytes: 5 });
+  expect(report.targets.sessionsArchived).toMatchObject({ removed: 0, candidates: 1, candidateBytes: 3 });
+  expect(report.targets.memoryAgents).toMatchObject({ removed: 0, candidates: 1, candidateBytes: 3 });
+  expect(report.worktreePrune).toEqual({ mode: "report", ok: 1, failed: 0, candidates: 1 });
+  const line = cleanupLine(report);
+  expect(line).toMatch(/^RUNNER_CLEANUP at=\S+ dryRun=1 .*bunChrome=report:1\/5B temp=report:2\/10B .*worktreePrune=report:1 freedBytes=0 wouldFreeBytes=\d+ /);
+  expect(line).toContain("temp.lock:1");
+});
+
+test("DORI_CLEANUP_TARGETS turns single targets off or to report; the rest keep removing", async () => {
+  const f = fixture();
+  const tempOld = file(join(f.tmp, "stale.txt"));
+  const agentOld = join(f.paths.memoryAgents, `gone${memoryAgentSuffix("/data/gone")}`);
+  file(join(agentOld, "repo", "a.md"));
+  const sandboxOld = file(join(f.paths.laneSandbox, "closed", "a.o"));
+  const settings = cleanupSettings({ DORI_CLEANUP_TARGETS: "temp=off, memoryAgents=report,bogus=on,sandbox=maybe" });
+  expect(settings).toMatchObject({ dryRun: false, modes: { temp: "off", memoryAgents: "report" } });
+  expect(settings.ignored).toHaveLength(2);
+
+  const report = await runCleanup(deps(f, { settings }));
+  expect(existsSync(tempOld) && existsSync(agentOld)).toBe(true);
+  expect(existsSync(sandboxOld)).toBe(false);
+  expect(report.targets.temp).toMatchObject({ mode: "off", skip: "off", candidates: 0 });
+  expect(report.targets.memoryAgents).toMatchObject({ mode: "report", candidates: 1, removed: 0 });
+  expect(report.errors).toHaveLength(2);
+  expect(cleanupLine(report)).toMatch(/ sandbox=2 .*temp=off .*memoryAgents=report:1\/1B /);
+  expect(cleanupSettings({ DORI_CLEANUP_DRY_RUN: "0" }).dryRun).toBe(false);
+});
+
 test("a failed in-use listing skips the deleting targets instead of guessing", async () => {
   const f = fixture();
   const tempOld = file(join(f.tmp, "stale.txt"));
@@ -128,6 +185,7 @@ test("a failed in-use listing skips the deleting targets instead of guessing", a
   expect(existsSync(tempOld)).toBe(true);
   expect(report.inUse).toBe("failed");
   expect(cleanupLine(report)).toContain("inUse=failed");
+  expect(cleanupLine(report)).toContain("temp=skip:inUseFailed");
 });
 
 test("git worktree prune drops records of deleted worktrees and keeps existing dirty ones", async () => {
@@ -149,7 +207,7 @@ test("git worktree prune drops records of deleted worktrees and keeps existing d
   expect(listed).not.toContain("wt-gone");
   expect(listed).toContain("wt-dirty");
   expect(readFileSync(join(dirty, "wip.txt"), "utf8")).toBe("uncommitted");
-  expect(report.worktreePrune).toEqual({ ok: 1, failed: 1 });
+  expect(report.worktreePrune).toEqual({ mode: "on", ok: 1, failed: 1, candidates: 0 });
 });
 
 test("paths resolve per OS: Windows from USERPROFILE and TEMP, macOS adds TMPDIR, Linux sweeps /tmp and /var/tmp", () => {
@@ -196,7 +254,7 @@ test("the schedule sweeps after the first delay, then only when the last sweep i
   const lines: string[] = [];
   let sweeps = 0;
   let settle: () => void = () => {};
-  const report = (): CleanupReport => ({ at: new Date(clock).toISOString(), ms: 1, targets: {}, worktreePrune: { ok: 0, failed: 0 }, inUse: "ok", skippedRoots: [], errors: [] });
+  const report = (): CleanupReport => ({ at: new Date(clock).toISOString(), ms: 1, dryRun: false, targets: {}, worktreePrune: { mode: "on", ok: 0, failed: 0, candidates: 0 }, inUse: "ok", skippedRoots: [], errors: [] });
   const stop = startCleanup({
     statusFile, now: () => clock, log: (l) => { lines.push(l); settle(); },
     delay: (ms, fn) => { delayMs = ms; delayed = fn; return () => {}; },

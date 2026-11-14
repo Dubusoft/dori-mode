@@ -675,7 +675,7 @@ code stay the runner's alone.
 ## Cleanup sweep
 
 Every runner (local, remote, Windows) sweeps its own host once a day (`src/runner/cleanup.ts`); there is no per-machine
-cron or tmpfiles rule and no dry-run mode. The first check runs 10 minutes after start and then hourly; a sweep runs when
+cron or tmpfiles rule. The first check runs 10 minutes after start and then hourly; a sweep runs when
 the last one recorded in `~/.dori/runner/logs/cleanup.json` is at least 24 hours old, so restarts neither skip nor repeat
 a day.
 
@@ -699,11 +699,31 @@ sessions (`tmux-*`, `herdr*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the
 that is the home dir, above it, or a secret store. When the in-use listing fails, that day's sweep skips the deleting
 targets and reports `inUse=failed`.
 
+Each target runs in one of three modes: `on` removes (sessions are moved), `report` only counts what it would remove
+and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
+Every target defaults to `on`; a target added later starts at `report` until its reports have been read. The runner's
+environment sets them, read at each sweep:
+
+| Variable | Effect |
+|---|---|
+| `DORI_CLEANUP_DRY_RUN=1` | every target that is not `off` runs in `report` (empty, `0`, `false`, `no` and `off` leave it unset) |
+| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune` |
+
+An entry that is not understood is ignored and logged as a `RUNNER_CLEANUP_ERROR`.
+
 Each sweep logs one line and rewrites the status file with the full report:
 
 ```text
-RUNNER_CLEANUP at=<iso> sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> worktreePrune=<ok>/<repos> freedBytes=<n> kept=<n> inUse=ok errors=<n> ms=<n>
+RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> worktreePrune=<ok>/<repos> freedBytes=<n> [wouldFreeBytes=<n>] kept=<n> inUse=ok errors=<n> [skipped=<target>.<reason>:<n>,...] ms=<n>
 ```
+
+A target's value is the number removed in `on`, `report:<candidates>/<bytes>B` in `report` (`worktreePrune=report:<records>`),
+`off`, or `skip:inUseFailed` when the in-use listing failed. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
+counts the entries left and why: `shielded` (an open lane's, in use, or a secret store), `checkout`, `lock`, `otherUser`,
+`excluded` (a live-session temp name), `archived` (already in the archive) and `unsafeRoot`. In `cleanup.json` each
+target carries `mode`, `removed`, `bytes`, `candidates`, `candidateBytes`, `kept`, `errors`, `skipped` and, when it did
+not run, `skip`; the report has `dryRun` and `worktreePrune.{mode,ok,failed,candidates}`. Bytes of a removed browser
+profile or memory agent are its files' total size.
 
 To check a host, read `~/.dori/runner/logs/cleanup.json` there (`at` is the last sweep) or find the `RUNNER_CLEANUP`
 line in the runner's log.
