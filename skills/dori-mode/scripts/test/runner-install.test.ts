@@ -392,8 +392,8 @@ test("a Linux reinstall over a complete sandbox policy prints no missing-key lin
   const host = fakeHost();
   expect((await runScript(host, linuxScript())).code).toBe(0);
   const wrapper = readFileSync(join(host.home, ".dori/runner/bin/lane-sandbox"), "utf8");
-  expect(wrapper).toContain('--ro-bind "$H/.dori/runner/briefs/$key.files"');
-  expect(wrapper).toContain('--bind "$H/.dori/runner/briefs/$key.out"');
+  expect(wrapper).toContain('keep --ro-bind "$R/briefs/$key.files"');
+  expect(wrapper).toContain('keep --bind "$R/briefs/$key.out"');
   expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
   const again = await runScript(host, linuxScript());
   expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
