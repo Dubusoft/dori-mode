@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { lstat, mkdir, readdir, readlink, realpath, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { join, posix, win32 } from "node:path";
+import type { Lane } from "../registry.ts";
 import type { Runner } from "../run.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
 
@@ -265,6 +266,19 @@ export type TargetCount = {
 };
 /** A lane the registry records as closed: when, and the worktrees it used (its cwd and its recorded worktrees). */
 export type ClosedLane = { readonly key: string; readonly closedAt: number; readonly worktrees: readonly string[] };
+
+/**
+ * The closed lanes of one host from registry records: `machine` undefined for the supervisor's own host (local lanes
+ * carry no machine), else that machine's label. Each lane's worktrees are its cwd and its recorded worktrees; a record
+ * without a readable `closedAt` is not closed and never listed.
+ */
+export const closedLanesOf = (lanes: readonly Lane[], machine: string | undefined): ClosedLane[] =>
+  lanes.flatMap((lane) => {
+    const closedAt = Date.parse(lane.closedAt ?? "");
+    if (!Number.isFinite(closedAt) || lane.machine !== machine) return [];
+    const worktrees = [...new Set([...(lane.cwd ? [lane.cwd] : []), ...(lane.worktrees ?? [])])];
+    return worktrees.length ? [{ key: lane.key, closedAt, worktrees }] : [];
+  });
 export type CleanupReport = {
   readonly at: string;
   readonly ms: number;

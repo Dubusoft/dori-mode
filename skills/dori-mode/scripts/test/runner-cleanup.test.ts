@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  CLEANUP_CHECK_MS, CLEANUP_FIRST_DELAY_MS, cleanupLine, cleanupPaths, cleanupSettings, type CleanupDeps, type CleanupPaths, type CleanupReport,
+  CLEANUP_CHECK_MS, CLEANUP_FIRST_DELAY_MS, cleanupLine, closedLanesOf, cleanupPaths, cleanupSettings, type CleanupDeps, type CleanupPaths, type CleanupReport,
   memoryAgentSuffix, parseLsof, runCleanup, sessionDirName, startCleanup,
 } from "../src/runner/cleanup.ts";
 import { run as realRun } from "../src/run.ts";
@@ -274,6 +274,18 @@ test("closedNodeModules is skipped whole when the in-use listing fails, the regi
   const none = await runCleanup(deps(f, { settings }));
   expect(none.targets.closedNodeModules).toMatchObject({ skip: "noRegistry" });
   expect(existsSync(nm(wt["repo-ap-2-1"]!))).toBe(true);
+});
+
+test("closedLanesOf lists one host's closed lanes with their cwd and recorded worktrees", () => {
+  const at = "2026-11-01T00:00:00.000Z";
+  const lanes = [
+    { key: "a", cwd: "/w/r-a", worktrees: ["/w/r-a", "/w/r-a-2"], openedAt: at, closedAt: at },
+    { key: "open", cwd: "/w/r-open", openedAt: at },
+    { key: "mac", cwd: "/w/r-mac", machine: "mini", openedAt: at, closedAt: at },
+    { key: "bad", cwd: "/w/r-bad", openedAt: at, closedAt: "never" },
+  ] as unknown as Parameters<typeof closedLanesOf>[0];
+  expect(closedLanesOf(lanes, undefined)).toEqual([{ key: "a", closedAt: Date.parse(at), worktrees: ["/w/r-a", "/w/r-a-2"] }]);
+  expect(closedLanesOf(lanes, "mini").map((l) => l.key)).toEqual(["mac"]);
 });
 
 test("git worktree prune drops records of deleted worktrees and keeps existing dirty ones", async () => {
