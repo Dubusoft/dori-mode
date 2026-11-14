@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
+import { INTENDED, SENSITIVE } from "../src/doctor.ts";
+import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -468,12 +469,33 @@ test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git
   const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" });
   const read = (p: string) => allows(sb, "file-read-data", p);
   for (const no of [".aws/credentials", ".azure/msal_token_cache.json", ".oci/config", ".gnupg/private-keys-v1.d/k.key", ".password-store/a.gpg", ".kube/config", ".docker/config.json",
-    ".netrc", ".git-credentials", ".vault-token", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml"]) {
+    ".netrc", ".git-credentials", ".vault-token", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml",
+    ".secrets/x", ".local/share/toodo-server/mcp-token", ".m2/settings.xml", ".zsh_history"]) {
     expect({ no, read: read(join(home, no)) }).toEqual({ no, read: false });
   }
   for (const ok of [".docker/cli-plugins/x", ".cargo/registry/index/x", ".gitconfig", ".config/gh/hosts.yml"]) {
     expect({ ok, read: read(join(home, ok)) }).toEqual({ ok, read: true });
   }
+});
+
+test("both templates carry the shared credential list as rendered, the same set doctor probes, and Linux hides each listed store outside ~/.dori", async () => {
+  const credentials = (template: string) => new Set(/^CREDENTIALS="([^"]*)"/m.exec(readFileSync(template, "utf8"))?.[1]?.split(/\s+/).filter(Boolean));
+  const doctorDeny = new Set(SENSITIVE.filter((p) => !INTENDED.has(p)));
+  for (const template of [LANE_SANDBOX_TEMPLATE, LANE_SANDBOX_MACOS_TEMPLATE]) {
+    expect(readFileSync(template, "utf8")).toBe(laneSandboxScript(template));
+    expect(credentials(template)).toEqual(doctorDeny);
+  }
+
+  const home = join(realpathSync(tempDir()), "home");
+  for (const d of [".cargo", ".aws", ".dori"]) mkdirSync(join(home, d), { recursive: true });
+  for (const f of [".cargo/credentials.toml", ".aws/credentials", ".zsh_history", ".dori/env"]) writeFileSync(join(home, f), "x");
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+  const at = (...seq: string[]) => argv.findIndex((_, i) => seq.every((s, j) => argv[i + j] === s));
+  expect(at("--ro-bind", "/dev/null", join(home, ".cargo/credentials.toml"))).toBeGreaterThan(at("--ro-bind-try", join(home, ".cargo"), join(home, ".cargo")));
+  expect(at("--tmpfs", join(home, ".aws"), "--remount-ro", join(home, ".aws"))).toBeGreaterThan(-1);
+  expect(at("--ro-bind", "/dev/null", join(home, ".zsh_history"))).toBeGreaterThan(-1);
+  // ~/.dori is a read-only tmpfs nothing of the host's env file reaches; it takes no mount point.
+  expect(argv).not.toContain(join(home, ".dori/env"));
 });
 
 test("macOS: ~/.dori/secrets is refused for reads, writes and socket connects with no hide file", async () => {

@@ -26,6 +26,23 @@
 # ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
 set -eu
 
+# Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
+# through the secret broker); the macOS template and `dori doctor` use the same list. Each one that exists outside
+# ~/.dori is hidden after every bind, like the hide list below; the rest of $HOME is a fresh tmpfs already.
+# BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
+CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
+  .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
+  .terraform.d/credentials.tfrc.json .vault-token .docker/config.json .config/containers/auth.json .gnupg
+  .password-store .local/share/keyrings .local/share/gnome-keyring .local/share/kwalletd .config/age .age
+  .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
+  .cargo/credentials .cargo/credentials.toml .gem/credentials .m2/settings.xml .gradle/gradle.properties
+  .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
+  .local/share/toodo-server .mozilla .config/google-chrome .config/chromium .config/BraveSoftware
+  .config/microsoft-edge .config/discord .config/Slack .config/Signal .local/share/TelegramDesktop
+  .config/Code/User/globalStorage .vscode .vscode-server .bash_history .zsh_history .python_history .psql_history
+  .mysql_history .lesshst"
+# END CREDENTIALS
+
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
 # below so it also answers on the lead; exit 3 (not 2) keeps "no sandbox here" apart from a usage error.
 if [ "${1:-}" = "--check" ]; then
@@ -287,20 +304,26 @@ for g in ${gits[@]+"${gits[@]}"}; do
   opts+=(--ro-bind-try "$g/hooks" "$g/hooks")
 done
 
-# Hidden host paths last among the binds, so neither the cwd nor LANE_SANDBOX_RW can re-expose one.
+# Hidden host paths last among the binds, so neither the cwd nor LANE_SANDBOX_RW can re-expose one: the credential
+# stores above, then the hide list.
+hide_path() {
+  [ -n "$1" ] && [ -e "$1" ] || return 0
+  local r
+  r=$(readlink -f "$1")
+  # ~/.dori is hidden already, and its read-only tmpfs takes no new mount point.
+  case "$r" in "$H/.dori" | "$H/.dori"/*) return 0 ;; esac
+  if [ -d "$r" ]; then
+    opts+=(--tmpfs "$r" --remount-ro "$r")
+  else
+    opts+=(--ro-bind /dev/null "$r")
+  fi
+}
+for p in $CREDENTIALS; do hide_path "$H/$p"; done
 if [ -f "$H/.dori/lane-sandbox-hide" ]; then
   while IFS= read -r p || [ -n "$p" ]; do
     p=${p%%#*}
     p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -n "$p" ] && [ -e "$p" ] || continue
-    r=$(readlink -f "$p")
-    # ~/.dori is hidden already, and its read-only tmpfs takes no new mount point.
-    case "$r" in "$H/.dori" | "$H/.dori"/*) continue ;; esac
-    if [ -d "$r" ]; then
-      opts+=(--tmpfs "$r" --remount-ro "$r")
-    else
-      opts+=(--ro-bind /dev/null "$r")
-    fi
+    hide_path "$p"
   done <"$H/.dori/lane-sandbox-hide"
 fi
 

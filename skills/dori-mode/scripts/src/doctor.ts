@@ -26,7 +26,7 @@ import { readRunnerEndpoints } from "./runner/endpoints.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
-import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "./lane-sandbox-install.ts";
+import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
 import { legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
 import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
@@ -118,19 +118,20 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
   // A runner refuses every sandboxed lane start and recovery behind a wrapper that does not grant the lane-file directories.
   if (!probe.out.split(/\r?\n/).includes("DORI_LANE_FILES=1")) return [fail("lane sandbox", `${installed} --check does not print DORI_LANE_FILES=1; sandboxed lane starts and recoveries are refused (LANE_FILES_SANDBOX_OLD)`, refresh)];
   const installedHash = createHash("sha256").update(readFileSync(installed)).digest("hex");
-  const templateHash = createHash("sha256").update(readFileSync(template)).digest("hex");
+  const templateHash = createHash("sha256").update(laneSandboxScript(template)).digest("hex");
   // Only a current wrapper is asked for its table: an older one has no --explain.
   const [exposed, allowed] = await Promise.all([exposure(d, installed), installedHash === templateHash ? permissions(d, installed) : undefined]);
   if (allowed) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`), exposed, allowed];
   return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh), exposed];
 };
 
-/** Credential stores under $HOME a lane must not read. ~/.ssh private keys (id_*) are added from the host's ~/.ssh. */
-const SENSITIVE = [".aws", ".azure", ".oci", ".gnupg", ".kube", ".docker/config.json", ".netrc", ".git-credentials", ".vault-token",
-  ".password-store", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml", ".config/gcloud", ".config/gh", ".npmrc",
-  ".dori/env", ".dori/secrets", ".dori/state"];
 /** Bound into every lane on purpose: gh drives PRs, and npm reads its registry settings. */
-const INTENDED = new Set([".config/gh", ".npmrc"]);
+export const INTENDED = new Set([".config/gh", ".npmrc"]);
+/**
+ * Paths under $HOME the exposure probe checks: the credential stores the lane sandbox templates hide (CREDENTIAL_DENY)
+ * and the ones bound on purpose. ~/.ssh private keys (id_*) are added from the host's ~/.ssh.
+ */
+export const SENSITIVE: readonly string[] = [...CREDENTIAL_DENY, ...INTENDED];
 /** Prints each argument a lane could read: a file with its first byte, a directory with at least one entry (a hidden one is an empty tmpfs or refused). */
 const PROBE = 'for p do if [ -d "$p" ]; then [ -n "$(ls -A "$p" 2>/dev/null)" ] && printf "%s\\n" "$p"; elif [ "$(head -c1 "$p" 2>/dev/null | wc -c)" -gt 0 ]; then printf "%s\\n" "$p"; fi; done; true';
 
