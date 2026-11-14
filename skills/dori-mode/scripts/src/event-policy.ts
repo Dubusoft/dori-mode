@@ -90,6 +90,9 @@ const URGENT_KINDS = [
   "TOODO_TASK_READY",
   // The supervisor's autopilot tick found a new set of tasks it may launch, or the same set still waiting after 30 min.
   "AUTOPILOT_READY",
+  // Review gate (review-gate.ts): a reviewer found defects, a review run failed or was escalated to the lead, and a merge
+  // landed on another base than the one the review approved.
+  "REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_ESCALATED", "REVIEW_BASE_RACE",
 ] as const;
 
 /**
@@ -121,6 +124,8 @@ const DIGEST_KINDS = [
   "LANE_CLOSED * closed seen-claim toodo=done", "TOODO_TASK_COMPLETED",
   // An autopilot lane's done outcome whose task the supervisor completed and read back (task-finish.ts finishedOutcome).
   "AUTOPILOT_LANE_DONE * * * toodo=done:",
+  // Review gate progress the supervisor settles itself (review-gate.ts): a review started, held, passed, or went stale.
+  "REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE",
 ] as const;
 
 /**

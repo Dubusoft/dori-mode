@@ -71,6 +71,7 @@ import { Waits } from "./waits.ts";
 import { GitHubEvents, githubTargets, type OpenPull } from "./github-events.ts";
 import { driftTick, pullOwners } from "./drift.ts";
 import { CiFollowUp, defaultCiIo } from "./ci-follow.ts";
+import { ReviewGate } from "./review-gate.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
@@ -604,6 +605,9 @@ export const WARN_REPEAT_MS = 60 * 60_000;
  */
 export const ARCHIVE_SWEEP_MS = 10 * 60_000;
 
+/** The sweeps' deps: `deps` with the D11 close hold answered by the supervisor's one review gate. */
+export const withReviewHold = (deps: FlowDeps, review: Pick<ReviewGate, "holdsLane">): FlowDeps => ({ ...deps, reviewHold: (lane) => review.holdsLane(lane) });
+
 /**
  * The supervisor's sweeps over one long-lived state (guard transitions, dead-pane memory, pane read cache). The first
  * sweep takes the round's pane snapshot; every later sweep of the round observes panes through it.
@@ -1035,7 +1039,9 @@ export const supervise = async (
     const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
     const ownRepo = doriRepo(deps);
     // A merge of dori's own repo into dev queues the automatic update (the auto-update sweep runs it).
-    const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps, {
+    // One review gate per supervisor (construction recovers its job store): CI follow-up merges only what it approved.
+    const review = probe.step("review-gate", () => new ReviewGate(deps));
+    const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps, review, {
       ...defaultCiIo,
       merged: async (pull, base) => {
         if (base === "dev" && pull.repo.toLowerCase() === await ownRepo()) noteDevMerge(deps.config.stateDir, `${pull.repo}#${pull.number}`);
@@ -1045,6 +1051,8 @@ export const supervise = async (
     const pollGithub = async (): Promise<void> => {
       await github.tick(deps, enqueueGitHub);
       await follow.tick(github.openPulls(), enqueueGitHub, github.mergedPulls());
+      // Timeouts, reviewer intake and close, snapshot release (review-gate.ts); errors per job are logged there.
+      await review.tick(enqueueGitHub);
     };
     // The sweep task gets its own span, so its timings never mix into the startup report.
     const sweepProbe = probe.span();
@@ -1054,7 +1062,8 @@ export const supervise = async (
     // An autopilot task it cannot finish, or whose lane closed cancelled, gets a blocker note instead.
     const toodoWriter = new ToodoWriter(deps.tunables.toodoWriter);
     const finishTask = taskFinisher({ writer: toodoWriter, append: (lane, text) => appendFollowUp(stateDir, discord, lane, text) });
-    const sweepDeps: FlowDeps = { ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter) };
+    // The watch sweep holds a lane whose review is pending through the same gate CI follow-up merges with (D11).
+    const sweepDeps: FlowDeps = withReviewHold({ ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter) }, review);
     const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard, () => github.openPulls()).map(([name, step]): Sweep => [name, async (emit) =>
       watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
     const recentWarnings = new Map<string, number>();
