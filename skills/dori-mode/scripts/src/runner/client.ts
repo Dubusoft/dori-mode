@@ -4,8 +4,8 @@ import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
-  MAX_FRAME_BYTES, PROTO, SECRET_PROTO, SECRET_PUT_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
-  type AnyRunnerControl, type AnyRunnerEvent, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
+  CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, SECRET_PUT_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  type AnyRunnerControl, type AnyRunnerEvent, type ClosedLaneBody, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
@@ -51,6 +51,10 @@ const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.
 export type SecretReply =
   | { readonly ok: true; readonly plaintext: string }
   | { readonly ok: false; readonly code: string; readonly detail: string };
+
+type PendingClosed = { readonly transport: Transport; readonly done: (error: Error | undefined, lanes?: readonly ClosedLaneBody[]) => void };
+/** How long `closedLanes` waits for the supervisor's `lanes.closed.result`. */
+export const CLOSED_LANES_TIMEOUT_MS = 60_000;
 
 type PendingSecret = { readonly answer: string; readonly transport: Transport; readonly settle: (reply: SecretReply) => void };
 
@@ -125,6 +129,8 @@ export class RunnerClient {
   private helloProto: number | undefined;
   /** Open `secretRequest`s by rid, each bound to the connection it went out on. */
   private readonly secrets = new Map<string, PendingSecret>();
+  /** Open `closedLanes` requests by rid, each bound to the connection it went out on. */
+  private readonly closedAsks = new Map<string, PendingClosed>();
 
   constructor(private readonly config: ClientConfig, private readonly deps: ClientDeps) {}
 
@@ -176,6 +182,7 @@ export class RunnerClient {
         this.secrets.delete(rid);
         pending.settle({ ok: false, code: "RUNNER_SECRET_FAILED", detail: "connection lost" });
       }
+      for (const pending of [...this.closedAsks.values()]) if (pending.transport === transport) pending.done(new Error("connection lost"));
       markClosed();
     });
     const hello: RunnerControlBodies["hello"] = {
@@ -279,6 +286,30 @@ export class RunnerClient {
     return this.secretAsk("secret.put", (rid, session, head) => ({
       ...rest, rid, sealed: session.sealSecret("r2s", { ...head, type: "secret.put", rid }, value),
     }), SECRET_PUT_PROTO);
+  }
+
+  /**
+   * The lanes of this runner the supervisor's registry records as closed (`lanes.closed`, proto 9), for the cleanup
+   * sweep. Rejects when not connected, when the supervisor is below CLOSED_LANES_PROTO, on its refusal, a lost
+   * connection or no answer within CLOSED_LANES_TIMEOUT_MS.
+   */
+  closedLanes(): Promise<readonly ClosedLaneBody[]> {
+    const transport = this.transport;
+    if (!this.connected || !transport) return Promise.reject(new Error("not connected to the supervisor"));
+    if ((this.helloProto ?? 0) < CLOSED_LANES_PROTO) return Promise.reject(new Error(`supervisor speaks proto ${this.helloProto}; closed lanes need proto ${CLOSED_LANES_PROTO}`));
+    const rid = randomBytes(16).toString("hex");
+    return new Promise((resolve, reject) => {
+      let cancel: () => void = () => {};
+      const done: PendingClosed["done"] = (error, lanes) => {
+        if (this.closedAsks.get(rid)?.done !== done) return;
+        this.closedAsks.delete(rid);
+        cancel();
+        if (error) reject(error); else resolve(lanes ?? []);
+      };
+      this.closedAsks.set(rid, { transport, done });
+      cancel = (this.deps.timer ?? defaultTimer)(CLOSED_LANES_TIMEOUT_MS, () => { done(new Error(`no answer to lanes.closed within ${CLOSED_LANES_TIMEOUT_MS / 1000}s`)); });
+      try { this.sendFrame(runnerControl(this.head(), "lanes.closed", { rid }) as AnyRunnerControl); } catch (e) { done(e instanceof Error ? e : new Error(String(e))); }
+    });
   }
 
   private secretAsk<T extends SecretRequestType | "secret.put">(
@@ -436,6 +467,14 @@ export class RunnerClient {
       case "secret.put.result":
         this.secretAnswer(frame);
         return;
+      case "lanes.closed.result": {
+        const body = frame.body as SupervisorControlBodies["lanes.closed.result"];
+        const pending = this.closedAsks.get(body.rid);
+        if (!pending) return;
+        if (body.ok) pending.done(undefined, body.lanes ?? []);
+        else pending.done(new Error(body.detail ?? "refused by the supervisor"));
+        return;
+      }
       default:
         if (isQueryType(frame.type)) {
           // A query is answered only on an admitted connection.

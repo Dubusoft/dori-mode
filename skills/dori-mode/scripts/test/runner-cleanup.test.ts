@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-  CLEANUP_CHECK_MS, CLEANUP_FIRST_DELAY_MS, cleanupLine, cleanupPaths, cleanupSettings, type CleanupDeps, type CleanupPaths, type CleanupReport,
+  CLEANUP_CHECK_MS, CLEANUP_FIRST_DELAY_MS, cleanupLine, closedLanesOf, cleanupPaths, cleanupSettings, type CleanupDeps, type CleanupPaths, type CleanupReport,
   memoryAgentSuffix, parseLsof, runCleanup, sessionDirName, startCleanup,
 } from "../src/runner/cleanup.ts";
 import { run as realRun } from "../src/run.ts";
@@ -186,6 +186,106 @@ test("a failed in-use listing skips the deleting targets instead of guessing", a
   expect(report.inUse).toBe("failed");
   expect(cleanupLine(report)).toContain("inUse=failed");
   expect(cleanupLine(report)).toContain("temp=skip:inUseFailed");
+});
+
+/** A repo with a linked worktree per name under `<base>/worktrees`, each holding `node_modules/pkg/index.js`. */
+const laneWorktrees = async (f: Fixture, names: readonly string[]): Promise<Record<string, string>> => {
+  const repo = join(f.tmp, "..", "repo");
+  mkdirSync(repo);
+  await git("-C", repo, "init", "-q", "-b", "main");
+  file(join(repo, "a.txt"));
+  await git("-C", repo, "add", "a.txt");
+  await git("-C", repo, "commit", "-q", "-m", "a");
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const wt = join(f.tmp, "..", "worktrees", name);
+    await git("-C", repo, "worktree", "add", "-q", "-b", name, wt);
+    file(join(wt, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
+    out[name] = wt;
+  }
+  return out;
+};
+const nm = (wt: string): string => join(wt, "node_modules");
+
+test("closed lanes' worktree node_modules: report by default, removed when on, the rest of the worktree stays", async () => {
+  const f = fixture();
+  const wt = await laneWorktrees(f, ["repo-ap-1-1"]);
+  const closedLanes = async () => [{ key: "ap-1-1", closedAt: NOW - 5 * DAY, worktrees: [wt["repo-ap-1-1"]!] }];
+
+  const reported = await runCleanup(deps(f, { closedLanes }));
+  expect(existsSync(nm(wt["repo-ap-1-1"]!))).toBe(true);
+  expect(reported.targets.closedNodeModules).toMatchObject({ mode: "report", candidates: 1, candidateBytes: 20, removed: 0 });
+  expect(cleanupLine(reported)).toContain("closedNodeModules=report:1/20B");
+
+  // A shell whose cwd is the home dir above the worktree holds nothing in it.
+  const on = await runCleanup(deps(f, { closedLanes, inUse: async () => ({ files: [], dirs: [f.home, dirname(f.tmp)] }), settings: cleanupSettings({ DORI_CLEANUP_TARGETS: "closedNodeModules=on" }) }));
+  expect(existsSync(nm(wt["repo-ap-1-1"]!))).toBe(false);
+  expect(existsSync(join(wt["repo-ap-1-1"]!, "a.txt"))).toBe(true);
+  expect(on.targets.closedNodeModules).toMatchObject({ mode: "on", candidates: 1, removed: 1, bytes: 20 });
+});
+
+test("closed lanes' node_modules stay for open and opening lanes, recent activity, in-use paths, unknown worktrees and reopened lanes", async () => {
+  const f = fixture();
+  const names = ["repo-open-1", "repo-ap-9-1", "repo-closed-lately", "repo-installing", "repo-held", "repo-busy-cwd", "repo-unknown", "repo-reopened", "repo-committed"];
+  const wt = await laneWorktrees(f, names);
+  const old = NOW - 5 * DAY;
+  fresh(nm(wt["repo-installing"]!), NOW - 60 * 60_000);
+  // A commit 2 days before the sweep is the lane's last activity, though the lane closed earlier.
+  fresh(file(join(f.tmp, "..", "repo", ".git", "worktrees", "repo-committed", "logs", "HEAD"), "x"), NOW - 2 * DAY);
+  let reads = 0;
+  const closedLanes = async () => {
+    reads++;
+    return [
+      { key: "open-1", closedAt: old, worktrees: [wt["repo-open-1"]!] },
+      { key: "gone-9", closedAt: old, worktrees: [wt["repo-ap-9-1"]!] },
+      { key: "lately", closedAt: NOW - DAY, worktrees: [wt["repo-closed-lately"]!] },
+      { key: "installing", closedAt: old, worktrees: [wt["repo-installing"]!] },
+      { key: "held", closedAt: old, worktrees: [wt["repo-held"]!] },
+      { key: "busy", closedAt: old, worktrees: [wt["repo-busy-cwd"]!] },
+      { key: "committed", closedAt: old, worktrees: [wt["repo-committed"]!] },
+      // Reopened while the first pass counted: gone from the closed list on the second read.
+      ...(reads === 1 ? [{ key: "reopened", closedAt: old, worktrees: [wt["repo-reopened"]!] }] : []),
+    ];
+  };
+  const report = await runCleanup(deps(f, {
+    closedLanes,
+    // An open lane working in a worktree a closed lane also recorded, and an observed lane (no cwd yet) being opened.
+    openLanes: [{ key: "open-2", cwd: wt["repo-open-1"]! }, { key: "ap-9-1" }],
+    inUse: async () => ({ files: [join(nm(wt["repo-held"]!), "pkg", "index.js")], dirs: [join(wt["repo-busy-cwd"]!, "src")] }),
+    settings: cleanupSettings({ DORI_CLEANUP_TARGETS: "closedNodeModules=on" }),
+  }));
+  for (const name of names) expect({ name, exists: existsSync(nm(wt[name]!)) }).toEqual({ name, exists: true });
+  expect(reads).toBe(2);
+  expect(report.targets.closedNodeModules).toMatchObject({
+    mode: "on", removed: 0, candidates: 0, skipped: { shielded: 4, recent: 3, reopened: 1 },
+  });
+});
+
+test("closedNodeModules is skipped whole when the in-use listing fails, the registry cannot be read or there is none", async () => {
+  const f = fixture();
+  const wt = await laneWorktrees(f, ["repo-ap-2-1"]);
+  const closedLanes = async () => [{ key: "ap-2-1", closedAt: NOW - 5 * DAY, worktrees: [wt["repo-ap-2-1"]!] }];
+  const settings = cleanupSettings({ DORI_CLEANUP_TARGETS: "closedNodeModules=on" });
+  const failed = await runCleanup(deps(f, { closedLanes, settings, inUse: async () => { throw new Error("lsof timed out"); } }));
+  expect(failed.targets.closedNodeModules).toMatchObject({ skip: "inUseFailed", candidates: 0 });
+  expect(cleanupLine(failed)).toContain("closedNodeModules=skip:inUseFailed");
+  const unread = await runCleanup(deps(f, { settings, closedLanes: async () => { throw new Error("link down"); } }));
+  expect(unread.targets.closedNodeModules).toMatchObject({ skip: "registryFailed", candidates: 0 });
+  const none = await runCleanup(deps(f, { settings }));
+  expect(none.targets.closedNodeModules).toMatchObject({ skip: "noRegistry" });
+  expect(existsSync(nm(wt["repo-ap-2-1"]!))).toBe(true);
+});
+
+test("closedLanesOf lists one host's closed lanes with their cwd and recorded worktrees", () => {
+  const at = "2026-11-01T00:00:00.000Z";
+  const lanes = [
+    { key: "a", cwd: "/w/r-a", worktrees: ["/w/r-a", "/w/r-a-2"], openedAt: at, closedAt: at },
+    { key: "open", cwd: "/w/r-open", openedAt: at },
+    { key: "mac", cwd: "/w/r-mac", machine: "mini", openedAt: at, closedAt: at },
+    { key: "bad", cwd: "/w/r-bad", openedAt: at, closedAt: "never" },
+  ] as unknown as Parameters<typeof closedLanesOf>[0];
+  expect(closedLanesOf(lanes, undefined)).toEqual([{ key: "a", closedAt: Date.parse(at), worktrees: ["/w/r-a", "/w/r-a-2"] }]);
+  expect(closedLanesOf(lanes, "mini").map((l) => l.key)).toEqual(["mac"]);
 });
 
 test("git worktree prune drops records of deleted worktrees and keeps existing dirty ones", async () => {

@@ -28,6 +28,7 @@ import {
   acceptRunners, drainRunnerAdmin, type HubHooks, LOCAL_RUNNER, loadIdentity, nextEpoch, openRunnerJournal, type RunnerAccept,
   type RunnerJournal,
 } from "./runner/serve.ts";
+import { closedLanesOf } from "./runner/cleanup.ts";
 import type { Listener } from "./runner/transport.ts";
 import { controlSocketPath, listenUnix } from "./runner/unix-transport.ts";
 import { dialWs, type DialingListener, type DialingOptions } from "./runner/ws-transport.ts";
@@ -213,7 +214,7 @@ export type RunnerHubHandle = {
   close(): void;
 };
 
-export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent" | "onSecret"> & {
+export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEvent" | "onSecret" | "onClosedLanes"> & {
   /** Discovery and reconnect dependencies; production reads runner-endpoints.json. */
   readonly network?: Partial<DialingOptions>;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
@@ -283,6 +284,7 @@ export const openRunnerHub = (
   const accept = acceptRunners(hub, [listener, network], {
     ...(options.onHeartbeat ? { onHeartbeat: options.onHeartbeat } : {}),
     ...(options.onSecret ? { onSecret: options.onSecret } : {}),
+    ...(options.onClosedLanes ? { onClosedLanes: options.onClosedLanes } : {}),
     onHello: (label, body) => { protos.set(label, body.proto); options.onHello?.(label, body); },
     onEvent: (label, frame) => {
       guard.event(label, frame);
@@ -1245,6 +1247,8 @@ export const supervise = async (
         const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
           onHeartbeat: (label) => { void monitor?.heartbeat(label); },
           onHerdr: (id, line) => { enqueueSweep(id, line); },
+          // A runner's cleanup sweep asks for its closed lanes (lanes.closed): local lanes carry no machine, a remote runner's carry its label.
+          onClosedLanes: async (label) => closedLanesOf(await deps.registry.archived(), label === LOCAL_RUNNER ? undefined : label),
           // A remote runner's secret.get: decided here with the registry, config and this host's store (secret-serve.ts).
           onSecret: supervisorSecretHandler({
             laneOwner: async (key) => { const lane = (await deps.registry.open()).find((l) => l.key === key); return lane && runnerOf(lane); },

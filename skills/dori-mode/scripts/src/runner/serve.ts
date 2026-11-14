@@ -12,7 +12,7 @@ import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
   decodeFrame, encodeFrame, LABEL_PATTERN, MAX_FRAME_BYTES, ProtocolError, supervisorCommand, supervisorControl,
-  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type FrameHead, type InventoryLane, type JsonValue, type LaneStatus,
+  type AnyRunnerEvent, type AnySupervisorCommand, type ClosedLaneBody, type CommandResults, type Frame, type FrameHead, type InventoryLane, type JsonValue, type LaneStatus,
   type QueryBodies, type QueryType, type RejectCode, type RunnerControl, type RunnerEventBodies, type SupervisorCommandBodies,
   type SupervisorCommandType, type SupervisorControlBodies,
 } from "./protocol.ts";
@@ -159,6 +159,8 @@ export type HubHooks = {
    * `ok:false RUNNER_SECRET_UNSUPPORTED`.
    */
   readonly onSecret?: (label: string, frame: SecretFrame, ctx: SecretReplyContext) => void;
+  /** Every admitted `lanes.closed`: the label's closed lanes. Absent, or when it throws, the answer is `ok:false`. */
+  readonly onClosedLanes?: (label: string) => Promise<readonly ClosedLaneBody[]>;
   /** The label's admitted connection closed (not called for a connection a newer one replaced). */
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
@@ -365,6 +367,15 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           };
           if (hooks.onSecret) hooks.onSecret(label, secret, ctx);
           else ctx.reply(answer, { rid: secret.body.rid, ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "this supervisor does not serve secrets" });
+          return;
+        }
+        if (frame.type === "lanes.closed") {
+          const rid = (frame as RunnerControl<"lanes.closed">).body.rid;
+          const answerHead = head(label, frame.gen);
+          const answer = (body: SupervisorControlBodies["lanes.closed.result"]): void => { reply(supervisorControl(answerHead, "lanes.closed.result", body) as Frame); };
+          if (!hooks.onClosedLanes) answer({ rid, ok: false, detail: "this supervisor does not list closed lanes" });
+          else hooks.onClosedLanes(label).then((lanes) => { answer({ rid, ok: true, lanes }); },
+            (e: unknown) => { answer({ rid, ok: false, detail: (e instanceof Error ? e.message : String(e)).slice(0, 200) }); });
           return;
         }
         reply(hub.handle(frame));

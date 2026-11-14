@@ -702,6 +702,7 @@ a day.
 | empty artifact dirs | empty `*-artifacts` session dirs, empty dirs under `~/.dori/runner/evidence` | removed after a day |
 | memory agents | `~/.omo/memory/agents/<slug>-<hash>` | removed when untouched for 30 days |
 | worktree records | every workspace repo the runner reports | `git worktree prune` |
+| closed lanes' `node_modules` | `<worktree>/node_modules` of each worktree (cwd and recorded worktrees) of a lane the registry records as closed | removed once the lane's last activity (its close, the worktree's `HEAD`, index and `HEAD` log) is 3 days old and nothing in the worktree, its `.git` or its `node_modules` changed for 6 hours; `report` by default |
 
 Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The sweep never removes: an open lane's
 sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
@@ -711,28 +712,42 @@ sessions (`tmux-*`, `herdr*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the
 that is the home dir, above it, or a secret store. When the in-use listing fails, that day's sweep skips the deleting
 targets and reports `inUse=failed`.
 
+The closed lanes' `node_modules` target only looks at worktrees of lanes the registry records as closed; a worktree the
+registry does not know (a lane being opened may not be registered yet) is never touched. It also keeps a worktree that
+an open lane uses as its cwd, one whose directory name carries an open or observed lane's key (the key itself,
+`<key>-...` or `<repo>-<key>`), and one under which a process holds a file open or runs (only paths inside the worktree
+count, not a shell whose cwd is a directory above it). The registry is read again right before removing, and a lane
+that is no longer closed by then keeps its worktree (`reopened`). The registry lives with the supervisor, so the runner asks it over
+the link at each sweep: the runner control frame `lanes.closed {rid}` (proto 9) is answered with `lanes.closed.result
+{rid, ok, detail?, lanes?}`, each lane `{key, closedAt, worktrees}` (closedAt in ms; worktrees are its cwd and recorded
+worktrees), only the asking runner's lanes (local lanes for `local`, a remote runner's by its label). Nothing in it is
+secret, so it is not sealed. Without a registry to ask the target is skipped (`noRegistry`); when the supervisor
+refuses, is older than proto 9 or does not answer within 60 seconds, it is skipped (`registryFailed`).
+
 Each target runs in one of three modes: `on` removes (sessions are moved), `report` only counts what it would remove
 and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
-Every target defaults to `on`; a target added later starts at `report` until its reports have been read. The runner's
+Every target defaults to `on` except `closedNodeModules`, which starts at `report`; a target added later starts at
+`report` until its reports have been read. The runner's
 environment sets them, read at each sweep:
 
 | Variable | Effect |
 |---|---|
 | `DORI_CLEANUP_DRY_RUN=1` | every target that is not `off` runs in `report` (empty, `0`, `false`, `no` and `off` leave it unset) |
-| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune` |
+| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune`, `closedNodeModules` |
 
 An entry that is not understood is ignored and logged as a `RUNNER_CLEANUP_ERROR`.
 
 Each sweep logs one line and rewrites the status file with the full report:
 
 ```text
-RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> worktreePrune=<ok>/<repos> freedBytes=<n> [wouldFreeBytes=<n>] kept=<n> inUse=ok errors=<n> [skipped=<target>.<reason>:<n>,...] ms=<n>
+RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> closedNodeModules=<n> worktreePrune=<ok>/<repos> freedBytes=<n> [wouldFreeBytes=<n>] kept=<n> inUse=ok errors=<n> [skipped=<target>.<reason>:<n>,...] ms=<n>
 ```
 
 A target's value is the number removed in `on`, `report:<candidates>/<bytes>B` in `report` (`worktreePrune=report:<records>`),
-`off`, or `skip:inUseFailed` when the in-use listing failed. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
+`off`, `skip:inUseFailed` when the in-use listing failed, or (closedNodeModules) `skip:noRegistry` / `skip:registryFailed`. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
 counts the entries left and why: `shielded` (an open lane's, in use, or a secret store), `checkout`, `lock`, `otherUser`,
-`excluded` (a live-session temp name), `archived` (already in the archive) and `unsafeRoot`. In `cleanup.json` each
+`excluded` (a live-session temp name), `archived` (already in the archive), `unsafeRoot`, `recent` (a closed lane's worktree
+active within 3 days or changed within 6 hours) and `reopened` (the lane is open again). In `cleanup.json` each
 target carries `mode`, `removed`, `bytes`, `candidates`, `candidateBytes`, `kept`, `errors`, `skipped` and, when it did
 not run, `skip`; the report has `dryRun` and `worktreePrune.{mode,ok,failed,candidates}`. Bytes of a removed browser
 profile or memory agent are its files' total size.
@@ -792,7 +807,9 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 7, so a supervisor accepts runners at 7 and 6. Protocol 6 adds the four secret control frames
+The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 adds `secret.put`; protocol 9 adds
+`lanes.closed` / `lanes.closed.result`, and a proto 8 runner still runs lanes and secrets while `dori doctor` warns
+that its cleanup sweep skips the closed lanes' `node_modules`. Earlier versions: Protocol 6 adds the four secret control frames
 (see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
 Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes and takes secrets, and `dori doctor`
 warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).

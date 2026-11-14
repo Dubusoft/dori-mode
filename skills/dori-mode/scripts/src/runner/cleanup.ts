@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { lstat, mkdir, readdir, readlink, realpath, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { join, posix, win32 } from "node:path";
+import type { Lane } from "../registry.ts";
 import type { Runner } from "../run.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
 
@@ -15,7 +16,9 @@ import { writeRunnerFile } from "./fs-safety.ts";
  * - omo sessions (`~/.omo/agent/sessions/<cwd>/*.jsonl` and their `-artifacts` dirs) untouched for 14 days are moved to
  *   `~/.omo/agent/sessions-archive/<cwd>/`, and empty `-artifacts` dirs and empty dirs under the runner's `evidence/` go;
  * - omo memory agents (`~/.omo/memory/agents/<slug>-<hash>`) untouched for 30 days;
- * - `git worktree prune` in every repo the runner knows (drops records of worktrees whose directory is gone).
+ * - `git worktree prune` in every repo the runner knows (drops records of worktrees whose directory is gone);
+ * - `node_modules` of the worktrees of lanes the registry records as closed, once the lane's last activity is 3 days
+ *   old and the worktree has not changed for 6 hours (closedNodeModules; `report` by default).
  * Never removed: anything outside those roots, `~/.dori/secrets`, `~/.secrets`, an open lane's cwd, sandbox TMPDIR,
  * session dir and memory agent, the lead's memory agent, any git checkout (a worktree, dirty or clean, stays as it is),
  * anything a process holds open or runs in (Linux /proc, macOS lsof; Windows refuses to delete an open file), sockets,
@@ -36,10 +39,15 @@ export const CLEANUP_AGES = {
   sessions: 14 * DAY_MS,
   emptyDirs: DAY_MS,
   memoryAgents: 30 * DAY_MS,
+  /** A closed lane's last activity (its close, its worktree's HEAD and index) before its `node_modules` may go. */
+  closedNodeModules: 3 * DAY_MS,
+  /** Any change to such a worktree (or its `node_modules`) this recent keeps it: something may be installing there. */
+  worktreeQuiet: 6 * HOUR_MS,
 } as const;
 /** The sweep's targets, as they appear in the report and in `DORI_CLEANUP_TARGETS`. */
 export const CLEANUP_TARGETS = [
   "sandbox", "omoTmp", "bunChrome", "temp", "varTmp", "sessionsArchived", "emptyArtifactDirs", "memoryAgents", "worktreePrune",
+  "closedNodeModules",
 ] as const;
 export type CleanupTarget = (typeof CLEANUP_TARGETS)[number];
 /** `on`: remove (or move, for sessions); `report`: count candidates and bytes, change nothing; `off`: skip the target. */
@@ -48,7 +56,7 @@ const CLEANUP_MODES: readonly CleanupMode[] = ["on", "report", "off"];
 /** A target missing from `DORI_CLEANUP_TARGETS` runs in this mode. A new target starts at `report`. */
 export const CLEANUP_DEFAULT_MODES: Readonly<Record<CleanupTarget, CleanupMode>> = {
   sandbox: "on", omoTmp: "on", bunChrome: "on", temp: "on", varTmp: "on", sessionsArchived: "on", emptyArtifactDirs: "on",
-  memoryAgents: "on", worktreePrune: "on",
+  memoryAgents: "on", worktreePrune: "on", closedNodeModules: "report",
 };
 export type CleanupSettings = {
   /** Every target that is not `off` runs in `report`. */
@@ -238,8 +246,9 @@ export const inUsePaths = async (os: string, run: Runner, uid: number | undefine
 };
 
 /** Why an entry the target walked was left: shielded (open lane, in use, secret store), a git checkout, a lock file,
- * another user's, a live-session temp name, an archive copy already there, a root the sweep refuses. */
-export type SkipReason = "shielded" | "checkout" | "lock" | "otherUser" | "excluded" | "archived" | "unsafeRoot";
+ * another user's, a live-session temp name, an archive copy already there, a root the sweep refuses, a closed lane's
+ * worktree still active (closed or worked in less than 3 days ago, changed in the last 6 hours), or reopened. */
+export type SkipReason = "shielded" | "checkout" | "lock" | "otherUser" | "excluded" | "archived" | "unsafeRoot" | "recent" | "reopened";
 /**
  * One target's counts. `candidates`/`candidateBytes`: what qualified for removal (removed in `on`, only counted in
  * `report`); `removed`/`bytes`: what was actually removed. `skip`: why the whole target did not run.
@@ -253,8 +262,23 @@ export type TargetCount = {
   kept: number;
   errors: number;
   skipped: Partial<Record<SkipReason, number>>;
-  skip?: "off" | "inUseFailed";
+  skip?: "off" | "inUseFailed" | "noRegistry" | "registryFailed";
 };
+/** A lane the registry records as closed: when, and the worktrees it used (its cwd and its recorded worktrees). */
+export type ClosedLane = { readonly key: string; readonly closedAt: number; readonly worktrees: readonly string[] };
+
+/**
+ * The closed lanes of one host from registry records: `machine` undefined for the supervisor's own host (local lanes
+ * carry no machine), else that machine's label. Each lane's worktrees are its cwd and its recorded worktrees; a record
+ * without a readable `closedAt` is not closed and never listed.
+ */
+export const closedLanesOf = (lanes: readonly Lane[], machine: string | undefined): ClosedLane[] =>
+  lanes.flatMap((lane) => {
+    const closedAt = Date.parse(lane.closedAt ?? "");
+    if (!Number.isFinite(closedAt) || lane.machine !== machine) return [];
+    const worktrees = [...new Set([...(lane.cwd ? [lane.cwd] : []), ...(lane.worktrees ?? [])])];
+    return worktrees.length ? [{ key: lane.key, closedAt, worktrees }] : [];
+  });
 export type CleanupReport = {
   readonly at: string;
   readonly ms: number;
@@ -285,6 +309,11 @@ export type CleanupDeps = {
   readonly uid: number | undefined;
   /** Per-target modes and dry run; absent runs every target in its default mode. */
   readonly settings?: CleanupSettings;
+  /**
+   * The lanes of this runner the registry records as closed, read once to pick candidates and again right before
+   * removing. Absent: this runner has no registry to ask, and closedNodeModules is skipped (`noRegistry`).
+   */
+  readonly closedLanes?: () => Promise<readonly ClosedLane[]>;
 };
 
 type Ctx = {
@@ -390,6 +419,102 @@ const agentAge = async (dir: string): Promise<number> => {
   return newest;
 };
 
+/** The newest change time of a path (mtime or ctime; atime is not a change), 0 when it is absent. */
+const changedAt = async (p: string): Promise<number> => {
+  try { const st = await lstat(p); return Math.max(st.mtimeMs, st.ctimeMs); } catch { return 0; }
+};
+
+/** A linked worktree's git dir (`.git` is a file `gitdir: <path>`), or its `.git` dir in a main checkout. */
+const gitDirOf = async (worktree: string): Promise<string | undefined> => {
+  const dotGit = join(worktree, ".git");
+  try {
+    const st = await lstat(dotGit);
+    if (st.isDirectory()) return dotGit;
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
+    return m?.[1] ? (posix.isAbsolute(m[1]) || win32.isAbsolute(m[1]) ? m[1] : join(worktree, m[1])) : undefined;
+  } catch { return undefined; }
+};
+
+/** Whether a lane key names this worktree dir: the key itself, `<key>-...` or `<repo>-<key>` (done-flow's worktree names). */
+const keyNames = (key: string, dir: string): boolean => dir === key || dir.startsWith(`${key}-`) || dir.endsWith(`-${key}`);
+
+/**
+ * closedNodeModules: `<worktree>/node_modules` of every worktree of a lane the registry records as closed, when the lane's
+ * last activity (its close, the worktree's HEAD, index and HEAD log) is CLEANUP_AGES.closedNodeModules old and nothing in
+ * the worktree, its `.git` or its `node_modules` changed within CLEANUP_AGES.worktreeQuiet. Left alone: a worktree any open
+ * lane uses as cwd or whose name carries an open lane's key (an observed lane has no cwd yet, a lane being opened may not
+ * be registered), anything under it a process holds open or runs in, and lanes reopened by the time the registry is read
+ * again right before removing.
+ */
+const sweepClosedNodeModules = async (
+  deps: CleanupDeps, closedLanes: () => Promise<readonly ClosedLane[]>, used: InUse, count: TargetCount, ctx: Ctx,
+): Promise<void> => {
+  const { paths, now } = deps;
+  const pathApi = paths.os === "win32" ? win32 : posix;
+  const fold = (p: string): string => (paths.os === "win32" ? pathApi.normalize(p).toLowerCase() : pathApi.normalize(p));
+  // Only what is inside the worktree counts: a shell whose cwd is the home dir above it holds nothing there.
+  const held = [...used.files, ...used.dirs].map(fold);
+  const inUseUnder = (dir: string): boolean => { const d = fold(dir); return held.some((p) => p === d || p.startsWith(`${d}${pathApi.sep}`)); };
+  let lanes: readonly ClosedLane[];
+  try { lanes = await closedLanes(); } catch (e) {
+    count.skip = "registryFailed";
+    if (ctx.errors.length < 20) ctx.errors.push(`closed lanes not read: ${errText(e)}`);
+    return;
+  }
+  const openKeys = deps.openLanes.map((l) => l.key);
+  const openCwds = new Set(deps.openLanes.flatMap((l) => (l.cwd ? [pathApi.normalize(l.cwd)] : [])));
+  const picked: { key: string; closedAt: number; dir: string; bytes: number }[] = [];
+  const seen = new Set<string>();
+  for (const lane of lanes) {
+    for (const raw of lane.worktrees) {
+      const worktree = stripSlash(pathApi.normalize(raw), pathApi);
+      const dir = pathApi.join(worktree, "node_modules");
+      if (seen.has(dir)) continue;
+      seen.add(dir);
+      let st;
+      try { st = await lstat(dir); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      if (!safeRoot(worktree, paths)) { skipped(count, "unsafeRoot"); continue; }
+      if (!(await isCheckout(worktree))) continue;
+      if (deps.uid !== undefined && st.uid !== deps.uid) { skipped(count, "otherUser"); continue; }
+      const name = pathApi.basename(worktree);
+      if (openKeys.includes(lane.key)) { skipped(count, "reopened"); continue; }
+      if (openCwds.has(worktree) || openKeys.some((k) => keyNames(k, name)) || inUseUnder(worktree)) {
+        count.kept++;
+        skipped(count, "shielded");
+        continue;
+      }
+      const gitDir = await gitDirOf(worktree);
+      const gitTimes = gitDir ? await Promise.all(["HEAD", "index", join("logs", "HEAD")].map((p) => changedAt(join(gitDir, p)))) : [];
+      const lastActivity = Math.max(lane.closedAt, ...gitTimes);
+      const lastChange = Math.max(...(await Promise.all([worktree, join(worktree, ".git"), dir].map(changedAt))));
+      if (lastActivity >= now - CLEANUP_AGES.closedNodeModules || lastChange >= now - CLEANUP_AGES.worktreeQuiet) { skipped(count, "recent"); continue; }
+      picked.push({ key: lane.key, closedAt: lane.closedAt, dir, bytes: await treeBytes(dir) });
+    }
+  }
+  if (!picked.length) return;
+  // Read the registry again: a lane reopened while the sizes were counted keeps its worktree.
+  let still: ReadonlySet<string> = new Set();
+  if (count.mode === "on") {
+    try { still = new Set((await closedLanes()).map((l) => `${l.key}\0${l.closedAt}`)); } catch (e) {
+      count.skip = "registryFailed";
+      if (ctx.errors.length < 20) ctx.errors.push(`closed lanes not read again: ${errText(e)}`);
+      return;
+    }
+  }
+  for (const p of picked) {
+    if (count.mode === "on" && !still.has(`${p.key}\0${p.closedAt}`)) { skipped(count, "reopened"); continue; }
+    count.candidates++;
+    count.candidateBytes += p.bytes;
+    if (count.mode !== "on") continue;
+    try {
+      await rm(p.dir, { recursive: true, force: true });
+      count.removed++;
+      count.bytes += p.bytes;
+    } catch (e) { noteError(ctx, count, p.dir, e); }
+  }
+};
+
 /** One sweep over every target. A target that fails is counted and logged; the others still run. */
 export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   const started = Date.now();
@@ -402,8 +527,9 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
     if (lane.cwd) shield.add(lane.cwd, true);
   }
   const errors: string[] = [];
+  let used: InUse = { files: [], dirs: [] };
   try {
-    const used = await deps.inUse();
+    used = await deps.inUse();
     for (const f of used.files) shield.add(f, false);
     for (const d of used.dirs) shield.add(d, true);
   } catch (e) {
@@ -537,6 +663,11 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
       } catch (e) { noteError(ctx, agents, dir, e); }
     }
   }
+
+  // node_modules of closed lanes' worktrees: only lanes the registry records as closed, never a worktree it does not know.
+  const nodeModules = runs("closedNodeModules", true);
+  if (nodeModules && !deps.closedLanes) nodeModules.skip = "noRegistry";
+  else if (nodeModules && deps.closedLanes) await sweepClosedNodeModules(deps, deps.closedLanes, used, nodeModules, ctx);
 
   // Worktree records whose directory is gone; git keeps locked ones and never touches a worktree that exists.
   // In report mode `--dry-run --verbose` lists the records (`Removing worktrees/<name>: ...`) without dropping them.
