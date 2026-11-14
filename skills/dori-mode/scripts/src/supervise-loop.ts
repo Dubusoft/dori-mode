@@ -73,6 +73,7 @@ import { driftTick, pullOwners } from "./drift.ts";
 import { CiFollowUp, defaultCiIo } from "./ci-follow.ts";
 import { ReviewGate } from "./review-gate.ts";
 import { reviewSectionOf, reviewStatusTick } from "./review-status.ts";
+import { mergePauseHolds } from "./merge-pause.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
 import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
@@ -606,8 +607,13 @@ export const WARN_REPEAT_MS = 60 * 60_000;
  */
 export const ARCHIVE_SWEEP_MS = 10 * 60_000;
 
-/** The sweeps' deps: `deps` with the D11 close hold answered by the supervisor's one review gate. */
-export const withReviewHold = (deps: FlowDeps, review: Pick<ReviewGate, "holdsLane">): FlowDeps => ({ ...deps, reviewHold: (lane) => review.holdsLane(lane) });
+/**
+ * The sweeps' deps: `deps` with the D11 close hold answered by the supervisor's one review gate, and while merges are
+ * paused (merge-pause.ts, read fresh each pass) also by the pause, so an approved lane waiting on its merge stays open.
+ */
+export const withReviewHold = (deps: FlowDeps, review: Pick<ReviewGate, "holdsLane">): FlowDeps => ({
+  ...deps, reviewHold: async (lane) => mergePauseHolds(deps.config.stateDir, lane) || review.holdsLane(lane),
+});
 
 /**
  * The supervisor's sweeps over one long-lived state (guard transitions, dead-pane memory, pane read cache). The first

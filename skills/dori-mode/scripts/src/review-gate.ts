@@ -252,6 +252,9 @@ const errorCode = (code: ReceiptRejectCode): ReviewErrorCode =>
 const line = (kind: string, r: ReviewJobRecord, rest: string): string =>
   `${kind} ${r.job.snapshot.repo}#${r.job.snapshot.prNumber} lane=${r.job.authorLaneKey} job=${r.job.jobId} ${rest}`.trimEnd();
 
+/** The keys review-result.json may carry; any other key is invalid_output. */
+const RESULT_FILE_KEYS = ["jobId", "jobToken", "source", "body", "taskRecord", "startedAt", "completedAt"] as const;
+
 type ResultFile = {
   readonly jobId?: unknown; readonly jobToken?: unknown; readonly source?: unknown; readonly body?: unknown;
   readonly taskRecord?: unknown; readonly startedAt?: unknown; readonly completedAt?: unknown;
@@ -705,6 +708,8 @@ export class ReviewGate {
     let result: ResultFile;
     try { result = JSON.parse(resultText) as ResultFile; } catch { return refuse("invalid_output", `${REVIEW_RESULT_FILE} is not JSON`); }
     if (typeof result !== "object" || result === null) return refuse("invalid_output", `${REVIEW_RESULT_FILE} is not an object`);
+    const unknownKeys = Object.keys(result).filter((k) => !(RESULT_FILE_KEYS as readonly string[]).includes(k));
+    if (unknownKeys.length > 0) return refuse("invalid_output", `${REVIEW_RESULT_FILE}: unknown key(s) ${unknownKeys.join(", ")}`);
     const str = (v: unknown): string => (typeof v === "string" ? v : "");
     const bodyName = str(result.body) || "review-body.json";
     if (basename(bodyName) !== bodyName) return refuse("invalid_output", "body must name a file in the lane's reports");
