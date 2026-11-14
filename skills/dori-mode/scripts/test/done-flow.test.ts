@@ -559,6 +559,15 @@ test("a closed lane's worktree its close had to keep is removed once clean, unde
   expect(removals()).toEqual([{ op: "worktree-remove", root: "/repo", path: KEPT_WT }]);
 });
 
+test("a local lane's kept worktree with commits no remote has stays, and one whose unpushed commits are unreadable stays with a warning", async () => {
+  await at(T0).registry.write(closedKept());
+  world.inspection = { git: { worktrees: [{ path: KEPT_WT, exists: true, dirty: false, ahead: 2 }] } };
+  expect(await watchTick(at(T0))).toEqual([]);
+  world.inspection = { git: { worktrees: [{ path: KEPT_WT, exists: true, dirty: false }] } };
+  expect(await watchTick(at(T0))).toEqual([`LANE_WATCH_WARN demo-lane cannot read unpushed commits of ${KEPT_WT}, so it is kept`]);
+  expect(removals()).toHaveLength(0);
+});
+
 test("working, not-done and paused lanes keep their worktrees even after their PR merged", async () => {
   facts([KEPT_WT], false);
   for (const status of ["working", "not-done", "paused"] as const) {
