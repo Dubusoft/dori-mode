@@ -224,6 +224,29 @@ test("doctor shows what a lane may write and what it cannot see, read off the in
   expect(find(await runDoctor({ ...f.deps, run: failing }), "lane permissions")).toMatchObject({ level: "WARN", detail: `${wrapper} --explain failed: usage: lane-sandbox` });
 });
 
+test("doctor warns about $HOME dot entries and ~/.dori entries a lane can read that dori does not know, unless hidden", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  expect(find(await runDoctor(f.deps), "lane home entries")).toMatchObject({ level: "OK" });
+
+  // Known: a shell file, a credential store (hidden by the sandbox), dori's own entries and its credential stores.
+  for (const d of [".aws", ".config/gcloud", ".dori/research", ".dori/state", ".dori/lead"]) mkdirSync(join(home, d), { recursive: true });
+  for (const p of [".zshrc", ".netrc", ".dori/env", ".dori/config.json"]) writeFileSync(join(home, p), "x");
+  expect(find(await runDoctor(f.deps), "lane home entries")).toMatchObject({ level: "OK" });
+
+  // Unknown: a new tool's dot dir, a stray file next to dori's env, and a hidden entry only once it is in the hide list.
+  mkdirSync(join(home, ".newtool"), { recursive: true });
+  mkdirSync(join(home, ".private"), { recursive: true });
+  for (const p of [".dori/env.bak", ".dori/notes", "plain-file"]) writeFileSync(join(home, p), "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# owner's list\n${join(home, ".private")}\n`);
+  const check = find(await runDoctor(f.deps), "lane home entries");
+  expect(check).toMatchObject({ level: "WARN", detail: "a lane can read ~/.dori/env.bak, ~/.dori/notes, ~/.newtool, which dori does not know; check that none holds a credential", fix: expect.stringContaining("~/.dori/lane-sandbox-hide") });
+  expect(doctorExit(await runDoctor(f.deps))).toBe(0);
+
+  // No lane sandbox on Windows, so nothing to check there.
+  expect((await runDoctor({ ...f.deps, platform: "win32" })).find((c) => c.id === "lane home entries")).toBeUndefined();
+});
+
 test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {
   const f = fixture();
   const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? ok() : f.deps.run(argv, {})) }), "lane sandbox");

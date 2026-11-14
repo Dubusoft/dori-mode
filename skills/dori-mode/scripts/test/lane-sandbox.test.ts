@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { INTENDED, SENSITIVE } from "../src/doctor.ts";
-import { installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
+import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -882,6 +883,56 @@ test("--explain prints the mount table bwrap gets, grants, repos, hide list and 
   expect(rows).toContain(`hide ${join(hidden, "key")}`);
   // A missing -try source (an absent dotfile) is not listed: bwrap skips it.
   expect(rows.some((r) => r.endsWith("/.zshrc"))).toBe(false);
+});
+
+test("--explain regression: every credential store, ssh key and other lane's token is hidden, and the writable set is exactly the expected one", async () => {
+  // /tmp is bound read-write after $HOME, so a fake home under it would read as writable: keep it outside /tmp.
+  const base = realpathSync(process.env.TMPDIR ?? "/tmp");
+  const parent = base === "/tmp" || base.startsWith("/tmp/") ? join(homedir(), ".cache") : base;
+  mkdirSync(parent, { recursive: true });
+  const root = realpathSync(mkdtempSync(join(parent, "dori-explain-")));
+  dirs.push(root);
+  const home = join(root, "home");
+  const R = join(home, ".dori", "runner");
+  const runs = join(root, "runs"), repos = join(root, "repos"), worktrees = join(root, "worktrees");
+  for (const d of [runs, join(repos, "app", ".git", "hooks"), worktrees, join(R, "briefs", "lane-a.files"), join(R, "sock", "lane.d")]) mkdirSync(d, { recursive: true });
+  // The read-write caches a lane gets, so each -try bind of them is listed.
+  for (const d of [".omo", ".cache", ".npm", ".bun/install/cache", ".cargo/registry", ".cargo/git"]) mkdirSync(join(home, d), { recursive: true });
+  const secrets = [...CREDENTIAL_DENY, ".ssh/id_ed25519", ".dori/runner/briefs/x.1.token", ".dori/runner/briefs/x.md"];
+  for (const p of secrets) {
+    mkdirSync(join(home, p, ".."), { recursive: true });
+    writeFileSync(join(home, p), p.endsWith("lane-sandbox-hide") ? "# nothing extra\n" : "secret\n");
+  }
+  for (const f of [".ssh/known_hosts", ".dori/runner/briefs/lane-a.md"]) writeFileSync(join(home, f), "x\n");
+  const token = join(R, "briefs", "lane-a.1.token");
+  writeFileSync(token, "own\n");
+  const env = { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token, LANE_SANDBOX_RW: runs, LANE_SANDBOX_REPOS: repos, LANE_SANDBOX_WORKTREES: worktrees };
+
+  const argv = await sandboxArgv(home, env);
+  const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "--explain"], { cwd: join(home, "work"), env: { PATH: `${join(home, "fake-bin")}:${process.env.PATH ?? ""}`, HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+  const rows = explainRows(out);
+  expect(rows).toEqual(mountTable(argv));
+  const table = rows.map((l) => ({ mode: l.slice(0, l.indexOf(" ")), path: l.slice(l.indexOf(" ") + 1) }));
+  // A later row wins at and below its path.
+  const verdict = (p: string) => table.findLast((r) => p === r.path || p.startsWith(`${r.path}/`))?.mode;
+
+  // Each secret is hidden by its own row or by a hidden subtree over it (~/.config, ~/.ssh, ~/.dori/runner).
+  expect(secrets.map((p) => [p, verdict(join(home, p))]).filter(([, mode]) => mode !== "hide")).toEqual([]);
+  // The lane's own files still show.
+  for (const p of [token, join(R, "briefs", "lane-a.md"), join(home, ".ssh", "known_hosts"), join(home, ".zshrc")]) expect([p, verdict(p)]).toEqual([p, "ro"]);
+  // No row names another lane's token or brief, so nothing re-exposes it.
+  expect(table.filter((r) => r.path.startsWith(join(R, "briefs")) && !r.path.startsWith(join(R, "briefs", "lane-a.")))).toEqual([]);
+  // The writable set, pinned: a new read-write bind (or a lost one) changes it.
+  expect(table.filter((r) => r.mode === "rw").map((r) => r.path).sort()).toEqual([
+    "/tmp",
+    join(home, ".bun", "install", "cache"), join(home, ".cache"), join(home, ".cargo", "git"), join(home, ".cargo", "registry"),
+    join(home, ".dori", "heavy"), join(R, "briefs", "lane-a.out"), join(home, ".lane-tmp"), join(home, ".npm"), join(home, ".omo"),
+    join(home, "work"), join(repos, "app", ".git"), runs, worktrees,
+  ].sort());
+  // ...and none of it is a hidden path.
+  expect(table.filter((r) => r.mode === "rw" && verdict(r.path) !== "rw")).toEqual([]);
 });
 
 test("macOS: --explain lists every path the profile names, each with the access the profile gives it", async () => {
