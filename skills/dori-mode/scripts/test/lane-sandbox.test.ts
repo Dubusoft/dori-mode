@@ -14,13 +14,12 @@ const tempDir = (): string => {
 };
 
 /** Runs the shipped template with a recording `bwrap` first on PATH and returns the argv it would have run bwrap with. */
-const sandboxArgv = async (home: string, env: Record<string, string>): Promise<string[]> => {
+const sandboxArgv = async (home: string, env: Record<string, string>, work = join(home, "work")): Promise<string[]> => {
   const bin = join(home, "fake-bin");
   const out = join(home, "bwrap-argv");
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(bin, "bwrap"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${out}"\n`);
   chmodSync(join(bin, "bwrap"), 0o755);
-  const work = join(home, "work");
   mkdirSync(work, { recursive: true });
   const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "true"], { cwd: work, env: { PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
   expect({ code: await child.exited, err: await new Response(child.stderr).text() }).toEqual({ code: 0, err: "" });
@@ -55,26 +54,29 @@ test("a sandboxed lane gets its own token file, the runner's lane socket, its br
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: own });
 
   const tokenBind = argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === own && argv[i + 2] === own);
-  const doriRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori"));
+  const runnerRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === runner);
   expect(tokenBind).toBeGreaterThan(-1);
-  // The token's mount point has to exist before ~/.dori's tmpfs turns read-only.
-  expect(tokenBind).toBeLessThan(doriRo);
-  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
+  // The token's mount point has to exist before the runner dir's tmpfs turns read-only.
+  expect(tokenBind).toBeLessThan(runnerRo);
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === runner)).toBeGreaterThan(-1);
   const runnerPaths = [...new Set(argv.filter((a) => a.startsWith(runner)))].sort();
-  expect(runnerPaths).toEqual([join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "herdr.d", "lane-a"), join(runner, "sock", "herdr.d", "lane-a", "herdr"), join(runner, "sock", "lane.d")]);
+  expect(runnerPaths).toEqual([runner, join(runner, "bin"), join(runner, "briefs", "lane-a.2.token"), join(runner, "briefs", "lane-a.files"), join(runner, "briefs", "lane-a.md"), join(runner, "briefs", "lane-a.out"), join(runner, "lanes", "lane-a"), join(runner, "sock"), join(runner, "sock", "herdr.d", "lane-a"), join(runner, "sock", "herdr.d", "lane-a", "herdr"), join(runner, "sock", "lane.d")]);
   // sock itself is only a mount point (--dir); the lane socket's directory is the one thing bound into it. A directory,
   // not the socket file: a restarted runner's new socket at the same path shows through a directory bind only.
   expect(argv.flatMap((a, i) => (argv[i + 1] === join(runner, "sock") ? [a] : []))).toEqual(["--dir"]);
   const laneDir = join(runner, "sock", "lane.d");
   expect(argv.flatMap((a, i) => (argv[i + 1] === laneDir && argv[i + 2] === laneDir ? [a] : []))).toEqual(["--ro-bind-try"]);
   const input = join(runner, "briefs", "lane-a.files"), output = join(runner, "briefs", "lane-a.out");
-  expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === input && argv[i + 2] === input)).toBeLessThan(doriRo);
-  expect(argv.findIndex((a, i) => a === "--dir" && argv[i + 1] === output)).toBeLessThan(doriRo);
-  expect(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === output && argv[i + 2] === output)).toBeGreaterThan(doriRo);
+  expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === input && argv[i + 2] === input)).toBeLessThan(runnerRo);
+  expect(argv.findIndex((a, i) => a === "--dir" && argv[i + 1] === output)).toBeLessThan(runnerRo);
+  expect(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === output && argv[i + 2] === output)).toBeGreaterThan(runnerRo);
   // A worker host's dori lives in bin: bound read-only, never read-write, so a lane cannot rewrite what the runner runs.
   const bin = join(runner, "bin");
   expect(argv.flatMap((a, i) => (argv[i + 1] === bin && argv[i + 2] === bin ? [a] : []))).toEqual(["--ro-bind-try"]);
-  expect(argv.some((a) => a.startsWith(join(home, ".dori", "env")))).toBe(false);
+  // The env file shows only as hidden: /dev/null over it, after the runner dir.
+  const env = join(home, ".dori", "env");
+  expect(argv.flatMap((a, i) => (argv[i + 2] === env ? [`${a} ${argv[i + 1]}`] : []))).toEqual(["--ro-bind /dev/null"]);
+  expect(argv.indexOf(env)).toBeGreaterThan(runnerRo);
 });
 
 test("a lane reaches herdr only through its own report socket directory, read-only, named by HERDR_SOCKET_PATH", async () => {
@@ -86,8 +88,8 @@ test("a lane reaches herdr only through its own report socket directory, read-on
   const herdrDirs = [...new Set(argv.filter((a) => a.includes("herdr.d")))].sort();
   expect(herdrDirs).toEqual([own, join(own, "herdr")]);
   expect(argv.flatMap((a, i) => (argv[i + 1] === own && argv[i + 2] === own ? [a] : []))).toEqual(["--ro-bind-try"]);
-  // The directory's mount point has to exist before ~/.dori's tmpfs turns read-only.
-  expect(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === own)).toBeLessThan(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori")));
+  // The directory's mount point has to exist before the runner dir's tmpfs turns read-only.
+  expect(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === own)).toBeLessThan(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori", "runner")));
   const setenv = argv.flatMap((a, i) => (a === "--setenv" && argv[i + 1] === "HERDR_SOCKET_PATH" ? [argv[i + 2]] : []));
   expect(setenv).toEqual([join(own, "herdr")]);
   expect(argv.some((a) => a.startsWith(join(home, ".config", "herdr")))).toBe(false);
@@ -111,12 +113,16 @@ test("the D-Bus session bus and the systemd user manager's sockets are covered, 
   }
 });
 
-test("of ~/.config only gh, git and an ssh agent socket under it are bound", async () => {
+test("~/.config is hidden after every read-write bind, with only gh, git and an ssh agent socket under it bound back", async () => {
   const home = join(tempDir(), "home");
-  const agent = join(home, ".config", "herdr", "herdr.sock.agent");
+  const config = join(home, ".config");
+  mkdirSync(join(config, "gcloud"), { recursive: true });
+  const agent = join(config, "herdr", "herdr.sock.agent");
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", SSH_AUTH_SOCK: agent });
-  const config = [...new Set(argv.filter((a) => a.startsWith(join(home, ".config"))))].sort();
-  expect(config).toEqual([join(home, ".config", "gh"), join(home, ".config", "git"), agent]);
+  expect([...new Set(argv.filter((a) => a.startsWith(config)))].sort()).toEqual([config, join(config, "gh"), join(config, "git"), agent]);
+  const hide = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === config);
+  expect(hide).toBeGreaterThan(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, "work")));
+  expect(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === config)).toBeGreaterThan(argv.indexOf(agent));
   // An agent socket outside $HOME is visible through the host's own binds already.
   const outside = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", SSH_AUTH_SOCK: "/run/user/1/openssh_agent" });
   expect(outside).not.toContain("/run/user/1/openssh_agent");
@@ -152,12 +158,15 @@ test("each existing path in ~/.dori/lane-sandbox-hide is covered after every bin
   expect(dir).toBeGreaterThan(rw);
   expect(file).toBeGreaterThan(rw);
   expect(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === backup)).toBeGreaterThan(dir);
-  // A missing path is skipped (bwrap would create it), and ~/.dori is hidden already.
+  // A missing path is skipped (bwrap would create it), under ~/.dori too.
   expect(argv).not.toContain(join(root, "missing"));
   expect(argv).not.toContain(join(home, ".dori", "env"));
 });
 
-test("~/.dori/secrets is never bound, even with no ~/.dori/lane-sandbox-hide file", async () => {
+/** The argv index of the last read-write bind other than the private TMPDIR's (which is bound after every hide). */
+const lastReadWrite = (argv: string[], home: string): number => argv.findLastIndex((a, i) => (a === "--bind" || a === "--bind-try") && argv[i + 2] !== join(home, ".lane-tmp"));
+
+test("~/.dori/secrets is hidden after every read-write bind, even with no ~/.dori/lane-sandbox-hide file", async () => {
   const home = join(tempDir(), "home");
   const secrets = join(home, ".dori", "secrets");
   mkdirSync(secrets, { recursive: true });
@@ -166,27 +175,72 @@ test("~/.dori/secrets is never bound, even with no ~/.dori/lane-sandbox-hide fil
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
 
   expect(existsSync(join(home, ".dori", "lane-sandbox-hide"))).toBe(false);
-  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
-  expect(argv.filter((a) => a === secrets || a.startsWith(`${secrets}/`))).toEqual([]);
+  expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === join(home, ".dori"))).toBeGreaterThan(-1);
+  const hide = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === secrets && argv[i + 2] === "--remount-ro" && argv[i + 3] === secrets);
+  expect(hide).toBeGreaterThan(lastReadWrite(argv, home));
+  expect(argv.filter((a) => a === secrets || a.startsWith(`${secrets}/`))).toEqual([secrets, secrets]);
 });
 
-test("every read-write mount under ~/.dori has its mount point created before ~/.dori turns read-only", async () => {
+test("~/.dori is the host's, read-only, with the state dir hidden; every read-write mount in the runner dir has its mount point created before that tmpfs turns read-only", async () => {
   const home = join(tempDir(), "home");
-  const dori = join(home, ".dori");
+  const dori = join(home, ".dori"), runner = join(dori, "runner");
   mkdirSync(join(dori, "state"), { recursive: true });
 
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
 
-  const doriRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === dori);
-  expect(doriRo).toBeGreaterThan(-1);
+  expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === dori && argv[i + 2] === dori)).toBeGreaterThan(-1);
+  // bwrap cannot mkdir a mount point in the read-only host bind, so the wrapper makes the heavy dir on the host.
+  expect(existsSync(join(dori, "heavy"))).toBe(true);
   const rwInDori = argv.flatMap((a, i) => ((a === "--bind" || a === "--bind-try") && argv[i + 2]?.startsWith(`${dori}/`) ? [argv[i + 2]] : []));
   expect(rwInDori).toContain(join(dori, "heavy"));
-  // The state dir (supervisor key, registry, decisions) is hidden: no bind, not even an empty mount point.
+  // The state dir (supervisor key, registry, decisions) is hidden after every read-write bind.
   const state = join(dori, "state");
-  expect(argv.filter((a) => a === state || a.startsWith(`${state}/`))).toEqual([]);
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === state && argv[i + 2] === "--remount-ro" && argv[i + 3] === state)).toBeGreaterThan(lastReadWrite(argv, home));
   // bwrap cannot mkdir a missing mount point on the read-only tmpfs (EROFS), so each one is a --dir before the remount.
-  const createdBefore = argv.slice(0, doriRo).flatMap((a, i, before) => (a === "--dir" ? [before[i + 1]] : []));
-  expect(rwInDori.filter((p) => !createdBefore.includes(p))).toEqual([]);
+  const runnerRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === runner);
+  expect(runnerRo).toBeGreaterThan(-1);
+  const createdBefore = argv.slice(0, runnerRo).flatMap((a, i, before) => (a === "--dir" ? [before[i + 1]] : []));
+  const rwInRunner = rwInDori.filter((p) => p?.startsWith(`${runner}/`));
+  expect(rwInRunner).toEqual([join(runner, "briefs", "lane-a.out")]);
+  expect(rwInRunner.filter((p) => !createdBefore.includes(p))).toEqual([]);
+});
+
+test("a cwd-less lane's cwd under the runner dir is bound read-write into that dir's tmpfs, once", async () => {
+  const home = realpathSync(join(tempDir()));
+  const cwd = join(home, ".dori", "runner", "lanes", "lane-a");
+  mkdirSync(cwd, { recursive: true });
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" }, cwd);
+
+  const runnerRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori", "runner"));
+  expect(argv.flatMap((a, i) => (argv[i + 1] === cwd && (argv[i + 2] === cwd || a === "--dir") ? [a] : []))).toEqual(["--dir", "--dir", "--bind"]);
+  expect(argv.findLastIndex((a, i) => a === "--dir" && argv[i + 1] === cwd)).toBeLessThan(runnerRo);
+  expect(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === cwd)).toBeGreaterThan(runnerRo);
+});
+
+test("a hidden path under ~/.dori is hidden too; inside a hidden subtree only a path under an entry bound back gets its own cover", async () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const research = join(home, ".dori", "research", "lane-x"), gh = join(home, ".config", "gh"), gcloud = join(home, ".config", "gcloud");
+  for (const d of [research, gh, gcloud, join(home, ".ssh")]) mkdirSync(d, { recursive: true });
+  for (const f of [join(research, "report.md"), join(research, "secret.txt"), join(gh, "hosts.yml"), join(home, ".ssh", "id_ed25519"), join(home, ".gitconfig")]) writeFileSync(f, "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${join(research, "secret.txt")}\n${join(gh, "hosts.yml")}\n${join(home, ".ssh", "id_ed25519")}\n`);
+
+  const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
+  const over = (p: string) => argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === p);
+
+  expect(over(join(research, "secret.txt"))).toBeGreaterThan(lastReadWrite(argv, home));
+  expect(argv).not.toContain(join(research, "report.md"));
+  // Bound back with gh, so covered on its own after that bind.
+  expect(over(join(gh, "hosts.yml"))).toBeGreaterThan(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === gh));
+  // Hidden with its subtree: no mount point there to cover (bwrap would fail on the read-only tmpfs).
+  expect(argv).not.toContain(join(home, ".ssh", "id_ed25519"));
+  expect(argv).not.toContain(gcloud);
+
+  // A review lane keeps no git config: the host's is covered, and neither gh nor git is bound back.
+  const review = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_PROFILE: "review" });
+  expect(review.findIndex((a, i) => a === "--ro-bind" && review[i + 1] === "/dev/null" && review[i + 2] === join(home, ".gitconfig"))).toBeGreaterThan(-1);
+  expect(review).not.toContain(gh);
 });
 
 test("the top-level directory holding $HOME is the sandbox's own, not a read-only bind of the host's root-owned one", async () => {
@@ -491,7 +545,7 @@ test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git
   }
 });
 
-test("both templates carry the shared credential list as rendered, the same set doctor probes, and Linux hides each listed store outside ~/.dori", async () => {
+test("both templates carry the shared credential list as rendered, the same set doctor probes, and Linux hides each listed store", async () => {
   const credentials = (template: string) => new Set(/^CREDENTIALS="([^"]*)"/m.exec(readFileSync(template, "utf8"))?.[1]?.split(/\s+/).filter(Boolean));
   const doctorDeny = new Set(SENSITIVE.filter((p) => !INTENDED.has(p)));
   for (const template of [LANE_SANDBOX_TEMPLATE, LANE_SANDBOX_MACOS_TEMPLATE]) {
@@ -504,11 +558,11 @@ test("both templates carry the shared credential list as rendered, the same set 
   for (const f of [".cargo/credentials.toml", ".aws/credentials", ".zsh_history", ".dori/env"]) writeFileSync(join(home, f), "x");
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
   const at = (...seq: string[]) => argv.findIndex((_, i) => seq.every((s, j) => argv[i + j] === s));
-  expect(at("--ro-bind", "/dev/null", join(home, ".cargo/credentials.toml"))).toBeGreaterThan(at("--ro-bind-try", join(home, ".cargo"), join(home, ".cargo")));
-  expect(at("--tmpfs", join(home, ".aws"), "--remount-ro", join(home, ".aws"))).toBeGreaterThan(-1);
-  expect(at("--ro-bind", "/dev/null", join(home, ".zsh_history"))).toBeGreaterThan(-1);
-  // ~/.dori is a read-only tmpfs nothing of the host's env file reaches; it takes no mount point.
-  expect(argv).not.toContain(join(home, ".dori/env"));
+  const rw = lastReadWrite(argv, home);
+  expect(at("--ro-bind", "/dev/null", join(home, ".cargo/credentials.toml"))).toBeGreaterThan(rw);
+  expect(at("--tmpfs", join(home, ".aws"), "--remount-ro", join(home, ".aws"))).toBeGreaterThan(rw);
+  expect(at("--ro-bind", "/dev/null", join(home, ".zsh_history"))).toBeGreaterThan(rw);
+  expect(at("--ro-bind", "/dev/null", join(home, ".dori/env"))).toBeGreaterThan(rw);
 });
 
 test("macOS: ~/.dori/secrets is refused for reads, writes and socket connects with no hide file", async () => {
@@ -731,8 +785,8 @@ const explainRows = (out: string): string[] => out.split("\n").filter((l) => l !
 
 /**
  * The mounts bwrap makes from `argv`, as --explain rows in mount order: a bind is rw or ro (ro over /dev/null hides the
- * path), a tmpfs remounted read-only at once hides its path and any other tmpfs starts empty; a -try bind of a missing
- * source is skipped, as bwrap skips it.
+ * path), a tmpfs other than the root that is remounted read-only later hides its path and any other tmpfs starts empty;
+ * a -try bind of a missing source is skipped, as bwrap skips it.
  */
 const mountTable = (argv: string[]): string[] => {
   const rows: string[] = [];
@@ -749,10 +803,9 @@ const mountTable = (argv: string[]): string[] => {
     } else if (o === "--tmpfs") {
       const p = argv[i + 1] as string;
       i += 2;
-      if (argv[i] === "--remount-ro" && argv[i + 1] === p) {
-        rows.push(`hide ${p}`);
-        i += 2;
-      } else rows.push(`empty ${p}`);
+      const end = argv.indexOf("--");
+      const later = argv.slice(i, end < 0 ? undefined : end).some((a, j, rest) => a === "--remount-ro" && rest[j + 1] === p);
+      rows.push(`${p !== "/" && later ? "hide" : "empty"} ${p}`);
     } else i += o === "--unshare-pid" || o === "--die-with-parent" ? 1 : 2;
   }
   return rows;
@@ -778,7 +831,7 @@ test("--explain prints the mount table bwrap gets, grants, repos, hide list and 
 
   const rows = explainRows(out);
   expect(rows).toEqual(mountTable(argv));
-  for (const row of [`rw ${runs}`, `ro ${notes}`, `rw ${worktrees}`, `rw ${join(repos, "app", ".git")}`, `ro ${join(repos, "app", ".git", "hooks")}`, `ro ${token}`, `ro ${join(home, ".gitconfig")}`, `empty ${join(home, ".dori")}`, `rw ${join(home, ".lane-tmp")}`]) expect(rows).toContain(row);
+  for (const row of [`rw ${runs}`, `ro ${notes}`, `rw ${worktrees}`, `rw ${join(repos, "app", ".git")}`, `ro ${join(repos, "app", ".git", "hooks")}`, `ro ${token}`, `ro ${home}`, `ro ${join(home, ".dori")}`, `hide ${join(home, ".dori", "runner")}`, `rw ${join(home, ".lane-tmp")}`]) expect(rows).toContain(row);
   // The hide list comes after every grant, so a granted path under a hidden one stays covered.
   expect(rows.indexOf(`hide ${hidden}`)).toBeGreaterThan(rows.indexOf(`rw ${underHidden}`));
   expect(rows).toContain(`hide ${join(hidden, "key")}`);

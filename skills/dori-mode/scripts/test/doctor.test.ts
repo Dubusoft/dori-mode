@@ -207,7 +207,7 @@ test("doctor shows what a lane may write and what it cannot see, read off the in
   const check = find(await runDoctor({ ...f.deps, run: real }), "lane permissions");
   expect(argvs).toContainEqual(["env", "DORI_LANE_KEY=doctor-probe", wrapper, "--explain"]);
   expect(check.level).toBe("OK");
-  expect(check.detail).toMatch(/^writable: [^;]*~\/\.cache[^;]*; hidden: [^;]*~\/backups[^;]*; empty \(only the paths bound into it show\): ~, ~\/\.dori; /);
+  expect(check.detail).toMatch(/^writable: [^;]*~\/\.cache[^;]*; hidden: [^;]*~\/\.dori\/runner[^;]*~\/backups[^;]*; each lane adds /);
   // Hidden after it is bound, so not writable.
   expect(check.detail).not.toContain("~/backups/granted");
   expect(check.detail).toContain(`${wrapper} --explain`);

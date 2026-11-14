@@ -8,7 +8,7 @@
 # Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir; the runner's grants)
-#   LANE_SANDBOX_RO      extra read-only directories under $HOME, which is otherwise empty (the runner's grants)
+#   LANE_SANDBOX_RO      extra read-only directories (the runner's grants); $HOME itself is read-only already
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
@@ -18,17 +18,19 @@
 #                        and each repo's .git are bound read-only, LANE_SANDBOX_RW is ignored (LANE_SANDBOX_RO kept), and
 #                        the only writable host paths are briefs/<key>.out, the private TMPDIR, ~/.omo and ~/.cache (/tmp
 #                        is a private tmpfs). No git or gh credentials reach it: ~/.gitconfig, ~/.config/gh, ~/.config/git
-#                        and the ssh agent socket are not bound, GH_TOKEN/GITHUB_TOKEN (and the enterprise ones) are
+#                        and an ssh agent socket under $HOME are hidden, GH_TOKEN/GITHUB_TOKEN (and the enterprise ones) are
 #                        unset, git ignores global and system config and never prompts. Nothing under the cwd is
 #                        writable, so omo cannot back up <cwd>/.omo/omo.jsonc there; omo tolerates that failure.
-# Host paths outside ~/.dori hidden from every lane (e.g. ~/.secrets) are listed one per line in ~/.dori/lane-sandbox-hide
-# ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it. ~/.dori/env and
-# ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
+# $HOME and ~/.dori are bound read-only; what no lane may read is hidden after every read-write bind, so neither the cwd
+# nor a grant can re-expose it: ~/.dori/runner, ~/.ssh and ~/.config (each an empty read-only tmpfs with only the
+# lane's own runner entries, ssh known_hosts and config, and gh, git and the ssh agent socket bound back), the
+# credential stores below (~/.dori/env, secrets and state among them) and every other host path listed one per line in
+# ~/.dori/lane-sandbox-hide ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it.
 set -eu
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
-# through the secret broker); the macOS template and `dori doctor` use the same list. Each one that exists outside
-# ~/.dori is hidden after every bind, like the hide list below; the rest of $HOME is a fresh tmpfs already.
+# through the secret broker); the macOS template and `dori doctor` use the same list. Each one that exists is hidden
+# after every bind, like the hide list below.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
   .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
@@ -105,6 +107,8 @@ chmod 700 "$LT"
 # entries are re-bound read-only and top-level symlinks recreated.
 top=${H#/}
 top=/${top%%/*}
+# $HOME is bound read-only from the host, where bwrap cannot create a mount point: make the ones it needs there now.
+mkdir -p "$H/.dori/heavy" "$H/.dori/runner" "$H/.lane-tmp"
 opts=(--perms 0755 --tmpfs /)
 shopt -s nullglob dotglob
 for e in /*; do
@@ -123,7 +127,8 @@ opts+=(
   --unshare-pid
   --die-with-parent
   --perms 0755 --dir "$(dirname "$H")"
-  --tmpfs "$H"
+  --ro-bind "$H" "$H"
+  --ro-bind "$H/.dori" "$H/.dori"
 )
 # A review lane gets a private /tmp: the host's is shared with every other process.
 if [ "$review" = 1 ]; then opts+=(--tmpfs /tmp); else opts+=(--bind /tmp /tmp); fi
@@ -135,50 +140,11 @@ if [ "$review" = 1 ]; then
   opts+=(--unsetenv SSH_AUTH_SOCK)
 fi
 
-# ~/.dori gets its own tmpfs that is made read-only after the ro binds, so
-# rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env, ~/.dori/secrets and ~/.dori/state stay hidden,
-# since nothing under ~/.dori is bound from the host and no bind below names them. A lane's dori reaches the
-# supervisor only through the runner's lane socket and never opens the state dir.
-# Every rw mount point under it is created here: bwrap cannot mkdir one once it is read-only.
-opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/heavy")
-
-# Read-only re-binds (skipped when missing)
-for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
-  .zshrc .bashrc .profile .gitconfig .ssh/known_hosts .ssh/config .config/gh .config/git \
-  .npmrc .dori/config.json .dori/src .dori/bin; do
-  if [ "$review" = 1 ]; then
-    case "$p" in .gitconfig | .config/gh | .config/git) continue ;; esac
-  fi
-  opts+=(--ro-bind-try "$H/$p" "$H/$p")
-done
 # The real BrowserSkill home (daemon.json and its daemon.sock), read-only: a lane drives bsk directly. A unix socket
 # connect needs no write mount; a lane cannot rewrite daemon.json or bsk's state.
 bsk_home=${BSK_HOME:-$H/.bsk}
 opts+=(--ro-bind-try "$bsk_home" "$bsk_home")
-# The rest of ~/.config (other tools' credentials, herdr's control socket) stays out. The ssh agent socket may live
-# there (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent): that one path is bound on its own.
-if [ "$review" = 0 ]; then
-  case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac
-fi
-# Only the lane socket: the runner's control and cli sockets (sock/control, sock/cli) are not a lane's to dial.
-# The lane socket's own directory is bound, not the socket file: a restarted runner unlinks the socket and binds a
-# new one at the same path, which a bind of the old file would never show (the lane would dial the dead inode).
-opts+=(--dir "$H/.dori/runner/sock" --ro-bind-try "$H/.dori/runner/sock/lane.d" "$H/.dori/runner/sock/lane.d")
-# The lane's own herdr report socket (the runner's sock/herdr.d/<key>, bound as a directory like lane.d): omo's herdr
-# extension reports the agent state through it, and the runner forwards only reports for this lane's own pane to herdr.
-opts+=(--ro-bind-try "$H/.dori/runner/sock/herdr.d/$key" "$H/.dori/runner/sock/herdr.d/$key")
 opts+=(--setenv HERDR_SOCKET_PATH "$H/.dori/runner/sock/herdr.d/$key/herdr")
-# A worker runner host's dori (the lane's `dori report`) lives here; read-only so a lane cannot rewrite what the runner runs.
-opts+=(--ro-bind-try "$H/.dori/runner/bin" "$H/.dori/runner/bin")
-opts+=(--ro-bind-try "$H/.dori/runner/briefs/$key.md" "$H/.dori/runner/briefs/$key.md")
-opts+=(--dir "$H/.dori/runner/briefs/$key.out")
-# The mount point of a lane started without --cwd, whose cwd is ~/.dori/runner/lanes/<key> (bound rw below as the cwd).
-opts+=(--dir "$H/.dori/runner/lanes/$key")
-opts+=(--ro-bind "$H/.dori/runner/briefs/$key.files" "$H/.dori/runner/briefs/$key.files")
-if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then
-  opts+=(--ro-bind-try "$DORI_LANE_TOKEN_FILE" "$DORI_LANE_TOKEN_FILE")
-fi
-opts+=(--remount-ro "$H/.dori")
 
 # ssh rejects root-owned include files inside the user namespace (root shows as
 # nobody): re-provide each /etc/ssh/ssh_config.d file as a user-owned ro copy.
@@ -197,8 +163,7 @@ if [ -n "${LANE_SANDBOX_RO:-}" ]; then
   done
 fi
 
-# Read-write re-binds (after ro ones so nested rw paths win)
-opts+=(--bind "$H/.dori/runner/briefs/$key.out" "$H/.dori/runner/briefs/$key.out")
+# Read-write re-binds (after ro ones so nested rw paths win); briefs/<key>.out is bound with the runner dir below.
 if [ "$review" = 1 ]; then
   # A review lane keeps only omo's own state and caches writable: no package caches, no heavy dir, no grants.
   for p in "$H/.omo" "$H/.cache"; do
@@ -209,7 +174,6 @@ else
     "$H/.cargo/registry" "$H/.cargo/git"; do
     opts+=(--bind-try "$p" "$p")
   done
-  mkdir -p "$H/.dori/heavy"
   opts+=(--bind-try "$H/.dori/heavy" "$H/.dori/heavy")
 fi
 
@@ -247,6 +211,8 @@ C=$(pwd -P)
 broad=0
 gits=()
 case "$C" in / | /home | "$H") broad=1 ;; esac
+# A cwd under the runner dir (a lane started without --cwd: ~/.dori/runner/lanes/<key>) is bound with that dir below.
+runner_cwd=0
 if [ -n "${LANE_SANDBOX_NO_CWD:-}" ]; then
   IFS=: read -r -a nocwd <<<"$LANE_SANDBOX_NO_CWD"
   for p in "${nocwd[@]}"; do
@@ -258,14 +224,15 @@ case "$broad" in
     echo "lane-sandbox: warning: cwd $C is too broad; not binding it rw" >&2
     ;;
   *)
+    case "$C" in "$H/.dori/runner" | "$H/.dori/runner"/*) runner_cwd=1 ;; esac
     if [ "$review" = 1 ]; then
       # The review snapshot and its git common dir, read-only: git log/diff/show work, nothing can be written there.
-      opts+=(--ro-bind "$C" "$C")
+      [ "$runner_cwd" = 1 ] || opts+=(--ro-bind "$C" "$C")
       if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
         opts+=(--ro-bind "$gcd" "$gcd")
       fi
     else
-      opts+=(--bind "$C" "$C")
+      [ "$runner_cwd" = 1 ] || opts+=(--bind "$C" "$C")
       if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
         opts+=(--bind "$gcd" "$gcd")
         gits+=("$gcd")
@@ -304,14 +271,83 @@ for g in ${gits[@]+"${gits[@]}"}; do
   opts+=(--ro-bind-try "$g/hooks" "$g/hooks")
 done
 
-# Hidden host paths last among the binds, so neither the cwd nor LANE_SANDBOX_RW can re-expose one: the credential
-# stores above, then the hide list.
+# Hidden host paths last among the binds, so neither the cwd nor LANE_SANDBOX_RW can re-expose one. First the hidden
+# subtrees: each an empty tmpfs, made read-only once the entries a lane keeps are bound back into it.
+trees=()
+kept=()
+# keep <bind option> <path>: binds <path> back at itself and records it (unless bwrap skips it), for hide_path below.
+keep() {
+  opts+=("$1" "$2" "$2")
+  case "$1" in *-try) [ -e "$2" ] || return 0 ;; esac
+  kept+=("$(readlink -m "$2")")
+}
+# The ssh agent socket may live in a hidden subtree (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent).
+keep_agent() {
+  [ "$review" = 0 ] || return 0
+  case "${SSH_AUTH_SOCK:-}" in "$1"/*) keep --ro-bind-try "$SSH_AUTH_SOCK" ;; esac
+}
+# The runner dir: only this lane's entries. The control and cli sockets (sock/control, sock/cli), the runner's keys and
+# state, and other lanes' briefs and tokens are not a lane's to read. The lane socket's own directory is bound, not the
+# socket file: a restarted runner unlinks the socket and binds a new one at the same path, which a bind of the old file
+# would never show (the lane would dial the dead inode). The lane's own herdr report socket (sock/herdr.d/<key>) is
+# bound the same way: omo's herdr extension reports the agent state through it, and the runner forwards only reports
+# for this lane's own pane to herdr. A worker runner host's dori (the lane's `dori report`) lives in bin.
+R="$H/.dori/runner"
+opts+=(--tmpfs "$R" --dir "$R/sock")
+keep --ro-bind-try "$R/sock/lane.d"
+keep --ro-bind-try "$R/sock/herdr.d/$key"
+keep --ro-bind-try "$R/bin"
+keep --ro-bind-try "$R/briefs/$key.md"
+keep --ro-bind "$R/briefs/$key.files"
+if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then keep --ro-bind-try "$DORI_LANE_TOKEN_FILE"; fi
+# Mount points for the read-write binds below (bwrap cannot mkdir one once the tmpfs is read-only), among them a
+# cwd-less lane's ~/.dori/runner/lanes/<key>.
+opts+=(--dir "$R/briefs/$key.out" --dir "$R/lanes/$key")
+if [ "$runner_cwd" = 1 ]; then opts+=(--dir "$C"); fi
+opts+=(--remount-ro "$R")
+keep --bind "$R/briefs/$key.out"
+if [ "$runner_cwd" = 1 ]; then
+  if [ "$review" = 1 ]; then keep --ro-bind "$C"; else keep --bind "$C"; fi
+fi
+trees+=("$(readlink -f "$R")")
+if [ -d "$H/.ssh" ]; then
+  # No ssh private key is ever readable: a lane gets a key only for one command, through the secret broker.
+  opts+=(--tmpfs "$H/.ssh")
+  keep --ro-bind-try "$H/.ssh/known_hosts"
+  keep --ro-bind-try "$H/.ssh/config"
+  keep_agent "$H/.ssh"
+  opts+=(--remount-ro "$H/.ssh")
+  trees+=("$(readlink -f "$H/.ssh")")
+fi
+if [ -d "$H/.config" ]; then
+  # Other tools' credentials and herdr's control socket stay out; a review lane keeps neither gh nor git.
+  opts+=(--tmpfs "$H/.config")
+  if [ "$review" = 0 ]; then
+    keep --ro-bind-try "$H/.config/gh"
+    keep --ro-bind-try "$H/.config/git"
+  fi
+  keep_agent "$H/.config"
+  opts+=(--remount-ro "$H/.config")
+  trees+=("$(readlink -f "$H/.config")")
+fi
+
+# Then each credential store, the hide list and, in a review lane, the git config and an ssh agent socket under $HOME.
 hide_path() {
   [ -n "$1" ] && [ -e "$1" ] || return 0
-  local r
+  local r t o covered=0
   r=$(readlink -f "$1")
-  # ~/.dori is hidden already, and its read-only tmpfs takes no new mount point.
-  case "$r" in "$H/.dori" | "$H/.dori"/*) return 0 ;; esac
+  # In a hidden subtree only a path at, below or above an entry bound back has a mount point, and only such a path
+  # shows; the rest is hidden with the subtree.
+  for t in ${trees[@]+"${trees[@]}"}; do
+    case "$r" in "$t"/*) covered=1 ;; esac
+  done
+  if [ "$covered" = 1 ]; then
+    for o in ${kept[@]+"${kept[@]}"}; do
+      case "$r/" in "$o"/*) covered=0 ;; esac
+      case "$o" in "$r"/*) covered=0 ;; esac
+    done
+  fi
+  [ "$covered" = 0 ] || return 0
   if [ -d "$r" ]; then
     opts+=(--tmpfs "$r" --remount-ro "$r")
   else
@@ -325,6 +361,10 @@ if [ -f "$H/.dori/lane-sandbox-hide" ]; then
     p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     hide_path "$p"
   done <"$H/.dori/lane-sandbox-hide"
+fi
+if [ "$review" = 1 ]; then
+  hide_path "$H/.gitconfig"
+  case "${SSH_AUTH_SOCK:-}" in "$H"/*) hide_path "$SSH_AUTH_SOCK" ;; esac
 fi
 
 # Private TMPDIR last, so the broad ~/.cache rw bind cannot shadow it
@@ -353,12 +393,14 @@ if [ "$explain" = 1 ]; then
       --tmpfs)
         a=${opts[$((i + 1))]}
         i=$((i + 2))
-        if [ "${opts[$i]:-}" = --remount-ro ] && [ "${opts[$((i + 1))]:-}" = "$a" ]; then
-          echo "hide $a"
-          i=$((i + 2))
-        else
-          echo "empty $a"
+        # A tmpfs made read-only later (other than the root) hides its path; the entries bound back show on later lines.
+        ro=0
+        if [ "$a" != / ]; then
+          for ((j = i; j + 1 < ${#opts[@]}; j++)); do
+            if [ "${opts[$j]}" = --remount-ro ] && [ "${opts[$((j + 1))]}" = "$a" ]; then ro=1 && break; fi
+          done
         fi
+        if [ "$ro" = 1 ]; then echo "hide $a"; else echo "empty $a"; fi
         ;;
       --unshare-pid | --die-with-parent) i=$((i + 1)) ;;
       *) i=$((i + 2)) ;;
