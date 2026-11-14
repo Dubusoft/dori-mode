@@ -28,6 +28,8 @@ export type ReviewBriefInputs = {
   readonly diffPath: string;
   readonly criteriaPath: string;
   readonly prPath: string;
+  /** A re-review: the previous round's findings and the author's answers (`previous.md`). */
+  readonly previousPath?: string;
 };
 
 /** Where the supervisor installs a lane's DORI_LANE_OUT files after its done claim (lane-files.ts installLaneReports). */
@@ -67,6 +69,7 @@ export const reviewBrief = (job: ReviewJob, token: string, inputs: ReviewBriefIn
     `- Diff (merge base...head): ${inputs.diffPath}`,
     `- Review criteria with ids: ${inputs.criteriaPath}`,
     `- PR title and body: ${inputs.prPath}`,
+    ...(inputs.previousPath ? [`- Previous review round and the author's answers: ${inputs.previousPath}`] : []),
     "",
     "## Steps",
     "1. Record the start time: `date -u +%Y-%m-%dT%H:%M:%SZ` (startedAt).",
@@ -80,6 +83,9 @@ export const reviewBrief = (job: ReviewJob, token: string, inputs: ReviewBriefIn
     `   ${job.jobId} of ${s.repo}#${s.prNumber}), the criteria file with its ids, the snapshot path, base and head SHAs, the diff path,`,
     "   your QA matrix, and the ReviewBody contract below. Tell it: write NO files except its body file",
     `   "$DORI_LANE_OUT/${REVIEW_BODY_FILE}", run no command longer than 60 s, and answer with exactly one JSON object.`,
+    ...(inputs.previousPath ? [
+      `   Also give it ${inputs.previousPath} and tell it to re-check each answered finding there and still review the whole diff.`,
+    ] : []),
     "5. Validate the body: exactly one JSON object (no fence, no prose), schemaVersion 1, jobId " + JSON.stringify(job.jobId) + ",",
     "   verdict pass (findings []) or findings (at least one finding), every key of the contract and no other. If it is invalid,",
     "   send the reviewer ONE correction message naming the problem; if it is still invalid, keep its last body as is.",

@@ -83,6 +83,10 @@ export type ReviewJob = {
   readonly authorModel: { readonly id: string };
   readonly tokenHash: string;
   readonly createdAt: number;
+  /** sha256 hex of the author response this job reviews (a re-review after findings). */
+  readonly responseSha256?: string;
+  /** The findings job whose answers this job reviews. */
+  readonly previousJobId?: string;
 };
 
 /** Where a result came from: the gate reviewer, or the review lane's own failing QA (no reviewer ran). */
@@ -459,6 +463,7 @@ const jobProblem = (job: ReviewJob): string | undefined => {
   if (!SHA256.test(job.tokenHash)) return "tokenHash not a 64-hex sha256";
   if (!job.authorModel.id) return "authorModel.id empty";
   if (!Number.isFinite(job.createdAt)) return "createdAt not a number";
+  if (job.responseSha256 !== undefined && !SHA256.test(job.responseSha256)) return "responseSha256 not a 64-hex sha256";
   return snapshotProblem(job.snapshot, "snapshot");
 };
 

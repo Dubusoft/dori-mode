@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { claimGate } from "./ci-follow.ts";
-import { closeLane, type FlowDeps } from "./done-flow.ts";
+import { closeLane, type FlowDeps, objectDone } from "./done-flow.ts";
 import type { OpenPull } from "./github-events.ts";
 import { briefBody } from "./lane-files.ts";
 import { machineRunner } from "./lane-ops.ts";
@@ -20,6 +20,7 @@ import {
   acceptReviewSubmission, isApproval, type ReceiptRejectCode, REVIEWER_CHANNEL, type ReviewErrorCode, type ReviewJob, type ReviewReceipt,
   type ReviewSnapshot, type ReviewSource, snapshotKey,
 } from "./review-receipt.ts";
+import { findingsReasons, MAX_REVIEW_ROUNDS, parseReviewResponse, previousReviewMarkdown, responseFileName } from "./review-response.ts";
 import {
   checkReviewScope, prepareReviewSnapshot, releaseReviewSnapshot, reviewSnapshotPath, type ReleaseResult, type ScopeInput, type ScopeResult,
   type SnapshotInput, type SnapshotResult,
@@ -39,6 +40,10 @@ import { runnerWorktreeRoot } from "./runner/hub.ts";
 export const REVIEW_POLICY_VERSION = "t4-1";
 /** D8: a job queued this long without a start, or running this long without a result, fails with `timeout`. */
 export const REVIEW_TIMEOUT_MS = 20 * 60_000;
+/** Per PR: review runs that may go stale on a head or base change and be scheduled again; one more escalates. */
+export const REVIEW_STALE_RESCHEDULES = 2;
+/** Per PR: time from the first review request after which a needed new job escalates instead. */
+export const REVIEW_TOTAL_MS = 60 * 60_000;
 
 /** Common review criteria; with the author lane's brief (criterion G1) they make the canonical criteria text (D2). */
 export const REVIEW_CRITERIA = [
@@ -118,6 +123,8 @@ export type ReviewGateIo = {
   /** Home whose `.omo/agent/projects` holds the trusted senpi-task records. */
   readonly home: string;
   readonly randomHex: (bytes: number) => string;
+  /** Puts the author lane in `not-done` with `reasons` and tells it (runner notice and pane steering: objectDone). */
+  readonly objectAuthor: (lane: Lane, reasons: readonly string[]) => Promise<void>;
 };
 
 const ghJson = async (deps: FlowDeps, argv: readonly string[]): Promise<string> => {
@@ -162,6 +169,7 @@ export const defaultReviewGateIo = (deps: FlowDeps): ReviewGateIo => ({
   repoDir: (author) => (author.machine ? undefined : author.cwd),
   home: homedir(),
   randomHex: (bytes) => randomBytes(bytes).toString("hex"),
+  objectAuthor: async (lane, reasons) => { await objectDone(deps, lane, reasons); },
 });
 
 export type ReviewEmit = (id: string, line: string) => void;
@@ -182,13 +190,48 @@ export type EnsureResult =
   | { readonly kind: "running"; readonly jobId: string }
   | { readonly kind: "completed"; readonly jobId: string; readonly verdict: "pass" | "findings" }
   | { readonly kind: "failed"; readonly jobId: string; readonly code: ReviewErrorCode; readonly detail: string }
-  | { readonly kind: "escalated"; readonly jobId: string; readonly reason: string };
+  | { readonly kind: "escalated"; readonly jobId: string; readonly reason: string }
+  /** The PR's last review ended in findings and the claiming lane has no valid answer yet: it was objected. */
+  | { readonly kind: "awaiting-response"; readonly jobId: string; readonly why: string };
 
 export type BaseRaceResult =
   | { readonly raced: false; readonly why: string }
   | { readonly raced: true; readonly approvedBaseSha: string; readonly mergedOntoSha: string };
 
 const LIVE = new Set(["queued", "running", "completed"]);
+
+/** What a PR used of its review limits, over every record of that repo#PR (any author lane, claim or reopen). */
+export type PrBudget = { readonly findingsRounds: number; readonly staleReschedules: number; readonly firstRequestAt?: number };
+
+/**
+ * The PR's review budget: rounds that ended in findings (a findings record made stale by the fix push still counts),
+ * runs that went stale without a findings receipt (re-scheduled on a head or base change), and the first request time.
+ */
+export const prBudget = (records: readonly ReviewJobRecord[]): PrBudget => {
+  const created = records.map((r) => r.job.createdAt);
+  return {
+    findingsRounds: records.filter((r) => r.receipt?.result.verdict === "findings").length,
+    staleReschedules: records.filter((r) => r.execution.state === "stale" && (!r.receipt || r.receipt.result.verdict === "pass")).length,
+    ...(created.length ? { firstRequestAt: Math.min(...created) } : {}),
+  };
+};
+
+/** Why the PR may get no more automatic review jobs, else undefined. */
+export const capReason = (budget: PrBudget, now: number): string | undefined => {
+  if (budget.findingsRounds >= MAX_REVIEW_ROUNDS) return `${budget.findingsRounds} review rounds ended with findings (limit ${MAX_REVIEW_ROUNDS})`;
+  if (budget.staleReschedules > REVIEW_STALE_RESCHEDULES) {
+    return `${budget.staleReschedules} review runs went stale on head or base changes (limit ${REVIEW_STALE_RESCHEDULES} re-schedules)`;
+  }
+  if (budget.firstRequestAt !== undefined && now - budget.firstRequestAt >= REVIEW_TOTAL_MS) {
+    return `no approval within ${REVIEW_TOTAL_MS / 60_000} min of the first review request`;
+  }
+  return undefined;
+};
+
+/** The author's answer to the PR's last findings review, as {@link ReviewGate.ensureJob} reads it. */
+type Answer =
+  | { readonly ok: true; readonly prior: ReviewJobRecord; readonly receipt: ReviewReceipt; readonly text: string; readonly sha256: string }
+  | { readonly ok: false; readonly prior: ReviewJobRecord; readonly receipt: ReviewReceipt; readonly problem: string };
 
 /** D4: the claimed PRs of `lane` in `pull`'s repo with a lower number, lowest first (candidates that go before `pull`). */
 export const reviewPredecessors = (lane: Lane, pull: Pick<OpenPull, "repo" | "number">): { readonly repo: string; readonly number: number }[] =>
@@ -318,6 +361,8 @@ export class ReviewGate {
    * D3-D5: makes sure a review job runs for the observed snapshot. The caller has checked green and mergeGate "merge";
    * claimGate is re-checked here. Marks older snapshots stale, respects the D4 order, never adds a second job for a key
    * (a queued one is launched again: the HOLD retry), retries once after an error and escalates a second error.
+   * After a findings review the claiming lane must answer it (else `awaiting-response` and one objection); an answer gets
+   * a new job (also at the same head when all findings are disputed). Past a per-PR limit ({@link capReason}) it escalates.
    */
   async ensureJob(lane: Lane, pull: ReviewPull & { readonly sha: string }, observed: ObservedReview, emit: ReviewEmit): Promise<EnsureResult> {
     await this.ready;
@@ -327,12 +372,88 @@ export class ReviewGate {
     const turn = await this.reviewTurn(lane, pull, observed.snapshot.baseRef);
     if (!turn.ok) return { kind: "waiting", why: turn.why };
     const key = snapshotKey(observed.snapshot);
+    const pr = this.recordsOf(pull.repo, pull.number);
+    const capped = pr.find((r) => r.capReached);
+    if (capped?.capReached) return { kind: "escalated", jobId: capped.job.jobId, reason: capped.capReached.reason };
+    const answer = this.answerOf(lane, pr, observed);
+    if (answer && !answer.ok) {
+      const reason = capReason(prBudget(pr), this.now());
+      if (reason) return this.capEscalate(pr, reason, emit);
+      const id = answer.prior.job.jobId;
+      await this.io.objectAuthor(lane, [`review ${id} of ${pull.repo}#${pull.number} is waiting for your answer: ${answer.problem}`, ...findingsReasons(answer.receipt)]);
+      return { kind: "awaiting-response", jobId: id, why: answer.problem };
+    }
+    const digest = answer?.ok ? answer.sha256 : undefined;
     const records = this.jobs.byKey(key);
-    const live = records.find((r) => LIVE.has(r.execution.state));
+    // Without an answer to give, any live record of the key continues (a pass of a re-review included).
+    const live = records.filter((r) => LIVE.has(r.execution.state) && (answer === undefined || r.job.responseSha256 === digest)).at(-1);
     if (live) return this.continueLive(live, lane, emit);
-    const blocked = this.escalation(records, emit);
+    const round = prBudget(pr).findingsRounds + 1;
+    const ofRound = records.filter((r) => r.job.round === round);
+    const blocked = this.escalation(ofRound, emit);
     if (blocked) return blocked;
-    return this.startJob(lane, pull, observed, records.length + 1, emit);
+    const reason = capReason(prBudget(pr), this.now());
+    if (reason) return this.capEscalate(pr, reason, emit);
+    return this.startJob(lane, pull, observed, ofRound.length + 1, round, answer?.ok ? answer : undefined, emit);
+  }
+
+  /**
+   * The claiming lane's answer to the PR's newest receipt when that receipt is findings (undefined otherwise): read from
+   * `review-response-<jobId>.json` in the lane's reports. A fixed finding needs a new head; an answer this snapshot
+   * already had reviewed is refused.
+   */
+  private answerOf(lane: Lane, pr: readonly ReviewJobRecord[], observed: ObservedReview): Answer | undefined {
+    const prior = pr.filter((r) => r.receipt).at(-1);
+    const receipt = prior?.receipt;
+    if (!prior || !receipt || receipt.result.verdict !== "findings") return undefined;
+    const refuse = (problem: string): Answer => ({ ok: false, prior, receipt, problem });
+    const file = responseFileName(prior.job.jobId);
+    const text = this.io.readText(join(this.io.outDir(lane.key), file));
+    if (text === undefined) return refuse(`no ${file} in the lane's reports`);
+    const parsed = parseReviewResponse(text, prior.job.jobId, receipt.result.findings);
+    if (!parsed.ok) return refuse(parsed.detail);
+    const sameHead = prior.job.snapshot.headSha === observed.snapshot.headSha;
+    if (sameHead && !parsed.allDisputed) return refuse("a fixed finding needs a new head: push the fix, or mark the finding disputed");
+    const key = snapshotKey(observed.snapshot);
+    if (sameHead && pr.some((r) => r.key === key && r.receipt && r.job.responseSha256 === parsed.sha256)) {
+      return refuse("this answer was already reviewed; write a new answer or push a fix");
+    }
+    return { ok: true, prior, receipt, text, sha256: parsed.sha256 };
+  }
+
+  /** A per-PR limit is reached: marks the PR's newest record and emits REVIEW_ESCALATED once; the lead decides. */
+  private capEscalate(pr: readonly ReviewJobRecord[], reason: string, emit: ReviewEmit): EnsureResult {
+    const capped = pr.find((r) => r.capReached);
+    if (capped?.capReached) return { kind: "escalated", jobId: capped.job.jobId, reason: capped.capReached.reason };
+    const newest = pr.at(-1)!, now = this.now(), s = newest.job.snapshot;
+    const next = annotate(this.jobs, now, newest.job.jobId, { capReached: { reason, at: now } });
+    emit(`review-cap:${s.repo}#${s.prNumber}`, line("REVIEW_ESCALATED", next, `head=${short(s.headSha)} ${reason}; automatic review stops for this PR and the lead decides ${prUrl(s.repo, s.prNumber)}`));
+    return { kind: "escalated", jobId: next.job.jobId, reason };
+  }
+
+  /**
+   * Goal 1: hands a completed findings receipt to its author lane once (objectDone), recorded as `authorNotified`. A
+   * findings round that reaches the PR's limit escalates to the lead instead. A gone or closed author is only recorded
+   * (a lane claiming the PR later gets the findings through ensureJob); an author whose objection already names the
+   * receipt (a crash before the record) is not objected again.
+   */
+  private async deliverFindings(r: ReviewJobRecord, emit: ReviewEmit): Promise<void> {
+    const receipt = r.receipt;
+    if (r.execution.state !== "completed" || !receipt || receipt.result.verdict !== "findings" || r.authorNotified) return;
+    const s = r.job.snapshot;
+    const author = await this.deps.registry.read(r.job.authorLaneKey);
+    if (!author || statusOf(author) === "closed") {
+      annotate(this.jobs, this.now(), r.job.jobId, { authorNotified: { at: this.now(), laneKey: r.job.authorLaneKey } });
+      return;
+    }
+    const pr = this.recordsOf(s.repo, s.prNumber);
+    if (pr.some((j) => j.capReached)) return;
+    const reason = capReason(prBudget(pr), this.now());
+    if (reason) { this.capEscalate(pr, reason, emit); return; }
+    if (!(author.objection?.reasons ?? []).some((x) => x.includes(receipt.receiptId))) {
+      await this.io.objectAuthor(author, findingsReasons(receipt));
+    }
+    annotate(this.jobs, this.now(), r.job.jobId, { authorNotified: { at: this.now(), laneKey: r.job.authorLaneKey } });
   }
 
   private continueLive(r: ReviewJobRecord, author: Lane, emit: ReviewEmit): Promise<EnsureResult> | EnsureResult {
@@ -369,15 +490,19 @@ export class ReviewGate {
     }
   }
 
-  private async startJob(lane: Lane, pull: ReviewPull & { readonly sha: string }, observed: ObservedReview, attempt: number, emit: ReviewEmit): Promise<EnsureResult> {
+  private async startJob(
+    lane: Lane, pull: ReviewPull & { readonly sha: string }, observed: ObservedReview, attempt: number, round: number,
+    answer: Extract<Answer, { ok: true }> | undefined, emit: ReviewEmit,
+  ): Promise<EnsureResult> {
     const io = this.io, s = observed.snapshot, now = this.now();
     const token = io.randomHex(32);
     const reviewerLaneKey = await this.reviewerKey(s.repo, s.prNumber, s.headSha);
     if (!LANE_KEY.test(reviewerLaneKey)) return { kind: "refused", why: `reviewer lane key ${reviewerLaneKey} is not a valid lane key` };
     const job: ReviewJob = {
       jobId: `rv-${repoName(s.repo)}-${s.prNumber}-${short(s.headSha)}-${io.randomHex(3)}`,
-      snapshot: s, authorLaneKey: lane.key, reviewerLaneKey, round: 1, diffSha256: sha256(""),
+      snapshot: s, authorLaneKey: lane.key, reviewerLaneKey, round, diffSha256: sha256(""),
       authorModel: { id: lane.model || this.deps.config.defaultModel }, tokenHash: sha256(token), createdAt: now,
+      ...(answer ? { responseSha256: answer.sha256, previousJobId: answer.prior.job.jobId } : {}),
     };
     // The diff is read before the job is recorded, so its digest is part of the job.
     const repoDir = io.repoDir(lane);
@@ -391,7 +516,7 @@ export class ReviewGate {
     const broken = (detail: string): EnsureResult => {
       const failed = fail(this.jobs, this.now(), id, "input_unavailable", detail);
       emit(`review-failed:${id}`, line("REVIEW_FAILED", failed, `code=input_unavailable attempt=${attempt}: ${oneLine(detail)}`));
-      return this.escalation(this.jobs.byKey(record.key), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail };
+      return this.escalation(this.jobs.byKey(record.key).filter((j) => j.job.round === record.job.round), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail };
     };
     const root = io.worktreeRoot();
     if (!root) return broken("worktreeRoot is not set");
@@ -409,9 +534,11 @@ export class ReviewGate {
     writeFileSync(diffPath, diff);
     writeFileSync(criteriaPath, observed.criteria);
     writeFileSync(prPath, `# ${observed.title}\n\n${observed.body}\n`);
+    const previousPath = answer ? join(inputDir, "previous.md") : undefined;
+    if (answer && previousPath) writeFileSync(previousPath, previousReviewMarkdown(answer.receipt, answer.text));
     mkdirSync(join(stateDir, "briefs"), { recursive: true });
     writeFileSync(this.briefPath(reviewerLaneKey), reviewBrief(record.job, token, {
-      url: observed.url, title: observed.title, snapshotPath: snap.path, inputDir, diffPath, criteriaPath, prPath,
+      url: observed.url, title: observed.title, snapshotPath: snap.path, inputDir, diffPath, criteriaPath, prPath, ...(previousPath ? { previousPath } : {}),
     }));
     return this.launchQueued(this.jobs.get(id) ?? record, lane, emit);
   }
@@ -450,7 +577,7 @@ export class ReviewGate {
     const failed = fail(this.jobs, this.now(), id, "input_unavailable", `launch refused: ${result.detail}`);
     emit(`review-failed:${id}`, line("REVIEW_FAILED", failed, `code=input_unavailable: launch refused: ${oneLine(result.detail)}`));
     await this.release(failed);
-    return this.escalation(this.jobs.byKey(r.key), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail: result.detail };
+    return this.escalation(this.jobs.byKey(r.key).filter((j) => j.job.round === r.job.round), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail: result.detail };
   }
 
   private started(r: ReviewJobRecord, emit: ReviewEmit): EnsureResult {
@@ -478,6 +605,12 @@ export class ReviewGate {
     for (const r of this.jobs.list({ states: ["queued", "running"] })) {
       try { await this.tickJob(r, emit); } catch (e) {
         console.error(`REVIEW_GATE_ERROR ${r.job.jobId} ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    for (const r of this.jobs.list({ states: ["completed"] })) {
+      if (r.receipt?.result.verdict !== "findings" || r.authorNotified) continue;
+      try { await this.deliverFindings(r, emit); } catch (e) {
+        console.error(`REVIEW_GATE_ERROR ${r.job.jobId} findings delivery: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
     for (const lane of (await this.deps.registry.open()).filter((l) => l.review && statusOf(l) !== "closed")) {
@@ -525,7 +658,7 @@ export class ReviewGate {
     if (r.execution.state !== "error") return;
     const attempt = this.jobs.byKey(r.key).filter((j) => j.job.createdAt <= r.job.createdAt).length;
     emit(`review-failed:${r.job.jobId}`, line("REVIEW_FAILED", r, `code=${r.execution.code} attempt=${attempt}: ${oneLine(r.execution.detail)}`));
-    this.escalation(this.jobs.byKey(r.key), emit);
+    this.escalation(this.jobs.byKey(r.key).filter((j) => j.job.round === r.job.round), emit);
   }
 
   /** D7: takes a claimed review lane's result in. Always ends with the reviewer closed and the snapshot released. */
@@ -593,6 +726,10 @@ export class ReviewGate {
       emit(`review-passed:${id}`, line("REVIEW_PASSED", done, `reviewer=${lane.key} receipt=${receipt.receiptId} head=${short(receipt.headSha)} base=${receipt.baseRef}@${short(receipt.baseSha)} ${url}`));
     } else {
       emit(`review-findings:${id}`, line("REVIEW_FINDINGS", done, `findings=${receipt.result.findings.length} source=${receipt.source} receipt=${receipt.receiptId} head=${short(receipt.headSha)} report=${receipt.reportArtifact} ${url}`));
+      // A failed delivery is retried by the next tick; the reviewer is closed either way.
+      try { await this.deliverFindings(done, emit); } catch (e) {
+        console.error(`REVIEW_GATE_ERROR ${id} findings delivery: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
     await this.closeReviewer(lane, done, `review ${id} ${receipt.result.verdict}`, true);
   }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  complete, enqueue, escalate, fail, markRunning, markStale, recoverAfterRestart, ReviewJobError, ReviewJobs, type ReviewJobErrorCode,
+  complete, enqueue, escalate, executionKey, fail, markRunning, markStale, recoverAfterRestart, ReviewJobError, ReviewJobs, type ReviewJobErrorCode,
 } from "../src/review-jobs.ts";
 import { snapshotKey, type ReviewJob, type ReviewReceipt, type ReviewSnapshot } from "../src/review-receipt.ts";
 
@@ -77,6 +77,24 @@ describe("review jobs", () => {
     markRunning(new ReviewJobs(dir), 3, "j1", "lane");
     expect(enqueue(new ReviewJobs(dir), 4, job("j3")).record.job.jobId).toBe("j1");
     expect(new ReviewJobs(dir).list()).toHaveLength(1);
+  });
+
+  test("the same snapshot with another response digest is a new execution; the same digest dedupes", () => {
+    const store = new ReviewJobs(dir);
+    const first = job("j1");
+    enqueue(store, 1, first);
+    markRunning(store, 2, "j1", "lane-1");
+    complete(store, 3, "j1", receiptFor(first));
+    expect(executionKey(first)).toBe(`${snapshotKey(first.snapshot)}+`);
+    const answered = { ...job("j2"), responseSha256: "1".repeat(64), previousJobId: "j1" };
+    const second = enqueue(store, 4, answered);
+    expect(second.created).toBe(true);
+    expect(second.record.key).toBe(snapshotKey(first.snapshot));
+    const again = enqueue(new ReviewJobs(dir), 5, { ...job("j3"), responseSha256: "1".repeat(64) });
+    expect(again).toMatchObject({ created: false, record: { job: { jobId: "j2" } } });
+    expect(enqueue(store, 6, job("j4")).record.job.jobId).toBe("j1");
+    expect(enqueue(store, 7, { ...job("j5"), responseSha256: "2".repeat(64) }).created).toBe(true);
+    expect(store.list().map((r) => r.job.jobId)).toEqual(["j1", "j2", "j5"]);
   });
 
   test("enqueue is allowed again after stale or error", () => {
