@@ -20,10 +20,12 @@
 # the runner's worktree root and the .git directories of the repos under its repos root,
 # the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
-# devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
-# its own brief and token), and ~/.dori/env, ~/.dori/secrets, ~/.ssh private keys and the credential stores in CREDENTIALS below
-# (cloud, kube, gpg, docker, git and registry logins, keyrings, browser profiles, shell history) are refused outright. Of ~/.config only gh and git
-# are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
+# devices. ~/.dori is readable but for targeted refusals that come after every grant: ~/.dori/runner (but the runner's
+# lane socket and bin and the lane's own brief, files, out dir, token and lanes/<key>, re-opened after it) and the
+# credential stores in CREDENTIALS below (~/.dori/env, secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube,
+# gpg, docker, git and registry logins, keyrings, browser profiles, shell history). ~/.ssh is refused but for config,
+# known_hosts and *.pub. Of ~/.config only gh and git are readable. A unix socket connect is not a file read to
+# Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
 # Host paths outside ~/.dori listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
@@ -96,15 +98,17 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" d_rules="" g_rules="" h_rules="" a_rules="" k_rules="" gcd broad kc rr
+  local n=0 p w_rules="" r_rules="" o_rules="" d_rules="" g_rules="" h_rules="" a_rules="" k_rules="" gcd broad kc rr
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   # The paths --explain lists, each as resolved for its parameter (LAST is the last one param resolved).
-  XW=() XR=() XHOOKS=() XCRED=() XHIDE=() XREPOS=
+  XW=() XR=() XO=() XHOOKS=() XCRED=() XHIDE=() XREPOS=
   param() { LAST=$(canon "$2"); PARAMS+=(-D "$1=$LAST"); }
   param_raw() { PARAMS+=(-D "$1=$2"); }
   w() { param "W$n" "$1"; XW+=("$LAST"); w_rules="$w_rules (subpath (param \"W$n\"))"; n=$((n + 1)); }
   r() { param "R$n" "$1"; XR+=("$LAST"); r_rules="$r_rules (subpath (param \"R$n\"))"; n=$((n + 1)); }
+  # o PATH: one of the lane's own entries under ~/.dori/runner, readable again after the runner refusal.
+  o() { param "O$n" "$1"; XO+=("$LAST"); o_rules="$o_rules (subpath (param \"O$n\"))"; n=$((n + 1)); }
 
   w "$LT"
   for p in "$H/.omo" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
@@ -160,27 +164,30 @@ build_profile() {
     fi
   fi
 
-  for p in .dori/config.json .dori/src .dori/bin .dori/heavy .dori/runner/sock/lane.d .dori/runner/bin "runner-brief"; do
-    case "$p" in runner-brief) r "$H/.dori/runner/briefs/$key.md" ;; *) r "$H/$p" ;; esac
-  done
-  if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then r "$DORI_LANE_TOKEN_FILE"; fi
-  r "$H/.dori/runner/briefs/$key.files"
-  r "$H/.dori/runner/briefs/$key.out"
+  o "$H/.dori/runner/sock/lane.d"
+  o "$H/.dori/runner/bin"
+  o "$H/.dori/runner/briefs/$key.md"
+  if [ -n "${DORI_LANE_TOKEN_FILE:-}" ]; then o "$DORI_LANE_TOKEN_FILE"; fi
+  o "$H/.dori/runner/briefs/$key.files"
+  o "$H/.dori/runner/briefs/$key.out"
   w "$H/.dori/runner/briefs/$key.out"
   # A lane started without --cwd works in ~/.dori/runner/lanes/<key>: readable here, writable as the cwd above.
-  if [ -n "$key" ]; then r "$H/.dori/runner/lanes/$key"; fi
+  if [ -n "$key" ]; then o "$H/.dori/runner/lanes/$key"; fi
   split_paths "${LANE_SANDBOX_RO:-}"
   for p in ${SPLIT[@]+"${SPLIT[@]}"}; do
     if [ -n "$p" ]; then r "$p"; fi
   done
 
   param DORI "$H/.dori"
-  XDORI=$LAST
   param DORI_RUNNER "$H/.dori/runner"
   param DORI_BRIEFS "$H/.dori/runner/briefs"
+  XDORI_RUNNER=$(canon "$H/.dori/runner")
   param DORI_LANES "$H/.dori/runner/lanes"
-  param DORI_ENV "$H/.dori/env"
-  XDORI_ENV=$LAST
+  param SSH "$H/.ssh"
+  XSSH=$LAST
+  param_raw SSH_PUB "^$(re_escape "$XSSH")/[^/]+[.]pub\$"
+  param SSH_CONFIG "$H/.ssh/config"
+  param SSH_KNOWN_HOSTS "$H/.ssh/known_hosts"
   param DORI_SECRETS "$H/.dori/secrets"
   XDORI_SECRETS=$LAST
   param DOCKER_HOME "$H/.docker/run/docker.sock"
@@ -229,11 +236,14 @@ build_profile() {
     done <"$H/.dori/lane-sandbox-hide"
   fi
 
-  # Later rules win over earlier ones in SBPL.
+  # Later rules win over earlier ones in SBPL, so every read refusal comes after the read grants (LANE_SANDBOX_RO): a
+  # grant never re-opens ~/.dori/runner, ~/.ssh, a credential store or ~/.config. Only the lane's own runner entries are
+  # re-opened after the runner refusal.
   # realpath() of a directory opens it, and omo resolves every parent of its cwd: a cwd-less lane's parents are
-  # ~/.dori/runner/lanes, ~/.dori/runner and ~/.dori. Each gets file-read-data on the directory itself (the names of its
-  # entries), never on anything under it: ~/.dori/env and the other lanes' files stay refused. /bin/ps is setuid root, and a
-  # sandboxed process cannot exec a setuid binary, so ps alone runs outside the profile; it writes nothing.
+  # ~/.dori/runner/lanes, ~/.dori/runner and ~/.dori (readable as a whole). The two under the runner get file-read-data
+  # on the directory itself (the names of its entries), never on anything under it: the other lanes' files stay refused.
+  # /bin/ps is setuid root, and a sandboxed process cannot exec a setuid binary, so ps alone runs outside the profile;
+  # it writes nothing.
   PROFILE="(version 1)
 (allow default)
 (deny file-write*)
@@ -242,13 +252,16 @@ $g_rules
 (allow file-write* (literal (param \"KEYCHAIN\")) (regex (param \"KEYCHAIN_TMP\")))
 (allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/ttys[0-9]+\$\") (regex #\"^/dev/fd/[0-9]+\$\"))
 $d_rules
-(deny file-read* (subpath (param \"DORI\")))
 (allow file-read*$r_rules)
-(allow file-read-metadata (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")) (literal (param \"DORI_LANES\")))
-(allow file-read-data (literal (param \"DORI\")) (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_LANES\")))
 (allow process-exec (literal \"/bin/ps\") (with no-sandbox))
-(deny file-read* (literal (param \"DORI_ENV\")) (regex #\"/\\.ssh/id_[^/.]+\$\"))
+(deny file-read* (subpath (param \"DORI_RUNNER\")))
+(allow file-read*$o_rules)
+(allow file-read-metadata (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")) (literal (param \"DORI_LANES\")))
+(allow file-read-data (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_LANES\")))
 (deny file-read*$c_rules)
+(deny file-read* (subpath (param \"SSH\")))
+(allow file-read-metadata (literal (param \"SSH\")))
+(allow file-read* (literal (param \"SSH_CONFIG\")) (literal (param \"SSH_KNOWN_HOSTS\")) (regex (param \"SSH_PUB\")))
 (deny file-read* (subpath (param \"CONFIG\")))
 (allow file-read* (subpath (param \"CONFIG_GH\")) (subpath (param \"CONFIG_GIT\")))
 (deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))
@@ -264,11 +277,10 @@ $h_rules
 }
 
 # The --explain table of the profile build_profile made, in the profile's own order so a later line wins as a later rule
-# does: ~/.dori refused, its exceptions readable, the writable paths, then the refusals that come after them.
+# does: the read grants, the writable paths, then the refusals that come after them and what each re-opens.
 explain_profile() {
-  local p
+  local p q m
   echo "# lane-sandbox --explain (seatbelt) for lane $key in $C: reads are allowed and writes refused outside these lines; a later line wins at and below its path"
-  echo "hide $XDORI"
   for p in ${XR[@]+"${XR[@]}"}; do echo "ro $p"; done
   for p in ${XW[@]+"${XW[@]}"}; do echo "rw $p"; done
   echo "rw $XKEYCHAIN"
@@ -277,9 +289,21 @@ explain_profile() {
     echo "ro $XREPOS/*/.git/hooks"
   fi
   for p in ${XHOOKS[@]+"${XHOOKS[@]}"}; do echo "ro $p"; done
-  echo "hide $XDORI_ENV"
-  echo "hide $H/.ssh/id_*"
+  # The runner refusal is a read refusal: the lane's own entries the profile also makes writable (its out dir, a
+  # cwd-less lane's cwd) are rw again.
+  echo "hide $XDORI_RUNNER"
+  for p in ${XO[@]+"${XO[@]}"}; do
+    m=ro
+    for q in ${XW[@]+"${XW[@]}"}; do
+      if [ "$q" = "$p" ]; then m=rw; fi
+    done
+    echo "$m $p"
+  done
   for p in ${XCRED[@]+"${XCRED[@]}"}; do echo "hide $p"; done
+  echo "hide $XSSH"
+  echo "ro $XSSH/config"
+  echo "ro $XSSH/known_hosts"
+  echo "ro $XSSH/*.pub"
   echo "hide $XCONFIG"
   echo "ro $XCONFIG_GH"
   echo "ro $XCONFIG_GIT"
