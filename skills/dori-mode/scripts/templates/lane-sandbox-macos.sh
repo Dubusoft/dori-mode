@@ -22,7 +22,7 @@
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
 # devices. Reads of ~/.dori are refused except what a lane needs (config, dori itself, the runner's lane socket and bin,
 # its own brief and token), and ~/.dori/env, ~/.dori/secrets, ~/.ssh private keys and the credential stores in CREDENTIALS below
-# (cloud, kube, gpg, docker and git logins) are refused outright. Of ~/.config only gh and git
+# (cloud, kube, gpg, docker, git and registry logins, keyrings, browser profiles, shell history) are refused outright. Of ~/.config only gh and git
 # are readable. A unix socket connect is not a file read to Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
@@ -39,10 +39,22 @@ if [ -n "${LANE_SANDBOX_PROFILE:-}" ]; then
   exit 2
 fi
 
-# Credential stores under $HOME no lane reads, files and directories alike (a lane gets a credential only through the
-# secret broker). ~/.config is refused already, but for gh and git.
-CREDENTIALS=".aws .azure .oci .gnupg .password-store .kube .docker/config.json .netrc .git-credentials .vault-token
-  .terraform.d/credentials.tfrc.json .pypirc .cargo/credentials .cargo/credentials.toml"
+# Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
+# through the secret broker); the Linux template and `dori doctor` use the same list. ~/.config is refused already, but
+# for gh and git.
+# BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
+CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
+  .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
+  .terraform.d/credentials.tfrc.json .vault-token .docker/config.json .config/containers/auth.json .gnupg
+  .password-store .local/share/keyrings .local/share/gnome-keyring .local/share/kwalletd .config/age .age
+  .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
+  .cargo/credentials .cargo/credentials.toml .gem/credentials .m2/settings.xml .gradle/gradle.properties
+  .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
+  .local/share/toodo-server .mozilla .config/google-chrome .config/chromium .config/BraveSoftware
+  .config/microsoft-edge .config/discord .config/Slack .config/Signal .local/share/TelegramDesktop
+  .config/Code/User/globalStorage .vscode .vscode-server .bash_history .zsh_history .python_history .psql_history
+  .mysql_history .lesshst"
+# END CREDENTIALS
 
 SBX=/usr/bin/sandbox-exec
 # macOS's own OpenSSL-format root bundle (what curl and git use by default).

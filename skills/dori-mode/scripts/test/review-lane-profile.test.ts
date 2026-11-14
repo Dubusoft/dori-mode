@@ -86,8 +86,11 @@ test("review profile: only briefs/<key>.out, ~/.omo, ~/.cache and the private TM
   // Read-only: the snapshot and its common dir (git log/diff/show), the worktree root, the repo .git, the RO grant.
   const ro = r.argv.flatMap((a, i) => (a === "--ro-bind" || a === "--ro-bind-try" ? [r.argv[i + 2] ?? ""] : []));
   for (const p of [f.snap, f.gitDir, f.worktrees, f.grantRo]) expect(ro).toContain(p);
-  // No credential: gh and git config, git credentials and the ssh agent socket are not in the argv at all.
-  for (const p of [".config/gh", ".config/git", ".gitconfig", ".git-credentials", ".config/herdr/agent"]) expect(r.argv).not.toContain(join(f.home, p));
+  // No credential: gh and git config and the ssh agent socket are not in the argv at all; git credentials only as the
+  // target of the /dev/null bind that hides the shared credential list.
+  for (const p of [".config/gh", ".config/git", ".gitconfig", ".config/herdr/agent"]) expect(r.argv).not.toContain(join(f.home, p));
+  const creds = join(f.home, ".git-credentials");
+  expect(r.argv.flatMap((a, i) => (a === creds ? [r.argv.slice(i - 2, i + 1).join(" ")] : []))).toEqual([`--ro-bind /dev/null ${creds}`]);
   expect(pairs(r.argv, "--setenv")).toEqual(expect.arrayContaining(["GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"]));
   expect(singles(r.argv, "--unsetenv")).toEqual(expect.arrayContaining(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK"]));
   expect(singles(r.argv, "--tmpfs")).toContain("/tmp");
