@@ -418,10 +418,23 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   for (const no of [join(home, "probe"), join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "state", "x"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {
     expect({ no, write: write(no) }).toEqual({ no, write: false });
   }
-  for (const ok of [token, join(runner, "briefs", "lane-a.md"), join(runner, "bin", "dori"), join(home, ".dori", "config.json"), join(home, ".dori", "src", "cli.ts"), join(home, ".ssh", "id_ed25519.pub"), join(home, ".ssh", "known_hosts"), "/etc/hosts", join(wt, "README.md")]) {
+  for (const ok of [token, join(runner, "briefs", "lane-a.md"), join(runner, "bin", "dori"), join(runner, "sock", "lane.d", "lane"), join(home, ".dori", "config.json"), join(home, ".dori", "src", "cli.ts"), join(home, ".dori", "research", "ap-1-1", "report.md"), join(home, ".dori", "lead", "notes.md"), join(home, ".dori", "heavy", "x"), join(home, ".ssh", "id_ed25519.pub"), join(home, ".ssh", "known_hosts"), join(home, ".ssh", "config"), "/etc/hosts", join(wt, "README.md")]) {
     expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
   }
-  for (const no of [join(home, ".dori", "env"), join(home, ".dori", "state", "runners.sqlite"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key")]) {
+  for (const no of [join(home, ".dori", "env"), join(home, ".dori", "env", "x"), join(home, ".dori", "secrets", "NPM_TOKEN.cred"), join(home, ".dori", "lane-sandbox-hide"), join(home, ".dori", "gateway-locks", "x"), join(home, ".dori", "state", "runners.sqlite"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "github_deploy"), join(home, ".ssh", "keys", "work.pem"), join(home, ".ssh", "config.d", "x"), join(home, ".ssh", "x.pub", "y"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key"), join(runner, "state.sqlite"), join(runner, "runner.json")]) {
+    expect({ no, read: read(no) }).toEqual({ no, read: false });
+  }
+});
+
+test("macOS: a read grant never re-opens ~/.dori/runner, ~/.ssh or a credential store: their refusals come after every grant", async () => {
+  const { home, runner, wt, token } = macHome();
+  const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token, LANE_SANDBOX_RO: [join(home, ".dori"), join(home, ".ssh"), join(home, ".aws"), join(home, ".config")].join(":") });
+  const read = (p: string) => allows(sb, "file-read-data", p);
+
+  for (const ok of [join(home, ".dori", "research", "x"), token, join(home, ".ssh", "known_hosts"), join(home, ".config", "gh", "config.yml")]) {
+    expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
+  }
+  for (const no of [join(home, ".dori", "env"), join(home, ".dori", "secrets", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "lane-sandbox-hide"), join(home, ".dori", "gateway-locks", "x"), join(runner, "briefs", "lane-b.1.token"), join(runner, "keys", "runner.key"), join(home, ".ssh", "id_ed25519"), join(home, ".aws", "credentials"), join(home, ".config", "herdr", "config.toml")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
 });
@@ -786,7 +799,7 @@ test("macOS: --explain lists every path the profile names, each with the access 
   const rows = explainRows(explained.out).map((l) => ({ mode: l.slice(0, l.indexOf(" ")), path: l.slice(l.indexOf(" ") + 1) }));
 
   // Every path parameter the profile's file rules use is a row (sockets, /dev and the keychain's temp copies are not paths).
-  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|CRED|HIDE)\d+$|^(DORI|DORI_ENV|DORI_SECRETS|CONFIG|CONFIG_GH|CONFIG_GIT|HOOKS|KEYCHAIN)$/.test(k)).map(([, v]) => v);
+  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|O|CRED|HIDE)\d+$|^(DORI_RUNNER|DORI_SECRETS|CONFIG|CONFIG_GH|CONFIG_GIT|HOOKS|KEYCHAIN|SSH|SSH_CONFIG|SSH_KNOWN_HOSTS)$/.test(k)).map(([, v]) => v);
   expect(named.filter((p) => !rows.some((r) => r.path === p))).toEqual([]);
   expect(sb.params.REPOS_GIT).toBeDefined();
   expect(rows).toContainEqual({ mode: "rw", path: `${repos}/*/.git` });
@@ -797,8 +810,9 @@ test("macOS: --explain lists every path the profile names, each with the access 
   const kc = sb.params.KEYCHAIN;
   for (const row of rows) {
     const at = row.path.replace(/\*/g, "app");
-    // ~/.dori itself may be listed (omo resolves a cwd-less lane's parents); the keychain and ssh keys are single files.
-    const probes = row.path === sb.params.DORI ? [join(at, "x")] : row.path === kc || row.path.endsWith("/id_*") ? [at] : [at, join(at, "x")];
+    // ~/.dori/runner itself may be listed (omo resolves a cwd-less lane's parents); the keychain and the readable ssh
+    // files are single files.
+    const probes = row.path === sb.params.DORI_RUNNER ? [join(at, "x")] : row.path === kc || row.path.startsWith(`${sb.params.SSH}/`) ? [at] : [at, join(at, "x")];
     for (const p of probes) {
       const mode = verdict(p);
       const got = { p, read: allows(sb, "file-read-data", p), write: allows(sb, "file-write-data", p) };
