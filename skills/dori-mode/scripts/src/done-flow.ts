@@ -774,6 +774,25 @@ const cleanupQueue = (lane: Lane): CleanupQueue => {
   };
 };
 
+/** Whether a closed lane's close queued cleanup the sweep has still to do (a worktree not yet removed, a branch not settled). */
+const cleanupPending = (deps: FlowDeps, lane: Lane): boolean => {
+  if (statusOf(lane) !== "closed") return false;
+  const queue = cleanupQueue(lane);
+  if (queue.branches.some((b) => !b.settled)) return true;
+  const root = lane.machine ? cleanupRoot(deps, lane) : "";
+  return queue.worktrees.some((w) => !w.removed && (!lane.machine || under(root, w.path)));
+};
+
+/**
+ * The watcher's memory, between passes, of closed lanes whose queued cleanup is still to do: `keys` are swept on every
+ * pass, also one that skips the archive, so a close's queue is worked off on the next pass instead of the next archive
+ * walk. `open` is the previous pass's open keys: a key gone from it was closed since (by this watcher or `dori close`).
+ * The queue itself is durable (`receipt.queue`); this is only an index, rebuilt by every archive pass, and a supervisor
+ * starts with an archive pass, so a restart loses nothing.
+ */
+export type PendingCleanup = { open?: ReadonlySet<string>; readonly keys: Set<string> };
+export const newPendingCleanup = (): PendingCleanup => ({ keys: new Set() });
+
 /** A branch keep no later pass can change: the branch is protected, or it moved off the merged head it was bound to. */
 const FINAL_KEEP = /^protected|is not the merged head|at another commit than the merged head|moved off the merged head/;
 
@@ -1119,11 +1138,14 @@ const windowStart = async (deps: FlowDeps, lane: Lane, claim: NonNullable<Lane["
 /**
  * One pass over every lane. With `emit`, each line is handed over the moment it exists (the supervisor enqueues it
  * durably); the lines are also returned. One lane's failure is a LANE_WATCH_WARN line and never stops the others.
- * `archived: false` skips the closed lanes in the archive (their worktree cleanup), so a pass reads open lanes only.
+ * `archived: false` skips the closed lanes in the archive (their worktree cleanup), so a pass reads open lanes only,
+ * plus, with `pending`, the closed lanes whose queued cleanup is still to do (PendingCleanup), each read by key.
  * A lane whose machine is not `admitted` (its runner has no admitted connection) is skipped without a line, and so is a
  * lane whose runner dropped its connection during the pass: the supervisor's RUNNER_UNAVAILABLE line reports that outage.
  */
-export const watchTick = async (deps: FlowDeps, emit?: Emit, archived = true, admitted: (machine?: string) => boolean = () => true): Promise<string[]> => {
+export const watchTick = async (
+  deps: FlowDeps, emit?: Emit, archived = true, admitted: (machine?: string) => boolean = () => true, pending?: PendingCleanup,
+): Promise<string[]> => {
   const out: string[] = [];
   const push: Emit = async (line, id, meta) => {
     if (emit) await (meta ? emit(line, id, meta) : emit(line, id));
@@ -1134,10 +1156,29 @@ export const watchTick = async (deps: FlowDeps, emit?: Emit, archived = true, ad
   } catch (e) {
     await push(`LANE_WATCH_WARN operations ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200)}`);
   }
-  for (const listed of archived ? await deps.registry.list() : await deps.registry.open()) {
+  let lanes = archived ? await deps.registry.list() : await deps.registry.open();
+  if (pending) {
+    const openKeys = new Set(lanes.filter((l) => statusOf(l) !== "closed").map((l) => l.key));
+    if (!archived) {
+      const closedSince = [...(pending.open ?? [])].filter((k) => !openKeys.has(k));
+      const keys = [...new Set([...pending.keys, ...closedSince])].filter((k) => !openKeys.has(k));
+      const read = await Promise.all(keys.map((k) => deps.registry.read(k)));
+      lanes = [...lanes, ...read.filter((l): l is Lane => l !== null && cleanupPending(deps, l))];
+      for (const k of keys) if (!lanes.some((l) => l.key === k)) pending.keys.delete(k);
+    }
+    pending.open = openKeys;
+  }
+  for (const listed of lanes) {
+    const queued = pending !== undefined && cleanupPending(deps, listed);
+    if (queued) pending.keys.add(listed.key);
     if (!admitted(listed.machine)) continue;
     try {
       await watchLane(deps, listed, push);
+      // Only a lane that had queued cleanup can settle it; the pass's copy is stale, so the registry is read again.
+      if (queued) {
+        const after = await deps.registry.read(listed.key);
+        if (!after || !cleanupPending(deps, after)) pending.keys.delete(listed.key);
+      }
     } catch (e) {
       if ((e as { code?: unknown } | null)?.code === "RUNNER_UNAVAILABLE" && !admitted(listed.machine)) continue;
       await push(`LANE_WATCH_WARN ${listed.key} ${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200)}`);

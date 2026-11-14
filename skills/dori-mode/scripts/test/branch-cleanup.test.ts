@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { closeLane, watchTick } from "../src/done-flow.ts";
+import { closeLane, newPendingCleanup, watchTick } from "../src/done-flow.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { run as realRun, type Runner } from "../src/run.ts";
@@ -171,6 +171,42 @@ test("a queued worktree that is dirty or holds a commit no remote has stays, and
   expect(existsSync(wt)).toBe(true);
   expect(await localTip()).not.toBe(mergedHead);
   expect(world.ops.filter((e) => e.op === "git")).toEqual([]);
+});
+
+/** One watcher pass that skips the archive (the supervisor's passes between two archive walks). */
+const quickPass = (pending: ReturnType<typeof newPendingCleanup>) => watchTick(deps(), undefined, false, () => true, pending);
+
+test("a lane closed between passes has its queued worktree and branch cleaned by the next pass that skips the archive", async () => {
+  const pending = newPendingCleanup();
+  expect(await quickPass(pending)).toEqual([]);
+  expect((await closeLane(deps(), lane(), "manual")).closed).toBe(true);
+  expect(await quickPass(pending)).toEqual([
+    `WORKTREE_CLEANED demo-lane ${wt}`,
+    `BRANCH_CLEANED demo-lane remote branch origin/feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)}); branch feat-x deleted (acme/app#7 merged head ${mergedHead.slice(0, 10)})`,
+  ]);
+  expect(existsSync(wt)).toBe(false);
+  expect(await localTip()).toBeUndefined();
+  expect(pending.keys.size).toBe(0);
+  expect(await quickPass(pending)).toEqual([]);
+});
+
+test("queued cleanup still to do survives a supervisor restart: its first archive pass picks it up and later quick passes finish it", async () => {
+  const before = newPendingCleanup();
+  await quickPass(before);
+  expect((await closeLane(deps(), lane(), "manual")).closed).toBe(true);
+  writeFileSync(join(wt, "scratch"), "x");
+  expect(await quickPass(before)).toEqual([]);
+  expect([...before.keys]).toEqual(["demo-lane"]);
+  // Restart: the watcher's memory is gone; the queue in the receipt is not.
+  const after = newPendingCleanup();
+  expect(await quickPass(after)).toEqual([]);
+  expect(await watchTick(deps(), undefined, true, () => true, after)).toEqual([]);
+  expect([...after.keys]).toEqual(["demo-lane"]);
+  expect(existsSync(wt)).toBe(true);
+  rmSync(join(wt, "scratch"));
+  expect((await quickPass(after))[0]).toBe(`WORKTREE_CLEANED demo-lane ${wt}`);
+  expect(existsSync(wt)).toBe(false);
+  expect(after.keys.size).toBe(0);
 });
 
 test("a local lane's queued worktree outside the worktree root is still removed: the close found and checked it as the lane's", async () => {

@@ -88,6 +88,7 @@ test("dori watch suppresses repeated warnings per lane and reason until they cle
       laneActRefusal: () => undefined,
       laneSendRefusal: () => undefined,
       laneMeta: () => ({}),
+      newPendingCleanup: () => ({ keys: new Set() }),
       objectDone: async () => "",
       watchTick: async () => results[tick++] ?? [],
     }));
