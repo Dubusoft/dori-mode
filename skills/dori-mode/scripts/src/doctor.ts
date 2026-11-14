@@ -125,8 +125,11 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
   return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh), exposed];
 };
 
-/** Bound into every lane on purpose: gh drives PRs, and npm reads its registry settings. */
-export const INTENDED = new Set([".config/gh", ".npmrc"]);
+/**
+ * Bound into every lane on purpose: npm reads its registry settings. gh's config dir is bound too, but its login file
+ * hosts.yml is hidden (CREDENTIAL_DENY): gh gets GH_TOKEN from the secret broker.
+ */
+export const INTENDED = new Set([".npmrc"]);
 /**
  * Paths under $HOME the exposure probe checks: the credential stores the lane sandbox templates hide (CREDENTIAL_DENY)
  * and the ones bound on purpose. ~/.ssh private keys (id_*) are added from the host's ~/.ssh.

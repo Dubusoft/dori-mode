@@ -29,7 +29,7 @@ export const CREDENTIAL_DENY: readonly string[] = [
   // git hosts and package registries
   ".git-credentials", ".netrc", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml", ".gem/credentials", ".m2/settings.xml",
   ".gradle/gradle.properties", ".config/composer/auth.json", ".yarnrc", ".yarnrc.yml", ".pnpmrc", ".config/pnpm/auth.ini", ".config/glab-cli",
-  ".nuget/NuGet",
+  ".nuget/NuGet", ".config/gh/hosts.yml",
   // toodo's server tokens
   ".local/share/toodo-server",
   // browser and chat app profiles
