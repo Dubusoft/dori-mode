@@ -114,7 +114,11 @@ export const resolvePlacement = (input: PlacementInput, placement: PlacementConf
 };
 
 /** `freeSlots`: lanes the pane limit still allows; absent when the limit is off or the pane count is unknown. */
-export type MachineCheck = { readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number };
+export type MachineCheck = {
+  readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number;
+  /** Admission inputs from the same observation; absent for an unobservable or offline machine. */
+  readonly paneCap?: number; readonly paneCount?: number; readonly paneIds?: readonly string[];
+};
 
 const freeSlots = (panes: number, t: GuardThresholds): { freeSlots?: number } =>
   t.panesMax > 0 && panes >= 0 ? { freeSlots: Math.max(0, t.panesMax - panes) } : {};
@@ -167,14 +171,20 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
     return { machine, verdict: { ok: false, reasons: [unobservable(machine, error)] }, summary: "" };
   }
   const s = seen.sample;
-  if (machine === LOCAL_MACHINE) return { machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard) };
+  if (machine === LOCAL_MACHINE) return {
+    machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard),
+    paneCap: config.guard.panesMax, paneCount: s.panes, paneIds: seen.panes.map((p) => p.pane_id),
+  };
   const panes = s.panes >= 0 ? seen.panes.length : -1;
   const result: SampleResult = {
     ok: true,
     sample: { os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
   };
   const guard: GuardThresholds = { ...config.guard, ...seen.guard };
-  return { machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes), ...freeSlots(panes, guard) };
+  return {
+    machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes), ...freeSlots(panes, guard),
+    paneCap: guard.panesMax, paneCount: panes, paneIds: seen.panes.map((p) => p.pane_id),
+  };
 };
 
 /** Local keeps the legacy `CAN_LAUNCH` / `HOLD <reasons>`; a remote line names its machine. */

@@ -157,7 +157,7 @@ export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry"
   }, () => ({ readable: false })),
   hosts: async (taskIds) => {
     const { defaultMachine } = flow.config.placement;
-    const probe = (machine: string) => within(PROBE_MS, async () => hostSummary(await checkMachine(flow.ops, flow.config, machine)), (why): HostSummary => ({ ok: false, reason: why }));
+    const probe = (machine: string) => within(PROBE_MS, async () => hostSummary(await checkMachine(flow.ops, flow.config, machine), flow.config.stateDir, flow.clock.now()), (why): HostSummary => ({ ok: false, reason: why }));
     try {
       const found = await machineHosts(flow, taskIds.map(() => ({ done: "" })), probe);
       return { defaultMachine, machines: found.machines, targets: new Map(taskIds.map((id, i) => [id, found.targets[i]!])) };
@@ -235,7 +235,7 @@ export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number
   if (!ids.length) return { paused, slots: null, verdicts: [] };
   const [openLanes, quota, found] = await Promise.all([deps.openLanes(), deps.quota(), deps.hosts(ids)]);
   const ledger = ledgerRows(deps.store);
-  const hosts = slotted(found, pendingReservations(ledger, openLanes, found.defaultMachine));
+  const hosts = slotted(found, pendingReservations(ledger, new Set([...openLanes, ...[...found.machines.values()].flatMap((h) => h.reservedKeys ?? [])]), found.defaultMachine));
   const verdicts = judgeAll({ tasks, ledger, openLanes, quota, hosts, config: deps.config }, ids);
   const { over, room } = quotaSplit(quota);
   return {
@@ -277,7 +277,7 @@ export const reserveAutopilot = async (deps: AutopilotDeps, taskId: number): Pro
   if (!read) return 1;
   const ledger = ledgerRows(deps.store);
   const [openLanes, quota, found] = await Promise.all([deps.openLanes(), deps.quota(), deps.hosts(read.ids)]);
-  const hosts = slotted(found, pendingReservations(ledger, openLanes, found.defaultMachine, taskId));
+  const hosts = slotted(found, pendingReservations(ledger, new Set([...openLanes, ...[...found.machines.values()].flatMap((h) => h.reservedKeys ?? [])]), found.defaultMachine, taskId));
   const verdict = judgeAll({ tasks: read.tasks, ledger, openLanes, quota, hosts, config: deps.config }, read.ids)
     .find((v) => v.taskId === taskId)!;
   if (verdict.verdict !== "LAUNCH") {

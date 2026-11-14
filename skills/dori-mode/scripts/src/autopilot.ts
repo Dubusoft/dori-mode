@@ -289,7 +289,11 @@ export const quotaAccountText = (a: QuotaAccount): string => `${a.name} (${a.max
  * One machine's `dori can-launch` verdict; `slots` is how many more lanes its pane limit allows (absent when the pane
  * limit is off, so nothing caps the count).
  */
-export type HostSummary = { readonly ok: boolean; readonly reason?: string; readonly slots?: number };
+export type HostSummary = {
+  readonly ok: boolean; readonly reason?: string; readonly slots?: number;
+  /** Keys already charged to slots by shared admission, so autopilot does not charge them again. */
+  readonly reservedKeys?: readonly string[];
+};
 
 /**
  * The machines the judged tasks would launch on: each one's summary (its slots already less the reservations waiting

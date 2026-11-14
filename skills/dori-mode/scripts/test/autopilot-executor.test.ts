@@ -211,6 +211,29 @@ test("HOLD keeps its queue and reservation, then resumes under the same lane key
   expect(ledgerRows(store)).toHaveLength(1);
 });
 
+test("binding admission HOLD after a successful placement stays held and resumes instead of failing", async () => {
+  const h = harness(), deps = h.fresh();
+  const result = await runExecutor({
+    ...deps, admit: async (input, placed) => {
+      expect(placed.plan.check.verdict.ok).toBe(true);
+      const verdict = { ok: false, reasons: ["review reserve 1 on machine local: author slots 0"] };
+      const queue = enqueueLaunch(dir, { ...input, mode: undefined, queuedAt: new Date(T0).toISOString(), reasons: verdict.reasons });
+      return { kind: "held", target: placed.target, verdict, queued: queue.length };
+    },
+  }, [12]);
+  expect(result).toEqual([{ taskId: 12, laneKey: KEY, kind: "held" }]);
+  expect(ledgerRows(store)[0]?.state).toBe("planned");
+  expect(row("execute").state).toBe("planned");
+  expect(h.calls.blocker).toBe(0);
+  expect(h.notices.size).toBe(0);
+  // A restart after the queue write but before the operation result also retains the HOLD outcome.
+  store.put({ ...row("admit"), state: "attempted" });
+  expect((await reconcileExecutions(h.fresh(freshStore())))[0]?.kind).toBe("launched");
+  expect(launchQueue(dir)).toEqual([]);
+  expect(h.calls.launch).toBe(1);
+  expect(h.calls.blocker).toBe(0);
+});
+
 test("a held key launched by hand is never admitted again", async () => {
   const h = harness(); h.held(true);
   await runExecutor(h.fresh(), [12]);
