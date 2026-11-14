@@ -219,6 +219,18 @@ it); the runner-directory safety check audits each `lanes/<key>` directory itsel
 A key that cannot name a directory is refused `cwd-missing`. The lane sandbox (Linux and macOS) lets such a lane read
 and write its own directory; update the wrapper (`dori runner update`) on a host that still has an older one.
 
+### Review lane profile
+
+A `lane.start` with `agentProfile: "review"` (the local policy's `agents.review`, the same argv as `agents.sandboxed`)
+always runs sandboxed: the runner runs `sandboxCheck` first even without `sandbox: true`, refuses it on a PowerShell pane
+(`RUNNER_LANE_REVIEW_UNSANDBOXED`), and launches it with `LANE_SANDBOX_PROFILE=review` and without `LANE_SANDBOX_REPOS`,
+`LANE_SANDBOX_WORKTREES` and `LANE_SANDBOX_RW`. The Linux wrapper then binds the cwd (the review snapshot worktree), its
+git common dir, the worktree root and the repos' `.git` read-only, ignores write grants, gives `/tmp` a private tmpfs
+and leaves only `briefs/<key>.out`, the lane TMPDIR, `~/.omo` and `~/.cache` writable; `~/.gitconfig`, `~/.config/gh`,
+`~/.config/git` and the ssh agent socket are not bound, GitHub tokens are unset and git reads no global or system
+config. Any other non-empty `LANE_SANDBOX_PROFILE` exits 2, and the macOS wrapper refuses every profile (review lanes run
+on Linux only). `lane-sandbox --explain` names the profile in its header.
+
 ### Path grants
 
 The owner keeps a named table of narrow paths in runner-config.json `grants`; the lead picks names from it per lane

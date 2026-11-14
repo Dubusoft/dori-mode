@@ -13,6 +13,14 @@
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
 #                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
+#   LANE_SANDBOX_PROFILE empty (the default above) or "review"; any other value exits 2. A review lane reads a locked
+#                        snapshot worktree and writes only its findings: the cwd, its git common dir, the worktree root
+#                        and each repo's .git are bound read-only, LANE_SANDBOX_RW is ignored (LANE_SANDBOX_RO kept), and
+#                        the only writable host paths are briefs/<key>.out, the private TMPDIR, ~/.omo and ~/.cache (/tmp
+#                        is a private tmpfs). No git or gh credentials reach it: ~/.gitconfig, ~/.config/gh, ~/.config/git
+#                        and the ssh agent socket are not bound, GH_TOKEN/GITHUB_TOKEN (and the enterprise ones) are
+#                        unset, git ignores global and system config and never prompts. Nothing under the cwd is
+#                        writable, so omo cannot back up <cwd>/.omo/omo.jsonc there; omo tolerates that failure.
 # Host paths outside ~/.dori hidden from every lane (e.g. ~/.secrets) are listed one per line in ~/.dori/lane-sandbox-hide
 # ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it. ~/.dori/env and
 # ~/.dori/secrets are hidden without that file: ~/.dori is a fresh tmpfs, so neither is ever bound.
@@ -42,6 +50,21 @@ fi
 
 if [ "$#" -eq 0 ] && [ "$explain" = 0 ]; then
   echo "usage: lane-sandbox <cmd> [args...] | --check | --explain" >&2
+  exit 2
+fi
+
+# Fail closed: an unknown profile, or a review lane with no lane key (which would pass through unsandboxed), runs nothing.
+profile=${LANE_SANDBOX_PROFILE:-}
+case "$profile" in
+  "") review=0 ;;
+  review) review=1 ;;
+  *)
+    echo "lane-sandbox: unknown LANE_SANDBOX_PROFILE '$profile' (expected empty or review)" >&2
+    exit 2
+    ;;
+esac
+if [ "$review" = 1 ] && [ -z "${DORI_LANE_KEY:-}" ]; then
+  echo "lane-sandbox: LANE_SANDBOX_PROFILE=review needs DORI_LANE_KEY; refusing to run unsandboxed" >&2
   exit 2
 fi
 
@@ -84,9 +107,16 @@ opts+=(
   --die-with-parent
   --perms 0755 --dir "$(dirname "$H")"
   --tmpfs "$H"
-  --bind /tmp /tmp
-  --setenv LANE_SANDBOX_ACTIVE 1
 )
+# A review lane gets a private /tmp: the host's is shared with every other process.
+if [ "$review" = 1 ]; then opts+=(--tmpfs /tmp); else opts+=(--bind /tmp /tmp); fi
+opts+=(--setenv LANE_SANDBOX_ACTIVE 1)
+# A review lane carries no git or gh credentials: no global/system git config, no prompt, no token.
+if [ "$review" = 1 ]; then
+  opts+=(--setenv GIT_TERMINAL_PROMPT 0 --setenv GIT_CONFIG_GLOBAL /dev/null --setenv GIT_CONFIG_NOSYSTEM 1)
+  opts+=(--unsetenv GH_TOKEN --unsetenv GITHUB_TOKEN --unsetenv GH_ENTERPRISE_TOKEN --unsetenv GITHUB_ENTERPRISE_TOKEN)
+  opts+=(--unsetenv SSH_AUTH_SOCK)
+fi
 
 # ~/.dori gets its own tmpfs that is made read-only after the ro binds, so
 # rm/creates directly in it fail with EROFS (not EBUSY); ~/.dori/env, ~/.dori/secrets and ~/.dori/state stay hidden,
@@ -99,6 +129,9 @@ opts+=(--tmpfs "$H/.dori" --dir "$H/.dori/heavy")
 for p in .local/bin .bun .npm-global .pyenv .cargo .rustup .fzf .oh-my-zsh \
   .zshrc .bashrc .profile .gitconfig .ssh/known_hosts .ssh/config .config/gh .config/git \
   .npmrc .dori/config.json .dori/src .dori/bin; do
+  if [ "$review" = 1 ]; then
+    case "$p" in .gitconfig | .config/gh | .config/git) continue ;; esac
+  fi
   opts+=(--ro-bind-try "$H/$p" "$H/$p")
 done
 # The real BrowserSkill home (daemon.json and its daemon.sock), read-only: a lane drives bsk directly. A unix socket
@@ -107,7 +140,9 @@ bsk_home=${BSK_HOME:-$H/.bsk}
 opts+=(--ro-bind-try "$bsk_home" "$bsk_home")
 # The rest of ~/.config (other tools' credentials, herdr's control socket) stays out. The ssh agent socket may live
 # there (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent): that one path is bound on its own.
-case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac
+if [ "$review" = 0 ]; then
+  case "${SSH_AUTH_SOCK:-}" in "$H"/*) opts+=(--ro-bind-try "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK") ;; esac
+fi
 # Only the lane socket: the runner's control and cli sockets (sock/control, sock/cli) are not a lane's to dial.
 # The lane socket's own directory is bound, not the socket file: a restarted runner unlinks the socket and binds a
 # new one at the same path, which a bind of the old file would never show (the lane would dial the dead inode).
@@ -147,14 +182,21 @@ fi
 
 # Read-write re-binds (after ro ones so nested rw paths win)
 opts+=(--bind "$H/.dori/runner/briefs/$key.out" "$H/.dori/runner/briefs/$key.out")
-for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
-  "$H/.cargo/registry" "$H/.cargo/git"; do
-  opts+=(--bind-try "$p" "$p")
-done
-mkdir -p "$H/.dori/heavy"
-opts+=(--bind-try "$H/.dori/heavy" "$H/.dori/heavy")
+if [ "$review" = 1 ]; then
+  # A review lane keeps only omo's own state and caches writable: no package caches, no heavy dir, no grants.
+  for p in "$H/.omo" "$H/.cache"; do
+    opts+=(--bind-try "$p" "$p")
+  done
+else
+  for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
+    "$H/.cargo/registry" "$H/.cargo/git"; do
+    opts+=(--bind-try "$p" "$p")
+  done
+  mkdir -p "$H/.dori/heavy"
+  opts+=(--bind-try "$H/.dori/heavy" "$H/.dori/heavy")
+fi
 
-if [ -n "${LANE_SANDBOX_RW:-}" ]; then
+if [ "$review" = 0 ] && [ -n "${LANE_SANDBOX_RW:-}" ]; then
   IFS=: read -r -a extra <<<"$LANE_SANDBOX_RW"
   for p in "${extra[@]}"; do
     [ -n "$p" ] && opts+=(--bind-try "$p" "$p")
@@ -199,10 +241,18 @@ case "$broad" in
     echo "lane-sandbox: warning: cwd $C is too broad; not binding it rw" >&2
     ;;
   *)
-    opts+=(--bind "$C" "$C")
-    if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
-      opts+=(--bind "$gcd" "$gcd")
-      gits+=("$gcd")
+    if [ "$review" = 1 ]; then
+      # The review snapshot and its git common dir, read-only: git log/diff/show work, nothing can be written there.
+      opts+=(--ro-bind "$C" "$C")
+      if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
+        opts+=(--ro-bind "$gcd" "$gcd")
+      fi
+    else
+      opts+=(--bind "$C" "$C")
+      if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
+        opts+=(--bind "$gcd" "$gcd")
+        gits+=("$gcd")
+      fi
     fi
     ;;
 esac
@@ -211,13 +261,20 @@ opts+=(--chdir "$C")
 # A lane started without --cwd makes its worktree from a repo under the repos root into the worktree root: the worktree
 # root and each repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>) are writable; the repos root itself and each
 # repo's working tree stay read-only.
+# A review lane gets both read-only (it may read neighbor code, never write another worktree or a repo's refs).
 if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then
-  opts+=(--bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+  if [ "$review" = 1 ]; then
+    opts+=(--ro-bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+  else
+    opts+=(--bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+  fi
 fi
 if [ -n "${LANE_SANDBOX_REPOS:-}" ]; then
   shopt -s nullglob
   for g in "${LANE_SANDBOX_REPOS%/}"/*/.git; do
-    if [ -d "$g" ]; then
+    if [ -d "$g" ] && [ "$review" = 1 ]; then
+      opts+=(--ro-bind "$g" "$g")
+    elif [ -d "$g" ]; then
       opts+=(--bind "$g" "$g")
       gits+=("$g")
     fi
@@ -254,7 +311,7 @@ opts+=(--remount-ro /)
 
 # --explain: the table is read off the very argv bwrap would get, so it cannot drift from the mounts.
 if [ "$explain" = 1 ]; then
-  echo "# lane-sandbox --explain (bwrap) for lane $key in $C: a later line wins at and below its path"
+  echo "# lane-sandbox --explain (bwrap) for lane $key in $C${profile:+ (profile $profile)}: a later line wins at and below its path"
   i=0
   while [ "$i" -lt "${#opts[@]}" ]; do
     o=${opts[$i]}

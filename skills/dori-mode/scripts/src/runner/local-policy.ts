@@ -13,6 +13,8 @@ import { BUILT_IN } from "../tunables.ts";
  *   `--model` or `--thinking` flag), its `{model}` and `{prompt}` slots left for the runner to fill.
  * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that. A lane writes its results
  *   only to its own `DORI_LANE_OUT`; no lead directory (such as `<leadCwd>/state/verify`) is made writable for it.
+ * - `agents.review`: the same argv as `agents.sandboxed`; the runner starts it with `LANE_SANDBOX_PROFILE=review`, so
+ *   the wrapper binds the snapshot worktree read-only and drops git and gh credentials (lanes.ts, lane-sandbox.sh).
  * - `sandboxCheck`: `<laneSandbox.command> --check`, so a sandboxed start on a host where the wrapper cannot sandbox is
  *   refused `sandbox-unavailable` before its pane opens. `sandbox` stays `optional`: lanes recorded unsandboxed must keep
  *   recovering, and the lead decides which new lanes need a sandbox.
@@ -37,7 +39,7 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
   const roots = [env.home ?? homedir(), env.tmp ?? tmpdir(), dirname(cfg.leadCwd), worktreeRoot]
     .filter((r): r is string => typeof r === "string" && r !== "");
   return {
-    agents: { default: lane, sandboxed: [...sandbox, ...lane] },
+    agents: { default: lane, sandboxed: [...sandbox, ...lane], review: [...sandbox, ...lane] },
     allowedRoots: [...new Set(roots)],
     sandbox: "optional",
     sandboxCheck: [...sandbox, "--check"],
