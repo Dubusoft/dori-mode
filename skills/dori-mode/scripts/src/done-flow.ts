@@ -56,6 +56,12 @@ export type FlowDeps = {
    * not complete (task-finish.ts taskBlocker). Absent, the failure line goes to the lead with nothing written.
    */
   readonly blockTask?: TaskBlocker;
+  /**
+   * D11 close hold (review-gate.ts ReviewGate.holdsLane): true while a review of a PR the lane's claim binds is pending,
+   * so the watcher neither closes nor objects to the lane (nor queues its worktrees), past closeAfterMin and
+   * mergeWaitMaxMin too, until every bound PR reads merged. Absent (`dori watch`), nothing is held.
+   */
+  readonly reviewHold?: (lane: Lane) => Promise<boolean>;
 };
 
 /**
@@ -985,6 +991,8 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   let lane = listed;
   let claim = lane.claim;
   if (statusOf(lane) !== "done-claimed" || !claim) return;
+  // A review lane's claim is the review gate's to take in and close (D7); the done watcher never settles it.
+  if (lane.review) return;
   const machine = machineClose(lane);
   if (!claim.emitted) {
     // Enqueued before the emitted mark is saved: a crash in between repeats the announcement instead of losing it
@@ -1005,6 +1013,8 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
     if (!merged) return;
     evidence = `${claim.evidence} (closed at once: ${merged})`;
   }
+  // D11: a pending review holds the lane open (no close, objection or worktree cleanup) until every bound PR is merged.
+  if (deps.reviewHold && (await deps.reviewHold(lane)) && "why" in (await laneMerges(deps, lane))) return;
   const settled = await settle(deps, lane, evidence, start ?? deps.clock.now());
   if (settled === undefined) return;
   const line = settled.line;

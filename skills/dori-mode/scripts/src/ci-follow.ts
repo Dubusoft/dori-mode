@@ -17,6 +17,7 @@ import { decisionDeliveryRefusal } from "./owner-decisions.ts";
 import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
+import type { ReviewGate } from "./review-gate.ts";
 import { canLaunch } from "./routing.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { parseSignal, splitDone } from "./signals.ts";
@@ -25,11 +26,14 @@ import { parseSignal, splitDone } from "./signals.ts";
  * CI follow-up for lane PRs (design 4.5, item 1.4). After each GitHub poll, for every open PR that
  * belongs to an open lane (its Done signal names the PR, or a lane worktree has the PR's branch):
  * - checks failing at the head SHA: a lane message with an ID, delivered safely (deliverLaneMessages);
- * - checks green and mergeable into `ciMergeBase`: the supervisor merges it (`--match-head-commit`, never `--admin`,
- *   never into main) and reads the merge SHA back;
+ * - checks green and mergeable into `ciMergeBase`, claimed at its head: the supervisor merges it only with a reviewer
+ *   `pass` receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
+ *   only while the base it re-reads right before merging is the approved base (`--match-head-commit`, never `--admin`,
+ *   never into main); it reads the merge SHA back and reports a merge that landed on another base (REVIEW_BASE_RACE);
  * - conflicting: while the PR's own lane is live (laneDown) it gets one lane message asking it to rebase, and no merge
- *   lane starts; once that lane is closed, paused or dead, a new merge lane (its own detached worktree) resolves, waits
- *   for green and merges; when none can be launched, the lead hears CI_CONFLICT.
+ *   lane starts; once that lane is closed, paused or dead, a new merge lane (its own detached worktree) resolves, pushes
+ *   and claims done at the pushed head; the supervisor reviews and merges it like any lane PR (the merge lane's claim
+ *   stands in for the owner's). When none can be launched, the lead hears CI_CONFLICT.
  * - a lane bound to a GitHub issue (Lane.ghIssue): once its PR is confirmed merged into `ciMergeBase`, the issue is
  *   closed with a comment (a `close-issue` operation planned while the PR is open, so a closed lane still settles it).
  * - a merged PR of an open lane that the supervisor did not merge itself: its merge is read back once (a `merge-verify`
@@ -43,6 +47,9 @@ import { parseSignal, splitDone } from "./signals.ts";
  */
 
 export type CiEmit = (id: string, line: string) => void;
+
+/** The review gate's part in a merge (design D3, D9, D10). Required: nothing approves a merge by default. */
+export type CiReview = Pick<ReviewGate, "observeSnapshot" | "approval" | "ensureJob" | "recordBaseRace">;
 
 export type MergeLaneRequest = {
   readonly key: string;
@@ -340,7 +347,10 @@ export class CiFollowUp {
   /** The delivery pass in progress: the GitHub poll's and the supervisor's own pass never run at once. */
   private delivering: Promise<void> = Promise.resolve();
 
-  constructor(private readonly deps: FlowDeps, private readonly io: CiIo = defaultCiIo, stores?: { readonly ops: OperationStore; readonly messages: LaneMessageStore }) {
+  constructor(
+    private readonly deps: FlowDeps, private readonly review: CiReview, private readonly io: CiIo = defaultCiIo,
+    stores?: { readonly ops: OperationStore; readonly messages: LaneMessageStore },
+  ) {
     this.ops = stores?.ops ?? deps.operations ?? openOperations(deps.config);
     this.messages = stores?.messages ?? openLaneMessages(deps.config);
   }
@@ -393,7 +403,9 @@ export class CiFollowUp {
     const failing = new Set<string>();
     this.rebasing = new Set();
     this.stalledNow = new Set();
-    for (const pull of pulls) {
+    // Lowest number first (D4): a claim's PRs into one base are reviewed and merged one at a time, in order.
+    const ordered = [...pulls].sort((a, b) => a.repo.toLowerCase().localeCompare(b.repo.toLowerCase()) || a.number - b.number);
+    for (const pull of ordered) {
       const lane = owner.get(`${pull.repo.toLowerCase()}#${pull.number}`);
       if (!lane) continue;
       try {
@@ -536,6 +548,8 @@ export class CiFollowUp {
       return observedMerge(view);
     };
     let op = await this.settle(spec, readBack);
+    // The lane whose claim (and review) the merge rests on: the owner, or the merge lane standing in for it (D12).
+    let claimant = lane;
     if (op?.state === "ambiguous") return;
     if (op?.state === "failed" && op.attempts >= MERGE_ATTEMPTS) {
       emit(`ci-merge-failed:${op.id}`, `OPERATION_FAILED ${op.id} merge refused ${op.attempts} times: ${op.detail}; merge ${pull.url} by hand or fix it`);
@@ -547,7 +561,7 @@ export class CiFollowUp {
       if (gate.verdict === "conflict") return this.conflict(lane, pull, emit);
       // Merged only once the lane says it is done with this head; read fresh so a claim made since the poll counts.
       const fresh = (await deps.registry.read(lane.key)) ?? lane;
-      const claim = claimGate(fresh, pull);
+      const { lane: claimed, claim } = await this.claimant(fresh, pull);
       if (gate.verdict === "wait") {
         if (gate.why.startsWith("base ")) this.settled.add(target);
         else if (claim.ok && stuckWait(gate.why)) this.stall(fresh, pull, gate.why, "claimed at this head, but the supervisor cannot merge it as it stands: fix its checks, review or draft state, or merge it by hand", emit);
@@ -557,6 +571,22 @@ export class CiFollowUp {
         if (waitsOnMerge(fresh, pull)) this.stall(fresh, pull, claim.why, "green and clean, but the supervisor merges only a lane that claimed done at this head: have the lane claim again, or merge it by hand", emit);
         return;
       }
+      // D9: a reviewer pass for exactly this snapshot, else the review job is (re)started and the merge waits. The
+      // claimed lane is the job's author; the criteria (G1) come from the owner lane's brief even when a merge lane stands
+      // in for it (D2), and the job's intake reuses the criteria it was started with.
+      const observed = await this.review.observeSnapshot(pull, fresh);
+      const approval = await this.review.approval(claimed, pull, observed);
+      if (!approval.approved) {
+        await this.review.ensureJob(claimed, pull, observed, emit);
+        return;
+      }
+      // Final base re-read: a base that moved since the approval makes it stale; a later poll reviews the new base.
+      const now = await this.review.observeSnapshot(pull, fresh);
+      if (now.snapshot.baseSha !== approval.receipt.baseSha) {
+        await this.review.ensureJob(claimed, pull, now, emit);
+        return;
+      }
+      claimant = claimed;
       // pull.sha is the head the claim recorded (claimGate) and the fresh read saw (mergeGate): GitHub merges no other.
       ({ op } = await perform(this.ops, deps.clock.now, spec, async () => {
         const r = await deps.run(["gh", "pr", "merge", String(pull.number), "-R", pull.repo, "--merge", "--match-head-commit", pull.sha], { timeoutMs: 60_000 });
@@ -567,6 +597,24 @@ export class CiFollowUp {
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
     await this.io.merged?.(pull, base);
+    // D10: a merge that landed on another base than the approved one is reported once; never reverted.
+    if (sha === "unknown") return;
+    try { await this.review.recordBaseRace(claimant, pull, sha, emit); } catch (e) {
+      console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} base race check: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * The lane whose done claim binds `pull` at its head: the owner when its claim does, else the open merge lane of the PR
+   * when its claim does (D12); otherwise the owner with its refusal.
+   */
+  private async claimant(owner: Lane, pull: OpenPull): Promise<{ readonly lane: Lane; readonly claim: { readonly ok: boolean; readonly why: string } }> {
+    const claim = claimGate(owner, pull);
+    const key = mergeLaneKey(pull);
+    if (claim.ok || owner.key === key) return { lane: owner, claim };
+    const merging = await this.deps.registry.read(key);
+    const stands = merging ? claimGate(merging, pull) : undefined;
+    return merging && stands?.ok ? { lane: merging, claim: stands } : { lane: owner, claim };
   }
 
   /**
@@ -630,7 +678,7 @@ export class CiFollowUp {
   }
 }
 
-/** The merge lane's brief: resolve, push to the PR branch, wait for green itself, merge into the base. */
+/** The merge lane's brief: resolve, push to the PR branch, wait for green itself, claim done; the supervisor reviews and merges. */
 export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): string => {
   const { pull, base, source } = request;
   return [
@@ -641,11 +689,11 @@ export const mergeLaneBrief = (request: MergeLaneRequest, worktree: string): str
     `1. Your worktree ${worktree} is a detached checkout of origin/${pull.branch}. Run git fetch origin, merge origin/${base} into it and resolve every conflict, keeping the intent of both sides. Run the repo's tests.`,
     `2. Push to the PR branch: git push origin HEAD:${pull.branch}. Never force-push, never push to ${base} or main.`,
     "3. Wait for CI yourself with your own monitor; fix failures and push again.",
-    `4. When every check is green (at least one passed; all skipped or neutral is not green) and the PR is mergeable, merge it: gh pr merge ${pull.number} -R ${pull.repo} --merge --match-head-commit <the head SHA you pushed>. Never --admin, never into main. The supervisor may merge it first; that is fine.`,
+    `4. When every check is green (at least one passed; all skipped or neutral is not green) and the PR is mergeable, claim done at the head you pushed: dori claim-done with that head SHA. Do not merge the PR yourself (never gh pr merge): the supervisor has it reviewed at that head and merges it. Push nothing after your claim.`,
     "5. If a conflict needs a product decision, report a question to the lead instead of guessing.",
     "",
     "## Done",
-    `PR #${pull.number} merged into ${base}. Then dori claim-done with the merge SHA.`,
+    `PR #${pull.number} green and mergeable into ${base} at the head you pushed, and dori claim-done made at that head. The supervisor reviews and merges it.`,
     "",
   ].join("\n");
 };
@@ -684,7 +732,7 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   const logged = (lines: readonly string[]): void => { for (const line of lines) console.error(line); };
   try {
     const { startup, notes } = await launchLane(deps, {
-      key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `merged ${pull.repo}#${pull.number}`,
+      key, title: `merge ${pull.repo}#${pull.number} into ${request.base}`, brief, done: `pr ${pull.repo} ${JSON.stringify(branch)}`,
       thread: source.thread, cwd: worktree, shareThread: true,
     });
     logged(await postSkippedNotices(deps, notice, notes));

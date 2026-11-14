@@ -34,7 +34,29 @@ export type ReviewJobRecord = {
   readonly attempts: number;
   readonly updatedAt: number;
   readonly receipt?: ReviewReceipt;
+  /** The review snapshot worktree the gate prepared for this job, and the ms stamp taken after its checkout. */
+  readonly snapshotPath?: string;
+  readonly snapshotStartedAt?: number;
+  /** The repo checkout the snapshot is a worktree of (for its release). */
+  readonly repoDir?: string;
+  /** Set once the snapshot worktree was released. */
+  readonly snapshotReleased?: boolean;
+  /** Set once the gate closed this job's reviewer lane. */
+  readonly reviewerClosed?: boolean;
+  /** D10: the approved base differed from the merge commit's first parent. */
+  readonly baseRace?: ReviewBaseRace;
 };
+
+/** A merge whose first parent was not the base the approval covered (another PR merged in between). */
+export type ReviewBaseRace = {
+  readonly approvedBaseSha: string;
+  readonly mergedOntoSha: string;
+  readonly mergeSha: string;
+  readonly at: number;
+};
+
+/** The fields {@link annotate} may set; identity, execution and receipt are never patched. */
+export type ReviewJobAnnotation = Partial<Pick<ReviewJobRecord, "snapshotPath" | "snapshotStartedAt" | "repoDir" | "snapshotReleased" | "reviewerClosed" | "baseRace">>;
 
 export type ReviewJobErrorCode = "unknown_job" | "duplicate_job_id" | "bad_state" | "key_running" | "receipt_mismatch";
 
@@ -204,6 +226,25 @@ export const markStale = (store: ReviewJobs, now: number, observed: ReviewSnapsh
       changed.push(next);
     }
     return changed;
+  });
+
+/** Sets bookkeeping fields of one record (snapshot path, release, reviewer close, base race); never its state. */
+export const annotate = (store: ReviewJobs, now: number, jobId: string, patch: ReviewJobAnnotation): ReviewJobRecord =>
+  store.transact((records, put) => {
+    const next: ReviewJobRecord = { ...require_(records, jobId), ...patch, updatedAt: now };
+    put(next);
+    return next;
+  });
+
+/** queued -> queued with a new reason (a held launch); unchanged reason writes nothing. Throws `bad_state` otherwise. */
+export const requeue = (store: ReviewJobs, now: number, jobId: string, reason: string): ReviewJobRecord =>
+  store.transact((records, put) => {
+    const r = require_(records, jobId);
+    need(r, "queued", "requeue");
+    if (r.execution.state === "queued" && r.execution.reason === reason) return r;
+    const next: ReviewJobRecord = { ...r, execution: { state: "queued", reason }, updatedAt: now };
+    put(next);
+    return next;
   });
 
 /**
