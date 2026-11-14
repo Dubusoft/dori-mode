@@ -8,6 +8,7 @@ import {
 import type { Lane } from "./registry.ts";
 import { dequeueLaunch, enqueueLaunch, type LaunchVerdict } from "./routing.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
+import { claimSlot, precheckSlots, releaseSlot } from "./launch-admission.ts";
 
 /**
  * The launch admission every launcher shares (`dori launch`, `dori autopilot` and the supervisor's autopilot): where a
@@ -35,9 +36,12 @@ export type PlacedLaunch = {
 };
 
 /** Places `input` (planLaunch over the runners' reports) and checks the machine it lands on. */
-export const placeLaunch = async (deps: Pick<FlowDeps, "ops" | "config">, input: LaunchInput): Promise<PlacedLaunch> => {
+export const placeLaunch = async (deps: Pick<FlowDeps, "ops" | "config"> & Partial<Pick<FlowDeps, "clock">>, input: LaunchInput): Promise<PlacedLaunch> => {
   const { config } = deps;
-  const plan = await planLaunch(input, config.placement, (machine) => checkMachine(deps.ops, config, machine), await placementReports(config.stateDir));
+  const plan = await planLaunch(input, config.placement, async (machine) => {
+    const check = await checkMachine(deps.ops, config, machine);
+    return check.verdict.ok ? { ...check, verdict: precheckSlots(config.stateDir, check, deps.clock?.now() ?? Date.now(), input.review ? "review" : "author", input.key).verdict } : check;
+  }, await placementReports(config.stateDir));
   const target = plan.check.machine;
   const machine = target === LOCAL_MACHINE ? undefined : target;
   // A remote launch without --cwd starts in the checkout its owning runner declared.
@@ -60,7 +64,9 @@ export type LaunchOutcome =
  */
 export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: PlacedLaunch, err: (line: string) => void): Promise<LaunchOutcome> => {
   const { stateDir } = deps.config;
-  const { verdict } = placed.plan.check;
+  const verdict = placed.plan.check.verdict.ok
+    ? claimSlot(stateDir, placed.plan.check, input.key, input.review ? "review" : "author", deps.clock.now())
+    : placed.plan.check.verdict;
   if (!verdict.ok) {
     const repos = doneRepos(input.done);
     const queue = enqueueLaunch(stateDir, {
@@ -69,11 +75,13 @@ export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: Pl
       ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}), ...(input.task !== undefined ? { task: input.task } : {}),
       ...(placed.machine ? { machine: placed.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
       ...(input.grants?.length ? { grants: input.grants } : {}),
+      ...(input.review ? { review: true as const } : {}),
     });
     return { kind: "held", target: placed.target, verdict, queued: queue.length };
   }
   // A refused sandbox and an allowed unsandboxed run both reach the owner on Discord (sandbox-notice.ts).
   const r = await launchLane(deps, { ...input, machine: placed.machine, ...(placed.cwd ? { cwd: placed.cwd } : {}) }).catch(async (e: unknown) => {
+    releaseSlot(stateDir, input.key);
     if (e instanceof SandboxRefusal) for (const line of await postSandboxNotice(deps, input, e.message)) err(line);
     throw e;
   });
@@ -90,9 +98,13 @@ export type MachineHosts = {
   readonly targets: readonly (readonly string[])[];
 };
 
-export const hostSummary = (c: MachineCheck): HostSummary => {
-  const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
-  return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
+export const hostSummary = (c: MachineCheck, stateDir?: string, now = Date.now()): HostSummary => {
+  const admission = stateDir && c.paneCap !== undefined ? precheckSlots(stateDir, c, now) : undefined;
+  const free = admission ? admission.authorAdmissible : c.freeSlots;
+  const slots = free === undefined || free === Infinity ? {} : { slots: free };
+  const verdict = admission?.verdict ?? c.verdict;
+  const reserved = admission?.reservedKeys.length ? { reservedKeys: admission.reservedKeys } : {};
+  return verdict.ok ? { ok: true, ...slots, ...reserved } : { ok: false, reason: verdict.reasons.join(" | "), ...slots, ...reserved };
 };
 
 /**

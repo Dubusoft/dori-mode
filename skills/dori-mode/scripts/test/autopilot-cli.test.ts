@@ -436,7 +436,7 @@ test("the live judge deps the CLI and the supervisor's tick share check every ma
   const live = liveJudgeDeps(flow as unknown as Parameters<typeof liveJudgeDeps>[0], store);
   const found = await live.hosts([12]);
   expect(asked.sort()).toEqual(["mac-mini", undefined]);
-  expect([found.defaultMachine, found.targets.get(12), found.machines.get("local")?.ok, found.machines.get("mac-mini")]).toEqual(["local", ["local", "mac-mini"], false, { ok: true, slots: max - 1 }]);
+  expect([found.defaultMachine, found.targets.get(12), found.machines.get("local")?.ok, found.machines.get("mac-mini")]).toEqual(["local", ["local", "mac-mini"], false, { ok: true, slots: max - 2 }]);
   const toodo = { flaggedTasks: async () => [task(12)], tasksByIds: async () => [] };
   const report = await judgeCandidates({ ...live, pauseFile: join(dir, "autopilot-pause.json"), toodo: () => toodo, quota: async () => ({ readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] }) });
   expect(report.verdicts).toEqual([{ taskId: 12, verdict: "LAUNCH", reasons: [], machine: "mac-mini" }]);

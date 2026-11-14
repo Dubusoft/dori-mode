@@ -33,6 +33,8 @@ export function launchNextLine(key: string, startup: string): string | undefined
 }
 
 export type LaunchInput = {
+  /** Internal review launch; selects the review profile and the reserved machine slot. */
+  readonly review?: true;
   readonly key: string;
   readonly title: string;
   readonly brief: string;
@@ -551,6 +553,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     runner: machineRunner(input.machine), runnerAdoptedAt: existing?.runnerAdoptedAt ?? deps.clock.now(),
     brief: input.brief, done: input.done, autoClose: prepared.autoClose, ghIssue: prepared.ghIssue,
     ...(input.task !== undefined ? { task: input.task } : {}),
+    ...(input.review ? { review: true as const } : {}),
     ...(!existing ? { fileRun: prepared.files.run } : {}),
     reportVia: "cli" as const, // every lane reports through its runner; an old-footer lane moves onto dori report when recovery relaunches it
     ...laneDirs(input.machine, dir, deps.config.leadCwd), ...(sandbox ? { sandbox: true as const } : {}), ...(input.grants?.length ? { grants: input.grants } : {}), model, mode, openedAt: existing?.openedAt ?? iso(deps.clock),
@@ -579,6 +582,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     await Bun.write(input.brief, brief);
     const start: StartInput = {
       key: input.key, cmdId, briefText: brief, files: prepared.files, done: input.done, thread: draft.thread, ...(cwd !== undefined ? { cwd } : {}), sandbox, mode, model,
+      ...((input.review ?? existing?.review) ? { review: true as const } : {}),
       keywords: mode === "mass-ulw" ? deps.tunables.massLaunchKeywords : deps.tunables.launchKeywords,
       ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
       ...(input.session !== undefined ? { session: input.session } : {}),

@@ -90,6 +90,8 @@ type Execution = {
   readonly placed?: PlacedLaunch;
   readonly startup?: string;
   readonly notStarted?: boolean;
+  /** Binding admission returned HOLD after placement passed; no launch effect happened. */
+  readonly heldAdmission?: true;
   readonly notified?: boolean;
   readonly outcome?: Terminal;
   readonly reasons?: readonly string[];
@@ -188,6 +190,7 @@ const launchReadback = async (deps: ExecutorDeps, row: Operation): Promise<Obser
   const data = dataOf(deps.store.get(row.id)!);
   if (data.notStarted) return "not-done";
   if (data.startup?.startsWith("STARTUP_OK") && await deps.readLane(data.laneKey)) return "done";
+  if (data.heldAdmission) return "not-done";
   return deps.observeLaunch(data.input!);
 };
 
@@ -197,9 +200,16 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
   // Read back an attempted launch before pause or scope checks: its effect may already exist.
   const priorLaunch = deps.store.get(stepId(row, "admit"));
   if (priorLaunch && priorLaunch.state !== "planned") {
-    const reconciled = await reconcile(deps.store, deps.now, priorLaunch, () => launchReadback(deps, row));
-    return stop(deps, row, reconciled.state === "verified" ? "launched" : reconciled.state === "planned" || reconciled.state === "failed" ? "failed" : "ambiguous",
-      reconciled.state === "verified" ? undefined : [reconciled.detail]);
+    if (data.heldAdmission) {
+      if (await deps.readLane(data.laneKey)) return stop(deps, row, "ambiguous", ["held launch started outside the executor"]);
+      if (!deps.queue().some((q) => q.key === data.laneKey)) return stop(deps, row, "review", ["hold-dropped"]);
+      deps.store.put({ ...priorLaunch, state: "planned", detail: "held admission; may retry", updatedAt: deps.now() });
+      data = save(deps, row, { heldAdmission: undefined });
+    } else {
+      const reconciled = await reconcile(deps.store, deps.now, priorLaunch, () => launchReadback(deps, row));
+      return stop(deps, row, reconciled.state === "verified" ? "launched" : reconciled.state === "planned" || reconciled.state === "failed" ? "failed" : "ambiguous",
+        reconciled.state === "verified" ? undefined : [reconciled.detail]);
+    }
   }
   if (readPause(deps.pauseFile)) return resultOf(data, "paused");
   const changed = await currentContract(deps, row);
@@ -294,12 +304,14 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
       try {
         const result = await deps.admit(launch, placed);
         if (result.kind === "launched") save(deps, row, { startup: result.startup });
-        return { ok: result.kind === "launched" && result.startup.startsWith("STARTUP_OK"), detail: result.kind === "held" ? "unexpected HOLD" : result.startup };
+        else save(deps, row, { heldAdmission: true });
+        return { ok: result.kind === "launched" && result.startup.startsWith("STARTUP_OK"), detail: result.kind === "held" ? "queued HOLD" : result.startup };
       } catch (e) {
         if (e instanceof SandboxRefusal) save(deps, row, { notStarted: true });
         throw e;
       }
     }, () => launchReadback(deps, row));
+  if (dataOf(deps.store.get(row.id)!).heldAdmission) return resultOf(data, "held");
   return stop(deps, row, admitted.op.state === "verified" ? "launched" : admitted.op.state === "failed" ? "failed" : "ambiguous",
     admitted.op.state === "verified" ? undefined : [admitted.op.detail]);
 };
