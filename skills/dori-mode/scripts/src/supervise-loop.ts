@@ -37,7 +37,7 @@ import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
-import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
+import { type Emit, newPendingCleanup, watchTick, type FlowDeps } from "./done-flow.ts";
 import { freshnessTick, scrubForThread } from "./freshness.ts";
 import { quotaReport } from "./claude-quota.ts";
 import { sharedQuotaLookup } from "./quota-cache.ts";
@@ -596,7 +596,10 @@ export type Sweep = readonly [name: string, step: (emit: Emit) => Promise<readon
 /** The same warning line is enqueued at most once per hour; the console still logs every failure. */
 export const WARN_REPEAT_MS = 60 * 60_000;
 
-/** How often the watcher also walks the closed lanes in the archive (their kept-worktree cleanup). */
+/**
+ * How often the watcher also walks every closed lane in the archive (their kept-worktree cleanup). A lane whose close
+ * queued cleanup is swept on every pass in between (done-flow.ts PendingCleanup).
+ */
 export const ARCHIVE_SWEEP_MS = 10 * 60_000;
 
 /**
@@ -623,6 +626,7 @@ export const supervisorSweeps = (
   const cache = newSweepCache();
   let view: SweepView = passthroughView(deps.ops);
   let lastArchive = -Infinity;
+  const pendingCleanup = newPendingCleanup();
   // The watch, dead-panes and freshness sweeps read a machine only through an admitted runner connection. A runner
   // without one (right after a restart, before its hello, or gone) is one RUNNER_UNAVAILABLE line per outage, by
   // runner label (the machine it serves as value), instead of one warning per lane and sweep every round.
@@ -659,7 +663,7 @@ export const supervisorSweeps = (
     ["watch", async (emit) => {
       // The archive's lanes are local: their pass waits for the local runner, so it runs right after its hello.
       const archived = deps.clock.now() - lastArchive >= ARCHIVE_SWEEP_MS && admitted(undefined);
-      await watchTick(deps, emit, archived, admitted);
+      await watchTick(deps, emit, archived, admitted, pendingCleanup);
       if (archived) lastArchive = deps.clock.now();
       return [];
     }],
