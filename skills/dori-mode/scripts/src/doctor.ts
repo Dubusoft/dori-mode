@@ -132,6 +132,18 @@ export const INTENDED = new Set([".config/gh", ".npmrc"]);
  * and the ones bound on purpose. ~/.ssh private keys (id_*) are added from the host's ~/.ssh.
  */
 export const SENSITIVE: readonly string[] = [...CREDENTIAL_DENY, ...INTENDED];
+/** The existing paths a glob entry (* ? [...], as the lane sandbox templates expand it) matches, dotfiles included; a plain path as is. */
+const globMatches = (p: string): string[] => {
+  const parts = p.split("/");
+  const first = parts.findIndex((s) => /[*?[]/.test(s));
+  if (first < 0) return [p];
+  const dir = parts.slice(0, first).join("/") || "/";
+  try {
+    return Array.from(new Bun.Glob(parts.slice(first).join("/")).scanSync({ cwd: dir, absolute: true, dot: true, onlyFiles: false, followSymlinks: false })).filter((m) => !/\/\.\.?$/.test(m));
+  } catch {
+    return []; // the glob's directory does not exist on this host
+  }
+};
 /** Prints each argument a lane could read: a file with its first byte, a directory with at least one entry (a hidden one is an empty tmpfs or refused). */
 const PROBE = 'for p do if [ -d "$p" ]; then [ -n "$(ls -A "$p" 2>/dev/null)" ] && printf "%s\\n" "$p"; elif [ "$(head -c1 "$p" 2>/dev/null | wc -c)" -gt 0 ]; then printf "%s\\n" "$p"; fi; done; true';
 
@@ -156,7 +168,7 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   }
   const hidePath = join(d.home, ".dori", "lane-sandbox-hide");
   const hidden = existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : [];
-  const candidates = [...new Set([...SENSITIVE, ...keys].map((p) => join(d.home, p)).concat(hidden))].filter(nonEmpty);
+  const candidates = [...new Set([...SENSITIVE, ...keys].map((p) => join(d.home, p)).concat(hidden).flatMap(globMatches))].filter(nonEmpty);
   if (candidates.length === 0) return ok("lane exposure", "none of the known credential stores exist on this host");
   // The wrapper binds a lane's input and output directories without -try (a lane missing its inputs must not start), so
   // the probe lane gets empty ones for the run.

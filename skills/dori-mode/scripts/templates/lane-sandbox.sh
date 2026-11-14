@@ -25,12 +25,14 @@
 # nor a grant can re-expose it: ~/.dori/runner, ~/.ssh and ~/.config (each an empty read-only tmpfs with only the
 # lane's own runner entries, ssh known_hosts and config, and gh, git and the ssh agent socket bound back), the
 # credential stores below (~/.dori/env, secrets and state among them) and every other host path listed one per line in
-# ~/.dori/lane-sandbox-hide ('#' starts a comment); the lead owns that file, and a lane can neither read nor change it.
+# ~/.dori/lane-sandbox-hide ('#' starts a comment), ~/.dori's own entries included; the lead owns that file, and a lane
+# can neither read nor change it. An entry of either list may be a glob (* ? [...], dotfiles matched too): each existing
+# path it matches when the lane starts is hidden, and one matching nothing is skipped.
 set -eu
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
-# through the secret broker); the macOS template and `dori doctor` use the same list. Each one that exists is hidden
-# after every bind, like the hide list below.
+# through the secret broker); the macOS template and `dori doctor` use the same list. Each one that exists (each match,
+# for a glob) is hidden after every bind, like the hide list below.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
   .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
@@ -41,8 +43,7 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
   .local/share/toodo-server .mozilla .config/google-chrome .config/chromium .config/BraveSoftware
   .config/microsoft-edge .config/discord .config/Slack .config/Signal .local/share/TelegramDesktop
-  .config/Code/User/globalStorage .vscode .vscode-server .bash_history .zsh_history .python_history .psql_history
-  .mysql_history .lesshst"
+  .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
 # END CREDENTIALS
 
 # --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
@@ -354,12 +355,36 @@ hide_path() {
     opts+=(--ro-bind /dev/null "$r")
   fi
 }
-for p in $CREDENTIALS; do hide_path "$H/$p"; done
+# hide_glob <path or glob>: hides the path, or each existing path the glob (* ? [...]) matches, dotfiles included; a
+# match ending in . or .. (a pattern such as dir/.*) is never one: it names the directory itself or its parent.
+hide_glob() {
+  local IFS= m
+  local -a ms
+  case "$1" in
+    *[*?[]*) ;;
+    *)
+      hide_path "$1"
+      return 0
+      ;;
+  esac
+  shopt -s nullglob dotglob
+  ms=($1)
+  shopt -u nullglob dotglob
+  for m in ${ms[@]+"${ms[@]}"}; do
+    case "/$m" in */. | */..) continue ;; esac
+    hide_path "$m"
+  done
+}
+# Split without globbing: a glob entry is expanded under $H by hide_glob, never against the cwd here.
+set -f
+creds=($CREDENTIALS)
+set +f
+for p in "${creds[@]}"; do hide_glob "$H/$p"; done
 if [ -f "$H/.dori/lane-sandbox-hide" ]; then
   while IFS= read -r p || [ -n "$p" ]; do
     p=${p%%#*}
     p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    hide_path "$p"
+    hide_glob "$p"
   done <"$H/.dori/lane-sandbox-hide"
 fi
 if [ "$review" = 1 ]; then

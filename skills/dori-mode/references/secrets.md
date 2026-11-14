@@ -262,7 +262,7 @@ Stored values are registered with dori's output masking, so a value that turns u
 
 Both lane sandbox scripts hide dori's own sensitive paths, `~/.dori/env` and `~/.dori/secrets`, by default. No file or setting is needed. On Linux `~/.dori` is a fresh tmpfs inside the sandbox with nothing bound from the host below it; on macOS the profile denies reads, writes and socket connects under both paths.
 
-`~/.dori/lane-sandbox-hide` is an optional per-machine list for paths unrelated to dori, such as `~/.secrets`: one host path per line, `#` starts a comment. Don't list `~/.dori/env` or `~/.dori/secrets` there; they're already covered.
+`~/.dori/lane-sandbox-hide` is an optional per-machine list of other host paths to hide, such as a backup directory or an entry under `~/.dori` like `~/.dori/research/<key>/secret.txt`: one host path per line, `#` starts a comment. A line may be a glob (`*` and `?` within one path component, `[...]` a class), such as `~/keys/*.pem` written as an absolute path: Linux hides each existing match when the lane starts, dotfiles included, and macOS refuses every path it matches, including ones created later. `lane-sandbox --explain` lists each hidden path (on macOS, the glob). Don't list `~/.dori/env` or `~/.dori/secrets` there; they're already covered.
 
 ## Protection scope
 
