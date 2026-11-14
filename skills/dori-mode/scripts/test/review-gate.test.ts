@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
-import { type ObservedReview, type PrInfo, REVIEW_TIMEOUT_MS, ReviewGate, type ReviewGateIo } from "../src/review-gate.ts";
+import { type ObservedReview, prBudget, type PrInfo, REVIEW_TIMEOUT_MS, REVIEW_TOTAL_MS, ReviewGate, type ReviewGateIo } from "../src/review-gate.ts";
 import type { ReviewLaunchRequest, ReviewLaunchResult } from "../src/review-lane.ts";
+import { responseFileName } from "../src/review-response.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-11-14T12:00:00Z");
@@ -37,6 +39,9 @@ const harness = () => {
   let scope: { ok: true } | { ok: false; code: "scope_violation"; detail: string } = { ok: true };
   let n = 0;
   const home = join(dir, "home");
+  /** objectAuthor calls as [lane key, reasons]; `objectFailures` makes the next calls throw before any effect. */
+  const objections: [string, string[]][] = [];
+  const objecting = { failures: 0 };
   const io: Partial<ReviewGateIo> = {
     prInfo: async (_repo, num) => { const p = prs.get(num); if (!p) throw new Error(`no PR ${num}`); return p; },
     branchSha: async () => gh.baseTip,
@@ -66,6 +71,12 @@ const harness = () => {
     repoDir: () => "/repo/main",
     home,
     randomHex: (bytes) => (++n).toString(16).padStart(bytes * 2, "0"),
+    objectAuthor: async (lane, reasons) => {
+      if (objecting.failures > 0) { objecting.failures--; throw new Error("notify failed"); }
+      objections.push([lane.key, [...reasons]]);
+      const at = new Date(clock.now()).toISOString();
+      await deps.registry.update(lane.key, (cur) => (cur ? { ...cur, status: "not-done", objection: { at, reasons: [...reasons] } } : undefined));
+    },
   };
   const brief = join(dir, "author.md");
   writeFileSync(brief, "Implement the thing.\n");
@@ -106,8 +117,25 @@ const harness = () => {
   };
 
   const observe = (g: ReviewGate, num = 7, lane = author()): Promise<ObservedReview> => g.observeSnapshot(pull(num), lane);
+
+  /** Writes the author's answer file for a findings job into `laneKey`'s installed reports; returns its raw text. */
+  const respond = (laneKey: string, jobId: string, responses: object[]): string => {
+    const text = JSON.stringify({ jobId, responses });
+    mkdirSync(join(dir, "out", laneKey), { recursive: true });
+    writeFileSync(join(dir, "out", laneKey, responseFileName(jobId)), text);
+    return text;
+  };
+  /** The author (or `key`) claims #7 again a minute later at `head`, and the registry records that claim. */
+  const reclaim = async (head: string, key = "author", evidence = "e"): Promise<Lane> => {
+    clock.at += 60_000;
+    const lane = author([{ number: 7, sha: head }], {
+      key, status: "done-claimed", claim: { at: new Date(clock.now()).toISOString(), evidence, pulls: [{ repo: REPO, number: 7, sha: head }] },
+    });
+    await deps.registry.update(key, () => lane);
+    return lane;
+  };
   return { io, registered, dir, clock, deps, prs, gh, launches, plan, closed, released, author, events, emit, kinds, gate, pull, submit, observe,
-    setScope: (s: typeof scope) => { scope = s; } };
+    objections, objecting, respond, reclaim, setScope: (s: typeof scope) => { scope = s; } };
 };
 
 /** Starts a running job for #7 and returns its id. */
@@ -425,5 +453,275 @@ describe("review gate holds and base race", () => {
   test("review event kinds are registered as urgent or digest", () => {
     for (const k of ["REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_ESCALATED", "REVIEW_BASE_RACE"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-urgent");
     for (const k of ["REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-digest");
+  });
+});
+
+const H2 = sha("2");
+const digest = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+
+/** Runs one review of #7 at the current head that ends in findings (F1); returns its job id. */
+const findingsRound = async (h: ReturnType<typeof harness>, g: ReviewGate, lane?: Lane, head = H7): Promise<string> => {
+  await h.registered;
+  const claimer = lane ?? h.author();
+  const res = await g.ensureJob(claimer, h.pull(7, head), await g.observeSnapshot(h.pull(7, head), claimer), h.emit);
+  if (res.kind !== "started") throw new Error(`expected started, got ${JSON.stringify(res)}`);
+  await h.submit(g, res.jobId, { verdict: "findings" });
+  await g.tick(h.emit);
+  return res.jobId;
+};
+
+/** All-disputed answer to `jobId`, written into the author's reports; returns its text. */
+const dispute = (h: ReturnType<typeof harness>, jobId: string, key = "author", note = "the guard exists at src/x.ts:3; test y covers it"): string =>
+  h.respond(key, jobId, [{ id: "F1", status: "disputed", note }]);
+
+/** Two findings rounds at H7 (the second answers the first with an all-disputed response): the PR's cap is reached. */
+const capped = async (h: ReturnType<typeof harness>, g: ReviewGate): Promise<{ first: string; second: string }> => {
+  const first = await findingsRound(h, g);
+  dispute(h, first);
+  const second = await findingsRound(h, g, await h.reclaim(H7));
+  return { first, second };
+};
+
+describe("review fix loop: findings delivery", () => {
+  test("findings object the author lane exactly once, across ticks, a restart and a lost annotation", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    const receipt = g.jobs.get(id)!.receipt!;
+    expect(h.objections).toHaveLength(1);
+    const [key, reasons] = h.objections[0]!;
+    expect(key).toBe("author");
+    expect(reasons[0]).toContain(`receipt ${receipt.receiptId}`);
+    expect(reasons[0]).toContain("(round 1 of 2) found 1 blocking finding(s)");
+    expect(reasons.some((r) => r.startsWith("F1 [high] C1 src/x.ts:1-2: o"))).toBe(true);
+    expect(reasons.at(-1)).toContain(responseFileName(id));
+    expect(await h.deps.registry.read("author")).toMatchObject({ status: "not-done", objection: { reasons } });
+    expect(g.jobs.get(id)?.authorNotified).toEqual({ at: h.clock.now(), laneKey: "author" });
+    await g.tick(h.emit);
+    await g.tick(h.emit);
+    await h.gate().tick(h.emit);
+    expect(h.objections).toHaveLength(1);
+    // A crash after the objection but before the annotation: the lane's objection names the receipt, so only the record is written.
+    g.jobs.transact((records, put) => { const { authorNotified: _lost, ...rest } = records[id]!; put(rest); });
+    expect(g.jobs.get(id)?.authorNotified).toBeUndefined();
+    await h.gate().tick(h.emit);
+    expect(h.objections).toHaveLength(1);
+    expect(g.jobs.get(id)?.authorNotified).toMatchObject({ laneKey: "author" });
+    expect(h.kinds().filter((k) => k === "REVIEW_FINDINGS")).toHaveLength(1);
+  });
+
+  test("a failed delivery is retried by the next tick and then recorded", async () => {
+    const h = harness(), g = h.gate();
+    // The intake's delivery and the same tick's delivery pass both fail.
+    h.objecting.failures = 2;
+    const id = await findingsRound(h, g);
+    expect(h.objections).toHaveLength(0);
+    expect(g.jobs.get(id)?.authorNotified).toBeUndefined();
+    expect(h.closed).toEqual([g.jobs.get(id)!.job.reviewerLaneKey]);
+    await g.tick(h.emit);
+    expect(h.objections).toHaveLength(1);
+    expect(g.jobs.get(id)?.authorNotified).toBeDefined();
+    await g.tick(h.emit);
+    expect(h.objections).toHaveLength(1);
+  });
+
+  test("a closed author lane is not objected; the record is marked delivered", async () => {
+    const h = harness(), g = h.gate();
+    const id = await running(h, g);
+    await h.deps.registry.update("author", (cur) => (cur ? { ...cur, closedAt: new Date(h.clock.now()).toISOString() } : undefined));
+    await h.submit(g, id, { verdict: "findings" });
+    await g.tick(h.emit);
+    expect(h.objections).toHaveLength(0);
+    expect(g.jobs.get(id)?.authorNotified).toMatchObject({ laneKey: "author" });
+  });
+
+  test("an old findings record without authorNotified and a closed author lane is only annotated, past the 60-minute limit too", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    expect(h.objections).toHaveLength(1);
+    g.jobs.transact((records, put) => { const { authorNotified: _old, ...rest } = records[id]!; put(rest); });
+    await h.deps.registry.update("author", (cur) => (cur ? { ...cur, closedAt: new Date(h.clock.now()).toISOString() } : undefined));
+    h.clock.at += REVIEW_TOTAL_MS + 1;
+    await g.tick(h.emit);
+    expect(g.jobs.get(id)?.authorNotified).toMatchObject({ laneKey: "author" });
+    expect(g.jobs.get(id)?.capReached).toBeUndefined();
+    expect(h.kinds()).not.toContain("REVIEW_ESCALATED");
+    expect(h.objections).toHaveLength(1);
+  });
+});
+
+describe("review fix loop: answers and re-review", () => {
+  test("fixed at a new head: a new reviewer reviews round 2 with the previous findings and the answer", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    const text = h.respond("author", id, [{ id: "F1", status: "fixed", note: "guarded the edge case; test x passes", evidence: ["bun test: 0 fail"] }]);
+    h.prs.set(7, { ...h.prs.get(7)!, headSha: H2 });
+    const lane = await h.reclaim(H2);
+    const res = await g.ensureJob(lane, h.pull(7, H2), await g.observeSnapshot(h.pull(7, H2), lane), h.emit);
+    expect(res.kind).toBe("started");
+    const next = g.jobs.get((res as { jobId: string }).jobId)!;
+    expect(next.job).toMatchObject({ round: 2, previousJobId: id, responseSha256: digest(text) });
+    expect(next.job.snapshot.headSha).toBe(H2);
+    expect(next.job.reviewerLaneKey).not.toBe(g.jobs.get(id)!.job.reviewerLaneKey);
+    const previous = join(h.dir, "review-inputs", next.job.jobId, "previous.md");
+    const md = readFileSync(previous, "utf8");
+    expect(md).toContain(`# Previous review: job ${id}, round 1, head ${H7}`);
+    expect(md).toContain('"id": "F1"');
+    expect(md).toContain("guarded the edge case; test x passes");
+    const brief = readFileSync(join(h.dir, "briefs", `${next.job.reviewerLaneKey}.md`), "utf8");
+    expect(brief).toContain(`Previous review round and the author's answers: ${previous}`);
+    const lines = brief.split("\n");
+    const at = lines.findIndex((l) => l.endsWith("Tell it: write NO files except its body file"));
+    expect(lines[at + 1]).toStartWith('   "$DORI_LANE_OUT/review-body.json", run no command longer than 60 s');
+    expect(lines[at + 2]).toBe(`   Also give it ${previous} and tell it to re-check each answered finding there and still review the whole diff.`);
+    expect(lines[at + 3]).toStartWith("5. ");
+    expect(g.jobs.get(id)?.execution.state).toBe("stale");
+    expect(g.jobs.get(id)?.receipt?.result.verdict).toBe("findings");
+    expect(prBudget(g.jobs.list())).toMatchObject({ findingsRounds: 1, staleReschedules: 0 });
+  });
+
+  test("all disputed at the same head: a new job and reviewer for the same snapshot, and the round count goes up", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    const firstKey = g.jobs.get(id)!.key;
+    const text = dispute(h, id);
+    const lane = await h.reclaim(H7);
+    const res = await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit);
+    expect(res.kind).toBe("started");
+    const jobId = (res as { jobId: string }).jobId;
+    const next = g.jobs.get(jobId)!;
+    expect(next.key).toBe(firstKey);
+    expect(next.job).toMatchObject({ round: 2, previousJobId: id, responseSha256: digest(text) });
+    expect(next.job.reviewerLaneKey).toBe(`review-app-7-${H7.slice(0, 7)}-2`);
+    for (let i = 0; i < 2; i++) expect(await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).toEqual({ kind: "running", jobId });
+    expect(g.jobs.list()).toHaveLength(2);
+    expect(h.launches).toHaveLength(2);
+    await h.submit(g, jobId, { verdict: "findings" });
+    await g.tick(h.emit);
+    expect(prBudget(g.jobs.list()).findingsRounds).toBe(2);
+  });
+
+  test("a same-head re-review that passed continues as that pass, not the old findings record", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    dispute(h, id);
+    const lane = await h.reclaim(H7);
+    const started = await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit);
+    expect(started.kind).toBe("started");
+    const jobId = (started as { jobId: string }).jobId;
+    await h.submit(g, jobId, { verdict: "pass" });
+    await g.tick(h.emit);
+    const res = await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit);
+    expect(res).toEqual({ kind: "completed", jobId, verdict: "pass" });
+  });
+
+  test("a missing, invalid, fixed-at-the-same-head or already reviewed answer objects and starts no job", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    const ask = async (): Promise<string> => {
+      const lane = await h.reclaim(H7);
+      const res = await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit);
+      expect(res).toMatchObject({ kind: "awaiting-response", jobId: id });
+      return res.kind === "awaiting-response" ? res.why : "";
+    };
+    expect(await ask()).toBe(`no ${responseFileName(id)} in the lane's reports`);
+    const [, reasons] = h.objections.at(-1)!;
+    expect(reasons[0]).toBe(`review ${id} of ${REPO}#7 is waiting for your answer: no ${responseFileName(id)} in the lane's reports`);
+    expect(reasons.slice(1)).toEqual(h.objections[0]![1]);
+    h.respond("author", id, [{ id: "F2", status: "disputed", note: "n" }]);
+    expect(await ask()).toBe("answer for unknown finding F2");
+    h.respond("author", id, [{ id: "F1", status: "fixed", note: "fixed it" }]);
+    expect(await ask()).toBe("a fixed finding needs a new head: push the fix, or mark the finding disputed");
+    // A record of this snapshot that already reviewed exactly this answer.
+    const text = dispute(h, id);
+    g.jobs.transact((records, put) => {
+      const r = records[id]!;
+      put({ ...r, job: { ...r.job, jobId: "rv-reviewed", createdAt: r.job.createdAt - 1, responseSha256: digest(text) },
+        receipt: { ...r.receipt!, jobId: "rv-reviewed", result: { schemaVersion: 1, jobId: "rv-reviewed", verdict: "pass", summary: "s", findings: [], notes: [] } } });
+    });
+    expect(await ask()).toBe("this answer was already reviewed; write a new answer or push a fix");
+    expect(g.jobs.list().map((r) => r.job.jobId).sort()).toEqual([id, "rv-reviewed"].sort());
+    expect(h.objections).toHaveLength(5);
+    expect(h.launches).toHaveLength(1);
+  });
+});
+
+describe("review fix loop: per-PR limits", () => {
+  test("a second findings round escalates once to the lead, objects no more and keeps the lane held", async () => {
+    const h = harness(), g = h.gate();
+    const { second } = await capped(h, g);
+    expect(h.objections).toHaveLength(1);
+    const esc = h.events.filter(([, l]) => l.startsWith("REVIEW_ESCALATED"));
+    expect(esc).toHaveLength(1);
+    expect(esc[0]![0]).toBe(`review-cap:${REPO}#7`);
+    expect(esc[0]![1]).toContain("2 review rounds ended with findings (limit 2); automatic review stops for this PR and the lead decides");
+    expect(g.jobs.get(second)?.capReached?.reason).toBe("2 review rounds ended with findings (limit 2)");
+    expect(g.jobs.get(second)?.authorNotified).toBeUndefined();
+    dispute(h, second);
+    const lane = await h.reclaim(H7);
+    expect(await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).toEqual({ kind: "escalated", jobId: second, reason: "2 review rounds ended with findings (limit 2)" });
+    await g.tick(h.emit);
+    await h.gate().tick(h.emit);
+    expect(g.jobs.list()).toHaveLength(2);
+    expect(h.objections).toHaveLength(1);
+    expect(h.kinds().filter((k) => k === "REVIEW_ESCALATED")).toHaveLength(1);
+    expect(await g.holdsLane(lane)).toBe(true);
+  });
+
+  test("two stale re-schedules are allowed; the third stale run escalates", async () => {
+    const h = harness(), g = h.gate();
+    await running(h, g);
+    const results: string[] = [];
+    for (const tip of ["d", "e", "f"]) {
+      h.gh.baseTip = sha(tip);
+      results.push((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind);
+    }
+    expect(results).toEqual(["started", "started", "escalated"]);
+    expect(g.jobs.list()).toHaveLength(3);
+    expect(prBudget(g.jobs.list()).staleReschedules).toBe(3);
+    expect(h.events.filter(([, l]) => l.startsWith("REVIEW_ESCALATED")).map(([, l]) => l))
+      .toEqual([expect.stringContaining("3 review runs went stale on head or base changes (limit 2 re-schedules)")]);
+    expect((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind).toBe("escalated");
+    expect(await g.holdsLane(h.author())).toBe(true);
+  });
+
+  test("60 minutes after the first request a needed new job escalates; a live job still continues", async () => {
+    const h = harness(), g = h.gate();
+    const id = await running(h, g);
+    h.clock.at += REVIEW_TOTAL_MS;
+    expect(await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).toEqual({ kind: "running", jobId: id });
+    h.gh.baseTip = sha("d");
+    expect(await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).toMatchObject({ kind: "escalated", reason: "no approval within 60 min of the first review request" });
+    expect(g.jobs.list()).toHaveLength(1);
+    expect(h.launches).toHaveLength(1);
+  });
+
+  test("no reset: a new claim, a new author lane and a reopened PR stay escalated", async () => {
+    const h = harness(), g = h.gate();
+    await capped(h, g);
+    const count = g.jobs.list().length;
+    const tryLane = async (lane: Lane, head = H7) => g.ensureJob(lane, h.pull(7, head), await g.observeSnapshot(h.pull(7, head), lane), h.emit);
+    expect((await tryLane(await h.reclaim(H7, "author", "other evidence"))).kind).toBe("escalated");
+    h.prs.set(7, { ...h.prs.get(7)!, headSha: H2 });
+    expect((await tryLane(await h.reclaim(H2, "author-2"), H2)).kind).toBe("escalated");
+    h.prs.set(7, { ...h.prs.get(7)!, state: "CLOSED" });
+    h.prs.set(7, { ...h.prs.get(7)!, state: "OPEN" });
+    expect((await tryLane(await h.reclaim(H2, "author-3", "reopened"), H2)).kind).toBe("escalated");
+    expect(g.jobs.list()).toHaveLength(count);
+    expect(h.kinds().filter((k) => k === "REVIEW_ESCALATED")).toHaveLength(1);
+  });
+
+  test("rounds count per PR: a new author lane after one findings round gets round 2", async () => {
+    const h = harness(), g = h.gate();
+    const id = await findingsRound(h, g);
+    const text = h.respond("author-2", id, [{ id: "F1", status: "fixed", note: "fixed in the respawned lane" }]);
+    h.prs.set(7, { ...h.prs.get(7)!, headSha: H2 });
+    const lane = await h.reclaim(H2, "author-2");
+    const res = await g.ensureJob(lane, h.pull(7, H2), await g.observeSnapshot(h.pull(7, H2), lane), h.emit);
+    expect(res.kind).toBe("started");
+    expect(g.jobs.get((res as { jobId: string }).jobId)?.job).toMatchObject({ round: 2, authorLaneKey: "author-2", responseSha256: digest(text) });
+    await h.submit(g, (res as { jobId: string }).jobId, { verdict: "findings" });
+    await g.tick(h.emit);
+    expect(h.kinds().filter((k) => k === "REVIEW_ESCALATED")).toHaveLength(1);
+    expect(h.objections.map(([k]) => k)).toEqual(["author"]);
   });
 });

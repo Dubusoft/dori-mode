@@ -45,6 +45,10 @@ export type ReviewJobRecord = {
   readonly reviewerClosed?: boolean;
   /** D10: the approved base differed from the merge commit's first parent. */
   readonly baseRace?: ReviewBaseRace;
+  /** Set once a findings receipt was delivered to the author lane (`laneKey`), or found undeliverable (lane gone). */
+  readonly authorNotified?: { readonly at: number; readonly laneKey: string };
+  /** Set on the PR's newest record once a per-PR review limit was reached: no more automatic jobs, the lead decides. */
+  readonly capReached?: { readonly reason: string; readonly at: number };
 };
 
 /** A merge whose first parent was not the base the approval covered (another PR merged in between). */
@@ -56,7 +60,7 @@ export type ReviewBaseRace = {
 };
 
 /** The fields {@link annotate} may set; identity, execution and receipt are never patched. */
-export type ReviewJobAnnotation = Partial<Pick<ReviewJobRecord, "snapshotPath" | "snapshotStartedAt" | "repoDir" | "snapshotReleased" | "reviewerClosed" | "baseRace">>;
+export type ReviewJobAnnotation = Partial<Pick<ReviewJobRecord, "snapshotPath" | "snapshotStartedAt" | "repoDir" | "snapshotReleased" | "reviewerClosed" | "baseRace" | "authorNotified" | "capReached">>;
 
 export type ReviewJobErrorCode = "unknown_job" | "duplicate_job_id" | "bad_state" | "key_running" | "receipt_mismatch";
 
@@ -132,17 +136,23 @@ const need = (r: ReviewJobRecord, state: ReviewExecutionState, to: string): void
   if (r.execution.state !== state) throw new ReviewJobError("bad_state", `${r.job.jobId} is ${r.execution.state}, cannot ${to}`);
 };
 
+/** What one job execution reviews: the snapshot key plus the digest of the author response it answers (empty: none). */
+export const executionKey = (job: ReviewJob): string => `${snapshotKey(job.snapshot)}+${job.responseSha256 ?? ""}`;
+
 /**
- * Records a new queued job. When a record with the same snapshot key is queued, running or completed, that record is
- * returned with `created: false` and nothing is written: a snapshot is never started twice. A key with only stale, error
- * or escalated records gets the new job. A reused job id for another key throws `duplicate_job_id`.
+ * Records a new queued job. When a record with the same {@link executionKey} (snapshot key and author response digest,
+ * absent equal to absent) is queued, running or completed, that record is returned with `created: false` and nothing is
+ * written: an execution is never started twice. The same snapshot with a new response digest (a re-review of a disputed
+ * answer at the same head) gets a new job, and so does a key with only stale, error or escalated records. A reused job
+ * id for another key throws `duplicate_job_id`.
  */
 export const enqueue = (
   store: ReviewJobs, now: number, job: ReviewJob, reason = "queued",
 ): { readonly record: ReviewJobRecord; readonly created: boolean } =>
   store.transact((records, put) => {
     const key = snapshotKey(job.snapshot);
-    const live = Object.values(records).filter((r) => r.key === key && LIVE_STATES.has(r.execution.state)).sort(byCreated)[0];
+    const exec = executionKey(job);
+    const live = Object.values(records).filter((r) => executionKey(r.job) === exec && LIVE_STATES.has(r.execution.state)).sort(byCreated)[0];
     if (live) return { record: live, created: false };
     if (records[job.jobId]) throw new ReviewJobError("duplicate_job_id", job.jobId);
     const record: ReviewJobRecord = { job, key, execution: { state: "queued", reason }, attempts: 0, updatedAt: now };
