@@ -140,12 +140,12 @@ test("a close records its effects and a second close of the same lane repeats no
   await deps.registry.write(lane);
   const first = await closeLane(deps, lane, "manual");
   expect(first.closed).toBe(true);
-  // The worktree removal (lane.git) and the pane close (lane.close), each through the lane's runner.
+  // The pane close (lane.close) through the lane's runner; the worktree is only queued for the watcher.
   const effects = () => w.ops.filter((e) => e.op === "git" || e.op === "close").length;
-  expect(effects()).toBe(2);
-  expect(store.list().map((op) => `${op.action} ${op.state}`).sort()).toEqual(["close verified", "pane-close verified", "worktree-remove verified"]);
+  expect(effects()).toBe(1);
+  expect(store.list().map((op) => `${op.action} ${op.state}`).sort()).toEqual(["close verified", "pane-close verified"]);
   const second = await closeLane(deps, lane, "manual");
   expect(second).toEqual({ closed: true, lines: ["CLOSED demo-lane already closed"] });
-  expect(effects()).toBe(2);
+  expect(effects()).toBe(1);
 });
 

@@ -103,11 +103,12 @@ test("dori close refuses unpushed work unless forced, and leaves pane, worktree 
   expect(closes()).toEqual(["demo-lane"]);
 });
 
-test("the worktree is removed before the pane closes, and a failed removal keeps the pane and the lane open", async () => {
+test("the close removes nothing before the pane closes: the watcher's next pass removes the queued worktree after it", async () => {
   const ok = await closeLane(at(T0), lane, "manual");
   expect(ok.closed).toBe(true);
+  expect(await watchTick(at(T0))).toEqual([`WORKTREE_CLEANED demo-lane ${WT}`]);
   const order = world.ops.map((e) => (e.op === "git" ? "remove" : e.op === "close" ? "close" : "")).filter(Boolean);
-  expect(order).toEqual(["remove", "close"]);
+  expect(order).toEqual(["close", "remove"]);
 });
 
 test("a lane whose worktree was removed before the close (someone got there first) closes and records it as already removed", async () => {
@@ -122,16 +123,15 @@ test("a lane whose worktree was removed before the close (someone got there firs
   expect(receipt?.cleanup).toContain(`worktree ${WT} already removed`);
 });
 
-test("a failed worktree removal refuses the close and keeps the pane, the thread and the lane open", async () => {
+test("a worktree git cannot remove never holds the close up: the lane closes, and the sweep warns and retries it", async () => {
   const base = at(T0);
   const failing = { ...base, ops: { ...base.ops, git: async () => ({ code: 128, out: "", err: "fatal: locked" }) } };
   const r = await closeLane(failing, lane, "manual");
-  expect(r.closed).toBe(false);
-  expect(r.lines.at(-1)).toStartWith(`REFUSED demo-lane: worktree ${WT} not removed: fatal: locked`);
-  expect(closes()).toHaveLength(0);
-  expect(statusOf((await base.registry.read("demo-lane")) ?? lane)).toBe("working");
-  expect((await closeLane(failing, lane, "manual", { force: true })).closed).toBe(true);
+  expect(r.closed).toBe(true);
   expect(closes()).toEqual(["demo-lane"]);
+  expect(statusOf((await base.registry.read("demo-lane")) ?? lane)).toBe("closed");
+  expect(await watchTick(failing)).toEqual([`LANE_WATCH_WARN demo-lane worktree ${WT} not removed: fatal: locked`]);
+  expect(await watchTick(base)).toEqual([`WORKTREE_CLEANED demo-lane ${WT}`]);
 });
 
 // Item 3: a close never touches the lane's thread, shared or not; the owner closes it.

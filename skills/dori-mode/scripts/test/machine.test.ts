@@ -379,14 +379,15 @@ test("remote worktree checks and cleanup skip explicitly and never ask for git",
   expectRemote();
 });
 
-test("a closed remote lane's worktrees under its runner's root are recorded at the close and removed once clean and pushed", async () => {
+test("a closed remote lane's worktrees under its runner's root are queued at the close and removed once clean and pushed", async () => {
   const d = { ...deps(), runnerWorktreeRoot: (label: string) => (label === MACHINE ? "/repo/.wt" : undefined) };
   world.aheadCount = "1";
   expect((await closeLane(d, lane(), "verified")).closed).toBe(true);
   const closed = (await d.registry.read("remote-lane")) as Lane;
   expect(closed.receipt).toMatchObject({ worktreeCheck: { status: "skipped" } });
   // Only the lane's worktree under the root: the checkout at /repo is outside it.
-  expect((closed.receipt as { cleanup: string[] }).cleanup.filter((l) => l.startsWith("worktree /"))).toEqual([`worktree ${WT} kept: remote lane, removed by the closed-lane cleanup once clean and pushed`]);
+  expect((closed.receipt as { cleanup: string[] }).cleanup.filter((l) => l.startsWith("worktree /"))).toEqual([`worktree ${WT} queued: remote lane, removed by the closed-lane cleanup once clean and pushed`]);
+  expect(closed.receipt).toMatchObject({ queue: { worktrees: [{ path: WT, root: WT }], branches: [] } });
   expect(opsOf("git")).toEqual([]);
   // A commit no remote has keeps it, and so does any change.
   expect(await closedWorktreeSweep(d, closed)).toEqual([]);
@@ -396,9 +397,30 @@ test("a closed remote lane's worktrees under its runner's root are recorded at t
   expect(opsOf("git")).toEqual([]);
   world.dirty = "";
   expect(await closedWorktreeSweep(d, closed)).toEqual([`WORKTREE_CLEANED remote-lane ${WT}`]);
-  expect(opsOf("git").map((e) => e.args)).toEqual([{ op: "worktree-remove", root: WT, path: WT }]);
+  expect(opsOf("git").map((e) => e.args)).toEqual([{ op: "worktree-remove", root: WT, path: WT, opts: { cmdId: `op:remote-lane/worktree-remove/${WT}:1` } }]);
   expect(opsOf("exists").every((e) => (e.args as { machine?: string }).machine === MACHINE)).toBe(true);
+  // The queue is marked done: the next pass reads nothing back and removes nothing.
+  expect(await closedWorktreeSweep(d, (await d.registry.read("remote-lane")) as Lane)).toEqual([]);
+  expect(opsOf("git")).toHaveLength(1);
   expectRemote();
+});
+
+test("a closed remote lane's own directory is its remoteCwd: swept under its runner's root, from inside itself, once clean and pushed", async () => {
+  const d = { ...deps(), runnerWorktreeRoot: (label: string) => (label === MACHINE ? "/repo/.wt" : undefined) };
+  const closed = lane({ remoteCwd: WT, status: "closed", closedAt: new Date(T0).toISOString(), receipt: { cleanup: [] } });
+  await d.registry.write(closed);
+  expect(await closedWorktreeSweep(d, closed)).toEqual([`WORKTREE_CLEANED remote-lane ${WT}`]);
+  expect(opsOf("git").map((e) => e.args)).toEqual([{ op: "worktree-remove", root: WT, path: WT, opts: { cmdId: `op:remote-lane/worktree-remove/${WT}:1` } }]);
+  expectRemote();
+});
+
+test("an open remote lane working in a closed lane's worktree (its remoteCwd) keeps that worktree", async () => {
+  const d = { ...deps(), runnerWorktreeRoot: (label: string) => (label === MACHINE ? "/repo/.wt" : undefined) };
+  const closed = lane({ status: "closed", closedAt: new Date(T0).toISOString(), receipt: { cleanup: [], queue: { worktrees: [{ path: WT, root: WT }], branches: [] } } });
+  await d.registry.write(closed);
+  await d.registry.write(lane({ key: "next-lane", pane: "w:p4", cwd: undefined, remoteCwd: WT }));
+  expect(await closedWorktreeSweep(d, closed)).toEqual([]);
+  expect(opsOf("git")).toEqual([]);
 });
 
 test("watch settles a remote claim using remote close and records skipped worktree detail", async () => {

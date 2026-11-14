@@ -708,6 +708,37 @@ RUNNER_CLEANUP at=<iso> sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n>
 To check a host, read `~/.dori/runner/logs/cleanup.json` there (`at` is the last sweep) or find the `RUNNER_CLEANUP`
 line in the runner's log.
 
+## Closed-lane worktree cleanup
+
+Lane worktrees are not the daily sweep's: the supervisor removes them in two stages, through the lane's runner
+(`lane.git`), the same way for local and remote lanes.
+
+1. **Close (queue).** A lane's close removes nothing. A local close still refuses uncommitted, untracked or unpushed
+   work (unless `--force`), then writes the worktrees it may drop into the closed lane's receipt (`receipt.queue`):
+   each worktree's path and the checkout its `git worktree remove` runs in, and each SHA-bound branch target
+   (repository, PR number, base, branch, merged head SHA, the checkout and remote to delete it from). A remote close
+   queues its worktrees under the runner's reported root, each removed from inside itself (it skips the unpushed check,
+   D10).
+2. **Watcher (remove).** The watcher's closed-lane pass reads each queued worktree again and removes it only when it is
+   clean and has no commit that no remote has (a worktree whose unpushed commits cannot be read stays, with a
+   warning). Then it deletes each queued branch, remote first with a lease on the merged head, then local with a
+   compare-and-delete, both only while the branch is still at that SHA, and also when the worktree was already gone.
+   A branch still checked out in a queued worktree that stays waits for it.
+
+Outside the root: a local lane's queued worktree is removed wherever it is, because its close found it as the lane's
+(named by its key, or recorded) and checked it. Everything else is removed only under the lane's runner's reported
+worktree root (a local lane uses `worktreeRoot` while its runner has reported none): a remote lane's queued
+worktrees, a worktree an older close listed as kept, and the lane's own directory (`cwd`; for a remote lane
+`remoteCwd`) and recorded worktrees that the close never found. A path an open lane uses (`cwd`, `remoteCwd`,
+`worktrees`), the lead's cwd and a worktree the close held with its branch are never removed.
+
+Every removal and delete is an operation row with a read-back, so a supervisor killed anywhere between the queue write
+and the last branch delete finishes on a later pass without repeating an effect. What is done is marked in the queue,
+so it is never repeated after its operation row is pruned. The pass prints `WORKTREE_CLEANED <key> <paths>` and
+`BRANCH_CLEANED <key> <receipt lines>`; a branch that can never be deleted on its binding (protected, or moved off
+the merged head) is one `LANE_WATCH_WARN` and is settled, and one that only has to wait (another open lane names its
+PR, a ref that cannot be read) is one `LANE_WATCH_WARN` for each new reason and is tried again on every pass.
+
 ## Shadow mode (removed)
 
 Shadow mode is gone. The supervisor always opens the hub, `dori supervise` always spawns the local runner as its
