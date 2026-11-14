@@ -141,7 +141,12 @@ test("doctor names the sensitive host paths a lane can read, probed through the 
   const backups = join(home, "backups");
   mkdirSync(backups);
   writeFileSync(join(backups, "snap"), "x");
-  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# backups\n${backups}\n`);
+  // Glob entries are probed match by match: the shared list's history files, the hide list's keys.
+  writeFileSync(join(home, ".node_repl_history"), "x");
+  mkdirSync(join(home, "keys"));
+  writeFileSync(join(home, "keys", "a.pem"), "x");
+  writeFileSync(join(home, "keys", "c.txt"), "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# backups\n${backups}\n${join(home, "keys", "*.pem")}\n`);
   const argvs: string[][] = [];
   const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
     if (argv[0] !== "env") return f.deps.run(argv, {});
@@ -155,6 +160,9 @@ test("doctor names the sensitive host paths a lane can read, probed through the 
   expect(check.detail).toContain("~/.aws");
   expect(check.detail).toContain("~/.ssh/id_rsa");
   expect(check.detail).toContain("~/backups");
+  expect(check.detail).toContain("~/.node_repl_history");
+  expect(check.detail).toContain("~/keys/a.pem");
+  expect(check.detail).not.toContain("~/keys/c.txt");
   expect(check.detail).toContain("bound on purpose: ~/.config/gh");
   // Empty on the host (an empty file, an empty dir) or a public key: not probed.
   for (const no of ["~/.netrc", "~/.kube", "id_rsa.pub"]) expect(check.detail).not.toContain(no);

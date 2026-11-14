@@ -28,9 +28,12 @@
 # Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
-# Host paths outside ~/.dori listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file) are
-# refused outright, reads, writes and socket connects alike, over every rule above. Every path is resolved first
-# (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as profile text.
+# Host paths listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file), ~/.dori's
+# own entries included, are refused outright, reads, writes and socket connects alike, over every rule above. Every path
+# is resolved first (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as
+# profile text. An entry of either list may be a glob (* and ? within one path component, [...] a class): it becomes a
+# regex refusing every path it matches and everything below one, whether it exists now or appears later; the part
+# before the first glob component is resolved like a path.
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
 set -eu
 
@@ -54,8 +57,7 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
   .local/share/toodo-server .mozilla .config/google-chrome .config/chromium .config/BraveSoftware
   .config/microsoft-edge .config/discord .config/Slack .config/Signal .local/share/TelegramDesktop
-  .config/Code/User/globalStorage .vscode .vscode-server .bash_history .zsh_history .python_history .psql_history
-  .mysql_history .lesshst"
+  .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
 # END CREDENTIALS
 
 SBX=/usr/bin/sandbox-exec
@@ -85,6 +87,66 @@ canon_parent() { printf '%s/%s\n' "$(canon "$(dirname "$1")")" "$(basename "$1")
 
 # $1 with every regex metacharacter escaped.
 re_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'; }
+
+# glob_regex PATH: sets GLOB_RE to the anchored regex for the glob PATH and everything below a match (* and ? stay
+# within one component, [...] is a class, [!...] a negated one) and GLOB_SHOW to PATH with its literal head resolved.
+glob_regex() {
+  local d=$1 rest="" re="" c i=0 j n cls
+  while case "$d" in *[*?[]*) true ;; *) false ;; esac; do
+    rest="/$(basename "$d")$rest"
+    d=$(dirname "$d")
+  done
+  d=$(canon "$d")
+  if [ "$d" = / ]; then d=""; fi
+  n=${#rest}
+  while [ "$i" -lt "$n" ]; do
+    c=${rest:$i:1}
+    case "$c" in
+      '*') re="$re[^/]*" ;;
+      '?') re="$re[^/]" ;;
+      '[')
+        # A class runs to the first ] after its first member; with none it is a literal [.
+        j=$((i + 1))
+        cls=""
+        if [ "${rest:$j:1}" = '!' ] || [ "${rest:$j:1}" = '^' ]; then cls="^" && j=$((j + 1)); fi
+        if [ "${rest:$j:1}" = ']' ]; then cls="$cls]" && j=$((j + 1)); fi
+        while [ "$j" -lt "$n" ] && [ "${rest:$j:1}" != ']' ]; do
+          if [ "${rest:$j:1}" != / ]; then cls="$cls${rest:$j:1}"; fi
+          j=$((j + 1))
+        done
+        if [ "$j" -lt "$n" ]; then
+          re="$re[$cls]"
+          i=$j
+        else
+          re="$re\\["
+        fi
+        ;;
+      '.' | '\' | '^' | '$' | '+' | '(' | ')' | '{' | '}' | '|' | ']') re="$re\\$c" ;;
+      *) re="$re$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  GLOB_RE="^$(re_escape "$d")$re(/|\$)"
+  GLOB_SHOW="$d$rest"
+}
+
+# deny_target NAME PATH: sets TARGET to the SBPL filter for PATH (a subpath, or a regex for a glob) as parameter NAME,
+# and SHOWN to the path --explain lists.
+deny_target() {
+  case "$2" in
+    *[*?[]*)
+      glob_regex "$2"
+      param_raw "$1" "$GLOB_RE"
+      SHOWN=$GLOB_SHOW
+      TARGET="(regex (param \"$1\"))"
+      ;;
+    *)
+      param "$1" "$2"
+      SHOWN=$LAST
+      TARGET="(subpath (param \"$1\"))"
+      ;;
+  esac
+}
 
 # Splits $1 on ':' into SPLIT, without globbing.
 split_paths() { local IFS=:; set -f; SPLIT=($1); set +f; }
@@ -213,11 +275,15 @@ build_profile() {
 (allow network-outbound (remote unix-socket (path-literal (param \"AGENT_SOCK\"))) (remote unix-socket (path-literal (param \"AGENT_LINK\"))))"
       ;;
   esac
-  local c_rules=""
-  for p in $CREDENTIALS; do
-    param "CRED$n" "$H/$p"
-    XCRED+=("$LAST")
-    c_rules="$c_rules (subpath (param \"CRED$n\"))"
+  local c_rules="" creds
+  # Split without globbing: a glob entry becomes a regex under $H, never a match against the cwd here.
+  set -f
+  creds=($CREDENTIALS)
+  set +f
+  for p in "${creds[@]}"; do
+    deny_target "CRED$n" "$H/$p"
+    XCRED+=("$SHOWN")
+    c_rules="$c_rules $TARGET"
     n=$((n + 1))
   done
   if [ -f "$H/.dori/lane-sandbox-hide" ]; then
@@ -225,12 +291,12 @@ build_profile() {
       p=${p%%#*}
       p=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
       if [ -n "$p" ]; then
-        param "HIDE$n" "$p"
-        XHIDE+=("$LAST")
+        deny_target "HIDE$n" "$p"
+        XHIDE+=("$SHOWN")
         h_rules="$h_rules
-(deny file-read* (subpath (param \"HIDE$n\")))
-(deny file-write* (subpath (param \"HIDE$n\")))
-(deny network-outbound (remote unix-socket (subpath (param \"HIDE$n\"))))"
+(deny file-read* $TARGET)
+(deny file-write* $TARGET)
+(deny network-outbound (remote unix-socket $TARGET))"
         n=$((n + 1))
       fi
     done <"$H/.dori/lane-sandbox-hide"

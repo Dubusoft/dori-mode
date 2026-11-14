@@ -243,6 +243,29 @@ test("a hidden path under ~/.dori is hidden too; inside a hidden subtree only a 
   expect(review).not.toContain(gh);
 });
 
+test("a glob in the hide list or the shared credential list hides each existing match, dotfiles and ~/.dori entries included, and --explain lists each", async () => {
+  const root = realpathSync(tempDir());
+  const home = join(root, "home");
+  const keys = join(root, "keys"), research = join(home, ".dori", "research");
+  for (const d of [join(keys, "sub"), join(research, "ap-1-1")]) mkdirSync(d, { recursive: true });
+  for (const f of [join(keys, "a.pem"), join(keys, ".b.pem"), join(keys, "c.txt"), join(keys, "sub", "d.pem"), join(research, "secret-x"), join(research, "ap-1-1", "report.md"), join(home, ".zsh_history"), join(home, ".node_repl_history")]) writeFileSync(f, "x");
+  // dir/.* never matches the directory itself or its parent; a glob matching nothing adds nothing.
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${join(keys, "*.pem")}\n${join(keys, ".*")}\n${join(root, "none", "*.key")}\n${join(research, "secret-x")}\n`);
+  const env = { DORI_LANE_KEY: "lane-a" };
+
+  const argv = await sandboxArgv(home, env);
+  const after = (p: string) => argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === p) > lastReadWrite(argv, home);
+  for (const p of [join(keys, "a.pem"), join(keys, ".b.pem"), join(research, "secret-x"), join(home, ".zsh_history"), join(home, ".node_repl_history")]) expect({ p, hidden: after(p) }).toEqual({ p, hidden: true });
+  const hides = argv.flatMap((a, i) => (a === "--tmpfs" ? [argv[i + 1]] : a === "--ro-bind" && argv[i + 1] === "/dev/null" ? [argv[i + 2]] : []));
+  for (const p of [keys, root, home, join(keys, "c.txt"), join(keys, "sub", "d.pem"), join(research, "ap-1-1", "report.md")]) expect({ p, hidden: hides.includes(p) }).toEqual({ p, hidden: false });
+  expect(argv.some((a) => a.includes("*"))).toBe(false);
+
+  const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "--explain"], { cwd: join(home, "work"), env: { PATH: `${join(home, "fake-bin")}:${process.env.PATH ?? ""}`, HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+  for (const p of [join(keys, "a.pem"), join(keys, ".b.pem"), join(research, "secret-x"), join(home, ".zsh_history"), join(home, ".node_repl_history")]) expect(explainRows(out)).toContain(`hide ${p}`);
+});
+
 test("the top-level directory holding $HOME is the sandbox's own, not a read-only bind of the host's root-owned one", async () => {
   // Under TMPDIR (/tmp, /dev/shm) the top-level entry is skipped anyway; next to this file it is one the script binds.
   const home = mkdtempSync(join(import.meta.dir, ".sandbox-home-"));
@@ -530,6 +553,28 @@ test("macOS: each path in ~/.dori/lane-sandbox-hide is refused for reads, writes
   expect(allows(sb, "file-read-data", join(root, "other"))).toBe(true);
   expect(sb.profile).not.toContain(root);
 });
+
+test("macOS: a glob in the hide list or the shared credential list refuses every path it matches, now or later, and ~/.dori entries are refused too", async () => {
+  const { root, home, wt } = macHome();
+  const keys = join(root, "keys"), research = join(home, ".dori", "research");
+  mkdirSync(keys);
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${join(keys, "*.pem")}\n${join(keys, "id_[!x]?")}\n${join(research, "secret-x")}\n`);
+  const env = { DORI_LANE_KEY: "lane-a" };
+  const sb = await seatbelt(home, wt, env);
+  const read = (p: string) => allows(sb, "file-read-data", p);
+
+  for (const no of [join(keys, "a.pem"), join(keys, ".b.pem"), join(keys, "a.pem", "x"), join(keys, "id_ab"), join(research, "secret-x"), join(research, "secret-x", "y"), join(home, ".zsh_history"), join(home, ".node_repl_history")]) {
+    expect({ no, read: read(no) }).toEqual({ no, read: false });
+  }
+  expect(allows(sb, "file-write-data", join(keys, "a.pem"))).toBe(false);
+  for (const ok of [join(keys, "c.txt"), join(keys, "sub", "d.pem"), join(keys, "a.pem.bak"), join(keys, "id_xb"), join(keys, "id_abc"), join(research, "secret-xy"), join(research, "ap-1-1", "report.md"), join(home, ".zsh_historyx")]) {
+    expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
+  }
+
+  const explained = await runMacos(home, wt, ["--explain"], env, join(root, "no-sandbox-exec"));
+  expect({ code: explained.code, err: explained.err }).toEqual({ code: 0, err: "" });
+  for (const row of [`hide ${join(keys, "*.pem")}`, `hide ${join(research, "secret-x")}`, `hide ${join(home, ".*_history")}`]) expect(explainRows(explained.out)).toContain(row);
+}, 30_000);
 
 test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git logins) are refused for reads", async () => {
   const { home, wt } = macHome();
@@ -853,7 +898,8 @@ test("macOS: --explain lists every path the profile names, each with the access 
 
   // Every path parameter the profile's file rules use is a row (sockets, /dev and the keychain's temp copies are not paths).
   const named = Object.entries(sb.params).filter(([k]) => /^(W|R|O|CRED|HIDE)\d+$|^(DORI_RUNNER|DORI_SECRETS|CONFIG|CONFIG_GH|CONFIG_GIT|HOOKS|KEYCHAIN|SSH|SSH_CONFIG|SSH_KNOWN_HOSTS)$/.test(k)).map(([, v]) => v);
-  expect(named.filter((p) => !rows.some((r) => r.path === p))).toEqual([]);
+  // A glob's parameter is its regex, which the row's pattern (as listed) matches.
+  expect(named.filter((p) => !rows.some((r) => r.path === p || (p.startsWith("^") && new RegExp(p).test(r.path))))).toEqual([]);
   expect(sb.params.REPOS_GIT).toBeDefined();
   expect(rows).toContainEqual({ mode: "rw", path: `${repos}/*/.git` });
 

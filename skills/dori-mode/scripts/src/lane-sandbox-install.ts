@@ -11,7 +11,8 @@ export const installedLaneSandbox = (home: string): string => join(home, ".local
 /**
  * Credential stores and secrets under $HOME no lane may read, files and directories alike: the one list both lane
  * sandbox templates hide (rendered into their CREDENTIALS block by laneSandboxScript) and `dori doctor` probes. A lane
- * gets a credential only through the secret broker. Paths that need a subtree hidden with parts of it re-opened
+ * gets a credential only through the secret broker. An entry may be a glob (* and ? within one path component, [...] a
+ * class): Linux hides each existing match, macOS refuses every path it matches. Paths that need a subtree hidden with parts of it re-opened
  * (~/.dori/runner, ~/.ssh, ~/.config) are handled by each template itself, not listed here.
  */
 export const CREDENTIAL_DENY: readonly string[] = [
@@ -35,7 +36,7 @@ export const CREDENTIAL_DENY: readonly string[] = [
   ".mozilla", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware", ".config/microsoft-edge", ".config/discord", ".config/Slack",
   ".config/Signal", ".local/share/TelegramDesktop", ".config/Code/User/globalStorage", ".vscode", ".vscode-server",
   // shell and REPL history
-  ".bash_history", ".zsh_history", ".python_history", ".psql_history", ".mysql_history", ".lesshst",
+  ".*_history", ".lesshst",
 ];
 
 const CREDENTIALS_BLOCK = /^# BEGIN CREDENTIALS\b.*\n[\s\S]*?^# END CREDENTIALS$/m;
@@ -45,7 +46,7 @@ const credentialsBlock = (): string => {
   const lines: string[] = [];
   let line = 'CREDENTIALS="';
   for (const p of CREDENTIAL_DENY) {
-    if (/[\s"'$`\\*?[]/.test(p)) throw new Error(`CREDENTIAL_DENY entry ${p} is not a plain path`);
+    if (/[\s"'$`\\]/.test(p)) throw new Error(`CREDENTIAL_DENY entry ${p} is not a plain path or glob`);
     if (line.length + p.length + 1 > 118) { lines.push(line.trimEnd()); line = "  "; }
     line += `${p} `;
   }
