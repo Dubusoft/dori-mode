@@ -8,6 +8,7 @@ import {
   closeOwnerDecision, type DecisionContext, type DecisionTransport, ownerDecisionTick, readDecisions, SECRET_REQUESTS_PER_LANE, secretRequester,
 } from "../src/owner-decisions.ts";
 import { secretGranter } from "../src/runner/secret-grant.ts";
+import { SecretStoreError } from "../src/secret-store.ts";
 
 const VALUE = "dori-test-throwaway-123";
 const NOW = 1_800_000_000_000;
@@ -34,7 +35,7 @@ const fakeTransport = () => {
 };
 
 /** One supervisor host: state dir, config file read per request by the granter, decision tick, and the CLI's config writer. */
-const host = (config: Record<string, unknown> = {}, commands: Record<string, SecretCommand> = {}, repoOf: (key: string) => string | undefined = () => REPO) => {
+const host = (config: Record<string, unknown> = {}, commands: Record<string, SecretCommand> = {}, repoOf: (key: string) => string | undefined = () => REPO, stored: (name: string) => boolean = () => true) => {
   const dir = mkdtempSync(join(tmpdir(), "secret-request-"));
   dirs.push(dir);
   const configPath = join(dir, "config.json");
@@ -47,7 +48,7 @@ const host = (config: Record<string, unknown> = {}, commands: Record<string, Sec
     secretGrant: (names, to) => grantSecretRule(configPath, names, to),
   };
   const grant = secretGranter({
-    store: { read: async () => VALUE },
+    store: { read: async (name) => { if (!stored(name)) throw new SecretStoreError("SECRET_MISSING", `${name} is not stored`); return VALUE; } },
     rules: async () => (await loadConfig(configPath, "/home/test")).secrets,
     laneRepo: async (key) => repoOf(key),
     audit: () => {},
@@ -61,17 +62,22 @@ const host = (config: Record<string, unknown> = {}, commands: Record<string, Sec
   return { dir, ctx, grant, tick, decisions, rules, threads: fake.threads, events };
 };
 
-test("a name outside the allowlist opens one owner decision; allowing this lane makes the next exec succeed", async () => {
+test("a name outside the allowlist asks the lead, not the owner; the lead's grant makes the next exec succeed", async () => {
   const h = host({ defaultModel: "a/b" });
   const denied = await h.grant("ap-1-1", ["NPM_TOKEN"]);
   expect(denied).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
-  expect(denied.ok ? "" : denied.detail).toContain("the owner is asked in an owner decision");
+  expect(denied.ok ? "" : denied.detail).toContain("the lead is asked to grant it");
   await h.tick();
-  expect(h.threads).toHaveLength(1);
+  expect(h.threads).toHaveLength(0);
   const [d] = h.decisions();
-  expect(d).toMatchObject({ state: "open", lane: "ap-1-1", task: 1, secretRequest: { names: ["NPM_TOKEN"], repo: REPO, grants: ["lane", "repo", "deny"] } });
+  expect(d).toMatchObject({ state: "open", lane: "ap-1-1", task: 1, leadOnly: true, secretRequest: { names: ["NPM_TOKEN"], repo: REPO, grants: ["lane", "repo", "deny"] } });
+  expect(d?.thread).toBeUndefined();
   expect(d?.options).toHaveLength(3);
+  expect(h.events).toHaveLength(1);
+  expect(h.events[0]).toStartWith(`SECRET_REQUEST ap-1-1 ${d?.id} names=NPM_TOKEN repo=${REPO}:`);
   expect(readDecisions(h.dir).secretRequests).toEqual([]);
+  await h.tick();
+  expect(h.decisions()).toHaveLength(1);
 
   const closed = await closeOwnerDecision(h.ctx, d?.id ?? "", { text: "allowed for this lane", choice: 1 });
   expect(closed.granted).toEqual({ names: ["NPM_TOKEN"], to: { lane: "ap-1-1" }, changed: ["NPM_TOKEN"] });
@@ -100,17 +106,17 @@ test("a deny leaves config alone and the lane stays denied without a new decisio
   expect(closed.granted).toBeUndefined();
   expect(h.rules()).toBeUndefined();
   const again = await h.grant("ap-1-1", ["NPM_TOKEN"]);
-  expect(again.ok ? "" : again.detail).toContain("the owner was already asked (decision d1)");
+  expect(again.ok ? "" : again.detail).toContain("the lead was already asked (decision d1)");
   await h.tick();
   expect(h.decisions()).toHaveLength(1);
-  expect(h.threads).toHaveLength(1);
+  expect(h.threads).toHaveLength(0);
 });
 
 test("repeated requests of one lane open no new decision, before or after the tick, and a lane is capped", async () => {
   const h = host();
   await h.grant("ap-1-1", ["NPM_TOKEN"]);
   const queuedTwice = await h.grant("ap-1-1", ["NPM_TOKEN"]);
-  expect(queuedTwice.ok ? "" : queuedTwice.detail).toContain("the owner was already asked; no new decision");
+  expect(queuedTwice.ok ? "" : queuedTwice.detail).toContain("the lead was already asked; no new request");
   await h.tick();
   await h.grant("ap-1-1", ["NPM_TOKEN"]);
   await h.tick();
@@ -124,6 +130,17 @@ test("repeated requests of one lane open no new decision, before or after the ti
   await h.grant("ap-2-1", ["NPM_TOKEN"]);
   await h.tick();
   expect(h.decisions()).toHaveLength(4);
+});
+
+test("a denied name the store does not hold is RUNNER_SECRET_MISSING and asks nobody", async () => {
+  const h = host({}, {}, () => REPO, (name) => name !== "GONE_TOKEN");
+  const missing = await h.grant("ap-1-1", ["GONE_TOKEN"]);
+  expect(missing).toMatchObject({ ok: false, code: "RUNNER_SECRET_MISSING" });
+  expect(missing.ok ? "" : missing.detail).toContain("GONE_TOKEN is not in the secret store");
+  expect(readDecisions(h.dir).secretRequests ?? []).toEqual([]);
+  await h.tick();
+  expect(h.decisions()).toEqual([]);
+  expect(h.events).toEqual([]);
 });
 
 test("a secretCommands secret is never offered: it goes through secret run only", async () => {

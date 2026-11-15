@@ -102,6 +102,16 @@ export type OwnerDecision = DecisionChoices & {
   readonly revisions?: readonly AnswerRevision[];
   /** Set on the decision a lane's denied `dori secret exec` opened: closing it with a choice applies `grants[choice - 1]`. */
   readonly secretRequest?: SecretRequestDecision;
+  /**
+   * Set on a decision only the lead answers (a lane's secret request): it is posted nowhere, has no thread, stays out of
+   * the owner's daily reminder, and its urgent event (`answerEvent`) is resolved by `dori decision close`.
+   */
+  readonly leadOnly?: boolean;
+  /**
+   * The open blocking decision of the same lane or task whose thread this one was posted into instead of a thread of its
+   * own (openOwnerDecision). A thread shared that way is archived only when its last decision closes.
+   */
+  readonly attachedTo?: string;
   /** Set on the decision a PR's reached review limit opened: closing it with a choice records that outcome on the job. */
   readonly reviewCap?: ReviewCapDecision;
   /** The `[System]` status message of the direct answer in the decision's thread, edited in place (decisionDeliveryTick). */
@@ -299,7 +309,7 @@ export const decisionThreadName = (d: Pick<OwnerDecision, "id" | "task" | "quest
 
 /** The thread's starter message: question, numbered options with the recommendation marked, reason, what waits, origin. */
 export const decisionStartText = (d: OwnerDecision, home: string): string => {
-  const head = [`**[${label(d)} ${d.id}]**`, d.task !== undefined ? `Toodo #${d.task}` : undefined, d.lane ? `레인 ${d.lane}` : undefined].filter(Boolean).join(" · ");
+  const head = [`**[${label(d)} ${d.id}]**`, d.task !== undefined ? `Toodo #${d.task}` : undefined, d.lane ? `레인 ${d.lane}` : undefined, d.attachedTo ? `${d.attachedTo}에 이어서` : undefined].filter(Boolean).join(" · ");
   const origin = refIds(d.origin)?.thread;
   if (d.kind === "request") return scrubForThread([
     head,
@@ -337,14 +347,14 @@ export type CloseOptions = {
   readonly force?: boolean;
 };
 
-export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string): string => {
+export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string, keepsThread = d.inLaneThread === true): string => {
   const from = options.from ? /^(\d+)\/(\d+)$/.exec(options.from) : null;
   const picked = options.choice !== undefined ? ` ${options.choice}번(${cut(d.options[options.choice - 1] ?? "", 60)})` : "";
   const by = d.answeredAt === undefined && !d.revisions?.length && !from && !options.cancel ? " (리드가 정함)" : "";
   const where = from ? ` (<#${from[1]}>에서 받은 답: https://discord.com/channels/@me/${from[1]}/${from[2]})` : "";
   const note = options.text.replace(/\s+/g, " ").trim();
   const outcome = options.cancel ? "취소" : d.kind === "request" ? "요청 처리" : `결정 반영:${picked}`;
-  return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."}${d.inLaneThread ? "" : " 스레드를 닫습니다."}`, home);
+  return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."}${keepsThread ? "" : " 스레드를 닫습니다."}`, home);
 };
 
 /** The line appended to the origin thread's link message when the decision closes. */
@@ -388,7 +398,7 @@ const isGone = (e: unknown): boolean => e instanceof MessengerError && e.status 
  * no origin thread or the owner closed it, failed (retried by the tick) when the post throws.
  */
 export const postDecisionLink = async (ctx: DecisionContext, d: OwnerDecision): Promise<LinkResult> => {
-  if (d.inLaneThread) return { kind: "none" };
+  if (d.inLaneThread || d.attachedTo) return { kind: "none" };
   const origin = refIds(d.origin)?.thread;
   if (!origin || !d.thread) {
     if (!d.linkSkipped) patchOne(ctx.config.stateDir, d.id, (x) => ({ ...x, linkSkipped: "no origin thread" }));
@@ -470,16 +480,20 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       const same = file.decisions.find((d) => d.state !== "closed" && d.lane === spec.lane && d.question === spec.question);
       if (same) return { result: { decision: same, duplicateOf: same.id } };
     }
-    if (!channel) return { result: undefined };
+    // One open blocking question per lane or task gets a thread; a later one joins it instead of opening another.
+    const attach = laneThread ? undefined : file.decisions.filter((x) => (x.state === "open" || x.state === "answered") && x.blocking && x.thread && !x.leadOnly
+      && ((spec.lane !== undefined && x.lane === spec.lane) || (spec.task !== undefined && x.task === spec.task))).at(-1);
+    if (!channel && !attach) return { result: undefined };
     const decision: OwnerDecision = {
       id: `d${file.nextSeq}`, state: "posting", question: spec.question, options: spec.options, recommend: spec.recommend, reason: spec.reason,
-      waiting: spec.waiting, blocking: spec.blocking, source: spec.source, channel: channel.channel, openedAt: now,
+      waiting: spec.waiting, blocking: spec.blocking, source: spec.source, channel: attach?.channel ?? channel?.channel ?? "", openedAt: now,
       ...(spec.kind ? { kind: spec.kind } : {}), ...(spec.file ? { file: spec.file } : {}),
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
       ...(spec.target ? { target: spec.target } : {}), ...(spec.secretRequest ? { secretRequest: spec.secretRequest } : {}),
       ...(spec.reviewCap ? { reviewCap: spec.reviewCap } : {}),
       ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
+      ...(attach ? { thread: attach.thread, attachedTo: attach.id, linkSkipped: `posted in ${attach.id}'s thread`, ...(attach.inLaneThread ? { inLaneThread: true } : {}) } : {}),
     };
     return { file: { ...file, nextSeq: file.nextSeq + 1, decisions: [...file.decisions, decision] }, result: { decision, duplicateOf: undefined } };
   });
@@ -504,7 +518,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
     const kept = noticeKept;
     d = patchOne(stateDir, d.id, (x) => ({ ...x, state: "open", message, ...(kept ? { noticeKept: kept } : {}) })) ?? { ...d, state: "open", message };
   } catch (e) {
-    if (thread && !d.inLaneThread) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
+    if (thread && !d.inLaneThread && !d.attachedTo) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
     removeOne(stateDir, d.id);
     throw new OwnerDecisionError("DECISION_NOT_POSTED", `DECISION_NOT_POSTED ${errorText(e)}`);
   }
@@ -669,10 +683,13 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   }
   let archivePending: string | undefined;
   if (d.thread) {
-    try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home), `decision-close:${d.id}`); }
+    // A thread another decision still waits in (attachedTo, either way) stays open until its last decision closes.
+    const shared = readDecisions(stateDir).decisions.some((x) => x.id !== d.id && x.thread === d.thread && x.state !== "closed");
+    const keepsThread = d.inLaneThread === true || shared;
+    try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home, keepsThread), `decision-close:${d.id}`); }
     catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
     // A decision posted in a lane's own thread leaves that thread open: the lane keeps working there.
-    if (!d.inLaneThread) {
+    if (!keepsThread) {
       try { await archiveThread(ctx.transport, d.thread); }
       catch (e) { archivePending = errorText(e); }
     }
@@ -763,7 +780,7 @@ const recordAnswer = (
 const short = (text: string, max = 80): string => cut(text.replace(/\s+/g, " ").trim(), max);
 /** The question as the lead's lines show it: a request marked `[request]`. */
 const subject = (d: OwnerDecision, max = 80): string => (d.kind === "request" ? `[request] ${short(d.question, max - 10)}` : short(d.question, max));
-const threadRef = (d: OwnerDecision): string => (d.thread ? `discord:${d.channel}/${d.thread}` : `discord:${d.channel}`);
+const threadRef = (d: OwnerDecision): string => (d.leadOnly ? "lead-only" : d.thread ? `discord:${d.channel}/${d.thread}` : `discord:${d.channel}`);
 
 /** The event raised by the owner's first answer; its second word is the lane (`-` for none), as decision obligations read it. */
 export const answeredLine = (d: OwnerDecision): string => {
@@ -781,7 +798,7 @@ export const answeredLine = (d: OwnerDecision): string => {
 
 /** The digest event of a decision the supervisor opened from a lane question. */
 export const openedLine = (d: OwnerDecision, duplicateOf?: string): string =>
-  `OWNER_DECISION_OPENED ${d.id} lane ${d.lane ?? "-"} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)} ${subject(d)}${duplicateOf ? ` (duplicate of ${duplicateOf})` : ""}`;
+  `OWNER_DECISION_OPENED ${d.id} lane ${d.lane ?? "-"} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)} ${subject(d)}${duplicateOf ? ` (duplicate of ${duplicateOf})` : ""}${d.attachedTo && !duplicateOf ? ` (posted in ${d.attachedTo}'s thread)` : ""}`;
 
 const age = (ms: number): string => {
   const min = Math.max(0, Math.floor(ms / 60_000));
@@ -870,7 +887,7 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
   }
   const { day, hour } = localDayHour(now, deps.config.displayTimeZone);
   if (hour >= DECISION_DIGEST_HOUR && readDecisions(stateDir).digestDay !== day) {
-    const waiting = openOwnerDecisions(stateDir).filter((d) => d.state === "open" || d.state === "answered");
+    const waiting = openOwnerDecisions(stateDir).filter((d) => !d.leadOnly && (d.state === "open" || d.state === "answered"));
     const target = deps.config.decisionsChannel?.trim() || alertsChannelOf(deps.config);
     if (waiting.length && target) {
       try {
@@ -879,7 +896,7 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
       } catch (e) { log(`OWNER_DECISION_DIGEST_FAILED ${errorText(e)}`); }
     } else updateDecisions(stateDir, (f) => ({ file: { ...f, digestDay: day }, result: undefined }));
   }
-  for (const r of readDecisions(stateDir).secretRequests ?? []) await openSecretRequest(deps, r, log);
+  for (const r of readDecisions(stateDir).secretRequests ?? []) await openSecretRequest(deps, r);
   if (readDecisions(stateDir).decisions.some((d) => d.state === "closed" && now - (d.closedAt ?? now) >= DECISION_KEEP_CLOSED_MS)) {
     updateDecisions(stateDir, (f) => ({ file: { ...f, decisions: f.decisions.filter((d) => !(d.state === "closed" && now - (d.closedAt ?? now) >= DECISION_KEEP_CLOSED_MS)) }, result: undefined }));
   }
@@ -890,25 +907,41 @@ export const SECRET_REQUESTS_PER_LANE = 3;
 
 const sameRequest = (a: PendingSecretRequest, b: PendingSecretRequest): boolean => a.lane === b.lane && a.at === b.at && a.names.join(",") === b.names.join(",");
 
+/** The urgent event that asks the lead to grant or deny a lane's secret request decision `d` (the owner is not asked). */
+export const secretRequestLine = (d: OwnerDecision): string => {
+  const names = d.secretRequest?.names.join(",") ?? "";
+  const choices = (d.secretRequest?.grants ?? []).map((g, i) => `${i + 1}=${g === "lane" ? `lane ${d.lane ?? "-"}` : g === "repo" ? `repo ${d.secretRequest?.repo ?? "-"}` : "deny"}`).join(" ");
+  return `SECRET_REQUEST ${d.lane ?? "-"} ${d.id} names=${names}${d.secretRequest?.repo ? ` repo=${d.secretRequest.repo}` : ""}: config secrets denied it; grant it yourself (the owner is not asked) with dori decision close ${d.id} --text "..." --choice N (${choices}), then tell the lane to run its command again`;
+};
+
 /**
- * Opens the owner decision of one pending secret request (secretRequestChoices; `sourceRef` `secret:<lane>:<names>`, so a
- * crash between opening and dequeuing resumes the same decision), then drops it from the queue. A request that cannot be
- * posted is dropped too and raises OWNER_DECISION_SECRET_REQUEST_FAILED once; the lane's next request queues it again.
+ * Records one pending secret request as a lead-only decision (secretRequestChoices; `sourceRef` `secret:<lane>:<names>`, so
+ * a crash between recording and dequeuing resumes the same decision), raises the urgent SECRET_REQUEST event for the lead
+ * under the id its close resolves, then drops the request from the queue. Nothing is posted to Discord: the lead grants
+ * credentials itself through the decision's close (`--choice`), and the owner never sees the request.
  */
-const openSecretRequest = async (deps: TickDeps, r: PendingSecretRequest, log: (line: string) => void): Promise<void> => {
+const openSecretRequest = async (deps: TickDeps, r: PendingSecretRequest): Promise<void> => {
   const { choices, grants } = secretRequestChoices(r.lane, r.names, r.repo);
   const task = taskOfLane(r.lane);
-  try {
-    const opened = await openOwnerDecision(deps, {
-      ...choices, source: "lane", lane: r.lane, sourceRef: `secret:${r.lane}:${r.names.join(",")}`,
-      secretRequest: { names: r.names, ...(r.repo ? { repo: r.repo } : {}), grants }, ...(task !== undefined ? { task } : {}),
-    });
-    log(`OWNER_DECISION_SECRET_REQUEST ${opened.decision.id} lane=${r.lane} names=${r.names.join(",")}`);
-  } catch (e) {
-    await deps.enqueue(`secret-request-failed:${r.lane}:${r.names.join(",")}:${r.at}`, `OWNER_DECISION_SECRET_REQUEST_FAILED ${r.lane} names=${r.names.join(",")}: ${errorText(e)}; the lane stays denied until config secrets allows it`);
-  }
+  const sourceRef = `secret:${r.lane}:${r.names.join(",")}`;
+  const now = deps.now();
+  const d = updateDecisions(deps.config.stateDir, (file): { file?: DecisionsFile; result: OwnerDecision } => {
+    const known = file.decisions.find((x) => x.source === "lane" && x.sourceRef === sourceRef);
+    if (known) return { result: known };
+    const id = `d${file.nextSeq}`;
+    const decision: OwnerDecision = {
+      ...choices, id, state: "open", source: "lane", channel: "", openedAt: now, lane: r.lane, sourceRef, leadOnly: true,
+      answerEvent: secretRequestEventId(id), secretRequest: { names: r.names, ...(r.repo ? { repo: r.repo } : {}), grants },
+      ...(task !== undefined ? { task } : {}),
+    };
+    return { file: { ...file, nextSeq: file.nextSeq + 1, decisions: [...file.decisions, decision] }, result: decision };
+  });
+  await deps.enqueue(secretRequestEventId(d.id), secretRequestLine(d));
   updateDecisions(deps.config.stateDir, (file) => ({ file: { ...file, secretRequests: (file.secretRequests ?? []).filter((x) => !sameRequest(x, r)) }, result: undefined }));
 };
+
+/** The event id of a secret request decision's SECRET_REQUEST line; closing the decision resolves it. */
+export const secretRequestEventId = (id: string): string => `secret-request:${id}`;
 
 /** What requestSecretGrant did with a denied request. */
 export type SecretAsk =
@@ -918,9 +951,9 @@ export type SecretAsk =
   | { readonly kind: "run-only"; readonly names: readonly string[] };
 
 /**
- * Queues lane `lane`'s denied request for `names` as a pending secret request, which ownerDecisionTick opens as one owner
- * decision. Nothing is queued when a decision of that lane (in any state, a denial included) or a pending request already
- * covers every name (`asked`), when the lane already has SECRET_REQUESTS_PER_LANE of them (`limited`), or when a name is
+ * Queues lane `lane`'s denied request for `names` as a pending secret request, which ownerDecisionTick records as one
+ * lead-only decision (openSecretRequest). Nothing is queued when a decision of that lane (in any state, a denial
+ * included) or a pending request already covers every name (`asked`), when the lane already has SECRET_REQUESTS_PER_LANE of them (`limited`), or when a name is
  * one of `runOnly` (the `secretCommands` secrets: those go only through `dori secret run`).
  */
 export const requestSecretGrant = (stateDir: string, req: { readonly lane: string; readonly names: readonly string[]; readonly repo?: string | undefined }, now: number, runOnly: readonly string[] = []): SecretAsk => {
@@ -950,9 +983,9 @@ export const secretRequester = (stateDir: string, commands: () => Promise<Readon
     const runOnly = Object.values(await commands()).flatMap((c) => c.secrets);
     const ask = requestSecretGrant(stateDir, { lane, names, repo }, now(), runOnly);
     switch (ask.kind) {
-      case "queued": return "the owner is asked in an owner decision; run the command again after the lead says it was answered";
-      case "asked": return `the owner was already asked${ask.decision ? ` (decision ${ask.decision})` : ""}; no new decision opens for this lane`;
-      case "limited": return `this lane already asked for ${SECRET_REQUESTS_PER_LANE} secrets; no new decision opens, report it to the lead as blocked`;
+      case "queued": return "the lead is asked to grant it; run the command again after the lead says it was granted";
+      case "asked": return `the lead was already asked${ask.decision ? ` (decision ${ask.decision})` : ""}; no new request opens for this lane`;
+      case "limited": return `this lane already asked for ${SECRET_REQUESTS_PER_LANE} secrets; no new request opens, report it to the lead as blocked`;
       case "run-only": return `${ask.names.join(",")} go only through dori secret run <op> (config secretCommands)`;
     }
   };

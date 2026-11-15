@@ -400,6 +400,31 @@ test("a second question in the same lane thread takes the next answer, and a lan
   expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
 });
 
+test("a question of a lane or task with an open blocking decision joins that thread, which is archived only when its last decision closes", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-1", text: serializeDecisionText(choices) });
+  const second = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
+  expect(second?.decision).toMatchObject({ id: "d2", state: "open", channel: "555", thread: "1000", attachedTo: "d1" });
+  expect(second?.link).toEqual({ kind: "none" });
+  // The lead's question for the same task (ap-926-1 is task 926) joins it too.
+  const lead = await openOwnerDecision(ctx, { ...choices, question: "A lead question", source: "lead", task: 926 });
+  expect(lead.decision).toMatchObject({ id: "d3", thread: "1000", attachedTo: "d2" });
+  expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
+  const followUp = String(fake.calls.filter((call) => call.method === "send" && call.args[0] === "1000").at(1)?.args[1]);
+  expect(followUp).toContain("d1에 이어서");
+  for (const id of ["d1", "d2"]) {
+    const closed = await closeOwnerDecision(ctx, id, { text: "done", choice: 1 });
+    expect(closed.archivePending).toBeUndefined();
+    expect(String(fake.calls.filter((call) => call.method === "send").at(-1)?.args[1])).not.toContain("스레드를 닫습니다");
+  }
+  expect(fake.calls.some((call) => call.method === "setThread" && call.args[0] === "1000")).toBe(false);
+  await closeOwnerDecision(ctx, "d3", { text: "done", choice: 1 });
+  expect(String(fake.calls.filter((call) => call.method === "send").at(-1)?.args[1])).toContain("스레드를 닫습니다");
+  expect(fake.archived.get("1000")).toBe(true);
+});
+
 /** Receipts that log each call into `calls` (beside the transport's), with the unseen counts and failures a case sets. */
 const fakeReceipts = (calls: { method: string; args: unknown[] }[], unseen: Record<string, string[]> = {}, failHandled = new Set<string>()) => {
   const acked = new Set<string>();

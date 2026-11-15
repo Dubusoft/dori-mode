@@ -117,6 +117,18 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
     if (!rule || !await ruleMatches(rule, key, laneRepo)) denied.push(name);
   }
   if (denied.length) {
+    // A denied name the store does not hold could not be used even once granted: the lead adds it, so nobody is asked.
+    const missing: string[] = [];
+    for (const name of denied) {
+      if (Object.hasOwn(rules, name) && rules[name]?.mint) continue;
+      try { await deps.store.read(name); } catch (e) {
+        if (e instanceof SecretStoreError && e.code === "SECRET_MISSING") missing.push(name);
+      }
+    }
+    if (missing.length) {
+      const gone = missing.join(",");
+      return refuse("RUNNER_SECRET_MISSING", `${gone} ${missing.length > 1 ? "are" : "is"} not in the secret store and ${key} may not receive ${denied.join(",")} (config secrets); no grant request opens: report it to the lead as blocked`, `missing: ${gone}`);
+    }
     const list = denied.join(",");
     const asked = deps.request ? await laneRepo().then((r) => deps.request?.(key, denied, r)).catch(() => undefined) : undefined;
     return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)${asked ? `; ${asked}` : ""}`, `not allowed: ${list}`);
