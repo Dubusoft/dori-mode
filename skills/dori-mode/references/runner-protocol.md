@@ -226,7 +226,7 @@ always runs sandboxed: the runner runs `sandboxCheck` first even without `sandbo
 (`RUNNER_LANE_REVIEW_UNSANDBOXED`), and launches it with `LANE_SANDBOX_PROFILE=review` and without `LANE_SANDBOX_REPOS`,
 `LANE_SANDBOX_WORKTREES` and `LANE_SANDBOX_RW`. The Linux wrapper then binds the cwd (the review snapshot worktree), its
 git common dir, the worktree root and the repos' `.git` read-only, ignores write grants, gives `/tmp` a private tmpfs
-and leaves only `briefs/<key>.out`, the lane TMPDIR, `~/.omo` and `~/.cache` writable; `~/.gitconfig`, `~/.config/gh`,
+and leaves only `briefs/<key>.out`, the lane TMPDIR, `~/.omo` and `~/.cache` writable; `~/.gitconfig`, `~/.config/gh` (its `hosts.yml` included),
 `~/.config/git` and the ssh agent socket are not bound, GitHub tokens are unset and git reads no global or system
 config. Any other non-empty `LANE_SANDBOX_PROFILE` exits 2, and the macOS wrapper refuses every profile (review lanes run
 on Linux only). `lane-sandbox --explain` names the profile in its header.

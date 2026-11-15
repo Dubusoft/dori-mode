@@ -54,6 +54,18 @@
     "tickSec": 300
   },
   "guardMachines": {},
+  "secrets": {
+    "GH_TOKEN": {
+      "repos": ["your-org/your-repo"],
+      "mint": {
+        "kind": "github-app",
+        "appId": "123456",
+        "installationId": "7890123",
+        "keySecret": "GH_APP_KEY",
+        "permissions": { "contents": "write", "pull_requests": "write" }
+      }
+    }
+  },
   "hooks": {
     "threadReply": [
       "my-messenger",

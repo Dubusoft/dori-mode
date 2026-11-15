@@ -163,7 +163,9 @@ test("doctor names the sensitive host paths a lane can read, probed through the 
   expect(check.detail).toContain("~/.node_repl_history");
   expect(check.detail).toContain("~/keys/a.pem");
   expect(check.detail).not.toContain("~/keys/c.txt");
-  expect(check.detail).toContain("bound on purpose: ~/.config/gh");
+  // gh's login file is no longer bound on purpose: a wrapper that hides nothing exposes it like any credential.
+  expect(check.detail).toContain("~/.config/gh/hosts.yml");
+  expect(check.detail).not.toContain("bound on purpose: ~/.config/gh");
   // Empty on the host (an empty file, an empty dir) or a public key: not probed.
   for (const no of ["~/.netrc", "~/.kube", "id_rsa.pub"]) expect(check.detail).not.toContain(no);
 
