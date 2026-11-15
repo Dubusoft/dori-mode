@@ -518,8 +518,10 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
     const kept = noticeKept;
     d = patchOne(stateDir, d.id, (x) => ({ ...x, state: "open", message, ...(kept ? { noticeKept: kept } : {}) })) ?? { ...d, state: "open", message };
   } catch (e) {
-    if (thread && !d.inLaneThread && !d.attachedTo) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
     removeOne(stateDir, d.id);
+    // An attached decision archives the shared thread only when the decisions it joined all closed meanwhile.
+    const orphaned = thread !== undefined && !d.inLaneThread && (!d.attachedTo || !readDecisions(stateDir).decisions.some((x) => x.thread === thread && x.state !== "closed"));
+    if (thread && orphaned) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
     throw new OwnerDecisionError("DECISION_NOT_POSTED", `DECISION_NOT_POSTED ${errorText(e)}`);
   }
   const link = await postDecisionLink(ctx, d);
@@ -683,24 +685,35 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   }
   let archivePending: string | undefined;
   if (d.thread) {
-    // A thread another decision still waits in (attachedTo, either way) stays open until its last decision closes.
+    // The confirmation's wording only: whether this close archives is settled below, with the close itself.
     const shared = readDecisions(stateDir).decisions.some((x) => x.id !== d.id && x.thread === d.thread && x.state !== "closed");
     const keepsThread = d.inLaneThread === true || shared;
     try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home, keepsThread), `decision-close:${d.id}`); }
     catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
-    // A decision posted in a lane's own thread leaves that thread open: the lane keeps working there.
-    if (!keepsThread) {
-      try { await archiveThread(ctx.transport, d.thread); }
-      catch (e) { archivePending = errorText(e); }
-    }
   }
   const at = ctx.now();
-  const closed = patchOne(stateDir, id, (x) => (x.state === "closed" ? undefined : {
-    ...x, state: "closed", closedAt: at, closeText: options.text,
-    ...(options.choice !== undefined ? { choice: options.choice } : {}), ...(options.cancel ? { cancelled: true } : {}),
-    ...(archivePending ? { archivePending: true } : {}),
-    ...(receipts && targets.covered.length ? { coveredAnswers: targets.covered, closeTasks: tasks } : {}),
-  })) ?? d;
+  // Under DECISIONS_LOCK with the close: the close that leaves no other decision waiting in its thread (attachedTo, either
+  // way; a lane's own thread never) owns the archive, recorded as archivePending until it is done. Overlapping closes and
+  // a decision attaching during the confirmation post therefore archive the thread exactly once, after its last decision.
+  const recorded = updateDecisions(stateDir, (file): { file?: DecisionsFile; result: { decision: OwnerDecision; owns: boolean } | undefined } => {
+    const x = file.decisions.find((y) => y.id === id);
+    if (!x || x.state === "closed") return { result: undefined };
+    const owns = x.thread !== undefined && !x.inLaneThread && !file.decisions.some((y) => y.id !== id && y.thread === x.thread && y.state !== "closed");
+    const next: OwnerDecision = {
+      ...x, state: "closed", closedAt: at, closeText: options.text,
+      ...(options.choice !== undefined ? { choice: options.choice } : {}), ...(options.cancel ? { cancelled: true } : {}),
+      ...(owns ? { archivePending: true } : {}),
+      ...(receipts && targets.covered.length ? { coveredAnswers: targets.covered, closeTasks: tasks } : {}),
+    };
+    return { file: { ...file, decisions: file.decisions.map((y) => (y.id === id ? next : y)) }, result: { decision: next, owns } };
+  });
+  let closed = recorded?.decision ?? d;
+  if (recorded?.owns && closed.thread) {
+    try {
+      await archiveThread(ctx.transport, closed.thread);
+      closed = patchOne(stateDir, id, (x) => { const { archivePending: _, ...rest } = x; return rest; }) ?? closed;
+    } catch (e) { archivePending = errorText(e); }
+  }
   let resolved: string | undefined;
   if (closed.answerEvent) {
     recordResolved(stateDir, closed.answerEvent, at, `decision ${id}`);
@@ -1007,7 +1020,7 @@ export const openLaneDecision = async (
   const request = parseRequestText(report.text);
   const choices = request ? requestSpec(request) : parseDecisionText(report.text);
   if (!choices) return undefined;
-  const task = taskOfLane(lane.key);
+  const task = lane.task ?? taskOfLane(lane.key);
   return openOwnerDecision(ctx, {
     ...choices, source: "lane", sourceRef: report.id, lane: lane.key, ...(request ? {} : { target: decisionTargetOf(lane) }),
     ...(task !== undefined ? { task } : {}), ...(lane.thread !== "none" && refIds(lane.thread) ? { origin: lane.thread } : {}),
@@ -1026,6 +1039,8 @@ export const openLaneDecision = async (
 /** The lane fields a decision target is read from (a registry Lane fits). */
 export type TargetLane = {
   readonly key: string;
+  /** The Toodo task the lane was launched for (registry Lane.task); else read from an autopilot key (taskOfLane). */
+  readonly task?: number;
   readonly runner?: string;
   readonly machine?: string;
   readonly lastRecoveryAt?: number;

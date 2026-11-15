@@ -425,6 +425,55 @@ test("a question of a lane or task with an open blocking decision joins that thr
   expect(fake.archived.get("1000")).toBe(true);
 });
 
+test("a lane launched for a task under an ordinary key joins that task's open blocking decision", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  await openOwnerDecision(ctx, { ...choices, source: "lead", task: 926 });
+  const opened = await openLaneDecision(ctx, { key: "feature-a", task: 926, thread: "none" }, { id: "row-1", text: serializeDecisionText({ ...choices, question: "Lane follow-up" }) });
+  expect(opened?.decision).toMatchObject({ id: "d2", task: 926, thread: "1000", attachedTo: "d1" });
+  expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
+});
+
+test("overlapping closes of a shared thread archive it once, after both", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-1", text: serializeDecisionText(choices) });
+  await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
+  const results = await Promise.all(["d1", "d2"].map((id) => closeOwnerDecision(ctx, id, { text: "done", choice: 1 })));
+  expect(results.map((r) => r.decision.state)).toEqual(["closed", "closed"]);
+  expect(fake.archived.get("1000")).toBe(true);
+  expect(readDecisions(dir).decisions.some((d) => d.archivePending)).toBe(false);
+});
+
+test("a decision attaching while the last one's close is being posted keeps the thread open until it closes", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  let release = (): void => {};
+  let reached = (): void => {};
+  const posting = new Promise<void>((resolve) => { reached = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const transport: DecisionTransport = {
+    ...fake.transport,
+    send: async (channel, content, stableId) => {
+      if (stableId === "decision-close:d1") { reached(); await gate; }
+      return fake.transport.send(channel, content, stableId);
+    },
+  };
+  const ctx = context(dir, transport);
+  await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-1", text: serializeDecisionText(choices) });
+  const closing = closeOwnerDecision(ctx, "d1", { text: "done", choice: 1 });
+  await posting;
+  const second = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
+  expect(second?.decision).toMatchObject({ id: "d2", thread: "1000", attachedTo: "d1" });
+  release();
+  await closing;
+  expect(fake.archived.get("1000")).toBeUndefined();
+  await closeOwnerDecision(ctx, "d2", { text: "done", choice: 1 });
+  expect(fake.archived.get("1000")).toBe(true);
+});
+
 /** Receipts that log each call into `calls` (beside the transport's), with the unseen counts and failures a case sets. */
 const fakeReceipts = (calls: { method: string; args: unknown[] }[], unseen: Record<string, string[]> = {}, failHandled = new Set<string>()) => {
   const acked = new Set<string>();

@@ -1654,7 +1654,7 @@ try {
         const laneKey = v.lane?.trim() || undefined;
         const found = laneKey === undefined ? undefined : await deps.registry.read(laneKey);
         if (laneKey !== undefined && !found) refuse(`unknown --lane ${laneKey}: no registered lane has this key`);
-        task ??= od.taskOfLane(laneKey);
+        task ??= found?.task ?? od.taskOfLane(laneKey);
         const thread = v.thread?.trim();
         if (thread !== undefined && !od.refIds(thread)) refuse(`--thread ${thread} is not a thread ref such as discord:<channel>/<thread>`);
         const laneThread = found?.thread && found.thread !== "none" ? found.thread : undefined;
