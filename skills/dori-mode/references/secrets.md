@@ -111,6 +111,8 @@ dori secret exec GH_TOKEN -- git push https://github.com/<owner>/<repo>.git HEAD
 
 The push names the https URL explicitly: an ssh remote doesn't use `GH_TOKEN`.
 
+`~/.npmrc` is hidden from lanes the same way. A lane that needs a registry token gets it as `NPM_TOKEN` through `dori secret exec NPM_TOKEN -- npm ...` (see [Lane usage](#lane-usage)).
+
 ## Minted GitHub tokens
 
 A rule with `mint` doesn't hand out a stored value. The granting side mints a GitHub App installation token for the lane on every request:

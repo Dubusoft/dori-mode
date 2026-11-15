@@ -55,7 +55,7 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .password-store .local/share/keyrings .local/share/gnome-keyring .local/share/kwalletd .config/age .age
   .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
   .cargo/credentials .cargo/credentials.toml .gem/credentials .m2/settings.xml .gradle/gradle.properties
-  .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
+  .config/composer/auth.json .yarnrc .yarnrc.yml .pnpmrc .npmrc .config/pnpm/auth.ini .config/glab-cli .nuget/NuGet
   .config/gh/hosts.yml .local/share/toodo-server .mozilla .config/google-chrome .config/chromium
   .config/BraveSoftware .config/microsoft-edge .config/discord .config/Slack .config/Signal
   .local/share/TelegramDesktop .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"

@@ -28,7 +28,7 @@ export const CREDENTIAL_DENY: readonly string[] = [
   ".config/sops", ".config/Bitwarden", ".config/keepassxc", ".config/1Password",
   // git hosts and package registries
   ".git-credentials", ".netrc", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml", ".gem/credentials", ".m2/settings.xml",
-  ".gradle/gradle.properties", ".config/composer/auth.json", ".yarnrc", ".yarnrc.yml", ".pnpmrc", ".config/pnpm/auth.ini", ".config/glab-cli",
+  ".gradle/gradle.properties", ".config/composer/auth.json", ".yarnrc", ".yarnrc.yml", ".pnpmrc", ".npmrc", ".config/pnpm/auth.ini", ".config/glab-cli",
   ".nuget/NuGet", ".config/gh/hosts.yml",
   // toodo's server tokens
   ".local/share/toodo-server",
