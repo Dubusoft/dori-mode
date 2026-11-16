@@ -163,7 +163,9 @@ export type PausedCheck = { readonly lane: Lane; readonly outcome: "working-whil
  * was working on two ticks in a row, or at once when Escape did not stop it; it stays paused.
  */
 export const checkPausedLane = async (deps: FlowDeps & Ops, lane: Lane, view: SweepView = passthroughView(deps.ops)): Promise<PausedCheck> => {
-  if (statusOf(lane) !== "paused" || !lane.pane) return null;
+  // A launch reservation is paused only so recovery never starts it too: the runner records the pane before the launch
+  // commits the lane as working, and that starting turn is not the owner's pause to enforce.
+  if (statusOf(lane) !== "paused" || !lane.pane || lane.launchReservation) return null;
   // A resume in flight starts this turn on purpose; interrupting it would make the resume read the lane held.
   const { resuming, resumingAt } = lane as ResumingLane;
   if (resuming && resumingAt !== undefined && deps.clock.now() - resumingAt < RESUME_CLAIM_MS) return null;
