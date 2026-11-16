@@ -40,7 +40,18 @@ export type SecretGranterDeps = {
    * appended to the refusal. A failure only drops the sentence: the refusal stands either way.
    */
   readonly request?: (key: string, names: readonly string[], repo: string | undefined) => Promise<string>;
+  /**
+   * Refusal counts keyed `<lane>\0<sorted names>\0<code>`, shared by every request of the process; a grant of those names
+   * to that lane clears them. Absent: every refusal is answered and audited alike.
+   */
+  readonly refusals?: Map<string, number>;
 };
+
+/** Refusals of one lane, names and code answered as usual; later ones tell the lane to stop (secretGranter). */
+export const SECRET_REFUSALS_BEFORE_STOP = 3;
+
+/** After the first stop, one repeated refusal in this many is audited. */
+export const SECRET_REFUSAL_AUDIT_EVERY = 100;
 
 /** Where the runner appends its secret audit lines. */
 export const secretAuditPath = (stateDir: string): string => join(stateDir, "secret-audit.jsonl");
@@ -49,11 +60,14 @@ export const secretAuditPath = (stateDir: string): string => join(stateDir, "sec
 export const laneMatches = (patterns: readonly string[], key: string): boolean =>
   patterns.some((p) => (p.endsWith("*") ? key.startsWith(p.slice(0, -1)) : p === key));
 
-/** Whether lane `key` (repo from `laneRepo`, read only when `repos` is non-empty) matches a rule's `lanes` or `repos`. */
+/**
+ * Whether lane `key` (repo from `laneRepo`, read only when `repos` is non-empty) matches a rule's `lanes` or `repos`; a
+ * `repos` entry `"*"` matches every lane that has a repo.
+ */
 export const ruleMatches = async (rule: { readonly lanes: readonly string[]; readonly repos: readonly string[] }, key: string, laneRepo: () => Promise<string | undefined>): Promise<boolean> => {
   if (laneMatches(rule.lanes, key)) return true;
   const r = rule.repos.length ? (await laneRepo())?.toLowerCase() : undefined;
-  return r !== undefined && rule.repos.some((p) => p.toLowerCase() === r);
+  return r !== undefined && rule.repos.some((p) => p === "*" || p.toLowerCase() === r);
 };
 
 /** Where a granted value comes from: the store, or a GitHub App mint for a rule with `mint`. */
@@ -100,9 +114,22 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
   const audit = (allowed: boolean, reason?: string): void => {
     deps.audit({ at: new Date(deps.now()).toISOString(), runner: deps.runner, lane: key, names: [...names], allowed, ...(reason !== undefined ? { reason } : {}), ...(minted.length ? { minted: [...minted] } : {}) });
   };
-  const refuse = (code: string, detail: string, reason: string): SecretGrant => {
-    audit(false, reason);
-    return { ok: false, code, detail };
+  // A lane retrying a refused command in a loop: from the 4th identical refusal on it is told to stop, asks nobody, and
+  // is audited at the 4th and then every SECRET_REFUSAL_AUDIT_EVERY-th repeat only.
+  const refusalPrefix = `${key}\0${[...names].sort().join(",")}\0`;
+  const countRefusal = (code: string): number => {
+    if (!deps.refusals) return 1;
+    const n = (deps.refusals.get(refusalPrefix + code) ?? 0) + 1;
+    deps.refusals.set(refusalPrefix + code, n);
+    return n;
+  };
+  const refuse = (code: string, detail: string, reason: string, n = countRefusal(code)): SecretGrant => {
+    if (n <= SECRET_REFUSALS_BEFORE_STOP) {
+      audit(false, reason);
+      return { ok: false, code, detail };
+    }
+    if (n === SECRET_REFUSALS_BEFORE_STOP + 1 || n % SECRET_REFUSAL_AUDIT_EVERY === 0) audit(false, `${reason} (repeats not logged)`);
+    return { ok: false, code, detail: `${detail}; refused ${n} times: stop retrying this command and report it to the lead as blocked` };
   };
   let rules: Readonly<Record<string, SecretRule>>;
   try { rules = await deps.rules(); } catch (e) {
@@ -130,8 +157,9 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
       return refuse("RUNNER_SECRET_MISSING", `${gone} ${missing.length > 1 ? "are" : "is"} not in the secret store and ${key} may not receive ${denied.join(",")} (config secrets); no grant request opens: report it to the lead as blocked`, `missing: ${gone}`);
     }
     const list = denied.join(",");
-    const asked = deps.request ? await laneRepo().then((r) => deps.request?.(key, denied, r)).catch(() => undefined) : undefined;
-    return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)${asked ? `; ${asked}` : ""}`, `not allowed: ${list}`);
+    const n = countRefusal("RUNNER_SECRET_DENIED");
+    const asked = deps.request && n <= SECRET_REFUSALS_BEFORE_STOP ? await laneRepo().then((r) => deps.request?.(key, denied, r)).catch(() => undefined) : undefined;
+    return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)${asked ? `; ${asked}` : ""}`, `not allowed: ${list}`, n);
   }
   const values: Record<string, string> = {};
   const kinds: Record<string, Exclude<SecretKind, "env">> = {};
@@ -144,6 +172,7 @@ export const secretGranter = (deps: SecretGranterDeps) => async (key: string, na
     if (rule.as === "ssh-key" || rule.as === "file") kinds[name] = rule.as;
   }
   audit(true);
+  if (deps.refusals) for (const k of deps.refusals.keys()) if (k.startsWith(refusalPrefix)) deps.refusals.delete(k);
   deps.onGranted?.(Object.values(values));
   return { ok: true, values, ...(Object.keys(kinds).length ? { kinds } : {}) };
 };

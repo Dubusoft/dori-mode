@@ -9,7 +9,7 @@ import { appendSecretAudit, repoFromRemote, type SecretAuditEntry, type SecretGr
 
 const VALUE = "dori-test-throwaway-123";
 
-const setup = (rules: Record<string, SecretRule>, opts: { repo?: string; stored?: Record<string, string>; mint?: SecretGranterDeps["mint"] } = {}) => {
+const setup = (rules: Record<string, SecretRule>, opts: { repo?: string; stored?: Record<string, string>; mint?: SecretGranterDeps["mint"]; refusals?: Map<string, number> } = {}) => {
   const audit: SecretAuditEntry[] = [];
   const granted: string[][] = [];
   const stored = opts.stored ?? { NPM_TOKEN: VALUE, OTHER_TOKEN: VALUE };
@@ -27,6 +27,7 @@ const setup = (rules: Record<string, SecretRule>, opts: { repo?: string; stored?
     runner: "local", now: () => 0,
     onGranted: (values) => { granted.push([...values]); },
     ...(opts.mint ? { mint: opts.mint } : {}),
+    ...(opts.refusals ? { refusals: opts.refusals } : {}),
   });
   return { grant, audit, granted };
 };
@@ -49,6 +50,33 @@ test("a lane matching a prefix* entry receives the value", async () => {
 test("a lane whose repo is listed receives the value, case-insensitively", async () => {
   const { grant } = setup({ NPM_TOKEN: rule([], ["Dubusoft/dori-mode"]) }, { repo: "dubusoft/DORI-mode" });
   expect((await grant("lane-x", ["NPM_TOKEN"])).ok).toBe(true);
+});
+
+test("a repos entry * matches every lane that has a repo, and no lane without one", async () => {
+  const { grant } = setup({ NPM_TOKEN: rule([], ["*"]) }, { repo: "o/any" });
+  expect((await grant("lane-x", ["NPM_TOKEN"])).ok).toBe(true);
+  expect((await setup({ NPM_TOKEN: rule([], ["*"]) }).grant("lane-x", ["NPM_TOKEN"])).ok).toBe(false);
+});
+
+test("a refusal repeated from the 4th time says to stop, queues no request and is audited at the 4th time and every 100th repeat; a grant resets the count", async () => {
+  const rules: Record<string, SecretRule> = {};
+  const refusals = new Map<string, number>();
+  const { grant, audit } = setup(rules, { refusals });
+  const base = "lane-a may not receive NPM_TOKEN (config secrets)";
+  for (let n = 1; n <= 3; n++) expect(await grant("lane-a", ["NPM_TOKEN"])).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: base });
+  expect(audit).toHaveLength(3);
+  const stop = (n: number) => ({ ok: false as const, code: "RUNNER_SECRET_DENIED", detail: `${base}; refused ${n} times: stop retrying this command and report it to the lead as blocked` });
+  expect(await grant("lane-a", ["NPM_TOKEN"])).toEqual(stop(4));
+  expect(audit).toHaveLength(4);
+  expect(audit[3]?.reason).toEndWith(" (repeats not logged)");
+  for (let n = 5; n <= 103; n++) expect(await grant("lane-a", ["NPM_TOKEN"])).toEqual(stop(n));
+  expect(audit).toHaveLength(5);
+  expect(await grant("lane-b", ["NPM_TOKEN"])).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-b may not receive NPM_TOKEN (config secrets)" });
+
+  rules.NPM_TOKEN = rule(["lane-a"]);
+  expect((await grant("lane-a", ["NPM_TOKEN"])).ok).toBe(true);
+  delete rules.NPM_TOKEN;
+  expect(await grant("lane-a", ["NPM_TOKEN"])).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: base });
 });
 
 test("no rule, another lane or another repo is denied", async () => {

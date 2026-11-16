@@ -647,8 +647,10 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   // A secret request's grant is written before anything is posted: a failed write leaves the decision open to close again.
   let granted: CloseResult["granted"];
   const grant = d.secretRequest && options.choice !== undefined ? d.secretRequest.grants[options.choice - 1] : undefined;
-  if (d.secretRequest && (grant === "lane" || grant === "repo")) {
-    const to: SecretGrantTarget | undefined = grant === "lane" ? (d.lane ? { lane: d.lane } : undefined) : (d.secretRequest.repo ? { repo: d.secretRequest.repo } : undefined);
+  if (d.secretRequest && (grant === "lane" || grant === "repo" || grant === "every-repo")) {
+    const to: SecretGrantTarget | undefined = grant === "lane" ? (d.lane ? { lane: d.lane } : undefined)
+      : grant === "every-repo" ? { repo: "*" }
+      : (d.secretRequest.repo ? { repo: d.secretRequest.repo } : undefined);
     if (!to) throw new OwnerDecisionError("DECISION_GRANT_FAILED", `DECISION_GRANT_FAILED ${id}: the request names no ${grant}`);
     if (!ctx.secretGrant) throw new OwnerDecisionError("DECISION_GRANT_FAILED", `DECISION_GRANT_FAILED ${id}: no config writer`);
     try { granted = { names: d.secretRequest.names, to, changed: [...ctx.secretGrant(d.secretRequest.names, to)] }; }
@@ -864,7 +866,7 @@ const sameRequest = (a: PendingSecretRequest, b: PendingSecretRequest): boolean 
 /** The urgent event that asks the lead to grant or deny a lane's secret request decision `d` (the owner is not asked). */
 export const secretRequestLine = (d: OwnerDecision): string => {
   const names = d.secretRequest?.names.join(",") ?? "";
-  const choices = (d.secretRequest?.grants ?? []).map((g, i) => `${i + 1}=${g === "lane" ? `lane ${d.lane ?? "-"}` : g === "repo" ? `repo ${d.secretRequest?.repo ?? "-"}` : "deny"}`).join(" ");
+  const choices = (d.secretRequest?.grants ?? []).map((g, i) => `${i + 1}=${g === "lane" ? `lane ${d.lane ?? "-"}` : g === "repo" ? `repo ${d.secretRequest?.repo ?? "-"}` : g === "every-repo" ? "every repo" : "deny"}`).join(" ");
   return `SECRET_REQUEST ${d.lane ?? "-"} ${d.id} names=${names}${d.secretRequest?.repo ? ` repo=${d.secretRequest.repo}` : ""}: config secrets denied it; grant it yourself (the owner is not asked) with dori decision close ${d.id} --text "..." --choice N (${choices}), then tell the lane to run its command again`;
 };
 
@@ -937,8 +939,8 @@ export const secretRequester = (stateDir: string, commands: () => Promise<Readon
     const runOnly = Object.values(await commands()).flatMap((c) => c.secrets);
     const ask = requestSecretGrant(stateDir, { lane, names, repo }, now(), runOnly);
     switch (ask.kind) {
-      case "queued": return "the lead is asked to grant it; run the command again after the lead says it was granted";
-      case "asked": return `the lead was already asked${ask.decision ? ` (decision ${ask.decision})` : ""}; no new request opens for this lane`;
+      case "queued": return "the lead is asked to grant it; run the command again only once the lead says it was granted, never in a loop";
+      case "asked": return `the lead was already asked${ask.decision ? ` (decision ${ask.decision})` : ""}; no new request opens for this lane: run the command again only once the lead says it was granted, never in a loop`;
       case "limited": return `this lane already asked for ${SECRET_REQUESTS_PER_LANE} secrets; no new request opens, report it to the lead as blocked`;
       case "run-only": return `${ask.names.join(",")} go only through dori secret run <op> (config secretCommands)`;
     }

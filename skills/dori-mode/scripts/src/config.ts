@@ -349,12 +349,12 @@ const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
   }));
 };
 
-/** Who a granted rule adds: one lane key, or every lane of one repo ("owner/repo"). */
+/** Who a granted rule adds: one lane key, every lane of one repo ("owner/repo"), or every lane that has a repo ("*"). */
 export type SecretGrantTarget = { readonly lane: string } | { readonly repo: string };
 
 /**
  * Adds `to` to the `secrets` rule of each of `names` in the config file at `path` (a missing rule is created with that
- * one entry; one already listed is left alone), keeping every other key as it is. The result is checked like loadConfig
+ * one entry; one already listed is left alone; `{ repo: "*" }` writes `"*"` into `repos`), keeping every other key as it is. The result is checked like loadConfig
  * checks `secrets` (TypeError, nothing written) and written atomically with mode 0600. Returns the names whose rule
  * changed. The supervisor and runners read config per secret request, so the next request sees it without a restart.
  */

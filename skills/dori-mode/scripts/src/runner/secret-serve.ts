@@ -112,18 +112,22 @@ export type SupervisorGranterDeps = {
  * `SupervisorSecretDeps.granter` for production: phase 1's `secretGranter` with `runner: label`, the frame's repo,
  * and audit lines appended to `<stateDir>/secret-audit.jsonl` plus a log line
  * `RUNNER_SECRET_GRANTED|RUNNER_SECRET_DENIED runner=<label> lane=<key> names=<A,B>`. A config denial queues a secret
- * request in `<stateDir>/decisions.json` (owner-decisions.ts secretRequester), which the decision tick opens.
+ * request in `<stateDir>/decisions.json` (owner-decisions.ts secretRequester), which the decision tick opens. One
+ * refusal count map serves every granter it builds (one per frame), so repeated refusals stop across frames.
  */
-export const supervisorGranter = (deps: SupervisorGranterDeps) => (label: string, repo: string | undefined): LaneGranter => {
-  const append = appendSecretAudit(secretAuditPath(deps.stateDir), deps.log);
-  return secretGranter({
-    runner: label, store: deps.store, rules: deps.rules, now: deps.now, laneRepo: async () => repo,
-    request: secretRequester(deps.stateDir, deps.commands, deps.now),
-    audit: (entry) => {
-      append(entry);
-      deps.log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} runner=${entry.runner} lane=${entry.lane} names=${entry.names.join(",")}`);
-    },
-  });
+export const supervisorGranter = (deps: SupervisorGranterDeps) => {
+  const refusals = new Map<string, number>();
+  return (label: string, repo: string | undefined): LaneGranter => {
+    const append = appendSecretAudit(secretAuditPath(deps.stateDir), deps.log);
+    return secretGranter({
+      runner: label, store: deps.store, rules: deps.rules, now: deps.now, laneRepo: async () => repo, refusals,
+      request: secretRequester(deps.stateDir, deps.commands, deps.now),
+      audit: (entry) => {
+        append(entry);
+        deps.log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} runner=${entry.runner} lane=${entry.lane} names=${entry.names.join(",")}`);
+      },
+    });
+  };
 };
 
 /**

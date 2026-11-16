@@ -20,6 +20,7 @@ export const CREDENTIAL_DENY: readonly string[] = [
   ".dori/env", ".dori/secrets", ".dori/state", ".dori/lane-sandbox-hide", ".dori/gateway-locks", ".secrets",
   // cloud
   ".aws", ".azure", ".oci", ".kube", ".config/gcloud", ".config/doctl", ".config/hcloud", ".config/flyctl", ".config/helm",
+  ".config/cloudflare", ".cloudflared",
   ".terraform.d/credentials.tfrc.json", ".vault-token",
   // docker and containers
   ".docker/config.json", ".config/containers/auth.json",

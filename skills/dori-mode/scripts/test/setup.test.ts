@@ -123,7 +123,8 @@ test("templates render with no placeholder left and no host-specific path, and a
   const values = { HOME: "/home/ana", PATH: "/usr/bin", SHELL: "/bin/zsh", DORI_BIN: "/x/dori", HERDR_BIN: "/x/herdr", ENV_FILE: "/home/ana/.dori/env", CONFIG: "/home/ana/.dori/config.json", WORK_DIR: "/home/ana/code", BOOT_PREP: "/home/ana/.dori/dori-boot-prep.sh", FAILURE_NOTIFY: "/home/ana/.dori/dori-failure-notify.sh" };
   for (const name of readdirSync(TEMPLATES)) {
     const text = readFileSync(join(TEMPLATES, name), "utf8");
-    expect(text).not.toMatch(/\/home\/ubuntu|\/data\b/);
+    // The Linux lane sandbox names /data on purpose: a top-level host directory it binds read-write.
+    expect(text).not.toMatch(name === "lane-sandbox.sh" ? /\/home\/ubuntu/ : /\/home\/ubuntu|\/data\b/);
     const out = renderTemplate(text, values);
     expect(out).not.toContain("{{");
   }

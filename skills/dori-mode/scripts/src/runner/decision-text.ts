@@ -63,17 +63,18 @@ export const decisionChoicesProblem = (choices: {
 };
 
 /** What one option of a secret request decision grants when the lead closes it with that choice. */
-export type SecretRequestGrant = "lane" | "repo" | "deny";
+export type SecretRequestGrant = "lane" | "repo" | "every-repo" | "deny";
 
 /**
  * The owner decision for a lane's `dori secret exec` of `names` that config `secrets` does not grant it: allow this lane
- * only, keep allowing lanes of `repo` (offered only when the lane has one), or deny. `grants[i]` is what option i+1 does.
+ * only, keep allowing lanes of `repo` or of every repo (both offered only when the lane has one), or deny. `grants[i]` is
+ * what option i+1 does.
  */
 export const secretRequestChoices = (lane: string, names: readonly string[], repo: string | undefined): { readonly choices: DecisionChoices; readonly grants: readonly SecretRequestGrant[] } => {
   const list = names.join(", ");
   const options: [string, SecretRequestGrant][] = [
     [`이 레인(${lane})만 허용`, "lane"],
-    ...(repo ? [[`${repo} 리포의 레인에 계속 허용`, "repo"] as [string, SecretRequestGrant]] : []),
+    ...(repo ? [[`${repo} 리포의 레인에 계속 허용`, "repo"], ["리포가 있는 모든 레인에 계속 허용", "every-repo"]] as [string, SecretRequestGrant][] : []),
     ["거부 (이 레인은 다시 묻지 않음)", "deny"],
   ];
   return {
