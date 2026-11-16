@@ -1,7 +1,7 @@
 import type { OwnerDecision } from "../decision-store.ts";
 
 /**
- * Number buttons under a lane question's starter message (references/messaging.md, "Answer buttons"). The custom_id
+ * Number buttons under a question's starter message (references/messaging.md, "Answer buttons"). The custom_id
  * `dori:decide:<dID>:<N>` names the decision and the option, so a click needs no stored state and never depends on which
  * question is newest in a shared thread.
  */
@@ -19,19 +19,27 @@ const label = (text: string): string => {
   return chars.length <= LABEL_MAX ? chars.join("") : `${chars.slice(0, LABEL_MAX - 1).join("").trimEnd()}…`;
 };
 
-/** Whether `d` gets answer buttons: a lane's own question, never a request or a decision the lead opened. */
-export const hasDecisionButtons = (d: Pick<OwnerDecision, "source" | "kind">): boolean => d.source === "lane" && d.kind !== "request";
+/** Whether `d` gets answer buttons: a question with options, a lane's or the lead's; never a request. */
+export const hasDecisionButtons = (d: Pick<OwnerDecision, "kind" | "options">): boolean => d.kind !== "request" && d.options.length > 0;
 
-type ButtonState = Pick<OwnerDecision, "id" | "source" | "kind" | "options" | "recommend"> & Partial<Pick<OwnerDecision, "state" | "choice" | "revisions">>;
+type ButtonState = Pick<OwnerDecision, "id" | "kind" | "options" | "recommend"> & Partial<Pick<OwnerDecision, "state" | "choice" | "revisions" | "answers">>;
+
+/** The option the owner's newest button press for the lead holds (an OwnerAnswer with a choice), with when it was made. */
+export const leadClick = (d: Pick<OwnerDecision, "answers">): { readonly choice: number; readonly at: number } | undefined => {
+  const click = d.answers?.filter((a) => a.choice !== undefined).at(-1);
+  return click?.choice === undefined ? undefined : { choice: click.choice, at: click.at };
+};
 
 /**
- * What `d`'s buttons show: the selected option (a closed decision's choice, else the newest answer revision's choice; none
- * after a withdrawal) and whether they are all disabled (closed, or the newest answer was acked or found undelivered). A
- * withdrawal the lane acked reopens the question, so its buttons stay live.
+ * What `d`'s buttons show: the selected option (a closed decision's choice, else the newer of the newest answer revision's
+ * choice, none after a withdrawal, and the newest button press handed to the lead) and whether they are all disabled
+ * (closed, or the newest answer revision was acked or found undelivered). A withdrawal the lane acked reopens the
+ * question, so its buttons stay live.
  */
 export const decisionButtonState = (d: ButtonState): { readonly selected?: number; readonly disabled: boolean } => {
   const newest = d.revisions?.at(-1);
-  const selected = d.state === "closed" ? d.choice : newest?.choice;
+  const click = leadClick(d);
+  const selected = d.state === "closed" ? d.choice : click && (!newest || click.at >= newest.at) ? click.choice : newest?.choice;
   const disabled = d.state === "closed" || newest?.delivery.state === "undelivered" || (newest?.delivery.state === "acked" && newest.choice !== undefined);
   return { ...(selected !== undefined ? { selected } : {}), disabled };
 };
