@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  decisionAnswerText,
   queueDecisionAnswer,
   reconcileDecisionDeliveries,
   reconcileDecisionsAtStart,
@@ -62,8 +63,8 @@ const fakeTransport = () => {
   const archived = new Map<string, boolean>();
   const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
   const transport: DecisionTransport = {
-    send: async (channel, content, stableId) => {
-      record("send", channel, content, stableId);
+    send: async (channel, content, stableId, components) => {
+      record("send", channel, content, stableId, ...(components ? [components] : []));
       sequence += 1;
       return `m${sequence}`;
     },
@@ -591,7 +592,11 @@ test("queueing an answer writes decision-d<ID>-r<n> once, replaces a queued olde
   recordAnswerRevision(dir, id, answer("ap-955-1", 1), 10);
   const q1 = queueDecisionAnswer(dir, store, id, 20);
   expect(q1).toMatchObject({ kind: "queued", message: { id: "decision-d1-r1", lane: "ap-955-1", state: "queued" } });
-  expect(q1.kind === "queued" && q1.message.text).toBe("[dori] Owner answered d1 (Which path should we take?): 1. Use the existing API. Revision r1. Confirm with: dori report ack decision-d1-r1");
+  expect(q1.kind === "queued" && q1.message.text).toBe("[dori] Owner answered d1 (Which path should we take?): 1. Use the existing API. Revision r1. Confirm with: ~/.dori/runner/bin/dori report ack decision-d1-r1");
+  // A lane on the lead's own runner acks with the dori on its PATH.
+  const asked = readDecisions(dir).decisions[0]!;
+  const r1 = asked.revisions![0]!;
+  expect(decisionAnswerText(asked, { ...r1, target: { ...r1.target, runner: "local" } })).toEndWith("Confirm with: dori report ack decision-d1-r1");
   expect(queueDecisionAnswer(dir, store, id, 21).kind).toBe("none");
   recordAnswerRevision(dir, id, answer("ap-955-1", 2, 1), 30);
   const q2 = queueDecisionAnswer(dir, store, id, 31);
@@ -601,7 +606,7 @@ test("queueing an answer writes decision-d<ID>-r<n> once, replaces a queued olde
   recordAnswerRevision(dir, id, answer("ap-955-1", 1, 2), 40);
   const q3 = queueDecisionAnswer(dir, store, id, 41);
   expect(q3).toMatchObject({ kind: "queued", replaces: 2 });
-  expect(q3.kind === "queued" && q3.message.text).toContain("1. Use the existing API. Revision r3 replaces r2; follow r3. Confirm with: dori report ack decision-d1-r3");
+  expect(q3.kind === "queued" && q3.message.text).toContain("1. Use the existing API. Revision r3 replaces r2; follow r3. Confirm with: ~/.dori/runner/bin/dori report ack decision-d1-r3");
   expect(store.get("decision-d1-r2")?.state).toBe("delivered");
   recordAnswerRevision(dir, id, answer("ap-955-1", undefined, 3), 50);
   const q4 = queueDecisionAnswer(dir, store, id, 51);

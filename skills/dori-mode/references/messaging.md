@@ -50,6 +50,20 @@ Only two forms qualify. The whole message, after trimming whitespace, must be on
 
 `N` must be between 1 and the number of options. No model, keyword match or "newest question" guess decides a target: if the form does not name exactly one open decision, the answer is not direct.
 
+### Answer buttons
+
+A lane's own question (not a `[요청]` request, not a decision the lead opened) is posted with one button per option under its starter message (`messenger/decision-buttons.ts`): label `N. <option>` cut to 80 characters, the recommended option in the primary style, up to 5 per row (2 rows for 6-9 options). The custom_id `dori:decide:<dID>:<N>` names the decision and the option, so a button answers exactly one question even in a shared thread. The starter message ends with "버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요."
+
+The supervisor's gateway handles a click (`discord-commands.ts`, `decision-inbound.ts` routeDecisionClick) and always answers it with an ephemeral reply only the clicker sees; the buttons themselves stay as posted:
+
+- a click by anyone but the owner (or from another application or guild) is refused;
+- a click from any channel other than the decision's own thread, or on an unknown decision, is refused;
+- a click on a closed decision says it is closed;
+- a click on a decision that cannot take a direct answer (the checks in "What is delegated": the lane relaunched or closed, the lead already holds an answer) records nothing and tells the owner to type the number in the thread;
+- otherwise the click is the answer `d<ID>=<N>` typed in the decision's thread: an answer revision of owner "message" `click:<interaction id>` (a redelivered click is the same revision), queued and reported to the lead exactly like a typed direct answer. A click on the choice the newest revision already holds changes nothing; a different button before the lane acks is a new revision like an edited answer.
+
+A free-text answer is unchanged: it goes to the lead whole, and the lead's `dori decision close --text` relays it.
+
 ### Everything else goes to the lead, whole
 
 The supervisor never splits a message. When any of these holds, the full message reaches the lead exactly as it does today (`INBOUND`, then `OWNER_DECISION_ANSWERED`), and the lead closes the decision with `dori decision close`:
@@ -75,7 +89,7 @@ Under the decision's lock the supervisor records the delivery intent, then queue
 [dori] Owner answered d17 (<question>): 2. <option text>. Revision r1. Confirm with: dori report ack decision-d17-r1
 ```
 
-The lane checks that the revision is the newest it has for that decision and that the choice is within its brief, then runs `dori report ack decision-d17-r1`. The ack means the lane received the answer, not that the work is done. On the ack the supervisor closes the decision as `dori decision close` would (choice recorded, answer messages acked and recorded handled, confirmation posted, link line in the origin thread updated, thread archived), and every step can be replayed after a crash. A lane that receives a newer revision follows it and acks it; an older one it already acked is superseded.
+A lane on a worker machine is told to ack with the runner's own CLI, `~/.dori/runner/bin/dori report ack ...`, since only that one is installed there. The lane checks that the revision is the newest it has for that decision and that the choice is within its brief, then runs the ack command. The ack means the lane received the answer, not that the work is done. On the ack the supervisor closes the decision as `dori decision close` would (choice recorded, answer messages acked and recorded handled, confirmation posted, link line in the origin thread updated, thread archived), and every step can be replayed after a crash. A lane that receives a newer revision follows it and acks it; an older one it already acked is superseded.
 
 ### Owner-facing notices
 

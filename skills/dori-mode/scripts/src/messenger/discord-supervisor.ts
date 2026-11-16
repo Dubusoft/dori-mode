@@ -1,6 +1,6 @@
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type DirectRouting, routeOwnerDelete, routeOwnerEdit, routeOwnerMessage } from "../decision-inbound.ts";
+import { type DirectRouting, routeDecisionClick, routeOwnerDelete, routeOwnerEdit, routeOwnerMessage } from "../decision-inbound.ts";
 import type { FlowDeps } from "../done-flow.ts";
 import type { LaneMessageStore } from "../lane-messages.ts";
 import { statusOf } from "../registry.ts";
@@ -79,8 +79,6 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   // The owner's hook button click reaches the lead as one journal line after the configured hook was started.
   const clicked = (name: string, arg: string, channel: string, interactionId: string): Promise<void> =>
     options.emit(`discord:${channel}:button:${interactionId}`, `BUTTON_CLICKED_BY_OWNER ${name} ${arg}`);
-  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, () => deps.config.discordChannels, options.statusLookup, threadClosed,
-    { hooks: deps.config.buttonHooks ?? {}, clicked });
   let lastPoll = -Infinity;
   let polling: Promise<void> | undefined;
   let catchupRequested = false;
@@ -109,6 +107,10 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
     lanes: async () => (await deps.registry.open()).filter((lane) => statusOf(lane) !== "closed"),
     emit: options.emit,
   };
+  // The owner's answer-button click is routed like typing d<ID>=<N> in the decision's thread; without the lane message
+  // queue every such click gets the unknown-button reply.
+  const commands = new DiscordCommands(options.http, options.token, config, options.lookup, undefined, () => deps.config.discordChannels, options.statusLookup, threadClosed,
+    { hooks: deps.config.buttonHooks ?? {}, clicked, ...(routing ? { decide: (click) => routeDecisionClick(routing, click) } : {}) });
   const inboundOptions: DiscordInboundOptions = {
     ...(routing ? {
       // The lead already has a message it was told about in this process, so it never becomes direct afterwards.

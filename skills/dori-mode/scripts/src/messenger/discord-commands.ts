@@ -1,5 +1,6 @@
 import { type ArgvTemplate, type DiscordConfig, fill } from "../config.ts";
 import { disabledRows, type HookInteraction, hookInteraction, type HookSpawner, spawnButtonHook } from "./discord-buttons.ts";
+import { type DecideInteraction, decideInteraction } from "./decision-buttons.ts";
 import type { Http } from "./http.ts";
 import { MessengerError } from "./http.ts";
 
@@ -41,11 +42,18 @@ const closeRow = (threadId: string, closed: boolean) => [{
 export type ThreadClosed = (threadId: string, interactionId: string) => Promise<void>;
 /** Called after the owner's button click started hook `name`; `channel` is the message's channel or thread. */
 export type ButtonClicked = (name: string, arg: string, channel: string, interactionId: string) => Promise<void>;
+/**
+ * Routes the owner's answer-button click on option `choice` of `decision`, made in `channel`; resolves to the ephemeral
+ * reply (decision-inbound.ts routeDecisionClick).
+ */
+export type DecisionClicked = (click: { readonly decision: string; readonly choice: number; readonly channel: string; readonly interaction: string }) => Promise<string>;
 export type ButtonHookOptions = {
   /** config `buttonHooks`: hook name -> argv template. */
   readonly hooks?: Readonly<Record<string, ArgvTemplate>>;
   readonly spawn?: HookSpawner;
   readonly clicked?: ButtonClicked;
+  /** Answer buttons (`dori:decide:`); without it every such click gets the unknown-button reply. */
+  readonly decide?: DecisionClicked;
 };
 
 type CloseInteraction = {
@@ -198,9 +206,35 @@ export class DiscordCommands {
       .catch(() => { console.error(`Discord button ${interaction.name} event failed`); });
   }
 
+  /**
+   * An answer-button click: a non-owner (or a foreign application or guild) gets an ephemeral refusal; the owner's click
+   * is routed first (`decide` checks the thread, the decision's state and whether the lane can take it), then answered
+   * with the ephemeral reply it returns. The buttons are left as they are. A failed route records nothing the router did
+   * not record and tells the owner to type the number.
+   */
+  private async decideButton(interaction: DecideInteraction): Promise<void> {
+    const reply = (content: string) => this.request("POST", `/interactions/${interaction.id}/${interaction.token}/callback`, { type: 4, data: { flags: 64, content } });
+    let content: string;
+    if (interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId || interaction.userId !== this.config.ownerId) {
+      content = "이 버튼은 오너만 누를 수 있습니다.";
+    } else if (!this.buttons.decide) {
+      content = "알 수 없는 버튼입니다.";
+    } else {
+      try {
+        content = await this.buttons.decide({ decision: interaction.decision, choice: interaction.choice, channel: interaction.channel, interaction: interaction.id });
+      } catch {
+        console.error(`Discord decision button ${interaction.decision} routing failed`);
+        content = "답을 기록하지 못했습니다. 번호를 스레드에 적어 주세요.";
+      }
+    }
+    await reply(content).catch(() => { console.error(`Discord decision button ${interaction.decision} acknowledgement failed`); });
+  }
+
   async handle(value: unknown): Promise<void> {
     const close = closeInteraction(value);
     if (close) return this.closeThread(close);
+    const decide = decideInteraction(value);
+    if (decide) return this.decideButton(decide);
     const hook = hookInteraction(value);
     if (hook) return this.hookButton(hook);
     const interaction = commandInteraction(value);
