@@ -463,6 +463,11 @@ console.log((await runnerVersion(run, import.meta.dir)) ?? "-");\n`);
   expect(ran.out.trim()).toBe(sha as string);
 }, 60_000);
 
+test("the runner entry bundles into the single file a worker receives", async () => {
+  // An import that reaches an asset (a .wasm, a new URL(..., import.meta.url) file) makes `--outfile` refuse to write.
+  expect(await buildBundle(realRun)()).toStartWith("#!/usr/bin/env bun");
+}, 120_000);
+
 const herdrUnitPath = (home: string) => join(home, ".config/systemd/user/herdr-server.service");
 const linuxScript = () => installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "h:1"), "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
 const logLines = (log: string) => readFileSync(log, "utf8").split("\n");

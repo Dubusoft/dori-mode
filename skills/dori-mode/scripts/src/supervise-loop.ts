@@ -1,4 +1,4 @@
-import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch } from "node:fs";
+import { existsSync, type FSWatcher, readFileSync, watch } from "node:fs";
 import { addKnownSecrets, replaceKnownSecrets } from "./redact.ts";
 import { SecretStore } from "./secret-store.ts";
 import { homedir } from "node:os";
@@ -24,7 +24,7 @@ import type { Listener } from "./runner/transport.ts";
 import { listenUnix } from "./runner/unix-transport.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { Database } from "bun:sqlite";
+import { acquireSupervisor } from "./state-lock.ts";
 
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
@@ -84,20 +84,6 @@ const MACHINE_LIST_RETRY_MS = 60_000;
 /** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
 export const SYSTEM_PREFIX = "[System] ";
 export const systemText = (text: string): string => text.startsWith(SYSTEM_PREFIX) ? text : `${SYSTEM_PREFIX}${text}`;
-
-/** One supervisor writer per stateDir, including across competing CLI invocations. */
-export const acquireSupervisor = (stateDir: string): (() => void) => {
-  mkdirSync(stateDir, { recursive: true });
-  // An OS-backed SQLite lock is released even on SIGKILL; a PID file is not.
-  const db = new Database(join(stateDir, "supervisor-lock.sqlite"));
-  try {
-    db.exec("BEGIN EXCLUSIVE");
-  } catch (e) {
-    db.close();
-    throw new SuperviseError(`cannot acquire supervisor lock: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  return () => { db.close(); };
-};
 
 /**
  * Tells systemd (Type=notify units) about `state`, e.g. READY=1 or WATCHDOG=1, through systemd-notify. A no-op returning

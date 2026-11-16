@@ -1,6 +1,6 @@
 import { Database, SQLiteError } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 export class StateLockError extends Error {}
 export const LOCK_WAIT_MS = 10_000;
@@ -40,6 +40,24 @@ export const tryStateLock = (path: string): (() => void) | undefined => {
     if (error instanceof SQLiteError && error.code === "SQLITE_BUSY") return undefined;
     throw error;
   }
+};
+
+/**
+ * One supervisor writer per stateDir, including across competing CLI invocations. It lives here rather than beside the
+ * supervise loop so the json store conversion (store-import.ts, reached from every config load) does not pull the
+ * supervisor into the runner bundle.
+ */
+export const acquireSupervisor = (stateDir: string): (() => void) => {
+  mkdirSync(stateDir, { recursive: true });
+  // An OS-backed SQLite lock is released even on SIGKILL; a PID file is not.
+  const db = new Database(join(stateDir, "supervisor-lock.sqlite"));
+  try {
+    db.exec("BEGIN EXCLUSIVE");
+  } catch (e) {
+    db.close();
+    throw new StateLockError(`cannot acquire supervisor lock: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return () => { db.close(); };
 };
 
 /** Short synchronous transactions, also used by supervisor callers whose API must stay synchronous. */

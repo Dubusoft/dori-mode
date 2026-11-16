@@ -8,7 +8,8 @@ import type { Http } from "../src/messenger/http.ts";
 import { cliRunnerCall, cliSocketPath } from "../src/runner/cli-relay.ts";
 import { defaultRunnerDir } from "../src/runner/fs-safety.ts";
 import { localRunnerArgv } from "../src/runner/local-child.ts";
-import { acquireSupervisor, supervise } from "../src/supervise-loop.ts";
+import { acquireSupervisor } from "../src/state-lock.ts";
+import { supervise } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 type Spawn = (argv: readonly string[], env: Record<string, string>) => { readonly pid: number; readonly exited: Promise<number>; kill(sig: "SIGTERM" | "SIGKILL"): void };

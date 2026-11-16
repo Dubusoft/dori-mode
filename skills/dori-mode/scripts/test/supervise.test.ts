@@ -8,7 +8,7 @@ import type { Runner } from "../src/run.ts";
 import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, RetryingDelivery, screenStill, Supervisor } from "../src/supervise.ts";
 import { leadPermissionArgs, plainShell, UNCONFIRMED_LIMIT } from "../src/lead-process.ts";
 import { SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/lead-soft-restart.ts";
-import { acquireSupervisor } from "../src/supervise-loop.ts";
+import { acquireSupervisor } from "../src/state-lock.ts";
 import { childWork } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";

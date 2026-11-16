@@ -8,7 +8,7 @@ import type { Runner } from "../src/run.ts";
 import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
 import { Supervisor } from "../src/supervise.ts";
-import { acquireSupervisor } from "../src/supervise-loop.ts";
+import { acquireSupervisor } from "../src/state-lock.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];

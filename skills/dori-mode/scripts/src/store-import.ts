@@ -3,13 +3,12 @@ import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, re
 import { join } from "node:path";
 
 import { GITHUB_FILE, importGithub, retireGithubFile } from "./github-events.ts";
-import { acquireSupervisor } from "./supervise-loop.ts";
 import { JOURNAL_FIELDS, JOURNAL_FILE, jsonStorePending, PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore, StoreError } from "./store.ts";
 import type { Journal } from "./supervise.ts";
 import { byAt, OPERATIONS_DDL, OPERATIONS_FILE, type Operation, putRows, readRows } from "./operations.ts";
 import { LANE_REPORTS_FILE, LANE_REPORTS_LOCK, type LaneReport, putReportRows, readReportRows, reportOrder } from "./lane-report-store.ts";
 import { LANE_MESSAGES_FILE, LANE_MESSAGES_LOCK, type LaneMessage, messageOrder, putMessageRows, readMessageRows } from "./lane-messages.ts";
-import { withStateLockSync } from "./state-lock.ts";
+import { acquireSupervisor, withStateLockSync } from "./state-lock.ts";
 
 /** A source file as the conversion read it: absent, or its byte size and sha256 (for the log: complete lines only). */
 type SourceCursor = { readonly path: string; readonly present: boolean; readonly size: number; readonly sha256: string };

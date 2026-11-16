@@ -9,7 +9,7 @@ import { openLaneReports } from "../src/lane-report-store.ts";
 import { openOperations } from "../src/operations.ts";
 import { Registry } from "../src/registry.ts";
 import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore, openStore } from "../src/store.ts";
-import { acquireSupervisor } from "../src/supervise-loop.ts";
+import { acquireSupervisor } from "../src/state-lock.ts";
 import { withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
