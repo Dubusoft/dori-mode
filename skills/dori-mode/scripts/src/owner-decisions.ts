@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { alertsChannelOf, type DoriConfig, type SecretCommand, type SecretGrantTarget } from "./config.ts";
+import { type DoriConfig, type SecretCommand, type SecretGrantTarget } from "./config.ts";
 import { recordResolved } from "./decision-obligations.ts";
 import { scrubForThread } from "./freshness.ts";
 import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
@@ -40,8 +40,6 @@ export const DECISION_POSTING_STUCK_MS = 10 * 60_000;
 /** Closed decisions are dropped this long after they closed; `dori decision list --all` shows the last DECISION_LIST_CLOSED_MS. */
 export const DECISION_KEEP_CLOSED_MS = 30 * 24 * 60 * 60_000;
 export const DECISION_LIST_CLOSED_MS = 7 * 24 * 60 * 60_000;
-/** The daily reminder of decisions still waiting is posted on the first pass at or after this hour in displayTimeZone. */
-export const DECISION_DIGEST_HOUR = 9;
 
 export type OwnerDecisionState = "posting" | "open" | "answered" | "closed";
 
@@ -102,8 +100,8 @@ export type OwnerDecision = DecisionChoices & {
   /** Set on the decision a lane's denied `dori secret exec` opened: closing it with a choice applies `grants[choice - 1]`. */
   readonly secretRequest?: SecretRequestDecision;
   /**
-   * Set on a decision only the lead answers (a lane's secret request): it is posted nowhere, has no thread, stays out of
-   * the owner's daily reminder, and its urgent event (`answerEvent`) is resolved by `dori decision close`.
+   * Set on a decision only the lead answers (a lane's secret request): it is posted nowhere, has no thread, and its
+   * urgent event (`answerEvent`) is resolved by `dori decision close`.
    */
   readonly leadOnly?: boolean;
   /**
@@ -155,8 +153,6 @@ export type AnswerRevision = {
 
 export type DecisionsFile = {
   readonly nextSeq: number;
-  /** The displayTimeZone date (YYYY-MM-DD) the daily reminder last ran on. */
-  readonly digestDay?: string;
   readonly decisions: readonly OwnerDecision[];
   /** Secret requests not opened as decisions yet (requestSecretGrant queues, ownerDecisionTick opens). */
   readonly secretRequests?: readonly PendingSecretRequest[];
@@ -815,23 +811,6 @@ export const takeOwnerDecisionLines = (stateDir: string, now: number): string[] 
 export const ownerDecisionBlockers = (stateDir: string): { readonly id: string; readonly lane: string }[] =>
   openOwnerDecisions(stateDir).flatMap((d) => (d.lane ? [{ id: d.id, lane: d.lane }] : []));
 
-/** The local date (YYYY-MM-DD) and hour of `ms` in `timeZone`. */
-export const localDayHour = (ms: number, timeZone: string): { readonly day: string; readonly hour: number } => {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" })
-    .formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
-  return { day: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) };
-};
-
-/** The daily reminder: one line per decision still waiting on the owner or on the lead. */
-export const digestText = (decisions: readonly OwnerDecision[], now: number): string => [
-  `[System] 답을 기다리는 결정·요청 ${decisions.length}건`,
-  ...decisions.map((d) => {
-    const days = Math.floor(Math.max(0, now - d.openedAt) / 86_400_000) + 1;
-    const state = d.state === "answered" ? "답 받음, 리드 반영 대기" : `${days}일째, ${d.blocking ? "막는 중" : "선진행"}`;
-    return `- [${label(d)}] ${d.id} <#${d.thread ?? d.channel}> ${state} · ${d.task !== undefined ? `#${d.task} ` : ""}${short(d.question, 60)}`;
-  }),
-].join("\n");
-
 export type TickDeps = DecisionContext & {
   /** Journals one event under a stable id (the supervisor dedupes ids). */
   readonly enqueue: (id: string, line: string) => unknown;
@@ -841,9 +820,8 @@ export type TickDeps = DecisionContext & {
 /**
  * The supervisor's pass over decisions.json: a decision stuck `posting` raises OWNER_DECISION_STUCK once; a missing link
  * line is posted again; a pending archive is retried (a thread Discord no longer has raises OWNER_DECISION_THREAD_GONE
- * once); the daily reminder goes to decisionsChannel (else alertsChannelOf) on the first pass at or after
- * DECISION_DIGEST_HOUR in displayTimeZone when anything still waits; closed decisions past DECISION_KEEP_CLOSED_MS are
- * dropped. The owner's answers themselves arrive through inbound (recordOwnerAnswer), and an answered decision left
+ * once); queued secret requests are opened; closed decisions past DECISION_KEEP_CLOSED_MS are dropped. Nothing is posted
+ * to the decisions channel on a schedule: the lead sees open decisions in `dori inbox take`. The owner's answers themselves arrive through inbound (recordOwnerAnswer), and an answered decision left
  * unclosed is reminded as an UNRESOLVED obligation.
  */
 export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
@@ -871,17 +849,6 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
         } else log(`OWNER_DECISION_ARCHIVE_FAILED ${d.id} ${errorText(e)}`);
       }
     }
-  }
-  const { day, hour } = localDayHour(now, deps.config.displayTimeZone);
-  if (hour >= DECISION_DIGEST_HOUR && readDecisions(stateDir).digestDay !== day) {
-    const waiting = openOwnerDecisions(stateDir).filter((d) => !d.leadOnly && (d.state === "open" || d.state === "answered"));
-    const target = deps.config.decisionsChannel?.trim() || alertsChannelOf(deps.config);
-    if (waiting.length && target) {
-      try {
-        await deps.transport.send(target, digestText(waiting, now), `decision-digest:${day}`);
-        updateDecisions(stateDir, (f) => ({ file: { ...f, digestDay: day }, result: undefined }));
-      } catch (e) { log(`OWNER_DECISION_DIGEST_FAILED ${errorText(e)}`); }
-    } else updateDecisions(stateDir, (f) => ({ file: { ...f, digestDay: day }, result: undefined }));
   }
   for (const r of readDecisions(stateDir).secretRequests ?? []) await openSecretRequest(deps, r);
   if (readDecisions(stateDir).decisions.some((d) => d.state === "closed" && now - (d.closedAt ?? now) >= DECISION_KEEP_CLOSED_MS)) {

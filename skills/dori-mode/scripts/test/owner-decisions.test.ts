@@ -274,21 +274,14 @@ test("a thread that stays open after archiving is recorded as a pending archive,
   expect(readDecisions(dir).decisions[0]?.archivePending).toBeUndefined();
 });
 
-test("tick sends one daily digest and enqueues a posting-stuck event once", async () => {
+test("tick posts no reminder of waiting decisions and enqueues a posting-stuck event once", async () => {
   const dir = stateDir();
   const fake = fakeTransport();
   const ctx = context(dir, fake.transport, {}, Date.UTC(2026, 10, 12, 9, 30));
-  const opened = await open(ctx);
-  const enqueue: string[] = [];
-  await ownerDecisionTick({
-    ...ctx,
-    enqueue: (id) => { enqueue.push(id); },
-  });
-  const digests = fake.calls.filter((call) => call.method === "send" && call.args[0] === "555" && String(call.args[2]).startsWith("decision-digest:"));
-  expect(digests).toHaveLength(1);
-  expect(digests[0]?.args[1]).toContain(opened.decision.id);
-  await ownerDecisionTick({ ...ctx, enqueue: (id) => { enqueue.push(id); } });
-  expect(fake.calls.filter((call) => call.method === "send" && String(call.args[2]).startsWith("decision-digest:"))).toHaveLength(1);
+  await open(ctx);
+  const sends = fake.calls.filter((call) => call.method === "send").length;
+  await ownerDecisionTick({ ...ctx, enqueue: () => {} });
+  expect(fake.calls.filter((call) => call.method === "send")).toHaveLength(sends);
 
   const stuckDir = stateDir();
   const stuckFake = fakeTransport();
