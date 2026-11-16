@@ -31,7 +31,7 @@
 # secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube, gpg, docker, git and registry logins, keyrings,
 # browser profiles and cookie stores, shell history), refused for reads and writes alike; of ~/.dori/state only
 # review-inputs is readable again. ~/.ssh is refused but for config, known_hosts and *.pub. ~/.config is readable but
-# for its credential stores, gh's hosts.yml login among them: a lane gets GH_TOKEN only through the secret broker, and
+# for its credential stores, gh's hosts.yml login among them: a lane gets GH_TOKEN only through its environment at launch (dori secret env), and
 # gh runs with GH_CONFIG_DIR in the lane's TMPDIR, holding a copy of ~/.config/gh/config.yml. /bin/ps and /usr/bin/log
 # refuse to run sandboxed and run outside the profile. A unix socket connect is not a file read to
 # Seatbelt, so sockets get their own rules: none under ~/.dori
@@ -47,7 +47,7 @@
 set -eu
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
-# through the secret broker); the Linux template and `dori doctor` use the same list. The profile refuses reads and
+# through its environment at launch (dori secret env)); the Linux template and `dori doctor` use the same list. The profile refuses reads and
 # writes of each after every grant, so ~/.config/gh/hosts.yml stays hidden.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
@@ -466,7 +466,7 @@ mkdir -p "$LT" "$H/.dori/heavy"
 chmod 700 "$LT"
 LT=$(canon "$LT")
 # gh reads its login from hosts.yml, which stays refused, and Seatbelt cannot put an empty file in its place: gh gets a
-# config dir of its own in TMPDIR with a copy of config.yml (aliases, settings), and GH_TOKEN from the secret broker. The
+# config dir of its own in TMPDIR with a copy of config.yml (aliases, settings), and GH_TOKEN from its environment (dori secret env at launch). The
 # dir is made fresh each start, so nothing a lane left there (a symlink included) is written through.
 if [ -z "${GH_CONFIG_DIR:-}" ]; then
   rm -rf "$LT/gh"

@@ -467,7 +467,7 @@ test("the lane token is never on the herdr command line; the lane CLI authentica
   await t.lanes.start(START);
   const run = t.calls.find((a) => a[2] === "run");
   const file = t.lanes.tokenPath("lane-a");
-  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} omo --model m1 `);
+  expect(run?.[4]).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
   expect(t.calls.flat().join("\n")).not.toContain("tok-1");
   expect(readFileSync(file, "utf8")).toBe("tok-1");
   expect(statSync(file).mode & 0o777).toBe(0o600);
@@ -523,6 +523,8 @@ test("B3: the launch command runs under /bin/sh when the runner directory has a 
   const t = setup();
   const runnerDir = join(t.runnerDir, "space in runner");
   mkdirSync(runnerDir, { mode: 0o700 });
+  mkdirSync(join(runnerDir, "bin"), { mode: 0o700 });
+  writeFileSync(join(runnerDir, "bin", "dori"), "#!/bin/sh\n[ \"$1 $2\" = \"secret env\" ]\n", { mode: 0o700 });
   let command = "";
   const lanes = new RunnerLanes({
     instance: async () => "server-1",
@@ -537,7 +539,7 @@ test("B3: the launch command runs under /bin/sh when the runner directory has a 
     },
   });
   await lanes.start(START);
-  const proc = Bun.spawn(["/bin/sh", "-c", command], { env: { PATH: process.env.PATH ?? "" }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["/bin/sh", "-c", command], { env: { PATH: `${join(runnerDir, "bin")}:${process.env.PATH ?? ""}` }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   expect({ code, err }).toEqual({ code: 0, err: "" });
   expect(out).toContain(`DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")}`);
@@ -552,12 +554,12 @@ test("lane.start carries keywords and heavy env into the launch line, and a reco
   expect(started.detail).toBe("started pane=p1 tab=t1");
   expect(started.result.startup.verdict).toBe("unconfirmed");
   const first = t.calls.find((a) => a[2] === "run")?.[4] ?? "";
-  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --permission-preset full-access 'ulw set goal and work. Read and execute`);
+  expect(first).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40; eval "$(dori secret env)"; omo --model m1 --permission-preset full-access 'ulw set goal and work. Read and execute`);
   t.world.panes = [];
   const recovered = await t.lanes.recover("lane-a", "ses_123", undefined, "# fresh brief\n", FILES);
   expect(recovered.result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true, resumed: true });
   const second = t.calls.filter((a) => a[2] === "run").at(-1)?.[4] ?? "";
-  expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --permission-preset full-access --session ses_123 'ulw set goal and work.");
+  expect(second).toContain(`DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40; eval "$(dori secret env)"; omo --model m1 --permission-preset full-access --session ses_123 'ulw set goal and work.`);
 });
 
 test("agentArgv runs every lane under omo's full-access preset unless its profile already names a preset", () => {
@@ -592,10 +594,10 @@ test("lane.start hands the policy's repos and worktree roots to the lane sandbox
   const policy = { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] } as const;
   const both = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos", worktreeRoot: "/Users/u/work/worktrees" } });
   await both.lanes.start(START);
-  expect(both.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/worktrees omo --model m1 ");
+  expect(both.calls.find((a) => a[2] === "run")?.[4]).toContain(` LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/worktrees; eval "$(dori secret env)"; omo --model m1 `);
   const repos = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos" } });
   await repos.lanes.start(START);
-  expect(repos.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/repos/worktrees omo --model m1 ");
+  expect(repos.calls.find((a) => a[2] === "run")?.[4]).toContain(` LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/repos/worktrees; eval "$(dori secret env)"; omo --model m1 `);
 });
 
 test("lane.start with a target runs in that idle shell pane, leaves it open on a failed run, and refuses a pane another lane holds", async () => {
@@ -763,7 +765,7 @@ test("lane.start hands a lane's grants to the sandbox as LANE_SANDBOX_RW/RO and 
   } as const;
   const granted = setup({ policy });
   await granted.lanes.start({ ...START, grants: ["blog-topic"] });
-  expect(granted.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_RW=/srv/blog-writer/runs LANE_SANDBOX_RO=/srv/notes:/srv/more omo --model m1 ");
+  expect(granted.calls.find((a) => a[2] === "run")?.[4]).toContain(` LANE_SANDBOX_RW=/srv/blog-writer/runs LANE_SANDBOX_RO=/srv/notes:/srv/more; eval "$(dori secret env)"; omo --model m1 `);
   expect(granted.lanes.records()["lane-a"]?.grants).toEqual(["blog-topic"]);
 
   const plain = setup({ policy });

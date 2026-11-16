@@ -25,7 +25,7 @@
 # cwd nor a grant can re-expose it: ~/.dori/runner, ~/.ssh, ~/.dori/state and ~/.config/herdr (herdr's control socket
 # drives the lead's panes), each an empty read-only tmpfs with only the lane's own runner entries, ssh known_hosts and
 # config, state/review-inputs and the ssh agent socket bound back; the credential stores below (~/.dori/env, secrets
-# and gh's hosts.yml login among them: a lane gets GH_TOKEN only through the secret broker), each hidden file an empty
+# and gh's hosts.yml login among them: a lane gets GH_TOKEN only through its environment at launch (dori secret env)), each hidden file an empty
 # read-only file, and every other host path listed one per line in
 # ~/.dori/lane-sandbox-hide ('#' starts a comment), ~/.dori's own entries included; the lead owns that file, and a lane
 # can neither read nor change it. An entry of either list may be a glob (* ? [...], dotfiles matched too): each existing
@@ -33,7 +33,7 @@
 set -eu
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
-# through the secret broker); the macOS template and `dori doctor` use the same list. Each one that exists (each match,
+# through its environment at launch (dori secret env)); the macOS template and `dori doctor` use the same list. Each one that exists (each match,
 # for a glob) is hidden after every bind, like the hide list below.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
@@ -181,8 +181,8 @@ if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   done
 fi
 
-# No ssh private key is ever bound, even when the agent holds no identities: a lane gets a key only for one command,
-# through the secret broker (dori secret exec <ssh-key secret> -- git push).
+# No ssh private key is ever bound, even when the agent holds no identities: lanes push over https with the GH_TOKEN
+# their environment got at launch (dori secret env).
 
 # Hide docker sockets (resolve symlinks such as /var/run -> /run, bind each real path once)
 seen=""
@@ -290,7 +290,7 @@ keep --bind "$R/briefs/$key.out"
 if [ "$runner_cwd" = 1 ]; then keep --bind "$C"; fi
 trees+=("$(readlink -f "$R")")
 if [ -d "$H/.ssh" ]; then
-  # No ssh private key is ever readable: a lane gets a key only for one command, through the secret broker.
+  # No ssh private key is ever readable: lanes push over https with GH_TOKEN from their environment.
   opts+=(--tmpfs "$H/.ssh")
   keep --ro-bind-try "$H/.ssh/known_hosts"
   keep --ro-bind-try "$H/.ssh/config"

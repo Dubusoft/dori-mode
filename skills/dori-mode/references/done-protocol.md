@@ -32,7 +32,7 @@ To ask the owner, use only `dori report <key> question --text "<question>" --opt
 
 To ask the owner for input only they can give (a one-time 2FA, login or device code; a file or value), use `dori report <key> request --text "<what you need>" --reason "..." [--file <path>] [--waiting "..."]`. It opens a `[요청]` thread for the owner. Never ask for a long-lived secret (password, API key, token) in Discord: `--file` names the path the owner writes it to (chmod 600), and you read it from there; such a request without `--file` is refused. A `--nonblocking` request opens no thread: it reaches the Dori as a digest line, and the Dori asks the owner only when it is really needed. So a check the work does not wait on (a real device or real account after the merge) is not a request at all: note it in your report.
 
-A credential is never an owner question. A `dori secret exec` of a name config `secrets` does not allow your lane is refused with `RUNNER_SECRET_DENIED` and asks the Dori to grant it: wait for the Dori, then run the command again. A name the secret store does not hold is refused with `RUNNER_SECRET_MISSING` and asks nobody: report it as `blocked` with the name and the command.
+A credential is never an owner question. Every stored secret is already in your environment from launch. A name you need that isn't there isn't stored: report it as `blocked` with the name and the command, and the Dori adds it with `dori secret add`.
 
 A lane on another machine (`dori launch --machine`) reports the same way with its runner's `~/.dori/runner/bin/dori report <key> ...`, so everything below applies unchanged (remote worktree checks are skipped and say so in the close receipt).
 

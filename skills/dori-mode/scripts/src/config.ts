@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -169,8 +169,6 @@ export type DoriConfig = {
   readonly displayTimeZone: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
-  /** Store secrets a lane may receive, by name; a secret with no rule (or an empty one) goes to no lane. */
-  readonly secrets: Readonly<Record<string, SecretRule>>;
   /** Proxy-execution ops (`dori secret run <op>`): the supervisor host runs argv with the listed secrets in its env, outside any lane. */
   readonly secretCommands: Readonly<Record<string, SecretCommand>>;
   /**
@@ -249,7 +247,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadArgs: [],
   discordChannels: [],
   githubIssueAuthors: [],
-  secrets: {},
   secretCommands: {},
   worktreeRoot: "",
   heavySlots: 1,
@@ -285,32 +282,6 @@ const laneRules = (raw: unknown): readonly string[] => {
 
 export type LaneSandbox = { readonly command: readonly string[] };
 
-/** A GitHub App installation token minted per lane repo instead of a stored value; `keySecret` names the App private key (PEM) in the store. */
-export type GithubAppMint = {
-  readonly kind: "github-app";
-  readonly appId: string;
-  readonly installationId: string;
-  readonly keySecret: string;
-  readonly permissions: Readonly<Record<string, "read" | "write">>;
-};
-
-/** Which lanes (exact key or `prefix-*`) and repos match a rule; both lists empty match nothing. */
-export type SecretLaneMatch = { readonly lanes: readonly string[]; readonly repos: readonly string[] };
-
-/**
- * Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. `as`
- * absent means env; `ssh-key` and `file` hand the lane a 0600 file path instead of the value; `mint` replaces the stored
- * value with a minted token. `put` lists the lanes that may store a value under the name (`dori secret put`): a separate
- * write-only permission that grants no read.
- */
-export type SecretRule = SecretLaneMatch & {
-  readonly as?: "env" | "ssh-key" | "file";
-  readonly mint?: GithubAppMint;
-  readonly put?: SecretLaneMatch;
-};
-
-const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key" | "file", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" }, "put"?: { "lanes": [strings], "repos": [strings] } }`;
-
 /** A list-of-strings field; absent is empty, anything else throws `bad(path)`. */
 const stringList = (value: unknown, bad: (what: string) => TypeError, path: string): readonly string[] => {
   if (value === undefined) return [];
@@ -318,73 +289,10 @@ const stringList = (value: unknown, bad: (what: string) => TypeError, path: stri
   return value as string[];
 };
 
-/** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?, repos?, as?, mint? } } (see RULE_SHAPE). */
-const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
-  if (raw == null) return {};
-  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`mint\` goes with neither a file \`as\` nor \`put\``);
-  if (!isRecord(raw)) throw bad("");
-  const mintOf = (value: unknown, path: string): GithubAppMint => {
-    const nonEmpty = (v: unknown) => typeof v === "string" && v.trim() !== "";
-    if (!isRecord(value) || Object.keys(value).some((key) => !["kind", "appId", "installationId", "keySecret", "permissions"].includes(key))) throw bad(path);
-    const { kind, appId, installationId, keySecret, permissions } = value;
-    if (kind !== "github-app" || !nonEmpty(appId) || !nonEmpty(installationId) || typeof keySecret !== "string" || !SECRET_NAME.test(keySecret)) throw bad(path);
-    if (!isRecord(permissions) || Object.keys(permissions).length === 0) throw bad(`${path}.permissions`);
-    for (const [perm, level] of Object.entries(permissions)) if (!/^[a-z_]+$/.test(perm) || (level !== "read" && level !== "write")) throw bad(`${path}.permissions.${perm}`);
-    return { kind, appId: appId as string, installationId: installationId as string, keySecret, permissions: permissions as Record<string, "read" | "write"> };
-  };
-  return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
-    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint", "put"].includes(key))) throw bad(`.${name}`);
-    const { as, mint, put } = rule;
-    if (as !== undefined && as !== "env" && as !== "ssh-key" && as !== "file") throw bad(`.${name}.as`);
-    // A minted name has no stored value to hand over as a file or to replace.
-    if (mint !== undefined && (as === "ssh-key" || as === "file" || put !== undefined)) throw bad(`.${name}.mint`);
-    if (put !== undefined && (!isRecord(put) || Object.keys(put).some((key) => key !== "lanes" && key !== "repos"))) throw bad(`.${name}.put`);
-    return [name, {
-      lanes: stringList(rule.lanes, bad, `.${name}.lanes`),
-      repos: stringList(rule.repos, bad, `.${name}.repos`),
-      ...(as !== undefined ? { as } : {}),
-      ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
-      ...(isRecord(put) ? { put: { lanes: stringList(put.lanes, bad, `.${name}.put.lanes`), repos: stringList(put.repos, bad, `.${name}.put.repos`) } } : {}),
-    }];
-  }));
-};
-
-/** Who a granted rule adds: one lane key, every lane of one repo ("owner/repo"), or every lane that has a repo ("*"). */
-export type SecretGrantTarget = { readonly lane: string } | { readonly repo: string };
-
-/**
- * Adds `to` to the `secrets` rule of each of `names` in the config file at `path` (a missing rule is created with that
- * one entry; one already listed is left alone; `{ repo: "*" }` writes `"*"` into `repos`), keeping every other key as it is. The result is checked like loadConfig
- * checks `secrets` (TypeError, nothing written) and written atomically with mode 0600. Returns the names whose rule
- * changed. The supervisor and runners read config per secret request, so the next request sees it without a restart.
- */
-export const grantSecretRule = (path: string, names: readonly string[], to: SecretGrantTarget): string[] => {
-  const loaded: unknown = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
-  if (!isRecord(loaded)) throw new TypeError(`${path} is not a JSON object`);
-  const current = loaded.secrets ?? {};
-  if (!isRecord(current)) throw new TypeError("secrets must be an object");
-  const [field, value] = "lane" in to ? ["lanes", to.lane] as const : ["repos", to.repo] as const;
-  const next: Record<string, unknown> = { ...current };
-  const changed: string[] = [];
-  for (const name of names) {
-    const rule = isRecord(next[name]) ? next[name] as Record<string, unknown> : {};
-    const list = Array.isArray(rule[field]) ? rule[field] as unknown[] : [];
-    if (list.includes(value)) continue;
-    next[name] = { ...rule, [field]: [...list, value] };
-    changed.push(name);
-  }
-  if (!changed.length) return [];
-  secrets(next);
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ ...loaded, secrets: next }, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, path);
-  return changed;
-};
-
 /** The longest `secretCommands.<op>.timeoutSec` may be; the op is killed then, so its answer comes no later. */
 export const SECRET_COMMAND_MAX_TIMEOUT_SEC = 3600;
 
-/** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match (same rules as `secrets`). */
+/** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match. */
 export type SecretCommand = {
   readonly argv: readonly string[];
   readonly secrets: readonly string[];
@@ -513,7 +421,7 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "secrets", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
+  "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -611,7 +519,6 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...(alerts ? { alertsChannel: alerts } : {}),
     ...(decisions ? { decisionsChannel: decisions } : {}),
     laneRules: laneRules(raw.laneRules),
-    secrets: secrets(raw.secrets),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),

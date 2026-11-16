@@ -1,5 +1,5 @@
 import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch } from "node:fs";
-import { replaceKnownSecrets } from "./redact.ts";
+import { addKnownSecrets, replaceKnownSecrets } from "./redact.ts";
 import { SecretStore } from "./secret-store.ts";
 import { homedir, hostname } from "node:os";
 import { resolveCredential } from "./credentials.ts";
@@ -18,7 +18,7 @@ import { RunnerGuardBoard } from "./runner/guard.ts";
 import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, type RunnerCall, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
 import { type Delivery, laneOps, type LaneOps, machineRunner, runnerOf } from "./lane-ops.ts";
-import { supervisorCommandRunner, supervisorDepositor, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
+import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
 import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
@@ -1263,20 +1263,11 @@ export const supervise = async (
           onSecret: supervisorSecretHandler({
             laneOwner: async (key) => { const lane = (await deps.registry.open()).find((l) => l.key === key); return lane && runnerOf(lane); },
             runnerUnsandboxed: (label) => deps.config.runners?.[label]?.allowUnsandboxed === true,
-            granter: supervisorGranter({
-              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets,
-              commands: async () => (await loadConfig()).secretCommands, now: deps.clock.now,
-              log: (line) => { console.log(line); },
-            }),
+            granter: supervisorGranter({ store: new SecretStore(), onGranted: addKnownSecrets }),
             // A remote runner's secret.run: the op runs here, outside any lane; only its redacted output goes back.
             commandRunner: supervisorCommandRunner({
-              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets,
-              commands: async () => (await loadConfig()).secretCommands, now: deps.clock.now,
-              log: (line) => { console.log(line); },
-            }),
-            // A remote lane's secret.put: stored in this host's store when secrets.<name>.put allows that lane.
-            depositor: supervisorDepositor({
-              stateDir: deps.config.stateDir, store: new SecretStore(), rules: async () => (await loadConfig()).secrets, now: deps.clock.now,
+              store: new SecretStore(), onGranted: addKnownSecrets,
+              commands: async () => (await loadConfig()).secretCommands,
               log: (line) => { console.log(line); },
             }),
             log: (line) => { console.log(line); },

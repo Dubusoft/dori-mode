@@ -1,13 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { SecretRule } from "../src/config.ts";
-import { readDecisions } from "../src/owner-decisions.ts";
 import { SecretStoreError } from "../src/secret-store.ts";
 import { RunnerAuth, SupervisorAuth, type Session } from "../src/runner/auth.ts";
 import { RunnerHub } from "../src/runner/hub.ts";
 import { decodeFrame, encodeFrame, runnerControl, type SupervisorControl, type SupervisorControlBodies } from "../src/runner/protocol.ts";
-import { secretAuditPath } from "../src/runner/secret-grant.ts";
 import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler, type SupervisorSecretDeps } from "../src/runner/secret-serve.ts";
 import { acceptRunners, type SecretFrame, type SecretReplyContext } from "../src/runner/serve.ts";
 import { memoryNetwork } from "../src/runner/transport.ts";
@@ -56,7 +53,6 @@ const context = (session: Session | undefined, proto = 6): SecretReplyContext & 
 const getFrame = (key: string, names: readonly string[], repo?: string): SecretFrame =>
   runnerControl(HEAD, "secret.get", { rid: RID, key, names, ...(repo !== undefined ? { repo } : {}) });
 
-const RULES: Record<string, SecretRule> = { API_TOKEN: { lanes: ["lane-a"], repos: [] }, REPO_TOKEN: { lanes: [], repos: ["Acme/Widget"] } };
 
 /** The production granter over a fake store, with the deps every test shares. */
 const harness = (patch: Partial<SupervisorSecretDeps> = {}, store: Record<string, string> = { API_TOKEN: VALUE, REPO_TOKEN: VALUE }) => {
@@ -67,8 +63,8 @@ const harness = (patch: Partial<SupervisorSecretDeps> = {}, store: Record<string
     laneOwner: (key) => owners[key],
     runnerUnsandboxed: () => false,
     granter: supervisorGranter({
-      stateDir: tmp.dir, rules: async () => RULES, commands: async () => ({}), now: clock.now, log,
       store: {
+        readAll: async () => new Map(Object.entries(store)),
         read: async (name) => {
           if (!Object.hasOwn(store, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`);
           return store[name] as string;
@@ -76,7 +72,7 @@ const harness = (patch: Partial<SupervisorSecretDeps> = {}, store: Record<string
       },
     }),
     commandRunner: supervisorCommandRunner({
-      stateDir: tmp.dir, rules: async () => RULES, now: clock.now, log, hostEnv: { PATH: process.env.PATH }, home: tmp.dir,
+      log, hostEnv: { PATH: process.env.PATH }, home: tmp.dir,
       commands: async () => ({ show: { argv: ["sh", "-c", "printf 'out %s' \"$API_TOKEN\"; exit 4"], secrets: ["API_TOKEN"], lanes: ["lane-a"], repos: [], timeoutSec: 60 } }),
       store: { read: async () => VALUE },
     }),
@@ -110,15 +106,11 @@ describe("supervisorSecretHandler", () => {
     expect(JSON.parse(opened as string)).toEqual({ values: { API_TOKEN: VALUE } });
     // Bound to its frame: another rid does not open it.
     expect(runner.openSecret("s2r", { ...HEAD, type: "secret.value", rid: "f".repeat(32) }, body.sealed as { n: string; c: string })).toBeUndefined();
-    expect(logs).toEqual([`RUNNER_SECRET_GRANTED runner=${LABEL} lane=lane-a names=API_TOKEN`]);
-    const audit = readFileSync(secretAuditPath(tmp.dir), "utf8");
-    expect(JSON.parse(audit)).toEqual({ at: "2026-11-11T00:00:00.000Z", runner: LABEL, lane: "lane-a", names: ["API_TOKEN"], allowed: true });
-    expect(audit).not.toContain(VALUE);
-    expect(statSync(secretAuditPath(tmp.dir)).mode & 0o777).toBe(0o600);
+    expect(logs).toEqual([]);
     expect(logs.join("\n")).not.toContain(VALUE);
   });
 
-  test("the repo from the frame matches a repos rule", async () => {
+  test("older named requests read only those names without rules", async () => {
     const { runner, supervisor } = handshake();
     const { handler } = harness();
     const ctx = context(supervisor);
@@ -126,6 +118,15 @@ describe("supervisorSecretHandler", () => {
     const body = ctx.replies[0]?.body as SupervisorControlBodies["secret.value"];
     expect(body.ok).toBe(true);
     expect(JSON.parse(runner.openSecret("s2r", { ...HEAD, type: "secret.value", rid: RID }, body.sealed as { n: string; c: string }) as string)).toEqual({ values: { REPO_TOKEN: VALUE } });
+  });
+
+  test("an empty names list returns every store value sealed", async () => {
+    const { runner, supervisor } = handshake();
+    const { handler } = harness();
+    const ctx = context(supervisor);
+    await handler(LABEL, getFrame("lane-c", []), ctx);
+    const body = ctx.replies[0]!.body;
+    expect(JSON.parse(runner.openSecret("s2r", { ...HEAD, type: "secret.value", rid: RID }, body.sealed!)!)).toEqual({ values: { API_TOKEN: VALUE, REPO_TOKEN: VALUE } });
   });
 
   test("no session -> UNSUPPORTED, before anything else is read", async () => {
@@ -154,7 +155,6 @@ describe("supervisorSecretHandler", () => {
       expect(refusal(ctx)).toEqual({ rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: `${key} is not a lane of runner ${LABEL}` });
     }
     expect(logs).toEqual([`RUNNER_FORGED_SECRET runner=${LABEL} key=lane-b`, `RUNNER_FORGED_SECRET runner=${LABEL} key=lane-x`]);
-    expect(() => statSync(secretAuditPath(tmp.dir))).toThrow();
   });
 
   test("an unsandboxed runner is DENIED", async () => {
@@ -166,16 +166,6 @@ describe("supervisorSecretHandler", () => {
     expect(ctx.replies[0]?.body.detail).toContain("allowUnsandboxed");
   });
 
-  test("a name outside the allowlist is DENIED by the granter and audited, the detail names only names", async () => {
-    const { supervisor } = handshake();
-    const { handler, logs } = harness();
-    const ctx = context(supervisor);
-    await handler(LABEL, getFrame("lane-a", ["API_TOKEN", "REPO_TOKEN"]), ctx);
-    expect(refusal(ctx)).toEqual({ rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: `lane-a may not receive REPO_TOKEN (config secrets); the lead is asked to grant it; run the command again only once the lead says it was granted, never in a loop` });
-    expect(readDecisions(tmp.dir).secretRequests).toEqual([{ lane: "lane-a", names: ["REPO_TOKEN"], at: clock.now() }]);
-    expect(logs).toEqual([`RUNNER_SECRET_DENIED runner=${LABEL} lane=lane-a names=API_TOKEN,REPO_TOKEN`]);
-    expect(JSON.parse(readFileSync(secretAuditPath(tmp.dir), "utf8"))).toMatchObject({ allowed: false, reason: "not allowed: REPO_TOKEN" });
-  });
 
   test("a name missing from the store -> MISSING", async () => {
     const { supervisor } = handshake();
@@ -201,9 +191,7 @@ describe("supervisorSecretHandler", () => {
     expect(JSON.parse(opened)).toEqual({ exitCode: 4, stdout: "out [REDACTED:API_TOKEN]", stderr: "", truncated: false });
     expect(opened).not.toContain(VALUE);
     expect(logs).toEqual([`RUNNER_SECRET_RUN runner=${LABEL} lane=lane-a op=show exit=4`]);
-    const audit = readFileSync(secretAuditPath(tmp.dir), "utf8");
-    expect(JSON.parse(audit)).toEqual({ at: "2026-11-11T00:00:00.000Z", runner: LABEL, lane: "lane-a", op: "show", names: ["API_TOKEN"], allowed: true, exitCode: 4 });
-    expect([audit, ...logs, JSON.stringify(ctx.replies)].join("\n")).not.toContain(VALUE);
+    expect([...logs, JSON.stringify(ctx.replies)].join("\n")).not.toContain(VALUE);
   });
 
   test("secret.run for another runner's lane is DENIED unsealed and logged as forged; nothing runs", async () => {

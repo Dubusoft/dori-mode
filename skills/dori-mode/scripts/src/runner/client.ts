@@ -4,7 +4,7 @@ import type { Clock } from "../run.ts";
 import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
-  CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, SECRET_PUT_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
   type AnyRunnerControl, type AnyRunnerEvent, type ClosedLaneBody, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
@@ -45,7 +45,7 @@ export const SECRET_RUN_TIMEOUT_MS = SECRET_COMMAND_MAX_TIMEOUT_SEC * 1000 + 60_
 
 /** The secret frames a runner sends through `secretRequest`, and the answer type each one waits for. */
 export type SecretRequestType = "secret.get" | "secret.run";
-const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.result", "secret.put": "secret.put.result" } as const;
+const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.result" } as const;
 
 /** The outcome of `secretRequest`: the opened box's plaintext (JSON, never logged), or a refusal with its code. */
 export type SecretReply =
@@ -277,18 +277,6 @@ export class RunnerClient {
   }
 
   /**
-   * Has the supervisor store `value` under `name` for lane `key` (`secret.put`, proto 8): the value goes only inside a
-   * box sealed `r2s` under aad `{runner, gen, epoch, type: "secret.put", rid}`. Resolves like `secretRequest`, with
-   * plaintext JSON `{created, backend}` on success; `RUNNER_SECRET_OUTDATED` when the supervisor is below `SECRET_PUT_PROTO`.
-   */
-  secretPut(body: { readonly key: string; readonly name: string; readonly value: string; readonly repo?: string }): Promise<SecretReply> {
-    const { value, ...rest } = body;
-    return this.secretAsk("secret.put", (rid, session, head) => ({
-      ...rest, rid, sealed: session.sealSecret("r2s", { ...head, type: "secret.put", rid }, value),
-    }), SECRET_PUT_PROTO);
-  }
-
-  /**
    * The lanes of this runner the supervisor's registry records as closed (`lanes.closed`, proto 9), for the cleanup
    * sweep. Rejects when not connected, when the supervisor is below CLOSED_LANES_PROTO, on its refusal, a lost
    * connection or no answer within CLOSED_LANES_TIMEOUT_MS.
@@ -312,7 +300,7 @@ export class RunnerClient {
     });
   }
 
-  private secretAsk<T extends SecretRequestType | "secret.put">(
+  private secretAsk<T extends SecretRequestType>(
     type: T, build: (rid: string, session: Session, head: ReturnType<RunnerClient["head"]>) => RunnerControlBodies[T], needProto = SECRET_PROTO,
   ): Promise<SecretReply> {
     const transport = this.transport;
@@ -320,7 +308,7 @@ export class RunnerClient {
     const session = this.session;
     if (!session) return Promise.resolve({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "unauthenticated link" });
     if (!secretsSupported(this.helloProto) || (this.helloProto as number) < needProto) {
-      return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; ${type === "secret.put" ? "secret put needs" : "secrets need"} proto ${needProto}` });
+      return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; secrets need proto ${needProto}` });
     }
     const rid = randomBytes(16).toString("hex");
     const timeoutMs = type === "secret.run" ? SECRET_RUN_TIMEOUT_MS : SECRET_TIMEOUT_MS;
@@ -344,18 +332,13 @@ export class RunnerClient {
   }
 
   /** Settles the open request an (already MAC-checked) secret answer answers; others are dropped. */
-  private secretAnswer(frame: AnySupervisorControl & { readonly type: "secret.value" | "secret.run.result" | "secret.put.result" }): void {
+  private secretAnswer(frame: AnySupervisorControl & { readonly type: "secret.value" | "secret.run.result" }): void {
     const body = frame.body;
     const pending = this.secrets.get(body.rid);
     if (!pending || pending.answer !== frame.type || !this.session) return;
     this.secrets.delete(body.rid);
     if (!body.ok) {
       pending.settle({ ok: false, code: body.code ?? "RUNNER_SECRET_FAILED", detail: body.detail ?? "refused by the supervisor" });
-      return;
-    }
-    if (frame.type === "secret.put.result") {
-      const put = frame.body as SupervisorControlBodies["secret.put.result"];
-      pending.settle({ ok: true, plaintext: JSON.stringify({ created: put.created === true, backend: put.backend ?? "" }) });
       return;
     }
     const aad = { runner: frame.runner, gen: frame.gen, epoch: frame.epoch, type: frame.type, rid: body.rid };
@@ -464,7 +447,6 @@ export class RunnerClient {
       }
       case "secret.value":
       case "secret.run.result":
-      case "secret.put.result":
         this.secretAnswer(frame);
         return;
       case "lanes.closed.result": {

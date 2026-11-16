@@ -77,8 +77,6 @@ const URGENT_KINDS = [
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
   // Owner decision answers, stuck posts, and missing threads require the lead to act or check state.
   "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
-  // A lane's secret request the lead grants or denies itself (owner-decisions.ts secretRequestLine); the owner is not asked.
-  "SECRET_REQUEST",
   // A direct decision answer whose lane session is gone: the lead takes the answer over (owner-decisions.ts).
   "DECISION_ANSWER_UNDELIVERED",
   // A direct answer changed or withdrawn after an older revision may have reached the lane (decision-inbound.ts).

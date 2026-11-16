@@ -6,7 +6,7 @@ type Json = Record<string, unknown>;
 /** The top-level key that holds a file's schema version; absent means version 0 (written before versions existed). */
 export const CONFIG_SCHEMA_KEY = "schemaVersion";
 /** The version this dori writes. Raise it together with a new CONFIG_MIGRATIONS entry. */
-export const CONFIG_SCHEMA_VERSION = 7;
+export const CONFIG_SCHEMA_VERSION = 8;
 
 export type ConfigMigration = {
   /** The version a file has after this step. */
@@ -54,6 +54,7 @@ export const CONFIG_MIGRATIONS: readonly ConfigMigration[] = [
   { to: 6, fills: { secrets: {} } },
   // Autopilot is always on: a task runs when it is marked for autopilot in toodo, and `dori autopilot pause` stops it.
   { to: 7, drops: { "autopilot.mode": "autopilot is always on; a task's toodo autopilot mark decides, and dori autopilot pause stops it" } },
+  { to: 8, drops: { secrets: "every stored secret arrives in every lane environment at launch" } },
 ];
 
 export class ConfigSchemaError extends Error {}
@@ -121,6 +122,9 @@ export const migrateConfigSchema = (raw: Json): SchemaMigrated => {
       if (sub === undefined) {
         if (!(top in next)) continue;
         delete next[top];
+        // A default filled by an earlier pending step never belonged to this file.
+        const transient = filled.indexOf(top);
+        if (transient >= 0) { filled.splice(transient, 1); continue; }
       } else {
         const parent = next[top];
         if (!isRecord(parent) || !(sub in parent)) continue;

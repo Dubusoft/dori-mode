@@ -7,8 +7,8 @@ import { RunnerLanes } from "./lanes.ts";
 import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
-import { appendSecretAudit, laneRepoOf, secretAuditPath, secretDepositor, secretGranter } from "./secret-grant.ts";
-import { remoteSecretDepositor, remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
+import { laneRepoOf, secretGranter } from "./secret-grant.ts";
+import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
@@ -27,7 +27,6 @@ import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig } from "../config.ts";
-import { secretRequester } from "../owner-decisions.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
@@ -207,7 +206,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A sandboxed lane reports its agent state to herdr through a socket of its own (herdr-report.ts); Windows has no lane sandbox.
     let lanesForReports: RunnerLanes | undefined;
     const herdrReports = process.platform === "win32" ? undefined
-      : new HerdrReportSockets({ runnerDir, log, laneOf: (key) => lanesForReports?.records()[key] });
+      : new HerdrReportSockets({ runnerDir, log, paneOf: (key) => lanesForReports?.records()[key]?.pane });
     const browserCheck = browserWindowCheck(platform.os, { run, clock: realClock, log });
     const runnerLanes = new RunnerLanes({
       runnerDir, run, clock: realClock, policy, publish, remote,
@@ -361,20 +360,14 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         }),
         // Proxy execution runs on the supervisor host: secret.run over the link.
         secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
-        // A value a lane made goes sealed to the supervisor's store: secret.put over the link.
-        secretPut: remoteSecretDepositor({
-          client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log, onGranted: addKnownSecrets,
-        }),
       };
     } else {
-      const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
       const secretStore = new SecretStore();
       const runOp = secretCommandRunner({
         store: secretStore,
         commands: async () => (await loadConfig()).secretCommands,
-        rules: async () => (await loadConfig()).secrets,
         laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
-        audit: auditFile, log, runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
+        log, onGranted: addKnownSecrets,
       });
       laneSocketLanes = {
         tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
@@ -382,30 +375,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         keyForPane: (pane) => runnerLanes.keyForPane(pane),
         reportFiles: (key) => runnerLanes.reportFiles(key),
         secretRun: (key, op) => runOp(key, op),
-        secretPut: secretDepositor({
-          store: secretStore,
-          rules: async () => (await loadConfig()).secrets,
-          laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
-          audit: (entry) => {
-            auditFile(entry);
-            log(`${entry.allowed ? "RUNNER_SECRET_STORED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")} put${entry.reason ? ` reason=${entry.reason}` : ""}`);
-          },
-          runner: identity.label, now: realClock.now, onStored: (value) => { addKnownSecrets([value]); },
-        }),
-        secrets: secretGranter({
-          store: secretStore,
-          rules: async () => (await loadConfig()).secrets,
-          laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
-          audit: (entry) => {
-            auditFile(entry);
-            log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")}${entry.reason ? ` reason=${entry.reason}` : ""}`);
-          },
-          runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
-          // A config denial asks the owner: queued in this host's decisions.json, opened by the supervisor's decision tick.
-          request: secretRequester(cfg.stateDir, async () => (await loadConfig()).secretCommands, realClock.now),
-          // Lives as long as this runner: a lane retrying a refused command is told to stop from the 4th refusal on.
-          refusals: new Map(),
-        }),
+        secrets: secretGranter({ store: secretStore, onGranted: addKnownSecrets }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.
       void new SecretStore().readAll().then((m) => { replaceKnownSecrets(m.values()); }, () => {});

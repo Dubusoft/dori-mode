@@ -528,7 +528,8 @@ export class RunnerLanes {
       // What the lane runs behind, for a command a lane runs in a pane it split off (herdr-report.ts): `env` makes it
       // usable after `exec`.
       if (wrapper.length > 0 && wrapper.every((part, at) => argv[at] === part)) sandboxPrefix = ["env", ...env, ...wrapper.map(quote)].join(" ");
-      command = [...env, ...argv.map(quote)].join(" ");
+      // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
+      command = `export ${env.join(" ")}; eval "$(${quote(this.deps.remote ? join(this.deps.runnerDir, "bin", "dori") : "dori")} secret env)"; ${argv.map(quote).join(" ")}`;
     }
     // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
     if (shell === "posix") this.deps.herdrReports?.open(key);

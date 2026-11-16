@@ -828,7 +828,7 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 adds `secret.put`; protocol 9 adds
+The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 added `secret.put` (since removed; the protocol number stays); protocol 9 adds
 `lanes.closed` / `lanes.closed.result`, and a proto 8 runner still runs lanes and secrets while `dori doctor` warns
 that its cleanup sweep skips the closed lanes' `node_modules`. Earlier versions: Protocol 6 adds the four secret control frames
 (see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
@@ -987,11 +987,11 @@ own pane when done. Any other method, a pane outside these rules or an unknown f
 (`{"id", "error": {"code": "forbidden" | "invalid_request", "message"}}`) and logs `HERDR_REPORT_REFUSED`; nothing
 reaches herdr. Windows has no lane herdr socket.
 
-**Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>", "names": ["NPM_TOKEN"]}`,
-sent by the lane's `dori secret exec NAME... -- <cmd>`. `names` holds 1 to 32 unique secret names (else
-`RUNNER_LANE_BAD_REQUEST`), and the token is checked first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "..."}}`;
-a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_MISSING`,
-`RUNNER_SECRET_FAILED`). The local runner grants from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
+**Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>"}`,
+sent by the lane's `dori secret env` at launch. It carries no names and means every store value; the token is checked
+first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "...", ...}}`;
+a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_FAILED`). The
+local runner answers from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
 a protocol 5 runner answers `RUNNER_SECRET_UNSUPPORTED` and never receives a value. The lane reply is never journaled,
 logged or put in the outbox. See [secrets.md](secrets.md).
 
@@ -999,6 +999,8 @@ logged or put in the outbox. See [secrets.md](secrets.md).
 
 Protocol 6. A remote runner sends `secret.get {rid, key, names, repo?}` (`rid`: 32 random hex chars; `repo`: the lane's
 `owner/repo` read from its worktree) and the supervisor answers `secret.value {rid, ok, code?, detail?, sealed?}`.
+Current runners send an empty `names` and get every store value; a non-empty list from an older runner gets just those
+names. There's no allowlist: the supervisor checks only the link, lane ownership and `allowUnsandboxed`.
 `secret.run {rid, key, op, repo?}` asks the supervisor host to run the configured command `op`; the answer is
 `secret.run.result`, shaped like `secret.value`. A refusal carries `ok: false` and a `RUNNER_SECRET_*` code
 (`DENIED`, `MISSING`, `FAILED`, `UNSUPPORTED`, `OUTDATED` when either side speaks protocol < 6, `TIMEOUT` when the runner
