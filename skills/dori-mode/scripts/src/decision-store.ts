@@ -97,6 +97,11 @@ export type OwnerDecision = DecisionChoices & {
   readonly attachedTo?: string;
   /** The `[System]` status message of the direct answer in the decision's thread, edited in place (decisionDeliveryTick). */
   readonly notice?: { readonly message: string; readonly text: string };
+  /**
+   * What the starter message's answer buttons last showed (messenger/decision-buttons.ts decisionButtonsKey); unset while
+   * they still show what was posted. syncDecisionButtons edits them when the decision moves on.
+   */
+  readonly buttons?: string;
   /** What `dori decision close` did with its text for the lane (decision-relay.ts); set once, when it closes. */
   readonly relay?: DecisionRelay;
 };
