@@ -1,11 +1,12 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, eventKind } from "./event-policy.ts";
 import { redactSecrets } from "./redact.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import type { Runner } from "./run.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 import { machineLabel, remoteRunner } from "./remote-jobs.ts";
 import type { RunnerCall } from "./runner/call.ts";
 import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, validateSchedule } from "./schedule.ts";
@@ -129,14 +130,7 @@ export const validateSpec = (raw: unknown): SourceSpec => {
 /** Writes `text` to `path` atomically (fsynced, then renamed), owner-readable only. */
 const writeAtomic = (dir: string, path: string, text: string): void => {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = `${path}.${randomUUID()}.tmp`;
-  try {
-    const fd = openSync(tmp, "wx", 0o600);
-    try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, path);
-    const handle = openSync(dir, "r");
-    try { fsyncSync(handle); } finally { closeSync(handle); }
-  } finally { rmSync(tmp, { force: true }); }
+  replaceFileDurable(path, text, 0o600);
 };
 
 /** The user sources in <stateDir>/sources.json (mode 0600: webhook secrets). Every read sees CLI changes. */
@@ -322,6 +316,10 @@ export class EventSources {
     return found?.type === type ? found : { type, events: 0, duplicates: 0 };
   }
 
+  private initialize(name: string, type: SourceStatus["type"]): void {
+    if (!this.status.has(name) || this.typeOf(name) !== type) this.set(name, this.entry(name, type));
+  }
+
   private set(name: string, entry: SourceStatus): void {
     this.status.set(name, entry);
     this.dirty = true;
@@ -393,10 +391,10 @@ export class EventSources {
     await Promise.all(specs.map(async (spec) => {
       if (spec.type === "webhook") return;
       if (spec.type === "schedule") {
-        if (!this.status.has(spec.name) || this.typeOf(spec.name) !== "schedule") this.set(spec.name, { type: "schedule", events: 0, duplicates: 0 });
+        this.initialize(spec.name, "schedule");
         return;
       }
-      if (!this.status.has(spec.name) || this.typeOf(spec.name) !== spec.type) this.set(spec.name, { type: spec.type, events: 0, duplicates: 0 });
+      this.initialize(spec.name, spec.type);
       if (this.running.has(spec.name)) return;
       if (spec.type === "poll") {
         if ((this.nextPoll.get(spec.name) ?? -Infinity) > now) return;
@@ -503,7 +501,7 @@ export class EventSources {
       this.listeners.delete(name);
     }
     for (const spec of specs) {
-      if (!this.status.has(spec.name) || this.typeOf(spec.name) !== "webhook") this.set(spec.name, { type: "webhook", events: 0, duplicates: 0 });
+      this.initialize(spec.name, "webhook");
       if (this.listeners.has(spec.name)) continue;
       try {
         const server = Bun.serve({

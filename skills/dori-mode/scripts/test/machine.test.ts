@@ -2,11 +2,13 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
 import { deadPaneTick, newDeadPaneState, UNRECOGNISED_ALERT_AFTER } from "../src/dead-panes.ts";
-import { claimDone, closeLane, closedWorktreeSweep, objectDone, unpushedWork, watchTick } from "../src/done-flow.ts";
+import { claimDone, closeLane, objectDone, unpushedWork, watchTick } from "../src/done-flow.ts";
+import { closedWorktreeSweep } from "../src/closed-cleanup.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { githubTargets } from "../src/github-events.ts";
 import { type LaneOps, LaneOpsError, machineRunner, runnerOf } from "../src/lane-ops.ts";
-import { adoptLane, footer, launchLane, paneShell } from "../src/launch.ts";
+import { adoptLane, launchLane, paneShell } from "../src/launch.ts";
+import { footer } from "../src/launch-footer.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";

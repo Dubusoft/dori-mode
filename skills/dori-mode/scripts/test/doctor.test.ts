@@ -11,9 +11,8 @@ import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
 import { pendingLeadRestart } from "../src/lead-restart.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Registry } from "../src/registry.ts";
-import { WAKES_FILE } from "../src/store.ts";
 import type { Ran } from "../src/run.ts";
-import { fakeClock, withState } from "./fakes.ts";
+import { fakeClock, withSqliteStore, withState, writeWakes } from "./fakes.ts";
 
 const TOKEN = "secret-token-xyz";
 const PATH = process.env.PATH;
@@ -54,6 +53,8 @@ const happyHttp: Record<string, ReturnType<typeof resp>> = {
 type Patch = { run?: Record<string, Ran>; http?: Record<string, ReturnType<typeof resp>>; gateway?: "live" | "none" | "stale" | "nocontent" | "down"; free?: number; deps?: Partial<DoctorDeps> };
 const fixture = (patch: Patch = {}) => {
   const state = withState();
+  // A healthy machine's supervisor has created its store.
+  withSqliteStore(state.dir);
   cleanups.push(state.done);
   mkdirSync(join(state.dir, ".dori", "runner"), { recursive: true });
   chmodSync(join(state.dir, ".dori", "runner"), 0o700);
@@ -323,18 +324,6 @@ test("doctor warns when the obsolete local runner unit is enabled", async () => 
   expect(find(await runDoctor(f.deps), "runner unit")).toMatchObject({ level: "WARN", detail: expect.stringContaining("supervisor runs the local runner itself") });
 });
 
-test("doctor warns only when standalone guard agent files remain", async () => {
-  const f = fixture();
-  expect((await runDoctor(f.deps)).find((c) => c.id === "guard agent")).toBeUndefined();
-  const path = join(f.deps.home, ".dori", "guard-agent.sh");
-  writeFileSync(path, "legacy");
-  expect(find(await runDoctor(f.deps), "guard agent")).toMatchObject({
-    level: "WARN",
-    detail: expect.stringContaining("guard-agent.sh left from the old standalone guard agent; the runner reports this host now"),
-    fix: "the runner removes them when it starts (dori update on the lead restarts runners); or delete them",
-  });
-});
-
 test("doctor warns when a lead restart is pending without consuming it or touching the warm lead", async () => {
   const f = fixture();
   const request = { id: "restart-doctor-177", at: NOW, models: [{ model: "qa/lead", thinking: "high" }, { model: "qa/fallback" }] };
@@ -351,11 +340,11 @@ test("doctor warns when a lead restart is pending without consuming it or touchi
 
 test("doctor warns when lead wakes not from owner messages exceed the 24-hour threshold, naming their top trigger", async () => {
   const f = fixture();
-  const wakes = (trigger: string[], n: number, from: number) => Array.from({ length: n }, (_, i) => JSON.stringify({ at: NOW - from - i, session: "lead", trigger, kinds: {} }));
-  const path = join(f.deps.config.stateDir, WAKES_FILE);
-  writeFileSync(path, wakes(["INBOUND"], 25, 0).join("\n"));
+  const wakes = (trigger: string[], n: number, from: number) => Array.from({ length: n }, (_, i) => ({ at: NOW - from - i, session: "lead", trigger, kinds: {} }));
+  const dir = f.deps.config.stateDir;
+  writeWakes(dir, wakes(["INBOUND"], 25, 0));
   expect((await runDoctor(f.deps)).some((check) => check.id === "lead wakes")).toBe(false);
-  writeFileSync(path, [...wakes(["INBOUND"], 25, 0), ...wakes(["HOST_GUARD OFFLINE"], 15, 100), ...wakes(["LANE_REPORT"], 6, 200)].join("\n"));
+  writeWakes(dir, [...wakes(["INBOUND"], 25, 0), ...wakes(["HOST_GUARD OFFLINE"], 15, 100), ...wakes(["LANE_REPORT"], 6, 200)]);
   const check = find(await runDoctor(f.deps), "lead wakes");
   expect(check).toMatchObject({
     level: "WARN", detail: "21 lead wakes not from owner messages in the last 24 hours (threshold 20; lane 6, noise 15); most from HOST_GUARD OFFLINE (15)",
@@ -551,7 +540,6 @@ test("doctor names each config value's source: file, default, env or derived, an
   expect(find(checks, "config.stateDir").detail).toStartWith("env DORI_STATE_DIR: ");
   expect(find(checks, "config.alertsChannel").detail).toBe('derived from discordChannels[0]: "500"');
   expect(find(checks, "config.decisionsChannel")).toMatchObject({ level: "WARN", detail: "decisionsChannel: unset (decisions go to the requesting channel)" });
-  expect(find(checks, "config.store").detail).toStartWith("derived from ");
   expect(find(checks, "config.leadThinking").detail).toBe("unset: (none)");
   expect(find(checks, "config ignored keys")).toMatchObject({ level: "WARN", detail: expect.stringContaining("laneThinking") });
 });

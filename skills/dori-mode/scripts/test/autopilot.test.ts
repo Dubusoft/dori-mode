@@ -7,17 +7,18 @@ import {
   autopilotLocalStateKey, candidatesJson, DEFAULT_AUTOPILOT, formatCandidates, type JudgeContext, judge, judgeAll, ledgerRows, ledgerState,
   parseAutopilotConfig, reservedTaskOf, singleHost, type ToodoTask,
 } from "../src/autopilot.ts";
-import { JsonOperations, type Operation, type OperationState } from "../src/operations.ts";
+import { SqliteOperations, type Operation, type OperationState } from "../src/operations.ts";
+import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const HOUR = 3_600_000;
 const WS = 7;
 
 let dir: string;
-let store: JsonOperations;
+let store: SqliteOperations;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "dori-autopilot-"));
-  store = new JsonOperations(dir);
+  store = new SqliteOperations(storePath(dir));
 });
 afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
 
@@ -257,9 +258,7 @@ test("parseAutopilotConfig ignores the removed bundle keys, quotaMaxUsedPct and 
 test("parseAutopilotConfig throws TypeError naming the key on an invalid value or an unknown key", () => {
   const cases: [unknown, RegExp][] = [
     [[], /^autopilot must be an object/],
-    [{ quotaUnreadable: "launch" }, /^autopilot\.quotaUnreadable /],
     [{ mergeBase: "" }, /^autopilot\.mergeBase /],
-    [{ crossWorkspacePrereqs: "allow" }, /^autopilot\.crossWorkspacePrereqs /],
     [{ tickSec: 29 }, /^autopilot\.tickSec /],
     [{ tickSec: 3601 }, /^autopilot\.tickSec /],
     [{ tickSec: 60.5 }, /^autopilot\.tickSec /],

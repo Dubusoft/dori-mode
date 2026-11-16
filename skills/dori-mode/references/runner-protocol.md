@@ -81,7 +81,7 @@ Protocol 3 adds, all optional on existing frames:
 Protocol 4 adds `guard.sample.herdr?: {state: up|down|hung|elevated, instance?: string, since: number}`,
 `herdr.state {state, instance?, detail}` on transitions, and `herdr.start {ok, detail}` for managed-unit start
 outcomes. `since` is the runner's wall time; the supervisor records its own receipt time for shared state.
-The supervisor continues to infer outages from `panes: -1` for protocol 3 runners. Protocol 4 samples without
+Samples without
 `herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
 Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
@@ -573,9 +573,6 @@ machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane o
 killed, but it kills nothing over ssh. A machine whose runner sent no fresh sample is skipped that round, and a machine
 without a runner isn't guarded.
 
-When it starts, a runner deletes the old guard agent files on its host (`~/.dori/guard-agent.sh`,
-`guard-agent.ps1`, `guard-agent.version`) and logs `RUNNER_GUARD_AGENT_REMOVED <files>`.
-
 ## herdr outages
 
 Each runner, including the local runner, watches herdr on the existing 30 s guard sampling timer. A readable pane
@@ -622,13 +619,8 @@ pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a 
 The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
 with `HERDR_DOWN` / `HERDR_HUNG` / `HERDR_ELEVATED` (urgent; lane recovery and launches on that machine are held as
 for down) and `HERDR_UP ... server=<instance>` (digest). `dori doctor` names the elevated-server fix above for
-`elevated`, not a restart. For protocol 3 runners:
+`elevated`, not a restart. A runner's first `up` is saved and says nothing.
 
-- Two committed samples in a row with `panes: -1` mark the machine's herdr `down`: `HERDR_DOWN machine=<label> ...`
-  (urgent), once. Protocol 3 cannot tell a stopped herdr from a hung one, and -1 also covers a pane list that timed
-  out or did not parse. One unreadable sample between readable ones changes nothing.
-- The next sample with a pane count marks it `up` again: `HERDR_UP machine=<label> ... after <n> s down` (digest), once.
-  A runner's first readable sample is saved as `up` and says nothing. A sample without `panes` changes nothing.
 - The state and the time it was entered are saved on the runner's row in `runners.sqlite` (`herdr`, `herdrSince`),
   so they survive a supervisor restart and other `dori` processes read them.
 - While a machine's herdr is down or hung the recovery sweep leaves that machine's lanes alone: nothing is read or relaunched
@@ -836,7 +828,7 @@ Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes 
 warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).
 **Upgrade the supervisor before its runners**: a proto 6 runner still connects to a proto 7 supervisor, but a proto 7
 runner is refused by a proto 6 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
-nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
+nullable `commands.result_json` column in protocol 3.
 
 ## Liveness and restarts
 
@@ -950,8 +942,7 @@ for the bundle). In a lane that CLI takes only `report`, `claim-done` and `heavy
 other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane.d/lane`
 with the lane's token. The socket has a directory of its own so the Linux lane sandbox can bind the directory rather
 than the socket file: a restarted runner binds a new socket at the same path, and a lane started before the restart
-reaches it. The runner also serves the older `~/.dori/runner/sock/lane`, and a lane's CLI falls back to it when the
-`lane.d` connect fails (a sandbox set up before the move). The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
+reaches it. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
 the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
 

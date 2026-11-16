@@ -2,21 +2,18 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultConfig } from "../src/config.ts";
 import { adoptLane, launchLane, remoteRepo, type SharedThreadLane } from "../src/launch.ts";
 import { readLaneAttachmentPin, writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { type LaneOps, LaneOpsError, laneOps } from "../src/lane-ops.ts";
 import { type RunnerCall, RunnerCalls, RunnerUnavailable } from "../src/runner/call.ts";
 import type { Lane } from "../src/registry.ts";
 import {
-  clearLaunchHold, dequeueLaunch, enqueueLaunch, launchGate, launchHeld, launchQueue, launchQueueText,
+  clearLaunchHold, dequeueLaunch, enqueueLaunch, launchHeld, launchQueue, launchQueueText,
   type QueuedLaunch, recordLaunchVerdict,
 } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
-const guard = defaultConfig("/home/test").guard;
-const roomy = { load1: 10, memFreePct: 45, diskFreeGb: 300, swapFreeGb: 2, swapTotalGb: 4, panes: 6 };
 let state: ReturnType<typeof withState>;
 let world: World;
 beforeEach(() => { state = withState(); world = newWorld(); });
@@ -67,21 +64,6 @@ test("the LAUNCH_READY text lists every queued launch with key, cwd, repo, threa
   expect(text).toContain('done="merged acme/app#1" brief=/briefs/lane-a.md queued 2026-01-01T12:00:00.000Z');
   expect(text).toContain("; lane-b repo=acme/app done=");
   expect(text).not.toContain("thread=none");
-});
-
-// Items 2, 5, 6: the launch gate
-test("dori launch's gate holds on host memory, disk and pane limits", () => {
-  expect(launchGate({ sample: roomy, guard })).toEqual({ lines: [] });
-  expect(launchGate({ sample: { ...roomy, memFreePct: 5 }, guard }).hold).toBe("memory free 5% < 20%");
-  expect(launchGate({ sample: { ...roomy, diskFreeGb: 3, panes: 20 }, guard }).hold).toBe("disk free 3 GB < 50 GB | panes 20 >= 20");
-});
-
-test("panesMax 0 means unlimited panes, with a warning on every launch", () => {
-  const open = { ...guard, panesMax: 0 };
-  const g = launchGate({ sample: { ...roomy, panes: 500 }, guard: open });
-  expect(g.hold).toBeUndefined();
-  expect(g.lines).toEqual([expect.stringMatching(/^LAUNCH_WARN guard\.panesMax is 0: the pane-count limit is off/)]);
-  expect(launchGate({ sample: { ...roomy, memFreePct: 1 }, guard: open }).lines[0]).toStartWith("LAUNCH_WARN");
 });
 
 // Items 3 and 4: placement and threads

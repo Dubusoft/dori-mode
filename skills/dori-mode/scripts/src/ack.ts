@@ -1,10 +1,10 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import { COLD_START_EMOJI } from "./supervise.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { dropCarried } from "./inbox.ts";
+import { dropFile, publishReceipt } from "./receipts.ts";
 import { hasColumn, JOURNAL_FILE, readStoreView, SQLITE_FILE } from "./store.ts";
 import { leadOwes } from "./supervise-journal.ts";
 
@@ -18,7 +18,8 @@ const ACK_FILE = /^(\d+)-(\d+)(?:-[\w-]+)?\.json$/;
 /** The journal id of an owner message: discord:<channel>:<message>. */
 export const ownerMessageId = (channel: string, message: string): string => `discord:${channel}:${message}`;
 
-const ackDir = (stateDir: string): string => join(stateDir, "acks");
+const ACK_DIR = "acks";
+const ackDir = (stateDir: string): string => join(stateDir, ACK_DIR);
 
 export class AckError extends Error {}
 
@@ -103,16 +104,7 @@ export const ack = async (stateDir: string, discord: AckReactions, channel: stri
 const recordReceipt = (stateDir: string, channel: string, message: string, at: number, coverage: MessageCoverage): void => {
   if (!DISCORD_ID.test(channel) || !DISCORD_ID.test(message)) throw new AckError("channel must be a Discord channel id, and message its message id (digits only)");
   checkTasks(coverage.tasks);
-  const dir = ackDir(stateDir);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${channel}-${message}-${randomUUID()}.json`);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ channel, message, at, ...coverage }), { mode: 0o600, flush: true });
-  renameSync(tmp, path);
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-  const parent = openSync(stateDir, "r");
-  try { fsyncSync(parent); } finally { closeSync(parent); }
+  publishReceipt(stateDir, ACK_DIR, `${channel}-${message}`, { channel, message, at, ...coverage });
 };
 
 export const recordAck = (stateDir: string, channel: string, message: string, at: number, tasks?: number): void =>
@@ -182,13 +174,6 @@ export const handled = async (
  */
 const trackedCoverage = (stateDir: string, id: string): { readonly entry?: TrackedCoverage; readonly ackedAt?: number } | undefined =>
   !existsSync(join(stateDir, JOURNAL_FILE)) && !existsSync(join(stateDir, SQLITE_FILE)) ? {} : readStoreView(stateDir, {
-  json: (journal) => {
-    const entry = journal.awaitingAck?.find((tracked) => tracked.id === id);
-    return entry ? {
-      entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply, awaitingOwnerAt: entry.awaitingOwnerAt },
-      ...(entry.ackedAt !== undefined ? { ackedAt: entry.ackedAt } : {}),
-    } : {};
-  },
   sqlite: (db) => {
     // A store the supervisor has not migrated yet has no awaiting column: nothing there is parked.
     const parked = hasColumn(db, "owner_messages", "awaiting_owner_at") ? ", awaiting_owner_at" : "";
@@ -227,8 +212,4 @@ export const pendingAcks = (stateDir: string): (MessageCoverage & { readonly id:
   });
 };
 
-export const dropAck = (path: string): void => {
-  try { unlinkSync(path); } catch (e) {
-    if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
-  }
-};
+export const dropAck = dropFile;

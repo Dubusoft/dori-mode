@@ -17,7 +17,7 @@ import { redactSecrets } from "./redact.ts";
 
 export const LAUNCH_ACTION = "autopilot-launch";
 /** A task ref naming the owner's word that marked it, e.g. `owner:discord:<channel>/<message>`. */
-const OWNER_REF = /^owner:\S+$/;
+export const OWNER_REF = /^owner:\S+$/;
 
 /** The toodo-server task fields the predicate reads (camelCase, as `list_tasks` / `get_task` return them). */
 export type ToodoTask = {
@@ -44,9 +44,7 @@ export type ToodoTask = {
 export type AutopilotConfig = {
   /** Supervisor execution is opt-in; false keeps the lead's manual launch flow. */
   readonly executor: boolean;
-  readonly quotaUnreadable: "hold";
   readonly mergeBase: string;
-  readonly crossWorkspacePrereqs: "block";
   /** Seconds between the supervisor's autopilot ticks. */
   readonly tickSec: number;
   /** Seconds a quota read is reused by every caller (judge, `dori quota`, `/quota`) before the endpoints are read again. */
@@ -60,16 +58,17 @@ export const QUOTA_CACHE_SEC_MAX = 900;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   executor: false,
-  quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300, quotaCacheSec: 90,
+  mergeBase: "dev", tickSec: 300, quotaCacheSec: 90,
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Keys read as nothing so an older config still loads: the bundle design's, `mode` (autopilot is always on; `dori
- * setup` removes it, see config-schema.ts) and `quotaMaxUsedPct` (an account counts as spent only at 100%).
+ * setup` removes it, see config-schema.ts), `quotaMaxUsedPct` (an account counts as spent only at 100%), and
+ * `quotaUnreadable` / `crossWorkspacePrereqs` (each had one value: unreadable quota holds, a cross-workspace prerequisite refuses).
  */
-const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode", "quotaMaxUsedPct"]);
+const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode", "quotaMaxUsedPct", "quotaUnreadable", "crossWorkspacePrereqs"]);
 
 /**
  * The config's `autopilot` (absent: DEFAULT_AUTOPILOT; each key optional). Throws TypeError naming the key on an
@@ -88,12 +87,9 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
     if (!ok(v)) throw new TypeError(`autopilot.${key} must be ${what}, not ${JSON.stringify(v)}`);
     return v as T;
   };
-  const only = (value: string) => (v: unknown) => v === value;
   return {
     executor: pick<boolean>("executor", (v) => typeof v === "boolean", "a boolean"),
-    quotaUnreadable: pick<"hold">("quotaUnreadable", only("hold"), "\"hold\""),
     mergeBase: pick<string>("mergeBase", (v) => typeof v === "string" && v.trim() !== "" && v === v.trim(), "a branch name"),
-    crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
     tickSec: pick<number>("tickSec", (v) => Number.isInteger(v) && (v as number) >= TICK_SEC_MIN && (v as number) <= TICK_SEC_MAX,
       `an integer from ${TICK_SEC_MIN} to ${TICK_SEC_MAX}`),
     quotaCacheSec: pick<number>("quotaCacheSec", (v) => Number.isInteger(v) && (v as number) >= QUOTA_CACHE_SEC_MIN && (v as number) <= QUOTA_CACHE_SEC_MAX,
@@ -327,7 +323,7 @@ const REFUSE_SET: ReadonlySet<string> = new Set(REFUSE_REASONS);
 const ORDER: readonly Reason[] = [...REFUSE_REASONS, ...HOLD_REASONS];
 
 /** A dependency counts as satisfied only when done with resolution merged or completed. */
-const depSatisfied = (dep: ToodoTask): boolean => dep.status === "done" && (dep.resolution === "merged" || dep.resolution === "completed");
+export const depSatisfied = (dep: ToodoTask): boolean => dep.status === "done" && (dep.resolution === "merged" || dep.resolution === "completed");
 
 const verdictOf = (taskId: number, found: ReadonlySet<Reason>): Verdict => {
   const reasons = ORDER.filter((r) => found.has(r));
@@ -428,11 +424,16 @@ export type CandidatesReport = {
   readonly quotaRoom?: readonly string[];
 };
 
+/** The quota notes a report may carry, in output order: header label and CandidatesReport key (quotaOver is followed by quotaRoom). */
+const QUOTA_NOTES = [["quota-skipped", "quotaSkipped"], ["quota-stale", "quotaStale"], ["quota-over", "quotaOver"]] as const;
+
 /** Text output of `dori autopilot candidates`: a header line and one line per verdict, or AUTOPILOT_NO_CANDIDATES. */
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
+  const quota = QUOTA_NOTES.filter(([, key]) => report[key]?.length)
+    .map(([label, key]) => ` ${label}: ${report[key]!.join(", ")}${key === "quotaOver" ? ` quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`).join("");
   return [
-    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"}${report.machines ? ` machines=${report.machines.map((m) => `${m.machine}:${m.slots ?? "unlimited"}`).join(",")}` : ""} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}${report.quotaStale?.length ? ` quota-stale: ${report.quotaStale.join(", ")}` : ""}${report.quotaOver?.length ? ` quota-over: ${report.quotaOver.join(", ")} quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`,
+    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"}${report.machines ? ` machines=${report.machines.map((m) => `${m.machine}:${m.slots ?? "unlimited"}`).join(",")}` : ""} candidates=${report.verdicts.length}${quota}`,
     ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? `would-launch${report.machines && v.machine ? ` machine=${v.machine}` : ""}` : v.reasons.join(", ")}`),
   ];
 };
@@ -443,7 +444,6 @@ export const candidatesJson = (report: CandidatesReport) => ({
   slots: report.slots,
   ...(report.machines ? { machines: report.machines } : {}),
   candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons, ...(report.machines && v.machine ? { machine: v.machine } : {}) })),
-  ...(report.quotaSkipped?.length ? { quotaSkipped: report.quotaSkipped } : {}),
-  ...(report.quotaStale?.length ? { quotaStale: report.quotaStale } : {}),
-  ...(report.quotaOver?.length ? { quotaOver: report.quotaOver, quotaRoom: report.quotaRoom ?? [] } : {}),
+  ...Object.fromEntries(QUOTA_NOTES.filter(([, key]) => report[key]?.length)
+    .flatMap(([, key]): [string, unknown][] => key === "quotaOver" ? [[key, report[key]], ["quotaRoom", report.quotaRoom ?? []]] : [[key, report[key]]])),
 });

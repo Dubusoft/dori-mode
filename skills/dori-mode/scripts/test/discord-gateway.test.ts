@@ -5,7 +5,7 @@ import { DiscordCommands } from "../src/messenger/discord-commands.ts";
 import { acquireDiscordGateway } from "../src/messenger/discord-lock.ts";
 import { GATEWAY_SESSION_FILE, GATEWAY_SESSION_MAX_AGE_MS, saveGatewaySession, supervisorDiscord, takeGatewaySession } from "../src/messenger/discord-supervisor.ts";
 import { discordSnowflakeAt } from "../src/messenger/discord-inbound.ts";
-import { discordPresence, type GatewaySocket } from "../src/messenger/discord.ts";
+import { discordPresence, type GatewaySocket } from "../src/messenger/discord-gateway.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { readOwnerClosed } from "../src/thread-followup.ts";

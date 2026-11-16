@@ -1,7 +1,8 @@
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
+import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord-split.ts";
 import { guardText } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
 import type { Lane } from "./registry.ts";
@@ -28,9 +29,7 @@ const readObject = (path: string): Record<string, unknown> => {
 };
 
 const writeObject = (path: string, value: Record<string, unknown>): void => {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
-  renameSync(tmp, path);
+  replaceFileAtomic(path, JSON.stringify(value), 0o600);
 };
 
 export const readOwnerClosed = (stateDir: string): Record<string, number> =>

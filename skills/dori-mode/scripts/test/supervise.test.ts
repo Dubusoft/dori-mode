@@ -5,9 +5,11 @@ import { randomUUID } from "node:crypto";
 
 import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
-import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
+import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, RetryingDelivery, screenStill, Supervisor } from "../src/supervise.ts";
+import { leadPermissionArgs, plainShell, UNCONFIRMED_LIMIT } from "../src/lead-process.ts";
+import { SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/lead-soft-restart.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork, leadPermissionArgs, SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
+import { childWork } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -17,8 +19,9 @@ import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, wri
 import { markHerdr } from "./herdr-world.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
-import { openLaneReports, routeReports } from "../src/lane-reports.ts";
-import { importStore } from "../src/store-import.ts";
+import { routeReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
+import { convertJsonStore } from "../src/store-import.ts";
 import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCarried } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 import { recordReported } from "../src/lane-outcomes.ts";
@@ -1067,9 +1070,9 @@ test("a journaled forced restart bypasses the soft path even for an idle lead", 
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
 });
 
-test.each([["json", false], ["sqlite", false], ["json", true], ["sqlite", true]] as const)("recovering a soft restart on %s, ready=%s, never resends the prompt", async (store, ready) => {
+test.each([false, true])("recovering a soft restart, ready=%s, never resends the prompt", async (ready) => {
   // Given durable intent and evidence written before the supervisor crashed.
-  const f = fixture({ store });
+  const f = fixture();
   const old = f.session();
   const planned = randomUUID();
   const actual = randomUUID();
@@ -1078,10 +1081,8 @@ test.each([["json", false], ["sqlite", false], ["json", true], ["sqlite", true]]
   writeFileSync(join(dirname(f.file), `${actual}.jsonl`), `${JSON.stringify({ type: "message", message: { role: "user", content: path } })}\n`);
   utimesSync(join(dirname(f.file), `${actual}.jsonl`), 0, 0);
   const initial = { events: [], restart: { session: ready ? actual : planned, events: [], offset: 0, phase: ready ? `soft-ready:${planned}` as const : `soft:${old}` as const } };
-  if (store === "sqlite") {
-    const seeded = new SqliteStore(join(f.state.dir, SQLITE_FILE), { create: true });
-    try { seeded.save(initial, "normal"); } finally { seeded.close(); }
-  } else writeFileSync(join(f.state.dir, JOURNAL_FILE), JSON.stringify(initial));
+  const seeded = new SqliteStore(join(f.state.dir, SQLITE_FILE), { create: true });
+  try { seeded.save(initial, "normal"); } finally { seeded.close(); }
   // When recovery runs, only confirmation and cleanup are allowed.
   const lines = await quiet(() => new Supervisor(f.deps).flush());
   // Then it confirms the existing session without typing anything again.
@@ -1090,10 +1091,8 @@ test.each([["json", false], ["sqlite", false], ["json", true], ["sqlite", true]]
   if (!ready) expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${actual}`);
   expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(actual);
   expect(existsSync(path)).toBe(false);
-  if (store === "sqlite") {
-    const saved = new SqliteStore(join(f.state.dir, SQLITE_FILE));
-    try { expect(saved.read(false).restart).toBeUndefined(); } finally { saved.close(); }
-  } else expect(JSON.parse(readFileSync(join(f.state.dir, JOURNAL_FILE), "utf8")).restart).toBeUndefined();
+  const saved = new SqliteStore(join(f.state.dir, SQLITE_FILE));
+  try { expect(saved.read(false).restart).toBeUndefined(); } finally { saved.close(); }
 });
 
 test("a healthy cold start with holder evidence launches once and never kills the new session", async () => {
@@ -1744,7 +1743,7 @@ test("a lead pane closed by hand together with its Dori workspace is recreated i
   }, "boot");
   const lines = await quiet(async () => {
     await delivery.tick();
-    f.clock.at = delivery.nextAttemptAt;
+    while (!delivery.due) f.clock.at += 1000;
     await delivery.tick();
   });
   expect(retries).toEqual([expect.stringMatching(/^SUPERVISOR_RETRY lead pane lead:p1 does not exist; attempt 1/)]);
@@ -2696,33 +2695,31 @@ test("an owner-only event is no longer posted: it is journaled for the lead, and
   expect(journal(f).events.map((event: { id: string }) => event.id)).toEqual(["custom"]);
 });
 
-// Phase 0.3: owner tracking from rows. Each case runs on the json store and on the sqlite store after dori store import.
+// Phase 0.3: owner tracking from rows, on a state dir an older json supervisor left and its conversion moved into the store.
 const DAY_MS = 24 * 60 * 60_000;
-type StoreName = "json" | "sqlite";
-/** Writes a json journal and its delivery log as an older supervisor left them, then imports it for the sqlite store. */
-const seedState = (dir: string, store: StoreName, journal: { events: { id: string; line: string; at?: number }[] } & Record<string, unknown>): void => {
+/** Writes a json journal and its delivery log as an older supervisor left them, then converts them into the store. */
+const seedState = (dir: string, journal: { events: { id: string; line: string; at?: number }[] } & Record<string, unknown>): void => {
   writeFileSync(join(dir, JOURNAL_FILE), JSON.stringify(journal));
   writeFileSync(join(dir, "lead-events.log"), journal.events.map(({ id, line }) => `${JSON.stringify({ id, line })}\n`).join(""));
-  if (store === "sqlite") importStore(dir, 1_800_000_000_000);
+  convertJsonStore(dir, 1_800_000_000_000);
 };
-const stored = (dir: string, store: StoreName): { events: { id: string; line: string }[]; awaitingAck?: (Tracked & Record<string, unknown>)[] } => {
-  if (store === "json") return JSON.parse(readFileSync(join(dir, JOURNAL_FILE), "utf8"));
+const stored = (dir: string): { events: { id: string; line: string }[]; awaitingAck?: (Tracked & Record<string, unknown>)[] } => {
   const db = new SqliteStore(join(dir, SQLITE_FILE));
   try { return db.read(false) as never; } finally { db.close(); }
 };
-const lines = (dir: string, store: StoreName, prefix: string): string[] =>
-  stored(dir, store).events.map((event) => event.line).filter((line) => line.startsWith(prefix));
+const lines = (dir: string, prefix: string): string[] =>
+  stored(dir).events.map((event) => event.line).filter((line) => line.startsWith(prefix));
 
-test.each(["json", "sqlite"] as const)("an ack-flood journal on the %s store: no per-message ACK_MISSING, one quarantine digest, nothing handed over", async (store) => {
+test("an ack-flood journal on the sqlite store: no per-message ACK_MISSING, one quarantine digest, nothing handed over", async () => {
   // Given a supervisor.json.bak-ackflood-like state: 300 owner messages delivered days ago and tracking reset to nothing,
   // one of them edited, one deleted and one already tombstoned (synthetic text only).
-  const f = fixture({ store });
+  const f = fixture();
   const old = f.clock.now() - 3 * DAY_MS;
   const events: { id: string; line: string; at?: number }[] = [];
   for (let i = 0; i < 300; i++) events.push({ id: `discord:11:${1000 + i}`, line: `INBOUND 11 ${1000 + i} synthetic flood message ${i}`, ...(i % 2 ? { at: old } : {}) });
   events.push({ id: "discord:11:1001:edit:2027-01-01T00:00:00.000Z", line: "INBOUND_EDIT 11 1001 synthetic flood message (edited)", at: old });
   events.push({ id: "discord:11:1002:delete", line: "INBOUND_DELETE 11 1002 (deleted)", at: old });
-  seedState(f.state.dir, store, { events, awaitingAck: [], closedOwners: ["discord:11:1003"] });
+  seedState(f.state.dir, { events, awaitingAck: [], closedOwners: ["discord:11:1003"] });
   // When the supervisor starts, delivers, passes several ack windows, cold-restarts the lead with a new request, and restarts itself.
   const supervisor = new Supervisor(f.deps);
   await supervisor.flush();
@@ -2742,9 +2739,9 @@ test.each(["json", "sqlite"] as const)("an ack-flood journal on the %s store: no
   restarted.ackTick(60_000);
   restarted.close();
   // Then the flood produced no ACK_MISSING and one digest listing the 298 untracked messages; only the new request is reminded.
-  expect(lines(f.state.dir, store, "ACK_MISSING ")).toEqual([]);
-  expect((stored(f.state.dir, store).awaitingAck ?? []).filter((entry) => entry.reminded).map((entry) => entry.id)).toEqual(["discord:11:5000"]);
-  const digest = lines(f.state.dir, store, "OWNER_QUARANTINED ");
+  expect(lines(f.state.dir, "ACK_MISSING ")).toEqual([]);
+  expect((stored(f.state.dir).awaitingAck ?? []).filter((entry) => entry.reminded).map((entry) => entry.id)).toEqual(["discord:11:5000"]);
+  const digest = lines(f.state.dir, "OWNER_QUARANTINED ");
   expect(digest).toHaveLength(1);
   expect(digest[0]).toStartWith("OWNER_QUARANTINED 298 11:1000,1001,1004,");
   expect(eventPriority(digest[0] ?? "")).toBe("digest");
@@ -2752,17 +2749,17 @@ test.each(["json", "sqlite"] as const)("an ack-flood journal on the %s store: no
   const handoff = handed(f);
   expect(handoff).toContain("synthetic new request");
   expect(handoff).not.toContain("synthetic flood message");
-  const rows = stored(f.state.dir, store).awaitingAck ?? [];
+  const rows = stored(f.state.dir).awaitingAck ?? [];
   expect(rows.filter((entry) => (entry as { quarantined?: true }).quarantined)).toHaveLength(298);
   expect(rows.find((entry) => entry.id === "discord:11:1002")).toMatchObject({ deleted: true });
 });
 
-test.each(["json", "sqlite"] as const)("a 3-day-old unresolved request survives the %s store and is still reminded; a handled one stays handled", async (store) => {
+test("a 3-day-old unresolved request survives the sqlite store and is still reminded; a handled one stays handled", async () => {
   // Given tracking rows written three days ago: an unacked edited request, an acked one covering 1 of 2 tasks, a handled one.
-  const f = fixture({ store });
+  const f = fixture();
   const old = f.clock.now() - 3 * DAY_MS;
   const handledAt = f.clock.now() - 60 * 60_000;
-  seedState(f.state.dir, store, {
+  seedState(f.state.dir, {
     events: [
       { id: "discord:11:1", line: "INBOUND 11 1 synthetic old request", at: old },
       { id: "discord:11:1:edit:2027-01-12T00:00:00.000Z", line: "INBOUND_EDIT 11 1 synthetic old request (edited)", at: old + 1 },
@@ -2781,10 +2778,10 @@ test.each(["json", "sqlite"] as const)("a 3-day-old unresolved request survives 
   supervisor.handledTick(30 * 60_000);
   supervisor.close();
   // Then the old request is reminded in its latest text, the coverage gap is reported, and the handled one is untouched.
-  expect(lines(f.state.dir, store, "ACK_MISSING ")).toEqual([]);
-  expect(lines(f.state.dir, store, "UNHANDLED ")).toEqual([expect.stringMatching(/^UNHANDLED 11 3 coverage=1\/2 /)]);
-  expect(lines(f.state.dir, store, "OWNER_QUARANTINED ")).toEqual([]);
-  const rows = stored(f.state.dir, store).awaitingAck ?? [];
+  expect(lines(f.state.dir, "ACK_MISSING ")).toEqual([]);
+  expect(lines(f.state.dir, "UNHANDLED ")).toEqual([expect.stringMatching(/^UNHANDLED 11 3 coverage=1\/2 /)]);
+  expect(lines(f.state.dir, "OWNER_QUARANTINED ")).toEqual([]);
+  const rows = stored(f.state.dir).awaitingAck ?? [];
   expect(rows.find((entry) => entry.id === "discord:11:1")).toMatchObject({ since: old, reminded: true, revisions: ["discord:11:1:edit:2027-01-12T00:00:00.000Z"] });
   expect(rows.find((entry) => entry.id === "discord:11:2")).toEqual({ id: "discord:11:2", since: old, ackedAt: old + 5, handledAt, tasks: 1, reply: true });
 });
@@ -2810,9 +2807,9 @@ test("a quarantined message the lead acks, or the owner edits, is tracked like a
   expect(ackMissing(f)).toEqual([]);
 });
 
-test.each(["json", "sqlite"] as const)("a message parked with handled --awaiting on the %s store is owed nothing and prints AWAITING_OWNER on take; a later --lane closes it", async (store) => {
+test("a message parked with handled --awaiting on the sqlite store is owed nothing and prints AWAITING_OWNER on take; a later --lane closes it", async () => {
   // Given an owner question the lead took, acked and answered with a question back to the owner.
-  const f = fixture({ store, handledTimeoutMin: 1 });
+  const f = fixture({ handledTimeoutMin: 1 });
   let supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:11:22", "INBOUND 11 22 owner shall I start the migration?");
   await supervisor.flush();
@@ -2836,12 +2833,12 @@ test.each(["json", "sqlite"] as const)("a message parked with handled --awaiting
   f.clock.at += 10 * 60_000;
   expect(supervisor.handledTick()).toEqual([]);
   // Then nothing came back as UNHANDLED.
-  expect(lines(f.state.dir, store, "UNHANDLED ")).toEqual([]);
+  expect(lines(f.state.dir, "UNHANDLED ")).toEqual([]);
   // When the owner answers and the lead links the lane it launched.
   recordHandled(f.state.dir, "11", "22", f.clock.now(), { lanes: ["alpha"] });
   supervisor.handledTick();
   supervisor.close();
   // Then the message is handled and the awaiting line is gone.
   expect(takeAwaitingReminders(f.state.dir)).toEqual([]);
-  expect(stored(f.state.dir, store).awaitingAck?.[0]).toMatchObject({ handledAt: f.clock.now(), awaitingOwnerAt: parkedAt, lanes: ["alpha"] });
+  expect(stored(f.state.dir).awaitingAck?.[0]).toMatchObject({ handledAt: f.clock.now(), awaitingOwnerAt: parkedAt, lanes: ["alpha"] });
 });

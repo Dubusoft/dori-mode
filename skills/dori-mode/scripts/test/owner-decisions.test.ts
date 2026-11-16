@@ -1,8 +1,17 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  queueDecisionAnswer,
+  reconcileDecisionDeliveries,
+  reconcileDecisionsAtStart,
+  recordAnswerRevision,
+  decisionDeliveryTick,
+} from "../src/decision-delivery.ts";
+import { decisionTargetOf, readDecisions } from "../src/decision-store.ts";
 import {
   answeredLine,
   answerOutcomeLines,
@@ -11,13 +20,6 @@ import {
   openOwnerDecision,
   openOwnerDecisions,
   ownerDecisionTick,
-  queueDecisionAnswer,
-  readDecisions,
-  reconcileDecisionDeliveries,
-  reconcileDecisionsAtStart,
-  recordAnswerRevision,
-  decisionTargetOf,
-  decisionDeliveryTick,
   recordChannelAnswer,
   recordOwnerAnswer,
   type DecisionContext,
@@ -33,7 +35,8 @@ import {
   serializeRequestText,
   type DecisionChoices,
 } from "../src/runner/decision-text.ts";
-import { ackLaneMessage, JsonLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
+import { ackLaneMessage, SqliteLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
+import { storePath } from "./fakes.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -289,7 +292,7 @@ test("tick posts no reminder of waiting decisions and enqueues a posting-stuck e
   await open(stuckCtx);
   const stored = readDecisions(stuckDir);
   // Simulate a writer that reserved its decision but stopped before posting.
-  const { updateDecisions } = await import("../src/owner-decisions.ts");
+  const { updateDecisions } = await import("../src/decision-store.ts");
   updateDecisions(stuckDir, (file) => ({
     file: { ...file, decisions: file.decisions.map((item) => ({ ...item, state: "posting" as const, openedAt: stuckCtx.now() - 11 * 60_000, thread: undefined })) },
     result: undefined,
@@ -583,7 +586,7 @@ test("a lane decision pins its target; answer revisions count from r1, drop a re
 
 test("queueing an answer writes decision-d<ID>-r<n> once, replaces a queued older one, and corrects or withdraws one the lane may have", async () => {
   const dir = stateDir();
-  const store = new JsonLaneMessages(dir);
+  const store = new SqliteLaneMessages(storePath(dir));
   const id = await openLane(context(dir, fakeTransport().transport), "ap-955-1");
   recordAnswerRevision(dir, id, answer("ap-955-1", 1), 10);
   const q1 = queueDecisionAnswer(dir, store, id, 20);
@@ -608,7 +611,7 @@ test("queueing an answer writes decision-d<ID>-r<n> once, replaces a queued olde
 
 test("a withdrawal before anything reached the lane cancels the queued answer and sends nothing", async () => {
   const dir = stateDir();
-  const store = new JsonLaneMessages(dir);
+  const store = new SqliteLaneMessages(storePath(dir));
   const id = await openLane(context(dir, fakeTransport().transport), "ap-955-1");
   recordAnswerRevision(dir, id, answer("ap-955-1", 2), 10);
   queueDecisionAnswer(dir, store, id, 11);
@@ -620,7 +623,7 @@ test("a withdrawal before anything reached the lane cancels the queued answer an
 
 test("after a restart the intents are reconciled with the queue: queued once, acked, closed, and undelivered when the lane session is gone", async () => {
   const dir = stateDir();
-  const store = new JsonLaneMessages(dir);
+  const store = new SqliteLaneMessages(storePath(dir));
   const ctx = context(dir, fakeTransport().transport);
   const [a, b, c, d, e] = [await openLane(ctx, "ap-1-1"), await openLane(ctx, "ap-2-1"), await openLane(ctx, "ap-3-1"), await openLane(ctx, "ap-4-1"), await openLane(ctx, "ap-5-1")];
   // A crash after the intent, before the queue write (a, b, d); c and e got their message queued.
@@ -629,7 +632,8 @@ test("after a restart the intents are reconciled with the queue: queued once, ac
   queueDecisionAnswer(dir, store, e, 11);
   await closeOwnerDecision(ctx, c, { text: "Closed by the lead", choice: 1 });
   // The queue lost e's message (a damaged or switched store): it is never queued again.
-  writeFileSync(join(dir, "lane-messages.json"), JSON.stringify({ messages: { "decision-d3-r1": store.get("decision-d3-r1") } }));
+  const db = new Database(storePath(dir));
+  try { db.query("DELETE FROM lane_messages WHERE id <> ?").run("decision-d3-r1"); } finally { db.close(); }
   const lanes = new Map([
     ["ap-1-1", decisionTargetOf(laneOf("ap-1-1"))],
     ["ap-3-1", decisionTargetOf(laneOf("ap-3-1"))],
@@ -665,7 +669,7 @@ const posts = (calls: { method: string; args: unknown[] }[]) => calls.filter((c)
 
 test("a direct answer waits queued for its lane with the owner told so; the lane's ack closes the decision once", async () => {
   const dir = stateDir();
-  const store = new JsonLaneMessages(dir);
+  const store = new SqliteLaneMessages(storePath(dir));
   const fake = fakeTransport();
   const { events, deps } = tickOf(dir, fake.transport);
   const lanes = async () => [laneOf("ap-957-1")];
@@ -697,7 +701,7 @@ test("a direct answer waits queued for its lane with the owner told so; the lane
 
 test("an acked answer whose close failed is closed by the next round, under the same lead event id", async () => {
   const dir = stateDir();
-  const store = new JsonLaneMessages(dir);
+  const store = new SqliteLaneMessages(storePath(dir));
   const fake = fakeTransport();
   let down = true;
   const transport: DecisionTransport = { ...fake.transport, send: async (channel, content, stableId) => {
@@ -721,7 +725,7 @@ test("an acked answer whose close failed is closed by the next round, under the 
 
 test("an answer whose lane was relaunched is never delivered: the owner is told and the lead is woken once", async () => {
   const dir = stateDir();
-  const store = new JsonLaneMessages(dir);
+  const store = new SqliteLaneMessages(storePath(dir));
   const fake = fakeTransport();
   const { events, deps } = tickOf(dir, fake.transport);
   const id = await openLane(deps, "ap-957-1");

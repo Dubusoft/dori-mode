@@ -12,7 +12,7 @@ import { ackLaneMessage, LaneMessageError } from "../src/lane-messages.ts";
 import type { Lane } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, fakeRunner, newWorld, sent, TEST_STORE, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, fakeRunner, newWorld, sent, withState, type World } from "./fakes.ts";
 import { BUILT_IN } from "../src/tunables.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -73,7 +73,7 @@ const follow = (patch: Partial<CiIo> = {}): CiFollowUp => {
 
 beforeEach(async () => {
   state = withState();
-  if (TEST_STORE === "sqlite") new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
+  new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
   world = newWorld();
   world.panes = [{ ...idle }];
   gh = { view: greenView(), viewCode: 0, mergeCode: 0, merges: [], issue: "OPEN", closes: [] };

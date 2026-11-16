@@ -1,10 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
 import { redactMeta, redactSecrets } from "./redact.ts";
-import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 
-import { EVENT_LOG, parseLogLine } from "./inbox.ts";
-import { DEFAULT_LEAD, readStoreView, TAKES_FILE } from "./store.ts";
+import { DEFAULT_LEAD, readStoreView } from "./store.ts";
 import type { Event, Journal, LaneOutcome } from "./supervise-journal.ts";
 
 /**
@@ -77,39 +74,6 @@ export const traceText = (trace: Trace): string[] => [
 type Row = Record<string, string | number | null>;
 const num = (value: unknown): number | undefined => (typeof value === "number" ? value : undefined);
 
-/** The first take of `id` in the json store's takes file. */
-const jsonTake = (stateDir: string, id: string): { takenAt?: number; takenSession?: string } => {
-  const path = join(stateDir, TAKES_FILE);
-  if (!existsSync(path)) return {};
-  for (const text of readFileSync(path, "utf8").split("\n")) {
-    if (!text) continue;
-    let row: { ids?: unknown; at?: unknown; session?: unknown };
-    try { row = JSON.parse(text); } catch (e) { if (e instanceof SyntaxError) continue; throw e; }
-    if (Array.isArray(row.ids) && row.ids.includes(id) && typeof row.at === "number") {
-      return { takenAt: row.at, ...(typeof row.session === "string" ? { takenSession: row.session } : {}) };
-    }
-  }
-  return {};
-};
-
-const inLog = (stateDir: string, id: string): boolean => {
-  const path = join(stateDir, EVENT_LOG);
-  return existsSync(path) && readFileSync(path, "utf8").split("\n").some((text) => text !== "" && parseLogLine(text).id === id);
-};
-
-const fromJson = (stateDir: string, id: string, journal: Journal): TraceSources => {
-  const owner = journal.awaitingAck?.find((entry) => entry.id === id);
-  const outcome = journal.outcomes?.find((entry) => entry.events?.includes(id));
-  return {
-    ...(() => { const event = journal.events.find((e) => e.id === id); return event ? { event } : {}; })(),
-    delivered: inLog(stateDir, id),
-    ...jsonTake(stateDir, id),
-    ...(owner ? { owner: { ackedAt: owner.ackedAt, handledAt: owner.handledAt, deleted: owner.deleted === true } } : {}),
-    ...(journal.closedOwners?.includes(id) ? { ownerClosed: true } : {}),
-    ...(outcome ? { outcome } : {}),
-  };
-};
-
 /** `SELECT *` throughout: a database the supervisor has not migrated yet simply lacks the newer columns. */
 const fromSqlite = (id: string, db: Database): TraceSources => {
   const eventRow = db.query("SELECT * FROM events WHERE id = ?").get(id) as Row | null;
@@ -133,4 +97,4 @@ const fromSqlite = (id: string, db: Database): TraceSources => {
 
 /** What this state dir's store holds about `id` (read-only); undefined when the store cannot be read. */
 export const loadTrace = (stateDir: string, id: string): TraceSources | undefined =>
-  readStoreView(stateDir, { json: (journal) => fromJson(stateDir, id, journal), sqlite: (db) => fromSqlite(id, db) });
+  readStoreView(stateDir, { sqlite: (db) => fromSqlite(id, db) });

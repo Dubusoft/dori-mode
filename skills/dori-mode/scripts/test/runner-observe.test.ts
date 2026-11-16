@@ -61,6 +61,7 @@ test("observeHost finds lanes by DORI_LANE_KEY without a registry and never read
     { key: "lane-a", pane: "p1", tab: "t1", status: "working" },
     { key: "lane-b", pane: "p2", tab: "t2", status: "idle" },
   ]);
+  expect(herdrCalls.filter((argv) => argv[1] === "pane" && argv[2] === "process-info").map((argv) => argv[4])).toEqual(["p1", "p2", "p3"]);
   expect(herdrCalls.filter((argv) => argv[1] === "pane" && argv[2] === "read")).toEqual([]);
 });
 

@@ -68,6 +68,8 @@ test("dori watch suppresses repeated warnings per lane and reason until they cle
   const dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "cli-watch-"));
   const preload = join(dir, "watch-preload.ts");
   const doneFlow = JSON.stringify(join(import.meta.dir, "..", "src", "done-flow.ts"));
+  const lanePerms = JSON.stringify(join(import.meta.dir, "..", "src", "lane-perms.ts"));
+  const closedCleanup = JSON.stringify(join(import.meta.dir, "..", "src", "closed-cleanup.ts"));
   writeFileSync(preload, `
     import { mock } from "bun:test";
     let tick = 0;
@@ -79,18 +81,22 @@ test("dori watch suppresses repeated warnings per lane and reason until they cle
       ["LANE_WATCH_WARN alpha worktree locked"],
     ];
     mock.module(${doneFlow}, () => ({
-      callerLane: async () => undefined,
       claimDone: async () => "",
       closeLane: async () => ({}),
       closeRunning: () => false,
       finishClosedTask: async () => undefined,
       finishedReason: () => "",
-      laneActRefusal: () => undefined,
-      laneSendRefusal: () => undefined,
       laneMeta: () => ({}),
-      newPendingCleanup: () => ({ keys: new Set() }),
       objectDone: async () => "",
       watchTick: async () => results[tick++] ?? [],
+    }));
+    mock.module(${lanePerms}, () => ({
+      callerLane: async () => undefined,
+      laneActRefusal: () => undefined,
+      laneSendRefusal: () => undefined,
+    }));
+    mock.module(${closedCleanup}, () => ({
+      newPendingCleanup: () => ({ keys: new Set() }),
     }));
     Bun.sleep = async () => { if (++sleep === 4) process.exit(0); };
   `);

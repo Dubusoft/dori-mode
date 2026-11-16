@@ -136,7 +136,7 @@ test("open decisions are listed for inbox take until resolved", () => {
 });
 
 test("retention keeps the body of an open decision event and prunes it once resolved", async () => {
-  const f = fixture({ store: "sqlite" });
+  const f = fixture();
   f.world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const supervisor = new Supervisor({
     ...f.deps,
