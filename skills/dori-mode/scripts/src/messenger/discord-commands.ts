@@ -44,12 +44,12 @@ export type ThreadClosed = (threadId: string, interactionId: string) => Promise<
 export type ButtonClicked = (name: string, arg: string, channel: string, interactionId: string) => Promise<void>;
 /**
  * Routes the owner's answer-button click on option `choice` of `decision`, made in `channel` (`late`: past Discord's
- * answer window); resolves to the owner's reply and the buttons as they should now show (decision-inbound.ts
- * routeDecisionClick).
+ * answer window); resolves to the owner's reply (none when the thread's `[System]` notice confirms the answer) and the
+ * buttons as they should now show (decision-inbound.ts routeDecisionClick).
  */
 export type DecisionClicked = (click: {
   readonly decision: string; readonly choice: number; readonly channel: string; readonly interaction: string; readonly late: boolean;
-}) => Promise<{ readonly content: string; readonly components?: readonly unknown[] }>;
+}) => Promise<{ readonly content?: string; readonly components?: readonly unknown[] }>;
 export type ButtonHookOptions = {
   /** config `buttonHooks`: hook name -> argv template. */
   readonly hooks?: Readonly<Record<string, ArgvTemplate>>;
@@ -213,7 +213,8 @@ export class DiscordCommands {
    * An answer-button click: a non-owner (or a foreign application or guild) and a click with no router get an ephemeral
    * reply. The owner's click is acknowledged at once (deferred, nothing shown yet), then routed (`decide` checks the
    * thread, the decision's state and whether the lane can take it); its buttons are updated to show the choice and the
-   * reply follows as an ephemeral message. A failed route records nothing the router did not record and tells the owner
+   * reply, when the router gives one, follows as an ephemeral message (a first direct answer has none: the thread's
+   * `[System]` notice is its one visible confirmation). A failed route records nothing the router did not record and tells the owner
    * to type the number.
    *
    * A click whose acknowledgement fails is still routed, as `late`: made while the supervisor was restarting, it reaches
@@ -235,7 +236,7 @@ export class DiscordCommands {
       late = true;
       console.error(`Discord decision button ${interaction.decision} acknowledgement failed; routing it late`);
     }
-    let result: { readonly content: string; readonly components?: readonly unknown[] };
+    let result: { readonly content?: string; readonly components?: readonly unknown[] };
     try {
       result = await this.buttons.decide({ decision: interaction.decision, choice: interaction.choice, channel: interaction.channel, interaction: interaction.id, late });
     } catch {
@@ -250,6 +251,7 @@ export class DiscordCommands {
       await this.request("PATCH", message, { components: result.components }, late)
         .catch(() => { console.error(`Discord decision button ${interaction.decision} update failed`); });
     }
+    if (result.content === undefined) return;
     const reply = late
       ? this.request("POST", `/channels/${interaction.channel}/messages`, { content: `[System] 재시작 중에 누른 버튼(${interaction.decision} ${interaction.choice}번)입니다. ${result.content}`, allowed_mentions: { parse: [] } }, true)
       : this.request("POST", webhook, { content: result.content, flags: 64 });
