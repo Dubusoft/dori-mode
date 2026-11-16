@@ -55,7 +55,7 @@ Fix every reason, then claim again. A new claim starts a fresh 5-minute window.
 
 ## Messages from the supervisor
 
-A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait until the PR is green; the message does not replace it. Never wait for the merge. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor merges it for you, but only at the head SHA your done claim recorded: push everything before you claim, and claim again after any later push; a conflict with `dev` may get its own merge lane. A merge lane doesn't merge either: it pushes the resolution to the PR branch and claims done at that head, and the supervisor reviews and merges it like any lane PR.
+A `[LEAD]` line that ends with `dori report ack <id>` (for example failing CI on your PR) needs that confirmation: run `dori report ack <id>` once you have read it, then act on it. Keep your own CI wait until the PR is green; the message does not replace it. Never wait for the merge. Without the ack the lead is told after 20 minutes. When your PR is green and mergeable into `dev`, the supervisor merges it for you, but only at the head SHA your done claim recorded: push everything before you claim, and claim again after any later push; a conflict with `dev` may get its own merge lane. A merge lane doesn't merge either: it pushes the resolution to the PR branch and claims done at that head, and the supervisor merges it like any lane PR.
 
 ## When the window starts
 
