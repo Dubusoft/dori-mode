@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { loadConfig } from "../src/config.ts";
-import { eventClass } from "../src/event-policy.ts";
+import { DEFAULT_EVENT_POLICY, eventClass } from "../src/event-policy.ts";
 import { JsonLaneReports, type LaneReportStore, putReportRows, readReportRows, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { footer, launchLane } from "../src/launch.ts";
 import { watchTick } from "../src/done-flow.ts";
@@ -13,7 +13,7 @@ import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { fakeLaneSocket } from "./fake-lane-socket.ts";
 import { BUILT_IN } from "../src/tunables.ts";
 import { openedLine, type OpenResult, type OwnerDecision } from "../src/owner-decisions.ts";
-import { parseDecisionText, serializeDecisionText } from "../src/runner/decision-text.ts";
+import { parseDecisionText, serializeDecisionText, serializeRequestText } from "../src/runner/decision-text.ts";
 
 // The CLI cases spawn `bun src/cli.ts`; a loaded full run on a small host needs more than bun's default 5 s per test.
 setDefaultTimeout(30_000);
@@ -373,6 +373,24 @@ test("routing: a question with choices opens an owner decision through the opene
   expect(journal).toEqual([["owner-decision-opened:d1", openedLine(decision)]]);
   expect(journal[0]?.[1]).toStartWith("OWNER_DECISION_OPENED d1 lane local-lane blocking");
   expect(store.list()[0]).toMatchObject({ route: "decision", eventId: "owner-decision-opened:d1" });
+});
+
+test("routing: a nonblocking input request opens no owner decision and reaches the lead as a digest event", async () => {
+  const dir = stateDir();
+  const deps = depsFor(newWorld(), fakeClock(T0), dir);
+  await deps.registry.write(lane(dir));
+  const store = new JsonLaneReports(dir);
+  const text = serializeRequestText({ need: "check the upload on a real phone", reason: "the simulator has no camera", waiting: "merging the PR", blocking: false });
+  const row = store.append({ lane: "local-lane", generation: 0, kind: "question", text, at: T0 });
+  const asked: string[] = [];
+  const journal: [string, string][] = [];
+  const opener = async (_lane: Lane, report: { readonly id: string }): Promise<OpenResult | undefined> => { asked.push(report.id); return undefined; };
+  expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); }, "/home/test", null, opener)).toEqual([`LANE_REPORT_ROUTED ${row.id} question journal`]);
+  expect(asked).toEqual([]);
+  expect(journal).toHaveLength(1);
+  expect(journal[0]?.[0]).toBe(`lane-request:${row.id}`);
+  expect(journal[0]?.[1]).toStartWith("LANE_REQUEST_NONBLOCKING local-lane check the upload on a real phone");
+  expect(eventClass(journal[0]?.[1] ?? "", DEFAULT_EVENT_POLICY)).toBe("lead-digest");
 });
 
 test("routing: a free-text question the opener declines is journaled as a LANE_REPORT question as before", async () => {

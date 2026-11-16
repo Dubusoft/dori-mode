@@ -17,7 +17,7 @@ Exit code 0 and echoed input aren't proof the agent got the message. A reply fro
 
 The supervisor never talks to the owner itself, with two exceptions:
 
-- a lane question with choices becomes a `[결정]` thread, and a lane's owner-input request (`dori report <key> request`) a `[요청]` thread, in the decisions channel (#inbox to the owner; wired by `decisionsChannel` id), opened by the supervisor;
+- a lane question with choices becomes a `[결정]` thread, and a lane's owner-input request (`dori report <key> request`) a `[요청]` thread, in the decisions channel (#inbox to the owner; wired by `decisionsChannel` id), opened by the supervisor. A lane's `--nonblocking` request is not posted: it reaches the lead as a digest `LANE_REQUEST_NONBLOCKING` line. A question for a lane or task that already has an open blocking decision (one the lead opened included) is posted into that decision's thread instead of a new one (`attachedTo`; an owner message there answers the newest open decision), and a shared thread is archived only when its last decision closes. A lane's secret request is never posted: the lead grants it ([secrets](secrets.md));
 - every day at 09:00 `displayTimeZone`, while any decision or request still waits, the supervisor posts one `[System]` reminder listing them in the decisions channel.
 
 The owner's answer is not forwarded to the lane. The lead relays it, except for one kind of answer: Decision answers straight to the lane (below).

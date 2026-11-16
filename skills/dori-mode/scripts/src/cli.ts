@@ -1654,7 +1654,7 @@ try {
         const laneKey = v.lane?.trim() || undefined;
         const found = laneKey === undefined ? undefined : await deps.registry.read(laneKey);
         if (laneKey !== undefined && !found) refuse(`unknown --lane ${laneKey}: no registered lane has this key`);
-        task ??= od.taskOfLane(laneKey);
+        task ??= found?.task ?? od.taskOfLane(laneKey);
         const thread = v.thread?.trim();
         if (thread !== undefined && !od.refIds(thread)) refuse(`--thread ${thread} is not a thread ref such as discord:<channel>/<thread>`);
         const laneThread = found?.thread && found.thread !== "none" ? found.thread : undefined;
@@ -1680,6 +1680,7 @@ try {
         });
         const d = opened.decision;
         console.log(`DECISION_OPENED ${d.id} discord:${d.channel}/${d.thread ?? ""}${d.kind === "request" ? " request" : ""}`);
+        if (d.attachedTo && !opened.duplicateOf) console.log(`DECISION_ATTACHED ${d.id} ${d.attachedTo}: posted in the thread of ${d.attachedTo}, the open blocking decision of the same lane or task`);
         if (opened.channel.unset) console.log(od.channelUnsetLine(opened.channel));
         if (opened.noticeKept) console.log(`DECISION_NOTICE_KEPT ${d.id}: the channel's "started a thread" notice could not be deleted: ${opened.noticeKept}`);
         const link = opened.link;

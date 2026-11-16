@@ -20,6 +20,7 @@ import type { LaneFileReceipt } from "./runner/protocol.ts";
 import { LaneFileError } from "./lane-files.ts";
 import { ownerClosedRecorded, redirectIfClosed } from "./thread-followup.ts";
 import { type OpenResult, openedLine } from "./owner-decisions.ts";
+import { parseRequestText } from "./runner/decision-text.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -503,12 +504,19 @@ export const routeReports = async (
       let eventId: string | undefined;
       const stale = lane && report.generation !== UNFENCED_GENERATION && report.generation < laneGeneration(lane);
       const late = !lane || statusOf(lane) === "closed" || stale;
-      const opened = !late && report.kind === "question" && openDecision ? await openDecision(lane, report) : undefined;
+      // A nonblocking input request (the lane goes ahead without it) is news for the lead, never an owner thread.
+      const request = !late && report.kind === "question" ? parseRequestText(report.text) : undefined;
+      const deferred = request && !request.blocking ? request : undefined;
+      const opened = !late && !deferred && report.kind === "question" && openDecision ? await openDecision(lane, report) : undefined;
       if (late || !lane) {
         eventId = `lane-report-late:${report.id}`;
         const line = reportLine(report, saveReportBody(deps.config.stateDir, report), "LANE_REPORT_LATE");
         await enqueue(eventId, stale ? `${line} (from a replaced session)` : line, lane ? laneMeta(lane) : { lane: report.lane });
         route = "late";
+      } else if (deferred) {
+        eventId = `lane-request:${report.id}`;
+        await enqueue(eventId, `LANE_REQUEST_NONBLOCKING ${lane.key} ${summary(deferred.need)} (why: ${summary(deferred.reason)}; going ahead: ${summary(deferred.waiting)}${deferred.file ? `; file ${deferred.file}` : ""}): not posted to the owner; ask the owner yourself with dori decision open --request only when it is really needed`, laneMeta(lane));
+        route = "journal";
       } else if (opened) {
         eventId = `owner-decision-opened:${opened.decision.id}`;
         await enqueue(eventId, openedLine(opened.decision, opened.duplicateOf), laneMeta(lane));
