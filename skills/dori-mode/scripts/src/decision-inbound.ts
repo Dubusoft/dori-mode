@@ -137,6 +137,30 @@ export const routeOwnerMessage = async (routing: DirectRouting, channel: string,
   }
 };
 
+/** One owner click on answer button `choice` of `decision`, made in channel `channel` (decision-buttons.ts). */
+export type DecisionClick = { readonly decision: string; readonly choice: number; readonly channel: string; readonly interaction: string };
+
+export const CLICK_HINT = "이 질문은 버튼으로 바로 답할 수 없습니다. 번호를 스레드에 적어 주세요.";
+
+/**
+ * An owner's answer-button click, routed like typing `d<ID>=<N>` in the decision's thread: when the decision is
+ * delegated it becomes an answer revision of owner "message" `click:<interaction>` (so a redelivered click is the same
+ * revision) and is queued for the lane; anything else records nothing. Returns the ephemeral reply for the owner: a
+ * click from another channel than the decision's thread or on a closed decision is refused, a decision that cannot take
+ * a direct answer gets the hint to type the number, and a click on the choice the newest revision already holds changes
+ * nothing.
+ */
+export const routeDecisionClick = async (routing: DirectRouting, click: DecisionClick): Promise<string> => {
+  const d = readDecisions(routing.stateDir).decisions.find((x) => x.id === click.decision);
+  if (!d || d.thread !== click.channel) return "이 스레드의 질문 버튼이 아닙니다.";
+  if (!waiting(d)) return `${d.id}은 이미 닫힌 질문입니다.`;
+  if (!delegated(d, await routing.lanes())) return CLICK_HINT;
+  if (d.revisions?.at(-1)?.choice === click.choice) return `${d.id}에 이미 ${click.choice}번으로 답했습니다.`;
+  const m: RoutedMessage = { id: `click:${click.interaction}`, content: `${d.id}=${click.choice}`, attachments: [] };
+  if ((await revise(routing, d, click.channel, m, 0, click.choice)) === "refused") return CLICK_HINT;
+  return `${d.id}에 ${click.choice}번으로 답했습니다. 레인에 전달합니다.`;
+};
+
 /** Withdraws the live answer `found` holds from this message; refused when there is none (already withdrawn, or closed). */
 const withdraw = async (routing: DirectRouting, found: { readonly decision: OwnerDecision; readonly last: AnswerRevision }, channel: string, m: RoutedMessage, edit: number): Promise<void> => {
   const newest = found.decision.revisions?.at(-1);

@@ -63,8 +63,8 @@ const fakeTransport = () => {
   const archived = new Map<string, boolean>();
   const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
   const transport: DecisionTransport = {
-    send: async (channel, content, stableId) => {
-      record("send", channel, content, stableId);
+    send: async (channel, content, stableId, components) => {
+      record("send", channel, content, stableId, ...(components ? [components] : []));
       sequence += 1;
       return `m${sequence}`;
     },

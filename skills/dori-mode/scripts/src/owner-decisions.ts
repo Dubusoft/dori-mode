@@ -5,13 +5,15 @@ import {
 } from "./decision-store.ts";
 import { recordResolved } from "./decision-obligations.ts";
 import { scrubForThread } from "./freshness.ts";
+import { decisionButtonRows, hasDecisionButtons } from "./messenger/decision-buttons.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { type DecisionChoices, parseDecisionText, parseRequestText } from "./runner/decision-text.ts";
 import { appendToMessage, closedByOwner } from "./thread-followup.ts";
 
 /** What opening, closing and the tick need from Discord; the Discord client fits it. */
 export type DecisionTransport = {
-  send(channel: string, content: string, stableId?: string): Promise<string>;
+  /** `components` (action rows) ride under the message, as Discord.send puts them. */
+  send(channel: string, content: string, stableId?: string, components?: readonly unknown[]): Promise<string>;
   edit(channel: string, messageId: string, content: string): Promise<void>;
   content(channel: string, messageId: string): Promise<string>;
   deleteMessage(channel: string, messageId: string): Promise<void>;
@@ -100,7 +102,10 @@ export const decisionThreadName = (d: Pick<OwnerDecision, "id" | "task" | "quest
   return chars.length <= DECISION_THREAD_NAME_MAX ? chars.join("") : `${chars.slice(0, DECISION_THREAD_NAME_MAX - 1).join("").trimEnd()}…`;
 };
 
-/** The thread's starter message: question, numbered options with the recommendation marked, reason, what waits, origin. */
+/**
+ * The thread's starter message: question, numbered options with the recommendation marked, reason, what waits, origin.
+ * A question with answer buttons (decisionButtonRows) says the owner can press one.
+ */
 export const decisionStartText = (d: OwnerDecision, home: string): string => {
   const head = [`**[${label(d)} ${d.id}]**`, d.task !== undefined ? `Toodo #${d.task}` : undefined, d.lane ? `레인 ${d.lane}` : undefined, d.attachedTo ? `${d.attachedTo}에 이어서` : undefined].filter(Boolean).join(" · ");
   const origin = refIds(d.origin)?.thread;
@@ -121,7 +126,7 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
     `추천 이유: ${d.reason}`,
     d.blocking ? `기다리는 동안 멈춘 것: ${d.waiting}` : `먼저 진행 중: 추천안(${d.recommend}번)으로 진행하고 있습니다(${d.waiting}). 다르게 정하시면 되돌립니다.`,
     ...(origin && !d.inLaneThread ? [`원래 스레드: <#${origin}>`] : []),
-    "이 스레드에 번호나 문장으로 답해 주세요.",
+    hasDecisionButtons(d) ? "버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요." : "이 스레드에 번호나 문장으로 답해 주세요.",
   ].join("\n"), home);
 };
 
@@ -304,7 +309,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       d = patchOne(stateDir, d.id, (x) => ({ ...x, thread: started })) ?? { ...d, thread: started };
       noticeKept = await removeThreadNotice(ctx.transport, d.channel, started);
     }
-    const message = d.message ?? await ctx.transport.send(thread, decisionStartText(d, ctx.home), `decision:${d.id}`);
+    const message = d.message ?? await ctx.transport.send(thread, decisionStartText(d, ctx.home), `decision:${d.id}`, decisionButtonRows(d));
     const kept = noticeKept;
     d = patchOne(stateDir, d.id, (x) => ({ ...x, state: "open", message, ...(kept ? { noticeKept: kept } : {}) })) ?? { ...d, state: "open", message };
   } catch (e) {

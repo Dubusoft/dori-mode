@@ -50,6 +50,20 @@ Only two forms qualify. The whole message, after trimming whitespace, must be on
 
 `N` must be between 1 and the number of options. No model, keyword match or "newest question" guess decides a target: if the form does not name exactly one open decision, the answer is not direct.
 
+### Answer buttons
+
+A lane's own question (not a `[요청]` request, not a decision the lead opened) is posted with one button per option under its starter message (`messenger/decision-buttons.ts`): label `N. <option>` cut to 80 characters, the recommended option in the primary style, up to 5 per row (2 rows for 6-9 options). The custom_id `dori:decide:<dID>:<N>` names the decision and the option, so a button answers exactly one question even in a shared thread. The starter message ends with "버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요."
+
+The supervisor's gateway handles a click (`discord-commands.ts`, `decision-inbound.ts` routeDecisionClick) and always answers it with an ephemeral reply only the clicker sees; the buttons themselves stay as posted:
+
+- a click by anyone but the owner (or from another application or guild) is refused;
+- a click from any channel other than the decision's own thread, or on an unknown decision, is refused;
+- a click on a closed decision says it is closed;
+- a click on a decision that cannot take a direct answer (the checks in "What is delegated": the lane relaunched or closed, the lead already holds an answer) records nothing and tells the owner to type the number in the thread;
+- otherwise the click is the answer `d<ID>=<N>` typed in the decision's thread: an answer revision of owner "message" `click:<interaction id>` (a redelivered click is the same revision), queued and reported to the lead exactly like a typed direct answer. A click on the choice the newest revision already holds changes nothing; a different button before the lane acks is a new revision like an edited answer.
+
+A free-text answer is unchanged: it goes to the lead whole, and the lead's `dori decision close --text` relays it.
+
 ### Everything else goes to the lead, whole
 
 The supervisor never splits a message. When any of these holds, the full message reaches the lead exactly as it does today (`INBOUND`, then `OWNER_DECISION_ANSWERED`), and the lead closes the decision with `dori decision close`:
