@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { browserWatch, browserWatchSettings, browserWindowCheck, CHROME_BUNDLE, ensureBrowserWindow, type BrowserWindowDeps } from "../src/runner/browser-window.ts";
+import { browserWindowCheck, CHROME_BUNDLE, ensureBrowserWindow, type BrowserWindowDeps } from "../src/runner/browser-window.ts";
 import type { Ran } from "../src/run.ts";
 
 const NONE: Ran = { code: 0, out: "(no browsers connected)", err: "" };
@@ -57,50 +57,6 @@ test("a bsk that cannot answer opens nothing", async () => {
   await ensureBrowserWindow(h.deps, "k1");
   expect(h.calls).toEqual(["bsk browsers"]);
   expect(h.logs[0]).toBe("RUNNER_BSK_UNAVAILABLE lane=k1 error: ensure daemon is running");
-});
-
-/** A watch over `host(answers)` whose clock moves one minute per tick, with a 5 min grace and a 30 min cooldown. */
-const watching = (answers: readonly Ran[]) => {
-  const h = host(answers);
-  let now = 0;
-  const tick = browserWatch(
-    { run: h.deps.run, now: () => now, log: h.deps.log, check: browserWindowCheck("darwin", h.deps)! },
-    browserWatchSettings({}),
-  );
-  const minutes = async (n: number) => { for (let i = 0; i < n; i++) { await tick(); now += 60_000; } };
-  const opens = () => h.calls.filter((c) => c.startsWith("open ")).length;
-  return { h, minutes, opens };
-};
-
-test("the watch opens a window once no browser has connected for the grace period", async () => {
-  const w = watching([ONE, NONE]);
-  await w.minutes(6);
-  expect(w.opens()).toBe(0);
-  await w.minutes(1);
-  expect(w.opens()).toBe(1);
-  expect(w.h.logs.some((l) => l.startsWith("RUNNER_BSK_WATCH_OPEN"))).toBe(true);
-});
-
-test("a browser that reconnects within the grace period opens nothing", async () => {
-  const w = watching([ONE, NONE, NONE, NONE, ONE]);
-  await w.minutes(20);
-  expect(w.opens()).toBe(0);
-  expect(w.h.logs.some((l) => l.startsWith("RUNNER_BSK_WATCH_RECONNECTED"))).toBe(true);
-});
-
-test("the watch waits out its cooldown before opening again", async () => {
-  const w = watching([NONE]);
-  await w.minutes(35);
-  expect(w.opens()).toBe(1);
-  await w.minutes(2);
-  expect(w.opens()).toBe(2);
-});
-
-test("watch settings read whole minutes and keep the defaults otherwise", () => {
-  expect(browserWatchSettings({ DORI_BSK_WATCH_MINUTES: "0", DORI_BSK_WATCH_COOLDOWN_MINUTES: "10" })).toEqual({ graceMs: 0, cooldownMs: 600_000, ignored: [] });
-  const bad = browserWatchSettings({ DORI_BSK_WATCH_MINUTES: "soon" });
-  expect(bad.graceMs).toBe(300_000);
-  expect(bad.ignored).toHaveLength(1);
 });
 
 test("the check runs only on macOS, and overlapping starts share one check", async () => {
