@@ -55,7 +55,7 @@ const grantLine = (grants: readonly string[]): string =>
   `- Path grants: ${grants.join(", ")} (its runner's runner-config.json grants table names the paths). Those paths are writable or readable inside the sandbox as the table says; the hide list still wins, and nothing else outside the lane sandbox opens.`;
 
 /** The kinds of a `dori report` footer and where each goes. */
-const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status); question (with --option choices, see the owner-decision rule above), request (owner input, see the owner-input rule above) and blocked wake the lead.";
+const REPORT_KINDS_TEXT = "milestone = what landed, standing vs Done, scope change; progress = 1-2 lines (updates the thread status; send the first one as soon as the brief is read and the goal set); question (with --option choices, see the owner-decision rule above), request (owner input, see the owner-input rule above) and blocked wake the lead.";
 
 /**
  * The footer every lane brief gets: the shared done rules, then this lane's values and how it reports through its runner.

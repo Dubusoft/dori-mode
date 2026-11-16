@@ -70,7 +70,7 @@ import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { routeReports } from "./lane-reports.ts";
 import { type LaneReportStore, openLaneReports } from "./lane-report-store.ts";
-import { statusTransportOf } from "./lane-status.ts";
+import { firstStatusTick, statusTransportOf } from "./lane-status.ts";
 import { criticalTick, errText, guardAlertDetail, laneMemoryOf, MACHINE_GUARD_STATE_FILE, type PressureIo, pressureIo, warnMachineLanes } from "./supervise-guard.ts";
 import { laneEventReader, openRunnerHub, readBackRunnerStarts, RUNNER_LANE_CURSOR_FILE, type RunnerHubHandle } from "./supervise-hub.ts";
 import { decisionDeliveryTick, reconcileDecisionsAtStart } from "./decision-delivery.ts";
@@ -757,7 +757,9 @@ export const supervise = async (
         reportStore.prune(now);
         nextHistoryPrune = now + 60 * 60_000;
       }
-      return routeReports(deps, reportStore, enqueueSweep, home, statusTransport, (lane, report) => openLaneDecision(decisionCtx, lane, report));
+      const routed = await routeReports(deps, reportStore, enqueueSweep, home, statusTransport, (lane, report) => openLaneDecision(decisionCtx, lane, report));
+      // After routing, so a lane whose first report just landed keeps that status message instead of a second one.
+      return [...routed, ...await firstStatusTick(deps, statusTransport, reportStore, home)];
     })())
       .then((lines) => { for (const line of lines) console.log(line); })
       .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
