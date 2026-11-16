@@ -48,6 +48,7 @@ import { AckError } from "./ack.ts";
 import { checklistLine, InboxError, take, takeAwaitingReminders, takeCarriedReminders, takeOutput } from "./inbox.ts";
 import { checkMemory, MemoryCheckError, needsAction, renderMemoryReport } from "./memory-check.ts";
 import { StoreError } from "./store.ts";
+import { convertJsonState } from "./store-convert.ts";
 import { openOperations, operationLine, type OperationState, settleOperation } from "./operations.ts";
 import { LaneMessageError } from "./lane-messages.ts";
 import { oneLine, openLaneReports } from "./lane-report-store.ts";
@@ -316,6 +317,7 @@ if (process.argv[2] === "status") {
   const page = paged ? Number(args[1]) : 1;
   const { collectStatus, statusPage } = await import("./status.ts");
   const cfg = await loadConfig();
+  await convertJsonState(cfg.stateDir);
   setDefaultRunTimeout(cfg.runTimeoutMs);
   try {
     const status = await collectStatus({ run, clock: realClock, config: cfg, tunables: BUILT_IN, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
@@ -334,11 +336,14 @@ if (process.argv[2] === "runner") {
     const { runnerHostMain } = await import("./runner/main.ts");
     process.exit(await runnerHostMain(process.argv.slice(3)));
   }
+  // evacuate reads the lane reports store, so a json state dir converts first, as for the lead commands below.
+  if (process.argv[3] === "evacuate") await convertJsonState((await loadConfig()).stateDir);
   const { runnerAdminMain } = await import("./runner-admin-cli.ts");
   process.exit(await runnerAdminMain({ die }));
 }
 
 const config = await loadConfig();
+await convertJsonState(config.stateDir);
 setDefaultRunTimeout(config.runTimeoutMs);
 // Lane operations go through the supervisor's CLI relay; built on first use, so commands that touch no lane never connect.
 let cliCall: CliRunnerCall | undefined;

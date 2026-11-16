@@ -10,6 +10,7 @@ import { loadPolicy } from "../src/runner/policy.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { enrollOverStdio, RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { readRunnerEndpoints } from "../src/runner/endpoints.ts";
+import { FORBIDDEN, walk } from "../src/runner/graph-check.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
 const FINGERPRINT = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
@@ -462,6 +463,24 @@ console.log((await runnerVersion(run, import.meta.dir)) ?? "-");\n`);
   const ran = await realRun(["bun", out], { timeoutMs: 30_000, cwd: dir });
   expect(ran.out.trim()).toBe(sha as string);
 }, 60_000);
+
+test("the runner entry bundles to a single file that holds no supervisor or store-conversion module", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dori-runner-graph-"));
+  dirs.push(dir);
+  const meta = join(dir, "meta.json");
+  const ran = await realRun(["bun", "build", "src/runner/bin.ts", "--target=bun", `--outfile=${join(dir, "dori.js")}`, `--metafile=${meta}`], { timeoutMs: 60_000, cwd: join(import.meta.dir, "..") });
+  expect(ran.err).not.toContain("cannot write multiple output files");
+  expect(ran.code).toBe(0);
+  const inputs = Object.keys(JSON.parse(readFileSync(meta, "utf8")).inputs);
+  expect(inputs.filter((file) => /src\/(store-import|supervise[^/]*|claude-quota)\.ts$/.test(file))).toEqual([]);
+}, 90_000);
+
+test("the runner import graph, dynamic imports included, reaches the runner and no supervisor or store-conversion module", () => {
+  const srcRoot = join(import.meta.dir, "../src");
+  const reached = [...walk(join(srcRoot, "runner/bin.ts"), srcRoot).keys()];
+  expect(reached).toContain(join(srcRoot, "runner/main.ts"));
+  expect(reached.filter((file) => FORBIDDEN.test(file))).toEqual([]);
+});
 
 const herdrUnitPath = (home: string) => join(home, ".config/systemd/user/herdr-server.service");
 const linuxScript = () => installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "h:1"), "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);

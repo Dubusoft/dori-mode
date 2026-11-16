@@ -9,6 +9,7 @@ import { openLaneReports } from "../src/lane-report-store.ts";
 import { openOperations } from "../src/operations.ts";
 import { Registry } from "../src/registry.ts";
 import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore, openStore } from "../src/store.ts";
+import { convertJsonState } from "../src/store-convert.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
 import { withState } from "./fakes.ts";
 
@@ -84,7 +85,7 @@ test("pre-sqlite marker with no journal and no database: openStore stops with ST
   expect(existsSync(join(state.dir, SQLITE_FILE))).toBe(false);
 });
 
-test("a state dir still on the json store is converted once when its config loads, every row readable afterwards", async () => {
+test("a state dir still on the json store is converted once at the CLI entry, not by loading its config, every row readable afterwards", async () => {
   const state = withState();
   cleanups.push(state.done);
   const dir = join(state.dir, "state");
@@ -106,13 +107,17 @@ test("a state dir still on the json store is converted once when its config load
   writeFileSync(join(dir, "lead-events.log"), `${JSON.stringify({ id: "e1", line: "INBOUND 1 2 hi" })}\n`);
   const path = join(state.dir, "config.json");
   await Bun.write(path, JSON.stringify({ stateDir: dir }));
-  // While a supervisor holds the lock nothing moves.
-  const release = acquireSupervisor(dir);
-  try { await loadConfig(path, "/home/ana"); } finally { release(); }
+  // Loading the config alone converts nothing.
+  const config = await loadConfig(path, "/home/ana");
   expect(existsSync(join(dir, "supervisor.json"))).toBe(true);
   expect(existsSync(join(dir, SQLITE_FILE))).toBe(false);
-  // When the config loads with no supervisor running.
-  const config = await loadConfig(path, "/home/ana");
+  // While a supervisor holds the lock nothing moves.
+  const release = acquireSupervisor(dir);
+  try { await convertJsonState(config.stateDir); } finally { release(); }
+  expect(existsSync(join(dir, "supervisor.json"))).toBe(true);
+  expect(existsSync(join(dir, SQLITE_FILE))).toBe(false);
+  // When the CLI entry converts with no supervisor running.
+  await convertJsonState(config.stateDir);
   // Then every json file is retired read-only and the store holds what they held.
   for (const file of Object.keys(files)) {
     expect(existsSync(join(dir, file))).toBe(false);
@@ -130,9 +135,9 @@ test("a state dir still on the json store is converted once when its config load
   const messages = openLaneMessages(config);
   try { expect(messages.get(message.id)).toEqual(message); } finally { messages.close(); }
   expect(githubSummary(dir)).toEqual({ polledAt: T0, failures: { "o/r": T0 }, issueRepos: [] });
-  // And a later load leaves the converted state dir as it is.
+  // And a later conversion leaves the converted state dir as it is.
   const before = readFileSync(join(dir, SQLITE_FILE));
-  await loadConfig(path, "/home/ana");
+  await convertJsonState(config.stateDir);
   expect(readFileSync(join(dir, SQLITE_FILE))).toEqual(before);
 });
 
@@ -157,7 +162,7 @@ const legacyJournal = (T0: number) => ({
   leadModel: 0, primaryRetryAt: T0, primaryClearChecks: 2, quotaExhausted: { at: T0 }, quotaStallSince: T0, emergencyEpisode: 1,
 });
 
-test("a json state dir with every field real data carried converts, the removed lead-chain fields dropped and the rest read back", async () => {
+test("a json state dir with every field real data carried converts at the CLI entry, the removed lead-chain fields dropped and the rest read back", async () => {
   const state = withState();
   cleanups.push(state.done);
   const dir = join(state.dir, "state");
@@ -172,6 +177,7 @@ test("a json state dir with every field real data carried converts, the removed 
   const path = join(state.dir, "config.json");
   await Bun.write(path, JSON.stringify({ stateDir: dir }));
   const config = await loadConfig(path, "/home/ana");
+  await convertJsonState(config.stateDir);
   expect(existsSync(join(dir, PRE_SQLITE_FILE))).toBe(true);
   expect(existsSync(join(dir, "supervisor.json"))).toBe(false);
   const store = openStore(dir);
