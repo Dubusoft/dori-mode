@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { buildTrace, loadTrace, traceText } from "../src/event-trace.ts";
 import { EVENT_LOG, take, takeOutput, takesDir } from "../src/inbox.ts";
 import { Supervisor } from "../src/supervise.ts";
-import { depsFor, fakeClock, newWorld, readJournal, withSqliteStore, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, readJournal, TEST_STORE, withSqliteStore, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -61,11 +61,12 @@ test("a consumed take receipt records when and in which session the lead took ea
   take(f.dir, { maxBytes: 16_384, now: f.clock.now(), session: "sess-1" });
   supervisor.ackTick(60_000);
   const trace = buildTrace("discord:11:1", loadTrace(f.dir, "discord:11:1") ?? { delivered: false });
+  // The json store records no delivery times; sqlite has the delivery row's.
   expect(trace).toEqual({
     id: "discord:11:1", line: "INBOUND 11 1 owner hello", meta: META,
     steps: [
       { step: "enqueued", at: T0 },
-      { step: "delivered", at: T0 },
+      { step: "delivered", ...(TEST_STORE === "sqlite" ? { at: T0 } : {}) },
       { step: "taken", at: T0 + 5_000, detail: "session sess-1" },
     ],
     open: ["acked", "handled"],

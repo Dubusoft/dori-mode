@@ -1,10 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { treeDigest } from "../src/lane-file-contract.ts";
+import { treeDigest } from "../src/lane-files.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { routeReports } from "../src/lane-reports.ts";
-import { openLaneReports } from "../src/lane-report-store.ts";
+import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import type { AnyRunnerEvent } from "../src/runner/protocol.ts";

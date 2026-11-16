@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { Discord } from "../src/messenger/discord.ts";
-import { discordPresence } from "../src/messenger/discord-gateway.ts";
+import { Discord, discordPresence } from "../src/messenger/discord.ts";
 import { type Http, type HttpRequest, type HttpResponse, UnsafeMessageError } from "../src/messenger/http.ts";
 import { transcribe, TranscriptionError } from "../src/messenger/voice.ts";
 import { fakeClock } from "./fakes.ts";

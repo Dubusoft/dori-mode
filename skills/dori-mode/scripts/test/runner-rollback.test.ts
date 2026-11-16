@@ -1,9 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
-import { treeDigest } from "../src/lane-file-contract.ts";
-import { routeReports } from "../src/lane-reports.ts";
-import { openLaneReports } from "../src/lane-report-store.ts";
+import { treeDigest } from "../src/lane-files.ts";
+import { openLaneReports, routeReports } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { evacuate } from "../src/runner/evacuate.ts";
 import { acceptLaneEvent, type LaneHubDeps } from "../src/runner/lanes-hub.ts";

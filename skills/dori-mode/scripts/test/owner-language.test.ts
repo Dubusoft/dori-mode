@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 
 import { languageInstruction } from "../src/config.ts";
 import { freshnessTick } from "../src/freshness.ts";
-import { footer } from "../src/launch-footer.ts";
+import { footer } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, sent as sentTexts, withState } from "./fakes.ts";
 

@@ -1,8 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_FRAME_BYTES } from "../src/runner/protocol.ts";
-import type { Transport } from "../src/runner/transport.ts";
-import { memoryPair } from "./support/memory-transport.ts";
-import { acceptWs, connectWs, dialWs, isPrivateListen, listenWs } from "../src/runner/ws-transport.ts";
+import { memoryPair, type Transport } from "../src/runner/transport.ts";
+import { acceptWs, backoff, connectWs, dialWs, isPrivateListen, listenWs } from "../src/runner/ws-transport.ts";
 
 const nextLine = (transport: Transport): Promise<string> =>
   new Promise((resolve) => {
@@ -37,6 +36,20 @@ describe("isPrivateListen", () => {
     expect(() => listenWs("0.0.0.0:0")).toThrow("RUNNER_LISTEN_REFUSED");
     expect(() => listenWs("[::]:0")).toThrow("RUNNER_LISTEN_REFUSED");
     expect(() => listenWs("8.8.8.8:0")).toThrow("RUNNER_LISTEN_REFUSED");
+  });
+});
+
+describe("backoff", () => {
+  test("doubles from 1s to the 60s cap with a fixed midpoint random", () => {
+    const sequence = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((attempt) => backoff(attempt, () => 0.5));
+    expect(sequence).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+  });
+
+  test("jitter spans plus or minus 20 percent", () => {
+    expect(backoff(0, () => 0)).toBe(800);
+    expect(backoff(0, () => 0.999999)).toBe(1200);
+    expect(backoff(10, () => 0)).toBe(48000);
+    expect(backoff(1000, () => 0.5)).toBe(60000);
   });
 });
 

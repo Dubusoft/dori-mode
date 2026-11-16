@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { readFileSync, writeFileSync } from "node:fs";
 import { CONFIG_FILE_KEYS, loadConfig } from "../src/config.ts";
 import { CONFIG_SCHEMA_VERSION, migrateConfigSchema } from "../src/config-schema.ts";
-import { readDecisions, updateDecisions } from "../src/decision-store.ts";
+import { readDecisions, updateDecisions } from "../src/owner-decisions.ts";
 import { withState } from "./fakes.ts";
 
 test("schema 8 drops the old secrets key and preserves secretCommands", async () => {

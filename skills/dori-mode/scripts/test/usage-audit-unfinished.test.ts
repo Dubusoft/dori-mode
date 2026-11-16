@@ -59,16 +59,18 @@ test("recordHandled prunes the carried entry only once the message is fully cove
   expect(readCarried(dir).map((item) => item.id)).toEqual(["launch-queue:s"]);
 });
 
-test("recordHandled counts the coverage the supervisor already consumed", () => {
-  const dir = state();
-  // The supervisor consumed an earlier receipt: three tasks declared, lane alpha linked; its receipt file is gone.
-  const store = openStore(dir);
-  store.save({ events: [], awaitingAck: [{ id: "discord:1:100", since: 1, ackedAt: 1, tasks: 3, lanes: ["alpha"] }] }, "full");
-  store.close?.();
-  writeCarried(dir, [{ kind: "owner", id: "discord:1:100", line: "INBOUND discord 1 three things" }]);
+for (const kind of ["json", "sqlite"] as const) {
+  test(`recordHandled counts the coverage the supervisor already consumed (${kind} store)`, () => {
+    const dir = state();
+    // The supervisor consumed an earlier receipt: three tasks declared, lane alpha linked; its receipt file is gone.
+    const store = openStore(dir, kind);
+    store.save({ events: [], awaitingAck: [{ id: "discord:1:100", since: 1, ackedAt: 1, tasks: 3, lanes: ["alpha"] }] }, "full");
+    store.close?.();
+    writeCarried(dir, [{ kind: "owner", id: "discord:1:100", line: "INBOUND discord 1 three things" }]);
 
-  recordHandled(dir, "1", "100", 2, { lanes: ["beta"] });
-  expect(readCarried(dir).map((item) => item.id)).toEqual(["discord:1:100"]);
-  recordHandled(dir, "1", "100", 3, { lanes: ["gamma"] });
-  expect(readCarried(dir)).toEqual([]);
-});
+    recordHandled(dir, "1", "100", 2, { lanes: ["beta"] });
+    expect(readCarried(dir).map((item) => item.id)).toEqual(["discord:1:100"]);
+    recordHandled(dir, "1", "100", 3, { lanes: ["gamma"] });
+    expect(readCarried(dir)).toEqual([]);
+  });
+}

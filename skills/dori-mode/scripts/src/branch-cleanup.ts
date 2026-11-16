@@ -3,7 +3,6 @@ import type { Lane } from "./registry.ts";
 import type { Ran, Runner } from "./run.ts";
 import type { Operation, OperationState, OperationStore, ReadBack } from "./operations.ts";
 import { parseSignal, splitDone } from "./signals.ts";
-import { repoFromRemote } from "./git-remote.ts";
 
 /**
  * SHA-bound branch cleanup (design 4.3, item 1.3; rows A17-A19 of the runner design: every git step on the lane's host
@@ -73,8 +72,14 @@ export const readBindings = async (done: string, run: Runner): Promise<(Binding 
 const isUnbound = (b: Binding | Unbound): b is Unbound => "error" in b;
 
 /** `owner/repo` of a remote URL on any host (its last two path segments), or undefined. */
+const repoOfUrl = (url: string): string | undefined => {
+  const path = url.trim().replace(/\.git\/?$/, "").replace(/\/+$/, "").replace(/^[^/]*:(?!\/)/, "/");
+  const m = /([\w.-]+)\/([\w.-]+)$/.exec(path);
+  return m ? `${m[1]}/${m[2]}` : undefined;
+};
+
 /** Whether a checkout whose origin is `origin` is `repo` (case-insensitive, any host). */
-const sameRepo = (origin: string | undefined, repo: string): boolean => (origin ? repoFromRemote(origin)?.toLowerCase() === repo.toLowerCase() : false);
+const sameRepo = (origin: string | undefined, repo: string): boolean => (origin ? repoOfUrl(origin)?.toLowerCase() === repo.toLowerCase() : false);
 
 type MergedPull = { number?: number; headRefName?: string; headRefOid?: string; baseRefName?: string; isCrossRepository?: boolean };
 
@@ -95,7 +100,7 @@ export const readBranchBindings = async (
     if (!wt.exists) continue;
     const branch = wt.branch ?? "";
     if (!branch || branch === base || PROTECTED_BRANCHES.has(branch)) continue;
-    const repo = wt.origin ? repoFromRemote(wt.origin) : undefined;
+    const repo = wt.origin ? repoOfUrl(wt.origin) : undefined;
     if (!repo) continue;
     if (bindings.some((b) => b.repo.toLowerCase() === repo.toLowerCase() && b.branch === branch)) continue;
     const r = await run(["gh", "pr", "list", "--repo", repo, "--state", "merged", "--base", base, "--head", branch,

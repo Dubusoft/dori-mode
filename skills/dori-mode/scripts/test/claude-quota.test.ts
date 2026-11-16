@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { classifyClaude, NO_CLAUDE, quotaReport, readUsage, resetIn, usageLine, type QuotaResult, type UsageLookup } from "../src/claude-quota.ts";
+import { claudeUsage, NO_CLAUDE, quotaReport, readUsage, resetIn, usageLine, type QuotaResult, type UsageLookup } from "../src/claude-quota.ts";
 
 const NOW = Date.parse("2026-10-22T03:00:00.000Z");
 const RESET_5H = Date.parse("2026-10-22T06:10:00.000Z"); // 15:10 KST
@@ -16,11 +16,11 @@ const lookupOf = (...results: QuotaResult[]): UsageLookup => async () => ({ resu
 
 test("Claude usage keeps every Claude account that answered; other providers and failed reads are ignored", () => {
   const results = [openai, { kind: "unavailable", provider: "anthropic" }, claude(10, 50, { account: "a" }), claude(60, 80, { account: "b" })];
-  expect(classifyClaude(results, NOW).usage).toEqual({ at: NOW, accounts: [
+  expect(claudeUsage(results, NOW)).toEqual({ at: NOW, accounts: [
     { name: "a", fiveHour: { usedPct: 90, resetAt: RESET_5H }, weekly: { usedPct: 50, resetAt: RESET_7D } },
     { name: "b", fiveHour: { usedPct: 40, resetAt: RESET_5H }, weekly: { usedPct: 20, resetAt: RESET_7D } },
   ] });
-  expect(classifyClaude([openai], NOW).usage).toBeUndefined();
+  expect(claudeUsage([openai], NOW)).toBeUndefined();
 });
 
 test("the Discord /quota reply is pi-quota's own block with no QUOTA line, with or without a Claude account", async () => {

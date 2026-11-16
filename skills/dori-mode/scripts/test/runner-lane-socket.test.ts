@@ -6,7 +6,7 @@ import type { Ran } from "../src/run.ts";
 import { serveLaneSocket } from "../src/runner/lane-socket.ts";
 import { RunnerLanes, type RunnerLanesDeps } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { memoryNetwork } from "../src/runner/transport.ts";
 import { fakeClock } from "./fakes.ts";
 
 const dirs: string[] = [];

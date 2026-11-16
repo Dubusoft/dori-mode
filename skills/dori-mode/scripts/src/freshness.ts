@@ -1,7 +1,7 @@
 import { languageInstruction } from "./config.ts";
 import { redactSecrets } from "./redact.ts";
 import type { FlowDeps, LaneReads } from "./done-flow.ts";
-import type { LaneReportStore } from "./lane-report-store.ts";
+import type { LaneReportStore } from "./lane-reports.ts";
 import { checkPausedLane } from "./pause.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import type { SweepView } from "./sweep-view.ts";

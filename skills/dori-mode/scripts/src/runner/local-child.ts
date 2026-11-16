@@ -1,10 +1,10 @@
 import type { Clock } from "../run.ts";
-import { backoffMs, RECONNECT_MAX_MS } from "./transport.ts";
+import { backoffMs, RECONNECT_MAX_MS } from "./client.ts";
 
 /**
  * The local runner as a child process of `supervise` (design 0.1 (c), section 4). `startLocalRunner` spawns
  * `dori runner serve` with the lane-mode variables removed from its environment (so the runner is never in lane mode),
- * restarts it whenever it exits with transport.ts `backoffMs` (1 s doubling to 60 s, with jitter; a child that stayed up
+ * restarts it whenever it exits with client.ts `backoffMs` (1 s doubling to 60 s, with jitter; a child that stayed up
  * for RECONNECT_MAX_MS starts again from the first step), and kills it when `signal` aborts: SIGTERM, up to
  * LOCAL_STOP_GRACE_MS for it to exit, then SIGKILL. `restart()` (the liveness monitor's restart for `local`) stops the
  * running child the same way and spawns the next one at once, without a backoff step.

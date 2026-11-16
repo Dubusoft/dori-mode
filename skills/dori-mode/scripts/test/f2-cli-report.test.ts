@@ -91,6 +91,15 @@ test("a lane's report and claim-done reach a runner restarted under it: the new 
   expect(after.requests.map((r) => r.kind)).toEqual(["progress", "done"]);
 });
 
+test("a lane that cannot connect to sock/lane.d/lane (a sandbox set up before lane.d) reports over the pre-lane.d sock/lane", async () => {
+  const h = home();
+  const sock = fakeLaneSocket(h.dir, undefined, true);
+  cleanups.push(sock.close);
+  const r = await cli(h, ["report", "demo-lane", "progress", "--text", "old sandbox"], inLane);
+  expect(r.code, r.err).toBe(0);
+  expect(sock.requests.map((q) => q.text)).toEqual(["old sandbox"]);
+});
+
 test("a multi-line --text keeps its newlines on the way to the runner", async () => {
   const h = home();
   const sock = fakeLaneSocket(h.dir);

@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { replaceFileDurable } from "./durable-write.ts";
 import type { DoriConfig } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { Repos } from "./repos.ts";
@@ -195,7 +194,10 @@ type SweepState = {
 };
 
 const saveState = (path: string, state: SweepState): void => {
-  replaceFileDurable(path, JSON.stringify(state), 0o600, `${path}.${process.pid}.tmp`);
+  const tmp = `${path}.${process.pid}.tmp`;
+  const fd = openSync(tmp, "w", 0o600);
+  try { writeFileSync(fd, JSON.stringify(state)); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, path);
 };
 
 /**

@@ -1,9 +1,8 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 import type { Lane } from "./registry.ts";
-import { replaceFileAtomic } from "./durable-write.ts";
 
 /**
  * The operational rollback switch of the supervisor's automatic merges (`dori merge pause|resume|status`). While the
@@ -39,7 +38,9 @@ export const readMergePause = (stateDir: string): MergePause | undefined => {
 const writeMergePause = (stateDir: string, pause: MergePause): void => {
   const path = mergePausePath(stateDir);
   mkdirSync(dirname(path), { recursive: true });
-  replaceFileAtomic(path, `${JSON.stringify(pause)}\n`, 0o666);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(pause)}\n`);
+  renameSync(tmp, path);
 };
 
 /** The visible text of a pause: `merge paused: <reason>`, as the MERGE_PAUSED log line shows it. */

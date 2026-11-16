@@ -4,22 +4,20 @@ import type { DoriConfig } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
-import { OPEN_STATES, openOperations, type Operation, operationId, type OperationStore, plan, type ReadBack, settleOperation } from "./operations.ts";
+import { OPEN_STATES, openOperations, type Operation, operationId, type OperationState, type OperationStore, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
 import { type Check, parseSignal, type SignalIo } from "./signals.ts";
-import { BRANCH_DELETE, type BranchPlan, planBranchCleanup, readBindings, readBranchBindings, type WorktreeFact } from "./branch-cleanup.ts";
+import { BRANCH_DELETE, type BranchPlan, type BranchTarget, deleteBranch, planBranchCleanup, readBindings, readBranchBindings, REMOTE_BRANCH_DELETE, type WorktreeFact } from "./branch-cleanup.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
-import { LaneOpsError, type LaneOps, type PaneRef } from "./lane-ops.ts";
+import { LaneOpsError, type LaneOps, machineRunner, type PaneRef } from "./lane-ops.ts";
+import { runnerWorktreeRoot } from "./runner/hub.ts";
 import { deliverLaneMessage, MERGE_VERIFY, queueSteering } from "./ci-follow.ts";
 import { blockedOutcome, finishedOutcome, type LaneMerge, notCompletedLine, type TaskBlocker, taskCompleted, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
 import { openLaneMessages } from "./lane-messages.ts";
-import { checkLaneReportText, installLaneReports, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
-import { LaneFileError } from "./lane-file-contract.ts";
+import { checkLaneReportText, installLaneReports, LaneFileError, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import type { Tunables } from "./tunables.ts";
-import { type Act, actRecorded, type LaneRead, probeWorktree, readLane, type Step, withOperations } from "./flow-io.ts";
-import { type CleanupQueue, cleanupPending, closedWorktreeSweep, type PendingCleanup, QUEUED_WORKTREE, remoteWorktrees } from "./closed-cleanup.ts";
 import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
 
 export type FlowDeps = {
@@ -74,6 +72,58 @@ export type LaneReads = {
   readonly panes: LaneOps["panes"];
   readonly status: LaneOps["status"];
   readonly screen: (ref: PaneRef, lines: number) => Promise<string>;
+};
+
+/** What the lane's runner read of a lane's checkout: its worktrees, Done checks, and where its git ran (design A17, D10). */
+type LaneRead = {
+  /** The lane's worktrees (found by the runner by key, and those the registry recorded); none for a remote lane. */
+  readonly worktrees: readonly WorktreeFact[];
+  /** The Done checks, when asked: in the lane's cwd, or in leadCwd for a remote lane or a gone cwd (on the local runner). */
+  readonly checks?: readonly Check[];
+  /** A local lane's cwd is set and no longer exists. */
+  readonly cwdGone: boolean;
+  /** Where a local lane's git runs: its cwd, else leadCwd. */
+  readonly root: string;
+};
+
+const baseName = (path: string): string => path.replace(/\/+$/, "").split("/").pop() ?? "";
+const named = (key: string, name: string): boolean => name === key || name.startsWith(`${key}-`);
+
+/**
+ * One worktree's git facts (branch, HEAD, dirty, ahead) and its checkout's origin, read by the lane's runner. The
+ * runner finds worktrees by name, so the path is inspected under its own directory name, listed from `<path>/.` (a
+ * root the listing does not skip). Undefined when git does not list it as a worktree.
+ */
+const probeWorktree = async (deps: FlowDeps, lane: Lane, path: string): Promise<WorktreeFact | undefined> => {
+  const inspection = await deps.ops.inspect({ ...lane, key: baseName(path) }, { git: true, cwd: `${path}/.` });
+  const hit = inspection.git?.worktrees.find((w) => w.path === path);
+  return hit ? { ...hit, ...(inspection.git?.origin ? { origin: inspection.git.origin } : {}) } : undefined;
+};
+
+/**
+ * Reads a lane through its runner: one `q.lane.inspect` (git facts, and the Done checks when `done`), then each worktree
+ * the registry recorded or the runner found by key, read one by one (the runner cannot see the registry). A remote
+ * lane's worktrees are never read (D10); its Done checks run on the local runner in leadCwd. Throws LaneOpsError when
+ * the runner cannot answer.
+ */
+const readLane = async (deps: FlowDeps, lane: Lane, want: { readonly done?: boolean } = {}): Promise<LaneRead> => {
+  const done = want.done ? { done: lane.done, doneCwd: deps.config.leadCwd } : {};
+  if (lane.machine) {
+    const checks = want.done ? (await deps.ops.inspect(lane, done)).done?.checks : undefined;
+    return { worktrees: [], ...(checks ? { checks } : {}), cwdGone: false, root: deps.config.leadCwd };
+  }
+  const inspection = await deps.ops.inspect(lane, { git: true, roots: [deps.config.leadCwd], ...done });
+  const cwdGone = Boolean(lane.cwd) && !inspection.cwdExists;
+  const listed = (inspection.git?.worktrees ?? []).filter((w) => named(lane.key, baseName(w.path)) || named(lane.key, (w.branch ?? "").split("/").pop() ?? ""));
+  const paths = [...new Set([...listed.map((w) => w.path), ...(lane.worktrees ?? []).map((p) => p.replace(/\/+$/, ""))])];
+  const present = paths.length ? await deps.ops.exists(undefined, paths) : [];
+  const worktrees: WorktreeFact[] = [];
+  for (const [i, path] of paths.entries()) {
+    if (!present[i]) { worktrees.push({ path, exists: false }); continue; }
+    worktrees.push((await probeWorktree(deps, lane, path)) ?? listed.find((w) => w.path === path) ?? { path, exists: true, error: "git lists no worktree there" });
+  }
+  const checks = inspection.done?.checks;
+  return { worktrees, ...(checks ? { checks } : {}), cwdGone, root: lane.cwd && !cwdGone ? lane.cwd : deps.config.leadCwd };
 };
 
 /**
@@ -158,13 +208,13 @@ export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, 
 };
 
 export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fileReceipt?: LaneFileReceipt): Promise<string> => {
-  const stale = (): LaneFileError => new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
-  const options = { now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
-    emit: deps.fileNote ?? ((_id: string, line: string) => console.error(line)) };
   const active = await deps.registry.read(lane.key);
-  if ((lane.fileRun && !active?.fileRun) || (active?.fileRun && active.closedAt)) throw stale();
+  if (lane.fileRun && !active?.fileRun) throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
   if (active?.fileRun) {
     checkLaneReportText(lane.key, "", evidence);
+    if (active.closedAt) throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
+    const options = { now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
+      emit: deps.fileNote ?? ((_id: string, line: string) => console.error(line)) };
     if (!fileReceipt) {
       const snapshot = await deps.ops.files(active);
       if (!snapshot) throw new LaneFileError("LANE_REPORT_FILES_MISSING", lane.key, "this managed lane's done report has no file snapshot; claim done again through its runner");
@@ -173,14 +223,14 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
     }
     lane = active;
   } else if (fileReceipt) {
-    throw stale();
+    throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
   }
   const admit = async (): Promise<string> => {
   // A repeated claim with the same evidence is the claim already recorded: it keeps that claim (and its single
   // LANE_DONE_CLAIMED, its window and its PR bindings) instead of re-issuing it and waking the lead again.
   const recorded = await deps.registry.read(lane.key);
   if (fileReceipt && (!recorded || recorded.closedAt || recorded.fileRun?.id !== fileReceipt.run.id))
-    throw stale();
+    throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
   const status = recorded ? statusOf(recorded) : undefined;
   if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
     return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
@@ -189,7 +239,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   const at = iso(deps.clock);
   await deps.registry.update(lane.key, (current) => {
     if (fileReceipt && (!current || current.closedAt || current.fileRun?.id !== fileReceipt.run.id))
-      throw stale();
+      throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
     return withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls } });
   });
   // `dori lane status` inside the lane answers from what its runner was told (D16).
@@ -206,7 +256,8 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   if (!fileReceipt) return admit();
   let result = "";
   await verifyLaneFileReceipt(deps.config.stateDir, lane.key, fileReceipt, {
-    ...options,
+    now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
+    emit: deps.fileNote ?? ((_id, line) => console.error(line)),
   }, async () => { result = await admit(); });
   return result;
 };
@@ -280,6 +331,30 @@ export const closeRunning = (deps: FlowDeps, key: string): boolean => {
   if (!release) return true;
   release();
   return false;
+};
+
+const withOperations = async <T>(deps: FlowDeps, body: (store: OperationStore) => Promise<T>): Promise<T> => {
+  const store = deps.operations ?? openOperations(deps.config);
+  try { return await body(store); } finally { if (!deps.operations) store.close(); }
+};
+
+/** One effect's result for the close sequence: `err`/`out` are the effect's own output when it ran (today's receipt text). */
+type Step = { readonly state: OperationState; readonly err: string; readonly out: string; readonly id?: string; readonly detail?: string };
+type Act = (action: string, target: string, effect: (cmdId: string) => Promise<Ran>, readBack: ReadBack) => Promise<Step>;
+
+/**
+ * The effect runs at most once per verified operation, and a read-back decides (operations.ts). Its runner command id is
+ * `op:<operation id>:<attempt>`: the runner answers a repeated command id with its first result, so a retry of a failed
+ * operation (a worktree cleaned since) needs its own.
+ */
+const actRecorded = (deps: FlowDeps, store: OperationStore, lane: Lane): Act => async (action, target, effect, readBack) => {
+  let ran: Ran | undefined;
+  const id = operationId({ lane: lane.key, action, target });
+  const { op } = await perform(store, deps.clock.now, { lane: lane.key, action, target }, async () => {
+    ran = await effect(`op:${id}:${store.get(id)?.attempts ?? 0}`);
+    return { ok: ran.code === 0, detail: ran.code === 0 ? "" : ran.err || ran.out };
+  }, readBack);
+  return { state: op.state, err: ran?.err ?? op.detail, out: ran?.out ?? "", id: op.id, detail: op.detail };
 };
 
 /** Gone from the pane list of the lane's machine (its runner's) is done; listed is not; an unreadable list cannot tell. */
@@ -634,6 +709,267 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
 
 const remoteWorktreeNote = (lane: Lane): string =>
   `worktree checks (unpushed/uncommitted) skipped on machine ${lane.machine}: a remote lane closes without them (D10); its worktrees under its runner's worktree root are left to the closed-lane cleanup`;
+
+/** The worktree root a lane's cleanup may remove under: its runner's reported root, else (local lanes only) `config.worktreeRoot`. */
+const cleanupRoot = (deps: FlowDeps, lane: Lane): string => {
+  const reported = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(lane.machine));
+  return (reported || (lane.machine ? "" : deps.config.worktreeRoot)).replace(/\/+$/, "");
+};
+
+const under = (root: string, path: string): boolean => Boolean(root) && path.startsWith(`${root}/`) && !path.includes("..");
+
+/**
+ * A remote lane's worktrees, found by its runner by key under its reported worktree root: each is queued for
+ * closedWorktreeSweep, which removes it from inside itself once it is clean and pushed. A runner that cannot answer
+ * never holds the close up.
+ */
+const remoteWorktrees = async (deps: FlowDeps, lane: Lane): Promise<{ readonly lines: string[]; readonly queued: string[] }> => {
+  const root = cleanupRoot(deps, lane);
+  if (!root) return { lines: [], queued: [] };
+  let found: readonly { readonly path: string }[];
+  try {
+    found = (await deps.ops.inspect(lane, { git: true })).git?.worktrees ?? [];
+  } catch (e) {
+    return { lines: [`remote worktrees not read on machine ${lane.machine}: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`], queued: [] };
+  }
+  const queued = [...new Set(found.map((w) => trimPath(w.path)))].filter((p) => under(root, p));
+  return { lines: queued.map((p) => `worktree ${p} queued: remote lane, ${QUEUED_WORKTREE}`), queued };
+};
+
+/**
+ * Worktrees a lane's close had to keep (`<prefix><path> kept: ...` in its receipt): with `worktree `, usually because
+ * they were dirty then; with `branch-bound worktree `, held with a branch that moved past its merged head.
+ */
+const keptWorktrees = (lane: Lane, prefix = "worktree "): string[] => {
+  const receipt = lane.receipt;
+  if (typeof receipt !== "object" || receipt === null || !("cleanup" in receipt) || !Array.isArray(receipt.cleanup)) return [];
+  return receipt.cleanup.flatMap((line: unknown) => {
+    if (typeof line !== "string" || !line.startsWith(prefix)) return [];
+    const end = line.indexOf(" kept: ");
+    return end > prefix.length ? [line.slice(prefix.length, end)] : [];
+  });
+};
+
+/** The receipt line of a worktree a close queued for the closed-lane cleanup. */
+const QUEUED_WORKTREE = "removed by the closed-lane cleanup once clean and pushed";
+
+const trimPath = (path: string): string => path.replace(/\/+$/, "");
+
+/** A worktree a close queued: `root` is the checkout its `git worktree remove` runs in (the worktree itself once that is gone). */
+type QueuedWorktree = { readonly path: string; readonly root: string; readonly removed?: true };
+/**
+ * A SHA-bound branch a close queued (branch-cleanup.ts BranchTarget). `settled` is set once nothing is left to do:
+ * `deleted`, or `kept: <why>` when this binding can never be deleted (protected, or moved off its merged head). `note`
+ * is the last reason a retry still waits on, so each reason is reported once.
+ */
+type QueuedBranch = BranchTarget & { readonly settled?: string; readonly note?: string };
+/** The cleanup a close leaves to the watcher, in its receipt (`receipt.queue`). */
+export type CleanupQueue = { readonly worktrees: QueuedWorktree[]; readonly branches: QueuedBranch[] };
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+const BRANCH_FIELDS = ["repo", "n", "base", "branch", "sha", "root", "remote"] as const;
+
+/** The cleanup queue in a closed lane's receipt; empty for a lane an older dori closed (its `kept:` lines still count). */
+const cleanupQueue = (lane: Lane): CleanupQueue => {
+  const queue = isRecord(lane.receipt) ? lane.receipt.queue : undefined;
+  if (!isRecord(queue)) return { worktrees: [], branches: [] };
+  const list = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? v.filter(isRecord) : []);
+  return {
+    worktrees: list(queue.worktrees).filter((w) => typeof w.path === "string" && typeof w.root === "string") as unknown as QueuedWorktree[],
+    branches: list(queue.branches).filter((b) => BRANCH_FIELDS.every((k) => typeof b[k] === "string")) as unknown as QueuedBranch[],
+  };
+};
+
+/** Whether a closed lane's close queued cleanup the sweep has still to do (a worktree not yet removed, a branch not settled). */
+const cleanupPending = (deps: FlowDeps, lane: Lane): boolean => {
+  if (statusOf(lane) !== "closed") return false;
+  const queue = cleanupQueue(lane);
+  if (queue.branches.some((b) => !b.settled)) return true;
+  const root = lane.machine ? cleanupRoot(deps, lane) : "";
+  return queue.worktrees.some((w) => !w.removed && (!lane.machine || under(root, w.path)));
+};
+
+/**
+ * The watcher's memory, between passes, of closed lanes whose queued cleanup is still to do: `keys` are swept on every
+ * pass, also one that skips the archive, so a close's queue is worked off on the next pass instead of the next archive
+ * walk. `open` is the previous pass's open keys: a key gone from it was closed since (by this watcher or `dori close`).
+ * The queue itself is durable (`receipt.queue`); this is only an index, rebuilt by every archive pass, and a supervisor
+ * starts with an archive pass, so a restart loses nothing.
+ */
+export type PendingCleanup = { open?: ReadonlySet<string>; readonly keys: Set<string> };
+export const newPendingCleanup = (): PendingCleanup => ({ keys: new Set() });
+
+/** A branch keep no later pass can change: the branch is protected, or it moved off the merged head it was bound to. */
+const FINAL_KEEP = /^protected|is not the merged head|at another commit than the merged head|moved off the merged head/;
+
+/**
+ * The watcher's half of a lane's close (two stages: the close queues, this removes). For a closed lane:
+ *
+ * - Each worktree its close queued (`receipt.queue`) is read again and removed once it is clean and has no commit that
+ *   no remote has; one whose unpushed commits cannot be read stays, with a warning. Then each SHA-bound branch the
+ *   close queued is deleted (branch-cleanup.ts deleteBranch: remote with a lease, then local with a compare-and-delete,
+ *   both only at the merged head), also when its worktree was already gone. A branch still checked out in a queued
+ *   worktree that stays waits for it.
+ * - Outside the root: a local lane's queued worktree is removed wherever it is, because its close found it as the
+ *   lane's and checked it (the close itself used to remove exactly these). A remote lane's queued worktree, a worktree an
+ *   older close listed as kept (`worktree <path> kept: ...`), and the lane's own directory (`cwd`, a remote lane's
+ *   `remoteCwd`) and recorded worktrees are removed only under the lane's runner's reported worktree root, or (local
+ *   lanes) `config.worktreeRoot` while that runner has reported none. One the close held with its branch
+ *   (`branch-bound worktree ... kept`) stays.
+ * - Every removal and delete is a recorded operation with a read-back (operations.ts), so a crash mid-sweep is resumed by
+ *   the next pass without repeating an effect; what is done is marked in the receipt's queue, so an operation row pruned
+ *   later never runs it again. A newly ambiguous operation is one OPERATION_AMBIGUOUS line.
+ *
+ * Open lanes (working, not-done, paused, done-claimed) are never touched, nor any path an open lane uses (its cwd,
+ * remoteCwd or worktrees) or the lead's cwd. Failures come back as LANE_WATCH_WARN lines.
+ */
+export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
+  if (statusOf(lane) !== "closed") return [];
+  const root = cleanupRoot(deps, lane);
+  const queue = cleanupQueue(lane);
+  const queuedPaths = queue.worktrees.map((w) => w.path);
+  const queued = queue.worktrees.filter((w) => !w.removed && (!lane.machine || under(root, w.path)));
+  const bound = keptWorktrees(lane, "branch-bound worktree ");
+  const kept = keptWorktrees(lane).filter((wt) => under(root, wt) && !queuedPaths.includes(wt));
+  const dir = lane.machine ? lane.remoteCwd : lane.cwd;
+  const own = [...new Set([...(dir ? [dir] : []), ...(lane.worktrees ?? [])].map(trimPath))]
+    .filter((p) => under(root, p) && !kept.includes(p) && !queuedPaths.includes(p) && !bound.includes(p));
+  const branches = queue.branches.filter((b) => !b.settled);
+  if (!queued.length && !kept.length && !own.length && !branches.length) return [];
+  const paths = [...new Set([...queued.flatMap((w) => [w.path, w.root]), ...kept, ...own])];
+  const [cwdThere = false, ...present] = lane.machine
+    ? [false, ...(await deps.ops.exists(lane.machine, paths))]
+    : await deps.ops.exists(undefined, [lane.cwd ?? deps.config.leadCwd, ...paths]);
+  const there = new Map(paths.map((p, i) => [p, Boolean(present[i])]));
+  const openLanes = await deps.registry.open();
+  const busy = new Set([deps.config.leadCwd, ...openLanes.flatMap((l) => [l.cwd ?? "", l.remoteCwd ?? "", ...(l.worktrees ?? [])])]
+    .filter(Boolean).map(trimPath));
+  const repo = lane.cwd && cwdThere ? lane.cwd : deps.config.leadCwd;
+  return withOperations(deps, async (store) => {
+    const act = actRecorded(deps, store, lane);
+    const out: string[] = [];
+    const removed: string[] = [];
+    const gone = new Set<string>();
+    /** Queued or candidate worktrees that stay this pass, as read: a branch they hold waits for them. */
+    const staying: WorktreeFact[] = [];
+    const stateOf = (action: string, target: string) => store.get(operationId({ lane: lane.key, action, target }))?.state;
+    const ambiguousOnce = (step: Step, before: OperationState | undefined) => {
+      if (before !== "ambiguous") out.push(`OPERATION_AMBIGUOUS ${step.id} ${step.detail}`);
+    };
+    /** The worktree's fact when it may go (clean, nothing unpushed); otherwise it stays, with a warning when unreadable. */
+    const removable = async (wt: string): Promise<boolean> => {
+      const fact = await probeWorktree(deps, lane, wt);
+      if (fact && fact.error === undefined && fact.dirty === false && fact.ahead === 0) return true;
+      if (fact) staying.push(fact);
+      if (!fact || fact.error !== undefined || fact.dirty === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read git status of ${wt}: ${(fact?.error ?? "git lists no worktree there").slice(0, 160)}`);
+      else if (!fact.dirty && fact.ahead === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read unpushed commits of ${wt}, so it is kept`);
+      return false;
+    };
+    const remove = async (wt: string, gitRoot: string, wasThere: boolean): Promise<void> => {
+      const before = stateOf("worktree-remove", wt);
+      const step = await act("worktree-remove", wt, (cmdId) => deps.ops.git(lane, { op: "worktree-remove", root: gitRoot, path: wt }, { cmdId }),
+        async () => ((await deps.ops.exists(lane.machine, [wt]))[0] ? "not-done" : "done"));
+      if (step.state === "verified") {
+        gone.add(wt);
+        if (wasThere) removed.push(wt);
+      } else if (step.state === "ambiguous") ambiguousOnce(step, before);
+      else out.push(`LANE_WATCH_WARN ${lane.key} worktree ${wt} not removed: ${(step.err || step.out).slice(0, 160)}`);
+    };
+    for (const w of queued) {
+      if (busy.has(w.path)) {
+        // An open lane works there: it stays, and so does a branch it has checked out.
+        const fact = there.get(w.path) ? await probeWorktree(deps, lane, w.path) : undefined;
+        if (fact) staying.push(fact);
+        continue;
+      }
+      // A queued worktree already gone (removed by hand, or by a pass a crash cut short) only settles its operation.
+      if (!there.get(w.path)) { await remove(w.path, w.path, false); continue; }
+      if (await removable(w.path)) await remove(w.path, there.get(w.root) && !gone.has(w.root) ? w.root : w.path, true);
+    }
+    for (const wt of [...kept, ...own]) {
+      if (!there.get(wt) || busy.has(wt)) continue;
+      // A remote worktree, and one found from the lane's record, is removed from inside itself: its repository is not known here.
+      if (await removable(wt)) await remove(wt, lane.machine || own.includes(wt) ? wt : repo, true);
+    }
+    const settled = new Map<string, Pick<QueuedBranch, "settled" | "note">>();
+    const cleaned: string[] = [];
+    const others = branches.length ? openLanes.filter((l) => l.key !== lane.key) : [];
+    for (const t of branches) {
+      if (staying.some((f) => f.branch === t.branch)) continue;
+      const key = `${t.repo}#${t.n}@${t.sha}`;
+      const before = new Map([REMOTE_BRANCH_DELETE, BRANCH_DELETE].map((a) => [operationId({ lane: lane.key, action: a, target: key }), stateOf(a, key)]));
+      // An ambiguous delete is the lead's to resolve (dori ops resolve); it was told once and is never retried on a guess.
+      if ([...before.values()].includes("ambiguous")) continue;
+      const r = await deleteBranch(deps.ops, lane, act, t, others, staying);
+      const stuck = [r.remoteStep, r.step].find((s) => s?.state === "ambiguous");
+      if (stuck) { ambiguousOnce(stuck, before.get(stuck.id ?? "")); continue; }
+      if (!r.kept && r.step?.state === "verified") {
+        settled.set(key, { settled: "deleted" });
+        cleaned.push(...(r.remoteLine ? [r.remoteLine] : []), r.line);
+        continue;
+      }
+      const why = r.kept ?? `delete failed: ${(r.step?.err || r.step?.out || "no answer").replace(/\s+/g, " ").slice(0, 120)}`;
+      if (r.kept && FINAL_KEEP.test(r.kept)) {
+        if (r.step === undefined) settleOperation(store, deps.clock.now(), operationId({ lane: lane.key, action: BRANCH_DELETE, target: key }), "failed", `kept: ${r.kept}`);
+        settled.set(key, { settled: `kept: ${r.kept}` });
+        out.push(`LANE_WATCH_WARN ${lane.key} branch ${t.branch} kept: ${r.kept}`);
+      } else if (t.note !== why) {
+        settled.set(key, { note: why });
+        out.push(`LANE_WATCH_WARN ${lane.key} branch ${t.branch} not deleted yet: ${why}`);
+      }
+    }
+    if (queue.worktrees.some((w) => gone.has(w.path)) || settled.size) {
+      await deps.registry.patch(lane.key, (current) => {
+        if (!isRecord(current.receipt)) return undefined;
+        const now = cleanupQueue(current);
+        return { receipt: { ...current.receipt, queue: {
+          worktrees: now.worktrees.map((w) => (gone.has(w.path) ? { ...w, removed: true as const } : w)),
+          branches: now.branches.map((b) => ({ ...b, ...settled.get(`${b.repo}#${b.n}@${b.sha}`) })),
+        } } };
+      });
+    }
+    return [
+      ...(removed.length ? [`WORKTREE_CLEANED ${lane.key} ${removed.join(" ")}`] : []),
+      ...(cleaned.length ? [`BRANCH_CLEANED ${lane.key} ${cleaned.join("; ")}`] : []),
+      ...out,
+    ];
+  });
+};
+
+/**
+ * The lane this process runs inside, or undefined for the lead. `dori launch` sets DORI_LANE_KEY in a local lane's
+ * pane; a pane registered to an open lane (HERDR_PANE_ID) counts as that lane too, so unsetting the variable is not
+ * enough. The lead pane (config.leadPane) is never a lane.
+ */
+export const callerLane = async (deps: Pick<FlowDeps, "registry" | "config">, env: Readonly<Record<string, string | undefined>> = process.env): Promise<string | undefined> => {
+  const key = env.DORI_LANE_KEY?.trim();
+  if (key) return key;
+  const pane = env.HERDR_PANE_ID?.trim();
+  if (!pane || pane === deps.config.leadPane) return undefined;
+  return (await deps.registry.byPane(pane))?.key;
+};
+
+/** Why a lane may not run `command` on lane `target`, or undefined when it may (the lead always may). */
+export const laneActRefusal = (caller: string | undefined, command: string, target: string): string | undefined =>
+  caller === undefined || caller === target ? undefined : `LANE_PERMISSION_DENIED lane ${caller} may not ${command} lane ${target}; only its own key (the lead can act on any lane)`;
+
+/**
+ * Why `caller` may not run `dori send`, or undefined for the lead. Only the lead talks to the owner: a lane, even in its
+ * own work thread, asks through `dori report <key> question` and the lead relays the answer.
+ */
+export const laneSendRefusal = (caller: string | undefined): string | undefined =>
+  caller === undefined
+    ? undefined
+    : `LANE_PERMISSION_DENIED lane ${caller} may not run send; it is lead-only. Ask the lead instead: dori report ${caller} question --text "..."`;
+
+/**
+ * Why `caller` may not run `dori decision`, or undefined for the lead. Only the lead opens, closes and lists owner
+ * decisions: a lane asks with a question report carrying choices, which the supervisor opens as a decision.
+ */
+export const laneDecisionRefusal = (caller: string | undefined): string | undefined =>
+  caller === undefined
+    ? undefined
+    : `LANE_PERMISSION_DENIED lane ${caller} may not run decision; it is lead-only. Ask with dori report ${caller} question --option ... --recommend N --reason ...`;
 
 /** Hands a line over; `id` is its journal id when the line has a stable one (else the supervisor assigns one). */
 export type Emit = (line: string, id?: string, meta?: EventMeta) => Promise<void>;

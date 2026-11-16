@@ -15,6 +15,7 @@ import {
   machineGuardTick,
   parseMachineList,
   readGuardMachines,
+  removeGuardAgents,
   saveMachineGuardState,
   sshArgv,
 } from "../src/remote-guard.ts";
@@ -163,4 +164,58 @@ test("machineGuardTick: alert -> clear, emitting only on change; machines absent
   expect(state.get("mac mini")).toEqual({ alerting: true });
   expect(tick({ ...healthy, swapFreeGb: 1.25 })).toEqual(["HOST_GUARD CLEAR machine=mac_mini load 1, memory free 50%, disk free 100 GB, swap free 1.3 GB"]);
   expect(tick(healthy)).toEqual([]);
+});
+
+const POSIX_RM = (argv: readonly string[]): boolean => (argv.at(-1) ?? "").includes("guard-agent.version") && !(argv.at(-1) ?? "").startsWith("powershell");
+
+test("removeGuardAgents: removed, nothing there, unreachable and failed POSIX machines", async () => {
+  const machines: GuardMachine[] = [
+    { label: "old", target: "o" }, { label: "clean", target: "c" }, { label: "down", target: "d" }, { label: "odd", target: "x" },
+  ];
+  const f = fake((argv) => {
+    const target = argv[6];
+    if (target === "d") return { code: 255, out: "", err: "ssh: connect to host d port 22: Connection timed out" };
+    if (argv.at(-1) === "uname -s") return ok("Linux");
+    if (!POSIX_RM(argv)) return { code: 9, out: "", err: `unexpected ${argv.at(-1)}` };
+    if (target === "o") return ok("motd\nguard-agent.sh\nguard-agent.version\n");
+    if (target === "x") return { code: 1, out: "", err: "rm: cannot remove: Permission denied" };
+    return ok("");
+  });
+  const logs: string[] = [];
+  expect(await removeGuardAgents(f.run, machines, (l) => logs.push(l))).toBe(2);
+  expect(logs.sort()).toEqual([
+    "GUARD_AGENT_FAILED odd remove failed (exit 1): rm: cannot remove: Permission denied",
+    "GUARD_AGENT_REMOVED old guard-agent.sh,guard-agent.version",
+    "GUARD_AGENT_UNREACHABLE down ssh: connect to host d port 22: Connection timed out",
+  ]);
+  const rm = f.calls.find((c) => c.argv[6] === "o" && POSIX_RM(c.argv))!;
+  expect(rm.argv.slice(0, 7)).toEqual(sshArgv("o", "").slice(0, 7));
+  for (const name of ["guard-agent.sh", "guard-agent.ps1", "guard-agent.version"]) expect(rm.argv[7]).toContain(name);
+  expect(rm.argv[7]).toContain('"$HOME/.dori/$f"');
+});
+
+test("removeGuardAgents: a Windows machine removes under %USERPROFILE%\\.dori; one with no usable shell is skipped, not failed", async () => {
+  clearShellModes();
+  const calls: string[][] = [];
+  const run: Runner = async (argv) => {
+    calls.push([...argv]);
+    const [target, cmd] = [argv[6], argv.at(-1) ?? ""];
+    if (cmd.startsWith("x=6;")) return { code: 1, out: "", err: "'x' is not recognized as an internal or external command," };
+    if (target === "win" && cmd.startsWith("powershell")) {
+      const snippet = Buffer.from(cmd.split(" ").at(-1)!, "base64").toString("utf16le");
+      if (snippet.includes("DORI_PS_")) return ok("DORI_PS_42\r\n");
+      expect(snippet).toContain("Join-Path $env:USERPROFILE '.dori'");
+      expect(snippet).toContain("'guard-agent.sh', 'guard-agent.ps1', 'guard-agent.version'");
+      return ok("guard-agent.ps1\r\nguard-agent.version\r\n");
+    }
+    return { code: 1, out: "", err: "nope" };
+  };
+  const logs: string[] = [];
+  expect(await removeGuardAgents(run, [{ label: "win", target: "win" }, { label: "box", target: "box" }], (l) => logs.push(l))).toBe(0);
+  expect(logs.sort()).toEqual([
+    "GUARD_AGENT_REMOVED win guard-agent.ps1,guard-agent.version",
+    "GUARD_AGENT_SKIPPED box unsupported remote shell (no POSIX sh or PowerShell): 'x' is not recognized as an internal or external command,",
+  ]);
+  // The skipped machine only got the two shell probes.
+  expect(calls.filter((c) => c[6] === "box")).toHaveLength(2);
 });

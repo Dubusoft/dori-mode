@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { replaceFileAtomic } from "./durable-write.ts";
 import { statusOf, type Lane } from "./registry.ts";
 
 /**
@@ -24,7 +23,9 @@ export const recordFinishedThread = (stateDir: string, thread: string, at: numbe
   const buttons = readFinishedThreads(stateDir);
   if ((buttons[thread] ?? -Infinity) >= at) return;
   const path = join(stateDir, FINISHED_THREADS_FILE);
-  replaceFileAtomic(path, JSON.stringify({ ...buttons, [thread]: at }), 0o600);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ ...buttons, [thread]: at }), { mode: 0o600 });
+  renameSync(tmp, path);
 };
 
 /** The thread id of a ref (`discord:<channel>/<thread>`, `discord:<thread>`) or of a bare id. */

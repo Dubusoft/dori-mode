@@ -5,8 +5,7 @@ import { withState } from "./fakes.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
 import { type LaneSocketLanes, serveLaneSocket } from "../src/runner/lane-socket.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
-import type { Connector, Transport } from "../src/runner/transport.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 
 const VALUE = "dori-test-throwaway-123";
 const env = { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN: "tok-a", PATH: "/bin" };

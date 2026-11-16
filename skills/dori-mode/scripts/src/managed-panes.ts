@@ -1,6 +1,5 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { replaceFileAtomic } from "./durable-write.ts";
 
 import type { Runner } from "./run.ts";
 
@@ -49,7 +48,9 @@ export const saveManagedPanes = (stateDir: string, patch: ManagedPanes): Managed
   const next = { ...readManagedPanes(stateDir), ...patch };
   mkdirSync(stateDir, { recursive: true });
   const path = managedPanesPath(stateDir);
-  replaceFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
   return next;
 };
 

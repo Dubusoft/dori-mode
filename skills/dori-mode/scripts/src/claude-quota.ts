@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { displayTime } from "./display-time.ts";
-import { cacheNoteLines, type QuotaCacheNote } from "./quota-presentation.ts";
+import { cacheNoteLines, type QuotaCacheNote } from "./quota-cache.ts";
 
 /** The subset of pi-quota's ProviderResult this module reads. */
 export type QuotaResult = {
@@ -22,7 +22,7 @@ export type ClaudeWindow = { readonly usedPct: number; readonly resetAt?: number
 /** One Claude account's windows; absent windows were not reported. */
 export type ClaudeAccount = { readonly name: string; readonly fiveHour?: ClaudeWindow; readonly weekly?: ClaudeWindow };
 
-/** Claude subscription usage of every account that answered (see classifyClaude). */
+/** Claude subscription usage of every account that answered (see claudeUsage). */
 export type ClaudeUsage = { readonly at: number; readonly accounts: readonly ClaudeAccount[] };
 
 const CLAUDE_PROVIDERS: ReadonlySet<string> = new Set(["anthropic", "claude-sdk-oauth"]);
@@ -51,6 +51,26 @@ const windowOf = (w: NonNullable<QuotaResult["windows"]>[number]): ClaudeWindow 
 const FIVE_HOUR = /five|5\s*h/i;
 const WEEKLY = /week|7\s*d/i;
 
+/**
+ * Usage from pi-quota results: every account of `providers` (default: anthropic and claude-sdk-oauth) that answered
+ * with a 5h or 7d window. Undefined when no such account answered.
+ */
+export const claudeUsage = (results: readonly QuotaResult[], at: number, providers = CLAUDE_PROVIDERS): ClaudeUsage | undefined => {
+  const accounts: ClaudeAccount[] = [];
+  for (const r of results) {
+    if (r.kind !== "success" || !providers.has(r.provider)) continue;
+    let fiveHour: ClaudeWindow | undefined;
+    let weekly: ClaudeWindow | undefined;
+    for (const w of r.windows ?? []) {
+      if (FIVE_HOUR.test(w.label)) fiveHour = windowOf(w);
+      else if (WEEKLY.test(w.label) && !weekly) weekly = windowOf(w);
+    }
+    if (!fiveHour && !weekly) continue;
+    accounts.push({ name: r.account || r.provider, ...(fiveHour ? { fiveHour } : {}), ...(weekly ? { weekly } : {}) });
+  }
+  return accounts.length ? { at, accounts } : undefined;
+};
+
 /** A Claude account whose usage could not be read (expired token, failed request, no window), so it is left out. */
 export type ClaudeSkip = { readonly name: string; readonly reason: string };
 
@@ -64,28 +84,14 @@ const skipReason = (r: QuotaResult): string => {
 };
 
 /**
- * Splits pi-quota results by account of `providers` (default: anthropic and claude-sdk-oauth). `usage` has every account
- * that answered with a 5h or 7d window (undefined when none did); `skipped` has every other one, with why, and the readable
- * accounts alone decide the usage. A provider nobody signed into (unlabelled oauth-not-configured) is not an account and
- * is not listed.
+ * Every Claude account claudeUsage leaves out, with why; the readable accounts alone decide the usage. A provider
+ * nobody signed into (unlabelled oauth-not-configured) is not an account and is not listed.
  */
-export const classifyClaude = (results: readonly QuotaResult[], at: number, providers = CLAUDE_PROVIDERS): { usage?: ClaudeUsage; skipped: ClaudeSkip[] } => {
-  const accounts: ClaudeAccount[] = [];
-  const skipped: ClaudeSkip[] = [];
-  for (const r of results) {
-    if (!providers.has(r.provider)) continue;
-    const name = r.account || r.provider;
-    let fiveHour: ClaudeWindow | undefined;
-    let weekly: ClaudeWindow | undefined;
-    for (const w of r.kind === "success" ? r.windows ?? [] : []) {
-      if (FIVE_HOUR.test(w.label)) fiveHour = windowOf(w);
-      else if (WEEKLY.test(w.label) && !weekly) weekly = windowOf(w);
-    }
-    if (fiveHour || weekly) accounts.push({ name, ...(fiveHour ? { fiveHour } : {}), ...(weekly ? { weekly } : {}) });
-    else if (!(r.account === undefined && r.reason === "oauth-not-configured")) skipped.push({ name, reason: skipReason(r) });
-  }
-  return { ...(accounts.length ? { usage: { at, accounts } } : {}), skipped };
-};
+export const skippedClaudeAccounts = (results: readonly QuotaResult[], providers = CLAUDE_PROVIDERS): ClaudeSkip[] =>
+  results
+    .filter((r) => providers.has(r.provider) && !(r.account === undefined && r.reason === "oauth-not-configured")
+      && (r.kind !== "success" || !(r.windows ?? []).some((w) => FIVE_HOUR.test(w.label) || WEEKLY.test(w.label))))
+    .map((r) => ({ name: r.account || r.provider, reason: skipReason(r) }));
 
 /** "default (token-expired), account-3 (http-error 429)". */
 export const skippedText = (skipped: readonly ClaudeSkip[]): string => skipped.map((s) => `${s.name} (${s.reason})`).join(", ");
@@ -139,10 +145,12 @@ export const lookupQuotaResults = (agentDir = join(homedir(), ".omo", "agent")):
 /** pi-quota's text, the Claude usage when a Claude account answered, and the Claude accounts left out. */
 export type UsageRead = { readonly text: string; readonly usage?: ClaudeUsage; readonly skipped: readonly ClaudeSkip[]; readonly cache?: QuotaCacheNote };
 
-/** `providers` narrows which pi-quota providers count (default: the Claude ones, see classifyClaude). */
+/** `providers` narrows which pi-quota providers count (default: the Claude ones, see claudeUsage). */
 export const readUsage = async (lookup: UsageLookup, now: number, signal: AbortSignal, providers = CLAUDE_PROVIDERS): Promise<UsageRead> => {
   const { results, text, cache } = await lookup(signal);
-  return { text, ...classifyClaude(results, now, providers), ...(cache ? { cache } : {}) };
+  const usage = claudeUsage(results, now, providers);
+  const skipped = skippedClaudeAccounts(results, providers);
+  return { text, ...(usage ? { usage } : {}), skipped, ...(cache ? { cache } : {}) };
 };
 
 /**

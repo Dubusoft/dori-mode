@@ -8,8 +8,7 @@ import type {
   SupervisorCommandBodies, TurnEvidence,
 } from "./runner/protocol.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
-import { isLaneOutputFiles } from "./lane-files.ts";
-import { checkLaneFilesBody } from "./lane-file-contract.ts";
+import { checkLaneFilesBody, isLaneOutputFiles } from "./lane-files.ts";
 import type { LaneBriefFiles, LaneFileTree, LaneOutputFiles } from "./runner/protocol.ts";
 
 /**

@@ -13,7 +13,7 @@ import type {
   AnySupervisorControl, JsonValue, LaneInspection, MachineObservation, ProcessInfo, QueryBodies, QueryResults, QueryType, RunnerControlBodies,
 } from "./protocol.ts";
 import { laneStatus } from "./serve.ts";
-import { checkLaneFilesBody, LaneFileError } from "../lane-file-contract.ts";
+import { checkFileBody, LaneFileError } from "./lane-files.ts";
 import type { LaneOutputFiles } from "./protocol.ts";
 
 /**
@@ -195,7 +195,7 @@ export const queryDispatcher = (deps: QueryDispatchDeps) => (frame: unknown): vo
     (result) => {
       const response = { qid, ok: true, detail: "", result };
       if (checked.query.type === "q.lane.files") {
-        try { checkLaneFilesBody(checked.query.body.key, response); }
+        try { checkFileBody(checked.query.body.key, response); }
         catch (error) { send({ qid, ok: false, detail: (error as Error).message }); return; }
       }
       send(response);

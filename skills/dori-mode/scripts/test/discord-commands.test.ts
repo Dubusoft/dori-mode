@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DiscordCommands, guildCommands, quotaMessage, type QuotaLookup } from "../src/messenger/discord-commands.ts";
-import { discordPresence } from "../src/messenger/discord-gateway.ts";
+import { discordPresence } from "../src/messenger/discord.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { withState } from "./fakes.ts";
 

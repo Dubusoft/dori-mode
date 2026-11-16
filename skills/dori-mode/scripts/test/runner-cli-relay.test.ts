@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { QueryFailed, RunnerUnavailable } from "../src/runner/call.ts";
 import type { RunnerCall, Timers } from "../src/runner/call.ts";
 import { CLI_SOCKET, cliRunnerCall, cliSocketPath, serveCliRelay } from "../src/runner/cli-relay.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { memoryNetwork } from "../src/runner/transport.ts";
 import type { Connector, Listener, Transport } from "../src/runner/transport.ts";
 import { listenUnix } from "../src/runner/unix-transport.ts";
 

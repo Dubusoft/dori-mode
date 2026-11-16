@@ -1,6 +1,6 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { replaceFileDurable } from "./durable-write.ts";
 
 export class ReposError extends Error {
   readonly name = "ReposError";
@@ -57,6 +57,16 @@ export class Repos {
   replace(repos: readonly string[]): void {
     const next = [...new Set(repos.map(normalize))];
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
-    replaceFileDurable(this.path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
+    const tmp = `${this.path}.${randomUUID()}.tmp`;
+    try {
+      const fd = openSync(tmp, "wx", 0o600);
+      try { writeFileSync(fd, `${JSON.stringify(next, null, 2)}\n`); fsyncSync(fd); }
+      finally { closeSync(fd); }
+      renameSync(tmp, this.path);
+      const dir = openSync(this.stateDir, "r");
+      try { fsyncSync(dir); } finally { closeSync(dir); }
+    } finally {
+      rmSync(tmp, { force: true });
+    }
   }
 }

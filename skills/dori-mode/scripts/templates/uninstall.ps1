@@ -8,25 +8,29 @@ $R = Split-Path -Parent $PSScriptRoot
 $TaskPath = '\dori\'
 $TaskName = 'dori-runner'
 
-function Stop-Tree($File, $Pattern) {
-  $PidFile = Join-Path $R $File
-  if (Test-Path -LiteralPath $PidFile) {
-    $Id = ([IO.File]::ReadAllText($PidFile)).Trim()
-    if ($Id -match '^\d+$') {
-      $Proc = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $Id) -ErrorAction SilentlyContinue
-      if ($Proc -and $Proc.CommandLine -like $Pattern) { & taskkill.exe /PID $Id /T /F | Out-Null }
-    }
-  }
-}
-
 if (Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Stop-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Confirm:$false
 }
 
 # The task runs the wrapper under conhost --headless, so stopping it leaves the wrapper; it goes before the runner tree.
-Stop-Tree 'runner-task-wrapper.pid' '*runner-task.ps1*'
-Stop-Tree 'runner-task.pid' '*dori.js*'
+$WrapperPidFile = Join-Path $R 'runner-task-wrapper.pid'
+if (Test-Path -LiteralPath $WrapperPidFile) {
+  $Id = ([IO.File]::ReadAllText($WrapperPidFile)).Trim()
+  if ($Id -match '^\d+$') {
+    $Proc = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $Id) -ErrorAction SilentlyContinue
+    if ($Proc -and $Proc.CommandLine -like '*runner-task.ps1*') { & taskkill.exe /PID $Id /T /F | Out-Null }
+  }
+}
+
+$PidFile = Join-Path $R 'runner-task.pid'
+if (Test-Path -LiteralPath $PidFile) {
+  $Id = ([IO.File]::ReadAllText($PidFile)).Trim()
+  if ($Id -match '^\d+$') {
+    $Proc = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $Id) -ErrorAction SilentlyContinue
+    if ($Proc -and $Proc.CommandLine -like '*dori.js*') { & taskkill.exe /PID $Id /T /F | Out-Null }
+  }
+}
 
 if ($Purge) {
   Remove-Item -LiteralPath $R -Recurse -Force

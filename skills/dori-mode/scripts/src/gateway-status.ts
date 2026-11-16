@@ -1,7 +1,5 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-
-import { replaceFileAtomic } from "./durable-write.ts";
 
 /** The supervisor's heartbeat file: doctor and status read it, so they never touch the lock or the socket. */
 export type GatewayStatus = {
@@ -18,7 +16,9 @@ export const gatewayStatusPath = (stateDir: string): string => join(stateDir, "g
 export const writeGatewayStatus = (stateDir: string, status: GatewayStatus): void => {
   mkdirSync(stateDir, { recursive: true });
   const path = gatewayStatusPath(stateDir);
-  replaceFileAtomic(path, JSON.stringify(status), 0o600);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(status), { mode: 0o600 });
+  renameSync(tmp, path);
 };
 
 export const readGatewayStatus = (stateDir: string): GatewayStatus | undefined => {

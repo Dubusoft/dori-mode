@@ -9,10 +9,7 @@ import {
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
-import { backoffMs, type Connector, type Transport } from "./transport.ts";
-
-/** serve.ts and the client tests reach the shared reconnect backoff through here. */
-export { backoffMs };
+import type { Connector, Transport } from "./transport.ts";
 
 /**
  * The runner side of the connection. One `connectOnce` is: connect, send `hello {proto, gen, label, hostId, cmdAck}`,
@@ -33,6 +30,9 @@ export { backoffMs };
  * backs off instead of holding a connection that never becomes ready.
  */
 
+export const RECONNECT_BASE_MS = 1_000;
+export const RECONNECT_MAX_MS = 60_000;
+export const RECONNECT_JITTER = 0.2;
 export const HEARTBEAT_MS = 15_000;
 /** How long `secretRequest("secret.get")` waits for the supervisor's answer before `RUNNER_SECRET_TIMEOUT`. */
 export const SECRET_TIMEOUT_MS = 30_000;
@@ -513,3 +513,9 @@ export class RunnerClient {
     return this.ready && this.transport?.open === true;
   }
 }
+
+/** Reconnect delay before attempt `attempt` (0-based): 1s doubled per attempt, capped at 60s, then +-20% jitter. */
+export const backoffMs = (attempt: number, random: () => number = Math.random): number => {
+  const base = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.min(attempt, 30));
+  return Math.round(base * (1 + (random() * 2 - 1) * RECONNECT_JITTER));
+};
