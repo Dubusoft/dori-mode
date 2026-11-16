@@ -8,7 +8,7 @@ import { type LaneReport, type LaneReportStore, oneLine } from "./lane-report-st
 import type { Clock } from "./run.ts";
 import type { Lane } from "./registry.ts";
 import type { ReportKind } from "./runner/report-kinds.ts";
-import { redirectIfClosed } from "./thread-followup.ts";
+import { ownerClosedRecorded, redirectIfClosed } from "./thread-followup.ts";
 
 /** A message posted after a lane's status message, as the status check reads it: by the bot itself, its Discord type, its text. */
 export type LaterMessage = { readonly own: boolean; readonly type: number; readonly content: string };
@@ -158,4 +158,36 @@ export const writeLaneStatus = async (
   }
   const id = await transport.post(channel, text, stableId, silent);
   await deps.registry.patch(lane.key, { statusMessageId: id });
+};
+
+/** How long after it opened a lane that has not reported yet gets its first status message from the supervisor. */
+export const FIRST_STATUS_AFTER_MS = 2 * 60_000;
+/** Lanes opened longer ago than this never get a first status message (no burst over older lanes when this ships). */
+export const FIRST_STATUS_WINDOW_MS = 15 * 60_000;
+
+/**
+ * Posts the first status message of each open lane whose thread has none yet FIRST_STATUS_AFTER_MS after it opened (and
+ * within FIRST_STATUS_WINDOW_MS), so the owner sees the lane working in its thread even before its first progress or
+ * milestone report. Skips a lane still reserving its launch, one with no Discord thread, and a thread the owner closed.
+ * A failed post is logged and retried on the next pass. Returns one log line per posted message.
+ */
+export const firstStatusTick = async (
+  deps: FlowDeps, transport: LaneStatusTransport, store: LaneReportStore, home: string,
+): Promise<string[]> => {
+  const out: string[] = [];
+  const now = deps.clock.now();
+  for (const lane of await deps.registry.open()) {
+    const channel = statusChannel(lane);
+    const age = now - Date.parse(lane.openedAt);
+    if (lane.statusMessageId || lane.launchReservation || !channel || !(age >= FIRST_STATUS_AFTER_MS && age < FIRST_STATUS_WINDOW_MS)) continue;
+    if (ownerClosedRecorded(deps.config.stateDir, lane.thread)) continue;
+    try {
+      const text = laneStatusText(lane, store.list({ lane: lane.key }), undefined, now, home, deps.config.displayTimeZone);
+      await writeLaneStatus(deps, transport, channel, lane, text, `lane-status:first:${lane.key}`);
+      out.push(`LANE_STATUS_FIRST ${lane.key}`);
+    } catch (e) {
+      console.error(`LANE_STATUS_FIRST_FAILED ${lane.key} ${errorText(e)}`);
+    }
+  }
+  return out;
 };
