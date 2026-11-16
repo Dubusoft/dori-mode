@@ -13,6 +13,8 @@ export const UNRECOGNISED_ALERT_AFTER = 3;
 
 /** Terminal title of the DAG viewer a mass-ulw lane opens next to its agent pane. It runs no agent, so herdr reports no status. */
 export const DAG_VIEWER_TITLE = "OmO DAG";
+/** Label prefix the DAG extension gives the pane it splits off, set before its viewer runs (and kept when it never does). */
+export const DAG_PANE_LABEL = "DAG · ";
 
 /** Per-pane memory across ticks: the CLI keeps one of these for the life of the loop. */
 export type DeadPaneState = {
@@ -103,7 +105,7 @@ const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, h
       state.activity.delete(id);
       continue;
     }
-    if (pane.tab_id && laneTabs.has(pane.tab_id) && pane.terminal_title?.trim().startsWith(DAG_VIEWER_TITLE)) {
+    if (pane.tab_id && laneTabs.has(pane.tab_id) && (pane.terminal_title?.trim().startsWith(DAG_VIEWER_TITLE) || pane.label?.startsWith(DAG_PANE_LABEL))) {
       state.unknown.delete(id);
       state.lastTail.delete(id);
       continue;

@@ -44,11 +44,15 @@ test("another pane, another herdr method, resume_argv, unknown fields and malfor
   for (const method of ["workspace.list", "server.stop", "layout.apply", "agent.list"]) {
     expect({ method, verdict: refused(report({}, method)) }).toEqual({ method, verdict: "forbidden" });
   }
-  // The own pane is never closed, written to or split into by id; a pane the lane did not create is not either.
+  // The own pane is never closed, written to or split into by id; a pane the lane did not create is never written to,
+  // and its layout changes go on to the socket's tab check.
   const call = (method: string, params: Record<string, unknown>) => refused(JSON.stringify({ id: "q", method, params }));
   const extra: Record<string, Record<string, unknown>> = { "pane.rename": { label: "l" }, "pane.send_input": { text: "x" }, "pane.send_text": { text: "x" } };
   for (const method of ["pane.close", "pane.rename", "pane.zoom", "pane.send_input", "pane.send_text"]) {
-    for (const pane_id of ["w1:p2", "w1:p9"]) expect({ method, pane_id, verdict: call(method, { pane_id, ...extra[method] }) }).toEqual({ method, pane_id, verdict: "forbidden" });
+    for (const pane_id of ["w1:p2", "w1:p9"]) {
+      const verdict = pane_id === "w1:p9" && !method.startsWith("pane.send_") ? "forwarded" : "forbidden";
+      expect({ method, pane_id, verdict: call(method, { pane_id, ...extra[method] }) }).toEqual({ method, pane_id, verdict });
+    }
   }
   expect(call("pane.split", { target_pane_id: "w1:p9", direction: "right" })).toBe("forbidden");
   expect(call("pane.split", { target_pane_id: "w1:p2", direction: "right", env: { A: "1" } })).toBe("invalid_request");
@@ -137,7 +141,7 @@ test("a lane's socket relays its own pane's report to herdr and herdr's reply ba
   const herdr = fakeHerdr(join(dir, ".."));
   const logs: string[] = [];
   const panes: Record<string, string> = { "lane-a": "w1:p2" };
-  const sockets = new HerdrReportSockets({ runnerDir: dir, herdrSocket: herdr.path, paneOf: (key) => panes[key], log: (line) => { logs.push(line); } });
+  const sockets = new HerdrReportSockets({ runnerDir: dir, herdrSocket: herdr.path, laneOf: (key) => (panes[key] ? { pane: panes[key] } : undefined), log: (line) => { logs.push(line); } });
   closers.push(() => { sockets.stop(); });
   sockets.open("lane-a");
   const path = herdrReportSocketPath(dir, "lane-a");
@@ -161,10 +165,49 @@ test("a lane's socket relays its own pane's report to herdr and herdr's reply ba
   expect(existsSync(join(dir, "sock", "herdr.d", "lane-a"))).toBe(false);
 });
 
+test("a sandboxed lane runs a command in a pane it split behind its sandbox, and closes only panes of its own tab", async () => {
+  const dir = runnerDir();
+  const path = join(dir, "..", "herdr-tabs.sock");
+  const tabs: Record<string, string> = { "w1:p2": "w1:t1", "w1:p5": "w1:t1", "w1:p6": "w1:t1", "w1:p8": "w1:t9" };
+  const received: { method: string; params: Record<string, unknown> }[] = [];
+  const server = Bun.listen({
+    unix: path,
+    socket: {
+      data(socket, chunk) {
+        for (const line of Buffer.from(chunk).toString().split("\n").filter(Boolean)) {
+          const req = JSON.parse(line) as { id: string; method: string; params: Record<string, unknown> };
+          received.push(req);
+          const result = req.method === "pane.get" ? { pane: { pane_id: req.params.pane_id, tab_id: tabs[req.params.pane_id as string] } }
+            : req.method === "pane.split" ? { pane: { pane_id: "w1:p5", tab_id: "w1:t1" } } : { type: "ok" };
+          socket.write(`${JSON.stringify({ id: req.id, result })}\n`);
+        }
+      },
+    },
+  });
+  closers.push(() => { server.stop(true); });
+  const sockets = new HerdrReportSockets({
+    runnerDir: dir, herdrSocket: path, log: () => {},
+    laneOf: () => ({ pane: "w1:p2", sandbox: true, profile: "sandboxed", sandboxPrefix: "env DORI_LANE_KEY=lane-a lane-sandbox" }),
+  });
+  closers.push(() => { sockets.stop(); });
+  sockets.open("lane-a");
+  const lane = herdrReportSocketPath(dir, "lane-a");
+  const call = (method: string, params: Record<string, unknown>) => ask(lane, JSON.stringify({ id: "q", method, params }));
+
+  expect(await call("pane.split", { target_pane_id: "w1:p2", direction: "right" })).toMatchObject({ result: { pane: { pane_id: "w1:p5" } } });
+  expect(await call("pane.send_input", { pane_id: "w1:p5", text: "node viewer.mjs", keys: ["Enter"] })).toEqual({ id: "q", result: { type: "ok" } });
+  expect(received.at(-1)).toMatchObject({ method: "pane.send_input", params: { pane_id: "w1:p5", text: "exec env DORI_LANE_KEY=lane-a lane-sandbox /bin/sh -c 'node viewer.mjs'" } });
+  // w1:p6 was split before this runner started: in the lane's tab it may be closed, never written to.
+  expect(await call("pane.close", { pane_id: "w1:p6" })).toEqual({ id: "q", result: { type: "ok" } });
+  expect(await call("pane.send_text", { pane_id: "w1:p6", text: "x" })).toMatchObject({ error: { code: "forbidden" } });
+  expect(await call("pane.close", { pane_id: "w1:p8" })).toMatchObject({ error: { code: "forbidden", message: "only panes in the lane's own tab" } });
+  expect(received.filter((r) => r.method === "pane.close").map((r) => r.params.pane_id)).toEqual(["w1:p6"]);
+});
+
 test("a report herdr cannot take answers an error instead of hanging the lane", async () => {
   const dir = runnerDir();
   const logs: string[] = [];
-  const sockets = new HerdrReportSockets({ runnerDir: dir, herdrSocket: join(dir, "no-herdr.sock"), paneOf: () => "w1:p2", log: (line) => { logs.push(line); } });
+  const sockets = new HerdrReportSockets({ runnerDir: dir, herdrSocket: join(dir, "no-herdr.sock"), laneOf: () => ({ pane: "w1:p2" }), log: (line) => { logs.push(line); } });
   closers.push(() => { sockets.stop(); });
   sockets.open("lane-a");
   expect(await ask(herdrReportSocketPath(dir, "lane-a"), report({}))).toMatchObject({ id: "custom:omo:1:a", error: { code: "herdr_unreachable" } });

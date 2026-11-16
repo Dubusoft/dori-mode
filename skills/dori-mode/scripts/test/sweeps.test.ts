@@ -140,6 +140,8 @@ test("a DAG viewer pane in a registered lane's tab is part of that lane and neve
   world.panes = [
     { pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2", agent: "pi", agent_status: "working" },
     { pane_id: "w:p8", workspace_id: "w", tab_id: "w:t2", agent_status: "unknown", terminal_title: "OmO DAG" },
+    // Split and labelled by the DAG extension, its viewer not (yet) running.
+    { pane_id: "w:p10", workspace_id: "w", tab_id: "w:t2", agent_status: "unknown", label: "DAG · 01a1e691", terminal_title: "ubuntu@host:~" },
   ];
   world.screen = "wave 2/3 running\n";
   const deps = depsFor(world, fakeClock(T0), state.dir);
