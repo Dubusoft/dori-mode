@@ -79,10 +79,9 @@ const URGENT_KINDS = [
   "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
   // A direct decision answer whose lane session is gone: the lead takes the answer over (owner-decisions.ts).
   "DECISION_ANSWER_UNDELIVERED",
-  // A direct answer changed or withdrawn after an older revision may have reached the lane (decision-inbound.ts).
+  // A direct answer changed or withdrawn after an older revision may have reached the lane, or a different answer button
+  // pressed on a question whose answer the lead holds (decision-inbound.ts).
   "DECISION_ANSWER_CORRECTED",
-  // An answer button pressed while the supervisor restarted on a question the lane cannot take directly (decision-inbound.ts).
-  "DECISION_BUTTON_LATE",
   // A `dori decision close` whose text could not be typed into the lane that asked (decision-relay.ts): the lead hands it over.
   "DECISION_RELAY_FAILED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.

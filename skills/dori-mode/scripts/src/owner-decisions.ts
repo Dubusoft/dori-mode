@@ -386,7 +386,8 @@ const refOf = (key: string): AnswerRef => {
  * thread (where every owner message counts as an answer while the decision is open) only the first answer and `--from`.
  */
 const answerTargets = (d: OwnerDecision, from: string | undefined): { readonly covered: string[]; readonly left: string[] } => {
-  const recorded = (d.answers ?? []).map(refKey);
+  // A button press handed to the lead is no Discord message: nothing to ack or record handled.
+  const recorded = (d.answers ?? []).filter((a) => a.choice === undefined).map(refKey);
   const fromKey = from && /^\d+\/\d+$/.test(from) ? [from] : [];
   const covered = [...new Set([...(d.inLaneThread ? recorded.slice(0, 1) : recorded), ...fromKey])];
   return { covered, left: [...new Set(recorded)].filter((key) => !covered.includes(key)) };
@@ -564,22 +565,35 @@ export const recordChannelAnswer = (stateDir: string, channel: string, message: 
   return recordAnswer(stateDir, (file) => { const waiting = waitingIn(file.decisions, channel); return waiting.length === 1 ? waiting[0] : undefined; }, channel, message, at);
 };
 
+/**
+ * Records the owner's press of button `choice` on decision `id`, made in `channel` as interaction message `message`
+ * (decision-inbound.ts routeDecisionClick, a click the lane cannot take directly), as an answer the lead holds, like
+ * recordOwnerAnswer: each click once; the first answer moves the decision to `answered` and returns `first: true`.
+ * `added` is false for a click already recorded or a closed decision. Undefined for an unknown decision.
+ */
+export const recordButtonAnswer = (
+  stateDir: string, id: string, channel: string, message: string, choice: number, at: number,
+): { readonly decision: OwnerDecision; readonly first: boolean; readonly added: boolean } | undefined =>
+  recordAnswer(stateDir, (file) => file.decisions.find((d) => d.id === id), channel, message, at, choice);
+
 const recordAnswer = (
-  stateDir: string, pick: (file: DecisionsFile) => OwnerDecision | undefined, channel: string, message: string, at: number,
-): { readonly decision: OwnerDecision; readonly first: boolean } | undefined =>
-  updateDecisions(stateDir, (file) => {
+  stateDir: string, pick: (file: DecisionsFile) => OwnerDecision | undefined, channel: string, message: string, at: number, choice?: number,
+): { readonly decision: OwnerDecision; readonly first: boolean; readonly added: boolean } | undefined =>
+  updateDecisions(stateDir, (file): { file?: DecisionsFile; result: { decision: OwnerDecision; first: boolean; added: boolean } | undefined } => {
     const d = pick(file);
     if (!d) return { result: undefined };
-    if (d.state === "closed" || d.answers?.some((a) => a.message === message)) return { result: { decision: d, first: false } };
+    if (d.state === "closed" || d.answers?.some((a) => a.message === message)) return { result: { decision: d, first: false, added: false } };
     const first = d.answeredAt === undefined;
     const next: OwnerDecision = {
-      ...d, answers: [...(d.answers ?? []), { channel, message, at }],
+      ...d, answers: [...(d.answers ?? []), { channel, message, at, ...(choice !== undefined ? { choice } : {}) }],
       ...(first ? { state: "answered" as const, answeredAt: at, answerEvent: answeredEventId(d.id) } : {}),
     };
-    return { file: { ...file, decisions: file.decisions.map((x) => (x.id === d.id ? next : x)) }, result: { decision: next, first } };
+    return { file: { ...file, decisions: file.decisions.map((x) => (x.id === d.id ? next : x)) }, result: { decision: next, first, added: true } };
   });
 
 export const short = (text: string, max = 80): string => cut(text.replace(/\s+/g, " ").trim(), max);
+/** How the lead's lines name a choice: its number and option text, `choice=2 "Replace"`. */
+export const choiceLabel = (d: Pick<OwnerDecision, "options">, choice: number): string => `choice=${choice} "${short(d.options[choice - 1] ?? "", 80)}"`;
 /** The question as the lead's lines show it: a request marked `[request]`. */
 const subject = (d: OwnerDecision, max = 80): string => (d.kind === "request" ? `[request] ${short(d.question, max - 10)}` : short(d.question, max));
 const threadRef = (d: OwnerDecision): string => (d.thread ? `discord:${d.channel}/${d.thread}` : `discord:${d.channel}`);
@@ -587,12 +601,15 @@ const threadRef = (d: OwnerDecision): string => (d.thread ? `discord:${d.channel
 /** The event raised by the owner's first answer; its second word is the lane (`-` for none), as decision obligations read it. */
 export const answeredLine = (d: OwnerDecision): string => {
   const answer = d.answers?.[0];
-  const from = answer && answer.channel !== d.thread ? ` --from ${answer.channel}/${answer.message}` : "";
+  // A button press the lane could not take directly: its choice is the answer, and no message to point --from at.
+  const button = answer?.choice;
+  const from = answer && button === undefined && answer.channel !== d.thread ? ` --from ${answer.channel}/${answer.message}` : "";
   const value = d.kind === "request"
     ? `; ${d.file ? `the owner says the value is in ${d.file}` : `the owner's reply is message ${answer?.channel ?? "?"}/${answer?.message ?? "?"}`} (never into a report, the repo or another thread)`
     : "";
-  const close = `dori decision close ${d.id}${from} --text "..."`;
-  const head = `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}`;
+  const close = `dori decision close ${d.id}${from}${button !== undefined ? ` --choice ${button}` : ""} --text "..."`;
+  const head = `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}`
+    + (button !== undefined ? ` ${choiceLabel(d, button)} via button` : "");
   // One wording for decisions and requests: the close is the first call, and for a lane's own question it also types
   // --text into that lane (decision-relay.ts), so --text is what the lane needs to go on.
   const relay = d.source === "lane" && d.lane

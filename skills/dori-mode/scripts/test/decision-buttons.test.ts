@@ -7,7 +7,11 @@ import { ackLaneMessage, SqliteLaneMessages } from "../src/lane-messages.ts";
 import { decisionButtonRows, decideInteraction } from "../src/messenger/decision-buttons.ts";
 import { DiscordCommands } from "../src/messenger/discord-commands.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
-import { closeOwnerDecision, type DecisionContext, type DecisionTransport, openLaneDecision, openOwnerDecision } from "../src/owner-decisions.ts";
+import { DEFAULT_RESOLVE_KINDS, isDecision } from "../src/decision-obligations.ts";
+import { eventClass } from "../src/event-policy.ts";
+import {
+  answeredEventId, closeOwnerDecision, type DecisionContext, type DecisionReceipts, type DecisionTransport, openLaneDecision, openOwnerDecision, recordOwnerAnswer,
+} from "../src/owner-decisions.ts";
 import { serializeDecisionText, serializeRequestText } from "../src/runner/decision-text.ts";
 import { storePath, withState } from "./fakes.ts";
 
@@ -20,8 +24,8 @@ type Button = { label: string; style: number; custom_id: string; disabled?: bool
 /** Each button as the owner sees it: its label, then ` off` when disabled. */
 const shown = (rows: unknown): string[] => (rows as { components: Button[] }[]).flatMap((row) => row.components.map((b) => `${b.label}${b.disabled ? " off" : ""}`));
 
-test("answer buttons: one row up to 5 options, two rows for 6-9, the recommended one primary, labels cut to 80; none for a request or a lead decision", () => {
-  const lane = { id: "d7", source: "lane" as const, options: choices.options, recommend: 2 };
+test("answer buttons: one row up to 5 options, two rows for 6-9, the recommended one primary, labels cut to 80; none for a request", () => {
+  const lane = { id: "d7", options: choices.options, recommend: 2 };
   expect(decisionButtonRows(lane)).toEqual([{ type: 1, components: [
     { type: 2, style: 2, label: "1. Keep", custom_id: "dori:decide:d7:1" },
     { type: 2, style: 1, label: "2. Replace", custom_id: "dori:decide:d7:2" },
@@ -32,11 +36,10 @@ test("answer buttons: one row up to 5 options, two rows for 6-9, the recommended
   expect(Array.from(nine[1]!.components[3]!.label)).toHaveLength(80);
   expect(nine[1]!.components[3]!.style).toBe(1);
   expect(decisionButtonRows({ ...lane, kind: "request" })).toBeUndefined();
-  expect(decisionButtonRows({ ...lane, source: "lead" })).toBeUndefined();
 });
 
 test("answer buttons show the newest answer green and marked, all disabled once it is acked or undelivered or the decision closes; a withdrawal shows none", () => {
-  const lane = { id: "d7", source: "lane" as const, options: choices.options, recommend: 2, state: "answered" as const };
+  const lane = { id: "d7", options: choices.options, recommend: 2, state: "answered" as const };
   const revision = (choice: number | undefined, state: "queued" | "acked" | "undelivered") =>
     ({ rev: 1, channel: "t", message: "m", edit: 0, hash: "h", ...(choice ? { choice } : {}), target: { lane: "ap-1-1", runner: "mini", generation: 0 }, at: 1, delivery: { id: "x", state, updatedAt: 1 } });
   const queued = decisionButtonRows({ ...lane, revisions: [revision(3, "queued")] }) as { components: Button[] }[];
@@ -90,7 +93,8 @@ const world = () => {
   };
   const store = new SqliteLaneMessages(storePath(state.dir));
   const emitted: string[] = [];
-  const routing: DirectRouting = { stateDir: state.dir, store: () => store, lanes: async () => lanes, now: () => 2_000, emit: async (_id, line) => { emitted.push(line); }, log: () => {} };
+  const ids: string[] = [];
+  const routing: DirectRouting = { stateDir: state.dir, store: () => store, lanes: async () => lanes, now: () => 2_000, emit: async (id, line) => { ids.push(id); emitted.push(line); }, log: () => {} };
   const requests: HttpRequest[] = [];
   // Off: the supervisor was restarting, so Discord's answer window for the interaction has passed.
   let window = true;
@@ -121,7 +125,7 @@ const world = () => {
   const queue = () => store.list().map((m) => `${m.id}:${m.state}`);
   const relaunch = (key: string) => { lanes = lanes.map((l) => (l.key === key ? laneOf(key, 9) : l)); };
   const reconcile = () => reconcileDecisionDeliveries(state.dir, store, new Map(lanes.map((l) => [l.key, decisionTargetOf(l)] as const)), 3_000);
-  return { ctx, sent, edited, ask, click, answer, revisions, queue, store, emitted, relaunch, reconcile, restarting: () => { window = false; } };
+  return { ctx, sent, edited, ask, click, answer, revisions, queue, store, emitted, ids, relaunch, reconcile, restarting: () => { window = false; } };
 };
 
 test("a lane question's starter message carries its buttons and says so; a request's carries none", async () => {
@@ -129,7 +133,7 @@ test("a lane question's starter message carries its buttons and says so; a reque
   await w.ask("ap-1-1");
   await w.ask("ap-2-1", serializeRequestText({ need: "the 2FA code", reason: "login", waiting: "deploy", blocking: true }));
   const [question, request] = w.sent;
-  expect(question?.components).toEqual(decisionButtonRows({ id: "d1", source: "lane", options: choices.options, recommend: 2 }));
+  expect(question?.components).toEqual(decisionButtonRows({ id: "d1", options: choices.options, recommend: 2 }));
   expect(question?.content.split("\n").at(-1)).toBe("버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요.");
   expect(request?.components).toBeUndefined();
 });
@@ -166,27 +170,83 @@ test("once the lane acked the answer a click changes nothing and the buttons go 
   expect(readDecisions(w.ctx.config.stateDir).decisions[0]?.buttons).toBe("2:off");
 });
 
-test("a non-owner, a click from another channel, a closed decision and one the lane cannot take get a reply and record nothing", async () => {
+test("a non-owner, a click from another channel and a closed decision get a reply and record nothing", async () => {
   const w = world();
   const d = await w.ask("ap-1-1");
   const refused = await w.click(d.id, 1, d.thread!, "910", "999");
   expect(refused).toEqual([{ method: "POST", url: "/interactions/910/secret/callback", body: { type: 4, data: { flags: 64, content: "이 버튼은 오너만 누를 수 있습니다." } } as Sent["body"], bot: false }]);
   expect(await w.answer(d.id, 1, "100", "911")).toEqual({ content: "이 스레드의 질문 버튼이 아닙니다." });
   expect(await w.answer("d99", 1, d.thread!, "912")).toEqual({ content: "이 스레드의 질문 버튼이 아닙니다." });
-  const lead = await openOwnerDecision(w.ctx, { ...choices, source: "lead", lane: "ap-3-1" });
-  expect(await w.answer(lead.decision.id, 1, lead.decision.thread!, "913")).toEqual({ content: "이 질문은 버튼으로 바로 답할 수 없습니다. 번호를 스레드에 적어 주세요." });
-  w.relaunch("ap-1-1");
-  expect((await w.answer(d.id, 1, d.thread!, "914")).content).toBe("이 질문은 버튼으로 바로 답할 수 없습니다. 번호를 스레드에 적어 주세요.");
   await closeOwnerDecision(w.ctx, d.id, { text: "done", choice: 1, force: true });
   expect(w.edited).toEqual([{ channel: d.thread!, message: d.message!, shown: ["✓ 1. Keep off", "2. Replace off", "3. Drop off"] }]);
   expect(await w.answer(d.id, 1, d.thread!, "915")).toEqual({ content: "d1은 이미 닫힌 질문입니다.", shown: ["✓ 1. Keep off", "2. Replace off", "3. Drop off"] });
   expect(w.revisions(d.id)).toEqual([]);
-  expect(w.revisions(lead.decision.id)).toEqual([]);
+  expect(readDecisions(w.ctx.config.stateDir).decisions[0]?.answers).toBeUndefined();
   expect(w.queue()).toEqual([]);
   expect(w.emitted).toEqual([]);
 });
 
-test("a click made while the supervisor restarted is carried out: buttons updated and the reply posted in the thread; one the lane cannot take goes to the lead", async () => {
+test("a lead decision carries buttons; a click goes to the lead as urgent OWNER_DECISION_ANSWERED via button, another button as a correction, and close --choice settles it", async () => {
+  const w = world();
+  const lead = (await openOwnerDecision(w.ctx, { ...choices, source: "lead", lane: "ap-3-1" })).decision;
+  expect(w.sent[0]?.components).toEqual(decisionButtonRows(lead));
+  expect(w.sent[0]?.content.split("\n").at(-1)).toBe("버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요.");
+
+  expect(await w.answer(lead.id, 2, lead.thread!, "930")).toEqual({
+    content: "d1에 2번으로 답했습니다. 레인에 바로 전달할 수 없어 리드에게 넘겼습니다.", shown: ["1. Keep", "✓ 2. Replace", "3. Drop"],
+  });
+  const answered = w.emitted[0]!;
+  expect(answered).toStartWith(`OWNER_DECISION_ANSWERED ap-3-1 d1 blocking discord:555/${lead.thread}: Which path? choice=2 "Replace" via button; run dori decision close d1 --choice 2 --text "..." first`);
+  expect(eventClass(answered)).toBe("lead-urgent");
+  expect(isDecision(answered, DEFAULT_RESOLVE_KINDS)).toBe(true);
+  expect(w.ids[0]).toBe(answeredEventId("d1"));
+  await w.answer(lead.id, 2, lead.thread!, "930");
+  expect((await w.answer(lead.id, 2, lead.thread!, "931")).content).toBe("d1에 이미 2번으로 답했습니다.");
+  expect(w.emitted).toHaveLength(1);
+
+  expect(await w.answer(lead.id, 3, lead.thread!, "932")).toEqual({ content: "d1의 답을 3번으로 바꾸었습니다. 리드에게 정정을 넘겼습니다.", shown: ["1. Keep", "2. Replace", "✓ 3. Drop"] });
+  expect(w.emitted[1]).toBe('DECISION_ANSWER_CORRECTED ap-3-1 d1 choice=3 "Drop" replaces choice=2 via button: the owner changed the answer the lead holds; settle it with dori decision close d1 --choice 3 --text "..."');
+  expect(eventClass(w.emitted[1]!)).toBe("lead-urgent");
+  expect(w.ids[1]).toBe("decision-button:d1:932");
+  expect(w.revisions(lead.id)).toEqual([]);
+  expect(w.queue()).toEqual([]);
+
+  // The close acks and records handled only Discord messages: a click is none.
+  const calls: string[] = [];
+  const receipts: DecisionReceipts = {
+    unseen: () => ({ count: 0, lines: [] }), acked: () => false,
+    ack: async (channel, message) => { calls.push(`ack ${channel}/${message}`); },
+    handled: async (channel, message) => { calls.push(`handled ${channel}/${message}`); },
+  };
+  const closed = await closeOwnerDecision({ ...w.ctx, receipts }, lead.id, { text: "3번으로 진행", choice: 3 });
+  expect(closed.resolved).toBe(answeredEventId("d1"));
+  expect(closed.decision).toMatchObject({ state: "closed", choice: 3, buttons: "3:off" });
+  expect(closed.answers).toMatchObject({ acked: [], handled: [], left: [] });
+  expect(calls).toEqual([]);
+  expect(w.edited).toEqual([{ channel: lead.thread!, message: lead.message!, shown: ["1. Keep off", "2. Replace off", "✓ 3. Drop off"] }]);
+  expect((await w.answer(lead.id, 1, lead.thread!, "933")).content).toBe("d1은 이미 닫힌 질문입니다.");
+  expect(w.emitted).toHaveLength(2);
+});
+
+test("a click on a lane question the lane can no longer take, or whose answer the lead holds, goes to the lead; the lane's queue is untouched", async () => {
+  const w = world();
+  const d = await w.ask("ap-1-1");
+  w.relaunch("ap-1-1");
+  expect((await w.answer(d.id, 1, d.thread!, "940")).content).toBe("d1에 1번으로 답했습니다. 레인에 바로 전달할 수 없어 리드에게 넘겼습니다.");
+  expect(w.emitted).toEqual([expect.stringMatching(/^OWNER_DECISION_ANSWERED ap-1-1 d1 blocking .* choice=1 "Keep" via button; run dori decision close d1 --choice 1 /)]);
+  expect(w.revisions(d.id)).toEqual([]);
+  expect(w.queue()).toEqual([]);
+
+  // Live lane, but the owner already typed an answer the lead holds: a click joins it as a correction.
+  const other = await w.ask("ap-2-1");
+  expect(recordOwnerAnswer(w.ctx.config.stateDir, other.thread!, "msg-1", 1_500)?.first).toBe(true);
+  expect((await w.answer(other.id, 3, other.thread!, "941")).content).toBe("d2에 3번으로 답했습니다. 레인에 바로 전달할 수 없어 리드에게 넘겼습니다.");
+  expect(w.emitted[1]).toStartWith('DECISION_ANSWER_CORRECTED ap-2-1 d2 choice=3 "Drop" via button:');
+  expect(w.revisions(other.id)).toEqual([]);
+  expect(w.queue()).toEqual([]);
+});
+
+test("a click made while the supervisor restarted is carried out: buttons updated and the reply posted in the thread; one the lane cannot take goes to the lead like any other", async () => {
   const w = world();
   const d = await w.ask("ap-1-1");
   const other = await w.ask("ap-2-1");
@@ -202,7 +262,8 @@ test("a click made while the supervisor restarted is carried out: buttons update
 
   w.relaunch("ap-2-1");
   const handed = await w.click(other.id, 3, other.thread!, "921");
-  expect(handed.at(-1)?.body.content).toBe("[System] 재시작 중에 누른 버튼(d2 3번)입니다. 레인에 바로 전달할 수 없어 리드에게 넘겼습니다.");
+  expect(handed.at(-1)?.body.content).toBe("[System] 재시작 중에 누른 버튼(d2 3번)입니다. d2에 3번으로 답했습니다. 레인에 바로 전달할 수 없어 리드에게 넘겼습니다.");
+  expect(shown(handed[1]?.body.components)).toEqual(["1. Keep", "2. Replace", "✓ 3. Drop"]);
   expect(w.revisions(other.id)).toEqual([]);
-  expect(w.emitted.at(-1)).toBe(`DECISION_BUTTON_LATE ap-2-1 d2 choice=3 "Drop" from ${other.thread}/click:921 via button: pressed while the supervisor restarted, and the lane cannot take it directly; take it over with dori decision close d2`);
+  expect(w.emitted.at(-1)).toStartWith(`OWNER_DECISION_ANSWERED ap-2-1 d2 blocking discord:555/${other.thread}: Which path? choice=3 "Drop" via button; run dori decision close d2 --choice 3 `);
 });

@@ -6,7 +6,7 @@ import {
 } from "./decision-store.ts";
 import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
 import { RUNNER_LANE_CLI } from "./launch-footer.ts";
-import { closeOwnerDecision, errorText, short, syncDecisionButtons, type TickDeps } from "./owner-decisions.ts";
+import { choiceLabel, closeOwnerDecision, errorText, short, syncDecisionButtons, type TickDeps } from "./owner-decisions.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 
 /*
@@ -270,9 +270,6 @@ export const decisionNoticeText = (d: OwnerDecision, r: AnswerRevision, m: LaneM
 
 /** The owner "message" of an answer-button click (decision-inbound.ts routeDecisionClick): one per interaction. */
 export const clickMessageId = (interaction: string): string => `click:${interaction}`;
-
-/** How the lead's lines name a choice: its number and option text, `choice=2 "Replace"`. */
-export const choiceLabel = (d: Pick<OwnerDecision, "options">, choice: number): string => `choice=${choice} "${short(d.options[choice - 1] ?? "", 80)}"`;
 
 /** ` via button` when revision `r` came from an answer button, else nothing. */
 export const viaButton = (r: Pick<AnswerRevision, "message">): string => (r.message.startsWith(clickMessageId("")) ? " via button" : "");

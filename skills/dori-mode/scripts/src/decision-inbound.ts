@@ -1,7 +1,8 @@
 import type { LaneMessageStore } from "./lane-messages.ts";
-import { choiceLabel, clickMessageId, queueDecisionAnswer, type QueueOutcome, recordAnswerRevision, viaButton } from "./decision-delivery.ts";
+import { clickMessageId, queueDecisionAnswer, type QueueOutcome, recordAnswerRevision, viaButton } from "./decision-delivery.ts";
 import { type AnswerRevision, decisionTargetOf, type OwnerDecision, readDecisions, sameTarget, type TargetLane } from "./decision-store.ts";
-import { decisionButtonRows } from "./messenger/decision-buttons.ts";
+import { decisionButtonRows, decisionButtonState } from "./messenger/decision-buttons.ts";
+import { answeredEventId, answeredLine, choiceLabel, recordButtonAnswer } from "./owner-decisions.ts";
 
 /*
  * Routing an owner message to exactly one side (references/messaging.md, "Decision answers straight to the lane"):
@@ -147,18 +148,18 @@ export type DecisionClick = { readonly decision: string; readonly choice: number
 /** What a click gets: the owner's reply text, and the decision's buttons as they should now show (none when it has none). */
 export type ClickReply = { readonly content: string; readonly components?: readonly unknown[] };
 
-export const CLICK_HINT = "이 질문은 버튼으로 바로 답할 수 없습니다. 번호를 스레드에 적어 주세요.";
-export const LATE_TO_LEAD = "레인에 바로 전달할 수 없어 리드에게 넘겼습니다.";
-
 /**
  * An owner's answer-button click, routed like typing `d<ID>=<N>` in the decision's thread: when the decision is
  * delegated it becomes an answer revision of owner "message" `click:<interaction>` (so a redelivered click is the same
  * revision) and is queued for the lane, a different button before the lane acks being a correction like an edited
- * answer; anything else records nothing. Returns the owner's reply with the buttons as they should now show: a click from
- * another channel than the decision's thread is refused; a closed decision, or an answer the lane already acked, is
- * final; the choice the newest revision already holds changes nothing; a decision that cannot take a direct answer gets
- * the hint to type the number, except a late click, which goes to the lead (DECISION_BUTTON_LATE) since the owner was not
- * there to read a reply.
+ * answer. Returns the owner's reply with the buttons as they should now show: a click from another channel than the
+ * decision's thread is refused; a closed decision, or an answer the lane already acked, is final; the choice the buttons
+ * already show changes nothing.
+ *
+ * A decision that cannot take a direct answer (the lead opened it, its lane relaunched or closed, the lead already holds
+ * an answer) takes the click as an answer the lead holds (recordButtonAnswer, once per interaction, late or not): the
+ * first answer raises the urgent OWNER_DECISION_ANSWERED obligation naming the choice `via button`, a later different
+ * button the urgent DECISION_ANSWER_CORRECTED; the lead settles it with `dori decision close d<ID> --choice N`.
  */
 export const routeDecisionClick = async (routing: DirectRouting, click: DecisionClick): Promise<ClickReply> => {
   const d = readDecisions(routing.stateDir).decisions.find((x) => x.id === click.decision);
@@ -170,14 +171,21 @@ export const routeDecisionClick = async (routing: DirectRouting, click: Decision
   if (!waiting(d)) return reply(`${d.id}은 이미 닫힌 질문입니다.`);
   const newest = d.revisions?.at(-1);
   if (newest?.choice !== undefined && newest.delivery.state === "acked") return reply(`레인이 이미 ${d.id}의 ${newest.choice}번을 받았습니다. 다른 답은 스레드에 적어 주세요.`);
+  const shown = decisionButtonState(d).selected;
   const toLead = async (): Promise<ClickReply> => {
-    if (!click.late) return reply(CLICK_HINT);
-    await routing.emit(`decision-button-late:${d.id}:${click.interaction}`, `DECISION_BUTTON_LATE ${d.lane ?? "-"} ${d.id} ${choiceLabel(d, click.choice)} from ${click.channel}/${clickMessageId(click.interaction)} via button: `
-      + `pressed while the supervisor restarted, and the lane cannot take it directly; take it over with dori decision close ${d.id}`);
-    return reply(LATE_TO_LEAD);
+    const recorded = recordButtonAnswer(routing.stateDir, d.id, click.channel, clickMessageId(click.interaction), click.choice, routing.now());
+    if (!recorded?.added) return reply(recorded?.decision.state === "closed" ? `${d.id}은 이미 닫힌 질문입니다.` : `${d.id}에 이미 ${click.choice}번으로 답했습니다.`);
+    const at = recorded.first ? answeredEventId(d.id) : `decision-button:${d.id}:${click.interaction}`;
+    const line = recorded.first ? answeredLine(recorded.decision)
+      : `DECISION_ANSWER_CORRECTED ${d.lane ?? "-"} ${d.id} ${choiceLabel(d, click.choice)}${shown !== undefined ? ` replaces choice=${shown}` : ""} via button: `
+        + `the owner changed the answer the lead holds; settle it with dori decision close ${d.id} --choice ${click.choice} --text "..."`;
+    await routing.emit(at, line);
+    return reply(recorded.first || shown === undefined
+      ? `${d.id}에 ${click.choice}번으로 답했습니다. 레인에 바로 전달할 수 없어 리드에게 넘겼습니다.`
+      : `${d.id}의 답을 ${click.choice}번으로 바꾸었습니다. 리드에게 정정을 넘겼습니다.`);
   };
+  if (shown === click.choice) return reply(`${d.id}에 이미 ${click.choice}번으로 답했습니다.`);
   if (!delegated(d, await routing.lanes())) return toLead();
-  if (newest?.choice === click.choice) return reply(`${d.id}에 이미 ${click.choice}번으로 답했습니다.`);
   const m: RoutedMessage = { id: clickMessageId(click.interaction), content: `${d.id}=${click.choice}`, attachments: [] };
   if ((await revise(routing, d, click.channel, m, 0, click.choice)) === "refused") return toLead();
   return reply(newest?.choice !== undefined

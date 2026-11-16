@@ -36,7 +36,11 @@ export const DECISION_LIST_CLOSED_MS = 7 * 24 * 60 * 60_000;
 
 export type OwnerDecisionState = "posting" | "open" | "answered" | "closed";
 
-export type OwnerAnswer = { readonly channel: string; readonly message: string; readonly at: number };
+/**
+ * An owner answer the lead holds: a message in the decision's thread or channel, or an answer-button click the lane could
+ * not take directly (`message` `click:<interaction id>`, `choice` the button's option), which is no Discord message.
+ */
+export type OwnerAnswer = { readonly channel: string; readonly message: string; readonly at: number; readonly choice?: number };
 
 export type OwnerDecision = DecisionChoices & {
   /** `d<n>`. */

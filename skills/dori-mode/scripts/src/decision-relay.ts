@@ -35,9 +35,10 @@ export const relayLine = (d: OwnerDecision): string | undefined => {
   return relayFailedLine(d);
 };
 
+/** The direct answer revision that already reached the lane, unless the close settled on another choice (a button press the lead took over). */
 const answeredDirectly = (d: OwnerDecision, store: LaneMessageStore): number | undefined => {
   const r = d.revisions?.at(-1);
-  return r && r.choice !== undefined && reachedLane(store.get(r.delivery.id)) ? r.rev : undefined;
+  return r && r.choice !== undefined && (d.choice === undefined || d.choice === r.choice) && reachedLane(store.get(r.delivery.id)) ? r.rev : undefined;
 };
 
 /**

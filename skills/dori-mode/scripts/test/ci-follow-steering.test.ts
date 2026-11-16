@@ -275,6 +275,13 @@ test("an answer that already reached the lane directly is not relayed again; a l
   expect(relayLine(d)).toBe("DECISION_RELAY_SKIPPED demo-lane d1: the owner's answer r1 already reached the lane directly");
   expect(t.typed).toEqual([]);
 
+  // The lead settled on another option (a button press it took over): the lane gets that one.
+  closedDecision(t.deps.config.stateDir, lane.key, { revisions: [{ ...revision, choice: 1 }] });
+  const other = await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
+  expect(other.relay?.state).toBe("relayed");
+  expect(t.typed).toEqual(["[LEAD] Answer to your question d1 (Which store?). Choice 2. json. Use json; keep the old file. Confirm you got this message: dori report ack decision-close-d1"]);
+  t.typed.length = 0;
+
   closedDecision(t.deps.config.stateDir, lane.key, { source: "lead" });
   const lead = await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
   expect(relayLine(lead)).toStartWith("DECISION_RELAY_SKIPPED demo-lane d1: the lead opened this decision");
