@@ -97,6 +97,22 @@ export type OwnerDecision = DecisionChoices & {
   readonly attachedTo?: string;
   /** The `[System]` status message of the direct answer in the decision's thread, edited in place (decisionDeliveryTick). */
   readonly notice?: { readonly message: string; readonly text: string };
+  /** What `dori decision close` did with its text for the lane (decision-relay.ts); set once, when it closes. */
+  readonly relay?: DecisionRelay;
+};
+
+/**
+ * The close text's way to a lane decision's lane: `relayed` (typed into its pane, lane message `message`), `failed`
+ * (not typed; the supervisor tick raises urgent DECISION_RELAY_FAILED once, then sets `reportedAt`), or `skipped` (the
+ * owner's answer already reached the lane directly, or the lane is closed).
+ */
+export type DecisionRelay = {
+  readonly state: "relayed" | "failed" | "skipped";
+  readonly lane: string;
+  readonly at: number;
+  readonly message?: string;
+  readonly reason?: string;
+  readonly reportedAt?: number;
 };
 
 /**

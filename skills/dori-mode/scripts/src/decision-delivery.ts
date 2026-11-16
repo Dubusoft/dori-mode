@@ -77,7 +77,7 @@ export const recordAnswerRevision = (stateDir: string, id: string, input: Answer
   });
 
 /** States in which a lane message may have reached the lane. */
-const reachedLane = (m: LaneMessage | undefined): boolean => m?.state === "delivered" || m?.state === "acked";
+export const reachedLane = (m: LaneMessage | undefined): boolean => m?.state === "delivered" || m?.state === "acked";
 
 /**
  * The lane message of revision `r`: the answer; a correction naming the revision it replaces when `replaces` (a revision
