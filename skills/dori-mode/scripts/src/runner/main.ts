@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
-import { BSK_WATCH_EVERY_MS, browserWatch, browserWatchSettings, browserWindowCheck } from "./browser-window.ts";
+import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
 import { laneRepoOf, secretGranter } from "./secret-grant.ts";
@@ -312,13 +312,6 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     };
     guardTick();
     const stopGuard = realEvery(GUARD_SAMPLE_MS, guardTick);
-    // On macOS, a Chrome window is opened when no BrowserSkill browser has connected for a while (browser-window.ts).
-    const bskWatchSettings = browserWatchSettings(process.env);
-    for (const line of bskWatchSettings.ignored) log(`RUNNER_BSK_WATCH_SETTING ${line}`);
-    const bskWatch = browserCheck && bskWatchSettings.graceMs > 0
-      ? browserWatch({ run, now: realClock.now, log, check: browserCheck }, bskWatchSettings)
-      : undefined;
-    const stopBskWatch = bskWatch ? realEvery(BSK_WATCH_EVERY_MS, () => { void bskWatch(); }) : () => {};
     // The daily cleanup sweep of this host's caches and temp (cleanup.ts); `logs/cleanup.json` holds the last report.
     const cleanupStatus = join(ensureRunnerSubdir(runnerDir, RUNNER_PATHS.logs), CLEANUP_STATUS_FILE);
     const stopCleanup = startCleanup({
@@ -419,7 +412,6 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       stopLaneSocket();
       herdrReports?.stop();
       stopGuard();
-      stopBskWatch();
       stopCleanup();
       stopPrune();
       stopOutboxTick();
