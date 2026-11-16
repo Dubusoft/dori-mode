@@ -452,7 +452,13 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   `RUNNER_BSK_OK`, `RUNNER_BSK_WINDOW_OPENED`, `RUNNER_BSK_UNAVAILABLE` (bsk did not answer; nothing opened),
   `RUNNER_BSK_OPEN_FAILED`, `RUNNER_BSK_STILL_NONE`, or `RUNNER_BSK_PROFILE_PROBLEM` (still none and no Chrome
   `--extension-process`: Chrome's sign-in or the extension needs the owner). Starts that overlap share one check, and
-  Chrome is never killed or scripted.
+  Chrome is never killed or scripted. Between starts the runner also asks `bsk browsers` every minute: Chrome can run
+  for many minutes with the extension not connected. Once no browser has been connected for `DORI_BSK_WATCH_MINUTES`
+  (runner environment, default 5; `0` turns the watch off) it runs the same check (logged `lane=watch`), at most once per
+  `DORI_BSK_WATCH_COOLDOWN_MINUTES` (default 30). The watch logs `RUNNER_BSK_WATCH_NONE` when the count starts,
+  `RUNNER_BSK_WATCH_OPEN` before a check, `RUNNER_BSK_WATCH_RECONNECTED` when a browser is back,
+  `RUNNER_BSK_WATCH_UNAVAILABLE` when bsk stops answering (that neither starts nor ends the count) and
+  `RUNNER_BSK_WATCH_SETTING` for a setting it could not read.
 - Then, on Linux, linger is turned on and the unit is enabled and restarted. On macOS the agent is loaded into
   `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
   `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.
