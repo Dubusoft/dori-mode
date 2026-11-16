@@ -258,7 +258,9 @@ const USAGE = `dori <command> [options]
                                        go to dori handled --lane; --from names an answer given outside the thread; unseen owner
                                        messages there exit 3 DECISION_STALE with UNREAD lines (--force closes anyway); a decision
                                        in a lane's own thread covers only its first answer (DECISION_ANSWER_LEFT for the rest);
-                                       a closed one records missing handled receipts and exits 2 DECISION_ALREADY_CLOSED
+                                       a closed one records missing handled receipts and exits 2 DECISION_ALREADY_CLOSED; a
+                                       lane's own question or request gets --text typed into the lane (DECISION_RELAYED,
+                                       DECISION_RELAY_SKIPPED, or DECISION_RELAY_FAILED: hand it over yourself)
   decision list [--all] [--json]       lead-only: decisions not closed, oldest first (DECISION_NONE when none); --all adds those
                                        closed in the last 7 days
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:

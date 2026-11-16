@@ -81,6 +81,8 @@ const URGENT_KINDS = [
   "DECISION_ANSWER_UNDELIVERED",
   // A direct answer changed or withdrawn after an older revision may have reached the lane (decision-inbound.ts).
   "DECISION_ANSWER_CORRECTED",
+  // A `dori decision close` whose text could not be typed into the lane that asked (decision-relay.ts): the lead hands it over.
+  "DECISION_RELAY_FAILED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",

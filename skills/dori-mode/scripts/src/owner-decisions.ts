@@ -562,15 +562,22 @@ const threadRef = (d: OwnerDecision): string => (d.thread ? `discord:${d.channel
 export const answeredLine = (d: OwnerDecision): string => {
   const answer = d.answers?.[0];
   const from = answer && answer.channel !== d.thread ? ` --from ${answer.channel}/${answer.message}` : "";
-  const act = d.kind === "request"
-    ? `${d.file ? `the owner says the value is in ${d.file}` : `the owner's reply is message ${answer?.channel ?? "?"}/${answer?.message ?? "?"}`}: hand it to ${d.lane ? `lane ${d.lane}` : "the work that waits"} (never into a report, the repo or another thread)`
-    : undefined;
+  const value = d.kind === "request"
+    ? `; ${d.file ? `the owner says the value is in ${d.file}` : `the owner's reply is message ${answer?.channel ?? "?"}/${answer?.message ?? "?"}`} (never into a report, the repo or another thread)`
+    : "";
   const close = `dori decision close ${d.id}${from} --text "..."`;
   const head = `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}`;
-  // A request closes once the value is handed over; a decision closes first (it acks, answers and covers the answer).
-  if (act) return `${head}; ${act}, then run ${close} right away`;
-  return `${head}; run ${close} first (it acks the answer, posts the reply and records it handled; --tasks N when the answer asks for more work), then act on it${d.lane ? ` and relay it to lane ${d.lane}` : ""}`;
+  // One wording for decisions and requests: the close is the first call, and for a lane's own question it also types
+  // --text into that lane (decision-relay.ts), so --text is what the lane needs to go on.
+  const relay = d.source === "lane" && d.lane
+    ? ` and types --text into lane ${d.lane}, so write it for the lane; hand it over yourself only on DECISION_RELAY_FAILED`
+    : d.lane ? `; it does not reach lane ${d.lane}, relay it yourself` : "";
+  return `${head}${value}; run ${close} first (it acks the answer, posts the reply, records it handled${relay}; --tasks N when the answer asks for more work), then act on it`;
 };
+
+/** The lead's urgent line for a close whose text could not be typed into its lane (decision-relay.ts). */
+export const relayFailedLine = (d: Pick<OwnerDecision, "id" | "relay">): string =>
+  `DECISION_RELAY_FAILED ${d.relay?.lane ?? "-"} ${d.id}: ${d.relay?.reason ?? "not delivered"}; the close text did not reach the lane and is not retried, hand it to the lane yourself`;
 
 /** The digest event of a decision the supervisor opened from a lane question. */
 export const openedLine = (d: OwnerDecision, duplicateOf?: string): string =>
@@ -613,7 +620,8 @@ export type TickDeps = DecisionContext & {
 /**
  * The supervisor's pass over decisions.json: a decision stuck `posting` raises OWNER_DECISION_STUCK once; a missing link
  * line is posted again; a pending archive is retried (a thread Discord no longer has raises OWNER_DECISION_THREAD_GONE
- * once); closed decisions past DECISION_KEEP_CLOSED_MS are dropped. Nothing is posted
+ * once); a close whose text could not be relayed to its lane raises DECISION_RELAY_FAILED once; closed decisions past
+ * DECISION_KEEP_CLOSED_MS are dropped. Nothing is posted
  * to the decisions channel on a schedule: the lead sees open decisions in `dori inbox take`. The owner's answers themselves arrive through inbound (recordOwnerAnswer), and an answered decision left
  * unclosed is reminded as an UNRESOLVED obligation.
  */
@@ -630,6 +638,10 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
     if ((d.state === "open" || d.state === "answered") && d.thread && d.origin && !d.linkMessage && !d.linkSkipped) {
       const link = await postDecisionLink(deps, d);
       if (link.kind === "failed") log(`OWNER_DECISION_LINK_FAILED ${d.id} ${link.reason}`);
+    }
+    if (d.state === "closed" && d.relay?.state === "failed" && d.relay.reportedAt === undefined) {
+      await deps.enqueue(`decision-relay-failed:${d.id}`, relayFailedLine(d));
+      patchOne(stateDir, d.id, (x) => (x.relay ? { ...x, relay: { ...x.relay, reportedAt: now } } : x));
     }
     if (d.state === "closed" && d.archivePending && d.thread && d.goneAt === undefined) {
       try {
