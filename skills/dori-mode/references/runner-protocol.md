@@ -446,6 +446,13 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   only in short DarkWake windows, heartbeats stop and the supervisor drops the link every few minutes. `-s` is what
   keeps a DarkWake from going back to sleep, and macOS honors it only on AC power; on battery, and with the lid closed,
   the Mac still sleeps. When `caffeinate` cannot start or exits, the runner logs `RUNNER_AWAKE_FAILED` and keeps serving.
+  Before each `lane.start` a macOS runner also checks BrowserSkill once, outside the lane sandbox and without holding
+  the start up (`runner/browser-window.ts`): the extension connects bsk only while a Chrome window is open, so when
+  `bsk browsers` shows none it runs `open -b com.google.Chrome` (no URL) and rechecks for 10 s. It logs one line:
+  `RUNNER_BSK_OK`, `RUNNER_BSK_WINDOW_OPENED`, `RUNNER_BSK_UNAVAILABLE` (bsk did not answer; nothing opened),
+  `RUNNER_BSK_OPEN_FAILED`, `RUNNER_BSK_STILL_NONE`, or `RUNNER_BSK_PROFILE_PROBLEM` (still none and no Chrome
+  `--extension-process`: Chrome's sign-in or the extension needs the owner). Starts that overlap share one check, and
+  Chrome is never killed or scripted.
 - Then, on Linux, linger is turned on and the unit is enabled and restarted. On macOS the agent is loaded into
   `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
   `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.

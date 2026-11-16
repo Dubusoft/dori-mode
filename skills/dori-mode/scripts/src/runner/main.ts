@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
+import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
 import { appendSecretAudit, laneRepoOf, secretAuditPath, secretDepositor, secretGranter } from "./secret-grant.ts";
@@ -207,7 +208,11 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     let lanesForReports: RunnerLanes | undefined;
     const herdrReports = process.platform === "win32" ? undefined
       : new HerdrReportSockets({ runnerDir, log, paneOf: (key) => lanesForReports?.records()[key]?.pane });
-    const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}), ...(herdrReports ? { herdrReports } : {}) });
+    const browserCheck = browserWindowCheck(platform.os, { run, clock: realClock, log });
+    const runnerLanes = new RunnerLanes({
+      runnerDir, run, clock: realClock, policy, publish, remote,
+      ...(winSample ? { procs: hostProcs } : {}), ...(herdrReports ? { herdrReports } : {}), ...(browserCheck ? { browserCheck } : {}),
+    });
     lanesForReports = runnerLanes;
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
     // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
