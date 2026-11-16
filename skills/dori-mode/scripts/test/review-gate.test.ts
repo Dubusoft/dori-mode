@@ -164,7 +164,7 @@ describe("review gate trigger", () => {
     expect(r?.job.jobId).toMatch(/^rv-app-7-aaaaaaa-[0-9a-f]{6}$/);
     expect(r?.job.snapshot).toMatchObject({ baseRef: "dev", baseSha: sha("b"), mergeBaseSha: sha("c"), policyVersion: "t4-1" });
     expect(h.launches[0]).toMatchObject({ key: r?.job.reviewerLaneKey, thread: "t1", cwd: `/wt/app-review-${r?.job.jobId}` });
-    expect(readFileSync(join(h.dir, "review-inputs", r!.job.jobId, "diff.patch"), "utf8")).toContain("diff --git");
+    expect(readFileSync(join(h.dir, "briefs", "review-inputs", r!.job.jobId, "diff.patch"), "utf8")).toContain("diff --git");
     expect(h.kinds()).toEqual(["REVIEW_STARTED"]);
     expect(h.events[0]![1]).toStartWith(`REVIEW_STARTED ${REPO}#7 lane=author job=${r!.job.jobId} `);
   });
@@ -565,7 +565,7 @@ describe("review fix loop: answers and re-review", () => {
     expect(next.job).toMatchObject({ round: 2, previousJobId: id, responseSha256: digest(text) });
     expect(next.job.snapshot.headSha).toBe(H2);
     expect(next.job.reviewerLaneKey).not.toBe(g.jobs.get(id)!.job.reviewerLaneKey);
-    const previous = join(h.dir, "review-inputs", next.job.jobId, "previous.md");
+    const previous = join(h.dir, "briefs", "review-inputs", next.job.jobId, "previous.md");
     const md = readFileSync(previous, "utf8");
     expect(md).toContain(`# Previous review: job ${id}, round 1, head ${H7}`);
     expect(md).toContain('"id": "F1"');
@@ -740,7 +740,7 @@ describe("review fix loop: per-PR limits", () => {
     expect(res.kind).toBe("started");
     const next = g.jobs.get((res as { jobId: string }).jobId)!;
     expect(next.job).toMatchObject({ round: 3, previousJobId: second, responseSha256: digest("owner-rereview:d1") });
-    expect(readFileSync(join(h.dir, "review-inputs", next.job.jobId, "previous.md"), "utf8")).toContain("The owner dismissed these findings (decision d1)");
+    expect(readFileSync(join(h.dir, "briefs", "review-inputs", next.job.jobId, "previous.md"), "utf8")).toContain("The owner dismissed these findings (decision d1)");
     expect(await g.ensureJob(lane, h.pull(), await h.observe(g, 7, lane), h.emit)).toEqual({ kind: "running", jobId: next.job.jobId });
   });
 

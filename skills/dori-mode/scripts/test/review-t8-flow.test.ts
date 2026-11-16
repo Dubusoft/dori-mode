@@ -276,7 +276,7 @@ test("flow 2: findings -> objectDone to the author exactly once -> fix pushed an
   expect(second?.job).toMatchObject({ round: 2, previousJobId: first, snapshot: { headSha: FIX } });
   expect(second!.job.responseSha256).toMatch(/^[0-9a-f]{64}$/);
   expect(second!.job.reviewerLaneKey).toBe(`review-app-7-${FIX.slice(0, 7)}`);
-  expect(readFileSync(join(h.dir, "review-inputs", second!.job.jobId, "previous.md"), "utf8")).toContain("guarded the empty input");
+  expect(readFileSync(join(h.dir, "briefs", "review-inputs", second!.job.jobId, "previous.md"), "utf8")).toContain("guarded the empty input");
   expect(h.merges).toEqual([]);
 
   await h.submit(second!.job.jobId, "pass");

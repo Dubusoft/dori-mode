@@ -6,7 +6,7 @@ import { basename, join, resolve } from "node:path";
 import { claimGate } from "./ci-follow.ts";
 import { closeLane, type FlowDeps, objectDone } from "./done-flow.ts";
 import type { OpenPull } from "./github-events.ts";
-import { briefBody } from "./lane-files.ts";
+import { briefBody, FILE_LIMITS } from "./lane-files.ts";
 import { machineRunner } from "./lane-ops.ts";
 import { type Lane, LANE_KEY, statusOf } from "./registry.ts";
 import {
@@ -14,7 +14,8 @@ import {
   ReviewJobError, type ReviewJobRecord, ReviewJobs, sinceOwner,
 } from "./review-jobs.ts";
 import {
-  installedOutDir, launchReviewLane, REVIEW_REPORT_FILE, REVIEW_RESULT_FILE, reviewBrief, type ReviewLaunchRequest, type ReviewLaunchResult,
+  installedOutDir, launchReviewLane, REVIEW_REPORT_FILE, REVIEW_RESULT_FILE, reviewBrief, reviewInputDir, type ReviewLaunchRequest,
+  type ReviewLaunchResult,
 } from "./review-lane.ts";
 import {
   acceptReviewSubmission, isApproval, type ReceiptRejectCode, REVIEWER_CHANNEL, type ReviewErrorCode, type ReviewJob, type ReviewReceipt,
@@ -553,17 +554,26 @@ export class ReviewGate {
     if (!snap.ok) return broken(`snapshot: ${snap.detail}${fetchError ? `; fetching ${short(s.headSha)} failed first: ${fetchError}` : ""}`);
     annotate(this.jobs, this.now(), id, { snapshotPath: snap.path, snapshotStartedAt: snap.startedAt, repoDir });
     const stateDir = this.deps.config.stateDir;
-    const inputDir = join(stateDir, "review-inputs", id);
+    // Under the briefs attachment root, so the launch ships them into the lane's read-only briefs/<key>.files (the
+    // review sandbox hides the rest of the state directory) and rewrites the brief's paths to those copies.
+    const inputDir = reviewInputDir(stateDir, id);
     mkdirSync(inputDir, { recursive: true });
-    const diffPath = join(inputDir, "diff.patch"), criteriaPath = join(inputDir, "criteria.md"), prPath = join(inputDir, "pr.md");
-    writeFileSync(diffPath, diff);
+    const criteriaPath = join(inputDir, "criteria.md"), prPath = join(inputDir, "pr.md");
+    const prText = `# ${observed.title}\n\n${observed.body}\n`;
     writeFileSync(criteriaPath, observed.criteria);
-    writeFileSync(prPath, `# ${observed.title}\n\n${observed.body}\n`);
+    writeFileSync(prPath, prText);
     const previousPath = answer ? join(inputDir, "previous.md") : undefined;
-    if (answer && previousPath) writeFileSync(previousPath, answer.dismissedBy ? answer.text : previousReviewMarkdown(answer.receipt, answer.text));
+    const previousText = answer ? (answer.dismissedBy ? answer.text : previousReviewMarkdown(answer.receipt, answer.text)) : "";
+    if (previousPath) writeFileSync(previousPath, previousText);
+    // A diff past the attachment caps would refuse the launch; the lane then reads it from the snapshot with git.
+    const shipped = [observed.criteria, prText, previousText].reduce((n, t) => n + Buffer.byteLength(t), 0);
+    const diffBytes = Buffer.byteLength(diff);
+    const diffPath = diffBytes <= FILE_LIMITS.fileBytes && shipped + diffBytes <= FILE_LIMITS.totalBytes ? join(inputDir, "diff.patch") : undefined;
+    if (diffPath) writeFileSync(diffPath, diff);
     mkdirSync(join(stateDir, "briefs"), { recursive: true });
     writeFileSync(this.briefPath(reviewerLaneKey), reviewBrief(record.job, token, {
-      url: observed.url, title: observed.title, snapshotPath: snap.path, inputDir, diffPath, criteriaPath, prPath, ...(previousPath ? { previousPath } : {}),
+      url: observed.url, title: observed.title, snapshotPath: snap.path, inputDir, criteriaPath, prPath,
+      ...(diffPath ? { diffPath } : {}), ...(previousPath ? { previousPath } : {}),
     }));
     return this.launchQueued(this.jobs.get(id) ?? record, lane, emit);
   }
@@ -693,7 +703,7 @@ export class ReviewGate {
     let observed: ObservedReview;
     // Unreadable GitHub: left running; the next tick tries again and the timeout bounds it. The criteria the job was
     // started with are reused (a merge lane's job takes them from the original owner's brief, not the merge lane's).
-    const criteria = io.readText(join(this.deps.config.stateDir, "review-inputs", id, "criteria.md"));
+    const criteria = io.readText(join(reviewInputDir(this.deps.config.stateDir, id), "criteria.md"));
     try { observed = await this.observeSnapshot({ repo: job.snapshot.repo, number: job.snapshot.prNumber }, author, criteria); } catch (e) {
       console.error(`REVIEW_GATE_ERROR ${id} snapshot unreadable: ${e instanceof Error ? e.message : String(e)}`);
       return;

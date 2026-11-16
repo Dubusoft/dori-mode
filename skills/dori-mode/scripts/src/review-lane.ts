@@ -23,14 +23,22 @@ export type ReviewBriefInputs = {
   readonly url: string;
   readonly title: string;
   readonly snapshotPath: string;
-  /** `<stateDir>/review-inputs/<jobId>/` with the three files below. */
+  /** reviewInputDir(stateDir, jobId) with the files below. */
   readonly inputDir: string;
-  readonly diffPath: string;
+  /** Absent when the diff exceeds the attachment caps: the lane then runs `git diff` in the snapshot. */
+  readonly diffPath?: string;
   readonly criteriaPath: string;
   readonly prPath: string;
   /** A re-review: the previous round's findings and the author's answers (`previous.md`). */
   readonly previousPath?: string;
 };
+
+/**
+ * Where the supervisor writes a review job's inputs: under the `<stateDir>/briefs` attachment root (lane-files.ts
+ * LEAD_ATTACHMENT_ROOTS), so the review lane's launch ships the files its brief names into the lane's read-only
+ * briefs/<key>.files. The review sandbox hides the rest of the state directory.
+ */
+export const reviewInputDir = (stateDir: string, jobId: string): string => join(stateDir, "briefs", "review-inputs", jobId);
 
 /** Where the supervisor installs a lane's DORI_LANE_OUT files after its done claim (lane-files.ts installLaneReports). */
 export const installedOutDir = (stateDir: string, laneKey: string): string => join(dirname(resolve(stateDir)), "research", laneKey);
@@ -66,7 +74,9 @@ export const reviewBrief = (job: ReviewJob, token: string, inputs: ReviewBriefIn
     "## Snapshot",
     `- Snapshot worktree (read-only, detached at the head): ${inputs.snapshotPath}`,
     `- Head ${s.headSha}; base ${s.baseRef} at ${s.baseSha}; merge base ${s.mergeBaseSha}; policy ${s.policyVersion}.`,
-    `- Diff (merge base...head): ${inputs.diffPath}`,
+    inputs.diffPath
+      ? `- Diff (merge base...head): ${inputs.diffPath}`
+      : `- Diff (merge base...head): too large to attach; read it with \`git -C ${inputs.snapshotPath} diff ${s.mergeBaseSha} ${s.headSha}\``,
     `- Review criteria with ids: ${inputs.criteriaPath}`,
     `- PR title and body: ${inputs.prPath}`,
     ...(inputs.previousPath ? [`- Previous review round and the author's answers: ${inputs.previousPath}`] : []),
@@ -80,7 +90,7 @@ export const reviewBrief = (job: ReviewJob, token: string, inputs: ReviewBriefIn
     `   "$DORI_LANE_OUT/${REVIEW_BODY_FILE}" with verdict "findings" (one finding per failing command, criterionId C2) and`,
     `   "$DORI_LANE_OUT/${REVIEW_RESULT_FILE}" with source "qa" and taskRecord null. Then go to step 7.`,
     `4. Otherwise spawn exactly one subagent with the task tool, subagent_type "${GATE_REVIEWER_AGENT}". Give it: the goal (review job`,
-    `   ${job.jobId} of ${s.repo}#${s.prNumber}), the criteria file with its ids, the snapshot path, base and head SHAs, the diff path,`,
+    `   ${job.jobId} of ${s.repo}#${s.prNumber}), the criteria file with its ids, the snapshot path, base and head SHAs, the diff ${inputs.diffPath ? "path" : "command"},`,
     "   your QA matrix, and the ReviewBody contract below. Tell it: write NO files except its body file",
     `   "$DORI_LANE_OUT/${REVIEW_BODY_FILE}", run no command longer than 60 s, and answer with exactly one JSON object.`,
     ...(inputs.previousPath ? [
