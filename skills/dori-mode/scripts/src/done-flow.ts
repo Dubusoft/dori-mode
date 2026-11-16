@@ -60,11 +60,11 @@ export type FlowDeps = {
    */
   readonly blockTask?: TaskBlocker;
   /**
-   * Close hold (merge-pause.ts mergePauseHolds): true while the lane waits on a merge that cannot happen now, so the
-   * watcher neither closes nor objects to the lane (nor queues its worktrees), past closeAfterMin and mergeWaitMaxMin
-   * too, until every bound PR reads merged. Absent (`dori watch`), nothing is held.
+   * D11 close hold (review-gate.ts ReviewGate.holdsLane): true while a review of a PR the lane's claim binds is pending,
+   * so the watcher neither closes nor objects to the lane (nor queues its worktrees), past closeAfterMin and
+   * mergeWaitMaxMin too, until every bound PR reads merged. Absent (`dori watch`), nothing is held.
    */
-  readonly mergeHold?: (lane: Lane) => Promise<boolean>;
+  readonly reviewHold?: (lane: Lane) => Promise<boolean>;
 };
 
 /**
@@ -629,7 +629,7 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
   }
   if (why.length) return { waiting: false, why };
   if (deps.clock.now() - start < maxMin * 60_000) return { waiting: true, why: [] };
-  return { waiting: false, why: [`not merged within ${maxMin} min of the claim (mergeWaitMaxMin): the supervisor could not merge it; check its checks and merge state`] };
+  return { waiting: false, why: [`not merged within ${maxMin} min of the claim (mergeWaitMaxMin): the supervisor could not merge it; check its checks, reviews and merge state`] };
 };
 
 /**
@@ -721,6 +721,8 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   let lane = listed;
   let claim = lane.claim;
   if (statusOf(lane) !== "done-claimed" || !claim) return;
+  // A review lane's claim is the review gate's to take in and close (D7); the done watcher never settles it.
+  if (lane.review) return;
   const machine = machineClose(lane);
   if (!claim.emitted) {
     // Enqueued before the emitted mark is saved: a crash in between repeats the announcement instead of losing it
@@ -747,8 +749,8 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
     if (!merged) return;
     evidence = `${claim.evidence} (closed at once: ${merged})`;
   }
-  // A merge hold keeps the lane open (no close, objection or worktree cleanup) until every bound PR is merged.
-  if (deps.mergeHold && (await deps.mergeHold(lane)) && "why" in (await laneMerges(deps, lane))) return;
+  // D11: a pending review holds the lane open (no close, objection or worktree cleanup) until every bound PR is merged.
+  if (deps.reviewHold && (await deps.reviewHold(lane)) && "why" in (await laneMerges(deps, lane))) return;
   const settled = await settle(deps, lane, evidence, start ?? deps.clock.now());
   if (settled === undefined) return;
   const line = settled.line;

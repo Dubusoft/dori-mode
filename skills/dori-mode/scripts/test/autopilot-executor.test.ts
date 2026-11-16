@@ -217,7 +217,7 @@ test("binding admission HOLD after a successful placement stays held and resumes
   const result = await runExecutor({
     ...deps, admit: async (input, placed) => {
       expect(placed.plan.check.verdict.ok).toBe(true);
-      const verdict = { ok: false, reasons: ["launch slots 0 on machine local: 1 pending launch(es) fill the pane cap 2"] };
+      const verdict = { ok: false, reasons: ["review reserve 1 on machine local: author slots 0"] };
       const queue = enqueueLaunch(dir, { ...input, mode: undefined, queuedAt: new Date(T0).toISOString(), reasons: verdict.reasons });
       return { kind: "held", target: placed.target, verdict, queued: queue.length };
     },

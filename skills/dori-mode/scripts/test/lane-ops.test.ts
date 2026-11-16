@@ -77,6 +77,15 @@ const ALL = {
   },
 };
 
+test("review start selects the review profile ahead of the ordinary sandbox profile", async () => {
+  const call = recording(ALL);
+  await laneOps(call, clock()).start({
+    key: "review-1", briefText: "Review", done: "closed a/b#1", thread: "none", sandbox: true, review: true,
+    mode: "ulw", model: "m", keywords: "ulw",
+  });
+  expect(call.seen[0]).toMatchObject({ fn: "call", type: "lane.start", body: { agentProfile: "review", sandbox: true } });
+});
+
 describe("laneOps: one runner call per method", () => {
   const cases: readonly [keyof LaneOps, (ops: LaneOps) => Promise<unknown>, Invocation, unknown][] = [
     ["panes", (o) => o.panes("box"), { fn: "query", label: "box", type: "q.panes", body: {} }, [PANE]],

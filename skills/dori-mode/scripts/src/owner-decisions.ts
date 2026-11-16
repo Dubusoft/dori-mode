@@ -10,6 +10,8 @@ import { MessengerError } from "./messenger/http.ts";
 import { type DecisionChoices, parseDecisionText, parseRequestText } from "./runner/decision-text.ts";
 import { appendToMessage, closedByOwner } from "./thread-followup.ts";
 
+import { recordReviewDecision, REVIEW_DECISION_OUTCOMES, type ReviewDecisionOutcome, ReviewJobs } from "./review-jobs.ts";
+import type { ReviewCapDecision } from "./decision-store.ts";
 /** What opening, closing and the tick need from Discord; the Discord client fits it. */
 export type DecisionTransport = {
   /** `components` (action rows) ride under the message, as Discord.send puts them. */
@@ -198,6 +200,7 @@ export type DecisionSpec = DecisionChoices & {
   readonly target?: DecisionTarget;
   /** A lead decision's `--relay-to`: the same key as `lane`. */
   readonly relayTo?: string;
+  readonly reviewCap?: ReviewCapDecision;
 };
 
 export const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
@@ -301,6 +304,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
       ...(spec.target ? { target: spec.target } : {}), ...(spec.relayTo ? { relayTo: spec.relayTo } : {}),
+      ...(spec.reviewCap ? { reviewCap: spec.reviewCap } : {}),
       ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
       ...(attach ? { thread: attach.thread, attachedTo: attach.id, linkSkipped: `posted in ${attach.id}'s thread`, ...(attach.inLaneThread ? { inLaneThread: true } : {}) } : {}),
     };
@@ -372,6 +376,8 @@ export type CloseResult = {
   readonly linkNote?: string;
   /** What the close did with the owner's answer messages (set when the context carries receipts). */
   readonly answers?: AnswerOutcome;
+  /** The outcome a review limit decision's choice recorded on its capped job. */
+  readonly review?: { readonly jobId: string; readonly outcome: ReviewDecisionOutcome };
 };
 
 export type AnswerRef = { readonly channel: string; readonly message: string };
@@ -463,6 +469,9 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   if (options.choice !== undefined && (!Number.isInteger(options.choice) || options.choice < 1 || options.choice > d.options.length)) {
     throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: --choice must be 1-${d.options.length}`);
   }
+  if (d.reviewCap && options.choice === undefined && !options.cancel) {
+    throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: a review limit decision closes with --choice 1-${d.options.length} (or --cancel)`);
+  }
   const tasks = options.tasks ?? 1;
   const targets = answerTargets(d, options.from);
   const acked: AnswerRef[] = [];
@@ -481,6 +490,15 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
       try { await receipts.ack(ref.channel, ref.message); acked.push(ref); }
       catch (e) { ackFailed.push({ ...ref, error: errorText(e) }); }
     }
+  }
+  // A review limit decision's outcome is recorded on its job first too: the review gate reads it from there.
+  let review: CloseResult["review"];
+  const outcome = d.reviewCap && options.choice !== undefined ? REVIEW_DECISION_OUTCOMES[options.choice - 1] : undefined;
+  if (d.reviewCap && outcome) {
+    try {
+      recordReviewDecision(new ReviewJobs(stateDir), ctx.now(), d.reviewCap.jobId, d.id, outcome);
+      review = { jobId: d.reviewCap.jobId, outcome };
+    } catch (e) { throw new OwnerDecisionError("DECISION_REVIEW_FAILED", `DECISION_REVIEW_FAILED ${id}: ${errorText(e)}; nothing closed`); }
   }
   let archivePending: string | undefined;
   if (d.thread) {
@@ -536,7 +554,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     answers = { tasks: closed.closeTasks ?? tasks, acked, ackFailed, left: targets.left.map(refOf), ...recorded };
   }
   const decision = readDecisions(stateDir).decisions.find((x) => x.id === id) ?? closed;
-  return { decision, ...(buttonsNote ? { buttonsNote } : {}), ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}) };
+  return { decision, ...(buttonsNote ? { buttonsNote } : {}), ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}), ...(review ? { review } : {}) };
 };
 
 /**

@@ -21,6 +21,8 @@ const holdFile = (stateDir: string): string => join(stateDir, "launch-hold.json"
 
 /** A launch that `dori launch` answered HOLD for; it waits in launch-hold.json until it launches or is dropped. */
 export type QueuedLaunch = {
+  /** Internal review launch, preserved while it waits for room. */
+  readonly review?: true;
   readonly key: string;
   readonly title: string;
   readonly done: string;

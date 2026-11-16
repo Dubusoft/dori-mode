@@ -8,4 +8,4 @@ const { stateDir, check, key, now, barrier } = workerData as {
 const gate = new Int32Array(barrier);
 parentPort!.postMessage("ready");
 Atomics.wait(gate, 0, 0);
-parentPort!.postMessage(claimSlot(stateDir, check, key, now));
+parentPort!.postMessage(claimSlot(stateDir, check, key, "author", now));

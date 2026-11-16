@@ -46,8 +46,8 @@ export type Tunables = {
    */
   readonly mergeWaitMaxMin: number;
   /**
-   * Minutes an open lane PR may stay unmergeable for a reason only a person fixes (claimed but no checks, a blocked
-   * merge state or a draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
+   * Minutes an open lane PR may stay unmergeable for a reason only a person fixes (claimed but no checks, review or
+   * draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
    */
   readonly mergeStallMin: number;
   /** Digest events wait for an urgent one, but never longer than this. */

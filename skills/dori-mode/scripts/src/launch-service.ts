@@ -41,7 +41,7 @@ export const placeLaunch = async (deps: Pick<FlowDeps, "ops" | "config"> & Parti
   const { config } = deps;
   const plan = await planLaunch(input, config.placement, async (machine) => {
     const check = await checkMachine(deps.ops, config, machine);
-    return check.verdict.ok ? { ...check, verdict: precheckSlots(config.stateDir, check, deps.clock?.now() ?? Date.now(), input.key).verdict } : check;
+    return check.verdict.ok ? { ...check, verdict: precheckSlots(config.stateDir, check, deps.clock?.now() ?? Date.now(), input.review ? "review" : "author", input.key).verdict } : check;
   }, await placementReports(config.stateDir));
   const target = plan.check.machine;
   const machine = target === LOCAL_MACHINE ? undefined : target;
@@ -66,7 +66,7 @@ export type LaunchOutcome =
 export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: PlacedLaunch, err: (line: string) => void): Promise<LaunchOutcome> => {
   const { stateDir } = deps.config;
   const verdict = placed.plan.check.verdict.ok
-    ? claimSlot(stateDir, placed.plan.check, input.key, deps.clock.now())
+    ? claimSlot(stateDir, placed.plan.check, input.key, input.review ? "review" : "author", deps.clock.now())
     : placed.plan.check.verdict;
   if (!verdict.ok) {
     const repos = doneRepos(input.done);
@@ -76,6 +76,7 @@ export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: Pl
       ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}), ...(input.task !== undefined ? { task: input.task } : {}),
       ...(placed.machine ? { machine: placed.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
       ...(input.grants?.length ? { grants: input.grants } : {}),
+      ...(input.review ? { review: true as const } : {}),
     });
     return { kind: "held", target: placed.target, verdict, queued: queue.length };
   }
@@ -100,7 +101,7 @@ export type MachineHosts = {
 
 export const hostSummary = (c: MachineCheck, stateDir?: string, now = Date.now()): HostSummary => {
   const admission = stateDir && c.paneCap !== undefined ? precheckSlots(stateDir, c, now) : undefined;
-  const free = admission ? admission.free : c.freeSlots;
+  const free = admission ? admission.authorAdmissible : c.freeSlots;
   const slots = free === undefined || free === Infinity ? {} : { slots: free };
   const verdict = admission?.verdict ?? c.verdict;
   const reserved = admission?.reservedKeys.length ? { reservedKeys: admission.reservedKeys } : {};

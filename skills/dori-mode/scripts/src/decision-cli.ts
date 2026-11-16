@@ -162,6 +162,7 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
     });
     const did = closed.decision.id;
     console.log(`DECISION_CLOSED ${did}`);
+    if (closed.review) console.log(`DECISION_REVIEW_RECORDED ${did} job=${closed.review.jobId} outcome=${closed.review.outcome}`);
     const { relayDecisionClose, relayLine } = await import("./decision-relay.ts");
     const relayed = relayLine(await relayDecisionClose(deps, closed.decision));
     if (relayed) console.log(relayed);

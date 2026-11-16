@@ -7,10 +7,13 @@ import { replaceFileAtomic } from "./durable-write.ts";
 
 /**
  * The operational rollback switch of the supervisor's automatic merges (`dori merge pause|resume|status`). While the
- * pause file exists CI follow-up makes no `gh pr merge` at all (ci-follow.ts, right before the merge, after every other
- * check) and lanes waiting on a merge stay held (supervise-loop.ts withMergePauseHold). Every reader reads the file
- * fresh, so a CLI change takes effect on the supervisor's next pass without a restart. Resuming only removes the file:
- * the next pass checks each PR again (mergeGate, claimGate) before it merges. The file keeps its historical name.
+ * pause file exists CI follow-up makes no `gh pr merge` at all (ci-follow.ts, right before the merge, after the full
+ * gate), review jobs and receipts go on, lanes waiting on a merge stay held (supervise-loop.ts withReviewHold) and the
+ * author lane's status message carries `merge paused: <reason>` (review-status.ts). Every reader reads the file fresh,
+ * so a CLI change takes effect on the supervisor's next pass without a restart. Resuming only removes the file: the next
+ * pass merges through the whole gate again (mergeGate, claimGate, and an approval of the snapshot observed then), so a
+ * receipt that went stale during the pause never merges. There is deliberately no switch that skips the review gate:
+ * pausing is the only rollback.
  */
 
 export const MERGE_PAUSE_FILE = "review-merge-pause.json";
@@ -49,8 +52,8 @@ const pauseDetail = (pause: MergePause): string => `${mergePausedText(pause)} (s
 
 /**
  * Whether the pause keeps `lane` open: while paused, a lane whose claim binds any PR waits on a merge that cannot happen
- * now, so the done watcher neither closes nor objects to it (done-flow.ts mergeHold, still only until every bound PR
- * reads merged). Not paused: false.
+ * now, so the done watcher neither closes nor objects to it (done-flow.ts reviewHold, still only until every bound PR
+ * reads merged). Not paused: false, and the review gate's own hold decides alone.
  */
 export const mergePauseHolds = (stateDir: string, lane: Lane): boolean =>
   readMergePause(stateDir) !== undefined && (lane.claim?.pulls?.length ?? 0) > 0;
@@ -81,7 +84,7 @@ export const mergePauseMain = (args: readonly string[], deps: MergePauseDeps): n
   if (sub !== "pause" && parsed.values.reason !== undefined) { deps.err(`--reason is not an option of merge ${sub}\n${MERGE_USAGE}`); return 2; }
   const current = readMergePause(deps.stateDir);
   if (sub === "status") {
-    deps.out(current ? `MERGE_PAUSED ${pauseDetail(current)}` : "MERGE_ACTIVE automatic merges run");
+    deps.out(current ? `MERGE_PAUSED ${pauseDetail(current)}` : "MERGE_ACTIVE automatic merges run through the review gate");
     return 0;
   }
   if (sub === "pause") {
@@ -95,6 +98,6 @@ export const mergePauseMain = (args: readonly string[], deps: MergePauseDeps): n
   }
   if (!current) { deps.out("MERGE_NOT_PAUSED"); return 0; }
   rmSync(mergePausePath(deps.stateDir), { force: true });
-  deps.out("MERGE_RESUMED merges go on at the next poll");
+  deps.out("MERGE_RESUMED merges go on through the full review gate at the next poll");
   return 0;
 };
