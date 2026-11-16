@@ -26,7 +26,7 @@
 # credential stores in CREDENTIALS below (~/.dori/env, secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube,
 # gpg, docker, git and registry logins, keyrings, browser profiles, shell history). ~/.ssh is refused but for config,
 # known_hosts and *.pub. Of ~/.config only gh (but for its hosts.yml login: a lane
-# gets GH_TOKEN only through the secret broker) and git are readable. A unix socket connect is not a file read to
+# gets GH_TOKEN only through its environment at launch (dori secret env)) and git are readable. A unix socket connect is not a file read to
 # Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
@@ -40,7 +40,7 @@
 set -eu
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
-# through the secret broker); the Linux template and `dori doctor` use the same list. ~/.config is refused already, but
+# through its environment at launch (dori secret env)); the Linux template and `dori doctor` use the same list. ~/.config is refused already, but
 # for gh and git; the profile refuses these after the gh/git grant, so ~/.config/gh/hosts.yml stays hidden.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure

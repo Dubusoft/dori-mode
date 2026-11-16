@@ -127,7 +127,7 @@ test("--help prints each lane command's usage with exit 0 and sends nothing; aft
     [["claim-done", "--help"], "usage: dori claim-done <key>"],
     [["lane", "status", "--help"], "usage: dori lane status"],
     [["heavy", "--help"], "usage: dori heavy <label>"],
-    [["secret", "exec", "--help"], "usage: dori secret exec"],
+    [["secret", "env", "--help"], "usage: dori secret env"],
   ] as const) {
     const r = io();
     expect(await laneCliMain([...args], { env, connect: sock.connect, ...r.deps })).toBe(0);

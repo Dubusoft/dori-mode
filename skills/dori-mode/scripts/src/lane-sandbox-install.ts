@@ -11,7 +11,7 @@ export const installedLaneSandbox = (home: string): string => join(home, ".local
 /**
  * Credential stores and secrets under $HOME no lane may read, files and directories alike: the one list both lane
  * sandbox templates hide (rendered into their CREDENTIALS block by laneSandboxScript) and `dori doctor` probes. A lane
- * gets a credential only through the secret broker. An entry may be a glob (* and ? within one path component, [...] a
+ * gets a credential only through its environment at launch (dori secret env). An entry may be a glob (* and ? within one path component, [...] a
  * class): Linux hides each existing match, macOS refuses every path it matches. Paths that need a subtree hidden with parts of it re-opened
  * (~/.dori/runner, ~/.ssh, ~/.config) are handled by each template itself, not listed here.
  */

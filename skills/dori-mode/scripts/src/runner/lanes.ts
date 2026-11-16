@@ -522,7 +522,7 @@ export class RunnerLanes {
         ...(granted?.read.length ? [`LANE_SANDBOX_RO=${quote(granted.read.join(":"))}`] : []),
       ];
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
-      command = [...env, ...argv.map(quote)].join(" ");
+      command = `export ${env.join(" ")}; eval "$(${quote(this.deps.remote ? join(this.deps.runnerDir, "bin", "dori") : "dori")} secret env)"; ${argv.map(quote).join(" ")}`;
     }
     // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
     if (shell === "posix") this.deps.herdrReports?.open(key);

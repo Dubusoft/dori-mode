@@ -296,7 +296,7 @@ test("footer: every lane is told to use dori report and never a pane; a remote l
   expect(on.brief).not.toContain("w:lead");
   expect(on.brief).not.toContain("[REPORT] cli-lane |");
   // Credentials come only through the broker, through the lane's own dori.
-  expect(on.brief).toContain("`dori secret exec NAME [NAME...] -- <command>`");
+  expect(on.brief).toContain("Every stored secret arrives in the lane environment at launch");
   expect(on.brief).toContain("`dori secret run <op>`");
   // A lane registered by an older dori (no reportVia) is told the same: no footer types into the lead's pane (D4).
   const old = footer({ ...on.lane, key: "old-lane", reportVia: undefined });

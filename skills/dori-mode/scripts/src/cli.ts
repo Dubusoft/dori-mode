@@ -5,7 +5,7 @@ import { homedir, loadavg, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
-import { alertsChannelOf, configPath, grantSecretRule, loadConfig } from "./config.ts";
+import { alertsChannelOf, configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import { discordThreadOf, resolveTarget, withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
@@ -123,7 +123,7 @@ const laneContext = async (env: Readonly<Record<string, string | undefined>>, ru
 };
 
 // The lane-mode gate runs before anything else (help, setup, runner *, loadConfig): inside a lane dori takes only
-// report, claim-done, report ack, lane status, heavy and secret exec, all over the runner's lane socket, and opens no registry,
+// report, claim-done, report ack, lane status, heavy and secret env, all over the runner's lane socket, and opens no registry,
 // store, journal, inbox or state-dir file.
 {
   const laneRunnerDir = defaultRunnerDir();
@@ -188,7 +188,7 @@ const USAGE = `dori <command> [options]
   close  <key> --cancelled --reason TEXT [--force]   lead-only: close a lane whose work was cancelled or whose Done can never hold;
                                        Done signals are not checked, the lane is recorded closed as cancelled with the reason
                                        inside a lane (DORI_LANE_KEY, or a pane its runner knows) dori takes only report, claim-done, report ack,
-                                       lane status, heavy, secret exec and secret run (alias host <op>) (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
+                                       lane status, heavy, secret env and secret run (alias host <op>) (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
                                        supervisor (RUNNER_UNAVAILABLE, exit 2, while it is down)
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
   resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
@@ -244,10 +244,10 @@ const USAGE = `dori <command> [options]
   schedule list [--json] | schedule remove <name> | schedule run-now <name>   jobs with their next and last run; run one now
   repos add/remove <owner/repo>        manage this machine's GitHub watched repos
   repos list                          print this machine's watched repos as JSON
-  secret add NAME | secret update NAME   store a secret for lanes to request by name; the value is read from stdin only (hidden prompt on a terminal), never argv
-  secret list [--json]                 stored secret names and backend (systemd-creds or plain); values are never printed
+  secret add NAME | secret update NAME   store a secret shared with every lane at launch; the value is read from stdin only (hidden prompt on a terminal), never argv
+  secret list [--json]                 stored secret names and backend (cred or plain); values are never printed
   secret delete NAME                   remove a stored secret
-  secret exec NAME... -- <cmd>         inside a lane: run cmd with the allowlisted secrets in its environment only
+  secret env                          inside a lane: export every stored secret as POSIX shell lines (loaded at launch)
   secret run <op> | host <op>          inside a lane: the supervisor host runs config secretCommands.<op> and prints its redacted output
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
@@ -932,8 +932,7 @@ try {
     case "secret": {
       const [action, name, ...extra] = flags.positionals;
       const usage = "usage: dori secret add NAME | dori secret update NAME | dori secret list [--json] | dori secret delete NAME";
-      if (action === "exec") die("SECRET_EXEC_LANE_ONLY dori secret exec runs inside a lane; it asks the runner for allowlisted names", 2);
-      if (action === "put") die("SECRET_PUT_LANE_ONLY dori secret put runs inside a lane; on the host use dori secret add or update", 2);
+      if (action === "env") die("SECRET_ENV_LANE_ONLY dori secret env runs inside a lane", 2);
       if (extra.length || Object.keys(flags.values).some((flag) => flag !== "json" || action !== "list")) die(usage, 2);
       const store = new SecretStore();
       try {
@@ -955,7 +954,6 @@ try {
           }
           const entry = action === "add" ? await store.add(name, value) : await store.update(name, value);
           console.log(`${action === "add" ? "SECRET_ADDED" : "SECRET_UPDATED"} ${entry.name} backend=${entry.backend}`);
-          if (entry.backend === "plain") console.error(`SECRET_PLAINTEXT_FALLBACK ${entry.name} stored as a 0600 plain file: systemd-creds --user is unavailable (see dori doctor)`);
         } else die(usage, 2);
       } catch (e) {
         if (e instanceof SecretStoreError) die(e.message);
@@ -1605,7 +1603,6 @@ try {
         return {
           config, now: realClock.now, home: homedir(),
           get transport() { return discord(); },
-          secretGrant: (names, to) => grantSecretRule(configPath(), names, to),
           ...(withReceipts ? { receipts } : {}),
         };
       };
@@ -1725,10 +1722,6 @@ try {
         if (closed.archivePending) console.log(`DECISION_ARCHIVE_PENDING ${did}: ${closed.archivePending}`);
         if (closed.resolved) console.log(`DECISION_RESOLVED_EVENT ${did} ${closed.resolved}`);
         if (closed.linkNote) console.log(`DECISION_LINK_NOTE ${did}: ${closed.linkNote}`);
-        if (closed.granted) {
-          const g = closed.granted;
-          console.log(`DECISION_SECRET_GRANTED ${did} ${g.names.join(",")} ${"lane" in g.to ? `lane=${g.to.lane}` : `repo=${g.to.repo}`} changed=${g.changed.join(",") || "-"}`);
-        }
         break;
       }
       if (sub === "list") {

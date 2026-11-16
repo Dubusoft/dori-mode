@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { SecretRule } from "../src/config.ts";
 import { SecretStoreError } from "../src/secret-store.ts";
 import { enrollRunner, RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
@@ -21,15 +20,14 @@ import { withState } from "./fakes.ts";
 /**
  * The whole remote secret path with real parts: enrollment and the signed handshake (SupervisorAuth/RunnerAuth) over
  * a real unix socket into `acceptRunners` with `supervisorSecretHandler`, a real `RunnerClient` with real state and
- * outbox files, the real lane socket with `remoteSecretGranter`, and `laneCliMain secret exec` spawning a real child.
- * Only the registry, the config rules and the store are fakes. Every line on the runner<->supervisor link, every log
+ * outbox files, the real lane socket with `remoteSecretGranter`, and `laneCliMain secret env` exporting into a real shell.
+ * Only the registry, the store are fakes. Every line on the runner<->supervisor link, every log
  * line and every file under both state directories is checked for the throwaway value.
  */
 
 const LABEL = "r1";
 const HOST = "host-1";
 const VALUE = "dori-test-throwaway-123";
-const RULES: Record<string, SecretRule> = { API_TOKEN: { lanes: ["lane-a", "lane-b"], repos: [] }, OTHER_TOKEN: { lanes: ["nobody"], repos: [] } };
 const STORE: Record<string, string> = { API_TOKEN: VALUE, OTHER_TOKEN: VALUE };
 /** The supervisor's registry: lane-b exists but belongs to another runner. */
 const OWNERS: Record<string, string> = { "lane-a": LABEL, "lane-b": "r2" };
@@ -70,8 +68,7 @@ const system = async () => {
     laneOwner: (key) => OWNERS[key],
     runnerUnsandboxed: () => false,
     granter: supervisorGranter({
-      stateDir: supDir, rules: async () => RULES, commands: async () => ({}), now: realClock.now, log,
-      store: { read: async (name) => { if (!Object.hasOwn(STORE, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`); return STORE[name] as string; } },
+      store: { readAll: async () => new Map(Object.entries(STORE)), read: async (name) => { if (!Object.hasOwn(STORE, name)) throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING ${name}`); return STORE[name] as string; } },
     }),
     log,
   });
@@ -99,21 +96,21 @@ const system = async () => {
   }, () => { throw new Error("nothing is published in this test"); }, log);
   cleanups.push(() => { stopLane(); laneListener.close(); });
 
-  /** `dori secret exec <names> -- <cmd>` as lane `key` holding `token`; extra env reaches the child. */
-  const lane = async (key: string, token: string, args: readonly string[], env: Record<string, string> = {}) => {
+  /** Pull the environment as the authenticated lane. */
+  const lane = async (key: string, token: string, env: Record<string, string> = {}) => {
     const tokenFile = join(tmp.dir, "lane", `${key}.token`);
     writeFileSync(tokenFile, `${token}\n`, { mode: 0o600 });
     const out: string[] = [];
     const err: string[] = [];
-    const code = await laneCliMain(["secret", "exec", ...args], {
+    const code = await laneCliMain(["secret", "env"], {
       env: { PATH: process.env.PATH, DORI_LANE_KEY: key, DORI_LANE_TOKEN_FILE: tokenFile, ...env },
       connect: connectUnix(lanePath), out: (l) => { out.push(l); }, err: (l) => { err.push(l); }, runnerDir,
     });
-    logs.push(...out, ...err);
+    logs.push(...err);
     return { code, out, err };
   };
 
-  /** Nothing anywhere carries the value: the wire, every log line, every file of both sides (sqlite, WAL, audit, keys). */
+  /** Nothing anywhere carries the value: the wire, every log line, every file of both sides (sqlite, WAL, keys). */
   const leakCheck = async (): Promise<void> => {
     await Promise.all(handled);
     expect(wire.length).toBeGreaterThan(0);
@@ -129,39 +126,24 @@ const system = async () => {
 const secretFrames = (wire: readonly string[], type: string) => wire.map((l) => JSON.parse(l) as { type: string; body: Record<string, unknown> }).filter((f) => f.type === type);
 
 describe("remote secrets end to end", () => {
-  test("a granted name reaches the child's env; only a sealed box crosses the link", async () => {
+  test("all values reach the lane environment and only sealed boxes cross the link", async () => {
     const s = await system();
-    const run = await s.lane("lane-a", TOKENS["lane-a"] as string, ["API_TOKEN", "--", "sh", "-c", 'test "$API_TOKEN" = "$EXPECTED"'], { EXPECTED: VALUE });
-    expect(run).toEqual({ code: 0, out: [], err: [] });
-    const answers = secretFrames(s.wire, "secret.value");
-    expect(answers).toHaveLength(1);
-    expect(answers[0]?.body).toMatchObject({ ok: true, sealed: { n: expect.any(String), c: expect.any(String) } });
-    expect(secretFrames(s.wire, "secret.get")[0]?.body).toMatchObject({ key: "lane-a", names: ["API_TOKEN"] });
-    expect(s.masked).toEqual([VALUE]);
-    expect(s.logs).toContain(`RUNNER_SECRET_GRANTED runner=${LABEL} lane=lane-a names=API_TOKEN`);
-    expect(s.logs).toContain("RUNNER_SECRET_GRANTED lane=lane-a names=API_TOKEN");
-    // A wrong value would fail the child: the env check is real, not vacuous.
-    expect((await s.lane("lane-a", TOKENS["lane-a"] as string, ["API_TOKEN", "--", "sh", "-c", 'test "$API_TOKEN" = "$EXPECTED"'], { EXPECTED: "not-it" })).code).toBe(1);
-    expect(readFileSync(join(s.supDir, "secret-audit.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).allowed)).toEqual([true, true]);
-    await s.leakCheck();
-  });
-
-  test("a name outside the allowlist is RUNNER_SECRET_DENIED and the command never runs", async () => {
-    const s = await system();
-    const marker = join(tmp.dir, "ran");
-    const run = await s.lane("lane-a", TOKENS["lane-a"] as string, ["OTHER_TOKEN", "--", "sh", "-c", 'touch "$MARKER"'], { MARKER: marker });
-    expect(run.code).toBe(1);
-    expect(run.err).toEqual(["RUNNER_SECRET_DENIED lane-a may not receive OTHER_TOKEN (config secrets); the lead is asked to grant it; run the command again after the lead says it was granted"]);
-    expect(existsSync(marker)).toBe(false);
-    expect(secretFrames(s.wire, "secret.value")[0]?.body).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
-    expect(s.logs).toContain("RUNNER_SECRET_DENIED lane=lane-a names=OTHER_TOKEN code=RUNNER_SECRET_DENIED");
+    const result = await s.lane("lane-a", TOKENS["lane-a"]!);
+    expect(result.code).toBe(0);
+    expect(result.err).toEqual([]);
+    expect(result.out).toEqual([`export API_TOKEN='${VALUE}'`, `export OTHER_TOKEN='${VALUE}'`]);
+    const child = Bun.spawn(["sh", "-c", result.out.join("\n") + `; sh -c 'test "$API_TOKEN" = "$EXPECTED" && test "$OTHER_TOKEN" = "$EXPECTED"'`], { env: { ...process.env, EXPECTED: VALUE }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+    expect(secretFrames(s.wire, "secret.get")[0]?.body).toMatchObject({ key: "lane-a", names: [] });
+    expect(secretFrames(s.wire, "secret.value")[0]?.body).toMatchObject({ ok: true, sealed: { n: expect.any(String), c: expect.any(String) } });
+    expect(s.masked).toEqual([VALUE, VALUE]);
     await s.leakCheck();
   });
 
   test("another lane's token is RUNNER_LANE_AUTH_FAILED and nothing reaches the supervisor", async () => {
     const s = await system();
     const marker = join(tmp.dir, "ran");
-    const run = await s.lane("lane-a", TOKENS["lane-b"] as string, ["API_TOKEN", "--", "sh", "-c", 'touch "$MARKER"'], { MARKER: marker });
+    const run = await s.lane("lane-a", TOKENS["lane-b"] as string);
     expect(run.code).toBe(1);
     expect(run.err).toEqual(["RUNNER_LANE_AUTH_FAILED not lane-a's lane token"]);
     expect(existsSync(marker)).toBe(false);
@@ -172,12 +154,11 @@ describe("remote secrets end to end", () => {
   test("a lane the registry gives to another runner is refused by the supervisor as forged", async () => {
     const s = await system();
     const marker = join(tmp.dir, "ran");
-    const run = await s.lane("lane-b", TOKENS["lane-b"] as string, ["API_TOKEN", "--", "sh", "-c", 'touch "$MARKER"'], { MARKER: marker });
+    const run = await s.lane("lane-b", TOKENS["lane-b"] as string);
     expect(run.code).toBe(1);
     expect(run.err).toEqual([`RUNNER_SECRET_DENIED lane-b is not a lane of runner ${LABEL}`]);
     expect(existsSync(marker)).toBe(false);
     expect(s.logs).toContain(`RUNNER_FORGED_SECRET runner=${LABEL} key=lane-b`);
-    expect(existsSync(join(s.supDir, "secret-audit.jsonl"))).toBe(false);
     await s.leakCheck();
   });
 });

@@ -1,5 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, loadavg, tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
+import { homedir, loadavg } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
@@ -8,12 +8,11 @@ import { decisionChoicesProblem, inputRequestProblem, serializeDecisionText, ser
 import { isReportKind } from "./report-kinds.ts";
 import { realClock, run as realRun, type Clock, type Runner } from "../run.ts";
 import { SECRET_NAME } from "../secret-name.ts";
-import { SECRET_PUT_MAX_BYTES } from "./lane-socket.ts";
 import type { Connector, Transport } from "./transport.ts";
 
 /**
  * The `dori` a lane runs on a worker machine (design 3.4): the runner bundle in lane mode, set by `DORI_LANE_KEY`. It
- * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret exec`, `secret run` (alias `host <op>`) and `secret put`, and only for the lane's own
+ * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret env` and `secret run` (alias `host <op>`), and only for the lane's own
  * key; any other subcommand exits 2 with `DORI_CLI_LANE_ONLY <cmd>`. A report goes to the runner's lane socket with the lane's token, read from
  * the file `DORI_LANE_TOKEN_FILE` names (or, for a lane an older runner started, `DORI_LANE_TOKEN` itself), so the
  * runner accepts it only from the lane it started. `heavy` uses the host's `~/.dori/heavy/slot.N` directories,
@@ -36,13 +35,7 @@ export type LaneCliDeps = {
   readonly heavyDir?: string;
   readonly clock?: Clock;
   readonly spawn?: (argv: readonly string[]) => Promise<number>;
-  /** Runs a command with exactly this environment and resolves to its exit code; default Bun.spawn with inherited stdio. */
-  readonly spawnWithEnv?: (argv: readonly string[], env: Record<string, string>) => Promise<number>;
   readonly readFile?: (path: string) => string;
-  /** Directory under which ssh-key and file secrets get their private temp dir; default `os.tmpdir()`. */
-  readonly tempRoot?: string;
-  /** All of stdin as text (`secret put` reads the value from it); default `Bun.stdin.text()`. */
-  readonly readStdin?: () => Promise<string>;
   /** The runner directory holding `briefs/<key>.token`; default `~/.dori/runner`. */
   readonly runnerDir?: string;
   /** The lane's own key when it is not in `DORI_LANE_KEY` (a lane found through the socket's whoami). */
@@ -116,8 +109,7 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
   }
 };
 
-const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec, secret run (alias host <op>) and secret put";
-const SECRET_PUT_USAGE = "usage: dori secret put NAME (the value comes from stdin)";
+const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret env and secret run (alias host <op>)";
 
 const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking] | dori report <key> request --text \"<what you need from the owner>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]";
 const CLAIM_DONE_USAGE = "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"";
@@ -137,10 +129,10 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
   lane: "usage: dori lane status [<key>]",
   heavy: "usage: dori heavy <label> -- <command ...>",
   secret: [
-    "usage: dori secret exec NAME [NAME...] -- <command ...>",
+    "usage: dori secret env",
     "usage: dori secret run <op>",
-    SECRET_PUT_USAGE,
-    "  put stores a credential the lane made, write only: the lane reads it back only if config also lets it exec the name",
+    "  every stored secret arrives in the lane environment at launch; GH_TOKEN supplies GitHub access directly",
+    "  production deploys and host work use dori secret run <op> or dori host <op>",
   ].join("\n"),
   host: [
     "usage: dori host <op>",
@@ -159,7 +151,7 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     deps.err(`DORI_CLI_LANE_ONLY ${sub === "lane" ? `lane ${rest[0] ?? ""}`.trim() : sub || "(none)"}: ${LANE_ONLY_TEXT}`);
     return 2;
   }
-  // `--help` before a `--` (after it, the arguments belong to the command heavy or secret exec runs) prints the usage.
+  // `--help` before a `--` (after it, the arguments belong to the command heavy runs) prints the usage.
   const sep = rest.indexOf("--");
   if ((sep >= 0 ? rest.slice(0, sep) : rest).some((arg) => arg === "--help" || arg === "-h")) {
     deps.out(LANE_HELP[sub as (typeof LANE_CLI_COMMANDS)[number]]);
@@ -174,7 +166,8 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (!token) { deps.err("RUNNER_LANE_AUTH_FAILED no lane token: DORI_LANE_TOKEN_FILE unreadable or empty, no DORI_LANE_TOKEN, and no briefs/<key>.token"); return 1; }
     let reply: Reply;
     try { reply = await request(deps.connect, { ...verb, key: own, token }, clock); } catch (error) {
-      deps.err(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      deps.err(sub === "secret" && rest[0] === "env" && !/^RUNNER_[A-Z_]+ /.test(detail) ? `RUNNER_SECRET_FAILED ${detail}` : detail);
       return 1;
     }
     if (!reply.ok) { deps.err(`${reply.code ?? "RUNNER_LANE_REFUSED"} ${reply.detail ?? ""}`.trim()); return 1; }
@@ -193,57 +186,16 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (result.truncated === true) deps.err(`dori: ${op} output was truncated at 64 KiB per stream`);
     return typeof result.exitCode === "number" && Number.isInteger(result.exitCode) ? result.exitCode : 1;
   }
-  if (sub === "secret" && rest[0] === "put") {
-    const [, name, ...extra] = rest;
-    if (!name || extra.length || !SECRET_NAME.test(name)) { deps.err(SECRET_PUT_USAGE); return 2; }
-    // As `dori secret add`: all of stdin minus one trailing newline; never argv, so the value stays out of `ps`.
-    const text = await (deps.readStdin ?? (() => Bun.stdin.text()))();
-    const value = text.endsWith("\n") ? text.slice(0, -1) : text;
-    if (!value) { deps.err(`SECRET_VALUE_EMPTY nothing on stdin for ${name}; ${SECRET_PUT_USAGE}`); return 2; }
-    if (Buffer.byteLength(value) > SECRET_PUT_MAX_BYTES) { deps.err(`SECRET_VALUE_TOO_LARGE ${name} is over ${SECRET_PUT_MAX_BYTES} bytes`); return 2; }
-    return send({ kind: "secret-put", name, value }, (reply) => {
-      deps.out(`${reply.created === true ? "SECRET_STORED" : "SECRET_REPLACED"} ${name}${typeof reply.backend === "string" ? ` backend=${reply.backend}` : ""}`);
-    });
-  }
   if (sub === "secret") {
-    const sep = rest.indexOf("--");
-    const names = sep >= 0 ? rest.slice(1, sep) : rest.slice(1);
-    const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
-    if (rest[0] !== "exec") { deps.err(`DORI_CLI_LANE_ONLY ${`secret ${rest[0] ?? ""}`.trim()}: ${LANE_ONLY_TEXT}`); return 2; }
-    if (!names.length || sep < 0 || !cmd.length || !names.every((n) => SECRET_NAME.test(n))) {
-      deps.err("usage: dori secret exec NAME [NAME...] -- <command ...>");
-      return 2;
-    }
-    let values: Record<string, string> = {};
-    let kinds: Record<string, string> = {};
-    const code = await send({ kind: "secret", names }, (reply) => {
-      values = (reply.values ?? {}) as Record<string, string>;
-      kinds = (reply.kinds ?? {}) as Record<string, string>;
-    });
+    if (rest.length !== 1 || rest[0] !== "env") { deps.err("usage: dori secret env | dori secret run <op>"); return 2; }
+    let values: unknown;
+    const code = await send({ kind: "secret" }, (reply) => { values = reply.values; });
     if (code !== 0) return code;
-    const base: Record<string, string> = {};
-    for (const [k, v] of Object.entries(deps.env)) if (typeof v === "string") base[k] = v;
-    const childEnv: Record<string, string> = { ...base, ...values };
-    // An ssh-key or file secret goes to a 0600 file in a private 0700 dir; the env carries the path, never the value.
-    // A file secret (a JSON credential, say) is written as stored; a key gets the trailing newline ssh wants.
-    const keyNames = Object.keys(values).filter((n) => kinds[n] === "ssh-key");
-    const fileNames = Object.keys(values).filter((n) => kinds[n] === "ssh-key" || kinds[n] === "file");
-    let dir: string | undefined;
-    try {
-      if (fileNames.length) {
-        dir = mkdtempSync(join(deps.tempRoot ?? tmpdir(), "dori-secret-"));
-        for (const name of fileNames) {
-          const path = join(dir, name);
-          const value = values[name] as string;
-          writeFileSync(path, kinds[name] === "file" || value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
-          childEnv[name] = path;
-        }
-        if (keyNames.length === 1) childEnv.GIT_SSH_COMMAND = `ssh -i ${shellQuote(childEnv[keyNames[0] as string] as string)} -o IdentitiesOnly=yes -o IdentityAgent=none`;
-      }
-      return await (deps.spawnWithEnv ?? (async (argv, env) => Bun.spawn([...argv], { env, stdout: "inherit", stderr: "inherit", stdin: "inherit" }).exited))(cmd, childEnv);
-    } finally {
-      if (dir) rmSync(dir, { recursive: true, force: true });
+    if (typeof values !== "object" || values === null || Array.isArray(values) || !Object.entries(values).every(([name, value]) => SECRET_NAME.test(name) && typeof value === "string")) {
+      deps.err("RUNNER_SECRET_FAILED the runner's grant is not a map of secret names to values"); return 1;
     }
+    for (const [name, value] of Object.entries(values)) deps.out(`export ${name}=${shellQuote(value as string)}`);
+    return 0;
   }
   if (sub === "heavy") {
     const sep = rest.indexOf("--");

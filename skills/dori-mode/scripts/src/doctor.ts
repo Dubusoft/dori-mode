@@ -53,7 +53,7 @@ export type DoctorDeps = {
   /** Test seam for the config source report: the environment loadConfig read (default process.env). */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Test seams for the secret store check: the store (default one under `home`) and the permission-bits lookup (default fs.statSync). */
-  readonly secretStore?: Pick<SecretStore, "dir" | "list" | "encryptionAvailable">;
+  readonly secretStore?: Pick<SecretStore, "dir" | "list">;
   readonly modeOf?: (path: string) => number | undefined;
 };
 
@@ -127,7 +127,7 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
 
 /**
  * Sensitive paths bound into every lane on purpose: none now. gh's config dir is bound, but its login file hosts.yml is
- * hidden (CREDENTIAL_DENY), and so is ~/.npmrc: gh and npm get GH_TOKEN and NPM_TOKEN from the secret broker.
+ * hidden (CREDENTIAL_DENY), and so is ~/.npmrc: gh and npm get GH_TOKEN and NPM_TOKEN from the lane environment (dori secret env at launch).
  */
 export const INTENDED: ReadonlySet<string> = new Set<string>();
 /**
@@ -613,8 +613,7 @@ const fileModeOf = (path: string): number | undefined => {
 
 /**
  * The secret store, inspected without reading or decrypting any value: entry names and backends through the store's
- * list, permission bits through stat. Warns on plain entries, a missing encryption backend, loose modes and allowlisted
- * names (config `secrets`) that are not stored.
+ * list, permission bits through stat. Warns on loose directory or file modes.
  */
 export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | "run" | "secretStore" | "modeOf">): Promise<Check[]> => {
   const id = "secret store";
@@ -625,15 +624,6 @@ export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | 
   catch (e) { return [warn(id, e instanceof SecretStoreError ? e.message : `cannot list ${store.dir}: ${e instanceof Error ? e.message : String(e)}`, `chmod 700 ${store.dir}`)]; }
   const problems: string[] = [];
   const fixes: string[] = [];
-  const plain = entries.filter((entry) => entry.backend === "plain");
-  if (plain.length) {
-    problems.push(`plain (unencrypted) entries: ${plain.map((entry) => entry.name).join(", ")}`);
-    fixes.push("re-add it with dori secret update NAME on a host where systemd-creds --user works");
-  }
-  if (entries.length && !(await store.encryptionAvailable())) {
-    problems.push("systemd-creds --user is unavailable");
-    fixes.push("install or enable systemd-creds --user (systemd 250+), then re-add the secrets");
-  }
   const dirMode = modeOf(store.dir);
   if (entries.length && dirMode !== undefined && dirMode !== 0o700) {
     problems.push(`${store.dir} mode is ${dirMode.toString(8)}, not 700`);
@@ -647,15 +637,8 @@ export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | 
       fixes.push(`chmod 600 ${path}`);
     }
   }
-  const allowed = Object.keys((d.config as { secrets?: Record<string, unknown> }).secrets ?? {});
-  const stored = new Set(entries.map((entry) => entry.name));
-  const missing = allowed.filter((name) => !stored.has(name));
-  if (missing.length) {
-    problems.push(`config secrets not in the store: ${missing.join(", ")}`);
-    fixes.push("dori secret add NAME for each");
-  }
   if (problems.length) return [warn(id, problems.join("; "), fixes.join("; "))];
-  return [ok(id, entries.length ? `${entries.length} secrets, encrypted (systemd-creds)` : "no secrets stored")];
+  return [ok(id, entries.length ? `${entries.length} secrets` : "no secrets stored")];
 };
 
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>

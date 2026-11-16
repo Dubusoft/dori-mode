@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { SecretStore } from "../src/secret-store.ts";
+import { secretGranter } from "../src/runner/secret-grant.ts";
+import { withState } from "./fakes.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
 import { type LaneSocketLanes, serveLaneSocket } from "../src/runner/lane-socket.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
@@ -32,110 +35,49 @@ const socket = (secrets?: LaneSocketLanes["secrets"], secretRun?: LaneSocketLane
   return { connect, published, logs };
 };
 
-test("exec hands values only to the child env and returns its exit code", async () => {
-  const calls: string[][] = [];
-  const sock = socket(async (key, names) => { calls.push([key, ...names]); return { ok: true, values: { NPM_TOKEN: VALUE } }; });
+test("env exports every value with POSIX quoting and no names in the request", async () => {
+  const calls: string[] = [];
+  const values = { API_TOKEN: VALUE, QUOTED: "it's $safe;\nsecond line" };
+  const sock = socket(async (key) => { calls.push(key); return { ok: true, values }; });
   const r = io();
-  let seen: { argv: readonly string[]; env: Record<string, string> } | undefined;
-  const code = await laneCliMain(["secret", "exec", "NPM_TOKEN", "--", "npm", "publish"], {
-    env, connect: sock.connect, ...r.deps, spawnWithEnv: async (argv, e) => { seen = { argv, env: e }; return 7; },
-  });
-  expect(code).toBe(7);
-  expect(calls).toEqual([["lane-a", "NPM_TOKEN"]]);
-  expect(seen?.argv).toEqual(["npm", "publish"]);
-  expect(seen?.env.NPM_TOKEN).toBe(VALUE);
-  expect(seen?.env.PATH).toBe("/bin");
-  expect(seen?.argv.join(" ")).not.toContain(VALUE);
-  expect([...r.out, ...r.err].join("\n")).not.toContain(VALUE);
+  expect(await laneCliMain(["secret", "env"], { env, connect: sock.connect, ...r.deps })).toBe(0);
+  expect(calls).toEqual(["lane-a"]);
+  expect(r.out).toEqual([`export API_TOKEN='${VALUE}'`, "export QUOTED='it'\\''s $safe;\nsecond line'"]);
+  expect(r.err).toEqual([]);
   expect(sock.published).toEqual([]);
-  expect(sock.logs.join("\n")).not.toContain(VALUE);
+  expect(sock.logs).toEqual([]);
+  const child = Bun.spawn(["sh", "-c", r.out.join("\n") + '; printf "%s" "$QUOTED"'], { env: process.env, stdout: "pipe", stderr: "pipe" });
+  expect(await new Response(child.stdout).text()).toBe(values.QUOTED);
+  expect(await child.exited).toBe(0);
 });
 
-test("a token that belongs to another lane is refused before secrets() runs", async () => {
-  let called = 0;
-  const sock = socket(async () => { called++; return { ok: true, values: { A: VALUE } }; });
-  const r = io();
-  let spawned = 0;
-  const code = await laneCliMain(["secret", "exec", "A", "--", "true"], {
-    env: { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN: "tok-b" }, connect: sock.connect, ...r.deps, spawnWithEnv: async () => { spawned++; return 0; },
-  });
-  expect(code).toBe(1);
-  expect(r.err[0]).toStartWith("RUNNER_LANE_AUTH_FAILED");
-  expect(called).toBe(0);
-  expect(spawned).toBe(0);
-  expect(sock.logs).toEqual(["RUNNER_LANE_AUTH_FAILED key=lane-a verb=secret names=A"]);
-});
-
-test("a refused grant exits 1 and never spawns", async () => {
-  const sock = socket(async () => ({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "not allowed for this lane" }));
-  const r = io();
-  let spawned = 0;
-  const code = await laneCliMain(["secret", "exec", "A", "--", "true"], { env, connect: sock.connect, ...r.deps, spawnWithEnv: async () => { spawned++; return 0; } });
-  expect(code).toBe(1);
-  expect(r.err).toEqual(["RUNNER_SECRET_DENIED not allowed for this lane"]);
-  expect(spawned).toBe(0);
-});
-
-test("a throwing grant becomes RUNNER_SECRET_FAILED", async () => {
-  const sock = socket(async () => { throw new Error("SECRET_DECRYPT_FAILED boom"); });
-  const r = io();
-  expect(await laneCliMain(["secret", "exec", "A", "--", "true"], { env, connect: sock.connect, ...r.deps, spawnWithEnv: async () => 0 })).toBe(1);
-  expect(r.err).toEqual(["RUNNER_SECRET_FAILED SECRET_DECRYPT_FAILED boom"]);
-});
-
-test("a runner without secrets answers RUNNER_SECRET_UNSUPPORTED", async () => {
-  const sock = socket();
-  const r = io();
-  expect(await laneCliMain(["secret", "exec", "A", "--", "true"], { env, connect: sock.connect, ...r.deps, spawnWithEnv: async () => 0 })).toBe(1);
-  expect(r.err[0]).toStartWith("RUNNER_SECRET_UNSUPPORTED");
-  expect(sock.published).toEqual([]);
-});
-
-test("bad usage exits 2 without contacting the runner", async () => {
-  let called = 0;
-  const sock = socket(async () => { called++; return { ok: true, values: {} }; });
-  for (const args of [
-    ["secret", "exec", "--", "true"],
-    ["secret", "exec", "lower", "--", "true"],
-    ["secret", "exec", "A", "true"],
-    ["secret", "exec", "A", "--"],
-    ["secret", "exec"],
-  ]) {
+test("env refusals and failures print only code and detail to stderr", async () => {
+  for (const grant of [undefined, async () => ({ ok: false as const, code: "RUNNER_SECRET_DENIED", detail: "unsandboxed" }), async () => { throw new Error("unreadable"); }]) {
+    const sock = socket(grant);
     const r = io();
-    expect(await laneCliMain(args, { env, connect: sock.connect, ...r.deps, spawnWithEnv: async () => 0 })).toBe(2);
-    expect(r.err[0]).toStartWith("usage: dori secret exec");
-  }
-  const other = io();
-  expect(await laneCliMain(["secret", "list"], { env, connect: sock.connect, ...other.deps })).toBe(2);
-  expect(other.err[0]).toStartWith("DORI_CLI_LANE_ONLY secret list:");
-  expect(called).toBe(0);
-});
-
-test("the socket rejects malformed names with RUNNER_LANE_BAD_REQUEST", async () => {
-  const sock = socket(async () => ({ ok: true, values: {} }));
-  for (const names of [[], ["A", "A"], ["a"], [1], "A", Array.from({ length: 33 }, (_, i) => `N${i}`)]) {
-    const replies: string[] = [];
-    const link = await sock.connect();
-    link.onLine((l) => { replies.push(l); });
-    link.send(`${JSON.stringify({ kind: "secret", key: "lane-a", token: "tok-a", names })}\n`);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    expect(JSON.parse(replies[0] ?? "{}").code).toBe("RUNNER_LANE_BAD_REQUEST");
+    expect(await laneCliMain(["secret", "env"], { env, connect: sock.connect, ...r.deps })).toBe(1);
+    expect(r.out).toEqual([]);
+    expect(r.err[0]).toMatch(/^RUNNER_SECRET_(UNSUPPORTED|DENIED|FAILED) /);
   }
 });
 
-test("kinds from the grant pass through the socket reply, and are omitted when absent", async () => {
-  for (const [grant, expected] of [
-    [{ ok: true, values: { K: VALUE }, kinds: { K: "ssh-key" } }, { ok: true, values: { K: VALUE }, kinds: { K: "ssh-key" } }],
-    [{ ok: true, values: { K: VALUE } }, { ok: true, values: { K: VALUE } }],
-  ] as const) {
-    const sock = socket(async () => grant);
-    const replies: string[] = [];
-    const link = await sock.connect();
-    link.onLine((l) => { replies.push(l); });
-    link.send(`${JSON.stringify({ kind: "secret", key: "lane-a", token: "tok-a", names: ["K"] })}\n`);
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    expect(JSON.parse(replies[0] ?? "{}")).toEqual(expected);
+test("env rejects another lane token before reading any values", async () => {
+  let called = false;
+  const sock = socket(async () => { called = true; return { ok: true, values: {} }; });
+  const r = io();
+  expect(await laneCliMain(["secret", "env"], { env: { ...env, DORI_LANE_TOKEN: "tok-b" }, connect: sock.connect, ...r.deps })).toBe(1);
+  expect(called).toBe(false);
+  expect(r.out).toEqual([]);
+  expect(r.err).toEqual(["RUNNER_LANE_AUTH_FAILED not lane-a's lane token"]);
+});
+
+test("env rejects arguments before contacting the runner", async () => {
+  let connected = false;
+  for (const args of [["secret"], ["secret", "env", "A"], ["secret", "list"]]) {
+    const r = io();
+    expect(await laneCliMain(args, { env, connect: async () => { connected = true; throw new Error("unused"); }, ...r.deps })).toBe(2);
   }
+  expect(connected).toBe(false);
 });
 
 /** Sends one raw request line on the socket and returns the parsed reply. */
@@ -216,4 +158,20 @@ test("dori secret run: a refusal prints code and detail and exits 1; bad usage e
     expect(u.err).toEqual(["usage: dori secret run <op>"]);
   }
   expect(connects).toBe(0);
+});
+
+test("env pulls a local store through the granter without publishing values", async () => {
+  const state = withState();
+  try {
+    const store = new SecretStore({ dir: state.dir + "/secrets" });
+    await store.add("LOCAL_TOKEN", "local throwaway");
+    const masked: string[] = [];
+    const sock = socket(secretGranter({ store, onGranted: (values) => { masked.push(...values); } }));
+    const r = io();
+    expect(await laneCliMain(["secret", "env"], { env, connect: sock.connect, ...r.deps })).toBe(0);
+    expect(r.out).toEqual(["export LOCAL_TOKEN='local throwaway'"]);
+    expect(masked).toEqual(["local throwaway"]);
+    expect(sock.published).toEqual([]);
+    expect(sock.logs).toEqual([]);
+  } finally { state.done(); }
 });
