@@ -389,6 +389,14 @@ test("--check exits 0 when bwrap --ro-bind / / true succeeds, even without DORI_
   expect(await check(bin)).toEqual({ code: 0, out: "DORI_LANE_FILES=1\n", err: "" });
 });
 
+test("without DORI_LANE_KEY a command is refused, never run unsandboxed", async () => {
+  const dir = tempDir();
+  const bin = fakeBwrap(dir, "exit 99");
+  const child = Bun.spawn([Bun.which("bash") ?? "bash", LANE_SANDBOX_TEMPLATE, "echo", "plain"], { cwd: dir, env: { PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: dir }, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, out, err }).toEqual({ code: 2, out: "", err: "lane-sandbox: DORI_LANE_KEY is not set; refusing to run echo unsandboxed (set DORI_LANE_KEY=<key>, or use --explain or --check)\n" });
+});
+
 test("--check exits 3 with bwrap's reason on one line when bwrap cannot create a sandbox", async () => {
   const bin = fakeBwrap(tempDir(), 'echo "bwrap: No permissions to create new namespace" >&2; exit 1');
   const r = await check(bin);
@@ -782,12 +790,12 @@ test("macOS: a cwd as broad as $HOME gets no write grant of its own, so what the
   for (const no of [".ssh/x", ".zshrc", ".dori/env", "Library/LaunchAgents/x.plist"]) expect({ no, write: allows(sb, "file-write-data", join(home, no)) }).toEqual({ no, write: false });
 });
 
-test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a missing or failing sandbox-exec", async () => {
+test("macOS: without DORI_LANE_KEY the command is refused, never run unsandboxed, and --check names a missing or failing sandbox-exec", async () => {
   const { root, home, wt } = macHome();
   const never = join(root, "never-called");
   writeFileSync(never, "#!/bin/sh\nexit 99\n");
   chmodSync(never, 0o755);
-  expect(await runMacos(home, wt, ["echo", "plain"], {}, never)).toEqual({ code: 0, out: "plain\n", err: "" });
+  expect(await runMacos(home, wt, ["echo", "plain"], {}, never)).toEqual({ code: 2, out: "", err: "lane-sandbox: DORI_LANE_KEY is not set; refusing to run echo unsandboxed (set DORI_LANE_KEY=<key>, or use --explain or --check)\n" });
 
   const missing = await runMacos(home, wt, ["--check"], {}, join(root, "no-such-sandbox-exec"));
   expect({ code: missing.code, err: missing.err }).toEqual({ code: 3, err: `lane-sandbox: ${join(root, "no-such-sandbox-exec")} not found\n` });

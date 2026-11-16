@@ -6,7 +6,8 @@
 # and below its path. Modes: rw, ro, hide (an empty read-only tmpfs or empty read-only file over the path, /dev/null over a
 # socket) and empty (a fresh tmpfs:
 # none of the host's entries there show). A -try bind whose source is missing is left out, as bwrap skips it.
-# Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
+# A command runs only with DORI_LANE_KEY set (dori launch and the runner set it; the lead never runs behind this wrapper):
+# without it the command is refused (exit 2), never run unsandboxed.
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir; the runner's grants)
 #   LANE_SANDBOX_RO      extra read-only directories (the runner's grants)
@@ -49,7 +50,7 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .local/share/TelegramDesktop .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
 # END CREDENTIALS
 
-# --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough
+# --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY refusal
 # below so it also answers on the lead; exit 3 (not 2) keeps "no sandbox here" apart from a usage error.
 if [ "${1:-}" = "--check" ]; then
   if ! command -v bwrap >/dev/null 2>&1; then
@@ -77,7 +78,8 @@ if [ "$#" -eq 0 ] && [ "$explain" = 0 ]; then
 fi
 
 if [ -z "${DORI_LANE_KEY:-}" ]; then
-  exec "$@"
+  echo "lane-sandbox: DORI_LANE_KEY is not set; refusing to run $1 unsandboxed (set DORI_LANE_KEY=<key>, or use --explain or --check)" >&2
+  exit 2
 fi
 
 H="${HOME:?}"
