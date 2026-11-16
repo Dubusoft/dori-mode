@@ -8,7 +8,8 @@
 # Same inputs as the Linux (bubblewrap) lane-sandbox. Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset:
 # the lead runs outside the sandbox. Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra writable directories (e.g. your worktree root, a scratch dir; the runner's grants)
-#   LANE_SANDBOX_RO      extra readable directories (the runner's grants); ~/.config and ~/.dori refusals still win
+#   LANE_SANDBOX_RO      extra readable directories (the runner's grants); the ~/.dori/runner, ~/.ssh, credential,
+#                        ~/.config and hide-list refusals come after them
 #   LANE_SANDBOX_NO_CWD  directories too broad to make writable as the cwd (e.g. the parents of the worktree root)
 #   DORI_LANE_TOKEN_FILE the lane's own token file, readable
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, made writable (the runner sets it from its policy)

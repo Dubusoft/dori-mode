@@ -278,9 +278,16 @@ Stored values are registered with dori's output masking, so a value that turns u
 
 ## Lane sandbox hiding
 
-Both lane sandbox scripts hide dori's own sensitive paths, `~/.dori/env` and `~/.dori/secrets`, by default. No file or setting is needed. On Linux `~/.dori` is a fresh tmpfs inside the sandbox with nothing bound from the host below it; on macOS the profile denies reads, writes and socket connects under both paths.
+A lane reads `$HOME` and `~/.dori` but writes neither (beyond the writable paths its footer lists), so both lane sandbox scripts hide what no lane may read, with no file or setting needed:
 
-`~/.dori/lane-sandbox-hide` is an optional per-machine list of other host paths to hide, such as a backup directory or an entry under `~/.dori` like `~/.dori/research/<key>/secret.txt`: one host path per line, `#` starts a comment. A line may be a glob (`*` and `?` within one path component, `[...]` a class), such as `~/keys/*.pem` written as an absolute path: Linux hides each existing match when the lane starts, dotfiles included, and macOS refuses every path it matches, including ones created later. `lane-sandbox --explain` lists each hidden path (on macOS, the glob). Don't list `~/.dori/env` or `~/.dori/secrets` there; they're already covered.
+- `~/.dori/runner`, except the lane's own entries (its brief, files, out dir and token, the lane socket and the runner's `bin`): other lanes' briefs and bearer tokens and the control sockets stay out of reach.
+- `~/.dori/env`, `~/.dori/secrets`, `~/.dori/state`, `~/.dori/lane-sandbox-hide` and `~/.dori/gateway-locks`.
+- `~/.ssh` but `known_hosts` and `config` (macOS also leaves `*.pub` readable), and `~/.config` but `git`, gh's config and the ssh agent socket.
+- One shared credential list: cloud, kube, gpg, keyring, docker, git and registry logins, gh's `hosts.yml` and `~/.npmrc`, browser and chat app profiles and shell history. `CREDENTIAL_DENY` in `scripts/src/lane-sandbox-install.ts` defines it, renders it into both templates, and `dori doctor` checks the same entries.
+
+On Linux `$HOME` and `~/.dori` are read-only binds and each hidden path is covered by an empty read-only tmpfs or `/dev/null`, mounted after every read-write bind and grant so neither the cwd nor a grant re-exposes it. On macOS Seatbelt can only refuse access, and the names still show in a directory listing. The profile refuses reads of each hidden path (EPERM) in rules placed after its read grants, so a read grant never re-opens one. Writes are refused only by the profile's default write deny, so a write grant or a cwd that covers a hidden path makes it writable again (it stays unreadable). Only the `~/.dori/lane-sandbox-hide` entries and `~/.dori/secrets` are refused for writes too in rules placed after every grant. Docker sockets and, on Linux, the user bus and systemd's runtime dir are hidden as well. `lane-sandbox --explain` prints the exact table for a lane in the current directory.
+
+`~/.dori/lane-sandbox-hide` is an optional per-machine list of other host paths to hide, such as a backup directory or an entry under `~/.dori` like `~/.dori/research/<key>/secret.txt`: one host path per line, `#` starts a comment. A line may be a glob (`*` and `?` within one path component, `[...]` a class), such as `~/keys/*.pem` written as an absolute path: Linux hides each existing match when the lane starts, dotfiles included, and macOS refuses every path it matches, including ones created later. `lane-sandbox --explain` lists each hidden path (on macOS, the glob). Don't list the paths above there; they're already covered.
 
 ## Protection scope
 
