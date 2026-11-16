@@ -54,13 +54,18 @@ Only two forms qualify. The whole message, after trimming whitespace, must be on
 
 A lane's own question (not a `[요청]` request, not a decision the lead opened) is posted with one button per option under its starter message (`messenger/decision-buttons.ts`): label `N. <option>` cut to 80 characters, the recommended option in the primary style, up to 5 per row (2 rows for 6-9 options). The custom_id `dori:decide:<dID>:<N>` names the decision and the option, so a button answers exactly one question even in a shared thread. The starter message ends with "버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요."
 
-The supervisor's gateway handles a click (`discord-commands.ts`, `decision-inbound.ts` routeDecisionClick) and always answers it with an ephemeral reply only the clicker sees; the buttons themselves stay as posted:
+The supervisor's gateway handles a click (`discord-commands.ts`, `decision-inbound.ts` routeDecisionClick). A click by anyone but the owner (or from another application or guild) gets an ephemeral refusal. The owner's click is acknowledged at once, routed, then its buttons are updated to the decision's state and an ephemeral reply only the owner sees follows:
 
-- a click by anyone but the owner (or from another application or guild) is refused;
 - a click from any channel other than the decision's own thread, or on an unknown decision, is refused;
-- a click on a closed decision says it is closed;
+- a click on a closed decision says it is closed; one after the lane acked the answer says the lane already has it and records nothing;
 - a click on a decision that cannot take a direct answer (the checks in "What is delegated": the lane relaunched or closed, the lead already holds an answer) records nothing and tells the owner to type the number in the thread;
-- otherwise the click is the answer `d<ID>=<N>` typed in the decision's thread: an answer revision of owner "message" `click:<interaction id>` (a redelivered click is the same revision), queued and reported to the lead exactly like a typed direct answer. A click on the choice the newest revision already holds changes nothing; a different button before the lane acks is a new revision like an edited answer.
+- otherwise the click is the answer `d<ID>=<N>` typed in the decision's thread: an answer revision of owner "message" `click:<interaction id>` (a redelivered click is the same revision), queued and reported to the lead exactly like a typed direct answer. A click on the choice the newest revision already holds changes nothing; a different button before the lane acks is a correction, a new revision like an edited answer.
+
+The buttons show the decision's state (`decision-buttons.ts` decisionButtonState): the newest answer's option is green and marked `✓` (none after a withdrawal); all of them are disabled once that answer is acked or undelivered, or the decision closes (the closed decision's `--choice` stays marked). A click updates them in its own reply; the supervisor's delivery round (`decisionDeliveryTick`) and `dori decision close` (before the archive) edit the starter message when it shows anything else, recording what it shows as the decision's `buttons`. A close that cannot edit them prints `DECISION_BUTTONS_NOTE`.
+
+The lead's lines for a direct answer name the option text and the button: `DECISION_ANSWER_DIRECT ap-1-1 d1 r1 choice=2 "Replace" decision-d1-r1 from <thread>/click:<id> via button: ...` (also `DECISION_ANSWER_CORRECTED` and `DECISION_ANSWER_ACKED`).
+
+A click made while the supervisor restarted reaches the next process when it resumes the gateway session, past Discord's answer window, so its acknowledgement fails. It is still routed: the buttons are edited with the bot's token and the reply is posted in the thread as `[System] 재시작 중에 누른 버튼(d<ID> N번)입니다. ...`. When the lane cannot take it directly, it goes to the lead as urgent `DECISION_BUTTON_LATE <lane> d<ID> choice=N "<option>" ...`, which the lead takes over with `dori decision close`.
 
 A free-text answer is unchanged: it goes to the lead whole, and the lead's `dori decision close --text` relays it.
 

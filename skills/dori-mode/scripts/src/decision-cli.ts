@@ -162,6 +162,7 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
     const relayed = relayLine(await relayDecisionClose(deps, closed.decision));
     if (relayed) console.log(relayed);
     for (const line of closed.answers ? od.answerOutcomeLines(closed.answers) : []) console.log(line);
+    if (closed.buttonsNote) console.log(`DECISION_BUTTONS_NOTE ${did}: ${closed.buttonsNote}`);
     if (closed.archivePending) console.log(`DECISION_ARCHIVE_PENDING ${did}: ${closed.archivePending}`);
     if (closed.resolved) console.log(`DECISION_RESOLVED_EVENT ${did} ${closed.resolved}`);
     if (closed.linkNote) console.log(`DECISION_LINK_NOTE ${did}: ${closed.linkNote}`);

@@ -69,6 +69,7 @@ const fakeTransport = () => {
       return `m${sequence}`;
     },
     edit: async (...args) => { record("edit", ...args); },
+    editComponents: async (...args) => { record("editComponents", ...args); },
     content: async (...args) => { record("content", ...args); return ""; },
     deleteMessage: async (...args) => { record("deleteMessage", ...args); },
     // Like Discord: the "started a thread" notice for the thread the fake starts carries the thread's own id, and `after`
@@ -672,6 +673,13 @@ const tickOf = (dir: string, transport: DecisionTransport) => {
 
 const posts = (calls: { method: string; args: unknown[] }[]) => calls.filter((c) => c.method === "send" || c.method === "edit").map((c) => c.args);
 
+/** Each answer-button edit as the owner sees it: the chosen option's number (or -), then whether the buttons are off. */
+const buttonEdits = (calls: { method: string; args: unknown[] }[]) => calls.filter((c) => c.method === "editComponents").map((c) => {
+  const buttons = (c.args[2] as { components: { label: string; disabled?: boolean }[] }[]).flatMap((row) => row.components);
+  const chosen = buttons.find((b) => b.label.startsWith("✓ "))?.label.slice(2, 3) ?? "-";
+  return `${c.args[1]} ${chosen} ${buttons.every((b) => b.disabled) ? "off" : buttons.some((b) => b.disabled) ? "mixed" : "on"}`;
+});
+
 test("a direct answer waits queued for its lane with the owner told so; the lane's ack closes the decision once", async () => {
   const dir = stateDir();
   const store = new SqliteLaneMessages(storePath(dir));
@@ -685,6 +693,8 @@ test("a direct answer waits queued for its lane with the owner told so; the lane
   await decisionDeliveryTick(deps, store, lanes);
   await decisionDeliveryTick(deps, store, lanes);
   expect(posts(fake.calls).slice(before)).toEqual([["1000", "[System] d1: 2번으로 기록했습니다. 레인 ap-957-1에 전달하는 중입니다.", "decision-notice:d1"]]);
+  const question = readDecisions(dir).decisions[0]?.message;
+  expect(buttonEdits(fake.calls)).toEqual([`${question} 2 on`]);
   expect(store.get("decision-d1-r1")?.state).toBe("queued");
   expect(readDecisions(dir).decisions[0]?.state).toBe("open");
   expect(events).toEqual([]);
@@ -699,9 +709,11 @@ test("a direct answer waits queued for its lane with the owner told so; the lane
     ["1000", "[System] d1 결정 반영: 2번(Build a replacement). 레인 ap-957-1이 2번을 받았습니다. 스레드를 닫습니다.", "decision-close:d1"],
   ]);
   expect(fake.archived.get("1000")).toBe(true);
-  expect(events).toEqual([["decision-acked:d1:r1", "DECISION_ANSWER_ACKED ap-957-1 d1 r1 choice=2 decision-d1-r1: the lane confirmed it received the answer; the decision closes, nothing to do"]]);
+  expect(events).toEqual([["decision-acked:d1:r1", 'DECISION_ANSWER_ACKED ap-957-1 d1 r1 choice=2 "Build a replacement" decision-d1-r1: the lane confirmed it received the answer; the decision closes, nothing to do']]);
+  expect(buttonEdits(fake.calls)).toEqual([`${question} 2 on`, `${question} 2 off`]);
   await decisionDeliveryTick(deps, store, lanes);
   expect(events).toHaveLength(1);
+  expect(buttonEdits(fake.calls)).toHaveLength(2);
 });
 
 test("an acked answer whose close failed is closed by the next round, under the same lead event id", async () => {
@@ -743,4 +755,5 @@ test("an answer whose lane was relaunched is never delivered: the owner is told 
   expect(readDecisions(dir).decisions[0]).toMatchObject({ state: "open", revisions: [{ delivery: { state: "undelivered" } }] });
   expect(events).toEqual([["decision-undelivered:d1:r1", "DECISION_ANSWER_UNDELIVERED ap-957-1 d1 r1 decision-d1-r1: lane ap-957-1 was relaunched, replaced or moved; take the answer over with dori decision close d1"]]);
   expect(readDecisions(dir).decisions[0]?.notice?.text).toBe("[System] d1: 레인 ap-957-1이 종료되거나 바뀌어 전달하지 못했습니다. 리드가 이어받습니다.");
+  expect(buttonEdits(fake.calls)).toEqual([`${readDecisions(dir).decisions[0]?.message} 2 off`]);
 });

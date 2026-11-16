@@ -6,7 +6,7 @@ import {
 } from "./decision-store.ts";
 import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
 import { RUNNER_LANE_CLI } from "./launch-footer.ts";
-import { closeOwnerDecision, errorText, short, type TickDeps } from "./owner-decisions.ts";
+import { closeOwnerDecision, errorText, short, syncDecisionButtons, type TickDeps } from "./owner-decisions.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 
 /*
@@ -268,9 +268,18 @@ export const decisionNoticeText = (d: OwnerDecision, r: AnswerRevision, m: LaneM
   return m?.blocked ? `${recorded} 레인 ${lane}이 받을 수 있게 되면 전달합니다.` : `${recorded} 레인 ${lane}에 전달하는 중입니다.`;
 };
 
+/** The owner "message" of an answer-button click (decision-inbound.ts routeDecisionClick): one per interaction. */
+export const clickMessageId = (interaction: string): string => `click:${interaction}`;
+
+/** How the lead's lines name a choice: its number and option text, `choice=2 "Replace"`. */
+export const choiceLabel = (d: Pick<OwnerDecision, "options">, choice: number): string => `choice=${choice} "${short(d.options[choice - 1] ?? "", 80)}"`;
+
+/** ` via button` when revision `r` came from an answer button, else nothing. */
+export const viaButton = (r: Pick<AnswerRevision, "message">): string => (r.message.startsWith(clickMessageId("")) ? " via button" : "");
+
 /** The lead's digest line once the lane acked a direct answer and its decision closes. */
 export const ackedLine = (d: OwnerDecision, r: AnswerRevision): string =>
-  `DECISION_ANSWER_ACKED ${r.target.lane} ${d.id} r${r.rev} choice=${r.choice ?? "-"} ${r.delivery.id}: the lane confirmed it received the answer; the decision closes, nothing to do`;
+  `DECISION_ANSWER_ACKED ${r.target.lane} ${d.id} r${r.rev} ${r.choice === undefined ? "choice=-" : choiceLabel(d, r.choice)} ${r.delivery.id}${viaButton(r)}: the lane confirmed it received the answer; the decision closes, nothing to do`;
 
 /** A revision that still moves (its notice may change, its ack may close the decision). */
 const live = (d: OwnerDecision): boolean => d.state !== "closed" && d.state !== "posting" && !!d.revisions?.length;
@@ -280,7 +289,8 @@ const live = (d: OwnerDecision): boolean => d.state !== "closed" && d.state !== 
  * them). In order: reconcileDecisionDeliveries against the open lanes (a lane message the lane acked marks its revision
  * acked; one superseded because its lane closed or changed marks it undelivered), each change logged, and one
  * DECISION_ANSWER_UNDELIVERED for a newest revision it just found undelivered; the owner's `[System]` status message per
- * decision, posted once (stable id `decision-notice:<id>`) and edited as the answer moves; then a newest revision
+ * decision, posted once (stable id `decision-notice:<id>`) and edited as the answer moves; its answer buttons edited to
+ * show the chosen option, all disabled once the answer is acked or undelivered (syncDecisionButtons); then a newest revision
  * acked with a choice closes its decision as `dori decision close` would (choice, confirmation, archive, link line),
  * after DECISION_ANSWER_ACKED (digest) under a stable id. Every step reads its state back from decisions.json and the
  * lane message store, so a pass cut short by a crash or a failed post is finished by a later one. `lanes` is read only
@@ -311,6 +321,8 @@ export const decisionDeliveryTick = async (deps: TickDeps, store: LaneMessageSto
         patchOne(stateDir, d.id, (x) => ({ ...x, notice: { message, text } }));
       } catch (e) { log(`DECISION_NOTICE_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`); }
     }
+    try { await syncDecisionButtons(deps, d); }
+    catch (e) { log(`DECISION_BUTTONS_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`); }
     if (r.delivery.state !== "acked" || r.choice === undefined) continue;
     await deps.enqueue(`decision-acked:${d.id}:r${r.rev}`, ackedLine(d, r));
     try {

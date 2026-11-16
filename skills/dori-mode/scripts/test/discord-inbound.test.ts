@@ -300,7 +300,7 @@ const decisionWorld = () => {
   let threads = 0;
   let posts = 0;
   const transport: DecisionTransport = {
-    send: async () => `q${++posts}`, edit: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
+    send: async () => `q${++posts}`, edit: async () => {}, editComponents: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
     startThread: async () => ({ id: `t${++threads}` }), setThread: async () => {},
     threadState: async () => ({ archived: false, parent: "555" }), threadArchived: async () => false,
   };

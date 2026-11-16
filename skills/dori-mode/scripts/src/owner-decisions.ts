@@ -5,7 +5,7 @@ import {
 } from "./decision-store.ts";
 import { recordResolved } from "./decision-obligations.ts";
 import { scrubForThread } from "./freshness.ts";
-import { decisionButtonRows, hasDecisionButtons } from "./messenger/decision-buttons.ts";
+import { decisionButtonRows, decisionButtonsKey, hasDecisionButtons, POSTED_BUTTONS_KEY } from "./messenger/decision-buttons.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { type DecisionChoices, parseDecisionText, parseRequestText } from "./runner/decision-text.ts";
 import { appendToMessage, closedByOwner } from "./thread-followup.ts";
@@ -15,6 +15,8 @@ export type DecisionTransport = {
   /** `components` (action rows) ride under the message, as Discord.send puts them. */
   send(channel: string, content: string, stableId?: string, components?: readonly unknown[]): Promise<string>;
   edit(channel: string, messageId: string, content: string): Promise<void>;
+  /** Replaces a message's action rows, leaving its text as it is. */
+  editComponents(channel: string, messageId: string, components: readonly unknown[]): Promise<void>;
   content(channel: string, messageId: string): Promise<string>;
   deleteMessage(channel: string, messageId: string): Promise<void>;
   messagesAfter(channel: string, afterId: string): Promise<readonly { readonly id: string; readonly type: number; readonly reference?: string }[]>;
@@ -334,8 +336,23 @@ const archiveThread = async (transport: Pick<DecisionTransport, "setThread" | "t
   if (!await transport.threadArchived(thread)) throw new Error(`thread ${thread} is still open after archiving it`);
 };
 
+/**
+ * Brings `d`'s answer buttons in line with its state (decision-buttons.ts decisionButtonState) when its starter message
+ * shows something else: one edit of the message's action rows, then `buttons` recorded. A failed edit throws and leaves
+ * `buttons` as it was, so the next call tries again.
+ */
+export const syncDecisionButtons = async (ctx: Pick<DecisionContext, "config" | "transport">, d: OwnerDecision): Promise<OwnerDecision> => {
+  const rows = decisionButtonRows(d);
+  const key = decisionButtonsKey(d);
+  if (!rows || !d.thread || !d.message || key === (d.buttons ?? POSTED_BUTTONS_KEY)) return d;
+  await ctx.transport.editComponents(d.thread, d.message, rows);
+  return patchOne(ctx.config.stateDir, d.id, (x) => ({ ...x, buttons: key })) ?? d;
+};
+
 export type CloseResult = {
   readonly decision: OwnerDecision;
+  /** Why the answer buttons could not be disabled (the decision is closed; they stay as they were). */
+  readonly buttonsNote?: string;
   /** Why archiving failed (the decision is closed; the tick retries the archive). */
   readonly archivePending?: string;
   /** The OWNER_DECISION_ANSWERED event resolved by this close. */
@@ -414,7 +431,7 @@ const recordAnswersHandled = async (
  * channels, then acks the answer messages before the thread is archived (a failed ack only warns); posts the `[System]`
  * confirmation into its thread (stable nonce `decision-close:<id>`, so two closes post it once), archives the thread and
  * reads it back (archiveThread), records it closed, appends the outcome to the origin link line, and resolves its
- * OWNER_DECISION_ANSWERED obligation; last, records handled --reply (coverage 1/`tasks`) for each covered answer. A
+ * OWNER_DECISION_ANSWERED obligation; its answer buttons are disabled once it is recorded closed, before the archive; last, records handled --reply (coverage 1/`tasks`) for each covered answer. A
  * close of a closed decision records the handled receipts still missing, then throws DECISION_ALREADY_CLOSED with their
  * lines. Throws OwnerDecisionError DECISION_UNKNOWN, DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, DECISION_STALE, or
  * DECISION_NOT_CLOSED (the confirmation could not be posted; nothing closed).
@@ -477,6 +494,10 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     return { file: { ...file, decisions: file.decisions.map((y) => (y.id === id ? next : y)) }, result: { decision: next, owns } };
   });
   let closed = recorded?.decision ?? d;
+  // Before the archive: a message in an archived thread cannot be edited.
+  let buttonsNote: string | undefined;
+  try { closed = await syncDecisionButtons(ctx, closed); }
+  catch (e) { buttonsNote = `answer buttons not disabled: ${errorText(e)}`; }
   if (recorded?.owns && closed.thread) {
     try {
       await archiveThread(ctx.transport, closed.thread);
@@ -502,7 +523,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     answers = { tasks: closed.closeTasks ?? tasks, acked, ackFailed, left: targets.left.map(refOf), ...recorded };
   }
   const decision = readDecisions(stateDir).decisions.find((x) => x.id === id) ?? closed;
-  return { decision, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}) };
+  return { decision, ...(buttonsNote ? { buttonsNote } : {}), ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}) };
 };
 
 /**

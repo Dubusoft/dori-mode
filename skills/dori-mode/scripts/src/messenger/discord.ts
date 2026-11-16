@@ -81,6 +81,10 @@ export class Discord {
     await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(content) });
   }
 
+  async editComponents(channelId: string, messageId: string, components: readonly unknown[]): Promise<void> {
+    await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { components });
+  }
+
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
     await this.call("DELETE", `/channels/${channelId}/messages/${messageId}`);
   }
