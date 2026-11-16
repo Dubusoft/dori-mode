@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -10,6 +10,8 @@ import { Repos } from "./repos.ts";
 import type { Runner } from "./run.ts";
 import { parseSignal, splitDone } from "./signals.ts";
 import { RETENTION, SQLITE_FILE, SqliteStore, StoreError, type StoreKind } from "./store.ts";
+import { replaceFileDurable } from "./durable-write.ts";
+import { githubRepoFromRemote } from "./git-remote.ts";
 
 export class GitHubError extends Error {}
 
@@ -83,8 +85,6 @@ const array = (value: unknown): readonly unknown[] => {
   return value;
 };
 const text = (value: unknown): string => typeof value === "string" ? value : "";
-const repoFromRemote = (remote: string): string | undefined =>
-  /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
 
 /**
  * Long-lived integration branches. A checkout that sits on one (a review-only lane working in the main clone) has not
@@ -128,7 +128,7 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
     // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
     const git = inspections[index]?.git;
-    const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
+    const repo = git?.origin ? githubRepoFromRemote(git.origin) : undefined;
     if (!git || !repo) continue;
     for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) {
       if (branch && !INTEGRATION_BRANCHES.has(branch)) target(repo).branches.add(branch);
@@ -279,13 +279,7 @@ export class GitHubEvents {
     const prev = this.state;
     this.state = next;
     if (this.store) { saveGithub(this.store.database, prev, next); return; }
-    const tmp = `${this.path}.${process.pid}.tmp`;
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeFileSync(fd, JSON.stringify(this.state)); fsyncSync(fd); }
-    finally { closeSync(fd); }
-    renameSync(tmp, this.path);
-    const dir = openSync(this.stateDir, "r");
-    try { fsyncSync(dir); } finally { closeSync(dir); }
+    replaceFileDurable(this.path, JSON.stringify(this.state), 0o600);
   }
 
   async tick(deps: FlowDeps, emit: Emit): Promise<void> {

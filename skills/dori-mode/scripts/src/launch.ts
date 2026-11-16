@@ -17,6 +17,7 @@ import { doneSyntaxErrors, parseSignal, splitDone } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
 import { threadIdOf } from "./thread-finality.ts";
+import { githubRepoFromRemote } from "./git-remote.ts";
 import { briefBody, FILE_FOOTER_HEADING, LaneFileError, prepareLaneAttachment, prepareLaneBrief, readLaneAttachmentPin, writeLaneAttachmentPin } from "./lane-files.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
 import type { LaneBriefFiles } from "./runner/protocol.ts";
@@ -128,7 +129,7 @@ export const doneRepos = (done: string): string[] => [...new Set(splitDone(done)
 
 /** owner/repo from a git remote URL (https, ssh or scp form), lowercased. */
 export const remoteRepo = (url: string): string | undefined =>
-  /[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(url.trim())?.[1]?.toLowerCase();
+  githubRepoFromRemote(url);
 
 /** The git toplevel and origin URL of `dir` on the lane's host, read by its runner (`q.lane.inspect`); none outside git. */
 const gitOf = async (deps: FlowDeps, key: string, dir: string): Promise<{ readonly top?: string; readonly origin?: string }> => {

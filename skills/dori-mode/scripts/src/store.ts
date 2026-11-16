@@ -1,7 +1,8 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
+import { appendFileDurable, replaceFileDurable } from "./durable-write.ts";
 import type { Wake } from "./lead-wakes.ts";
 import type { AwaitingAck, Journal, JournalEvent, Notice, OutboxItem, Restart } from "./supervise.ts";
 
@@ -73,15 +74,7 @@ export interface JournalStore {
   close(): void;
 }
 
-const appendLine = (path: string, line: string): void => {
-  const fd = openSync(path, "a", 0o600);
-  try {
-    const data = Buffer.from(`${line}\n`);
-    let at = 0;
-    while (at < data.length) at += writeSync(fd, data, at);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-};
+const appendLine = (path: string, line: string): void => appendFileDurable(path, `${line}\n`, 0o600);
 
 /** The wakes of a json store's lead-wakes.jsonl in order, closes applied; a torn last line is skipped. */
 const readWakesFile = (path: string): Wake[] => {
@@ -104,17 +97,7 @@ const readWakesFile = (path: string): Wake[] => {
 };
 
 /** Rename only after the new contents reach disk; a crash leaves either complete version. */
-export const saveJsonFile = (path: string, value: unknown): void => {
-  const tmp = `${path}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify(value));
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  renameSync(tmp, path);
-  const dir = openSync(join(path, ".."), "r");
-  try { fsyncSync(dir); } finally { closeSync(dir); }
-};
+export const saveJsonFile = (path: string, value: unknown): void => replaceFileDurable(path, JSON.stringify(value), 0o600, `${path}.tmp`);
 
 class JsonStore implements JournalStore {
   readonly kind = "json" as const;

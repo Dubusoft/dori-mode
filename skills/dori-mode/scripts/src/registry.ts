@@ -1,8 +1,9 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 import type { LaneFileRun } from "./runner/protocol.ts";
 export { LOCK_WAIT_MS, StateLockError as RegistryLockError } from "./state-lock.ts";
 
@@ -164,11 +165,6 @@ const readLaneFile = (path: string): Lane | null => {
   catch (e) { if (missing(e)) return null; throw e; }
 };
 
-const fsyncDir = (dir: string): void => {
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-};
-
 /**
  * `lanes/` holds open lanes only, so the sweeps read O(open lanes). A closed lane is saved there and then renamed into
  * `lanes-archive/` (one atomic step, so a crash leaves it in exactly one place); `read` falls back to the archive, so
@@ -225,16 +221,13 @@ export class Registry {
     // An archived lane that stays closed is rewritten in place; anything else is written to lanes/ first.
     const dir = closed && archived ? this.archiveDir : this.dir;
     const target = join(dir, `${lane.key}.json`);
-    const tmp = `${target}.${process.pid}.tmp`;
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeFileSync(fd, JSON.stringify(next, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, target);
-    fsyncDir(dir);
+    replaceFileDurable(target, JSON.stringify(next, null, 1), 0o600);
     if (closed && !archived) this.moveToArchive(lane.key);
     else if (!closed && archived) {
       // Reopened: the archived copy goes, so the key lives in exactly one place.
       unlinkSync(this.archivePath(lane.key));
-      fsyncDir(this.archiveDir);
+      const archive = openSync(this.archiveDir, "r");
+      try { fsyncSync(archive); } finally { closeSync(archive); }
     }
     return next;
   }
@@ -243,8 +236,10 @@ export class Registry {
   private moveToArchive(key: string): void {
     mkdirSync(this.archiveDir, { recursive: true });
     renameSync(this.path(key), this.archivePath(key));
-    fsyncDir(this.archiveDir);
-    fsyncDir(this.dir);
+    const archive = openSync(this.archiveDir, "r");
+    try { fsyncSync(archive); } finally { closeSync(archive); }
+    const lanes = openSync(this.dir, "r");
+    try { fsyncSync(lanes); } finally { closeSync(lanes); }
   }
 
   /** Archives a closed lane left in lanes/ (written by older code, or a crash between save and rename). */
@@ -270,7 +265,8 @@ export class Registry {
       const to = join(this.legacyDir, f);
       if (!existsSync(to)) renameSync(join(this.oldClosedDir, f), to);
     }
-    fsyncDir(this.legacyDir);
+    const legacy = openSync(this.legacyDir, "r");
+    try { fsyncSync(legacy); } finally { closeSync(legacy); }
     if (readdirSync(this.oldClosedDir).length === 0) rmdirSync(this.oldClosedDir);
   }
 
@@ -317,7 +313,8 @@ export class Registry {
     try {
       if ((await this.read(key))?.launchReservation !== token) return;
       unlinkSync(this.path(key));
-      fsyncDir(this.dir);
+      const lanes = openSync(this.dir, "r");
+      try { fsyncSync(lanes); } finally { closeSync(lanes); }
     } finally { release(); }
   }
 

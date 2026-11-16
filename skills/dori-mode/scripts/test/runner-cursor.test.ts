@@ -292,6 +292,10 @@ describe("backoffMs", () => {
     expect(backoffMs(20, () => 0.5)).toBe(60_000);
     expect(backoffMs(0, () => 0)).toBe(800);
     expect(backoffMs(20, () => 0.999999)).toBeLessThanOrEqual(72_000);
+    expect([0, 1, 2, 3, 4, 5, 6, 7, 8].map((attempt) => backoffMs(attempt, () => 0.5))).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+    expect(backoffMs(0, () => 0.999999)).toBe(1200);
+    expect(backoffMs(10, () => 0)).toBe(48000);
+    expect(backoffMs(1000, () => 0.5)).toBe(60000);
   });
 });
 

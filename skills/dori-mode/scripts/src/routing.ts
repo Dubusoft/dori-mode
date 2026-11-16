@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
 import type { HostSample } from "./host-guard.ts";
 import { withStateLockSync } from "./state-lock.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 
 export type LaunchVerdict = { readonly ok: boolean; readonly reasons: readonly string[] };
 
@@ -119,13 +120,8 @@ const readHold = (stateDir: string): HoldState | undefined => {
 
 const writeHold = (stateDir: string, state: HoldState): HoldState => {
   mkdirSync(stateDir, { recursive: true });
-  const tmp = `${holdFile(stateDir)}.${process.pid}.tmp`;
   const next = { ...state, revision: randomUUID() };
-  const fd = openSync(tmp, "w", 0o600);
-  try { writeFileSync(fd, JSON.stringify(next, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, holdFile(stateDir));
-  const dir = openSync(stateDir, "r");
-  try { fsyncSync(dir); } finally { closeSync(dir); }
+  replaceFileDurable(holdFile(stateDir), JSON.stringify(next, null, 1), 0o600);
   return next;
 };
 

@@ -1,8 +1,8 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import { outcomeLane } from "./lane-outcomes.ts";
+import { dropFile, publishReceipt, receiptPaths, writeDurable } from "./receipts.ts";
 import { hasColumn, readStoreView } from "./store.ts";
 import { splitChannelName } from "./messenger/discord-inbound.ts";
 
@@ -15,25 +15,12 @@ import { splitChannelName } from "./messenger/discord-inbound.ts";
 
 export const EVENT_LOG = "lead-events.log";
 export const CURSOR_FILE = "inbox-cursor.json";
-const TAKE_FILE = /^\d+-[\w-]+\.json$/;
 
-export const takesDir = (stateDir: string): string => join(stateDir, "takes");
+const TAKES_DIR = "takes";
+export const takesDir = (stateDir: string): string => join(stateDir, TAKES_DIR);
 const cursorPath = (stateDir: string): string => join(stateDir, CURSOR_FILE);
 
 export class InboxError extends Error {}
-
-const fsyncDir = (dir: string): void => {
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-};
-
-/** tmp, fsync, rename, then the directory fsync: a crash leaves either the old file or the complete new one. */
-const writeDurable = (path: string, dir: string, text: string): void => {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, text, { mode: 0o600, flush: true });
-  renameSync(tmp, path);
-  fsyncDir(dir);
-};
 
 export type TakeReceipt = { readonly path: string; readonly offset: number; readonly at: number };
 
@@ -41,10 +28,7 @@ const offsetOk = (value: unknown): value is number => typeof value === "number" 
 
 /** Take receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
 export const pendingTakes = (stateDir: string): TakeReceipt[] => {
-  let names: string[];
-  try { names = readdirSync(takesDir(stateDir)); } catch { return []; }
-  return names.filter((name) => TAKE_FILE.test(name)).flatMap((name) => {
-    const path = join(takesDir(stateDir), name);
+  return receiptPaths(takesDir(stateDir)).flatMap((path) => {
     try {
       const { offset, at } = JSON.parse(readFileSync(path, "utf8")) as { offset?: unknown; at?: unknown };
       if (!offsetOk(offset)) return [];
@@ -53,11 +37,7 @@ export const pendingTakes = (stateDir: string): TakeReceipt[] => {
   });
 };
 
-export const dropTake = (path: string): void => {
-  try { unlinkSync(path); } catch (e) {
-    if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
-  }
-};
+export const dropTake = dropFile;
 
 export const readCursorFile = (stateDir: string): number | undefined => {
   try {
@@ -67,7 +47,7 @@ export const readCursorFile = (stateDir: string): number | undefined => {
 };
 
 export const writeCursorFile = (stateDir: string, offset: number): void => {
-  writeDurable(cursorPath(stateDir), stateDir, JSON.stringify({ offset }));
+  writeDurable(cursorPath(stateDir), JSON.stringify({ offset }));
 };
 
 /**
@@ -170,11 +150,7 @@ export const take = (stateDir: string, options: { readonly maxBytes: number; rea
     for (const event of owners) carried.set(event.id, { kind: "owner", id: event.id, line: event.line });
     writeCarried(stateDir, [...carried.values()]);
   }
-  const dir = takesDir(stateDir);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${options.now}-${randomUUID()}.json`);
-  writeDurable(path, dir, JSON.stringify({ offset: start, ids: events.map((event) => event.id), at: options.now, session: options.session ?? "" }));
-  fsyncDir(stateDir);
+  const path = publishReceipt(stateDir, TAKES_DIR, options.now, { offset: start, ids: events.map((event) => event.id), at: options.now, session: options.session ?? "" });
   return { events, offset: start, ...(more ? { more } : {}), receipt: path };
 };
 
@@ -196,7 +172,7 @@ export const readCarried = (stateDir: string): Carried[] => {
 
 /** Durable like the cursor file; an empty list removes the file. */
 export const writeCarried = (stateDir: string, items: readonly Carried[]): void => {
-  if (items.length) writeDurable(join(stateDir, CARRIED_FILE), stateDir, JSON.stringify(items));
+  if (items.length) writeDurable(join(stateDir, CARRIED_FILE), JSON.stringify(items));
   else dropTake(join(stateDir, CARRIED_FILE));
 };
 
@@ -368,7 +344,7 @@ export const readSeen = (stateDir: string): string[] => {
 const recordSeen = (stateDir: string, ids: readonly string[]): void => {
   if (!ids.length) return;
   const merged = [...new Set([...readSeen(stateDir), ...ids])];
-  writeDurable(join(stateDir, SEEN_FILE), stateDir, JSON.stringify(merged.slice(-SEEN_MAX)));
+  writeDurable(join(stateDir, SEEN_FILE), JSON.stringify(merged.slice(-SEEN_MAX)));
 };
 
 /**

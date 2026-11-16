@@ -1,6 +1,7 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { replaceFileDurable } from "./durable-write.ts";
 import type { DriftConfig } from "./config.ts";
 import type { Emit } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
@@ -40,10 +41,7 @@ export const loadDriftState = (stateDir: string): DriftState => {
 
 export const saveDriftState = (stateDir: string, state: DriftState): void => {
   const path = join(stateDir, DRIFT_STATE_FILE);
-  const tmp = `${path}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try { writeFileSync(fd, JSON.stringify(state)); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, path);
+  replaceFileDurable(path, JSON.stringify(state), 0o600, `${path}.${process.pid}.tmp`);
 };
 
 type Out = { readonly id: string; readonly line: string };

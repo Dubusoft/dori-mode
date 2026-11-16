@@ -1,6 +1,8 @@
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
+import { replaceFileAtomic } from "./durable-write.ts";
+import { githubRepoFromRemote } from "./git-remote.ts";
 import type { Runner } from "./run.ts";
 
 export const SUPERVISOR_UNIT = "dori-supervisor.service";
@@ -198,9 +200,7 @@ const readJson = <T>(path: string): T | undefined => {
   return JSON.parse(readFileSync(path, "utf8")) as T;
 };
 const writeJson = (path: string, value: unknown): void => {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(value)}\n`);
-  renameSync(tmp, path);
+  replaceFileAtomic(path, `${JSON.stringify(value)}\n`, 0o666);
 };
 
 export const readAutoUpdateState = (stateDir: string): AutoUpdateState => readJson<AutoUpdateState>(join(stateDir, AUTO_UPDATE_STATE)) ?? {};
@@ -217,7 +217,7 @@ export const writeUpdateResult = (path: string, result: UpdateResult): void => w
 
 /** `owner/repo` (lowercased) of a GitHub remote URL, else undefined. */
 export const githubRepoOf = (remote: string): string | undefined =>
-  /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
+  githubRepoFromRemote(remote);
 
 /** dori's own repo: the GitHub origin of the checkout holding `packageDir`; undefined when it has none. */
 export const doriRepoOf = async (run: Runner, packageDir: string): Promise<string | undefined> => {

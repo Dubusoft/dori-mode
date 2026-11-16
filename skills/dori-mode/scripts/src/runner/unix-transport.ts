@@ -4,7 +4,7 @@ import { basename, dirname, join } from "node:path";
 import type { Socket } from "bun";
 import { RUNNER_PATHS } from "./fs-safety.ts";
 import { LineSplitter } from "./protocol.ts";
-import type { Connector, Listener, Transport } from "./transport.ts";
+import { type Connector, type Listener, LineTransport, type Transport } from "./transport.ts";
 
 /**
  * The local runner link: frame lines over a unix socket at `<runnerDir>/sock/control`. The supervisor's hub listens
@@ -27,19 +27,13 @@ type Wire = { write(data: Uint8Array): number; end(data?: Uint8Array): void };
  * arrive before the first `onLine` subscriber are held for it. Writes the kernel did not take are kept and written on
  * `drain`, so a burst (an outbox replay) is never cut. A frame over the protocol size limit closes the link.
  */
-class SocketTransport implements Transport {
-  private readonly lines = new Set<(line: string) => void>();
-  private readonly closers = new Set<(reason: string) => void>();
-  private readonly held: string[] = [];
+class SocketTransport extends LineTransport {
   private readonly splitter = new LineSplitter();
   private readonly decoder = new TextDecoder();
   private pending: Buffer = Buffer.alloc(0);
-  private closed = false;
 
-  constructor(private readonly wire: Wire) {}
-
-  get open(): boolean {
-    return !this.closed;
+  constructor(private readonly wire: Wire) {
+    super();
   }
 
   send(line: string): void {
@@ -67,25 +61,6 @@ class SocketTransport implements Transport {
     for (const line of lines) this.deliver(line);
   }
 
-  private deliver(line: string): void {
-    if (!this.lines.size) {
-      this.held.push(line);
-      return;
-    }
-    for (const handler of [...this.lines]) handler(line);
-  }
-
-  onLine(handler: (line: string) => void): () => void {
-    this.lines.add(handler);
-    while (this.held.length && this.lines.size) this.deliver(this.held.shift() as string);
-    return () => { this.lines.delete(handler); };
-  }
-
-  onClose(handler: (reason: string) => void): () => void {
-    this.closers.add(handler);
-    return () => { this.closers.delete(handler); };
-  }
-
   close(reason = "closed"): void {
     if (this.closed) return;
     const rest = this.pending;
@@ -93,13 +68,6 @@ class SocketTransport implements Transport {
     this.ended(reason);
     // Whatever is still pending (a hello.reject before the close) goes out with the end.
     this.wire.end(rest.length ? rest : undefined);
-  }
-
-  /** The peer or the OS closed the socket. */
-  ended(reason: string): void {
-    if (this.closed) return;
-    this.closed = true;
-    for (const handler of [...this.closers]) handler(reason);
   }
 }
 

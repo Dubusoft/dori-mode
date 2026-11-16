@@ -72,6 +72,15 @@ import { BUILT_IN } from "./tunables.ts";
 /** How long the lane-mode check waits for the lane socket's whoami answer before it falls back to the runner's lane record. */
 const WHOAMI_TIMEOUT_MS = 500;
 
+const redirectClosedThread = async (
+  discord: Discord, thread: string, text: string, parent: string | undefined, owner: string | undefined,
+  line: (thread: string, text: string) => string, missing: () => never, components?: readonly unknown[],
+): Promise<{ message: string; target: string }> => {
+  const target = parent ?? owner ?? missing();
+  const message = await discord.send(target, line(thread, text), randomUUID(), components);
+  return { message, target };
+};
+
 /** The lane socket's whoami for `pane`; `answered` only when the runner replied ok (with or without a key). */
 const whoami = async (pane: string, socketExists: boolean, connect: Connector): Promise<{ answered: boolean; key: string | undefined }> => {
   if (!socketExists) return { answered: false, key: undefined };
@@ -1515,12 +1524,11 @@ try {
       const receipt = (posted: { message: string; target: string; thread?: string; button?: boolean; followUp?: boolean }): void => {
         recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, posted);
       };
-      // A thread the owner closed is never posted into: one line linking it goes to its parent channel (else the owner
-      // channel), and the thread stays archived.
       const redirect = async (thread: string, text: string, parent: string | undefined): Promise<void> => {
-        const target = parent ?? owner;
-        if (!target) die(`REPORT_NOT_POSTED ${found.key}: thread ${thread} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel; nothing recorded`);
-        const message = await discord.send(target ?? "", followUps.closedThreadLine(thread, text), randomUUID());
+        const { message, target } = await redirectClosedThread(
+          discord, thread, text, parent, owner, followUps.closedThreadLine,
+          () => die(`REPORT_NOT_POSTED ${found.key}: thread ${thread} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel; nothing recorded`),
+        );
         receipt({ message, target: `discord:${target}`, followUp: true });
         console.log(`REPORT_REDIRECTED ${found.key} ${message}: thread ${thread} was closed by the owner, so one line linking it went to ${parent ? "its parent channel" : "the owner channel"} ${target}`);
       };
@@ -1797,17 +1805,17 @@ try {
       }
       const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
       const { closedByOwner, closedThreadLine } = await import("./thread-followup.ts");
-      // A thread the owner closed is never posted into (a post would reopen it): one line linking it goes to its parent
-      // channel, else the owner channel.
       const closed = await closedByOwner(config.stateDir, discord, to);
       if (closed && flags.values["no-redirect"] === true) {
         console.log(`SEND_NOT_REDIRECTED ${to}: thread ${to} was closed by the owner and --no-redirect is set, so nothing was posted`);
         process.exit(5);
       }
       if (closed) {
-        const target = closed.parent ?? config.discordChannels[0]
-          ?? die(`SEND_NOT_POSTED thread ${to} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel`);
-        const sent = await discord.send(target, closedThreadLine(to, text), randomUUID(), components);
+        const { message: sent, target } = await redirectClosedThread(
+          discord, to, text, closed.parent, config.discordChannels[0], closedThreadLine,
+          () => die(`SEND_NOT_POSTED thread ${to} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel`),
+          components,
+        );
         console.log(`SENT_REDIRECTED ${sent}: thread ${to} was closed by the owner, so one line linking it went to ${closed.parent ? "its parent channel" : "the owner channel"} ${target}`);
         break;
       }
