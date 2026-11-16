@@ -959,12 +959,33 @@ the supervisor's scheduled heavy jobs use, so there's one heavy count per machin
 sandboxed lane cannot report its state there itself. On Linux and macOS the runner serves each lane its own socket,
 `~/.dori/runner/sock/herdr.d/<key>/herdr` (opened before the lane's command runs, removed by `lane.close`), and the lane
 sandbox makes only that lane's one reachable and points `HERDR_SOCKET_PATH` at it. A line there is herdr's own socket
-request. The runner forwards it to herdr's socket (`HERDR_SOCKET_PATH`, else `<XDG_CONFIG_HOME or ~/.config>/herdr/herdr.sock`),
-rebuilt from the checked fields, only when it is `pane.report_agent` or `pane.release_agent` for the pane the runner
-records for that lane, with known parameters of the right type, and relays herdr's reply. Any other method, another
-pane, `resume_argv` (a command herdr would run outside the sandbox) or an unknown field gets herdr's error reply shape
+request. The runner checks it against a closed list of methods and parameters, forwards it to herdr's socket
+(`HERDR_SOCKET_PATH`, else `<XDG_CONFIG_HOME or ~/.config>/herdr/herdr.sock`) and relays herdr's reply. Below, the own
+pane is the one the runner records for the lane, the own tab is the tab herdr reports for that pane (asked of herdr,
+never taken from the lane), and lane panes are the panes this runner split off for the lane. That set lives in the
+runner's memory: a pane leaves it on a successful `pane.close`, and the whole set goes when the lane's socket closes.
+
+- `ping` with no parameters, so the herdr CLI works inside a lane.
+- `pane.report_agent`, `pane.release_agent` and `pane.report_agent_session` for the own pane; `pane.report_metadata`
+  for the own pane or a lane pane (no workspace metadata). `resume_argv`, a command herdr would run outside the
+  sandbox, is refused.
+- `pane.get` and `pane.read` for a pane in the own tab; `pane.list` and `pane.layout`, with the reply cut down to the
+  own tab.
+- `pane.split` of the own pane or a lane pane, with only `target_pane_id`, `direction`, `ratio`, `cwd`, `focus` and
+  `right_click` (no env, no command). The new pane joins the lane panes.
+- `pane.rename`, `pane.close`, `pane.resize` and `pane.zoom` for a lane pane only, never the own pane.
+- `pane.send_input` (herdr's `pane run`) to a lane pane, once per pane, with `keys` absent or `["Enter"]`. A split pane
+  starts herdr's shell outside the sandbox, so the runner rewrites the text to
+  `exec <prefix> /bin/sh -c '<original text>'`. The prefix is the one the lane's own agent was started behind (the
+  lane env and the sandbox wrapper), kept as `sandboxPrefix` in the lane record, so the command gets the lane's
+  sandbox and the pane ends with it. A lane started unsandboxed gets its text through unchanged. A sandboxed lane
+  whose record predates `sandboxPrefix` is refused until it's relaunched. After that first command,
+  `pane.send_text` and `pane.send_keys` may reach the pane.
+
+This is what omo's DAG pane needs: it splits a pane beside the lane, runs its viewer there, and the viewer closes its
+own pane when done. Any other method, a pane outside these rules or an unknown field gets herdr's error reply shape
 (`{"id", "error": {"code": "forbidden" | "invalid_request", "message"}}`) and logs `HERDR_REPORT_REFUSED`; nothing
-reaches herdr.
+reaches herdr. Windows has no lane herdr socket.
 
 **Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>"}`,
 sent by the lane's `dori secret env` at launch. It carries no names and means every store value; the token is checked
