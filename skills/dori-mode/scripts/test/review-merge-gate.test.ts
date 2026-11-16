@@ -276,7 +276,7 @@ test("a merge lane's PR: the owner's claim fails, the merge lane's claim at this
   const [job] = h.gate.jobs.list();
   expect(job?.job.authorLaneKey).toBe(key);
   // G1 comes from the original owner's brief, not the merge lane's; intake reuses it, so the pass below is accepted.
-  const criteria = readFileSync(join(h.dir, "review-inputs", job!.job.jobId, "criteria.md"), "utf8");
+  const criteria = readFileSync(join(h.dir, "briefs", "review-inputs", job!.job.jobId, "criteria.md"), "utf8");
   expect(criteria).toContain("Implement the thing.");
   expect(criteria).not.toContain("Resolve the conflict.");
   expect(job?.job.snapshot.criteriaSha256).toBe(createHash("sha256").update(criteriaText("Implement the thing.\n"), "utf8").digest("hex"));
