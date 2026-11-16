@@ -7,13 +7,14 @@ import { eventClass } from "../src/event-policy.ts";
 import { LaunchError, validateLaunch } from "../src/launch.ts";
 import { enrollRunner, RunnerAuth } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
-import { herdrDownSince } from "../src/runner/herdr-down.ts";
+import { HERDR_DOWN_SAMPLES, herdrDownSince, HerdrDownInference, type HerdrRecord } from "../src/runner/herdr-down.ts";
 import { HUB_FILE, readRunnerRows } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
+import type { AnyRunnerEvent } from "../src/runner/protocol.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { machineLines, runnerViews } from "../src/status.ts";
-import { openRunnerHub } from "../src/supervise-hub.ts";
+import { openRunnerHub } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
 
@@ -24,6 +25,54 @@ const sampleBody = (panes?: number) => ({
   level: "ok", reasons: [], sampledAt: 0, load1: 1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 2, swapTotalGb: 2, os: "linux",
   ...(panes === undefined ? {} : { panes }),
 });
+const sample = (label: string, panes?: number): AnyRunnerEvent =>
+  ({ v: 1, runner: label, gen: 1, epoch: 1, seq: 1, type: "guard.sample", body: sampleBody(panes) }) as unknown as AnyRunnerEvent;
+
+/** The inference over an in-memory store; `lines` are the transitions it returned. */
+const inference = (store = new Map<string, HerdrRecord>()) => {
+  const clock = fakeClock(1_000_000);
+  const infer = new HerdrDownInference({ read: (l) => store.get(l), save: (l, r) => { store.set(l, r); } }, clock.now);
+  const feed = (label: string, panes?: number): string | undefined => infer.event(label, sample(label, panes))?.line;
+  return { store, clock, feed, infer };
+};
+
+test("two unreadable samples in a row say HERDR_DOWN once; the next readable one says HERDR_UP once", () => {
+  const w = inference();
+  // First sight of a readable herdr is saved as up and says nothing.
+  expect(w.feed("worker-a", 4)).toBeUndefined();
+  expect(w.store.get("worker-a")).toEqual({ state: "up", since: 1_000_000 });
+  expect(w.feed("worker-a", -1)).toBeUndefined();
+  w.clock.at += 60_000;
+  expect(w.feed("worker-a", -1)).toBe(`HERDR_DOWN machine=worker-a herdr unreadable in ${HERDR_DOWN_SAMPLES} guard samples in a row (panes=-1); lane recovery on this machine is held and dori launch --machine worker-a is refused until herdr reads again`);
+  expect(w.store.get("worker-a")).toEqual({ state: "down", since: 1_060_000 });
+  w.clock.at += 60_000;
+  expect(w.feed("worker-a", -1)).toBeUndefined();
+  w.clock.at += 60_000;
+  expect(w.feed("worker-a", 0)).toBe("HERDR_UP machine=worker-a herdr reads again (panes=0) after 120 s down; held lane recovery resumes at the next recovery sweep");
+  expect(w.store.get("worker-a")).toEqual({ state: "up", since: 1_180_000 });
+  expect(w.feed("worker-a", 3)).toBeUndefined();
+});
+
+test("one unreadable sample between readable ones, and a sample without a pane count, change nothing", () => {
+  const w = inference();
+  expect([w.feed("mac", 2), w.feed("mac", -1), w.feed("mac", 2), w.feed("mac", -1), w.feed("mac", undefined), w.feed("mac", 2)]).toEqual(Array(6).fill(undefined));
+  expect(w.store.get("mac")?.state).toBe("up");
+  // A protocol-2 runner never sends panes: no state at all.
+  expect(w.feed("old", undefined)).toBeUndefined();
+  expect(w.store.has("old")).toBe(false);
+  // Machines are counted apart, and the local runner's line names no launch refusal.
+  w.feed("local", -1);
+  w.feed("mac", -1);
+  expect(w.feed("local", -1)).toBe("HERDR_DOWN machine=local herdr unreadable in 2 guard samples in a row (panes=-1); lane recovery on this machine is held until herdr reads again");
+});
+
+test("a supervisor restart keeps the saved down state: no second HERDR_DOWN, and the first readable sample says HERDR_UP", () => {
+  const store = new Map<string, HerdrRecord>([["worker-a", { state: "down", since: 1_000_000 - 30_000 }]]);
+  const w = inference(store);
+  expect([w.feed("worker-a", -1), w.feed("worker-a", -1)]).toEqual([undefined, undefined]);
+  expect(w.feed("worker-a", 5)).toBe("HERDR_UP machine=worker-a herdr reads again (panes=5) after 30 s down; held lane recovery resumes at the next recovery sweep");
+});
+
 test("HERDR_DOWN wakes the lead, HERDR_UP is digest", () => {
   expect(eventClass("HERDR_DOWN machine=mac herdr unreadable")).toBe("lead-urgent");
   expect(eventClass("HERDR_UP machine=mac herdr reads again")).toBe("lead-digest");

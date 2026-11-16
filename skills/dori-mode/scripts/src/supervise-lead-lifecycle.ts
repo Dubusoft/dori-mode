@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -7,16 +7,16 @@ import { fileURLToPath } from "node:url";
 import type { FlowDeps } from "./done-flow.ts";
 import { leadModels, leadCommand, LEAD_DIET_ARGS, LEAD_DIET_ENV, qualifiedModel } from "./config.ts";
 import { eventClass } from "./event-policy.ts";
-import { listPanes, type Pane, quoteForPane, readScreen, sendVerified } from "./panes.ts";
+import { ALIVE_STATUSES, listPanes, type Pane, readScreen, sendGuarded, sendVerified } from "./panes.ts";
+import { quoteForPane } from "./launch.ts";
 import type { Runner } from "./run.ts";
 import { type Carried, completeLines, parseLogLine, readCarried, takeCursor, writeCarried } from "./inbox.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { completeLeadRestart } from "./lead-restart.ts";
-import { awaitStartupEvidence, confirmLead, hasStartupEvidence, heldSession, killTargets, LEAD_STAYS, leadPermissionArgs, ownedTargets, plainShell, processInfo, stopHung, stopLead, supervisorLaunch, UNCONFIRMED_LIMIT } from "./lead-process.ts";
-import { softCommand, softEvidence, softLive, softSessionStarted, sessionModel } from "./lead-soft-restart.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { redactSecrets } from "./redact.ts";
+import { LANE_PERMISSION_FLAGS } from "./runner/lanes.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import type { Durability } from "./store.ts";
@@ -58,6 +58,21 @@ const sessionTail = (file: string): string | undefined => {
     console.error(`LEAD_SESSION_UNREADABLE ${file}: ${e.message}`);
     return undefined;
   }
+};
+
+/** /new keeps argv unchanged; a holder for the same process identifies its newest persisted session. */
+const heldSession = (dir: string, pid: number | undefined): { readonly id: string; readonly file: string } | undefined => {
+  if (!pid || !existsSync(dir)) return undefined;
+  return readdirSync(dir).flatMap((name) => {
+    const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
+    if (!id || !existsSync(join(dir, "session-holders", id, `${pid}.json`))) return [];
+    const file = join(dir, name);
+    try { return [{ id, file, mtime: statSync(file).mtimeMs }]; }
+    catch (e) {
+      if (e instanceof Error && "code" in e && e.code === "ENOENT") return [];
+      throw e;
+    }
+  }).sort((a, b) => b.mtime - a.mtime)[0];
 };
 
 /**
@@ -849,3 +864,327 @@ export class LeadLifecycle {
     // hourglass never outlives a start that failed to get going.
   }
 }
+
+export const UNCONFIRMED_LIMIT = 5;
+
+type ForegroundProcess = { readonly pid?: number; readonly argv?: readonly string[] };
+type ProcessInfo = { readonly shell_pid?: number; readonly foreground_process_group_id?: number; readonly foreground_processes?: readonly ForegroundProcess[] };
+
+const STARTUP_ERROR = /Cannot find module|All fallback models failed|No API key|model_not_available|No model matching|usage limit|rate limit|quota|Session crashed|unknown provider/i;
+
+const softLive = async (deps: FlowDeps): Promise<boolean> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  return !!pane?.agent && ALIVE_STATUSES.has(pane.agent_status ?? "");
+};
+
+/**
+ * Submit, then observe a completed interactive command before submitting the next one. Typing alone changes the screen,
+ * and omo's argument autocomplete takes the first Enter to accept its selection, leaving the command in the editor;
+ * a command still shown there gets Enter again, so the next command is never typed onto the same line.
+ */
+const softCommand = async (deps: FlowDeps, command: string, prompt = false): Promise<void> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError("lead left idle/done before soft command");
+  const before = await readScreen(deps.run, deps.config.leadPane);
+  const previous = new Set(before.split("\n"));
+  let enterFailed = false;
+  const run: FlowDeps["run"] = async (argv, options) => {
+    const result = await deps.run(argv, options);
+    if (argv[2] === "send-keys" && result.code !== 0) enterFailed = true;
+    return result;
+  };
+  if (await sendGuarded(run, deps.config.leadPane, command) === "failed" || enterFailed) throw new TransientSuperviseError("soft command send failed");
+  if (prompt) return;
+  const deadline = deps.clock.now() + 5_000;
+  let enters = 1;
+  for (let attempt = 0; attempt <= 25; attempt++) {
+    const after = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+    const screen = await readScreen(deps.run, deps.config.leadPane);
+    const addedLines = screen.split("\n").filter((line) => !previous.has(line));
+    // omo's herdr integration can release the pane's agent once /new has shut the old session down; that is /new
+    // taking effect, and softSessionStarted waits for the agent to come back.
+    if (command === "/new" && !after?.agent) return;
+    if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
+    if (addedLines.some((line) => line.includes(command))) {
+      if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
+      if ((await deps.run(["herdr", "pane", "send-keys", deps.config.leadPane, "enter"])).code !== 0) throw new TransientSuperviseError("soft command send failed");
+      enters++;
+    } else if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
+    if (deps.clock.now() >= deadline) break;
+    await deps.clock.sleep(200);
+  }
+  throw new TransientSuperviseError("soft command showed no completed screen change");
+};
+
+/**
+ * After /new omo writes the new session's header at once, its model entry while still starting, and its startup
+ * bookkeeping right after; the session takes input once that file has stopped growing for this long.
+ */
+export const SOFT_SESSION_SETTLE_MS = 1_000;
+
+/** The model (`provider/modelId`) and thinking level a session file last recorded. */
+const sessionModel = (file: string): { model?: string; thinking?: string } => {
+  let model: string | undefined;
+  let thinking: string | undefined;
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"model_change"') && !line.includes('"thinking_level_change"')) continue;
+    let entry: { type?: unknown; provider?: unknown; modelId?: unknown; thinkingLevel?: unknown };
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type === "model_change" && typeof entry.provider === "string" && typeof entry.modelId === "string") model = `${entry.provider}/${entry.modelId}`;
+    if (entry.type === "thinking_level_change" && typeof entry.thinkingLevel === "string") thinking = entry.thinkingLevel;
+  }
+  return { model, thinking };
+};
+
+/**
+ * After /new omo's herdr integration can release the pane's agent while the old session shuts down and report it again
+ * once the new one has started (about two seconds). For this long a missing agent whose process still holds the pane's
+ * foreground is that switch, not a dead lead.
+ */
+export const SOFT_RELEASE_GRACE_MS = 10_000;
+
+/**
+ * One soft wait's liveness: true when the agent is ready, false during a release gap. Throws at once when only the
+ * shell is left in the pane, and once the agent has been missing for longer than the grace.
+ */
+const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
+  let missingSince: number | undefined;
+  return async () => {
+    if (await softLive(deps)) {
+      missingSince = undefined;
+      return true;
+    }
+    const now = deps.clock.now();
+    missingSince ??= now;
+    const info = await processInfo(deps);
+    if (!info || plainShell(info)) throw new TransientSuperviseError("reused lead is not live");
+    if (now - missingSince >= SOFT_RELEASE_GRACE_MS) throw new TransientSuperviseError(`reused lead is not live after ${SOFT_RELEASE_GRACE_MS / 1000}s`);
+    return false;
+  };
+};
+
+/** The new session's file once it has started and settled with its agent back, or undefined at the deadline. */
+const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
+  const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  const live = softLiveCheck(deps);
+  let seen: { readonly file: string; readonly size: number; readonly since: number } | undefined;
+  while (deps.clock.now() < deadline) {
+    // The next command is typed only into a settled new session whose agent is back.
+    const ready = await live();
+    let found: { readonly file: string; readonly size: number } | undefined;
+    for (const name of readdirSync(dir)) {
+      const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
+      if (!id || id === old) continue;
+      const file = join(dir, name);
+      try {
+        const stat = statSync(file);
+        if (startedAt !== undefined && stat.mtimeMs < startedAt) continue;
+        if (readFileSync(file, "utf8").includes('"type":"model_change"')) found = { file, size: stat.size };
+      } catch (e) {
+        if (e instanceof Error && "code" in e && e.code === "ENOENT") continue;
+        throw e;
+      }
+    }
+    if (found && seen?.file === found.file && seen.size === found.size) {
+      if (ready && deps.clock.now() - seen.since >= SOFT_SESSION_SETTLE_MS) return found.file;
+    } else seen = found && { ...found, since: deps.clock.now() };
+    await deps.clock.sleep(200);
+  }
+  return undefined;
+};
+
+/** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
+const softEvidence = async (deps: FlowDeps, old: string, markers: readonly string[], startedAt: number | undefined): Promise<string | undefined> => {
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
+  const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  const live = softLiveCheck(deps);
+  for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
+    for (const name of (await live()) ? readdirSync(dir) : []) {
+      if (deps.clock.now() >= deadline) return undefined;
+      const id = /(?:^|_)([0-9a-f-]{36})\.jsonl$/.exec(name)?.[1];
+      if (!id || id === old) continue;
+      const file = join(dir, name);
+      try {
+        if (startedAt !== undefined && statSync(file).mtimeMs < startedAt) continue;
+        if (deps.clock.now() >= deadline) return undefined;
+        const text = readFileSync(file, "utf8");
+        if (markers.some((marker) => text.includes(marker)) && deps.clock.now() < deadline) return id;
+      } catch (e) {
+        if (e instanceof Error && "code" in e && e.code === "ENOENT") continue;
+        throw e;
+      }
+    }
+    if (deps.clock.now() >= deadline) break;
+    await deps.clock.sleep(500);
+  }
+  return undefined;
+};
+
+const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> => {
+  const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
+  if (info.code !== 0) return undefined;
+  try { return (JSON.parse(info.out) as { result: { process_info: ProcessInfo } }).result.process_info; }
+  catch (e) { if (e instanceof SyntaxError) return undefined; throw e; }
+};
+
+/** The old lead's tree was killed but is still listed: it is stuck in its pane, not refused. */
+const LEAD_STAYS = /old lead has not exited|cannot stop owned lead process/;
+
+/** A lead process the supervisor launched: its lead command always carries `--session-id`. Entries without argv never match. */
+/**
+ * The lead's omo permission flags: like every lane, the lead has nobody to answer an omo permission prompt, so it runs
+ * under `--permission-preset full-access` on every OS unless its own argv (`leadArgs`, `agentCommand`) names a preset.
+ */
+export const leadPermissionArgs = (argv: readonly string[]): readonly string[] =>
+  argv.some((part) => /^--permission-preset(?:=|$)/.test(part)) ? [] : LANE_PERMISSION_FLAGS;
+
+const supervisorLaunch = (p: ForegroundProcess): boolean => Array.isArray(p.argv) && p.argv.includes("--session-id");
+
+/**
+ * The part of a pane's screen written since the launch of `session`: the lines after the last one naming it. A reused
+ * pane still shows what its old occupant printed above (the previous lead's own words, or the escape-sequence replies a
+ * broken terminal typed), which says nothing about the new process. The whole screen when the launch line is not on it.
+ */
+export const screenSinceLaunch = (screen: string, session: string): string => {
+  const lines = screen.split("\n");
+  const at = lines.findLastIndex((line) => line.includes(session));
+  return at < 0 ? screen : lines.slice(at + 1).join("\n");
+};
+
+/** A short-lived or partly read entry can lack argv; it never matches. */
+const launchedAs = (p: ForegroundProcess, session: string): boolean =>
+  Array.isArray(p.argv) && p.argv.some((arg, i, argv) => arg === "--session-id" && argv[i + 1] === session);
+
+/** Nothing but the pane's shell is in the foreground, so typed text reaches the shell and not a program's input. */
+export const plainShell = (info: ProcessInfo): boolean =>
+  !!info.shell_pid && (!info.foreground_process_group_id || info.foreground_process_group_id === info.shell_pid) &&
+  (info.foreground_processes ?? []).every((p) => p.pid === undefined || p.pid === info.shell_pid);
+
+/** Only a ready status for the exact newly requested process is positive evidence. */
+export const confirmLead = async (deps: FlowDeps, session: string): Promise<boolean> => {
+  // `pane run` acknowledges admission, not execution. A stale idle/done status
+  // from the old occupant cannot confirm the new process. Recheck identity after
+  // the status gate until the bounded startup deadline.
+  const deadline = deps.clock.now() + 30_000;
+  for (let attempt = 0; attempt < 60 && deps.clock.now() <= deadline; attempt++) {
+    const ready = await deps.run(["herdr", "agent", "wait", deps.config.leadPane, "--until", "idle", "--until", "working", "--until", "done", "--timeout", String(Math.max(1, deadline - deps.clock.now()))]);
+    if (ready.code !== 0) {
+      // During replacement herdr can briefly report agent_not_running before
+      // the new occupant registers. This is not failed admission.
+      await deps.clock.sleep(500);
+      continue;
+    }
+    const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+    const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
+    if (info.code !== 0) return false;
+    const processes: readonly ForegroundProcess[] = JSON.parse(info.out).result.process_info.foreground_processes ?? [];
+    const identity = processes.some((p) => launchedAs(p, session));
+    if (identity && pane && (pane.agent_status === "idle" || pane.agent_status === "working" || pane.agent_status === "done")) {
+      const screen = await readScreen(deps.run, deps.config.leadPane, 40);
+      return !STARTUP_ERROR.test(screenSinceLaunch(screen, session));
+    }
+    await deps.clock.sleep(500);
+  }
+  return false;
+};
+
+export const STARTUP_EVIDENCE_MS = 20_000;
+
+/**
+ * A healthy omo writes <sessionDir>/session-holders/<session>/<pid>.json and the session jsonl within
+ * seconds of launch; a hung cold start creates the empty holder directory and nothing else. Either file
+ * is positive evidence for that exact session and does not depend on the model replying.
+ */
+export const hasStartupEvidence = (deps: FlowDeps, session: string): boolean => {
+  const dir = sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd);
+  const names = (path: string): readonly string[] => { try { return readdirSync(path); } catch { return []; } };
+  return names(join(dir, "session-holders", session)).some((name) => name.endsWith(".json")) ||
+    names(dir).some((name) => name.endsWith(`_${session}.jsonl`) || name === `${session}.jsonl`);
+};
+
+export const awaitStartupEvidence = async (deps: FlowDeps, session: string): Promise<boolean> => {
+  const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
+  for (let attempt = 0; attempt <= STARTUP_EVIDENCE_MS / 500; attempt++) {
+    if (hasStartupEvidence(deps, session)) return true;
+    if (deps.clock.now() >= deadline) return false;
+    await deps.clock.sleep(500);
+  }
+  return false;
+};
+
+/** Descendants of `root` plus detached processes whose environment carries PI_SESSION_ID=<id>. */
+const ownedTargets = async (deps: FlowDeps, table: Awaited<ReturnType<typeof procTable>>, root: number | undefined, id: string): Promise<Set<number>> => {
+  const targets = new Set<number>();
+  if (root) {
+    targets.add(root);
+    for (;;) {
+      const before = targets.size;
+      for (const p of table) if (targets.has(p.ppid)) targets.add(p.pid);
+      if (targets.size === before) break;
+    }
+  }
+  if (id) {
+    // Detached monitor processes inherit PI_SESSION_ID. Do not match command text
+    // (which may quote another session), and never kill the supervisor itself.
+    for (const p of table) {
+      if (targets.has(p.pid) || p.pid === process.pid) continue;
+      const env = await deps.run(["ps", "eww", "-o", "command=", "-p", String(p.pid)]);
+      if (new RegExp(`(?:^|\\s)PI_SESSION_ID=${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`).test(env.out)) targets.add(p.pid);
+    }
+  }
+  targets.delete(process.pid);
+  return targets;
+};
+
+const killTargets = async (deps: FlowDeps, targets: ReadonlySet<number>): Promise<void> => {
+  for (const pid of [...targets].reverse()) {
+    const stopped = await deps.run(["kill", "-KILL", String(pid)]);
+    if (stopped.code !== 0 && (await deps.run(["kill", "-0", String(pid)])).code === 0) throw new TransientSuperviseError(`cannot stop owned lead process ${pid}`);
+  }
+  // Waiting for the foreground process group to exit is an observable gate, not
+  // a fixed delay. The runner is bounded and never sends keys to a shell.
+  if (targets.size) {
+    const released = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
+    if (released.code !== 0) throw new TransientSuperviseError("cannot verify lead termination");
+    const live: readonly ForegroundProcess[] = JSON.parse(released.out).result.process_info.foreground_processes ?? [];
+    if (live.some((p) => p.pid !== undefined && targets.has(p.pid))) throw new TransientSuperviseError("old lead has not exited; events retained");
+  }
+};
+
+/** Kill only the process tree launched with `--session-id <session>`; status gates do not apply to a hung start. */
+export const stopHung = async (deps: FlowDeps, session: string): Promise<void> => {
+  const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
+  if (info.code !== 0) throw new TransientSuperviseError("cannot identify hung lead process; refusing broad process cleanup");
+  const processes: readonly ForegroundProcess[] = JSON.parse(info.out).result.process_info.foreground_processes ?? [];
+  const hung = processes.find((p) => p.pid && launchedAs(p, session));
+  await killTargets(deps, await ownedTargets(deps, await procTable(deps.run), hung?.pid, session));
+};
+
+/** Stop the pane's exact foreground agent tree, then its detached session-owned monitors. */
+export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> => {
+  const { leadPane, leadCwd } = deps.config;
+  const { sessionsDir } = deps.tunables;
+  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
+  if (!pane) throw new TransientSuperviseError(`lead pane ${leadPane} is missing`);
+  // `force` (a stuck lead) stops a working/blocked lead too.
+  if (!force && pane.agent && pane.agent_status !== "idle" && pane.agent_status !== "done") return false;
+  const table = await procTable(deps.run);
+  const hit = await resolveSession(leadPane, pane.cwd ?? leadCwd, table, { run: deps.run, sessionsDir });
+  if (pane.agent && !hit.pid) throw new TransientSuperviseError("cannot identify lead process; refusing broad process cleanup");
+  if (!pane.agent && !hit.pid) {
+    const info = await deps.run(["herdr", "pane", "process-info", "--pane", leadPane]);
+    if (info.code !== 0) throw new TransientSuperviseError("cannot verify an available shell in the lead pane");
+    const proc: { readonly shell_pid: number; readonly foreground_process_group_id?: number } = JSON.parse(info.out).result.process_info;
+    if (proc.foreground_process_group_id && proc.foreground_process_group_id !== proc.shell_pid) throw new TransientSuperviseError("lead pane contains a non-agent foreground process; refusing to type into it");
+  }
+  const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? leadCwd), hit.pid);
+  const targets = await ownedTargets(deps, table, hit.pid, current?.id ?? hit.id);
+  const latest = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
+  if (!latest) throw new TransientSuperviseError("lead pane disappeared during process resolution");
+  if (!force && latest.agent && latest.agent_status !== "idle" && latest.agent_status !== "done") return false;
+  await killTargets(deps, targets);
+  return true;
+};

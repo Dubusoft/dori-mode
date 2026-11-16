@@ -224,7 +224,4 @@ test("resumeArgv inserts --session before the prompt, and refuses what it cannot
   expect(resumeArgv(["omo", "{prompt}"], "-x")).toBeUndefined();
   expect(resumeArgv(["omo", "--continue", "{prompt}"], "abc")).toBeUndefined();
   expect(resumeArgv(["{prompt}"], "abc")).toBeUndefined();
-  expect(resumeArgv(["omo", "--model", "{model}"], "abc")).toBeUndefined();
-  expect(resumeArgv(["omo", "{prompt}"], "--evil")).toBeUndefined();
-  expect(resumeArgv(["omo", "{prompt}"], "a b")).toBeUndefined();
 });

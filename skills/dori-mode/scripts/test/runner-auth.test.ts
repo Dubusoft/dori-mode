@@ -13,7 +13,7 @@ import {
 } from "../src/runner/protocol.ts";
 import { acceptRunners } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { memoryNetwork } from "../src/runner/transport.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const clock = fakeClock(1_000_000);

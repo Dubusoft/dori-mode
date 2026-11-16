@@ -9,13 +9,13 @@ import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE } from "../src/store.ts";
 import { eventClass } from "../src/event-policy.ts";
 import { Supervisor, eventPriority } from "../src/supervise.ts";
-import { depsFor, fakeClock, fakeLaneOps, newWorld, readGithub, readJournal, withState } from "./fakes.ts";
+import { depsFor, fakeClock, fakeLaneOps, newWorld, readGithub, readJournal, TEST_STORE, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 /** A poller on the suite's store, closed before its state dir is removed. */
 const poller = (dir: string): GitHubEvents => {
-  const github = new GitHubEvents(dir);
+  const github = new GitHubEvents(dir, TEST_STORE);
   cleanups.unshift(() => github.close());
   return github;
 };
@@ -337,9 +337,16 @@ test("closing a reopened PR produces a new stable event identity", async () => {
 test("the first issue poll is a baseline: existing open issues emit nothing, also for an already-watched repo", async () => {
   const f = await fixture();
   expect(githubSummary(f.state.dir).issueRepos).toEqual(["acme/app"]);
-  const db = new Database(join(f.state.dir, SQLITE_FILE));
-  db.exec("UPDATE gh_repos SET issues = 0; DELETE FROM gh_issues");
-  db.close();
+  if (TEST_STORE === "json") {
+    const file = join(f.state.dir, "github-events.json");
+    const saved = JSON.parse(readFileSync(file, "utf8"));
+    delete saved.repos["acme/app"].issues;
+    writeFileSync(file, JSON.stringify(saved));
+  } else {
+    const db = new Database(join(f.state.dir, SQLITE_FILE));
+    db.exec("UPDATE gh_repos SET issues = 0; DELETE FROM gh_issues");
+    db.close();
+  }
   f.responses.set(ISSUES, ok([issue({ number: 1 }), issue({ number: 3 })], '"more"'));
   await poller(f.state.dir).tick(f.deps, f.emit);
   expect(f.events).toEqual([]);
@@ -513,17 +520,15 @@ test("closed PR history keeps its baseline but drops activity and unused cached 
 
 test("github-events.json moves into the store at the first sqlite start: slimmed, read back, kept read-only, never replayed", async () => {
   const f = await fixture();
-  // Given a json poll state written by an older version: whole response bodies, no use times (built from a poll elsewhere).
+  // Given a json poll state written by an older version: whole response bodies, no use times.
   const legacy = withState();
-  const scratch = withState();
-  cleanups.push(legacy.done, scratch.done);
-  for (const dir of [legacy.dir, scratch.dir]) new Repos(dir).add("acme/app");
+  cleanups.push(legacy.done);
+  new Repos(legacy.dir).add("acme/app");
   const deps = { ...f.deps, config: { ...f.deps.config, stateDir: legacy.dir } };
-  const earlier = new GitHubEvents(scratch.dir);
-  await earlier.tick({ ...f.deps, config: { ...f.deps.config, stateDir: scratch.dir } }, f.emit);
-  earlier.close();
+  const json = new GitHubEvents(legacy.dir, "json");
+  await json.tick(deps, f.emit);
   const file = join(legacy.dir, "github-events.json");
-  const saved = readGithub(scratch.dir);
+  const saved = JSON.parse(readFileSync(file, "utf8"));
   for (const entry of Object.values(saved.repos["acme/app"].cache) as { body: unknown; usedAt?: number }[]) {
     delete entry.usedAt;
     entry.body = Array.isArray(entry.body) ? entry.body.map((row) => ({ ...row, body: "x".repeat(2_000) })) : { ...entry.body as object, bio: "x".repeat(2_000) };
@@ -533,7 +538,7 @@ test("github-events.json moves into the store at the first sqlite start: slimmed
   const bytes = readFileSync(file);
   // When a supervisor on the sqlite store starts its poller (it holds the supervisor lock).
   f.clock.at += 60_000;
-  const github = new GitHubEvents(legacy.dir, f.clock.now);
+  const github = new GitHubEvents(legacy.dir, "sqlite", f.clock.now);
   cleanups.unshift(() => github.close());
   // Then the store holds the same state with only the read fields, the file is kept read-only, and readers see the store.
   expect(existsSync(file)).toBe(false);

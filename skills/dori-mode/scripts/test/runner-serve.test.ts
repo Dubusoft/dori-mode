@@ -10,11 +10,11 @@ import { HUB_FILE, readRunnerRows, RunnerHub } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { acceptRunners, drainRunnerAdmin, loadIdentity, type ObservedLane, queueRunnerAdmin, runnerAdminResult, serveRunner, trackedConnector } from "../src/runner/serve.ts";
 import { encodeFrame, MAX_FRAME_BYTES, runnerControl } from "../src/runner/protocol.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { memoryNetwork } from "../src/runner/transport.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
-import { openRunnerHub } from "../src/supervise-hub.ts";
+import { openRunnerHub } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];

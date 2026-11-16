@@ -10,14 +10,14 @@ import { Registry } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
 import { quotaMessage } from "../src/messenger/discord-commands.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
-import { SqliteLaneReports } from "../src/lane-report-store.ts";
-import { convertJsonStore } from "../src/store-import.ts";
+import { JsonLaneReports, type LaneReportStore, SqliteLaneReports } from "../src/lane-reports.ts";
+import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind, WAKES_FILE } from "../src/store.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { healthPath } from "../src/runner/health.ts";
 import { displayTime } from "../src/display-time.ts";
 import { collectStatus, lookupStatus, machineLines, renderStatus, runnerViews, shortModel, STATUS_MAX_CHARS, statusPages, waitFireMs, type Status, type StatusDeps } from "../src/status.ts";
 import { unsandboxedReason } from "../src/runner-sandbox.ts";
-import { fakeClock, storePath, withState, writeJournal, writeWakes } from "./fakes.ts";
+import { fakeClock, withState } from "./fakes.ts";
 import { builtInTunables } from "../src/tunables.ts";
 
 const OPENED = "2026-10-19T00:00:00.000Z";
@@ -86,7 +86,6 @@ test("status shows services, pending waits, watched repos with poll time and fai
   writeFileSync(join(f.dir, "waits.json"), JSON.stringify([{ key: "ci-pr-7", until: "merged o/r#7", note: "n", deadline: NOW + 1 }]));
   writeFileSync(join(f.dir, "github-repos.json"), JSON.stringify(["o/r"]));
   writeFileSync(join(f.dir, "github-events.json"), JSON.stringify({ repos: { "o/r": { cache: {}, pulls: {}, issues: {} } }, failures: { "o/r": NOW - 20 * 60_000 }, polledAt: NOW - 2 * 60_000 }));
-  convertJsonStore(f.dir, NOW, () => () => {});
   writeGatewayStatus(f.dir, { pid: 1, at: NOW - 4_000, connected: true, messageContent: true });
   const s = await collectStatus(f.deps);
   const text = renderStatus(s);
@@ -190,47 +189,60 @@ test("few lanes stay one page, the same text as renderStatus", async () => {
   expect(statusPages(s)).toEqual([renderStatus(s)]);
 });
 
-test("status --json carries each lane's latest report row", async () => {
+const REPORT_STORES: readonly (readonly [StoreKind, (dir: string) => LaneReportStore])[] = [
+  ["json", (dir) => new JsonLaneReports(dir)],
+  ["sqlite", (dir) => { new SqliteStore(join(dir, SQLITE_FILE), { create: true }).close(); return new SqliteLaneReports(join(dir, SQLITE_FILE)); }],
+];
+
+test.each(REPORT_STORES)("%s store: status --json carries each lane's latest report row", async (store, open) => {
   const f = await fixture();
   await f.registry.write(lane("alpha"));
   await f.registry.write(lane("beta"));
-  const reports = new SqliteLaneReports(storePath(f.dir));
+  const reports = open(f.dir);
   reports.append({ lane: "alpha", generation: 0, kind: "progress", text: "step 1", at: NOW - 3_000 });
   reports.append({ lane: "gone", generation: 0, kind: "done", text: "closed lane", at: NOW - 2_500 });
   const latest = reports.append({ lane: "alpha", generation: 0, kind: "question", text: "which base?", evidence: "PR #4", at: NOW - 2_000 });
   reports.consume("alpha:0:1", NOW - 1_000, "thread");
   reports.close();
-  const on = await collectStatus(f.deps);
+  const config = { ...f.deps.config, store };
+  const on = await collectStatus({ ...f.deps, config });
   expect(on.lanes.find((l) => l.key === "alpha")?.report).toEqual(latest);
   expect(on.lanes.find((l) => l.key === "beta")).not.toHaveProperty("report");
   expect(JSON.parse(JSON.stringify(on))).toEqual(on);
 });
 
 test("status with no reports yet shows none and creates no table or file", async () => {
-  const f = await fixture();
-  await f.registry.write(lane("alpha"));
-  const s = await collectStatus({ ...f.deps, config: { ...f.deps.config } });
-  expect(s.lanes[0]).not.toHaveProperty("report");
-  expect(await Bun.file(join(f.dir, "lane-reports.json")).exists()).toBe(false);
-  const db = new Database(storePath(f.dir), { readonly: true });
-  try { expect(db.query("SELECT name FROM sqlite_master WHERE name = 'lane_reports'").all()).toEqual([]); } finally { db.close(); }
+  for (const store of ["json", "sqlite"] as const) {
+    const f = await fixture();
+    await f.registry.write(lane("alpha"));
+    if (store === "sqlite") new SqliteStore(join(f.dir, SQLITE_FILE), { create: true }).close();
+    const s = await collectStatus({ ...f.deps, config: { ...f.deps.config, store } });
+    expect(s.lanes[0]).not.toHaveProperty("report");
+    expect(await Bun.file(join(f.dir, "lane-reports.json")).exists()).toBe(false);
+    if (store === "sqlite") {
+      const db = new Database(join(f.dir, SQLITE_FILE), { readonly: true });
+      try { expect(db.query("SELECT name FROM sqlite_master WHERE name = 'lane_reports'").all()).toEqual([]); } finally { db.close(); }
+    }
+  }
 });
 
 test("status shows per-kind event counts over 24h, the wakes each kind triggered and calls per wake", async () => {
   const f = await fixture();
   const at = NOW - 60 * 60_000;
-  writeJournal(f.dir, { events: [
+  writeFileSync(join(f.dir, JOURNAL_FILE), JSON.stringify({ events: [
     { id: "old", line: "INBOUND 1 0 yesterday", at: NOW - 25 * 60 * 60_000 },
     { id: "a", line: "INBOUND 1 1 hi", at }, { id: "b", line: "INBOUND 1 2 again", at },
     { id: "c", line: "GH_PR o/r#7 merged sha=1 u", at }, { id: "d", line: "NUDGED lane", at }, { id: "e", line: "NUDGED lane", at },
     { id: "f", line: "NUDGED lane", at },
-  ] });
-  writeWakes(f.dir, [
+  ] }));
+  writeFileSync(join(f.dir, WAKES_FILE), [
     { at: NOW - 26 * 60 * 60_000, session: "s0", trigger: ["INBOUND"], kinds: {} },
-    { at, session: "s1", trigger: ["INBOUND", "GH_PR * merged"], kinds: { INBOUND: 1, "GH_PR * merged": 1 }, closed: true, calls: 9 },
-    { at: at + 1, session: "s1", trigger: ["INBOUND"], kinds: { INBOUND: 1 }, closed: true, calls: 4 },
+    { at, session: "s1", trigger: ["INBOUND", "GH_PR * merged"], kinds: { INBOUND: 1, "GH_PR * merged": 1 } },
+    { close: at, calls: 9 },
+    { at: at + 1, session: "s1", trigger: ["INBOUND"], kinds: { INBOUND: 1 } },
+    { close: at + 1, calls: 4 },
     { at: at + 2, session: "s2", trigger: ["(restart)"], kinds: {} },
-  ]);
+  ].map((row) => JSON.stringify(row)).join("\n"));
   const s = await collectStatus(f.deps);
   expect(s.events).toMatchObject({ hours: 24, wakes: 3, sources: { owner: 3, lane: 0, noise: 0 }, measured: 2, calls: 13 });
   expect(s.events.kinds).toEqual([
@@ -251,11 +263,11 @@ test("status shows per-kind event counts over 24h, the wakes each kind triggered
 test("status splits wakes into owner, lane and noise by their triggers; a wake an owner message triggered is the owner's", async () => {
   const f = await fixture();
   const at = NOW - 60 * 60_000;
-  writeJournal(f.dir, { events: [{ id: "a", line: "HOST_GUARD OFFLINE mac", at }] });
-  writeWakes(f.dir, [
+  writeFileSync(join(f.dir, JOURNAL_FILE), JSON.stringify({ events: [{ id: "a", line: "HOST_GUARD OFFLINE mac", at }] }));
+  writeFileSync(join(f.dir, WAKES_FILE), [
     ["INBOUND", "HOST_GUARD OFFLINE"], ["UNHANDLED"], ["LANE_REPORT", "HOST_GUARD OFFLINE"], ["GH_PR * closed"], ["UNREPORTED"],
     ["HOST_GUARD OFFLINE"], ["HOST_GUARD OFFLINE"], ["RUNNER_FORGED_EVENT"],
-  ].map((trigger, i) => ({ at: at + i, session: "s", trigger, kinds: {} })));
+  ].map((trigger, i) => JSON.stringify({ at: at + i, session: "s", trigger, kinds: {} })).join("\n"));
   const s = await collectStatus(f.deps);
   expect(s.events).toMatchObject({ wakes: 8, sources: { owner: 2, lane: 3, noise: 3 } });
   expect(s.events.kinds[0]).toMatchObject({ kind: "HOST_GUARD OFFLINE", wakes: 4 });

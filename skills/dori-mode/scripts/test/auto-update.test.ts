@@ -8,7 +8,7 @@ import type { Ran, Runner } from "../src/run.ts";
 import { lanesBlockingUpdate } from "../src/supervise-loop.ts";
 import {
   AUTO_UPDATE_RESULT, AUTO_UPDATE_UNIT, AutoUpdate, noteDevMerge, readAutoUpdateState, writeUpdateResult,
-} from "../src/auto-update.ts";
+} from "../src/update.ts";
 
 let dir = "";
 let calls: string[][] = [];

@@ -28,6 +28,7 @@ import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
+import { LEGACY_GUARD_AGENT_FILES, legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
 import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
@@ -125,10 +126,15 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
 };
 
 /**
- * Paths under $HOME the exposure probe checks: the credential stores the lane sandbox templates hide (CREDENTIAL_DENY)
- * and ~/.ssh private keys (id_*) added from the host's ~/.ssh.
+ * Sensitive paths bound into every lane on purpose: none now. gh's config dir is bound, but its login file hosts.yml is
+ * hidden (CREDENTIAL_DENY), and so is ~/.npmrc: gh and npm get GH_TOKEN and NPM_TOKEN from the lane environment (dori secret env at launch).
  */
-export const SENSITIVE: readonly string[] = CREDENTIAL_DENY;
+export const INTENDED: ReadonlySet<string> = new Set<string>();
+/**
+ * Paths under $HOME the exposure probe checks: the credential stores the lane sandbox templates hide (CREDENTIAL_DENY)
+ * and the ones bound on purpose. ~/.ssh private keys (id_*) are added from the host's ~/.ssh.
+ */
+export const SENSITIVE: readonly string[] = [...CREDENTIAL_DENY, ...INTENDED];
 /** The existing paths a glob entry (* ? [...], as the lane sandbox templates expand it) matches, dotfiles included; a plain path as is. */
 const globMatches = (p: string): string[] => {
   const parts = p.split("/");
@@ -181,9 +187,11 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   if (probe.code !== 0) return warn("lane exposure", `could not probe what a lane can read (${probe.err.trim() || `exit ${probe.code}`})`, "run dori doctor again once the lane sandbox check passes");
   const seen = new Set(probe.out.split(/\r?\n/).filter(Boolean));
   const home = (p: string) => (p.startsWith(`${d.home}/`) ? `~/${p.slice(d.home.length + 1)}` : p);
-  const readable = candidates.filter((p) => seen.has(p));
-  if (readable.length) return warn("lane exposure", `a lane can read ${readable.map(home).join(", ")}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
-  return ok("lane exposure", `${candidates.length} sensitive path(s) checked, none readable in a lane`);
+  const intended = candidates.filter((p) => seen.has(p) && INTENDED.has(p.slice(d.home.length + 1)));
+  const unexpected = candidates.filter((p) => seen.has(p) && !intended.includes(p));
+  const onPurpose = intended.length ? `; bound on purpose: ${intended.map(home).join(", ")}` : "";
+  if (unexpected.length) return warn("lane exposure", `a lane can read ${unexpected.map(home).join(", ")}${onPurpose}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
+  return ok("lane exposure", `${candidates.length - intended.length} sensitive path(s) checked, none readable in a lane${onPurpose}`);
 };
 
 /**
@@ -197,7 +205,7 @@ const KNOWN_HOME_ENTRIES: ReadonlySet<string> = new Set([
   ".zlogin", ".zlogout", ".oh-my-zsh", ".fzf", ".fzf.bash", ".fzf.zsh", ".inputrc", ".tmux.conf", ".vim", ".vimrc", ".viminfo",
   ".hushlogin", ".sudo_as_admin_successful", ".selected_editor", ".wget-hsts", ".motd_shown", ".landscape",
 ]);
-/** What dori itself keeps directly in ~/.dori; its credential stores (CREDENTIAL_DENY) are known too. */
+/** What dori itself keeps directly in ~/.dori; its credential stores (CREDENTIAL_DENY) and the legacy guard files are known too. */
 const KNOWN_DORI_ENTRIES: ReadonlySet<string> = new Set(["runner", "heavy", "lead", "research", "config.json", "src", "bin", "dori-boot-prep.sh", "freshness.log"]);
 
 /**
@@ -218,7 +226,7 @@ const homeEntries = (d: Pick<DoctorDeps, "home" | "platform">): Check[] => {
   const hidePath = join(d.home, ".dori", "lane-sandbox-hide");
   const hidden = new Set(existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : []);
   const homeKnown = new Set([...KNOWN_HOME_ENTRIES, ...CREDENTIAL_DENY.map((p) => p.split("/")[0] as string)]);
-  const doriKnown = new Set([...KNOWN_DORI_ENTRIES, ...CREDENTIAL_DENY.filter((p) => p.startsWith(".dori/")).map((p) => p.slice(".dori/".length))]);
+  const doriKnown = new Set([...KNOWN_DORI_ENTRIES, ...LEGACY_GUARD_AGENT_FILES, ...CREDENTIAL_DENY.filter((p) => p.startsWith(".dori/")).map((p) => p.slice(".dori/".length))]);
   const unknown = [
     ...list(d.home).filter((n) => n.startsWith(".") && !homeKnown.has(n)).map((n) => [`~/${n}`, join(d.home, n)] as const),
     ...list(join(d.home, ".dori")).filter((n) => !doriKnown.has(n)).map((n) => [`~/.dori/${n}`, join(d.home, ".dori", n)] as const),
@@ -383,6 +391,7 @@ export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "con
     else checks.push(line(key, inFile ? "file" : values[key] === undefined ? "unset" : "default", values[key]));
   }
   checks.push(
+    line("store", `derived from ${c.stateDir}`, c.store),
     line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
     line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
   );
@@ -466,7 +475,7 @@ const leadWakes = (d: DoctorDeps): Check[] => {
   const [top, count] = [...triggers].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0] ?? ["?", 0];
   return [warn("lead wakes",
     `${wakes.length} lead wakes not from owner messages in the last 24 hours (threshold ${LEAD_WAKE_WARNING_THRESHOLD}; lane ${lane}, noise ${wakes.length - lane}); most from ${top} (${count})`,
-    "review dori status (the activities section lists wake triggers and model calls)")];
+    "review dori status --stats for wake triggers and model calls")];
 };
 
 /** memoryCheck: the lead's human.md is found and within maxKb. */
@@ -528,6 +537,8 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
  */
 export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
   const checks: Check[] = [];
+  const legacyGuardFiles = legacyGuardAgentFiles(d.home);
+  if (legacyGuardFiles.length) checks.push(warn("guard agent", `${legacyGuardFiles.join(", ")} left from the old standalone guard agent; the runner reports this host now`, "the runner removes them when it starts (dori update on the lead restarts runners); or delete them"));
   try {
     const endpoints = Object.entries(readRunnerEndpoints(d.config.stateDir));
     checks.push(endpoints.length
@@ -585,7 +596,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
       ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
       : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}${row.herdr ? `, herdr ${row.herdr}` : ""}`));
   }
-  // Runners whose lanes run without a sandbox (launch-sandbox.ts sandboxChoice): Windows by design, others by opt-in.
+  // Runners whose lanes run without a sandbox (launch.ts sandboxChoice): Windows by design, others by opt-in.
   for (const label of new Set([...rows.map((row) => row.label), ...Object.keys(d.config.runners ?? {})])) {
     const os = rows.find((row) => row.label === label)?.machine?.os;
     const why = unsandboxedReason(d.config, label, os);

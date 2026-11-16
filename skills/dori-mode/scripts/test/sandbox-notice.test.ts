@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
-import type { LaneStatusTransport } from "../src/lane-status.ts";
+import type { LaneStatusTransport } from "../src/lane-reports.ts";
 import { postSandboxNotice, postSkippedNotices } from "../src/sandbox-notice.ts";
 import type { Ran } from "../src/run.ts";
 import { recordOwnerClosed } from "../src/thread-followup.ts";

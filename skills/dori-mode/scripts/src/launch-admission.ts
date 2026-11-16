@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { MachineCheck } from "./placement.ts";
@@ -29,10 +29,15 @@ const readLane = (path: string): Lane | undefined => {
 /** The locked snapshot includes registry reads, pruning, the decision and (for claims) the write. */
 const inspect = (stateDir: string, check: MachineCheck, now: number, key?: string, claim = false) =>
   withStateLockSync(join(stateDir, "launch-slots.lock.sqlite"), () => {
-    const path = join(stateDir, "launch-slots.json");
+    const path = join(stateDir, "launch-slots.json"), dir = join(stateDir, "lanes");
+    const lanes = new Map<string, Lane>();
+    if (existsSync(dir)) for (const name of readdirSync(dir).filter((n) => n.endsWith(".json"))) {
+      const lane = readLane(join(dir, name));
+      if (lane) lanes.set(lane.key, lane);
+    }
     const before = readSlots(stateDir), panes = new Set(check.paneIds);
     const slots = before.filter((slot) => {
-      const lane = readLane(join(stateDir, "lanes", `${slot.key}.json`)) ?? readLane(join(stateDir, "lanes-archive", `${slot.key}.json`));
+      const lane = lanes.get(slot.key) ?? readLane(join(stateDir, "lanes-archive", `${slot.key}.json`));
       if (lane && statusOf(lane) === "closed") return false;
       if (slot.machine === check.machine && lane?.pane && panes.has(lane.pane)) return false;
       return now - slot.at <= LAUNCH_SLOT_TTL_MS;

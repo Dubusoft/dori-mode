@@ -9,8 +9,8 @@ import type { CommandResults, ExecutionOutcome, GoalOutcome, PauseStep, ProcessI
  * the runner's own host through `run`; nothing here reads the supervisor's registry.
  *
  * Copied from pause.ts (goalCommand, stopTurn, isWorking), launch.ts (resolveTargetPane, inspectCreated, paneShell,
- * startup poll, startupFailure, screenLines, lastLines); the supervisor
- * copies are deleted by later packages. recover.ts imports `resumeArgv` from here.
+ * startup poll, startupFailure, screenLines, lastLines) and recover.ts (resumeCommand as `resumeArgv`); the supervisor
+ * copies are deleted by later packages.
  */
 
 export type ControlDeps = { readonly run: Runner; readonly clock: Clock };

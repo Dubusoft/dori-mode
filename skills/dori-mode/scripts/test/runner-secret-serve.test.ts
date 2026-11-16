@@ -7,7 +7,7 @@ import { RunnerHub } from "../src/runner/hub.ts";
 import { decodeFrame, encodeFrame, runnerControl, type SupervisorControl, type SupervisorControlBodies } from "../src/runner/protocol.ts";
 import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler, type SupervisorSecretDeps } from "../src/runner/secret-serve.ts";
 import { acceptRunners, type SecretFrame, type SecretReplyContext } from "../src/runner/serve.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { memoryNetwork } from "../src/runner/transport.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const LABEL = "r1";

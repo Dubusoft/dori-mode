@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, OWNER_REF } from "./autopilot.ts";
+import { autopilotLaneKey, LAUNCH_ACTION, ledgerRows } from "./autopilot.ts";
 import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
 import { type AutopilotContract, planTask } from "./autopilot-plan.ts";
 import { resolveCredential } from "./credentials.ts";
@@ -121,12 +121,12 @@ const prepare = async (deps: ExecutorDeps, taskId: number) => {
   if (!deps.parentChannel) reasons.push("thread-channel-missing");
   if (planned.contract.base !== deps.ciMergeBase) reasons.push("merge-base-mismatch");
   if (!task.autopilot) reasons.push("not-flagged");
-  if (!task.refs.some((ref) => OWNER_REF.test(ref))) reasons.push("owner-ref-missing");
+  if (!task.refs.some((ref) => /^owner:\S+$/.test(ref))) reasons.push("owner-ref-missing");
   if (!task.criteria.length) reasons.push("criteria-missing");
   if (task.wait) reasons.push("waiting");
   for (const id of task.dependsOn) {
     const dep = tasks.find((t) => t.id === id);
-    if (!dep || dep.workspaceId !== task.workspaceId || !depSatisfied(dep)) reasons.push(`prerequisite-open:${id}`);
+    if (!dep || dep.workspaceId !== task.workspaceId || dep.status !== "done" || !["merged", "completed"].includes(dep.resolution ?? "")) reasons.push(`prerequisite-open:${id}`);
   }
   return reasons.length ? { kind: "review" as const, reasons } : { ...planned, task };
 };
@@ -186,12 +186,6 @@ const currentContract = async (deps: ExecutorDeps, row: Operation): Promise<read
   return [];
 };
 
-/** The stop result when the task or contract changed since the execution began, else undefined. */
-const guard = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResult | undefined> => {
-  const changed = await currentContract(deps, row);
-  return changed.length ? stop(deps, row, "review", changed) : undefined;
-};
-
 const launchReadback = async (deps: ExecutorDeps, row: Operation): Promise<Observed> => {
   const data = dataOf(deps.store.get(row.id)!);
   if (data.notStarted) return "not-done";
@@ -218,8 +212,8 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     }
   }
   if (readPause(deps.pauseFile)) return resultOf(data, "paused");
-  const changed = await guard(deps, row);
-  if (changed) return changed;
+  const changed = await currentContract(deps, row);
+  if (changed.length) return stop(deps, row, "review", changed);
   await perform(deps.store, deps.now, step(row, "prepare", { taskId: data.taskId, laneKey: data.laneKey, version: data.contract.version, base: data.contract.base }),
     async () => ({ ok: true, detail: "contract prepared" }), async () => "done");
 
@@ -230,8 +224,8 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     if (reserved.op.state === "ambiguous") return stop(deps, row, "ambiguous", [reserved.op.detail]);
     return resultOf(data, "refused");
   }
-  const afterReservation = await guard(deps, row);
-  if (afterReservation) return afterReservation;
+  const afterReservation = await currentContract(deps, row);
+  if (afterReservation.length) return stop(deps, row, "review", afterReservation);
   const started = await perform(deps.store, deps.now, step(row, "start-task", { taskId: data.taskId, refs: [`lane:${data.laneKey}`] }),
     async () => { await deps.writer.startTask(data.taskId, { reason: `Autopilot ${data.laneKey}`, refs: [`lane:${data.laneKey}`] }); return { ok: true, detail: "started task" }; },
     async () => {
@@ -242,8 +236,8 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     if (started.op.state === "ambiguous") return stop(deps, row, "ambiguous", [started.op.detail]);
     return resultOf(data, "held");
   }
-  const beforeThread = await guard(deps, row);
-  if (beforeThread) return beforeThread;
+  const beforeThread = await currentContract(deps, row);
+  if (beforeThread.length) return stop(deps, row, "review", beforeThread);
   if (readPause(deps.pauseFile)) return resultOf(data, "paused");
   const threaded = await perform(deps.store, deps.now, step(row, "thread", data.thread),
     async () => {
@@ -261,8 +255,8 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     });
   if (threaded.op.state !== "verified") return stop(deps, row, "ambiguous", [threaded.op.detail]);
   data = dataOf(deps.store.get(row.id)!);
-  const beforeBrief = await guard(deps, row);
-  if (beforeBrief) return beforeBrief;
+  const beforeBrief = await currentContract(deps, row);
+  if (beforeBrief.length) return stop(deps, row, "review", beforeBrief);
   const input: LaunchInput = data.input ?? {
     key: data.laneKey, title: data.title, brief: join(deps.stateDir, "autopilot", data.laneKey, "brief.md"),
     done: data.contract.done, mode: data.contract.mode, ...(data.contract.model ? { model: data.contract.model } : {}),
@@ -273,8 +267,8 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     async () => (await deps.readBrief(input.brief))?.startsWith(data.brief.trimEnd()) ? "done" : "not-done");
   if (written.op.state !== "verified") return resultOf(data, "held");
 
-  const beforeLaunch = await guard(deps, row);
-  if (beforeLaunch) return beforeLaunch;
+  const beforeLaunch = await currentContract(deps, row);
+  if (beforeLaunch.length) return stop(deps, row, "review", beforeLaunch);
   if (readPause(deps.pauseFile)) return resultOf(data, "paused");
   if (deps.store.get(stepId(row, "hold"))?.state === "verified") {
     // A held key left the queue without this execution: a manual launch is never repeated, a manual drop is the lead's call.

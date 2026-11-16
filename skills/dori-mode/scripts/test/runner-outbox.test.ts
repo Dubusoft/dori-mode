@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { treeDigest } from "../src/lane-file-contract.ts";
+import { treeDigest } from "../src/runner/lane-files.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { RunnerState } from "../src/runner/state.ts";
-import { memoryPair } from "./support/memory-transport.ts";
+import { memoryPair } from "../src/runner/transport.ts";
 import { encodeFrame, supervisorControl } from "../src/runner/protocol.ts";
 import { join } from "node:path";
 import {

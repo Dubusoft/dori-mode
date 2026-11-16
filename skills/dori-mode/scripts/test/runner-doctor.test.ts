@@ -10,7 +10,6 @@ import { herdrDownSince } from "../src/runner/herdr-down.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { writeRunnerEndpoint } from "../src/runner/endpoints.ts";
 import { markHerdr } from "./herdr-world.ts";
-import { withSqliteStore } from "./fakes.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -22,8 +21,7 @@ const setup = (endpoint?: string) => {
   mkdirSync(join(stateDir, ".dori", "runner"), { recursive: true, mode: 0o700 });
   chmodSync(join(stateDir, ".dori"), 0o700);
   chmodSync(join(stateDir, ".dori", "runner"), 0o700);
-  withSqliteStore(stateDir);
-  const config = { ...defaultConfig(), stateDir };
+  const config = { ...defaultConfig(), stateDir, store: "json" as const };
   if (endpoint) writeRunnerEndpoint(stateDir, "worker-a", endpoint);
   return { config, stateDir, deps: { config, clock: { now: () => NOW, sleep: async () => {} }, home: stateDir, exists: existsSync } };
 };

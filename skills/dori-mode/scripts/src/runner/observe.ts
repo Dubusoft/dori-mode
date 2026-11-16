@@ -84,7 +84,6 @@ export const turnStop = (screen: string, asking: boolean): TurnStop => {
 
 export type ObserveHostDeps = {
   readonly run: Runner;
-  readonly panes?: readonly Pane[];
   readonly procs?: () => Promise<readonly Proc[]>;
   /** The lanes this runner owns, as pane id to lane key, for the panes listed (only panes whose identity checked out). */
   readonly owned?: (panes: readonly Pane[]) => Promise<ReadonlyMap<string, string>>;
@@ -117,16 +116,14 @@ export const laneProcessAlive = async (run: Runner, pane: string, key: string, p
 };
 
 export const observeHost = async (deps: ObserveHostDeps): Promise<ObservedLane[]> => {
-  const [panes, procs] = await Promise.all([deps.panes ?? listPanes(deps.run), (deps.procs ?? (() => sampleProcs(deps.run)))()]);
+  const [panes, procs] = await Promise.all([listPanes(deps.run), (deps.procs ?? (() => sampleProcs(deps.run)))()]);
   const owner = procLanes(procs);
   const owned = (await deps.owned?.(panes)) ?? new Map<string, string>();
   const seen = new Set<string>();
   const out: ObservedLane[] = [];
-  const infos = await Promise.all(panes.map((pane) =>
-    owned.has(pane.pane_id) && laneStatus(pane) !== "dead" ? undefined : processInfo(deps.run, pane.pane_id)));
-  for (const [index, pane] of panes.entries()) {
+  for (const pane of panes) {
     const ownedKey = owned.get(pane.pane_id);
-    const info = infos[index];
+    const info = ownedKey ? undefined : await processInfo(deps.run, pane.pane_id);
     const pids = [...(info?.foreground_processes ?? []).map((p) => p.pid), info?.shell_pid].filter((pid): pid is number => typeof pid === "number");
     const key = ownedKey
       ?? pids.map((pid) => owner.get(pid)).find((k): k is string => typeof k === "string")
@@ -134,7 +131,7 @@ export const observeHost = async (deps: ObserveHostDeps): Promise<ObservedLane[]
     if (!key || seen.has(key)) continue;
     seen.add(key);
     const status = laneStatus(pane);
-    const running = status === "dead" && laneAgentRunning(info, key, owner);
+    const running = status === "dead" && laneAgentRunning(info ?? await processInfo(deps.run, pane.pane_id), key, owner);
     out.push({ key, pane: pane.pane_id, tab: pane.tab_id ?? "", status: running ? "idle" : status });
   }
   return out.sort((a, b) => a.key.localeCompare(b.key));

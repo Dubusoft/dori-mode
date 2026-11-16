@@ -42,7 +42,7 @@ export const remoteRunner = (call: RunnerCall, label: string, job: { readonly op
       opKey: job.opKey, name: job.name, command: [...argv], cwd: opts.cwd, timeoutSec, heavy: false,
     }, { timeoutMs: timeoutSec * 1000 + REMOTE_JOB_MARGIN_MS });
     const ok = r.state === "verified" && RESULT_GUARDS["job.run"](r.result);
-    if (!ok) throw new Error(`RUNNER_JOB_REFUSED runner=${label}: ${refusal(r, r.state === "verified")}`);
+    if (r.state !== "verified" || !ok) throw new Error(`RUNNER_JOB_REFUSED runner=${label}: ${refusal(r, r.state === "verified")}`);
     const done = r.result;
     return { code: done.exitCode, out: done.output, err: done.err, ...(done.timedOut ? { timedOut: true } : {}) };
   };
@@ -54,7 +54,7 @@ type RemoteWait = { readonly id: string; readonly until: string; readonly cwd: s
  * (`RUNNER_WAIT_REFUSED runner=<label>: <detail>`); RunnerUnavailable propagates, and the caller counts it as one.
  */
 export const remoteWaitCheck = (call: RunnerCall, label: string, timeoutMs = 10_000 + REMOTE_MARGIN_MS) =>
-  async (wait: RemoteWait): Promise<Check> => {
+  async (wait: RemoteWait, _signal?: AbortSignal): Promise<Check> => {
     const r = await call.call(label, "wait.check", { waitId: wait.id, signal: wait.until, cwd: wait.cwd }, { timeoutMs });
     if (r.state !== "verified" || !RESULT_GUARDS["wait.check"](r.result)) {
       const error = `RUNNER_WAIT_REFUSED runner=${label}: ${refusal(r, r.state === "verified")}`;

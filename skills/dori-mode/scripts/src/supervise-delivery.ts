@@ -152,6 +152,8 @@ export class RetryingDelivery {
     readonly log: (line: string) => void;
   }, private readonly boot: string) {}
 
+  get nextAttemptAt(): number { return this.retryAt; }
+
   get due(): boolean { return this.io.now() >= this.retryAt; }
 
   async tick(): Promise<void> {

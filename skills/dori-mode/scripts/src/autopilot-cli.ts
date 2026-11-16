@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -8,14 +8,12 @@ import {
   type QuotaSummary, type ToodoTask,
 } from "./autopilot.ts";
 import { type ClaudeSkip, type ClaudeUsage, quotaProvidersFor, readUsage } from "./claude-quota.ts";
-import { sharedQuotaLookup } from "./quota-cache.ts";
-import { ageText, type QuotaCacheNote } from "./quota-presentation.ts";
+import { ageText, type QuotaCacheNote, sharedQuotaLookup } from "./quota-cache.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
 import { hostSummary, machineHosts } from "./launch-service.ts";
 import { checkMachine } from "./placement.ts";
 import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
-import { replaceFileAtomic } from "./durable-write.ts";
 
 /**
  * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
@@ -58,7 +56,9 @@ const pauseText = (p: Pause): string => `since ${p.since}${p.reason ? `: ${p.rea
 
 const writePause = (path: string, pause: Pause): void => {
   mkdirSync(dirname(path), { recursive: true });
-  replaceFileAtomic(path, `${JSON.stringify(pause)}\n`, 0o666);
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(pause)}\n`);
+  renameSync(tmp, path);
 };
 
 /** The operation action of an executor sequence row (`toodo:<taskId>/autopilot-execute/<attempt>`). */

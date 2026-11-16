@@ -1,6 +1,8 @@
 import type { LaneMessageStore } from "./lane-messages.ts";
-import { queueDecisionAnswer, type QueueOutcome, recordAnswerRevision } from "./decision-delivery.ts";
-import { type AnswerRevision, decisionTargetOf, type OwnerDecision, readDecisions, sameTarget, type TargetLane } from "./decision-store.ts";
+import {
+  type AnswerRevision, decisionTargetOf, type OwnerDecision, queueDecisionAnswer, type QueueOutcome, readDecisions, recordAnswerRevision,
+  sameTarget, type TargetLane,
+} from "./owner-decisions.ts";
 
 /*
  * Routing an owner message to exactly one side (references/messaging.md, "Decision answers straight to the lane"):

@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import type { Runner } from "../src/run.ts";
 import { criticalReasons, guardTick, sampleHost } from "../src/host-guard.ts";
 import { laneMemory, type Proc, procLanes, sampleProcs } from "../src/lane-memory.ts";
-import { guardAlertDetail, laneMemoryOf, WARN_COOLDOWN_MS, warnHeaviestLane } from "../src/supervise-guard.ts";
+import { guardAlertDetail, laneMemoryOf, WARN_COOLDOWN_MS, warnHeaviestLane } from "../src/supervise-loop.ts";
 import { fakeLaneOps, newWorld, sent } from "./fakes.ts";
 import type { DoriConfig } from "../src/config.ts";
 import type { Lane } from "../src/registry.ts";

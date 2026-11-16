@@ -101,7 +101,7 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     const d = defaultConfig("/home/ana");
     const same = ["drift", "guard", "heavyKill"].filter((k) => JSON.stringify(a[k]) === JSON.stringify(d[k]));
     const tunables = ["closeAfterMin", "eventPolicy", "resolveKinds", "delivery", "sessionsDir", "laneThinking", "toodoEvents"].filter((k) => k in a);
-    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a, tunables, diskGuard: "diskGuardPath" in a }));`;
+    console.log(JSON.stringify({ same, model: b.defaultModel, base: a.ciMergeBase, memoryCheck: a.memoryCheck, hooks: a.hooks, sandbox: a.laneSandbox, runners: "runners" in a, future: "futureKey" in a, store: a.store, tunables, diskGuard: "diskGuardPath" in a }));`;
   const p = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_STATE_DIR: state.dir } });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   expect(code).toBe(0);
@@ -109,7 +109,7 @@ test("only user and environment keys are read: unknown, removed and malformed tu
     same: ["drift", "guard", "heavyKill"],
     model: "m/lane", base: "release", memoryCheck: { repo: "", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
     sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
-    tunables: [], diskGuard: false,
+    store: "json", tunables: [], diskGuard: false,
   });
   const ignored = "store, futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, memoryCheck, sessionsDir, diskGuardPath, laneThinking, toodoEvents, hooks.threadDone, laneSandbox.default, placement.workspaces, runners.listen, runners.mode";
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
@@ -179,7 +179,7 @@ test("old lead controls are ignored and legacy arrays select only the first vali
 test("legacy arrays with no usable entry fall back to the lane model", async () => {
   const path = join(state.dir, "empty-lead.json");
   await Bun.write(path, JSON.stringify({ leadModel: [null, " ", {}], defaultModel: "m/default", leadThinking: "low" }));
-  expect(leadModels(await loadConfig(path, state.dir))).toEqual([{ model: "m/default", thinking: "low" }]);
+  expect(leadModels(await loadConfig(path))).toEqual([{ model: "m/default", thinking: "low" }]);
 });
 
 test("placement defaults to local with no fallback", async () => {

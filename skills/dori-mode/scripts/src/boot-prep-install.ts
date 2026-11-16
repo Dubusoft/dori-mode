@@ -8,17 +8,6 @@ export const BOOT_PREP_TEMPLATE = fileURLToPath(new URL(`../templates/${BOOT_PRE
 
 const SUPERVISOR_UNIT_FILE = "dori-supervisor.service";
 
-/** Replaces an outdated installed script while preserving its backup and executable mode. */
-export const refreshInstalledScript = (installed: string, want: Buffer): boolean => {
-  if (readFileSync(installed).equals(want)) return false;
-  copyFileSync(installed, `${installed}.bak`);
-  const next = `${installed}.new-${process.pid}`;
-  writeFileSync(next, want);
-  chmodSync(next, 0o755);
-  renameSync(next, installed);
-  return true;
-};
-
 /** The path of the first `ExecStartPre=` line of a unit file, without systemd's `-`, `@`, `+` or `!` prefixes. */
 const execStartPre = (unit: string): string | undefined => {
   const m = /^ExecStartPre=[-@+!:]*\s*(\S+)/m.exec(unit);
@@ -40,6 +29,11 @@ export const refreshBootPrep = (
   const installed = execStartPre(readFileSync(unitFile, "utf8"));
   if (!installed || !existsSync(installed)) return undefined;
   const want = Buffer.from(renderTemplate(readFileSync(template, "utf8"), {}));
-  if (!refreshInstalledScript(installed, want)) return undefined;
+  if (readFileSync(installed).equals(want)) return undefined;
+  copyFileSync(installed, `${installed}.bak`);
+  const next = `${installed}.new-${process.pid}`;
+  writeFileSync(next, want);
+  chmodSync(next, 0o755);
+  renameSync(next, installed);
   return `BOOT_PREP_UPDATED ${installed} from templates/${BOOT_PREP}; the previous copy is ${installed}.bak`;
 };

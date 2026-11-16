@@ -7,14 +7,12 @@ import { join, win32 } from "node:path";
 import type { Pane } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
-import { agentArgv, outsideDenyRules } from "../src/runner/lane-launch.ts";
-import { RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
+import { agentArgv, outsideDenyRules, RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerPolicy } from "../src/runner/policy.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { type RunnerEventType, runnerEvent, type TurnEvidence } from "../src/runner/protocol.ts";
 import { STARTUP_GRACE_MS } from "../src/runner/serve.ts";
-import type { Connector, Transport } from "../src/runner/transport.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { fakeClock } from "./fakes.ts";
 import { writeRunnerFile } from "../src/runner/fs-safety.ts";
 

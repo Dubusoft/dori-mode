@@ -2,8 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { footer, footerDoneRules } from "../src/launch-footer.ts";
-import { LaunchError, launchLane, parseLaneTask, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
+import { footer, footerDoneRules, LaunchError, launchLane, parseLaneTask, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
 import { LaneOpsError, laneOps, type StartInput } from "../src/lane-ops.ts";
 import type { Lane } from "../src/registry.ts";
 import type { RunnerCall } from "../src/runner/call.ts";

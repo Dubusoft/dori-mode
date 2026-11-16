@@ -100,8 +100,6 @@ const POSIX_TOKEN = "DORI_POSIX_42";
 const PS_PROBE = "Write-Output ('DORI_PS_' + (6*7))";
 const PS_TOKEN = "DORI_PS_42";
 const NO_SHELL = `${UNSUPPORTED_SHELL} (no POSIX sh or PowerShell)`;
-const runnerKinds = new Map<string, MachineKind>();
-const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
 
 /** The ssh command that runs PowerShell `snippet` on Windows, whether the OpenSSH login shell is cmd.exe or PowerShell. */
 export const encodedPowerShell = (snippet: string): string =>
@@ -109,9 +107,13 @@ export const encodedPowerShell = (snippet: string): string =>
 
 /** How a machine runs commands over ssh: POSIX sh, or Windows PowerShell through an encoded command. */
 export type MachineKind = "posix" | "windows";
+const machineKinds = new Map<string, MachineKind>();
 
 /** Forgets every machine's resolved kind. */
-export const clearShellModes = (): void => runnerKinds.clear();
+export const clearShellModes = (): void => {
+  machineKinds.clear();
+  runnerKinds.clear();
+};
 
 const runIn = (run: Runner, target: string, cmd: { readonly command: string; readonly stdin?: string }, timeoutMs: number): Promise<Ran> =>
   run(sshArgv(target, cmd.command), cmd.stdin === undefined ? { timeoutMs } : { timeoutMs, stdin: cmd.stdin });
@@ -125,14 +127,8 @@ const resolveKind = async (run: Runner, target: string, timeoutMs: number): Prom
     const r = await runIn(run, target, { command }, timeoutMs);
     if (unreachable(r)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(r)}` };
     if (r.out.split("\n").some((l) => l.trim() === token)) {
-      let resolved = kind;
-      if (kind === "posix") {
-        const uname = await runIn(run, target, { command: "uname -s" }, timeoutMs);
-        if (unreachable(uname)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(uname)}` };
-        if (uname.code === 0 && WINDOWS_UNAME.test(uname.out.trim())) resolved = "windows";
-      }
-      runnerKinds.set(target, resolved);
-      return { ok: true, kind: resolved };
+      machineKinds.set(target, kind);
+      return { ok: true, kind };
     }
     why ||= stderrLine(r.err);
   }
@@ -141,6 +137,8 @@ const resolveKind = async (run: Runner, target: string, timeoutMs: number): Prom
 
 /** A machine's kind, or why it could not be found. */
 export type KindResult = { readonly ok: true; readonly kind: MachineKind } | ShellFailure;
+const runnerKinds = new Map<string, MachineKind>();
+const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
 
 /**
  * The kind of commands `m`'s runner takes: the cached or probed kind, except that a POSIX shell on Windows (Git Bash,
@@ -150,7 +148,17 @@ export type KindResult = { readonly ok: true; readonly kind: MachineKind } | She
 export const machineKind = async (run: Runner, m: GuardMachine, timeoutMs: number = SAMPLE_TIMEOUT_MS): Promise<KindResult> => {
   const known = runnerKinds.get(m.target);
   if (known) return { ok: true, kind: known };
-  return resolveKind(run, m.target, timeoutMs);
+  const cached = machineKinds.get(m.target);
+  const k = cached ? { ok: true as const, kind: cached } : await resolveKind(run, m.target, timeoutMs);
+  if (!k.ok) return k;
+  let kind = k.kind;
+  if (kind === "posix") {
+    const r = await runIn(run, m.target, { command: "uname -s" }, timeoutMs);
+    if (unreachable(r)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(r)}` };
+    if (r.code === 0 && WINDOWS_UNAME.test(r.out.trim())) kind = "windows";
+  }
+  runnerKinds.set(m.target, kind);
+  return { ok: true, kind };
 };
 
 /** A runner's kills on its machine (`RunnerGuardBoard.takeKills`, from `guard.critical`), as the critical stage reads them. */
@@ -229,4 +237,61 @@ export const machineGuardTick = (
     state.set(machine.label, { alerting });
   }
   return out;
+};
+
+/** The files the retired standalone guard agent left in each worker's ~/.dori. */
+const OLD_AGENT_FILES = ["guard-agent.sh", "guard-agent.ps1", "guard-agent.version"] as const;
+const POSIX_REMOVE = [
+  "rc=0",
+  `for f in ${OLD_AGENT_FILES.join(" ")}; do`,
+  '  p="$HOME/.dori/$f"',
+  '  if [ -e "$p" ]; then rm -f "$p" && echo "$f" || rc=1; fi',
+  "done",
+  "exit $rc",
+].join("\n");
+const PS_REMOVE = encodedPowerShell([
+  "$ErrorActionPreference = 'Stop'",
+  "try {",
+  "  $d = Join-Path $env:USERPROFILE '.dori'",
+  `  foreach ($f in ${OLD_AGENT_FILES.map((f) => `'${f}'`).join(", ")}) {`,
+  "    $p = Join-Path $d $f",
+  "    if (Test-Path -LiteralPath $p) { Remove-Item -Force -LiteralPath $p; Write-Output $f }",
+  "  }",
+  "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }",
+  "exit 0",
+].join("\n"));
+
+const oneLine = (s: string): string => s.replace(/\s*\n\s*/g, " ").trim();
+
+/**
+ * Deletes the retired standalone guard agent's files (~/.dori/guard-agent.sh, .ps1, .version) from every machine and
+ * logs GUARD_AGENT_REMOVED with what was there; a machine with nothing to delete logs nothing. A machine with neither
+ * POSIX sh nor PowerShell is skipped (GUARD_AGENT_SKIPPED, not a failure). Returns how many machines were unreachable
+ * (GUARD_AGENT_UNREACHABLE) or failed otherwise (GUARD_AGENT_FAILED).
+ */
+export const removeGuardAgents = async (run: Runner, machines: readonly GuardMachine[], log: (line: string) => void): Promise<number> => {
+  const failed = await Promise.all(machines.map(async (m) => {
+    const k = await machineKind(run, m);
+    if (!k.ok && k.unsupported) {
+      log(`GUARD_AGENT_SKIPPED ${m.label} ${oneLine(k.detail)}`);
+      return false;
+    }
+    if (!k.ok) {
+      log(`GUARD_AGENT_UNREACHABLE ${m.label} ${oneLine(k.detail.replace(/^unreachable: /, ""))}`);
+      return true;
+    }
+    const r = await runIn(run, m.target, { command: k.kind === "windows" ? PS_REMOVE : POSIX_REMOVE }, SAMPLE_TIMEOUT_MS);
+    if (unreachable(r)) {
+      log(`GUARD_AGENT_UNREACHABLE ${m.label} ${sshError(r)}`);
+      return true;
+    }
+    if (r.code !== 0) {
+      log(`GUARD_AGENT_FAILED ${m.label} remove failed (exit ${r.code}): ${sshError(r)}`);
+      return true;
+    }
+    const removed = OLD_AGENT_FILES.filter((f) => r.out.split("\n").some((l) => l.trim() === f));
+    if (removed.length) log(`GUARD_AGENT_REMOVED ${m.label} ${removed.join(",")}`);
+    return false;
+  }));
+  return failed.filter(Boolean).length;
 };

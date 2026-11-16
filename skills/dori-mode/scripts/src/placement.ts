@@ -1,5 +1,5 @@
 import type { DoriConfig, GuardThresholds, PlacementConfig } from "./config.ts";
-import { doneRepos } from "./signals.ts";
+import { doneRepos } from "./launch.ts";
 import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
 import { type SampleResult, UNSUPPORTED_SHELL } from "./remote-guard.ts";
 import { canLaunch, type LaunchVerdict } from "./routing.ts";
@@ -244,7 +244,8 @@ const offlineHold = (machine: string, repo: string | undefined): MachineCheck =>
  * (`p.machine`), with a HOLD line for every other candidate.
  */
 const planCandidates = async (p: Placement, candidates: readonly PlacementCandidate[], placement: PlacementConfig, check: (machine: string) => Promise<MachineCheck>): Promise<LaunchPlan> => {
-  const checks = await Promise.all(candidates.filter((c) => c.online).map(async (c) => ({ c, check: await check(c.machine) })));
+  const checks: { c: PlacementCandidate; check: MachineCheck }[] = [];
+  for (const c of candidates) if (c.online) checks.push({ c, check: await check(c.machine) });
   const pick = preferred(checks.filter((x) => x.check.verdict.ok).map((x) => ({ ...x, machine: x.c.machine })), placement);
   if (pick) {
     const placed: Placement = { ...p, machine: pick.c.machine, cwd: pick.c.cwd, online: true };

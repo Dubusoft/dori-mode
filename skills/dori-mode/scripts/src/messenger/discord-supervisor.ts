@@ -12,8 +12,7 @@ import {
   discordMessageChannel, discordOwnerConfigured, discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound, listDiscordThreads,
   parseDiscordMessage, pollDiscordInbound, seedDiscordCursor,
 } from "./discord-inbound.ts";
-import { Discord } from "./discord.ts";
-import { discordPresence, type GatewaySession, openDiscordGateway, type GatewaySocket } from "./discord-gateway.ts";
+import { Discord, discordPresence, type GatewaySession, openDiscordGateway, type GatewaySocket } from "./discord.ts";
 import { type Http, MessengerError } from "./http.ts";
 import { realTimers, type Timers } from "./typing.ts";
 

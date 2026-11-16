@@ -1,11 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { replaceFileDurable } from "./durable-write.ts";
 import type { DriftConfig } from "./config.ts";
 import type { Emit } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
-import type { LaneReport, LaneReportStore } from "./lane-report-store.ts";
+import type { LaneReport, LaneReportStore } from "./lane-reports.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import type { LaneOps } from "./lane-ops.ts";
 
@@ -41,7 +40,10 @@ export const loadDriftState = (stateDir: string): DriftState => {
 
 export const saveDriftState = (stateDir: string, state: DriftState): void => {
   const path = join(stateDir, DRIFT_STATE_FILE);
-  replaceFileDurable(path, JSON.stringify(state), 0o600, `${path}.${process.pid}.tmp`);
+  const tmp = `${path}.${process.pid}.tmp`;
+  const fd = openSync(tmp, "w", 0o600);
+  try { writeFileSync(fd, JSON.stringify(state)); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, path);
 };
 
 type Out = { readonly id: string; readonly line: string };
@@ -85,9 +87,8 @@ const pullKey = (pull: Pick<OpenPull, "repo" | "number">): string => `${pull.rep
 export const pullOwners = (ops: Pick<LaneOps, "inspect">): PullOwners => async (lanes, pulls) => {
   const owner = new Map<string, string>();
   const sorted = [...lanes].sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.key.localeCompare(b.key));
-  const targetsByLane = await Promise.all(sorted.map(async (lane) => await githubTargets([lane], ops)));
-  for (const [index, lane] of sorted.entries()) {
-    for (const [repo, targets] of targetsByLane[index]!) {
+  for (const lane of sorted) {
+    for (const [repo, targets] of await githubTargets([lane], ops)) {
       for (const pull of pulls) {
         if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || targets.branches.has(pull.branch))) continue;
         if (!owner.has(pullKey(pull))) owner.set(pullKey(pull), lane.key);

@@ -6,8 +6,9 @@ import { closeLane } from "../src/done-flow.ts";
 import { type Observed, openOperations, type OperationStore, OPERATIONS_FILE, perform } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { convertJsonStore } from "../src/store-import.ts";
-import { depsFor, fakeClock, newWorld, withSqliteStore, withState, type World } from "./fakes.ts";
+import { exportStore } from "../src/store-export.ts";
+import { importStore } from "../src/store-import.ts";
+import { depsFor, fakeClock, newWorld, TEST_STORE, withState, type World } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 
@@ -27,8 +28,8 @@ const readBack = async () => world;
 
 beforeEach(() => {
   state = withState();
-  withSqliteStore(state.dir);
-  store = openOperations({ stateDir: state.dir });
+  if (TEST_STORE === "sqlite") new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
+  store = openOperations({ stateDir: state.dir, store: TEST_STORE });
   ran = 0;
   world = "not-done";
 });
@@ -41,10 +42,10 @@ test("a verified operation never runs its effect again", async () => {
   expect({ state: again.op.state, ran: again.ran, effects: ran }).toEqual({ state: "verified", ran: false, effects: 1 });
 });
 
-test("operation retention removes only verified rows older than 30 days", () => {
+test.each(["json", "sqlite"] as const)("%s operation retention removes only verified rows older than 30 days", (kind) => {
   const dir = withState();
-  new SqliteStore(join(dir.dir, SQLITE_FILE), { create: true }).close();
-  const history = openOperations({ stateDir: dir.dir });
+  if (kind === "sqlite") new SqliteStore(join(dir.dir, SQLITE_FILE), { create: true }).close();
+  const history = openOperations({ stateDir: dir.dir, store: kind });
   try {
     const cutoff = T0 - 30 * 24 * 60 * 60_000;
     for (const state of ["verified", "planned", "attempted", "failed", "ambiguous"] as const) {
@@ -116,19 +117,19 @@ test("a read-back proving absence after a throwing effect is failed and may retr
   expect(ran).toBe(2);
 });
 
-test("operations survive the json conversion with their states", async () => {
+test("operations survive a store import and export with their states", async () => {
+  if (TEST_STORE === "sqlite") return;
   await perform(store, now, spec, effect, readBack);
   await perform(store, now, { ...spec, action: "pane-close", target: "w:p2" }, effect, async () => "unknown");
   const before = store.list();
-  // Given the operations.json a json store kept with these rows.
-  const legacy = withState();
-  try {
-    writeFileSync(join(legacy.dir, OPERATIONS_FILE), JSON.stringify({ ops: Object.fromEntries(before.map((op) => [op.id, op])) }));
-    expect(convertJsonStore(legacy.dir, T0, () => () => {})).toBe(true);
-    expect(existsSync(join(legacy.dir, OPERATIONS_FILE))).toBe(false);
-    const converted = openOperations({ stateDir: legacy.dir });
-    try { expect(converted.list()).toEqual(before); } finally { converted.close(); }
-  } finally { legacy.done(); }
+  writeFileSync(join(state.dir, "supervisor.json"), JSON.stringify({ events: [] }));
+  importStore(state.dir, T0, () => () => {});
+  expect(existsSync(join(state.dir, OPERATIONS_FILE))).toBe(false);
+  const imported = openOperations({ stateDir: state.dir, store: "sqlite" });
+  try { expect(imported.list()).toEqual(before); } finally { imported.close(); }
+  exportStore(state.dir, T0, () => () => {});
+  const exported = openOperations({ stateDir: state.dir, store: "json" });
+  expect(exported.list()).toEqual(before);
 });
 
 test("a close records its effects and a second close of the same lane repeats none of them", async () => {

@@ -13,7 +13,7 @@ import { Registry } from "../../src/registry.ts";
 import type { LaneOps } from "../../src/lane-ops.ts";
 import type { Ran, Runner } from "../../src/run.ts";
 import { checkDone } from "../../src/signals.ts";
-import { fakeClock, fakeLaneOps, newWorld, testTunables } from "../fakes.ts";
+import { fakeClock, fakeLaneOps, newWorld, TEST_STORE, testTunables } from "../fakes.ts";
 
 const [stateDir = "", worldDir = "", killArg = "-1", mode = "watch"] = process.argv.slice(2);
 const killAt = Number(killArg);
@@ -71,7 +71,7 @@ class StepRegistry extends Registry {
   }
 }
 
-const config = { ...defaultConfig("/home/test"), stateDir, leadCwd: repo, leadPane: "lead:p1" };
+const config = { ...defaultConfig("/home/test"), stateDir, leadCwd: repo, leadPane: "lead:p1", store: TEST_STORE };
 const inner = openOperations(config);
 const operations: OperationStore = {
   get: (id) => inner.get(id),

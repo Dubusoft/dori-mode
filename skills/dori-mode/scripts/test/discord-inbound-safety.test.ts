@@ -6,8 +6,7 @@ import {
   discordAttachments, discordThreadFloor, emitDiscordDelete, emitDiscordEdit, emitDiscordInbound, listDiscordInbound,
   MISSING_CONTENT_NOTE, pollDiscordInbound, unresolvedHydration,
 } from "../src/messenger/discord-inbound.ts";
-import { Discord } from "../src/messenger/discord.ts";
-import { DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from "../src/messenger/discord-split.ts";
+import { Discord, DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from "../src/messenger/discord.ts";
 import type { HttpRequest } from "../src/messenger/http.ts";
 import type { Runner } from "../src/run.ts";
 import { fakeClock, withState } from "./fakes.ts";

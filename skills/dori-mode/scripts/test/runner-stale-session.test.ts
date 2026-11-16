@@ -6,8 +6,7 @@ import type { Ran } from "../src/run.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
 import { RunnerLanes, serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
-import type { Connector, Transport } from "../src/runner/transport.ts";
-import { memoryNetwork } from "./support/memory-transport.ts";
+import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
 import { fakeClock } from "./fakes.ts";
 
 /**
