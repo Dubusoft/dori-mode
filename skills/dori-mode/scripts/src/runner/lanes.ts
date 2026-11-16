@@ -118,6 +118,8 @@ export type RunnerLanesDeps = {
   readonly realpath?: (path: string) => string;
   /** The per-lane herdr report sockets (herdr-report.ts): opened before a POSIX lane's command runs, closed with the lane. */
   readonly herdrReports?: { open(key: string): void; close(key: string): void };
+  /** Runs before each start without holding it up: on macOS the BrowserSkill window check (browser-window.ts). */
+  readonly browserCheck?: (key: string) => Promise<void>;
 };
 
 export type Effect<T extends keyof CommandResults> = { readonly detail: string; readonly result: CommandResults[T] };
@@ -395,6 +397,7 @@ export class RunnerLanes {
       ensureRunnerSubdir(this.deps.runnerDir, join(RUNNER_PATHS.lanes, body.key));
     }
     if (body.sandbox) await this.checkSandbox(body.key);
+    void this.deps.browserCheck?.(body.key);
     let mayStart = false;
     try {
       prepareInput(this.deps.runnerDir, body.key, body.briefText, body.files, false);
