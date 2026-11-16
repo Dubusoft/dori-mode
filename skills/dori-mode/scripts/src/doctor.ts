@@ -202,7 +202,7 @@ const KNOWN_DORI_ENTRIES: ReadonlySet<string> = new Set(["runner", "heavy", "lea
 
 /**
  * Entries a lane can read that nobody has looked at: a $HOME dot entry or a ~/.dori entry outside the known sets above
- * and not in ~/.dori/lane-sandbox-hide. A lane sees $HOME and ~/.dori read-only, so a new tool's credential file there is
+ * and not in ~/.dori/lane-sandbox-hide. A lane can read $HOME and ~/.dori, so a new tool's credential file there is
  * readable until it is hidden. Only hosts with a lane sandbox (Linux, macOS) are checked.
  */
 const homeEntries = (d: Pick<DoctorDeps, "home" | "platform">): Check[] => {

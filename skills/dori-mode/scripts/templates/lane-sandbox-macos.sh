@@ -18,15 +18,16 @@
 #
 # Seatbelt cannot hide or remap paths the way bubblewrap does; it only refuses access (EPERM). So the profile allows
 # reads almost everywhere and refuses writes outside $HOME and /opt/homebrew, which are writable but for what the host
-# later runs or trusts outside the sandbox: ~/.dori, ~/.ssh, ~/Library/LaunchAgents, ~/Library/Keychains, the shell
+# later runs or trusts outside the sandbox: what dori runs or trusts in ~/.dori (its runner dir, dori itself, its config,
+# the scripts its secret commands run, the lead's cwd and the attachment pins), ~/.ssh, ~/Library/LaunchAgents, ~/Library/Keychains, the shell
 # startup files, ~/.local/bin, ~/.bun/bin, ~/.cargo/bin, ~/.gitconfig and ~/.config/git, gh and herdr (HOST_RUN below),
-# and the directories holding them (~, ~/.config, ~/.local, ~/.bun, ~/.cargo, ~/Library) themselves, so none of them
+# and the directories holding them (~, ~/.dori, ~/.config, ~/.local, ~/.bun, ~/.cargo, ~/Library) themselves, so none of them
 # can be renamed away and replaced by a symlink. Writable again after those refusals: the cwd (worktree) and its git
 # common dir, the runner's worktree root and the .git directories of the repos under its repos root, the lane's own
-# TMPDIR, ~/.omo, ~/.cache, ~/.dori/heavy, the lane's brief out dir, package caches, Xcode's per-user dirs, /tmp,
+# TMPDIR, ~/.omo, ~/.cache, the lane's brief out dir, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
-# devices; the hooks of those git dirs stay refused. ~/.dori is readable but for targeted refusals that come after every
-# grant: ~/.dori/runner (but the runner's lane socket and bin and the lane's own brief, files, out dir, token and
+# devices; the hooks of those git dirs stay refused. The rest of ~/.dori (~/.dori/research and ~/.dori/heavy among it)
+# is writable like the rest of $HOME. ~/.dori is readable but for targeted refusals that come after every grant: ~/.dori/runner (but the runner's lane socket and bin and the lane's own brief, files, out dir, token and
 # lanes/<key>, re-opened after it) and the credential stores in CREDENTIALS and MAC_CREDENTIALS below (~/.dori/env,
 # secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube, gpg, docker, git and registry logins, keyrings,
 # browser profiles and cookie stores, shell history), refused for reads and writes alike; of ~/.dori/state only
@@ -70,13 +71,15 @@ MAC_CREDENTIALS=(
 )
 
 # What the host later runs or trusts outside the sandbox, under $HOME: refused for writes after the $HOME write grant.
-# ~/.dori/heavy, the lane's brief out dir and the login keychain file are writable again after it.
-HOST_RUN=".dori .ssh Library/LaunchAgents Library/Keychains .bashrc .bash_profile .bash_login .bash_logout .profile
+# The lane's brief out dir and the login keychain file are writable again after it. An entry may be a glob, like the
+# CREDENTIALS ones (config.json* covers dori's config and its backups, existing or not).
+HOST_RUN=".dori/runner .dori/bin .dori/src .dori/dori-boot-prep.sh .dori/config.json* .dori/ops .dori/lead
+  .dori/lane-attachments .dori/worktrees .ssh Library/LaunchAgents Library/Keychains .bashrc .bash_profile .bash_login .bash_logout .profile
   .zshrc .zprofile .zshenv .zlogin .zlogout .local/bin .bun/bin .cargo/bin .gitconfig .config/git .config/gh
   .config/herdr"
 # The directories holding HOST_RUN entries, refused as themselves only: renaming one away would leave its old path free
 # for a symlink into a writable directory.
-HOST_RUN_PARENTS=". .config .local .bun .cargo Library"
+HOST_RUN_PARENTS=". .dori .config .local .bun .cargo Library"
 
 SBX=/usr/bin/sandbox-exec
 # macOS's own OpenSSL-format root bundle (what curl and git use by default).
@@ -195,12 +198,14 @@ build_profile() {
   XHOME=$LAST
   param HOMEBREW /opt/homebrew
   XHOMEBREW=$LAST
+  set -f
   for p in $HOST_RUN; do
-    param "U$n" "$H/$p"
-    XRUN+=("$LAST")
-    u_rules="$u_rules (subpath (param \"U$n\"))"
+    deny_target "U$n" "$H/$p"
+    XRUN+=("$SHOWN")
+    u_rules="$u_rules $TARGET"
     n=$((n + 1))
   done
+  set +f
   for p in $HOST_RUN_PARENTS; do
     param "L$n" "$H/$p"
     l_rules="$l_rules (literal (param \"L$n\"))"
@@ -208,7 +213,7 @@ build_profile() {
   done
 
   w "$LT"
-  for p in "$H/.omo" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
+  for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
     "$H/.cargo/registry" "$H/.cargo/git" "$H/Library/Caches" "$H/Library/Developer" /tmp; do
     w "$p"
   done
@@ -340,7 +345,7 @@ build_profile() {
   fi
 
   # Later rules win over earlier ones in SBPL. Writes: the $HOME and Homebrew grant, then the HOST_RUN refusals, then
-  # the specific write grants (which re-open ~/.dori/heavy, the lane's out dir, a cwd-less lane's cwd and the login
+  # the specific write grants (which re-open the lane's out dir, a cwd-less lane's cwd and the login
   # keychain under them), then the credential and git hooks refusals over every grant. Reads: every read refusal comes
   # after the read grants (LANE_SANDBOX_RO): a grant never re-opens ~/.dori/runner, ~/.ssh or a credential store. Only
   # the lane's own runner entries are re-opened after the runner refusal, and ~/.dori/state/review-inputs after the

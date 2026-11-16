@@ -14,7 +14,7 @@ export const LEAD_ATTACHMENT_ROOTS = (stateDir: string): readonly string[] => [
 ];
 /**
  * The attachment sources a fresh launch shipped, pinned beside the research root rather than under stateDir: the lane
- * sandboxes hide stateDir (briefs and registry included) from a lane and leave the rest of the dori home read-only, so
+ * sandboxes hide stateDir (briefs and registry included) from a lane and keep lane-attachments read-only, so
  * a lane can read its pin but never change it. Recovery ships only references inside this set, so a lane that rewrites its own brief gains no new reads.
  */
 const attachmentPinPath = (stateDir: string, key: string): string => join(dirname(resolve(stateDir)), "lane-attachments", `${key}.json`);
