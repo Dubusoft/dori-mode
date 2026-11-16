@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep, win32 } from "node:path";
 import { defaultRunnerDir, RUNNER_PATHS } from "./fs-safety.ts";
-import { validateFileKey } from "./lane-files.ts";
+import { validateFileKey } from "../lane-file-contract.ts";
 import {
   isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
 } from "./protocol.ts";

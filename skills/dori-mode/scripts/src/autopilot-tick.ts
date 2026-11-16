@@ -53,10 +53,9 @@ export class AutopilotTick {
   private firstKickAt: number | undefined;
   private lastKickAt = Number.NEGATIVE_INFINITY;
   private remembered: { ids: readonly number[]; slots: number | null; at: number } | undefined;
-  private lastError: string | undefined;
+  /** The last error text logged per failing step, so a repeated error is logged once. */
+  private readonly errors = new Map<"local" | "execute" | "tick", string>();
   private localKey: string | undefined;
-  private lastLocalError: string | undefined;
-  private lastExecuteError: string | undefined;
 
   constructor(private readonly deps: AutopilotTickDeps) {}
 
@@ -65,6 +64,12 @@ export class AutopilotTick {
     const now = this.deps.now();
     this.firstKickAt ??= now;
     this.lastKickAt = now;
+  }
+
+  private warnOnce(step: "local" | "execute" | "tick", label: string, e: unknown): void {
+    const why = e instanceof Error ? e.message : String(e);
+    if (why !== this.errors.get(step)) this.deps.log(`${label} ${why}`);
+    this.errors.set(step, why);
   }
 
   due(now: number): boolean {
@@ -79,11 +84,9 @@ export class AutopilotTick {
       const key = await this.deps.localState();
       if (this.localKey !== undefined && key !== this.localKey) this.kick();
       this.localKey = key;
-      this.lastLocalError = undefined;
+      this.errors.delete("local");
     } catch (e) {
-      const why = e instanceof Error ? e.message : String(e);
-      if (why !== this.lastLocalError) this.deps.log(`AUTOPILOT_LOCAL_STATE_ERROR ${why}`);
-      this.lastLocalError = why;
+      this.warnOnce("local", "AUTOPILOT_LOCAL_STATE_ERROR", e);
     }
   }
 
@@ -91,12 +94,10 @@ export class AutopilotTick {
   private async execute(ids: readonly number[], all: readonly number[]): Promise<number[]> {
     try {
       const results = await this.deps.execute!(ids);
-      this.lastExecuteError = undefined;
+      this.errors.delete("execute");
       return all.filter((id) => !ids.includes(id) || results.every((r) => r.taskId !== id || LEAD_KINDS.has(r.kind)) );
     } catch (e) {
-      const why = e instanceof Error ? e.message : String(e);
-      if (why !== this.lastExecuteError) this.deps.log(`AUTOPILOT_EXECUTOR_ERROR ${why}`);
-      this.lastExecuteError = why;
+      this.warnOnce("execute", "AUTOPILOT_EXECUTOR_ERROR", e);
       return [...all];
     }
   }
@@ -112,13 +113,10 @@ export class AutopilotTick {
     try {
       report = await this.deps.judge();
     } catch (e) {
-      const why = e instanceof Error ? e.message : String(e);
-      if (why !== this.lastError) this.deps.log(`AUTOPILOT_TICK_ERROR ${why}`);
-      this.lastError = why;
+      this.warnOnce("tick", "AUTOPILOT_TICK_ERROR", e);
       return;
     }
-    if (this.lastError !== undefined) this.deps.log("AUTOPILOT_TICK_OK");
-    this.lastError = undefined;
+    if (this.errors.delete("tick")) this.deps.log("AUTOPILOT_TICK_OK");
     let ids = report.verdicts.filter((v) => v.verdict === "LAUNCH").map((v) => v.taskId).sort((a, b) => a - b);
     if (this.deps.execute && this.deps.executorOn?.()) ids = await this.execute(report.paused ? [] : ids, ids);
     // A pause wakes no one; forgetting the set makes it news once the pause is lifted.

@@ -3,17 +3,18 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { answeredDecision, type DirectRouting, routeOwnerDelete, routeOwnerEdit, routeOwnerMessage } from "../src/decision-inbound.ts";
-import { JsonLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
+import { SqliteLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
 import {
   discordChannels, discordDispatchThreads, discordSnowflakeAt, discordThreadFloor, emitDiscordEdit, emitDiscordInbound, type InboundMessage,
   listDiscordInbound, parseDiscordMessage, pollDiscordInbound, seedDiscordCursor,
 } from "../src/messenger/discord-inbound.ts";
-import { type DecisionTransport, openLaneDecision, openOwnerDecision, readDecisions, type TargetLane } from "../src/owner-decisions.ts";
+import { readDecisions, type TargetLane } from "../src/decision-store.ts";
+import { type DecisionTransport, openLaneDecision, openOwnerDecision } from "../src/owner-decisions.ts";
 import { serializeDecisionText, serializeRequestText } from "../src/runner/decision-text.ts";
 import { Discord } from "../src/messenger/discord.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
-import { withState } from "./fakes.ts";
+import { withState, storePath } from "./fakes.ts";
 import { fakeClock } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -314,7 +315,7 @@ const decisionWorld = () => {
     if (!opened) throw new Error("not a decision text");
     return opened.decision;
   };
-  const store = new JsonLaneMessages(s.dir);
+  const store = new SqliteLaneMessages(storePath(s.dir));
   const logs: string[] = [];
   const routing: DirectRouting = { stateDir: s.dir, store: () => store, lanes: async () => lanes, now: () => 2_000, emit: s.emit, log: (line) => { logs.push(line); } };
   const options = {

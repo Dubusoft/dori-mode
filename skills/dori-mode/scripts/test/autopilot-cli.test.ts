@@ -10,19 +10,20 @@ import type { HostSample } from "../src/host-guard.ts";
 import type { LaneOps } from "../src/lane-ops.ts";
 import type { MachineObservation } from "../src/runner/protocol.ts";
 import { quotaProvidersFor, type QuotaResult, readUsage } from "../src/claude-quota.ts";
-import { JsonOperations, plan } from "../src/operations.ts";
+import { SqliteOperations, plan } from "../src/operations.ts";
 import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
+import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const WS = 7;
 
 let dir: string;
-let store: JsonOperations;
+let store: SqliteOperations;
 let tokenFile: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "dori-autopilot-cli-"));
-  store = new JsonOperations(dir);
+  store = new SqliteOperations(storePath(dir));
   tokenFile = join(dir, "web-token");
   writeFileSync(tokenFile, "tok-1\n");
 });

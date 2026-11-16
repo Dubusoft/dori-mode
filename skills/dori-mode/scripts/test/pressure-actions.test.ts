@@ -7,7 +7,7 @@ import type { LaneMemory } from "../src/lane-memory.ts";
 import type { PauseResult } from "../src/pause.ts";
 import type { Lane } from "../src/registry.ts";
 import type { GuardMachine, KillResult, MachineSample } from "../src/remote-guard.ts";
-import { criticalTick, type PressureIo, warnMachineLanes } from "../src/supervise-loop.ts";
+import { criticalTick, type PressureIo, warnMachineLanes } from "../src/supervise-guard.ts";
 import { fakeLaneOps, newWorld, sent, type World } from "./fakes.ts";
 
 const config = {

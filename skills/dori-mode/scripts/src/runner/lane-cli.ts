@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { homedir, loadavg } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
@@ -70,7 +70,7 @@ type Reply = { ok: boolean; code?: string; detail?: string; [k: string]: unknown
 
 /** The heavy admission load: the sampler's load1 on win32 (`loadavg()` is all zeros there), else the 1-minute load average. */
 export const heavyLoad = (platform: string, run: Runner, runnerDir?: string): (() => Promise<number>) =>
-  platform === "win32" ? () => sampleLoad1(platform, run, runnerDir) : async () => loadavg()[0] ?? 0;
+  () => sampleLoad1(platform, run, runnerDir);
 
 export const retryable = (error: unknown): boolean => {
   const code = (error as { code?: unknown } | null)?.code;

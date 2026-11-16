@@ -1,8 +1,9 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import { eventClass, type EventPolicy, forLead } from "./event-policy.ts";
+import { dropFile, publishReceipt, receiptPaths } from "./receipts.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
 import type { Event, Journal, JournalCore, Obligation } from "./supervise-journal.ts";
 
 /**
@@ -35,7 +36,6 @@ export const DEFAULT_RESOLVE_KINDS: readonly string[] = [
 
 /** One word without control characters: an event id as a receipt and the UNRESOLVED line can carry it. */
 const EVENT_ID = /^[^\s\p{Cc}]{1,300}$/u;
-const RECEIPT_FILE = /^\d+-[\w-]+\.json$/;
 export const validEventId = (id: string): boolean => EVENT_ID.test(id);
 
 export class ResolvedError extends Error {}
@@ -54,37 +54,14 @@ export const isDecision = (line: string, kinds: readonly string[]): boolean => e
 /** `dori resolved <eventId>`'s receipt: written like `dori reported`'s (tmp, fsync, rename, both directories fsynced). */
 export const recordResolved = (stateDir: string, id: string, at: number, note?: string): string => {
   if (!EVENT_ID.test(id)) throw new ResolvedError("usage: dori resolved <eventId> [<eventId> ...] [--note TEXT] (an event id)");
-  const dir = join(stateDir, RESOLVED_DIR);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${at}-${randomUUID()}.json`);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ id, at, ...(note ? { note } : {}) }), { mode: 0o600, flush: true });
-  renameSync(tmp, path);
-  fsyncDir(dir);
-  fsyncDir(stateDir);
-  return path;
-};
-
-const fsyncDir = (dir: string): void => {
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-};
-
-const dropReceipt = (path: string): void => {
-  try { unlinkSync(path); } catch (e) {
-    if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
-  }
+  return publishReceipt(stateDir, RESOLVED_DIR, at, { id, at, ...(note ? { note } : {}) });
 };
 
 export type ResolvedReceipt = { readonly path: string; readonly id: string; readonly at: number; readonly note?: string };
 
 /** Receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
 export const pendingResolved = (stateDir: string): ResolvedReceipt[] => {
-  const dir = join(stateDir, RESOLVED_DIR);
-  let names: string[];
-  try { names = readdirSync(dir); } catch { return []; }
-  return names.filter((name) => RECEIPT_FILE.test(name)).flatMap((name) => {
-    const path = join(dir, name);
+  return receiptPaths(join(stateDir, RESOLVED_DIR)).flatMap((path) => {
     try {
       const { id, at, note } = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; at?: unknown; note?: unknown };
       if (typeof id !== "string" || !EVENT_ID.test(id)) return [];
@@ -177,7 +154,7 @@ export class DecisionTracking {
     }
     this.journal = { ...this.journal, pending };
     this.core.persist();
-    for (const receipt of receipts) dropReceipt(receipt.path);
+    for (const receipt of receipts) dropFile(receipt.path);
     this.publish();
   }
 
@@ -220,9 +197,7 @@ export class DecisionTracking {
     const text = JSON.stringify(list);
     if (text === this.published) return;
     const path = join(this.core.deps.config.stateDir, UNRESOLVED_FILE);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, text, { mode: 0o600 });
-    renameSync(tmp, path);
+    replaceFileAtomic(path, text, 0o600);
     this.published = text;
   }
 }

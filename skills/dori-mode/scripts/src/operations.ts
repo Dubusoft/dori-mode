@@ -1,10 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { redactSecrets } from "./redact.ts";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
-import { withStateLockSync } from "./state-lock.ts";
+import { RETENTION, SQLITE_FILE, StoreError, storeFile } from "./store.ts";
 
 /**
  * The operation contract (design 4.1): every mechanical effect the engine or a CLI command performs on a lane's world
@@ -75,47 +74,14 @@ export interface OperationStore {
   close(): void;
 }
 
+/** The retired json store's operation rows, converted once into the `operations` table (store-import.ts). */
 export const OPERATIONS_FILE = "operations.json";
-const OPERATIONS_LOCK = "operations.lock.sqlite";
 
-/** Oldest first, then by id: the order both stores list rows in. */
+/** Oldest first, then by id: the order the store lists rows in. */
 export const byAt = (a: Operation, b: Operation): number => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 const matches = (op: Operation, filter: { readonly lane?: string; readonly states?: readonly OperationState[] }): boolean =>
   (filter.lane === undefined || op.lane === filter.lane) && (filter.states === undefined || filter.states.includes(op.state));
-
-/** `operations.json`: rewritten whole (temp file, fsync, rename) under a short state lock, so CLI and supervisor can both write. */
-export class JsonOperations implements OperationStore {
-  readonly path: string;
-  private readonly lock: string;
-  constructor(stateDir: string) {
-    this.path = join(stateDir, OPERATIONS_FILE);
-    this.lock = join(stateDir, OPERATIONS_LOCK);
-  }
-  private read(): Record<string, Operation> {
-    return existsSync(this.path) ? (JSON.parse(readFileSync(this.path, "utf8")) as { ops: Record<string, Operation> }).ops : {};
-  }
-  get(id: string): Operation | undefined { return this.read()[id]; }
-  put(op: Operation): void {
-    withStateLockSync(this.lock, () => { saveJsonFile(this.path, { ops: { ...this.read(), [op.id]: op } }); });
-  }
-  list(filter: { readonly lane?: string; readonly states?: readonly OperationState[] } = {}): Operation[] {
-    return Object.values(this.read()).filter((op) => matches(op, filter)).sort(byAt);
-  }
-  prune(now: number): void {
-    withStateLockSync(this.lock, () => {
-      const ops = this.read();
-      let changed = false;
-      for (const [id, op] of Object.entries(ops)) {
-        if (op.state !== "verified" || op.updatedAt >= now - RETENTION.statusHistoryMs) continue;
-        delete ops[id];
-        changed = true;
-      }
-      if (changed) saveJsonFile(this.path, { ops });
-    });
-  }
-  close(): void {}
-}
 
 /**
  * The table lives in supervisor.sqlite but is created on first use, not by a schema migration: until the first close
@@ -135,7 +101,7 @@ const fromRow = (row: OpRow): Operation => ({
   ...(row.data !== null ? { data: row.data } : {}), attempts: row.attempts, at: row.at, updatedAt: row.updated_at,
 });
 
-/** Writes `ops` into a database's operations table (store import, and the sqlite store itself). */
+/** Writes `ops` into a database's operations table (the json conversion, and the store itself). */
 export const putRows = (db: Database, ops: readonly Operation[]): void => {
   const insert = db.prepare(`INSERT OR REPLACE INTO operations (id, lane, action, target, state, detail, data, attempts, at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -178,8 +144,7 @@ export class SqliteOperations implements OperationStore {
   close(): void { this.db.close(); }
 }
 
-export const openOperations = (config: { readonly stateDir: string; readonly store: StoreKind }): OperationStore =>
-  config.store === "sqlite" ? new SqliteOperations(join(config.stateDir, SQLITE_FILE)) : new JsonOperations(config.stateDir);
+export const openOperations = (config: { readonly stateDir: string }): OperationStore => new SqliteOperations(storeFile(config.stateDir));
 
 const write = (store: OperationStore, op: Operation, patch: Partial<Operation>, now: number): Operation => {
   const next: Operation = { ...op, ...patch, ...(patch.detail !== undefined ? { detail: redactSecrets(patch.detail) } : {}), updatedAt: now };

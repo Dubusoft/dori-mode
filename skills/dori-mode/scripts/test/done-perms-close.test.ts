@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { callerLane, claimDone, closeLane, laneActRefusal, laneSendRefusal, unpushedWork, watchTick } from "../src/done-flow.ts";
+import { claimDone, closeLane, unpushedWork, watchTick } from "../src/done-flow.ts";
+import { callerLane, laneActRefusal, laneSendRefusal } from "../src/lane-perms.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { run, type Runner } from "../src/run.ts";
 import { laneOps, type LaneOps } from "../src/lane-ops.ts";

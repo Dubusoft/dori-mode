@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { treeDigest } from "../src/lane-files.ts";
+import { treeDigest } from "../src/lane-file-contract.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";

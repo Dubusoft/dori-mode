@@ -45,6 +45,11 @@ const descendants = (table: readonly Proc[], root: number): Proc[] => {
   return out;
 };
 
+const sessionFlag = (argv: readonly string[]): string | undefined => {
+  const at = argv.indexOf("--session") >= 0 ? argv.indexOf("--session") : argv.indexOf("--session-id");
+  return at >= 0 ? argv[at + 1] : undefined;
+};
+
 export const sessionDirFor = (sessionsDir: string, cwd: string): string => join(sessionsDir, `--${cwd.replace(/^\//, "").replace(/\//g, "-")}--`);
 
 export type SessionDeps = { readonly run: Runner; readonly sessionsDir: string; readonly listDir?: (dir: string) => readonly string[] };
@@ -58,8 +63,7 @@ export const resolveSession = async (pane: string, cwd: string, table: readonly 
     for (const process of processes) {
       const argv = process.argv ?? [];
       if (!argv.some((arg) => AGENT.test(arg))) continue;
-      const at = argv.indexOf("--session") >= 0 ? argv.indexOf("--session") : argv.indexOf("--session-id");
-      const id = at >= 0 ? argv[at + 1] : undefined;
+      const id = sessionFlag(argv);
       if (id) return { id, via: "argv", ...(process.pid ? { pid: process.pid } : {}) };
     }
     return { id: "", via: "none" };
@@ -68,8 +72,7 @@ export const resolveSession = async (pane: string, cwd: string, table: readonly 
   const agent = shellPid ? descendants(table, shellPid).find((p) => AGENT.test(p.cmd) && !/\bmcp\b/.test(p.cmd)) : undefined;
   if (!agent) return { id: "", via: "none" };
   const argv = agent.cmd.split(/\s+/);
-  const flagAt = argv.indexOf("--session") >= 0 ? argv.indexOf("--session") : argv.indexOf("--session-id");
-  const fromFlag = flagAt >= 0 ? (argv[flagAt + 1] ?? "") : "";
+  const fromFlag = sessionFlag(argv);
   if (fromFlag) return { id: fromFlag, via: "argv", pid: agent.pid };
   const children = descendants(table, agent.pid).slice(0, 40);
   if (children.length > 0) {

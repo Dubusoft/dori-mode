@@ -182,3 +182,5 @@ export const sendVerified = async (
   if (status !== "working" && (await statusLookup(run, pane)).status === "working") return "delivered";
   return "unconfirmed";
 };
+
+export const quoteForPane = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);

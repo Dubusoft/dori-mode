@@ -8,10 +8,11 @@ import { type ExecutorDeps, reconcileExecutions, runExecutor } from "../src/auto
 import { type LaunchInput, SandboxRefusal } from "../src/launch.ts";
 import type { PlacedLaunch } from "../src/launch-service.ts";
 import type { ThreadMember } from "../src/messenger/discord.ts";
-import { JsonOperations, type Observed, type Operation, type OperationStore, plan } from "../src/operations.ts";
+import { SqliteOperations, type Observed, type Operation, type OperationStore, plan } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue } from "../src/routing.ts";
 import type { ToodoGuideline, ToodoTaskRecord } from "../src/toodo-client.ts";
+import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const KEY = "ap-12-1";
@@ -22,8 +23,8 @@ const task = (over: Partial<ToodoTask> = {}): ToodoTask => ({
 });
 
 let dir: string;
-let store: JsonOperations;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "dori-autopilot-executor-")); store = new JsonOperations(dir); });
+let store: SqliteOperations;
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "dori-autopilot-executor-")); store = new SqliteOperations(storePath(dir)); });
 afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
 
 /** Only the store and world survive restart. Every dependency can stop at a completed step without timers or a server. */
@@ -142,7 +143,7 @@ const harness = (initial = task()) => {
 };
 
 const row = (action: string): Operation => store.get(`toodo:12/autopilot-${action}/1`)!;
-const freshStore = () => new JsonOperations(dir);
+const freshStore = () => new SqliteOperations(storePath(dir));
 
 test("ready contract reserves, starts, threads, writes, launches and settles exactly once", async () => {
   const h = harness(task({ refs: [...task().refs, "mode:mass-ulw", "model:test-model"] }));

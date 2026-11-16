@@ -183,8 +183,13 @@ export class HerdrWatch {
   private misses = 0;
   private nextStart = -Infinity;
   private backoff = 60_000;
+  private readonly process: NonNullable<HerdrWatchDeps["process"]>;
+  private readonly start: NonNullable<HerdrWatchDeps["start"]>;
 
-  constructor(private readonly deps: HerdrWatchDeps) {}
+  constructor(private readonly deps: HerdrWatchDeps) {
+    this.process = deps.process ?? (() => herdrProcess(deps.run));
+    this.start = deps.start ?? (() => startManagedHerdr({ run: deps.run }));
+  }
 
   snapshot(): HerdrHealth | undefined { return this.health; }
 
@@ -197,8 +202,8 @@ export class HerdrWatch {
   async boot(): Promise<void> {
     if ((this.deps.platform ?? process.platform) !== "win32" || (this.deps.paused?.() ?? false)) return;
     try { await listPanes(this.deps.run); return; } catch { /* not answering: is there a server at all? */ }
-    if ((await (this.deps.process ?? (() => herdrProcess(this.deps.run)))()).running) return;
-    const result = await (this.deps.start ?? (() => startManagedHerdr({ run: this.deps.run })))();
+    if ((await this.process()).running) return;
+    const result = await this.start();
     if (!result) return;
     this.nextStart = this.deps.monotonic() + this.backoff;
     this.deps.publish("herdr.start", result);
@@ -215,7 +220,7 @@ export class HerdrWatch {
     if (panes >= 0) {
       this.misses = 0;
       this.failedAt = undefined;
-      const proc = await (this.deps.process ?? (() => herdrProcess(this.deps.run)))();
+      const proc = await this.process();
       this.transition("up", proc.instance, "pane list readable");
       this.backoff = 60_000;
       this.nextStart = -Infinity;
@@ -228,14 +233,14 @@ export class HerdrWatch {
       this.transition("elevated", undefined, `pane list refused: the herdr server runs elevated and refuses this unelevated runner; ${HERDR_ELEVATED_FIX}`);
       return panes;
     }
-    const proc = await (this.deps.process ?? (() => herdrProcess(this.deps.run)))();
+    const proc = await this.process();
     const state = proc.running ? "hung" : "down";
     const paused = !proc.running && (this.deps.paused?.() ?? false);
     this.transition(state, undefined, proc.running ? "pane list failed; server process may still be running"
       : paused ? "pane list failed; no server process; stopped by dori runner herdr stop, not started again" : "pane list failed; no server process");
     if (state === "down" && !paused && at >= this.nextStart) {
       this.nextStart = at + this.backoff;
-      const result = await (this.deps.start ?? (() => startManagedHerdr({ run: this.deps.run })))();
+      const result = await this.start();
       if (result) {
         this.deps.publish("herdr.start", result);
         this.backoff = Math.min(30 * 60_000, this.backoff * 2);

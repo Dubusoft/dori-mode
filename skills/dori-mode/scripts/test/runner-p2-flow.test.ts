@@ -17,7 +17,7 @@ import { RunnerState } from "../src/runner/state.ts";
 import type { Connector, Transport } from "../src/runner/transport.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { acceptWs } from "../src/runner/ws-transport.ts";
-import { openRunnerHub } from "../src/supervise-loop.ts";
+import { openRunnerHub } from "../src/supervise-hub.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];

@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { heavyDirOf, laneCliMain } from "../src/runner/lane-cli.ts";
 import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
-import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
+import type { Connector, Transport } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import { connectUnix, listenUnix } from "../src/runner/unix-transport.ts";
 import { parseDecisionText, parseRequestText } from "../src/runner/decision-text.ts";
-import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
+import { LaneFileError, treeDigest } from "../src/lane-file-contract.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 const dirs: string[] = [];

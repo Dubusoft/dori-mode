@@ -1,27 +1,32 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
+import { replaceFileDurable } from "./durable-write.ts";
 import type { Wake } from "./lead-wakes.ts";
 import type { AwaitingAck, Journal, JournalEvent, Notice, OutboxItem, Restart } from "./supervise.ts";
 
 /**
- * Where the supervisor journal lives (config `store`). "json" is today's `supervisor.json`, rewritten whole on every
- * save. "sqlite" is `supervisor.sqlite` (WAL): each save writes only the rows that changed, so an enqueue costs one
- * row instead of the whole history. Both keep `lead-events.log` as the lead's transport; the sqlite store also records
- * each delivery and the log byte offset it has read, so a restart reads only the log tail.
- */
-export type StoreKind = "json" | "sqlite";
-export const STORE_KINDS: readonly StoreKind[] = ["json", "sqlite"];
+ * Where the supervisor journal lives (config `store`): `supervisor.sqlite` (WAL), the only store. Each save writes only
+ * the rows that changed, so an enqueue costs one row instead of the whole history. `lead-events.log` stays the lead's
+ * transport; the store records each delivery and the log byte offset it has read, so a restart reads only the log tail.
+ * A state dir still holding the retired json store's files is converted once when its config loads (store-import.ts).
+*/
 
 export const JOURNAL_FILE = "supervisor.json";
 export const SQLITE_FILE = "supervisor.sqlite";
-/** The imported `supervisor.json`, kept read-only for audit; it is not the rollback source (that is 0.5's export). */
+/** The converted `supervisor.json`, kept read-only for audit. */
 export const PRE_SQLITE_FILE = "supervisor.json.pre-sqlite";
-/** The json store's lead wakes (lead-wakes.ts), one JSON object per line: a wake, or `{close, calls}` closing one. */
-export const WAKES_FILE = "lead-wakes.jsonl";
-/** The json store's consumed take receipts (event-trace.ts), one `{ids, at, session}` per line; sqlite keeps them on deliveries. */
-export const TAKES_FILE = "lead-takes.jsonl";
+/**
+ * The retired json store's files: a state dir holding any of them and no supervisor.sqlite (nor its import marker) is
+ * converted once (store-import.ts). The journal, operations, lane reports, lane messages and the GitHub poll state.
+ */
+const JSON_STORE_FILES: readonly string[] = [JOURNAL_FILE, "operations.json", "lane-reports.json", "lane-messages.json", "github-events.json"];
+const holdsJson = (stateDir: string): boolean => JSON_STORE_FILES.some((file) => existsSync(join(stateDir, file)));
+/** supervisor.sqlite, or the import marker left when it was made (its database may since be lost). */
+const holdsSqlite = (stateDir: string): boolean => existsSync(join(stateDir, SQLITE_FILE)) || existsSync(join(stateDir, PRE_SQLITE_FILE));
+/** Whether `stateDir` still holds the retired json store and has not been converted. */
+export const jsonStorePending = (stateDir: string): boolean => !holdsSqlite(stateDir) && holdsJson(stateDir);
 export const SCHEMA_VERSION = 9;
 /** Every row belongs to the single lead today; per-lead rows arrive with Phase 3. */
 export const DEFAULT_LEAD = "dori";
@@ -41,20 +46,19 @@ export const RETENTION = { eventBodyMs: 7 * DAY_MS, tombstoneMs: 90 * DAY_MS, st
 export type Durability = "full" | "normal";
 
 export interface JournalStore {
-  readonly kind: StoreKind;
   /** The stored journal, or undefined when nothing is stored yet. */
   load(): Journal | undefined;
   /** Persist `journal`; a sqlite store writes only what differs from the last load or save. */
   save(journal: Journal, durability: Durability): void;
-  /** Delivered event ids the store recorded; undefined when the delivery log is the only record (json). */
+  /** Delivered event ids the store recorded. */
   deliveredIds(): Set<string> | undefined;
-  /** Bytes of lead-events.log already reflected in deliveredIds (0 for json: read the whole log). */
+  /** Bytes of lead-events.log already reflected in deliveredIds. */
   logCursor(): number;
   /** Record deliveries appended to the log, and the log offset they reach. */
   recordDeliveries(ids: readonly string[], cursor: number, at: number): void;
   /** Record that the lead took delivered events `ids` at `at` in `session` (a consumed take receipt); the first take wins. */
   recordTakes(ids: readonly string[], at: number, session: string): void;
-  /** Whether the store prunes delivered event bodies (sqlite); the json journal keeps every event. */
+  /** Whether the store prunes delivered event bodies. */
   readonly retains: boolean;
   /** An event id whose body was pruned: still a duplicate until its tombstone expires. */
   tombstoned(id: string): boolean;
@@ -68,87 +72,13 @@ export interface JournalStore {
   openWake(): Wake | undefined;
   /** Closes the open wake started at `at` with its model calls (undefined: not readable). */
   closeWake(at: number, calls: number | undefined): void;
-  /** Drops wakes older than `cutoff` (sqlite; the json store keeps every wake as it keeps every event). */
+  /** Drops wakes older than `cutoff`. */
   pruneWakes(cutoff: number): void;
   close(): void;
 }
 
-const appendLine = (path: string, line: string): void => {
-  const fd = openSync(path, "a", 0o600);
-  try {
-    const data = Buffer.from(`${line}\n`);
-    let at = 0;
-    while (at < data.length) at += writeSync(fd, data, at);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-};
-
-/** The wakes of a json store's lead-wakes.jsonl in order, closes applied; a torn last line is skipped. */
-const readWakesFile = (path: string): Wake[] => {
-  if (!existsSync(path)) return [];
-  const wakes: Wake[] = [];
-  const byAt = new Map<number, number>();
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (!line) continue;
-    let row: { close?: unknown; calls?: unknown } & Partial<Wake>;
-    try { row = JSON.parse(line); } catch (e) { if (e instanceof SyntaxError) continue; throw e; }
-    if (typeof row.close === "number") {
-      const i = byAt.get(row.close);
-      if (i !== undefined) wakes[i] = { ...(wakes[i] as Wake), closed: true, ...(typeof row.calls === "number" ? { calls: row.calls } : {}) };
-    } else if (typeof row.at === "number" && typeof row.session === "string") {
-      byAt.set(row.at, wakes.length);
-      wakes.push({ at: row.at, session: row.session, trigger: row.trigger ?? [], kinds: row.kinds ?? {} });
-    }
-  }
-  return wakes;
-};
-
 /** Rename only after the new contents reach disk; a crash leaves either complete version. */
-export const saveJsonFile = (path: string, value: unknown): void => {
-  const tmp = `${path}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify(value));
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  renameSync(tmp, path);
-  const dir = openSync(join(path, ".."), "r");
-  try { fsyncSync(dir); } finally { closeSync(dir); }
-};
-
-class JsonStore implements JournalStore {
-  readonly kind = "json" as const;
-  constructor(private readonly path: string) {}
-  load(): Journal | undefined { return existsSync(this.path) ? JSON.parse(readFileSync(this.path, "utf8")) as Journal : undefined; }
-  save(journal: Journal): void { saveJsonFile(this.path, journal); }
-  deliveredIds(): undefined { return undefined; }
-  logCursor(): number { return 0; }
-  recordDeliveries(): void {}
-  recordTakes(ids: readonly string[], at: number, session: string): void {
-    if (ids.length) appendLine(join(this.path, "..", TAKES_FILE), JSON.stringify({ ids, at, ...(session ? { session } : {}) }));
-  }
-  readonly retains = false;
-  tombstoned(): boolean { return false; }
-  expireTombstones(): string[] { return []; }
-  sync(): void {}
-  private get wakesPath(): string { return join(this.path, "..", WAKES_FILE); }
-  /** The latest wake, read once from the file and then kept in step with each write. */
-  private latest?: { readonly wake: Wake | undefined };
-  recordWake(wake: Wake): void {
-    appendLine(this.wakesPath, JSON.stringify(wake));
-    this.latest = { wake };
-  }
-  openWake(): Wake | undefined {
-    this.latest ??= { wake: readWakesFile(this.wakesPath).at(-1) };
-    return this.latest.wake?.closed ? undefined : this.latest.wake;
-  }
-  closeWake(at: number, calls: number | undefined): void {
-    appendLine(this.wakesPath, JSON.stringify({ close: at, ...(calls !== undefined ? { calls } : {}) }));
-    if (this.latest?.wake?.at === at) this.latest = { wake: { ...this.latest.wake, closed: true, ...(calls !== undefined ? { calls } : {}) } };
-  }
-  pruneWakes(): void {}
-  close(): void {}
-}
+export const saveJsonFile = (path: string, value: unknown): void => replaceFileDurable(path, JSON.stringify(value), 0o600, `${path}.tmp`);
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -251,7 +181,6 @@ const ownerState = (entry: AwaitingAck): string =>
  * supervisor lock makes it the only writer, so that snapshot is the database's content.
  */
 export class SqliteStore implements JournalStore {
-  readonly kind = "sqlite" as const;
   private readonly db: Database;
   private last: Journal = { events: [] };
   /** How many events of `last.events` are stored: the supervisor appends to that array in place. */
@@ -651,7 +580,6 @@ const wakeOf = (row: Row): Wake => ({
 /** Wakes since `since` from this state dir's store on disk, oldest first (read-only; [] when none or unreadable). */
 export const readWakes = (stateDir: string, since: number): Wake[] => {
   try {
-    if (storeOnDisk(stateDir) === "json") return readWakesFile(join(stateDir, WAKES_FILE)).filter((wake) => wake.at >= since);
     const db = new Database(join(stateDir, SQLITE_FILE), { readonly: true });
     try { return (db.query("SELECT * FROM lead_wakes WHERE at >= ? ORDER BY seq").all(since) as Row[]).map(wakeOf); } finally { db.close(); }
   } catch (e) {
@@ -676,22 +604,27 @@ const restartOf = (row: Row): Restart => {
 };
 
 /**
- * The store the supervisor uses for `kind`, refusing a state dir whose files belong to the other kind: a json
- * supervisor next to an imported database would start from an empty journal and replay the whole delivery log, and
- * a sqlite supervisor next to a live supervisor.json would ignore it.
+ * supervisor.sqlite of `stateDir`, created with its schema when the state dir holds no store at all (a fresh install
+ * before the supervisor's first start), as the json store's first write created its file. Never over json files still
+ * awaiting their conversion, nor beside an import marker whose database is gone: there the stores stop with STORE_MISSING.
  */
-export const openStore = (stateDir: string, kind: StoreKind, now: () => number = Date.now): JournalStore => {
+export const storeFile = (stateDir: string): string => {
+  const path = join(stateDir, SQLITE_FILE);
+  if (!holdsSqlite(stateDir) && !holdsJson(stateDir)) {
+    mkdirSync(stateDir, { recursive: true });
+    new SqliteStore(path, { create: true }).close();
+  }
+  return path;
+};
+
+/**
+ * The supervisor's store, refusing a state dir that still holds a live supervisor.json (its conversion failed or has not
+ * run: the store would ignore it) or one whose database is gone after a conversion. */
+export const openStore = (stateDir: string, now: () => number = Date.now): JournalStore => {
   const jsonPath = join(stateDir, JOURNAL_FILE);
   const sqlitePath = join(stateDir, SQLITE_FILE);
-  if (kind === "json") {
-    if (!existsSync(jsonPath) && existsSync(sqlitePath)) {
-      throw new StoreError(`STORE_MISMATCH ${stateDir} holds an imported ${SQLITE_FILE} and no ${JOURNAL_FILE}; set "store": "sqlite" in the config`);
-    }
-    return new JsonStore(jsonPath);
-  }
-  if (kind !== "sqlite") throw new StoreError(`STORE_UNKNOWN store must be one of ${STORE_KINDS.join(", ")}, got ${String(kind)}`);
   if (existsSync(jsonPath)) {
-    throw new StoreError(`STORE_IMPORT_PENDING ${jsonPath} exists; stop the supervisor and run dori store import before using "store": "sqlite"`);
+    throw new StoreError(`STORE_IMPORT_PENDING ${jsonPath} exists; its conversion to ${SQLITE_FILE} did not complete (see the STORE_CONVERT_FAILED line of the last config load)`);
   }
   if (!existsSync(sqlitePath) && existsSync(join(stateDir, PRE_SQLITE_FILE))) {
     throw new StoreError(`STORE_MISSING ${sqlitePath} is gone but ${PRE_SQLITE_FILE} shows an import; restore the database before starting`);
@@ -700,22 +633,10 @@ export const openStore = (stateDir: string, kind: StoreKind, now: () => number =
 };
 
 /**
- * The store that holds this state dir's journal on disk: sqlite once imported (no supervisor.json left), else json.
- * An import marker with neither file left (database lost) also answers sqlite, so openStore stops with STORE_MISSING
- * instead of starting an empty json journal.
+ * Read-only views for readers outside the Supervisor (status). Undefined when nothing is stored or it cannot be read.
  */
-export const storeOnDisk = (stateDir: string): StoreKind => {
-  if (existsSync(join(stateDir, JOURNAL_FILE))) return "json";
-  return existsSync(join(stateDir, SQLITE_FILE)) || existsSync(join(stateDir, PRE_SQLITE_FILE)) ? "sqlite" : "json";
-};
-
-/**
- * Read-only views for readers outside the Supervisor (status): they never parse the journal file
- * themselves. Undefined when nothing is stored or it cannot be read.
- */
-export const readStoreView = <T>(stateDir: string, view: { readonly json: (journal: Journal) => T; readonly sqlite: (db: Database) => T }): T | undefined => {
+export const readStoreView = <T>(stateDir: string, view: { readonly sqlite: (db: Database) => T }): T | undefined => {
   try {
-    if (storeOnDisk(stateDir) === "json") return view.json(JSON.parse(readFileSync(join(stateDir, JOURNAL_FILE), "utf8")) as Journal);
     const db = new Database(join(stateDir, SQLITE_FILE), { readonly: true });
     try { return view.sqlite(db); } finally { db.close(); }
   } catch {

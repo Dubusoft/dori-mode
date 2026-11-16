@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -9,6 +9,7 @@ import type { EventMeta } from "./supervise-journal.ts";
 import { checkSignal, parseSignal, type Check } from "./signals.ts";
 import { machineLabel, REMOTE_MARGIN_MS, remoteWaitCheck } from "./remote-jobs.ts";
 import { type RunnerCall, RunnerUnavailable } from "./runner/call.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 
 export class WaitError extends Error {}
 export const WAIT_CHECK_MS = 10_000;
@@ -143,12 +144,7 @@ export class Waits {
   }
 
   private save(waits: readonly Wait[]): void {
-    const tmp = `${this.path}.${process.pid}.tmp`;
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeFileSync(fd, JSON.stringify(waits)); fsyncSync(fd); }
-    finally { closeSync(fd); }
-    renameSync(tmp, this.path);
-    this.syncDir();
+    replaceFileDurable(this.path, JSON.stringify(waits), 0o600);
   }
 
   private syncDir(): void {

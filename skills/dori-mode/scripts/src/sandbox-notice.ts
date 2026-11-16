@@ -1,12 +1,13 @@
 import { fillHook } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { discordStatusTransport, type LaneStatusTransport } from "./lane-reports.ts";
+import { discordStatusTransport, type LaneStatusTransport } from "./lane-status.ts";
 import { redirectHookPost } from "./thread-followup.ts";
 
 /** Marks every sandbox notice so the owner reads it as a warning about the lane's isolation, not as lane output. */
 export const SANDBOX_NOTICE_PREFIX = "[sandbox] ";
 
 const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim().slice(0, 160);
+const failure = (prefix: string, error: unknown): string => `${prefix}: ${oneLine(error instanceof Error ? error.message : String(error))}`;
 
 /**
  * Posts a sandbox refusal or an allowed unsandboxed run to the owner on Discord and returns the event lines to log.
@@ -25,21 +26,22 @@ export const postSandboxNotice = async (
   const body = text.startsWith(SANDBOX_NOTICE_PREFIX) ? text : `${SANDBOX_NOTICE_PREFIX}${text}`;
   const failures: string[] = [];
   const hook = deps.config.hooks.threadReply;
+  const threaded = lane.thread && lane.thread !== "none";
   let closed = false;
-  if (lane.thread && lane.thread !== "none") {
+  if (threaded) {
     try {
       if (await redirectHookPost(deps.config.stateDir, transport, lane.thread, body, deps.config.discordChannels[0], `sandbox-notice:${lane.key}:${deps.clock.now()}`)) return [];
     } catch (error) {
       closed = true;
-      failures.push(`closed thread redirect failed: ${oneLine(error instanceof Error ? error.message : String(error))}`);
+      failures.push(failure("closed thread redirect failed", error));
     }
   }
-  if (hook && !closed && lane.thread && lane.thread !== "none") {
+  if (hook && !closed && threaded) {
     try {
       const posted = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, text: body }));
       if (posted.code === 0) return [];
       failures.push(`thread post failed: ${oneLine(posted.err || posted.out || `exit ${posted.code}`)}`);
-    } catch (error) { failures.push(`thread post failed: ${oneLine(error instanceof Error ? error.message : String(error))}`); }
+    } catch (error) { failures.push(failure("thread post failed", error)); }
   }
   const main = deps.config.discordChannels[0];
   if (!transport || !main) failures.push(!transport ? "no DORI_DISCORD_TOKEN for the owner channel" : "no discordChannels configured");
@@ -47,7 +49,7 @@ export const postSandboxNotice = async (
     try {
       await transport.post(main, body, `sandbox-notice:${lane.key}:${deps.clock.now()}`);
       return failures.length ? [`SANDBOX_NOTICE_FALLBACK ${lane.key} posted to the owner channel (${failures.join("; ")})`] : [];
-    } catch (error) { failures.push(`owner channel post failed: ${oneLine(error instanceof Error ? error.message : String(error))}`); }
+    } catch (error) { failures.push(failure("owner channel post failed", error)); }
   }
   return [`SANDBOX_NOTICE_ERROR ${lane.key} (${failures.join("; ")}): ${body}`];
 };
