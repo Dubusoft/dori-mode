@@ -211,7 +211,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A sandboxed lane reports its agent state to herdr through a socket of its own (herdr-report.ts); Windows has no lane sandbox.
     let lanesForReports: RunnerLanes | undefined;
     const herdrReports = process.platform === "win32" ? undefined
-      : new HerdrReportSockets({ runnerDir, log, paneOf: (key) => lanesForReports?.records()[key]?.pane });
+      : new HerdrReportSockets({ runnerDir, log, laneOf: (key) => lanesForReports?.records()[key] });
     const browserCheck = browserWindowCheck(platform.os, { run, clock: realClock, log });
     const runnerLanes = new RunnerLanes({
       runnerDir, run, clock: realClock, policy, publish, remote,

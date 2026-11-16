@@ -44,6 +44,8 @@ const PANE_PARAMS: Readonly<Record<string, readonly string[]>> = {
   "pane.send_keys": ["pane_id", "keys"],
 };
 const REQUEST_FIELDS: ReadonlySet<string> = new Set(["id", "method", "params"]);
+/** Methods that change only a pane's place in the tab, never what runs in it. */
+const LAYOUT_METHODS: ReadonlySet<string> = new Set(["pane.rename", "pane.close", "pane.resize", "pane.zoom"]);
 
 export type HerdrReportVerdict =
   | { readonly ok: true; readonly id: string; readonly request: string }
@@ -90,7 +92,8 @@ export const checkHerdrReport = (line: string, pane: string | undefined, lanePan
       if (params.focus !== undefined && typeof params.focus !== "boolean") return refuse("invalid_request", "invalid focus");
       if (params.right_click !== undefined && !isLabel(params.right_click)) return refuse("invalid_request", "invalid right_click");
     } else if (!["pane.get", "pane.read", "pane.list", "pane.layout"].includes(method)) {
-      if (target === pane || !lanePanes.has(target as string)) return refuse("forbidden", "only a lane pane may be changed");
+      // Layout changes may also reach a pane the lane split before a runner restart; serveLink checks its tab.
+      if (target === pane || (!LAYOUT_METHODS.has(method) && !lanePanes.has(target as string))) return refuse("forbidden", "only a lane pane may be changed");
     }
     if (["pane.send_input", "pane.send_text"].includes(method) && typeof params.text !== "string") return refuse("invalid_request", "needs text");
     if (["pane.send_input", "pane.send_keys"].includes(method) && params.keys !== undefined && !(Array.isArray(params.keys) && params.keys.every(isLabel))) return refuse("invalid_request", "invalid keys");
@@ -164,9 +167,11 @@ const askHerdr = async (path: string, request: string): Promise<string> => {
 
 export type HerdrReportDeps = {
   readonly runnerDir: string;
-  /** The pane the runner records for lane `key`, read at each request (a relaunch moves the lane to a new pane). */
-  readonly paneOf?: (key: string) => string | undefined;
-  readonly laneOf?: (key: string) => { readonly pane: string; readonly sandboxPrefix?: string; readonly sandbox?: boolean; readonly profile?: string } | undefined;
+  /**
+   * The runner's record of lane `key`, read at each request: its pane (a relaunch moves the lane to a new pane) and what
+   * a command run in a pane it split must run behind.
+   */
+  readonly laneOf: (key: string) => { readonly pane: string; readonly sandboxPrefix?: string; readonly sandbox?: boolean; readonly profile?: string } | undefined;
   readonly log: (line: string) => void;
   /** herdr's control socket (default `herdrControlSocket()`). */
   readonly herdrSocket?: string;
@@ -182,8 +187,8 @@ const serveLink = (link: Transport, key: string, deps: HerdrReportDeps, state: L
   link.onLine((line) => {
     state.chain = state.chain.then(async () => {
       if (state.closed || !link.open) return;
-      const lane = deps.laneOf?.(key);
-      const pane = lane?.pane ?? deps.paneOf?.(key);
+      const lane = deps.laneOf(key);
+      const pane = lane?.pane;
       if (state.pane !== pane) {
         state.panes.clear();
         state.pane = pane;
@@ -200,7 +205,9 @@ const serveLink = (link: Transport, key: string, deps: HerdrReportDeps, state: L
           const params = req.params ?? {};
           const refuse = (message: string): string => JSON.stringify({ id: verdict.id, error: { code: "forbidden", message } });
           let tab: string | undefined;
-          if (["pane.get", "pane.read", "pane.list", "pane.layout"].includes(req.method)) {
+          const inTab = ["pane.get", "pane.read", "pane.list", "pane.layout"].includes(req.method)
+            || (LAYOUT_METHODS.has(req.method) && !state.panes.has(params.pane_id as string));
+          if (inTab) {
             const own = JSON.parse(await askHerdr(path, JSON.stringify({ id: verdict.id, method: "pane.get", params: { pane_id: pane } })));
             tab = own.result?.pane?.tab_id;
             if (typeof tab !== "string") {
