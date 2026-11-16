@@ -5,7 +5,7 @@ import { replaceFileDurable } from "./durable-write.ts";
 import type { DriftConfig } from "./config.ts";
 import type { Emit } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
-import type { LaneReport, LaneReportStore } from "./lane-reports.ts";
+import type { LaneReport, LaneReportStore } from "./lane-report-store.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import type { LaneOps } from "./lane-ops.ts";
 

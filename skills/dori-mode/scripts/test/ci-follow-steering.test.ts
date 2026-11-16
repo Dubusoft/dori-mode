@@ -7,7 +7,7 @@ import { claimDone, type FlowDeps, objectDone } from "../src/done-flow.ts";
 import { laneOps } from "../src/lane-ops.ts";
 import { ackLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
 import { openOperations, operationId, plan, settleOperation } from "../src/operations.ts";
-import { decisionTargetOf, DECISIONS_FILE } from "../src/owner-decisions.ts";
+import { decisionTargetOf, DECISIONS_FILE } from "../src/decision-store.ts";
 import { sendVerified } from "../src/panes.ts";
 import type { Lane } from "../src/registry.ts";
 import type { RunnerCall } from "../src/runner/call.ts";

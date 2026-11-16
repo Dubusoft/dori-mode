@@ -1,6 +1,7 @@
 import type { HostSummary } from "./autopilot.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { doneRepos, type LaunchInput, launchLane, SandboxRefusal } from "./launch.ts";
+import { type LaunchInput, launchLane, SandboxRefusal } from "./launch.ts";
+import { doneRepos } from "./signals.ts";
 import {
   checkMachine, type LaunchPlan, LOCAL_MACHINE, type MachineCheck, type PlacementInput, placementTargets, planLaunch, resolvePlacement,
   type RunnerPlacement, runnerPlacements,

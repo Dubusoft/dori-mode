@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import type { Ran, Runner } from "../src/run.ts";
 import type { RunnerControlBodies } from "../src/runner/protocol.ts";
-import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
+import { LaneFileError, treeDigest } from "../src/lane-file-contract.ts";
 import {
   laneInspect, observeMachine, queryDispatcher, type QueryDeps, queryProcess, queryScreen, queryStat, SCREEN_MAX_LINES,
   answerQuery,

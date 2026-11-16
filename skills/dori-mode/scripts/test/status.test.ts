@@ -10,7 +10,7 @@ import { Registry } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
 import { quotaMessage } from "../src/messenger/discord-commands.ts";
 import { resolveEventPolicy } from "../src/event-policy.ts";
-import { SqliteLaneReports } from "../src/lane-reports.ts";
+import { SqliteLaneReports } from "../src/lane-report-store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { healthPath } from "../src/runner/health.ts";

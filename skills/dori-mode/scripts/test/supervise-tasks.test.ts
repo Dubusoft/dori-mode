@@ -9,7 +9,7 @@ import { Repos } from "../src/repos.ts";
 import type { Ran } from "../src/run.ts";
 import { defaultRunnerDir } from "../src/runner/fs-safety.ts";
 import { SqliteOperations } from "../src/operations.ts";
-import { SqliteLaneReports } from "../src/lane-reports.ts";
+import { SqliteLaneReports } from "../src/lane-report-store.ts";
 import { RUNNER_HUB_RETRY_MS, supervise, SUPERVISOR_TASKS, type SupervisorTask, TASK_ALERT_MS, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { Waits } from "../src/waits.ts";

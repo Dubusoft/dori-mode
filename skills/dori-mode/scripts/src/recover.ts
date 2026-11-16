@@ -9,14 +9,14 @@ import { closeLane, closeRunning, finishClosedTask, type FlowDeps, finishedReaso
 import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
 import { resumeArgv } from "./runner/lane-control.ts";
-import { checkLaneFilesBody } from "./lane-files.ts";
+import { checkLaneFilesBody } from "./lane-file-contract.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
-import { discordStatusTransport } from "./lane-reports.ts";
+import { discordStatusTransport } from "./lane-status.ts";
 import { redirectHookPost } from "./thread-followup.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";

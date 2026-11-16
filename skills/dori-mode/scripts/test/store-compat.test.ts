@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { defaultConfig, loadConfig } from "../src/config.ts";
 import { githubSummary } from "../src/github-events.ts";
 import { openLaneMessages } from "../src/lane-messages.ts";
-import { openLaneReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
 import { openOperations } from "../src/operations.ts";
 import { Registry } from "../src/registry.ts";
 import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore, openStore } from "../src/store.ts";

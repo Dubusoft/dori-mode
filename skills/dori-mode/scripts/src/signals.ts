@@ -320,3 +320,8 @@ export const doneSyntaxErrors = (done: string): string[] => {
     }
   });
 };
+
+/** owner/repo names in the Done line's merged/closed/pr signals, lowercased. */
+export const doneRepos = (done: string): string[] => [...new Set(splitDone(done).flatMap((part) => {
+  try { const s = parseSignal(part); return s.kind === "merged" || s.kind === "closed" || s.kind === "pr" ? [s.repo.toLowerCase()] : []; } catch { return []; }
+}))];

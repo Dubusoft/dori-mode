@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { LANE_MESSAGES_FILE, type LaneMessageStore, queueLaneMessage, SqliteLaneMessages, updateLaneMessage } from "../src/lane-messages.ts";
-import { LANE_REPORTS_FILE, type LaneReportStore, openLaneReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { LANE_REPORTS_FILE, type LaneReportStore, openLaneReports, SqliteLaneReports } from "../src/lane-report-store.ts";
 import { SQLITE_FILE } from "../src/store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
 import { storePath, withState } from "./fakes.ts";

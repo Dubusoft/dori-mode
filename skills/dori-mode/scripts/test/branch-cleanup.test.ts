@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { closeLane, newPendingCleanup, watchTick } from "../src/done-flow.ts";
+import { closeLane, watchTick } from "../src/done-flow.ts";
+import { newPendingCleanup } from "../src/closed-cleanup.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { run as realRun, type Runner } from "../src/run.ts";

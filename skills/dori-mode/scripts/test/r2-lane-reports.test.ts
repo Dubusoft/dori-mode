@@ -5,7 +5,8 @@ import { Database } from "bun:sqlite";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { INLINE_REPORT_MAX, type LaneReportStore, openLaneReports, POISON_ALERT_AFTER, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { INLINE_REPORT_MAX, POISON_ALERT_AFTER, routeReports } from "../src/lane-reports.ts";
+import { type LaneReportStore, openLaneReports, SqliteLaneReports } from "../src/lane-report-store.ts";
 import { launchLane } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";

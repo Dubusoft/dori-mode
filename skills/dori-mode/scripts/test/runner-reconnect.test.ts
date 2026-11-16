@@ -7,7 +7,7 @@ import { acceptRunners, type RunnerAccept } from "../src/runner/serve.ts";
 import { RunnerClient, backoffMs } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { RunnerState } from "../src/runner/state.ts";
-import { memoryNetwork } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import { journalId, runnerControl, runnerEvent, type AnySupervisorControl, type RunnerControl } from "../src/runner/protocol.ts";
 import { fakeClock, withState } from "./fakes.ts";
 

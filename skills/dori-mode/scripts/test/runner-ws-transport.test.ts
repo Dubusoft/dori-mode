@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_FRAME_BYTES } from "../src/runner/protocol.ts";
-import { memoryPair, type Transport } from "../src/runner/transport.ts";
+import type { Transport } from "../src/runner/transport.ts";
+import { memoryPair } from "./support/memory-transport.ts";
 import { acceptWs, connectWs, dialWs, isPrivateListen, listenWs } from "../src/runner/ws-transport.ts";
 
 const nextLine = (transport: Transport): Promise<string> =>

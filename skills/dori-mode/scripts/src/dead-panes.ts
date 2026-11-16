@@ -1,7 +1,7 @@
 import type { DoriConfig } from "./config.ts";
 import type { LaneReads } from "./done-flow.ts";
 import type { LaneOps } from "./lane-ops.ts";
-import { appendDeadPaneReport } from "./lane-reports.ts";
+import { appendDeadPaneReport } from "./lane-report-store.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Lane } from "./registry.ts";
 import { laneAgentRunning } from "./runner/observe.ts";

@@ -9,7 +9,7 @@ import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./e
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { githubSummary } from "./github-events.ts";
 import { gatewayView, readGatewayStatus, type GatewayView } from "./gateway-status.ts";
-import { type LaneReport, latestLaneReports } from "./lane-reports.ts";
+import { type LaneReport, latestLaneReports } from "./lane-report-store.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { WAKE_SOURCES, wakeSource, type WakeSource } from "./lead-wakes.ts";
 import { listPanes } from "./panes.ts";

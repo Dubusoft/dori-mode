@@ -8,7 +8,7 @@ import { acceptRunners } from "../src/runner/serve.ts";
 import { RunnerClient, backoffMs } from "../src/runner/client.ts";
 import { Outbox, OUTBOX_FILE, TRUNCATION_MARKER } from "../src/runner/outbox.ts";
 import { RunnerState } from "../src/runner/state.ts";
-import { memoryNetwork } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import {
   decodeFrame, encodeFrame, isQueryType, journalId, PROTO, QUERY_TYPES, runnerControl, runnerEvent, SUPERVISOR_CONTROL_TYPES, supervisorControl,
 } from "../src/runner/protocol.ts";

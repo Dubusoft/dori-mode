@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fillHook } from "../src/config.ts";
 import { buildTrace, traceText } from "../src/event-trace.ts";
-import { SqliteLaneReports } from "../src/lane-reports.ts";
+import { SqliteLaneReports } from "../src/lane-report-store.ts";
 import { redactMeta, redactSecrets } from "../src/redact.ts";
 import { storePath } from "./fakes.ts";
 

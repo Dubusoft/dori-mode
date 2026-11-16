@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Ran } from "../src/run.ts";
 import { paneShell } from "../src/runner/lane-control.ts";
-import { powershellLaunchLine, RunnerLanes } from "../src/runner/lanes.ts";
+import { powershellLaunchLine } from "../src/runner/lane-launch.ts";
+import { RunnerLanes } from "../src/runner/lanes.ts";
 import { fakeClock } from "./fakes.ts";
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };

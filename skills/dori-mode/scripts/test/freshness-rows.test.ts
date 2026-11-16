@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { freshnessTick } from "../src/freshness.ts";
-import { type LaneReport, type LaneReportStore, putReportRows, SqliteLaneReports, UNFENCED_GENERATION } from "../src/lane-reports.ts";
+import { type LaneReport, type LaneReportStore, putReportRows, SqliteLaneReports, UNFENCED_GENERATION } from "../src/lane-report-store.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, newWorld, withState, storePath } from "./fakes.ts";

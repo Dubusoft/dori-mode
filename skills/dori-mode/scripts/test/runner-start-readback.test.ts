@@ -14,7 +14,7 @@ import { commandDispatcher, type DispatchDeps, trackedConnector } from "../src/r
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import type { Lane } from "../src/registry.ts";
-import { openRunnerHub, readBackRunnerStarts } from "../src/supervise-loop.ts";
+import { openRunnerHub, readBackRunnerStarts } from "../src/supervise-hub.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];

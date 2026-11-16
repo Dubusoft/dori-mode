@@ -585,7 +585,7 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
       ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
       : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}${row.herdr ? `, herdr ${row.herdr}` : ""}`));
   }
-  // Runners whose lanes run without a sandbox (launch.ts sandboxChoice): Windows by design, others by opt-in.
+  // Runners whose lanes run without a sandbox (launch-sandbox.ts sandboxChoice): Windows by design, others by opt-in.
   for (const label of new Set([...rows.map((row) => row.label), ...Object.keys(d.config.runners ?? {})])) {
     const os = rows.find((row) => row.label === label)?.machine?.os;
     const why = unsandboxedReason(d.config, label, os);

@@ -13,7 +13,7 @@ import { Outbox } from "../src/runner/outbox.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { machineLines, runnerViews } from "../src/status.ts";
-import { openRunnerHub } from "../src/supervise-loop.ts";
+import { openRunnerHub } from "../src/supervise-hub.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
 

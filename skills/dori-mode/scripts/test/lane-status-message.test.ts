@@ -1,7 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { discordStatusTransport, SqliteLaneReports, type LaneStatusTransport, type LaterMessage, routeReports } from "../src/lane-reports.ts";
+import { routeReports } from "../src/lane-reports.ts";
+import { SqliteLaneReports } from "../src/lane-report-store.ts";
+import { discordStatusTransport, type LaneStatusTransport, type LaterMessage } from "../src/lane-status.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { readOwnerClosed, recordOwnerClosed } from "../src/thread-followup.ts";
 import { depsFor, fakeClock, newWorld, withState, storePath } from "./fakes.ts";

@@ -1,6 +1,6 @@
 import { fillHook } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { discordStatusTransport, type LaneStatusTransport } from "./lane-reports.ts";
+import { discordStatusTransport, type LaneStatusTransport } from "./lane-status.ts";
 import { redirectHookPost } from "./thread-followup.ts";
 
 /** Marks every sandbox notice so the owner reads it as a warning about the lane's isolation, not as lane output. */

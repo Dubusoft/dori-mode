@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import { askingLine } from "../src/ask-user.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { openLaneReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
 import type { RecoveryLane } from "../src/recover.ts";
 import type { Lane } from "../src/registry.ts";
 import { queueLaneMessage, openLaneMessages } from "../src/lane-messages.ts";

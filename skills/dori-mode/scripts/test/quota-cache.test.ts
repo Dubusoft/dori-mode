@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { quotaSummary } from "../src/autopilot-cli.ts";
 import { DEFAULT_AUTOPILOT, judge, singleHost, type ToodoTask } from "../src/autopilot.ts";
 import { type QuotaResult, classifyClaude, readUsage, type UsageLookup } from "../src/claude-quota.ts";
-import { cachedQuotaLookup, cacheNoteLines, DEFAULT_BACKOFF_SEC, STALE_READ_MAX_MS } from "../src/quota-cache.ts";
+import { cachedQuotaLookup, DEFAULT_BACKOFF_SEC, STALE_READ_MAX_MS } from "../src/quota-cache.ts";
+import { cacheNoteLines } from "../src/quota-presentation.ts";
 
 const T0 = Date.parse("2026-11-12T03:00:00.000Z");
 const TTL = 90_000;

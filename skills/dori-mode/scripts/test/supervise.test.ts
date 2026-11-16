@@ -5,9 +5,11 @@ import { randomUUID } from "node:crypto";
 
 import { defaultConfig, LEAD_DIET_EXCLUDED_TOOLS } from "../src/config.ts";
 import type { Runner } from "../src/run.ts";
-import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, plainShell, RetryingDelivery, screenStill, Supervisor, UNCONFIRMED_LIMIT } from "../src/supervise.ts";
+import { ACK_KEEP_MS, eventPriority, LEAD_SKILL, RetryingDelivery, screenStill, Supervisor } from "../src/supervise.ts";
+import { leadPermissionArgs, plainShell, UNCONFIRMED_LIMIT } from "../src/lead-process.ts";
+import { SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/lead-soft-restart.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
-import { childWork, leadPermissionArgs, SOFT_RELEASE_GRACE_MS, SOFT_SESSION_SETTLE_MS } from "../src/supervise-lead-lifecycle.ts";
+import { childWork } from "../src/supervise-lead-lifecycle.ts";
 import { Waits } from "../src/waits.ts";
 import { pendingLeadRestart, requestLeadRestart } from "../src/lead-restart.ts";
 import { sessionDirFor } from "../src/session-id.ts";
@@ -17,7 +19,8 @@ import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, wri
 import { markHerdr } from "./herdr-world.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
-import { openLaneReports, routeReports } from "../src/lane-reports.ts";
+import { routeReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
 import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCarried } from "../src/inbox.ts";
 import { POINTER_PREFIX } from "../src/supervise-push.ts";

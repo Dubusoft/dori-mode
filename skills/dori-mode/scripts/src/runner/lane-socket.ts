@@ -6,7 +6,7 @@ import { isReportKind } from "./report-kinds.ts";
 import type { LaneNotice } from "./lanes.ts";
 import type { RunnerEventBodies, RunnerEventType } from "./protocol.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
-import { LaneFileError } from "./lane-files.ts";
+import { LaneFileError } from "../lane-file-contract.ts";
 import type { LaneOutputFiles } from "./protocol.ts";
 import type { SecretRunResult } from "./secret-run.ts";
 

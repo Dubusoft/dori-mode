@@ -2,7 +2,7 @@ import type {
   AnyRunnerEvent, CommandResults, CommandStatusState, DurableCommandType, QueryBodies, QueryResults, QueryType, RunnerControl, SupervisorCommandBodies,
 } from "./protocol.ts";
 import type { RunnerAccept } from "./serve.ts";
-import { checkLaneFilesBody } from "../lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
  * The supervisor's awaitable runner calls (design D6): durable effects await their `cmd.result` by `cmdId`, read-only

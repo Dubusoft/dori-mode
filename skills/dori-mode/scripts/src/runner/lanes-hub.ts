@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { askingLine } from "../ask-user.ts";
 import { ackLaneMessage, LaneMessageError, type LaneMessageStore } from "../lane-messages.ts";
-import { laneGeneration, type LaneReportStore } from "../lane-reports.ts";
+import { laneGeneration, type LaneReportStore } from "../lane-report-store.ts";
 import type { RecoveryLane } from "../recover.ts";
 import { type Observation, settleAttempted, type SupervisorReadback } from "./durability.ts";
 import { type AttemptRow, HUB_FILE } from "./hub.ts";
@@ -12,7 +12,8 @@ import { LOCAL_RUNNER } from "./serve.ts";
 import type { Lane, Registry } from "../registry.ts";
 import { journalId, type AnyRunnerEvent, type CommandStatusState, type InventoryLane } from "./protocol.ts";
 import type { LaneBriefFiles, LaneFileReceipt } from "./protocol.ts";
-import { installLaneReports, invalidFiles, LaneFileError, validateLaneOutput, checkLaneFilesBody, checkLaneReportText } from "../lane-files.ts";
+import { installLaneReports, validateLaneOutput, checkLaneReportText } from "../lane-files.ts";
+import { invalidFiles, LaneFileError, checkLaneFilesBody } from "../lane-file-contract.ts";
 import { RunnerUnavailable } from "./call.ts";
 import { recoveryFields } from "../launch.ts";
 
@@ -158,117 +159,113 @@ export const laneEventsAfter = (stateDir: string, afterRowid: number): Journaled
   }
 };
 
-/** `position`: the event's journal position, when it was read from the journal (laneEventsAfter). */
-export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: AnyRunnerEvent, position?: number): Promise<void> => {
-  if (frame.type === "cmd.result") {
-    // A refused or failed lane.start leaves a registered lane with no agent: the lead has to hear of it.
-    const b = frame.body;
-    if (b.state !== "failed") return;
-    const failedKey = RECOVER_CMD.exec(b.cmdId)?.[1] ?? LANE_START_CMD.exec(b.cmdId)?.[1];
-    let retired = false;
-    if (failedKey) await deps.registry.update(failedKey, (current) => {
-      const lane = current as RecoveryLane | null;
-      const proposal = lane?.fileProposal;
-      if (!lane || lane.closedAt || lane.runner !== label || !proposal || proposal.cmdId !== b.cmdId
-        || lane.pendingFileRun?.id !== proposal.runId) return undefined;
-      // The final result proves this proposal did not start. Never retire a newer writer's pending run.
-      retired = true;
-      return { ...lane, ...recoveryFields(proposal.prior) };
-    });
-    const recoverKey = RECOVER_CMD.exec(b.cmdId)?.[1];
-    if (recoverKey) {
-      // A failed lane.recover leaves the lane recoveryPending with no agent the runner knows of.
-      const lane = await deps.registry.read(recoverKey);
-      if (!lane || lane.closedAt || lane.runner !== label) return;
-      deps.emit(`runner-recover-failed:${label}:${frame.seq}`, `RUNNER_RECOVER_FAILED ${recoverKey} runner=${label} ${oneLine(b.detail)}; the lane was not recovered: fix the runner and let it reconnect, or dori close ${recoverKey} --cancelled and launch again`);
-      return;
-    }
-    const key = LANE_START_CMD.exec(b.cmdId)?.[1];
-    if (!key) return;
-    const lane = await deps.registry.read(key);
-    if (!lane || lane.closedAt || lane.runner !== label || (lane.pane && !retired)) return;
-    deps.emit(`runner-launch-failed:${label}:${frame.seq}`, `RUNNER_LAUNCH_FAILED ${key} runner=${label} ${oneLine(b.detail)}; the lane has no agent: fix the runner, dori close ${key} --cancelled and launch again`);
+type LaneEventFrame<T extends AnyRunnerEvent["type"]> = Extract<AnyRunnerEvent, { readonly type: T }>;
+
+const onCmdResult = async (deps: LaneHubDeps, label: string, frame: LaneEventFrame<"cmd.result">): Promise<void> => {
+  // A refused or failed lane.start leaves a registered lane with no agent: the lead has to hear of it.
+  const b = frame.body;
+  if (b.state !== "failed") return;
+  const failedKey = RECOVER_CMD.exec(b.cmdId)?.[1] ?? LANE_START_CMD.exec(b.cmdId)?.[1];
+  let retired = false;
+  if (failedKey) await deps.registry.update(failedKey, (current) => {
+    const lane = current as RecoveryLane | null;
+    const proposal = lane?.fileProposal;
+    if (!lane || lane.closedAt || lane.runner !== label || !proposal || proposal.cmdId !== b.cmdId
+      || lane.pendingFileRun?.id !== proposal.runId) return undefined;
+    // The final result proves this proposal did not start. Never retire a newer writer's pending run.
+    retired = true;
+    return { ...lane, ...recoveryFields(proposal.prior) };
+  });
+  const recoverKey = RECOVER_CMD.exec(b.cmdId)?.[1];
+  if (recoverKey) {
+    // A failed lane.recover leaves the lane recoveryPending with no agent the runner knows of.
+    const lane = await deps.registry.read(recoverKey);
+    if (!lane || lane.closedAt || lane.runner !== label) return;
+    deps.emit(`runner-recover-failed:${label}:${frame.seq}`, `RUNNER_RECOVER_FAILED ${recoverKey} runner=${label} ${oneLine(b.detail)}; the lane was not recovered: fix the runner and let it reconnect, or dori close ${recoverKey} --cancelled and launch again`);
     return;
   }
-  if (!LANE_EVENTS.has(frame.type)) return;
-  const key = (frame.body as { readonly key: string }).key;
+  const key = LANE_START_CMD.exec(b.cmdId)?.[1];
+  if (!key) return;
   const lane = await deps.registry.read(key);
-  if (lane && ownMachineObservation(label, frame, lane)) return;
-  if (!lane || lane.runner !== label) {
-    deps.emit(`runner-forged:${JSON.stringify([label, key, frame.type, lane?.runner ?? null, lane ? laneGeneration(lane) : null])}`, `RUNNER_FORGED_EVENT runner=${label} key=${key} type=${frame.type}${lane?.runner ? ` owner=${lane.runner}` : " (no such runner lane)"}`);
+  if (!lane || lane.closedAt || lane.runner !== label || (lane.pane && !retired)) return;
+  deps.emit(`runner-launch-failed:${label}:${frame.seq}`, `RUNNER_LAUNCH_FAILED ${key} runner=${label} ${oneLine(b.detail)}; the lane has no agent: fix the runner, dori close ${key} --cancelled and launch again`);
+  return;
+};
+
+const onStarted = async (deps: LaneHubDeps, label: string, frame: LaneEventFrame<"lane.started">, lane: Lane, key: string, position: number | undefined): Promise<void> => {
+  const b = frame.body;
+  if (lane.closedAt) {
+    // A lane closed with a pane was started and its close took that pane: this is a replay. A lane closed with no pane
+    // was cancelled while its start was still out: that start landed late, and its agent is stopped, not recorded.
+    if (lane.pane) return;
+    const sent = deps.close?.(label, key, `late-start-close:${key}:${frame.seq}`);
+    deps.emit(`lane-started-after-close:${label}:${frame.seq}`, `LANE_STARTED_AFTER_CLOSE ${key} runner=${label} pane=${b.pane} started after the lane was closed; ${sent === undefined ? "the runner is not connected, so lane.close was not sent: the agent may still run in that pane" : "lane.close sent to stop it"}`);
     return;
   }
-  if (frame.type === "lane.started") {
-    const b = frame.body;
-    if (lane.closedAt) {
-      // A lane closed with a pane was started and its close took that pane: this is a replay. A lane closed with no pane
-      // was cancelled while its start was still out: that start landed late, and its agent is stopped, not recorded.
-      if (lane.pane) return;
-      const sent = deps.close?.(label, key, `late-start-close:${key}:${frame.seq}`);
-      deps.emit(`lane-started-after-close:${label}:${frame.seq}`, `LANE_STARTED_AFTER_CLOSE ${key} runner=${label} pane=${b.pane} started after the lane was closed; ${sent === undefined ? "the runner is not connected, so lane.close was not sent: the agent may still run in that pane" : "lane.close sent to stop it"}`);
-      return;
-    }
-    // A replayed journal can hold an old start: only a first launch, an outstanding recovery or the current pane applies.
-    const lr = lane as RecoveryLane;
-    if (lr.pane && !lr.recoveryPending && lr.pane !== b.pane) return;
-    // A start journaled before the hello that asked for the recovery is not the recovery's.
-    if (lr.recoveryPending && position !== undefined && lr.recoveryAfter !== undefined && position <= lr.recoveryAfter) return;
-    if ((lane.fileRun || lane.pendingFileRun) && (!b.fileRun || ![lane.fileRun?.id, lane.pendingFileRun?.id].includes(b.fileRun.id))) return;
-    if (b.fileRun && (b.fileRun.requiredReport !== (b.fileRun.id === lane.pendingFileRun?.id ? lane.pendingFileRun : lane.fileRun)?.requiredReport)) return;
-    // A start or a recovery: either way the lane runs again, so a pending recovery (reconcileInventory) is over.
-    // A launch that gave up waiting (launchUnconfirmed) left its reservation paused: this start confirms it.
-    const late = Boolean(lane.launchReservation && lane.launchUnconfirmed);
-    await deps.registry.update(key, (current) => {
-      if (!current || current.closedAt || current.runner !== label
-        || (b.fileRun && ![current.fileRun?.id, current.pendingFileRun?.id].includes(b.fileRun.id))) return undefined;
-      return { ...current,
-      pane: b.pane, tab: b.tab, ...(b.session ? { session: b.session } : {}),
-      ...(b.fileRun ? { fileRun: b.fileRun, pendingFileRun: undefined } : {}),
-      fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined, deadAlertPane: undefined,
-      ...(late ? { status: undefined, launchReservation: undefined, launchUnconfirmed: undefined } : {}),
-    }; });
-    if (late) deps.emit(`launch-confirmed-late:${label}:${frame.seq}`, `LAUNCH_CONFIRMED_LATE ${key} runner=${label} pane=${b.pane} the runner started the lane after its launch stopped waiting; the reservation is released and the lane is working`);
-    return;
-  }
-  if (frame.type === "lane.state") {
-    const pane = frame.body.pane ?? "";
-    if (frame.body.status === "working" || frame.body.status === "idle") {
-      // Alive again on the pane its last dead named: a later dead there is news again.
-      if (lane.deadAlertPane !== undefined && lane.deadAlertPane === pane) {
-        await deps.registry.update(key, (current) => current?.deadAlertPane === pane ? { ...current, deadAlertPane: undefined } : undefined);
-      }
-      return;
-    }
-    if (frame.body.status !== "dead") return;
-    // A dead replayed from the journal can predate what the lane is now: a closed lane, a launch still being
-    // reserved, a recovery already under way, or another pane than the lane's own say nothing about its agent.
-    const lr = lane as RecoveryLane;
-    if (lr.closedAt || lr.launchReservation || lr.recoveryPending) return;
-    if (frame.body.pane && lr.pane && frame.body.pane !== lr.pane) return;
-    // One alert per lane and pane: a dead the lead already heard of for this pane is not raised again.
-    if (lane.deadAlertPane === pane) return;
-    deps.emit(`runner-lane-dead:${label}:${frame.seq}`, `RUNNER_LANE_DEAD ${key} runner=${label}${frame.body.pane ? ` pane=${frame.body.pane}` : ""}${frame.body.reason ? ` reason=${frame.body.reason}` : ""} the lane's agent stopped on its runner: read its last report, then dori close ${key} or launch it again`);
-    await deps.registry.update(key, (current) => current && !current.closedAt ? { ...current, deadAlertPane: pane } : undefined);
-    return;
-  }
-  if (frame.type === "lane.asking") {
-    // The runner sends its own askingLine (lanes.ts); the line is rebuilt here around the owner-checked key.
-    const question = frame.body.text.replace(/^LANE_ASKING \S+ waits on an on-screen question, not dori report: /, "");
-    deps.emit(`runner-lane-asking:${label}:${frame.seq}`, askingLine(key, { question, options: [], pending: 1 }));
-    return;
-  }
-  if (frame.type === "lane.ack") {
-    const messages = deps.messages?.();
-    if (!messages) throw new Error(`RUNNER_ACK_UNSTORED no lane message store for ${key}`);
-    try {
-      ackLaneMessage(messages, key, frame.body.id, deps.now());
-    } catch (e) {
-      if (!(e instanceof LaneMessageError)) throw e;
-      deps.emit(`lane-ack-failed:${label}:${frame.seq}`, `LANE_ACK_FAILED ${key} ${frame.body.id} ${oneLine(e.message)}`);
+  // A replayed journal can hold an old start: only a first launch, an outstanding recovery or the current pane applies.
+  const lr = lane as RecoveryLane;
+  if (lr.pane && !lr.recoveryPending && lr.pane !== b.pane) return;
+  // A start journaled before the hello that asked for the recovery is not the recovery's.
+  if (lr.recoveryPending && position !== undefined && lr.recoveryAfter !== undefined && position <= lr.recoveryAfter) return;
+  if ((lane.fileRun || lane.pendingFileRun) && (!b.fileRun || ![lane.fileRun?.id, lane.pendingFileRun?.id].includes(b.fileRun.id))) return;
+  if (b.fileRun && (b.fileRun.requiredReport !== (b.fileRun.id === lane.pendingFileRun?.id ? lane.pendingFileRun : lane.fileRun)?.requiredReport)) return;
+  // A start or a recovery: either way the lane runs again, so a pending recovery (reconcileInventory) is over.
+  // A launch that gave up waiting (launchUnconfirmed) left its reservation paused: this start confirms it.
+  const late = Boolean(lane.launchReservation && lane.launchUnconfirmed);
+  await deps.registry.update(key, (current) => {
+    if (!current || current.closedAt || current.runner !== label
+      || (b.fileRun && ![current.fileRun?.id, current.pendingFileRun?.id].includes(b.fileRun.id))) return undefined;
+    return { ...current,
+    pane: b.pane, tab: b.tab, ...(b.session ? { session: b.session } : {}),
+    ...(b.fileRun ? { fileRun: b.fileRun, pendingFileRun: undefined } : {}),
+    fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined, recoveryExhausted: undefined, deadAlertPane: undefined,
+    ...(late ? { status: undefined, launchReservation: undefined, launchUnconfirmed: undefined } : {}),
+  }; });
+  if (late) deps.emit(`launch-confirmed-late:${label}:${frame.seq}`, `LAUNCH_CONFIRMED_LATE ${key} runner=${label} pane=${b.pane} the runner started the lane after its launch stopped waiting; the reservation is released and the lane is working`);
+  return;
+};
+
+const onState = async (deps: LaneHubDeps, label: string, frame: LaneEventFrame<"lane.state">, lane: Lane, key: string): Promise<void> => {
+  const pane = frame.body.pane ?? "";
+  if (frame.body.status === "working" || frame.body.status === "idle") {
+    // Alive again on the pane its last dead named: a later dead there is news again.
+    if (lane.deadAlertPane !== undefined && lane.deadAlertPane === pane) {
+      await deps.registry.update(key, (current) => current?.deadAlertPane === pane ? { ...current, deadAlertPane: undefined } : undefined);
     }
     return;
   }
-  if (frame.type !== "lane.report") return;
+  if (frame.body.status !== "dead") return;
+  // A dead replayed from the journal can predate what the lane is now: a closed lane, a launch still being
+  // reserved, a recovery already under way, or another pane than the lane's own say nothing about its agent.
+  const lr = lane as RecoveryLane;
+  if (lr.closedAt || lr.launchReservation || lr.recoveryPending) return;
+  if (frame.body.pane && lr.pane && frame.body.pane !== lr.pane) return;
+  // One alert per lane and pane: a dead the lead already heard of for this pane is not raised again.
+  if (lane.deadAlertPane === pane) return;
+  deps.emit(`runner-lane-dead:${label}:${frame.seq}`, `RUNNER_LANE_DEAD ${key} runner=${label}${frame.body.pane ? ` pane=${frame.body.pane}` : ""}${frame.body.reason ? ` reason=${frame.body.reason}` : ""} the lane's agent stopped on its runner: read its last report, then dori close ${key} or launch it again`);
+  await deps.registry.update(key, (current) => current && !current.closedAt ? { ...current, deadAlertPane: pane } : undefined);
+  return;
+};
+
+const onAsking = async (deps: LaneHubDeps, label: string, frame: LaneEventFrame<"lane.asking">, key: string): Promise<void> => {
+  // The runner sends its own askingLine (lanes.ts); the line is rebuilt here around the owner-checked key.
+  const question = frame.body.text.replace(/^LANE_ASKING \S+ waits on an on-screen question, not dori report: /, "");
+  deps.emit(`runner-lane-asking:${label}:${frame.seq}`, askingLine(key, { question, options: [], pending: 1 }));
+  return;
+};
+
+const onAck = async (deps: LaneHubDeps, label: string, frame: LaneEventFrame<"lane.ack">, key: string): Promise<void> => {
+  const messages = deps.messages?.();
+  if (!messages) throw new Error(`RUNNER_ACK_UNSTORED no lane message store for ${key}`);
+  try {
+    ackLaneMessage(messages, key, frame.body.id, deps.now());
+  } catch (e) {
+    if (!(e instanceof LaneMessageError)) throw e;
+    deps.emit(`lane-ack-failed:${label}:${frame.seq}`, `LANE_ACK_FAILED ${key} ${frame.body.id} ${oneLine(e.message)}`);
+  }
+};
+
+const onReport = async (deps: LaneHubDeps, label: string, frame: LaneEventFrame<"lane.report">, lane: Lane, key: string): Promise<void> => {
   const store = deps.reports();
   if (!store) throw new Error(`RUNNER_REPORT_UNSTORED no lane report store for ${key}`);
   const b = frame.body;
@@ -301,6 +298,27 @@ export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: A
     at: deps.now(), source: journalId(label, frame.seq), ...(fileReceipt ? { fileReceipt } : {}),
   });
   await patch(deps, key, { lastRunnerReportAt: deps.now() });
+};
+
+/** `position`: the event's journal position, when it was read from the journal (laneEventsAfter). */
+export const acceptLaneEvent = async (deps: LaneHubDeps, label: string, frame: AnyRunnerEvent, position?: number): Promise<void> => {
+  if (frame.type === "cmd.result") return onCmdResult(deps, label, frame);
+  if (!LANE_EVENTS.has(frame.type)) return;
+  const key = (frame.body as { readonly key: string }).key;
+  const lane = await deps.registry.read(key);
+  if (lane && ownMachineObservation(label, frame, lane)) return;
+  if (!lane || lane.runner !== label) {
+    deps.emit(`runner-forged:${JSON.stringify([label, key, frame.type, lane?.runner ?? null, lane ? laneGeneration(lane) : null])}`, `RUNNER_FORGED_EVENT runner=${label} key=${key} type=${frame.type}${lane?.runner ? ` owner=${lane.runner}` : " (no such runner lane)"}`);
+    return;
+  }
+  switch (frame.type) {
+    case "lane.started": return onStarted(deps, label, frame, lane, key, position);
+    case "lane.state": return onState(deps, label, frame, lane, key);
+    case "lane.asking": return onAsking(deps, label, frame, key);
+    case "lane.ack": return onAck(deps, label, frame, key);
+    case "lane.report": return onReport(deps, label, frame, lane, key);
+    default: return;
+  }
 };
 
 export const reconcileInventory = async (deps: LaneHubDeps, label: string, inventory: readonly InventoryLane[]): Promise<void> => {

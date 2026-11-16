@@ -1,5 +1,5 @@
 import type { DoriConfig, GuardThresholds, PlacementConfig } from "./config.ts";
-import { doneRepos } from "./launch.ts";
+import { doneRepos } from "./signals.ts";
 import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
 import { type SampleResult, UNSUPPORTED_SHELL } from "./remote-guard.ts";
 import { canLaunch, type LaunchVerdict } from "./routing.ts";

@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { displayTime } from "./display-time.ts";
-import { cacheNoteLines, type QuotaCacheNote } from "./quota-cache.ts";
+import { cacheNoteLines, type QuotaCacheNote } from "./quota-presentation.ts";
 
 /** The subset of pi-quota's ProviderResult this module reads. */
 export type QuotaResult = {

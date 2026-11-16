@@ -19,7 +19,7 @@ import { policyReloader } from "./policy-reload.ts";
 import { watchConfigFiles } from "../config-watch.ts";
 import { workspaceReport, type WorkspaceReport } from "./workspaces.ts";
 import { queryDispatcher } from "./queries.ts";
-import { checkFileBody } from "./lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSource } from "../host-guard.ts";
@@ -100,7 +100,7 @@ export const runnerEffects = (deps: {
   "lane.attach": async (command) => deps.lanes.attach(command.body),
   "lane.git": async (command) => laneGitEffect(deps.run, command.body),
   "lane.recover": async (command) => {
-    if (command.body.files) checkFileBody(command.body.key, command.body);
+    if (command.body.files) checkLaneFilesBody(command.body.key, command.body);
     return deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace, command.body.briefText, command.body.files);
   },
   "lane.observe": async (command) => deps.lanes.observe(command.body.key),

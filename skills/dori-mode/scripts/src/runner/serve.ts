@@ -19,7 +19,7 @@ import {
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 import { fileCapabilityDetail, isFileOperation, RunnerUnavailable } from "./call.ts";
-import { checkLaneFilesBody } from "../lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
  * The P1 wiring between the runner modules and the product: the runner's identity file, the supervisor epoch, the hub's

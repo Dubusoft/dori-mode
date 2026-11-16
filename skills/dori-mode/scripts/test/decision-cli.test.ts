@@ -3,7 +3,7 @@ import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { EVENT_LOG, writeCursorFile } from "../src/inbox.ts";
-import { DECISIONS_FILE } from "../src/owner-decisions.ts";
+import { DECISIONS_FILE } from "../src/decision-store.ts";
 import { Registry } from "../src/registry.ts";
 
 // Each case spawns `bun src/cli.ts`; process startup under a loaded full run outgrows bun's default 5 s.

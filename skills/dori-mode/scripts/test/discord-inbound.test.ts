@@ -8,7 +8,8 @@ import {
   discordChannels, discordDispatchThreads, discordSnowflakeAt, discordThreadFloor, emitDiscordEdit, emitDiscordInbound, type InboundMessage,
   listDiscordInbound, parseDiscordMessage, pollDiscordInbound, seedDiscordCursor,
 } from "../src/messenger/discord-inbound.ts";
-import { type DecisionTransport, openLaneDecision, openOwnerDecision, readDecisions, type TargetLane } from "../src/owner-decisions.ts";
+import { readDecisions, type TargetLane } from "../src/decision-store.ts";
+import { type DecisionTransport, openLaneDecision, openOwnerDecision } from "../src/owner-decisions.ts";
 import { serializeDecisionText, serializeRequestText } from "../src/runner/decision-text.ts";
 import { Discord } from "../src/messenger/discord.ts";
 import { type Lane, Registry } from "../src/registry.ts";

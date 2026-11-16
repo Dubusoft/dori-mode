@@ -8,7 +8,8 @@ import {
   type QuotaSummary, type ToodoTask,
 } from "./autopilot.ts";
 import { type ClaudeSkip, type ClaudeUsage, quotaProvidersFor, readUsage } from "./claude-quota.ts";
-import { ageText, type QuotaCacheNote, sharedQuotaLookup } from "./quota-cache.ts";
+import { sharedQuotaLookup } from "./quota-cache.ts";
+import { ageText, type QuotaCacheNote } from "./quota-presentation.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
 import { hostSummary, machineHosts } from "./launch-service.ts";

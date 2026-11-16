@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  queueDecisionAnswer,
+  reconcileDecisionDeliveries,
+  reconcileDecisionsAtStart,
+  recordAnswerRevision,
+  decisionDeliveryTick,
+} from "../src/decision-delivery.ts";
+import { decisionTargetOf, readDecisions } from "../src/decision-store.ts";
+import {
   answeredLine,
   answerOutcomeLines,
   closeOwnerDecision,
@@ -12,13 +20,6 @@ import {
   openOwnerDecision,
   openOwnerDecisions,
   ownerDecisionTick,
-  queueDecisionAnswer,
-  readDecisions,
-  reconcileDecisionDeliveries,
-  reconcileDecisionsAtStart,
-  recordAnswerRevision,
-  decisionTargetOf,
-  decisionDeliveryTick,
   recordChannelAnswer,
   recordOwnerAnswer,
   type DecisionContext,
@@ -291,7 +292,7 @@ test("tick posts no reminder of waiting decisions and enqueues a posting-stuck e
   await open(stuckCtx);
   const stored = readDecisions(stuckDir);
   // Simulate a writer that reserved its decision but stopped before posting.
-  const { updateDecisions } = await import("../src/owner-decisions.ts");
+  const { updateDecisions } = await import("../src/decision-store.ts");
   updateDecisions(stuckDir, (file) => ({
     file: { ...file, decisions: file.decisions.map((item) => ({ ...item, state: "posting" as const, openedAt: stuckCtx.now() - 11 * 60_000, thread: undefined })) },
     result: undefined,
