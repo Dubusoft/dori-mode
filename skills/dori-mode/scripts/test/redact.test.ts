@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fillHook } from "../src/config.ts";
 import { buildTrace, traceText } from "../src/event-trace.ts";
-import { JsonLaneReports } from "../src/lane-reports.ts";
+import { SqliteLaneReports } from "../src/lane-report-store.ts";
 import { redactMeta, redactSecrets } from "../src/redact.ts";
+import { storePath } from "./fakes.ts";
 
 // Fake values, assembled at run time so no secret scanner sees a literal.
 const body = (n: number): string => "Ab1".repeat(n);
@@ -77,9 +78,9 @@ describe("sanitize boundaries", () => {
   test("stored lane report text and evidence", () => {
     const dir = mkdtempSync(join(tmpdir(), "redact-reports-"));
     dirs.push(dir);
-    const row = new JsonLaneReports(dir).append({ lane: "k", generation: 0, kind: "progress", text: `EXPO_TOKEN=${FAKE}`, evidence: `{"token":"${FAKE}"}`, at: 1 });
+    const row = new SqliteLaneReports(storePath(dir)).append({ lane: "k", generation: 0, kind: "progress", text: `EXPO_TOKEN=${FAKE}`, evidence: `{"token":"${FAKE}"}`, at: 1 });
     expect(JSON.stringify(row)).not.toContain(FAKE);
-    expect(JSON.stringify(new JsonLaneReports(dir).list())).not.toContain(FAKE);
+    expect(JSON.stringify(new SqliteLaneReports(storePath(dir)).list())).not.toContain(FAKE);
   });
   test("hook argv text and title", () => {
     const argv = fillHook(["hook", "{text}", "{title}", "{thread}"], { text: `EXPO_TOKEN=${FAKE}`, title: `EXPO_TOKEN=${FAKE}`, thread: "t" });

@@ -1,6 +1,8 @@
-import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { refreshInstalledScript } from "./boot-prep-install.ts";
 
 export const LANE_SANDBOX_TEMPLATE = fileURLToPath(new URL("../templates/lane-sandbox.sh", import.meta.url));
 /** The macOS (Seatbelt) wrapper `dori runner install` puts on a Mac runner; same inputs as the Linux one. */
@@ -73,11 +75,6 @@ export const refreshLaneSandbox = (home: string, template?: string, platform: No
   const installed = installedLaneSandbox(home);
   if (!existsSync(installed)) return undefined;
   const want = Buffer.from(laneSandboxScript(template));
-  if (readFileSync(installed).equals(want)) return undefined;
-  copyFileSync(installed, `${installed}.bak`);
-  const next = `${installed}.new-${process.pid}`;
-  writeFileSync(next, want);
-  chmodSync(next, 0o755);
-  renameSync(next, installed);
+  if (!refreshInstalledScript(installed, want)) return undefined;
   return `LANE_SANDBOX_UPDATED ${installed} from templates/${basename(template)}; the previous copy is ${installed}.bak`;
 };

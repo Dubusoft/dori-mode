@@ -2,8 +2,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { lookupQuotaResults, type QuotaResult, type UsageLookup } from "./claude-quota.ts";
-import { displayTime } from "./display-time.ts";
 import { acquireStateLock, StateLockError } from "./state-lock.ts";
+import type { QuotaCacheNote } from "./quota-presentation.ts";
 
 /**
  * One quota read shared by every caller (the autopilot judge, `dori quota`, Discord `/quota`) through a file in the
@@ -42,18 +42,6 @@ type CacheEntry = {
 };
 
 type CacheFile = { readonly version: 1; readonly fetchedAt: number; readonly text: string; readonly entries: Readonly<Record<string, CacheEntry>> };
-
-/** Where a served read came from. */
-export type QuotaCacheNote = {
-  /** When the endpoints were last called. */
-  readonly fetchedAt: number;
-  /** This call ran the lookup itself. */
-  readonly refreshed: boolean;
-  /** Accounts backing off after a 429, with the time their backoff ends. */
-  readonly backoff: readonly { readonly name: string; readonly until: number }[];
-  /** Accounts served from a read older than the TTL (a 429 fallback, or no lookup during a backoff), with its time. */
-  readonly stale: readonly { readonly name: string; readonly at: number }[];
-};
 
 const nameOf = (r: QuotaResult): string => r.account || r.provider;
 const keyOf = (r: QuotaResult): string => `${r.provider}/${r.account ?? ""}`;
@@ -148,19 +136,3 @@ export const cachedQuotaLookup = (lookup: UsageLookup, { path, ttlMs, now }: Quo
 export const sharedQuotaLookup = (config: { readonly stateDir: string; readonly autopilot: { readonly quotaCacheSec: number } }): UsageLookup =>
   cachedQuotaLookup(lookupQuotaResults(), { path: quotaCachePath(config.stateDir), ttlMs: config.autopilot.quotaCacheSec * 1000, now: Date.now });
 
-export const ageText = (ms: number): string => {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`;
-};
-
-/** Lines saying a read came from the cache, which accounts are stale and which back off after a 429; none for a fresh read. */
-export const cacheNoteLines = (note: QuotaCacheNote | undefined, now: number, timeZone?: string): string[] => {
-  if (!note) return [];
-  return [
-    ...(note.refreshed ? [] : [`QUOTA | cached read from ${ageText(now - note.fetchedAt)} ago`]),
-    ...note.stale.map((s) => `QUOTA | ${s.name}: stale, last good read ${ageText(now - s.at)} ago`),
-    ...note.backoff.map((b) => `QUOTA | ${b.name}: rate-limited (HTTP 429), no usage call until ${displayTime(b.until, timeZone, "short")}`),
-  ];
-};

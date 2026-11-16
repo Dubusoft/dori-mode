@@ -3,8 +3,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
-import type { Lane } from "../src/registry.ts";
-import { canLaunch, clearLaunchHold, enqueueLaunch, heldMachines, idleLaneFor, launchHeld, launchQueue, queueFor, recordLaunchVerdict } from "../src/routing.ts";
+import { canLaunch, clearLaunchHold, enqueueLaunch, launchHeld, launchQueue, queueFor, recordLaunchVerdict } from "../src/routing.ts";
 import { withState } from "./fakes.ts";
 
 const t = defaultConfig("/home/test").guard;
@@ -20,14 +19,6 @@ test("low memory, low disk or a full pane budget each hold the launch and say wh
   const both = canLaunch({ ...roomy, panes: 20, diskFreeGb: 9 }, t);
   expect(both.ok).toBe(false);
   expect(both.reasons).toHaveLength(2);
-});
-
-test("an idle working lane on the same repo is preferred over opening a new one", () => {
-  const lane = (key: string, cwd: string, pane: string, status?: Lane["status"]): Lane => ({ key, title: key, thread: "none", brief: "", done: "", cwd, pane, openedAt: "2026-01-01T00:00:00Z", ...(status ? { status } : {}) });
-  const lanes = [lane("busy", "/repo/a", "w:p1"), lane("idle-other", "/repo/b", "w:p2"), lane("claimed", "/repo/a", "w:p3", "done-claimed"), lane("idle-same", "/repo/a", "w:p4")];
-  const idle = new Set(["w:p2", "w:p3", "w:p4"]);
-  expect(idleLaneFor(lanes, "/repo/a", idle)?.key).toBe("idle-same");
-  expect(idleLaneFor(lanes, "/repo/c", idle)).toBeNull();
 });
 
 test("a corrupt hold file is moved aside and remains blocked with no queue", () => {
@@ -112,21 +103,6 @@ test("enqueueing a remote item raises only that machine", () => {
     enqueueLaunch(state.dir, item("l"));
     expect(launchHeld(state.dir)).toBe(true);
     enqueueLaunch(state.dir, item("l2", "local"));
-    expect(heldMachines(state.dir)).toEqual(["box"]);
-  } finally {
-    state.done();
-  }
-});
-
-test("heldMachines lists blocked labels sorted", () => {
-  const state = withState();
-  try {
-    expect(heldMachines(state.dir)).toEqual([]);
-    recordLaunchVerdict(state.dir, hold("x"), 1, "zed");
-    recordLaunchVerdict(state.dir, hold("x"), 1, "alpha");
-    recordLaunchVerdict(state.dir, hold("x"), 1, "mid");
-    recordLaunchVerdict(state.dir, { ok: true, reasons: [] }, 2, "mid");
-    expect(heldMachines(state.dir)).toEqual(["alpha", "zed"]);
   } finally {
     state.done();
   }
@@ -165,7 +141,6 @@ test("a hold file without machines loads unchanged", () => {
     writeFileSync(join(state.dir, "launch-hold.json"), JSON.stringify({ blocked: true, reasons: ["old"] }));
     expect(launchHeld(state.dir)).toBe(true);
     expect(launchHeld(state.dir, "box")).toBe(false);
-    expect(heldMachines(state.dir)).toEqual([]);
     expect(readdirSync(state.dir).some((name) => name.includes("corrupt"))).toBe(false);
   } finally {
     state.done();
@@ -179,7 +154,6 @@ test("an invalid machines shape is treated as corrupt", () => {
       writeFileSync(join(state.dir, "launch-hold.json"), JSON.stringify({ blocked: false, machines }));
       expect(launchHeld(state.dir)).toBe(true);
       expect(readdirSync(state.dir).some((name) => name.startsWith("launch-hold.json.corrupt-"))).toBe(true);
-      expect(heldMachines(state.dir)).toEqual([]);
     } finally {
       state.done();
     }

@@ -9,11 +9,11 @@ import { defaultConfig } from "../src/config.ts";
 import { admissionSlots, claimSlot, LAUNCH_SLOT_TTL_MS, type LaunchSlot, precheckSlots } from "../src/launch-admission.ts";
 import type { LaunchInput } from "../src/launch.ts";
 import { admitLaunch, hostSummary, placeLaunch } from "../src/launch-service.ts";
-import { JsonOperations, plan } from "../src/operations.ts";
+import { SqliteOperations, plan } from "../src/operations.ts";
 import { checkMachine, type MachineCheck, verdictLine } from "../src/placement.ts";
 import type { Lane } from "../src/registry.ts";
 import { launchQueue } from "../src/routing.ts";
-import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, storePath } from "./fakes.ts";
 import { enrollRunners } from "./runner-guard-world.ts";
 
 const T0 = Date.parse("2026-11-14T12:00:00Z");
@@ -208,7 +208,7 @@ test("a default machine filled by pending launches tries fallback and uses the r
 });
 
 test("autopilot plans 19 lanes and de-duplicates shared ledger claims against pending reservations by key", async () => {
-  const h = world(), store = new JsonOperations(h.state.dir);
+  const h = world(), store = new SqliteOperations(storePath(h.state.dir));
   cleanups.push(() => store.close());
   const tasks: ToodoTask[] = Array.from({ length: 20 }, (_, i) => ({
     id: i + 1, workspaceId: 1, title: `task ${i + 1}`, description: "Do it", status: "planned", resolution: null, dependsOn: [],

@@ -12,7 +12,8 @@ import {
 import { remoteSecretGranter, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
 import type { SecretFrame } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
-import { memoryNetwork, type Transport } from "../src/runner/transport.ts";
+import type { Transport } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const clock = fakeClock(1_000_000);

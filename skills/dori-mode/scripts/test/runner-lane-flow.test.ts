@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { treeDigest } from "../src/lane-files.ts";
+import { treeDigest } from "../src/lane-file-contract.ts";
 import { join } from "node:path";
-import { openLaneReports, routeReports } from "../src/lane-reports.ts";
+import { routeReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
 import type { Lane } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
 import { Database } from "bun:sqlite";

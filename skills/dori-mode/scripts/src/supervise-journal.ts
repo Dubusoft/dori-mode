@@ -1,8 +1,9 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, statSync, truncateSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, truncateSync } from "node:fs";
 import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
 import type { LeadRestartRequest } from "./lead-restart.ts";
+import { appendFileDurable } from "./durable-write.ts";
 import { eventClass, forLead } from "./event-policy.ts";
 import { WakeMeter } from "./lead-wakes.ts";
 import { dropTake, pendingTakes, writeCursorFile } from "./inbox.ts";
@@ -217,16 +218,6 @@ const takeIds = (path: string): { readonly ids: readonly string[]; readonly sess
   } catch { return { ids: [], session: "" }; }
 };
 
-export const append = (path: string, text: string): void => {
-  const fd = openSync(path, "a", 0o600);
-  try {
-    const data = Buffer.from(text);
-    let at = 0;
-    while (at < data.length) at += writeSync(fd, data, at);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-};
-
 /** The journal state shared by the supervisor's parts. `deps` is replaced when the lead pane is recreated. */
 export class JournalCore {
   readonly eventLog: string;
@@ -242,7 +233,7 @@ export class JournalCore {
   constructor(public deps: FlowDeps) {
     mkdirSync(deps.config.stateDir, { recursive: true });
     this.eventLog = join(deps.config.stateDir, "lead-events.log");
-    try { this.store = openStore(deps.config.stateDir, deps.config.store, deps.clock.now); } catch (e) {
+    try { this.store = openStore(deps.config.stateDir, deps.clock.now); } catch (e) {
       throw e instanceof StoreError ? new SuperviseError(e.message) : e;
     }
     this.wakes = new WakeMeter(this.store, () => this.deps, () => this.deps.clock.now());
@@ -261,7 +252,7 @@ export class JournalCore {
    */
   recoverLog(): { readonly tail: readonly string[]; readonly cursor: number } {
     const { deps } = this;
-    if (!existsSync(this.eventLog)) append(this.eventLog, "");
+    if (!existsSync(this.eventLog)) appendFileDurable(this.eventLog, "", 0o600);
     // The store's deliveries cover the log up to its cursor (json: none, so the whole log is read).
     for (const id of this.store.deliveredIds() ?? []) this.delivered.add(id);
     const size = statSync(this.eventLog).size;
@@ -430,7 +421,7 @@ export class JournalCore {
     for (const event of events) {
       if (this.delivered.has(event.id)) continue;
       // `meta` is an extra field: `dori inbox take` (parseLogLine) reads only id and line.
-      append(this.eventLog, `${JSON.stringify({ id: event.id, line: redactSecrets(event.line), ...(event.meta ? { meta: redactMeta(event.meta) } : {}) })}\n`);
+      appendFileDurable(this.eventLog, `${JSON.stringify({ id: event.id, line: redactSecrets(event.line), ...(event.meta ? { meta: redactMeta(event.meta) } : {}) })}\n`, 0o600);
       this.delivered.add(event.id);
       appended.push(event.id);
     }

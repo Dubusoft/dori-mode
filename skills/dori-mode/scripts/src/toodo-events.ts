@@ -1,9 +1,9 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { SourceEnqueue } from "./event-sources.ts";
 import { redactSecrets } from "./redact.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 
 /*
  * The Toodo task events (the built-in `toodo` source). The supervisor follows toodo-server's event stream
@@ -65,12 +65,7 @@ export const readToodoCursor = (stateDir: string): string | undefined => {
 const writeCursor = (stateDir: string, lastEventId: string): void => {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const path = join(stateDir, TOODO_CURSOR_FILE);
-  const tmp = `${path}.${randomUUID()}.tmp`;
-  try {
-    const fd = openSync(tmp, "wx", 0o600);
-    try { writeFileSync(fd, `${JSON.stringify({ lastEventId })}\n`); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, path);
-  } finally { rmSync(tmp, { force: true }); }
+  replaceFileDurable(path, `${JSON.stringify({ lastEventId })}\n`, 0o600);
 };
 
 const field = (data: Record<string, unknown>, name: string): string => {

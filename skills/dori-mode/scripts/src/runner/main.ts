@@ -6,7 +6,7 @@ import { type Observation, pruneCommandRecords, resolveInterrupted } from "./dur
 import { RunnerLanes } from "./lanes.ts";
 import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
-import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
+import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
 import { laneRepoOf, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
@@ -19,21 +19,21 @@ import { policyReloader } from "./policy-reload.ts";
 import { watchConfigFiles } from "../config-watch.ts";
 import { workspaceReport, type WorkspaceReport } from "./workspaces.ts";
 import { queryDispatcher } from "./queries.ts";
-import { checkFileBody } from "./lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSource } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
+import { listPanes } from "../panes.ts";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig } from "../config.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
-import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
-import { HerdrWatch } from "./herdr-watch.ts";
+import { HerdrWatch, herdrProcess } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
 import { processCommands } from "./cleanup-artifacts.ts";
 import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
@@ -100,7 +100,7 @@ export const runnerEffects = (deps: {
   "lane.attach": async (command) => deps.lanes.attach(command.body),
   "lane.git": async (command) => laneGitEffect(deps.run, command.body),
   "lane.recover": async (command) => {
-    if (command.body.files) checkFileBody(command.body.key, command.body);
+    if (command.body.files) checkLaneFilesBody(command.body.key, command.body);
     return deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace, command.body.briefText, command.body.files);
   },
   "lane.observe": async (command) => deps.lanes.observe(command.body.key),
@@ -168,22 +168,27 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       return [...owned, ...observedOnly.filter((l) => !owned.some((o) => o.key === l.key))];
     };
     // The lanes this runner started are attributed from its own records, whatever runs in their panes now.
-    const ownedPanes = async (panes: readonly Pane[]): Promise<Map<string, string>> => {
+    const ownedPanes = async (panes: readonly Pane[], instance: string): Promise<Map<string, string>> => {
       const owned = new Map<string, string>();
       for (const record of Object.values(runnerLanes.records())) {
-        const pane = await runnerLanes.currentPane(record, panes);
+        const pane = await runnerLanes.currentPane(record, panes, instance);
         if (pane) owned.set(pane.pane_id, record.key);
       }
       return owned;
     };
-    const observedLanes = () => observeHost({ run, owned: ownedPanes, ...(winSample ? { procs: hostProcs } : {}) });
+    const observedLanes = async () => {
+      const [panes, process] = await Promise.all([listPanes(run), herdrProcess(run)]);
+      const instance = process.instance ?? "";
+      const owned = await ownedPanes(panes, instance);
+      return { lanes: await observeHost({ run, panes, owned: async () => owned, ...(winSample ? { procs: hostProcs } : {}) }), panes, instance };
+    };
     const observe = async () => {
-      const lanes = await observedLanes();
+      const { lanes, panes, instance } = await observedLanes();
       const observed = lanes.map(({ status: _status, ...lane }) => lane);
       // The lanes this runner started come first; the rest are lanes it only observes on its host.
       observedOnly = observed;
       // An owned lane waiting on an on-screen question goes out as one lane.asking per question.
-      await runnerLanes.askTick().catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
+      await runnerLanes.askTick(panes, instance).catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
       return lanes;
     };
     const version = await runnerVersion(run, import.meta.dir);
@@ -225,12 +230,6 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       kill: { clock: realClock, alive: platform.pidAlive, signal: platform.signal },
       publish: (type, body) => { client?.publish(type, body); },
     });
-    try {
-      const removed = removeLegacyGuardAgent(homedir());
-      if (removed.length) log(`RUNNER_GUARD_AGENT_REMOVED ${removed.join(",")}`);
-    } catch (error) {
-      log(`RUNNER_GUARD_AGENT_REMOVE_FAILED ${error instanceof Error ? error.message : String(error)}`);
-    }
     const dispatch = commandDispatcher({
       state, policy, realpath: realpathSync, runnerDir, log,
       publish: (body) => { client?.publish("cmd.result", body); },
@@ -344,7 +343,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     ensureRunnerSubdir(join(runnerDir, RUNNER_PATHS.sock), LANE_SOCKET_DIR);
-    const laneListeners = [listenUnix(laneSocketPath(runnerDir)), listenUnix(legacyLaneSocketPath(runnerDir))];
+    const laneListeners = [listenUnix(laneSocketPath(runnerDir))];
     for (const key of Object.keys(runnerLanes.records())) herdrReports?.open(key);
     // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;

@@ -547,6 +547,113 @@ const sweepClosedNodeModules = async (
   }
 };
 
+const sweepBunChrome = async (
+  deps: CleanupDeps, ctx: Ctx, count: TargetCount, temps: readonly string[], skippedRoots: string[],
+): Promise<void> => {
+  const { paths, now } = deps;
+  const { shield } = ctx;
+  for (const root of temps) {
+    if (!safeRoot(root, paths)) { skippedRoots.push(root); skipped(count, "unsafeRoot"); continue; }
+    for (const name of await listDirs(root)) {
+      if (!BUN_CHROME.test(name)) continue;
+      const dir = join(root, name);
+      if (shield.covers(dir)) { count.kept++; skipped(count, "shielded"); continue; }
+      try {
+        const st = await lstat(dir);
+        if (deps.uid !== undefined && st.uid !== deps.uid) { skipped(count, "otherUser"); continue; }
+        let newest = st.mtimeMs;
+        for (const child of await readdir(dir)) { try { newest = Math.max(newest, (await lstat(join(dir, child))).mtimeMs); } catch { /* gone */ } }
+        if (newest >= now - CLEANUP_AGES.bunChrome) continue;
+        const bytes = await treeBytes(dir);
+        count.candidates++;
+        count.candidateBytes += bytes;
+        if (count.mode !== "on") continue;
+        await rm(dir, { recursive: true, force: true });
+        count.removed++;
+        count.bytes += bytes;
+      } catch (e) { noteError(ctx, count, dir, e); }
+    }
+  }
+};
+
+const sweepSessions = async (
+  deps: CleanupDeps, ctx: Ctx, archived: TargetCount | undefined, emptyDirs: TargetCount | undefined,
+  skippedRoots: string[], walk: (count: TargetCount, root: string, opts: WalkOptions) => Promise<void>,
+): Promise<void> => {
+  const { paths, now } = deps;
+  const { shield } = ctx;
+  const openSessionDirs = new Set(deps.openLanes.flatMap((l) => (l.cwd ? [sessionDirName(l.cwd)] : [])));
+  const sessionsCount = archived ?? emptyDirs;
+  if (sessionsCount && !(safeRoot(paths.sessions, paths) && safeRoot(paths.sessionsArchive, paths))) {
+    skippedRoots.push(paths.sessions);
+    skipped(sessionsCount, "unsafeRoot");
+  } else if (sessionsCount) {
+    for (const cwdDir of await listDirs(paths.sessions)) {
+      if (cwdDir.startsWith(".") || openSessionDirs.has(cwdDir)) continue;
+      const dir = join(paths.sessions, cwdDir);
+      let names: string[];
+      try { names = await readdir(dir); } catch (e) { noteError(ctx, sessionsCount, dir, e); continue; }
+      if (archived) for (const name of names.filter((n) => n.endsWith(".jsonl"))) {
+        const file = join(dir, name);
+        if (shield.covers(file)) { archived.kept++; skipped(archived, "shielded"); continue; }
+        try {
+          const st = await lstat(file);
+          if (!st.isFile() || st.mtimeMs >= now - CLEANUP_AGES.sessions) continue;
+          const dest = join(paths.sessionsArchive, cwdDir);
+          if (existsSync(join(dest, name))) { skipped(archived, "archived"); continue; }
+          archived.candidates++;
+          archived.candidateBytes += st.size;
+          if (archived.mode !== "on") continue;
+          await mkdir(dest, { recursive: true, mode: 0o700 });
+          await rename(file, join(dest, name));
+          archived.removed++;
+          archived.bytes += st.size;
+          const artifacts = `${name.slice(0, -".jsonl".length)}-artifacts`;
+          if (existsSync(join(dir, artifacts)) && !existsSync(join(dest, artifacts))) await rename(join(dir, artifacts), join(dest, artifacts));
+        } catch (e) { noteError(ctx, archived, file, e); }
+      }
+      // Empty artifact dirs left behind by sessions that never wrote one.
+      if (emptyDirs) for (const name of names.filter((n) => n.endsWith("-artifacts"))) {
+        const art = join(dir, name);
+        try {
+          const st = await lstat(art);
+          if (!st.isDirectory() || st.mtimeMs >= now - CLEANUP_AGES.emptyDirs || (await readdir(art)).length) continue;
+          emptyDirs.candidates++;
+          if (emptyDirs.mode !== "on") continue;
+          await rmdir(art);
+          emptyDirs.removed++;
+        } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") noteError(ctx, emptyDirs, art, e); }
+      }
+    }
+  }
+  if (emptyDirs) await walk(emptyDirs, paths.evidence, { cutoff: now - CLEANUP_AGES.emptyDirs, files: false });
+};
+
+const sweepMemoryAgents = async (deps: CleanupDeps, ctx: Ctx, agents: TargetCount | undefined): Promise<void> => {
+  const { paths, now } = deps;
+  const { shield } = ctx;
+  const keepSuffixes = [...deps.keepAgents, ...deps.openLanes.flatMap((l) => (l.cwd ? [l.cwd] : []))].map(memoryAgentSuffix);
+  if (agents && !safeRoot(paths.memoryAgents, paths)) skipped(agents, "unsafeRoot");
+  else if (agents) {
+    for (const name of await listDirs(paths.memoryAgents)) {
+      const dir = join(paths.memoryAgents, name);
+      if (keepSuffixes.some((s) => name.endsWith(s)) || shield.covers(dir)) { agents.kept++; skipped(agents, "shielded"); continue; }
+      try {
+        const st = await lstat(dir);
+        if (deps.uid !== undefined && st.uid !== deps.uid) { skipped(agents, "otherUser"); continue; }
+        if (await agentAge(dir) >= now - CLEANUP_AGES.memoryAgents) continue;
+        const bytes = await treeBytes(dir);
+        agents.candidates++;
+        agents.candidateBytes += bytes;
+        if (agents.mode !== "on") continue;
+        await rm(dir, { recursive: true, force: true });
+        agents.removed++;
+        agents.bytes += bytes;
+      } catch (e) { noteError(ctx, agents, dir, e); }
+    }
+  }
+};
+
 /** One sweep over every target. A target that fails is counted and logged; the others still run. */
 export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   const started = Date.now();
@@ -595,30 +702,7 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   if (omoTmp) await walk(omoTmp, paths.omoTmp, { cutoff: now - CLEANUP_AGES.omoTmp, files: true, skipTop: (n) => n === "lane-sandbox" });
   // Browser profiles first: they are also temp entries, but on a 2 hour clock.
   const chrome = runs("bunChrome", true);
-  if (chrome) {
-    for (const root of temps) {
-      if (!safeRoot(root, paths)) { skippedRoots.push(root); skipped(chrome, "unsafeRoot"); continue; }
-      for (const name of await listDirs(root)) {
-        if (!BUN_CHROME.test(name)) continue;
-        const dir = join(root, name);
-        if (shield.covers(dir)) { chrome.kept++; skipped(chrome, "shielded"); continue; }
-        try {
-          const st = await lstat(dir);
-          if (deps.uid !== undefined && st.uid !== deps.uid) { skipped(chrome, "otherUser"); continue; }
-          let newest = st.mtimeMs;
-          for (const child of await readdir(dir)) { try { newest = Math.max(newest, (await lstat(join(dir, child))).mtimeMs); } catch { /* gone */ } }
-          if (newest >= now - CLEANUP_AGES.bunChrome) continue;
-          const bytes = await treeBytes(dir);
-          chrome.candidates++;
-          chrome.candidateBytes += bytes;
-          if (chrome.mode !== "on") continue;
-          await rm(dir, { recursive: true, force: true });
-          chrome.removed++;
-          chrome.bytes += bytes;
-        } catch (e) { noteError(ctx, chrome, dir, e); }
-      }
-    }
-  }
+  if (chrome) await sweepBunChrome(deps, ctx, chrome, temps, skippedRoots);
   const temp = runs("temp", true);
   if (temp) for (const root of temps) await walk(temp, root, { cutoff: now - CLEANUP_AGES.temp, files: true, skipTop: (n) => tempExcluded(n) || BUN_CHROME.test(n) });
   const varTmp = paths.varTmp ? runs("varTmp", true) : undefined;
@@ -627,74 +711,11 @@ export const runCleanup = async (deps: CleanupDeps): Promise<CleanupReport> => {
   // Sessions: archived (moved), never deleted. An open lane's session dir stays where omo resumes it from.
   const archived = runs("sessionsArchived", false);
   const emptyDirs = runs("emptyArtifactDirs", false);
-  const openSessionDirs = new Set(deps.openLanes.flatMap((l) => (l.cwd ? [sessionDirName(l.cwd)] : [])));
-  const sessionsCount = archived ?? emptyDirs;
-  if (sessionsCount && !(safeRoot(paths.sessions, paths) && safeRoot(paths.sessionsArchive, paths))) {
-    skippedRoots.push(paths.sessions);
-    skipped(sessionsCount, "unsafeRoot");
-  } else if (sessionsCount) {
-    for (const cwdDir of await listDirs(paths.sessions)) {
-      if (cwdDir.startsWith(".") || openSessionDirs.has(cwdDir)) continue;
-      const dir = join(paths.sessions, cwdDir);
-      let names: string[];
-      try { names = await readdir(dir); } catch (e) { noteError(ctx, sessionsCount, dir, e); continue; }
-      if (archived) for (const name of names.filter((n) => n.endsWith(".jsonl"))) {
-        const file = join(dir, name);
-        if (shield.covers(file)) { archived.kept++; skipped(archived, "shielded"); continue; }
-        try {
-          const st = await lstat(file);
-          if (!st.isFile() || st.mtimeMs >= now - CLEANUP_AGES.sessions) continue;
-          const dest = join(paths.sessionsArchive, cwdDir);
-          if (existsSync(join(dest, name))) { skipped(archived, "archived"); continue; }
-          archived.candidates++;
-          archived.candidateBytes += st.size;
-          if (archived.mode !== "on") continue;
-          await mkdir(dest, { recursive: true, mode: 0o700 });
-          await rename(file, join(dest, name));
-          archived.removed++;
-          archived.bytes += st.size;
-          const artifacts = `${name.slice(0, -".jsonl".length)}-artifacts`;
-          if (existsSync(join(dir, artifacts)) && !existsSync(join(dest, artifacts))) await rename(join(dir, artifacts), join(dest, artifacts));
-        } catch (e) { noteError(ctx, archived, file, e); }
-      }
-      // Empty artifact dirs left behind by sessions that never wrote one.
-      if (emptyDirs) for (const name of names.filter((n) => n.endsWith("-artifacts"))) {
-        const art = join(dir, name);
-        try {
-          const st = await lstat(art);
-          if (!st.isDirectory() || st.mtimeMs >= now - CLEANUP_AGES.emptyDirs || (await readdir(art)).length) continue;
-          emptyDirs.candidates++;
-          if (emptyDirs.mode !== "on") continue;
-          await rmdir(art);
-          emptyDirs.removed++;
-        } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") noteError(ctx, emptyDirs, art, e); }
-      }
-    }
-  }
-  if (emptyDirs) await walk(emptyDirs, paths.evidence, { cutoff: now - CLEANUP_AGES.emptyDirs, files: false });
+  await sweepSessions(deps, ctx, archived, emptyDirs, skippedRoots, walk);
 
   // Memory agents of lanes long gone. The lead's and every open lane's stay.
   const agents = runs("memoryAgents", true);
-  const keepSuffixes = [...deps.keepAgents, ...deps.openLanes.flatMap((l) => (l.cwd ? [l.cwd] : []))].map(memoryAgentSuffix);
-  if (agents && !safeRoot(paths.memoryAgents, paths)) skipped(agents, "unsafeRoot");
-  else if (agents) {
-    for (const name of await listDirs(paths.memoryAgents)) {
-      const dir = join(paths.memoryAgents, name);
-      if (keepSuffixes.some((s) => name.endsWith(s)) || shield.covers(dir)) { agents.kept++; skipped(agents, "shielded"); continue; }
-      try {
-        const st = await lstat(dir);
-        if (deps.uid !== undefined && st.uid !== deps.uid) { skipped(agents, "otherUser"); continue; }
-        if (await agentAge(dir) >= now - CLEANUP_AGES.memoryAgents) continue;
-        const bytes = await treeBytes(dir);
-        agents.candidates++;
-        agents.candidateBytes += bytes;
-        if (agents.mode !== "on") continue;
-        await rm(dir, { recursive: true, force: true });
-        agents.removed++;
-        agents.bytes += bytes;
-      } catch (e) { noteError(ctx, agents, dir, e); }
-    }
-  }
+  await sweepMemoryAgents(deps, ctx, agents);
 
   // node_modules of closed lanes' worktrees: only lanes the registry records as closed, never a worktree it does not know.
   const nodeModules = runs("closedNodeModules", true);

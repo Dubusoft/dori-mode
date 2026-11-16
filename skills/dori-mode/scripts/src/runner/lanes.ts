@@ -7,11 +7,13 @@ import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { ASK_SCREEN_LINES, askingLine, screenQuestion, type ScreenQuestion } from "../ask-user.ts";
 import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
+import { agentArgv, outsideDenyRules, powershellLaunchLine, quote, removeLegacyLaneMcp } from "./lane-launch.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, resolveGrants, runnerPaths, runtimeDirOption, type RunnerPolicy } from "./policy.ts";
 import { herdrProcess } from "./herdr-watch.ts";
-import { addInput, captureOutput, checkFileBody, laneFilePaths, LaneFileError, prepareInput, removeLaneTree, treeDigest, validateBriefFiles, type FileReaders } from "./lane-files.ts";
+import { addInput, captureOutput, laneFilePaths, prepareInput, removeLaneTree, validateBriefFiles, type FileReaders } from "./lane-files.ts";
+import { checkLaneFilesBody, LaneFileError, treeDigest } from "../lane-file-contract.ts";
 import { laneProcessAlive, turnStop } from "./observe.ts";
 import { STARTUP_GRACE_MS } from "./serve.ts";
 import type {
@@ -130,94 +132,6 @@ const hash = (token: string): string => createHash("sha256").update(token).diges
 /** One question across ticks, like ask-user's own key: header, text and options, not the pending count. */
 const questionKey = (q: ScreenQuestion): string =>
   createHash("sha256").update(JSON.stringify(q.tabs && q.tabs.length > 1 ? [q.tabs] : [q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
-const quote = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);
-const psQuote = (value: string): string => `'${value.replace(/'/g, "''")}'`;
-
-/**
- * The line typed into a PowerShell pane: a nested `<shell> -NoLogo -EncodedCommand <base64(utf16le(script))>`, so the
- * variables live only in the nested process and the typed text is plain base64. Windows PowerShell 5.1 mangles native
- * arguments containing a double quote, so it is refused there (`RUNNER_LANE_ARGV_UNSAFE`); pwsh passes them intact.
- * With `cwd` the nested shell enters it before the agent starts: the nested shell loads the user's profile, and a profile
- * that changes directory would otherwise start the agent outside the lane's directory.
- */
-export const powershellLaunchLine = (
-  shell: "pwsh" | "powershell", env: readonly (readonly [string, string])[], argv: readonly string[], cwd?: string,
-): string => {
-  if (shell === "powershell" && argv.some((arg) => arg.includes('"'))) {
-    throw new Error("RUNNER_LANE_ARGV_UNSAFE Windows PowerShell 5.1 cannot pass an argument containing a double quote; use pwsh");
-  }
-  const [program, ...args] = argv;
-  const script = [
-    ...env.map(([name, value]) => `$env:${name}=${psQuote(value)}`),
-    "$env:PSExecutionPolicyPreference='Bypass'",
-    ...(cwd !== undefined ? [`Set-Location -LiteralPath ${psQuote(cwd)}`] : []),
-    `& ${[program ?? "", ...args].map(psQuote).join(" ")}`,
-    "exit $LASTEXITCODE",
-  ].join("; ");
-  return `${shell} -NoLogo -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
-};
-
-/** The old lane `.omo/mcp.json` (figma disabled) that launch.ts used to write; the same bytes as `LEGACY_LANE_MCP` there. */
-export const LEGACY_LANE_MCP = `${JSON.stringify({ mcpServers: { figma: { enabled: false, url: "https://mcp.figma.com/mcp" } } }, null, 2)}\n`;
-
-/**
- * Removes a `.omo/mcp.json` in `cwd` that is byte-for-byte the old lane file, so an old worktree stops keeping figma
- * off; a user's own file is never touched. Runs on the lane's host before the agent starts (moved from launch.ts).
- */
-export const removeLegacyLaneMcp = async (cwd: string): Promise<boolean> => {
-  const file = Bun.file(join(cwd, ".omo", "mcp.json"));
-  try {
-    if (!(await file.exists()) || (await file.text()) !== LEGACY_LANE_MCP) return false;
-    await file.delete();
-    return true;
-  } catch { return false; } // unremovable: the lane still launches as before
-};
-
-/**
- * omo's permission preset for every lane. A lane's pane has no one to answer omo's interactive permission prompt, and a
- * host whose omo settings pick a stricter preset (`workspace`, `ask`) would stop the lane on it. Under `full-access` omo
- * never prompts: a configured `deny` rule still refuses, and the lane sandbox, not omo, bounds what the lane can reach.
- */
-export const LANE_PERMISSION_FLAGS: readonly string[] = ["--permission-preset", "full-access"];
-
-/**
- * The omo `--permission` value for a lane with no sandbox (a Windows runner, a machine opted in to run unsandboxed), where
- * full-access alone would leave nothing in place: every path outside the lane's cwd is refused without a prompt, except
- * each `allowed` directory and everything under it. A directory whose path holds `,` or `=` cannot be written as an omo
- * rule, so it stays refused.
- */
-export const outsideDenyRules = (allowed: readonly string[], join: (dir: string, name: string) => string): string => [
-  "external_directory=deny",
-  ...[...new Set(allowed)].filter((dir) => dir !== "" && !/[,=]/.test(dir))
-    .flatMap((dir) => [`external_directory:${dir}=allow`, `external_directory:${join(dir, "*")}=allow`]),
-].join(",");
-
-/**
- * `template` with LANE_PERMISSION_FLAGS (and `--permission <outsideRules>` when given) before its `{prompt}` slot;
- * unchanged when it already names a preset or has no slot.
- */
-export const lanePermissionArgv = (template: readonly string[], outsideRules?: string): readonly string[] => {
-  if (template.some((part) => /^--permission-preset(?:=|$)/.test(part))) return template;
-  const at = template.findIndex((part) => part.includes("{prompt}"));
-  const flags = [...LANE_PERMISSION_FLAGS, ...(outsideRules ? ["--permission", outsideRules] : [])];
-  return at < 1 ? template : [...template.slice(0, at), ...flags, ...template.slice(at)];
-};
-
-/**
- * The agent argv of `profile`, each `{prompt}`, `{model}` and `{brief}` filled in, with the lane permission flags
- * (`lanePermissionArgv`, `outsideRules` for an unsandboxed lane); `session` resumes it when the profile allows (`resumeArgv`).
- */
-export const agentArgv = (
-  policy: RunnerPolicy, profile: string, values: { readonly prompt: string; readonly model: string; readonly brief: string }, session?: string,
-  outsideRules?: string,
-): string[] => {
-  const configured = policy.agents[profile];
-  if (!configured?.length) throw new Error(`RUNNER_LANE_PROFILE_UNKNOWN ${profile}`);
-  const template = lanePermissionArgv(configured, outsideRules);
-  const parts = resumeArgv(template, session) ?? template;
-  return parts.map((part) => part.replaceAll("{prompt}", values.prompt).replaceAll("{model}", values.model).replaceAll("{brief}", values.brief));
-};
-
 /** What a launch needs; a relaunch takes it from the record. */
 type LaunchInput = {
   readonly sandbox?: boolean;
@@ -229,6 +143,15 @@ type LaunchInput = {
   readonly grants?: readonly string[];
   readonly restored?: boolean;
 };
+type LaunchOptions = Pick<LaunchInput, "keywords" | "session" | "target" | "heavySlots" | "heavyMaxLoad" | "tabWorkspace" | "grants">;
+/** The optional `LaunchInput` fields a start body or a lane record carries, each set only when present (no explicit undefined). */
+const launchOptions = (o: { [K in keyof LaunchOptions]?: LaunchOptions[K] | undefined }): LaunchOptions => ({
+  ...(o.keywords !== undefined ? { keywords: o.keywords } : {}), ...(o.session !== undefined ? { session: o.session } : {}),
+  ...(o.target ? { target: o.target } : {}),
+  ...(o.heavySlots !== undefined ? { heavySlots: o.heavySlots } : {}), ...(o.heavyMaxLoad !== undefined ? { heavyMaxLoad: o.heavyMaxLoad } : {}),
+  ...(o.tabWorkspace !== undefined ? { tabWorkspace: o.tabWorkspace } : {}),
+  ...(o.grants?.length ? { grants: o.grants } : {}),
+});
 type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string };
 
 export class RunnerLanes {
@@ -251,8 +174,8 @@ export class RunnerLanes {
   }
 
   /** Pre-proto-4 records acquire identity only from a live foreground process positively attributed to their key. */
-  async currentPane(record: LaneRecord, panes?: readonly Pane[]): Promise<Pane | undefined> {
-    const instance = await this.instance();
+  async currentPane(record: LaneRecord, panes?: readonly Pane[], knownInstance?: string): Promise<Pane | undefined> {
+    const instance = knownInstance ?? await this.instance();
     if (!instance || record.herdrInstance && record.herdrInstance !== instance) return undefined;
     const pane = (panes ?? await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
     if (!record.herdrInstance) {
@@ -264,7 +187,7 @@ export class RunnerLanes {
       const owner = procLanes(await (this.deps.procs ?? (() => sampleProcs(this.deps.run)))());
       const foreground = info?.foreground_processes ?? [];
       const attributed = foreground.some((p) => p.pid !== undefined && owner.get(p.pid) === record.key);
-      if (!attributed || instance !== await this.instance()) return undefined;
+      if (!attributed || instance !== knownInstance && instance !== await this.instance()) return undefined;
       this.update(record.key, (r) => ({ ...r, herdrInstance: instance, ...(pane?.terminal_id ? { terminalId: pane.terminal_id } : {}) }));
       return pane;
     }
@@ -317,6 +240,20 @@ export class RunnerLanes {
 
   private tokenFileOf(key: string, gen: number | undefined): string {
     return join(this.deps.runnerDir, RUNNER_PATHS.briefs, gen === undefined ? `${key}.token` : `${key}.${gen}.token`);
+  }
+
+  private newToken(): string {
+    return (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
+  }
+
+  /** Deletes the lane's brief and both token files (generation `gen` and the stable adopted one), and its file trees when `trees`. */
+  private forgetLaneFiles(key: string, gen: number | undefined, trees: boolean): void {
+    rmSync(this.briefPath(key), { force: true });
+    rmSync(this.tokenFileOf(key, gen), { force: true });
+    rmSync(this.tokenFileOf(key, undefined), { force: true });
+    if (!trees) return;
+    const paths = laneFilePaths(this.deps.runnerDir, key);
+    for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
   }
 
   /** Throws `RUNNER_CMD_REJECTED <rule>` when a pane directory found on this host is not under the policy's allowedRoots. */
@@ -390,7 +327,7 @@ export class RunnerLanes {
     if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
     if (!body.files) throw new LaneFileError("LANE_FILES_INPUT_REQUIRED", body.key, "this start needs a fresh lead brief and attachment scan; launch the lane again from the lead");
     validateBriefFiles(body.key, body.briefText, body.files);
-    checkFileBody(body.key, body);
+    checkLaneFilesBody(body.key, body);
     // policy.ts checkCommand fills a missing cwd (the lane's own laneCwd) at dispatch; a body without one never got checked.
     const cwd = body.cwd;
     if (cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} ${body.key}`);
@@ -407,21 +344,11 @@ export class RunnerLanes {
         sandbox: body.sandbox,
         fileRun: body.files.run, mayStart: (value) => { mayStart = value; },
         key: body.key, cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
-        ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
-        ...(body.target ? { target: body.target } : {}),
-        ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
-        ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
-        ...(body.grants?.length ? { grants: body.grants } : {}),
+        ...launchOptions(body),
       });
       return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd } };
     } catch (error) {
-      if (!mayStart && !this.records()[body.key]) {
-        const paths = laneFilePaths(this.deps.runnerDir, body.key);
-        for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
-        rmSync(this.briefPath(body.key), { force: true });
-        rmSync(this.tokenFileOf(body.key, 1), { force: true });
-        rmSync(this.tokenFileOf(body.key, undefined), { force: true });
-      }
+      if (!mayStart && !this.records()[body.key]) this.forgetLaneFiles(body.key, 1, true);
       throw error;
     }
   }
@@ -444,6 +371,56 @@ export class RunnerLanes {
     // Checks the profile before a tab opens; an unsandboxed lane's rules wait for its final cwd (a target pane's own).
     let argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session);
     const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
+    const { pane, tab, terminalId, shell, shellPid, cwd, rollback } = await this.acquirePane(input);
+    await (this.deps.legacyMcp ?? removeLegacyLaneMcp)(cwd);
+    if (!input.sandbox && input.profile !== "sandboxed") {
+      argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session, this.outsideRules(cwd));
+    }
+    const token = this.newToken();
+    ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
+    const previous = this.records()[key];
+    const gen = (previous?.gen ?? 0) + 1;
+    const tokenFile = this.tokenFileOf(key, gen);
+    writeRunnerFile(tokenFile, token);
+    const { command, sandboxPrefix } = await this.buildLaunchCommand(input, { shell, argv, cwd, tokenFile, granted, rollback });
+    // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
+    if (shell === "posix") this.deps.herdrReports?.open(key);
+    input.mayStart?.(true);
+    const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
+    if (ran.code !== 0) {
+      input.mayStart?.(false);
+      if (!previous) this.deps.herdrReports?.close(key);
+      rmSync(tokenFile, { force: true });
+      await rollback();
+      throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
+    }
+    this.save({
+      ...this.records(),
+      [key]: {
+        key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
+        ...(input.fileRun ? { fileRun: input.fileRun } : {}),
+        ...(input.sandbox !== undefined ? { sandbox: input.sandbox } : {}),
+        ...(sandboxPrefix !== undefined ? { sandboxPrefix } : {}),
+        herdrInstance, ...(terminalId ? { terminalId } : {}), ...(shellPid ? { shellPid } : {}),
+        ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
+        ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),
+        ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
+        ...(input.grants?.length ? { grants: input.grants } : {}),
+      },
+    });
+    // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
+    if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
+    this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
+    const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
+    return { pane, tab, resumed, startup, cwd };
+  }
+
+  /** Opens the lane's pane (a new tab, or the checked `target` pane) and returns what the launch needs to go on; `rollback` closes what it opened. */
+  private async acquirePane(input: LaunchInput): Promise<{
+    readonly pane: string; readonly tab: string; readonly terminalId: string | undefined; readonly shell: PaneShell;
+    readonly shellPid: number | undefined; readonly cwd: string; readonly rollback: () => Promise<void>;
+  }> {
+    const { key } = input;
     let pane: string;
     let tab: string;
     let terminalId: string | undefined;
@@ -485,16 +462,18 @@ export class RunnerLanes {
         throw new TargetError("RUNNER_LANE_TARGET_INVALID", cmdRefused(pane));
       }
     }
-    await (this.deps.legacyMcp ?? removeLegacyLaneMcp)(cwd);
-    if (!input.sandbox && input.profile !== "sandboxed") {
-      argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session, this.outsideRules(cwd));
-    }
-    const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
-    ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
-    const previous = this.records()[key];
-    const gen = (previous?.gen ?? 0) + 1;
-    const tokenFile = this.tokenFileOf(key, gen);
-    writeRunnerFile(tokenFile, token);
+    return { pane, tab, terminalId, shell, shellPid, cwd, rollback };
+  }
+
+  /** The command typed into the pane: a PowerShell line or the POSIX `export`/`eval` line; a refused PowerShell argv closes the opened tab. */
+  private async buildLaunchCommand(
+    input: LaunchInput,
+    { shell, argv, cwd, tokenFile, granted, rollback }: {
+      readonly shell: PaneShell; readonly argv: readonly string[]; readonly cwd: string; readonly tokenFile: string;
+      readonly granted: ReturnType<typeof resolveGrants> | undefined; readonly rollback: () => Promise<void>;
+    },
+  ): Promise<{ readonly command: string; readonly sandboxPrefix: string | undefined }> {
+    const { key } = input;
     let command: string;
     let sandboxPrefix: string | undefined;
     if (shell === "pwsh" || shell === "powershell") {
@@ -531,36 +510,7 @@ export class RunnerLanes {
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = `export ${env.join(" ")}; eval "$(${quote(this.deps.remote ? join(this.deps.runnerDir, "bin", "dori") : "dori")} secret env)"; ${argv.map(quote).join(" ")}`;
     }
-    // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
-    if (shell === "posix") this.deps.herdrReports?.open(key);
-    input.mayStart?.(true);
-    const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
-    if (ran.code !== 0) {
-      input.mayStart?.(false);
-      if (!previous) this.deps.herdrReports?.close(key);
-      rmSync(tokenFile, { force: true });
-      await rollback();
-      throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
-    }
-    this.save({
-      ...this.records(),
-      [key]: {
-        key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
-        ...(input.fileRun ? { fileRun: input.fileRun } : {}),
-        ...(input.sandbox !== undefined ? { sandbox: input.sandbox } : {}),
-        ...(sandboxPrefix !== undefined ? { sandboxPrefix } : {}),
-        herdrInstance, ...(terminalId ? { terminalId } : {}), ...(shellPid ? { shellPid } : {}),
-        ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
-        ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),
-        ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}), ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
-        ...(input.grants?.length ? { grants: input.grants } : {}),
-      },
-    });
-    // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
-    if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
-    this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
-    const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
-    return { pane, tab, resumed, startup, cwd };
+    return { command, sandboxPrefix };
   }
 
   private record(key: string): LaneRecord {
@@ -596,7 +546,7 @@ export class RunnerLanes {
     if (paneCwd === undefined && body.cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} pane ${body.pane} reports no directory`);
     for (const dir of [body.cwd, paneCwd]) if (dir !== undefined) this.checkPaneCwd(dir);
     const cwd = body.cwd ?? paneCwd ?? "";
-    const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
+    const token = this.newToken();
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
     const tokenFile = this.tokenPath(body.key);
     writeRunnerFile(tokenFile, token);
@@ -621,7 +571,7 @@ export class RunnerLanes {
   async attach(body: SupervisorCommandBodies["lane.attach"]): Promise<Effect<"lane.attach">> {
     const record = this.record(body.key);
     if (!record.fileRun) throw new LaneFileError("LANE_ATTACH_UNMANAGED", body.key, "this lane was not started with lane files (adopted or started by an older dori); relaunch it from the lead to attach files");
-    checkFileBody(body.key, body);
+    checkLaneFilesBody(body.key, body);
     const dir = addInput(this.deps.runnerDir, body.key, body.tree);
     return { detail: `attached files=${body.tree.files.length} dir=${dir}`, result: { dir } };
   }
@@ -632,13 +582,7 @@ export class RunnerLanes {
     const closed: "tab" | "pane" | "none" = !current ? "none" : record.tab ? "tab" : record.pane ? "pane" : "none";
     if (closed === "tab") await this.deps.run(["herdr", "tab", "close", record.tab]);
     else if (closed === "pane") await this.deps.run(["herdr", "pane", "close", record.pane]);
-    rmSync(this.briefPath(key), { force: true });
-    rmSync(this.tokenFileOf(key, record.gen), { force: true });
-    rmSync(this.tokenFileOf(key, undefined), { force: true });
-    if (record.fileRun) {
-      const paths = laneFilePaths(this.deps.runnerDir, key);
-      for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
-    }
+    this.forgetLaneFiles(key, record.gen, record.fileRun !== undefined);
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
     this.deps.herdrReports?.close(key);
@@ -759,10 +703,7 @@ export class RunnerLanes {
       fileRun: files.run,
       key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,
       ...(restored ? { target: { pane: restored }, restored: true } : {}),
-      ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),
-      ...((tabWorkspace ?? record.tabWorkspace) !== undefined ? { tabWorkspace: tabWorkspace ?? record.tabWorkspace } : {}),
-      ...(record.heavySlots !== undefined ? { heavySlots: record.heavySlots } : {}), ...(record.heavyMaxLoad !== undefined ? { heavyMaxLoad: record.heavyMaxLoad } : {}),
-      ...(record.grants?.length ? { grants: record.grants } : {}),
+      ...launchOptions({ ...record, session, tabWorkspace: tabWorkspace ?? record.tabWorkspace }),
     });
     // The relaunch replaced the record; a notice the supervisor pushed stays with the lane.
     if (record.notice) this.update(key, (r) => ({ ...r, notice: record.notice as LaneNotice }));
@@ -777,10 +718,13 @@ export class RunnerLanes {
    * and is remembered in the record (`lastAsk`); a lane whose prompt is gone forgets it, so its next question goes out
    * again. An empty or failed screen read changes nothing. Returns the keys published.
    */
-  async askTick(): Promise<string[]> {
+  async askTick(panes?: readonly Pane[], instance?: string): Promise<string[]> {
     const asked: string[] = [];
-    for (const record of Object.values(this.records())) {
-      const pane = await this.currentPane(record);
+    const records = this.records();
+    const next = { ...records };
+    let changed = false;
+    for (const record of Object.values(records)) {
+      const pane = await this.currentPane(record, panes, instance);
       if (!pane) continue;
       const screen = await readScreen(this.deps.run, record.pane, ASK_SCREEN_LINES).catch(() => "");
       await this.noteTurn(record, pane, screen);
@@ -789,12 +733,14 @@ export class RunnerLanes {
       const seen = q ? questionKey(q) : undefined;
       if (seen === record.lastAsk) continue;
       if (q) { this.deps.publish("lane.asking", { key: record.key, text: askingLine(record.key, q) }); asked.push(record.key); }
-      const current = this.records()[record.key];
+      const current = next[record.key];
       if (current) {
         const { lastAsk: _was, ...rest } = current;
-        this.save({ ...this.records(), [record.key]: seen ? { ...rest, lastAsk: seen } : rest });
+        next[record.key] = seen ? { ...rest, lastAsk: seen } : rest;
+        changed = true;
       }
     }
+    if (changed) this.save(next);
     return asked;
   }
 }

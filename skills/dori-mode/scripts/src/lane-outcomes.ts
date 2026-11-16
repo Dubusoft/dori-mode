@@ -1,9 +1,10 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { redactSecrets } from "./redact.ts";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import { eventClass, forLead } from "./event-policy.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
+import { dropFile, publishReceipt, receiptPaths } from "./receipts.ts";
 import { unresolved } from "./decision-obligations.ts";
 import { ownerDecisionBlockers } from "./owner-decisions.ts";
 import type { Registry } from "./registry.ts";
@@ -41,7 +42,6 @@ export const REPORTED_KEEP_MS = 7 * 24 * 60 * 60_000;
 export const OUTCOME_LINE_MAX = 300;
 
 const LANE_KEY = /^[\w.-]+$/;
-const RECEIPT_FILE = /^\d+-[\w-]+\.json$/;
 
 export class ReportedError extends Error {}
 
@@ -70,11 +70,6 @@ const riderLane = (line: string): string | undefined => keyOf(line.startsWith(AU
 /** The lane whose done claim was rejected: `LANE_NOT_DONE <key> ...`. */
 export const rejectedLane = (line: string): string | undefined => keyOf(line.startsWith(REJECTED) ? line.split(" ")[1] : undefined);
 
-const fsyncDir = (dir: string): void => {
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-};
-
 /**
  * Where `dori reported` posted the report: the message id and its target (`platform:to[/thread]`); `thread` is the id of
  * the lane's thread (its bound thread, else the thread the report went into), `button` that the post carried the owner's
@@ -90,16 +85,8 @@ export type ReportedPost = { readonly message: string; readonly target: string; 
  */
 export const recordReported = (stateDir: string, lane: string, at: number, note?: string, posted?: ReportedPost): string => {
   if (!LANE_KEY.test(lane)) throw new ReportedError("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT] (a lane key)");
-  const dir = join(stateDir, REPORTED_DIR);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${at}-${randomUUID()}.json`);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ lane, at, ...(note ? { note: redactSecrets(note) } : {}), ...(posted ? { message: posted.message, target: posted.target } : {}),
-    ...(posted?.thread ? { thread: posted.thread } : {}), ...(posted?.button ? { button: true } : {}), ...(posted?.followUp ? { followUp: true } : {}) }), { mode: 0o600, flush: true });
-  renameSync(tmp, path);
-  fsyncDir(dir);
-  fsyncDir(stateDir);
-  return path;
+  return publishReceipt(stateDir, REPORTED_DIR, at, { lane, at, ...(note ? { note: redactSecrets(note) } : {}), ...(posted ? { message: posted.message, target: posted.target } : {}),
+    ...(posted?.thread ? { thread: posted.thread } : {}), ...(posted?.button ? { button: true } : {}), ...(posted?.followUp ? { followUp: true } : {}) });
 };
 
 /** `message` and `target` are absent in receipts written before `dori reported` posted the report itself. */
@@ -110,11 +97,7 @@ export type ReportedReceipt = {
 
 /** Receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
 export const pendingReported = (stateDir: string): ReportedReceipt[] => {
-  const dir = join(stateDir, REPORTED_DIR);
-  let names: string[];
-  try { names = readdirSync(dir); } catch { return []; }
-  return names.filter((name) => RECEIPT_FILE.test(name)).flatMap((name) => {
-    const path = join(dir, name);
+  return receiptPaths(join(stateDir, REPORTED_DIR)).flatMap((path) => {
     try {
       const { lane, at, note, message, target, thread, button, followUp } = JSON.parse(readFileSync(path, "utf8")) as {
         lane?: unknown; at?: unknown; note?: unknown; message?: unknown; target?: unknown; thread?: unknown; button?: unknown; followUp?: unknown;
@@ -131,12 +114,6 @@ export const pendingReported = (stateDir: string): ReportedReceipt[] => {
       }];
     } catch { return []; }
   });
-};
-
-const dropReported = (path: string): void => {
-  try { unlinkSync(path); } catch (e) {
-    if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
-  }
 };
 
 export const unreported = (journal: Journal): LaneOutcome[] => (journal.outcomes ?? []).filter((outcome) => outcome.reportedAt === undefined);
@@ -242,7 +219,7 @@ export class OutcomeTracking {
     }
     this.journal = { ...this.journal, outcomes };
     this.core.persist();
-    for (const receipt of receipts) dropReported(receipt.path);
+    for (const receipt of receipts) dropFile(receipt.path);
     this.publish();
   }
 
@@ -395,9 +372,7 @@ export class OutcomeTracking {
     const text = JSON.stringify(list);
     if (text === this.published) return;
     const path = join(this.core.deps.config.stateDir, UNREPORTED_FILE);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, text, { mode: 0o600 });
-    renameSync(tmp, path);
+    replaceFileAtomic(path, text, 0o600);
     this.published = text;
   }
 }

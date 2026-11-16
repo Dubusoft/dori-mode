@@ -6,7 +6,7 @@ import { acceptLaneEvent, type LaneHubDeps } from "../src/runner/lanes-hub.ts";
 import type { LaneBriefFiles } from "../src/runner/protocol.ts";
 import { launchLane } from "../src/launch.ts";
 
-import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, resumeCommand, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
+import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
@@ -525,15 +525,6 @@ test("item 7: a resume that does not start falls back to the brief on the next a
   expect(relaunches).toHaveLength(2);
   expect(relaunches[0]?.args).toMatchObject({ opts: { session: "gone-session" } });
   expect((relaunches[1]?.args as { session?: string }).session).toBeUndefined();
-});
-
-test("item 7: resumeCommand puts --session before the prompt, and declines when it cannot resume", () => {
-  expect(resumeCommand(["omo", "--model", "{model}", "{prompt}"], "abc")).toEqual(["omo", "--model", "{model}", "--session", "abc", "{prompt}"]);
-  expect(resumeCommand(["omo", "--model", "{model}", "{prompt}"], undefined)).toBeUndefined();
-  expect(resumeCommand(["omo", "--continue", "{prompt}"], "abc")).toBeUndefined();
-  expect(resumeCommand(["omo", "--model", "{model}"], "abc")).toBeUndefined();
-  expect(resumeCommand(["omo", "{prompt}"], "--evil")).toBeUndefined();
-  expect(resumeCommand(["omo", "{prompt}"], "a b")).toBeUndefined();
 });
 
 test.each([{ live: false, reason: "missing-pane" }, { live: true, reason: "missing-model" }])("never relaunches a lane whose PR is merged ($reason); the lane is closed instead", async ({ live, reason }) => {

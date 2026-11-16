@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -9,7 +9,8 @@ import type { Lane } from "./registry.ts";
 import { Repos } from "./repos.ts";
 import type { Runner } from "./run.ts";
 import { parseSignal, splitDone } from "./signals.ts";
-import { RETENTION, SQLITE_FILE, SqliteStore, StoreError, type StoreKind } from "./store.ts";
+import { RETENTION, SQLITE_FILE, SqliteStore, StoreError } from "./store.ts";
+import { githubRepoFromRemote } from "./git-remote.ts";
 
 export class GitHubError extends Error {}
 
@@ -83,8 +84,6 @@ const array = (value: unknown): readonly unknown[] => {
   return value;
 };
 const text = (value: unknown): string => typeof value === "string" ? value : "";
-const repoFromRemote = (remote: string): string | undefined =>
-  /(?:github\.com[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(remote.trim())?.[1]?.toLowerCase();
 
 /**
  * Long-lived integration branches. A checkout that sits on one (a review-only lane working in the main clone) has not
@@ -106,7 +105,9 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     if (!hit) { hit = { numbers: new Set(), branches: new Set() }; targets.set(key, hit); }
     return hit;
   };
-  for (const lane of lanes) {
+  const inspections = await Promise.all(lanes.map(async (lane) => lane.machine ? undefined :
+    await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; })));
+  for (const [index, lane] of lanes.entries()) {
     for (const part of splitDone(lane.done)) {
       try {
         const signal = parseSignal(part);
@@ -125,8 +126,8 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     }
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
     // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
-    const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; }))?.git;
-    const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
+    const git = inspections[index]?.git;
+    const repo = git?.origin ? githubRepoFromRemote(git.origin) : undefined;
     if (!git || !repo) continue;
     for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) {
       if (branch && !INTEGRATION_BRANCHES.has(branch)) target(repo).branches.add(branch);
@@ -231,16 +232,12 @@ export class GitHubEvents {
   private readonly path: string;
   private state: State;
   private readonly partial = new Map<string, RepoProgress>();
-  /** The store holding the poll state once the journal is on sqlite; github-events.json otherwise. */
-  private readonly store?: SqliteStore;
+  /** The store holding the poll state (its `gh_*` tables). */
+  private readonly store: SqliteStore;
 
-  constructor(private readonly stateDir: string, store: StoreKind = "json", now: () => number = Date.now) {
+  constructor(private readonly stateDir: string, now: () => number = Date.now) {
     mkdirSync(stateDir, { recursive: true });
     this.path = join(stateDir, GITHUB_FILE);
-    if (store !== "sqlite") {
-      this.state = existsSync(this.path) ? JSON.parse(readFileSync(this.path, "utf8")) : EMPTY;
-      return;
-    }
     this.store = new SqliteStore(join(stateDir, SQLITE_FILE), { create: true, now });
     try {
       this.store.database.exec("PRAGMA synchronous = NORMAL");
@@ -256,7 +253,7 @@ export class GitHubEvents {
     }
   }
 
-  close(): void { this.store?.close(); }
+  close(): void { this.store.close(); }
 
   /** The open PRs as of the last poll, per repo (ci-follow.ts reads it after each tick; no GitHub call). */
   openPulls(): readonly OpenPull[] {
@@ -276,14 +273,7 @@ export class GitHubEvents {
   private commit(next: State): void {
     const prev = this.state;
     this.state = next;
-    if (this.store) { saveGithub(this.store.database, prev, next); return; }
-    const tmp = `${this.path}.${process.pid}.tmp`;
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeFileSync(fd, JSON.stringify(this.state)); fsyncSync(fd); }
-    finally { closeSync(fd); }
-    renameSync(tmp, this.path);
-    const dir = openSync(this.stateDir, "r");
-    try { fsyncSync(dir); } finally { closeSync(dir); }
+    saveGithub(this.store.database, prev, next);
   }
 
   async tick(deps: FlowDeps, emit: Emit): Promise<void> {
@@ -438,13 +428,9 @@ export const githubSummary = (stateDir: string): {
   readonly issueRepos: readonly string[];
 } => {
   try {
-    const file = join(stateDir, GITHUB_FILE);
+    const db = new Database(join(stateDir, SQLITE_FILE), { readonly: true });
     let s: Partial<State>;
-    if (existsSync(file) || !existsSync(join(stateDir, SQLITE_FILE))) s = JSON.parse(readFileSync(file, "utf8")) as Partial<State>;
-    else {
-      const db = new Database(join(stateDir, SQLITE_FILE), { readonly: true });
-      try { s = loadGithub(db, false); } finally { db.close(); }
-    }
+    try { s = loadGithub(db, false); } finally { db.close(); }
     return {
       ...(typeof s.polledAt === "number" ? { polledAt: s.polledAt } : {}),
       failures: s.failures ?? {},

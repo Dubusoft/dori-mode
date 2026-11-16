@@ -1,9 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
-import { withStateLockSync } from "./state-lock.ts";
+import { SQLITE_FILE, StoreError, storeFile } from "./store.ts";
 
 /**
  * Messages the supervisor owes a lane (design 4.5): each has an ID the lane confirms with `dori report ack <id>`.
@@ -49,46 +48,27 @@ export interface LaneMessageStore {
   close(): void;
 }
 
+/** The retired json store's lane messages, converted once into the `lane_messages` table (store-import.ts). */
 export const LANE_MESSAGES_FILE = "lane-messages.json";
-/** Held while lane-messages.json is written; `dori store import` holds it so no message lands between its copy and the file's retirement. */
+/** Held while lane-messages.json was written by the json store; the conversion holds it so no message lands between its copy and the file's retirement. */
 export const LANE_MESSAGES_LOCK = "lane-messages.lock.sqlite";
 
-const order = (a: LaneMessage, b: LaneMessage): number => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+/** The order lane messages list in: by time, then id. */
+export const messageOrder = (a: LaneMessage, b: LaneMessage): number => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 const matches = (m: LaneMessage, filter: { readonly lane?: string; readonly states?: readonly LaneMessageState[] }): boolean =>
   (filter.lane === undefined || m.lane === filter.lane) && (filter.states === undefined || filter.states.includes(m.state));
-
-/** `lane-messages.json` beside supervisor.json, rewritten whole under a short state lock (CLI and supervisor both write). */
-export class JsonLaneMessages implements LaneMessageStore {
-  private readonly path: string;
-  private readonly lock: string;
-  constructor(stateDir: string) {
-    this.path = join(stateDir, LANE_MESSAGES_FILE);
-    this.lock = join(stateDir, LANE_MESSAGES_LOCK);
-  }
-  private read(): Record<string, LaneMessage> {
-    return existsSync(this.path) ? (JSON.parse(readFileSync(this.path, "utf8")) as { messages: Record<string, LaneMessage> }).messages : {};
-  }
-  get(id: string): LaneMessage | undefined { return this.read()[id]; }
-  put(message: LaneMessage): void {
-    withStateLockSync(this.lock, () => { saveJsonFile(this.path, { messages: { ...this.read(), [message.id]: message } }); });
-  }
-  list(filter: { readonly lane?: string; readonly states?: readonly LaneMessageState[] } = {}): LaneMessage[] {
-    return Object.values(this.read()).filter((m) => matches(m, filter)).sort(order);
-  }
-  close(): void {}
-}
 
 /** Created on first use like the operations table, not by a schema migration. */
 const DDL = `CREATE TABLE IF NOT EXISTS lane_messages (id TEXT PRIMARY KEY, lane TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, body TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS lane_messages_open ON lane_messages (state, lane);`;
 
-/** Every message in `db`'s lane_messages table, in list() order; no table reads as no messages (`dori store export`). */
+/** Every message in `db`'s lane_messages table, in list() order; no table reads as no messages (the json conversion's read-back). */
 export const readMessageRows = (db: Database): LaneMessage[] =>
   db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lane_messages'").get()
     ? (db.query("SELECT body FROM lane_messages ORDER BY at, id").all() as { body: string }[]).map((row) => JSON.parse(row.body) as LaneMessage)
     : [];
 
-/** Inserts `messages` as they are (state and times kept), for `dori store import`; an id already there throws. */
+/** Inserts `messages` as they are (state and times kept), for the json conversion; an id already there throws. */
 export const putMessageRows = (db: Database, messages: readonly LaneMessage[]): void => {
   db.exec(DDL);
   const insert = db.query("INSERT INTO lane_messages (id, lane, state, at, body) VALUES (?, ?, ?, ?, ?)");
@@ -123,8 +103,7 @@ export class SqliteLaneMessages implements LaneMessageStore {
   close(): void { this.db.close(); }
 }
 
-export const openLaneMessages = (config: { readonly stateDir: string; readonly store: StoreKind }): LaneMessageStore =>
-  config.store === "sqlite" ? new SqliteLaneMessages(join(config.stateDir, SQLITE_FILE)) : new JsonLaneMessages(config.stateDir);
+export const openLaneMessages = (config: { readonly stateDir: string }): LaneMessageStore => new SqliteLaneMessages(storeFile(config.stateDir));
 
 /** Queues `message` unless a message with its ID exists (the same subject is the same message); returns the stored one. */
 export const queueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text" | "whileWorking">): LaneMessage => {

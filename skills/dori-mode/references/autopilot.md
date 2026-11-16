@@ -64,9 +64,7 @@ Key `autopilot` in `config.json`; every field is optional. An invalid value or a
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `quotaUnreadable` | `"hold"` | Only value in v1: unreadable quota holds (`quota-unreadable`). |
 | `mergeBase` | `"dev"` | Autopilot lanes merge into this branch only. |
-| `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
 | `tickSec` | `300` | Seconds between the supervisor's ticks, an integer from 30 to 3600. |
 | `quotaCacheSec` | `90` | Seconds a quota read is reused before the usage endpoints are read again, an integer from 30 to 900. It applies to every quota caller (the judge, `dori quota`, Discord `/quota`); see Quota reads. |
 | `executor` | `false` | A boolean (anything else is rejected). `true` lets the supervisor launch LAUNCH tasks itself; see Supervisor executor. |

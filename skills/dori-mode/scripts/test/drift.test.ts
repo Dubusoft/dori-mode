@@ -6,7 +6,7 @@ import { DEFAULT_DRIFT, defaultConfig, loadConfig } from "../src/config.ts";
 import { ciDrift, DRIFT_STATE_FILE, driftTick, type DriftDeps, loadDriftState, milestoneDrift, type PullOwners } from "../src/drift.ts";
 import { eventClass } from "../src/event-policy.ts";
 import type { OpenPull } from "../src/github-events.ts";
-import type { LaneReport, LaneReportStore } from "../src/lane-reports.ts";
+import type { LaneReport, LaneReportStore } from "../src/lane-report-store.ts";
 import type { Lane } from "../src/registry.ts";
 import { supervisorSweeps } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";

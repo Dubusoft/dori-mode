@@ -1,7 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import { realTimers, type Timers } from "./call.ts";
 import { MAX_FRAME_BYTES } from "./protocol.ts";
-import type { Connector, Listener, Transport } from "./transport.ts";
+import { backoffMs, type Connector, LineTransport, type Listener, type Transport } from "./transport.ts";
 
 /**
  * The network runner link: one frame per WebSocket text message over TCP. Lines cross the `Transport` boundary the
@@ -48,20 +48,6 @@ export const isPrivateListen = (hostPort: string): boolean => {
   return parsed !== undefined && parsed.host !== "" && isPrivateHost(parsed.host);
 };
 
-const BACKOFF_BASE_MS = 1000;
-const BACKOFF_MAX_MS = 60_000;
-const BACKOFF_JITTER = 0.2;
-
-/**
- * Delay in ms before reconnect attempt number `attempt` (0 is the first retry): 1s doubling up to 60s, then scaled by
- * a factor in [0.8, 1.2] taken from `random()` (a value in [0, 1)). Pure: pass a seeded or fixed `random` in tests.
- */
-export const backoff = (attempt: number, random: () => number): number => {
-  const exponent = Math.max(0, Math.min(Math.floor(attempt), 30));
-  const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** exponent);
-  return Math.round(base * (1 + (random() * 2 - 1) * BACKOFF_JITTER));
-};
-
 type Wire = { send(data: string): unknown; close(code?: number, reason?: string): void };
 
 const stripNewline = (line: string): string => (line.endsWith("\r\n") ? line.slice(0, -2) : line.endsWith("\n") ? line.slice(0, -1) : line);
@@ -73,16 +59,9 @@ const shortReason = (reason: string): string => Buffer.from(reason, "utf8").suba
  * One WebSocket as a `Transport`. Lines that arrive before the first `onLine` subscriber are held for it. A message
  * over the protocol size limit, or a binary message, closes the link.
  */
-class WsTransport implements Transport {
-  private readonly lines = new Set<(line: string) => void>();
-  private readonly closers = new Set<(reason: string) => void>();
-  private readonly held: string[] = [];
-  private closed = false;
-
-  constructor(private readonly wire: Wire) {}
-
-  get open(): boolean {
-    return !this.closed;
+class WsTransport extends LineTransport {
+  constructor(private readonly wire: Wire) {
+    super();
   }
 
   send(line: string): void {
@@ -102,38 +81,13 @@ class WsTransport implements Transport {
       this.close("frame too large");
       return;
     }
-    if (!this.lines.size) {
-      this.held.push(message);
-      return;
-    }
-    for (const handler of [...this.lines]) handler(message);
-  }
-
-  onLine(handler: (line: string) => void): () => void {
-    this.lines.add(handler);
-    while (this.held.length && this.lines.size) {
-      const next = this.held.shift() as string;
-      for (const each of [...this.lines]) each(next);
-    }
-    return () => { this.lines.delete(handler); };
-  }
-
-  onClose(handler: (reason: string) => void): () => void {
-    this.closers.add(handler);
-    return () => { this.closers.delete(handler); };
+    this.deliver(message);
   }
 
   close(reason = "closed"): void {
     if (this.closed) return;
     this.ended(reason);
     try { this.wire.close(1000, shortReason(reason)); } catch { /* already closed */ }
-  }
-
-  /** The peer or the OS closed the socket. */
-  ended(reason: string): void {
-    if (this.closed) return;
-    this.closed = true;
-    for (const handler of [...this.closers]) handler(reason);
   }
 }
 
@@ -290,7 +244,7 @@ export const dialWs = (options: DialingOptions): DialingListener => {
   const connect = (label: string, peer: Peer): void => {
     const retry = (): void => {
       if (!current(label, peer)) return;
-      peer.timer = timers.set(() => { peer.timer = undefined; connect(label, peer); }, backoff(peer.attempt++, random));
+      peer.timer = timers.set(() => { peer.timer = undefined; connect(label, peer); }, backoffMs(peer.attempt++, random));
     };
     void dial(`ws://${peer.endpoint}`).then((transport) => {
       if (!current(label, peer)) { transport.close("endpoint removed"); return; }

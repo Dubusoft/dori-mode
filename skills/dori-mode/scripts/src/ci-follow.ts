@@ -13,7 +13,7 @@ import {
 import {
   FINAL_STATES, type Observed, type Operation, operationId, type OperationSpec, type OperationStore, openOperations, perform, plan, type ReadBack, reconcile, settleOperation,
 } from "./operations.ts";
-import { decisionDeliveryRefusal } from "./owner-decisions.ts";
+import { decisionDeliveryRefusal } from "./decision-delivery.ts";
 import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { mergePausedText, readMergePause } from "./merge-pause.ts";
@@ -687,7 +687,7 @@ export const launchMergeLane = async (deps: FlowDeps, request: MergeLaneRequest)
   if (source.machine) return { ok: false, detail: `lane ${source.key} runs on machine ${source.machine}; merge lanes start on this host only` };
   if (!source.cwd) return { ok: false, detail: `lane ${source.key} has no local checkout to branch from` };
   // The local runner's reported worktree root (it reports config.worktreeRoot unless its runner-config sets one); the
-  // config's only while that runner has reported none. The closed-lane sweep (done-flow.ts) uses the same root.
+  // config's only while that runner has reported none. The closed-lane sweep (closed-cleanup.ts) uses the same root.
   const root = (deps.runnerWorktreeRoot ?? ((label) => runnerWorktreeRoot(deps.config.stateDir, label)))(machineRunner(undefined)) || deps.config.worktreeRoot;
   if (!root) return { ok: false, detail: "worktreeRoot is not set" };
   const paneCount = async (): Promise<number> => deps.ops.panes().then((panes) => panes.length, () => -1); // the local runner's panes; -1 when unreadable

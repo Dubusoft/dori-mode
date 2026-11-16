@@ -23,8 +23,7 @@ export {
   OWNER_NOTIFY_ATTEMPTS, type SupervisorHooks,
 } from "./supervise-owner-tracking.ts";
 export {
-  awaitStartupEvidence, confirmLead, hasStartupEvidence, LEAD_SKILL, plainShell, screenStill,
-  STARTUP_EVIDENCE_MS, stopHung, stopLead, UNCONFIRMED_LIMIT,
+  LEAD_SKILL, screenStill,
 } from "./supervise-lead-lifecycle.ts";
 export {
   BACKOFF_MAX_MS, BACKOFF_MIN_MS, eventPriority, RetryingDelivery, STUCK_AFTER_MS,
