@@ -136,7 +136,10 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
 export const decisionLinkText = (d: OwnerDecision): string => `[System] 오너 ${label(d)} ${d.id}: <#${d.thread ?? ""}>`;
 
 export type CloseOptions = {
+  /** The close text: the reply to the owner, except for a lane's own question or request, where it goes to the lane (relaysToLane). */
   readonly text: string;
+  /** The owner's line in the thread confirmation, in place of `text` (or of the automatic line when `text` goes to the lane). */
+  readonly ownerText?: string;
   readonly choice?: number;
   /** `<channel>/<message>` of an answer the owner gave outside the decision thread. */
   readonly from?: string;
@@ -147,12 +150,15 @@ export type CloseOptions = {
   readonly force?: boolean;
 };
 
+/** A lane's own question or request (asked with `dori report`): its close text is relayed to that lane (decision-relay.ts), not shown to the owner. */
+export const relaysToLane = (d: Pick<OwnerDecision, "source" | "lane">): boolean => d.source === "lane" && !!d.lane;
+
 export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string, keepsThread = d.inLaneThread === true): string => {
   const from = options.from ? /^(\d+)\/(\d+)$/.exec(options.from) : null;
   const picked = options.choice !== undefined ? ` ${options.choice}번(${cut(d.options[options.choice - 1] ?? "", 60)})` : "";
   const by = d.answeredAt === undefined && !d.revisions?.length && !from && !options.cancel ? " (리드가 정함)" : "";
   const where = from ? ` (<#${from[1]}>에서 받은 답: https://discord.com/channels/@me/${from[1]}/${from[2]})` : "";
-  const note = options.text.replace(/\s+/g, " ").trim();
+  const note = (options.ownerText ?? (relaysToLane(d) ? `레인 ${d.lane}에 전달합니다` : options.text)).replace(/\s+/g, " ").trim();
   const outcome = options.cancel ? "취소" : d.kind === "request" ? "요청 처리" : `결정 반영:${picked}`;
   return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."}${keepsThread ? "" : " 스레드를 닫습니다."}`, home);
 };

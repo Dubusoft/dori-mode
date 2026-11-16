@@ -124,25 +124,25 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
     return 0;
   }
   if (sub === "close") {
-    const usage = "usage: dori decision close <id> --text TEXT [--choice N] [--from CHANNEL/MESSAGE] [--cancel] [--tasks N] [--force]";
+    const usage = "usage: dori decision close <id> --text TEXT [--owner-text TEXT] [--choice N] [--from CHANNEL/MESSAGE] [--cancel] [--tasks N] [--force]";
     const parsed = (() => {
       try {
         return parseArgs({
           args: subArgs, allowPositionals: true, strict: true,
           options: {
-            text: { type: "string" }, choice: { type: "string" }, from: { type: "string" }, cancel: { type: "boolean" },
+            text: { type: "string" }, "owner-text": { type: "string" }, choice: { type: "string" }, from: { type: "string" }, cancel: { type: "boolean" },
             tasks: { type: "string" }, force: { type: "boolean" },
           },
         });
       } catch (e) { return die(`${e instanceof Error ? e.message : String(e)}\n${usage}`, 2); }
     })();
     const [id, ...extra] = parsed.positionals;
-    const { text, choice, from, cancel, tasks, force } = parsed.values;
-    if (!id || extra.length || !text?.trim() || (choice !== undefined && !/^\d+$/.test(choice.trim()))
+    const { text, "owner-text": ownerText, choice, from, cancel, tasks, force } = parsed.values;
+    if (!id || extra.length || !text?.trim() || (ownerText !== undefined && !ownerText.trim()) || (choice !== undefined && !/^\d+$/.test(choice.trim()))
       || (from !== undefined && !/^\d+\/\d+$/.test(from.trim())) || (cancel && choice !== undefined)
       || (tasks !== undefined && !/^[1-9]\d*$/.test(tasks.trim()))) die(usage, 2);
     const closed = await od.closeOwnerDecision(decisionContext(undefined, true), id ?? "", {
-      text: (text ?? "").trim(), ...(choice !== undefined ? { choice: Number(choice.trim()) } : {}),
+      text: (text ?? "").trim(), ...(ownerText !== undefined ? { ownerText: ownerText.trim() } : {}), ...(choice !== undefined ? { choice: Number(choice.trim()) } : {}),
       ...(from !== undefined ? { from: from.trim() } : {}), ...(cancel ? { cancel: true } : {}),
       ...(tasks !== undefined ? { tasks: Number(tasks.trim()) } : {}), ...(force ? { force: true } : {}),
     }).catch((e: unknown) => {
