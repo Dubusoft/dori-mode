@@ -8,8 +8,8 @@
 # Same inputs as the Linux (bubblewrap) lane-sandbox. Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset:
 # the lead runs outside the sandbox. Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra writable directories (e.g. your worktree root, a scratch dir; the runner's grants)
-#   LANE_SANDBOX_RO      extra readable directories (the runner's grants); the ~/.dori/runner, ~/.ssh, credential,
-#                        ~/.config and hide-list refusals come after them
+#   LANE_SANDBOX_RO      extra readable directories (the runner's grants); the ~/.dori/runner, ~/.ssh, credential
+#                        and hide-list refusals come after them
 #   LANE_SANDBOX_NO_CWD  directories too broad to make writable as the cwd (e.g. the parents of the worktree root)
 #   DORI_LANE_TOKEN_FILE the lane's own token file, readable
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, made writable (the runner sets it from its policy)
@@ -17,16 +17,23 @@
 #                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
 #
 # Seatbelt cannot hide or remap paths the way bubblewrap does; it only refuses access (EPERM). So the profile allows
-# reads almost everywhere and refuses writes by default, with a whitelist: the cwd (worktree) and its git common dir,
-# the runner's worktree root and the .git directories of the repos under its repos root,
-# the lane's own TMPDIR, ~/.omo, ~/.cache, ~/.dori/heavy, package caches, Xcode's per-user dirs, /tmp,
+# reads almost everywhere and refuses writes outside $HOME and /opt/homebrew, which are writable but for what the host
+# later runs or trusts outside the sandbox: ~/.dori, ~/.ssh, ~/Library/LaunchAgents, ~/Library/Keychains, the shell
+# startup files, ~/.local/bin, ~/.bun/bin, ~/.cargo/bin, ~/.gitconfig and ~/.config/git, gh and herdr (HOST_RUN below),
+# and the directories holding them (~, ~/.config, ~/.local, ~/.bun, ~/.cargo, ~/Library) themselves, so none of them
+# can be renamed away and replaced by a symlink. Writable again after those refusals: the cwd (worktree) and its git
+# common dir, the runner's worktree root and the .git directories of the repos under its repos root, the lane's own
+# TMPDIR, ~/.omo, ~/.cache, ~/.dori/heavy, the lane's brief out dir, package caches, Xcode's per-user dirs, /tmp,
 # Claude Code's lock dir, the user's login keychain file (and its atomic-write temp copies) and the terminal and null
-# devices. ~/.dori is readable but for targeted refusals that come after every grant: ~/.dori/runner (but the runner's
-# lane socket and bin and the lane's own brief, files, out dir, token and lanes/<key>, re-opened after it) and the
-# credential stores in CREDENTIALS below (~/.dori/env, secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube,
-# gpg, docker, git and registry logins, keyrings, browser profiles, shell history). ~/.ssh is refused but for config,
-# known_hosts and *.pub. Of ~/.config only gh (but for its hosts.yml login: a lane
-# gets GH_TOKEN only through the secret broker) and git are readable. A unix socket connect is not a file read to
+# devices; the hooks of those git dirs stay refused. ~/.dori is readable but for targeted refusals that come after every
+# grant: ~/.dori/runner (but the runner's lane socket and bin and the lane's own brief, files, out dir, token and
+# lanes/<key>, re-opened after it) and the credential stores in CREDENTIALS and MAC_CREDENTIALS below (~/.dori/env,
+# secrets, state, lane-sandbox-hide and gateway-locks; cloud, kube, gpg, docker, git and registry logins, keyrings,
+# browser profiles and cookie stores, shell history), refused for reads and writes alike; of ~/.dori/state only
+# review-inputs is readable again. ~/.ssh is refused but for config, known_hosts and *.pub. ~/.config is readable but
+# for its credential stores, gh's hosts.yml login among them: a lane gets GH_TOKEN only through the secret broker, and
+# gh runs with GH_CONFIG_DIR in the lane's TMPDIR, holding a copy of ~/.config/gh/config.yml. /bin/ps and /usr/bin/log
+# refuse to run sandboxed and run outside the profile. A unix socket connect is not a file read to
 # Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
 # HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
@@ -40,11 +47,11 @@
 set -eu
 
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
-# through the secret broker); the Linux template and `dori doctor` use the same list. ~/.config is refused already, but
-# for gh and git; the profile refuses these after the gh/git grant, so ~/.config/gh/hosts.yml stays hidden.
+# through the secret broker); the Linux template and `dori doctor` use the same list. The profile refuses reads and
+# writes of each after every grant, so ~/.config/gh/hosts.yml stays hidden.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
-  .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
+  .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm .config/cloudflare .cloudflared
   .terraform.d/credentials.tfrc.json .vault-token .docker/config.json .config/containers/auth.json .gnupg
   .password-store .local/share/keyrings .local/share/gnome-keyring .local/share/kwalletd .config/age .age
   .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
@@ -54,6 +61,22 @@ CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/g
   .config/BraveSoftware .config/microsoft-edge .config/discord .config/Slack .config/Signal
   .local/share/TelegramDesktop .config/Code/User/globalStorage .vscode .vscode-server .*_history .lesshst"
 # END CREDENTIALS
+# The macOS browser cookie and login stores, refused like CREDENTIALS. Their paths hold spaces, which the
+# space-separated CREDENTIALS list cannot carry.
+MAC_CREDENTIALS=(
+  "Library/Application Support/Google/Chrome/*/Cookies"
+  "Library/Application Support/Google/Chrome/*/Login Data"
+  "Library/Cookies"
+)
+
+# What the host later runs or trusts outside the sandbox, under $HOME: refused for writes after the $HOME write grant.
+# ~/.dori/heavy, the lane's brief out dir and the login keychain file are writable again after it.
+HOST_RUN=".dori .ssh Library/LaunchAgents Library/Keychains .bashrc .bash_profile .bash_login .bash_logout .profile
+  .zshrc .zprofile .zshenv .zlogin .zlogout .local/bin .bun/bin .cargo/bin .gitconfig .config/git .config/gh
+  .config/herdr"
+# The directories holding HOST_RUN entries, refused as themselves only: renaming one away would leave its old path free
+# for a symlink into a writable directory.
+HOST_RUN_PARENTS=". .config .local .bun .cargo Library"
 
 SBX=/usr/bin/sandbox-exec
 # macOS's own OpenSSL-format root bundle (what curl and git use by default).
@@ -156,16 +179,33 @@ case "$key" in . | ..) key="_$key" ;; esac
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
   local n=0 p w_rules="" r_rules="" o_rules="" d_rules="" g_rules="" h_rules="" a_rules="" k_rules="" gcd broad kc rr
+  local u_rules="" l_rules=""
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
   # The paths --explain lists, each as resolved for its parameter (LAST is the last one param resolved).
-  XW=() XR=() XO=() XHOOKS=() XCRED=() XHIDE=() XREPOS=
+  XW=() XR=() XO=() XHOOKS=() XCRED=() XHIDE=() XRUN=() XREPOS=
   param() { LAST=$(canon "$2"); PARAMS+=(-D "$1=$LAST"); }
   param_raw() { PARAMS+=(-D "$1=$2"); }
   w() { param "W$n" "$1"; XW+=("$LAST"); w_rules="$w_rules (subpath (param \"W$n\"))"; n=$((n + 1)); }
   r() { param "R$n" "$1"; XR+=("$LAST"); r_rules="$r_rules (subpath (param \"R$n\"))"; n=$((n + 1)); }
   # o PATH: one of the lane's own entries under ~/.dori/runner, readable again after the runner refusal.
   o() { param "O$n" "$1"; XO+=("$LAST"); o_rules="$o_rules (subpath (param \"O$n\"))"; n=$((n + 1)); }
+
+  param HOME_DIR "$H"
+  XHOME=$LAST
+  param HOMEBREW /opt/homebrew
+  XHOMEBREW=$LAST
+  for p in $HOST_RUN; do
+    param "U$n" "$H/$p"
+    XRUN+=("$LAST")
+    u_rules="$u_rules (subpath (param \"U$n\"))"
+    n=$((n + 1))
+  done
+  for p in $HOST_RUN_PARENTS; do
+    param "L$n" "$H/$p"
+    l_rules="$l_rules (literal (param \"L$n\"))"
+    n=$((n + 1))
+  done
 
   w "$LT"
   for p in "$H/.omo" "$H/.dori/heavy" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
@@ -256,18 +296,14 @@ build_profile() {
     k_rules="(allow network-outbound (remote unix-socket (path-literal (param \"HERDR_SOCK\"))))"
   fi
   param CONFIG "$H/.config"
-  XCONFIG=$LAST
-  param CONFIG_GH "$H/.config/gh"
-  XCONFIG_GH=$LAST
-  param CONFIG_GIT "$H/.config/git"
-  XCONFIG_GIT=$LAST
+  param REVIEW_INPUTS "$H/.dori/state/review-inputs"
+  XREVIEW_INPUTS=$LAST
   # herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent, a symlink to the agent's socket: both names stay usable.
   case "${SSH_AUTH_SOCK:-}" in
     "$H"/.config/*)
       param AGENT_SOCK "$SSH_AUTH_SOCK"
       param_raw AGENT_LINK "$(canon_parent "$SSH_AUTH_SOCK")"
-      a_rules="(allow file-read* (literal (param \"AGENT_SOCK\")) (literal (param \"AGENT_LINK\")))
-(allow network-outbound (remote unix-socket (path-literal (param \"AGENT_SOCK\"))) (remote unix-socket (path-literal (param \"AGENT_LINK\"))))"
+      a_rules="(allow network-outbound (remote unix-socket (path-literal (param \"AGENT_SOCK\"))) (remote unix-socket (path-literal (param \"AGENT_LINK\"))))"
       ;;
   esac
   local c_rules="" creds
@@ -276,6 +312,12 @@ build_profile() {
   creds=($CREDENTIALS)
   set +f
   for p in "${creds[@]}"; do
+    deny_target "CRED$n" "$H/$p"
+    XCRED+=("$SHOWN")
+    c_rules="$c_rules $TARGET"
+    n=$((n + 1))
+  done
+  for p in "${MAC_CREDENTIALS[@]}"; do
     deny_target "CRED$n" "$H/$p"
     XCRED+=("$SHOWN")
     c_rules="$c_rules $TARGET"
@@ -297,24 +339,31 @@ build_profile() {
     done <"$H/.dori/lane-sandbox-hide"
   fi
 
-  # Later rules win over earlier ones in SBPL, so every read refusal comes after the read grants (LANE_SANDBOX_RO): a
-  # grant never re-opens ~/.dori/runner, ~/.ssh, a credential store or ~/.config. Only the lane's own runner entries are
-  # re-opened after the runner refusal.
+  # Later rules win over earlier ones in SBPL. Writes: the $HOME and Homebrew grant, then the HOST_RUN refusals, then
+  # the specific write grants (which re-open ~/.dori/heavy, the lane's out dir, a cwd-less lane's cwd and the login
+  # keychain under them), then the credential and git hooks refusals over every grant. Reads: every read refusal comes
+  # after the read grants (LANE_SANDBOX_RO): a grant never re-opens ~/.dori/runner, ~/.ssh or a credential store. Only
+  # the lane's own runner entries are re-opened after the runner refusal, and ~/.dori/state/review-inputs after the
+  # credential refusal.
   # realpath() of a directory opens it, and omo resolves every parent of its cwd: a cwd-less lane's parents are
   # ~/.dori/runner/lanes, ~/.dori/runner and ~/.dori (readable as a whole). The two under the runner get file-read-data
   # on the directory itself (the names of its entries), never on anything under it: the other lanes' files stay refused.
-  # /bin/ps is setuid root, and a sandboxed process cannot exec a setuid binary, so ps alone runs outside the profile;
-  # it writes nothing.
+  # /bin/ps is setuid root, and a sandboxed process cannot exec a setuid binary; /usr/bin/log refuses to run sandboxed
+  # ("Cannot run while sandboxed"). These two alone run outside the profile; they write nothing.
   PROFILE="(version 1)
 (allow default)
 (deny file-write*)
+(allow file-write* (subpath (param \"HOME_DIR\")) (subpath (param \"HOMEBREW\")))
+(deny file-write*$u_rules)
+(deny file-write*$l_rules)
 (allow file-write*$w_rules)
 $g_rules
 (allow file-write* (literal (param \"KEYCHAIN\")) (regex (param \"KEYCHAIN_TMP\")))
 (allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/ttys[0-9]+\$\") (regex #\"^/dev/fd/[0-9]+\$\"))
+(deny file-write*$c_rules)
 $d_rules
 (allow file-read*$r_rules)
-(allow process-exec (literal \"/bin/ps\") (with no-sandbox))
+(allow process-exec (literal \"/bin/ps\") (literal \"/usr/bin/log\") (with no-sandbox))
 (deny file-read* (subpath (param \"DORI_RUNNER\")))
 (allow file-read*$o_rules)
 (allow file-read-metadata (literal (param \"DORI_RUNNER\")) (literal (param \"DORI_BRIEFS\")) (literal (param \"DORI_LANES\")))
@@ -322,9 +371,8 @@ $d_rules
 (deny file-read* (subpath (param \"SSH\")))
 (allow file-read-metadata (literal (param \"SSH\")))
 (allow file-read* (literal (param \"SSH_CONFIG\")) (literal (param \"SSH_KNOWN_HOSTS\")) (regex (param \"SSH_PUB\")))
-(deny file-read* (subpath (param \"CONFIG\")))
-(allow file-read* (subpath (param \"CONFIG_GH\")) (subpath (param \"CONFIG_GIT\")))
 (deny file-read*$c_rules)
+(allow file-read* (subpath (param \"REVIEW_INPUTS\")))
 (deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))
 (allow network-outbound (remote unix-socket (path-literal (param \"LANE_SOCK\"))))
 $k_rules
@@ -338,11 +386,15 @@ $h_rules
 }
 
 # The --explain table of the profile build_profile made, in the profile's own order so a later line wins as a later rule
-# does: the read grants, the writable paths, then the refusals that come after them and what each re-opens.
+# does: the read grants, $HOME and Homebrew, what the host runs, the writable paths, then the refusals that come after
+# them and what each re-opens. The HOST_RUN_PARENTS refusals guard one directory entry each, not a tree, and are left out.
 explain_profile() {
   local p q m
   echo "# lane-sandbox --explain (seatbelt) for lane $key in $C: reads are allowed and writes refused outside these lines; a later line wins at and below its path"
   for p in ${XR[@]+"${XR[@]}"}; do echo "ro $p"; done
+  echo "rw $XHOME"
+  echo "rw $XHOMEBREW"
+  for p in "${XRUN[@]}"; do echo "ro $p"; done
   for p in ${XW[@]+"${XW[@]}"}; do echo "rw $p"; done
   echo "rw $XKEYCHAIN"
   if [ -n "$XREPOS" ]; then
@@ -364,10 +416,8 @@ explain_profile() {
   echo "ro $XSSH/config"
   echo "ro $XSSH/known_hosts"
   echo "ro $XSSH/*.pub"
-  echo "hide $XCONFIG"
-  echo "ro $XCONFIG_GH"
-  echo "ro $XCONFIG_GIT"
   for p in ${XCRED[@]+"${XCRED[@]}"}; do echo "hide $p"; done
+  echo "ro $XREVIEW_INPUTS"
   for p in ${XHIDE[@]+"${XHIDE[@]}"}; do echo "hide $p"; done
   echo "hide $XDORI_SECRETS"
 }
@@ -415,6 +465,15 @@ LT="$H/.cache/omo-tmp/lane-sandbox/${key:?}"
 mkdir -p "$LT" "$H/.dori/heavy"
 chmod 700 "$LT"
 LT=$(canon "$LT")
+# gh reads its login from hosts.yml, which stays refused, and Seatbelt cannot put an empty file in its place: gh gets a
+# config dir of its own in TMPDIR with a copy of config.yml (aliases, settings), and GH_TOKEN from the secret broker. The
+# dir is made fresh each start, so nothing a lane left there (a symlink included) is written through.
+if [ -z "${GH_CONFIG_DIR:-}" ]; then
+  rm -rf "$LT/gh"
+  mkdir -m 700 "$LT/gh"
+  if [ -f "$H/.config/gh/config.yml" ]; then cp "$H/.config/gh/config.yml" "$LT/gh/config.yml"; fi
+  export GH_CONFIG_DIR="$LT/gh"
+fi
 C=$(pwd -P)
 build_profile
 

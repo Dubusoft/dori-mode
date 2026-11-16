@@ -3,21 +3,30 @@
 # Usage: lane-sandbox <cmd> [args...] | lane-sandbox --check | lane-sandbox --explain
 # --explain prints the mount table a lane in the current directory would get (same environment, DORI_LANE_KEY defaulting
 # to "explain") instead of running anything: one "<mode> <path>" line per mount, in mount order, where a later line wins at
-# and below its path. Modes: rw, ro, hide (an empty read-only tmpfs or /dev/null over the path) and empty (a fresh tmpfs:
+# and below its path. Modes: rw, ro, hide (an empty read-only tmpfs or empty read-only file over the path, /dev/null over a
+# socket) and empty (a fresh tmpfs:
 # none of the host's entries there show). A -try bind whose source is missing is left out, as bwrap skips it.
 # Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset: the lead runs outside the sandbox.
 # Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra read-write directories (e.g. your worktree root, a scratch dir; the runner's grants)
-#   LANE_SANDBOX_RO      extra read-only directories (the runner's grants); $HOME itself is read-only already
+#   LANE_SANDBOX_RO      extra read-only directories (the runner's grants)
 #   LANE_SANDBOX_NO_CWD  directories too broad to bind read-write as the cwd (e.g. the parents of the worktree root)
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
 #                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
-# $HOME and ~/.dori are bound read-only; what no lane may read is hidden after every read-write bind, so neither the cwd
-# nor a grant can re-expose it: ~/.dori/runner, ~/.ssh and ~/.config (each an empty read-only tmpfs with only the
-# lane's own runner entries, ssh known_hosts and config, and gh (without its hosts.yml login: a lane gets GH_TOKEN only
-# through the secret broker), git and the ssh agent socket bound back), the
-# credential stores below (~/.dori/env, secrets and state among them) and every other host path listed one per line in
+# /data and each existing top-level entry of $HOME are bound read-write; $HOME itself stays read-only, so no new
+# top-level entry (a missing shell startup file such as ~/.bash_profile) can be created there. What the host runs outside
+# the sandbox stays read-only: the shell startup files, ~/.gitconfig and ~/.dori (never bound read-write), and
+# ~/.local/bin, ~/.bun/bin, ~/.cargo/bin, the systemd, autostart and environment.d user config and git's and gh's
+# config (gh aliases can run a shell), each made on the host when missing (an empty directory there is harmless) and
+# bound read-only right after the top-level binds; the read-write binds after it (caches,
+# ~/.dori/heavy, grants, the cwd, worktrees, repos' .git) sit outside that list and stay writable, and each writable
+# .git's hooks are bound read-only again. What no lane may read is hidden after every read-write bind, so neither the
+# cwd nor a grant can re-expose it: ~/.dori/runner, ~/.ssh, ~/.dori/state and ~/.config/herdr (herdr's control socket
+# drives the lead's panes), each an empty read-only tmpfs with only the lane's own runner entries, ssh known_hosts and
+# config, state/review-inputs and the ssh agent socket bound back; the credential stores below (~/.dori/env, secrets
+# and gh's hosts.yml login among them: a lane gets GH_TOKEN only through the secret broker), each hidden file an empty
+# read-only file, and every other host path listed one per line in
 # ~/.dori/lane-sandbox-hide ('#' starts a comment), ~/.dori's own entries included; the lead owns that file, and a lane
 # can neither read nor change it. An entry of either list may be a glob (* ? [...], dotfiles matched too): each existing
 # path it matches when the lane starts is hidden, and one matching nothing is skipped.
@@ -28,7 +37,7 @@ set -eu
 # for a glob) is hidden after every bind, like the hide list below.
 # BEGIN CREDENTIALS (rendered from CREDENTIAL_DENY in src/lane-sandbox-install.ts; edit the list there)
 CREDENTIALS=".dori/env .dori/secrets .dori/state .dori/lane-sandbox-hide .dori/gateway-locks .secrets .aws .azure
-  .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm
+  .oci .kube .config/gcloud .config/doctl .config/hcloud .config/flyctl .config/helm .config/cloudflare .cloudflared
   .terraform.d/credentials.tfrc.json .vault-token .docker/config.json .config/containers/auth.json .gnupg
   .password-store .local/share/keyrings .local/share/gnome-keyring .local/share/kwalletd .config/age .age
   .config/sops .config/Bitwarden .config/keepassxc .config/1Password .git-credentials .netrc .pypirc
@@ -83,17 +92,26 @@ chmod 700 "$LT"
 
 # Root is a namespace-owned tmpfs (uid = us, 0755) instead of --ro-bind / /, so
 # / and the parent of $HOME do not show up as nobody-owned. Host top-level
-# entries are re-bound read-only and top-level symlinks recreated.
+# entries are re-bound read-only (/data read-write) and top-level symlinks recreated.
 top=${H#/}
 top=/${top%%/*}
-# $HOME is bound read-only from the host, where bwrap cannot create a mount point: make the ones it needs there now.
+# ~/.dori is bound read-only from the host, where bwrap cannot create a mount point: make the ones it needs there now.
 mkdir -p "$H/.dori/heavy" "$H/.dori/runner" "$H/.lane-tmp"
+# What the host runs outside the sandbox: top-level files (one missing cannot be created, as $HOME is read-only) and
+# directories, made here when missing so a lane cannot create them under a writable parent.
+host_run_files=(.bashrc .bash_profile .bash_login .bash_logout .profile .zshrc .zprofile .zshenv .zlogin .zlogout
+  .gitconfig)
+host_run_dirs=(.local/bin .bun/bin .cargo/bin .config/systemd .config/autostart .config/environment.d .config/git
+  .config/gh)
+if [ "$explain" = 0 ]; then for p in "${host_run_dirs[@]}"; do mkdir -p "$H/$p"; done; fi
 opts=(--perms 0755 --tmpfs /)
 shopt -s nullglob dotglob
 for e in /*; do
   case "$e" in "$top" | /tmp | /proc | /dev) continue ;; esac
   if [ -L "$e" ]; then
     opts+=(--symlink "$(readlink "$e")" "$e")
+  elif [ "$e" = /data ]; then
+    opts+=(--bind-try "$e" "$e")
   else
     opts+=(--ro-bind "$e" "$e")
   fi
@@ -109,6 +127,21 @@ opts+=(
   --ro-bind "$H" "$H"
   --ro-bind "$H/.dori" "$H/.dori"
 )
+# Each existing top-level entry of $HOME read-write, except the host-run files, ~/.ssh and ~/.dori (hidden or read-only
+# below), the private TMPDIR's mount point and the dirs bound read-write below. A symlink is left as it is: binding it
+# would bind its target.
+shopt -s nullglob dotglob
+for e in "$H"/*; do
+  n=${e##*/}
+  [ -L "$e" ] && continue
+  case " ${host_run_files[*]} .ssh .dori .lane-tmp .omo .cache .npm " in *" $n "*) continue ;; esac
+  opts+=(--bind "$e" "$e")
+done
+shopt -u nullglob dotglob
+# The host-run entries read-only, before every read-write bind below (so a cwd under one stays writable). A missing
+# file is skipped; $HOME is read-only, so a lane cannot create it.
+for p in "${host_run_files[@]}"; do opts+=(--ro-bind-try "$H/$p" "$H/$p"); done
+for p in "${host_run_dirs[@]}"; do opts+=(--ro-bind "$H/$p" "$H/$p"); done
 opts+=(--bind /tmp /tmp --setenv LANE_SANDBOX_ACTIVE 1)
 
 # The real BrowserSkill home (daemon.json and its daemon.sock), read-only: a lane drives bsk directly. A unix socket
@@ -199,8 +232,8 @@ esac
 opts+=(--chdir "$C")
 
 # A lane started without --cwd makes its worktree from a repo under the repos root into the worktree root: the worktree
-# root and each repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>) are writable; the repos root itself and each
-# repo's working tree stay read-only.
+# root and each repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>) are writable; outside /data the repos root
+# itself and each repo's working tree stay read-only.
 if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then
   opts+=(--bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
 fi
@@ -265,25 +298,35 @@ if [ -d "$H/.ssh" ]; then
   opts+=(--remount-ro "$H/.ssh")
   trees+=("$(readlink -f "$H/.ssh")")
 fi
-if [ -d "$H/.config" ]; then
-  # Other tools' credentials and herdr's control socket stay out.
-  opts+=(--tmpfs "$H/.config")
-  keep --ro-bind-try "$H/.config/gh"
-  keep --ro-bind-try "$H/.config/git"
-  keep_agent "$H/.config"
-  opts+=(--remount-ro "$H/.config")
-  trees+=("$(readlink -f "$H/.config")")
+if [ -d "$H/.config/herdr" ]; then
+  # herdr's control socket drives the lead's panes.
+  opts+=(--tmpfs "$H/.config/herdr")
+  keep_agent "$H/.config/herdr"
+  opts+=(--remount-ro "$H/.config/herdr")
+  trees+=("$(readlink -f "$H/.config/herdr")")
+fi
+if [ -d "$H/.dori/state" ]; then
+  # The state dir may hold tokens; a lane reads only the review inputs the lead hands it.
+  opts+=(--tmpfs "$H/.dori/state")
+  keep --ro-bind-try "$H/.dori/state/review-inputs"
+  opts+=(--remount-ro "$H/.dori/state")
+  trees+=("$(readlink -f "$H/.dori/state")")
 fi
 
-# Then each credential store and the hide list.
+# Then each credential store and the hide list. A hidden file is an empty read-only file (read from /dev/null at setup):
+# a /dev/null bind on a nodev mount fails every open() with EACCES instead of reading empty.
+hidden=()
 hide_path() {
   [ -n "$1" ] && [ -e "$1" ] || return 0
   local r t o covered=0
   r=$(readlink -f "$1")
   # In a hidden subtree only a path at, below or above an entry bound back has a mount point, and only such a path
-  # shows; the rest is hidden with the subtree.
+  # shows; the rest is hidden with the subtree. A subtree itself is hidden already.
   for t in ${trees[@]+"${trees[@]}"}; do
-    case "$r" in "$t"/*) covered=1 ;; esac
+    case "$r" in
+      "$t") return 0 ;;
+      "$t"/*) covered=1 ;;
+    esac
   done
   if [ "$covered" = 1 ]; then
     for o in ${kept[@]+"${kept[@]}"}; do
@@ -295,7 +338,9 @@ hide_path() {
   if [ -d "$r" ]; then
     opts+=(--tmpfs "$r" --remount-ro "$r")
   else
-    opts+=(--ro-bind /dev/null "$r")
+    exec {fd}</dev/null
+    opts+=(--ro-bind-data "$fd" "$r")
+    hidden+=("$r")
   fi
 }
 # hide_glob <path or glob>: hides the path, or each existing path the glob (* ? [...]) matches, dotfiles included; a
@@ -351,7 +396,13 @@ if [ "$explain" = 1 ]; then
         case "$o" in
           --bind | --bind-try) echo "rw $b" ;;
           --ro-bind | --ro-bind-try) if [ "$a" = /dev/null ]; then echo "hide $b"; else echo "ro $b"; fi ;;
-          --ro-bind-data) echo "ro $b" ;;
+          --ro-bind-data)
+            m=ro
+            for h in ${hidden[@]+"${hidden[@]}"}; do
+              if [ "$h" = "$b" ]; then m=hide && break; fi
+            done
+            echo "$m $b"
+            ;;
         esac
         ;;
       --tmpfs)

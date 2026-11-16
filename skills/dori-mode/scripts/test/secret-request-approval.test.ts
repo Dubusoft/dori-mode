@@ -70,9 +70,9 @@ test("a name outside the allowlist asks the lead, not the owner; the lead's gran
   await h.tick();
   expect(h.threads).toHaveLength(0);
   const [d] = h.decisions();
-  expect(d).toMatchObject({ state: "open", lane: "ap-1-1", task: 1, leadOnly: true, secretRequest: { names: ["NPM_TOKEN"], repo: REPO, grants: ["lane", "repo", "deny"] } });
+  expect(d).toMatchObject({ state: "open", lane: "ap-1-1", task: 1, leadOnly: true, secretRequest: { names: ["NPM_TOKEN"], repo: REPO, grants: ["lane", "repo", "every-repo", "deny"] } });
   expect(d?.thread).toBeUndefined();
-  expect(d?.options).toHaveLength(3);
+  expect(d?.options).toHaveLength(4);
   expect(h.events).toHaveLength(1);
   expect(h.events[0]).toStartWith(`SECRET_REQUEST ap-1-1 ${d?.id} names=NPM_TOKEN repo=${REPO}:`);
   expect(readDecisions(h.dir).secretRequests).toEqual([]);
@@ -98,11 +98,23 @@ test("allowing the repo grants every lane of that repo and no other", async () =
   expect((await h.grant("other-1", ["NPM_TOKEN"])).ok).toBe(false);
 });
 
+test("allowing every repo writes * into the secret's repos: every lane with a repo is granted, a lane without one is not", async () => {
+  const h = host({}, {}, (key) => (key.startsWith("norepo") ? undefined : key.startsWith("other") ? "Dubusoft/other" : REPO));
+  await h.grant("ap-1-1", ["NPM_TOKEN"]);
+  await h.tick();
+  const closed = await closeOwnerDecision(h.ctx, h.decisions()[0]?.id ?? "", { text: "every repo", choice: 3 });
+  expect(closed.granted?.to).toEqual({ repo: "*" });
+  expect(h.rules()).toEqual({ NPM_TOKEN: { repos: ["*"] } });
+  expect((await h.grant("ap-9-1", ["NPM_TOKEN"])).ok).toBe(true);
+  expect((await h.grant("other-1", ["NPM_TOKEN"])).ok).toBe(true);
+  expect((await h.grant("norepo-1", ["NPM_TOKEN"])).ok).toBe(false);
+});
+
 test("a deny leaves config alone and the lane stays denied without a new decision", async () => {
   const h = host();
   await h.grant("ap-1-1", ["NPM_TOKEN"]);
   await h.tick();
-  const closed = await closeOwnerDecision(h.ctx, h.decisions()[0]?.id ?? "", { text: "no", choice: 3 });
+  const closed = await closeOwnerDecision(h.ctx, h.decisions()[0]?.id ?? "", { text: "no", choice: 4 });
   expect(closed.granted).toBeUndefined();
   expect(h.rules()).toBeUndefined();
   const again = await h.grant("ap-1-1", ["NPM_TOKEN"]);

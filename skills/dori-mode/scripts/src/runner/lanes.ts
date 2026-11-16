@@ -61,6 +61,8 @@ export type LaneNotice = {
 
 export type LaneRecord = {
   readonly sandbox?: boolean;
+  /** POSIX env and wrapper before the agent argv; absent in records written before pane run support. */
+  readonly sandboxPrefix?: string;
   readonly fileRun?: LaneFileRun;
   readonly fileRevision?: number;
   readonly fileDigest?: string;
@@ -494,6 +496,7 @@ export class RunnerLanes {
     const tokenFile = this.tokenFileOf(key, gen);
     writeRunnerFile(tokenFile, token);
     let command: string;
+    let sandboxPrefix: string | undefined;
     if (shell === "pwsh" || shell === "powershell") {
       try {
         command = powershellLaunchLine(shell, [
@@ -521,7 +524,10 @@ export class RunnerLanes {
         ...(granted?.write.length ? [`LANE_SANDBOX_RW=${quote(granted.write.join(":"))}`] : []),
         ...(granted?.read.length ? [`LANE_SANDBOX_RO=${quote(granted.read.join(":"))}`] : []),
       ];
-      // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
+      const wrapper = this.deps.policy.sandboxCheck?.slice(0, -1) ?? [];
+      // What the lane runs behind, for a command a lane runs in a pane it split off (herdr-report.ts): `env` makes it
+      // usable after `exec`.
+      if (wrapper.length > 0 && wrapper.every((part, at) => argv[at] === part)) sandboxPrefix = ["env", ...env, ...wrapper.map(quote)].join(" ");
       command = [...env, ...argv.map(quote)].join(" ");
     }
     // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
@@ -541,6 +547,7 @@ export class RunnerLanes {
         key, pane, tab, cwd, tokenHash: hash(token), profile: input.profile, mode: input.mode, model: input.model, startedAt: this.deps.clock.now(), gen,
         ...(input.fileRun ? { fileRun: input.fileRun } : {}),
         ...(input.sandbox !== undefined ? { sandbox: input.sandbox } : {}),
+        ...(sandboxPrefix !== undefined ? { sandboxPrefix } : {}),
         herdrInstance, ...(terminalId ? { terminalId } : {}), ...(shellPid ? { shellPid } : {}),
         ...(input.keywords !== undefined ? { keywords: input.keywords } : {}),
         ...(input.tabWorkspace !== undefined && (!input.target || input.restored) ? { tabWorkspace: input.tabWorkspace } : {}),

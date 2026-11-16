@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 
 import { INTENDED, SENSITIVE } from "../src/doctor.ts";
 import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
@@ -17,7 +17,9 @@ const tempDir = (): string => {
 /** Runs the shipped template with a recording `bwrap` first on PATH and returns the argv it would have run bwrap with. */
 const sandboxArgv = async (home: string, env: Record<string, string>, work = join(home, "work")): Promise<string[]> => {
   const bin = join(home, "fake-bin");
-  const out = join(home, "bwrap-argv");
+  // Outside $HOME (--explain would list it) and outside the repo, in a dir of its own.
+  const out = join(mkdtempSync(join(tmpdir(), "bwrap-argv-")), "argv");
+  dirs.push(dirname(out));
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(bin, "bwrap"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${out}"\n`);
   chmodSync(join(bin, "bwrap"), 0o755);
@@ -27,21 +29,25 @@ const sandboxArgv = async (home: string, env: Record<string, string>, work = joi
   return readFileSync(out, "utf8").split("\n");
 };
 
+/** The argv index of the empty read-only file bound over `path`, which is how a hidden file shows (-1 when there is none). */
+const hiddenFile = (argv: string[], path: string): number => argv.findIndex((a, i) => a === "--ro-bind-data" && argv[i + 2] === path);
+
 test("the real BrowserSkill home is bound read-only, including an explicit BSK_HOME", async () => {
   const home = join(tempDir(), "home");
   const bskHome = join(home, ".bsk");
   mkdirSync(bskHome, { recursive: true });
   const bind = (argv: string[], path: string) => argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === path && argv[i + 2] === path);
-  const readWriteNames = (argv: string[], path: string) => argv.some((a, i) => (a === "--bind" || a === "--bind-try") && (argv[i + 1] === path || argv[i + 2] === path));
+  // ~/.bsk is a top-level entry of $HOME, bound read-write with the others; the read-only bind after it wins.
+  const lastReadWrite = (argv: string[], path: string) => argv.findLastIndex((a, i) => (a === "--bind" || a === "--bind-try") && (argv[i + 1] === path || argv[i + 2] === path));
 
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
   expect(bind(argv, bskHome)).toBeGreaterThan(-1);
-  expect(readWriteNames(argv, bskHome)).toBe(false);
+  expect(bind(argv, bskHome)).toBeGreaterThan(lastReadWrite(argv, bskHome));
 
   const customBskHome = tempDir();
   const customArgv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", BSK_HOME: customBskHome });
   expect(bind(customArgv, customBskHome)).toBeGreaterThan(-1);
-  expect(readWriteNames(customArgv, customBskHome)).toBe(false);
+  expect(lastReadWrite(customArgv, customBskHome)).toBe(-1);
 });
 
 test("a sandboxed lane gets its own token file, the runner's lane socket, its brief and the runner's bin (read-only), its own lanes/<key> mount point, and nothing else of the runner dir or the env file", async () => {
@@ -74,9 +80,10 @@ test("a sandboxed lane gets its own token file, the runner's lane socket, its br
   // A worker host's dori lives in bin: bound read-only, never read-write, so a lane cannot rewrite what the runner runs.
   const bin = join(runner, "bin");
   expect(argv.flatMap((a, i) => (argv[i + 1] === bin && argv[i + 2] === bin ? [a] : []))).toEqual(["--ro-bind-try"]);
-  // The env file shows only as hidden: /dev/null over it, after the runner dir.
+  // The env file shows only as hidden: an empty read-only file over it, after the runner dir.
   const env = join(home, ".dori", "env");
-  expect(argv.flatMap((a, i) => (argv[i + 2] === env ? [`${a} ${argv[i + 1]}`] : []))).toEqual(["--ro-bind /dev/null"]);
+  expect(argv.flatMap((a, i) => (argv[i + 2] === env ? [a] : []))).toEqual(["--ro-bind-data"]);
+  expect(hiddenFile(argv, env)).toBeGreaterThan(runnerRo);
   expect(argv.indexOf(env)).toBeGreaterThan(runnerRo);
 });
 
@@ -114,16 +121,35 @@ test("the D-Bus session bus and the systemd user manager's sockets are covered, 
   }
 });
 
-test("~/.config is hidden after every read-write bind, with only gh, git and an ssh agent socket under it bound back", async () => {
+test("~/.config is no longer a hidden tree: it is bound read-write, only ~/.config/herdr is hidden, with an ssh agent socket kept, and what the host runs stays read-only", async () => {
   const home = join(tempDir(), "home");
   const config = join(home, ".config");
   mkdirSync(join(config, "gcloud"), { recursive: true });
   const agent = join(config, "herdr", "herdr.sock.agent");
+  mkdirSync(join(config, "herdr"), { recursive: true });
+  writeFileSync(agent, "");
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", SSH_AUTH_SOCK: agent });
-  expect([...new Set(argv.filter((a) => a.startsWith(config)))].sort()).toEqual([config, join(config, "gh"), join(config, "git"), agent]);
-  const hide = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === config);
-  expect(hide).toBeGreaterThan(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, "work")));
-  expect(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === config)).toBeGreaterThan(argv.indexOf(agent));
+  expect([...new Set(argv.filter((a) => a.startsWith(config)))].sort()).toEqual([
+    config, join(config, "autostart"), join(config, "environment.d"), join(config, "gcloud"), join(config, "gh"), join(config, "git"), join(config, "herdr"), agent, join(config, "systemd"),
+  ].sort());
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === config)).toBe(-1);
+  // gcloud is a credential store: its own empty tmpfs, after every read-write bind.
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(config, "gcloud"))).toBeGreaterThan(lastReadWrite(argv, home));
+  // herdr's control socket drives lead panes: its directory is hidden, the agent socket bound back before it turns read-only.
+  const hide = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === join(config, "herdr"));
+  expect(hide).toBeGreaterThan(lastReadWrite(argv, home));
+  expect(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(config, "herdr"))).toBeGreaterThan(argv.indexOf(agent));
+  // $HOME itself stays read-only (no new top-level entry), each existing entry of it is read-write. The host's startup
+  // files, bin dirs and git and gh config are bound read-only after those, before the cwd; a startup file is never read-write.
+  expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === home && argv[i + 2] === home)).toBeGreaterThan(-1);
+  expect(argv.some((a, i) => (a === "--bind" || a === "--bind-try") && argv[i + 1] === home)).toBe(false);
+  const cwd = argv.findLastIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, "work"));
+  for (const p of [".bashrc", ".zshrc", ".gitconfig"]) expect({ p, rw: argv.some((a, i) => (a === "--bind" || a === "--bind-try") && argv[i + 1] === join(home, p)) }).toEqual({ p, rw: false });
+  for (const p of [".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout", ".local/bin", ".bun/bin", ".cargo/bin", ".config/systemd", ".config/autostart", ".config/environment.d", ".gitconfig", ".config/git", ".config/gh"]) {
+    const ro = argv.findIndex((a, i) => (a === "--ro-bind-try" || a === "--ro-bind") && argv[i + 1] === join(home, p) && argv[i + 2] === join(home, p));
+    const top = argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, p.split("/")[0] ?? p));
+    expect({ p, after: ro > top, before: ro < cwd }).toEqual({ p, after: true, before: true });
+  }
   // An agent socket outside $HOME is visible through the host's own binds already.
   const outside = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", SSH_AUTH_SOCK: "/run/user/1/openssh_agent" });
   expect(outside).not.toContain("/run/user/1/openssh_agent");
@@ -153,7 +179,7 @@ test("each existing path in ~/.dori/lane-sandbox-hide is covered after every bin
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: join(backup, "snap") });
 
   const dir = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === backup);
-  const file = argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === copy);
+  const file = hiddenFile(argv, copy);
   const rw = argv.findIndex((a, i) => a === "--bind-try" && argv[i + 1] === join(backup, "snap"));
   expect(rw).toBeGreaterThan(-1);
   expect(dir).toBeGreaterThan(rw);
@@ -195,8 +221,14 @@ test("~/.dori is the host's, read-only, with the state dir hidden; every read-wr
   const rwInDori = argv.flatMap((a, i) => ((a === "--bind" || a === "--bind-try") && argv[i + 2]?.startsWith(`${dori}/`) ? [argv[i + 2]] : []));
   expect(rwInDori).toContain(join(dori, "heavy"));
   // The state dir (supervisor key, registry, decisions) is hidden after every read-write bind.
+  // Only review-inputs is bound back into it, read-only, before the tmpfs turns read-only.
   const state = join(dori, "state");
-  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === state && argv[i + 2] === "--remount-ro" && argv[i + 3] === state)).toBeGreaterThan(lastReadWrite(argv, home));
+  const stateTmpfs = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === state);
+  const reviewInputs = argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === join(state, "review-inputs") && argv[i + 2] === join(state, "review-inputs"));
+  expect(stateTmpfs).toBeGreaterThan(lastReadWrite(argv, home));
+  expect(reviewInputs).toBeGreaterThan(stateTmpfs);
+  expect(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === state)).toBeGreaterThan(reviewInputs);
+  expect(argv.filter((a) => a === state || a.startsWith(`${state}/`))).toEqual([state, join(state, "review-inputs"), join(state, "review-inputs"), state]);
   // bwrap cannot mkdir a missing mount point on the read-only tmpfs (EROFS), so each one is a --dir before the remount.
   const runnerRo = argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === runner);
   expect(runnerRo).toBeGreaterThan(-1);
@@ -228,7 +260,7 @@ test("a hidden path under ~/.dori is hidden too; inside a hidden subtree only a 
   writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${join(research, "secret.txt")}\n${join(gh, "hosts.yml")}\n${join(home, ".ssh", "id_ed25519")}\n`);
 
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
-  const over = (p: string) => argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === p);
+  const over = (p: string) => hiddenFile(argv, p);
 
   expect(over(join(research, "secret.txt"))).toBeGreaterThan(lastReadWrite(argv, home));
   expect(argv).not.toContain(join(research, "report.md"));
@@ -236,7 +268,8 @@ test("a hidden path under ~/.dori is hidden too; inside a hidden subtree only a 
   expect(over(join(gh, "hosts.yml"))).toBeGreaterThan(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === gh));
   // Hidden with its subtree: no mount point there to cover (bwrap would fail on the read-only tmpfs).
   expect(argv).not.toContain(join(home, ".ssh", "id_ed25519"));
-  expect(argv).not.toContain(gcloud);
+  // A credential store with no tree over it is an empty tmpfs of its own, after every read-write bind.
+  expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === gcloud)).toBeGreaterThan(lastReadWrite(argv, home));
 });
 
 test("a glob in the hide list or the shared credential list hides each existing match, dotfiles and ~/.dori entries included, and --explain lists each", async () => {
@@ -250,9 +283,9 @@ test("a glob in the hide list or the shared credential list hides each existing 
   const env = { DORI_LANE_KEY: "lane-a" };
 
   const argv = await sandboxArgv(home, env);
-  const after = (p: string) => argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === p) > lastReadWrite(argv, home);
+  const after = (p: string) => hiddenFile(argv, p) > lastReadWrite(argv, home);
   for (const p of [join(keys, "a.pem"), join(keys, ".b.pem"), join(research, "secret-x"), join(home, ".zsh_history"), join(home, ".node_repl_history")]) expect({ p, hidden: after(p) }).toEqual({ p, hidden: true });
-  const hides = argv.flatMap((a, i) => (a === "--tmpfs" ? [argv[i + 1]] : a === "--ro-bind" && argv[i + 1] === "/dev/null" ? [argv[i + 2]] : []));
+  const hides = argv.flatMap((a, i) => (a === "--tmpfs" ? [argv[i + 1]] : a === "--ro-bind-data" ? [argv[i + 2]] : []));
   for (const p of [keys, root, home, join(keys, "c.txt"), join(keys, "sub", "d.pem"), join(research, "ap-1-1", "report.md")]) expect({ p, hidden: hides.includes(p) }).toEqual({ p, hidden: false });
   expect(argv.some((a) => a.includes("*"))).toBe(false);
 
@@ -381,7 +414,7 @@ const runMacos = async (home: string, cwd: string, args: string[], env: Record<s
 const seatbelt = async (home: string, cwd: string, env: Record<string, string>): Promise<Seatbelt> => {
   const out = join(home, "..", "sbx-argv");
   const sbx = join(home, "..", "fake-sandbox-exec");
-  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0OMO_PROFILE=%s\\0HERDR_SOCKET_PATH=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" "$OMO_PROFILE" "$HERDR_SOCKET_PATH" > "${out}.env"\n`);
+  writeFileSync(sbx, `#!/bin/sh\nprintf '%s\\0' "$@" > "${out}"\nprintf 'TMPDIR=%s\\0LANE_SANDBOX_ACTIVE=%s\\0SSL_CERT_FILE=%s\\0OMO_PROFILE=%s\\0HERDR_SOCKET_PATH=%s\\0GH_CONFIG_DIR=%s\\0' "$TMPDIR" "$LANE_SANDBOX_ACTIVE" "$SSL_CERT_FILE" "$OMO_PROFILE" "$HERDR_SOCKET_PATH" "$GH_CONFIG_DIR" > "${out}.env"\n`);
   chmodSync(sbx, 0o755);
   const r = await runMacos(home, cwd, ["omo", "--model", "m"], env, sbx);
   expect(r.code).toBe(0);
@@ -467,15 +500,24 @@ const macHome = () => {
   return { root, home, runner, wt, token: join(runner, "briefs", "lane-a.2.token") };
 };
 
-test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else, and cannot read ~/.dori/env, ssh keys or another lane's token", async () => {
+test("macOS: a lane may write under $HOME but not what the host runs, and cannot read ~/.dori/env, ssh keys or another lane's token", async () => {
   const { home, runner, wt, token } = macHome();
+  mkdirSync(join(home, ".config", "gh"), { recursive: true });
+  writeFileSync(join(home, ".config", "gh", "config.yml"), "aliases: {}\n");
+  writeFileSync(join(home, ".config", "gh", "hosts.yml"), "oauth_token: x\n");
   const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token });
   const lt = join(home, ".cache", "omo-tmp", "lane-sandbox", "lane-a");
 
   expect(sb.command).toEqual(["omo", "--model", "m"]);
-  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "", OMO_PROFILE: "dori-lane", HERDR_SOCKET_PATH: join(runner, "sock", "herdr.d", "lane-a", "herdr") });
-  expect(statSync(lt).mode & 0o777).toBe(0o700);
+  expect(sb.env).toEqual({ TMPDIR: lt, LANE_SANDBOX_ACTIVE: "1", SSL_CERT_FILE: "", OMO_PROFILE: "dori-lane", HERDR_SOCKET_PATH: join(runner, "sock", "herdr.d", "lane-a", "herdr"), GH_CONFIG_DIR: join(lt, "gh") });
+  expect(statSync(lt).mode & 0o700).toBe(0o700);
   expect(sb.err).toBe("");
+  // gh gets a config dir of its own: config.yml copied, the hosts.yml login left behind; one already set is kept.
+  expect(readFileSync(join(lt, "gh", "config.yml"), "utf8")).toBe("aliases: {}\n");
+  expect(existsSync(join(lt, "gh", "hosts.yml"))).toBe(false);
+  expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", GH_CONFIG_DIR: "/mine/gh" })).env.GH_CONFIG_DIR).toBe("/mine/gh");
+  // /usr/bin/log refuses to run sandboxed, like /bin/ps.
+  expect(sb.profile).toContain('(allow process-exec (literal "/bin/ps") (literal "/usr/bin/log") (with no-sandbox))');
 
   const write = (p: string) => allows(sb, "file-write-data", p);
   const read = (p: string) => allows(sb, "file-read-data", p);
@@ -485,34 +527,34 @@ test("macOS: a lane may write its worktree, TMPDIR and caches, but nothing else,
   expect(write(join(runner, "briefs/lane-a.out/report.md"))).toBe(true);
   expect(read(join(runner, "briefs/lane-b.files/input.bin"))).toBe(false);
   expect(write(join(runner, "briefs/lane-b.out/report.md"))).toBe(false);
-  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null"]) {
+  for (const ok of [join(wt, "src", "a.ts"), join(wt, ".git", "index"), join(lt, "x"), join(home, ".omo", "x"), join(home, ".cache", "x"), join(home, ".dori", "heavy", "x"), join(home, ".npm", "x"), "/tmp/x", "/dev/null", join(home, "probe"), join(home, "Documents", "x"), join(home, "work", "x"), "/opt/homebrew/x"]) {
     expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
   }
-  for (const no of [join(home, "probe"), join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "state", "x"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {
+  for (const no of [join(home, ".dori", "config.json"), join(home, ".dori", "env"), join(home, ".dori", "state", "x"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".dori", "src", "x"), join(runner, "bin", "dori"), join(home, ".zshrc"), join(home, ".ssh", "authorized_keys"), join(home, "Library", "LaunchAgents", "x.plist"), join(home, "Library", "Keychains", "x"), join(home, ".local", "bin", "x"), join(home, ".bun", "bin", "x"), join(home, ".cargo", "bin", "x"), join(home, ".gitconfig"), join(home, ".config", "git", "config"), join(home, ".config", "gh", "config.yml"), join(home, ".config", "herdr", "x"), join(wt, ".git", "hooks", "pre-commit"), "/etc/hosts"]) {
     expect({ no, write: write(no) }).toEqual({ no, write: false });
   }
-  for (const ok of [token, join(runner, "briefs", "lane-a.md"), join(runner, "bin", "dori"), join(runner, "sock", "lane.d", "lane"), join(home, ".dori", "config.json"), join(home, ".dori", "src", "cli.ts"), join(home, ".dori", "research", "ap-1-1", "report.md"), join(home, ".dori", "lead", "notes.md"), join(home, ".dori", "heavy", "x"), join(home, ".ssh", "id_ed25519.pub"), join(home, ".ssh", "known_hosts"), join(home, ".ssh", "config"), "/etc/hosts", join(wt, "README.md")]) {
+  for (const ok of [token, join(runner, "briefs", "lane-a.md"), join(runner, "bin", "dori"), join(runner, "sock", "lane.d", "lane"), join(home, ".dori", "config.json"), join(home, ".dori", "src", "cli.ts"), join(home, ".dori", "research", "ap-1-1", "report.md"), join(home, ".dori", "lead", "notes.md"), join(home, ".dori", "heavy", "x"), join(home, ".ssh", "id_ed25519.pub"), join(home, ".ssh", "known_hosts"), join(home, ".ssh", "config"), join(home, ".config", "herdr", "config.toml"), join(home, ".dori", "state", "review-inputs", "x"), "/etc/hosts", join(wt, "README.md")]) {
     expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
   }
   for (const no of [join(home, ".dori", "env"), join(home, ".dori", "env", "x"), join(home, ".dori", "secrets", "NPM_TOKEN.cred"), join(home, ".dori", "lane-sandbox-hide"), join(home, ".dori", "gateway-locks", "x"), join(home, ".dori", "state", "runners.sqlite"), join(home, ".dori", "state", "runner-keys", "supervisor.key"), join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "github_deploy"), join(home, ".ssh", "keys", "work.pem"), join(home, ".ssh", "config.d", "x"), join(home, ".ssh", "x.pub", "y"), join(runner, "briefs", "lane-b.1.token"), join(runner, "briefs", "lane-b.md"), join(runner, "keys", "runner.key"), join(runner, "state.sqlite"), join(runner, "runner.json")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
-});
+}, 30_000);
 
 test("macOS: a read grant never re-opens ~/.dori/runner, ~/.ssh or a credential store: their refusals come after every grant", async () => {
   const { home, runner, wt, token } = macHome();
   const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token, LANE_SANDBOX_RO: [join(home, ".dori"), join(home, ".ssh"), join(home, ".aws"), join(home, ".config")].join(":") });
   const read = (p: string) => allows(sb, "file-read-data", p);
 
-  for (const ok of [join(home, ".dori", "research", "x"), token, join(home, ".ssh", "known_hosts"), join(home, ".config", "gh", "config.yml")]) {
+  for (const ok of [join(home, ".dori", "research", "x"), token, join(home, ".ssh", "known_hosts"), join(home, ".config", "gh", "config.yml"), join(home, ".config", "herdr", "config.toml")]) {
     expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
   }
-  for (const no of [join(home, ".dori", "env"), join(home, ".dori", "secrets", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "lane-sandbox-hide"), join(home, ".dori", "gateway-locks", "x"), join(runner, "briefs", "lane-b.1.token"), join(runner, "keys", "runner.key"), join(home, ".ssh", "id_ed25519"), join(home, ".aws", "credentials"), join(home, ".config", "herdr", "config.toml")]) {
+  for (const no of [join(home, ".dori", "env"), join(home, ".dori", "secrets", "x"), join(home, ".dori", "state", "x"), join(home, ".dori", "lane-sandbox-hide"), join(home, ".dori", "gateway-locks", "x"), join(runner, "briefs", "lane-b.1.token"), join(runner, "keys", "runner.key"), join(home, ".ssh", "id_ed25519"), join(home, ".aws", "credentials"), join(home, ".config", "cloudflare", "x")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
 });
 
-test("macOS: of the runner's sockets only the lane socket can be dialed, and of ~/.config only gh, git and the ssh agent socket are reachable", async () => {
+test("macOS: of the runner's sockets only the lane socket can be dialed, and under ~/.config only the ssh agent socket; ~/.config files read except credential stores", async () => {
   const { home, runner, wt } = macHome();
   const agent = join(home, ".config", "herdr", "herdr.sock.agent");
   const sb = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", SSH_AUTH_SOCK: agent });
@@ -527,10 +569,10 @@ test("macOS: of the runner's sockets only the lane socket can be dialed, and of 
   }
   expect(dial(agent)).toBe(true);
   expect(dial("/private/tmp/com.apple.launchd.x/Listeners")).toBe(true);
-  for (const ok of [join(home, ".config", "gh", "config.yml"), join(home, ".config", "git", "ignore")]) {
+  for (const ok of [join(home, ".config", "gh", "config.yml"), join(home, ".config", "git", "ignore"), join(home, ".config", "herdr", "config.toml"), join(home, ".config", "nvim", "init.lua")]) {
     expect({ ok, read: read(ok) }).toEqual({ ok, read: true });
   }
-  for (const no of [join(home, ".config", "gh", "hosts.yml"), join(home, ".config", "cloudflare", "x"), join(home, ".config", "herdr", "config.toml")]) {
+  for (const no of [join(home, ".config", "gh", "hosts.yml"), join(home, ".config", "cloudflare", "x"), join(home, ".cloudflared", "cert.pem")]) {
     expect({ no, read: read(no) }).toEqual({ no, read: false });
   }
 });
@@ -578,10 +620,11 @@ test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git
   const read = (p: string) => allows(sb, "file-read-data", p);
   for (const no of [".aws/credentials", ".azure/msal_token_cache.json", ".oci/config", ".gnupg/private-keys-v1.d/k.key", ".password-store/a.gpg", ".kube/config", ".docker/config.json",
     ".netrc", ".git-credentials", ".vault-token", ".terraform.d/credentials.tfrc.json", ".pypirc", ".cargo/credentials", ".cargo/credentials.toml",
-    ".secrets/x", ".local/share/toodo-server/mcp-token", ".m2/settings.xml", ".zsh_history", ".config/gh/hosts.yml"]) {
+    ".secrets/x", ".local/share/toodo-server/mcp-token", ".m2/settings.xml", ".zsh_history", ".config/gh/hosts.yml",
+    ".config/cloudflare/x", ".cloudflared/cert.pem", "Library/Cookies/Cookies.binarycookies", "Library/Application Support/Google/Chrome/Default/Cookies", "Library/Application Support/Google/Chrome/Profile 1/Login Data"]) {
     expect({ no, read: read(join(home, no)) }).toEqual({ no, read: false });
   }
-  for (const ok of [".docker/cli-plugins/x", ".cargo/registry/index/x", ".gitconfig", ".config/gh/config.yml"]) {
+  for (const ok of [".docker/cli-plugins/x", ".cargo/registry/index/x", ".gitconfig", ".config/gh/config.yml", "Library/Application Support/Google/Chrome/Default/Preferences"]) {
     expect({ ok, read: read(join(home, ok)) }).toEqual({ ok, read: true });
   }
 });
@@ -593,6 +636,10 @@ test("both templates carry the shared credential list as rendered, the same set 
     expect(readFileSync(template, "utf8")).toBe(laneSandboxScript(template));
     expect(credentials(template)).toEqual(doctorDeny);
   }
+  // Cloudflare's CLI login and tunnel credentials are on the shared list; the macOS browser stores, whose paths hold spaces, are the macOS template's own list.
+  for (const p of [".config/cloudflare", ".cloudflared"]) expect(doctorDeny).toContain(p);
+  const mac = readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8");
+  for (const p of ["Library/Application Support/Google/Chrome/*/Cookies", "Library/Application Support/Google/Chrome/*/Login Data", "Library/Cookies"]) expect(mac).toContain(`"${p}"`);
 
   const home = join(realpathSync(tempDir()), "home");
   for (const d of [".cargo", ".aws", ".dori"]) mkdirSync(join(home, d), { recursive: true });
@@ -600,10 +647,10 @@ test("both templates carry the shared credential list as rendered, the same set 
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a" });
   const at = (...seq: string[]) => argv.findIndex((_, i) => seq.every((s, j) => argv[i + j] === s));
   const rw = lastReadWrite(argv, home);
-  expect(at("--ro-bind", "/dev/null", join(home, ".cargo/credentials.toml"))).toBeGreaterThan(rw);
+  expect(hiddenFile(argv, join(home, ".cargo/credentials.toml"))).toBeGreaterThan(rw);
   expect(at("--tmpfs", join(home, ".aws"), "--remount-ro", join(home, ".aws"))).toBeGreaterThan(rw);
-  expect(at("--ro-bind", "/dev/null", join(home, ".zsh_history"))).toBeGreaterThan(rw);
-  expect(at("--ro-bind", "/dev/null", join(home, ".dori/env"))).toBeGreaterThan(rw);
+  expect(hiddenFile(argv, join(home, ".zsh_history"))).toBeGreaterThan(rw);
+  expect(hiddenFile(argv, join(home, ".dori/env"))).toBeGreaterThan(rw);
 });
 
 test("macOS: ~/.dori/secrets is refused for reads, writes and socket connects with no hide file", async () => {
@@ -629,10 +676,10 @@ test("macOS: a lane may rewrite its own login keychain and Claude Code's lock di
   const kc = join(home, "Library", "Keychains");
   const write = (p: string) => allows(sb, "file-write-data", p);
 
-  for (const ok of [join(kc, "login.keychain-db"), join(kc, "login.keychain-db.sb-d1fd7dce-8dNHuB"), join(home, ".local", "state", "claude", "locks", "x.lock")]) {
+  for (const ok of [join(kc, "login.keychain-db"), join(kc, "login.keychain-db.sb-d1fd7dce-8dNHuB"), join(home, ".local", "state", "claude", "locks", "x.lock"), join(home, ".local", "state", "other")]) {
     expect({ ok, write: write(ok) }).toEqual({ ok, write: true });
   }
-  for (const no of [join(kc, "login.keychain-db-journal"), join(kc, "login.keychain-db-wal"), join(kc, "login.keychain-db.sb-x", "y"), join(kc, "metadata.keychain-db"), join(kc, ".fl34AC2A0A"), join(kc, "78D2CB8D", "keychain-2.db"), join(root, "other", "Library", "Keychains", "login.keychain-db"), join(root, "other", "Library", "Keychains", "login.keychain-db.sb-x"), join(home, ".local", "state", "other")]) {
+  for (const no of [join(kc, "login.keychain-db-journal"), join(kc, "login.keychain-db-wal"), join(kc, "login.keychain-db.sb-x", "y"), join(kc, "metadata.keychain-db"), join(kc, ".fl34AC2A0A"), join(kc, "78D2CB8D", "keychain-2.db"), join(root, "other", "Library", "Keychains", "login.keychain-db"), join(root, "other", "Library", "Keychains", "login.keychain-db.sb-x")]) {
     expect({ no, write: write(no) }).toEqual({ no, write: false });
   }
   expect(sb.profile).not.toContain(root);
@@ -662,13 +709,13 @@ test("macOS: a lane's tools get the system root bundle as SSL_CERT_FILE, and one
   writeFileSync(join(root, "cert.pem"), "");
   expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" })).env.SSL_CERT_FILE).toBe(join(root, "cert.pem"));
   expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", SSL_CERT_FILE: "/opt/corp.pem" })).env.SSL_CERT_FILE).toBe("/opt/corp.pem");
-});
+}, 30_000);
 
 test("macOS: a lane's omo runs under the dori-lane profile, and an OMO_PROFILE already set is kept", async () => {
   const { home, wt } = macHome();
   expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a" })).env.OMO_PROFILE).toBe("dori-lane");
   expect((await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", OMO_PROFILE: "mine" })).env.OMO_PROFILE).toBe("mine");
-});
+}, 30_000);
 
 test("macOS: a cwd-less lane may list the directories above its cwd (realpath opens them), but read nothing under them", async () => {
   const { home, runner } = macHome();
@@ -727,11 +774,12 @@ test("macOS: every path reaches the profile resolved (as /var does to /private/v
   expect(sb.profile).not.toContain(root);
 });
 
-test("macOS: a cwd as broad as $HOME is not made writable", async () => {
+test("macOS: a cwd as broad as $HOME gets no write grant of its own, so what the host runs stays refused", async () => {
   const { home } = macHome();
   const sb = await seatbelt(home, home, { DORI_LANE_KEY: "lane-a" });
   expect(sb.err).toBe(`lane-sandbox: warning: cwd ${home} is too broad; not making it writable\n`);
-  expect(allows(sb, "file-write-data", join(home, "probe"))).toBe(false);
+  expect(Object.entries(sb.params).filter(([k, v]) => /^W\d+$/.test(k) && v === home)).toEqual([]);
+  for (const no of [".ssh/x", ".zshrc", ".dori/env", "Library/LaunchAgents/x.plist"]) expect({ no, write: allows(sb, "file-write-data", join(home, no)) }).toEqual({ no, write: false });
 });
 
 test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a missing or failing sandbox-exec", async () => {
@@ -760,7 +808,7 @@ test("macOS: without DORI_LANE_KEY the command runs as is, and --check names a m
   expect(argv[0]).toBe("-p");
   expect(argv[1]).toContain("(deny file-write*)");
   expect(argv.at(-1)).toBe("/usr/bin/true");
-});
+}, 30_000);
 
 test("a granted lane gets its runner's write grants read-write and read grants read-only, before its cwd; an ungranted lane names neither", async () => {
   const root = realpathSync(tempDir());
@@ -772,7 +820,7 @@ test("a granted lane gets its runner's write grants read-write and read grants r
 
   const rw = argv.findIndex((a, i) => a === "--bind-try" && argv[i + 1] === runs && argv[i + 2] === runs);
   const ro = argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === notes && argv[i + 2] === notes);
-  const cwd = argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, "work"));
+  const cwd = argv.findLastIndex((a, i) => a === "--bind" && argv[i + 1] === join(home, "work"));
   expect(rw).toBeGreaterThan(-1);
   expect(ro).toBeGreaterThan(-1);
   // A read grant above a writable path must not shadow it: the read-write re-binds, grants and cwd come after it.
@@ -780,10 +828,12 @@ test("a granted lane gets its runner's write grants read-write and read grants r
   expect(ro).toBeLessThan(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === out));
   expect(rw).toBeGreaterThan(ro);
   expect(cwd).toBeGreaterThan(ro);
-  expect(argv.some((a, i) => (a === "--bind" || a === "--bind-try") && argv[i + 1] === notes)).toBe(false);
+  // ~/notes is a top-level entry of $HOME, bound read-write with the others; the read-only grant after it wins.
+  expect(argv.findLastIndex((a, i) => (a === "--bind" || a === "--bind-try") && argv[i + 1] === notes)).toBeLessThan(ro);
 
   const plain = await sandboxArgv(home, { DORI_LANE_KEY: "lane-b" });
-  expect(plain.some((a) => a.startsWith(runs) || a.startsWith(notes))).toBe(false);
+  expect(plain.some((a) => a.startsWith(runs))).toBe(false);
+  expect(plain.some((a, i) => a === "--ro-bind-try" && plain[i + 1] === notes)).toBe(false);
 });
 
 test("the hide list wins over a lane's grants: a granted path under a hidden one is covered after it is bound", async () => {
@@ -819,7 +869,7 @@ test("macOS: a granted lane may write its write grants and read its read grants;
   const hidden = await seatbelt(home, wt, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_RW: runs, LANE_SANDBOX_RO: notes });
   expect(allows(hidden, "file-write-data", join(runs, "topic.lock"))).toBe(false);
   expect(allows(hidden, "file-read-data", join(notes, "a.md"))).toBe(false);
-});
+}, 30_000);
 
 /** The `<mode> <path>` lines a template's --explain prints, comments dropped. */
 const explainRows = (out: string): string[] => out.split("\n").filter((l) => l !== "" && !l.startsWith("#"));
@@ -839,7 +889,8 @@ const mountTable = (argv: string[]): string[] => {
       i += 3;
       if (o.endsWith("-try") && !existsSync(src)) continue;
       if (o === "--bind" || o === "--bind-try") rows.push(`rw ${dst}`);
-      else if (o === "--ro-bind-data") rows.push(`ro ${dst}`);
+      // The ssh_config.d copies under /etc or /usr show as ro; any other --ro-bind-data is the empty file a hidden path gets.
+      else if (o === "--ro-bind-data") rows.push(`${dst.startsWith("/etc/") || dst.startsWith("/usr/") ? "ro" : "hide"} ${dst}`);
       else if (o === "--ro-bind" || o === "--ro-bind-try") rows.push(`${src === "/dev/null" ? "hide" : "ro"} ${dst}`);
     } else if (o === "--tmpfs") {
       const p = argv[i + 1] as string;
@@ -899,6 +950,9 @@ test("--explain regression: every credential store, ssh key and other lane's tok
     writeFileSync(join(home, p), p.endsWith("lane-sandbox-hide") ? "# nothing extra\n" : "secret\n");
   }
   for (const f of [".ssh/known_hosts", ".dori/runner/briefs/lane-a.md"]) writeFileSync(join(home, f), "x\n");
+  // What the host runs outside the sandbox stays read-only under the read-write home.
+  mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  for (const f of [".zshrc", ".gitconfig"]) writeFileSync(join(home, f), "x\n");
   const token = join(R, "briefs", "lane-a.1.token");
   writeFileSync(token, "own\n");
   const env = { DORI_LANE_KEY: "lane-a", DORI_LANE_TOKEN_FILE: token, LANE_SANDBOX_RW: runs, LANE_SANDBOX_REPOS: repos, LANE_SANDBOX_WORKTREES: worktrees };
@@ -916,18 +970,20 @@ test("--explain regression: every credential store, ssh key and other lane's tok
   // Each secret is hidden by its own row or by a hidden subtree over it (~/.config, ~/.ssh, ~/.dori/runner).
   expect(secrets.map((p) => [p, verdict(join(home, p))]).filter(([, mode]) => mode !== "hide")).toEqual([]);
   // The lane's own files still show.
-  for (const p of [token, join(R, "briefs", "lane-a.md"), join(home, ".ssh", "known_hosts"), join(home, ".zshrc")]) expect([p, verdict(p)]).toEqual([p, "ro"]);
+  for (const p of [token, join(R, "briefs", "lane-a.md"), join(home, ".ssh", "known_hosts"), join(home, ".zshrc"), join(home, ".gitconfig"), join(home, ".local", "bin")]) expect([p, verdict(p)]).toEqual([p, "ro"]);
   // No row names another lane's token or brief, so nothing re-exposes it.
   expect(table.filter((r) => r.path.startsWith(join(R, "briefs")) && !r.path.startsWith(join(R, "briefs", "lane-a.")))).toEqual([]);
-  // The writable set, pinned: a new read-write bind (or a lost one) changes it.
-  expect(table.filter((r) => r.mode === "rw").map((r) => r.path).sort()).toEqual([
-    "/tmp",
-    join(home, ".bun", "install", "cache"), join(home, ".cache"), join(home, ".cargo", "git"), join(home, ".cargo", "registry"),
-    join(home, ".dori", "heavy"), join(R, "briefs", "lane-a.out"), join(home, ".lane-tmp"), join(home, ".npm"), join(home, ".omo"),
-    join(home, "work"), join(repos, "app", ".git"), runs, worktrees,
+  // The writable set, pinned: a new read-write bind (or a lost one) changes it. Each existing top-level entry of $HOME is
+  // read-write too, but the host-run files, ~/.ssh and ~/.dori are not among them, and nothing hidden is writable.
+  const writable = table.filter((r) => r.mode === "rw" && verdict(r.path) === "rw");
+  const topLevel = writable.filter((r) => dirname(r.path) === home).map((r) => basename(r.path));
+  for (const n of [".zshrc", ".gitconfig", ".ssh", ".dori", ".bashrc"]) expect({ n, writable: topLevel.includes(n) }).toEqual({ n, writable: false });
+  for (const n of [".omo", ".cache", ".npm", ".lane-tmp", "work"]) expect({ n, writable: topLevel.includes(n) }).toEqual({ n, writable: true });
+  expect(writable.filter((r) => dirname(r.path) !== home).map((r) => r.path).sort()).toEqual([
+    "/tmp", ...(existsSync("/data") ? ["/data"] : []),
+    join(home, ".bun", "install", "cache"), join(home, ".cargo", "git"), join(home, ".cargo", "registry"),
+    join(home, ".dori", "heavy"), join(R, "briefs", "lane-a.out"), join(repos, "app", ".git"), runs, worktrees,
   ].sort());
-  // ...and none of it is a hidden path.
-  expect(table.filter((r) => r.mode === "rw" && verdict(r.path) !== "rw")).toEqual([]);
 });
 
 test("the gh login file is hidden under the kept gh config bind, and --explain says so; config.yml is not", async () => {
@@ -938,7 +994,7 @@ test("the gh login file is hidden under the kept gh config bind, and --explain s
   const env = { DORI_LANE_KEY: "lane-a" };
 
   const argv = await sandboxArgv(home, env);
-  const over = (p: string) => argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === "/dev/null" && argv[i + 2] === p);
+  const over = (p: string) => hiddenFile(argv, p);
   expect(over(join(gh, "hosts.yml"))).toBeGreaterThan(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === gh));
   expect(over(join(gh, "hosts.yml"))).toBeGreaterThan(lastReadWrite(argv, home));
   expect(argv).not.toContain(join(gh, "config.yml"));
@@ -965,7 +1021,7 @@ test("macOS: --explain lists every path the profile names, each with the access 
   const rows = explainRows(explained.out).map((l) => ({ mode: l.slice(0, l.indexOf(" ")), path: l.slice(l.indexOf(" ") + 1) }));
 
   // Every path parameter the profile's file rules use is a row (sockets, /dev and the keychain's temp copies are not paths).
-  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|O|CRED|HIDE)\d+$|^(DORI_RUNNER|DORI_SECRETS|CONFIG|CONFIG_GH|CONFIG_GIT|HOOKS|KEYCHAIN|SSH|SSH_CONFIG|SSH_KNOWN_HOSTS)$/.test(k)).map(([, v]) => v);
+  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|O|U|CRED|HIDE)\d+$|^(HOME_DIR|HOMEBREW|DORI_RUNNER|DORI_SECRETS|REVIEW_INPUTS|HOOKS|KEYCHAIN|SSH|SSH_CONFIG|SSH_KNOWN_HOSTS)$/.test(k)).map(([, v]) => v);
   // A glob's parameter is its regex, which the row's pattern (as listed) matches.
   expect(named.filter((p) => !rows.some((r) => r.path === p || (p.startsWith("^") && new RegExp(p).test(r.path))))).toEqual([]);
   expect(sb.params.REPOS_GIT).toBeDefined();
@@ -979,7 +1035,8 @@ test("macOS: --explain lists every path the profile names, each with the access 
     const at = row.path.replace(/\*/g, "app");
     // ~/.dori/runner itself may be listed (omo resolves a cwd-less lane's parents); the keychain and the readable ssh
     // files are single files.
-    const probes = row.path === sb.params.DORI_RUNNER ? [join(at, "x")] : row.path === kc || row.path.startsWith(`${sb.params.SSH}/`) ? [at] : [at, join(at, "x")];
+    // The home itself is refused for writes (its entries are not): only what is below it is probed.
+    const probes = row.path === sb.params.DORI_RUNNER || row.path === sb.params.HOME_DIR ? [join(at, "x")] : row.path === kc || row.path.startsWith(`${sb.params.SSH}/`) ? [at] : [at, join(at, "x")];
     for (const p of probes) {
       const mode = verdict(p);
       const got = { p, read: allows(sb, "file-read-data", p), write: allows(sb, "file-write-data", p) };

@@ -41,9 +41,22 @@ test("another pane, another herdr method, resume_argv, unknown fields and malfor
   };
   expect(refused(report({ pane_id: "w1:p1" }))).toBe("forbidden");
   expect(checkHerdrReport(report({}), undefined)).toMatchObject({ ok: false, code: "forbidden" });
-  for (const method of ["pane.send_input", "pane.close", "workspace.list", "server.stop", "pane.report_metadata", "pane.report_agent_session"]) {
+  for (const method of ["workspace.list", "server.stop", "layout.apply", "agent.list"]) {
     expect({ method, verdict: refused(report({}, method)) }).toEqual({ method, verdict: "forbidden" });
   }
+  // The own pane is never closed, written to or split into by id; a pane the lane did not create is not either.
+  const call = (method: string, params: Record<string, unknown>) => refused(JSON.stringify({ id: "q", method, params }));
+  const extra: Record<string, Record<string, unknown>> = { "pane.rename": { label: "l" }, "pane.send_input": { text: "x" }, "pane.send_text": { text: "x" } };
+  for (const method of ["pane.close", "pane.rename", "pane.zoom", "pane.send_input", "pane.send_text"]) {
+    for (const pane_id of ["w1:p2", "w1:p9"]) expect({ method, pane_id, verdict: call(method, { pane_id, ...extra[method] }) }).toEqual({ method, pane_id, verdict: "forbidden" });
+  }
+  expect(call("pane.split", { target_pane_id: "w1:p9", direction: "right" })).toBe("forbidden");
+  expect(call("pane.split", { target_pane_id: "w1:p2", direction: "right", env: { A: "1" } })).toBe("invalid_request");
+  expect(call("pane.split", { target_pane_id: "w1:p2", direction: "right", command: "sh" })).toBe("invalid_request");
+  expect(call("pane.split", { target_pane_id: "w1:p2", direction: "right", ratio: 0.65, cwd: "/wt", focus: false, right_click: "herdr" })).toBe("forwarded");
+  expect(call("pane.report_agent_session", { pane_id: "w1:p2", source: "s", agent: "a", resume_argv: ["sh"] })).toBe("forbidden");
+  expect(call("pane.report_metadata", { pane_id: "w1:p1", source: "s", agent: "a", title: "t" })).toBe("forbidden");
+  expect(refused(JSON.stringify({ id: "p", method: "ping", params: { x: 1 } }))).toBe("invalid_request");
   expect(refused(report({ resume_argv: ["sh", "-c", "touch /tmp/x"] }))).toBe("forbidden");
   expect(refused(report({ state: "idle" }, "pane.release_agent"))).toBe("invalid_request");
   expect(refused(report({ cwd: "/" }))).toBe("invalid_request");
@@ -55,6 +68,29 @@ test("another pane, another herdr method, resume_argv, unknown fields and malfor
   expect(refused(JSON.stringify({ method: "pane.report_agent", params: { pane_id: "w1:p2", source: "s", agent: "a", state: "idle" } }))).toBe("invalid_request");
   expect(refused("not json")).toBe("invalid_request");
   expect(refused("[]")).toBe("invalid_request");
+});
+
+test("ping, own-pane session and metadata reports, and reads are forwarded; lane panes are tracked by the caller's map", () => {
+  const ok = (line: string, panes?: ReadonlyMap<string, boolean>) => checkHerdrReport(line, "w1:p2", panes).ok;
+  expect(ok(JSON.stringify({ id: "p", method: "ping", params: {} }))).toBe(true);
+  expect(ok(JSON.stringify({ id: "p", method: "ping" }))).toBe(true);
+  const own = { pane_id: "w1:p2", source: "custom:omo", agent: "omo", seq: 1 };
+  const send = (method: string, params: Record<string, unknown>) => JSON.stringify({ id: "m", method, params: { ...own, ...params } });
+  expect(ok(send("pane.report_agent_session", { agent_session_id: "s1", agent_session_path: "/s.jsonl" }))).toBe(true);
+  expect(ok(send("pane.report_metadata", { title: "t", ttl_ms: 5 }))).toBe(true);
+  expect(ok(send("pane.report_metadata", { pane_id: "w1:p5", title: "t" }))).toBe(false);
+  expect(ok(send("pane.report_metadata", { pane_id: "w1:p5", title: "t" }), new Map([["w1:p5", false]]))).toBe(true);
+  expect(ok(JSON.stringify({ id: "g", method: "pane.get", params: { pane_id: "w1:p5" } }))).toBe(true);
+  expect(ok(JSON.stringify({ id: "l", method: "pane.list", params: {} }))).toBe(true);
+  const lane = new Map([["w1:p5", false]]);
+  const input = JSON.stringify({ id: "i", method: "pane.send_input", params: { pane_id: "w1:p5", text: "node v.mjs", keys: ["Enter"] } });
+  expect(ok(input)).toBe(false);
+  expect(ok(input, lane)).toBe(true);
+  expect(ok(JSON.stringify({ id: "i", method: "pane.send_input", params: { pane_id: "w1:p5", text: "x", keys: ["Ctrl-C"] } }), lane)).toBe(false);
+  expect(ok(input, new Map([["w1:p5", true]]))).toBe(false);
+  const text = JSON.stringify({ id: "t", method: "pane.send_text", params: { pane_id: "w1:p5", text: "y" } });
+  expect(ok(text, lane)).toBe(false);
+  expect(ok(text, new Map([["w1:p5", true]]))).toBe(true);
 });
 
 test("herdr's control socket is found the way its CLI finds it", () => {

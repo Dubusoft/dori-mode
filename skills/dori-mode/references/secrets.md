@@ -46,7 +46,7 @@ A lane may receive a name when any of these holds:
 
 - its key equals an entry in `lanes`;
 - an entry ends in `*` and the key starts with the part before it (`pub-*` matches `pub-docs`);
-- `repos` lists the lane's repo. That's the `owner/repo` of the `origin` remote of the lane's worktree, compared case-insensitively. The lane can rewrite its own `origin` (`git remote set-url`), so a repo entry is weaker than a lane entry: use `lanes` for anything a lane of another repo must not get.
+- `repos` lists the lane's repo, or holds `"*"`, which matches every lane that has a repo. A repo is the `owner/repo` of the `origin` remote of the lane's worktree, compared case-insensitively. The lane can rewrite its own `origin` (`git remote set-url`), so a repo entry is weaker than a lane entry: use `lanes` for anything a lane of another repo must not get.
 
 A rule may also carry `as` (`"env"`, the default; `"ssh-key"`, see [Deploy keys](#deploy-keys); or `"file"`, see [Credential files](#credential-files)), `mint` (see [Minted GitHub tokens](#minted-github-tokens)) or `put` (see [Lane-made secrets](#lane-made-secrets)). `mint` goes with neither a file `as` nor `put`.
 
@@ -54,19 +54,21 @@ A request names one or more secrets, and it's all or nothing: if any one name is
 
 ## Asking the lead
 
-Credentials are granted by the lead; the owner is not asked. When `secrets` denies a lane some names, the host that decided (the local runner, or the supervisor for a remote runner) first checks that the store holds each of them: a name it does not hold (and no `mint` rule covers) is refused with `RUNNER_SECRET_MISSING` and queues nothing, since a grant could not be used anyway; the lane reports it to the lead as blocked and the lead adds it with `dori secret add`. Otherwise it queues a secret request in `<stateDir>/decisions.json`, and the supervisor's decision tick records it as one lead-only decision: nothing is posted to Discord, and the lead is woken by the urgent `SECRET_REQUEST <lane> <id> names=<names> [repo=<owner/repo>]: ...` event, a decision obligation. It offers three options:
+Credentials are granted by the lead; the owner is not asked. When `secrets` denies a lane some names, the host that decided (the local runner, or the supervisor for a remote runner) first checks that the store holds each of them: a name it does not hold (and no `mint` rule covers) is refused with `RUNNER_SECRET_MISSING` and queues nothing, since a grant could not be used anyway; the lane reports it to the lead as blocked and the lead adds it with `dori secret add`. Otherwise it queues a secret request in `<stateDir>/decisions.json`, and the supervisor's decision tick records it as one lead-only decision: nothing is posted to Discord, and the lead is woken by the urgent `SECRET_REQUEST <lane> <id> names=<names> [repo=<owner/repo>]: ...` event, a decision obligation. It offers these options:
 
 1. allow this lane only (adds the lane key to the name's `lanes`);
 2. keep allowing lanes of this repo (adds the lane's `owner/repo` to `repos`; offered only when the lane has a repo);
-3. deny.
+3. keep allowing every lane that has a repo (adds `"*"` to `repos`; offered only when the lane has a repo);
+4. deny (3 when the lane has no repo, since the repo options are left out).
 
-The lead runs `dori decision close <id> --choice N --text "..."`, which also resolves the `SECRET_REQUEST` event. For options 1 and 2 the close writes the rule into the config file first (a new rule is created when the name has none, other keys are kept, the file stays mode 0600) and prints `DECISION_SECRET_GRANTED <id> <names> lane=<key>|repo=<owner/repo> changed=<names>`. Because config is read per request, the lane's next `dori secret exec` succeeds. If the write fails, `DECISION_GRANT_FAILED` is printed and the decision stays open. A deny writes nothing, and the lane stays refused.
+The lead runs `dori decision close <id> --choice N --text "..."`, which also resolves the `SECRET_REQUEST` event. For a grant option the close writes the rule into the config file first (a new rule is created when the name has none, other keys are kept, the file stays mode 0600) and prints `DECISION_SECRET_GRANTED <id> <names> lane=<key>|repo=<owner/repo> changed=<names>`. Because config is read per request, the lane's next `dori secret exec` succeeds. If the write fails, `DECISION_GRANT_FAILED` is printed and the decision stays open. A deny writes nothing, and the lane stays refused.
 
 The refusal's detail tells the lane what happened. A lane opens at most one request per set of names:
 
 - A repeat request for names a pending request or a decision of that lane (in any state, a denied one included) already covers opens nothing, and the detail names the decision.
 - After `SECRET_REQUESTS_PER_LANE` (3) secret requests, the lane opens no more and is told to report the refusal to the lead as blocked.
 - Names listed in any `secretCommands` op are never offered, because production deploy credentials go only through `dori secret run`.
+- The host counts refusals of the same names with the same code for each lane while it runs. From the fourth one on, the detail ends with `refused <n> times: stop retrying this command and report it to the lead as blocked`, no request is queued, and the audit log records only the fourth (marked `(repeats not logged)`) and then every 100th. A grant of those names to that lane resets the count. A lane runs a refused command again only once the lead says it was granted.
 
 Other lanes are not affected.
 
@@ -81,7 +83,7 @@ The lane CLI sends the names to the runner over the lane socket with the lane's 
 
 A lane should pass the variable to the tool that needs it, not echo it, write it to a file or put it in a report. Keep the value itself off command lines too (for example `test "$NAME" = <value>`): argv shows in `ps`, shell history and the pane.
 
-Every lane footer `dori launch` writes says this: credentials come only through `secret exec` and `secret run` (the runner's `~/.dori/runner/bin/dori` on a remote lane), production deploys only through `secret run`, the lane never reads or copies credential files or CLI logins (gh's `~/.config/gh/hosts.yml` is hidden from lanes; GitHub access goes through `secret exec GH_TOKEN`, see [GitHub access in lanes](#github-access-in-lanes)), and a refusal is reported as `blocked` with the name or op so the lead can add the secret or its rule.
+Every lane footer `dori launch` writes says this: credentials come only through `secret exec` and `secret run` (the runner's `~/.dori/runner/bin/dori` on a remote lane), production deploys only through `secret run`, the lane never reads or copies credential files or CLI logins (gh's `~/.config/gh/hosts.yml` is hidden from lanes, though the rest of `~/.config` is readable; GitHub access goes through `secret exec GH_TOKEN`, see [GitHub access in lanes](#github-access-in-lanes)), and a refusal is reported as `blocked` with the name or op so the lead can add the secret or its rule.
 
 An `ssh-key` or `file` secret arrives as a file path instead of the value (see [Deploy keys](#deploy-keys) and [Credential files](#credential-files)). A minted name looks like any other env secret to the lane.
 
@@ -97,7 +99,7 @@ See [Proxy execution](#proxy-execution). The lane gets the command's output and 
 
 ## GitHub access in lanes
 
-A lane cannot read `~/.config/gh/hosts.yml`: the lane sandbox hides it, and the rest of `~/.config/gh` (`config.yml`) stays readable. A lane gets a GitHub token only through the broker, under the name `GH_TOKEN`, which both `gh` and gh's git credential helper (`gh auth git-credential`) read from the environment. Configure it one of two ways:
+A lane cannot read `~/.config/gh/hosts.yml`: on Linux the lane sandbox replaces it with an empty file, and on macOS, where it can only be refused, the wrapper sets `GH_CONFIG_DIR` (when unset) to a directory in the lane's temp dir holding a copy of `config.yml`. Either way `gh` starts, logged out, and the rest of gh's config stays readable. A lane gets a GitHub token only through the broker, under the name `GH_TOKEN`, which both `gh` and gh's git credential helper (`gh auth git-credential`) read from the environment. Configure it one of two ways:
 
 - A stored token: `dori secret add GH_TOKEN`, plus a `secrets.GH_TOKEN` rule whose `lanes` or `repos` allow the lane (see [Allowlist](#allowlist)).
 - A GitHub App mint rule on `secrets.GH_TOKEN`, see [Minted GitHub tokens](#minted-github-tokens).
@@ -278,14 +280,16 @@ Stored values are registered with dori's output masking, so a value that turns u
 
 ## Lane sandbox hiding
 
-A lane reads `$HOME` and `~/.dori` but writes neither (beyond the writable paths its footer lists), so both lane sandbox scripts hide what no lane may read, with no file or setting needed:
+The lane sandbox is shallow on purpose. It blocks credentials, and the paths a lane could use to break the host or run code outside the sandbox, and leaves everything else readable and writable. Both lane sandbox scripts hide what no lane may read, with no file or setting needed:
 
 - `~/.dori/runner`, except the lane's own entries (its brief, files, out dir and token, the lane socket and the runner's `bin`): other lanes' briefs and bearer tokens and the control sockets stay out of reach.
-- `~/.dori/env`, `~/.dori/secrets`, `~/.dori/state`, `~/.dori/lane-sandbox-hide` and `~/.dori/gateway-locks`.
-- `~/.ssh` but `known_hosts` and `config` (macOS also leaves `*.pub` readable), and `~/.config` but `git`, gh's config and the ssh agent socket.
-- One shared credential list: cloud, kube, gpg, keyring, docker, git and registry logins, gh's `hosts.yml` and `~/.npmrc`, browser and chat app profiles and shell history. `CREDENTIAL_DENY` in `scripts/src/lane-sandbox-install.ts` defines it, renders it into both templates, and `dori doctor` checks the same entries.
+- `~/.dori/env`, `~/.dori/secrets`, `~/.dori/state` (but `review-inputs`, which stays readable), `~/.dori/lane-sandbox-hide` and `~/.dori/gateway-locks`.
+- `~/.ssh` but `known_hosts` and `config` (macOS also leaves `*.pub` readable), and `~/.config/herdr` but the ssh agent socket. The rest of `~/.config` is readable.
+- One shared credential list: cloud (Cloudflare and `~/.cloudflared` included), kube, gpg, keyring, docker, git and registry logins, gh's `hosts.yml` and `~/.npmrc`, browser and chat app profiles and shell history. macOS also refuses the Chrome `Cookies` and `Login Data` files and `~/Library/Cookies`, through a separate list in its template, because those paths hold spaces. `CREDENTIAL_DENY` in `scripts/src/lane-sandbox-install.ts` defines it, renders it into both templates, and `dori doctor` checks the same entries.
 
-On Linux `$HOME` and `~/.dori` are read-only binds and each hidden path is covered by an empty read-only tmpfs or `/dev/null`, mounted after every read-write bind and grant so neither the cwd nor a grant re-exposes it. On macOS Seatbelt can only refuse access, and the names still show in a directory listing. The profile refuses reads of each hidden path (EPERM) in rules placed after its read grants, so a read grant never re-opens one. Writes are refused only by the profile's default write deny, so a write grant or a cwd that covers a hidden path makes it writable again (it stays unreadable). Only the `~/.dori/lane-sandbox-hide` entries and `~/.dori/secrets` are refused for writes too in rules placed after every grant. Docker sockets and, on Linux, the user bus and systemd's runtime dir are hidden as well. `lane-sandbox --explain` prints the exact table for a lane in the current directory.
+What a lane can write: on Linux `$HOME` itself stays a read-only bind, so a lane can't create a new top-level file there, and a missing shell startup file can't be planted. Every existing top-level entry of `$HOME` is bound read-write, except the shell startup files, `~/.ssh` and `~/.dori`, and `/data` is read-write too. `~/.local/bin`, `~/.bun/bin`, `~/.cargo/bin`, `~/.config/git`, `~/.config/gh`, `~/.config/systemd`, `~/.config/autostart` and `~/.config/environment.d` are created on the host when missing and then bound read-only, as are the existing startup files, `~/.gitconfig` and `~/.dori`, because the host runs them outside the sandbox; the lane's own writable paths (its cwd, worktrees, caches, `~/.dori/heavy`) are bound after them. On macOS writes are allowed under `$HOME` and `/opt/homebrew`, then refused again for `~/.dori` (but `~/.dori/heavy` and the lane's out file), `~/.ssh`, `~/Library/LaunchAgents`, `~/Library/Keychains` (but the login keychain), the same startup files and bin dirs, `~/.gitconfig`, `~/.config/git`, `~/.config/gh` and `~/.config/herdr`. Repo `.git/hooks` stay read-only on both.
+
+On Linux each hidden path is covered by an empty read-only tmpfs, or an empty read-only file for a file (it reads as empty rather than failing), mounted after every read-write bind and grant so neither the cwd nor a grant re-exposes it. On macOS Seatbelt can only refuse access, and the names still show in a directory listing. The profile refuses reads of each hidden path (EPERM) in rules placed after its read grants, so a read grant never re-opens one. A write grant or a cwd that covers a hidden path can make it writable again (it stays unreadable). Only the `~/.dori/lane-sandbox-hide` entries and `~/.dori/secrets` are refused for writes too in rules placed after every grant. Docker sockets and, on Linux, the user bus and systemd's runtime dir are hidden as well. `lane-sandbox --explain` prints the exact table for a lane in the current directory.
 
 `~/.dori/lane-sandbox-hide` is an optional per-machine list of other host paths to hide, such as a backup directory or an entry under `~/.dori` like `~/.dori/research/<key>/secret.txt`: one host path per line, `#` starts a comment. A line may be a glob (`*` and `?` within one path component, `[...]` a class), such as `~/keys/*.pem` written as an absolute path: Linux hides each existing match when the lane starts, dotfiles included, and macOS refuses every path it matches, including ones created later. `lane-sandbox --explain` lists each hidden path (on macOS, the glob). Don't list the paths above there; they're already covered.
 

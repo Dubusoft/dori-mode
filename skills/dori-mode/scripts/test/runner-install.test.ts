@@ -373,7 +373,7 @@ test("on Darwin the script installs the seatbelt lane-sandbox and a starter poli
   });
   expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ sandbox: "required", sandboxCheck: [wrapperPath, "--check"] });
   expect(readFileSync(wrapperPath, "utf8")).toBe(readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"));
-  expect(readFileSync(wrapperPath, "utf8")).toContain('r "$H/.dori/runner/briefs/$key.files"');
+  expect(readFileSync(wrapperPath, "utf8")).toContain('o "$H/.dori/runner/briefs/$key.files"');
   expect(readFileSync(wrapperPath, "utf8")).toContain('w "$H/.dori/runner/briefs/$key.out"');
   expect(readFileSync(wrapperPath, "utf8")).toContain('echo "DORI_LANE_FILES=1"');
   expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);

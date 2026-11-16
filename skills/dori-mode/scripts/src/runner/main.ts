@@ -207,7 +207,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A sandboxed lane reports its agent state to herdr through a socket of its own (herdr-report.ts); Windows has no lane sandbox.
     let lanesForReports: RunnerLanes | undefined;
     const herdrReports = process.platform === "win32" ? undefined
-      : new HerdrReportSockets({ runnerDir, log, paneOf: (key) => lanesForReports?.records()[key]?.pane });
+      : new HerdrReportSockets({ runnerDir, log, laneOf: (key) => lanesForReports?.records()[key] });
     const browserCheck = browserWindowCheck(platform.os, { run, clock: realClock, log });
     const runnerLanes = new RunnerLanes({
       runnerDir, run, clock: realClock, policy, publish, remote,
@@ -403,6 +403,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
           runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
           // A config denial asks the owner: queued in this host's decisions.json, opened by the supervisor's decision tick.
           request: secretRequester(cfg.stateDir, async () => (await loadConfig()).secretCommands, realClock.now),
+          // Lives as long as this runner: a lane retrying a refused command is told to stop from the 4th refusal on.
+          refusals: new Map(),
         }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.

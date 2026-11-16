@@ -171,7 +171,7 @@ describe("supervisorSecretHandler", () => {
     const { handler, logs } = harness();
     const ctx = context(supervisor);
     await handler(LABEL, getFrame("lane-a", ["API_TOKEN", "REPO_TOKEN"]), ctx);
-    expect(refusal(ctx)).toEqual({ rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: `lane-a may not receive REPO_TOKEN (config secrets); the lead is asked to grant it; run the command again after the lead says it was granted` });
+    expect(refusal(ctx)).toEqual({ rid: RID, ok: false, code: "RUNNER_SECRET_DENIED", detail: `lane-a may not receive REPO_TOKEN (config secrets); the lead is asked to grant it; run the command again only once the lead says it was granted, never in a loop` });
     expect(readDecisions(tmp.dir).secretRequests).toEqual([{ lane: "lane-a", names: ["REPO_TOKEN"], at: clock.now() }]);
     expect(logs).toEqual([`RUNNER_SECRET_DENIED runner=${LABEL} lane=lane-a names=API_TOKEN,REPO_TOKEN`]);
     expect(JSON.parse(readFileSync(secretAuditPath(tmp.dir), "utf8"))).toMatchObject({ allowed: false, reason: "not allowed: REPO_TOKEN" });

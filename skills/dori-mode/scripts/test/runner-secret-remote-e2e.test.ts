@@ -151,7 +151,7 @@ describe("remote secrets end to end", () => {
     const marker = join(tmp.dir, "ran");
     const run = await s.lane("lane-a", TOKENS["lane-a"] as string, ["OTHER_TOKEN", "--", "sh", "-c", 'touch "$MARKER"'], { MARKER: marker });
     expect(run.code).toBe(1);
-    expect(run.err).toEqual(["RUNNER_SECRET_DENIED lane-a may not receive OTHER_TOKEN (config secrets); the lead is asked to grant it; run the command again after the lead says it was granted"]);
+    expect(run.err).toEqual(["RUNNER_SECRET_DENIED lane-a may not receive OTHER_TOKEN (config secrets); the lead is asked to grant it; run the command again only once the lead says it was granted, never in a loop"]);
     expect(existsSync(marker)).toBe(false);
     expect(secretFrames(s.wire, "secret.value")[0]?.body).toMatchObject({ ok: false, code: "RUNNER_SECRET_DENIED" });
     expect(s.logs).toContain("RUNNER_SECRET_DENIED lane=lane-a names=OTHER_TOKEN code=RUNNER_SECRET_DENIED");
