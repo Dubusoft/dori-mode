@@ -323,7 +323,8 @@ export const decisionDeliveryTick = async (deps: TickDeps, store: LaneMessageSto
     if (r.delivery.state !== "acked" || r.choice === undefined) continue;
     await deps.enqueue(`decision-acked:${d.id}:r${r.rev}`, ackedLine(d, r));
     try {
-      await closeOwnerDecision(deps, d.id, { text: `레인 ${r.target.lane}이 ${r.choice}번을 받았습니다`, choice: r.choice, force: true });
+      const received = `레인 ${r.target.lane}이 ${r.choice}번을 받았습니다`;
+      await closeOwnerDecision(deps, d.id, { text: received, ownerText: received, choice: r.choice, force: true });
       log(`DECISION_CLOSED_ON_ACK ${d.id} r${r.rev} ${r.delivery.id}`);
     } catch (e) {
       if (!(e instanceof OwnerDecisionError && e.code === "DECISION_ALREADY_CLOSED")) log(`DECISION_CLOSE_ON_ACK_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`);
