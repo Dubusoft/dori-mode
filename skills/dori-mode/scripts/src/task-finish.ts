@@ -20,8 +20,9 @@ export type LaneMerge = { readonly repo: string; readonly number: number; readon
 
 /**
  * What a close says about its task, as `toodo=<tag>` on the close line: `done` (completed and read back; the report was
- * appended, or there was nothing it could be appended to without a new post), `append-failed` (completed, the append
- * failed), `failed` (not completed), `unmerged` (no merge read back, so not completed), `no-task`.
+ * appended, or there was nothing it could be appended to without a new post; or, with no merge read back, the task
+ * already reads done and completed), `append-failed` (completed, the append failed), `failed` (not completed),
+ * `unmerged` (no merge read back and the task not read done, so not completed), `no-task`.
  */
 export type TaskFinishTag = "done" | "append-failed" | "failed" | "unmerged" | "no-task";
 export type TaskFinish = { readonly tag: TaskFinishTag; readonly lines: readonly string[] };
@@ -35,7 +36,10 @@ export type TaskFinisherDeps = {
   readonly append: (lane: Lane, text: string) => Promise<AppendOutcome>;
 };
 
-export type TaskFinisher = (lane: Lane, task: number, merges: readonly LaneMerge[]) => Promise<TaskFinish>;
+/** The merges of a closed lane (done-flow.ts laneMerges), or why none was read back. */
+export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly why: string };
+
+export type TaskFinisher = (lane: Lane, task: number, read: LaneMergeRead) => Promise<TaskFinish>;
 
 const flat = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim().slice(0, max);
 const errorText = (e: unknown): string => flat(e instanceof Error ? e.message : String(e));
@@ -76,7 +80,25 @@ export const blockedOutcome = (line: string, said: string): string =>
 export const notCompletedLine = (lane: Lane, task: number, why: string): string =>
   `TOODO_TASK_NOT_COMPLETED ${lane.key} #${task} ${flat(why)}; finish it yourself (complete_task with the PR and its merge SHA, then dori reported ${lane.key} --append)`;
 
-export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lane, task, merges) => {
+/**
+ * A close with no merge read back (no PR of the lane, or one not read merged) completes nothing. Its task is read first:
+ * one the lead already finished (done, completed) needs no follow-up, so the close says `toodo=done` with no line;
+ * otherwise, or when the read fails, the lead is told to finish it.
+ */
+const unmergedFinish = async (writer: Pick<ToodoWriter, "read">, lane: Lane, task: number, why: string): Promise<TaskFinish> => {
+  let unread = "";
+  try {
+    const record = await writer.read(task);
+    if (record.status === "done" && record.resolution === "completed") return { tag: "done", lines: [] };
+  } catch (e) {
+    unread = `; the task could not be read: ${errorText(e)}`;
+  }
+  return { tag: "unmerged", lines: [notCompletedLine(lane, task, `no merge read back: ${why}${unread}`)] };
+};
+
+export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lane, task, read) => {
+  if ("why" in read) return unmergedFinish(deps.writer, lane, task, read.why);
+  const { merges } = read;
   const merged = merges.map((m) => `${m.url} merged into ${m.base} as ${m.sha}`).join("; ");
   try {
     const record = await deps.writer.read(task);
