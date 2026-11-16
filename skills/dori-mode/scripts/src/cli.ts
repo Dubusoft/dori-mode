@@ -14,7 +14,7 @@ import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./do
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick } from "./host-guard.ts";
-import { type GuardMachine, listGuardMachines, machineKind, type MachineKind, removeGuardAgents } from "./remote-guard.ts";
+import { type GuardMachine, listGuardMachines, machineKind, type MachineKind } from "./remote-guard.ts";
 import type { Json, KeyPrompter } from "./config-keys.ts";
 import { adoptLane, attachLaneFiles, type LaunchInput, launchNextLine, LaunchError, parseLaneTask, validateLaunch } from "./launch.ts";
 import { admitLaunch, placeLaunch, placementReports } from "./launch-service.ts";
@@ -234,10 +234,6 @@ const USAGE = `dori <command> [options]
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always);
                                        also runs dori setup --migrate, and runner setup --new for every runner (RUNNER_POLICY_MISSING);
                                        ends with UPDATE_SUMMARY (changed, failed); exit 2 when a step failed (migrate degraded)
-  store import                         with the supervisor stopped: move supervisor.json into supervisor.sqlite (verified field by field);
-                                       the store follows the files in the state dir
-  store export                         with the supervisor stopped: write supervisor.json, lead-events.log and github-events.json back
-                                       from supervisor.sqlite (rollback); the store follows the files in the state dir
   wait <key> --until SIGNAL --note TEXT [--thread REF] [--every SEC] [--timeout MIN] [--on-success wake|digest|silent] [--machine M --cwd DIR]
   wait --list | --cancel <key>          durable supervisor-owned follow-ups
   emit <KIND> --text T [--id ID]       journal one event (dedupe by --id); its class comes from eventPolicy
@@ -374,8 +370,14 @@ if (process.argv[2] === "status") {
   const { collectStatus, statusPage } = await import("./status.ts");
   const cfg = await loadConfig();
   setDefaultRunTimeout(cfg.runTimeoutMs);
-  const status = await collectStatus({ run, clock: realClock, config: cfg, tunables: BUILT_IN, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
-  console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
+  try {
+    const status = await collectStatus({ run, clock: realClock, config: cfg, tunables: BUILT_IN, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
+    console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
+  } catch (e) {
+    // A state dir whose json store did not convert has no database to read (STORE_CONVERT_FAILED was printed above).
+    if (e instanceof StoreError) die(e.message);
+    throw e;
+  }
   process.exit(0);
 }
 
@@ -425,7 +427,6 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
   const rows = readRunnerRows(cfg.stateDir);
   const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
   const machines = await listGuardMachines(run, cfg.guardMachines, cfg.stateDir);
-  try { await removeGuardAgents(run, machines, (line) => console.log(line)); } catch (e) { console.log(`WARN guard agents: ${e instanceof Error ? e.message : String(e)}`); }
   let bundle: string | undefined;
   const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
   const before = new Map(rows.map((r) => [r.label, r.maxGen]));
@@ -866,22 +867,6 @@ try {
       if (key && !(await deps.registry.read(key))) die(`no registered lane "${key}"`);
       await needSupervisor();
       for (const line of await recoverLanes(deps, key)) console.log(line);
-      break;
-    }
-    case "store": {
-      const [action, ...extra] = flags.positionals;
-      if (extra.length || Object.keys(flags.values).length || (action !== "import" && action !== "export")) die("usage: dori store import|export");
-      if (action === "export") {
-        const { exportStore } = await import("./store-export.ts");
-        const report = exportStore(config.stateDir, realClock.now());
-        console.log(JSON.stringify(report, null, 2));
-        console.log(`STORE_EXPORTED ${config.stateDir}; the supervisor now uses the json store`);
-        break;
-      }
-      const { importStore } = await import("./store-import.ts");
-      const report = importStore(config.stateDir, realClock.now());
-      console.log(JSON.stringify(report, null, 2));
-      console.log(`STORE_IMPORTED ${report.database}; the supervisor now uses the sqlite store`);
       break;
     }
     case "lead-restart": {

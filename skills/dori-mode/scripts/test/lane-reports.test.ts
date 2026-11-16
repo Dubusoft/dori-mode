@@ -4,12 +4,12 @@ import { Database } from "bun:sqlite";
 
 import { loadConfig } from "../src/config.ts";
 import { DEFAULT_EVENT_POLICY, eventClass } from "../src/event-policy.ts";
-import { JsonLaneReports, type LaneReportStore, putReportRows, readReportRows, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { type LaneReportStore, putReportRows, readReportRows, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
 import { footer, launchLane } from "../src/launch.ts";
 import { watchTick } from "../src/done-flow.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, storePath } from "./fakes.ts";
 import { fakeLaneSocket } from "./fake-lane-socket.ts";
 import { BUILT_IN } from "../src/tunables.ts";
 import { openedLine, type OpenResult, type OwnerDecision } from "../src/owner-decisions.ts";
@@ -28,9 +28,8 @@ const stateDir = (): string => {
   return state.dir;
 };
 
-/** Both stores, whichever store the suite runs on: rows must behave the same on each. */
+/** The store rows live in. */
 const STORES: readonly (readonly [string, (dir: string) => LaneReportStore])[] = [
-  ["json", (dir) => new JsonLaneReports(dir)],
   ["sqlite", (dir) => {
     new SqliteStore(join(dir, SQLITE_FILE), { create: true }).close();
     return new SqliteLaneReports(join(dir, SQLITE_FILE));
@@ -67,7 +66,7 @@ test.each(STORES)("%s store preserves receipts across reopen and SQLite export/i
   const fileReceipt = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: true }, revision: 3, sha256: "a".repeat(64) };
   const row = store.append({ lane: "lane-a", generation: 0, kind: "done", text: "done", at: T0, fileReceipt });
   store.close();
-  const reopened = _name === "json" ? new JsonLaneReports(dir) : new SqliteLaneReports(join(dir, SQLITE_FILE));
+  const reopened = new SqliteLaneReports(join(dir, SQLITE_FILE));
   cleanups.push(() => reopened.close());
   expect(reopened.pending()[0]).toEqual(row);
   expect(Object.keys(row.fileReceipt!)).toEqual(["run", "revision", "sha256"]);
@@ -97,7 +96,7 @@ test("managed done rows without receipts are refused once with the leaf line, ne
   const dir = stateDir(), world = newWorld(), deps = depsFor(world, fakeClock(T0), dir);
   const managed = lane(dir, { fileRun: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false } });
   await deps.registry.write(managed);
-  const store = new JsonLaneReports(dir); cleanups.push(() => store.close());
+  const store = new SqliteLaneReports(storePath(dir)); cleanups.push(() => store.close());
   const row = store.append({ lane: managed.key, generation: 0, kind: "done", text: "missing", at: T0 });
   const journal: [string, string][] = [];
   const enqueue = (id: string, line: string) => { journal.push([id, line]); };
@@ -113,7 +112,7 @@ test("a done row for an older lane run is routed late under lane-report-late and
   const dir = stateDir(), world = newWorld(), deps = depsFor(world, fakeClock(T0), dir);
   const managed = lane(dir, { fileRun: { id: "00000000-0000-4000-8000-000000000002", requiredReport: false } });
   await deps.registry.write(managed);
-  const store = new JsonLaneReports(dir); cleanups.push(() => store.close());
+  const store = new SqliteLaneReports(storePath(dir)); cleanups.push(() => store.close());
   const fileReceipt = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, revision: 1, sha256: "a".repeat(64) };
   const row = store.append({ lane: managed.key, generation: 0, kind: "done", text: "old run", at: T0, fileReceipt });
   const journal: [string, string][] = [];
@@ -164,7 +163,7 @@ test("routing: progress posts to the lane's thread, done is the lane's claim, a 
   const deps = { ...base, run: async (argv: readonly string[]) => { if (argv[0] === "notify") posts.push(argv); return base.run(argv); } };
   await deps.registry.write(lane(dir));
   await deps.registry.write(lane(dir, { key: "gone-lane", closedAt: new Date(T0).toISOString() }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "tests green in /home/test/repo", at: T0 });
   store.append({ lane: "gone-lane", generation: 0, kind: "question", text: "still there?", at: T0 });
   store.append({ lane: "local-lane", generation: 0, kind: "done", text: "merged", evidence: "merged acme/app#3 abc123", at: T0 + 1 });
@@ -197,7 +196,7 @@ test("routing: an unregistered lane's row is a late event too, and one throwing 
     return realRead(key);
   };
   const flaky = deps;
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "poison-lane", generation: 0, kind: "question", text: "first", at: T0 });
   store.append({ lane: "nobody", generation: 0, kind: "blocked", text: "never registered", at: T0 + 1 });
   store.append({ lane: "local-lane", generation: 0, kind: "question", text: "after the poison", at: T0 + 2 });
@@ -224,7 +223,7 @@ test("routing: progress with no thread hook, or a failing one, reaches the lead 
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir, { hooks: { threadReply: ["false-hook", "{text}"] } });
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   const journal: [string, string][] = [];
   await routeReports(deps, store, (id, line) => { journal.push([id, line]); });
@@ -274,7 +273,7 @@ test("dori report: a lane sends a report for its own key only, through its runne
   expect(badKind.err).toContain("usage: dori report <key> <progress|blocked|milestone|done>");
 
   expect(sock.requests).toHaveLength(1);
-  expect(new JsonLaneReports(dir).list()).toHaveLength(0);
+  expect(new SqliteLaneReports(storePath(dir)).list()).toHaveLength(0);
 });
 
 /** Launches a local lane through the fakes (herdr tab create answers with pane w:p9). */
@@ -319,11 +318,11 @@ test("a dori-report lane's row is routed and counts as hearing from it, and an o
   await deps.registry.write(lane(dir, { key: "remote-lane", pane: "w:p5", machine: "m1" }));
 
   // The lane's `dori report` arrives through its runner, and the hub appends it to the store (lanes-hub.ts).
-  expect(new JsonLaneReports(dir).append({ lane: "cli-lane", generation: 0, kind: "question", text: "which base?", at: T0 }).id).toBe("cli-lane:0:1");
+  expect(new SqliteLaneReports(storePath(dir)).append({ lane: "cli-lane", generation: 0, kind: "question", text: "which base?", at: T0 }).id).toBe("cli-lane:0:1");
 
   // The supervisor routes the row, and the question wakes the lead.
   const journal: [string, string][] = [];
-  expect(await routeReports(deps, new JsonLaneReports(dir), (id, line) => { journal.push([id, line]); })).toEqual(["LANE_REPORT_ROUTED cli-lane:0:1 question journal"]);
+  expect(await routeReports(deps, new SqliteLaneReports(storePath(dir)), (id, line) => { journal.push([id, line]); })).toEqual(["LANE_REPORT_ROUTED cli-lane:0:1 question journal"]);
   expect(journal).toEqual([["lane-report:cli-lane:0:1", "LANE_REPORT cli-lane question which base?"]]);
   expect(eventClass("LANE_REPORT cli-lane question which base?", deps.tunables.eventPolicy)).toBe("lead-urgent");
   // Being routed is being heard: freshness counts from it.
@@ -341,7 +340,7 @@ test("routing: journal and late events carry the lane's meta (lane, thread, cwd)
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { cwd: "/repo/work" }));
   await deps.registry.write(lane(dir, { key: "gone-lane", closedAt: new Date(T0).toISOString() }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: 0, kind: "question", text: "which base?", at: T0 });
   store.append({ lane: "gone-lane", generation: 0, kind: "question", text: "still there?", at: T0 });
   store.append({ lane: "nowhere", generation: 0, kind: "question", text: "anyone?", at: T0 });
@@ -358,7 +357,7 @@ test("routing: a question with choices opens an owner decision through the opene
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const choices = { question: "which base?", options: ["main", "develop"], recommend: 1, reason: "main is current", waiting: "the PR", blocking: true };
   const row = store.append({ lane: "local-lane", generation: 0, kind: "question", text: serializeDecisionText(choices), at: T0 });
   const asked: string[] = [];
@@ -379,7 +378,7 @@ test("routing: a nonblocking input request opens no owner decision and reaches t
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const text = serializeRequestText({ need: "check the upload on a real phone", reason: "the simulator has no camera", waiting: "merging the PR", blocking: false });
   const row = store.append({ lane: "local-lane", generation: 0, kind: "question", text, at: T0 });
   const asked: string[] = [];
@@ -397,7 +396,7 @@ test("routing: a free-text question the opener declines is journaled as a LANE_R
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const row = store.append({ lane: "local-lane", generation: 0, kind: "question", text: "which base?", at: T0 });
   const journal: [string, string][] = [];
   expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); }, "/home/test", null, async () => undefined)).toEqual([`LANE_REPORT_ROUTED ${row.id} question journal`]);

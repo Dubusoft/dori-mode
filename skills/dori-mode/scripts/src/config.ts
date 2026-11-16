@@ -8,7 +8,7 @@ import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed
 import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
 import { SECRET_NAME } from "./secret-name.ts";
-import { type StoreKind, storeOnDisk } from "./store.ts";
+import { jsonStorePending, SQLITE_FILE } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
 
@@ -200,8 +200,6 @@ export type DoriConfig = {
    * 60 is kept: a deferred lead still gets its events in place, and push-ladder and stuck restarts never wait for it.
    */
   readonly leadChildWaitMaxMin: number;
-  /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`); read from `stateDir` (storeOnDisk). */
-  readonly store: StoreKind;
   /** The only base branch the supervisor merges lane PRs into; `main` is refused whatever this says. */
   readonly ciMergeBase: string;
   /** Which machine a launch runs on. */
@@ -259,7 +257,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   runTimeoutMs: 60_000,
   leadStuckRestartMin: 30,
   leadChildWaitMaxMin: 60,
-  store: "json",
   ciMergeBase: "dev",
   displayTimeZone: DEFAULT_DISPLAY_TIME_ZONE,
   placement: { defaultMachine: "local", fallback: [] },
@@ -459,6 +456,23 @@ const warnOnce = (id: string, line: string): void => {
   console.error(line);
 };
 
+/**
+ * Converts a state dir still on the retired json store to supervisor.sqlite, once, before anything opens its store:
+ * every entry point (CLI and supervisor) loads its config first. A refusal, or an older supervisor still holding the lock,
+ * leaves the json files as they are with one STORE_CONVERT_FAILED line; the next load tries again, and the supervisor
+ * refuses to start on them (STORE_IMPORT_PENDING).
+ */
+const convertJsonState = async (stateDir: string): Promise<void> => {
+  if (!jsonStorePending(stateDir)) return;
+  const { convertJsonStore } = await import("./store-import.ts");
+  try {
+    if (convertJsonStore(stateDir, Date.now())) warnOnce("storeConverted", `STORE_CONVERTED ${stateDir}: the json store moved into ${SQLITE_FILE}`);
+  } catch (e) {
+    if (!(e instanceof Error)) throw e;
+    warnOnce("storeConvertFailed", `STORE_CONVERT_FAILED ${stateDir}: ${e.message}`);
+  }
+};
+
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
@@ -486,6 +500,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
   const fromFile = raw as Partial<DoriConfig>;
   const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
+  await convertJsonState(stateDir);
   const panes = resolveManagedPanes(stateDir, loaded);
   if (paneKeys.length) {
     warnOnce("paneKeys", panes.migrated?.saved
@@ -513,7 +528,6 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     }),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     stateDir,
-    store: storeOnDisk(stateDir),
     leadCwd: expandHome(merged.leadCwd, home),
     leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
     laneWorkspace: panes.laneWorkspace,

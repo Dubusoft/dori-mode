@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { discordStatusTransport, JsonLaneReports, type LaneStatusTransport, type LaterMessage, routeReports } from "../src/lane-reports.ts";
+import { discordStatusTransport, SqliteLaneReports, type LaneStatusTransport, type LaterMessage, routeReports } from "../src/lane-reports.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { readOwnerClosed, recordOwnerClosed } from "../src/thread-followup.ts";
-import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00Z");
 const MIN = 60_000;
@@ -66,7 +66,7 @@ test("status message: the first progress posts it, later progress and milestones
   const clock = fakeClock(T0 + 65 * MIN);
   const base = depsFor(world, clock, dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
   await base.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport();
   const journal: [string, string][] = [];
   const enqueue = (id: string, line: string) => { journal.push([id, line]); };
@@ -100,7 +100,7 @@ test("status message: every time is shown in displayTimeZone, labelled with that
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0 + 65 * MIN), dir, { displayTimeZone: "Asia/Seoul" });
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport();
   store.append({ lane: "local-lane", generation: 0, kind: "milestone", text: "parser done", at: T0 + 60 * MIN });
   await routeReports(deps, store, () => {}, "/home/test", transport);
@@ -115,7 +115,7 @@ test("status message: a failed edit (message deleted) posts a new one and stores
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { statusMessageId: "gone" }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(true);
   const errors = quietErrors();
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
@@ -130,7 +130,7 @@ test("status message: a thread the owner closed is neither edited nor posted int
   const deps = depsFor(newWorld(), fakeClock(T0), dir, { discordChannels: ["main-1"] });
   await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
   recordOwnerClosed(dir, "2", T0 - MIN);
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(false, false, { archived: true, parent: "1" });
   const errors = quietErrors();
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way in /home/test/repo", at: T0 });
@@ -151,7 +151,7 @@ test("status message: a recorded thread Discord reports open again is edited in 
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
   recordOwnerClosed(dir, "2", T0 - MIN);
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(false, false, { archived: false, parent: "1" });
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   await routeReports(deps, store, () => {}, "/home/test", transport);
@@ -165,7 +165,7 @@ test("status message: without a transport, a thread the owner closed gets no hoo
   const deps = depsFor(world, fakeClock(T0), dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
   await deps.registry.write(lane(dir));
   recordOwnerClosed(dir, "2", T0 - MIN);
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const journal: [string, string][] = [];
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   expect(await routeReports(deps, store, (id, line) => { journal.push([id, line]); }, "/home/test", null)).toEqual(["LANE_REPORT_ROUTED local-lane:0:1 progress journal"]);
@@ -177,16 +177,16 @@ test("status message: the id survives a supervisor restart through the registry,
   const dir = stateDir();
   const first = depsFor(newWorld(), fakeClock(T0), dir);
   await first.registry.write(lane(dir));
-  new JsonLaneReports(dir).append({ lane: "local-lane", generation: 0, kind: "progress", text: "step 1", at: T0 });
+  new SqliteLaneReports(storePath(dir)).append({ lane: "local-lane", generation: 0, kind: "progress", text: "step 1", at: T0 });
   const before = fakeTransport();
-  await routeReports(first, new JsonLaneReports(dir), () => {}, "/home/test", before.transport);
+  await routeReports(first, new SqliteLaneReports(storePath(dir)), () => {}, "/home/test", before.transport);
   expect(before.calls.map((c) => c[0])).toEqual(["post"]);
 
   // A new process: fresh registry, store and transport over the same state directory.
   const second = { ...depsFor(newWorld(), fakeClock(T0 + MIN), dir), registry: new Registry(dir) };
-  new JsonLaneReports(dir).append({ lane: "local-lane", generation: 0, kind: "milestone", text: "step 1 landed; scope unchanged", at: T0 + MIN });
+  new SqliteLaneReports(storePath(dir)).append({ lane: "local-lane", generation: 0, kind: "milestone", text: "step 1 landed; scope unchanged", at: T0 + MIN });
   const after = fakeTransport();
-  await routeReports(second, new JsonLaneReports(dir), () => {}, "/home/test", after.transport);
+  await routeReports(second, new SqliteLaneReports(storePath(dir)), () => {}, "/home/test", after.transport);
   expect(after.calls.map((c) => c.slice(0, 3))).toEqual([["edit", "2", "m1"]]);
 });
 
@@ -196,7 +196,7 @@ test("status message: no thread, no transport and no hook, or a failed post, kee
   await deps.registry.write(lane(dir, { thread: "none" }));
   await deps.registry.write(lane(dir, { key: "bare-lane" }));
   await deps.registry.write(lane(dir, { key: "denied-lane" }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "no thread", at: T0 });
   store.append({ lane: "local-lane", generation: 0, kind: "milestone", text: "landed", at: T0 + 1 });
   const journal: [string, string][] = [];
@@ -223,7 +223,7 @@ test("status message: a milestone whose status update fails still reaches the le
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: 0, kind: "milestone", text: "landed", at: T0 });
   const errors = quietErrors();
   const journal: string[] = [];
@@ -237,7 +237,7 @@ test("status message: still the thread's last message, it is edited in place", a
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(false, false, { archived: false, lastMessageId: "s1", later: [{ own: false, type: 0, content: "never read" }] });
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   await routeReports(deps, store, () => {}, "/home/test", transport);
@@ -249,7 +249,7 @@ test("status message: an owner message after it re-posts it silently at the bott
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(false, false, { archived: false, lastMessageId: "o9", later: [statusOf("other-lane"), { own: false, type: 0, content: "how is it going?" }] });
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });
   expect(await routeReports(deps, store, () => {}, "/home/test", transport)).toEqual(["LANE_REPORT_ROUTED local-lane:0:1 progress thread"]);
@@ -270,7 +270,7 @@ test("status message: only other lanes' status messages after it keep it latest,
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(false, false, { archived: false, lastMessageId: "s3", later: [statusOf("lane-b"), statusOf("lane-c")] });
   store.append({ lane: "local-lane", generation: 0, kind: "milestone", text: "landed", at: T0 });
   await routeReports(deps, store, () => {}, "/home/test", transport);
@@ -287,7 +287,7 @@ test("status message: a failed delete of the old message is logged and the re-po
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir, { statusMessageId: "s1" }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const { transport, calls } = fakeTransport(false, false, { archived: false, lastMessageId: "o9", later: [{ own: false, type: 0, content: "hi" }], failDelete: true });
   const errors = quietErrors();
   store.append({ lane: "local-lane", generation: 0, kind: "progress", text: "half way", at: T0 });

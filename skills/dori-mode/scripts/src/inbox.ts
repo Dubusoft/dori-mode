@@ -197,11 +197,6 @@ export const takeCarriedReminders = (stateDir: string, skipIds: ReadonlySet<stri
 export const takeAwaitingReminders = (stateDir: string): string[] => {
   type Parked = { readonly id: string; readonly at: number; readonly note?: string; readonly line?: string };
   const parked = readStoreView<Parked[]>(stateDir, {
-    json: (journal) => (journal.awaitingAck ?? []).filter((entry) => entry.awaitingOwnerAt !== undefined && entry.handledAt === undefined &&
-      !entry.quarantined && !entry.deleted).map((entry) => ({
-      id: entry.id, at: entry.awaitingOwnerAt ?? 0, note: entry.awaitingNote,
-      line: journal.events.find((event) => event.id === (entry.revision ?? entry.id))?.line,
-    })),
     sqlite: (db) => !hasColumn(db, "owner_messages", "awaiting_owner_at") ? [] : (db.query(`SELECT o.id, o.awaiting_owner_at AS at, o.awaiting_note AS note, e.line
       FROM owner_messages o LEFT JOIN events e ON e.id = coalesce(o.revision, o.id)
       WHERE o.awaiting_owner_at IS NOT NULL AND o.handled_at IS NULL AND o.state != 'quarantined' AND o.deleted IS NULL ORDER BY o.pos`)

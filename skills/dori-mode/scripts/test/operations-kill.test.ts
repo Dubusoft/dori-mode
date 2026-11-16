@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { openOperations } from "../src/operations.ts";
 import { type Lane, Registry, statusOf } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { TEST_STORE, withState } from "./fakes.ts";
+import { withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const WORKER = join(import.meta.dir, "fixtures", "close-kill-worker.ts");
@@ -24,7 +24,7 @@ const seed = async (): Promise<void> => {
   writeFileSync(join(world, "repo", ".git", "HEAD"), "ref: refs/heads/main\n");
   writeFileSync(join(world, "world.json"), JSON.stringify({ panes: [{ pane_id: "w:p1", workspace_id: "w" }] }));
   mkdirSync(stateDir());
-  if (TEST_STORE === "sqlite") new SqliteStore(join(stateDir(), SQLITE_FILE), { create: true }).close();
+  new SqliteStore(join(stateDir(), SQLITE_FILE), { create: true }).close();
   const lane: Lane = {
     key: "demo-lane", title: "demo", thread: "discord:111/222", pane: "w:p1", brief: "/briefs/demo.md", done: "merged acme/app#1",
     cwd: join(world, "repo"), openedAt: new Date(T0 - 60 * 60_000).toISOString(), status: "done-claimed",
@@ -37,7 +37,7 @@ beforeEach(seed);
 afterEach(() => state.done());
 
 const worker = async (killAt: number, mode: "watch" | "close" = "watch"): Promise<{ killed: boolean; steps: number; lines: string[] }> => {
-  const proc = Bun.spawn(["bun", WORKER, stateDir(), world, String(killAt), mode], { stdout: "pipe", stderr: "pipe", env: { ...process.env, DORI_TEST_STORE: TEST_STORE } });
+  const proc = Bun.spawn(["bun", WORKER, stateDir(), world, String(killAt), mode], { stdout: "pipe", stderr: "pipe", env: process.env });
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (proc.signalCode === "SIGKILL") return { killed: true, steps: killAt, lines: [] };
   if (proc.exitCode !== 0) throw new Error(`worker exited ${proc.exitCode}: ${err}`);
@@ -49,7 +49,7 @@ const effects = (): string[] => {
   return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean) : [];
 };
 const ops = () => {
-  const store = openOperations({ stateDir: stateDir(), store: TEST_STORE });
+  const store = openOperations({ stateDir: stateDir() });
   try { return store.list(); } finally { store.close(); }
 };
 const laneStatus = async () => statusOf((await new Registry(stateDir()).read("demo-lane")) as Lane);

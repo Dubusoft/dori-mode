@@ -253,7 +253,6 @@ export const STATS_HOURS = 24;
 const eventStats = (config: DoriConfig, policy: EventPolicy, now: number): EventStats => {
   const since = now - STATS_HOURS * 3_600_000;
   const lines = readStoreView(config.stateDir, {
-    json: (journal) => (Array.isArray(journal.events) ? journal.events : []).filter((event) => (event.at ?? 0) >= since).map((event) => event.line),
     sqlite: (db) => (db.query("SELECT line FROM events WHERE at >= ?").all(since) as { line: string }[]).map((row) => row.line),
   }) ?? [];
   const kinds = new Map<string, { cls?: EventClass; events: number; wakes: number; measured: number; calls: number }>();
@@ -347,7 +346,6 @@ const readWaits = (stateDir: string): Status["waits"] => {
 };
 
 const readUnacked = (stateDir: string): number => readStoreView(stateDir, {
-  json: (journal) => Array.isArray(journal.awaitingAck) ? journal.awaitingAck.filter((entry: { reminded?: unknown }) => entry?.reminded === true).length : 0,
   sqlite: (db) => (db.query("SELECT count(*) AS n FROM owner_messages WHERE reminded = 1").get() as { n: number }).n,
 }) ?? 0;
 
@@ -357,7 +355,6 @@ const readUnreported = (stateDir: string): NonNullable<Status["unreported"]> => 
     .map((entry: { lane: string; since: number }) => ({ lane: entry.lane, since: new Date(entry.since).toISOString() }))
     .sort((a, b) => a.since.localeCompare(b.since));
   return readStoreView(stateDir, {
-    json: (journal) => owed(journal.outcomes),
     sqlite: (db) => {
       const row = db.query("SELECT outcomes FROM lead_state").get() as { outcomes?: string | null } | null;
       return owed(row?.outcomes ? JSON.parse(row.outcomes) : []);

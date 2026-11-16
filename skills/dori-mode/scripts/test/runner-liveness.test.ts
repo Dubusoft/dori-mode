@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openOperations, plan, type OperationStore } from "../src/operations.ts";
 import { fileOutageStore, LivenessMonitor, livenessIo, OUTAGES_FILE, type ProbeOutcome } from "../src/runner/liveness.ts";
 import type { Runner } from "../src/run.ts";
+import { withSqliteStore } from "./fakes.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -21,12 +22,13 @@ type RigOptions = {
 const rig = (probe: (monitor: LivenessMonitor) => ProbeOutcome | Promise<ProbeOutcome>, lanes: readonly string[] = [], options: RigOptions = {}) => {
   const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), "runner-liveness-"));
   if (!options.stateDir) dirs.push(dir);
+  withSqliteStore(dir);
   let at = 0;
   const lines: string[] = [];
   const alerts: string[] = [];
   const restarts: number[] = [];
   let owned = lanes;
-  const operations = openOperations({ stateDir: dir, store: "json" });
+  const operations = openOperations({ stateDir: dir });
   options.seed?.(operations, 1_800_000_000_000);
   const monitor: LivenessMonitor = new LivenessMonitor({
     monotonic: () => at, now: () => 1_800_000_000_000 + at, epoch: 7,

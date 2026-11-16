@@ -12,7 +12,7 @@ import type { RunnerCall } from "../src/runner/call.ts";
 import { laneGitEffect } from "../src/runner/lane-git.ts";
 import type { AnySupervisorControl, SupervisorCommandBodies } from "../src/runner/protocol.ts";
 import { answerQuery } from "../src/runner/queries.ts";
-import { depsFor, fakeClock, newWorld, TEST_STORE, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 
@@ -103,7 +103,7 @@ const QUEUED = "removed by the closed-lane cleanup once clean and pushed";
 beforeEach(async () => {
   state = withState();
   world = newWorld();
-  if (TEST_STORE === "sqlite") new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
+  new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
   const origin = join(state.dir, "acme", "app.git");
   mkdirSync(join(state.dir, "acme"));
   repo = join(state.dir, "repo");
@@ -152,7 +152,7 @@ test("the close queues a branch still at the merged head SHA with its worktree, 
     { op: "remote-branch-delete", root: repo, branch: "feat-x", remote: "origin", sha: mergedHead, opts: { cmdId: `op:demo-lane/remote-branch-delete/acme/app#7@${mergedHead}:1` } },
     { op: "branch-delete", root: repo, branch: "feat-x", sha: mergedHead, opts: { cmdId: `op:demo-lane/branch-delete/acme/app#7@${mergedHead}:1` } },
   ]);
-  const ops = openOperations({ stateDir: state.dir, store: TEST_STORE });
+  const ops = openOperations({ stateDir: state.dir });
   try {
     expect(ops.get(`demo-lane/worktree-remove/${wt}`)?.state).toBe("verified");
     expect(ops.get(`demo-lane/branch-delete/acme/app#7@${mergedHead}`)?.state).toBe("verified");
@@ -388,7 +388,7 @@ const claimed = (): Lane => ({ ...branchLane(), status: "done-claimed", claim: {
 
 test("a done-claimed lane whose PR the supervisor merged (CI_MERGED) closes at once, with its branch cleanup", async () => {
   await deps().registry.write(claimed());
-  const ops = openOperations({ stateDir: state.dir, store: TEST_STORE });
+  const ops = openOperations({ stateDir: state.dir });
   try {
     const op = plan(ops, T0, { lane: "plain-lane", action: "merge", target: `acme/app#9@${mergedHead}` });
     settleOperation(ops, T0, op.id, "verified", "");
@@ -447,7 +447,7 @@ test("a branch delete whose read-back fails is ambiguous, never verified", async
   const r = await closeThenSweep(failing);
   expect(r.closed).toBe(true);
   expect(r.swept.some((l) => l.startsWith(`OPERATION_AMBIGUOUS demo-lane/branch-delete/acme/app#7@${mergedHead}`))).toBe(true);
-  const ops = openOperations({ stateDir: state.dir, store: TEST_STORE });
+  const ops = openOperations({ stateDir: state.dir });
   try { expect(ops.get(`demo-lane/branch-delete/acme/app#7@${mergedHead}`)?.state).toBe("ambiguous"); } finally { ops.close(); }
   // An ambiguous delete is the lead's (dori ops resolve): it is told once and never retried on a guess.
   expect(await watchTick(failing)).toEqual([]);

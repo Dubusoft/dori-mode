@@ -21,7 +21,6 @@ import { type Delivery, laneOps, type LaneOps, machineRunner, runnerOf } from ".
 import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
 import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
 import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
-import { adoptLegacyLanes } from "./runner/adopt-legacy.ts";
 import type { InventoryLane, LaneMemoryBody, SupervisorCommandBodies } from "./runner/protocol.ts";
 import { type LaneMessageStore, openLaneMessages } from "./lane-messages.ts";
 import {
@@ -181,13 +180,11 @@ export const TASK_ALERT_MS = 5 * 60_000;
 /** The supervisor's independent tasks. */
 export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
-/** The fifth task: liveness, lane events, runner admin, legacy adoption, journal pruning; it reopens a hub that failed to open. */
+/** The fifth task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
 /** The autopilot tick's task (autopilot-tick.ts); it judges only while the toodo source is enabled. */
 export const AUTOPILOT_TASK = "autopilot";
 export const AUTOPILOT_PASS_MS = 5_000;
-/** How often the runners task tries to adopt open lanes that have no runner yet. */
-export const LEGACY_ADOPT_MS = 60_000;
 /** How often the runners task runs; the hub itself answers frames as they arrive. */
 export const RUNNERS_PASS_MS = 5_000;
 /** How often the polling task delivers queued lane messages (lead steering, CI, rebase), apart from the GitHub poll. */
@@ -290,7 +287,7 @@ export const openRunnerHub = (
     onEvent: (label, frame) => {
       guard.event(label, frame);
       if (frame.type === "guard.sample") hub.setMachine(label, frame.body);
-      const changed = herdr.event(label, frame, protos.get(label) ?? hub.runner(label)?.proto);
+      const changed = herdr.event(label, frame);
       if (changed) { log(changed.line); options.onHerdr?.(changed.id, changed.line); }
       calls?.onEvent(label, frame);
       options.onEvent?.(label, frame);
@@ -1047,7 +1044,7 @@ export const supervise = async (
       onEvent: (event) => { if (AUTOPILOT_KICK_EVENTS.has(event)) autopilot.kick(); },
     });
     const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.tunables.waitMaxFailures, hubCall));
-    const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.config.store, deps.clock.now));
+    const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.clock.now));
     const ownRepo = doriRepo(deps);
     // A merge of dori's own repo into dev queues the automatic update (the auto-update sweep runs it).
     const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps, {
@@ -1367,7 +1364,6 @@ export const supervise = async (
       stopConfigWatch = watchConfigFiles([configFile], reload);
     }
     let lastJournalPrune = -Infinity;
-    let lastAdoption = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
     await probe.step("ready", () => notify("READY=1"));
     ready = true;
@@ -1443,14 +1439,6 @@ export const supervise = async (
         if (!handle) return;
         try { await liveness?.tick(); } catch (e) { console.error(`RUNNER_LIVENESS_ERROR ${e instanceof Error ? e.message : String(e)}`); }
         try { await takeLaneEvents(); } catch (e) { console.error(`RUNNER_LANE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        // Open lanes from before every lane was runner-owned are adopted once the local runner is up (D18).
-        if (deps.clock.now() - lastAdoption >= LEGACY_ADOPT_MS && handle.calls.connected(LOCAL_RUNNER)) {
-          lastAdoption = deps.clock.now();
-          try {
-            const adopted = await adoptLegacyLanes({ registry: deps.registry, ops: deps.ops, emit: (id, line) => { enqueueSweep(id, line); }, log: (line) => { console.error(line); } });
-            for (const key of adopted) console.log(`LANE_RUNNER_ADOPTED ${key}`);
-          } catch (e) { console.error(`LANE_ADOPT_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        }
         // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
         try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now(), (label) => { liveness?.untrack(label); })) console.log(line); }
         catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }

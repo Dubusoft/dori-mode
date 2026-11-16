@@ -37,30 +37,11 @@ export const LANE_SOCKET_DIR = "lane.d";
 /** `<runnerDir>/sock/lane.d/lane`, where the runner serves the lane socket. */
 export const laneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET_DIR, LANE_SOCKET);
 
-/**
- * `<runnerDir>/sock/lane`, where runners before `lane.d` served it. The runner serves it too, for lanes whose sandbox
- * was set up for that path (a macOS profile that allows only it, or a lane started before the update).
- */
-export const legacyLaneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET);
+/** Whether the lane socket path exists as seen from here (inside a lane: through its sandbox). */
+export const laneSocketExists = (runnerDir: string): boolean => existsSync(laneSocketPath(runnerDir));
 
-/** Whether either lane socket path exists as seen from here (inside a lane: through its sandbox). */
-export const laneSocketExists = (runnerDir: string): boolean =>
-  existsSync(laneSocketPath(runnerDir)) || existsSync(legacyLaneSocketPath(runnerDir));
-
-/**
- * How a lane's `dori` dials the lane socket: the `lane.d` path, and when that connect fails the legacy path. Existence
- * does not decide it: an older macOS profile lets a lane stat `lane.d` but refuses the connect. Rejects with the
- * `lane.d` error when neither connects.
- */
-export const connectLaneSocket = (runnerDir: string, connect: (path: string) => Connector): Connector => {
-  const current = connect(laneSocketPath(runnerDir));
-  const legacy = connect(legacyLaneSocketPath(runnerDir));
-  return async () => {
-    try { return await current(); } catch (error) {
-      try { return await legacy(); } catch { throw error; }
-    }
-  };
-};
+/** How a lane's `dori` dials the lane socket: the `lane.d` path. */
+export const connectLaneSocket = (runnerDir: string, connect: (path: string) => Connector): Connector => connect(laneSocketPath(runnerDir));
 
 type Publish = <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
 

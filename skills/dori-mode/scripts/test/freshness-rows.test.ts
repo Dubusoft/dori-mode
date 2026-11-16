@@ -3,10 +3,10 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { freshnessTick } from "../src/freshness.ts";
-import { JsonLaneReports, LANE_REPORTS_FILE, type LaneReport, type LaneReportStore, putReportRows, SqliteLaneReports, UNFENCED_GENERATION } from "../src/lane-reports.ts";
+import { type LaneReport, type LaneReportStore, putReportRows, SqliteLaneReports, UNFENCED_GENERATION } from "../src/lane-reports.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MIN = 60_000;
@@ -14,10 +14,6 @@ const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0).reverse()) done(); });
 
 const STORES: readonly (readonly [string, (dir: string, rows: LaneReport[]) => LaneReportStore])[] = [
-  ["json", (dir, rows) => {
-    writeFileSync(join(dir, LANE_REPORTS_FILE), JSON.stringify({ reports: rows }));
-    return new JsonLaneReports(dir);
-  }],
   ["sqlite", (dir, rows) => {
     const store = new SqliteStore(join(dir, SQLITE_FILE), { create: true });
     try { store.transaction("full", () => putReportRows(store.database, rows)); } finally { store.close(); }
@@ -58,7 +54,7 @@ test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep n
 test("a lane with no row, or whose last row is older than nudgeAfterMin, keeps the screen-based nudge counted from that row", async () => {
   const state = withState();
   cleanups.push(state.done);
-  const store = new JsonLaneReports(state.dir);
+  const store = new SqliteLaneReports(storePath(state.dir));
   const world = newWorld();
   const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir);
   await deps(T0).registry.write(lane("no-rows", "w:p1"));

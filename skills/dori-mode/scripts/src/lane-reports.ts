@@ -1,5 +1,5 @@
 import { redactSecrets } from "./redact.ts";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
@@ -12,9 +12,8 @@ import { fetchHttp } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
 import type { Clock } from "./run.ts";
 import { type Lane, statusOf } from "./registry.ts";
-import { withStateLockSync } from "./state-lock.ts";
 import type { EventMeta } from "./supervise-journal.ts";
-import { RETENTION, saveJsonFile, SQLITE_FILE, StoreError, type StoreKind } from "./store.ts";
+import { RETENTION, SQLITE_FILE, StoreError, storeFile } from "./store.ts";
 import { REPORT_KINDS, type ReportKind } from "./runner/report-kinds.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import { LaneFileError } from "./lane-files.ts";
@@ -78,60 +77,19 @@ export interface LaneReportStore {
   close(): void;
 }
 
+/** The retired json store's lane reports, converted once into the `lane_reports` table (store-import.ts). */
 export const LANE_REPORTS_FILE = "lane-reports.json";
-/** Held while lane-reports.json is written; `dori store import` holds it so no row lands between its copy and the file's retirement. */
+/** Held while lane-reports.json was written by the json store; the conversion holds it so no row lands between its copy and the file's retirement. */
 export const LANE_REPORTS_LOCK = "lane-reports.lock.sqlite";
 
-const order = (a: LaneReport, b: LaneReport): number => a.at - b.at || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0) || a.seq - b.seq;
+/** The order lane reports list in: by time, lane, then seq. */
+export const reportOrder = (a: LaneReport, b: LaneReport): number => a.at - b.at || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0) || a.seq - b.seq;
 const withId = (report: NewReport, seq: number): LaneReport => ({
   id: `${report.lane}:${report.generation}:${seq}`, lane: report.lane, generation: report.generation, seq, kind: report.kind,
   text: redactSecrets(report.text), ...(report.evidence ? { evidence: redactSecrets(report.evidence) } : {}), at: report.at,
   ...(report.source ? { source: report.source } : {}),
   ...(report.fileReceipt ? { fileReceipt: report.fileReceipt } : {}),
 });
-
-/** `lane-reports.json` beside supervisor.json, rewritten whole under a short state lock (lanes and the supervisor both write). */
-export class JsonLaneReports implements LaneReportStore {
-  private readonly path: string;
-  private readonly lock: string;
-  constructor(stateDir: string) {
-    this.path = join(stateDir, LANE_REPORTS_FILE);
-    this.lock = join(stateDir, LANE_REPORTS_LOCK);
-  }
-  private read(): LaneReport[] {
-    return existsSync(this.path) ? (JSON.parse(readFileSync(this.path, "utf8")) as { reports: LaneReport[] }).reports : [];
-  }
-  append(report: NewReport): LaneReport {
-    return withStateLockSync(this.lock, () => {
-      const reports = this.read();
-      const known = report.source ? reports.find((r) => r.source === report.source) : undefined;
-      if (known) return known;
-      const seq = reports.reduce((max, r) => (r.lane === report.lane ? Math.max(max, r.seq) : max), 0) + 1;
-      const row = withId(report, seq);
-      saveJsonFile(this.path, { reports: [...reports, row] });
-      return row;
-    });
-  }
-  pending(): LaneReport[] { return this.read().filter((r) => r.consumedAt === undefined).sort(order); }
-  list(filter: { readonly lane?: string } = {}): LaneReport[] {
-    return this.read().filter((r) => filter.lane === undefined || r.lane === filter.lane).sort(order);
-  }
-  consume(id: string, at: number, route: ReportRoute, eventId?: string): void {
-    withStateLockSync(this.lock, () => {
-      saveJsonFile(this.path, { reports: this.read().map((r) => (r.id === id && r.consumedAt === undefined ? { ...r, consumedAt: at, route, ...(eventId ? { eventId } : {}) } : r)) });
-    });
-  }
-  prune(now: number): void {
-    withStateLockSync(this.lock, () => {
-      const reports = this.read();
-      const latest = new Map<string, number>();
-      for (const row of reports) latest.set(row.lane, Math.max(latest.get(row.lane) ?? 0, row.seq));
-      const kept = reports.filter((row) => row.consumedAt === undefined || row.consumedAt >= now - RETENTION.statusHistoryMs || row.seq === latest.get(row.lane));
-      if (kept.length !== reports.length) saveJsonFile(this.path, { reports: kept });
-    });
-  }
-  close(): void {}
-}
 
 /** Created on first use like the lane_messages table, not by a schema migration. */
 const DDL = `CREATE TABLE IF NOT EXISTS lane_reports (
@@ -158,13 +116,13 @@ const reportOf = (row: Row): LaneReport => ({
   ...(row.file_receipt != null ? { fileReceipt: JSON.parse(row.file_receipt) as LaneFileReceipt } : {}),
 });
 
-/** Every row of `db`'s lane_reports table, as stored and in list() order; no table reads as no rows (`dori store export`). */
+/** Every row of `db`'s lane_reports table, as stored and in list() order; no table reads as no rows (the json conversion's read-back). */
 export const readReportRows = (db: Database): LaneReport[] =>
   db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lane_reports'").get()
     ? (db.query("SELECT * FROM lane_reports ORDER BY at, lane, seq").all() as Row[]).map(reportOf)
     : [];
 
-/** Inserts `rows` with every column kept (id, seq, consumed_at, route), for `dori store import`; an id already there throws. */
+/** Inserts `rows` with every column kept (id, seq, consumed_at, route), for the json conversion; an id already there throws. */
 export const putReportRows = (db: Database, rows: readonly LaneReport[]): void => {
   ensureSchema(db);
   const insert = db.query("INSERT INTO lane_reports (id, lane, generation, seq, kind, text, evidence, at, consumed_at, route, event_id, source, file_receipt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -221,14 +179,13 @@ export class SqliteLaneReports implements LaneReportStore {
 }
 
 /**
- * Each lane's latest row (highest seq), read-only for `dori status`: lane-reports.json, or the lane_reports table opened
- * read-only (never the DDL a store connection runs). No file, no table or an unreadable one reads as no rows.
+ * Each lane's latest row (highest seq), read-only for `dori status`: the lane_reports table opened read-only (never the
+ * DDL a store connection runs). No database, no table or an unreadable one reads as no rows.
  */
-export const latestLaneReports = (config: { readonly stateDir: string; readonly store: StoreKind }): Map<string, LaneReport> => {
+export const latestLaneReports = (config: { readonly stateDir: string }): Map<string, LaneReport> => {
   let rows: LaneReport[] = [];
   try {
-    if (config.store === "json") rows = new JsonLaneReports(config.stateDir).list();
-    else if (existsSync(join(config.stateDir, SQLITE_FILE))) {
+    if (existsSync(join(config.stateDir, SQLITE_FILE))) {
       const db = new Database(join(config.stateDir, SQLITE_FILE), { readonly: true });
       try {
         rows = (db.query("SELECT r.* FROM lane_reports r JOIN (SELECT lane, max(seq) AS seq FROM lane_reports GROUP BY lane) m ON r.lane = m.lane AND r.seq = m.seq").all() as Row[]).map(reportOf);
@@ -240,15 +197,14 @@ export const latestLaneReports = (config: { readonly stateDir: string; readonly 
   return latest;
 };
 
-export const openLaneReports = (config: { readonly stateDir: string; readonly store: StoreKind }): LaneReportStore =>
-  config.store === "sqlite" ? new SqliteLaneReports(join(config.stateDir, SQLITE_FILE)) : new JsonLaneReports(config.stateDir);
+export const openLaneReports = (config: { readonly stateDir: string }): LaneReportStore => new SqliteLaneReports(storeFile(config.stateDir));
 
 /**
  * The synthetic `blocked` row of a lane whose pane died (dead-panes.ts): the lane stopped without reporting, so its
  * result is a row under its key like any report. Written once per (lane, pane): a row with the same text is kept.
  * Returns the row id, or undefined when that row already exists.
  */
-export const appendDeadPaneReport = (config: { readonly stateDir: string; readonly store: StoreKind }, lane: Lane, pane: string, at: number): string | undefined => {
+export const appendDeadPaneReport = (config: { readonly stateDir: string }, lane: Lane, pane: string, at: number): string | undefined => {
   const text = `pane ${pane} stopped (a dead marker held on its screen) and the lane wrote no report; recovery may relaunch it, else the lead decides`;
   const store = openLaneReports(config);
   try {

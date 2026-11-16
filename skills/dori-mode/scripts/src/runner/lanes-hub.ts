@@ -24,8 +24,8 @@ import { recoveryFields } from "../launch.ts";
  * the registry does not have - is dropped as `RUNNER_FORGED_EVENT runner=<label> key=<key>` (urgent). The hub still
  * acks it, so the runner does not resend it forever. The line's id is the forged identity (runner, key, event type, the
  * lane's owner and generation), not the frame: the same forgery repeated is journaled once, a new one is a new alert. One exception: an observation (`lane.state`, `lane.progress`)
- * from a runner about an open lane on its own machine that no runner owns yet (a legacy lane before adopt-legacy.ts has
- * adopted it) is dropped here without a line: a runner observes every lane on its host. That runner's `lane.started`, `lane.report` or `lane.asking` about such a lane
+ * from a runner about an open lane on its own machine that no runner owns yet (a legacy lane no runner has
+ * adopted yet) is dropped here without a line: a runner observes every lane on its host. That runner's `lane.started`, `lane.report` or `lane.asking` about such a lane
  * is still forged: it controls no lane it does not own.
  *
  * Reports: a `lane.report` becomes a row of the lane report store, its `source` the event's journal id, so the same
@@ -51,7 +51,7 @@ import { recoveryFields } from "../launch.ts";
  * is never applied: one closed with no pane (a launch cancelled before its start landed) gets `lane.close` and one
  * `LANE_STARTED_AFTER_CLOSE` line; one closed with its pane is a replay. A start for a reservation its launch stopped
  * waiting for (`launchUnconfirmed`) releases it: `LAUNCH_CONFIRMED_LATE`. A key in the inventory with no open lane in the registry is `LANE_ORPHAN <key>` and gets no registry
- * entry, unless the archive holds that key closed, owned by the same runner, in the same pane (an open lane that no runner owns is left to adopt-legacy.ts);
+ * entry, unless the archive holds that key closed, owned by the same runner, in the same pane (an open lane that no runner owns is left alone);
  * a lane in both whose pane, tab or session differs takes the runner's values for those three only.
  *
  * Lane events are read back from the hub's own journal (`runner_events`), not taken from the connection: the hub

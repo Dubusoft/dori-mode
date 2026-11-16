@@ -28,7 +28,6 @@ import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
 import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
 import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
-import { LEGACY_GUARD_AGENT_FILES, legacyGuardAgentFiles } from "./runner/legacy-guard.ts";
 import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
 
 export type Level = "OK" | "WARN" | "FAIL";
@@ -198,7 +197,7 @@ const KNOWN_HOME_ENTRIES: ReadonlySet<string> = new Set([
   ".zlogin", ".zlogout", ".oh-my-zsh", ".fzf", ".fzf.bash", ".fzf.zsh", ".inputrc", ".tmux.conf", ".vim", ".vimrc", ".viminfo",
   ".hushlogin", ".sudo_as_admin_successful", ".selected_editor", ".wget-hsts", ".motd_shown", ".landscape",
 ]);
-/** What dori itself keeps directly in ~/.dori; its credential stores (CREDENTIAL_DENY) and the legacy guard files are known too. */
+/** What dori itself keeps directly in ~/.dori; its credential stores (CREDENTIAL_DENY) are known too. */
 const KNOWN_DORI_ENTRIES: ReadonlySet<string> = new Set(["runner", "heavy", "lead", "research", "config.json", "src", "bin", "dori-boot-prep.sh", "freshness.log"]);
 
 /**
@@ -219,7 +218,7 @@ const homeEntries = (d: Pick<DoctorDeps, "home" | "platform">): Check[] => {
   const hidePath = join(d.home, ".dori", "lane-sandbox-hide");
   const hidden = new Set(existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : []);
   const homeKnown = new Set([...KNOWN_HOME_ENTRIES, ...CREDENTIAL_DENY.map((p) => p.split("/")[0] as string)]);
-  const doriKnown = new Set([...KNOWN_DORI_ENTRIES, ...LEGACY_GUARD_AGENT_FILES, ...CREDENTIAL_DENY.filter((p) => p.startsWith(".dori/")).map((p) => p.slice(".dori/".length))]);
+  const doriKnown = new Set([...KNOWN_DORI_ENTRIES, ...CREDENTIAL_DENY.filter((p) => p.startsWith(".dori/")).map((p) => p.slice(".dori/".length))]);
   const unknown = [
     ...list(d.home).filter((n) => n.startsWith(".") && !homeKnown.has(n)).map((n) => [`~/${n}`, join(d.home, n)] as const),
     ...list(join(d.home, ".dori")).filter((n) => !doriKnown.has(n)).map((n) => [`~/.dori/${n}`, join(d.home, ".dori", n)] as const),
@@ -384,7 +383,6 @@ export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "con
     else checks.push(line(key, inFile ? "file" : values[key] === undefined ? "unset" : "default", values[key]));
   }
   checks.push(
-    line("store", `derived from ${c.stateDir}`, c.store),
     line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
     line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
   );
@@ -530,8 +528,6 @@ const recovery = async (d: DoctorDeps): Promise<Check[]> => {
  */
 export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "exists">): Check[] => {
   const checks: Check[] = [];
-  const legacyGuardFiles = legacyGuardAgentFiles(d.home);
-  if (legacyGuardFiles.length) checks.push(warn("guard agent", `${legacyGuardFiles.join(", ")} left from the old standalone guard agent; the runner reports this host now`, "the runner removes them when it starts (dori update on the lead restarts runners); or delete them"));
   try {
     const endpoints = Object.entries(readRunnerEndpoints(d.config.stateDir));
     checks.push(endpoints.length

@@ -174,13 +174,6 @@ export const handled = async (
  */
 const trackedCoverage = (stateDir: string, id: string): { readonly entry?: TrackedCoverage; readonly ackedAt?: number } | undefined =>
   !existsSync(join(stateDir, JOURNAL_FILE)) && !existsSync(join(stateDir, SQLITE_FILE)) ? {} : readStoreView(stateDir, {
-  json: (journal) => {
-    const entry = journal.awaitingAck?.find((tracked) => tracked.id === id);
-    return entry ? {
-      entry: { tasks: entry.tasks, lanes: entry.lanes, reply: entry.reply, awaitingOwnerAt: entry.awaitingOwnerAt },
-      ...(entry.ackedAt !== undefined ? { ackedAt: entry.ackedAt } : {}),
-    } : {};
-  },
   sqlite: (db) => {
     // A store the supervisor has not migrated yet has no awaiting column: nothing there is parked.
     const parked = hasColumn(db, "owner_messages", "awaiting_owner_at") ? ", awaiting_owner_at" : "";

@@ -10,8 +10,8 @@ import { COMMAND_RETENTION_MS } from "./durability.ts";
  * - `maxEpoch`: the highest supervisor epoch seen; a command whose epoch is lower is stale and is refused right
  *   before its effect;
  * - `commands`: `{cmdId, cmdSeq, type, key, epoch, state, result, result_json}`; the intent row is committed before
- *   the effect, the result after it. `result` is the detail text, `result_json` (added in proto 3 with `ALTER TABLE`,
- *   nullable) the effect's structured result, so a resent cmdId can be answered again in full;
+ *   the effect, the result after it. `result` is the detail text, `result_json` (nullable)
+ *   the effect's structured result, so a resent cmdId can be answered again in full;
  * - `cmdAck`: the highest `cmdSeq` such that every `cmdSeq` up to it has a final (non-intent) row.
  */
 
@@ -102,12 +102,10 @@ export class RunnerState {
         state TEXT NOT NULL,
         result TEXT,
         at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        result_json TEXT
       );
     `);
-    // A state file from before proto 3 has no result_json; add it nullable so its rows keep loading.
-    const columns = this.db.query("PRAGMA table_info(commands)").all() as { name: string }[];
-    if (!columns.some((c) => c.name === "result_json")) this.db.exec("ALTER TABLE commands ADD COLUMN result_json TEXT");
   }
 
   private meta(name: string): number {

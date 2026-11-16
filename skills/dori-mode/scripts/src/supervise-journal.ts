@@ -233,7 +233,7 @@ export class JournalCore {
   constructor(public deps: FlowDeps) {
     mkdirSync(deps.config.stateDir, { recursive: true });
     this.eventLog = join(deps.config.stateDir, "lead-events.log");
-    try { this.store = openStore(deps.config.stateDir, deps.config.store, deps.clock.now); } catch (e) {
+    try { this.store = openStore(deps.config.stateDir, deps.clock.now); } catch (e) {
       throw e instanceof StoreError ? new SuperviseError(e.message) : e;
     }
     this.wakes = new WakeMeter(this.store, () => this.deps, () => this.deps.clock.now());

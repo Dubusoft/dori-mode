@@ -6,7 +6,7 @@ import { type Observation, pruneCommandRecords, resolveInterrupted } from "./dur
 import { RunnerLanes } from "./lanes.ts";
 import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
-import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
+import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
 import { laneRepoOf, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
@@ -32,7 +32,6 @@ import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
-import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
 import { HerdrWatch, herdrProcess } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
@@ -231,12 +230,6 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       kill: { clock: realClock, alive: platform.pidAlive, signal: platform.signal },
       publish: (type, body) => { client?.publish(type, body); },
     });
-    try {
-      const removed = removeLegacyGuardAgent(homedir());
-      if (removed.length) log(`RUNNER_GUARD_AGENT_REMOVED ${removed.join(",")}`);
-    } catch (error) {
-      log(`RUNNER_GUARD_AGENT_REMOVE_FAILED ${error instanceof Error ? error.message : String(error)}`);
-    }
     const dispatch = commandDispatcher({
       state, policy, realpath: realpathSync, runnerDir, log,
       publish: (body) => { client?.publish("cmd.result", body); },
@@ -350,7 +343,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     ensureRunnerSubdir(join(runnerDir, RUNNER_PATHS.sock), LANE_SOCKET_DIR);
-    const laneListeners = [listenUnix(laneSocketPath(runnerDir)), listenUnix(legacyLaneSocketPath(runnerDir))];
+    const laneListeners = [listenUnix(laneSocketPath(runnerDir))];
     for (const key of Object.keys(runnerLanes.records())) herdrReports?.open(key);
     // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
