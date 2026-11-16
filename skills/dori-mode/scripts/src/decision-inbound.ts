@@ -145,14 +145,18 @@ export const routeOwnerMessage = async (routing: DirectRouting, channel: string,
  */
 export type DecisionClick = { readonly decision: string; readonly choice: number; readonly channel: string; readonly interaction: string; readonly late?: boolean };
 
-/** What a click gets: the owner's reply text, and the decision's buttons as they should now show (none when it has none). */
-export type ClickReply = { readonly content: string; readonly components?: readonly unknown[] };
+/**
+ * What a click gets: the owner's reply text (none when the thread's `[System]` notice already confirms it), and the
+ * decision's buttons as they should now show (none when it has none).
+ */
+export type ClickReply = { readonly content?: string; readonly components?: readonly unknown[] };
 
 /**
  * An owner's answer-button click, routed like typing `d<ID>=<N>` in the decision's thread: when the decision is
  * delegated it becomes an answer revision of owner "message" `click:<interaction>` (so a redelivered click is the same
  * revision) and is queued for the lane, a different button before the lane acks being a correction like an edited
- * answer. Returns the owner's reply with the buttons as they should now show: a click from another channel than the
+ * answer. Returns the owner's reply with the buttons as they should now show (no reply text for a first direct answer: the decision's `[System]` notice,
+ * decision-delivery.ts, confirms it in the thread): a click from another channel than the
  * decision's thread is refused; a closed decision, or an answer the lane already acked, is final; the choice the buttons
  * already show changes nothing.
  *
@@ -164,7 +168,7 @@ export type ClickReply = { readonly content: string; readonly components?: reado
 export const routeDecisionClick = async (routing: DirectRouting, click: DecisionClick): Promise<ClickReply> => {
   const d = readDecisions(routing.stateDir).decisions.find((x) => x.id === click.decision);
   if (!d || d.thread !== click.channel) return { content: "이 스레드의 질문 버튼이 아닙니다." };
-  const reply = (content: string): ClickReply => {
+  const reply = (content?: string): ClickReply => {
     const rows = decisionButtonRows(readDecisions(routing.stateDir).decisions.find((x) => x.id === d.id) ?? d);
     return { content, ...(rows ? { components: rows } : {}) };
   };
@@ -188,9 +192,7 @@ export const routeDecisionClick = async (routing: DirectRouting, click: Decision
   if (!delegated(d, await routing.lanes())) return toLead();
   const m: RoutedMessage = { id: clickMessageId(click.interaction), content: `${d.id}=${click.choice}`, attachments: [] };
   if ((await revise(routing, d, click.channel, m, 0, click.choice)) === "refused") return toLead();
-  return reply(newest?.choice !== undefined
-    ? `${d.id}의 답을 ${click.choice}번으로 바꾸었습니다. 레인에 정정을 전달합니다.`
-    : `${d.id}에 ${click.choice}번으로 답했습니다. 레인에 전달합니다.`);
+  return reply(newest?.choice !== undefined ? `${d.id}의 답을 ${click.choice}번으로 바꾸었습니다. 레인에 정정을 전달합니다.` : undefined);
 };
 
 /** Withdraws the live answer `found` holds from this message; refused when there is none (already withdrawn, or closed). */

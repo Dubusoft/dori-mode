@@ -141,7 +141,11 @@ test("a lane question's starter message carries its buttons and says so; a reque
 test("the owner's click answers like d<ID>=<N> and shows the choice; another button before the ack corrects it; a redelivered click adds nothing", async () => {
   const w = world();
   const d = await w.ask("ap-1-1");
-  expect(await w.answer(d.id, 2, d.thread!, "900")).toEqual({ content: "d1에 2번으로 답했습니다. 레인에 전달합니다.", shown: ["1. Keep", "✓ 2. Replace", "3. Drop"] });
+  // The first answer's one visible confirmation is the thread's [System] notice: the click shows nothing of its own.
+  const first = await w.click(d.id, 2, d.thread!, "900");
+  expect(first.map((r) => `${r.method} ${r.url}`)).toEqual(["POST /interactions/900/secret/callback", "PATCH /webhooks/100/secret/messages/@original"]);
+  expect(first[0]?.body).toEqual({ type: 6 });
+  expect(shown(first[1]?.body.components)).toEqual(["1. Keep", "✓ 2. Replace", "3. Drop"]);
   expect(w.revisions(d.id)).toEqual(["r1:2:click:900"]);
   expect(w.queue()).toEqual(["decision-d1-r1:queued"]);
   expect(w.store.get("decision-d1-r1")?.text).toBe("[dori] Owner answered d1 (Which path?): 2. Replace. Revision r1. Confirm with: ~/.dori/runner/bin/dori report ack decision-d1-r1");
@@ -160,7 +164,7 @@ test("the owner's click answers like d<ID>=<N> and shows the choice; another but
 test("once the lane acked the answer a click changes nothing and the buttons go off; the close disables them before the archive", async () => {
   const w = world();
   const d = await w.ask("ap-1-1");
-  await w.answer(d.id, 2, d.thread!, "900");
+  await w.click(d.id, 2, d.thread!, "900");
   ackLaneMessage(w.store, "ap-1-1", "decision-d1-r1", 2_500);
   w.reconcile();
   expect(await w.answer(d.id, 3, d.thread!, "901")).toEqual({ content: "레인이 이미 d1의 2번을 받았습니다. 다른 답은 스레드에 적어 주세요.", shown: ["1. Keep off", "✓ 2. Replace off", "3. Drop off"] });
@@ -253,10 +257,9 @@ test("a click made while the supervisor restarted is carried out: buttons update
   w.restarting();
   const late = await w.click(d.id, 2, d.thread!, "920");
   expect(late.map((r) => `${r.method} ${r.url} ${r.bot ? "bot" : "interaction"}`)).toEqual([
-    "POST /interactions/920/secret/callback interaction", `PATCH /channels/${d.thread}/messages/q1 bot`, `POST /channels/${d.thread}/messages bot`,
+    "POST /interactions/920/secret/callback interaction", `PATCH /channels/${d.thread}/messages/q1 bot`,
   ]);
   expect(shown(late[1]?.body.components)).toEqual(["1. Keep", "✓ 2. Replace", "3. Drop"]);
-  expect(late[2]?.body.content).toBe("[System] 재시작 중에 누른 버튼(d1 2번)입니다. d1에 2번으로 답했습니다. 레인에 전달합니다.");
   expect(w.revisions(d.id)).toEqual(["r1:2:click:920"]);
   expect(w.queue()).toEqual(["decision-d1-r1:queued"]);
 
