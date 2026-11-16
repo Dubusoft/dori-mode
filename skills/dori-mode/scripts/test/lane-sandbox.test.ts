@@ -974,7 +974,8 @@ test("--explain regression: every credential store, ssh key and other lane's tok
   // No row names another lane's token or brief, so nothing re-exposes it.
   expect(table.filter((r) => r.path.startsWith(join(R, "briefs")) && !r.path.startsWith(join(R, "briefs", "lane-a.")))).toEqual([]);
   // The writable set, pinned: a new read-write bind (or a lost one) changes it. Each existing top-level entry of $HOME is
-  // read-write too, but the host-run files, ~/.ssh and ~/.dori are not among them, and nothing hidden is writable.
+  // read-write too, but the host-run files, ~/.ssh and ~/.dori are not among them, and nothing hidden is writable. In
+  // ~/.dori the work dirs (heavy, research) are writable.
   const writable = table.filter((r) => r.mode === "rw" && verdict(r.path) === "rw");
   const topLevel = writable.filter((r) => dirname(r.path) === home).map((r) => basename(r.path));
   for (const n of [".zshrc", ".gitconfig", ".ssh", ".dori", ".bashrc"]) expect({ n, writable: topLevel.includes(n) }).toEqual({ n, writable: false });
@@ -982,7 +983,7 @@ test("--explain regression: every credential store, ssh key and other lane's tok
   expect(writable.filter((r) => dirname(r.path) !== home).map((r) => r.path).sort()).toEqual([
     "/tmp", ...(existsSync("/data") ? ["/data"] : []),
     join(home, ".bun", "install", "cache"), join(home, ".cargo", "git"), join(home, ".cargo", "registry"),
-    join(home, ".dori", "heavy"), join(R, "briefs", "lane-a.out"), join(repos, "app", ".git"), runs, worktrees,
+    join(home, ".dori", "heavy"), join(home, ".dori", "research"), join(R, "briefs", "lane-a.out"), join(repos, "app", ".git"), runs, worktrees,
   ].sort());
 });
 

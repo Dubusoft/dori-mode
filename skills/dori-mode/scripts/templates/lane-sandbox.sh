@@ -16,11 +16,12 @@
 #                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
 # /data and each existing top-level entry of $HOME are bound read-write; $HOME itself stays read-only, so no new
 # top-level entry (a missing shell startup file such as ~/.bash_profile) can be created there. What the host runs outside
-# the sandbox stays read-only: the shell startup files, ~/.gitconfig and ~/.dori (never bound read-write), and
+# the sandbox stays read-only: the shell startup files, ~/.gitconfig, ~/.dori itself and what dori runs or trusts in it
+# (DORI_HOST below; the rest of ~/.dori, ~/.dori/research and ~/.dori/heavy among it, is bound read-write), and
 # ~/.local/bin, ~/.bun/bin, ~/.cargo/bin, the systemd, autostart and environment.d user config and git's and gh's
 # config (gh aliases can run a shell), each made on the host when missing (an empty directory there is harmless) and
 # bound read-only right after the top-level binds; the read-write binds after it (caches,
-# ~/.dori/heavy, grants, the cwd, worktrees, repos' .git) sit outside that list and stay writable, and each writable
+# grants, the cwd, worktrees, repos' .git) sit outside that list and stay writable, and each writable
 # .git's hooks are bound read-only again. What no lane may read is hidden after every read-write bind, so neither the
 # cwd nor a grant can re-expose it: ~/.dori/runner, ~/.ssh, ~/.dori/state and ~/.config/herdr (herdr's control socket
 # drives the lead's panes), each an empty read-only tmpfs with only the lane's own runner entries, ssh known_hosts and
@@ -95,8 +96,14 @@ chmod 700 "$LT"
 # entries are re-bound read-only (/data read-write) and top-level symlinks recreated.
 top=${H#/}
 top=/${top%%/*}
-# ~/.dori is bound read-only from the host, where bwrap cannot create a mount point: make the ones it needs there now.
-mkdir -p "$H/.dori/heavy" "$H/.dori/runner" "$H/.lane-tmp"
+# ~/.dori is bound read-only from the host, where bwrap cannot create a mount point: make the ones it needs there now,
+# and the work dirs a lane writes in (no new top-level entry can be made in ~/.dori inside the sandbox).
+mkdir -p "$H/.dori/heavy" "$H/.dori/research" "$H/.dori/runner" "$H/.lane-tmp"
+# What dori runs or trusts in ~/.dori, kept read-only: the runner dir (hidden below but for the lane's own entries),
+# dori itself and its boot script, its config (hooks and secret commands run on the host), the scripts secret commands
+# run, the lead's cwd, the attachment pins and the old watchdog copy. A trailing * is a prefix (config.json backups).
+# The credential stores in ~/.dori (CREDENTIALS) are hidden below. Every other existing entry is bound read-write.
+DORI_HOST="runner bin src dori-boot-prep.sh config.json* ops lead lane-attachments worktrees"
 # What the host runs outside the sandbox: top-level files (one missing cannot be created, as $HOME is read-only) and
 # directories, made here when missing so a lane cannot create them under a writable parent.
 host_run_files=(.bashrc .bash_profile .bash_login .bash_logout .profile .zshrc .zprofile .zshenv .zlogin .zlogout
@@ -140,6 +147,22 @@ done
 shopt -u nullglob dotglob
 # The host-run entries read-only, before every read-write bind below (so a cwd under one stays writable). A missing
 # file is skipped; $HOME is read-only, so a lane cannot create it.
+# Each existing top-level entry of ~/.dori read-write, but DORI_HOST and the credential stores; ~/.dori itself stays
+# read-only, so none of them can be renamed away and replaced.
+shopt -s nullglob dotglob
+dori_entries=("$H/.dori"/*)
+shopt -u nullglob dotglob
+set -f
+for e in ${dori_entries[@]+"${dori_entries[@]}"}; do
+  [ -L "$e" ] && continue
+  n=${e##*/}
+  for p in $DORI_HOST $CREDENTIALS; do
+    case "$p" in .dori/*) p=${p#.dori/} ;; .*) continue ;; esac
+    case "$p" in *\*) [ "${n#"${p%\*}"}" != "$n" ] && continue 2 ;; *) [ "$n" = "$p" ] && continue 2 ;; esac
+  done
+  opts+=(--bind "$e" "$e")
+done
+set +f
 for p in "${host_run_files[@]}"; do opts+=(--ro-bind-try "$H/$p" "$H/$p"); done
 for p in "${host_run_dirs[@]}"; do opts+=(--ro-bind "$H/$p" "$H/$p"); done
 opts+=(--bind /tmp /tmp --setenv LANE_SANDBOX_ACTIVE 1)
@@ -172,7 +195,6 @@ for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
   "$H/.cargo/registry" "$H/.cargo/git"; do
   opts+=(--bind-try "$p" "$p")
 done
-opts+=(--bind-try "$H/.dori/heavy" "$H/.dori/heavy")
 
 if [ -n "${LANE_SANDBOX_RW:-}" ]; then
   IFS=: read -r -a extra <<<"$LANE_SANDBOX_RW"
