@@ -237,11 +237,6 @@ test("a hidden path under ~/.dori is hidden too; inside a hidden subtree only a 
   // Hidden with its subtree: no mount point there to cover (bwrap would fail on the read-only tmpfs).
   expect(argv).not.toContain(join(home, ".ssh", "id_ed25519"));
   expect(argv).not.toContain(gcloud);
-
-  // A review lane keeps no git config: the host's is covered, and neither gh nor git is bound back.
-  const review = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_PROFILE: "review" });
-  expect(review.findIndex((a, i) => a === "--ro-bind" && review[i + 1] === "/dev/null" && review[i + 2] === join(home, ".gitconfig"))).toBeGreaterThan(-1);
-  expect(review).not.toContain(gh);
 });
 
 test("a glob in the hide list or the shared credential list hides each existing match, dotfiles and ~/.dori entries included, and --explain lists each", async () => {

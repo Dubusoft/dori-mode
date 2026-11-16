@@ -173,10 +173,8 @@ const USAGE = `dori <command> [options]
                                        lead-only: stop new autopilot reservations and AUTOPILOT_READY wakes until resume (running
                                        lanes go on to claim); kept in <stateDir>/autopilot-pause.json
   merge pause --reason TEXT | merge resume | merge status
-                                       lead-only rollback: the supervisor makes no gh pr merge (exempt PRs and merge lanes too)
-                                       until resume; reviews go on, waiting lanes stay held, status lines show "merge paused: <reason>";
-                                       after resume merges pass the full review gate again; kept in <stateDir>/review-merge-pause.json
-  review audit [--json]                read-only audit of the stored review history (jobs, exemptions, merges): exit 1 when a violation exists; --json prints it
+                                       lead-only rollback: the supervisor makes no gh pr merge (merge lanes too) until resume;
+                                       waiting lanes stay held; kept in <stateDir>/review-merge-pause.json
   sync   [--write] [--full]            registry vs live panes: summary and drift (--full adds the table); read-only unless --write
   recover [key]                        recover missing or wrong-model working lane panes
   attach <key> <path> [<path> ...]    add lead files or directories under the attachment roots to a running lane's briefs/<key>.files
@@ -1197,14 +1195,6 @@ try {
         out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
       }));
     }
-    case "review": {
-      const [action, ...extra] = flags.positionals;
-      if (action !== "audit" || extra.length || Object.keys(flags.values).some((k) => k !== "json")) die("usage: dori review audit [--json]", 2);
-      const { auditReviewHistory, formatReviewAudit } = await import("./review-audit.ts");
-      const audit = auditReviewHistory(config.stateDir);
-      console.log(flags.values.json ? JSON.stringify(audit, null, 2) : formatReviewAudit(audit));
-      process.exit(audit.violations.length > 0 ? 1 : 0);
-    }
     case "hold": {
       const [action, dropKey, ...extra] = flags.positionals;
       if (Object.keys(flags.values).length || extra.length || (action === "list" ? dropKey !== undefined : action !== "drop" || !dropKey)) die("usage: dori hold list | dori hold drop <key>");
@@ -1739,7 +1729,6 @@ try {
           const g = closed.granted;
           console.log(`DECISION_SECRET_GRANTED ${did} ${g.names.join(",")} ${"lane" in g.to ? `lane=${g.to.lane}` : `repo=${g.to.repo}`} changed=${g.changed.join(",") || "-"}`);
         }
-        if (closed.review) console.log(`DECISION_REVIEW_RECORDED ${did} job=${closed.review.jobId} outcome=${closed.review.outcome}`);
         break;
       }
       if (sub === "list") {

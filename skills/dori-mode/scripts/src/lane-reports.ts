@@ -354,11 +354,10 @@ const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message
 
 /**
  * The text of a lane's status message as of `report` (absent: every row): its key, time since it opened, and its last
- * milestone and last progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post;
- * then the lines of `review` (review-status.ts reviewStatusLines), scrubbed the same way.
+ * milestone and last progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post.
  */
 export const laneStatusText = (
-  lane: Lane, rows: readonly LaneReport[], report: LaneReport | undefined, now: number, home: string, timeZone?: string, review: readonly string[] = [],
+  lane: Lane, rows: readonly LaneReport[], report: LaneReport | undefined, now: number, home: string, timeZone?: string,
 ): string => {
   const stamp = (at: number): string => displayTime(at, timeZone);
   const upTo = rows.filter((r) => (!report || r.seq <= report.seq) && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
@@ -374,7 +373,6 @@ export const laneStatusText = (
     `[System] 레인 ${lane.key} 상태, 진행 ${Number.isNaN(opened) ? "(알 수 없음)" : elapsed(now - opened)} (갱신 ${stamp(now)})`,
     line("마지막 마일스톤", last("milestone")),
     line("마지막 진행", last("progress")),
-    ...review.map((l) => scrubForThread(l, home)),
   ].join("\n");
 };
 
@@ -412,7 +410,6 @@ export const statusChannel = (lane: Lane): string | undefined =>
  */
 const upsertStatus = async (
   deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string,
-  review: readonly string[] = [],
 ): Promise<void> => {
   const relayed = relayedText(lane.key, scrubForThread(oneLine(report.text), home));
   const redirected = await redirectIfClosed(deps.config.stateDir, transport, channel, relayed, deps.config.discordChannels[0],
@@ -421,7 +418,7 @@ const upsertStatus = async (
     console.error(`LANE_STATUS_REDIRECTED ${lane.key} ${report.id}: thread ${channel} was closed by the owner, so one line went to ${redirected}`);
     return;
   }
-  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone, review);
+  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone);
   await writeLaneStatus(deps, transport, channel, lane, text, `lane-status:${report.id}`);
 };
 
@@ -456,9 +453,6 @@ export const writeLaneStatus = async (
   await deps.registry.patch(lane.key, { statusMessageId: id });
 };
 
-/** The review lines a lane's status message carries (review-status.ts), read when a report updates it. */
-export type ReviewSection = (lane: Lane) => Promise<readonly string[]>;
-
 /**
  * Routes every pending row once, oldest first, and marks it consumed after its effect. question, blocked and milestone
  * become a `LANE_REPORT` event under the id `lane-report:<row id>` (its class comes from eventPolicy: question and
@@ -485,15 +479,8 @@ export type ReviewSection = (lane: Lane) => Promise<readonly string[]>;
  */
 export const routeReports = async (
   deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? "",
-  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener, reviewSection?: ReviewSection,
+  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener,
 ): Promise<string[]> => {
-  // A review status that cannot be read never stops a report: the status message goes out without it.
-  const review = async (lane: Lane): Promise<readonly string[]> => {
-    try { return (await reviewSection?.(lane)) ?? []; } catch (e) {
-      console.error(`LANE_STATUS_REVIEW_ERROR ${lane.key} ${errorText(e)}`);
-      return [];
-    }
-  };
   const out: string[] = [];
   const failed = failures.get(store) ?? new Map<string, number>();
   failures.set(store, failed);
@@ -530,7 +517,7 @@ export const routeReports = async (
         route = "claim";
       } else if (report.kind === "progress" && transport && statusChannel(lane)) {
         try {
-          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home, await review(lane));
+          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home);
           route = "thread";
         } catch (e) {
           eventId = `lane-report:${report.id}`;
@@ -552,7 +539,7 @@ export const routeReports = async (
         route = "journal";
         const channel = statusChannel(lane);
         if (report.kind === "milestone" && transport && channel) {
-          try { await upsertStatus(deps, transport, channel, lane, store, report, home, await review(lane)); }
+          try { await upsertStatus(deps, transport, channel, lane, store, report, home); }
           catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errorText(e)}`); }
         }
       }
