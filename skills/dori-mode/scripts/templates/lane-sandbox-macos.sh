@@ -5,8 +5,9 @@
 # to "explain") lets it touch, instead of running anything: one "<mode> <path>" line per profile path, where a later line
 # wins at and below its path. Modes: rw, ro (readable, writes refused) and hide (reads and writes refused). Outside every
 # line reads are allowed and writes refused; a * stands for one path component.
-# Same inputs as the Linux (bubblewrap) lane-sandbox. Passthrough (no sandbox) only when DORI_LANE_KEY is empty/unset:
-# the lead runs outside the sandbox. Host paths come from the environment, colon-separated:
+# Same inputs as the Linux (bubblewrap) lane-sandbox. A command runs only with DORI_LANE_KEY set (dori launch and the
+# runner set it; the lead never runs behind this wrapper): without it the command is refused (exit 2), never run
+# unsandboxed. Host paths come from the environment, colon-separated:
 #   LANE_SANDBOX_RW      extra writable directories (e.g. your worktree root, a scratch dir; the runner's grants)
 #   LANE_SANDBOX_RO      extra readable directories (the runner's grants); the ~/.dori/runner, ~/.ssh, credential
 #                        and hide-list refusals come after them
@@ -437,7 +438,7 @@ if [ "${1:-}" = "--explain" ]; then
   exit 0
 fi
 
-# --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY passthrough below so it
+# --check: preflight for `dori doctor` and the runner. Runs before the usage and DORI_LANE_KEY refusal below so it
 # also answers on the lead; exit 3 (not 2) keeps "no sandbox here" apart from a usage error. It runs `true` under the
 # same profile a lane gets, so a profile this macOS refuses is caught before a lane's pane opens.
 if [ "${1:-}" = "--check" ]; then
@@ -463,7 +464,8 @@ if [ "$#" -eq 0 ]; then
 fi
 
 if [ -z "${DORI_LANE_KEY:-}" ]; then
-  exec "$@"
+  echo "lane-sandbox: DORI_LANE_KEY is not set; refusing to run $1 unsandboxed (set DORI_LANE_KEY=<key>, or use --explain or --check)" >&2
+  exit 2
 fi
 
 LT="$H/.cache/omo-tmp/lane-sandbox/${key:?}"
