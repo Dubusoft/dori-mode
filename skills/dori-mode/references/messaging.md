@@ -75,7 +75,7 @@ Under the decision's lock the supervisor records the delivery intent, then queue
 [dori] Owner answered d17 (<question>): 2. <option text>. Revision r1. Confirm with: dori report ack decision-d17-r1
 ```
 
-The lane checks that the revision is the newest it has for that decision and that the choice is within its brief, then runs `dori report ack decision-d17-r1`. The ack means the lane received the answer, not that the work is done. On the ack the supervisor closes the decision as `dori decision close` would (choice recorded, answer messages acked and recorded handled, confirmation posted, link line in the origin thread updated, thread archived), and every step can be replayed after a crash. A lane that receives a newer revision follows it and acks it; an older one it already acked is superseded.
+A lane on a worker machine is told to ack with the runner's own CLI, `~/.dori/runner/bin/dori report ack ...`, since only that one is installed there. The lane checks that the revision is the newest it has for that decision and that the choice is within its brief, then runs the ack command. The ack means the lane received the answer, not that the work is done. On the ack the supervisor closes the decision as `dori decision close` would (choice recorded, answer messages acked and recorded handled, confirmation posted, link line in the origin thread updated, thread archived), and every step can be replayed after a crash. A lane that receives a newer revision follows it and acks it; an older one it already acked is superseded.
 
 ### Owner-facing notices
 

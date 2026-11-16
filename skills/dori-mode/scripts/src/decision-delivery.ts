@@ -5,7 +5,9 @@ import {
   OwnerDecisionError, patchOne, readDecisions, sameTarget, type TargetLane, updateDecisions,
 } from "./decision-store.ts";
 import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
+import { RUNNER_LANE_CLI } from "./launch-footer.ts";
 import { closeOwnerDecision, errorText, short, type TickDeps } from "./owner-decisions.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
 
 /*
  * Decision answers straight to the lane (references/messaging.md): the store side. Each direct answer is an answer
@@ -81,11 +83,12 @@ export const reachedLane = (m: LaneMessage | undefined): boolean => m?.state ===
 
 /**
  * The lane message of revision `r`: the answer; a correction naming the revision it replaces when `replaces` (a revision
- * that may have reached the lane) is given; a withdrawal when `r` has no choice.
+ * that may have reached the lane) is given; a withdrawal when `r` has no choice. The ack command is the `dori` the lane
+ * runs: a lane on a worker has only the runner's own CLI, never a `dori` on PATH (launch-footer.ts laneCli).
  */
 export const decisionAnswerText = (d: OwnerDecision, r: AnswerRevision, replaces?: number): string => {
   const q = short(d.question, 120);
-  const ack = `Confirm with: dori report ack ${r.delivery.id}`;
+  const ack = `Confirm with: ${r.target.runner === LOCAL_RUNNER ? "dori" : RUNNER_LANE_CLI} report ack ${r.delivery.id}`;
   if (r.choice === undefined) return `[dori] Owner withdrew the answer to ${d.id} (${q}). Revision r${r.rev} replaces r${replaces ?? r.rev - 1}: do not act on that answer; the question is open again. ${ack}`;
   const picked = `${r.choice}. ${short(d.options[r.choice - 1] ?? "", 120)}`;
   if (replaces !== undefined) return `[dori] Owner changed the answer to ${d.id} (${q}): ${picked}. Revision r${r.rev} replaces r${replaces}; follow r${r.rev}. ${ack}`;
