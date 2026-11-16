@@ -126,15 +126,10 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
 };
 
 /**
- * Sensitive paths bound into every lane on purpose: none now. gh's config dir is bound, but its login file hosts.yml is
- * hidden (CREDENTIAL_DENY), and so is ~/.npmrc: gh and npm get GH_TOKEN and NPM_TOKEN from the lane environment (dori secret env at launch).
- */
-export const INTENDED: ReadonlySet<string> = new Set<string>();
-/**
  * Paths under $HOME the exposure probe checks: the credential stores the lane sandbox templates hide (CREDENTIAL_DENY)
- * and the ones bound on purpose. ~/.ssh private keys (id_*) are added from the host's ~/.ssh.
+ * and ~/.ssh private keys (id_*) added from the host's ~/.ssh.
  */
-export const SENSITIVE: readonly string[] = [...CREDENTIAL_DENY, ...INTENDED];
+export const SENSITIVE: readonly string[] = CREDENTIAL_DENY;
 /** The existing paths a glob entry (* ? [...], as the lane sandbox templates expand it) matches, dotfiles included; a plain path as is. */
 const globMatches = (p: string): string[] => {
   const parts = p.split("/");
@@ -187,11 +182,9 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   if (probe.code !== 0) return warn("lane exposure", `could not probe what a lane can read (${probe.err.trim() || `exit ${probe.code}`})`, "run dori doctor again once the lane sandbox check passes");
   const seen = new Set(probe.out.split(/\r?\n/).filter(Boolean));
   const home = (p: string) => (p.startsWith(`${d.home}/`) ? `~/${p.slice(d.home.length + 1)}` : p);
-  const intended = candidates.filter((p) => seen.has(p) && INTENDED.has(p.slice(d.home.length + 1)));
-  const unexpected = candidates.filter((p) => seen.has(p) && !intended.includes(p));
-  const onPurpose = intended.length ? `; bound on purpose: ${intended.map(home).join(", ")}` : "";
-  if (unexpected.length) return warn("lane exposure", `a lane can read ${unexpected.map(home).join(", ")}${onPurpose}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
-  return ok("lane exposure", `${candidates.length - intended.length} sensitive path(s) checked, none readable in a lane${onPurpose}`);
+  const readable = candidates.filter((p) => seen.has(p));
+  if (readable.length) return warn("lane exposure", `a lane can read ${readable.map(home).join(", ")}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
+  return ok("lane exposure", `${candidates.length} sensitive path(s) checked, none readable in a lane`);
 };
 
 /**
@@ -475,7 +468,7 @@ const leadWakes = (d: DoctorDeps): Check[] => {
   const [top, count] = [...triggers].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0] ?? ["?", 0];
   return [warn("lead wakes",
     `${wakes.length} lead wakes not from owner messages in the last 24 hours (threshold ${LEAD_WAKE_WARNING_THRESHOLD}; lane ${lane}, noise ${wakes.length - lane}); most from ${top} (${count})`,
-    "review dori status --stats for wake triggers and model calls")];
+    "review dori status (the activities section lists wake triggers and model calls)")];
 };
 
 /** memoryCheck: the lead's human.md is found and within maxKb. */

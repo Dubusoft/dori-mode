@@ -2,12 +2,13 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Database, SQLiteError } from "bun:sqlite";
 
-import { type ArgvTemplate, fillHook } from "./config.ts";
+import { fillHook } from "./config.ts";
 import { isLaneOutcomeLine, laneOutcomeEventId } from "./autopilot.ts";
 import { finishedOutcome } from "./task-finish.ts";
 import { closeLane, closeRunning, finishClosedTask, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
+import { resumeArgv } from "./runner/lane-control.ts";
 import { checkLaneFilesBody } from "./lane-files.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
@@ -76,20 +77,6 @@ const turnInterrupted = async (deps: FlowDeps, lane: RecoveryLane, pane: Pane, e
   if (event && enqueue) await enqueue(event, `turn:${JSON.stringify([lane.key, lane.openedAt, id])}`);
   await deps.registry.patch<RecoveryLane>(lane.key, { turnRan: undefined, turnStopRead: id });
   return event && !enqueue ? [event] : [];
-};
-
-/** omo's flag that continues an existing session file or id (`omo --session <path|id>`). */
-export const RESUME_FLAG = "--session";
-
-/**
- * The agent command that resumes `session` instead of starting fresh: `--session <id>` before the prompt. Undefined
- * when it cannot (no {prompt} slot, the template already picks a session, or an id that is not a plain token).
- */
-export const resumeCommand = (template: ArgvTemplate, session: string | undefined): string[] | undefined => {
-  if (!session || !/^[\w.:/-]+$/.test(session) || session.startsWith("-")) return undefined;
-  if (template.some((part) => /^--(?:session|session-id|resume|continue|fork)(?:=|$)|^-[rc]$/.test(part))) return undefined;
-  const at = template.findIndex((part) => part.includes("{prompt}"));
-  return at < 1 ? undefined : [...template.slice(0, at), RESUME_FLAG, session, ...template.slice(at)];
 };
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -314,7 +301,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   }
   const now = deps.clock.now();
   // Resume the lane's own session when the registry has one, so it continues its work instead of restarting from the brief.
-  const session = current.recoveryResumeFailed !== current.session && resumeCommand(deps.config.agentCommand, current.session) ? current.session : undefined;
+  const session = current.recoveryResumeFailed !== current.session && resumeArgv(deps.config.agentCommand, current.session) ? current.session : undefined;
   const prepared = await prepareLeadLaneBrief(deps, current, undefined, true);
   const cmdId = `recover:${lane.key}:${now}`;
   checkLaneFilesBody(lane.key, { cmdId, key: lane.key, briefText: prepared.briefText, files: prepared.files, ...(session ? { session } : {}) });

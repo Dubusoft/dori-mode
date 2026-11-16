@@ -470,6 +470,12 @@ export const pressureIo = (deps: FlowDeps): PressureIo => ({
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 160);
 
+/** Runs one best-effort pass; a failure is logged as `CODE message` and never stops the round. */
+const isolate = async (code: string, work: () => unknown): Promise<void> => {
+  try { await work(); }
+  catch (e) { console.error(`${code} ${e instanceof Error ? e.message : String(e)}`); }
+};
+
 const OWNER = " - tell the owner";
 
 /** Pauses `lane` for critical memory and says how it went; a failure becomes the text, never a throw. */
@@ -913,21 +919,21 @@ export const supervise = async (
   notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
 ): Promise<void> => {
   const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
-  if (!Number.isFinite(deps.tunables.cacheTtlMin) || deps.tunables.cacheTtlMin <= 0) throw new SuperviseError("cacheTtlMin must be positive");
-  if (!Number.isFinite(deps.tunables.leadContextCapTokens) || deps.tunables.leadContextCapTokens <= 0) throw new SuperviseError("leadContextCapTokens must be positive");
-  if (!Number.isFinite(deps.tunables.githubPollSeconds) || deps.tunables.githubPollSeconds <= 0) throw new SuperviseError("githubPollSeconds must be positive");
-  if (!Number.isFinite(deps.tunables.githubTimeoutMs) || deps.tunables.githubTimeoutMs <= 0) throw new SuperviseError("githubTimeoutMs must be positive");
-  if (!Number.isFinite(deps.tunables.discordSafetyPollSeconds) || deps.tunables.discordSafetyPollSeconds <= 0) throw new SuperviseError("discordSafetyPollSeconds must be positive");
-  if (!Number.isFinite(deps.tunables.digestMaxDelayMin) || deps.tunables.digestMaxDelayMin <= 0) throw new SuperviseError("digestMaxDelayMin must be positive");
-  if (!Number.isFinite(deps.tunables.ackTimeoutSec) || deps.tunables.ackTimeoutSec <= 0) throw new SuperviseError("ackTimeoutSec must be positive");
-  if (!Number.isFinite(deps.config.runTimeoutMs) || deps.config.runTimeoutMs < 0) throw new SuperviseError("runTimeoutMs must be zero or positive");
-  if (!Number.isFinite(deps.tunables.handledTimeoutMin) || deps.tunables.handledTimeoutMin <= 0) throw new SuperviseError("handledTimeoutMin must be positive");
-  if (!Number.isFinite(deps.tunables.reportTimeoutMin) || deps.tunables.reportTimeoutMin <= 0) throw new SuperviseError("reportTimeoutMin must be positive");
-  if (!Number.isFinite(deps.tunables.resolveTimeoutMin) || deps.tunables.resolveTimeoutMin <= 0) throw new SuperviseError("resolveTimeoutMin must be positive");
-  if (!Number.isFinite(deps.config.leadStuckRestartMin) || deps.config.leadStuckRestartMin <= 0) throw new SuperviseError("leadStuckRestartMin must be positive");
-  if (!Number.isFinite(deps.config.leadChildWaitMaxMin) || deps.config.leadChildWaitMaxMin <= 0) throw new SuperviseError("leadChildWaitMaxMin must be positive");
-  if (!Number.isFinite(deps.tunables.idleEscalateMin) || deps.tunables.idleEscalateMin <= 0) throw new SuperviseError("idleEscalateMin must be positive");
-  if (!Number.isInteger(deps.tunables.waitMaxFailures) || deps.tunables.waitMaxFailures <= 0) throw new SuperviseError("waitMaxFailures must be a positive integer");
+  const bounds: readonly (readonly [Record<string, unknown>, string, string])[] = [
+    [deps.tunables, "cacheTtlMin", "positive"], [deps.tunables, "leadContextCapTokens", "positive"],
+    [deps.tunables, "githubPollSeconds", "positive"], [deps.tunables, "githubTimeoutMs", "positive"],
+    [deps.tunables, "discordSafetyPollSeconds", "positive"], [deps.tunables, "digestMaxDelayMin", "positive"],
+    [deps.tunables, "ackTimeoutSec", "positive"], [deps.config, "runTimeoutMs", "zero or positive"],
+    [deps.tunables, "handledTimeoutMin", "positive"], [deps.tunables, "reportTimeoutMin", "positive"],
+    [deps.tunables, "resolveTimeoutMin", "positive"], [deps.config, "leadStuckRestartMin", "positive"],
+    [deps.config, "leadChildWaitMaxMin", "positive"], [deps.tunables, "idleEscalateMin", "positive"],
+    [deps.tunables, "waitMaxFailures", "a positive integer"],
+  ];
+  for (const [source, key, rule] of bounds) {
+    const value = source[key] as number;
+    const ok = rule === "a positive integer" ? Number.isInteger(value) && value > 0 : Number.isFinite(value) && (rule === "positive" ? value > 0 : value >= 0);
+    if (!ok) throw new SuperviseError(`${key} must be ${rule}`);
+  }
   const deliveryProblem = deliveryConfigError(deps.tunables.delivery);
   if (deliveryProblem) throw new SuperviseError(deliveryProblem);
   setDefaultRunTimeout(deps.config.runTimeoutMs);
@@ -1134,80 +1140,57 @@ export const supervise = async (
       .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
     const tickSources = (): Promise<void> => watchdog.track("sources", registry.tick())
       .catch((e: unknown) => { console.error(`SOURCES_ERROR ${e instanceof Error ? e.message : String(e)}`); });
-    // An owner message the lead has not taken within a minute gets one plain line in its own channel or thread.
-    const noticeOverdue = async (): Promise<void> => {
+    // One plain line to the owner per message a lead-side check found due; each notice is attempted once per round.
+    const noticeDue = async (
+      kind: "delay" | "ack" | "unhandled", text: string, checkCode: string, failCode: string,
+      findDue: () => ReturnType<typeof supervisor.overdueOwnerMessages>, announce?: string,
+    ): Promise<void> => {
       let due: ReturnType<typeof supervisor.overdueOwnerMessages>;
-      try { due = supervisor.overdueOwnerMessages(OWNER_NOTICE_AFTER_MS); }
-      catch (e) { console.error(`OWNER_NOTICE_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
+      try { due = findDue(); }
+      catch (e) { console.error(`${checkCode} ${e instanceof Error ? e.message : String(e)}`); return; }
       for (const { channel, message } of due) {
+        if (announce) console.log(`${announce} ${channel}/${message}`);
         try {
-          supervisor.noticeAttempt("delay", channel, message);
-          await ownerNotice(channel, deps.tunables.ownerDelayNotice, `delay:${channel}:${message}`);
-          supervisor.noticeSent("delay", channel, message);
+          supervisor.noticeAttempt(kind, channel, message);
+          await ownerNotice(channel, text, `${kind}:${channel}:${message}`);
+          supervisor.noticeSent(kind, channel, message);
         }
-        catch (e) { console.error(`OWNER_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
+        catch (e) { console.error(`${failCode} ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
       }
     };
+    // An owner message the lead has not taken within a minute gets one plain line in its own channel or thread.
+    const noticeOverdue = (): Promise<void> => noticeDue("delay", deps.tunables.ownerDelayNotice, "OWNER_NOTICE_ERROR", "OWNER_NOTICE_FAILED",
+      () => supervisor.overdueOwnerMessages(OWNER_NOTICE_AFTER_MS));
     // A message the lead was handed but never acked is re-pushed, and after a second window the owner gets one line.
-    const noticeUnacked = async (): Promise<void> => {
-      let due: ReturnType<typeof supervisor.ackTick>;
-      try { due = supervisor.ackTick(deps.tunables.ackTimeoutSec * 1_000); }
-      catch (e) { console.error(`ACK_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
-      for (const { channel, message } of due) {
-        console.log(`ACK_MISSING_NOTICE ${channel}/${message}`);
-        try {
-          supervisor.noticeAttempt("ack", channel, message);
-          await ownerNotice(channel, deps.tunables.ackMissingNotice, `ack:${channel}:${message}`);
-          supervisor.noticeSent("ack", channel, message);
-        }
-        catch (e) { console.error(`ACK_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
-      }
-    };
+    const noticeUnacked = (): Promise<void> => noticeDue("ack", deps.tunables.ackMissingNotice, "ACK_CHECK_ERROR", "ACK_NOTICE_FAILED",
+      () => supervisor.ackTick(deps.tunables.ackTimeoutSec * 1_000), "ACK_MISSING_NOTICE");
     // A message the lead acked but never linked to lanes or a reply: UNHANDLED wakes it, then the owner gets one line.
-    const noticeUnhandled = async (): Promise<void> => {
-      let due: ReturnType<typeof supervisor.handledTick>;
-      try { due = supervisor.handledTick(deps.tunables.handledTimeoutMin * 60_000); }
-      catch (e) { console.error(`HANDLED_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); return; }
-      for (const { channel, message } of due) {
-        console.log(`UNHANDLED_NOTICE ${channel}/${message}`);
-        try {
-          supervisor.noticeAttempt("unhandled", channel, message);
-          await ownerNotice(channel, deps.tunables.unhandledNotice, `unhandled:${channel}:${message}`);
-          supervisor.noticeSent("unhandled", channel, message);
-        }
-        catch (e) { console.error(`UNHANDLED_NOTICE_FAILED ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
-      }
-    };
+    const noticeUnhandled = (): Promise<void> => noticeDue("unhandled", deps.tunables.unhandledNotice, "HANDLED_CHECK_ERROR", "UNHANDLED_NOTICE_FAILED",
+      () => supervisor.handledTick(deps.tunables.handledTimeoutMin * 60_000), "UNHANDLED_NOTICE");
     // A finished lane the lead did not report to the owner (dori reported) in time: UNREPORTED wakes the lead. The
     // supervisor never tells the owner itself.
     let decisionsReconciled = false;
     const checkReported = async (): Promise<void> => {
-      try { await supervisor.reportTick(); }
-      catch (e) { console.error(`REPORT_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      await isolate("REPORT_CHECK_ERROR", () => supervisor.reportTick());
       // A decision event the lead did not close (dori resolved) in time: UNRESOLVED wakes the lead.
-      try { supervisor.resolveTick(); }
-      catch (e) { console.error(`RESOLVE_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      await isolate("RESOLVE_CHECK_ERROR", () => supervisor.resolveTick());
       // Once per start: direct decision answers' delivery intents against the lane message queue (crash repair).
       if (!decisionsReconciled) {
-        try {
+        await isolate("DECISION_RECONCILE_ERROR", async () => {
           const open = (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed");
           await reconcileDecisionsAtStart(deps.config.stateDir, laneMessages ??= openLaneMessages(deps.config), open, deps.clock.now(),
             (id, line) => supervisor.enqueue(id, line), (line) => { console.error(line); });
           decisionsReconciled = true;
-        } catch (e) { console.error(`DECISION_RECONCILE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        });
       }
       // Every round: direct answers' acks close their decisions, the owner's status line follows each answer, and an
       // answer whose lane session went away is handed to the lead once.
-      try {
-        await decisionDeliveryTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
-          laneMessages ??= openLaneMessages(deps.config), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed"));
-      } catch (e) { console.error(`DECISION_DELIVERY_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      await isolate("DECISION_DELIVERY_ERROR", () => decisionDeliveryTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
+        laneMessages ??= openLaneMessages(deps.config), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed")));
       // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
-      try { await ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }); }
-      catch (e) { console.error(`OWNER_DECISION_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      await isolate("OWNER_DECISION_CHECK_ERROR", () => ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }));
       // A thread whose work is all finished and reported is closed (archived) once; the owner gets no button to press.
-      try { await supervisor.autoCloseTick(async (thread) => { await discord.setThread(thread, { archived: true }); }); }
-      catch (e) { console.error(`THREAD_AUTO_CLOSE_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      await isolate("THREAD_AUTO_CLOSE_CHECK_ERROR", () => supervisor.autoCloseTick(async (thread) => { await discord.setThread(thread, { archived: true }); }));
     };
     let lastGitHub = -Infinity;
     let lastLaneMessages = -Infinity;

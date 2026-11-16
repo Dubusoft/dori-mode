@@ -251,18 +251,22 @@ export const takeOutput = (result: Take): string[] => {
   if (!result.events.length) return ["INBOX_EMPTY"];
   const text = (event: TakenEvent): string => `${event.id}\t${event.line}`;
   // Owner chat leads, whatever lane groups follow: it never hides behind lane output (log order kept within each part).
-  const isOwner = (event: TakenEvent): boolean => OWNER_LINE.test(event.line);
-  const events = [...result.events.filter(isOwner), ...result.events.filter((event) => !isOwner(event))];
+  const ownerEvents: TakenEvent[] = [];
+  const rest: TakenEvent[] = [];
+  for (const event of result.events) (OWNER_LINE.test(event.line) ? ownerEvents : rest).push(event);
+  const events = [...ownerEvents, ...rest];
   let body: string[];
   if (events.some((event) => event.meta)) {
     const groups = new Map<string, string[]>();
-    const owner = events.filter(isOwner).map(text);
+    const owner = ownerEvents.map(text);
     const other: string[] = [];
     for (const event of events) {
-      if (isOwner(event)) continue;
+      if (OWNER_LINE.test(event.line)) continue;
       if (!event.meta) { other.push(text(event)); continue; }
       const header = metaHeader(event.meta);
-      groups.set(header, [...(groups.get(header) ?? []), text(event)]);
+      const lines = groups.get(header);
+      if (lines) lines.push(text(event));
+      else groups.set(header, [text(event)]);
     }
     body = [...(owner.length ? ["## owner", ...owner] : []), ...[...groups].flatMap(([header, lines]) => [header, ...lines]), ...(other.length ? ["## other", ...other] : [])];
   } else body = events.map(text);

@@ -99,10 +99,6 @@ const PM_COMMANDS: Readonly<Record<(typeof PM_TARGETS)[number], { probe: string[
   npmCache: { probe: ["npm", "config", "get", "cache"], dir: (out) => posix.join(out.trim(), "_cacache"), act: ["npm", "cache", "verify"] },
   pnpmStore: { probe: ["pnpm", "store", "path"], dir: (out) => out.trim(), act: ["pnpm", "store", "prune"] },
 };
-/** The exact commands the tool targets run, and the only ones. */
-export const pmCommands = (): Readonly<Record<(typeof PM_TARGETS)[number], readonly string[]>> =>
-  ({ bunCache: PM_COMMANDS.bunCache.act, npmCache: PM_COMMANDS.npmCache.act, pnpmStore: PM_COMMANDS.pnpmStore.act });
-
 /** The `lastRuns` of the status file's last report: when each tool target last ran its command. */
 export const readLastRuns = (statusFile: string): Partial<Record<DevCacheTarget, string>> => {
   try {

@@ -186,13 +186,8 @@ export const runnerViews = (rows: readonly RunnerRow[], now: number, opts: {
  * heartbeat time is the supervisor's own wall clock, written by the hub on this host.
  */
 /** Restarts the liveness monitor planned for `label` in the last hour (operations rows `runner:<label>/restart/...`). */
-const runnerRestarts = (config: Parameters<typeof openOperations>[0], label: string, now: number): number | undefined => {
-  try {
-    const ops = openOperations(config);
-    try { return ops.list({ lane: `runner:${label}` }).filter((op) => op.action === "restart" && now - op.at < 60 * 60_000).length; }
-    finally { ops.close(); }
-  } catch { return undefined; }
-};
+const runnerRestarts = (ops: ReturnType<typeof openOperations>, label: string, now: number): number | undefined =>
+  ops.list({ lane: `runner:${label}` }).filter((op) => op.action === "restart" && now - op.at < 60 * 60_000).length;
 
 /**
  * The open lanes on runner `label`'s machine, read from the registry so the count follows every launch and close: the
@@ -405,11 +400,17 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     // The same owner rule as runnerLaneCount: the owning runner, else the unowned lane's machine, else local.
     machine: l.runner ?? (l.machine || LOCAL_RUNNER),
   }));
-  const runners = runnerViews(readRunnerRows(d.config.stateDir), now, {
-    restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
-    unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
-    ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
-  });
+  const ops = openOperations(d.config);
+  let runners: RunnerView[];
+  try {
+    runners = runnerViews(readRunnerRows(d.config.stateDir), now, {
+      restarts: (label) => runnerRestarts(ops, label, now), lanes: (label) => runnerLaneCount(open, label),
+      unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
+      ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
+    });
+  } finally {
+    ops.close();
+  }
   return {
     at: new Date(now).toISOString(),
     timeZone: d.config.displayTimeZone,

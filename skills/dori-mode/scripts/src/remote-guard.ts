@@ -100,6 +100,8 @@ const POSIX_TOKEN = "DORI_POSIX_42";
 const PS_PROBE = "Write-Output ('DORI_PS_' + (6*7))";
 const PS_TOKEN = "DORI_PS_42";
 const NO_SHELL = `${UNSUPPORTED_SHELL} (no POSIX sh or PowerShell)`;
+const runnerKinds = new Map<string, MachineKind>();
+const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
 
 /** The ssh command that runs PowerShell `snippet` on Windows, whether the OpenSSH login shell is cmd.exe or PowerShell. */
 export const encodedPowerShell = (snippet: string): string =>
@@ -107,13 +109,9 @@ export const encodedPowerShell = (snippet: string): string =>
 
 /** How a machine runs commands over ssh: POSIX sh, or Windows PowerShell through an encoded command. */
 export type MachineKind = "posix" | "windows";
-const machineKinds = new Map<string, MachineKind>();
 
 /** Forgets every machine's resolved kind. */
-export const clearShellModes = (): void => {
-  machineKinds.clear();
-  runnerKinds.clear();
-};
+export const clearShellModes = (): void => runnerKinds.clear();
 
 const runIn = (run: Runner, target: string, cmd: { readonly command: string; readonly stdin?: string }, timeoutMs: number): Promise<Ran> =>
   run(sshArgv(target, cmd.command), cmd.stdin === undefined ? { timeoutMs } : { timeoutMs, stdin: cmd.stdin });
@@ -127,8 +125,14 @@ const resolveKind = async (run: Runner, target: string, timeoutMs: number): Prom
     const r = await runIn(run, target, { command }, timeoutMs);
     if (unreachable(r)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(r)}` };
     if (r.out.split("\n").some((l) => l.trim() === token)) {
-      machineKinds.set(target, kind);
-      return { ok: true, kind };
+      let resolved = kind;
+      if (kind === "posix") {
+        const uname = await runIn(run, target, { command: "uname -s" }, timeoutMs);
+        if (unreachable(uname)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(uname)}` };
+        if (uname.code === 0 && WINDOWS_UNAME.test(uname.out.trim())) resolved = "windows";
+      }
+      runnerKinds.set(target, resolved);
+      return { ok: true, kind: resolved };
     }
     why ||= stderrLine(r.err);
   }
@@ -137,8 +141,6 @@ const resolveKind = async (run: Runner, target: string, timeoutMs: number): Prom
 
 /** A machine's kind, or why it could not be found. */
 export type KindResult = { readonly ok: true; readonly kind: MachineKind } | ShellFailure;
-const runnerKinds = new Map<string, MachineKind>();
-const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
 
 /**
  * The kind of commands `m`'s runner takes: the cached or probed kind, except that a POSIX shell on Windows (Git Bash,
@@ -148,17 +150,7 @@ const WINDOWS_UNAME = /^(MINGW|MSYS|CYGWIN)/;
 export const machineKind = async (run: Runner, m: GuardMachine, timeoutMs: number = SAMPLE_TIMEOUT_MS): Promise<KindResult> => {
   const known = runnerKinds.get(m.target);
   if (known) return { ok: true, kind: known };
-  const cached = machineKinds.get(m.target);
-  const k = cached ? { ok: true as const, kind: cached } : await resolveKind(run, m.target, timeoutMs);
-  if (!k.ok) return k;
-  let kind = k.kind;
-  if (kind === "posix") {
-    const r = await runIn(run, m.target, { command: "uname -s" }, timeoutMs);
-    if (unreachable(r)) return { ok: false, unsupported: false, detail: `unreachable: ${sshError(r)}` };
-    if (r.code === 0 && WINDOWS_UNAME.test(r.out.trim())) kind = "windows";
-  }
-  runnerKinds.set(m.target, kind);
-  return { ok: true, kind };
+  return resolveKind(run, m.target, timeoutMs);
 };
 
 /** A runner's kills on its machine (`RunnerGuardBoard.takeKills`, from `guard.critical`), as the critical stage reads them. */

@@ -25,6 +25,7 @@ import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSource } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
+import { listPanes } from "../panes.ts";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig } from "../config.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
@@ -33,7 +34,7 @@ import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
-import { HerdrWatch } from "./herdr-watch.ts";
+import { HerdrWatch, herdrProcess } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
 import { processCommands } from "./cleanup-artifacts.ts";
 import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
@@ -168,22 +169,27 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       return [...owned, ...observedOnly.filter((l) => !owned.some((o) => o.key === l.key))];
     };
     // The lanes this runner started are attributed from its own records, whatever runs in their panes now.
-    const ownedPanes = async (panes: readonly Pane[]): Promise<Map<string, string>> => {
+    const ownedPanes = async (panes: readonly Pane[], instance: string): Promise<Map<string, string>> => {
       const owned = new Map<string, string>();
       for (const record of Object.values(runnerLanes.records())) {
-        const pane = await runnerLanes.currentPane(record, panes);
+        const pane = await runnerLanes.currentPane(record, panes, instance);
         if (pane) owned.set(pane.pane_id, record.key);
       }
       return owned;
     };
-    const observedLanes = () => observeHost({ run, owned: ownedPanes, ...(winSample ? { procs: hostProcs } : {}) });
+    const observedLanes = async () => {
+      const [panes, process] = await Promise.all([listPanes(run), herdrProcess(run)]);
+      const instance = process.instance ?? "";
+      const owned = await ownedPanes(panes, instance);
+      return { lanes: await observeHost({ run, panes, owned: async () => owned, ...(winSample ? { procs: hostProcs } : {}) }), panes, instance };
+    };
     const observe = async () => {
-      const lanes = await observedLanes();
+      const { lanes, panes, instance } = await observedLanes();
       const observed = lanes.map(({ status: _status, ...lane }) => lane);
       // The lanes this runner started come first; the rest are lanes it only observes on its host.
       observedOnly = observed;
       // An owned lane waiting on an on-screen question goes out as one lane.asking per question.
-      await runnerLanes.askTick().catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
+      await runnerLanes.askTick(panes, instance).catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
       return lanes;
     };
     const version = await runnerVersion(run, import.meta.dir);

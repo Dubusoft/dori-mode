@@ -43,7 +43,7 @@ import { supervise, SUPERVISE_STOP_DEADLINE_MS, watchSecretStore } from "./super
 import { SecretStore, SecretStoreError } from "./secret-store.ts";
 import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
-import { LeadRestartError, requestLeadRestart } from "./lead-restart.ts";
+import { requestLeadRestart } from "./lead-restart.ts";
 import { recoverLanes } from "./recover.ts";
 import { ack, AckError, ackRecorded, AWAITING_NOTE_MAX, handled } from "./ack.ts";
 import { checklistLine, InboxError, take, takeAwaitingReminders, takeCarriedReminders, takeOutput, staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
@@ -1892,6 +1892,6 @@ try {
 } catch (e) {
   // The supervisor (and with it every runner) is unreachable, or a runner answered RUNNER_UNAVAILABLE: fail closed (D7).
   if (e instanceof RunnerUnavailable || (e instanceof LaneOpsError && e.code === "RUNNER_UNAVAILABLE")) die(e.message, 2);
-  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof ReposError || e instanceof DiscordGatewayOwnedError || e instanceof AckError || e instanceof LeadRestartError || e instanceof StoreError || e instanceof LaneMessageError || e instanceof SourceError) die(e.message);
+  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof ReposError || e instanceof DiscordGatewayOwnedError || e instanceof AckError || e instanceof StoreError || e instanceof LaneMessageError || e instanceof SourceError) die(e.message);
   throw e;
 }

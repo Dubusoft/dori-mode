@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-import { INTENDED, SENSITIVE } from "../src/doctor.ts";
+import { SENSITIVE } from "../src/doctor.ts";
 import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript, refreshLaneSandbox } from "../src/lane-sandbox-install.ts";
 
 const dirs: string[] = [];
@@ -631,7 +631,7 @@ test("macOS: the credential stores under $HOME (cloud, kube, gpg, docker and git
 
 test("both templates carry the shared credential list as rendered, the same set doctor probes, and Linux hides each listed store", async () => {
   const credentials = (template: string) => new Set(/^CREDENTIALS="([^"]*)"/m.exec(readFileSync(template, "utf8"))?.[1]?.split(/\s+/).filter(Boolean));
-  const doctorDeny = new Set(SENSITIVE.filter((p) => !INTENDED.has(p)));
+  const doctorDeny = new Set(SENSITIVE);
   for (const template of [LANE_SANDBOX_TEMPLATE, LANE_SANDBOX_MACOS_TEMPLATE]) {
     expect(readFileSync(template, "utf8")).toBe(laneSandboxScript(template));
     expect(credentials(template)).toEqual(doctorDeny);

@@ -1744,7 +1744,7 @@ test("a lead pane closed by hand together with its Dori workspace is recreated i
   }, "boot");
   const lines = await quiet(async () => {
     await delivery.tick();
-    f.clock.at = delivery.nextAttemptAt;
+    while (!delivery.due) f.clock.at += 1000;
     await delivery.tick();
   });
   expect(retries).toEqual([expect.stringMatching(/^SUPERVISOR_RETRY lead pane lead:p1 does not exist; attempt 1/)]);

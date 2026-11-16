@@ -106,7 +106,9 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     if (!hit) { hit = { numbers: new Set(), branches: new Set() }; targets.set(key, hit); }
     return hit;
   };
-  for (const lane of lanes) {
+  const inspections = await Promise.all(lanes.map(async (lane) => lane.machine ? undefined :
+    await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; })));
+  for (const [index, lane] of lanes.entries()) {
     for (const part of splitDone(lane.done)) {
       try {
         const signal = parseSignal(part);
@@ -125,7 +127,7 @@ export const githubTargets = async (lanes: readonly Lane[], ops: Pick<LaneOps, "
     }
     if (lane.machine) continue; // Remote paths cannot establish a branch on the lead host.
     // origin and branch come from the lane's runner; a lane whose runner cannot answer establishes no branch (as an unreadable checkout did).
-    const git = (await ops.inspect(lane, { git: true, roots: lane.worktrees ?? [] }).catch(() => { unresolved?.add(lane.key); return undefined; }))?.git;
+    const git = inspections[index]?.git;
     const repo = git?.origin ? repoFromRemote(git.origin) : undefined;
     if (!git || !repo) continue;
     for (const branch of new Set([git.branch, ...git.worktrees.map((w) => w.branch)])) {

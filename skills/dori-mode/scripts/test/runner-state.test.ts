@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { statSync } from "node:fs";
 import { join } from "node:path";
-import { COMMAND_RETENTION_MS, RunnerState, STATE_FILE, type CommandIntent } from "../src/runner/state.ts";
+import { COMMAND_RETENTION_MS } from "../src/runner/durability.ts";
+import { RunnerState, STATE_FILE, type CommandIntent } from "../src/runner/state.ts";
 import { withState } from "./fakes.ts";
 
 let sandbox: ReturnType<typeof withState>;

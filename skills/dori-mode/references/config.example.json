@@ -48,9 +48,7 @@
   "runTimeoutMs": 60000,
   "ciMergeBase": "dev",
   "autopilot": {
-    "quotaUnreadable": "hold",
     "mergeBase": "dev",
-    "crossWorkspacePrereqs": "block",
     "tickSec": 300
   },
   "guardMachines": {},

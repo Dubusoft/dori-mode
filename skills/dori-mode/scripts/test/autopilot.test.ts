@@ -257,9 +257,7 @@ test("parseAutopilotConfig ignores the removed bundle keys, quotaMaxUsedPct and 
 test("parseAutopilotConfig throws TypeError naming the key on an invalid value or an unknown key", () => {
   const cases: [unknown, RegExp][] = [
     [[], /^autopilot must be an object/],
-    [{ quotaUnreadable: "launch" }, /^autopilot\.quotaUnreadable /],
     [{ mergeBase: "" }, /^autopilot\.mergeBase /],
-    [{ crossWorkspacePrereqs: "allow" }, /^autopilot\.crossWorkspacePrereqs /],
     [{ tickSec: 29 }, /^autopilot\.tickSec /],
     [{ tickSec: 3601 }, /^autopilot\.tickSec /],
     [{ tickSec: 60.5 }, /^autopilot\.tickSec /],

@@ -184,27 +184,17 @@ export class Discord {
       : await this.call<{ id: string }>("POST", `/channels/${channelId}/threads`, { name: title, type: 11, ...archive })).id;
     if (memberId === undefined || !/^\d+$/.test(memberId)) return { id, member: "skipped" };
     try {
-      if (await this.isThreadMember(id, memberId)) return { id, member: "already" };
-      await this.addThreadMember(id, memberId);
+      try {
+        await this.call("GET", `/channels/${id}/thread-members/${memberId}`);
+        return { id, member: "already" };
+      } catch (e) {
+        if (!(e instanceof MessengerError) || e.status !== 404) throw e;
+      }
+      await this.call("PUT", `/channels/${id}/thread-members/${memberId}`);
       return { id, member: "added" };
     } catch (e) {
       return { id, member: { failed: e instanceof Error ? e.message : String(e) } };
     }
-  }
-
-  /** Whether `userId` is a member of thread `threadId`: Discord's 404 (unknown member) is false, any other error throws. */
-  async isThreadMember(threadId: string, userId: string): Promise<boolean> {
-    try {
-      await this.call("GET", `/channels/${threadId}/thread-members/${userId}`);
-      return true;
-    } catch (e) {
-      if (e instanceof MessengerError && e.status === 404) return false;
-      throw e;
-    }
-  }
-
-  async addThreadMember(threadId: string, userId: string): Promise<void> {
-    await this.call("PUT", `/channels/${threadId}/thread-members/${userId}`);
   }
 
   async setThread(threadId: string, patch: { readonly name?: string; readonly archived?: boolean }): Promise<void> {

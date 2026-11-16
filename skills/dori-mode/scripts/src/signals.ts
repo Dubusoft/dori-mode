@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 import { fetchHttp, type Http } from "./messenger/http.ts";
-import type { Runner } from "./run.ts";
+import type { Ran, Runner } from "./run.ts";
 
 /** `error` means the check failed to run, rather than the condition being unmet. */
 export type Check = { readonly signal: string; readonly ok: boolean; readonly detail: string; readonly error?: string };
@@ -29,20 +29,23 @@ export const UNREADABLE = [
 
 export class SignalSyntaxError extends Error {}
 
+const skipString = (s: string, start: number): number => {
+  let end = start + 1;
+  while (end < s.length && s[end] !== '"') end += s[end] === "\\" ? 2 : 1;
+  return end;
+};
+
 const readJson = (s: string, i: number): { readonly value: unknown; readonly end: number } => {
   const open = s[i];
   let end = i;
   if (open === '"') {
-    end++;
-    while (end < s.length && s[end] !== '"') end += s[end] === "\\" ? 2 : 1;
-    end++;
+    end = skipString(s, end) + 1;
   } else if (open === "[" || open === "{") {
     let depth = 0;
     for (; end < s.length; end++) {
       const c = s[end];
       if (c === '"') {
-        end++;
-        while (end < s.length && s[end] !== '"') end += s[end] === "\\" ? 2 : 1;
+        end = skipString(s, end);
       } else if (c === "[" || c === "{") depth++;
       else if ((c === "]" || c === "}") && --depth === 0) break;
     }
@@ -67,8 +70,7 @@ export const splitDone = (done: string): string[] => {
   for (let i = 0; i < body.length; i++) {
     const c = body[i];
     if (c === '"') {
-      i++;
-      while (i < body.length && body[i] !== '"') i += body[i] === "\\" ? 2 : 1;
+      i = skipString(body, i);
     } else if (c === "[" || c === "{") depth++;
     else if (c === "]" || c === "}") depth--;
     else if (c === ";" && depth === 0) {
@@ -184,6 +186,10 @@ const dig = (v: unknown, path: readonly (string | number)[]): { readonly found: 
 };
 
 const short = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 120);
+const failed = (signal: string, detail: string): Check => ({ signal, ok: false, detail, error: detail });
+const ghFailure = (signal: string, result: Ran): Check | undefined => result.code !== 0 || result.timedOut
+  ? failed(signal, result.err || `gh exited ${result.code}`)
+  : undefined;
 
 export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}): Promise<Check> => {
   const s = signal.trim();
@@ -192,42 +198,36 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
     sig = parseSignal(s);
   } catch (e) {
     const detail = e instanceof SignalSyntaxError ? e.message : String(e);
-    return { signal: s, ok: false, detail, error: detail };
+    return failed(s, detail);
   }
   switch (sig.kind) {
     case "merged": {
       const r = await run(["gh", "pr", "view", sig.n, "--repo", sig.repo, "--json", "state,mergeCommit"]);
-      if (r.code !== 0 || r.timedOut) {
-        const detail = r.err || `gh exited ${r.code}`;
-        return { signal: s, ok: false, detail, error: detail };
-      }
+      const failure = ghFailure(s, r);
+      if (failure) return failure;
       const j = JSON.parse(r.out) as { state?: string; mergeCommit?: { oid?: string } | null };
       const sha = j.mergeCommit?.oid ?? "";
       return { signal: s, ok: j.state === "MERGED" && sha.length > 0, detail: j.state ? `${j.state} ${sha.slice(0, 10)}`.trim() : r.err || "no answer" };
     }
     case "closed": {
       const r = await run(["gh", "issue", "view", sig.n, "--repo", sig.repo, "--json", "state"]);
-      if (r.code !== 0 || r.timedOut) {
-        const detail = r.err || `gh exited ${r.code}`;
-        return { signal: s, ok: false, detail, error: detail };
-      }
+      const failure = ghFailure(s, r);
+      if (failure) return failure;
       const j = JSON.parse(r.out) as { state?: string };
       return { signal: s, ok: j.state === "CLOSED", detail: j.state ?? (r.err || "no answer") };
     }
     case "pr": {
       // No cwd: the check reads GitHub only, so a deleted worktree cannot break it.
       const r = await run(["gh", "pr", "list", "--repo", sig.repo, "--head", sig.branch, "--state", "all", "--json", "number,state,isDraft,statusCheckRollup,isCrossRepository,url,createdAt"]);
-      if (r.code !== 0 || r.timedOut) {
-        const detail = r.err || `gh exited ${r.code}`;
-        return { signal: s, ok: false, detail, error: detail };
-      }
+      const failure = ghFailure(s, r);
+      if (failure) return failure;
       type Pr = { state?: string; isDraft?: boolean; isCrossRepository?: boolean; url?: string; createdAt?: string; statusCheckRollup?: { conclusion?: string; state?: string }[] | null };
       let prs: Pr[];
       try {
         prs = JSON.parse(r.out) as Pr[];
       } catch {
         const detail = `gh answered no JSON: ${short(r.out) || "(empty)"}`;
-        return { signal: s, ok: false, detail, error: detail };
+        return failed(s, detail);
       }
       // The newest PR decides, so an older merged PR from a reused branch name never counts for new work.
       const latest = [...prs].sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))[0];
@@ -235,7 +235,7 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
       const url = latest.url ?? "";
       if (latest.isCrossRepository) {
         const detail = `${url} comes from a fork; pr signals support same-repo branches only`;
-        return { signal: s, ok: false, detail, error: detail };
+        return failed(s, detail);
       }
       if (latest.state === "MERGED") return { signal: s, ok: true, detail: `MERGED ${url}` };
       if (latest.state !== "OPEN") return { signal: s, ok: false, detail: `${latest.state ?? "no state"} ${url}` };

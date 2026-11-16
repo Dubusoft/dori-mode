@@ -208,13 +208,13 @@ export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, 
 };
 
 export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fileReceipt?: LaneFileReceipt): Promise<string> => {
+  const stale = (): LaneFileError => new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
+  const options = { now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
+    emit: deps.fileNote ?? ((_id: string, line: string) => console.error(line)) };
   const active = await deps.registry.read(lane.key);
-  if (lane.fileRun && !active?.fileRun) throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
+  if ((lane.fileRun && !active?.fileRun) || (active?.fileRun && active.closedAt)) throw stale();
   if (active?.fileRun) {
     checkLaneReportText(lane.key, "", evidence);
-    if (active.closedAt) throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
-    const options = { now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
-      emit: deps.fileNote ?? ((_id: string, line: string) => console.error(line)) };
     if (!fileReceipt) {
       const snapshot = await deps.ops.files(active);
       if (!snapshot) throw new LaneFileError("LANE_REPORT_FILES_MISSING", lane.key, "this managed lane's done report has no file snapshot; claim done again through its runner");
@@ -223,14 +223,14 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
     }
     lane = active;
   } else if (fileReceipt) {
-    throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
+    throw stale();
   }
   const admit = async (): Promise<string> => {
   // A repeated claim with the same evidence is the claim already recorded: it keeps that claim (and its single
   // LANE_DONE_CLAIMED, its window and its PR bindings) instead of re-issuing it and waking the lead again.
   const recorded = await deps.registry.read(lane.key);
   if (fileReceipt && (!recorded || recorded.closedAt || recorded.fileRun?.id !== fileReceipt.run.id))
-    throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
+    throw stale();
   const status = recorded ? statusOf(recorded) : undefined;
   if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
     return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
@@ -239,7 +239,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   const at = iso(deps.clock);
   await deps.registry.update(lane.key, (current) => {
     if (fileReceipt && (!current || current.closedAt || current.fileRun?.id !== fileReceipt.run.id))
-      throw new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
+      throw stale();
     return withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls } });
   });
   // `dori lane status` inside the lane answers from what its runner was told (D16).
@@ -256,8 +256,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   if (!fileReceipt) return admit();
   let result = "";
   await verifyLaneFileReceipt(deps.config.stateDir, lane.key, fileReceipt, {
-    now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
-    emit: deps.fileNote ?? ((_id, line) => console.error(line)),
+    ...options,
   }, async () => { result = await admit(); });
   return result;
 };

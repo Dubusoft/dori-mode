@@ -322,6 +322,10 @@ export class EventSources {
     return found?.type === type ? found : { type, events: 0, duplicates: 0 };
   }
 
+  private initialize(name: string, type: SourceStatus["type"]): void {
+    if (!this.status.has(name) || this.typeOf(name) !== type) this.set(name, this.entry(name, type));
+  }
+
   private set(name: string, entry: SourceStatus): void {
     this.status.set(name, entry);
     this.dirty = true;
@@ -393,10 +397,10 @@ export class EventSources {
     await Promise.all(specs.map(async (spec) => {
       if (spec.type === "webhook") return;
       if (spec.type === "schedule") {
-        if (!this.status.has(spec.name) || this.typeOf(spec.name) !== "schedule") this.set(spec.name, { type: "schedule", events: 0, duplicates: 0 });
+        this.initialize(spec.name, "schedule");
         return;
       }
-      if (!this.status.has(spec.name) || this.typeOf(spec.name) !== spec.type) this.set(spec.name, { type: spec.type, events: 0, duplicates: 0 });
+      this.initialize(spec.name, spec.type);
       if (this.running.has(spec.name)) return;
       if (spec.type === "poll") {
         if ((this.nextPoll.get(spec.name) ?? -Infinity) > now) return;
@@ -503,7 +507,7 @@ export class EventSources {
       this.listeners.delete(name);
     }
     for (const spec of specs) {
-      if (!this.status.has(spec.name) || this.typeOf(spec.name) !== "webhook") this.set(spec.name, { type: "webhook", events: 0, duplicates: 0 });
+      this.initialize(spec.name, "webhook");
       if (this.listeners.has(spec.name)) continue;
       try {
         const server = Bun.serve({

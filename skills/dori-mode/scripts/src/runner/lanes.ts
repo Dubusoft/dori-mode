@@ -229,6 +229,15 @@ type LaunchInput = {
   readonly grants?: readonly string[];
   readonly restored?: boolean;
 };
+type LaunchOptions = Pick<LaunchInput, "keywords" | "session" | "target" | "heavySlots" | "heavyMaxLoad" | "tabWorkspace" | "grants">;
+/** The optional `LaunchInput` fields a start body or a lane record carries, each set only when present (no explicit undefined). */
+const launchOptions = (o: { [K in keyof LaunchOptions]?: LaunchOptions[K] | undefined }): LaunchOptions => ({
+  ...(o.keywords !== undefined ? { keywords: o.keywords } : {}), ...(o.session !== undefined ? { session: o.session } : {}),
+  ...(o.target ? { target: o.target } : {}),
+  ...(o.heavySlots !== undefined ? { heavySlots: o.heavySlots } : {}), ...(o.heavyMaxLoad !== undefined ? { heavyMaxLoad: o.heavyMaxLoad } : {}),
+  ...(o.tabWorkspace !== undefined ? { tabWorkspace: o.tabWorkspace } : {}),
+  ...(o.grants?.length ? { grants: o.grants } : {}),
+});
 type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string };
 
 export class RunnerLanes {
@@ -251,8 +260,8 @@ export class RunnerLanes {
   }
 
   /** Pre-proto-4 records acquire identity only from a live foreground process positively attributed to their key. */
-  async currentPane(record: LaneRecord, panes?: readonly Pane[]): Promise<Pane | undefined> {
-    const instance = await this.instance();
+  async currentPane(record: LaneRecord, panes?: readonly Pane[], knownInstance?: string): Promise<Pane | undefined> {
+    const instance = knownInstance ?? await this.instance();
     if (!instance || record.herdrInstance && record.herdrInstance !== instance) return undefined;
     const pane = (panes ?? await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
     if (!record.herdrInstance) {
@@ -264,7 +273,7 @@ export class RunnerLanes {
       const owner = procLanes(await (this.deps.procs ?? (() => sampleProcs(this.deps.run)))());
       const foreground = info?.foreground_processes ?? [];
       const attributed = foreground.some((p) => p.pid !== undefined && owner.get(p.pid) === record.key);
-      if (!attributed || instance !== await this.instance()) return undefined;
+      if (!attributed || instance !== knownInstance && instance !== await this.instance()) return undefined;
       this.update(record.key, (r) => ({ ...r, herdrInstance: instance, ...(pane?.terminal_id ? { terminalId: pane.terminal_id } : {}) }));
       return pane;
     }
@@ -317,6 +326,20 @@ export class RunnerLanes {
 
   private tokenFileOf(key: string, gen: number | undefined): string {
     return join(this.deps.runnerDir, RUNNER_PATHS.briefs, gen === undefined ? `${key}.token` : `${key}.${gen}.token`);
+  }
+
+  private newToken(): string {
+    return (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
+  }
+
+  /** Deletes the lane's brief and both token files (generation `gen` and the stable adopted one), and its file trees when `trees`. */
+  private forgetLaneFiles(key: string, gen: number | undefined, trees: boolean): void {
+    rmSync(this.briefPath(key), { force: true });
+    rmSync(this.tokenFileOf(key, gen), { force: true });
+    rmSync(this.tokenFileOf(key, undefined), { force: true });
+    if (!trees) return;
+    const paths = laneFilePaths(this.deps.runnerDir, key);
+    for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
   }
 
   /** Throws `RUNNER_CMD_REJECTED <rule>` when a pane directory found on this host is not under the policy's allowedRoots. */
@@ -407,21 +430,11 @@ export class RunnerLanes {
         sandbox: body.sandbox,
         fileRun: body.files.run, mayStart: (value) => { mayStart = value; },
         key: body.key, cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
-        ...(body.keywords !== undefined ? { keywords: body.keywords } : {}), ...(body.session !== undefined ? { session: body.session } : {}),
-        ...(body.target ? { target: body.target } : {}),
-        ...(body.heavySlots !== undefined ? { heavySlots: body.heavySlots } : {}), ...(body.heavyMaxLoad !== undefined ? { heavyMaxLoad: body.heavyMaxLoad } : {}),
-        ...(body.tabWorkspace !== undefined ? { tabWorkspace: body.tabWorkspace } : {}),
-        ...(body.grants?.length ? { grants: body.grants } : {}),
+        ...launchOptions(body),
       });
       return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd } };
     } catch (error) {
-      if (!mayStart && !this.records()[body.key]) {
-        const paths = laneFilePaths(this.deps.runnerDir, body.key);
-        for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
-        rmSync(this.briefPath(body.key), { force: true });
-        rmSync(this.tokenFileOf(body.key, 1), { force: true });
-        rmSync(this.tokenFileOf(body.key, undefined), { force: true });
-      }
+      if (!mayStart && !this.records()[body.key]) this.forgetLaneFiles(body.key, 1, true);
       throw error;
     }
   }
@@ -489,7 +502,7 @@ export class RunnerLanes {
     if (!input.sandbox && input.profile !== "sandboxed") {
       argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session, this.outsideRules(cwd));
     }
-    const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
+    const token = this.newToken();
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
     const previous = this.records()[key];
     const gen = (previous?.gen ?? 0) + 1;
@@ -596,7 +609,7 @@ export class RunnerLanes {
     if (paneCwd === undefined && body.cwd === undefined) throw new Error(`${rejectionText("cwd-missing")} pane ${body.pane} reports no directory`);
     for (const dir of [body.cwd, paneCwd]) if (dir !== undefined) this.checkPaneCwd(dir);
     const cwd = body.cwd ?? paneCwd ?? "";
-    const token = (this.deps.token ?? (() => randomBytes(32).toString("base64url")))();
+    const token = this.newToken();
     ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.briefs);
     const tokenFile = this.tokenPath(body.key);
     writeRunnerFile(tokenFile, token);
@@ -632,13 +645,7 @@ export class RunnerLanes {
     const closed: "tab" | "pane" | "none" = !current ? "none" : record.tab ? "tab" : record.pane ? "pane" : "none";
     if (closed === "tab") await this.deps.run(["herdr", "tab", "close", record.tab]);
     else if (closed === "pane") await this.deps.run(["herdr", "pane", "close", record.pane]);
-    rmSync(this.briefPath(key), { force: true });
-    rmSync(this.tokenFileOf(key, record.gen), { force: true });
-    rmSync(this.tokenFileOf(key, undefined), { force: true });
-    if (record.fileRun) {
-      const paths = laneFilePaths(this.deps.runnerDir, key);
-      for (const path of [paths.input, paths.output, paths.stage]) removeLaneTree(this.deps.runnerDir, path);
-    }
+    this.forgetLaneFiles(key, record.gen, record.fileRun !== undefined);
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
     this.deps.herdrReports?.close(key);
@@ -759,10 +766,7 @@ export class RunnerLanes {
       fileRun: files.run,
       key, cwd: record.cwd, profile: record.profile, mode: record.mode, model: record.model,
       ...(restored ? { target: { pane: restored }, restored: true } : {}),
-      ...(record.keywords !== undefined ? { keywords: record.keywords } : {}), ...(session !== undefined ? { session } : {}),
-      ...((tabWorkspace ?? record.tabWorkspace) !== undefined ? { tabWorkspace: tabWorkspace ?? record.tabWorkspace } : {}),
-      ...(record.heavySlots !== undefined ? { heavySlots: record.heavySlots } : {}), ...(record.heavyMaxLoad !== undefined ? { heavyMaxLoad: record.heavyMaxLoad } : {}),
-      ...(record.grants?.length ? { grants: record.grants } : {}),
+      ...launchOptions({ ...record, session, tabWorkspace: tabWorkspace ?? record.tabWorkspace }),
     });
     // The relaunch replaced the record; a notice the supervisor pushed stays with the lane.
     if (record.notice) this.update(key, (r) => ({ ...r, notice: record.notice as LaneNotice }));
@@ -777,10 +781,13 @@ export class RunnerLanes {
    * and is remembered in the record (`lastAsk`); a lane whose prompt is gone forgets it, so its next question goes out
    * again. An empty or failed screen read changes nothing. Returns the keys published.
    */
-  async askTick(): Promise<string[]> {
+  async askTick(panes?: readonly Pane[], instance?: string): Promise<string[]> {
     const asked: string[] = [];
-    for (const record of Object.values(this.records())) {
-      const pane = await this.currentPane(record);
+    const records = this.records();
+    const next = { ...records };
+    let changed = false;
+    for (const record of Object.values(records)) {
+      const pane = await this.currentPane(record, panes, instance);
       if (!pane) continue;
       const screen = await readScreen(this.deps.run, record.pane, ASK_SCREEN_LINES).catch(() => "");
       await this.noteTurn(record, pane, screen);
@@ -789,12 +796,14 @@ export class RunnerLanes {
       const seen = q ? questionKey(q) : undefined;
       if (seen === record.lastAsk) continue;
       if (q) { this.deps.publish("lane.asking", { key: record.key, text: askingLine(record.key, q) }); asked.push(record.key); }
-      const current = this.records()[record.key];
+      const current = next[record.key];
       if (current) {
         const { lastAsk: _was, ...rest } = current;
-        this.save({ ...this.records(), [record.key]: seen ? { ...rest, lastAsk: seen } : rest });
+        next[record.key] = seen ? { ...rest, lastAsk: seen } : rest;
+        changed = true;
       }
     }
+    if (changed) this.save(next);
     return asked;
   }
 }

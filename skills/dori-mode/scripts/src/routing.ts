@@ -4,7 +4,6 @@ import { join } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
 import type { HostSample } from "./host-guard.ts";
-import { type Lane, statusOf } from "./registry.ts";
 import { withStateLockSync } from "./state-lock.ts";
 
 export type LaunchVerdict = { readonly ok: boolean; readonly reasons: readonly string[] };
@@ -63,11 +62,29 @@ const withFlag = (hold: HoldState | undefined, machine: string | undefined, flag
   return { ...base, machines: { ...base.machines, [label]: { ...base.machines?.[label], ...flag } } };
 };
 
-const validFlag = (value: unknown): boolean =>
+type Kind = "string" | "strings" | "boolean" | "finite" | "posint" | "mass-ulw";
+const KINDS: Record<Kind, (v: unknown) => boolean> = {
+  string: (v) => typeof v === "string",
+  strings: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
+  boolean: (v) => typeof v === "boolean",
+  finite: (v) => typeof v === "number" && Number.isFinite(v),
+  posint: (v) => typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  "mass-ulw": (v) => v === "mass-ulw",
+};
+/** Field table: kind and whether the key must be present. A present key must match its kind. */
+type Fields = Readonly<Record<string, readonly [Kind, boolean]>>;
+const conforms = (value: unknown, fields: Fields): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value) &&
-  "blocked" in value && typeof value.blocked === "boolean" &&
-  (!("at" in value) || (typeof value.at === "number" && Number.isFinite(value.at))) &&
-  (!("reasons" in value) || (Array.isArray(value.reasons) && value.reasons.every((reason) => typeof reason === "string")));
+  Object.entries(fields).every(([key, [kind, required]]) => key in value ? KINDS[kind]((value as Record<string, unknown>)[key]) : !required);
+
+const FLAG_FIELDS: Fields = { blocked: ["boolean", false], at: ["finite", false], reasons: ["strings", false] };
+const MACHINE_FLAG_FIELDS: Fields = { ...FLAG_FIELDS, blocked: ["boolean", true] };
+const LAUNCH_FIELDS: Fields = {
+  key: ["string", true], title: ["string", true], done: ["string", true], brief: ["string", true],
+  cwd: ["string", false], repos: ["strings", false], thread: ["string", false], model: ["string", false], mode: ["mass-ulw", false],
+  task: ["posint", false], machine: ["string", false], pane: ["string", false], workspace: ["string", false], grants: ["strings", false],
+  queuedAt: ["string", true], reasons: ["strings", true],
+};
 
 const lockedHold = <T>(stateDir: string, act: () => T): T =>
   withStateLockSync(join(stateDir, "launch-hold.lock.sqlite"), act);
@@ -77,35 +94,15 @@ const observedHolds = new Map<string, string>();
 const observedKey = (stateDir: string, machine?: string): string => `${stateDir}\0${remoteLabel(machine) ?? LOCAL}`;
 const holdRevision = (hold: HoldState): string => hold.revision ?? JSON.stringify(hold);
 
-const validLaunch = (value: unknown): value is QueuedLaunch =>
-  typeof value === "object" && value !== null &&
-  "key" in value && typeof value.key === "string" &&
-  "title" in value && typeof value.title === "string" &&
-  "done" in value && typeof value.done === "string" &&
-  "brief" in value && typeof value.brief === "string" &&
-  (!("cwd" in value) || typeof value.cwd === "string") &&
-  (!("repos" in value) || (Array.isArray(value.repos) && value.repos.every((repo) => typeof repo === "string"))) &&
-  (!("thread" in value) || typeof value.thread === "string") &&
-  (!("model" in value) || typeof value.model === "string") &&
-  (!("mode" in value) || value.mode === "mass-ulw") &&
-  (!("task" in value) || (typeof value.task === "number" && Number.isSafeInteger(value.task) && value.task > 0)) &&
-  (!("machine" in value) || typeof value.machine === "string") &&
-  (!("pane" in value) || typeof value.pane === "string") &&
-  (!("workspace" in value) || typeof value.workspace === "string") &&
-  (!("grants" in value) || (Array.isArray(value.grants) && value.grants.every((grant) => typeof grant === "string"))) &&
-  "queuedAt" in value && typeof value.queuedAt === "string" &&
-  "reasons" in value && Array.isArray(value.reasons) && value.reasons.every((reason) => typeof reason === "string");
+const validLaunch = (value: unknown): value is QueuedLaunch => conforms(value, LAUNCH_FIELDS);
 
 const readHold = (stateDir: string): HoldState | undefined => {
   const path = holdFile(stateDir);
   if (!existsSync(path)) return undefined;
   try {
     const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw) ||
-        ("blocked" in raw && typeof raw.blocked !== "boolean") ||
-        ("at" in raw && (typeof raw.at !== "number" || !Number.isFinite(raw.at))) ||
-        ("reasons" in raw && (!Array.isArray(raw.reasons) || !raw.reasons.every((reason) => typeof reason === "string"))) ||
-        ("machines" in raw && (typeof raw.machines !== "object" || raw.machines === null || Array.isArray(raw.machines) || !Object.values(raw.machines).every(validFlag))) ||
+    if (!conforms(raw, FLAG_FIELDS) ||
+        ("machines" in raw && (typeof raw.machines !== "object" || raw.machines === null || Array.isArray(raw.machines) || !Object.values(raw.machines).every((flag) => conforms(flag, MACHINE_FLAG_FIELDS)))) ||
         ("queue" in raw && !Array.isArray(raw.queue))) throw new Error("invalid launch hold state");
     const entries = "queue" in raw ? raw.queue as unknown[] : undefined;
     const queue = entries?.filter(validLaunch);
@@ -167,10 +164,6 @@ export const clearLaunchHold = (stateDir: string, machine?: string): void => {
   });
 };
 
-/** Remote labels whose flag is blocked, sorted. */
-export const heldMachines = (stateDir: string): string[] => lockedHold(stateDir, () =>
-  Object.entries(readHold(stateDir)?.machines ?? {}).filter(([, flag]) => flag.blocked).map(([label]) => label).sort());
-
 /** The queued launches that target `machine` (default: the local host; entries without a machine are local). */
 export const queueFor = (queue: readonly QueuedLaunch[], machine?: string): readonly QueuedLaunch[] =>
   queue.filter((q) => remoteLabel(q.machine) === remoteLabel(machine));
@@ -211,18 +204,3 @@ export const launchQueueText = (queue: readonly QueuedLaunch[]): string =>
       `queued ${q.queuedAt}`,
     ].join(" ")).join("; ")} (dori hold list)`
     : "";
-
-/** What `dori launch` must do before it starts a lane: refuse, hold, or go with these stdout lines. */
-export type LaunchGate = { readonly hold?: string; readonly lines: readonly string[] };
-
-/** The host guard (memory, disk, pane count) always applies. A pane budget of 0 or less is unlimited, with a warning. */
-export const launchGate = (o: { readonly sample: HostSample; readonly guard: GuardThresholds }): LaunchGate => {
-  const lines: string[] = [];
-  if (o.guard.panesMax <= 0) lines.push(`LAUNCH_WARN guard.panesMax is ${o.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`);
-  const reasons = canLaunch(o.sample, o.guard).reasons;
-  if (reasons.length) return { hold: reasons.join(" | "), lines };
-  return { lines };
-};
-
-export const idleLaneFor = (lanes: readonly Lane[], cwd: string, idlePanes: ReadonlySet<string>): Lane | null =>
-  lanes.find((l) => statusOf(l) === "working" && l.cwd === cwd && l.pane !== undefined && idlePanes.has(l.pane)) ?? null;

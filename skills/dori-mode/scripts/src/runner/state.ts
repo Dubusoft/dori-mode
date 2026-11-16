@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { chmodSync, closeSync, openSync } from "node:fs";
 import { join } from "node:path";
 import type { CommandOutcome, JsonValue, SupervisorCommandType } from "./protocol.ts";
+import { COMMAND_RETENTION_MS } from "./durability.ts";
 
 /**
  * The runner's own durable state (`<runnerDir>/state.sqlite`, 0600 with its WAL):
@@ -15,8 +16,6 @@ import type { CommandOutcome, JsonValue, SupervisorCommandType } from "./protoco
  */
 
 export const STATE_FILE = "state.sqlite";
-/** Command rows are kept this long after their last update. */
-export const COMMAND_RETENTION_MS = 30 * 24 * 60 * 60_000;
 
 export type CommandRowState = "intent" | CommandOutcome;
 

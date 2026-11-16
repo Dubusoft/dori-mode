@@ -432,16 +432,9 @@ const displayTimeZone = (raw: unknown): string => {
 };
 
 /** The config's `alertsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
-const alertsChannel = (raw: unknown): string | undefined => {
+const optionalChannel = (name: string, raw: unknown): string | undefined => {
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "string") throw new TypeError("alertsChannel must be a Discord channel id string");
-  return raw.trim() || undefined;
-};
-
-/** The config's `decisionsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
-const decisionsChannel = (raw: unknown): string | undefined => {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "string") throw new TypeError("decisionsChannel must be a Discord channel id string");
+  if (typeof raw !== "string") throw new TypeError(`${name} must be a Discord channel id string`);
   return raw.trim() || undefined;
 };
 
@@ -459,11 +452,12 @@ export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
 /** `leadCwd`'s former name: still read while a file has no `leadCwd`, until `dori setup` renames it. */
 export const LEGACY_LEAD_CWD_KEY = "defaultCwd";
 
-let warnedIgnoredKeys = false;
-let warnedLegacyLeadCwd = false;
-let warnedLeadArray = false;
-let warnedPaneKeys = false;
-let warnedAutopilot = false;
+const warned = new Set<string>();
+const warnOnce = (id: string, line: string): void => {
+  if (warned.has(id)) return;
+  warned.add(id);
+  console.error(line);
+};
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -477,42 +471,32 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
   if (LEGACY_LEAD_CWD_KEY in loaded) {
     if (!("leadCwd" in loaded)) raw.leadCwd = loaded[LEGACY_LEAD_CWD_KEY];
-    if (!warnedLegacyLeadCwd) {
-      warnedLegacyLeadCwd = true;
-      console.error(`CONFIG_KEY_RENAMED ${LEGACY_LEAD_CWD_KEY} -> leadCwd in ${path}: ${"leadCwd" in loaded ? "leadCwd is set, so defaultCwd is ignored" : "still read as leadCwd for now"}; run dori setup to rename it`);
-    }
+    warnOnce("legacyLeadCwd", `CONFIG_KEY_RENAMED ${LEGACY_LEAD_CWD_KEY} -> leadCwd in ${path}: ${"leadCwd" in loaded ? "leadCwd is set, so defaultCwd is ignored" : "still read as leadCwd for now"}; run dori setup to rename it`);
   }
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
   if (isRecord(raw.placement) && "workspaces" in raw.placement) ignored.push("placement.workspaces");
   ignored.push(...ignoredRunnerKeys(raw.runners));
-  if (ignored.length && !warnedIgnoredKeys) {
-    warnedIgnoredKeys = true;
-    console.error(`CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
-  }
+  if (ignored.length) warnOnce("ignoredKeys", `CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
   if (Array.isArray(raw.leadModel)) {
-    if (!warnedLeadArray) {
-      warnedLeadArray = true;
-      console.error(`CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
-    }
+    warnOnce("leadArray", `CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
     raw.leadModel = modelEntries(raw.leadModel, undefined)[0];
   }
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
   const fromFile = raw as Partial<DoriConfig>;
   const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
   const panes = resolveManagedPanes(stateDir, loaded);
-  if (paneKeys.length && !warnedPaneKeys) {
-    warnedPaneKeys = true;
-    console.error(panes.migrated?.saved
+  if (paneKeys.length) {
+    warnOnce("paneKeys", panes.migrated?.saved
       ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
       : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
   }
   const { runners: rawRunners, ...rest } = fromFile;
   const machineRunners = runners(rawRunners);
   const { alertsChannel: rawAlerts, decisionsChannel: rawDecisions, ...fileValues } = rest;
-  const alerts = alertsChannel(rawAlerts);
-  const decisions = decisionsChannel(rawDecisions);
+  const alerts = optionalChannel("alertsChannel", rawAlerts);
+  const decisions = optionalChannel("decisionsChannel", rawDecisions);
   const merged: DoriConfig = { ...base, ...fileValues, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
@@ -525,9 +509,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
     autopilot: parseAutopilotConfig(raw.autopilot, (line) => {
-      if (warnedAutopilot) return;
-      warnedAutopilot = true;
-      console.error(`CONFIG_AUTOPILOT_KEYS_IGNORED ${line} in ${path}`);
+      warnOnce("autopilot", `CONFIG_AUTOPILOT_KEYS_IGNORED ${line} in ${path}`);
     }),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     stateDir,
