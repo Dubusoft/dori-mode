@@ -1202,7 +1202,7 @@ export const supervise = async (
         await decisionDeliveryTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
           laneMessages ??= openLaneMessages(deps.config), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed"));
       } catch (e) { console.error(`DECISION_DELIVERY_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-      // Owner decisions: a stuck post, a missing link line, a pending archive, the daily reminder.
+      // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
       try { await ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }); }
       catch (e) { console.error(`OWNER_DECISION_CHECK_ERROR ${e instanceof Error ? e.message : String(e)}`); }
       // A thread whose work is all finished and reported is closed (archived) once; the owner gets no button to press.

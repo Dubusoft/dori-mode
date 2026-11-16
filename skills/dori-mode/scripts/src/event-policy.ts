@@ -2,8 +2,8 @@
  * The event policy table (design 1.7): every event kind is delivered by class. `lead-urgent` wakes the lead,
  * `lead-digest` waits for the next urgent delivery (or `digestMaxDelayMin`), `engine-only` is journaled for the engine and
  * the counts only. The supervisor never posts an event to the owner itself: everything the owner hears goes through the lead,
- * except failed-delivery notices, owner decision threads (a lane question with choices becomes
- * a decision thread), and the daily 09:00 reminder of waiting decisions.
+ * except failed-delivery notices and owner decision threads (a lane question with choices becomes
+ * a decision thread).
  * The removed `owner-only` class still loads from an old config, as `lead-digest`, with one warning per process.
  *
  * A kind is the event line's first word, optionally followed by more words that must match the line's next words in
