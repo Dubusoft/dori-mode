@@ -9,6 +9,7 @@ import { ackLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
 import { openOperations, operationId, plan, settleOperation } from "../src/operations.ts";
 import { decisionTargetOf, DECISIONS_FILE, readDecisions } from "../src/decision-store.ts";
 import { relayDecisionClose, relayLine, retryDecisionRelays } from "../src/decision-relay.ts";
+import { sendToLane } from "../src/lane-send.ts";
 import { answeredLine, ownerDecisionTick, type TickDeps } from "../src/owner-decisions.ts";
 import { sendVerified } from "../src/panes.ts";
 import type { Lane } from "../src/registry.ts";
@@ -51,8 +52,12 @@ const memoryState = (): RunnerState => {
   } as unknown as RunnerState;
 };
 
-/** The pane as the runner's send sees it: `refuse` throws as runner/lanes.ts does for a pane that did not take the text. */
-type Pane = "refuse" | "take" | "down";
+/**
+ * The pane as the runner's send sees it: `refuse` throws as runner/lanes.ts does for a pane that did not take the text;
+ * `asking` shows a question prompt (runner/lanes.ts refuses a send with refuseWhileAsking and types any other);
+ * `unconfirmed` takes the text without the pane confirming it.
+ */
+type Pane = "refuse" | "take" | "down" | "asking" | "unconfirmed";
 
 const setup = async () => {
   const s = withState();
@@ -74,8 +79,11 @@ const setup = async () => {
       "lane.send": async (command) => {
         cmdIds.push(command.body.cmdId);
         if (control.pane === "refuse") throw new Error(`RUNNER_LANE_SEND_FAILED ${lane.key}: ${REFUSAL}`);
+        if (control.pane === "asking" && command.body.refuseWhileAsking) {
+          return { detail: "refused asking", result: { delivery: "failed", refusal: `RUNNER_LANE_ASKING ${command.body.key} shows a question prompt; not typed` } };
+        }
         typed.push(command.body.text);
-        return { detail: "typed", result: { delivery: "delivered" } };
+        return { detail: "typed", result: { delivery: control.pane === "unconfirmed" ? "unconfirmed" : "delivered" } };
       },
     },
   });
@@ -246,6 +254,53 @@ test("a remote lane gets the close text through its machine's runner, with the r
   expect(t.labels).toEqual(["mac-mini"]);
   expect(t.typed).toEqual(["[LEAD] Answer to your request d1 (Which store?). The code is in ~/in/code.txt. Confirm you got this message: ~/.dori/runner/bin/dori report ack decision-close-d1"]);
   expect(d.relay?.state).toBe("relayed");
+});
+
+test("dori lane send types the lead's text once into a local and a remote lane through their runners and prints LANE_SEND_DELIVERED", async () => {
+  const t = await setup();
+  t.control.pane = "take";
+  const local = await sendToLane(t.deps, lane, "rebase onto dev,\n then push");
+  const id = `lane-send-demo-lane-${T0}`;
+  expect(local).toEqual({ ok: true, line: `LANE_SEND_DELIVERED demo-lane ${id}: the lane confirms with dori report ack ${id}` });
+  expect(t.messages.get(id)).toMatchObject({ state: "delivered", refuseWhileAsking: true });
+
+  const remote: Lane = { ...lane, key: "mac-lane", machine: "mac-mini" };
+  await t.deps.registry.update(remote.key, () => remote);
+  t.clock.at += MIN;
+  expect((await sendToLane(t.deps, remote, "[LEAD] stop and wait")).line).toStartWith("LANE_SEND_DELIVERED mac-lane");
+  expect(t.labels).toEqual(["local", "mac-mini"]);
+  expect(t.typed).toEqual([
+    `[LEAD] rebase onto dev, then push. Confirm you got this message: dori report ack ${id}`,
+    `[LEAD] stop and wait. Confirm you got this message: ~/.dori/runner/bin/dori report ack lane-send-mac-lane-${T0 + MIN}`,
+  ]);
+});
+
+test("dori lane send to a lane showing a question prompt is refused, types nothing and is never typed by a later pass; other steering still is", async () => {
+  const t = await setup();
+  t.control.pane = "asking";
+  const sent = await sendToLane(t.deps, lane, "hello");
+  const id = `lane-send-demo-lane-${T0}`;
+  expect(sent.ok).toBe(false);
+  expect(sent.line).toStartWith(`LANE_SEND_REFUSED demo-lane ${id}: send failed (pane w:p1 idle): `);
+  expect(sent.line).toContain("RUNNER_LANE_ASKING demo-lane shows a question prompt");
+  expect(t.messages.get(id)?.state).toBe("superseded");
+  queueSteering(t.messages, T0, lane, { id: ID, subject: "demo-lane done status", text: "[LEAD] not done" });
+  t.control.pane = "take";
+  t.clock.at += 30 * MIN;
+  await t.pass();
+  expect(t.typed).toEqual([`[LEAD] not done. Confirm you got this message: dori report ack ${ID}`]);
+});
+
+test("dori lane send prints LANE_SEND_UNCONFIRMED when the pane does not confirm it took the text, and LANE_SEND_FAILED when the runner is away", async () => {
+  const t = await setup();
+  t.control.pane = "unconfirmed";
+  expect((await sendToLane(t.deps, lane, "hi")).line).toStartWith(`LANE_SEND_UNCONFIRMED demo-lane lane-send-demo-lane-${T0}: typed`);
+  t.control.pane = "down";
+  t.clock.at += MIN;
+  const failed = await sendToLane(t.deps, lane, "hi");
+  expect(failed.ok).toBe(false);
+  expect(failed.line).toStartWith(`LANE_SEND_FAILED demo-lane lane-send-demo-lane-${T0 + MIN}: `);
+  expect(t.typed).toHaveLength(1);
 });
 
 test("a close text the pane keeps refusing is retried, never typed by the general pass, and wakes the lead once after the last attempt", async () => {

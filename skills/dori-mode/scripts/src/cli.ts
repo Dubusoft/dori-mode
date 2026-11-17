@@ -60,6 +60,7 @@ import { writeUpdateResult } from "./auto-update.ts";
 import { refreshBootPrep } from "./boot-prep-install.ts";
 import { refreshLaneSandbox } from "./lane-sandbox-install.ts";
 import { laneOps, type LaneOps, LaneOpsError } from "./lane-ops.ts";
+import { sendToLane } from "./lane-send.ts";
 import { type CliRunnerCall, cliRunnerCall, cliSocketPath } from "./runner/cli-relay.ts";
 import { RunnerUnavailable } from "./runner/call.ts";
 import { defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
@@ -144,6 +145,7 @@ const USAGE = `dori <command> [options]
   claim-done <key> --evidence TEXT    inside a lane: its own key only, as a done report through its runner; the lead names any lane
   object-done <key> --reason TEXT [--reason TEXT ...]
   lane status [<key>]                  a lane's status, its last objection's reasons and its done claim (JSON); inside a lane its own (from its runner), the lead names the lane
+  lane send <key> --text TEXT          types TEXT into the lane once through its runner (local or remote) as a lead message it acks; refused while the lane shows a question prompt; prints LANE_SEND_DELIVERED, LANE_SEND_UNCONFIRMED, or LANE_SEND_REFUSED/LANE_SEND_FAILED (exit 1, nothing typed, not retried)
   ops [list] [--lane KEY] [--all] [--json]   operation rows: open, failed and ambiguous ones; --all adds verified
   ops resolve <id> --as verified|retry  the lead's answer for an ambiguous or failed operation after checking the world by hand
   close  <key> [--note TEXT] [--force] close now (Done signals must read back live; unpushed, uncommitted or untracked work refuses unless --force)
@@ -859,7 +861,17 @@ try {
     }
     case "lane": {
       const [action, laneKey, ...extra] = flags.positionals;
-      if (action !== "status" || !laneKey || extra.length || Object.keys(flags.values).length) die("usage: dori lane status <key> (inside a lane: dori lane status)");
+      if (action === "send") {
+        if (!laneKey || extra.length || Object.keys(flags.values).some((name) => name !== "text")) die("usage: dori lane send <key> --text TEXT");
+        const text = need("text");
+        const target = await lane(laneKey ?? "");
+        await needSupervisor();
+        const sent = await sendToLane(deps, target, text);
+        console.log(sent.line);
+        if (!sent.ok) process.exit(1);
+        break;
+      }
+      if (action !== "status" || !laneKey || extra.length || Object.keys(flags.values).length) die("usage: dori lane status <key> | dori lane send <key> --text TEXT (inside a lane: dori lane status)");
       const found = (await deps.registry.read(laneKey ?? "")) ?? die(`no registered lane "${laneKey}"`);
       console.log(JSON.stringify({ key: found.key, status: statusOf(found), objection: found.objection ?? null, claim: found.claim ?? null }, null, 2));
       break;

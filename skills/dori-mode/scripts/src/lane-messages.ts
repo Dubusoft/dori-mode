@@ -32,6 +32,10 @@ export type LaneMessage = {
    * alone decides whether its pane takes it (never over other text or without a prompt). CI messages wait for an idle pane.
    */
   readonly whileWorking?: boolean;
+  /** Not typed while the lane shows a question prompt: the runner refuses the send (`dori lane send`). */
+  readonly refuseWhileAsking?: boolean;
+  /** Typed, but the pane did not confirm it took the text (the runner's `unconfirmed` delivery). */
+  readonly unconfirmed?: boolean;
   readonly updatedAt: number;
 };
 
@@ -106,7 +110,7 @@ export class SqliteLaneMessages implements LaneMessageStore {
 export const openLaneMessages = (config: { readonly stateDir: string }): LaneMessageStore => new SqliteLaneMessages(storeFile(config.stateDir));
 
 /** Queues `message` unless a message with its ID exists (the same subject is the same message); returns the stored one. */
-export const queueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text" | "whileWorking">): LaneMessage => {
+export const queueLaneMessage = (store: LaneMessageStore, now: number, message: Pick<LaneMessage, "id" | "lane" | "subject" | "text" | "whileWorking" | "refuseWhileAsking">): LaneMessage => {
   if (!LANE_MESSAGE_ID.test(message.id)) throw new LaneMessageError(`lane message id must match ${LANE_MESSAGE_ID}`);
   const existing = store.get(message.id);
   if (existing) return existing;

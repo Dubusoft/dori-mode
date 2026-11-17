@@ -161,11 +161,12 @@ const panesReader = (deps: FlowDeps): ((lane: Lane) => Promise<Pane[] | Error>) 
  * notice or objection). Returns the stored message; a known id is the same intent and stays as it is.
  */
 export const queueSteering = (
-  store: LaneMessageStore, now: number, lane: Pick<Lane, "key" | "machine">, message: Pick<LaneMessage, "id" | "subject" | "text">,
+  store: LaneMessageStore, now: number, lane: Pick<Lane, "key" | "machine">, message: Pick<LaneMessage, "id" | "subject" | "text" | "refuseWhileAsking">,
 ): LaneMessage => {
   const dori = lane.machine ? "~/.dori/runner/bin/dori" : "dori";
   const queued = queueLaneMessage(store, now, {
     id: message.id, lane: lane.key, subject: message.subject, whileWorking: true,
+    ...(message.refuseWhileAsking ? { refuseWhileAsking: true } : {}),
     text: `${message.text.replace(/\.$/, "")}. Confirm you got this message: ${dori} report ack ${message.id}`,
   });
   for (const old of store.list({ lane: lane.key, states: OPEN_MESSAGE_STATES })) {
@@ -231,23 +232,28 @@ const deliver = async (
   let typedHere: Observed = "unknown";
   const readBack: ReadBack = async () => (messages.get(message.id)?.state === "acked" ? "done" : typedHere);
   let refused: string | undefined;
+  let unconfirmed = false;
   const { op } = await perform(ops, deps.clock.now, spec, async () => {
     // The runner answers a repeated cmdId with its first result, so each attempt has its own id (done-flow.ts act):
     // a retry after a definitive failure reaches the effect again, while a replay of one attempt keeps its id.
     const id = operationId(spec);
     const delivery = await deps.ops.send(lane, message.text, {
       mode: "verified", inputCheck: true, cmdId: `op:${id}:${ops.get(id)?.attempts ?? 0}`, onFailed: (detail) => { refused = detail; },
+      ...(message.refuseWhileAsking ? { refuseWhileAsking: true } : {}),
     });
     if (delivery === "failed") {
       typedHere = "not-done";
       return { ok: false, detail: refused ?? "the runner could not deliver the text (input line busy, refused, or runner unavailable)" };
     }
     typedHere = "done";
+    unconfirmed = delivery === "unconfirmed";
     return { ok: true, detail: delivery === "unconfirmed" ? "typed, not confirmed in the pane" : "" };
   }, readBack);
   const current = messages.get(message.id) ?? message;
   if (current.state === "acked") return current;
-  if (op.state === "verified") return updateLaneMessage(messages, current, { state: "delivered", deliveredAt: deps.clock.now(), blocked: undefined }, deps.clock.now());
+  if (op.state === "verified") {
+    return updateLaneMessage(messages, current, { state: "delivered", deliveredAt: deps.clock.now(), blocked: undefined, ...(unconfirmed ? { unconfirmed } : {}) }, deps.clock.now());
+  }
   const panes = await panesOf(lane);
   const status = panes instanceof Error ? "status unreadable" : (panes.find((p) => p.pane_id === lane.pane)?.agent_status ?? "not listed");
   const where = `pane ${lane.pane ?? "-"} ${status}`;
