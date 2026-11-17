@@ -221,7 +221,7 @@ and write its own directory; update the wrapper (`dori runner update`) on a host
 
 ### Review lane profile
 
-A `lane.start` with `agentProfile: "review"` (the local policy's `agents.review`, the same argv as `agents.sandboxed`)
+A `lane.start` with `agentProfile: "review"` (the runner policy's `agents.review`, the same argv as `agents.sandboxed`; every runner-config that takes review lanes needs it)
 always runs sandboxed: the runner runs `sandboxCheck` first even without `sandbox: true`, refuses it on a PowerShell pane
 (`RUNNER_LANE_REVIEW_UNSANDBOXED`), and launches it with `LANE_SANDBOX_PROFILE=review` and without `LANE_SANDBOX_REPOS`,
 `LANE_SANDBOX_WORKTREES` and `LANE_SANDBOX_RW`. The Linux wrapper then binds the cwd (the review snapshot worktree), its
