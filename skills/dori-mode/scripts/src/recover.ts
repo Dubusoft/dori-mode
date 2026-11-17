@@ -221,9 +221,14 @@ const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, s
     throw error;
   }
   const moved = await deps.registry.update(lane.key, (current) => {
-    if (!current || current.closedAt || current.pendingFileRun?.id !== prepared.files.run.id) return undefined;
+    if (!current || current.closedAt) return undefined;
     // A runner profile that pins its own model runs that one: the lane is judged against it from now on.
-    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}), ...(r.relaunched && r.model ? { model: r.model } : {}),
+    const model = r.relaunched && r.model && r.model !== current.model ? { model: r.model } : undefined;
+    if (current.pendingFileRun?.id !== prepared.files.run.id) {
+      // The run's lane.started landed first and confirmed it (pane and fileRun): only the model is left to record.
+      return model && current.fileRun?.id === prepared.files.run.id && !current.pendingFileRun ? { ...current, ...model } : undefined;
+    }
+    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}), ...model,
       fileRun: r.relaunched ? prepared.files.run : current.fileRun, pendingFileRun: undefined, fileProposal: undefined };
   });
   const next: Lane = moved ?? await deps.registry.read(lane.key) ?? stored;

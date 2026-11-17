@@ -489,13 +489,31 @@ test("a sandboxed lane replaced on the wrong model is started sandboxed again, r
   expect((await deps.registry.read(lane.key))?.sandbox).toBe(true);
 });
 
-test("a lane whose runner profile pins another model records that model on recovery and is not replaced again", async () => {
+/**
+ * Runner ops whose lane.start and lane.recover report the profile's pinned model. `early` hands the run's lane.started to
+ * the hub before the result comes back, as a runner publishes it before its startup check.
+ */
+const pinnedOps = (deps: Deps, early: boolean): LaneOps => {
+  const hub: LaneHubDeps = { stateDir: state.dir, registry: deps.registry, reports: () => undefined,
+    now: deps.clock.now, emit: () => {}, prepareRecovery: async () => ({ cmdId: "unused", notes: [] }), recover: () => undefined };
+  let seq = 0;
+  const started = async (key: string, made: { readonly pane: string; readonly tab: string }, run: LaneBriefFiles["run"] | undefined) => {
+    if (early) await acceptLaneEvent(hub, "local", { v: 1, runner: "local", gen: 1, epoch: 1, seq: ++seq, type: "lane.started",
+      body: { key, pane: made.pane, tab: made.tab, session: "", ...(run ? { fileRun: run } : {}) } }, seq);
+  };
+  return { ...deps.ops,
+    start: async (input) => { const made = await deps.ops.start(input); await started(input.key, made, input.files?.run); return { ...made, model: "provider/pinned" }; },
+    recover: async (l, opts) => { const made = await deps.ops.recover(l, opts); await started(l.key, made, opts?.files?.run); return { ...made, model: "provider/pinned" }; },
+  };
+};
+
+test.each([false, true])("a live agent on the model its runner profile pins is replaced once, records that model and is left alone after (lane.started first: %p)", async (early) => {
   const { deps, world, lane, control, clock } = await fixture();
   clock.at = STARTUP_GRACE_MS;
   control.live(true);
   control.argv = ["omo", "--model", "provider/pinned"];
   // The live agent on the wrong model is closed and started again (lane.start), which reports the profile's pinned model.
-  const pinned = { ...deps, ops: { ...deps.ops, start: async (input) => ({ ...(await deps.ops.start(input)), model: "provider/pinned" }) } satisfies LaneOps };
+  const pinned = { ...deps, ops: pinnedOps(deps, early) };
   expect(await recoverLanes(pinned)).toEqual(["LANE_RECOVERED recover-lane new:p1 model-mismatch", "STARTUP_OK recover-lane new:p1", SKIP]);
   expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
   clock.at += STARTUP_GRACE_MS;
@@ -503,19 +521,22 @@ test("a lane whose runner profile pins another model records that model on recov
   expect(opsOf(world, "start")).toHaveLength(1);
 });
 
-test("a runner relaunch of a missing pane records the model its runner profile pins", async () => {
-  const { deps, lane } = await fixture();
-  const ops: LaneOps = { ...deps.ops, recover: async (l, opts) => ({ ...(await deps.ops.recover(l, opts)), model: "provider/pinned" }) };
-  expect(await recoverLanes({ ...deps, ops }, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
+test.each([false, true])("a runner relaunch of a missing pane records the model its runner profile pins and is left alone after (lane.started first: %p)", async (early) => {
+  const { deps, world, lane, control, clock } = await fixture();
+  control.argv = ["omo", "--model", "provider/pinned"];
+  const pinned = { ...deps, ops: pinnedOps(deps, early) };
+  expect((await recoverLanes(pinned, lane.key))[0]).toStartWith("LANE_RECOVERED recover-lane new:p1 missing-pane");
   expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+  clock.at += STARTUP_GRACE_MS;
+  expect((await recoverLanes(pinned)).filter((line) => line.includes("model-mismatch"))).toEqual([]);
+  expect(opsOf(world, "recover", "start")).toHaveLength(1);
 });
 
-test("a relaunch from the brief records the model its runner profile pins", async () => {
+test.each([false, true])("a relaunch from the brief records the model its runner profile pins (lane.started first: %p)", async (early) => {
   const { deps, lane } = await fixture();
   const existing = { ...lane, runner: "local", fileRun: { id: "00000000-0000-4000-8000-0000000000ab", requiredReport: false } };
   await deps.registry.write(existing);
-  const ops: LaneOps = { ...deps.ops, start: async (input) => ({ ...(await deps.ops.start(input)), model: "provider/pinned" }) };
-  const result = await launchLane({ ...deps, ops }, { key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, cwd: lane.cwd, model: "provider/expected" }, existing);
+  const result = await launchLane({ ...deps, ops: pinnedOps(deps, early) }, { key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, cwd: lane.cwd, model: "provider/expected" }, existing);
   expect(result.lane.model).toBe("provider/pinned");
   expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
 });
