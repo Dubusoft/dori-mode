@@ -756,7 +756,7 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   if (settled === undefined) return;
   const line = settled.line;
   // A close whose claim announcement already reached the lead is marked seen-claim. It wakes the lead unless the
-  // supervisor finished the lane's task itself (`seen-claim toodo=done`, digest).
+  // supervisor finished the lane's task itself or it has none (`seen-claim toodo=done` / `toodo=no-task`, digest).
   const event = claim.event;
   const seen = event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event));
   const marked = seen ? line.replace(/^(LANE_CLOSED \S+ closed)(?= |$)/, "$1 seen-claim") : line;

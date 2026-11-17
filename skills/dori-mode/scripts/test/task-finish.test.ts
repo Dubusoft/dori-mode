@@ -129,12 +129,12 @@ test("a task-linked lane closing after its merge has its task completed and read
   expect(fake.sends).toEqual([]);
 });
 
-test("a lane with no Toodo task closes as before and wakes the lead; toodo is never called", async () => {
+test("a lane with no Toodo task closes as before, as digest after a seen claim; toodo is never called", async () => {
   const { task: _none, ...untasked } = lane;
   const fake = fakeDiscord();
   const { lines, calls } = await closeMerged(untasked, inProgress([manual(1)]), fake.discord);
   expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed seen-claim toodo=no-task ${PR}`);
-  expect(eventClass(lines[0] ?? "")).toBe("lead-urgent");
+  expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
   expect(calls).toEqual([]);
   expect(fake.edits).toEqual([]);
 });

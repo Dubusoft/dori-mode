@@ -364,6 +364,11 @@ test("one lane result wakes the lead once: a finished close and the autopilot ou
     [["lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim toodo=done https://x/7"], autopilotDone]], 2)).map((step) => step.pointers)).toEqual([1, 0, 0]);
   // Claim and close pending together are one wake.
   expect((await finishSteps([[claim, ["lane-closed:alpha", "LANE_CLOSED alpha closed toodo=done https://x/7"], autopilotDone]])).map((step) => step.pointers)).toEqual([1]);
+  // A lane with no Toodo task: after the claim's wake its close is news only; after a merge's wake too.
+  expect((await finishSteps([[claim], [["lane-closed:alpha", "LANE_CLOSED alpha closed seen-claim toodo=no-task https://x/7"]]])).map((step) => step.pointers)).toEqual([1, 0]);
+  expect((await finishSteps([[["ci-merged:acme/app#7", MERGED_7]], [["lane-closed:alpha", "LANE_CLOSED alpha closed toodo=no-task https://x/7"]]])).map((step) => step.pointers)).toEqual([1, 0]);
+  // With no earlier wake, a no-task close is the lane's first result and wakes the lead.
+  expect((await finishSteps([[["lane-closed:alpha", "LANE_CLOSED alpha closed toodo=no-task https://x/7"]]])).map((step) => step.pointers)).toEqual([1]);
 });
 
 test("a lane result the lead still has work on wakes it again: an unfinished task, a failed autopilot lane, an outcome with no earlier wake", async () => {
