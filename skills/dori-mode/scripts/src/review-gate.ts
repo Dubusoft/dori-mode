@@ -44,8 +44,14 @@ import { runnerWorktreeRoot } from "./runner/hub.ts";
  */
 
 export const REVIEW_POLICY_VERSION = "t4-1";
-/** D8: a job queued this long without a start, or running this long without a result, fails with `timeout`. */
+/** D8: a job queued this long without a start fails with `timeout`. */
 export const REVIEW_TIMEOUT_MS = 15 * 60_000;
+/**
+ * D8: a job running this long without a result fails with `timeout`. A normal review (QA with the full test suite, then
+ * the gate reviewer subagent) takes 11-17 minutes, so this leaves about twice that; a reviewer lane that dies is caught
+ * at once as `runner_lost`, not by this limit.
+ */
+export const REVIEW_RUN_TIMEOUT_MS = 30 * 60_000;
 /** Per PR: review runs that may go stale on a head or merge base change and be scheduled again; one more escalates. */
 export const REVIEW_STALE_RESCHEDULES = 2;
 /** Per PR: time from the first review request after which a needed new job escalates instead. */
@@ -690,8 +696,8 @@ export class ReviewGate {
       await this.release(next);
       return;
     }
-    if (now - e.startedAt < REVIEW_TIMEOUT_MS) return;
-    const next = fail(this.jobs, now, r.job.jobId, "timeout", `running ${REVIEW_TIMEOUT_MS / 60_000} min without a result`);
+    if (now - e.startedAt < REVIEW_RUN_TIMEOUT_MS) return;
+    const next = fail(this.jobs, now, r.job.jobId, "timeout", `running ${REVIEW_RUN_TIMEOUT_MS / 60_000} min without a result`);
     this.failed(next, emit);
     await this.closeReviewer(lane, next, `review ${r.job.jobId} timed out`, false);
   }
