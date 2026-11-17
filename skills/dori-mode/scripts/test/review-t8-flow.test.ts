@@ -346,8 +346,8 @@ test("flow 3: findings twice -> no merge, one owner decision, the author lane he
     watched.push(...await watchTick(withReviewHold(h.deps, h.gate)));
     await h.poll();
   }
-  // The claim is announced to the lead as usual; it is never settled, objected to or closed.
-  expect(watched.filter((l) => l.includes(" author"))).toEqual(["LANE_DONE_CLAIMED author w:p1 F1 fixed and pushed"]);
+  // The claim is announced to the lead as usual (with its pre-verification); it is never settled, objected to or closed.
+  expect(watched.filter((l) => l.includes(" author"))).toEqual(["LANE_DONE_CLAIMED author w:p1 F1 fixed and pushed | verified: pr=#7 head=5555555 checks=green conflict=no sig=0/1"]);
   expect(h.world.ops.filter((e) => e.op === "close" && e.key === "author")).toEqual([]);
   expect(statusOf(await h.author())).toBe("done-claimed");
   expect(h.objections()).toHaveLength(1);
