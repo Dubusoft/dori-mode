@@ -118,6 +118,11 @@ export type OwnerDecision = DecisionChoices & {
   readonly relayTo?: string;
   /** What `dori decision close` did with its text for the lane (decision-relay.ts); set when it closes, updated by retries. */
   readonly relay?: DecisionRelay;
+  /**
+   * Set once the supervisor dealt with the lane's goal after this blocking ask was answered (decision-resume.ts): `resumed`
+   * (its parked goal is active again), `not parked (<hold>)` (nothing to resume), or `resume <outcome>` (not confirmed).
+   */
+  readonly goalResume?: { readonly at: number; readonly outcome: string };
 };
 
 /**
@@ -239,3 +244,40 @@ export const decisionTargetOf = (lane: TargetLane): DecisionTarget => ({
 
 export const sameTarget = (a: DecisionTarget, b: DecisionTarget): boolean =>
   a.lane === b.lane && a.runner === b.runner && a.generation === b.generation && (a.openedAt === undefined || b.openedAt === undefined || a.openedAt === b.openedAt);
+
+/**
+ * Which lanes wait on the owner, for the sweeps that would otherwise wake or report them (freshness, milestone drift).
+ * A lane waits while one of its own blocking questions or requests, asked in its current session, is not closed and no
+ * direct answer to it is queued or acked. Only the newest revision counts: a withdrawal (a revision without a choice)
+ * opens the question again, so the lane waits again even once the withdrawal reached it. `resolvedAt` is when the lane's
+ * last wait ended (a close, or a direct answer queued for it): its silence and milestone clocks count from there, not
+ * from before it asked.
+ */
+export type LaneOwnerWait = { readonly waiting: ReadonlySet<string>; readonly resolvedAt: ReadonlyMap<string, number> };
+
+export const directAnswer = (d: OwnerDecision): AnswerDelivery | undefined => {
+  const r = d.revisions?.at(-1);
+  return r && r.choice !== undefined && (r.delivery.state === "queued" || r.delivery.state === "acked") ? r.delivery : undefined;
+};
+
+/** Whether lane decision `d` was asked by `lane`'s current session (a request has no target: asked after its last recovery). */
+export const askedThisSession = (d: OwnerDecision, lane: TargetLane): boolean =>
+  d.target ? sameTarget(d.target, decisionTargetOf(lane)) : (lane.lastRecoveryAt ?? 0) <= d.openedAt;
+
+export const laneOwnerWait = (decisions: readonly OwnerDecision[], lanes: readonly TargetLane[]): LaneOwnerWait => {
+  const byKey = new Map(lanes.map((l) => [l.key, l]));
+  const waiting = new Set<string>();
+  const resolvedAt = new Map<string, number>();
+  const resolved = (key: string, at: number | undefined): void => {
+    if (at !== undefined) resolvedAt.set(key, Math.max(resolvedAt.get(key) ?? at, at));
+  };
+  for (const d of decisions) {
+    const lane = d.source === "lane" && d.blocking && d.lane !== undefined ? byKey.get(d.lane) : undefined;
+    if (!lane) continue;
+    const direct = directAnswer(d);
+    if (d.state === "closed") { resolved(lane.key, d.closedAt); continue; }
+    if (direct) { resolved(lane.key, direct.updatedAt); continue; }
+    if (askedThisSession(d, lane)) waiting.add(lane.key);
+  }
+  return { waiting, resolvedAt };
+};

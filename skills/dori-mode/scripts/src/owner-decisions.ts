@@ -650,7 +650,7 @@ export const answeredLine = (d: OwnerDecision): string => {
 
 /** The lead's urgent line for a close whose text could not be typed into its lane after every attempt (decision-relay.ts). */
 export const relayFailedLine = (d: Pick<OwnerDecision, "id" | "relay">): string =>
-  `DECISION_RELAY_FAILED ${d.relay?.lane ?? "-"} ${d.id}: ${d.relay?.reason ?? "not delivered"}; the close text did not reach the lane after ${d.relay?.attempts ?? 1} attempts and is not retried again, hand it to the lane yourself`;
+  `DECISION_RELAY_FAILED ${d.relay?.lane ?? "-"} ${d.id}: ${d.relay?.reason ?? "not delivered"}; the close text did not reach the lane after ${d.relay?.attempts ?? 1} attempts and is not retried again, hand it to the lane yourself with dori lane send naming ${d.id} (its parked goal resumes once the lane acks it)`;
 
 /** The digest event of a decision the supervisor opened from a lane question. */
 export const openedLine = (d: OwnerDecision, duplicateOf?: string): string =>
