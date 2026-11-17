@@ -54,6 +54,16 @@ test("the done claim and lane-ending events, a close after a received claim too,
   }
 });
 
+test("a seen-claim close with no task left to finish is digest; one whose task is unfinished stays urgent", () => {
+  for (const line of ["LANE_CLOSED alpha closed seen-claim toodo=done https://x", "LANE_CLOSED alpha closed seen-claim toodo=no-task https://x", "LANE_CLOSED alpha closed seen-claim toodo=no-task"]) {
+    expect([line, eventClass(line)]).toEqual([line, "lead-digest"]);
+  }
+  for (const line of [
+    "LANE_CLOSED alpha closed toodo=no-task https://x", "LANE_CLOSED alpha closed seen-claim toodo=failed https://x",
+    "LANE_CLOSED alpha closed seen-claim toodo=unmerged", "LANE_CLOSED alpha closed seen-claim toodo=append-failed", "LANE_AUTO_CLOSED alpha closed toodo=no-task",
+  ]) expect([line, eventClass(line)]).toEqual([line, "lead-urgent"]);
+});
+
 test("routine PR states, runner link states, a delivered nudge, the owner's thread close and queueing Toodo moves are engine-only", () => {
   for (const line of [
     "GH_PR acme/app#7 opened sha=abc https://x", "GH_PR acme/app#7 updated sha=abc https://x", "GH_PR acme/app#7 checks_green sha=abc https://x",
