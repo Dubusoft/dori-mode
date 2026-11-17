@@ -200,15 +200,20 @@ export type StartupVerdict = { readonly verdict: "ok" | "error" | "unconfirmed";
 
 /** The `result` of a verified `cmd.result`, per command type. */
 export type CommandResults = {
-  /** `cwd`: the directory the lane started in (the filled default, or a target pane's own). */
-  readonly "lane.start": { readonly pane: string; readonly tab: string; readonly startup: StartupVerdict; readonly cwd?: string };
+  /**
+   * `cwd`: the directory the lane started in (the filled default, or a target pane's own). `model`: the model the agent
+   * argv names, which a profile that pins its own `--model` sets instead of the requested one; absent when the argv names
+   * none or the runner predates it (optional, so no proto bump).
+   */
+  readonly "lane.start": { readonly pane: string; readonly tab: string; readonly startup: StartupVerdict; readonly cwd?: string; readonly model?: string };
   readonly "lane.adopt": { readonly pane: string; readonly tab: string; readonly tokenFile: string };
   readonly "lane.stop": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
   readonly "lane.close": { readonly closed: "tab" | "pane" | "none"; readonly gone: boolean };
   readonly "lane.pause": { readonly goal?: GoalOutcome; readonly working?: boolean; readonly stopped?: boolean };
   /** `execution` is read only after a confirmed goal; a runner older than it never sends it. */
   readonly "lane.resume": { readonly goal: GoalOutcome; readonly execution?: ExecutionOutcome };
-  readonly "lane.recover": { readonly pane: string; readonly tab: string; readonly relaunched: boolean; readonly resumed: boolean; readonly startup?: StartupVerdict };
+  /** `model`: as for lane.start, sent only with a relaunch. */
+  readonly "lane.recover": { readonly pane: string; readonly tab: string; readonly relaunched: boolean; readonly resumed: boolean; readonly startup?: StartupVerdict; readonly model?: string };
   readonly "lane.send": { readonly delivery: "delivered" | "unconfirmed" | "failed" | "sent"; readonly refusal?: string };
   /** `dir`: the added group's path as the lane sees it. */
   readonly "lane.attach": { readonly dir: string };

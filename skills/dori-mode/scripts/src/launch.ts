@@ -443,7 +443,10 @@ const commitLaunched = async (deps: FlowDeps, lane: Lane, existing: Lane | undef
     : { ...current, ...lane, status: current.status === "paused" ? lane.status : current.status, launchReservation: undefined };
   await deps.registry.update(lane.key, (current) => {
     if (existing && current?.pendingFileRun?.id !== prepared.files.run.id && current?.fileRun?.id !== prepared.files.run.id) return undefined;
-    if (existing && current?.fileRun?.id === prepared.files.run.id && !current.pendingFileRun) return undefined;
+    // The run's lane.started landed first and confirmed it: only a model the runner reported in place of the stored one is left.
+    if (existing && current?.fileRun?.id === prepared.files.run.id && !current.pendingFileRun) {
+      return current.closedAt || lane.model === existing.model || current.model === lane.model ? undefined : { ...current, model: lane.model };
+    }
     if (token && current?.launchReservation !== token) throw new LaunchError(`lane ${lane.key} lost its launch reservation`);
     const next = current ? launched(current) : lane;
     return { ...next, pendingFileRun: undefined, fileProposal: undefined, recoveryPending: undefined, recoveryAfter: undefined, recoveryPreviousPane: undefined };
@@ -518,7 +521,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       return await startFailure(deps, input, error, token, draft, progress);
     }
     progress.started = true;
-    const lane: Lane = { ...draft, ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
+    // A runner profile that pins its own model runs that one instead of `model`: recovery judges the lane against it.
+    const lane: Lane = { ...draft, ...(result.model ? { model: result.model } : {}), ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
     return { lane: await commitLaunched(deps, lane, existing, token, prepared), notes, startup: startupLine(input.key, result.pane, result.startup) };
   } catch (error) {
     if (token && !progress.started) await deps.registry.releaseReservation(input.key, token);

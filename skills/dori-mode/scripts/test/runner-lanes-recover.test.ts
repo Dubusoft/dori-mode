@@ -779,3 +779,15 @@ test("lane.start hands a lane's grants to the sandbox as LANE_SANDBOX_RW/RO and 
   await expect(gone.lanes.start({ ...START, grants: ["blog-topic"] })).rejects.toThrow("RUNNER_CMD_REJECTED grant-unknown blog-topic");
   expect(gone.calls.some((a) => a[1] === "tab" && a[2] === "create")).toBe(false);
 });
+
+test("lane.start and a relaunching lane.recover report the model the agent argv runs: the one a profile pins over the requested one", async () => {
+  const t = setup({ policy: {
+    agents: { omo: ["omo", "--model", "{model}", "{prompt}"], pinned: ["omo", "--model=pinned/sonnet", "{prompt}"], bare: ["omo", "{prompt}"] },
+    allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"],
+  } });
+  expect((await t.lanes.start(START)).result).toMatchObject({ model: "m1" });
+  expect((await t.lanes.start({ ...START, cmdId: "c2", key: "lane-b", agentProfile: "pinned" })).result).toMatchObject({ model: "pinned/sonnet" });
+  expect((await t.lanes.start({ ...START, cmdId: "c3", key: "lane-c", agentProfile: "bare" })).result).not.toHaveProperty("model");
+  const next = { ...FILES, run: { ...FILES.run, id: "00000000-0000-4000-8000-000000000002" } };
+  expect((await t.lanes.recover("lane-b", undefined, undefined, "new brief", next)).result).toMatchObject({ relaunched: true, model: "pinned/sonnet" });
+});
