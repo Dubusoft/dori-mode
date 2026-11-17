@@ -8,6 +8,7 @@ import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
+import { OUTCOME_LINE_MAX } from "../src/lane-outcomes.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf, withStatus } from "../src/registry.ts";
 import { LAUNCH_ACTION, ledgerRows, ledgerState } from "../src/autopilot.ts";
@@ -138,7 +139,7 @@ test("sendVerified types nothing when the pane list cannot be read", async () =>
 test("five quiet minutes after a claim is handed over the lane is closed, and the next pass removes its queued worktree", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
-  expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
   expect(await watchTick(at(T0 + 4 * MIN))).toEqual([]);
   expect(closedVia()).toHaveLength(0);
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
@@ -156,7 +157,7 @@ test("five quiet minutes after a claim is handed over the lane is closed, and th
 test("a second done with the same evidence keeps the first claim: one LANE_DONE_CLAIMED, one notice, the window unmoved", async () => {
   livePane();
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
-  expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(at(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
   const notices = sent(world).length;
   const ghCalls = world.calls.filter((c) => c[0] === "gh").length;
   expect(await claimDone(at(T0 + 2 * MIN), lane, "merged acme/app#1 abc123")).toBe(`LANE_DONE_ALREADY_CLAIMED demo-lane ${new Date(T0).toISOString()} merged acme/app#1 abc123`);
@@ -167,7 +168,7 @@ test("a second done with the same evidence keeps the first claim: one LANE_DONE_
   expect(await watchTick(at(T0 + 3 * MIN))).toEqual([]);
   // New evidence is a new claim, announced again.
   await claimDone(at(T0 + 4 * MIN), lane, "merged acme/app#1 def456");
-  expect(await watchTick(at(T0 + 4 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 def456"]);
+  expect(await watchTick(at(T0 + 4 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 def456 | verified: pr=none sig=ok"]);
 });
 
 test("after an objection the same evidence claims again", async () => {
@@ -189,9 +190,11 @@ test("claim evidence and objection reasons are capped at 300 chars in event line
   expect(await objectDone(at(T0), { ...lane, pane: undefined }, ["x".repeat(300)])).toBe(`LANE_NOT_DONE demo-lane ${"x".repeat(300)}`);
 });
 
-test("the watcher's claim announcement is capped too", async () => {
+test("the watcher's claim announcement is capped too, shortening the evidence so its snapshot stays inside one outcome line", async () => {
   await claimDone(at(T0), lane, "w".repeat(400));
-  expect(await watchTick(at(T0))).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 ${"w".repeat(299)}…`]);
+  const lines = await watchTick(at(T0));
+  expect(lines).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 ${"w".repeat(238)}… | verified: pr=none sig=ok`]);
+  expect(lines[0]!.length).toBeLessThanOrEqual(OUTCOME_LINE_MAX);
 });
 
 test("CLOSED and LANE_CLOSED carry no receipt JSON while the registry keeps the receipt", async () => {
@@ -380,7 +383,8 @@ test("a Done=merged claim whose CI outlasts the window stays claimed, stays merg
   const { bound, deps, HEAD } = mergeOnly(pr);
   await deps(T0).registry.write(bound);
   await claimDone(deps(T0), bound, "PR acme/app#1 pushed");
-  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 PR acme/app#1 pushed"]);
+  // Running CI is not a failure: the claim wakes the lead with it as pending.
+  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 PR acme/app#1 pushed | verified: pr=#1 head=aaaaaaa checks=pending conflict=no sig=0/1"]);
   // The window ends with CI still running: no objection, the claim and its bound head stand.
   expect(await watchTick(deps(T0 + 6 * MIN))).toEqual([]);
   pr.checks = [{ status: "COMPLETED", conclusion: "SUCCESS" }];
@@ -399,17 +403,18 @@ test("a Done=merged claim whose CI outlasts the window stays claimed, stays merg
 
 test("a Done=merged claim objects with the reason once a check fails, the head moves, or the merge wait passes mergeWaitMaxMin", async () => {
   world.prState = "OPEN";
-  const pr: { state: string; head?: string; checks: { status: string; conclusion?: string }[] } = { state: "OPEN", checks: [{ status: "COMPLETED", conclusion: "FAILURE" }] };
+  const pr: { state: string; head?: string; checks: { status: string; conclusion?: string }[] } = { state: "OPEN", checks: [{ status: "QUEUED" }] };
   const { bound, deps } = mergeOnly(pr);
   const objection = async () => ((await at(T0).registry.read("demo-lane")) ?? bound).objection?.reasons;
-  const claimAndSettle = async (ms: number, afterClaim = () => {}): Promise<string[]> => {
+  // Each change lands after the claim's announcement, so the settle at the window's end (not the pre-check) objects.
+  const claimAndSettle = async (ms: number, afterAnnounce = () => {}): Promise<string[]> => {
     await deps(ms).registry.write(bound);
     await claimDone(deps(ms), bound, `claim ${ms}`);
-    afterClaim();
     await watchTick(deps(ms));
+    afterAnnounce();
     return watchTick(deps(ms + 6 * MIN));
   };
-  expect((await claimAndSettle(T0))[0]).toStartWith("LANE_NOT_DONE demo-lane");
+  expect((await claimAndSettle(T0, () => { pr.checks = [{ status: "COMPLETED", conclusion: "FAILURE" }]; }))[0]).toStartWith("LANE_NOT_DONE demo-lane");
   expect(await objection()).toEqual(["merged acme/app#1 -> OPEN", "acme/app#1 has 1 failed check(s)"]);
   pr.checks = [{ status: "QUEUED" }];
   // A push after the claim: the PR's head is no longer the one the claim recorded.
@@ -422,6 +427,55 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
   expect(await watchTick(deps(T0 + 79 * MIN))).toEqual([]);
   expect((await watchTick(deps(T0 + 80 * MIN)))[0]).toStartWith("LANE_NOT_DONE demo-lane");
   expect((await objection())?.[1]).toStartWith("not merged within 60 min of the claim");
+});
+
+test("a fresh claim is read once before it wakes the lead: a conflict, a failed check, a moved head or unpushed work is objected to instead", async () => {
+  world.prState = "OPEN";
+  const view = { mergeable: "MERGEABLE", head: "a".repeat(40), checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }] as { status: string; conclusion?: string }[] };
+  const { bound, deps } = mergeOnly({ state: "OPEN", checks: [] });
+  const live = (ms: number): FlowDeps => {
+    const base = deps(ms);
+    return { ...base, run: async (argv, opts) => {
+      const r = await base.run(argv, opts);
+      if (argv[0] !== "gh" || argv[2] !== "view" || !argv.includes("state,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup")) return r;
+      return { ...r, out: JSON.stringify({ ...JSON.parse(r.out), mergeable: view.mergeable, mergeStateStatus: view.mergeable === "CONFLICTING" ? "DIRTY" : "BLOCKED", headRefOid: view.head, statusCheckRollup: view.checks.map((c) => ({ __typename: "CheckRun", ...c })) }) };
+    } };
+  };
+  const claim = async (ms: number): Promise<string[]> => {
+    await deps(ms).registry.write(bound);
+    await claimDone(live(ms), bound, `claim ${ms}`);
+    return watchTick(live(ms));
+  };
+  const reasons = async () => (await at(T0).registry.read("demo-lane"))?.objection?.reasons;
+  view.mergeable = "CONFLICTING";
+  expect(await claim(T0)).toEqual(["LANE_NOT_DONE demo-lane acme/app#1 conflicts with its base"]);
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).toBe("not-done");
+  view.mergeable = "MERGEABLE";
+  view.checks = [{ status: "COMPLETED", conclusion: "FAILURE" }, { status: "IN_PROGRESS" }];
+  await claim(T0 + MIN);
+  expect(await reasons()).toEqual(["acme/app#1 has 1 failed check(s)"]);
+  view.checks = [];
+  view.head = "b".repeat(40);
+  await claim(T0 + 2 * MIN);
+  expect((await reasons())?.[0]).toStartWith("acme/app#1 head moved to bbbbbbbbbb after the claim at aaaaaaaaaa");
+  view.head = "a".repeat(40);
+  world.aheadCount = "1";
+  await claim(T0 + 3 * MIN);
+  expect(await reasons()).toEqual([`unpushed work in ${WT}`]);
+  // None of these woke the lead with a claim; a clean read does, with its snapshot.
+  world.aheadCount = "0";
+  expect(await claim(T0 + 4 * MIN)).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 claim ${T0 + 4 * MIN} | verified: pr=#1 head=aaaaaaa checks=none conflict=no sig=0/1`]);
+});
+
+test("a PR GitHub cannot be read for at the claim is UNREAD in the snapshot, never green and never an objection", async () => {
+  world.prState = "OPEN";
+  const { bound, deps } = mergeOnly({ state: "OPEN", checks: [] });
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "claim");
+  const base = deps(T0);
+  const unread: FlowDeps = { ...base, run: async (argv, opts) => argv[0] === "gh" && argv[2] === "view" ? { code: 1, out: "", err: "HTTP 502" } : base.run(argv, opts) };
+  expect(await watchTick(unread)).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 claim | verified: pr=#1 head=aaaaaaa checks=UNREAD conflict=UNREAD sig=0/1"]);
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).toBe("done-claimed");
 });
 
 /** A lane whose Done is `pr acme/app feat/x`: its green PR #7 (into `base`) reads live while open; the claim binds it at HEAD. */
@@ -450,7 +504,7 @@ test("a lane that stops at its green PR into the merge base stays claimed past t
   const { bound, deps, HEAD } = greenPrLane(pr);
   await deps(T0).registry.write(bound);
   await claimDone(deps(T0), bound, "https://github.com/acme/app/pull/7 green");
-  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 https://github.com/acme/app/pull/7 green"]);
+  expect(await watchTick(deps(T0))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 https://github.com/acme/app/pull/7 green | verified: pr=#7 head=ccccccc checks=green conflict=no sig=ok"]);
   // Its `pr` signal reads live, but closing now would leave the PR unmerged: the claim (and its bound head) stands.
   expect(await watchTick(deps(T0 + 6 * MIN))).toEqual([]);
   expect(await watchTick(deps(T0 + 30 * MIN))).toEqual([]);
@@ -607,7 +661,7 @@ test("LANE_DONE_CLAIMED is handed over before the claim is marked announced, and
   expect((await at(T0).registry.read("demo-lane"))?.claim?.emitted).toBe(false);
   const got: string[] = [];
   await watchTick(at(T0 + 2 * MIN), async (line) => { got.push(line); });
-  expect(got).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(got).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
   expect((await at(T0).registry.read("demo-lane"))?.claim?.emitted).toBe(true);
 });
 
@@ -619,7 +673,7 @@ test("one lane's failure is a LANE_WATCH_WARN line and the other lanes are still
     update: async (key: string, mutate: Parameters<typeof base.registry.update>[1]) => { if (key === "a-broken") throw new Error("registry write failed"); return base.registry.update(key, mutate); },
   });
   const lines = await watchTick({ ...base, registry });
-  expect([...lines].sort()).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123", "LANE_WATCH_WARN a-broken registry write failed"]);
+  expect([...lines].sort()).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok", "LANE_WATCH_WARN a-broken registry write failed"]);
 });
 
 /** `received` is the supervisor's answer for journaled ids (absent: `dori watch`, no supervisor). */
@@ -635,7 +689,7 @@ test("with claims made digest, a claim is the supervisor's to settle: its window
   await claimDone(onDelivery(T0, undefined, true), lane, "merged acme/app#1 abc123");
   expect(sent(world).at(-1)).toContain("closes automatically at 12:05Z (5 minutes) once its Done signals read back live");
   const never = () => false;
-  expect(await watchTick(onDelivery(T0 + MIN, never, true))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(onDelivery(T0 + MIN, never, true))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
   expect((await at(T0).registry.read("demo-lane"))?.claim?.deliveredAt).toBe(new Date(T0 + MIN).toISOString());
   expect(await watchTick(onDelivery(T0 + 5 * MIN, never, true))).toEqual([]);
   const lines = await watchTick(onDelivery(T0 + 6 * MIN + 1, never, true));
@@ -651,7 +705,7 @@ test("by default a claim the lead receives 40 minutes late still gets the full w
   await claimDone(onDelivery(T0), lane, "merged acme/app#1 abc123");
   expect(sent(world).at(-1)).toContain("closes automatically 5 minutes after the lead receives this claim");
   const ids: (string | undefined)[] = [];
-  expect(await watchTick(onDelivery(T0 + MIN, lead), async (_line, id) => { ids.push(id); })).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(onDelivery(T0 + MIN, lead), async (_line, id) => { ids.push(id); })).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
   expect(ids).toEqual([`done-claim:demo-lane:${claimAt}`]);
   // Undelivered (the lead is down): the claim waits, however old.
   expect(await watchTick(onDelivery(T0 + 39 * MIN, lead))).toEqual([]);
@@ -668,7 +722,7 @@ test("by default a claim the lead receives 40 minutes late still gets the full w
 
 test("with no supervisor (dori watch) the window starts when the claim is handed over", async () => {
   await claimDone(onDelivery(T0), lane, "merged acme/app#1");
-  expect(await watchTick(onDelivery(T0 + 20 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1"]);
+  expect(await watchTick(onDelivery(T0 + 20 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 | verified: pr=none sig=ok"]);
   expect(await watchTick(onDelivery(T0 + 24 * MIN))).toEqual([]);
   expect((await watchTick(onDelivery(T0 + 25 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
 });
@@ -685,7 +739,7 @@ test("a close whose claim the lead already received is marked seen-claim and wak
   livePane();
   await claimDone(onDelivery(T0), lane, "merged acme/app#1");
   // The lead never receives the claim: its window never starts, so the lane stays open however long it waits.
-  expect(await watchTick(onDelivery(T0, () => false))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1"]);
+  expect(await watchTick(onDelivery(T0, () => false))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 | verified: pr=none sig=ok"]);
   expect(await watchTick(onDelivery(T0 + 60 * MIN, () => false))).toEqual([]);
   expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("done-claimed");
   // Its PR then reads merged: the lane closes at once, before the lead got the claim, so this close wakes the lead.
@@ -723,5 +777,5 @@ test("events about a lane carry its meta: the claim announcement gets lane, thre
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
   const got: [string, unknown][] = [];
   await watchTick(at(T0 + MIN), async (line, _id, meta) => { got.push([line, meta]); });
-  expect(got).toEqual([["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123", { lane: "demo-lane", thread: "chat:team/123", cwd: "/repo" }]]);
+  expect(got).toEqual([["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok", { lane: "demo-lane", thread: "chat:team/123", cwd: "/repo" }]]);
 });

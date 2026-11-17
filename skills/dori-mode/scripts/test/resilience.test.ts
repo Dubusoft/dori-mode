@@ -117,7 +117,7 @@ test("a failing sweep never ends the supervisor or loses a done claim: the claim
   const w = sweepWorld(true);
   await w.deps.registry.write({ key: "demo-lane", title: "d", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), status: "done-claimed", claim: { at: new Date(T0).toISOString(), evidence: "merged acme/app#1 abc", emitted: false } });
   await w.tick();
-  expect(w.queue).toContain("LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc");
+  expect(w.queue).toContain("LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc | verified: pr=none sig=ok");
   expect(w.queue).toContain(`SWEEP_WARN dead-panes ${PANES_DOWN}`);
   expect((await w.deps.registry.read("demo-lane"))?.claim?.emitted).toBe(true);
   expect(w.logs).toContain(`SWEEP_ERROR dead-panes ${PANES_DOWN}`);
