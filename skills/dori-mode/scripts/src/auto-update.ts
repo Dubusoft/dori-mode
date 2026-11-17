@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { replaceFileAtomic } from "./durable-write.ts";
 import { githubRepoFromRemote } from "./git-remote.ts";
 import type { Runner } from "./run.ts";
+import type { EventMeta } from "./supervise-journal.ts";
 
 /**
  * Automatic `dori update --dev` after the supervisor merges a PR of dori's own repo into dev. The merge only records
@@ -14,6 +15,9 @@ import type { Runner } from "./run.ts";
  * <stateDir>/auto-update-result.json. The supervisor that reads that file (usually the restarted one) reports it: digest
  * AUTO_UPDATE_DONE on exit 0, urgent AUTO_UPDATE_FAILED on anything else, a unit that could not start, or one that ended
  * without a result.
+ * A lane that holds the update back for `staleAfterMs` (counted from the first tick it blocked, kept in the state file)
+ * is handed to `staleBlocker` at most every STALE_RECHECK_MS: it closes the lane when that is safe, and otherwise its
+ * line reaches the lead once per blocking stretch.
  */
 export const AUTO_UPDATE_UNIT = "dori-auto-update";
 export const AUTO_UPDATE_STATE = "auto-update.json";
@@ -21,12 +25,18 @@ export const AUTO_UPDATE_RESULT = "auto-update-result.json";
 /** The environment the unit gets from the supervisor (systemd's user manager has its own, which may lack these). */
 export const AUTO_UPDATE_ENV = ["PATH", "HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "DORI_CONFIG", "DORI_STATE_DIR"] as const;
 const UNIT_RUNNING = new Set(["active", "activating", "deactivating", "reloading"]);
+/** How often a stale blocker is checked again (its close conditions may come true later). */
+export const STALE_RECHECK_MS = 10 * 60_000;
+
+export type AutoUpdateEmit = (line: string, id: string, meta?: EventMeta) => Promise<void>;
 
 export type AutoUpdateState = {
   /** Merges (`owner/repo#N`) not yet covered by a started update. */
   readonly pending?: readonly string[];
   /** The update started for these merges, still waiting for its result. */
   readonly running?: { readonly at: number; readonly merges: readonly string[] };
+  /** Lanes holding the pending merges back: since when, and whether the lead was told. A started update clears it. */
+  readonly blocked?: Readonly<Record<string, { readonly since: number; readonly escalated?: true }>>;
 };
 export type UpdateResult = { readonly at: number; readonly code: number; readonly lines: readonly string[] };
 
@@ -70,6 +80,10 @@ export type AutoUpdateDeps = {
   /** Open lanes of dori's repo that are working or wait on their claim; the update waits while there is one. */
   readonly busy: () => Promise<readonly string[]>;
   readonly log: (line: string) => void;
+  /** How long a lane may hold the update back before `staleBlocker` is asked about it. */
+  readonly staleAfterMs: number;
+  /** Closes a stale blocker when that is safe (update-blocker.ts); otherwise returns the line for the lead. */
+  readonly staleBlocker: (key: string, since: number, emit: AutoUpdateEmit) => Promise<{ readonly closed: true } | { readonly closed: false; readonly line: string }>;
 };
 
 const STOP_LINE = /^(UPDATE_FAILED|UPDATE_STASH_CONFLICT|UPDATE_NOT_FAST_FORWARD)\b/;
@@ -93,6 +107,7 @@ const rest = (state: AutoUpdateState, covered: readonly string[]): readonly stri
 /** The supervisor's side of the automatic update; one per supervisor process. */
 export class AutoUpdate {
   private deferred = "";
+  private readonly checkedAt = new Map<string, number>();
 
   constructor(private readonly d: AutoUpdateDeps) {}
 
@@ -111,8 +126,26 @@ export class AutoUpdate {
     return UNIT_RUNNING.has(r.out.trim());
   }
 
+  /** Records since when each lane in `busy` blocks, then hands the stale ones to staleBlocker; the lead hears of each once. */
+  private async staleBlockers(busy: readonly string[], emit: AutoUpdateEmit): Promise<void> {
+    const now = this.d.now();
+    const current = readAutoUpdateState(this.d.stateDir);
+    const blocked = Object.fromEntries(busy.map((key) => [key, current.blocked?.[key] ?? { since: now }]));
+    if (JSON.stringify(blocked) !== JSON.stringify(current.blocked ?? {})) this.save((s) => ({ ...s, blocked }));
+    for (const key of this.checkedAt.keys()) if (!busy.includes(key)) this.checkedAt.delete(key);
+    for (const key of busy) {
+      const entry = blocked[key]!;
+      if (now - entry.since < this.d.staleAfterMs || now - (this.checkedAt.get(key) ?? -Infinity) < STALE_RECHECK_MS) continue;
+      this.checkedAt.set(key, now);
+      const verdict = await this.d.staleBlocker(key, entry.since, emit);
+      if (verdict.closed || entry.escalated) continue;
+      await emit(verdict.line, `auto-update-blocker:${key}:${entry.since}`);
+      this.save((s) => (s.blocked?.[key]?.since === entry.since ? { ...s, blocked: { ...s.blocked, [key]: { since: entry.since, escalated: true } } } : s));
+    }
+  }
+
   /** Reports a result the unit left, if any, and forgets its run. Returns the state as it now stands. */
-  private async report(state: AutoUpdateState, emit: (line: string, id: string) => Promise<void>): Promise<AutoUpdateState> {
+  private async report(state: AutoUpdateState, emit: AutoUpdateEmit): Promise<AutoUpdateState> {
     const result = readJson<UpdateResult>(this.resultPath);
     if (!result) return state;
     // Journaled before the files change: a crash in between re-emits the same id, which the journal dedupes.
@@ -122,7 +155,7 @@ export class AutoUpdate {
     return next;
   }
 
-  async tick(emit: (line: string, id: string) => Promise<void>): Promise<void> {
+  async tick(emit: AutoUpdateEmit): Promise<void> {
     const d = this.d;
     let state = await this.report(readAutoUpdateState(d.stateDir), emit);
     if (state.running) {
@@ -146,6 +179,7 @@ export class AutoUpdate {
       const note = `AUTO_UPDATE_DEFERRED after ${merges.join(", ")}: lanes of dori's repo still open: ${busy.join(", ")}`;
       if (note !== this.deferred) d.log(note);
       this.deferred = note;
+      await this.staleBlockers(busy, emit);
       return;
     }
     this.deferred = "";
