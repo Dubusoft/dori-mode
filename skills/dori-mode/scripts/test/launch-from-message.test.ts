@@ -2,8 +2,9 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { type AckReactions, pendingAcks, recordAck } from "../src/ack.ts";
 import {
-  assembleBrief, BriefFromMessageError, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief,
+  assembleBrief, BriefFromMessageError, generatedBriefPath, launchBriefArgs, linkLaunchMessages, ownerMessageText, writeGeneratedBrief,
 } from "../src/brief-from-message.ts";
 import { EVENT_LOG } from "../src/inbox.ts";
 import { launchLane } from "../src/launch.ts";
@@ -96,6 +97,37 @@ test("launch needs exactly one of --brief and --from-message", async () => {
   const notes = await cli(["k1", "--title", "t", "--done", "merged acme/app#1", "--brief", join(state.dir, "b.md"), "--note", "x"]);
   expect(notes.code).toBe(1);
   expect(notes.err).toContain("--note goes with --from-message");
+});
+
+test("--no-handled goes with --from-message only", async () => {
+  const r = await cli(["k1", "--title", "t", "--done", "merged acme/app#1", "--brief", join(state.dir, "b.md"), "--no-handled"]);
+  expect(r.code).toBe(1);
+  expect(r.err).toContain("--no-handled goes with --from-message");
+});
+
+const noDiscord = (): AckReactions => { throw new Error("no Discord call expected"); };
+
+test("a launched lane is linked as handled to each distinct owner message it came from", async () => {
+  recordAck(state.dir, "111", "501", T0);
+  recordAck(state.dir, "111", "502", T0);
+  const refs = [{ channel: "111", message: "501" }, { channel: "111", message: "502" }, { channel: "111", message: "501" }];
+  const r = await linkLaunchMessages(state.dir, "k1", refs, noDiscord, T0 + 1);
+  expect(r).toEqual({ out: ["HANDLED_LINKED 111 501", "HANDLED_LINKED 111 502"], err: [] });
+  const links = pendingAcks(state.dir).filter((receipt) => receipt.lanes);
+  expect(links.map((receipt) => [receipt.id, receipt.lanes]).sort()).toEqual([["discord:111:501", ["k1"]], ["discord:111:502", ["k1"]]]);
+});
+
+test("an unacked message is acked first, and a link that cannot be recorded names the command instead", async () => {
+  const ops: string[] = [];
+  const reactions: AckReactions = {
+    react: async (c, m, e) => { ops.push(`add ${c}/${m} ${e}`); }, unreact: async () => {}, typing: async () => {},
+  };
+  const acked = await linkLaunchMessages(state.dir, "k1", [{ channel: "111", message: "501" }], () => reactions, T0);
+  expect(acked.out).toEqual([expect.stringMatching(/^HANDLED_AUTO_ACKED 111 501: /), "HANDLED_LINKED 111 501"]);
+  expect(ops).toHaveLength(1);
+  const failed = await linkLaunchMessages(state.dir, "bad key", [{ channel: "111", message: "501" }], noDiscord, T0);
+  expect(failed.out).toEqual([]);
+  expect(failed.err).toEqual([expect.stringMatching(/^LAUNCH_HANDLED_FAILED 111 501: .*; run dori handled 111 501 --lane bad key$/)]);
 });
 
 test("launch --from-message with an unknown id exits 1 naming it and writes no brief", async () => {

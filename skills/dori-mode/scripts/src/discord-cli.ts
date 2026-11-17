@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 
-import { ack, AckError, AWAITING_NOTE_MAX, handled } from "./ack.ts";
+import { ack, AckError, AWAITING_NOTE_MAX, handled, handledLines } from "./ack.ts";
 import { alertsChannelOf } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import type { FlowDeps } from "./done-flow.ts";
@@ -154,9 +154,9 @@ export const discordMain = async (args: string[], { flow: deps, die, messengerTo
         ...(parsed.values.awaiting ? { awaiting: true } : {}),
         ...(parsed.values.note !== undefined ? { note: oneLine(parsed.values.note).slice(0, AWAITING_NOTE_MAX) } : {}),
       });
-      if (outcome.autoAck === "acked") console.log(`HANDLED_AUTO_ACKED ${channel} ${message}: no dori ack before dori handled, so it was acked now; run dori ack first next time`);
-      if (outcome.autoAck === "failed") console.error(`HANDLED_AUTO_ACK_FAILED ${channel} ${message}: no dori ack before dori handled and acking it now failed (${outcome.error}); handled is recorded anyway`);
-      console.log(parsed.values.awaiting ? `HANDLED_AWAITING ${channel} ${message}` : `HANDLED_LINKED ${channel} ${message}`);
+      const lines = handledLines(channel ?? "", message ?? "", outcome, parsed.values.awaiting === true);
+      for (const line of lines.err) console.error(line);
+      for (const line of lines.out) console.log(line);
       break;
     }
     case "send": {
