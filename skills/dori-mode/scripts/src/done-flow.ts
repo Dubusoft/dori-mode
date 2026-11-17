@@ -809,7 +809,15 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
   }
   // An autopilot lane's task is its launch attempt's, also when the lead launched it without --task.
   const task = lane.task ?? (attempt ? Number(attempt.lane.slice("toodo:".length)) : undefined);
-  if (task === undefined || !Number.isSafeInteger(task)) return { tag: "no-task", lines: [] };
+  if (task !== undefined && !Number.isSafeInteger(task)) return { tag: "no-task", lines: [] };
+  if (task === undefined) {
+    // No task to finish: a merged lane's report still gets the merge fact line (task-finish.ts).
+    try {
+      return await deps.finishTask(lane, undefined, await laneMerges(deps, lane));
+    } catch (e) {
+      return { tag: "no-task", lines: [`MERGE_FACT ${lane.key}; report not appended: ${e instanceof Error ? e.message : String(e)}`] };
+    }
+  }
   // Finished at an earlier close of the lane (a resumed close): nothing is written or told again.
   const mark = attempt ? toodoMarkOf(attempt) : undefined;
   if (mark !== undefined) return { tag: mark === "done" ? "done" : "failed", lines: [] };

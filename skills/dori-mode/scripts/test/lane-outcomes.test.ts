@@ -771,6 +771,26 @@ test("a report, an append or a send into a thread the owner closed goes to its p
   expect(readOwnerClosed(f.state.dir)).toEqual({});
 }, CLI_TIMEOUT);
 
+test("dori reported --append --no-redirect leaves a closed thread alone: nothing is posted anywhere and the text stays in the receipt", async () => {
+  const f = fixture();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  const config = join(f.state.dir, "config.json");
+  writeFileSync(config, JSON.stringify({ discordChannels: ["900"] }));
+  recordOwnerClosed(f.state.dir, "200", T0);
+  writeFileSync(join(f.state.dir, "last-reports.json"), JSON.stringify({ alpha: { channel: "200", message: "m-1", at: T0 } }));
+  const env = { DORI_CONFIG: config, FAKE_ARCHIVED: "true", FAKE_PARENT: "100" };
+  const append = await cli(f.state.dir, ["reported", "alpha", "--append", "머지 acme/app#7 (abc1234)", "--no-redirect"], env);
+  expect(append.code).toBe(0);
+  expect(append.out).toContain("REPORT_NOT_REDIRECTED alpha m-1: thread 200 was closed by the owner and --no-redirect is set, so nothing was posted");
+  expect(calls(append.requests)).toEqual(["GET /channels/200"]);
+  expect(pendingReported(f.state.dir).map((r) => ({ note: r.note, followUp: r.followUp, message: r.message })))
+    .toEqual([{ note: "머지 acme/app#7 (abc1234)", followUp: true, message: "m-1" }]);
+  // --no-redirect belongs to --append only.
+  const misuse = await cli(f.state.dir, ["reported", "alpha", "--text", "done", "--no-redirect"], env);
+  expect(misuse.code).toBe(1);
+  expect(misuse.requests).toEqual([]);
+}, CLI_TIMEOUT);
+
 test("a follow-up receipt never re-arms the close, and a thread the owner closed after its last report is left alone", async () => {
   const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));

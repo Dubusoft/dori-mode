@@ -6,8 +6,11 @@ import type { ToodoWriter } from "./toodo-client.ts";
  * The follow-up of a lane that closed after its PR merged, done by the supervisor instead of the lead: the lane's Toodo
  * task (`dori launch --task`) gets every pending manual criterion checked with the merge as evidence and is completed
  * with a note naming the PR and its merge SHA (ToodoWriter reads every write back), then the lane's last report gets
- * the merge appended. The close line then carries `toodo=done` and, after a claim the lead already took, is digest
- * (event-policy.ts). Anything else (no task, no merge read back, a refused or unconfirmed write) is left to the lead.
+ * the merge appended as one fixed fact line (mergeFactLine). The close line then carries `toodo=done` and, after a claim
+ * the lead already took, is digest (event-policy.ts). A merged lane with no task gets the same line with no Toodo part
+ * (`MERGE_FACT <key> ...`, digest); its close stays `toodo=no-task`. So does a lane whose task toodo refused or did not
+ * confirm: the merge is appended without the Toodo part and the task is left to the lead (`toodo=failed`). With no merge
+ * read back nothing is appended and the task is left to the lead.
  *
  * An autopilot lane's close is told the same way: its AUTOPILOT_LANE_DONE is rewritten `toodo=done` (digest) once the
  * supervisor completed the task (finishedOutcome). An autopilot task the supervisor did not finish, or whose lane closed
@@ -34,15 +37,61 @@ export type TaskFinisherDeps = {
   readonly writer: Pick<ToodoWriter, "read" | "checkCriterion" | "completeTask">;
   /** Appends `text` to `lane`'s last report (thread-followup.ts appendFollowUp). */
   readonly append: (lane: Lane, text: string) => Promise<AppendOutcome>;
+  /** The owner's language (config ownerLanguage), read at each finish so a config reload applies. */
+  readonly language?: () => string | undefined;
 };
 
 /** The merges of a closed lane (done-flow.ts laneMerges), or why none was read back. */
 export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly why: string };
 
-export type TaskFinisher = (lane: Lane, task: number, read: LaneMergeRead) => Promise<TaskFinish>;
+/** `task` is undefined for a lane with no Toodo task: only the merge fact line is appended. */
+export type TaskFinisher = (lane: Lane, task: number | undefined, read: LaneMergeRead) => Promise<TaskFinish>;
 
 const flat = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim().slice(0, max);
 const errorText = (e: unknown): string => flat(e instanceof Error ? e.message : String(e));
+
+const FACT_WORDS = {
+  ko: { merged: "머지", done: (task: number) => `Toodo #${task} 완료` },
+  ja: { merged: "マージ", done: (task: number) => `Toodo #${task} 完了` },
+  zh: { merged: "已合并", done: (task: number) => `Toodo #${task} 已完成` },
+  en: { merged: "Merged", done: (task: number) => `Toodo #${task} done` },
+} as const;
+
+const factLanguage = (language: string | undefined): keyof typeof FACT_WORDS => {
+  const l = (language ?? "").trim().toLowerCase();
+  if (/^ko\b|korean|한국/.test(l)) return "ko";
+  if (/^ja\b|japanese|日本/.test(l)) return "ja";
+  if (/^zh\b|chinese|中文|汉语|漢語/.test(l)) return "zh";
+  return "en";
+};
+
+/**
+ * The fact line appended to a merged lane's report, with no judgment in it: each PR as `<repo>#<n> (<sha7>)`, then its
+ * Toodo task done when the supervisor completed it, in the owner's language (Korean, Japanese, Chinese; else English).
+ */
+export const mergeFactLine = (merges: readonly LaneMerge[], task: number | undefined, language: string | undefined): string => {
+  const words = FACT_WORDS[factLanguage(language)];
+  const pulls = merges.map((m) => `${m.repo}#${m.number} (${m.sha.slice(0, 7)})`).join(", ");
+  return `${words.merged} ${pulls}${task === undefined ? "" : ` · ${words.done(task)}`}`;
+};
+
+const appendedText = (appended: AppendOutcome): string => appended.appended ? `appended (${appended.message})` : `not appended: ${appended.why}`;
+
+/** The lead's fallback for a fact line the supervisor could not append: an append that never redirects. */
+const appendYourself = (lane: Lane): string => `dori reported ${lane.key} --append TEXT --no-redirect`;
+
+/**
+ * Appends the merge fact line with no Toodo part (a lane with no task, or one whose task the supervisor did not complete)
+ * and says how it ended as a `MERGE_FACT <key> ...` line (digest). Never throws.
+ */
+const appendMergeFact = async (deps: TaskFinisherDeps, lane: Lane, merges: readonly LaneMerge[]): Promise<string> => {
+  const head = `MERGE_FACT ${lane.key} ${merges.map((m) => `${m.url} merge=${m.sha}`).join(" ")}`;
+  try {
+    return `${head}; report ${appendedText(await deps.append(lane, mergeFactLine(merges, undefined, deps.language?.())))}`;
+  } catch (e) {
+    return `${head}; report not appended: ${errorText(e)}; append it with ${appendYourself(lane)}`;
+  }
+};
 
 /** Records why an autopilot lane's task was not finished, as a blocker note; returns what to say about it (never throws). */
 export type TaskBlocker = (lane: Lane, task: number, why: string) => Promise<string>;
@@ -78,7 +127,7 @@ export const blockedOutcome = (line: string, said: string): string =>
   line.startsWith(`${LANE_FAILED_EVENT} `) ? line.replace(/: tell the owner; /, ` toodo=blocked: ${said}; tell the owner; `) : line;
 
 export const notCompletedLine = (lane: Lane, task: number, why: string): string =>
-  `TOODO_TASK_NOT_COMPLETED ${lane.key} #${task} ${flat(why)}; finish it yourself (complete_task with the PR and its merge SHA, then dori reported ${lane.key} --append)`;
+  `TOODO_TASK_NOT_COMPLETED ${lane.key} #${task} ${flat(why)}; finish it yourself (complete_task with the PR and its merge SHA, then ${appendYourself(lane)})`;
 
 /**
  * A close with no merge read back (no PR of the lane, or one not read merged) completes nothing. Its task is read first:
@@ -97,6 +146,7 @@ const unmergedFinish = async (writer: Pick<ToodoWriter, "read">, lane: Lane, tas
 };
 
 export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lane, task, read) => {
+  if (task === undefined) return "why" in read ? { tag: "no-task", lines: [] } : { tag: "no-task", lines: [await appendMergeFact(deps, lane, read.merges)] };
   if ("why" in read) return unmergedFinish(deps.writer, lane, task, read.why);
   const { merges } = read;
   const merged = merges.map((m) => `${m.url} merged into ${m.base} as ${m.sha}`).join("; ");
@@ -109,14 +159,15 @@ export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lan
     }
     await deps.writer.completeTask(task, { note: `Merged: ${merged}. Completed by the dori supervisor when lane ${lane.key} closed.`, refs: merges.map((m) => m.url) });
   } catch (e) {
-    return { tag: "failed", lines: [notCompletedLine(lane, task, `toodo: ${errorText(e)}`)] };
+    // The merge still happened: its fact line is appended without the Toodo part, and the task stays the lead's.
+    return { tag: "failed", lines: [notCompletedLine(lane, task, `toodo: ${errorText(e)}`), await appendMergeFact(deps, lane, merges)] };
   }
-  const text = `머지 확인: ${merges.map((m) => `${m.url} (${m.sha.slice(0, 7)})`).join(", ")} · Toodo #${task} 완료`;
+  const text = mergeFactLine(merges, task, deps.language?.());
   const head = `TOODO_TASK_COMPLETED ${lane.key} #${task} ${merges.map((m) => `${m.url} merge=${m.sha}`).join(" ")}`;
   try {
     const appended = await deps.append(lane, text);
-    return { tag: "done", lines: [`${head}; report ${appended.appended ? `appended (${appended.message})` : `not appended: ${appended.why}`}`] };
+    return { tag: "done", lines: [`${head}; report ${appendedText(appended)}`] };
   } catch (e) {
-    return { tag: "append-failed", lines: [`${head}; report not appended: ${errorText(e)}; append it with dori reported ${lane.key} --append`] };
+    return { tag: "append-failed", lines: [`${head}; report not appended: ${errorText(e)}; append it with ${appendYourself(lane)}`] };
   }
 };
