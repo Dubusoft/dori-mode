@@ -12,7 +12,7 @@ import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
 import { LaneOpsError, type LaneOps, type PaneRef } from "./lane-ops.ts";
 import { deliverLaneMessage, MERGE_VERIFY, queueSteering } from "./ci-follow.ts";
-import { blockedOutcome, finishedOutcome, type LaneMerge, notCompletedLine, type TaskBlocker, taskCompleted, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
+import { blockedOutcome, finishedOutcome, type LaneMerge, type LaneMergeRead, notCompletedLine, type TaskBlocker, taskCompleted, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
 import { openLaneMessages } from "./lane-messages.ts";
 import { checkLaneReportText, installLaneReports, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import { LaneFileError } from "./lane-file-contract.ts";
@@ -700,7 +700,7 @@ const PR_SUBJECT = /^([\w.-]+\/[\w.-]+)#(\d+)(?:@\S+)?$/;
  * merged or verified merged for it (`merge` / `merge-verify` operations, CI_MERGED / MERGE_VERIFIED). A lane with none,
  * or with one GitHub does not read MERGED with a merge commit, has `why` instead.
  */
-export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<{ readonly merges: readonly LaneMerge[] } | { readonly why: string }> => {
+export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<LaneMergeRead> => {
   const pulls = new Map<string, { readonly repo: string; readonly number: number }>();
   for (const p of lane.claim?.pulls ?? []) pulls.set(`${p.repo.toLowerCase()}#${p.number}`, { repo: p.repo, number: p.number });
   const ops = await withOperations(deps, async (store) => store.list({ lane: lane.key }).filter((op) => (op.action === "merge" || op.action === MERGE_VERIFY) && op.state === "verified"));
@@ -741,11 +741,8 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
   let finish: TaskFinish;
   let why: string | undefined;
   try {
-    const read = await laneMerges(deps, lane);
-    if ("why" in read) {
-      why = `no merge read back: ${read.why}`;
-      finish = { tag: "unmerged", lines: [notCompletedLine(lane, task, why)] };
-    } else finish = await deps.finishTask(lane, task, read.merges);
+    // With no merge read back the finisher completes nothing; it only reads whether the task is already done.
+    finish = await deps.finishTask(lane, task, await laneMerges(deps, lane));
   } catch (e) {
     why = e instanceof Error ? e.message : String(e);
     finish = { tag: "failed", lines: [notCompletedLine(lane, task, why)] };

@@ -160,7 +160,43 @@ test("a lane whose PR does not read back merged with a merge SHA wakes the lead 
   expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed seen-claim toodo=unmerged ${PR}`);
   expect(eventClass(lines[0] ?? "")).toBe("lead-urgent");
   expect(lines[1]).toStartWith("TOODO_TASK_NOT_COMPLETED demo-lane #951 no merge read back: acme/app#1 reads MERGED with no merge commit;");
-  expect(calls).toEqual([]);
+  // The task is only read: nothing is written to it.
+  expect(calls.map((c) => c.name)).toEqual(["get_task"]);
+});
+
+/** The finish of `demo-lane` closed with no PR recorded (no claim), against a toodo holding `task`. */
+const finishNoPr = async (task: Task, token = "mcp-1") => {
+  const toodo = fakeToodo(task);
+  stops.push(toodo.stop);
+  writeFileSync(join(state.dir, "mcp-token"), `${token}\n`);
+  const writer = new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") });
+  const finishTask = taskFinisher({ writer, append: async () => { throw new Error("appended"); } });
+  return { finish: await finishClosedTask({ ...at(T0), finishTask }, lane), calls: toodo.calls };
+};
+
+test("a lane closing with no PR whose task the lead already completed says toodo=done and warns no one", async () => {
+  const task: Task = { ...inProgress([manual(1, true)]), status: "done", resolution: "completed" };
+  const { finish, calls } = await finishNoPr(task);
+  expect(finish).toEqual({ tag: "done", lines: [] });
+  expect(calls.map((c) => c.name)).toEqual(["get_task"]);
+});
+
+test("a lane closing with no PR still warns when its task is open, concluded otherwise, or cannot be read, and never completes it", async () => {
+  const why = "TOODO_TASK_NOT_COMPLETED demo-lane #951 no merge read back: no PR of the lane is recorded (no claimed or supervisor-merged PR)";
+  const open = inProgress([manual(1, true)]);
+  const opened = await finishNoPr(open);
+  expect(opened.finish?.tag).toBe("unmerged");
+  expect(opened.finish?.lines[0] ?? "").toStartWith(`${why}; finish it yourself`);
+  expect(opened.calls.map((c) => c.name)).toEqual(["get_task"]);
+  expect(open.status).toBe("in_progress");
+
+  const dropped = await finishNoPr({ ...inProgress([]), status: "done", resolution: "not_adopted" });
+  expect(dropped.finish?.tag).toBe("unmerged");
+  expect(dropped.finish?.lines[0] ?? "").toStartWith(`${why}; finish it yourself`);
+
+  const unread = await finishNoPr(inProgress([]), "refused");
+  expect(unread.finish?.tag).toBe("unmerged");
+  expect(unread.finish?.lines[0] ?? "").toStartWith(`${why}; the task could not be read: toodo-server get_task answered HTTP 401`);
 });
 
 test("a thread already closed gets no append and no redirected line in its parent channel; the task is still completed", async () => {
