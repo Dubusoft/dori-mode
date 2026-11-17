@@ -159,13 +159,13 @@ const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
 };
 
 export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boolean } = {
-  "lane.start": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStartup(v.startup),
+  "lane.start": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStartup(v.startup) && optStr(v.model),
   "lane.adopt": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStr(v.tokenFile),
   "lane.stop": (v) => isObj(v) && CLOSED(v.closed) && isBool(v.gone),
   "lane.close": (v) => isObj(v) && CLOSED(v.closed) && isBool(v.gone),
   "lane.pause": (v) => isObj(v) && (v.goal === undefined || GOALS(v.goal)) && optBool(v.working) && optBool(v.stopped),
   "lane.resume": (v) => isObj(v) && GOALS(v.goal),
-  "lane.recover": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isBool(v.relaunched) && isBool(v.resumed) && (v.startup === undefined || isStartup(v.startup)),
+  "lane.recover": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isBool(v.relaunched) && isBool(v.resumed) && (v.startup === undefined || isStartup(v.startup)) && optStr(v.model),
   "lane.send": (v) => isObj(v) && DELIVERIES(v.delivery) && optStr(v.refusal),
   "lane.notify": (v) => v === undefined || isObj(v),
   "lane.attach": (v) => isObj(v) && isStr(v.dir),

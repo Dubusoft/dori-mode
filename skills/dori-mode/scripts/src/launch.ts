@@ -518,7 +518,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       return await startFailure(deps, input, error, token, draft, progress);
     }
     progress.started = true;
-    const lane: Lane = { ...draft, ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
+    // A runner profile that pins its own model runs that one instead of `model`: recovery judges the lane against it.
+    const lane: Lane = { ...draft, ...(result.model ? { model: result.model } : {}), ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
     return { lane: await commitLaunched(deps, lane, existing, token, prepared), notes, startup: startupLine(input.key, result.pane, result.startup) };
   } catch (error) {
     if (token && !progress.started) await deps.registry.releaseReservation(input.key, token);

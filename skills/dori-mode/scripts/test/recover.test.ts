@@ -489,6 +489,37 @@ test("a sandboxed lane replaced on the wrong model is started sandboxed again, r
   expect((await deps.registry.read(lane.key))?.sandbox).toBe(true);
 });
 
+test("a lane whose runner profile pins another model records that model on recovery and is not replaced again", async () => {
+  const { deps, world, lane, control, clock } = await fixture();
+  clock.at = STARTUP_GRACE_MS;
+  control.live(true);
+  control.argv = ["omo", "--model", "provider/pinned"];
+  // The live agent on the wrong model is closed and started again (lane.start), which reports the profile's pinned model.
+  const pinned = { ...deps, ops: { ...deps.ops, start: async (input) => ({ ...(await deps.ops.start(input)), model: "provider/pinned" }) } satisfies LaneOps };
+  expect(await recoverLanes(pinned)).toEqual(["LANE_RECOVERED recover-lane new:p1 model-mismatch", "STARTUP_OK recover-lane new:p1", SKIP]);
+  expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+  clock.at += STARTUP_GRACE_MS;
+  expect(await recoverLanes(pinned)).toEqual([]);
+  expect(opsOf(world, "start")).toHaveLength(1);
+});
+
+test("a runner relaunch of a missing pane records the model its runner profile pins", async () => {
+  const { deps, lane } = await fixture();
+  const ops: LaneOps = { ...deps.ops, recover: async (l, opts) => ({ ...(await deps.ops.recover(l, opts)), model: "provider/pinned" }) };
+  expect(await recoverLanes({ ...deps, ops }, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane", "STARTUP_OK recover-lane new:p1"]);
+  expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+});
+
+test("a relaunch from the brief records the model its runner profile pins", async () => {
+  const { deps, lane } = await fixture();
+  const existing = { ...lane, runner: "local", fileRun: { id: "00000000-0000-4000-8000-0000000000ab", requiredReport: false } };
+  await deps.registry.write(existing);
+  const ops: LaneOps = { ...deps.ops, start: async (input) => ({ ...(await deps.ops.start(input)), model: "provider/pinned" }) };
+  const result = await launchLane({ ...deps, ops }, { key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, cwd: lane.cwd, model: "provider/expected" }, existing);
+  expect(result.lane.model).toBe("provider/pinned");
+  expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+});
+
 test.each([
   { name: "missing", setup: (d: Deps) => ({ ...d, which: () => null }), event: "LANE_RECOVERY_ERROR recover-lane sandbox-missing: SANDBOX_MISSING recover-lane: " },
   { name: "broken", setup: (d: Deps, w: World) => { w.sandboxCheck = { code: 3, out: "", err: "lane-sandbox: bwrap not found" }; return d; }, event: "LANE_RECOVERY_ERROR recover-lane sandbox-broken: SANDBOX_BROKEN recover-lane: " },

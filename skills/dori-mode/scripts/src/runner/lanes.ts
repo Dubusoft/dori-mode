@@ -7,7 +7,7 @@ import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { ASK_SCREEN_LINES, askingLine, screenQuestion, type ScreenQuestion } from "../ask-user.ts";
 import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
-import { agentArgv, outsideDenyRules, powershellLaunchLine, quote, removeLegacyLaneMcp } from "./lane-launch.ts";
+import { agentArgv, argvModel, outsideDenyRules, powershellLaunchLine, quote, removeLegacyLaneMcp } from "./lane-launch.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, resolveGrants, runnerPaths, runtimeDirOption, type RunnerPolicy } from "./policy.ts";
@@ -159,7 +159,8 @@ const launchOptions = (o: { [K in keyof LaunchOptions]?: LaunchOptions[K] | unde
   ...(o.tabWorkspace !== undefined ? { tabWorkspace: o.tabWorkspace } : {}),
   ...(o.grants?.length ? { grants: o.grants } : {}),
 });
-type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string };
+/** `model`: the model the agent argv names (a profile may pin its own over the requested one). */
+type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string; readonly model?: string };
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {}
@@ -353,7 +354,9 @@ export class RunnerLanes {
         key: body.key, cwd, profile: body.agentProfile, mode: body.mode, model: body.model,
         ...launchOptions(body),
       });
-      return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: { pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd } };
+      return { detail: `started pane=${launched.pane} tab=${launched.tab}`, result: {
+        pane: launched.pane, tab: launched.tab, startup: launched.startup, cwd: launched.cwd, ...(launched.model ? { model: launched.model } : {}),
+      } };
     } catch (error) {
       if (!mayStart && !this.records()[body.key]) this.forgetLaneFiles(body.key, 1, true);
       throw error;
@@ -419,7 +422,8 @@ export class RunnerLanes {
     if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
     this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
     const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
-    return { pane, tab, resumed, startup, cwd };
+    const model = argvModel(argv);
+    return { pane, tab, resumed, startup, cwd, ...(model ? { model } : {}) };
   }
 
   /** Opens the lane's pane (a new tab, or the checked `target` pane) and returns what the launch needs to go on; `rollback` closes what it opened. */
@@ -723,7 +727,7 @@ export class RunnerLanes {
     if (record.notice) this.update(key, (r) => ({ ...r, notice: record.notice as LaneNotice }));
     return {
       detail: `started pane=${launched.pane} tab=${launched.tab}`,
-      result: { pane: launched.pane, tab: launched.tab, relaunched: true, resumed: launched.resumed, startup: launched.startup },
+      result: { pane: launched.pane, tab: launched.tab, relaunched: true, resumed: launched.resumed, startup: launched.startup, ...(launched.model ? { model: launched.model } : {}) },
     };
   }
 

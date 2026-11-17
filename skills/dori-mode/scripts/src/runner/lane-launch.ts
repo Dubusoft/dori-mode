@@ -88,6 +88,12 @@ export const lanePermissionArgv = (template: readonly string[], outsideRules?: s
   return [...template.slice(0, at), ...flags, ...template.slice(at)];
 };
 
+/** The model an agent argv names (`--model X` or `--model=X`), or undefined when it names none. */
+export const argvModel = (argv: readonly string[]): string | undefined => {
+  const at = argv.indexOf("--model");
+  return (at >= 0 ? argv[at + 1] : argv.find((arg) => arg.startsWith("--model="))?.slice(8)) || undefined;
+};
+
 /**
  * The agent argv of `profile`, each `{prompt}`, `{model}` and `{brief}` filled in, with the lane permission flags
  * (`lanePermissionArgv`, `outsideRules` for an unsandboxed lane); `session` resumes it when the profile allows (`resumeArgv`).

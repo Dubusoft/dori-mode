@@ -9,6 +9,7 @@ import { closeLane, closeRunning, finishClosedTask, type FlowDeps, finishedReaso
 import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
 import { resumeArgv } from "./runner/lane-control.ts";
+import { argvModel } from "./runner/lane-launch.ts";
 import { checkLaneFilesBody } from "./lane-file-contract.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
@@ -111,8 +112,7 @@ const liveModel = (raw: unknown): { readonly omo: boolean; readonly model?: stri
     if (typeof proc !== "object" || proc === null || !("argv" in proc) || !Array.isArray(proc.argv)) continue;
     const argv: string[] = proc.argv.filter((arg: unknown): arg is string => typeof arg === "string");
     if (!argv.slice(0, 2).some((arg) => /(?:^|[/\\])omo(?:\.[cm]?[jt]s)?$|[/\\]senpi[/\\]dist[/\\]bundle[/\\]cli\.js$/.test(arg))) continue;
-    const at = argv.indexOf("--model");
-    const model = at >= 0 ? argv[at + 1] : argv.find((arg) => arg.startsWith("--model="))?.slice(8);
+    const model = argvModel(argv);
     if (model) return { omo: true, model };
     omo = true;
   }
@@ -222,7 +222,8 @@ const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, s
   }
   const moved = await deps.registry.update(lane.key, (current) => {
     if (!current || current.closedAt || current.pendingFileRun?.id !== prepared.files.run.id) return undefined;
-    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}),
+    // A runner profile that pins its own model runs that one: the lane is judged against it from now on.
+    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}), ...(r.relaunched && r.model ? { model: r.model } : {}),
       fileRun: r.relaunched ? prepared.files.run : current.fileRun, pendingFileRun: undefined, fileProposal: undefined };
   });
   const next: Lane = moved ?? await deps.registry.read(lane.key) ?? stored;
