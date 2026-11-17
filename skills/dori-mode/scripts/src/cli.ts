@@ -17,7 +17,7 @@ import { watchSimulators } from "./heavy-simulators.ts";
 import { guardTick } from "./host-guard.ts";
 import { listGuardMachines } from "./remote-guard.ts";
 import { adoptLane, attachLaneFiles, type LaunchInput, launchNextLine, LaunchError, parseLaneTask, validateLaunch } from "./launch.ts";
-import { admitLaunch, placeLaunch, placementReports } from "./launch-service.ts";
+import { admitLaunch, createLaunchWorktree, DEFAULT_WORKTREE_BASE, placeLaunch, placementReports, removeLaunchWorktree } from "./launch-service.ts";
 import { assembleBrief, generatedBriefPath, launchBriefArgs, linkLaunchMessages, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
@@ -119,6 +119,9 @@ const USAGE = `dori <command> [options]
                 [--sandbox]   every lane runs in the sandbox (--sandbox is accepted and changes nothing): a local one (--pane too) in laneSandbox.command after a --check preflight, a --machine one under its runner's sandboxed profile; a missing or broken sandbox refuses the launch (SANDBOX_MISSING / SANDBOX_BROKEN / SANDBOX_UNAVAILABLE) and warns on Discord; only Windows runners (no lane sandbox exists there) and machines opted in with runners.<label>.allowUnsandboxed run unsandboxed, with SANDBOX_SKIPPED and a Discord warning each time
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
                 [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
+                [--worktree REPO [--base REMOTE/BRANCH]]   instead of --cwd: create <worktree root>/<repo name>-<key> on the placed machine, detached at the
+                                       fetched base (default origin/dev), from the checkout of REPO (owner/repo or name) its runner declares or detects;
+                                       an existing path refuses the launch (LAUNCH_WORKTREE_EXISTS); removed again when the launch registers no lane
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   autopilot candidates [--tasks 12,13] [--json]
@@ -393,6 +396,7 @@ const flags = parseArgs({
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
     dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" }, result: { type: "string" },
     "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" }, "no-handled": { type: "boolean" },
+    worktree: { type: "string" }, base: { type: "string" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -757,11 +761,21 @@ try {
         } catch (e) { return die(e instanceof Error ? e.message : String(e)); }
       })() : undefined;
       const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), ...(task !== undefined ? { task } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }), ...(grants.length ? { grants } : {}) };
+      const worktree = opt("worktree");
+      if (worktree === undefined && opt("base") !== undefined) die("--base goes with --worktree");
+      if (worktree !== undefined && (input.cwd || input.pane || input.workspace)) die("--worktree creates the lane's directory; drop --cwd, --pane and --workspace");
       await validateLaunch(deps, input);
       if (generated) writeGeneratedBrief(generated.path, generated.text);
-      const placed = await placeLaunch(deps, input);
-      for (const line of placed.lines) console.log(line);
-      const r = await admitLaunch(deps, input, placed, (line) => { console.error(line); });
+      const placement = await placeLaunch(deps, input);
+      for (const line of placement.lines) console.log(line);
+      // --worktree: the lane's own worktree on the machine it was placed on, which becomes its cwd (and a held launch's).
+      const made = worktree === undefined ? undefined : await createLaunchWorktree(deps, input, placement, { repo: worktree, base: opt("base") ?? DEFAULT_WORKTREE_BASE });
+      if (made) console.log(made.line);
+      const placed = made ? { ...placement, cwd: made.path } : placement;
+      const r = await admitLaunch(deps, made ? { ...input, cwd: made.path } : input, placed, (line) => { console.error(line); }).catch(async (e: unknown) => {
+        if (made && !(await deps.registry.read(input.key))) console.error(await removeLaunchWorktree(deps, input, placed, made.path, made.checkout));
+        throw e;
+      });
       if (r.kind === "held") {
         console.log(verdictLine(r.target, r.verdict));
         console.log(`QUEUED ${input.key} (${r.queued} waiting; dori hold list)`);
