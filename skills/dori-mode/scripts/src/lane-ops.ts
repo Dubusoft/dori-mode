@@ -49,7 +49,9 @@ export type GitOp =
   | { readonly op: "remote-branch-delete"; readonly root: string; readonly branch: string; readonly remote: string; readonly sha?: string }
   // fetch-branch: `git fetch <remote> +refs/heads/<branch>:refs/remotes/<remote>/<branch>`; worktree-add: a detached worktree of `ref` at `path`.
   | { readonly op: "fetch-branch"; readonly root: string; readonly remote: string; readonly branch: string }
-  | { readonly op: "worktree-add"; readonly root: string; readonly path: string; readonly ref: string };
+  | { readonly op: "worktree-add"; readonly root: string; readonly path: string; readonly ref: string }
+  // leftover-remove: the directory at `path` git lists no worktree at, removed only while omo's own files are all it holds.
+  | { readonly op: "leftover-remove"; readonly root: string; readonly path: string };
 export type LaneNotice = { readonly status: string; readonly objection?: Objection; readonly claim?: { readonly at: string; readonly evidence: string } };
 
 export type LaneOpsErrorCode = "RUNNER_UNAVAILABLE" | "RUNNER_OUTDATED" | "LANE_OP_FAILED" | "LANE_OP_AMBIGUOUS";
