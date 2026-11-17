@@ -1,0 +1,23 @@
+ Running PreToolUse hook: matching project rules (1s)
+
+ Todo
+ [•] start the workflow run
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Permission required: eval
+
+ Tool: eval
+
+ Patterns:
+   - *
+
+ → Allow once
+   Allow always
+   Deny
+   Deny with feedback
+
+ ↑↓ navigate  enter select  esc/ctrl+c cancel
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/repo • fix/branch
+(😺 OmO Native by Q Kim) waiting_human · question
