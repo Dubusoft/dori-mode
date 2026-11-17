@@ -8,8 +8,9 @@ import type { ToodoWriter } from "./toodo-client.ts";
  * with a note naming the PR and its merge SHA (ToodoWriter reads every write back), then the lane's last report gets
  * the merge appended as one fixed fact line (mergeFactLine). The close line then carries `toodo=done` and, after a claim
  * the lead already took, is digest (event-policy.ts). A merged lane with no task gets the same line with no Toodo part
- * (`MERGE_FACT <key> ...`, digest); its close stays `toodo=no-task`. Anything else (no merge read back, a refused or
- * unconfirmed write) is left to the lead.
+ * (`MERGE_FACT <key> ...`, digest); its close stays `toodo=no-task`. So does a lane whose task toodo refused or did not
+ * confirm: the merge is appended without the Toodo part and the task is left to the lead (`toodo=failed`). With no merge
+ * read back nothing is appended and the task is left to the lead.
  *
  * An autopilot lane's close is told the same way: its AUTOPILOT_LANE_DONE is rewritten `toodo=done` (digest) once the
  * supervisor completed the task (finishedOutcome). An autopilot task the supervisor did not finish, or whose lane closed
@@ -79,14 +80,16 @@ const appendedText = (appended: AppendOutcome): string => appended.appended ? `a
 /** The lead's fallback for a fact line the supervisor could not append: an append that never redirects. */
 const appendYourself = (lane: Lane): string => `dori reported ${lane.key} --append TEXT --no-redirect`;
 
-/** A merged lane with no Toodo task: the fact line is appended all the same; the close stays `toodo=no-task`. */
-const untaskedFinish = async (deps: TaskFinisherDeps, lane: Lane, read: LaneMergeRead): Promise<TaskFinish> => {
-  if ("why" in read) return { tag: "no-task", lines: [] };
-  const head = `MERGE_FACT ${lane.key} ${read.merges.map((m) => `${m.url} merge=${m.sha}`).join(" ")}`;
+/**
+ * Appends the merge fact line with no Toodo part (a lane with no task, or one whose task the supervisor did not complete)
+ * and says how it ended as a `MERGE_FACT <key> ...` line (digest). Never throws.
+ */
+const appendMergeFact = async (deps: TaskFinisherDeps, lane: Lane, merges: readonly LaneMerge[]): Promise<string> => {
+  const head = `MERGE_FACT ${lane.key} ${merges.map((m) => `${m.url} merge=${m.sha}`).join(" ")}`;
   try {
-    return { tag: "no-task", lines: [`${head}; report ${appendedText(await deps.append(lane, mergeFactLine(read.merges, undefined, deps.language?.())))}`] };
+    return `${head}; report ${appendedText(await deps.append(lane, mergeFactLine(merges, undefined, deps.language?.())))}`;
   } catch (e) {
-    return { tag: "no-task", lines: [`${head}; report not appended: ${errorText(e)}; append it with ${appendYourself(lane)}`] };
+    return `${head}; report not appended: ${errorText(e)}; append it with ${appendYourself(lane)}`;
   }
 };
 
@@ -143,7 +146,7 @@ const unmergedFinish = async (writer: Pick<ToodoWriter, "read">, lane: Lane, tas
 };
 
 export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lane, task, read) => {
-  if (task === undefined) return untaskedFinish(deps, lane, read);
+  if (task === undefined) return "why" in read ? { tag: "no-task", lines: [] } : { tag: "no-task", lines: [await appendMergeFact(deps, lane, read.merges)] };
   if ("why" in read) return unmergedFinish(deps.writer, lane, task, read.why);
   const { merges } = read;
   const merged = merges.map((m) => `${m.url} merged into ${m.base} as ${m.sha}`).join("; ");
@@ -156,7 +159,8 @@ export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lan
     }
     await deps.writer.completeTask(task, { note: `Merged: ${merged}. Completed by the dori supervisor when lane ${lane.key} closed.`, refs: merges.map((m) => m.url) });
   } catch (e) {
-    return { tag: "failed", lines: [notCompletedLine(lane, task, `toodo: ${errorText(e)}`)] };
+    // The merge still happened: its fact line is appended without the Toodo part, and the task stays the lead's.
+    return { tag: "failed", lines: [notCompletedLine(lane, task, `toodo: ${errorText(e)}`), await appendMergeFact(deps, lane, merges)] };
   }
   const text = mergeFactLine(merges, task, deps.language?.());
   const head = `TOODO_TASK_COMPLETED ${lane.key} #${task} ${merges.map((m) => `${m.url} merge=${m.sha}`).join(" ")}`;

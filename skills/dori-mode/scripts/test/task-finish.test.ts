@@ -165,7 +165,7 @@ test("the merge fact line follows the owner's language, English when it is unset
   expect(mergeFactLine(merges.slice(0, 1), undefined, "Klingon")).toBe("Merged acme/app#1 (abc1234)");
 });
 
-test("a task toodo refuses to complete wakes the lead with the reason, and nothing is appended", async () => {
+test("a task toodo refuses to complete wakes the lead with the reason, and the merge is still appended without the Toodo part", async () => {
   // A URL criterion toodo has not seen met: complete_task is refused.
   const task = inProgress([{ id: 1, text: "deployed", kind: "url", state: "pending", evidence: null }]);
   const fake = fakeDiscord();
@@ -175,7 +175,10 @@ test("a task toodo refuses to complete wakes the lead with the reason, and nothi
   expect(lines[1]).toStartWith("TOODO_TASK_NOT_COMPLETED demo-lane #951 toodo: toodo-server refused complete_task: Rejected: criteriaUnmet;");
   expect(eventClass(lines[1] ?? "")).toBe("lead-urgent");
   expect(task.status).toBe("in_progress");
-  expect(fake.edits).toEqual([]);
+  expect(lines[2]).toBe(`MERGE_FACT demo-lane ${PR} merge=${SHA}; report appended (m1)`);
+  expect(eventClass(lines[2] ?? "")).toBe("lead-digest");
+  expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234)"]]);
+  expect(fake.sends).toEqual([]);
 });
 
 test("a lane whose PR does not read back merged with a merge SHA wakes the lead and its task is left alone", async () => {
