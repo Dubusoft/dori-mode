@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { displayTime } from "./display-time.ts";
 import type { FlowDeps } from "./done-flow.ts";
@@ -100,8 +100,26 @@ const prsOf = (lane: Lane, input: ReviewStatusInput): { readonly repo: string; r
   return out.sort((a, b) => a.repo.localeCompare(b.repo) || a.number - b.number);
 };
 
-const findingsText = (r: ReviewJobRecord): string =>
-  (r.receipt?.result.findings ?? []).map((f) => `${f.id} ${f.path}:${f.lineStart} ${cut(flat(f.observation), 60)}`).join("; ");
+/** The shortest summary item worth showing: a finding's id, file and line plus some of its observation. */
+const FINDING_ITEM_MIN = 50;
+/** The longest the state ahead of the findings summary may be, so the summary always keeps room in the line. */
+const FINDINGS_STATE_MAX = 190;
+
+/**
+ * The findings of `r` as `<id> <file>:<line> <observation>` items within `budget` characters: the first findings that
+ * fit at FINDING_ITEM_MIN or more each share it evenly and the rest are counted (`외 N건`), so the summary never
+ * overflows the line and a dropped finding is never silent. Empty when not even one item fits.
+ */
+const findingsText = (r: ReviewJobRecord, budget: number): string => {
+  const findings = r.receipt?.result.findings ?? [];
+  for (let k = findings.length; k > 0; k--) {
+    const rest = k < findings.length ? `; 외 ${findings.length - k}건` : "";
+    const each = Math.floor((budget - rest.length - 2 * (k - 1)) / k);
+    if (each < FINDING_ITEM_MIN) continue;
+    return findings.slice(0, k).map((f) => cut(`${f.id} ${basename(f.path)}:${f.lineStart} ${flat(f.observation)}`, each)).join("; ") + rest;
+  }
+  return "";
+};
 
 /** The one status line of PR `repo#number` (design 5.8 table), or undefined when nothing is known about it yet. */
 const prLine = (pull: { readonly repo: string; readonly number: number; readonly sha?: string }, input: ReviewStatusInput): string | undefined => {
@@ -144,7 +162,12 @@ const prLine = (pull: { readonly repo: string; readonly number: number; readonly
       const dismissed = dismissalOf(pr, cur);
       if (dismissed) return `${name}: 재리뷰 대기 -${at}, 오너 결정 ${dismissed}로 지적 ${receipt?.result.findings.length ?? 0}건 기각, 새 리뷰어 대기 (job ${job.jobId})`;
       const sent = cur.authorNotified ? `작성 레인 전달 ${stamp(cur.authorNotified.at)}` : "작성 레인 전달 대기";
-      return `${name}: 수정 중 -${at}, 지적 ${receipt?.result.findings.length ?? 0}건 (${findingsText(cur)}), ${sent}, 남은 자동 라운드 ${left}, receipt ${receipt?.receiptId ?? "-"}, 보고서 ${receipt?.reportArtifact ?? "-"}`;
+      // The state the owner acts on (count, hand-off to the author lane, rounds left, receipt) comes first, bounded so the
+      // summary keeps room; the report is named by its research directory (the full path is in the lead's digest).
+      const report = receipt?.reportArtifact ? basename(dirname(receipt.reportArtifact)) : "-";
+      const state = cut(`${name}: 수정 중 -${at}, 지적 ${receipt?.result.findings.length ?? 0}건, ${sent}, 남은 자동 라운드 ${left}, receipt ${receipt?.receiptId ?? "-"}, 보고서 ${report}`, FINDINGS_STATE_MAX);
+      const summary = findingsText(cur, REVIEW_LINE_MAX - state.length - "; 요약 ".length);
+      return summary ? `${state}; 요약 ${summary}` : state;
     }
     case "error":
       return `${name}: 리뷰 재시도 대기 -${at}, 실행 실패 ${e.code}: ${cut(flat(e.detail), 80)} (job ${job.jobId})`;
