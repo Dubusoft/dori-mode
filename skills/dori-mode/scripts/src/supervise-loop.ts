@@ -33,7 +33,7 @@ import { freshnessTick, scrubForThread } from "./freshness.ts";
 import { quotaReport } from "./claude-quota.ts";
 import { sharedQuotaLookup } from "./quota-cache.ts";
 import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
-import { memorySweep } from "./memory-check.ts";
+import { memorySizeTrigger, memorySweep } from "./memory-check.ts";
 import { alertReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { AutoUpdate, doriRepoOf, noteDevMerge } from "./auto-update.ts";
@@ -349,6 +349,8 @@ export const supervisorSweeps = (
       }, laneReports(), openPulls(), emit);
       return [];
     }],
+    // The size trigger runs every round in its own unit, so a failing daily check never costs its urgent line.
+    ["memory-size", async () => memorySizeTrigger(deps, home)],
     ["memory", async () => memorySweep(deps, home)],
     // `dori update --dev` after a merge of dori's own repo into dev, in its own unit once no lane of that repo is working.
     ["auto-update", async (emit) => {

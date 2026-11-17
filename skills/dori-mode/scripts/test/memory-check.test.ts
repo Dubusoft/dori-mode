@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { DEFAULT_MEMORY_LIMITS, type MemoryLimits } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
-import { checkMemory, itemRefs, MEMORY_CHECK_EVERY_MS, MEMORY_CHECK_GROWTH_BYTES, memorySweep, needsAction, openItems, renderMemoryReport } from "../src/memory-check.ts";
+import { eventClass } from "../src/event-policy.ts";
+import { checkMemory, itemRefs, MEMORY_CHECK_EVERY_MS, MEMORY_CHECK_GROWTH_BYTES, memorySizeTrigger, memorySweep, needsAction, openItems, renderMemoryReport } from "../src/memory-check.ts";
 import type { Lane } from "../src/registry.ts";
-import type { Ran } from "../src/run.ts";
+import { type Ran, run, type RunOptions } from "../src/run.ts";
 import { runSweeps, supervisorSweeps } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
@@ -36,19 +38,38 @@ const lane = (key: string, patch: Partial<Lane> = {}): Lane => ({
   openedAt: new Date(T0).toISOString(), ...patch,
 });
 
-/** gh pr view N -R repo: PRs 7 and 9 merged, the rest open. */
-const prRunner = (calls: string[][]) => async (argv: readonly string[]): Promise<Ran> => {
+/** gh pr view N -R repo: PRs 7 and 9 merged, the rest open. git runs for real, on the fixture repo. */
+const prRunner = (calls: string[][]) => async (argv: readonly string[], opts?: RunOptions): Promise<Ran> => {
+  if (argv[0] === "git") return run(argv, opts);
   calls.push([...argv]);
   if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "view") return { code: 0, out: JSON.stringify({ state: ["7", "9"].includes(argv[3] ?? "") ? "MERGED" : "OPEN" }), err: "" };
   return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` };
 };
 
-const setup = async (human = HUMAN, maxKb = 15): Promise<{ deps: FlowDeps; calls: string[][]; memory: string }> => {
+const git = async (repo: string, ...args: string[]): Promise<void> => {
+  const r = await run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", ...args]);
+  if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.err}`);
+};
+
+/** Writes `files` (paths under the memory repo) and commits them, as omo's memory tool does. */
+const commit = async (memory: string, files: Readonly<Record<string, string>>): Promise<void> => {
+  for (const [path, text] of Object.entries(files)) {
+    mkdirSync(join(memory, path, ".."), { recursive: true });
+    writeFileSync(join(memory, path), text);
+  }
+  await git(memory, "add", "-A");
+  await git(memory, "commit", "-q", "--allow-empty", "-m", "memory");
+};
+
+const setup = async (human = HUMAN, maxKb = 15, limits: Partial<MemoryLimits> = {}): Promise<{ deps: FlowDeps; calls: string[][]; memory: string }> => {
   const memory = join(state.dir, "memory");
-  mkdirSync(join(memory, "system"), { recursive: true });
-  writeFileSync(join(memory, "system", "human.md"), human);
+  mkdirSync(memory, { recursive: true });
+  await git(memory, "init", "-q");
+  await commit(memory, { "system/human.md": human });
   const calls: string[][] = [];
-  const base = depsFor(newWorld(), fakeClock(T0), join(state.dir, "state"), { memoryCheck: { repo: memory, maxKb } });
+  const base = depsFor(newWorld(), fakeClock(T0), join(state.dir, "state"), {
+    memoryCheck: { repo: memory }, memoryLimits: { ...DEFAULT_MEMORY_LIMITS, humanMaxKb: maxKb, ...limits },
+  });
   const deps: FlowDeps = { ...base, run: prRunner(calls) };
   await deps.registry.write(lane("dori-ack", { closedAt: new Date(T0).toISOString(), status: "closed" }));
   await deps.registry.write(lane("live-lane"));
@@ -89,6 +110,7 @@ test("the report names stale Open items by closed lane and merged PR, reads only
   const text = renderMemoryReport(report);
   expect(text).toContain("SIZE ");
   expect(text).toContain(": ok");
+  expect(text).toContain(`SYSTEM ~${Math.floor(Buffer.byteLength(HUMAN) / 4)} tokens`);
   expect(text).toContain("STALE #1");
   expect(text.split("\n").at(-1)).toStartWith("MEMORY_CHECK action needed");
   expect(calls.every((c) => c[0] === "gh" && c[1] === "pr" && c[2] === "view")).toBe(true);
@@ -164,15 +186,118 @@ test("the same findings are sent again only when human.md grew 1 KB since the la
 test("an oversized human.md is said once, then again only after 1 KB more", async () => {
   const { deps, memory } = await setup(`## Open\n- ${"x".repeat(2048)}\n`, 1);
   const file = join(memory, "system", "human.md");
-  const day = (n: number): FlowDeps => ({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) });
-  const first = await memorySweep(day(0), "/home/test");
+  const daily = (n: number): Promise<string[]> => memorySweep({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) }, "/home/test");
+  const first = await daily(0);
   expect(first[0]).toContain("over the 1.0KB limit");
-  expect(await memorySweep(day(1), "/home/test")).toEqual([]);
+  expect(await daily(1)).toEqual([]);
   // Condensed but still over: the lower size is the new baseline.
   writeFileSync(file, `## Open\n- ${"x".repeat(1500)}\n`);
-  expect(await memorySweep(day(2), "/home/test")).toEqual([]);
+  expect(await daily(2)).toEqual([]);
   writeFileSync(file, `## Open\n- ${"x".repeat(1500 + MEMORY_CHECK_GROWTH_BYTES)}\n`);
-  expect(await memorySweep(day(3), "/home/test")).toHaveLength(1);
+  expect(await daily(3)).toHaveLength(1);
+});
+
+test("system memory is sized as omo sizes it: committed system/**/*.md at HEAD, bytes / 4", async () => {
+  const { deps, memory } = await setup("## Open\n");
+  await commit(memory, { "system/persona.md": "p".repeat(401), "system/nested/block.md": "\u00e9".repeat(100), "system/notes.txt": "t".repeat(999), "reference/x.md": "r".repeat(999) });
+  // Not committed yet: omo does not count it, and neither does the check.
+  writeFileSync(join(memory, "system", "draft.md"), "d".repeat(4000));
+  const bytes = Buffer.byteLength("## Open\n") + 401 + 200;
+  const report = await checkMemory(deps, "/home/test");
+  expect(report.system).toEqual({ bytes, tokens: Math.floor(bytes / 4), files: 3 });
+  expect(needsAction(report)).toBe(false);
+  const tight = await checkMemory({ ...deps, config: { ...deps.config, memoryLimits: { ...deps.config.memoryLimits, systemMaxTokens: 100 } } }, "/home/test");
+  expect(needsAction(tight)).toBe(true);
+  expect(renderMemoryReport(tight)).toContain(`advisory 100: OVER by ${Math.floor(bytes / 4) - 100}`);
+});
+
+test("a memory repo git cannot read leaves system memory UNCHECKED, not zero", async () => {
+  const { deps, memory } = await setup("## Open\n");
+  rmSync(join(memory, ".git"), { recursive: true, force: true });
+  const report = await checkMemory(deps, "/home/test");
+  expect(report.system).toBeUndefined();
+  expect(report.unchecked).toHaveLength(1);
+  expect(report.unchecked[0]).toStartWith("system memory: git ls-tree HEAD in ");
+  expect(renderMemoryReport(report)).toContain("SYSTEM unknown (see UNCHECKED)");
+});
+
+test("the daily check names system memory over omo's advisory once, then again only after 1 KB more", async () => {
+  const { deps, memory } = await setup("## Open\n", 15, { systemMaxTokens: 1_000, triggerPct: 100 });
+  const daily = (n: number): Promise<string[]> => memorySweep({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) }, "/home/test");
+  expect(await daily(0)).toEqual([]);
+  await commit(memory, { "system/big.md": "b".repeat(4_200) });
+  const first = await daily(1);
+  expect(first).toHaveLength(1);
+  expect(first[0]).toContain("system memory is ~1052 tokens, over omo's 1000 advisory");
+  expect(await daily(2)).toEqual([]);
+  await commit(memory, { "system/big.md": "b".repeat(4_200 + MEMORY_CHECK_GROWTH_BYTES - 1) });
+  expect(await daily(3)).toEqual([]);
+  await commit(memory, { "system/big.md": "b".repeat(4_200 + MEMORY_CHECK_GROWTH_BYTES) });
+  expect(await daily(4)).toHaveLength(1);
+  // A day git cannot size system/ is not a clean day: once git reads it again, the unchanged size stays quiet.
+  renameSync(join(memory, ".git"), join(memory, ".git-off"));
+  expect(await daily(5)).toEqual([]);
+  renameSync(join(memory, ".git-off"), join(memory, ".git"));
+  expect(await daily(6)).toEqual([]);
+  // The same holds when another finding is said on the unmeasured day.
+  writeFileSync(join(memory, "system", "human.md"), "## Open\n- acme/app#9 shipped\n");
+  renameSync(join(memory, ".git"), join(memory, ".git-off"));
+  const other = await daily(7);
+  expect(other).toHaveLength(1);
+  expect(other[0]).not.toContain("system memory");
+  renameSync(join(memory, ".git-off"), join(memory, ".git"));
+  expect(await daily(8)).toEqual([]);
+});
+
+test("the size trigger wakes the lead at once past triggerPct, and names the same size only after 1 KB more", async () => {
+  // systemMaxTokens 1000 at 80%: over 800 tokens, i.e. more than 3203 bytes.
+  const { deps, memory } = await setup("## Open\n", 15, { systemMaxTokens: 1_000, triggerPct: 80 });
+  const head = Buffer.byteLength("## Open\n");
+  const big = (bytes: number) => commit(memory, { "system/big.md": "b".repeat(bytes - head) });
+  const round = () => memorySizeTrigger(deps, "/home/test");
+  expect(await round()).toEqual([]);
+  await big(3_200);
+  expect(await round()).toEqual([]);
+  await big(3_208);
+  const first = await round();
+  expect(first).toEqual(["MEMORY_SIZE system memory ~802 tokens, over 800 (80% of omo's 1000 advisory) (run dori memory check, then condense now)"]);
+  expect(eventClass(first[0] ?? "")).toBe("lead-urgent");
+  // No daily wait: every round looks, but the same size is not said again, nor growth short of 1 KB.
+  expect(await round()).toEqual([]);
+  await big(3_208 + MEMORY_CHECK_GROWTH_BYTES - 1);
+  expect(await round()).toEqual([]);
+  await big(3_208 + MEMORY_CHECK_GROWTH_BYTES);
+  expect(await round()).toHaveLength(1);
+  // Condensed under the trigger, then over it again: said again.
+  await big(2_000);
+  expect(await round()).toEqual([]);
+  await big(3_208);
+  expect(await round()).toHaveLength(1);
+  // human.md past 80% of 15 KB (12 KB) is its own measure, read from the working tree.
+  writeFileSync(join(memory, "system", "human.md"), `## Open\n${"h".repeat(12 * 1024)}\n`);
+  const human = await round();
+  expect(human).toHaveLength(1);
+  expect(human[0]).toContain("human.md 12.0KB, over 12.0KB (80% of the 15.0KB limit)");
+  expect(human[0]).toContain("system memory ~802 tokens");
+  expect(await round()).toEqual([]);
+  expect(JSON.parse(readFileSync(join(deps.config.stateDir, "memory-size.json"), "utf8"))).toEqual({ human: 12 * 1024 + head + 1, system: 3_208 });
+});
+
+test("the size trigger is its own supervisor sweep: a failing daily check does not cost its line", async () => {
+  const { deps, memory } = await setup("## Open\n", 15, { systemMaxTokens: 1_000 });
+  await commit(memory, { "system/big.md": "b".repeat(4_000) });
+  // The daily check is due and its registry read fails in the round the threshold is crossed.
+  const broken: FlowDeps = { ...deps, registry: Object.assign(Object.create(deps.registry) as typeof deps.registry, { open: async () => { throw new Error("registry unreadable"); } }) };
+  const round = async (d: FlowDeps): Promise<string[]> => {
+    const queue: string[] = [];
+    await runSweeps(supervisorSweeps(d, "/home/test").filter(([name]) => name.startsWith("memory")), async (line) => { queue.push(line); }, d.clock.now, new Map(), () => {});
+    return queue;
+  };
+  const crossed = await round(broken);
+  expect(crossed.filter((line) => line.startsWith("MEMORY_SIZE system memory ~"))).toHaveLength(1);
+  expect(crossed).toContain("SWEEP_WARN memory registry unreadable");
+  // The next healthy round: the size line was delivered, so it is not repeated.
+  expect((await round({ ...deps, clock: fakeClock(T0 + MIN) })).filter((line) => line.startsWith("MEMORY_SIZE"))).toEqual([]);
 });
 
 test("a state written before the daily-only sweep does not repeat the line it already sent", async () => {

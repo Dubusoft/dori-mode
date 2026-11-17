@@ -58,6 +58,9 @@ const URGENT_KINDS = [
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
   "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",
+  // The lead's memory is close to omo's advisory or human.md to its limit (memory-check.ts memorySizeTrigger): condense
+  // now, before every prompt pays for it. The daily MEMORY_CHECK digest stays digest (the default).
+  "MEMORY_SIZE",
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",

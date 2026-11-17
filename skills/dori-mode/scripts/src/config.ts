@@ -32,8 +32,38 @@ export type GuardThresholds = {
 export type MemoryCheckConfig = {
   /** The lead's omo memory repo (holds system/human.md); blank finds omo's repo for `leadCwd` under ~/.omo/memory/agents. */
   readonly repo: string;
+};
+
+/** The config's `memoryLimits`: the sizes `dori memory check`, its daily sweep and the size trigger judge the lead's memory by. */
+export type MemoryLimits = {
   /** human.md above this many KB (1024 bytes) needs condensing. */
-  readonly maxKb: number;
+  readonly humanMaxKb: number;
+  /** omo's advisory for the whole system/ projection (its memory.compile_warn_tokens), in omo's bytes/4 tokens. */
+  readonly systemMaxTokens: number;
+  /** Percent of `humanMaxKb` or `systemMaxTokens` past which the supervisor wakes the lead at once (urgent MEMORY_SIZE). */
+  readonly triggerPct: number;
+};
+
+export const DEFAULT_MEMORY_LIMITS: MemoryLimits = { humanMaxKb: 15, systemMaxTokens: 30_000, triggerPct: 80 };
+
+const MEMORY_LIMIT_KEYS = Object.keys(DEFAULT_MEMORY_LIMITS) as readonly (keyof MemoryLimits)[];
+
+/**
+ * The config's `memoryLimits`: absent keeps the defaults; otherwise `{ "humanMaxKb"?, "systemMaxTokens"?, "triggerPct"? }`,
+ * positive numbers with triggerPct at most 100 (an absent key keeps its default), else TypeError.
+ */
+const memoryLimits = (raw: unknown): MemoryLimits => {
+  const base = DEFAULT_MEMORY_LIMITS;
+  if (raw == null) return base;
+  const bad = new TypeError(`memoryLimits must be { "humanMaxKb"?: KB, "systemMaxTokens"?: tokens, "triggerPct"?: 1-100 } with positive numbers, not ${JSON.stringify(raw)}`);
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !(MEMORY_LIMIT_KEYS as readonly string[]).includes(key))) throw bad;
+  const num = (key: keyof MemoryLimits, fallback: number): number => {
+    const v = raw[key];
+    if (v === undefined) return fallback;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || (key === "triggerPct" && v > 100)) throw bad;
+    return v;
+  };
+  return { humanMaxKb: num("humanMaxKb", base.humanMaxKb), systemMaxTokens: num("systemMaxTokens", base.systemMaxTokens), triggerPct: num("triggerPct", base.triggerPct) };
 };
 
 /**
@@ -188,6 +218,7 @@ export type DoriConfig = {
   readonly guardMachines: Readonly<Record<string, string>>;
   readonly guard: GuardThresholds;
   readonly memoryCheck: MemoryCheckConfig;
+  readonly memoryLimits: MemoryLimits;
   readonly hooks: Hooks;
   /** Default limit in ms for every external call (herdr, git, df, ...) that sets none itself; 0 turns it off. */
   readonly runTimeoutMs: number;
@@ -259,7 +290,8 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   heavyMaxLoad: 80,
   guardMachines: {},
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 },
-  memoryCheck: { repo: "", maxKb: 15 },
+  memoryCheck: { repo: "" },
+  memoryLimits: DEFAULT_MEMORY_LIMITS,
   hooks: {},
   runTimeoutMs: 60_000,
   leadStuckRestartMin: 30,
@@ -436,6 +468,7 @@ export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
+  "memoryLimits",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -518,6 +551,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...(decisions ? { decisionsChannel: decisions } : {}),
     laneRules: laneRules(raw.laneRules),
     review: reviewConfig(raw.review),
+    memoryLimits: memoryLimits(raw.memoryLimits),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),

@@ -469,20 +469,20 @@ const leadWakes = (d: DoctorDeps): Check[] => {
     "review dori status (the activities section lists wake triggers and model calls)")];
 };
 
-/** memoryCheck: the lead's human.md is found and within maxKb. */
+/** memoryCheck: the lead's human.md is found and within memoryLimits.humanMaxKb. */
 const memory = (d: DoctorDeps): Check[] => {
-  const m = d.config.memoryCheck;
+  const m = d.config.memoryLimits;
   const repo = resolveMemoryRepo(d.config, d.home);
   const file = repo ? `${repo}/${MEMORY_FILE}` : undefined;
-  const limit = Math.round(m.maxKb * 1024);
+  const limit = Math.round(m.humanMaxKb * 1024);
   const checks: Check[] = [];
   if (!file || !d.exists(file)) {
     checks.push(warn("memory check", file ? `${file} does not exist` : `no omo memory repo for ${d.config.leadCwd}; dori memory check and its sweep are off`, `check leadCwd in ${d.configPath}: the memory repo is omo's for that directory`));
   } else {
     const bytes = statSync(file).size;
     checks.push(bytes > limit
-      ? warn("memory check", `${file} is ${(bytes / 1024).toFixed(1)}KB, over memoryCheck.maxKb ${m.maxKb}`, "dori memory check, then the lead condenses human.md")
-      : ok("memory check", `${file} ${(bytes / 1024).toFixed(1)}KB of ${m.maxKb}KB`));
+      ? warn("memory check", `${file} is ${(bytes / 1024).toFixed(1)}KB, over memoryLimits.humanMaxKb ${m.humanMaxKb}`, "dori memory check, then the lead condenses human.md")
+      : ok("memory check", `${file} ${(bytes / 1024).toFixed(1)}KB of ${m.humanMaxKb}KB`));
   }
   return checks;
 };

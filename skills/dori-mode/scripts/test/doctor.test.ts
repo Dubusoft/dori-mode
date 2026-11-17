@@ -496,7 +496,7 @@ test("tokenFrom reads the env file forms and gatewayView ages with the injected 
   expect(gatewayView(s, 1000 + 61_000).state).toBe("stale");
 });
 
-test("memory check: omo's repo for leadCwd, WARN over maxKb or when nothing is found", async () => {
+test("memory check: omo's repo for leadCwd, WARN over humanMaxKb or when nothing is found", async () => {
   const f = fixture();
   const real = { ...f.deps, exists: existsSync };
   expect(find(await runDoctor(real), "memory check").level).toBe("OK");
@@ -510,7 +510,7 @@ test("memory check: omo's repo for leadCwd, WARN over maxKb or when nothing is f
   const over = find(await runDoctor(discovered), "memory check");
   expect(over.level).toBe("WARN");
   expect(over.detail).toContain(agent);
-  expect(over.detail).toContain("over memoryCheck.maxKb 15");
+  expect(over.detail).toContain("over memoryLimits.humanMaxKb 15");
 });
 
 test("item 6: doctor fails on lanes whose recovery is exhausted and warns on lanes still pending recovery", async () => {

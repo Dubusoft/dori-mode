@@ -9,7 +9,8 @@ import { Repos } from "./repos.ts";
 import type { Runner } from "./run.ts";
 
 /**
- * Read-only check of the lead's omo memory: system/human.md against `memoryCheck.maxKb`, and Open items that still
+ * Read-only check of the lead's omo memory: system/human.md against `memoryLimits.humanMaxKb`, the whole system/
+ * projection against omo's advisory token budget (`memoryLimits.systemMaxTokens`), and Open items that still
  * reference finished work (a closed lane, a merged PR). Detection only; condensing stays with the lead.
  */
 
@@ -17,8 +18,11 @@ export class MemoryCheckError extends Error {}
 
 export const MEMORY_FILE = join("system", "human.md");
 export const MEMORY_CHECK_EVERY_MS = 24 * 60 * 60_000;
-/** Growth of human.md since the last MEMORY_CHECK that is worth another one. */
+/** Growth of human.md (or of system/) since the last MEMORY_CHECK or MEMORY_SIZE that is worth another one. */
 export const MEMORY_CHECK_GROWTH_BYTES = 1024;
+
+/** The system memory omo projects into every prompt, sized the way omo sizes it. */
+export type SystemMemory = { readonly bytes: number; readonly tokens: number; readonly files: number };
 
 export type OpenItem = { readonly index: number; readonly label: string; readonly text: string };
 export type StaleItem = { readonly item: OpenItem; readonly refs: readonly string[] };
@@ -26,6 +30,9 @@ export type MemoryReport = {
   readonly file: string;
   readonly bytes: number;
   readonly limitBytes: number;
+  /** Undefined when git could not read the repo's HEAD; the reason is in `unchecked`. */
+  readonly system?: SystemMemory;
+  readonly systemMaxTokens: number;
   readonly items: number;
   readonly stale: readonly StaleItem[];
   readonly unchecked: readonly string[];
@@ -121,6 +128,39 @@ const knownRepos = async (deps: FlowDeps): Promise<string[]> => {
 
 const T = { timeoutMs: 20_000 };
 
+/**
+ * omo's own estimate (its memory status check): every committed system/**\/*.md blob at HEAD, UTF-8 bytes summed,
+ * divided by 4 and floored. Read from git, not the working tree, so the number is the one omo warns with.
+ */
+export const systemMemory = async (run: Runner, repo: string): Promise<SystemMemory> => {
+  const r = await run(["git", "-C", repo, "ls-tree", "-r", "-l", "-z", "HEAD", "--", "system"], T);
+  if (r.code !== 0) throw new MemoryCheckError(`git ls-tree HEAD in ${repo}: ${(r.err || r.out).trim().split("\n")[0]?.slice(0, 120) || `exit ${r.code}`}`);
+  let bytes = 0;
+  let files = 0;
+  for (const entry of r.out.split("\0")) {
+    const m = /^\S+ blob \S+\s+(\d+)\t(.+)$/.exec(entry);
+    if (!m || !m[2]?.endsWith(".md")) continue;
+    bytes += Number(m[1]);
+    files += 1;
+  }
+  return { bytes, tokens: Math.floor(bytes / 4), files };
+};
+
+const systemOrError = async (run: Runner, repo: string): Promise<{ readonly system?: SystemMemory; readonly error?: string }> => {
+  try { return { system: await systemMemory(run, repo) }; }
+  catch (e) {
+    if (e instanceof MemoryCheckError) return { error: e.message };
+    throw e;
+  }
+};
+
+/** The memory repo and its human.md; throws MemoryCheckError when either is missing. */
+const memoryFile = (deps: FlowDeps, home: string): { readonly repo: string; readonly file: string } => {
+  const repo = resolveMemoryRepo(deps.config, home);
+  if (!repo) throw new MemoryCheckError(`lead memory repo not found: memoryCheck.repo is unset and no omo memory repo exists for ${deps.config.leadCwd} under ${join(home, ".omo", "memory", "agents")}`);
+  return { repo, file: join(repo, MEMORY_FILE) };
+};
+
 const prState = async (run: Runner, ref: string): Promise<{ readonly state?: string; readonly error?: string }> => {
   const [repo = "", number = ""] = ref.split("#");
   const r = await run(["gh", "pr", "view", number, "-R", repo, "--json", "state"], T);
@@ -129,11 +169,9 @@ const prState = async (run: Runner, ref: string): Promise<{ readonly state?: str
   catch { return { error: "gh printed no JSON" }; }
 };
 
-/** Reads only: the memory file, the registry and gh. Throws MemoryCheckError when the memory file is missing. */
+/** Reads only: the memory files, the memory repo's HEAD, the registry and gh. Throws MemoryCheckError when the memory file is missing. */
 export const checkMemory = async (deps: FlowDeps, home: string): Promise<MemoryReport> => {
-  const repo = resolveMemoryRepo(deps.config, home);
-  if (!repo) throw new MemoryCheckError(`lead memory repo not found: memoryCheck.repo is unset and no omo memory repo exists for ${deps.config.leadCwd} under ${join(home, ".omo", "memory", "agents")}`);
-  const file = join(repo, MEMORY_FILE);
+  const { repo, file } = memoryFile(deps, home);
   let text: string;
   try { text = readFileSync(file, "utf8"); } catch { throw new MemoryCheckError(`${file} is missing or unreadable`); }
   const bytes = statSync(file).size;
@@ -143,6 +181,8 @@ export const checkMemory = async (deps: FlowDeps, home: string): Promise<MemoryR
   const refs = items.map((item) => ({ item, refs: itemRefs(item.text, closed, repos) }));
   const prs = [...new Set(refs.flatMap((r) => r.refs.prs))];
   const unchecked: string[] = [];
+  const { system, error } = await systemOrError(deps.run, repo);
+  if (error) unchecked.push(`system memory: ${error}`);
   const prStates = new Map(await Promise.all(prs.map(async (ref) => [ref, await prState(deps.run, ref)] as const)));
   for (const [ref, s] of prStates) if (s.error) unchecked.push(`PR ${ref}: ${s.error}`);
   for (const { item, refs: r } of refs) for (const pr of r.unresolved) unchecked.push(`item ${item.index}: ${pr} (repo unclear; write owner/repo#N)`);
@@ -153,10 +193,15 @@ export const checkMemory = async (deps: FlowDeps, home: string): Promise<MemoryR
     ];
     return found.length ? [{ item, refs: found }] : [];
   });
-  return { file, bytes, limitBytes: Math.round(deps.config.memoryCheck.maxKb * 1024), items: items.length, stale, unchecked };
+  return {
+    file, bytes, limitBytes: Math.round(deps.config.memoryLimits.humanMaxKb * 1024), ...(system ? { system } : {}),
+    systemMaxTokens: deps.config.memoryLimits.systemMaxTokens, items: items.length, stale, unchecked,
+  };
 };
 
-export const needsAction = (r: MemoryReport): boolean => r.bytes > r.limitBytes || r.stale.length > 0;
+const systemOver = (r: MemoryReport): boolean => r.system !== undefined && r.system.tokens > r.systemMaxTokens;
+
+export const needsAction = (r: MemoryReport): boolean => r.bytes > r.limitBytes || systemOver(r) || r.stale.length > 0;
 
 const kb = (bytes: number): string => `${(bytes / 1024).toFixed(1)}KB`;
 
@@ -165,6 +210,7 @@ export const memoryEvent = (r: MemoryReport): string => {
   if (!needsAction(r)) return "";
   const parts = [
     ...(r.bytes > r.limitBytes ? [`human.md is ${kb(r.bytes)}, over the ${kb(r.limitBytes)} limit`] : []),
+    ...(systemOver(r) ? [`system memory is ~${r.system?.tokens} tokens, over omo's ${r.systemMaxTokens} advisory`] : []),
     ...(r.stale.length ? [`${r.stale.length} Open item(s) reference finished work: ${r.stale.map((s) => `#${s.item.index} ${s.refs.join(", ")}`).join("; ")}`] : []),
   ];
   const line = `MEMORY_CHECK ${parts.join("; ")}`;
@@ -175,10 +221,13 @@ export const memoryEvent = (r: MemoryReport): string => {
 export const renderMemoryReport = (r: MemoryReport): string => [
   `MEMORY_FILE ${r.file}`,
   `SIZE ${r.bytes} bytes (${kb(r.bytes)}), limit ${kb(r.limitBytes)}: ${r.bytes > r.limitBytes ? `OVER by ${kb(r.bytes - r.limitBytes)}` : "ok"}`,
+  r.system
+    ? `SYSTEM ~${r.system.tokens} tokens (${r.system.bytes} bytes in ${r.system.files} system/*.md at HEAD, bytes/4), advisory ${r.systemMaxTokens}: ${systemOver(r) ? `OVER by ${r.system.tokens - r.systemMaxTokens}` : "ok"}`
+    : "SYSTEM unknown (see UNCHECKED)",
   `OPEN_ITEMS ${r.items}`,
   ...r.stale.map((s) => `STALE #${s.item.index} ${JSON.stringify(s.item.label)}: ${s.refs.join("; ")}`),
   ...r.unchecked.map((u) => `UNCHECKED ${u}`),
-  needsAction(r) ? "MEMORY_CHECK action needed: condense human.md and delete or shrink the STALE Open items" : "MEMORY_CHECK clean",
+  needsAction(r) ? "MEMORY_CHECK action needed: condense human.md and the system/ blocks and delete or shrink the STALE Open items" : "MEMORY_CHECK clean",
 ].join("\n");
 
 /**
@@ -189,6 +238,9 @@ type SweepState = {
   readonly at?: number;
   readonly bytes?: number;
   readonly over?: boolean;
+  /** system/ bytes at HEAD, and whether they were over the advisory. */
+  readonly system?: number;
+  readonly systemOver?: boolean;
   readonly stale?: readonly string[];
   /** Pre-daily-only state: a fingerprint of the last line sent. Read once, so an upgrade does not repeat it. */
   readonly sent?: string;
@@ -199,17 +251,20 @@ const saveState = (path: string, state: SweepState): void => {
 };
 
 /**
- * The supervisor's memory sweep: one check every MEMORY_CHECK_EVERY_MS, nothing else triggers it. A finding becomes
- * one MEMORY_CHECK line only when there was no earlier one, human.md grew by MEMORY_CHECK_GROWTH_BYTES or went over
- * the limit since it, or a STALE reference it did not name appears. State lives in <stateDir>/memory-check.json. The
- * run is recorded before checking, so a failure waits for the next daily turn.
+ * The supervisor's daily memory sweep (the size trigger, memorySizeTrigger, is its own sweep, so a failure here never
+ * costs its line): one check every MEMORY_CHECK_EVERY_MS. A finding becomes one MEMORY_CHECK line only when there was
+ * no earlier one, human.md or system/ grew by MEMORY_CHECK_GROWTH_BYTES or went over its limit since it, or a STALE
+ * reference it did not name appears. human.md and the Open items share one baseline, system/ keeps its own, and a
+ * day git cannot size system/ leaves that baseline as it was. State lives in <stateDir>/memory-check.json. The run is
+ * recorded before checking, so a failure waits for the next daily turn.
  */
 export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[]> => {
   const path = join(deps.config.stateDir, "memory-check.json");
   const now = deps.clock.now();
   const state: SweepState = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as SweepState : {};
   if (now - (state.at ?? -Infinity) < MEMORY_CHECK_EVERY_MS) return [];
-  const base: SweepState = state.bytes === undefined ? {} : { bytes: state.bytes, over: state.over, stale: state.stale };
+  const kept: SweepState = state.systemOver ? { system: state.system, systemOver: true } : {};
+  const base: SweepState = state.bytes === undefined ? kept : { bytes: state.bytes, over: state.over, stale: state.stale, ...kept };
   saveState(path, { ...base, at: now });
   let report: MemoryReport;
   try { report = await checkMemory(deps, home); }
@@ -218,16 +273,70 @@ export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[
     throw e;
   }
   const line = memoryEvent(report);
-  // A clean check forgets the last finding, so the same finding coming back later is said again.
-  if (!line) { saveState(path, { at: now }); return []; }
   const over = report.bytes > report.limitBytes;
   const stale = [...new Set(report.stale.flatMap((s) => s.refs))].sort();
-  // An old state's fingerprint means a line went out already: take today's findings as its baseline.
-  const last = base.bytes !== undefined ? base : state.sent !== undefined ? { bytes: report.bytes, over, stale } : undefined;
+  const system = report.system?.bytes;
+  const sysOver = systemOver(report);
+  // system/: said when newly over or grown 1 KB past what was said; unknown (git failed) keeps the baseline.
+  const sendSystem = sysOver && system !== undefined && (!kept.systemOver || system - (kept.system ?? 0) >= MEMORY_CHECK_GROWTH_BYTES);
+  const systemState: SweepState = system === undefined ? kept
+    : !sysOver ? {}
+    : sendSystem ? { system, systemOver: true } : { system: Math.min(kept.system ?? system, system), systemOver: true };
+  // human.md and Open items: a clean check forgets the last finding, so the same finding coming back later is said
+  // again. An old state's fingerprint means a line went out already: take today's findings as its baseline.
+  const found = over || stale.length > 0;
+  const last: SweepState | undefined = base.bytes !== undefined ? base : state.sent !== undefined ? { bytes: report.bytes, over, stale } : undefined;
   const said = new Set(last?.stale ?? []);
-  const send = !last || report.bytes - (last.bytes ?? 0) >= MEMORY_CHECK_GROWTH_BYTES || (over && !last.over) || stale.some((ref) => !said.has(ref));
-  saveState(path, send
-    ? { at: now, bytes: report.bytes, over, stale }
-    : { at: now, bytes: Math.min(last.bytes ?? report.bytes, report.bytes), over: over && last.over === true, stale: stale.filter((ref) => said.has(ref)) });
+  const sendHuman = found && (!last || report.bytes - (last.bytes ?? 0) >= MEMORY_CHECK_GROWTH_BYTES || (over && !last.over) || stale.some((ref) => !said.has(ref)));
+  const send = line !== "" && (sendHuman || sendSystem);
+  const humanState: SweepState = !found ? {}
+    : send || !last ? { bytes: report.bytes, over, stale }
+    : { bytes: Math.min(last.bytes ?? report.bytes, report.bytes), over: over && last.over === true, stale: stale.filter((ref) => said.has(ref)) };
+  saveState(path, { at: now, ...humanState, ...systemState });
   return send ? [line] : [];
+};
+
+/** Per measure, the size the last MEMORY_SIZE named it at, lowered while it shrinks; absent while under its trigger. */
+type TriggerState = { readonly human?: number; readonly system?: number };
+
+/**
+ * The size trigger, every sweep round: human.md over `triggerPct` of `humanMaxKb`, or system/ over `triggerPct` of
+ * `systemMaxTokens`, wakes the lead with one urgent MEMORY_SIZE line before omo's own advisory is reached. The same
+ * measure is named again only after it grows MEMORY_CHECK_GROWTH_BYTES past the last line (or drops under its trigger
+ * and crosses it again). Reads the human.md size and the repo's HEAD only; a repo git cannot read skips the system
+ * measure (the daily check reports it as UNCHECKED), a missing human.md is the daily check's MEMORY_CHECK_WARN. State
+ * lives in <stateDir>/memory-size.json.
+ */
+export const memorySizeTrigger = async (deps: FlowDeps, home: string): Promise<string[]> => {
+  let paths: { readonly repo: string; readonly file: string };
+  try { paths = memoryFile(deps, home); }
+  catch (e) {
+    if (e instanceof MemoryCheckError) return [];
+    throw e;
+  }
+  if (!existsSync(paths.file)) return [];
+  const m = deps.config.memoryLimits;
+  const pct = m.triggerPct / 100;
+  const human = { bytes: statSync(paths.file).size, trigger: Math.round(m.humanMaxKb * 1024 * pct) };
+  const { system } = await systemOrError(deps.run, paths.repo);
+  const systemTrigger = Math.floor(m.systemMaxTokens * pct);
+  const path = join(deps.config.stateDir, "memory-size.json");
+  const state: TriggerState = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as TriggerState : {};
+  // Per measure: whether it fires, and its next baseline (undefined: under its trigger). Unmeasured keeps the baseline.
+  const step = (value: number | undefined, over: boolean, last: number | undefined): { readonly fire: boolean; readonly next?: number } => {
+    if (value === undefined) return { fire: false, ...(last !== undefined ? { next: last } : {}) };
+    if (!over) return { fire: false };
+    if (last === undefined || value - last >= MEMORY_CHECK_GROWTH_BYTES) return { fire: true, next: value };
+    return { fire: false, next: Math.min(last, value) };
+  };
+  const h = step(human.bytes, human.bytes > human.trigger, state.human);
+  const s = step(system?.bytes, system !== undefined && system.tokens > systemTrigger, state.system);
+  const next: TriggerState = { ...(h.next !== undefined ? { human: h.next } : {}), ...(s.next !== undefined ? { system: s.next } : {}) };
+  if (JSON.stringify(next) !== JSON.stringify(state)) saveState(path, next);
+  if (!h.fire && !s.fire) return [];
+  const parts = [
+    ...(s.next !== undefined && system && system.tokens > systemTrigger ? [`system memory ~${system.tokens} tokens, over ${systemTrigger} (${m.triggerPct}% of omo's ${m.systemMaxTokens} advisory)`] : []),
+    ...(h.next !== undefined ? [`human.md ${kb(human.bytes)}, over ${kb(human.trigger)} (${m.triggerPct}% of the ${kb(Math.round(m.humanMaxKb * 1024))} limit)`] : []),
+  ];
+  return [`MEMORY_SIZE ${parts.join("; ")} (run dori memory check, then condense now)`];
 };

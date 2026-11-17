@@ -224,7 +224,7 @@ const USAGE = `dori <command> [options]
   can-launch [--machine M] [--cwd D] [--done "..."] [--all]
                                        exit 0 if the machine a launch with these flags is placed on (none: placement.defaultMachine)
                                        has room for a new lane, else print why and exit 4; --all checks local and every listed machine
-  memory check                         read-only: the lead's human.md size vs memoryCheck.maxKb and Open items naming closed lanes
+  memory check                         read-only: the lead's human.md size and system/ tokens vs memoryLimits, and Open items naming closed lanes
                                        or merged PRs; exit 1 when action is needed, 2 when it cannot check
   report <key> <progress|question|blocked|milestone|done> --text T [--evidence E]
                                        inside a lane: its structured report (own key only), sent through its runner to the supervisor;

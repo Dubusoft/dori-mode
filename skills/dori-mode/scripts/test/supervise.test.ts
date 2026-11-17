@@ -389,8 +389,8 @@ test("a cold lead's prompt names SKILL.md and human.md by absolute path, or says
   process.env.HOME = home.dir;
   cleanups.push(() => { process.env.HOME = before; });
   for (const [memoryCheck, memory] of [
-    [{ repo, maxKb: 15 }, `then your memory file ${join(repo, "system", "human.md")} in full`],
-    [{ repo: "", maxKb: 15 }, `its path could not be resolved (memoryCheck.repo is unset and no omo memory repo exists for /repo under ${join(home.dir, ".omo", "memory", "agents")})`],
+    [{ repo }, `then your memory file ${join(repo, "system", "human.md")} in full`],
+    [{ repo: "" }, `its path could not be resolved (memoryCheck.repo is unset and no omo memory repo exists for /repo under ${join(home.dir, ".omo", "memory", "agents")})`],
   ] as const) {
     const f = fixture({ memoryCheck });
     f.cold();
