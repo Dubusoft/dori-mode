@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { resumeAnsweredGoals } from "../src/decision-resume.ts";
 import { DECISIONS_FILE, type OwnerDecision, readDecisions } from "../src/decision-store.ts";
+import { ackLaneMessage, openLaneMessages, queueLaneMessage } from "../src/lane-messages.ts";
 import type { Lane } from "../src/registry.ts";
 import type { TurnEvidence } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
@@ -93,4 +94,42 @@ test("an unconfirmed /goal resume is reported once for the lead", async () => {
   const [line] = await resumeAnsweredGoals(deps(T0 + 40 * MIN));
   expect(line).toStartWith("GOAL_RESUME_FAILED ask-lane d1 answered, but /goal resume was unconfirmed");
   expect(await resumeAnsweredGoals(deps(T0 + 41 * MIN))).toEqual([]);
+});
+
+/** A `dori lane send` to the lane, acked by it at `at`. */
+const laneSend = (text: string, at: number) => {
+  const store = openLaneMessages({ stateDir: state.dir });
+  try {
+    const id = `lane-send-ask-lane-${at}`;
+    queueLaneMessage(store, at - MIN, { id, lane: "ask-lane", subject: id, text, whileWorking: true });
+    ackLaneMessage(store, "ask-lane", id, at);
+  } finally { store.close(); }
+};
+
+test("a close whose text is not typed in yet resumes nothing and is not used up; its relay does", async () => {
+  await deps(T0).registry.write(lane);
+  idle();
+  world.turn = parked();
+  decisions(decision({ state: "closed", closedAt: T0 + 30 * MIN }));
+  expect(await resumeAnsweredGoals(deps(T0 + 30 * MIN))).toEqual([]);
+  expect(readDecisions(state.dir).decisions[0]?.goalResume).toBeUndefined();
+  decisions(relayed);
+  expect(await resumeAnsweredGoals(deps(T0 + 40 * MIN))).toEqual(["GOAL_RESUMED ask-lane d1 answered: its parked goal is active again"]);
+  expect(resumes()).toEqual(["ask-lane"]);
+});
+
+test("the lead's dori lane send naming the ask resumes it once the lane acks it, for an open ask and after DECISION_RELAY_FAILED", async () => {
+  await deps(T0).registry.write(lane);
+  idle();
+  world.turn = parked();
+  decisions(decision());
+  laneSend("[LEAD] unrelated steering", T0 + 10 * MIN);
+  expect(await resumeAnsweredGoals(deps(T0 + 20 * MIN))).toEqual([]);
+  laneSend("[LEAD] answer to d1: take option a", T0 + 25 * MIN);
+  expect(await resumeAnsweredGoals(deps(T0 + 30 * MIN))).toEqual(["GOAL_RESUMED ask-lane d1 answered: its parked goal is active again"]);
+  decisions(decision({ id: "d2", openedAt: T0 + 40 * MIN, state: "closed", closedAt: T0 + 50 * MIN, relay: { state: "failed", lane: "ask-lane", at: T0 + 52 * MIN, attempts: 3, reportedAt: T0 + 52 * MIN } }));
+  expect(await resumeAnsweredGoals(deps(T0 + 55 * MIN))).toEqual([]);
+  laneSend("[LEAD] d2: go with b", T0 + 60 * MIN);
+  expect(await resumeAnsweredGoals(deps(T0 + 61 * MIN))).toEqual(["GOAL_RESUMED ask-lane d2 answered: its parked goal is active again"]);
+  expect(resumes()).toEqual(["ask-lane", "ask-lane"]);
 });
