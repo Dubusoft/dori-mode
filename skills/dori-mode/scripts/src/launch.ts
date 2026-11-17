@@ -36,7 +36,7 @@ export function launchNextLine(key: string, startup: string): string | undefined
 }
 
 export type LaunchInput = {
-  /** Internal review launch; selects the review profile and the reserved machine slot. */
+  /** Internal review launch; selects the review profile (it takes an ordinary lane slot). */
   readonly review?: true;
   readonly key: string;
   readonly title: string;

@@ -25,6 +25,25 @@ export const placementReports = async (stateDir: string): Promise<RunnerPlacemen
   return runnerPlacements(readRunnerRows(stateDir), (row) => !["offline", "lost", "revoked"].includes(runnerView(row, now).state));
 };
 
+/** Starts every reason {@link reviewRefusal} gives: a machine that cannot run a review lane at all, not one that is full. */
+export const REVIEW_UNSUPPORTED = "REVIEW_UNSUPPORTED";
+
+/**
+ * Why `machine` cannot run a review lane, or undefined when it can: its runner reports agent profiles without
+ * `review` (runner-config.json lacks agents.review, so the runner would refuse the start `agent-profile`), or it is
+ * macOS, whose lane-sandbox has no review profile (lane-sandbox-macos.sh exits on LANE_SANDBOX_PROFILE=review). A runner
+ * too old to report its profiles is not refused here; its own policy check still refuses the start.
+ */
+export const reviewRefusal = async (ops: Pick<FlowDeps["ops"], "observeMachine">, machine: string): Promise<string | undefined> => {
+  const seen = await ops.observeMachine(machine === LOCAL_MACHINE ? undefined : machine);
+  // lane-ops' q.machine.observe guard does not check `profiles` yet, so its shape is checked here.
+  if (Array.isArray(seen.profiles) && !seen.profiles.includes("review")) {
+    return `${REVIEW_UNSUPPORTED} machine ${machine}: its runner-config has no agents.review (dori runner setup${machine === LOCAL_MACHINE ? "" : ` --machine ${machine}`} adds it)`;
+  }
+  if (seen.os === "darwin") return `${REVIEW_UNSUPPORTED} machine ${machine}: the macOS lane sandbox has no review profile`;
+  return undefined;
+};
+
 export type PlacedLaunch = {
   readonly plan: LaunchPlan;
   /** The machine the launch goes to ("local" for this host) and the --machine to launch with (undefined for local). */
@@ -41,7 +60,10 @@ export const placeLaunch = async (deps: Pick<FlowDeps, "ops" | "config"> & Parti
   const { config } = deps;
   const plan = await planLaunch(input, config.placement, async (machine) => {
     const check = await checkMachine(deps.ops, config, machine);
-    return check.verdict.ok ? { ...check, verdict: precheckSlots(config.stateDir, check, deps.clock?.now() ?? Date.now(), input.review ? "review" : "author", input.key).verdict } : check;
+    if (!check.verdict.ok) return check;
+    const refusal = input.review ? await reviewRefusal(deps.ops, machine) : undefined;
+    if (refusal) return { ...check, verdict: { ok: false, reasons: [refusal] } };
+    return { ...check, verdict: precheckSlots(config.stateDir, check, deps.clock?.now() ?? Date.now(), input.key).verdict };
   }, await placementReports(config.stateDir));
   const target = plan.check.machine;
   const machine = target === LOCAL_MACHINE ? undefined : target;
@@ -66,7 +88,7 @@ export type LaunchOutcome =
 export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: PlacedLaunch, err: (line: string) => void): Promise<LaunchOutcome> => {
   const { stateDir } = deps.config;
   const verdict = placed.plan.check.verdict.ok
-    ? claimSlot(stateDir, placed.plan.check, input.key, input.review ? "review" : "author", deps.clock.now())
+    ? claimSlot(stateDir, placed.plan.check, input.key, deps.clock.now())
     : placed.plan.check.verdict;
   if (!verdict.ok) {
     const repos = doneRepos(input.done);
@@ -101,7 +123,7 @@ export type MachineHosts = {
 
 export const hostSummary = (c: MachineCheck, stateDir?: string, now = Date.now()): HostSummary => {
   const admission = stateDir && c.paneCap !== undefined ? precheckSlots(stateDir, c, now) : undefined;
-  const free = admission ? admission.authorAdmissible : c.freeSlots;
+  const free = admission ? admission.free : c.freeSlots;
   const slots = free === undefined || free === Infinity ? {} : { slots: free };
   const verdict = admission?.verdict ?? c.verdict;
   const reserved = admission?.reservedKeys.length ? { reservedKeys: admission.reservedKeys } : {};

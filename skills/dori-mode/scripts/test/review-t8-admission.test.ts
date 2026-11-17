@@ -18,9 +18,9 @@ import type { ToodoTaskRecord } from "../src/toodo-client.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 /**
- * T8 admission faults: reviewers keep their reserved slot when panes are full, manual `dori launch` (placeLaunch +
- * admitLaunch) never takes the review reserve, a memory/disk HOLD binds reviews too, and a crashed reviewer returns its
- * reservation. Every scenario runs on an isolated temp stateDir with the fake World, runner and clock.
+ * T8 admission faults: reviews and authors share one free-slot count (no reserved review slot), manual `dori launch`
+ * (placeLaunch + admitLaunch) and reviews never over-admit it, a memory/disk HOLD binds reviews too, and a crashed
+ * reviewer returns its slot. Every scenario runs on an isolated temp stateDir with the fake World, runner and clock.
  */
 
 const T0 = Date.parse("2026-11-14T12:00:00Z");
@@ -120,45 +120,43 @@ const autopilot = (h: World, count: number) => {
 // ---------------------------------------------------------------------------------------------------------------------
 // (a) full-pane batch through autopilot
 
-test("autopilot fills 18 of 19 author slots, a review lane takes the reserve, and the 19th author starts only after an author closes", async () => {
+test("autopilot fills all 19 free slots with authors; a review then waits for a slot like any lane and starts once an author closes", async () => {
   const h = world(20), ap = autopilot(h, 19);
   const ids = Array.from({ length: 19 }, (_, i) => i + 1);
   const first = await ap.run(ids);
-  const launched = first.filter((r) => r.kind === "launched").map((r) => r.taskId);
-  expect(launched).toEqual(ids.slice(0, 18));
-  expect(first.find((r) => r.taskId === 19)?.kind).not.toBe("launched");
-  expect(h.started()).toEqual(ids.slice(0, 18).map((id) => autopilotLaneKey(id, 1)));
-  // 1 other pane + 18 authors: physical room 1, held for the unfilled review reserve.
-  expect(await h.observe()).toMatchObject({ physicalFree: 1, authorAdmissible: 0, reviewAdmissible: 1 });
+  expect(first.filter((r) => r.kind === "launched").map((r) => r.taskId)).toEqual(ids);
+  expect(h.started()).toEqual(ids.map((id) => autopilotLaneKey(id, 1)));
+  // 1 other pane + 19 authors: the pane cap is full and no slot is kept back for reviews.
+  expect((await h.observe()).free).toBe(0);
 
-  // A claim on author ap-1-1 starts its review lane in the reserved slot.
+  const held = await h.review("review-app-1-aaaaaaa");
+  expect(held.kind).toBe("held");
+  expect(launchQueue(h.state.dir).map((q) => [q.key, q.review])).toEqual([["review-app-1-aaaaaaa", true]]);
+
+  // An author pane closes: the freed slot goes to the waiting review.
+  await h.close(autopilotLaneKey(1, 1));
   const review = await h.review("review-app-1-aaaaaaa");
   expect(review.kind).toBe("started");
   if (review.kind !== "started") throw new Error("review did not start");
   expect(review.lane.review).toBe(true);
   expect(h.w.panes).toHaveLength(20);
-
-  // The 19th author still waits: the pane cap is full.
-  const waiting = await ap.run([19]);
-  expect(waiting[0]?.kind).not.toBe("launched");
-  expect(h.started()).not.toContain(autopilotLaneKey(19, 1));
-  expect(await h.observe()).toMatchObject({ physicalFree: 0, authorAdmissible: 0, reviewAdmissible: 0 });
-
-  // An author pane closes: the freed slot goes to the 19th author (the reserve is filled by the running review).
-  await h.close(autopilotLaneKey(1, 1));
-  const resumed = await ap.run([19]);
-  expect(resumed[0]?.kind).toBe("launched");
-  expect(h.started()).toContain(autopilotLaneKey(19, 1));
-  expect(h.w.panes).toHaveLength(20);
   expect(launchQueue(h.state.dir)).toEqual([]);
+});
+
+test("several reviews run at once while the machine has free slots", async () => {
+  const h = world(4);
+  const outcomes = await Promise.all(["review-1", "review-2", "review-3", "review-4"].map((key) => h.review(key)));
+  // Cap 4 with one other pane: three slots, all usable by reviews.
+  expect(outcomes.map((o) => o.kind).sort()).toEqual(["held", "started", "started", "started"]);
+  expect(h.w.panes).toHaveLength(4);
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
 // (b) manual `dori launch` racing a review for the last free slot
 
-test("a manual author launch racing a review for the last free slot holds on the reserve in either order", async () => {
+test("a manual author launch racing a review for the last free slot: exactly one wins, in either order", async () => {
   for (const reviewFirst of [true, false]) {
-    // Cap 2 with one other pane: one physical slot, which is the review reserve.
+    // Cap 2 with one other pane: one physical slot, shared by authors and reviews.
     const h = world(2);
     const author = h.manual("manual-1");
     // Whichever call is made first runs first up to its first await; both then interleave.
@@ -166,17 +164,16 @@ test("a manual author launch racing a review for the last free slot holds on the
     if (reviewFirst) { reviewRun = h.review("review-1"); manualRun = h.manualLaunch(author); }
     else { manualRun = h.manualLaunch(author); reviewRun = h.review("review-1"); }
     const [reviewed, manual] = await Promise.all([reviewRun, manualRun]);
-    expect(reviewed.kind).toBe("started");
-    expect(manual.kind).toBe("held");
-    if (manual.kind === "held") expect(manual.verdict.reasons.join(" ")).toContain("review reserve 1 on machine local: author slots 0");
-    expect(h.started()).toEqual(["review-1"]);
-    expect(launchQueue(h.state.dir).map((q) => q.key)).toEqual(["manual-1"]);
-    expect(launchQueue(h.state.dir)[0]?.review).toBeUndefined();
+    expect([reviewed.kind === "started", manual.kind === "launched"].filter(Boolean)).toHaveLength(1);
+    expect(h.started()).toHaveLength(1);
+    // The loser waits in the HOLD queue, keeping its review flag.
+    expect(launchQueue(h.state.dir).map((q) => [q.key, q.review ?? false]))
+      .toEqual([reviewed.kind === "started" ? ["manual-1", false] : ["review-1", true]]);
   }
 });
 
-test("concurrent manual authors and reviews placed before any claim never over-admit or spill into the reserve", async () => {
-  // Cap 4 with one other pane: 3 physical slots = 2 author + 1 review.
+test("concurrent manual authors and reviews placed before any claim never over-admit the shared slots", async () => {
+  // Cap 4 with one other pane: 3 physical slots for authors and reviews alike.
   const h = world(4);
   const authors = ["manual-1", "manual-2", "manual-3"].map(h.manual);
   // Every launch is placed (prechecked) while the machine is still empty, then all admissions run at once.
@@ -186,30 +183,27 @@ test("concurrent manual authors and reviews placed before any claim never over-a
     ...authors.map((input, i) => admitLaunch(h.deps, input, placed[i]!, () => {})),
     h.review("review-1"), h.review("review-2"),
   ]);
-  const authorKinds = outcomes.slice(0, 3).map((o) => o.kind).sort();
-  const reviewKinds = outcomes.slice(3).map((o) => o.kind).sort();
-  expect(authorKinds).toEqual(["held", "launched", "launched"]);
-  expect(reviewKinds).toEqual(["held", "started"]);
+  expect(outcomes.filter((o) => o.kind === "launched" || o.kind === "started")).toHaveLength(3);
+  expect(outcomes.filter((o) => o.kind === "held")).toHaveLength(2);
   expect(h.w.panes).toHaveLength(4);
-  expect(slots(h.state.dir).filter((s) => s.kind === "review")).toHaveLength(1);
-  expect(slots(h.state.dir).filter((s) => s.kind === "author")).toHaveLength(2);
+  expect(slots(h.state.dir)).toHaveLength(3);
 });
 
 /** Claims from separate threads on one ledger, released together by a shared barrier. */
-const raceClaims = async (stateDir: string, cap: number, claims: readonly { key: string; kind: LaunchSlot["kind"] }[]) => {
+const raceClaims = async (stateDir: string, cap: number, keys: readonly string[]) => {
   const worker = join(stateDir, "claim-worker.ts");
   writeFileSync(worker, [
     `import { parentPort, workerData } from "node:worker_threads";`,
     `import { claimSlot } from ${JSON.stringify(join(SRC, "launch-admission.ts"))};`,
-    `const { stateDir, check, key, kind, now, barrier } = workerData;`,
+    `const { stateDir, check, key, now, barrier } = workerData;`,
     `parentPort.postMessage("ready");`,
     `Atomics.wait(new Int32Array(barrier), 0, 0);`,
-    `parentPort.postMessage(claimSlot(stateDir, check, key, kind, now));`,
+    `parentPort.postMessage(claimSlot(stateDir, check, key, now));`,
   ].join("\n"));
   const barrier = new SharedArrayBuffer(4);
   const check = { machine: "local", verdict: { ok: true, reasons: [] }, summary: "", paneCap: cap, paneCount: 1, paneIds: ["p0"] };
-  const workers = claims.map(({ key, kind }) => {
-    const thread = new Worker(worker, { workerData: { stateDir, check, key, kind, now: T0, barrier } });
+  const workers = keys.map((key) => {
+    const thread = new Worker(worker, { workerData: { stateDir, check, key, now: T0, barrier } });
     let ready!: () => void, done!: (v: { ok: boolean }) => void;
     const waiting = new Promise<void>((resolve) => { ready = resolve; });
     const result = new Promise<{ ok: boolean }>((resolve, reject) => { done = resolve; thread.on("error", reject); });
@@ -224,29 +218,17 @@ const raceClaims = async (stateDir: string, cap: number, claims: readonly { key:
   return results.map((r) => r.ok);
 };
 
-test("cross-thread claims for the last slot: the author claim never wins the review reserve", async () => {
-  const h = world(2);
-  const [author, review] = await raceClaims(h.state.dir, 2, [{ key: "manual-1", kind: "author" }, { key: "review-1", kind: "review" }]);
-  expect([author, review]).toEqual([false, true]);
-  expect(slots(h.state.dir).map((s) => [s.key, s.kind])).toEqual([["review-1", "review"]]);
-});
-
-test("cross-thread claims from four authors and two reviews admit exactly 2 authors and 1 review", async () => {
+test("cross-thread claims from four authors and two reviews admit exactly the three free slots", async () => {
   const h = world(4);
-  const claims = [
-    ...["a1", "a2", "a3", "a4"].map((key) => ({ key, kind: "author" as const })),
-    ...["r1", "r2"].map((key) => ({ key, kind: "review" as const })),
-  ];
-  const results = await raceClaims(h.state.dir, 4, claims);
-  expect(results.slice(0, 4).filter(Boolean)).toHaveLength(2);
-  expect(results.slice(4).filter(Boolean)).toHaveLength(1);
+  const results = await raceClaims(h.state.dir, 4, ["a1", "a2", "a3", "a4", "r1", "r2"]);
+  expect(results.filter(Boolean)).toHaveLength(3);
   expect(slots(h.state.dir)).toHaveLength(3);
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
 // (c) memory/disk HOLD
 
-test("a review launch does not bypass a memory or disk HOLD and keeps the reserve for later", async () => {
+test("a review launch does not bypass a memory or disk HOLD and starts once the pressure clears", async () => {
   for (const metric of [{ memFreePct: 0 }, { diskFreeGb: 0 }]) {
     const h = world(20);
     const observeMachine = h.ops.observeMachine;
@@ -260,7 +242,7 @@ test("a review launch does not bypass a memory or disk HOLD and keeps the reserv
     expect(h.started()).toEqual([]);
     expect(slots(h.state.dir)).toEqual([]);
     expect(launchQueue(h.state.dir).map((q) => [q.key, q.review])).toEqual([["review-1", true]]);
-    // The pressure clears: the reserve is still there for the review.
+    // The pressure clears: the free slot takes the review.
     h.ops.observeMachine = observeMachine;
     expect((await h.review("review-1")).kind).toBe("started");
     expect(launchQueue(h.state.dir)).toEqual([]);
@@ -270,12 +252,14 @@ test("a review launch does not bypass a memory or disk HOLD and keeps the reserv
 // ---------------------------------------------------------------------------------------------------------------------
 // (d) reviewer crash
 
-test("a reviewer pane crash after it was observed returns the reserve to the next review", async () => {
-  const h = world(3);
+test("a reviewer pane crash after it was observed returns its slot to the next review", async () => {
+  // Cap 2 with one other pane: one slot.
+  const h = world(2);
   expect((await h.review("review-1")).kind).toBe("started");
-  // The next admission observes the pane, which turns the ledger entry into a running review.
-  expect((await h.review("review-2")).kind).toBe("held");
+  // An observation sees the pane, which turns the ledger entry into a counted pane.
+  expect((await h.observe()).free).toBe(0);
   expect(slots(h.state.dir)).toEqual([]);
+  expect((await h.review("review-2")).kind).toBe("held");
   await h.crash("review-1");
   expect((await h.review("review-2")).kind).toBe("started");
   expect((await h.deps.registry.read("review-1"))?.status).not.toBe("closed");
@@ -303,7 +287,7 @@ test("closing a crashed reviewer's lane returns its reservation even when its pa
 
 test("a reviewer whose pane crashed before any observation returns its reservation after the slot TTL", async () => {
   // launch-admission.ts expires an unobserved slot after LAUNCH_SLOT_TTL_MS, so a review pane that died between its start
-  // and the next observation releases the reserve without waiting for the lane to close.
+  // and the next observation releases its slot without waiting for the lane to close.
   const h = world(2);
   expect((await h.review("review-1")).kind).toBe("started");
   await h.crash("review-1");

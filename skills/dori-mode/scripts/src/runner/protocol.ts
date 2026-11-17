@@ -277,6 +277,8 @@ export type LaneInspection = {
 export type MachineObservation = {
   readonly os: string; readonly sampledAt: number; readonly sample: HostSample; readonly panes: readonly Pane[];
   readonly guard?: Readonly<Partial<GuardThresholds>>;
+  /** The agent profiles the runner's policy can start (runner-config `agents` keys); absent from a runner older than this field. */
+  readonly profiles?: readonly string[];
 };
 
 /** The `result` of an `ok` `q.result`, per query type. */

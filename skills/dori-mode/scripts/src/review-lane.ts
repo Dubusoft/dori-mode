@@ -2,7 +2,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { LaunchError, type LaunchInput } from "./launch.ts";
-import { admitLaunch, placeLaunch } from "./launch-service.ts";
+import { admitLaunch, placeLaunch, REVIEW_UNSUPPORTED } from "./launch-service.ts";
 import { LOCAL_MACHINE } from "./placement.ts";
 import type { Lane } from "./registry.ts";
 import { GATE_REVIEWER_AGENT, type ReviewJob } from "./review-receipt.ts";
@@ -137,9 +137,16 @@ export type ReviewLaunchResult =
   | { readonly kind: "refused"; readonly detail: string };
 
 /**
- * Launches a review lane through the shared admission (placeLaunch + admitLaunch, `review: true`, this machine, the lane
- * default model, the snapshot as cwd, sharing the author's thread). A held machine is `held`; a launch refusal
- * (LaunchError, SandboxRefusal) is `refused`; anything else is rethrown.
+ * Launches a review lane through the shared admission (placeLaunch + admitLaunch, `review: true`, the lane default model,
+ * the snapshot as cwd, sharing the author's thread). A review takes an ordinary free lane slot, like an author lane:
+ * there is no reserved review slot, so as many reviews run at once as the machine has free slots.
+ *
+ * The lane stays on this machine: the gate prepares, scope-checks and releases the snapshot worktree in this host's
+ * checkout (review-gate.ts), and the review sandbox gives the lane no git credentials or writable worktree root, so a
+ * runner on another host could neither see the snapshot nor make its own. A machine that cannot run a review lane at
+ * all (REVIEW_UNSUPPORTED: no agents.review, or macOS) is `refused` at once instead of held, so the gate fails the job
+ * into REVIEW_STALLED rather than waiting out its timeout. A full or pressured machine is `held` (the gate's queued
+ * timeout bounds it); a launch refusal (LaunchError, SandboxRefusal) is `refused`; anything else is rethrown.
  */
 export const launchReviewLane = async (
   deps: FlowDeps, request: ReviewLaunchRequest, err: (line: string) => void = (line) => console.error(line),
@@ -151,6 +158,8 @@ export const launchReviewLane = async (
   };
   try {
     const placed = await placeLaunch(deps, input);
+    const unsupported = placed.plan.check.verdict.reasons.find((r) => r.startsWith(REVIEW_UNSUPPORTED));
+    if (unsupported) return { kind: "refused", detail: unsupported };
     const outcome = await admitLaunch(deps, input, placed, err);
     if (outcome.kind === "held") return { kind: "held", reason: `HOLD ${outcome.verdict.reasons.join(" | ")}` };
     return { kind: "started", lane: outcome.lane, startup: outcome.startup };

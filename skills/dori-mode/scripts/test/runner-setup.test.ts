@@ -183,6 +183,29 @@ describe("runRunnerSetup", () => {
     expect(await runRunnerSetup(again.deps, { patch: {}, unset: [] })).toBe(0);
     expect(again.lines).toEqual([`RUNNER_SETUP_UNCHANGED ${cfgPath(dir)}`]);
   });
+
+  test("a remote runner's config (macOS and Linux share the posix rules, Windows its own) gets agents.review too", async () => {
+    for (const [platform, sandboxed] of [
+      ["linux", ["/Users/u/.dori/runner/bin/lane-sandbox", "pi", "{prompt}"]],
+      ["win32", ["C:\\Users\\u\\.dori\\runner\\bin\\lane-sandbox.cmd", "pi", "{prompt}"]],
+    ] as const) {
+      const dir = temp();
+      writeFileSync(cfgPath(dir), JSON.stringify({ ...BASE, agents: { ...BASE.agents, sandboxed } }));
+      const { deps, lines } = setup(dir);
+      const remote = { ...deps, io: { ...deps.io, platform } };
+      expect(await runRunnerSetup(remote, { patch: {}, unset: [] })).not.toBe(1);
+      expect(readCfg(dir).agents.review).toEqual([...sandboxed]);
+      expect(lines[0]).toStartWith("RUNNER_SETUP_REVIEW_PROFILE_ADDED agents.review");
+    }
+  });
+
+  test("a remote runner without agents.sandboxed is warned that its review lanes are refused", async () => {
+    const dir = temp();
+    writeFileSync(cfgPath(dir), JSON.stringify(BASE));
+    const { deps, lines } = setup(dir);
+    await runRunnerSetup({ ...deps, io: { ...deps.io, platform: "linux" } }, { patch: {}, unset: [] });
+    expect(lines[0]).toStartWith("RUNNER_SETUP_REVIEW_PROFILE_MISSING");
+  });
 });
 
 describe("remoteRunnerConfigIO posix", () => {
