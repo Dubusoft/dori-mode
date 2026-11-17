@@ -76,7 +76,7 @@ describe("review status lines (design 5.8)", () => {
     expect(one([record({ id: "j2", round: 2, response: "r", execution: { state: "running", startedAt: T0, reviewerLaneKey: "review-x" } })]))
       .toContain("재리뷰 중 - head aaaaaaa, 라운드 2, 리뷰 레인 review-x (모델 default-model, 머신 local)");
     const findings = one([record({ id: "j1", verdict: "findings", execution: { state: "completed", receiptId: "rr-j1" }, patch: { authorNotified: { at: T0, laneKey: "author" } } })]);
-    expect(findings).toBe(`리뷰 ${REPO}#7: 수정 중 - head aaaaaaa, 지적 1건, 작성 레인 전달 11-14 12:00 UTC, 남은 자동 라운드 1, receipt rr-j1, 보고서 /state/research/review-j1/review-report.md; 요약 F1 x.ts:3 the edge case is unguarded`);
+    expect(findings).toBe(`리뷰 ${REPO}#7: 수정 중 - head aaaaaaa, 지적 1건, 작성 레인 전달 11-14 12:00 UTC, 남은 자동 라운드 1, receipt rr-j1, 보고서 review-j1; 요약 F1 x.ts:3 the edge case is unguarded`);
     expect(one([record({ id: "j1", verdict: "pass", execution: { state: "completed", receiptId: "rr-j1" } })]))
       .toBe(`리뷰 ${REPO}#7: 리뷰 통과 - head aaaaaaa, base dev@bbbbbbb, receipt rr-j1 (리뷰 레인 review-app-7-aaaaaaa); CI와 머지 조건 확인 후 머지`);
     const exempt = { kind: "exempt", key: "k", receipt: { kind: "exempt", receiptId: "rx_1", repo: REPO, prNumber: 7, headSha: H, exemptPolicyVersion: "t6-1", ruleIds: ["docs-md"], files: ["README.md"] } } as unknown as ExemptDecision;
@@ -98,18 +98,31 @@ describe("review status lines (design 5.8)", () => {
     expect(one([record({ id: "j1", execution: { state: "escalated", reason: "model unavailable: x" } })])).toContain("결정 필요 - head aaaaaaa, 리뷰 실행 장애: model unavailable: x; 리드가 확인 중 (job j1)");
   });
 
-  test("long findings never cut the hand-off state off the line; every finding keeps a share of the summary", () => {
-    const long = (id: string) => ({ id, severity: "high", criterionId: "C1", path: "skills/dori-mode/scripts/src/decision-resume.ts", lineStart: 30, lineEnd: 31, observation: `${id} ${"x".repeat(400)}`, consequence: "c", evidence: ["e"], requestedChange: "r" });
-    const base = record({ id: "j1", verdict: "findings", execution: { state: "completed", receiptId: "rr-j1" } });
-    const two = { ...base, receipt: { ...base.receipt!, result: { verdict: "findings", findings: [long("F1"), long("F2")] } } } as unknown as ReviewJobRecord;
+  test("long findings keep the hand-off state and a real summary; findings that do not fit are counted", () => {
+    const finding = (id: string) => ({ id, severity: "high", criterionId: "C1", path: "skills/dori-mode/scripts/src/decision-resume.ts", lineStart: 30, lineEnd: 31, observation: `${id} the status message drops the finding summary ${"x".repeat(400)}`, consequence: "c", evidence: ["e"], requestedChange: "r" });
+    const base = record({ id: "j1", verdict: "findings", execution: { state: "completed", receiptId: "rr-j1" }, patch: { authorNotified: { at: T0, laneKey: "author" } } });
+    const withFindings = (n: number, report = "/home/ubuntu/.dori/research/review-dori-mode-369-e827ef8/review-report.md"): ReviewJobRecord => ({
+      ...base, receipt: { ...base.receipt!, receiptId: `rr_${"a".repeat(32)}`, reportArtifact: report, result: { verdict: "findings", findings: Array.from({ length: n }, (_, i) => finding(`F${i + 1}`)) } },
+    }) as unknown as ReviewJobRecord;
     const shown = (r: ReviewJobRecord): string => reviewStatusLines(lane(), input([r]))[0]!;
-    const pending = shown(two), sent = shown({ ...two, authorNotified: { at: T0, laneKey: "author" } });
-    expect(pending).toContain("지적 2건, 작성 레인 전달 대기, 남은 자동 라운드 1, receipt rr-j1");
-    expect(sent).toContain("지적 2건, 작성 레인 전달 11-14 12:00 UTC, 남은 자동 라운드 1, receipt rr-j1");
-    for (const l of [pending, sent]) {
-      expect(l.length).toBeLessThanOrEqual(REVIEW_LINE_MAX);
-      expect(l).toMatch(/; 요약 F1 decision-resume\.ts:30 F1 x+\.\.\.; F2 decision-resume\.ts:30 F2 x+\.\.\.$/);
+    const item = (id: string): RegExp => new RegExp(`${id} decision-resume\\.ts:30 ${id} the status message`);
+    const two = shown(withFindings(2));
+    expect(two).toContain(`지적 2건, 작성 레인 전달 11-14 12:00 UTC, 남은 자동 라운드 1, receipt rr_${"a".repeat(32)}, 보고서 review-dori-mode-369-e827ef8; 요약 `);
+    expect(two).toMatch(item("F1"));
+    expect(two).toMatch(item("F2"));
+    expect(two).not.toContain("외 ");
+    for (const n of [5, 7]) {
+      const many = shown(withFindings(n));
+      expect(many).toContain(`지적 ${n}건, 작성 레인 전달 11-14 12:00 UTC`);
+      expect(many).toMatch(item("F1"));
+      expect(many).toMatch(new RegExp(`; 외 ${n - 2}건$`));
+      expect(many.length).toBeLessThanOrEqual(REVIEW_LINE_MAX);
     }
+    const longState = shown(withFindings(2, `/home/ubuntu/${"x".repeat(100)}/.dori/state/research/review-${"y".repeat(150)}/review-report.md`));
+    expect(longState).toContain("지적 2건, 작성 레인 전달 11-14 12:00 UTC, 남은 자동 라운드 1");
+    expect(longState).toMatch(item("F1"));
+    expect(longState).toMatch(item("F2"));
+    expect(longState.length).toBeLessThanOrEqual(REVIEW_LINE_MAX);
   });
 
   test("a lane with no claim and no jobs has no review lines; another lane's jobs are not shown", () => {
