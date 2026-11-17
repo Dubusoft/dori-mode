@@ -33,6 +33,9 @@ export const DECISION_POSTING_STUCK_MS = 10 * 60_000;
 /** Closed decisions are dropped this long after they closed; `dori decision list --all` shows the last DECISION_LIST_CLOSED_MS. */
 export const DECISION_KEEP_CLOSED_MS = 30 * 24 * 60 * 60_000;
 export const DECISION_LIST_CLOSED_MS = 7 * 24 * 60 * 60_000;
+/** A close text its lane did not take is tried this many times in all (the close's own try first), this far apart, before DECISION_RELAY_FAILED. */
+export const DECISION_RELAY_ATTEMPTS = 3;
+export const DECISION_RELAY_RETRY_MS = 60_000;
 
 export type OwnerDecisionState = "posting" | "open" | "answered" | "closed";
 
@@ -106,14 +109,20 @@ export type OwnerDecision = DecisionChoices & {
    * they still show what was posted. syncDecisionButtons edits them when the decision moves on.
    */
   readonly buttons?: string;
-  /** What `dori decision close` did with its text for the lane (decision-relay.ts); set once, when it closes. */
+  /**
+   * Set on a lead decision opened with `--relay-to` (always its `lane`): its close text goes to that lane like a lane's
+   * own question's (relaysToLane), instead of being left for the lead to hand over.
+   */
+  readonly relayTo?: string;
+  /** What `dori decision close` did with its text for the lane (decision-relay.ts); set when it closes, updated by retries. */
   readonly relay?: DecisionRelay;
 };
 
 /**
  * The close text's way to a lane decision's lane: `relayed` (typed into its pane, lane message `message`), `failed`
- * (not typed; the supervisor tick raises urgent DECISION_RELAY_FAILED once, then sets `reportedAt`), or `skipped` (the
- * owner's answer already reached the lane directly, or the lane is closed).
+ * (not typed after `attempts` tries, `at` the last; the supervisor retries it up to DECISION_RELAY_ATTEMPTS, then raises
+ * urgent DECISION_RELAY_FAILED once and sets `reportedAt`), or `skipped` (the owner's answer already reached the lane
+ * directly, or the lane is closed).
  */
 export type DecisionRelay = {
   readonly state: "relayed" | "failed" | "skipped";
@@ -121,6 +130,8 @@ export type DecisionRelay = {
   readonly at: number;
   readonly message?: string;
   readonly reason?: string;
+  /** Delivery attempts so far; unset on records from before retries counts as 1. */
+  readonly attempts?: number;
   readonly reportedAt?: number;
 };
 

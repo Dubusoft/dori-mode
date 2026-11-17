@@ -237,7 +237,7 @@ const USAGE = `dori <command> [options]
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
   decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT
-                [--task N] [--lane KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]
+                [--task N] [--lane KEY | --relay-to KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]
                                        lead-only: ask the owner one question with 2-9 numbered options, a recommendation and its
                                        reason in its own thread in decisionsChannel (else the asking thread's channel, else the
                                        first discordChannels entry); a link line goes into --thread (else --lane's thread);
@@ -245,6 +245,7 @@ const USAGE = `dori <command> [options]
                                        question came from no thread (DECISION_LINK_SKIPPED);
                                        --task defaults to the ap-<task>-<n> lane's task; --nonblocking: work goes ahead on the
                                        recommendation; --from-event resolves that decision event (DECISION_SOURCE_RESOLVED);
+                                       --relay-to KEY: --lane KEY, and the close types --text into that lane;
                                        a bad or missing field exits 2 DECISION_REFUSED
   decision open --request --question "<what is needed>" --reason TEXT --waiting TEXT [--file PATH] [...]
                                        lead-only: ask the owner for input only they can give (a one-time code, a file or value) in a
@@ -259,8 +260,9 @@ const USAGE = `dori <command> [options]
                                        messages there exit 3 DECISION_STALE with UNREAD lines (--force closes anyway); a decision
                                        in a lane's own thread covers only its first answer (DECISION_ANSWER_LEFT for the rest);
                                        a closed one records missing handled receipts and exits 2 DECISION_ALREADY_CLOSED; a
-                                       lane's own question or request gets --text typed into the lane (DECISION_RELAYED,
-                                       DECISION_RELAY_SKIPPED, or DECISION_RELAY_FAILED: hand it over yourself)
+                                       lane's own question or request, or a --relay-to decision, gets --text typed into the lane
+                                       (DECISION_RELAYED, DECISION_RELAY_SKIPPED, or DECISION_RELAY_RETRYING: the supervisor
+                                       retries; hand it over yourself only on DECISION_RELAY_FAILED)
   decision list [--all] [--json]       lead-only: decisions not closed, oldest first (DECISION_NONE when none); --all adds those
                                        closed in the last 7 days
   ack <channel> <messageId> [...]      the lead's read receipt (one <channel> <messageId> pair per message) on a Discord owner message:

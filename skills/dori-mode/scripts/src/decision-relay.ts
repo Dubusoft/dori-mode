@@ -1,19 +1,21 @@
 import { deliverLaneMessage, queueSteering } from "./ci-follow.ts";
 import { reachedLane } from "./decision-delivery.ts";
-import { type DecisionRelay, type OwnerDecision, patchOne } from "./decision-store.ts";
+import { DECISION_RELAY_ATTEMPTS, DECISION_RELAY_RETRY_MS, type DecisionRelay, type OwnerDecision, patchOne, readDecisions } from "./decision-store.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { type LaneMessageStore, openLaneMessages, updateLaneMessage } from "./lane-messages.ts";
 import { openOperations } from "./operations.ts";
-import { errorText, relayFailedLine, short } from "./owner-decisions.ts";
+import { errorText, relayFailedLine, relaysToLane, short } from "./owner-decisions.ts";
 import { statusOf } from "./registry.ts";
 
 /*
- * `dori decision close` on a lane's own question or request (source "lane") hands the close text to that lane: queued as
- * a lead steering message `decision-close-<id>` and typed once right away through the lane's runner (local or remote),
- * like a done-claim notice. A text the pane does not take now is not kept for later: the message is superseded so it is
- * never typed after the lead has handed the answer over itself, and the failure is recorded on the decision for the
- * supervisor tick to raise once as urgent DECISION_RELAY_FAILED. A lane the owner's answer already reached directly
- * (DECISION_ANSWER_DIRECT, delivered or acked) gets nothing more.
+ * `dori decision close` on a decision that relays to its lane (a lane's own question or request, or a lead decision
+ * opened with `--relay-to`: relaysToLane) hands the close text to that lane: queued as a lead steering message
+ * `decision-close-<id>` and typed once right away through the lane's runner (local or remote), like a done-claim notice.
+ * A text the pane does not take is superseded between attempts, so the general lane message pass never types it on its
+ * own; the supervisor tries it again (retryDecisionRelays) under the same message id and delivery operation, so a text
+ * that was typed is never typed twice, up to DECISION_RELAY_ATTEMPTS tries DECISION_RELAY_RETRY_MS apart. Only then does
+ * the tick raise urgent DECISION_RELAY_FAILED once, and the lead hands the answer over itself. A lane the owner's answer
+ * already reached directly (DECISION_ANSWER_DIRECT, delivered or acked) gets nothing more.
  */
 
 export const relayMessageId = (id: string): string => `decision-close-${id}`;
@@ -29,10 +31,13 @@ export const relayText = (d: OwnerDecision, text: string): string => {
 /** The close's line about the relay; undefined when the decision is no lane's. */
 export const relayLine = (d: OwnerDecision): string | undefined => {
   const r = d.relay;
-  if (!r) return d.lane ? `DECISION_RELAY_SKIPPED ${d.lane} ${d.id}: the lead opened this decision; relay the answer to lane ${d.lane} yourself` : undefined;
+  if (!r) return d.lane && !relaysToLane(d) ? `DECISION_RELAY_SKIPPED ${d.lane} ${d.id}: the lead opened this decision without --relay-to; relay the answer to lane ${d.lane} yourself` : undefined;
   if (r.state === "relayed") return `DECISION_RELAYED ${r.lane} ${d.id} ${r.message ?? "-"}${r.reason ? ` (${r.reason})` : ""}: the close text was typed into the lane; it confirms with dori report ack ${r.message ?? "-"}`;
   if (r.state === "skipped") return `DECISION_RELAY_SKIPPED ${r.lane} ${d.id}: ${r.reason ?? "nothing to relay"}`;
-  return relayFailedLine(d);
+  const attempts = r.attempts ?? 1;
+  return r.reportedAt === undefined && attempts < DECISION_RELAY_ATTEMPTS
+    ? `DECISION_RELAY_RETRYING ${r.lane} ${d.id}: ${r.reason ?? "not delivered"}; the supervisor tries again (attempt ${attempts} of ${DECISION_RELAY_ATTEMPTS}); hand it to the lane yourself only on DECISION_RELAY_FAILED`
+    : relayFailedLine(d);
 };
 
 /** The direct answer revision that already reached the lane, unless the close settled on another choice (a button press the lead took over). */
@@ -42,15 +47,32 @@ const answeredDirectly = (d: OwnerDecision, store: LaneMessageStore): number | u
 };
 
 /**
- * Relays closed decision `d`'s close text to its lane (lane decisions only) and records the outcome on the decision;
- * returns the decision as recorded. Never throws: a failure is the `failed` outcome.
+ * Relays closed decision `d`'s close text to its lane (decisions that relay to their lane only) and records the outcome
+ * on the decision; returns the decision as recorded. Never throws: a failure is the `failed` outcome, retried by
+ * retryDecisionRelays.
  */
-export const relayDecisionClose = async (deps: FlowDeps, d: OwnerDecision): Promise<OwnerDecision> => {
-  if (d.state !== "closed" || d.source !== "lane" || !d.lane || d.relay) return d;
-  const laneKey = d.lane;
+export const relayDecisionClose = async (deps: FlowDeps, d: OwnerDecision): Promise<OwnerDecision> =>
+  d.state !== "closed" || !relaysToLane(d) || d.relay ? d : attemptRelay(deps, d, 1);
+
+/**
+ * The supervisor's retry of close texts not typed yet: each failed relay not reported, with attempts left and its last
+ * try DECISION_RELAY_RETRY_MS ago, is tried once more. Returns the decisions as recorded after this pass's attempts.
+ */
+export const retryDecisionRelays = async (deps: FlowDeps): Promise<OwnerDecision[]> => {
+  const now = deps.clock.now();
+  const due = readDecisions(deps.config.stateDir).decisions.filter((d) => d.state === "closed" && relaysToLane(d) && d.relay?.state === "failed"
+    && d.relay.reportedAt === undefined && (d.relay.attempts ?? 1) < DECISION_RELAY_ATTEMPTS && now - d.relay.at >= DECISION_RELAY_RETRY_MS);
+  const done: OwnerDecision[] = [];
+  for (const d of due) done.push(await attemptRelay(deps, d, (d.relay?.attempts ?? 1) + 1));
+  return done;
+};
+
+/** One try at typing `d`'s close text into its lane, recorded as attempt `attempts`. Never throws. */
+const attemptRelay = async (deps: FlowDeps, d: OwnerDecision, attempts: number): Promise<OwnerDecision> => {
+  const laneKey = d.lane ?? "";
   const at = deps.clock.now();
-  const record = (relay: Omit<DecisionRelay, "lane" | "at">): OwnerDecision =>
-    patchOne(deps.config.stateDir, d.id, (x) => ({ ...x, relay: { lane: laneKey, at, ...relay } })) ?? d;
+  const record = (relay: Omit<DecisionRelay, "lane" | "at" | "attempts">): OwnerDecision =>
+    patchOne(deps.config.stateDir, d.id, (x) => ({ ...x, relay: { lane: laneKey, at, attempts, ...relay } })) ?? d;
   let messages: LaneMessageStore | undefined;
   try {
     messages = openLaneMessages(deps.config);
@@ -59,7 +81,10 @@ export const relayDecisionClose = async (deps: FlowDeps, d: OwnerDecision): Prom
     const lane = await deps.registry.read(laneKey);
     if (!lane || statusOf(lane) === "closed") return record({ state: "skipped", reason: `lane ${laneKey} is closed` });
     const id = relayMessageId(d.id);
-    const queued = queueSteering(messages, at, lane, { id, subject: `decision:${d.id}`, text: relayText(d, d.closeText ?? "") });
+    let queued = queueSteering(messages, at, lane, { id, subject: `decision:${d.id}`, text: relayText(d, d.closeText ?? "") });
+    // A retry finds the message the last attempt superseded and queues it again under its id: its delivery operation
+    // decides whether to type it (a failed send is retried; a typed or possibly typed one is not typed again).
+    if (queued.state === "superseded") queued = updateLaneMessage(messages, queued, { state: "queued" }, at);
     const ops = deps.operations ?? openOperations(deps.config);
     const sent = await deliverLaneMessage(deps, ops, messages, lane, queued).finally(() => { if (!deps.operations) ops.close(); });
     if (sent.state === "delivered" || sent.state === "acked") return record({ state: "relayed", message: id });

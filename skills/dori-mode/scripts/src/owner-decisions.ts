@@ -1,6 +1,6 @@
 import { type DoriConfig } from "./config.ts";
 import {
-  DECISION_AUTO_ARCHIVE_MIN, DECISION_KEEP_CLOSED_MS, DECISION_POSTING_STUCK_MS, type DecisionTarget, type DecisionsFile, decisionTargetOf, type OwnerDecision,
+  DECISION_AUTO_ARCHIVE_MIN, DECISION_KEEP_CLOSED_MS, DECISION_POSTING_STUCK_MS, DECISION_RELAY_ATTEMPTS, type DecisionTarget, type DecisionsFile, decisionTargetOf, type OwnerDecision,
   OwnerDecisionError, patchOne, readDecisions, removeOne, type TargetLane, updateDecisions,
 } from "./decision-store.ts";
 import { recordResolved } from "./decision-obligations.ts";
@@ -136,7 +136,7 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
 export const decisionLinkText = (d: OwnerDecision): string => `[System] 오너 ${label(d)} ${d.id}: <#${d.thread ?? ""}>`;
 
 export type CloseOptions = {
-  /** The close text: the reply to the owner, except for a lane's own question or request, where it goes to the lane (relaysToLane). */
+  /** The close text: the reply to the owner, except for a decision that relays to its lane, where it goes to the lane (relaysToLane). */
   readonly text: string;
   /** The owner's line in the thread confirmation, in place of `text` (or of the automatic line when `text` goes to the lane). */
   readonly ownerText?: string;
@@ -150,8 +150,12 @@ export type CloseOptions = {
   readonly force?: boolean;
 };
 
-/** A lane's own question or request (asked with `dori report`): its close text is relayed to that lane (decision-relay.ts), not shown to the owner. */
-export const relaysToLane = (d: Pick<OwnerDecision, "source" | "lane">): boolean => d.source === "lane" && !!d.lane;
+/**
+ * A lane's own question or request (asked with `dori report`), or a lead decision opened with `--relay-to`: its close
+ * text is relayed to that lane (decision-relay.ts), not shown to the owner.
+ */
+export const relaysToLane = (d: Pick<OwnerDecision, "source" | "lane" | "relayTo">): boolean =>
+  !!d.lane && (d.source === "lane" || d.relayTo === d.lane);
 
 export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string, keepsThread = d.inLaneThread === true): string => {
   const from = options.from ? /^(\d+)\/(\d+)$/.exec(options.from) : null;
@@ -192,6 +196,8 @@ export type DecisionSpec = DecisionChoices & {
   readonly source: "lead" | "lane";
   readonly sourceRef?: string;
   readonly target?: DecisionTarget;
+  /** A lead decision's `--relay-to`: the same key as `lane`. */
+  readonly relayTo?: string;
 };
 
 export const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
@@ -294,7 +300,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       ...(spec.kind ? { kind: spec.kind } : {}), ...(spec.file ? { file: spec.file } : {}),
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
-      ...(spec.target ? { target: spec.target } : {}),
+      ...(spec.target ? { target: spec.target } : {}), ...(spec.relayTo ? { relayTo: spec.relayTo } : {}),
       ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
       ...(attach ? { thread: attach.thread, attachedTo: attach.id, linkSkipped: `posted in ${attach.id}'s thread`, ...(attach.inLaneThread ? { inLaneThread: true } : {}) } : {}),
     };
@@ -616,17 +622,17 @@ export const answeredLine = (d: OwnerDecision): string => {
   const close = `dori decision close ${d.id}${from}${button !== undefined ? ` --choice ${button}` : ""} --text "..."`;
   const head = `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}`
     + (button !== undefined ? ` ${choiceLabel(d, button)} via button` : "");
-  // One wording for decisions and requests: the close is the first call, and for a lane's own question it also types
-  // --text into that lane (decision-relay.ts), so --text is what the lane needs to go on.
-  const relay = d.source === "lane" && d.lane
+  // One wording for decisions and requests: the close is the first call, and for a decision that relays to its lane it
+  // also types --text into that lane (decision-relay.ts), so --text is what the lane needs to go on.
+  const relay = relaysToLane(d)
     ? ` and types --text into lane ${d.lane}, so write it for the lane; hand it over yourself only on DECISION_RELAY_FAILED`
     : d.lane ? `; it does not reach lane ${d.lane}, relay it yourself` : "";
   return `${head}${value}; run ${close} first (it acks the answer, posts the reply, records it handled${relay}; --tasks N when the answer asks for more work), then act on it`;
 };
 
-/** The lead's urgent line for a close whose text could not be typed into its lane (decision-relay.ts). */
+/** The lead's urgent line for a close whose text could not be typed into its lane after every attempt (decision-relay.ts). */
 export const relayFailedLine = (d: Pick<OwnerDecision, "id" | "relay">): string =>
-  `DECISION_RELAY_FAILED ${d.relay?.lane ?? "-"} ${d.id}: ${d.relay?.reason ?? "not delivered"}; the close text did not reach the lane and is not retried, hand it to the lane yourself`;
+  `DECISION_RELAY_FAILED ${d.relay?.lane ?? "-"} ${d.id}: ${d.relay?.reason ?? "not delivered"}; the close text did not reach the lane after ${d.relay?.attempts ?? 1} attempts and is not retried again, hand it to the lane yourself`;
 
 /** The digest event of a decision the supervisor opened from a lane question. */
 export const openedLine = (d: OwnerDecision, duplicateOf?: string): string =>
@@ -669,7 +675,8 @@ export type TickDeps = DecisionContext & {
 /**
  * The supervisor's pass over decisions.json: a decision stuck `posting` raises OWNER_DECISION_STUCK once; a missing link
  * line is posted again; a pending archive is retried (a thread Discord no longer has raises OWNER_DECISION_THREAD_GONE
- * once); a close whose text could not be relayed to its lane raises DECISION_RELAY_FAILED once; closed decisions past
+ * once); a close whose text could not be relayed to its lane in DECISION_RELAY_ATTEMPTS tries (decision-relay.ts
+ * retryDecisionRelays) raises DECISION_RELAY_FAILED once; closed decisions past
  * DECISION_KEEP_CLOSED_MS are dropped. Nothing is posted
  * to the decisions channel on a schedule: the lead sees open decisions in `dori inbox take`. The owner's answers themselves arrive through inbound (recordOwnerAnswer), and an answered decision left
  * unclosed is reminded as an UNRESOLVED obligation.
@@ -688,7 +695,7 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
       const link = await postDecisionLink(deps, d);
       if (link.kind === "failed") log(`OWNER_DECISION_LINK_FAILED ${d.id} ${link.reason}`);
     }
-    if (d.state === "closed" && d.relay?.state === "failed" && d.relay.reportedAt === undefined) {
+    if (d.state === "closed" && d.relay?.state === "failed" && d.relay.reportedAt === undefined && (d.relay.attempts ?? 1) >= DECISION_RELAY_ATTEMPTS) {
       await deps.enqueue(`decision-relay-failed:${d.id}`, relayFailedLine(d));
       patchOne(stateDir, d.id, (x) => (x.relay ? { ...x, relay: { ...x.relay, reportedAt: now } } : x));
     }

@@ -263,6 +263,20 @@ test("closing an answered decision posts confirmation, archives, resolves, and r
   await expect(closeOwnerDecision(ctx, decision.id, { text: "Again" })).rejects.toMatchObject({ code: "DECISION_ALREADY_CLOSED" });
 });
 
+test("a lead decision opened with relayTo keeps it: its answer tells the lead the close types --text into the lane, and the owner sees no lane text", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const { decision } = await open(ctx, { lane: "ap-7-1", relayTo: "ap-7-1" });
+  expect(readDecisions(dir).decisions[0]).toMatchObject({ source: "lead", lane: "ap-7-1", relayTo: "ap-7-1" });
+  const answer = recordOwnerAnswer(dir, decision.thread as string, "answer-1", 1_800_000_000_100);
+  expect(answeredLine(answer?.decision as never)).toContain("types --text into lane ap-7-1");
+  await closeOwnerDecision(ctx, decision.id, { text: "Lane: use the existing API", choice: 1 });
+  const reply = fake.calls.filter((call) => call.method === "send" && call.args[0] === decision.thread).at(-1)?.args[1] as string;
+  expect(reply).toContain("레인 ap-7-1에 전달합니다");
+  expect(reply).not.toContain("Lane: use the existing API");
+});
+
 test("a thread that stays open after archiving is recorded as a pending archive, and the tick archives it", async () => {
   const dir = stateDir();
   const fake = fakeTransport();
