@@ -239,3 +239,33 @@ export const decisionTargetOf = (lane: TargetLane): DecisionTarget => ({
 
 export const sameTarget = (a: DecisionTarget, b: DecisionTarget): boolean =>
   a.lane === b.lane && a.runner === b.runner && a.generation === b.generation && (a.openedAt === undefined || b.openedAt === undefined || a.openedAt === b.openedAt);
+
+/**
+ * Which lanes wait on the owner, for the sweeps that would otherwise wake or report them (freshness, milestone drift).
+ * A lane waits while one of its own blocking questions or requests, asked in its current session, is not closed and no
+ * direct answer to it is queued or acked. `resolvedAt` is when the lane's last wait ended (a close, or a direct answer
+ * queued for it): its silence and milestone clocks count from there, not from before it asked.
+ */
+export type LaneOwnerWait = { readonly waiting: ReadonlySet<string>; readonly resolvedAt: ReadonlyMap<string, number> };
+
+const answeredDirectly = (d: OwnerDecision): AnswerDelivery | undefined =>
+  d.revisions?.map((r) => r.delivery).filter((x) => x.state === "queued" || x.state === "acked").at(-1);
+
+export const laneOwnerWait = (decisions: readonly OwnerDecision[], lanes: readonly TargetLane[]): LaneOwnerWait => {
+  const byKey = new Map(lanes.map((l) => [l.key, l]));
+  const waiting = new Set<string>();
+  const resolvedAt = new Map<string, number>();
+  const resolved = (key: string, at: number | undefined): void => {
+    if (at !== undefined) resolvedAt.set(key, Math.max(resolvedAt.get(key) ?? at, at));
+  };
+  for (const d of decisions) {
+    const lane = d.source === "lane" && d.blocking && d.lane !== undefined ? byKey.get(d.lane) : undefined;
+    if (!lane) continue;
+    const direct = answeredDirectly(d);
+    if (d.state === "closed") { resolved(lane.key, d.closedAt); continue; }
+    if (direct) { resolved(lane.key, direct.updatedAt); continue; }
+    const current = d.target ? sameTarget(d.target, decisionTargetOf(lane)) : (lane.lastRecoveryAt ?? 0) <= d.openedAt;
+    if (current) waiting.add(lane.key);
+  }
+  return { waiting, resolvedAt };
+};

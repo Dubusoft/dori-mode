@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { DEFAULT_DRIFT, defaultConfig, loadConfig } from "../src/config.ts";
+import { DECISIONS_FILE, type OwnerDecision } from "../src/decision-store.ts";
 import { ciDrift, DRIFT_STATE_FILE, driftTick, type DriftDeps, loadDriftState, milestoneDrift, type PullOwners } from "../src/drift.ts";
 import { eventClass } from "../src/event-policy.ts";
 import type { OpenPull } from "../src/github-events.ts";
@@ -135,4 +136,16 @@ test("the supervisor's drift sweep emits LANE_DRIFT with a stable id from the re
   pulls[0] = pull("s3", "failing");
   await run();
   expect(out.slice(1)).toEqual([["LANE_DRIFT lane-a ci-failing 3 consecutive failures https://github.com/acme/app/pull/7", "lane-drift:lane-a:ci:acme/app#7:s3"]]);
+});
+
+test("a lane waiting on its blocking request gets no milestone drift, and its stretch restarts when the request closes", async () => {
+  const request = (patch: Partial<OwnerDecision>) => ({ id: "d1", kind: "request", state: "open", source: "lane", lane: "lane-a", blocking: true, channel: "c", openedAt: T0 + MIN, question: "code", options: [], recommend: 0, reason: "r", ...patch }) as OwnerDecision;
+  const write = (d: OwnerDecision) => writeFileSync(join(state.dir, DECISIONS_FILE), JSON.stringify({ nextSeq: 2, decisions: [d] }));
+  const lanes = [lane("lane-a")];
+  write(request({}));
+  expect(await tick(T0 + 90 * MIN, lanes, [])).toEqual([]);
+  expect(await tick(T0 + 200 * MIN, lanes, [])).toEqual([]);
+  write(request({ state: "closed", closedAt: T0 + 200 * MIN }));
+  expect(await tick(T0 + 289 * MIN, lanes, [])).toEqual([]);
+  expect(await tick(T0 + 290 * MIN, lanes, [])).toEqual(["LANE_DRIFT lane-a milestone-overdue 90min since open"]);
 });

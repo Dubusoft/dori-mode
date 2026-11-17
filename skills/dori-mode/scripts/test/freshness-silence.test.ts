@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
+import { DECISIONS_FILE, type OwnerDecision } from "../src/decision-store.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import type { Lane } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World } from "./fakes.ts";
@@ -63,4 +65,39 @@ test("a registry row with the removed progress fields still loads and does not c
   world.screen = WITH_TODO;
   expect((await freshnessTick(deps(T0 + 16 * MIN))).map((a) => a.kind)).toEqual(["no-progress"]);
   expect(posts()).toEqual([]);
+});
+
+const decision = (patch: Partial<OwnerDecision> = {}): OwnerDecision => ({
+  id: "d1", state: "open", source: "lane", lane: "busy-lane", blocking: true, channel: "decisions", openedAt: T0 + MIN,
+  question: "which way", options: ["a", "b"], recommend: 1, reason: "r", ...patch,
+} as OwnerDecision);
+const decisions = (...list: OwnerDecision[]) => writeFileSync(join(state.dir, DECISIONS_FILE), JSON.stringify({ nextSeq: list.length + 1, decisions: list }));
+
+for (const agent_status of ["idle", "working"] as const) {
+  test(`${agent_status === "idle" ? "an" : "a"} ${agent_status} lane waiting on its blocking question is not nudged, flagged or escalated, and its silence counts from the close`, async () => {
+    await deps(T0).registry.write(lane);
+    world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status }];
+    decisions(decision());
+    for (const min of [16, 50, 120, 300]) expect(await freshnessTick(deps(T0 + min * MIN))).toEqual([]);
+    decisions(decision({ state: "closed", closedAt: T0 + 300 * MIN }));
+    expect(await freshnessTick(deps(T0 + 314 * MIN))).toEqual([]);
+    expect((await freshnessTick(deps(T0 + 316 * MIN))).map((a) => a.kind)).toEqual([agent_status === "idle" ? "nudged" : "no-progress"]);
+    expect(sent(world)).toHaveLength(agent_status === "idle" ? 1 : 0);
+  });
+}
+
+test("a nonblocking question, another lane's question or one asked before the lane's recovery leaves the nudge as it was", async () => {
+  await deps(T0).registry.write({ ...lane, lastRecoveryAt: T0 + 2 * MIN });
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "idle" }];
+  decisions(decision({ blocking: false }), decision({ id: "d2", lane: "other-lane" }), decision({ id: "d3" }));
+  expect((await freshnessTick(deps(T0 + 16 * MIN))).map((a) => a.kind)).toEqual(["nudged"]);
+});
+
+test("a direct answer queued for the lane ends its wait and restarts its silence clock", async () => {
+  await deps(T0).registry.write(lane);
+  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "idle" }];
+  const delivery = { id: "decision-d1-r1", state: "queued", updatedAt: T0 + 100 * MIN } as const;
+  decisions(decision({ state: "answered", revisions: [{ rev: 1, channel: "c", message: "m", edit: 0, hash: "h", choice: 1, target: { lane: "busy-lane", runner: "local", generation: 0 }, at: T0 + 100 * MIN, delivery }] }));
+  expect(await freshnessTick(deps(T0 + 114 * MIN))).toEqual([]);
+  expect((await freshnessTick(deps(T0 + 116 * MIN))).map((a) => a.kind)).toEqual(["nudged"]);
 });
