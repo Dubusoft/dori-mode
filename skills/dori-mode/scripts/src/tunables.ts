@@ -50,6 +50,12 @@ export type Tunables = {
    * draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
    */
   readonly mergeStallMin: number;
+  /**
+   * Minutes an open lane may hold the automatic `dori update --dev` back (auto-update.ts) before the supervisor checks
+   * whether it can close it safely (update-blocker.ts) and, when it cannot, tells the lead once. An initial value, not a
+   * measured one.
+   */
+  readonly updateBlockerStaleMin: number;
   /** Digest events wait for an urgent one, but never longer than this. */
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
@@ -99,6 +105,7 @@ export const builtInTunables = (home = homedir()): Tunables => ({
   closeAfterMin: 5,
   mergeWaitMaxMin: 60,
   mergeStallMin: 15,
+  updateBlockerStaleMin: 360,
   digestMaxDelayMin: 60,
   ownerDelayNotice: "메시지를 받았습니다. 리드 세션이 아직 메시지를 받지 못하고 있어 대기열에 보관해 두었고, 리드가 돌아오는 대로 답변드립니다.",
   ackTimeoutSec: 60,

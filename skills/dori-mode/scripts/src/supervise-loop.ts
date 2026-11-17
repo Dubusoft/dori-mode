@@ -37,6 +37,7 @@ import { memorySweep } from "./memory-check.ts";
 import { alertReasons, diskGuardPath, type GuardState, guardTick, type HostSample, memIsLow, sampleHost } from "./host-guard.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { AutoUpdate, doriRepoOf, noteDevMerge } from "./auto-update.ts";
+import { staleBlocker } from "./update-blocker.ts";
 import { type GuardMachine, loadMachineGuardState, machineGuardTick, readGuardMachines, saveMachineGuardState } from "./remote-guard.ts";
 
 import { run, type Runner, setDefaultRunTimeout } from "./run.ts";
@@ -284,6 +285,8 @@ export const supervisorSweeps = (
       const repo = await ownRepo();
       return repo ? lanesBlockingUpdate(deps, repo) : [];
     },
+    staleAfterMs: deps.tunables.updateBlockerStaleMin * 60_000,
+    staleBlocker: (key, since, emit) => staleBlocker(deps, key, since, emit),
   });
   return [
     ["snapshot", async (emit) => {
@@ -349,7 +352,7 @@ export const supervisorSweeps = (
     ["memory", async () => memorySweep(deps, home)],
     // `dori update --dev` after a merge of dori's own repo into dev, in its own unit once no lane of that repo is working.
     ["auto-update", async (emit) => {
-      await autoUpdate.tick((line, id) => emit(line, id));
+      await autoUpdate.tick(emit);
       return [];
     }],
     // Each worker machine with an enrolled runner is judged from its runner's guard sample; nothing is sampled over ssh.

@@ -108,7 +108,7 @@ const PULL_URL = /https:\/\/\S+\/pull\/\d+/;
  * The fixed close event: no receipt (the registry keeps it). The first PR URL the close note or a Done signal names is
  * kept, so the lead sees which PR the lane closed with.
  */
-const closedEvent = (key: string, note: string, lines: readonly string[]): string => {
+export const closedEvent = (key: string, note: string, lines: readonly string[]): string => {
   const pr = [note, ...lines.filter((l) => l.startsWith("SIGNAL "))].map((t) => PULL_URL.exec(t)?.[0]).find(Boolean);
   return `LANE_CLOSED ${key} closed${pr ? ` ${pr}` : ""}`;
 };

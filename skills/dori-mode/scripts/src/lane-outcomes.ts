@@ -122,15 +122,16 @@ export const reportRule = (lane: string): string => `run dori reported ${lane} -
 
 type Published = { readonly lane: string; readonly since: number; readonly line?: string };
 
-/** `dori inbox take`'s reminder lines (id<TAB>line, like the events) from the supervisor's published obligations. */
-export const takeReminders = (stateDir: string): string[] => {
+/** The published open report obligations (UNREPORTED_FILE); empty when unreadable. */
+export const publishedUnreported = (stateDir: string): Published[] => {
   let list: unknown;
   try { list = JSON.parse(readFileSync(join(stateDir, UNREPORTED_FILE), "utf8")); } catch { return []; }
-  if (!Array.isArray(list)) return [];
-  return list.flatMap((item: Partial<Published>) => typeof item?.lane === "string" && LANE_KEY.test(item.lane) && typeof item.since === "number"
-    ? [`unreported:${item.lane}\tUNREPORTED ${item.lane} since ${new Date(item.since).toISOString()}: ${reportRule(item.lane)}`]
-    : []);
+  return Array.isArray(list) ? list.filter((item: Partial<Published>) => typeof item?.lane === "string" && LANE_KEY.test(item.lane) && typeof item.since === "number") : [];
 };
+
+/** `dori inbox take`'s reminder lines (id<TAB>line, like the events) from the supervisor's published obligations. */
+export const takeReminders = (stateDir: string): string[] =>
+  publishedUnreported(stateDir).map((item) => `unreported:${item.lane}\tUNREPORTED ${item.lane} since ${new Date(item.since).toISOString()}: ${reportRule(item.lane)}`);
 
 export class OutcomeTracking {
   private published?: string;

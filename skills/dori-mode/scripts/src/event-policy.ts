@@ -72,6 +72,8 @@ const URGENT_KINDS = [
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED", "TOODO_TASK_NOT_COMPLETED",
   // The automatic `dori update --dev` after a merge of dori's own repo failed (update.ts AutoUpdate); its success is digest.
   "AUTO_UPDATE_FAILED",
+  // A lane that has held the automatic update back for updateBlockerStaleMin and could not be closed safely (update-blocker.ts).
+  "AUTO_UPDATE_BLOCKER_STALE",
   // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched; the supervisor
   // records the task's blocker), a done one whose task the supervisor could not complete is completed by the lead.
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",

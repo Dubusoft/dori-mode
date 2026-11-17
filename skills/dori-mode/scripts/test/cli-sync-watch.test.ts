@@ -82,12 +82,15 @@ test("dori watch suppresses repeated warnings per lane and reason until they cle
     ];
     mock.module(${doneFlow}, () => ({
       claimDone: async () => "",
+      closedEvent: () => "",
       closeLane: async () => ({}),
       closeRunning: () => false,
       finishClosedTask: async () => undefined,
       finishedReason: () => "",
       laneMeta: () => ({}),
+      mergeConfirmed: async () => undefined,
       objectDone: async () => "",
+      unpushedWork: async () => [],
       watchTick: async () => results[tick++] ?? [],
     }));
     mock.module(${lanePerms}, () => ({

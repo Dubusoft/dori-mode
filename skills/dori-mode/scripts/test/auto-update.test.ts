@@ -7,7 +7,7 @@ import type { Lane } from "../src/registry.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { lanesBlockingUpdate } from "../src/supervise-loop.ts";
 import {
-  AUTO_UPDATE_RESULT, AUTO_UPDATE_UNIT, AutoUpdate, noteDevMerge, readAutoUpdateState, writeUpdateResult,
+  AUTO_UPDATE_RESULT, AUTO_UPDATE_UNIT, AutoUpdate, noteDevMerge, readAutoUpdateState, STALE_RECHECK_MS, writeUpdateResult,
 } from "../src/auto-update.ts";
 
 let dir = "";
@@ -17,6 +17,10 @@ let startCode = 0;
 let busy: string[] = [];
 let events: [string, string][] = [];
 let now = 1_000;
+const STALE_MS = 6 * 60 * 60_000;
+/** staleBlocker calls (`key@since`); with `staleCloses` the check closes the lane, which then no longer blocks. */
+let stale: string[] = [];
+let staleCloses = false;
 
 const runner: Runner = async (argv): Promise<Ran> => {
   calls.push([...argv]);
@@ -31,7 +35,13 @@ const starts = (): string[][] => calls.filter((c) => c[0] === "systemd-run");
 const emit = async (line: string, id: string): Promise<void> => { events.push([id, line]); };
 const auto = (): AutoUpdate => new AutoUpdate({
   stateDir: dir, run: runner, now: () => now, env: { PATH: "/usr/bin", HOME: "/home/u" }, log: () => {},
-  command: ["/bin/bun", "/dori/src/cli.ts", "update", "--dev"], busy: async () => busy,
+  command: ["/bin/bun", "/dori/src/cli.ts", "update", "--dev"], busy: async () => busy, staleAfterMs: STALE_MS,
+  staleBlocker: async (key, since) => {
+    stale.push(`${key}@${since}`);
+    if (!staleCloses) return { closed: false, line: `AUTO_UPDATE_BLOCKER_STALE ${key} since ${since}` };
+    busy = busy.filter((k) => k !== key);
+    return { closed: true };
+  },
 });
 /** The unit finished: it wrote its result and exited. */
 const finish = (code: number, lines: string[]): void => {
@@ -41,7 +51,7 @@ const finish = (code: number, lines: string[]): void => {
 
 beforeEach(() => {
   dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "dori-auto-update-"));
-  calls = []; unit = "inactive"; startCode = 0; busy = []; events = []; now = 1_000;
+  calls = []; unit = "inactive"; startCode = 0; busy = []; events = []; now = 1_000; stale = []; staleCloses = false;
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -135,6 +145,45 @@ test("a unit that ended without a result, or could not start, wakes the lead", a
   await auto().tick(emit);
   expect(events[1]![1]).toBe("AUTO_UPDATE_FAILED after Dubusoft/dori-mode#6: systemd-run exit 1: Failed to connect to bus; run dori update --dev by hand");
   expect(readAutoUpdateState(dir)).toEqual({ pending: [] });
+});
+
+test("a lane holding the update back past staleAfterMs is checked every STALE_RECHECK_MS, and the lead hears of it once, across restarts too", async () => {
+  busy = ["lane-a"];
+  noteDevMerge(dir, "Dubusoft/dori-mode#5");
+  await auto().tick(emit);
+  now += STALE_MS - 1;
+  await auto().tick(emit);
+  expect(stale).toEqual([]);
+  now += 1;
+  const a = auto();
+  await a.tick(emit);
+  expect(stale).toEqual(["lane-a@1000"]);
+  expect(events).toEqual([["auto-update-blocker:lane-a:1000", "AUTO_UPDATE_BLOCKER_STALE lane-a since 1000"]]);
+  expect(eventClass(events[0]![1])).toBe("lead-urgent");
+  await a.tick(emit);
+  expect(stale).toHaveLength(1);
+  now += STALE_RECHECK_MS;
+  await a.tick(emit);
+  await auto().tick(emit);
+  expect(stale).toEqual(["lane-a@1000", "lane-a@1000", "lane-a@1000"]);
+  expect(events).toHaveLength(1);
+  expect(starts()).toEqual([]);
+});
+
+test("a stale blocker its check closes lets the deferred update start, and the started update forgets the blockers", async () => {
+  busy = ["lane-a"];
+  noteDevMerge(dir, "Dubusoft/dori-mode#5");
+  await auto().tick(emit);
+  expect(readAutoUpdateState(dir).blocked).toEqual({ "lane-a": { since: 1_000 } });
+  now += STALE_MS;
+  staleCloses = true;
+  const a = auto();
+  await a.tick(emit);
+  expect(stale).toEqual(["lane-a@1000"]);
+  expect(events).toEqual([]);
+  await a.tick(emit);
+  expect(starts()).toHaveLength(1);
+  expect(readAutoUpdateState(dir).blocked).toBeUndefined();
 });
 
 const lane = (key: string, patch: Partial<Lane>): Lane => ({
