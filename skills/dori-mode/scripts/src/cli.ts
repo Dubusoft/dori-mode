@@ -12,7 +12,8 @@ import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { displayTime } from "./display-time.ts";
 import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
-import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
+import { acquireSlot, pidAlive } from "./heavy-slot.ts";
+import { watchSimulators } from "./heavy-simulators.ts";
 import { guardTick } from "./host-guard.ts";
 import { listGuardMachines } from "./remote-guard.ts";
 import { adoptLane, attachLaneFiles, type LaunchInput, launchNextLine, LaunchError, parseLaneTask, validateLaunch } from "./launch.ts";
@@ -958,12 +959,14 @@ try {
       if (!label || label === "--" || !cmd.length) die("usage: dori heavy <label> -- <command ...>");
       // One slot directory per host (D17), shared with the lanes' `dori heavy` and the supervisor's scheduled heavy jobs.
       const load = async () => loadavg()[0] ?? 0;
-      const slot = await acquireSlot({ dir: heavyDirOf(), slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
+      const dir = heavyDirOf();
+      const slot = await acquireSlot({ dir, slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
+      const finish = await watchSimulators({ run, dir, platform: process.platform, alive: (pid) => pidAlive(pid), now: realClock.now, pid: process.pid, err: (line) => console.error(line) }, slot);
       try {
         const child = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit", stdin: "inherit" });
         process.exitCode = await child.exited;
       } finally {
-        releaseSlot(slot);
+        await finish();
       }
       break;
     }
