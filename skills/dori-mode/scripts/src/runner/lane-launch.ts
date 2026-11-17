@@ -53,6 +53,14 @@ export const removeLegacyLaneMcp = async (cwd: string): Promise<boolean> => {
 export const LANE_PERMISSION_FLAGS: readonly string[] = ["--permission-preset", "full-access"];
 
 /**
+ * Turns off omo's on-screen question tool for a lane. Nobody watches a lane's pane, so a lane asks with `dori report
+ * question`; omo gives its subagents (task children, workflow nodes) no question tool, so the lane itself was the only
+ * session that could open one. Written with its value: omo reads a bare unknown `--flag` followed by a plain argument as
+ * that flag's value, so `--no-ask-user` right before the prompt would swallow the prompt.
+ */
+export const LANE_NO_ASK_FLAG = "--no-ask-user=true";
+
+/**
  * The omo `--permission` value for a lane with no sandbox (a Windows runner, a machine opted in to run unsandboxed), where
  * full-access alone would leave nothing in place: every path outside the lane's cwd is refused without a prompt, except
  * each `allowed` directory and everything under it. A directory whose path holds `,` or `=` cannot be written as an omo
@@ -65,14 +73,19 @@ export const outsideDenyRules = (allowed: readonly string[], join: (dir: string,
 ].join(",");
 
 /**
- * `template` with LANE_PERMISSION_FLAGS (and `--permission <outsideRules>` when given) before its `{prompt}` slot;
- * unchanged when it already names a preset or has no slot.
+ * `template` with LANE_PERMISSION_FLAGS (and `--permission <outsideRules>` when given) and LANE_NO_ASK_FLAG before its
+ * `{prompt}` slot. The permission flags are left out when it already names a preset, the no-ask flag when it already
+ * has it; a template without a slot is unchanged.
  */
 export const lanePermissionArgv = (template: readonly string[], outsideRules?: string): readonly string[] => {
-  if (template.some((part) => /^--permission-preset(?:=|$)/.test(part))) return template;
   const at = template.findIndex((part) => part.includes("{prompt}"));
-  const flags = [...LANE_PERMISSION_FLAGS, ...(outsideRules ? ["--permission", outsideRules] : [])];
-  return at < 1 ? template : [...template.slice(0, at), ...flags, ...template.slice(at)];
+  if (at < 1) return template;
+  const preset = template.some((part) => /^--permission-preset(?:=|$)/.test(part));
+  const flags = [
+    ...(preset ? [] : [...LANE_PERMISSION_FLAGS, ...(outsideRules ? ["--permission", outsideRules] : [])]),
+    ...(template.some((part) => /^--no-ask-user(?:=|$)/.test(part)) ? [] : [LANE_NO_ASK_FLAG]),
+  ];
+  return [...template.slice(0, at), ...flags, ...template.slice(at)];
 };
 
 /**
