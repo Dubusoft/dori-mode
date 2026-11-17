@@ -51,6 +51,13 @@ const table = (kinds: readonly string[]): EventPolicy => {
 /** `line` is a decision event under `kinds`. */
 export const isDecision = (line: string, kinds: readonly string[]): boolean => eventClass(line, table(kinds)) === "lead-urgent";
 
+/**
+ * A live event with `line` opens an obligation: a decision kind that reaches the lead. `dori inbox take` marks such lines
+ * `[resolve]`, and `dori resolved` on a known event that does not is RESOLVED_NOT_NEEDED.
+ */
+export const opensObligation = (line: string, tunables: { readonly resolveKinds: readonly string[]; readonly eventPolicy: EventPolicy }): boolean =>
+  isDecision(line, tunables.resolveKinds) && forLead(eventClass(line, tunables.eventPolicy));
+
 /** `dori resolved <eventId>`'s receipt: written like `dori reported`'s (tmp, fsync, rename, both directories fsynced). */
 export const recordResolved = (stateDir: string, id: string, at: number, note?: string): string => {
   if (!EVENT_ID.test(id)) throw new ResolvedError("usage: dori resolved <eventId> [<eventId> ...] [--note TEXT] (an event id)");
@@ -118,7 +125,7 @@ export class DecisionTracking {
    */
   track(event: Event): void {
     const { tunables } = this.core.deps;
-    if (!EVENT_ID.test(event.id) || !isDecision(event.line, tunables.resolveKinds) || !forLead(eventClass(event.line, tunables.eventPolicy))) return;
+    if (!EVENT_ID.test(event.id) || !opensObligation(event.line, tunables)) return;
     const pending = this.journal.pending ?? [];
     const line = event.line.slice(0, OBLIGATION_LINE_MAX);
     const at = pending.findIndex((item) => item.id === event.id);
@@ -132,16 +139,26 @@ export class DecisionTracking {
 
   /**
    * `dori resolved` receipts close their obligation; one naming no obligation yet is kept (resolved before its event
-   * arrived, or a mistyped id: logged as unmatched), so that event opens nothing. Persisted before the receipts are
-   * dropped: a replay only takes the earliest resolve time again.
+   * arrived, or a mistyped id: logged as unmatched), so that event opens nothing. One naming a journaled event that
+   * opens no obligation (a decision close's or `--from-event`'s source, say) is only logged as not needed. Persisted
+   * before the receipts are dropped: a replay only takes the earliest resolve time again.
    */
   consumeReceipts(): void {
     const receipts = pendingResolved(this.core.deps.config.stateDir);
     if (!receipts.length) return;
     const pending = [...(this.journal.pending ?? [])];
+    let lines: Map<string, string> | undefined;
     for (const receipt of receipts) {
       const at = pending.findIndex((item) => item.id === receipt.id);
       const found = at < 0 ? undefined : pending[at];
+      if (!found) {
+        lines ??= new Map(this.journal.events.map((event) => [event.id, event.line]));
+        const line = lines.get(receipt.id);
+        if (line !== undefined && !opensObligation(line, this.core.deps.tunables)) {
+          console.log(`DECISION_RESOLVED_NOT_NEEDED ${receipt.id}`);
+          continue;
+        }
+      }
       const note = found?.note ?? receipt.note;
       const next: Obligation = {
         ...(found ?? { id: receipt.id, since: receipt.at }),
