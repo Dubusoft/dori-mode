@@ -1,6 +1,8 @@
 import type { HostSummary } from "./autopilot.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { type LaunchInput, launchLane, SandboxRefusal } from "./launch.ts";
+import { type LaunchInput, LaunchError, launchLane, SandboxRefusal } from "./launch.ts";
+import { machineRunner } from "./lane-ops.ts";
+import { runnerWorktreeRoot } from "./runner/hub.ts";
 import { doneRepos } from "./signals.ts";
 import {
   checkMachine, type LaunchPlan, LOCAL_MACHINE, type MachineCheck, type PlacementInput, placementTargets, planLaunch, resolvePlacement,
@@ -73,6 +75,53 @@ export const placeLaunch = async (deps: Pick<FlowDeps, "ops" | "config"> & Parti
     ? [`LAUNCH_WARN guard.panesMax is ${config.guard.panesMax}: the pane-count limit is off, so nothing caps concurrent lanes; set guard.panesMax to re-enable it`]
     : [];
   return { plan, target, ...(machine ? { machine } : {}), ...(cwd ? { cwd } : {}), lines: [...plan.lines, ...warn] };
+};
+
+/** `dori launch --worktree <repo>`'s base when `--base` is not given. */
+export const DEFAULT_WORKTREE_BASE = "origin/dev";
+
+/** `--worktree <repo> [--base <remote>/<branch>]`: `repo` is owner/repo or the bare repo name. */
+export type LaunchWorktree = { readonly repo: string; readonly base: string };
+
+/** The lane git ref a launch worktree op runs under: the new lane's key on the placed machine's runner. */
+const worktreeRef = (key: string, machine: string | undefined) => ({ key, ...(machine ? { machine } : {}) });
+
+/**
+ * Creates the new lane's worktree for `dori launch --worktree` on the machine the launch is placed on, through that
+ * machine's runner (`lane.git` fetch-branch, then worktree-add, the merge lane's ops): `<root>/<repo name>-<key>`,
+ * detached at the fetched base. The root is the runner's reported worktree root (for this host, config.worktreeRoot
+ * while the local runner reported none), the checkout the one its runner declared or detected for the repo. An existing
+ * path is refused before any git runs, so nothing in it is overwritten.
+ */
+export const createLaunchWorktree = async (deps: FlowDeps, input: LaunchInput, placed: PlacedLaunch, want: LaunchWorktree): Promise<{ readonly path: string; readonly checkout: string; readonly line: string }> => {
+  const [, remote, branch] = /^([\w.-]+)\/([\w./-]+)$/.exec(want.base) ?? [];
+  if (!remote || !branch || want.base.startsWith("-")) throw new LaunchError(`--base ${JSON.stringify(want.base)} must be <remote>/<branch>, e.g. ${DEFAULT_WORKTREE_BASE}`);
+  const name = want.repo.split("/").pop()?.toLowerCase() ?? "";
+  if (!/^[\w.-]+(?:\/[\w.-]+)?$/.test(want.repo) || name.startsWith(".")) throw new LaunchError(`--worktree ${JSON.stringify(want.repo)} must be owner/repo or a repo name`);
+  const machine = placed.machine ?? LOCAL_MACHINE;
+  const label = machineRunner(placed.machine);
+  const report = (await placementReports(deps.config.stateDir)).find((r) => r.machine === label);
+  const reported = (deps.runnerWorktreeRoot ?? ((l) => runnerWorktreeRoot(deps.config.stateDir, l)))(label);
+  const root = (reported || (placed.machine ? undefined : deps.config.worktreeRoot) || "").replace(/[\\/]+$/, "");
+  if (!root) throw new LaunchError(`LAUNCH_WORKTREE_NO_ROOT ${input.key}: machine ${machine} reports no worktree root${placed.machine ? "" : " and config.worktreeRoot is not set"}`);
+  const matches = (repo: string): boolean => want.repo.includes("/") ? repo.toLowerCase() === want.repo.toLowerCase() : repo.split("/").pop()?.toLowerCase() === name;
+  const checkout = [...(report?.declared ?? []), ...(report?.detected ?? [])].find((e) => matches(e.repo))?.path;
+  if (!checkout) throw new LaunchError(`LAUNCH_WORKTREE_NO_CHECKOUT ${input.key}: the runner on machine ${machine} declares or detects no checkout of ${want.repo} (dori placement lists them)`);
+  // A Windows runner's root is a drive path: join with its own separator.
+  const path = `${root}${/^[A-Za-z]:\\/.test(root) ? "\\" : "/"}${name}-${input.key}`;
+  if ((await deps.ops.exists(placed.machine, [path]))[0]) throw new LaunchError(`LAUNCH_WORKTREE_EXISTS ${input.key}: ${path} already exists on machine ${machine}; remove it or launch with --cwd ${path}`);
+  const ref = worktreeRef(input.key, placed.machine);
+  const fetched = await deps.ops.git(ref, { op: "fetch-branch", root: checkout, remote, branch });
+  if (fetched.code !== 0) throw new LaunchError(`LAUNCH_WORKTREE_FAILED ${input.key}: git fetch ${want.base} in ${checkout} failed: ${(fetched.err || fetched.out).trim()}`);
+  const added = await deps.ops.git(ref, { op: "worktree-add", root: checkout, path, ref: `refs/remotes/${remote}/${branch}` });
+  if (added.code !== 0) throw new LaunchError(`LAUNCH_WORKTREE_FAILED ${input.key}: git worktree add ${path} failed: ${(added.err || added.out).trim()}`);
+  return { path, checkout, line: `WORKTREE_CREATED ${input.key} ${path} from ${want.base} (checkout ${checkout}${placed.machine ? `, machine ${machine}` : ""})` };
+};
+
+/** Removes a worktree createLaunchWorktree made for a launch that registered no lane; git refuses one that changed meanwhile. */
+export const removeLaunchWorktree = async (deps: FlowDeps, input: LaunchInput, placed: PlacedLaunch, path: string, checkout: string): Promise<string> => {
+  const removed = await deps.ops.git(worktreeRef(input.key, placed.machine), { op: "worktree-remove", root: checkout, path }).catch((e: unknown) => ({ code: 1, out: "", err: e instanceof Error ? e.message : String(e) }));
+  return removed.code === 0 ? `WORKTREE_REMOVED ${input.key} ${path} (the launch registered no lane)` : `WORKTREE_KEPT ${input.key} ${path}: ${(removed.err || removed.out).trim()}`;
 };
 
 export type LaunchOutcome =
