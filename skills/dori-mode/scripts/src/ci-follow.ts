@@ -27,8 +27,9 @@ import { parseSignal, splitDone } from "./signals.ts";
  * CI follow-up for lane PRs (design 4.5, item 1.4). After each GitHub poll, for every open PR that
  * belongs to an open lane (its Done signal names the PR, or a lane worktree has the PR's branch):
  * - checks failing at the head SHA: a lane message with an ID, delivered safely (deliverLaneMessages);
- * - checks green and mergeable into `ciMergeBase`, claimed at its head: the supervisor merges it (a repo outside config
- *   `review.repos` directly, review-gate.ts reviewEnabledFor; a listed one) only with a reviewer `pass` receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
+ * - checks green and mergeable into `ciMergeBase`, claimed at its head: the supervisor merges it. A repo outside config
+ *   `review.repos` (review-gate.ts reviewEnabledFor) merges directly; a listed one merges only with a reviewer `pass`
+ *   receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
  *   only while the base it re-reads right before merging is the approved base (`--match-head-commit`, never `--admin`,
  *   never into main); it reads the merge SHA back and reports a merge that landed on another base (REVIEW_BASE_RACE);
  *   while `dori merge pause` is in force (merge-pause.ts) it runs that whole gate but makes no merge (MERGE_PAUSED);

@@ -154,7 +154,8 @@ const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
     && (v.done === undefined || (isObj(v.done) && isStr(v.done.cwd) && isBool(v.done.fallback) && listOf(v.done.checks, isCheck)))
     && (v.session === undefined || (isObj(v.session) && isStr(v.session.id) && isStr(v.session.via))),
   "q.machine.observe": (v) => isObj(v) && isStr(v.os) && isNum(v.sampledAt) && isObj(v.sample) && listOf(v.panes, isPane)
-    && (v.guard === undefined || (isObj(v.guard) && Object.values(v.guard).every(isNum))),
+    && (v.guard === undefined || (isObj(v.guard) && Object.values(v.guard).every(isNum)))
+    && (v.profiles === undefined || listOf(v.profiles, isStr)),
 };
 
 export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boolean } = {

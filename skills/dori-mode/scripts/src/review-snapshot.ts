@@ -78,16 +78,10 @@ const newerFiles = (root: string, dir: string, since: number, out: string[]): vo
   }
 };
 
-const statusPath = (line: string): string => {
-  const p = line.slice(3);
-  const arrow = p.indexOf(" -> ");
-  const raw = arrow >= 0 ? p.slice(arrow + 4) : p;
-  return raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
-};
-
 /**
  * Checks after a review that its snapshot is untouched: HEAD still `headSha`, a clean `git status`, and no file
- * modified after `since` (ignored files included). `.omo/omo.jsonc` and `.omo/omo.jsonc.bak.*` are exempt.
+ * modified after `since` (ignored files included). omo's own changes are exempt: a `.omo/omo.jsonc` that differs from
+ * HEAD's only in its top-level `_migrations` key and `.omo/omo.jsonc.bak.*` backups (runner/lane-git.ts omoNoise).
  */
 export const checkReviewScope = async (run: Runner, input: ScopeInput): Promise<ScopeResult> => {
   const { path, headSha, since } = input;
@@ -96,8 +90,9 @@ export const checkReviewScope = async (run: Runner, input: ScopeInput): Promise<
   if (head !== headSha) return bad(`HEAD is ${head ?? "unreadable"}, expected ${headSha}`);
   const st = await run(["git", "-C", path, "status", "--porcelain", "--untracked-files=all"]);
   if (st.code !== 0) return bad(`git status failed: ${tail(st.err)}`);
-  const dirty = st.out.split("\n").filter((l) => l.length > 0 && !OMO_CONFIG_RE.test(statusPath(l)));
-  if (dirty.length > 0 || (st.out.trim() !== "" && !(await omoNoise(run, path)))) {
+  // run() trims its output, so the first porcelain line can lose its leading status column: whether a non-empty status
+  // is only omo's own config migration and backups is decided by omoNoise's name-only reads instead of parsing it.
+  if (st.out !== "" && !(await omoNoise(run, path))) {
     return bad(`worktree is not clean: ${st.out.split("\n").filter((l) => l.length > 0).slice(0, 5).join("; ")}`);
   }
   const newer: string[] = [];

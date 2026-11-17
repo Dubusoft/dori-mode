@@ -277,7 +277,6 @@ export const languageInstruction = (ownerLanguage: string | undefined): string =
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
 };
 
-/** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
 /** The config's `review`: absent is no gated repo; otherwise `{ "repos"?: ["owner/repo", ...] }`, else TypeError. */
 const reviewConfig = (raw: unknown): ReviewConfig => {
   if (raw == null) return {};
@@ -288,6 +287,7 @@ const reviewConfig = (raw: unknown): ReviewConfig => {
   return { repos: (raw.repos as string[]).map((repo) => repo.trim()) };
 };
 
+/** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
 const laneRules = (raw: unknown): readonly string[] => {
   if (raw == null) return [];
   if (!Array.isArray(raw) || raw.some((rule) => typeof rule !== "string")) throw new TypeError("laneRules must be an array of strings");
