@@ -1,5 +1,8 @@
 {
   "memory": {
     "agent": "dori-mode"
-  }
+  },
+  "_migrations": [
+    "2026-08-reasoning-unification"
+  ]
 }

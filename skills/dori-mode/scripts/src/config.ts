@@ -210,7 +210,15 @@ export type DoriConfig = {
    * `executor` (default false) moves reserve, launch and settle from the lead to the supervisor; while it is on the CLI refuses to reserve.
    */
   readonly autopilot: AutopilotConfig;
+  /**
+   * The PR review gate (review-gate.ts reviewEnabledFor): `repos` lists the owner/repo names (case-insensitive) whose lane
+   * PRs are reviewed before the supervisor merges them. Absent or empty: the gate is off and every claimed green
+   * mergeable lane PR is merged directly.
+   */
+  readonly review?: ReviewConfig;
 };
+
+export type ReviewConfig = { readonly repos?: readonly string[] };
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
 export const LEAD_DIET_EXCLUDED_TOOLS: readonly string[] = [
@@ -267,6 +275,16 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
   const language = typeof ownerLanguage === "string" ? ownerLanguage.trim() : "";
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
+};
+
+/** The config's `review`: absent is no gated repo; otherwise `{ "repos"?: ["owner/repo", ...] }`, else TypeError. */
+const reviewConfig = (raw: unknown): ReviewConfig => {
+  if (raw == null) return {};
+  const bad = new TypeError(`review must be { "repos"?: ["owner/repo", ...] }, not ${JSON.stringify(raw)}`);
+  if (!isRecord(raw) || Object.keys(raw).some((key) => key !== "repos")) throw bad;
+  if (raw.repos == null) return {};
+  if (!Array.isArray(raw.repos) || raw.repos.some((repo) => typeof repo !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim()))) throw bad;
+  return { repos: (raw.repos as string[]).map((repo) => repo.trim()) };
 };
 
 /** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
@@ -417,7 +435,7 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
+  "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -499,6 +517,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...(alerts ? { alertsChannel: alerts } : {}),
     ...(decisions ? { decisionsChannel: decisions } : {}),
     laneRules: laneRules(raw.laneRules),
+    review: reviewConfig(raw.review),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),

@@ -15,6 +15,14 @@
 #   LANE_SANDBOX_WORKTREES the runner's lane worktree root, bound read-write (the runner sets it from its policy)
 #   LANE_SANDBOX_REPOS   the runner's repos root: the .git directory of each repo directly under it is bound read-write
 #                        (hooks excluded), so a lane can fetch there and `git worktree add` into the worktree root
+#   LANE_SANDBOX_PROFILE empty (the default above) or "review"; any other value exits 2. A review lane reads a locked
+#                        snapshot worktree and writes only its findings: the cwd, its git common dir, the worktree root
+#                        and each repo's .git are bound read-only, LANE_SANDBOX_RW is ignored (LANE_SANDBOX_RO kept), and
+#                        the only writable host paths are briefs/<key>.out, the private TMPDIR, ~/.omo and ~/.cache (/tmp
+#                        is a private tmpfs). No git or gh credentials reach it: ~/.gitconfig, ~/.config/gh, ~/.config/git
+#                        and an ssh agent socket under $HOME are hidden, GH_TOKEN/GITHUB_TOKEN (and the enterprise ones) are
+#                        unset, git ignores global and system config and never prompts. Nothing under the cwd is
+#                        writable, so omo cannot back up <cwd>/.omo/omo.jsonc there; omo tolerates that failure.
 # /data and each existing top-level entry of $HOME are bound read-write; $HOME itself stays read-only, so no new
 # top-level entry (a missing shell startup file such as ~/.bash_profile) can be created there. What the host runs outside
 # the sandbox stays read-only: the shell startup files, ~/.gitconfig, ~/.dori itself and what dori runs or trusts in it
@@ -77,6 +85,21 @@ if [ "$#" -eq 0 ] && [ "$explain" = 0 ]; then
   exit 2
 fi
 
+# Fail closed: an unknown profile, or a review lane with no lane key (which would pass through unsandboxed), runs nothing.
+profile=${LANE_SANDBOX_PROFILE:-}
+case "$profile" in
+  "") review=0 ;;
+  review) review=1 ;;
+  *)
+    echo "lane-sandbox: unknown LANE_SANDBOX_PROFILE '$profile' (expected empty or review)" >&2
+    exit 2
+    ;;
+esac
+if [ "$review" = 1 ] && [ -z "${DORI_LANE_KEY:-}" ]; then
+  echo "lane-sandbox: LANE_SANDBOX_PROFILE=review needs DORI_LANE_KEY; refusing to run unsandboxed" >&2
+  exit 2
+fi
+
 if [ -z "${DORI_LANE_KEY:-}" ]; then
   echo "lane-sandbox: DORI_LANE_KEY is not set; refusing to run $1 unsandboxed (set DORI_LANE_KEY=<key>, or use --explain or --check)" >&2
   exit 2
@@ -119,7 +142,7 @@ for e in /*; do
   case "$e" in "$top" | /tmp | /proc | /dev) continue ;; esac
   if [ -L "$e" ]; then
     opts+=(--symlink "$(readlink "$e")" "$e")
-  elif [ "$e" = /data ]; then
+  elif [ "$e" = /data ] && [ "$review" = 0 ]; then
     opts+=(--bind-try "$e" "$e")
   else
     opts+=(--ro-bind "$e" "$e")
@@ -136,6 +159,7 @@ opts+=(
   --ro-bind "$H" "$H"
   --ro-bind "$H/.dori" "$H/.dori"
 )
+if [ "$review" = 0 ]; then
 # Each existing top-level entry of $HOME read-write, except the host-run files, ~/.ssh and ~/.dori (hidden or read-only
 # below), the private TMPDIR's mount point and the dirs bound read-write below. A symlink is left as it is: binding it
 # would bind its target.
@@ -167,7 +191,16 @@ done
 set +f
 for p in "${host_run_files[@]}"; do opts+=(--ro-bind-try "$H/$p" "$H/$p"); done
 for p in "${host_run_dirs[@]}"; do opts+=(--ro-bind "$H/$p" "$H/$p"); done
-opts+=(--bind /tmp /tmp --setenv LANE_SANDBOX_ACTIVE 1)
+fi
+# A review lane gets a private /tmp: the host's is shared with every other process.
+if [ "$review" = 1 ]; then opts+=(--tmpfs /tmp); else opts+=(--bind /tmp /tmp); fi
+opts+=(--setenv LANE_SANDBOX_ACTIVE 1)
+# A review lane carries no git or gh credentials: no global/system git config, no prompt, no token.
+if [ "$review" = 1 ]; then
+  opts+=(--setenv GIT_TERMINAL_PROMPT 0 --setenv GIT_CONFIG_GLOBAL /dev/null --setenv GIT_CONFIG_NOSYSTEM 1)
+  opts+=(--unsetenv GH_TOKEN --unsetenv GITHUB_TOKEN --unsetenv GH_ENTERPRISE_TOKEN --unsetenv GITHUB_ENTERPRISE_TOKEN)
+  opts+=(--unsetenv SSH_AUTH_SOCK)
+fi
 
 # The real BrowserSkill home (daemon.json and its daemon.sock), read-only: a lane drives bsk directly. A unix socket
 # connect needs no write mount; a lane cannot rewrite daemon.json or bsk's state.
@@ -193,12 +226,19 @@ if [ -n "${LANE_SANDBOX_RO:-}" ]; then
 fi
 
 # Read-write re-binds (after ro ones so nested rw paths win); briefs/<key>.out is bound with the runner dir below.
-for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
-  "$H/.cargo/registry" "$H/.cargo/git"; do
-  opts+=(--bind-try "$p" "$p")
-done
+if [ "$review" = 1 ]; then
+  # A review lane keeps only omo's own state and caches writable: no package caches, no heavy dir, no grants.
+  for p in "$H/.omo" "$H/.cache"; do
+    opts+=(--bind-try "$p" "$p")
+  done
+else
+  for p in "$H/.omo" "$H/.cache" "$H/.npm" "$H/.bun/install/cache" \
+    "$H/.cargo/registry" "$H/.cargo/git"; do
+    opts+=(--bind-try "$p" "$p")
+  done
+fi
 
-if [ -n "${LANE_SANDBOX_RW:-}" ]; then
+if [ "$review" = 0 ] && [ -n "${LANE_SANDBOX_RW:-}" ]; then
   IFS=: read -r -a extra <<<"$LANE_SANDBOX_RW"
   for p in "${extra[@]}"; do
     [ -n "$p" ] && opts+=(--bind-try "$p" "$p")
@@ -246,10 +286,18 @@ case "$broad" in
     ;;
   *)
     case "$C" in "$H/.dori/runner" | "$H/.dori/runner"/*) runner_cwd=1 ;; esac
-    [ "$runner_cwd" = 1 ] || opts+=(--bind "$C" "$C")
-    if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
-      opts+=(--bind "$gcd" "$gcd")
-      gits+=("$gcd")
+    if [ "$review" = 1 ]; then
+      # The review snapshot and its git common dir, read-only: git log/diff/show work, nothing can be written there.
+      [ "$runner_cwd" = 1 ] || opts+=(--ro-bind "$C" "$C")
+      if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
+        opts+=(--ro-bind "$gcd" "$gcd")
+      fi
+    else
+      [ "$runner_cwd" = 1 ] || opts+=(--bind "$C" "$C")
+      if gcd=$(git -C "$C" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -d "$gcd" ]; then
+        opts+=(--bind "$gcd" "$gcd")
+        gits+=("$gcd")
+      fi
     fi
     ;;
 esac
@@ -258,13 +306,20 @@ opts+=(--chdir "$C")
 # A lane started without --cwd makes its worktree from a repo under the repos root into the worktree root: the worktree
 # root and each repo's .git (refs, objects, FETCH_HEAD, worktrees/<name>) are writable; outside /data the repos root
 # itself and each repo's working tree stay read-only.
+# A review lane gets both read-only (it may read neighbor code, never write another worktree or a repo refs).
 if [ -n "${LANE_SANDBOX_WORKTREES:-}" ]; then
-  opts+=(--bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+  if [ "$review" = 1 ]; then
+    opts+=(--ro-bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+  else
+    opts+=(--bind-try "$LANE_SANDBOX_WORKTREES" "$LANE_SANDBOX_WORKTREES")
+  fi
 fi
 if [ -n "${LANE_SANDBOX_REPOS:-}" ]; then
   shopt -s nullglob
   for g in "${LANE_SANDBOX_REPOS%/}"/*/.git; do
-    if [ -d "$g" ]; then
+    if [ -d "$g" ] && [ "$review" = 1 ]; then
+      opts+=(--ro-bind "$g" "$g")
+    elif [ -d "$g" ]; then
       opts+=(--bind "$g" "$g")
       gits+=("$g")
     fi
@@ -289,6 +344,7 @@ keep() {
 }
 # The ssh agent socket may live in a hidden subtree (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent).
 keep_agent() {
+  [ "$review" = 0 ] || return 0
   case "${SSH_AUTH_SOCK:-}" in "$1"/*) keep --ro-bind-try "$SSH_AUTH_SOCK" ;; esac
 }
 # The runner dir: only this lane's entries. The control and cli sockets (sock/control, sock/cli), the runner's keys and
@@ -311,7 +367,9 @@ opts+=(--dir "$R/briefs/$key.out" --dir "$R/lanes/$key")
 if [ "$runner_cwd" = 1 ]; then opts+=(--dir "$C"); fi
 opts+=(--remount-ro "$R")
 keep --bind "$R/briefs/$key.out"
-if [ "$runner_cwd" = 1 ]; then keep --bind "$C"; fi
+if [ "$runner_cwd" = 1 ]; then
+  if [ "$review" = 1 ]; then keep --ro-bind "$C"; else keep --bind "$C"; fi
+fi
 trees+=("$(readlink -f "$R")")
 if [ -d "$H/.ssh" ]; then
   # No ssh private key is ever readable: lanes push over https with GH_TOKEN from their environment.
@@ -322,7 +380,10 @@ if [ -d "$H/.ssh" ]; then
   opts+=(--remount-ro "$H/.ssh")
   trees+=("$(readlink -f "$H/.ssh")")
 fi
-if [ -d "$H/.config/herdr" ]; then
+if [ "$review" = 1 ] && [ -d "$H/.config" ]; then
+  opts+=(--tmpfs "$H/.config" --remount-ro "$H/.config")
+  trees+=("$(readlink -f "$H/.config")")
+elif [ -d "$H/.config/herdr" ]; then
   # herdr's control socket drives the lead's panes.
   opts+=(--tmpfs "$H/.config/herdr")
   keep_agent "$H/.config/herdr"
@@ -337,7 +398,7 @@ if [ -d "$H/.dori/state" ]; then
   trees+=("$(readlink -f "$H/.dori/state")")
 fi
 
-# Then each credential store and the hide list. A hidden file is an empty read-only file (read from /dev/null at setup):
+# Then each credential store, the hide list and review credentials. A hidden file is an empty read-only file (read from /dev/null at setup):
 # a /dev/null bind on a nodev mount fails every open() with EACCES instead of reading empty.
 hidden=()
 hide_path() {
@@ -399,6 +460,10 @@ if [ -f "$H/.dori/lane-sandbox-hide" ]; then
     hide_glob "$p"
   done <"$H/.dori/lane-sandbox-hide"
 fi
+if [ "$review" = 1 ]; then
+  hide_path "$H/.gitconfig"
+  case "${SSH_AUTH_SOCK:-}" in "$H"/*) hide_path "$SSH_AUTH_SOCK" ;; esac
+fi
 
 # Private TMPDIR last, so the broad ~/.cache rw bind cannot shadow it
 opts+=(--bind "$LT" "$H/.lane-tmp" --setenv TMPDIR "$H/.lane-tmp")
@@ -407,7 +472,7 @@ opts+=(--remount-ro /)
 
 # --explain: the table is read off the very argv bwrap would get, so it cannot drift from the mounts.
 if [ "$explain" = 1 ]; then
-  echo "# lane-sandbox --explain (bwrap) for lane $key in $C: a later line wins at and below its path"
+  echo "# lane-sandbox --explain (bwrap) for lane $key in $C${profile:+ (profile $profile)}: a later line wins at and below its path"
   i=0
   while [ "$i" -lt "${#opts[@]}" ]; do
     o=${opts[$i]}

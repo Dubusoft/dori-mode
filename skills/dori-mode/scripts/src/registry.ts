@@ -33,6 +33,8 @@ export type Objection = { readonly at: string; readonly reasons: readonly string
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
 
 export type Lane = {
+  /** A review lane (review-lane.ts): it takes a free lane slot like any lane and runs under the review sandbox profile. */
+  readonly review?: true;
   readonly fileRun?: LaneFileRun;
   readonly pendingFileRun?: LaneFileRun;
   readonly key: string;

@@ -93,6 +93,13 @@ const URGENT_KINDS = [
   "TOODO_TASK_READY",
   // The supervisor's autopilot tick found a new set of tasks it may launch, or the same set still waiting after 30 min.
   "AUTOPILOT_READY",
+  // Review gate (review-gate.ts): review runs that failed until the lead decides, a merge that landed on another base than
+  // the one the review approved, and an owner decision for a reached review limit that could not be opened (review-status.ts).
+  "REVIEW_ESCALATED", "REVIEW_BASE_RACE", "REVIEW_DECISION_FAILED",
+  // The first failure of a PR head's review (timeout queued or running, lost runner, unusable inputs, refused launch,
+  // invalid output): once per head (id review-stalled:<repo>#<n>@<head>), so a failing or stalled review never waits
+  // silently in the digest; later failures of that head stay digest REVIEW_FAILED until REVIEW_ESCALATED.
+  "REVIEW_STALLED",
 ] as const;
 
 /**
@@ -126,6 +133,10 @@ const DIGEST_KINDS = [
   "LANE_CLOSED * closed seen-claim toodo=done", "TOODO_TASK_COMPLETED",
   // An autopilot lane's done outcome whose task the supervisor completed and read back (task-finish.ts finishedOutcome).
   "AUTOPILOT_LANE_DONE * * * toodo=done:",
+  // Review gate progress the supervisor settles itself (review-gate.ts): a review started, held, passed or went stale,
+  // findings went back to the author lane, one failed run is retried, and a reached limit is asked of the owner (its
+  // decision is opened by review-status.ts; the answer wakes the lead as OWNER_DECISION_ANSWERED).
+  "REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE", "REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_CAP_REACHED",
 ] as const;
 
 /**

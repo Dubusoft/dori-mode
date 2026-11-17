@@ -48,6 +48,13 @@
 # macOS ships bash 3.2: no ${x,,}, no {fd} redirections, and no empty "${array[@]}" under set -u.
 set -eu
 
+# LANE_SANDBOX_PROFILE (e.g. review) has no Seatbelt profile yet: review lanes are placed on local Linux only. Refused
+# before anything else (--check and --explain too), so a profiled lane never runs here with the default write access.
+if [ -n "${LANE_SANDBOX_PROFILE:-}" ]; then
+  echo "lane-sandbox: LANE_SANDBOX_PROFILE=$LANE_SANDBOX_PROFILE is not supported on macOS (review lanes run on Linux only); refusing" >&2
+  exit 2
+fi
+
 # Credential stores and secrets under $HOME no lane reads, files and directories alike (a lane gets a credential only
 # through its environment at launch (dori secret env)); the Linux template and `dori doctor` use the same list. The profile refuses reads and
 # writes of each after every grant, so ~/.config/gh/hosts.yml stays hidden.

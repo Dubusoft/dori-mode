@@ -102,6 +102,8 @@ export type OwnerDecision = DecisionChoices & {
    * own (openOwnerDecision). A thread shared that way is archived only when its last decision closes.
    */
   readonly attachedTo?: string;
+  /** The capped review job whose outcome is recorded when this decision closes. */
+  readonly reviewCap?: ReviewCapDecision;
   /** The `[System]` status message of the direct answer in the decision's thread, edited in place (decisionDeliveryTick). */
   readonly notice?: { readonly message: string; readonly text: string };
   /**
@@ -134,6 +136,9 @@ export type DecisionRelay = {
   readonly attempts?: number;
   readonly reportedAt?: number;
 };
+
+/** The capped review job answered by an owner decision. */
+export type ReviewCapDecision = { readonly jobId: string; readonly repo: string; readonly prNumber: number };
 
 /**
  * The lane session a lane decision belongs to: lane key, owning runner, session generation (lane-reports.ts

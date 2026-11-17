@@ -32,6 +32,8 @@ export type InspectWant = {
   readonly process?: boolean; readonly session?: boolean; readonly sessionsDir?: string; readonly cwd?: string;
 };
 export type StartInput = {
+  /** Uses the runner's restricted review profile. */
+  readonly review?: true;
   readonly files?: LaneBriefFiles;
   readonly key: string; readonly machine?: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd?: string;
   readonly sandbox: boolean; readonly mode: string; readonly model: string; readonly keywords: string; readonly session?: string;
@@ -110,6 +112,7 @@ export type LaneOps = {
 /** The runner profiles `lane.start` names (the runner holds the argv): `sandboxed` wraps `default` in the lane sandbox. */
 const AGENT_PROFILE = "default";
 const SANDBOXED_PROFILE = "sandboxed";
+const REVIEW_PROFILE = "review";
 /** A failed send is logged at most this often per lane. */
 const SEND_LOG_EVERY_MS = 60_000;
 
@@ -151,7 +154,8 @@ const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
     && (v.done === undefined || (isObj(v.done) && isStr(v.done.cwd) && isBool(v.done.fallback) && listOf(v.done.checks, isCheck)))
     && (v.session === undefined || (isObj(v.session) && isStr(v.session.id) && isStr(v.session.via))),
   "q.machine.observe": (v) => isObj(v) && isStr(v.os) && isNum(v.sampledAt) && isObj(v.sample) && listOf(v.panes, isPane)
-    && (v.guard === undefined || (isObj(v.guard) && Object.values(v.guard).every(isNum))),
+    && (v.guard === undefined || (isObj(v.guard) && Object.values(v.guard).every(isNum)))
+    && (v.profiles === undefined || listOf(v.profiles, isStr)),
 };
 
 export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boolean } = {
@@ -316,7 +320,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
     resume: (lane) => effect(runnerOf(lane), "lane.resume", { key: lane.key }),
     start: (input) => effect(machineRunner(input.machine), "lane.start", {
       key: input.key, briefText: input.briefText, done: input.done, thread: input.thread, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-      agentProfile: input.sandbox ? SANDBOXED_PROFILE : AGENT_PROFILE, mode: input.mode, model: input.model, sandbox: input.sandbox,
+      agentProfile: input.review ? REVIEW_PROFILE : input.sandbox ? SANDBOXED_PROFILE : AGENT_PROFILE, mode: input.mode, model: input.model, sandbox: input.sandbox,
       expectedLaneGen: 0, keywords: input.keywords,
       ...(input.files !== undefined ? { files: input.files } : {}),
       ...(input.session !== undefined ? { session: input.session } : {}),

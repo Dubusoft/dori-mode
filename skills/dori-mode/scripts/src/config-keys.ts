@@ -42,6 +42,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("ciMergeBase", "string", "The only base branch the supervisor merges lane PRs into"),
   spec("ignorePanes", "list", "herdr panes the sweeps ignore"),
   spec("autopilot", "json", "Autopilot (always on; dori autopilot pause stops it): tickSec, quota threshold, merge base, executor (default false)"),
+  spec("review", "json", "PR review gate: { repos: [\"owner/repo\", ...] } (case-insensitive); unlisted or empty: lane PRs merge without review"),
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */

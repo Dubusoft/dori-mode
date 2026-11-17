@@ -62,6 +62,9 @@ export type DecisionOpener = (lane: Lane, report: LaneReport) => Promise<OpenRes
 /** Journals one line under a stable id; the supervisor dedupes a repeat of the same id. */
 export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unknown;
 
+/** The review lines a lane status message carries. */
+export type ReviewSection = (lane: Lane) => Promise<readonly string[]>;
+
 /**
  * Routes every pending row once, oldest first, and marks it consumed after its effect. question, blocked and milestone
  * become a `LANE_REPORT` event under the id `lane-report:<row id>` (its class comes from eventPolicy: question and
@@ -88,8 +91,15 @@ export type ReportEnqueue = (id: string, line: string, meta?: EventMeta) => unkn
  */
 export const routeReports = async (
   deps: FlowDeps, store: LaneReportStore, enqueue: ReportEnqueue, home = process.env.HOME ?? "",
-  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener,
+  transport: LaneStatusTransport | null = discordStatusTransport(deps.clock) ?? null, openDecision?: DecisionOpener, reviewSection?: ReviewSection,
 ): Promise<string[]> => {
+  // A review status that cannot be read never stops a report: the status message goes out without it.
+  const review = async (lane: Lane): Promise<readonly string[]> => {
+    try { return (await reviewSection?.(lane)) ?? []; } catch (e) {
+      console.error(`LANE_STATUS_REVIEW_ERROR ${lane.key} ${errorText(e)}`);
+      return [];
+    }
+  };
   const out: string[] = [];
   const failed = failures.get(store) ?? new Map<string, number>();
   failures.set(store, failed);
@@ -126,7 +136,7 @@ export const routeReports = async (
         route = "claim";
       } else if (report.kind === "progress" && transport && statusChannel(lane)) {
         try {
-          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home);
+          await upsertStatus(deps, transport, statusChannel(lane) ?? "", lane, store, report, home, await review(lane));
           route = "thread";
         } catch (e) {
           eventId = `lane-report:${report.id}`;
@@ -148,7 +158,7 @@ export const routeReports = async (
         route = "journal";
         const channel = statusChannel(lane);
         if (report.kind === "milestone" && transport && channel) {
-          try { await upsertStatus(deps, transport, channel, lane, store, report, home); }
+          try { await upsertStatus(deps, transport, channel, lane, store, report, home, await review(lane)); }
           catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errorText(e)}`); }
         }
       }

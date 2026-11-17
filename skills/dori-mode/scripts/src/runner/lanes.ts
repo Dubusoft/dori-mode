@@ -132,6 +132,13 @@ const hash = (token: string): string => createHash("sha256").update(token).diges
 /** One question across ticks, like ask-user's own key: header, text and options, not the pending count. */
 const questionKey = (q: ScreenQuestion): string =>
   createHash("sha256").update(JSON.stringify(q.tabs && q.tabs.length > 1 ? [q.tabs] : [q.header ?? "", q.question, q.options])).digest("hex").slice(0, 16);
+/** The agent profile of a review lane: always sandboxed, launched with `LANE_SANDBOX_PROFILE=review` (lane-sandbox.sh). */
+export const REVIEW_PROFILE = "review";
+
+/** Whether a lane of `profile` (with its recorded `sandbox` flag) runs in the lane sandbox; a review lane always does. */
+export const sandboxedLane = (profile: string, sandbox?: boolean): boolean =>
+  sandbox === true || profile === "sandboxed" || profile === REVIEW_PROFILE;
+
 /** What a launch needs; a relaunch takes it from the record. */
 type LaunchInput = {
   readonly sandbox?: boolean;
@@ -335,7 +342,7 @@ export class RunnerLanes {
       ensureRunnerSubdir(this.deps.runnerDir, RUNNER_PATHS.lanes);
       ensureRunnerSubdir(this.deps.runnerDir, join(RUNNER_PATHS.lanes, body.key));
     }
-    if (body.sandbox) await this.checkSandbox(body.key);
+    if (body.sandbox || body.agentProfile === REVIEW_PROFILE) await this.checkSandbox(body.key);
     void this.deps.browserCheck?.(body.key);
     let mayStart = false;
     try {
@@ -373,7 +380,7 @@ export class RunnerLanes {
     const resumed = input.session !== undefined && resumeArgv(this.deps.policy.agents[input.profile] ?? [], input.session) !== undefined;
     const { pane, tab, terminalId, shell, shellPid, cwd, rollback } = await this.acquirePane(input);
     await (this.deps.legacyMcp ?? removeLegacyLaneMcp)(cwd);
-    if (!input.sandbox && input.profile !== "sandboxed") {
+    if (!sandboxedLane(input.profile, input.sandbox)) {
       argv = agentArgv(this.deps.policy, input.profile, agentValues, input.session, this.outsideRules(cwd));
     }
     const token = this.newToken();
@@ -474,6 +481,11 @@ export class RunnerLanes {
     },
   ): Promise<{ readonly command: string; readonly sandboxPrefix: string | undefined }> {
     const { key } = input;
+    const review = input.profile === REVIEW_PROFILE;
+    if (review && shell !== "posix") {
+      await rollback();
+      throw new Error(`RUNNER_LANE_REVIEW_UNSANDBOXED ${key}: a review lane runs only in the lane sandbox, which a ${shell} pane does not have`);
+    }
     let command: string;
     let sandboxPrefix: string | undefined;
     if (shell === "pwsh" || shell === "powershell") {
@@ -496,11 +508,13 @@ export class RunnerLanes {
         ...(input.fileRun ? [`DORI_LANE_OUT=${quote(laneFilePaths(this.deps.runnerDir, key).output)}`] : []),
         ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
         ...(input.heavyMaxLoad !== undefined ? [`DORI_HEAVY_MAX_LOAD=${input.heavyMaxLoad}`] : []),
+        // A review lane writes no worktree, repo or grant: it gets the review profile and none of the rw roots below.
+        ...(review ? [`LANE_SANDBOX_PROFILE=${REVIEW_PROFILE}`] : []),
         // Where a lane started without --cwd makes its worktree; the macOS lane-sandbox makes them writable.
-        ...(this.deps.policy.reposRoot !== undefined ? [`LANE_SANDBOX_REPOS=${quote(this.deps.policy.reposRoot)}`] : []),
-        ...(worktreeRoot !== undefined ? [`LANE_SANDBOX_WORKTREES=${quote(worktreeRoot)}`] : []),
+        ...(!review && this.deps.policy.reposRoot !== undefined ? [`LANE_SANDBOX_REPOS=${quote(this.deps.policy.reposRoot)}`] : []),
+        ...(!review && worktreeRoot !== undefined ? [`LANE_SANDBOX_WORKTREES=${quote(worktreeRoot)}`] : []),
         // The lane's runner-config grants: the wrapper binds these on top of its own, under its hide list.
-        ...(granted?.write.length ? [`LANE_SANDBOX_RW=${quote(granted.write.join(":"))}`] : []),
+        ...(!review && granted?.write.length ? [`LANE_SANDBOX_RW=${quote(granted.write.join(":"))}`] : []),
         ...(granted?.read.length ? [`LANE_SANDBOX_RO=${quote(granted.read.join(":"))}`] : []),
       ];
       const wrapper = this.deps.policy.sandboxCheck?.slice(0, -1) ?? [];
@@ -694,7 +708,7 @@ export class RunnerLanes {
     if (record.adopted) throw new Error(`RUNNER_LANE_ADOPTED ${key} was adopted, not started here; it has no brief or profile to relaunch from`);
     if (briefText === undefined || files === undefined) throw new LaneFileError("LANE_FILES_RECOVER_INPUT_REQUIRED", key, "recovery needs a fresh lead brief and attachment scan; recover the lane again from the lead");
     validateBriefFiles(key, briefText, files);
-    if (record.sandbox || record.profile === "sandboxed") await this.checkSandbox(key);
+    if (sandboxedLane(record.profile, record.sandbox)) await this.checkSandbox(key);
     prepareInput(this.deps.runnerDir, key, briefText, files, true);
     const restored = record.herdrInstance && !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;
     if (pane && record.tab) await this.deps.run(["herdr", "tab", "close", record.tab]);

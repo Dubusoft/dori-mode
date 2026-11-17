@@ -64,7 +64,7 @@ export const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.
  * milestone and last progress (rows up to `report`, late ones left out), each with its time, scrubbed like a thread post.
  */
 export const laneStatusText = (
-  lane: Lane, rows: readonly LaneReport[], report: LaneReport | undefined, now: number, home: string, timeZone?: string,
+  lane: Lane, rows: readonly LaneReport[], report: LaneReport | undefined, now: number, home: string, timeZone?: string, review: readonly string[] = [],
 ): string => {
   const stamp = (at: number): string => displayTime(at, timeZone);
   const upTo = rows.filter((r) => (!report || r.seq <= report.seq) && r.route !== "late" && (r.kind === "milestone" || r.kind === "progress"));
@@ -80,6 +80,7 @@ export const laneStatusText = (
     `[System] 레인 ${lane.key} 상태, 진행 ${Number.isNaN(opened) ? "(알 수 없음)" : elapsed(now - opened)} (갱신 ${stamp(now)})`,
     line("마지막 마일스톤", last("milestone")),
     line("마지막 진행", last("progress")),
+    ...review.map((line) => scrubForThread(line, home)),
   ].join("\n");
 };
 
@@ -117,6 +118,7 @@ export const statusChannel = (lane: Lane): string | undefined =>
  */
 export const upsertStatus = async (
   deps: FlowDeps, transport: LaneStatusTransport, channel: string, lane: Lane, store: LaneReportStore, report: LaneReport, home: string,
+  review: readonly string[] = [],
 ): Promise<void> => {
   const relayed = relayedText(lane.key, scrubForThread(oneLine(report.text), home));
   const redirected = await redirectIfClosed(deps.config.stateDir, transport, channel, relayed, deps.config.discordChannels[0],
@@ -125,7 +127,7 @@ export const upsertStatus = async (
     console.error(`LANE_STATUS_REDIRECTED ${lane.key} ${report.id}: thread ${channel} was closed by the owner, so one line went to ${redirected}`);
     return;
   }
-  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone);
+  const text = laneStatusText(lane, store.list({ lane: lane.key }), report, deps.clock.now(), home, deps.config.displayTimeZone, review);
   await writeLaneStatus(deps, transport, channel, lane, text, `lane-status:${report.id}`);
 };
 

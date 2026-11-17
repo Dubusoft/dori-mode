@@ -137,6 +137,25 @@ export type RunnerSetupDeps = {
 const isRecord = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
+ * A runner-config whose `agents` lack the `review` profile refuses every review lane (`agent-profile`). When
+ * `agents.sandboxed` is there, `review` gets the same argv, as the derived local policy has it (local-policy.ts); the
+ * runner adds `LANE_SANDBOX_PROFILE=review` itself. This holds on every platform (local, Linux, macOS, Windows runners):
+ * the runner reports its profiles, and review placement refuses a machine without `review` before any lane starts.
+ * Without `agents.sandboxed` to copy, a warning line names the gap instead.
+ */
+const withReviewProfile = (next: Json, log: (line: string) => void): Json => {
+  const agents = next.agents;
+  if (!isRecord(agents) || Object.hasOwn(agents, "review")) return next;
+  const sandboxed = agents.sandboxed;
+  if (Array.isArray(sandboxed) && sandboxed.length > 0) {
+    log("RUNNER_SETUP_REVIEW_PROFILE_ADDED agents.review (the agents.sandboxed argv; review lanes run under it)");
+    return { ...next, agents: { ...agents, review: [...sandboxed] } };
+  }
+  log("RUNNER_SETUP_REVIEW_PROFILE_MISSING agents.review is not set and there is no agents.sandboxed to copy; review lanes on this runner are refused until it is added");
+  return next;
+};
+
+/**
  * Exit 0 done (or skipped: no file, nothing to set, not interactive), 1 failed (bad JSON, or a result parsePolicy
  * refuses; nothing written), 2 written or unchanged but required keys are still missing, or no file while `requireFile`.
  * IO errors propagate.
@@ -171,7 +190,7 @@ export const runRunnerSetup = async (d: RunnerSetupDeps, input: { readonly patch
     specs: RUNNER_CONFIG_KEYS, current: pruned.next, patch: input.patch, unset: input.unset,
     prompt: d.prompt, interactive: d.interactive, seen, mode: d.mode, skip: RUNNER_UNASKED_KEYS, defaults: runnerConfigDefault(d.home, d.io.platform), log: d.log,
   });
-  const { next } = configured;
+  const next = withReviewProfile(configured.next, d.log);
   try {
     parsePolicy(next, d.home, undefined, d.io.platform ? { platform: d.io.platform } : {});
   } catch (e) {

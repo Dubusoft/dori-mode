@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
+import { CiFollowUp, type CiIo, type CiReview, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -10,6 +10,7 @@ import type { OpenPull } from "../src/github-events.ts";
 import { briefIssue, LaunchError } from "../src/launch.ts";
 import { ackLaneMessage, LaneMessageError } from "../src/lane-messages.ts";
 import type { Lane } from "../src/registry.ts";
+import type { ReviewReceipt } from "../src/review-receipt.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, sent, withState, type World } from "./fakes.ts";
@@ -65,8 +66,19 @@ let open: CiFollowUp[];
 const emit = (id: string, line: string): void => { events.push([id, line]); };
 const lines = (kind: string): string[] => [...new Map(events.filter(([, l]) => l.startsWith(kind))).values()];
 const io = (patch: Partial<CiIo> = {}): CiIo => ({ launch: async () => ({ ok: false, detail: "no launch in this test" }), ...patch });
+/** A review gate stub that approves every snapshot at one fixed base: these tests are about the gates before review. */
+const BASE = "b".repeat(40);
+const approving: CiReview = {
+  observeSnapshot: async (p) => ({
+    snapshot: { repo: p.repo, prNumber: p.number, headSha: p.sha ?? SHA, baseRef: "dev", baseSha: BASE, mergeBaseSha: BASE, policyVersion: "t4-1", criteriaSha256: "c" },
+    criteria: "", title: "", body: "", url: "",
+  }),
+  approval: async () => ({ approved: true, jobId: "rv-stub", receipt: { baseSha: BASE } as ReviewReceipt }),
+  ensureJob: async () => ({ kind: "refused", why: "stub" }),
+  recordBaseRace: async () => ({ raced: false, why: "stub" }),
+};
 const follow = (patch: Partial<CiIo> = {}): CiFollowUp => {
-  const ci = new CiFollowUp(deps, io(patch));
+  const ci = new CiFollowUp(deps, approving, io(patch));
   open.push(ci);
   return ci;
 };
@@ -263,7 +275,7 @@ test("a green lane PR is merged only at the head its done claim recorded: no cla
   expect(gh.merges).toEqual([["gh", "pr", "merge", "7", "-R", "acme/app", "--merge", "--match-head-commit", SHA]]);
 });
 
-test("a claimed PR the supervisor cannot merge (merge state BLOCKED, no checks) wakes the lead once as urgent MERGE_STALLED after mergeStallMin; pending CI never does", async () => {
+test("a claimed PR the supervisor cannot merge (review BLOCKED, no checks) wakes the lead once as urgent MERGE_STALLED after mergeStallMin; pending CI never does", async () => {
   gh.view = greenView({ mergeStateStatus: "BLOCKED" });
   const ci = follow();
   await ci.tick([pull({ checks: "green" })], emit);
@@ -590,8 +602,8 @@ test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and 
 });
 
 test("a lane checkout sitting on dev reads back none of the dev -> main release PRs merged in its repo; its own branch's PR still is", async () => {
-  // Given a report-only lane working in the main clone (on dev) next to a feature worktree, and old release PRs from dev.
-  await deps.registry.update("report-lane", () => ({ ...lane, key: "report-lane", done: "file /data/report.md", openedAt: new Date(T0 + MIN).toISOString() }));
+  // Given a review-only lane working in the main clone (on dev) next to a feature worktree, and old release PRs from dev.
+  await deps.registry.update("review-lane", () => ({ ...lane, key: "review-lane", done: "file /data/report.md", openedAt: new Date(T0 + MIN).toISOString() }));
   world.inspection = { git: { origin: "git@github.com:acme/app.git", branch: "dev", worktrees: [{ path: "/repo", branch: "dev", exists: true }, { path: "/wt", branch: "review/fix", exists: true }] } };
   gh.view = greenView({ state: "MERGED", baseRefName: "main", mergeCommit: { oid: "m41n" } });
   const merged = [2, 4, 6, 9].map((number) => ({
