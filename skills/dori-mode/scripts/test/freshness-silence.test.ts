@@ -101,3 +101,17 @@ test("a direct answer queued for the lane ends its wait and restarts its silence
   expect(await freshnessTick(deps(T0 + 114 * MIN))).toEqual([]);
   expect((await freshnessTick(deps(T0 + 116 * MIN))).map((a) => a.kind)).toEqual(["nudged"]);
 });
+
+for (const state of ["queued", "acked"] as const) {
+  test(`an answer withdrawn after it reached the lane (withdrawal ${state}) keeps the lane waiting`, async () => {
+    await deps(T0).registry.write(lane);
+    world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "omo", agent_status: "idle" }];
+    const target = { lane: "busy-lane", runner: "local", generation: 0 };
+    decisions(decision({ state: "answered", revisions: [
+      { rev: 1, channel: "c", message: "m", edit: 0, hash: "h1", choice: 1, target, at: T0 + 10 * MIN, delivery: { id: "decision-d1-r1", state: "superseded", updatedAt: T0 + 20 * MIN } },
+      { rev: 2, channel: "c", message: "m", edit: 1, hash: "h2", target, at: T0 + 20 * MIN, delivery: { id: "decision-d1-r2", state, updatedAt: T0 + 20 * MIN } },
+    ] }));
+    for (const min of [16, 40, 120]) expect(await freshnessTick(deps(T0 + min * MIN))).toEqual([]);
+    expect(sent(world)).toEqual([]);
+  });
+}

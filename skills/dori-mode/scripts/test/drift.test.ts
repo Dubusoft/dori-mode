@@ -149,3 +149,13 @@ test("a lane waiting on its blocking request gets no milestone drift, and its st
   expect(await tick(T0 + 289 * MIN, lanes, [])).toEqual([]);
   expect(await tick(T0 + 290 * MIN, lanes, [])).toEqual(["LANE_DRIFT lane-a milestone-overdue 90min since open"]);
 });
+
+test("a lane whose answer was withdrawn after it reached the lane still gets no milestone drift", async () => {
+  const target = { lane: "lane-a", runner: "local", generation: 0 };
+  const d = { id: "d1", state: "answered", source: "lane", lane: "lane-a", blocking: true, channel: "c", openedAt: T0 + MIN, question: "which", options: ["a", "b"], recommend: 1, reason: "r", waiting: "the plan", revisions: [
+    { rev: 1, channel: "c", message: "m", edit: 0, hash: "h1", choice: 1, target, at: T0 + 10 * MIN, delivery: { id: "decision-d1-r1", state: "superseded", updatedAt: T0 + 20 * MIN } },
+    { rev: 2, channel: "c", message: "m", edit: 1, hash: "h2", target, at: T0 + 20 * MIN, delivery: { id: "decision-d1-r2", state: "acked", updatedAt: T0 + 21 * MIN } },
+  ] } as OwnerDecision;
+  writeFileSync(join(state.dir, DECISIONS_FILE), JSON.stringify({ nextSeq: 2, decisions: [d] }));
+  expect(await tick(T0 + 120 * MIN, [lane("lane-a")], [])).toEqual([]);
+});

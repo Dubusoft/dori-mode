@@ -243,13 +243,17 @@ export const sameTarget = (a: DecisionTarget, b: DecisionTarget): boolean =>
 /**
  * Which lanes wait on the owner, for the sweeps that would otherwise wake or report them (freshness, milestone drift).
  * A lane waits while one of its own blocking questions or requests, asked in its current session, is not closed and no
- * direct answer to it is queued or acked. `resolvedAt` is when the lane's last wait ended (a close, or a direct answer
- * queued for it): its silence and milestone clocks count from there, not from before it asked.
+ * direct answer to it is queued or acked. Only the newest revision counts: a withdrawal (a revision without a choice)
+ * opens the question again, so the lane waits again even once the withdrawal reached it. `resolvedAt` is when the lane's
+ * last wait ended (a close, or a direct answer queued for it): its silence and milestone clocks count from there, not
+ * from before it asked.
  */
 export type LaneOwnerWait = { readonly waiting: ReadonlySet<string>; readonly resolvedAt: ReadonlyMap<string, number> };
 
-const answeredDirectly = (d: OwnerDecision): AnswerDelivery | undefined =>
-  d.revisions?.map((r) => r.delivery).filter((x) => x.state === "queued" || x.state === "acked").at(-1);
+const answeredDirectly = (d: OwnerDecision): AnswerDelivery | undefined => {
+  const r = d.revisions?.at(-1);
+  return r && r.choice !== undefined && (r.delivery.state === "queued" || r.delivery.state === "acked") ? r.delivery : undefined;
+};
 
 export const laneOwnerWait = (decisions: readonly OwnerDecision[], lanes: readonly TargetLane[]): LaneOwnerWait => {
   const byKey = new Map(lanes.map((l) => [l.key, l]));
